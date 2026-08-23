@@ -147,7 +147,8 @@ pub const ANSWER_PLACEHOLDER: &str = "{answer}";
 
 /// The invocation this build reviewed, mirroring the owner's live vehicle.
 ///
-/// `exec -` is a pure completion with the prompt on stdin; `-s read-only` and
+/// `exec --json -` is a pure completion with the prompt on stdin and a
+/// normalized JSONL progress stream on stdout; `-s read-only` and
 /// `--ephemeral` keep it from writing outside its workspace or keeping state;
 /// `--skip-git-repo-check` is needed because the workspace is an empty directory
 /// rather than a repository; `--color never` keeps escape sequences out of a
@@ -158,8 +159,9 @@ pub const ANSWER_PLACEHOLDER: &str = "{answer}";
 /// the launch frame has no working-directory line, so the workload starts in
 /// whatever directory the supervisor is in and a relative path would be written
 /// somewhere else entirely.
-pub const DEFAULT_ARGV: [&str; 12] = [
+pub const DEFAULT_ARGV: [&str; 13] = [
     "exec",
+    "--json",
     "-",
     "-s",
     "read-only",

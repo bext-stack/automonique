@@ -181,6 +181,16 @@ Use one-shot `claude -p --output-format stream-json --verbose` and resume by cap
 
 ## Codex
 
+### Current production status
+
+Production currently uses the pinned Codex CLI `exec --json` fallback at
+version 0.149.0. The fallback preserves durable new/resumed thread identity,
+the answer-file contract and normalized JSONL progress. It does not advertise
+App Server-only steering, provider approval/input RPCs, model/account RPCs or
+authoritative item-history reconciliation. The preferred App Server surface
+below remains future capability work rather than a claim about the deployed
+adapter.
+
 ### Preferred surface
 
 Start one `codex app-server --listen stdio:// --strict-config` inside an execution-host process boundary. Use stdio JSONL, not remote WebSocket. The installed CLI can generate a JSON Schema bundle for its exact version; check that bundle into adapter fixtures and include its hash in the host manifest.

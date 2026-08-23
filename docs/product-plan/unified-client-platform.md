@@ -10,9 +10,9 @@ As of 2026-08-23, the contract/fork baseline, shared substrate, production
 vertical slice, client convergence, execution convergence and compatibility
 cleanup are deployed. The production
 slice has completed AI Operations release approval and job delivery through a
-registered Automonique node, an installed JCode engine turn and an ordered
-terminal receipt. Exact idempotent replay returns the original completed
-receipt, and JCode, the ShellDeck client-only build and the hosted web surface
+registered Automonique node, a pinned Codex CLI turn and an ordered terminal
+receipt. Exact idempotent replay returns the original completed receipt, and
+the JCode-derived TUI, the ShellDeck client-only build and the hosted web surface
 agree on the authority-qualified provider model catalog.
 
 The maintained JCode cockpit is installed as the `automonique tui` managed
@@ -56,7 +56,7 @@ behind the control plane in managed mode.
 | AI Operations | global jobs, release approvals, fleet/node registration, assignment and organization-wide coordination | local process truth, sandbox enforcement, provider credentials or session control |
 | Automonique node | local intake and execution, sandbox/credential admission, provider hosts and sessions, local/provider approvals, ordered events, action receipts and controller leases | GitHub issue truth or an AI Operations job state it has not received |
 | GitHub | issue scope, checklist, discussion, pull requests and recorded delivery evidence | live execution or node health |
-| JCode engine/provider | provider-native session execution and raw/provider events | work authority, external-effect approval or canonical job state |
+| Codex provider | provider-native session execution and raw/provider events | work authority, external-effect approval or canonical job state |
 | Clients | authorized projections, composition and explicit typed actions | durable authority, direct provider bypasses or private retry semantics |
 
 Every cross-authority record carries its authority, opaque resource ID,
@@ -119,7 +119,8 @@ live availability rather than treating configured names as proof of access.
 - host `monique.1clic.pro` and migrate it off handwritten/private endpoints;
 - consume AI Operations assignments without turning its projection into local
   execution evidence;
-- host JCode through a pinned, conformance-tested provider adapter.
+- host the pinned Codex CLI fallback through a conformance-tested provider
+  adapter, and advertise only the capabilities that fallback actually has.
 
 ### `benfavre/bext` / AI Operations
 
@@ -135,12 +136,12 @@ live availability rather than treating configured names as proof of access.
 
 - remain a traceable MIT fork of `1jehuang/jcode` with an explicit upstream
   synchronization and divergence policy;
-- retain standalone mode while introducing a backend boundary for managed mode;
+- retain standalone mode while keeping the separate managed cockpit behind an
+  operator-backend boundary;
 - in Automonique mode, route start, follow-up, steering, approval, cancellation
   and model selection through the shared client with no direct-provider bypass;
-- expose its headless engine through the pinned Automonique provider/ACP
-  adapter and supply the terminal interaction implementation for
-  `automonique tui`.
+- supply the terminal interaction implementation for `automonique tui` while
+  leaving provider execution under Automonique's independently pinned adapter.
 
 Directly adapted upstream files retain MIT copyright and licence notices and
 are recorded in the third-party inventory before distribution.
@@ -160,8 +161,8 @@ are recorded in the third-party inventory before distribution.
    registered Automonique node.
 3. The node validates current assignment, local authorization, sandbox,
    credentials and provider capabilities before recording a local action.
-4. The node launches or reconnects the pinned JCode engine through its provider
-   adapter and durably records normalized events.
+4. The node launches or resumes the pinned Codex CLI JSONL fallback through its
+   provider adapter and durably records normalized events.
 5. AI Operations receives bounded authority-qualified projections and receipts;
    transport loss leaves the command unknown until receipt reconciliation.
 6. The TUI may connect directly to the node. ShellDeck and the web client may
@@ -181,7 +182,7 @@ are recorded in the third-party inventory before distribution.
    fixtures alongside the Automonique kernel, AI Operations federation and
    JCode backend boundary.
 3. **Vertical slice:** prove AI Operations job -> approval -> Automonique node
-   -> JCode execution -> ordered events and receipt.
+   -> pinned provider execution -> ordered events and receipt.
 4. **Client convergence:** expose the same job, session and model inventory in
    `automonique tui`, ShellDeck and `monique.1clic.pro`.
 5. **Execution convergence:** disable and remove ShellDeck's independent
@@ -215,7 +216,7 @@ architecture and acceptance contract.
 
 ## Exit criteria
 
-- One AI Operations job is approved, assigned, executed by JCode on an
+- One AI Operations job is approved, assigned, executed by the pinned provider on an
   Automonique node and shown with consistent authority-qualified state in all
   three clients.
 - Forced disconnects resume from cursors without a duplicate mutation, missing

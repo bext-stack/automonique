@@ -177,7 +177,13 @@ impl Normalizer {
         exact(item, &["id", "text", "type"])?;
         let item_id = string(item, "id")?;
         validate_coordinate(item_id, "provider_item_id")?;
-        if self.active_item.as_deref() != Some(item_id) {
+        // Codex CLI 0.149 may publish a terminal assistant item without a
+        // separate `item.started`. An explicit start still fences the exact
+        // provider item ID; only the absent-start form is treated as an
+        // atomic item lifecycle.
+        if let Some(active_item) = self.active_item.as_deref()
+            && active_item != item_id
+        {
             return Err(AdapterError::EventOrder);
         }
         require_agent_message(item)?;
@@ -197,10 +203,17 @@ impl Normalizer {
             .get("usage")
             .and_then(Value::as_object)
             .ok_or(AdapterError::UnknownSchema)?;
-        exact(
-            usage,
-            &["cached_input_tokens", "input_tokens", "output_tokens"],
-        )?;
+        let legacy_fields = ["cached_input_tokens", "input_tokens", "output_tokens"];
+        let current_fields = [
+            "cache_write_input_tokens",
+            "cached_input_tokens",
+            "input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+        ];
+        if !has_exact_fields(usage, &legacy_fields) && !has_exact_fields(usage, &current_fields) {
+            return Err(AdapterError::UnknownSchema);
+        }
         let cached_input_tokens = usage
             .get("cached_input_tokens")
             .and_then(Value::as_u64)
@@ -213,6 +226,17 @@ impl Normalizer {
             .get("output_tokens")
             .and_then(Value::as_u64)
             .ok_or(AdapterError::UnknownSchema)?;
+        // These current-CLI counters are recognized and type-checked even
+        // though the stable usage projection remains the compatible three
+        // totals. An unrecognized or ill-typed counter still refuses.
+        for supplemental in ["cache_write_input_tokens", "reasoning_output_tokens"] {
+            if usage
+                .get(supplemental)
+                .is_some_and(|value| value.as_u64().is_none())
+            {
+                return Err(AdapterError::UnknownSchema);
+            }
+        }
         self.usage = Some(ProviderUsage::new(
             cached_input_tokens,
             input_tokens,
@@ -315,9 +339,13 @@ fn string<'a>(object: &'a Map<String, Value>, field: &str) -> Result<&'a str, Ad
 }
 
 fn exact(object: &Map<String, Value>, fields: &[&str]) -> Result<(), AdapterError> {
-    if object.len() == fields.len() && fields.iter().all(|field| object.contains_key(*field)) {
+    if has_exact_fields(object, fields) {
         Ok(())
     } else {
         Err(AdapterError::UnknownSchema)
     }
+}
+
+fn has_exact_fields(object: &Map<String, Value>, fields: &[&str]) -> bool {
+    object.len() == fields.len() && fields.iter().all(|field| object.contains_key(*field))
 }
