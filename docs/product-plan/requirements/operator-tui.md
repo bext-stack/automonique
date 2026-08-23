@@ -232,6 +232,15 @@ Keep these layers separate:
 The fork pins its upstream base, retains MIT notices on directly adapted files
 and passes both standalone JCode tests and Automonique semantic conformance.
 
+The deployed managed execution path consumes `SubmitRequest` and `FollowUp`
+through Automonique's fenced scheduler and authenticated local execution lane.
+It captures the normalized provider session identifier from the event stream,
+persists the exact session-to-run binding, resumes only that binding, and
+terminalizes the platform receipt through a restart-reconcilable outbox. The
+cockpit therefore never guesses a provider session from a filename or recent
+process, and an interrupted generation cannot blindly replay an uncertain
+provider or platform effect.
+
 Most behavior should be testable without a real terminal. Golden screen tests use a fixed terminal size and sanitized data; reducer/property tests cover duplicates, gaps, reorder rejection, reconnects and stale revisions.
 
 ## Accessibility and operability
