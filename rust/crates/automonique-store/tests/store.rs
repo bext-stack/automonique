@@ -1649,6 +1649,52 @@ fn reconciliation_discovers_old_epoch_and_accepts_live_successor_authority() {
 }
 
 #[test]
+fn reconciliation_can_commit_independently_proven_success_and_custom_receipt() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let old_epoch = lease(&mut store, "holder-a", 0);
+    submit(&mut store, "reconcile-complete", "scope:complete");
+    let claim = claim_next(&mut store, "holder-a", old_epoch, 2).expect("claim");
+    let evidence = store
+        .inspect_reconciliation(claim.run_id)
+        .expect("evidence");
+    let successor = lease(&mut store, "holder-b", 101);
+    let payload = br#"{"outcome":"completed"}"#;
+    let receipt = store
+        .reconcile_run(ReconciliationRequest {
+            run_id: claim.run_id,
+            authority_generation_id: "generation-a",
+            authority_holder_id: "holder-b",
+            authority_lease_epoch: successor,
+            expected_generation_id: "generation-a",
+            expected_lease_epoch: old_epoch,
+            expected_revision: evidence.run_revision,
+            decision_key: "platform-reconcile-complete",
+            now_ms: 102,
+            decision: ReconciliationDecision::Complete {
+                event_kind: "run.managed_completed",
+                event_payload: payload,
+                outbox_kind: "platform.managed_receipt",
+                outbox_payload: payload,
+            },
+        })
+        .expect("proven completion");
+    assert!(!receipt.duplicate);
+    let recovered = store
+        .terminal_receipt(claim.run_id, "platform-reconcile-complete")
+        .expect("terminal receipt");
+    assert_eq!(recovered.event_id, receipt.run_event_id);
+    assert_eq!(recovered.outbox_id, receipt.outbox_id);
+    let snapshot = store
+        .status_snapshot_at("generation-a", 103)
+        .expect("snapshot");
+    assert_eq!(snapshot.runs_running(), 0);
+    assert_eq!(snapshot.runs_reconciliation_pending(), 0);
+    assert_eq!(snapshot.inbox_pending(), 0);
+    assert_eq!(snapshot.outbox_pending(), 1);
+}
+
+#[test]
 fn explicit_reconciliation_failure_is_atomic_retryable_and_unique() {
     let database = PrivateDatabase::new();
     let mut store = Store::open(database.path()).expect("open");

@@ -85,9 +85,9 @@ use std::time::{Duration, Instant};
 
 use automonique_daemon::compose::{
     ANSWER_LEAF, ANSWER_PLACEHOLDER, COMPOSE_MEMORY_BYTES, ComposeRefusal, Composition,
-    CompositionInputs, DEFAULT_ARGV, PROVIDER_CONFIG_NAME, ProviderConfig, ProviderRunProfile,
-    QUESTION_MEMORY_BYTES, QUESTION_MODEL_CONFIG, QUESTION_REASONING_CONFIG, WORKSPACE_PLACEHOLDER,
-    compose, compose_with_profile,
+    CompositionInputs, DEFAULT_ARGV, ManagedSessionMode, PROVIDER_CONFIG_NAME, ProviderConfig,
+    ProviderRunProfile, QUESTION_MEMORY_BYTES, QUESTION_MODEL_CONFIG, QUESTION_REASONING_CONFIG,
+    WORKSPACE_PLACEHOLDER, compose, compose_managed, compose_with_profile,
 };
 use automonique_daemon::execute::{
     DAEMON_BACKEND_ID, DAEMON_WORKSPACE_REGISTRY, locate_launch_helper, offered_host_features,
@@ -484,6 +484,79 @@ fn the_answer_path_is_the_workspace_the_lane_will_resolve() {
     assert!(
         DEFAULT_ARGV.contains(&"--ephemeral") && DEFAULT_ARGV.contains(&ANSWER_PLACEHOLDER),
         "the reviewed invocation must be a pure completion that names its answer file"
+    );
+}
+
+#[test]
+fn managed_new_and_follow_up_argv_preserve_and_resume_one_exact_session() {
+    let fixture = Fixture::new(None, None);
+    let home = fixture.provider_home();
+    write_private(
+        &fixture.state_dir().join(PROVIDER_CONFIG_NAME),
+        &busybox_provider(&home, &[]),
+    );
+    let provider = fixture.provider();
+    let offered = features();
+    let new_run = compose_managed(
+        "first turn",
+        &CompositionInputs {
+            state_dir: &fixture.state_dir(),
+            run_id: "managed-new-1",
+            provider: &provider,
+            offered_features: &offered,
+            egress_configured: true,
+        },
+        ManagedSessionMode::New,
+    )
+    .expect("managed new request");
+    let new_spec = RunSpec::from_canonical_bytes(new_run.document()).expect("new spec");
+    assert!(new_spec.arguments().iter().any(|value| value == "--json"));
+    assert!(
+        !new_spec
+            .arguments()
+            .iter()
+            .any(|value| value == "--ephemeral")
+    );
+
+    let follow_up = compose_managed(
+        "second turn",
+        &CompositionInputs {
+            state_dir: &fixture.state_dir(),
+            run_id: "managed-follow-up-1",
+            provider: &provider,
+            offered_features: &offered,
+            egress_configured: true,
+        },
+        ManagedSessionMode::Resume("018f0000-0000-7000-8000-000000000001"),
+    )
+    .expect("managed follow-up");
+    let follow_spec = RunSpec::from_canonical_bytes(follow_up.document()).expect("follow-up spec");
+    let arguments = follow_spec
+        .arguments()
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        arguments,
+        [
+            "-s",
+            "read-only",
+            "-C",
+            follow_up
+                .answer_path()
+                .parent()
+                .expect("workspace")
+                .to_str()
+                .expect("workspace text"),
+            "exec",
+            "resume",
+            "--skip-git-repo-check",
+            "-o",
+            follow_up.answer_path().to_str().expect("answer text"),
+            "--json",
+            "018f0000-0000-7000-8000-000000000001",
+            "-",
+        ]
     );
 }
 

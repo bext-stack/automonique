@@ -1011,14 +1011,30 @@ pub struct ClaimedInbox {
     pub received_ms: i64,
 }
 
-/// Closed operator decision for one ambiguous running item.
+/// Closed authority decision for one ambiguous running item.
 ///
 /// There is deliberately no requeue decision: missing durable outcome rows do
-/// not prove that an external execution did not begin before a crash.
+/// not prove that an external execution did not begin before a crash. A
+/// successful completion is expressible only when the caller has independent
+/// durable terminal evidence and supplies the exact terminal/event intent that
+/// must be committed under the new generation's reconciliation authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReconciliationDecision<'a> {
     /// Record an explicit failed outcome and one fake reconciliation receipt.
     Fail { reason: &'a str },
+    /// Record a proven failed outcome with a caller-owned durable effect.
+    FailWithIntent {
+        reason: &'a str,
+        outbox_kind: &'a str,
+        outbox_payload: &'a [u8],
+    },
+    /// Record a proven successful outcome and its external-effect intent.
+    Complete {
+        event_kind: &'a str,
+        event_payload: &'a [u8],
+        outbox_kind: &'a str,
+        outbox_payload: &'a [u8],
+    },
 }
 
 /// Exact observation an operator must carry into a reconciliation decision.
@@ -3244,8 +3260,32 @@ impl Store {
         validate_id(request.expected_generation_id, "expected_generation_id")?;
         validate_id(request.decision_key, "decision_key")?;
         validate_time(request.now_ms)?;
-        let ReconciliationDecision::Fail { reason } = request.decision;
-        validate_id(reason, "reconciliation_reason")?;
+        let parts = reconciliation_parts(request.decision);
+        match request.decision {
+            ReconciliationDecision::Fail { reason } => {
+                validate_id(reason, "reconciliation_reason")?;
+            }
+            ReconciliationDecision::FailWithIntent {
+                reason,
+                outbox_kind,
+                outbox_payload,
+            } => {
+                validate_id(reason, "reconciliation_reason")?;
+                validate_id(outbox_kind, "outbox_kind")?;
+                validate_payload(outbox_payload, "outbox_payload")?;
+            }
+            ReconciliationDecision::Complete {
+                event_kind,
+                event_payload,
+                outbox_kind,
+                outbox_payload,
+            } => {
+                validate_id(event_kind, "event_kind")?;
+                validate_payload(event_payload, "event_payload")?;
+                validate_id(outbox_kind, "outbox_kind")?;
+                validate_payload(outbox_payload, "outbox_payload")?;
+            }
+        }
         let lease_now_ms = self.lease_now_ms(request.now_ms)?;
         let transaction = self
             .connection
@@ -3338,8 +3378,6 @@ impl Store {
             .checked_add(1)
             .ok_or(StoreError::InvalidField("inbox_revision"))?;
 
-        let payload = reason.as_bytes();
-
         let run_changed = transaction.execute(
             "UPDATE runs SET state = ?2, revision = ?3, finished_ms = ?4,
              terminal_payload = ?5, outbox_intent_key = ?6
@@ -3347,10 +3385,10 @@ impl Store {
                AND state = 'running' AND revision = ?9",
             params![
                 request.run_id,
-                "failed",
+                parts.run_state,
                 to_db_u64(next_revision, "run_revision")?,
                 request.now_ms,
-                payload,
+                parts.event_payload,
                 request.decision_key,
                 request.expected_generation_id,
                 to_db_u64(request.expected_lease_epoch, "lease_epoch")?,
@@ -3365,7 +3403,7 @@ impl Store {
              WHERE inbox_id = ?1 AND state = 'claimed' AND claimed_run_id = ?4",
             params![
                 run.6,
-                "failed",
+                parts.inbox_state,
                 to_db_u64(next_inbox_revision, "inbox_revision")?,
                 request.run_id
             ],
@@ -3391,8 +3429,8 @@ impl Store {
                     &request.run_id.to_string(),
                     next_revision,
                     request.now_ms,
-                    "run.reconciliation_failed",
-                    payload,
+                    parts.run_event_kind,
+                    parts.event_payload,
                     provenance,
                 )?,
                 append_event_with_provenance(
@@ -3401,8 +3439,8 @@ impl Store {
                     &run.6.to_string(),
                     next_inbox_revision,
                     request.now_ms,
-                    "inbox.reconciliation_failed",
-                    payload,
+                    parts.inbox_event_kind,
+                    parts.event_payload,
                     provenance,
                 )?,
             )
@@ -3414,8 +3452,8 @@ impl Store {
                     &request.run_id.to_string(),
                     next_revision,
                     request.now_ms,
-                    "run.reconciliation_failed",
-                    payload,
+                    parts.run_event_kind,
+                    parts.event_payload,
                 )?,
                 append_event(
                     &transaction,
@@ -3423,8 +3461,8 @@ impl Store {
                     &run.6.to_string(),
                     next_inbox_revision,
                     request.now_ms,
-                    "inbox.reconciliation_failed",
-                    payload,
+                    parts.inbox_event_kind,
+                    parts.event_payload,
                 )?,
             )
         };
@@ -3442,12 +3480,14 @@ impl Store {
             "INSERT INTO outbox
              (intent_key, event_id, transport, kind, payload, state, revision,
               attempts, available_ms, created_ms, trace_id, correlation_id, causation_id)
-             VALUES (?1, ?2, 'fake', 'fake.reconciliation.receipt', ?3,
-                     'pending', 1, 0, ?4, ?4, ?5, ?6, ?7)",
+             VALUES (?1, ?2, ?3, ?4, ?5,
+                     'pending', 1, 0, ?6, ?6, ?7, ?8, ?9)",
             params![
                 request.decision_key,
                 run_event_id,
-                payload,
+                outbox_transport(parts.outbox_kind),
+                parts.outbox_kind,
+                parts.outbox_payload,
                 request.now_ms,
                 outbox_provenance
                     .as_ref()
@@ -5947,9 +5987,8 @@ fn reconciliation_retry_receipt(
     if revision != expected_revision || run.5.as_deref() != Some(request.decision_key) {
         return Err(StoreError::AlreadyTerminal);
     }
-    let ReconciliationDecision::Fail { reason } = request.decision;
-    let expected_payload = reason.as_bytes();
-    if run.0 != "failed" || run.4.as_deref() != Some(expected_payload) {
+    let parts = reconciliation_parts(request.decision);
+    if run.0 != parts.run_state || run.4.as_deref() != Some(parts.event_payload) {
         return Err(StoreError::AlreadyTerminal);
     }
     let run_event_id: i64 = transaction.query_row(
@@ -5958,15 +5997,20 @@ fn reconciliation_retry_receipt(
         params![
             request.run_id.to_string(),
             to_db_u64(revision, "run_revision")?,
-            "run.reconciliation_failed",
-            expected_payload
+            parts.run_event_kind,
+            parts.event_payload
         ],
         |row| row.get(0),
     )?;
     let outbox_id = transaction.query_row(
         "SELECT outbox_id FROM outbox WHERE event_id = ?1 AND intent_key = ?2
-         AND kind = 'fake.reconciliation.receipt' AND payload = ?3",
-        params![run_event_id, request.decision_key, expected_payload],
+         AND kind = ?3 AND payload = ?4",
+        params![
+            run_event_id,
+            request.decision_key,
+            parts.outbox_kind,
+            parts.outbox_payload
+        ],
         |row| row.get(0),
     )?;
     let inbox_event_id = transaction.query_row(
@@ -5974,9 +6018,14 @@ fn reconciliation_retry_receipt(
            ON e.aggregate_kind = 'inbox'
           AND e.aggregate_id = CAST(i.inbox_id AS TEXT)
           AND e.revision = i.revision
-         WHERE i.inbox_id = ?1 AND i.state = 'failed' AND i.claimed_run_id IS NULL
-           AND e.kind = 'inbox.reconciliation_failed' AND e.payload = ?2",
-        params![run.6, expected_payload],
+         WHERE i.inbox_id = ?1 AND i.state = ?2 AND i.claimed_run_id IS NULL
+           AND e.kind = ?3 AND e.payload = ?4",
+        params![
+            run.6,
+            parts.inbox_state,
+            parts.inbox_event_kind,
+            parts.event_payload
+        ],
         |row| row.get(0),
     )?;
     Ok(ReconciliationReceipt {
@@ -5985,6 +6034,57 @@ fn reconciliation_retry_receipt(
         outbox_id,
         duplicate: true,
     })
+}
+
+struct ReconciliationParts<'a> {
+    run_state: &'static str,
+    inbox_state: &'static str,
+    run_event_kind: &'a str,
+    inbox_event_kind: &'static str,
+    event_payload: &'a [u8],
+    outbox_kind: &'a str,
+    outbox_payload: &'a [u8],
+}
+
+fn reconciliation_parts(decision: ReconciliationDecision<'_>) -> ReconciliationParts<'_> {
+    match decision {
+        ReconciliationDecision::Fail { reason } => ReconciliationParts {
+            run_state: "failed",
+            inbox_state: "failed",
+            run_event_kind: "run.reconciliation_failed",
+            inbox_event_kind: "inbox.reconciliation_failed",
+            event_payload: reason.as_bytes(),
+            outbox_kind: "fake.reconciliation.receipt",
+            outbox_payload: reason.as_bytes(),
+        },
+        ReconciliationDecision::FailWithIntent {
+            reason,
+            outbox_kind,
+            outbox_payload,
+        } => ReconciliationParts {
+            run_state: "failed",
+            inbox_state: "failed",
+            run_event_kind: "run.reconciliation_failed",
+            inbox_event_kind: "inbox.reconciliation_failed",
+            event_payload: reason.as_bytes(),
+            outbox_kind,
+            outbox_payload,
+        },
+        ReconciliationDecision::Complete {
+            event_kind,
+            event_payload,
+            outbox_kind,
+            outbox_payload,
+        } => ReconciliationParts {
+            run_state: "succeeded",
+            inbox_state: "completed",
+            run_event_kind: event_kind,
+            inbox_event_kind: "inbox.reconciliation_completed",
+            event_payload,
+            outbox_kind,
+            outbox_payload,
+        },
+    }
 }
 
 fn count_table(connection: &Connection, table: &'static str) -> Result<u64, StoreError> {

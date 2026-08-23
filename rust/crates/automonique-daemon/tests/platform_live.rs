@@ -359,7 +359,10 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
     );
 
     let follow_up_key = IdempotencyKey::new("follow-up-live-1").expect("key");
-    let PlatformResponse::Receipt(follow_up) = platform(
+    let PlatformResponse::Refused {
+        outcome,
+        explanation,
+    } = platform(
         &config,
         "follow-up",
         PlatformRequest::Execute(
@@ -372,18 +375,12 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
             )
             .expect("follow-up action"),
         ),
-    ) else {
-        panic!("follow-up receipt")
+    )
+    else {
+        panic!("non-managed session follow-up refusal")
     };
-    assert_eq!(follow_up.outcome, ReceiptOutcome::Accepted);
-    let PlatformResponse::Receipt(reconciled_follow_up) = platform(
-        &config,
-        "follow-up-reconcile",
-        PlatformRequest::GetReceipt(GetReceiptRequest::by_idempotency_key(follow_up_key)),
-    ) else {
-        panic!("reconciled follow-up receipt")
-    };
-    assert_eq!(reconciled_follow_up, follow_up);
+    assert_eq!(outcome, ReceiptOutcome::Rejected);
+    assert_eq!(explanation.as_str(), "session_not_resumable");
 
     let request = ClaimControlRequest {
         session: session(),
@@ -475,5 +472,71 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
     };
     assert_eq!(outcome, ReceiptOutcome::Rejected);
     assert_eq!(explanation.as_str(), "target_not_active_node");
+    serving.shutdown(&config);
+}
+
+#[test]
+fn managed_request_worker_reconciles_a_typed_provider_refusal() {
+    let (_root, config) = fixture();
+    std::fs::create_dir(config.state_dir()).expect("product state");
+    std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
+        .expect("private product state");
+    write_catalog_provider(&config, "gpt-5.6-sol", true);
+    let serving = serve(&config);
+    let PlatformResponse::Snapshot(snapshot) = platform(
+        &config,
+        "managed-refusal-snapshot",
+        PlatformRequest::Snapshot(SnapshotRequest::new(Vec::new()).expect("snapshot request")),
+    ) else {
+        panic!("snapshot response")
+    };
+    let node = snapshot
+        .resources
+        .into_iter()
+        .find(|resource| resource.resource.kind == ResourceKind::Node)
+        .expect("active node");
+    let key = IdempotencyKey::new("managed-refusal-request").expect("key");
+    let PlatformResponse::Receipt(accepted) = platform(
+        &config,
+        "managed-refusal-submit",
+        PlatformRequest::Execute(
+            ExecuteRequest::new(
+                PlatformAction::SubmitRequest,
+                node.resource,
+                key.clone(),
+                Some(node.freshness.revision),
+                Some(PlatformText::new("bounded request").expect("body")),
+            )
+            .expect("request"),
+        ),
+    ) else {
+        panic!("accepted receipt")
+    };
+    assert_eq!(accepted.outcome, ReceiptOutcome::Accepted);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let completed = loop {
+        let PlatformResponse::Receipt(receipt) = platform(
+            &config,
+            "managed-refusal-reconcile",
+            PlatformRequest::GetReceipt(GetReceiptRequest::by_idempotency_key(key.clone())),
+        ) else {
+            panic!("receipt response")
+        };
+        if receipt.outcome != ReceiptOutcome::Accepted {
+            break receipt;
+        }
+        assert!(Instant::now() < deadline, "managed receipt stayed accepted");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(completed.outcome, ReceiptOutcome::Rejected);
+    assert_eq!(
+        completed
+            .explanation
+            .as_ref()
+            .expect("typed explanation")
+            .as_str(),
+        "run_not_configured"
+    );
     serving.shutdown(&config);
 }

@@ -441,6 +441,8 @@ pub struct ExecutionLane {
     /// The read model a worker advances, opened again per worker on its own
     /// connection. See [`advance`].
     run_index_path: PathBuf,
+    /// Durable normalized provider-session bindings written by run workers.
+    managed_sessions_path: PathBuf,
     /// The entry helper, when one is configured as an absolute path.
     helper: Option<PathBuf>,
     /// Whether the startup probe said this host can enforce the composed
@@ -503,6 +505,7 @@ impl ExecutionLane {
                 .unwrap_or_default();
         Self {
             attempt_host,
+            managed_sessions_path: state_dir.join(crate::MANAGED_SESSIONS_NAME),
             state_dir,
             run_index_path,
             helper,
@@ -764,8 +767,9 @@ impl ExecutionLane {
         // refusal-first normalizer on its first line — costing the run nothing
         // and the operator a stream that never says anything — so the presence
         // of the flag that makes stdout the normalized grammar is the gate.
+        let session_capture = Arc::new(Mutex::new(None));
         let prepared = if emits_normalized_stream(spec) {
-            match progress_capture(spec, run_id, &self.progress) {
+            match progress_capture(spec, run_id, &self.progress, Arc::clone(&session_capture)) {
                 Some(capture) => prepared.with_progress(capture),
                 None => prepared,
             }
@@ -787,6 +791,8 @@ impl ExecutionLane {
             progress: Arc::clone(&self.progress),
             attempt_host: Arc::clone(&self.attempt_host),
             broker,
+            session_capture,
+            managed_sessions_path: self.managed_sessions_path.clone(),
         })
     }
 
@@ -1065,6 +1071,10 @@ struct Attempt {
     /// worker drops it, including a panic, and its drop stops the listener and
     /// tears down every tunnel still open.
     broker: Option<EgressBroker>,
+    /// Exact provider session observed by the normalized stream.
+    session_capture: Arc<Mutex<Option<String>>>,
+    /// Independent durable connection opened after the run becomes terminal.
+    managed_sessions_path: PathBuf,
 }
 
 impl Attempt {
@@ -1088,6 +1098,8 @@ impl Attempt {
             progress,
             attempt_host,
             broker,
+            session_capture,
+            managed_sessions_path,
         } = self;
 
         let report = prepared.execute(&cancellation, timeout);
@@ -1130,6 +1142,15 @@ impl Attempt {
             // not. The supervisor publishes the position it actually reached.
             Err(_) => (RunSpoolState::Failed, observed.get()),
         };
+        if state == RunSpoolState::Completed
+            && let Ok(captured) = session_capture.lock()
+            && let Some(provider_session_id) = captured.as_deref()
+            && let Ok(now_ms) = crate::unix_millis()
+            && let Ok(mut sessions) =
+                crate::managed_sessions::ManagedSessionStore::open(&managed_sessions_path)
+        {
+            let _ = sessions.observe(provider_session_id, &run_id, now_ms);
+        }
         advance(index_path, submission_id, revision, state, last_sequence);
         // The process and spool are terminal and the registration is already
         // gone, so no caller can reach this attempt again. Failure is safe: it
@@ -1171,6 +1192,7 @@ fn progress_capture(
     spec: &RunSpec,
     run_id: &str,
     hub: &Arc<ProgressHub>,
+    session_capture: Arc<Mutex<Option<String>>>,
 ) -> Option<ProgressCapture> {
     // The scope is this daemon's own deployment identity rather than anything
     // the document supplies: it names where the events came from, and a
@@ -1189,8 +1211,10 @@ fn progress_capture(
     // normalizer demand a session identity the provider will not report.
     let mode = automonique_agents::ExecutionMode::NewSession;
     Some(
-        ProgressCapture::new(Box::new(ProviderProgressMapper::new(&coordinates, &mode)))
-            .publishing_to(hub.publisher(run_id)),
+        ProgressCapture::new(Box::new(
+            ProviderProgressMapper::new(&coordinates, &mode).with_session_capture(session_capture),
+        ))
+        .publishing_to(hub.publisher(run_id)),
     )
 }
 

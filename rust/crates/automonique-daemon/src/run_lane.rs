@@ -95,8 +95,8 @@ use automonique_transport_runtime::{
 };
 
 use crate::compose::{
-    ComposeRefusal, Composition, CompositionInputs, ProviderConfig, ProviderRunProfile, compose,
-    compose_with_profile, read_answer,
+    ComposeRefusal, Composition, CompositionInputs, ManagedSessionMode, ProviderConfig,
+    ProviderRunProfile, compose, compose_managed, compose_with_profile, read_answer,
 };
 use crate::progress_hub::ProgressHub;
 use crate::telegram_bridge::{
@@ -999,6 +999,67 @@ impl RunLane for SocketRunLane {
 }
 
 impl SocketRunLane {
+    /// Execute or recover one deterministic managed run.
+    ///
+    /// `run_id` is derived from the durable inbox idempotency key by the
+    /// managed worker. Reusing it never starts a second provider attempt: a
+    /// ready/running/terminal read-model row is resumed from its exact state.
+    pub fn run_managed(
+        &mut self,
+        run_id: &str,
+        task: &str,
+        mode: ManagedSessionMode<'_>,
+    ) -> Result<String, RunFailure> {
+        let provider = self.provider.clone().ok_or(RunFailure::NotConfigured)?;
+        let inputs = CompositionInputs {
+            state_dir: &self.state_dir,
+            run_id,
+            provider: &provider,
+            offered_features: &self.offered,
+            egress_configured: self.egress_configured,
+        };
+        let composition = compose_managed(task, &inputs, mode).map_err(RunFailure::from_compose)?;
+        let slot = self.place_prompt(&composition)?;
+        let outcome = self.execute_managed(&composition);
+        let _ = fs::remove_file(&slot);
+        outcome
+    }
+
+    fn execute_managed(&mut self, composition: &Composition) -> Result<String, RunFailure> {
+        let existing = self
+            .run_index
+            .by_run_id(composition.run_id())
+            .map_err(|_| RunFailure::Unavailable)?
+            .into_iter()
+            .last();
+        let (submission_id, state) = match existing {
+            Some(record) => (
+                u64::try_from(record.submission_id).map_err(|_| RunFailure::Unavailable)?,
+                record.spool_state,
+            ),
+            None => (self.submit(composition)?, RunSpoolState::Ready),
+        };
+        match state {
+            RunSpoolState::Ready => self.start(composition)?,
+            RunSpoolState::Running => {}
+            RunSpoolState::Completed => return self.managed_answer(composition),
+            RunSpoolState::TimedOut => return Err(RunFailure::TimedOut),
+            RunSpoolState::Cancelled => return Err(RunFailure::Cancelled),
+            RunSpoolState::Failed => return Err(RunFailure::Failed),
+        }
+        match self.await_terminal(submission_id, composition.run_id())? {
+            RunSpoolState::Completed => self.managed_answer(composition),
+            RunSpoolState::TimedOut => Err(RunFailure::TimedOut),
+            RunSpoolState::Cancelled => Err(RunFailure::Cancelled),
+            RunSpoolState::Failed => Err(RunFailure::Failed),
+            RunSpoolState::Ready | RunSpoolState::Running => Err(RunFailure::Unavailable),
+        }
+    }
+
+    fn managed_answer(&self, composition: &Composition) -> Result<String, RunFailure> {
+        read_answer(composition.answer_path()).ok_or(RunFailure::NoAnswer)
+    }
+
     fn run_with_profile(
         &mut self,
         task: &str,
