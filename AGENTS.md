@@ -58,6 +58,5 @@ Product code is `Elastic-2.0`; `sdk/` is the only `Apache-2.0` root. Moving code
 across that boundary needs owner review before distribution. Distribution work
 also follows `LICENSE-POLICY.md`.
 
-Codex commits use `Automonique Candidate <candidate@automonique.invalid>`.
-Human commits use the human author's configured identity. Do not add assistant
+Use the repository owner's configured Git identity. Do not add assistant
 attribution or co-author trailers.
