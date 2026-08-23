@@ -82,11 +82,174 @@ fn main() -> ExitCode {
     if command.as_deref() == Some(std::ffi::OsStr::new("tui")) {
         return tui_command(arguments.collect());
     }
+    if command.as_deref() == Some(std::ffi::OsStr::new("platform-job")) {
+        return platform_job_command(arguments.collect());
+    }
     ExitCode::from(automonique_cli::run(
         std::env::args_os().skip(1),
         std::io::stdout().lock(),
         std::io::stderr().lock(),
     ))
+}
+
+struct PlatformJobArguments {
+    socket: std::path::PathBuf,
+    idempotency_key: String,
+    timeout: Duration,
+}
+
+/// Submit one federated AI Operations assignment through Automonique's local
+/// platform authority and wait for its durable terminal receipt. The prompt is
+/// accepted only on stdin, and the command line remains a closed typed shape.
+fn platform_job_command(values: Vec<std::ffi::OsString>) -> ExitCode {
+    let arguments = match platform_job_arguments(&values) {
+        Ok(arguments) => arguments,
+        Err(()) => {
+            eprintln!(
+                "usage: automonique platform-job --socket PATH --idempotency-key KEY --timeout-seconds SECONDS < prompt"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let mut prompt = Vec::new();
+    {
+        use std::io::Read as _;
+        if std::io::stdin()
+            .lock()
+            .take(257)
+            .read_to_end(&mut prompt)
+            .is_err()
+            || prompt.is_empty()
+            || prompt.len() > 256
+        {
+            eprintln!("automonique platform-job refused: prompt");
+            return ExitCode::from(2);
+        }
+    }
+    let Ok(prompt) = String::from_utf8(prompt) else {
+        eprintln!("automonique platform-job refused: prompt");
+        return ExitCode::from(2);
+    };
+    match run_platform_job(&arguments, &prompt) {
+        Ok((outcome, explanation)) => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema": "automonique.platform-job/v1",
+                    "outcome": outcome.as_str(),
+                    "explanation": explanation,
+                })
+            );
+            if outcome == automonique_protocol::platform::ReceiptOutcome::Completed {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(category) => {
+            eprintln!("automonique platform-job refused: {category}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn platform_job_arguments(values: &[std::ffi::OsString]) -> Result<PlatformJobArguments, ()> {
+    if values.len() != 6
+        || values[0] != "--socket"
+        || values[2] != "--idempotency-key"
+        || values[4] != "--timeout-seconds"
+    {
+        return Err(());
+    }
+    let socket = std::path::PathBuf::from(&values[1]);
+    let idempotency_key = values[3].to_str().ok_or(())?.to_owned();
+    let timeout_seconds = values[5]
+        .to_str()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (1..=21_600).contains(value))
+        .ok_or(())?;
+    if !socket.is_absolute()
+        || automonique_protocol::platform::IdempotencyKey::new(&idempotency_key).is_err()
+    {
+        return Err(());
+    }
+    Ok(PlatformJobArguments {
+        socket,
+        idempotency_key,
+        timeout: Duration::from_secs(timeout_seconds),
+    })
+}
+
+fn run_platform_job(
+    arguments: &PlatformJobArguments,
+    prompt: &str,
+) -> Result<
+    (
+        automonique_protocol::platform::ReceiptOutcome,
+        Option<String>,
+    ),
+    &'static str,
+> {
+    use automonique_platform_client::{ActionResult, PlatformClient, UnixTransport};
+    use automonique_protocol::platform::{
+        ExecuteRequest, FreshnessState, GetReceiptRequest, IdempotencyKey, PlatformAction,
+        PlatformText, ReceiptOutcome, ResourceAuthority, ResourceKind,
+    };
+
+    let mut client = PlatformClient::new(UnixTransport::new(&arguments.socket));
+    let snapshot = client.snapshot(Vec::new()).map_err(|_| "snapshot")?;
+    let mut nodes = snapshot.resources.into_iter().filter(|record| {
+        record.resource.authority == ResourceAuthority::Automonique
+            && record.resource.kind == ResourceKind::Node
+            && record.freshness.state == FreshnessState::Fresh
+            && record.summary.as_str() == "daemon ready"
+    });
+    let node = nodes.next().ok_or("active_node")?;
+    if nodes.next().is_some() {
+        return Err("active_node_ambiguous");
+    }
+    let key = IdempotencyKey::new(&arguments.idempotency_key).map_err(|_| "idempotency_key")?;
+    let request = ExecuteRequest::new(
+        PlatformAction::SubmitRequest,
+        node.resource,
+        key.clone(),
+        Some(node.freshness.revision),
+        Some(PlatformText::new(prompt.trim_end()).map_err(|_| "prompt")?),
+    )
+    .map_err(|_| "request")?;
+    let receipt = match client.execute_outcome(request).map_err(|_| "execute")? {
+        ActionResult::Receipt(receipt) => receipt,
+        ActionResult::Refused {
+            outcome,
+            explanation,
+        } => return Ok((outcome, Some(explanation.as_str().to_owned()))),
+    };
+    if receipt.outcome != ReceiptOutcome::Accepted {
+        return Ok((
+            receipt.outcome,
+            receipt.explanation.map(|value| value.as_str().to_owned()),
+        ));
+    }
+
+    let deadline = Instant::now() + arguments.timeout;
+    loop {
+        if Instant::now() >= deadline {
+            return Ok((
+                ReceiptOutcome::Unknown,
+                Some("local_receipt_timeout".to_owned()),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let receipt = client
+            .get_receipt(GetReceiptRequest::by_idempotency_key(key.clone()))
+            .map_err(|_| "receipt")?;
+        if receipt.outcome != ReceiptOutcome::Accepted {
+            return Ok((
+                receipt.outcome,
+                receipt.explanation.map(|value| value.as_str().to_owned()),
+            ));
+        }
+    }
 }
 
 /// Launch the maintained JCode-derived operator client over Automonique's
@@ -500,8 +663,9 @@ fn command_result(command: &str, result: Result<(), &'static str>) -> ExitCode {
 
 #[cfg(test)]
 mod tui_tests {
-    use super::tui_arguments;
+    use super::{platform_job_arguments, tui_arguments};
     use std::ffi::OsString;
+    use std::time::Duration;
 
     #[test]
     fn tui_wrapper_forwards_only_typed_platform_options() {
@@ -525,5 +689,44 @@ mod tui_tests {
         assert!(tui_arguments(&[OsString::from("--provider")]).is_err());
         assert!(tui_arguments(&[OsString::from("--socket")]).is_err());
         assert!(tui_arguments(&[OsString::from("--json"), OsString::from("--json")]).is_err());
+    }
+
+    #[test]
+    fn platform_job_arguments_are_closed_and_bounded() {
+        let parsed = platform_job_arguments(&[
+            OsString::from("--socket"),
+            OsString::from("/run/user/1000/automonique/admin.sock"),
+            OsString::from("--idempotency-key"),
+            OsString::from("cmd_12345678"),
+            OsString::from("--timeout-seconds"),
+            OsString::from("60"),
+        ])
+        .expect("valid platform job");
+        assert!(parsed.socket.is_absolute());
+        assert_eq!(parsed.idempotency_key, "cmd_12345678");
+        assert_eq!(parsed.timeout, Duration::from_secs(60));
+
+        assert!(
+            platform_job_arguments(&[
+                OsString::from("--socket"),
+                OsString::from("relative.sock"),
+                OsString::from("--idempotency-key"),
+                OsString::from("cmd_12345678"),
+                OsString::from("--timeout-seconds"),
+                OsString::from("60"),
+            ])
+            .is_err()
+        );
+        assert!(
+            platform_job_arguments(&[
+                OsString::from("--socket"),
+                OsString::from("/run/automonique.sock"),
+                OsString::from("--idempotency-key"),
+                OsString::from("cmd_12345678"),
+                OsString::from("--timeout-seconds"),
+                OsString::from("21601"),
+            ])
+            .is_err()
+        );
     }
 }

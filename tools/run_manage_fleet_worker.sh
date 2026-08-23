@@ -37,6 +37,11 @@ fleet_config=$state_dir/support/fleet.conf
 provider_config=$state_dir/provider
 runtime_dir=$state_dir/manage-fleet-worker
 output_dir=$runtime_dir/process-output
+platform_commands_dir=$runtime_dir/platform-commands
+platform_pending_dir=$platform_commands_dir/pending
+platform_running_dir=$platform_commands_dir/running
+platform_done_dir=$platform_commands_dir/done
+platform_receipt_dir=$platform_commands_dir/receipts
 aggregate_auth_health_file=$runtime_dir/auth-health.json
 agent_auth_dir=${AUTOMONIQUE_AGENT_AUTH_DIR:-}
 account_registry=${agent_auth_dir:+$agent_auth_dir/accounts.json}
@@ -58,14 +63,25 @@ fleet_instance=$(private_value instance "$fleet_config")
 fleet_token=$(private_value token "$fleet_config")
 provider_binary=$(private_value binary "$provider_config")
 provider_home=$(private_value home "$provider_config")
-worker_home=${AUTOMONIQUE_FLEET_CODEX_HOME:-$provider_home}
-platform_url=${fleet_base%/}/api/manage/automonique/platform
-
-if [[ ! -x "$provider_binary" || ! -d "$worker_home" ]]; then
-    printf '%s\n' 'configured Codex provider is unavailable' >&2
+provider_engine=$(sed -n 's/^engine=//p' "$provider_config")
+if [[ -z "$provider_engine" ]]; then
+    provider_engine=codex
+elif [[ $(sed -n 's/^engine=//p' "$provider_config" | wc -l) -ne 1 ]]; then
+    printf '%s\n' 'missing or duplicate engine in provider configuration' >&2
     exit 2
 fi
-if [[ -n "$agent_auth_dir" && ( ! -d "$agent_auth_dir" || ! -x "$claude_binary" ) ]]; then
+case "$provider_engine" in
+    codex|jcode) ;;
+    *) printf '%s\n' 'unsupported provider engine' >&2; exit 2 ;;
+esac
+codex_worker_home=${AUTOMONIQUE_FLEET_CODEX_HOME:-$provider_home}
+platform_url=${fleet_base%/}/api/manage/automonique/platform
+
+if [[ ! -x "$provider_binary" || ! -d "$provider_home" ]]; then
+    printf '%s\n' 'configured provider engine is unavailable' >&2
+    exit 2
+fi
+if [[ -n "$agent_auth_dir" && -e "$agent_auth_dir" && ( ! -d "$agent_auth_dir" || ! -x "$claude_binary" ) ]]; then
     printf '%s\n' 'configured native account directory or Claude provider is unavailable' >&2
     exit 2
 fi
@@ -75,21 +91,41 @@ mkdir -p -- "$runtime_dir"
 chmod 700 -- "$runtime_dir"
 mkdir -p -- "$output_dir"
 chmod 700 -- "$output_dir"
+mkdir -p -- "$runtime_dir/jcode-runtime"
+chmod 700 -- "$runtime_dir/jcode-runtime"
+mkdir -p -- "$platform_pending_dir" "$platform_running_dir" "$platform_done_dir" "$platform_receipt_dir"
+chmod 700 -- "$platform_commands_dir" "$platform_pending_dir" "$platform_running_dir" "$platform_done_dir" "$platform_receipt_dir"
+
+# A command moved to running before a worker restart is safe to retry: its
+# local platform idempotency key is the immutable AI Operations command id.
+for interrupted_command in "$platform_running_dir"/*.json; do
+    [[ -f "$interrupted_command" && ! -L "$interrupted_command" ]] || continue
+    mv -n -- "$interrupted_command" "$platform_pending_dir/$(basename -- "$interrupted_command")"
+done
 
 auth_method=unknown
-selected_provider=codex
+selected_provider=$provider_engine
 selected_account=legacy
 selected_binary=$provider_binary
-selected_home=$worker_home
+selected_home=$provider_home
 auth_health_file=$aggregate_auth_health_file
 auth_revision_file=$runtime_dir/auth-revision-legacy
 
 load_selected_account() {
+    if [[ "$provider_engine" == jcode ]]; then
+        selected_provider=jcode
+        selected_account=legacy
+        selected_binary=$provider_binary
+        selected_home=$provider_home
+        auth_health_file=$aggregate_auth_health_file
+        auth_revision_file=$runtime_dir/auth-revision-jcode
+        return 0
+    fi
     if [[ -z "$account_registry" || ! -f "$account_registry" ]]; then
         selected_provider=codex
         selected_account=legacy
         selected_binary=$provider_binary
-        selected_home=$worker_home
+        selected_home=$codex_worker_home
         auth_health_file=$aggregate_auth_health_file
         auth_revision_file=$runtime_dir/auth-revision-legacy
         return 0
@@ -131,7 +167,7 @@ load_selected_account || {
 }
 
 credential_revision() {
-    if [[ "$selected_provider" == codex ]]; then
+    if [[ "$selected_provider" == codex || "$selected_provider" == jcode ]]; then
         auth_file=$selected_home/auth.json
     else
         auth_file=$selected_home/.credentials.json
@@ -144,7 +180,13 @@ credential_revision() {
 }
 
 probe_local_auth() {
-    if [[ "$selected_provider" == codex ]]; then auth_method=chatgpt; else auth_method=claude_ai; fi
+    if [[ "$selected_provider" == codex ]]; then
+        auth_method=chatgpt
+    elif [[ "$selected_provider" == jcode ]]; then
+        auth_method=jcode_native
+    else
+        auth_method=claude_ai
+    fi
     if [[ "$selected_provider" == codex ]]; then
         local_status=$(CODEX_HOME="$selected_home" "$selected_binary" login status 2>&1) || return 1
         case "$local_status" in
@@ -153,6 +195,12 @@ probe_local_auth() {
             *'Logged in using an access token'*) return 1 ;;
         esac
         return 1
+    fi
+    if [[ "$selected_provider" == jcode ]]; then
+        local_status=$(JCODE_HOME="$selected_home" JCODE_RUNTIME_DIR="$runtime_dir/jcode-runtime" \
+            "$selected_binary" --quiet --no-update --no-selfdev auth status --json 2>/dev/null) || return 1
+        jq -e '.any_available == true' >/dev/null <<<"$local_status"
+        return
     fi
     local_status=$(CLAUDE_CONFIG_DIR="$selected_home" "$selected_binary" auth status --json 2>/dev/null) || return 1
     if jq -e '.loggedIn == true and .authMethod == "claude.ai"' >/dev/null <<<"$local_status"; then
@@ -306,19 +354,64 @@ initialize_auth_health() {
 initialize_auth_health
 selection_key=$selected_provider:$selected_account
 
+enqueue_platform_commands() {
+    response=$1
+    while IFS= read -r command; do
+        command_id=$(jq -er '.id' <<<"$command") || continue
+        command_file=$command_id.json
+        if [[ -e "$platform_pending_dir/$command_file" \
+            || -e "$platform_running_dir/$command_file" \
+            || -e "$platform_done_dir/$command_file" ]]
+        then
+            continue
+        fi
+        temporary=$(mktemp "$platform_pending_dir/.command.XXXXXX") || continue
+        if ! printf '%s\n' "$command" >"$temporary"; then
+            rm -f -- "$temporary"
+            continue
+        fi
+        chmod 600 -- "$temporary"
+        mv -n -- "$temporary" "$platform_pending_dir/$command_file"
+        rm -f -- "$temporary"
+    done < <(jq -cer '
+        .commands[]?
+        | select(.id | type == "string" and test("^[A-Za-z0-9._-]{8,256}$"))
+        | select(.action == "approve_release"
+            or (.action == "submit_job"
+                and (.parameter | type == "string" and length > 0 and length <= 256)))
+    ' <<<"$response" 2>/dev/null)
+}
+
 platform_runtime() {
     runtime=$1
+    sent_receipt_files=()
+    for receipt_file in "$platform_receipt_dir"/*.json; do
+        [[ -f "$receipt_file" && ! -L "$receipt_file" ]] || continue
+        sent_receipt_files+=("$receipt_file")
+        (( ${#sent_receipt_files[@]} >= 64 )) && break
+    done
+    if (( ${#sent_receipt_files[@]} == 0 )); then
+        receipts='[]'
+    else
+        receipts=$(jq -sc '.' "${sent_receipt_files[@]}") || return 1
+    fi
     body=$(jq -cn \
         --arg node "$fleet_instance" \
         --argjson runtime "$runtime" \
-        '{node_id:$node,revision:0,capabilities:["execute_jobs","report_jobs","stream_job_logs"],receipts:[],runtime:$runtime}') || return 1
-    curl --silent --show-error --max-time 15 \
+        --argjson receipts "$receipts" \
+        '{node_id:$node,revision:0,capabilities:["execute_jobs","report_jobs","stream_job_logs","platform_commands","local_platform_receipts"],receipts:$receipts,runtime:$runtime}') || return 1
+    response=$(curl --silent --show-error --max-time 15 \
         --request PUT "$platform_url" \
         --header "Authorization: Bearer $fleet_token" \
         --header 'Content-Type: application/json' \
         --header 'Accept: application/json' \
-        --data-binary "$body" \
-        | jq -ec 'if .ok == true and (.runtime | type) == "object" then .runtime else error(.error // "platform runtime request refused") end'
+        --data-binary "$body") || return 1
+    jq -e '.ok == true and (.runtime | type) == "object"' >/dev/null <<<"$response" || return 1
+    enqueue_platform_commands "$response"
+    for receipt_file in "${sent_receipt_files[@]}"; do
+        rm -f -- "$receipt_file"
+    done
+    jq -ec '.runtime' <<<"$response"
 }
 
 fleet_snapshot() {
@@ -637,6 +730,99 @@ workspace_for() {
     esac
 }
 
+claim_platform_command() {
+    for command in "$platform_pending_dir"/*.json; do
+        [[ -f "$command" && ! -L "$command" ]] || continue
+        claimed=$platform_running_dir/$(basename -- "$command")
+        if mv -n -- "$command" "$claimed" && [[ -f "$claimed" ]]; then
+            printf '%s' "$claimed"
+            return 0
+        fi
+    done
+    printf '%s' null
+}
+
+write_platform_receipt() {
+    command_id=$1
+    outcome=$2
+    explanation=$3
+    temporary=$(mktemp "$platform_receipt_dir/.receipt.XXXXXX") || return 1
+    if ! jq -n \
+        --arg command "$command_id" \
+        --arg outcome "$outcome" \
+        --arg explanation "${explanation:0:256}" \
+        '{command_id:$command,outcome:$outcome,explanation:$explanation}' >"$temporary"
+    then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    chmod 600 -- "$temporary"
+    mv -f -- "$temporary" "$platform_receipt_dir/$command_id.json"
+}
+
+finish_platform_command() {
+    command=$1
+    command_id=$2
+    outcome=$3
+    explanation=$4
+    write_platform_receipt "$command_id" "$outcome" "$explanation" || return 1
+    mv -f -- "$command" "$platform_done_dir/$command_id.json"
+}
+
+run_platform_command() {
+    command=$1
+    command_id=$(jq -er '.id | select(type == "string" and test("^[A-Za-z0-9._-]{8,256}$"))' "$command") || return
+    action=$(jq -er '.action | select(. == "approve_release" or . == "submit_job")' "$command") || {
+        finish_platform_command "$command" "$command_id" rejected invalid_platform_command || true
+        return
+    }
+    if [[ "$action" == approve_release ]]; then
+        finish_platform_command "$command" "$command_id" completed release_approval_acknowledged || true
+        return
+    fi
+
+    prompt=$(jq -er '.parameter | select(type == "string" and length > 0 and length <= 256)' "$command") || {
+        finish_platform_command "$command" "$command_id" rejected invalid_platform_job || true
+        return
+    }
+    automonique_binary=${AUTOMONIQUE_FLEET_AUTOMONIQUE_BINARY:-$(dirname -- "${BASH_SOURCE[0]}")/automonique}
+    platform_socket=${AUTOMONIQUE_PLATFORM_SOCKET:-${XDG_RUNTIME_DIR:-}/automonique/admin.sock}
+    platform_timeout=${AUTOMONIQUE_PLATFORM_JOB_TIMEOUT_SECONDS:-21600}
+    if [[ ! -x "$automonique_binary" || "$platform_socket" != /* || ! -S "$platform_socket" \
+        || ! "$platform_timeout" =~ ^[0-9]+$ \
+        || "$platform_timeout" -lt 1 || "$platform_timeout" -gt 21600 ]]
+    then
+        finish_platform_command "$command" "$command_id" rejected local_platform_unavailable || true
+        return
+    fi
+
+    local_result=$runtime_dir/platform-command-$command_id.json
+    : >"$local_result"
+    chmod 600 -- "$local_result"
+    set +e
+    printf '%s\n' "$prompt" \
+        | "$automonique_binary" platform-job \
+            --socket "$platform_socket" \
+            --idempotency-key "$command_id" \
+            --timeout-seconds "$platform_timeout" >"$local_result"
+    local_status=${PIPESTATUS[1]:-1}
+    set -u
+    local_outcome=$(jq -er '
+        select(.schema == "automonique.platform-job/v1")
+        | .outcome
+        | select(. == "completed" or . == "rejected" or . == "conflict"
+            or . == "unknown" or . == "resync_required")
+    ' "$local_result" 2>/dev/null) || local_outcome=unknown
+    local_explanation=$(jq -er '.explanation | select(type == "string" and length > 0)' "$local_result" 2>/dev/null) \
+        || local_explanation=local_platform_${local_status}
+    if [[ "$local_outcome" == unknown || "$local_outcome" == resync_required ]]; then
+        write_platform_receipt "$command_id" "$local_outcome" "$local_explanation" || true
+        mv -f -- "$command" "$platform_pending_dir/$command_id.json"
+    else
+        finish_platform_command "$command" "$command_id" "$local_outcome" "$local_explanation" || true
+    fi
+}
+
 log_provider_line() {
     job_id=$1
     line=$2
@@ -645,6 +831,15 @@ log_provider_line() {
         text=$(jq -r '
             if .type == "item.completed" and .item.type == "agent_message" then .item.text
             elif .type == "item.started" then ("started " + (.item.type // "item"))
+            elif .type == "error" then (.message // "provider error")
+            else empty end
+        ' <<<"$line" 2>/dev/null) || text=
+    elif [[ "$selected_provider" == jcode ]]; then
+        text=$(jq -r '
+            if .type == "done" then (.text // empty)
+            elif .type == "tool_start" then ("started tool " + (.name // "unknown"))
+            elif .type == "tool_done" then
+                ((if .error == null then "completed tool " else "failed tool " end) + (.name // "unknown"))
             elif .type == "error" then (.message // "provider error")
             else empty end
         ' <<<"$line" 2>/dev/null) || text=
@@ -762,6 +957,26 @@ run_job() {
                 log_provider_line "$job_id" "$line"
             done
         provider_status=${PIPESTATUS[1]:-1}
+    elif [[ "$selected_provider" == jcode ]]; then
+        cd -- "$cwd" || {
+            set -u
+            report_job "$job_id" failed 'JCode could not enter the selected workspace.' || true
+            return
+        }
+        printf '%s\n' "$provider_prompt" \
+            | JCODE_HOME="$selected_home" \
+                JCODE_RUNTIME_DIR="$runtime_dir/jcode-runtime" \
+                JCODE_SERVER_EXECUTABLE="$selected_binary" \
+                "$selected_binary" --quiet --no-update --no-selfdev run --ndjson - \
+                2> >(while IFS= read -r line; do
+                    printf '%s\n' "$line" >>"$error_output"
+                    post_job_log "$job_id" provider_stderr "$line"
+                done) \
+            | tee "$output" \
+            | while IFS= read -r line; do
+                log_provider_line "$job_id" "$line"
+            done
+        provider_status=${PIPESTATUS[1]:-1}
     else
         cd -- "$cwd" || {
             set -u
@@ -789,6 +1004,9 @@ run_job() {
     if [[ "$selected_provider" == codex ]]; then
         session_id=$(jq -rs '[.[] | select(.type == "thread.started") | .thread_id] | first // ""' "$output" 2>/dev/null) || session_id=
         result=$(jq -rs '[.[] | select(.type == "item.completed" and .item.type == "agent_message") | .item.text] | last // ""' "$output" 2>/dev/null) || result=
+    elif [[ "$selected_provider" == jcode ]]; then
+        session_id=$(jq -rs '[.[] | select(.type == "done") | .session_id] | last // ""' "$output" 2>/dev/null) || session_id=
+        result=$(jq -rs '[.[] | select(.type == "done") | .text] | last // ""' "$output" 2>/dev/null) || result=
     else
         session_id=$(jq -rs '[.[] | select(.type == "result") | .session_id] | last // ""' "$output" 2>/dev/null) || session_id=
         result=$(jq -rs '[.[] | select(.type == "result") | .result] | last // ""' "$output" 2>/dev/null) || result=
@@ -875,6 +1093,12 @@ while (( stopping == 0 )); do
         && [[ "$(auth_health_status)" != authenticating ]] \
         && [[ "$(auth_health_status)" != unavailable ]]
     do
+        platform_command=$(claim_platform_command) || break
+        if [[ "$platform_command" != null ]]; then
+            run_platform_command "$platform_command" &
+            active=$((active + 1))
+            continue
+        fi
         job=$(claim_one) || break
         [[ "$job" != null ]] || break
         run_job "$job" &

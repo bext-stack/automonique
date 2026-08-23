@@ -27,6 +27,8 @@ dependencies = [
  "automonique-backup",
  "automonique-cli",
  "automonique-daemon",
+ "automonique-platform-client",
+ "automonique-protocol",
  "automonique-store",
  "rusqlite",
  "serde_json",
