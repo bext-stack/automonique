@@ -2,7 +2,7 @@
 
 # Unified client platform
 
-**Status:** all six platform phases deployed; production TUI release in progress
+**Status:** all six platform phases and the production TUI deployed
 
 ## Delivery status
 
@@ -14,6 +14,16 @@ registered Automonique node, an installed JCode engine turn and an ordered
 terminal receipt. Exact idempotent replay returns the original completed
 receipt, and JCode, the ShellDeck client-only build and the hosted web surface
 agree on the authority-qualified provider model catalog.
+
+The maintained JCode cockpit is installed as the `automonique tui` managed
+client. Production verification submitted a new durable request, reconciled
+its completed receipt and exact provider session, resumed that same session
+for a follow-up, and exercised observer attach, exclusive control acquisition,
+control release and detach. Both provider answers matched their requested
+canaries, the session revision advanced, terminal teardown restored the shell,
+and the daemon returned to zero running, pending, outbox and reconciliation
+work. The JSON cockpit projection also returned the fresh configured-account
+model catalog, replacing the former status-only answer path.
 
 ShellDeck's client-only implementation is published and merged after Linux,
 macOS, Windows, dependency-policy and RustSec checks. The production worker now
