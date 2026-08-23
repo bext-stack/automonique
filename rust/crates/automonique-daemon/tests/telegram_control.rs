@@ -4628,7 +4628,7 @@ fn natural_system_access_questions_answer_from_typed_configuration_without_provi
     assert!(messages[3].contains("Slack is configured"));
     assert!(messages[3].contains("GitHub:"));
     assert!(messages[3].contains("Memory:"));
-    assert!(messages[3].contains("Models:"));
+    assert!(messages[3].contains("Monique’s configured model routes:"));
     assert!(messages[3].contains("Public web research:"));
 
     let unavailable_outbound = FakeOutbound::default();
