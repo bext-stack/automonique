@@ -259,7 +259,7 @@ mod tests {
     fn nothing_after_the_origin_is_accepted() {
         for refused in [
             "https://manage.example.com/api",
-            "https://manage.example.com/api/manage/shelldeck/fleet",
+            "https://manage.example.com/api/manage/automonique/support",
             "https://manage.example.com/?a=1",
             "https://manage.example.com/#frag",
             "https://manage.example.com?a=1",

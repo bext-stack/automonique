@@ -3,7 +3,7 @@
 //! Typed client for the Support backend's fleet API.
 //!
 //! One product surface is reachable here: the support board behind the fleet
-//! endpoint `POST <base>/api/manage/shelldeck/fleet`. Eight actions are
+//! endpoint `POST <base>/api/manage/automonique/support`. Eight actions are
 //! spelled — one per private `WireAction` variant — and nothing else can be.
 //!
 //! Five work the support queue directly: read it

@@ -59,7 +59,7 @@ fleet_token=$(private_value token "$fleet_config")
 provider_binary=$(private_value binary "$provider_config")
 provider_home=$(private_value home "$provider_config")
 worker_home=${AUTOMONIQUE_FLEET_CODEX_HOME:-$provider_home}
-fleet_url=${fleet_base%/}/api/manage/shelldeck/fleet
+platform_url=${fleet_base%/}/api/manage/automonique/platform
 
 if [[ ! -x "$provider_binary" || ! -d "$worker_home" ]]; then
     printf '%s\n' 'configured Codex provider is unavailable' >&2
@@ -306,21 +306,36 @@ initialize_auth_health() {
 initialize_auth_health
 selection_key=$selected_provider:$selected_account
 
-fleet_post() {
-    body=$1
+platform_runtime() {
+    runtime=$1
+    body=$(jq -cn \
+        --arg node "$fleet_instance" \
+        --argjson runtime "$runtime" \
+        '{node_id:$node,revision:0,capabilities:["execute_jobs","report_jobs","stream_job_logs"],receipts:[],runtime:$runtime}') || return 1
     curl --silent --show-error --max-time 15 \
-        --request POST "$fleet_url" \
+        --request PUT "$platform_url" \
         --header "Authorization: Bearer $fleet_token" \
         --header 'Content-Type: application/json' \
         --header 'Accept: application/json' \
-        --data-binary "$body"
+        --data-binary "$body" \
+        | jq -ec 'if .ok == true and (.runtime | type) == "object" then .runtime else error(.error // "platform runtime request refused") end'
 }
 
 fleet_snapshot() {
-    curl --silent --show-error --max-time 15 \
-        --request GET "$fleet_url" \
-        --header "Authorization: Bearer $fleet_token" \
-        --header 'Accept: application/json'
+    body=$(jq -cn --arg id "$fleet_instance" '{action:"snapshot",id:$id}')
+    platform_runtime "$body"
+}
+
+register_runtime() {
+    runtime_workdir=${AUTOMONIQUE_FLEET_WORKDIR:-$PWD}
+    runtime_workdir=$(realpath -e -- "$runtime_workdir") || return 1
+    body=$(jq -cn \
+        --arg id "$fleet_instance" \
+        --arg workdir "$runtime_workdir" \
+        --arg provider "$selected_provider" \
+        '{action:"register",id:$id,workdir:$workdir,provider:$provider}')
+    response=$(platform_runtime "$body") || return 1
+    jq -e '.ok == true and .instance.id != null' >/dev/null <<<"$response"
 }
 
 publish_process_snapshot() {
@@ -465,6 +480,11 @@ load_instance_root() {
         <<<"$snapshot"
 }
 
+register_runtime || {
+    printf '%s\n' 'Manage refused the platform runtime registration' >&2
+    exit 1
+}
+
 instance_root=$(load_instance_root) || {
     printf '%s\n' 'configured Manage instance or workspace is unavailable' >&2
     exit 2
@@ -493,13 +513,13 @@ heartbeat() {
         --arg binary "$(basename -- "$selected_binary")" \
         --arg auth "$auth_status" \
         '{action:"heartbeat",id:$id,status:$status,detail:$detail,version:"automonique-manage-worker/v1",harness:{agent:$provider,binary:$binary,available:true,auth_status:$auth,permission_mode:"confirmed-ticket"}}')
-    response=$(fleet_post "$body") || return 1
+    response=$(platform_runtime "$body") || return 1
     jq -e '.ok == true' >/dev/null <<<"$response"
 }
 
 claim_one() {
     body=$(jq -cn --arg id "$fleet_instance" '{action:"claim",id:$id}')
-    response=$(fleet_post "$body") || return 1
+    response=$(platform_runtime "$body") || return 1
     jq -ec 'if .ok == true then (.job // null) else error("claim refused") end' <<<"$response"
 }
 
@@ -514,7 +534,7 @@ report_job() {
         --arg result "${result:0:2000}" \
         --arg session "$session_id" \
         '{action:"job",jobId:$job,status:$status,result:$result} + (if $session == "" then {} else {session_id:$session} end)')
-    response=$(fleet_post "$body") || return 1
+    response=$(platform_runtime "$body") || return 1
     jq -e '.ok == true' >/dev/null <<<"$response"
 }
 
@@ -583,7 +603,7 @@ post_job_log() {
         --arg text "${text:0:1000}" \
         --argjson at "$now_ms" \
         '{action:"joblog",jobId:$job,lines:[{at:$at,kind:$kind,text:$text}]}')
-    response=$(fleet_post "$body") || return 0
+    response=$(platform_runtime "$body") || return 0
     jq -e '.ok == true' >/dev/null <<<"$response" || true
 }
 

@@ -2,24 +2,24 @@
 
 # Unified client platform
 
-**Status:** phases 1–4 deployed; phases 5–6 gated on ShellDeck publication
+**Status:** all six phases deployed and live-verified
 
 ## Delivery status
 
-As of 2026-08-22, the contract/fork baseline, shared substrate, production
-vertical slice and client-inventory convergence are deployed. The production
+As of 2026-08-23, the contract/fork baseline, shared substrate, production
+vertical slice, client convergence, execution convergence and compatibility
+cleanup are deployed. The production
 slice has completed AI Operations release approval and job delivery through a
 registered Automonique node, an installed JCode engine turn and an ordered
 terminal receipt. Exact idempotent replay returns the original completed
 receipt, and JCode, the ShellDeck client-only build and the hosted web surface
 agree on the authority-qualified provider model catalog.
 
-The ShellDeck client-only implementation is complete, tested and packaged in
-its repository worktree, but it is not yet published: that repository requires
-GitHub actor `pedrokarim`, while the available CLI and SSH credentials identify
-as `benfavre`. Until the required actor publishes that branch, the phase-5
-client cutover and phase-6 compatibility removals remain intentionally open.
-The central epic and repository issues are the canonical live checklist.
+ShellDeck's client-only implementation is published and merged after Linux,
+macOS, Windows, dependency-policy and RustSec checks. The production worker now
+uses the owned AI Operations platform and support routes, and the superseded
+fleet endpoint is absent in source and returns 404 in production. The central
+epic and repository issues retain the delivery evidence.
 
 ## Outcome
 
@@ -117,7 +117,8 @@ live availability rather than treating configured names as proof of access.
   policy;
 - expose versioned commands, receipts, sessions, capabilities and model
   catalogs through the shared contracts;
-- preserve current ShellDeck fleet routes only as migration adapters;
+- expose dedicated Automonique platform and support routes, with no ShellDeck
+  transport ownership of worker lifecycle;
 - provide browser authentication/session exchange for `monique.1clic.pro`.
 
 ### `benfavre/jcode`

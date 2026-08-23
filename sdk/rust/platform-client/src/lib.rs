@@ -5,14 +5,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(unix)]
+use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use automonique_protocol::codec::{
-    FrameDecode, LENGTH_PREFIX_BYTES, RequestId, decode_frame, encode_frame,
-};
+use automonique_protocol::codec::RequestId;
+#[cfg(unix)]
+use automonique_protocol::codec::{FrameDecode, LENGTH_PREFIX_BYTES, decode_frame, encode_frame};
 use automonique_protocol::platform::{
     ActionReceipt, AttachRequest, Attachment, Capabilities, ClaimControlRequest, ClientId,
     ControlLease, DetachRequest, ExecuteRequest, GetReceiptRequest, IdempotencyKey,
@@ -105,12 +109,14 @@ pub trait PlatformTransport {
 }
 
 /// Authenticated local Unix-socket transport.
+#[cfg(unix)]
 #[derive(Clone, Debug)]
 pub struct UnixTransport {
     socket: PathBuf,
     timeout: Duration,
 }
 
+#[cfg(unix)]
 impl UnixTransport {
     #[must_use]
     pub fn new(socket: impl Into<PathBuf>) -> Self {
@@ -132,6 +138,7 @@ impl UnixTransport {
     }
 }
 
+#[cfg(unix)]
 impl PlatformTransport for UnixTransport {
     fn request(
         &mut self,

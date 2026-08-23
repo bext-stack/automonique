@@ -273,7 +273,7 @@ fn issues_page() -> String {
 /// Every request must be the one POST this connector is allowed to make.
 fn assert_wire_shape(captured: &Captured, expected_action: &str) {
     assert_eq!(
-        captured.request_line, "POST /api/manage/shelldeck/fleet HTTP/1.1",
+        captured.request_line, "POST /api/manage/automonique/support HTTP/1.1",
         "the connector must address exactly one path with exactly one verb"
     );
     assert_eq!(
