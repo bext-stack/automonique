@@ -13,7 +13,7 @@ use automonique_protocol::platform::{
     ActionReceipt, Attachment, Capabilities, ClientId, CursorTopic, ExecuteRequest, IdempotencyKey,
     PlatformAction, PlatformCursor, PlatformEvent, PlatformRequest, PlatformResponse, PlatformText,
     ReceiptId, ReceiptOutcome, ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
-    ResourceRecord, Snapshot, Subscription,
+    ResourceRecord, SessionList, Snapshot, Subscription,
 };
 use automonique_protocol::platform_api::{PlatformRequestMessage, PlatformResponseMessage};
 use automonique_protocol::primitives::{EpochMillis, Revision};
@@ -252,6 +252,16 @@ fn platform_view_tracks_independent_attachments_and_reconciles_receipts() {
         resources: vec![record(session_a.clone(), 1, "waiting")],
         cursor: cursor("platform", 7),
     });
+    view.apply_session_list(&SessionList {
+        sessions: Vec::new(),
+        cursor: cursor("sessions", 5),
+    });
+    assert_eq!(
+        view.cursor(&cursor("sessions", 1))
+            .expect("directory cursor")
+            .sequence,
+        revision(5)
+    );
 
     let attachment_a = attachment(session_a.clone(), "sessions", 10);
     let attachment_b = attachment(session_b, "sessions", 20);

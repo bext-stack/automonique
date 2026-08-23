@@ -624,6 +624,26 @@ impl PlatformView {
         self.resync_required.remove(&key);
     }
 
+    /// Register an independently resumed non-attachment stream such as the
+    /// session directory.
+    pub fn track_cursor(&mut self, cursor: PlatformCursor) {
+        let key = CursorKey::of(&cursor);
+        self.cursors.insert(key.clone(), cursor);
+        self.resync_required.remove(&key);
+    }
+
+    /// Apply the authoritative attachable-session directory and establish its
+    /// independent resume cursor.
+    pub fn apply_session_list(&mut self, sessions: &SessionList) {
+        for session in &sessions.sessions {
+            self.resources.insert(
+                resource_key(&session.session.resource),
+                session.session.clone(),
+            );
+        }
+        self.track_cursor(sessions.cursor.clone());
+    }
+
     #[must_use]
     pub fn apply_subscription(&mut self, page: Subscription) -> SubscriptionApply {
         let key = CursorKey::of(&page.cursor);
