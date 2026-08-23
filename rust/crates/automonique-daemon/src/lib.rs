@@ -3313,6 +3313,23 @@ impl Daemon {
                     && resource.id.as_str() == self.instance_id.as_str()
             });
         if wants_node {
+            let (existing_nodes, _) = self
+                .platform
+                .snapshot(&[], "resources")
+                .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+            let active_node = self.instance_id.as_str().to_owned();
+            for retired in existing_nodes.into_iter().filter(|record| {
+                record.resource.authority == ResourceAuthority::Automonique
+                    && record.resource.kind == ResourceKind::Node
+                    && record.resource.id.as_str() != active_node
+            }) {
+                self.upsert_platform_observation(
+                    retired.resource,
+                    FreshnessState::Stale,
+                    "daemon retired",
+                    now_ms,
+                )?;
+            }
             let node = ResourceRecord {
                 resource: ResourceCoordinate::new(
                     ResourceAuthority::Automonique,
@@ -3625,6 +3642,9 @@ impl Daemon {
             PlatformAction::SubmitRequest => {
                 if request.target.kind != ResourceKind::Node {
                     return platform_refusal(ReceiptOutcome::Rejected, "target_kind_invalid");
+                }
+                if request.target.id.as_str() != self.instance_id.as_str() {
+                    return platform_refusal(ReceiptOutcome::Rejected, "target_not_active_node");
                 }
                 let Some(record) = self
                     .platform

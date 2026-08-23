@@ -241,10 +241,15 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
     ) else {
         panic!("snapshot response")
     };
-    assert!(snapshot.resources.iter().any(|resource| {
-        resource.resource.authority == ResourceAuthority::Automonique
-            && resource.resource.kind == ResourceKind::Node
-    }));
+    let first_node = snapshot
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.resource.authority == ResourceAuthority::Automonique
+                && resource.resource.kind == ResourceKind::Node
+        })
+        .expect("active node is projected")
+        .clone();
     let mut actions = snapshot
         .resources
         .iter()
@@ -441,5 +446,34 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
         current_model.summary.as_str(),
         "source=codex_model_list; scope=configured_account; available=true; default=false; configured_route=false"
     );
+    let retired_node = restarted_snapshot
+        .resources
+        .iter()
+        .find(|resource| resource.resource == first_node.resource)
+        .expect("retired node remains explicit");
+    assert_eq!(retired_node.freshness.state.as_str(), "stale");
+    assert_eq!(retired_node.summary.as_str(), "daemon retired");
+    let PlatformResponse::Refused {
+        outcome,
+        explanation,
+    } = platform(
+        &config,
+        "retired-node-submit",
+        PlatformRequest::Execute(
+            ExecuteRequest::new(
+                PlatformAction::SubmitRequest,
+                first_node.resource,
+                IdempotencyKey::new("retired-node-submit").expect("key"),
+                Some(first_node.freshness.revision),
+                Some(PlatformText::new("must not enter intake").expect("body")),
+            )
+            .expect("submit request"),
+        ),
+    )
+    else {
+        panic!("retired node must be refused")
+    };
+    assert_eq!(outcome, ReceiptOutcome::Rejected);
+    assert_eq!(explanation.as_str(), "target_not_active_node");
     serving.shutdown(&config);
 }
