@@ -2,7 +2,7 @@
 
 # Unified client platform
 
-**Status:** all six phases deployed and live-verified
+**Status:** all six platform phases deployed; production TUI release in progress
 
 ## Delivery status
 

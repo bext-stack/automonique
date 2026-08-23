@@ -14,9 +14,10 @@ use automonique_daemon::{Daemon, DaemonConfig};
 use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse};
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
 use automonique_protocol::platform::{
-    ClaimControlRequest, ClientId, ExecuteRequest, IdempotencyKey, ListSessionsRequest,
-    PlatformAction, PlatformRequest, PlatformResponse, PlatformText, ReceiptOutcome,
-    ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind, SnapshotRequest,
+    ClaimControlRequest, ClientId, ExecuteRequest, GetReceiptRequest, IdempotencyKey,
+    ListSessionsRequest, PlatformAction, PlatformRequest, PlatformResponse, PlatformText,
+    ReceiptOutcome, ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
+    SnapshotRequest,
 };
 use automonique_protocol::platform_api::{PlatformRequestMessage, PlatformResponseMessage};
 use automonique_store::approval_requests::{ApprovalContext, ApprovalProposal, ApprovalRequests};
@@ -244,6 +245,31 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
         resource.resource.authority == ResourceAuthority::Automonique
             && resource.resource.kind == ResourceKind::Node
     }));
+    let mut actions = snapshot
+        .resources
+        .iter()
+        .filter(|resource| {
+            resource.resource.authority == ResourceAuthority::Automonique
+                && resource.resource.kind == ResourceKind::Client
+                && resource
+                    .resource
+                    .id
+                    .as_str()
+                    .starts_with("platform-action-")
+        })
+        .map(|resource| resource.resource.id.as_str())
+        .collect::<Vec<_>>();
+    actions.sort_unstable();
+    assert_eq!(
+        actions,
+        [
+            "platform-action-decide_approval",
+            "platform-action-follow_up",
+            "platform-action-start_run",
+            "platform-action-stop_run",
+            "platform-action-submit_request",
+        ]
+    );
     let model = snapshot
         .resources
         .iter()
@@ -326,6 +352,33 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
             .as_str(),
         "platform-live-session"
     );
+
+    let follow_up_key = IdempotencyKey::new("follow-up-live-1").expect("key");
+    let PlatformResponse::Receipt(follow_up) = platform(
+        &config,
+        "follow-up",
+        PlatformRequest::Execute(
+            ExecuteRequest::new(
+                PlatformAction::FollowUp,
+                sessions.sessions[0].session.resource.clone(),
+                follow_up_key.clone(),
+                Some(sessions.sessions[0].session.freshness.revision),
+                Some(PlatformText::new("continue with the verified next step").expect("body")),
+            )
+            .expect("follow-up action"),
+        ),
+    ) else {
+        panic!("follow-up receipt")
+    };
+    assert_eq!(follow_up.outcome, ReceiptOutcome::Accepted);
+    let PlatformResponse::Receipt(reconciled_follow_up) = platform(
+        &config,
+        "follow-up-reconcile",
+        PlatformRequest::GetReceipt(GetReceiptRequest::by_idempotency_key(follow_up_key)),
+    ) else {
+        panic!("reconciled follow-up receipt")
+    };
+    assert_eq!(reconciled_follow_up, follow_up);
 
     let request = ClaimControlRequest {
         session: session(),

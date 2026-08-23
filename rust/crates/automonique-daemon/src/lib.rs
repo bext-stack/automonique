@@ -230,6 +230,18 @@ pub const ADMIN_SOCKET_NAME: &str = concat!("admin", ".sock");
 /// every UI tick while a daemon restart still forces an immediate read.
 const PLATFORM_MODEL_REFRESH_MILLIS: i64 = 30_000;
 
+/// Mutations implemented by this local authority. They are projected as
+/// ordinary v1 resources so strict existing clients remain wire-compatible
+/// while newer clients can build action surfaces without guessing from the
+/// generic `execute` method.
+const PLATFORM_LOCAL_ACTIONS: [PlatformAction; 5] = [
+    PlatformAction::StartRun,
+    PlatformAction::StopRun,
+    PlatformAction::DecideApproval,
+    PlatformAction::SubmitRequest,
+    PlatformAction::FollowUp,
+];
+
 /// Database filename inside the private product state directory.
 pub const DATABASE_NAME: &str = concat!("automonique", ".sqlite3");
 
@@ -3277,6 +3289,15 @@ impl Daemon {
         now_ms: i64,
     ) -> Result<(), DaemonError> {
         let wants_all = requested.is_empty();
+        let wants_actions = wants_all
+            || requested.iter().any(|resource| {
+                resource.authority == ResourceAuthority::Automonique
+                    && resource.kind == ResourceKind::Client
+                    && resource.id.as_str().starts_with("platform-action-")
+            });
+        if wants_actions {
+            self.refresh_platform_actions(now_ms)?;
+        }
         let wants_models = wants_all
             || requested.iter().any(|resource| {
                 resource.authority == ResourceAuthority::Provider
@@ -3350,6 +3371,37 @@ impl Daemon {
             self.platform
                 .upsert_resource("resources", &resource)
                 .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+        }
+        Ok(())
+    }
+
+    fn refresh_platform_actions(&mut self, now_ms: i64) -> Result<(), DaemonError> {
+        for action in PLATFORM_LOCAL_ACTIONS {
+            let (target, parameter, confirmation) = match action {
+                PlatformAction::StartRun => ("run", "none", "required"),
+                PlatformAction::StopRun => ("run", "none", "required"),
+                PlatformAction::DecideApproval => ("approval", "enum:grant|deny", "required"),
+                PlatformAction::SubmitRequest => ("node", "text", "required"),
+                PlatformAction::FollowUp => ("session", "text", "required"),
+                PlatformAction::SubmitJob
+                | PlatformAction::ApproveRelease
+                | PlatformAction::RegisterNode => continue,
+            };
+            let coordinate = ResourceCoordinate::new(
+                ResourceAuthority::Automonique,
+                ResourceKind::Client,
+                ResourceId::new(format!("platform-action-{}", action.as_str()))
+                    .map_err(|_| DaemonError::PlatformStoreFailed("action_id_invalid"))?,
+            );
+            self.upsert_platform_observation(
+                coordinate,
+                FreshnessState::Fresh,
+                &format!(
+                    "registry=platform-v1;action={};target={target};parameter={parameter};confirmation={confirmation}",
+                    action.as_str()
+                ),
+                now_ms,
+            )?;
         }
         Ok(())
     }
@@ -3570,6 +3622,35 @@ impl Daemon {
                 Revision::new(record.revision)
                     .map_err(|_| DaemonError::PlatformStoreFailed("revision_invalid"))?
             }
+            PlatformAction::SubmitRequest => {
+                if request.target.kind != ResourceKind::Node {
+                    return platform_refusal(ReceiptOutcome::Rejected, "target_kind_invalid");
+                }
+                let Some(record) = self
+                    .platform
+                    .resource(&request.target)
+                    .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?
+                else {
+                    return platform_refusal(ReceiptOutcome::Rejected, "unknown_node");
+                };
+                record.freshness.revision
+            }
+            PlatformAction::FollowUp => {
+                if request.target.kind != ResourceKind::Session {
+                    return platform_refusal(ReceiptOutcome::Rejected, "target_kind_invalid");
+                }
+                if !self.platform_session_is_open(&request.target)? {
+                    return platform_refusal(ReceiptOutcome::Rejected, "session_not_controllable");
+                }
+                let Some(record) = self
+                    .platform
+                    .resource(&request.target)
+                    .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?
+                else {
+                    return platform_refusal(ReceiptOutcome::Rejected, "unknown_session");
+                };
+                record.freshness.revision
+            }
             PlatformAction::SubmitJob
             | PlatformAction::ApproveRelease
             | PlatformAction::RegisterNode => {
@@ -3626,6 +3707,40 @@ impl Daemon {
                 self.record_decision(request.target.id.as_str(), decision, "platform-v1", now_ms)
                     .map(|_| ReceiptOutcome::Completed)
                     .map_err(|error| error.category())
+            }
+            PlatformAction::SubmitRequest | PlatformAction::FollowUp => {
+                if self.disconnected_recovery {
+                    Err("disconnected_recovery")
+                } else if self.reconciliation_run_id.is_some()
+                    || snapshot_requires_reconciliation(status)
+                {
+                    Err(DaemonError::ReconciliationRequired.category())
+                } else if self.store.intake_paused(GENERATION_ID, now_ms)?.is_some() {
+                    Err(INTAKE_PAUSED_CATEGORY)
+                } else {
+                    let Some(parameter) = request.parameter.as_ref() else {
+                        return self.finalize_platform_rejection(
+                            request,
+                            "request_text_required",
+                            now_ms,
+                        );
+                    };
+                    let transport = match request.action {
+                        PlatformAction::SubmitRequest => "local.tui",
+                        PlatformAction::FollowUp => "local.tui.follow_up",
+                        _ => unreachable!(),
+                    };
+                    self.store
+                        .submit_inbox(InboxSubmission {
+                            transport,
+                            transport_key: request.idempotency_key.as_str(),
+                            scope: request.target.id.as_str(),
+                            payload: parameter.as_str().as_bytes(),
+                            received_ms: now_ms,
+                        })
+                        .map(|_| ReceiptOutcome::Accepted)
+                        .map_err(|error| error.category())
+                }
             }
             PlatformAction::SubmitJob
             | PlatformAction::ApproveRelease

@@ -79,11 +79,73 @@ fn main() -> ExitCode {
     if command.as_deref() == Some(std::ffi::OsStr::new("restore")) {
         return restore_command(arguments.collect());
     }
+    if command.as_deref() == Some(std::ffi::OsStr::new("tui")) {
+        return tui_command(arguments.collect());
+    }
     ExitCode::from(automonique_cli::run(
         std::env::args_os().skip(1),
         std::io::stdout().lock(),
         std::io::stderr().lock(),
     ))
+}
+
+/// Launch the maintained JCode-derived operator client over Automonique's
+/// authenticated platform socket. The wrapper accepts only the two platform
+/// client options it owns and forwards them as an explicit argument vector;
+/// no request or model-produced text is ever interpreted as a command line.
+fn tui_command(values: Vec<std::ffi::OsString>) -> ExitCode {
+    let arguments = match tui_arguments(&values) {
+        Ok(arguments) => arguments,
+        Err(()) => {
+            eprintln!("usage: automonique tui [--json] [--socket PATH]");
+            return ExitCode::from(2);
+        }
+    };
+    let binary = std::env::var_os("AUTOMONIQUE_TUI_BINARY")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| std::ffi::OsString::from("jcode"));
+    match std::process::Command::new(binary)
+        .arg("platform")
+        .args(arguments)
+        .status()
+    {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        Ok(status) => status
+            .code()
+            .and_then(|code| u8::try_from(code).ok())
+            .map_or(ExitCode::FAILURE, ExitCode::from),
+        Err(_) => {
+            eprintln!(
+                "automonique tui unavailable: install the maintained jcode client or set AUTOMONIQUE_TUI_BINARY"
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn tui_arguments(values: &[std::ffi::OsString]) -> Result<Vec<std::ffi::OsString>, ()> {
+    let mut output = Vec::new();
+    let mut index = 0;
+    let mut json = false;
+    let mut socket = false;
+    while index < values.len() {
+        if values[index] == "--json" && !json {
+            json = true;
+            output.push(values[index].clone());
+            index += 1;
+        } else if values[index] == "--socket" && !socket {
+            let Some(path) = values.get(index + 1).filter(|value| !value.is_empty()) else {
+                return Err(());
+            };
+            socket = true;
+            output.push(values[index].clone());
+            output.push(path.clone());
+            index += 2;
+        } else {
+            return Err(());
+        }
+    }
+    Ok(output)
 }
 
 /// `automonique work-brief --state-dir D --job-id J --issue-url U` prints the
@@ -433,5 +495,35 @@ fn command_result(command: &str, result: Result<(), &'static str>) -> ExitCode {
             eprintln!("automonique {command} refused: {category}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tui_tests {
+    use super::tui_arguments;
+    use std::ffi::OsString;
+
+    #[test]
+    fn tui_wrapper_forwards_only_typed_platform_options() {
+        assert_eq!(
+            tui_arguments(&[
+                OsString::from("--socket"),
+                OsString::from("/run/user/1/operator.sock"),
+                OsString::from("--json"),
+            ])
+            .expect("arguments"),
+            vec![
+                OsString::from("--socket"),
+                OsString::from("/run/user/1/operator.sock"),
+                OsString::from("--json"),
+            ]
+        );
+    }
+
+    #[test]
+    fn tui_wrapper_rejects_unknown_duplicate_or_missing_values() {
+        assert!(tui_arguments(&[OsString::from("--provider")]).is_err());
+        assert!(tui_arguments(&[OsString::from("--socket")]).is_err());
+        assert!(tui_arguments(&[OsString::from("--json"), OsString::from("--json")]).is_err());
     }
 }
