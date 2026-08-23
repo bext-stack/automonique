@@ -5,8 +5,9 @@ use std::net::TcpListener;
 use std::thread;
 
 use automonique_platform_client::{
-    ActionResult, BearerToken, ClientError, HttpsTransport, PLATFORM_CONTENT_TYPE, PlatformClient,
-    PlatformTransport, PlatformView, SessionListResult, SubscriptionApply, SubscriptionResult,
+    ActionResult, BearerToken, ClientError, ControlClaimResult, HttpsTransport,
+    PLATFORM_CONTENT_TYPE, PlatformClient, PlatformTransport, PlatformView, SessionListResult,
+    SubscriptionApply, SubscriptionResult,
 };
 use automonique_protocol::codec::RequestId;
 use automonique_protocol::platform::{
@@ -203,6 +204,10 @@ impl PlatformTransport for TypedRefusalTransport {
                 outcome: ReceiptOutcome::Conflict,
                 explanation: text("revision changed"),
             }),
+            PlatformRequest::ClaimControl(_) => Ok(PlatformResponse::Refused {
+                outcome: ReceiptOutcome::Conflict,
+                explanation: text("controller held"),
+            }),
             _ => panic!("unexpected request"),
         }
     }
@@ -239,6 +244,19 @@ fn session_refresh_and_mutation_keep_typed_refusals() {
         ActionResult::Refused {
             outcome: ReceiptOutcome::Conflict,
             explanation: text("revision changed")
+        }
+    );
+    assert_eq!(
+        client
+            .claim_control_outcome(
+                coordinate("session-controlled"),
+                ClientId::new("shelldeck-test").expect("client"),
+                IdempotencyKey::new("claim-control-1").expect("idempotency key"),
+            )
+            .expect("typed control response"),
+        ControlClaimResult::Refused {
+            outcome: ReceiptOutcome::Conflict,
+            explanation: text("controller held")
         }
     );
 }

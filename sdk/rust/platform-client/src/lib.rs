@@ -345,6 +345,16 @@ pub enum ActionResult {
     },
 }
 
+/// Typed result of requesting exclusive control over one session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ControlClaimResult {
+    Claimed(ControlLease),
+    Refused {
+        outcome: ReceiptOutcome,
+        explanation: PlatformText,
+    },
+}
+
 impl<T: PlatformTransport> PlatformClient<T> {
     #[must_use]
     pub const fn new(transport: T) -> Self {
@@ -521,12 +531,33 @@ impl<T: PlatformTransport> PlatformClient<T> {
         client: ClientId,
         idempotency_key: IdempotencyKey,
     ) -> Result<ControlLease, ClientError> {
+        match self.claim_control_outcome(session, client, idempotency_key)? {
+            ControlClaimResult::Claimed(value) => Ok(value),
+            ControlClaimResult::Refused { .. } => Err(ClientError::Protocol),
+        }
+    }
+
+    /// Claim control without erasing a typed ownership conflict or policy
+    /// refusal.
+    pub fn claim_control_outcome(
+        &mut self,
+        session: ResourceCoordinate,
+        client: ClientId,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<ControlClaimResult, ClientError> {
         match self.request(PlatformRequest::ClaimControl(ClaimControlRequest {
             session,
             client,
             idempotency_key,
         }))? {
-            PlatformResponse::ControlClaimed(value) => Ok(value),
+            PlatformResponse::ControlClaimed(value) => Ok(ControlClaimResult::Claimed(value)),
+            PlatformResponse::Refused {
+                outcome,
+                explanation,
+            } => Ok(ControlClaimResult::Refused {
+                outcome,
+                explanation,
+            }),
             _ => Err(ClientError::Protocol),
         }
     }
