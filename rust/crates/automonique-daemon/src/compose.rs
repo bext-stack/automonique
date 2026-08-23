@@ -364,19 +364,26 @@ impl std::error::Error for ComposeRefusal {}
 /// other line must parse completely — there is no key this reader skips.
 ///
 /// ```text
-/// # the provider binary, absolute
-/// binary=/home/owner/.local/bin/codex
-/// # an isolated CODEX_HOME: a copy of auth.json and a minimal config.toml
-/// home=/home/owner/.local/state/automonique/codex-home
+/// # production provider protocol
+/// engine=jcode
+/// # the exact immutable JCode binary, absolute
+/// binary=/opt/automonique/jcode/versions/COMMIT/jcode
+/// # isolated JCODE_HOME/JCODE_RUNTIME_DIR
+/// home=/var/lib/automonique/jcode-home
 /// # optional, informational only; recorded as the pinned binary's version
-/// version=codex-0.146.0
+/// version=jcode-COMMIT
+/// # fixed supervised protocol invocation; repeated arg keys preserve order
+/// arg=--quiet
+/// arg=--no-update
+/// arg=--no-selfdev
+/// arg=api-stdio
 /// ```
 ///
 /// `binary` and `home` are both required and both must be absolute. Neither is
 /// opened here: [`ProviderConfig::load`] validates shape, and
 /// [`compose`] is where the binary is hashed.
 ///
-/// # The optional argv, and why it is optional
+/// # The invocation
 ///
 /// A repeated `arg=` key replaces [`DEFAULT_ARGV`] **entirely** — there is no
 /// merging, because a partial override of an invocation has no single meaning.
@@ -392,8 +399,9 @@ impl std::error::Error for ComposeRefusal {}
 /// arg={answer}
 /// ```
 ///
-/// An override that never names [`ANSWER_PLACEHOLDER`] is refused, because a run
-/// that cannot write an answer is a `/run` that can never reply.
+/// A Codex compatibility override that never names [`ANSWER_PLACEHOLDER`] is
+/// refused. A JCode invocation must name `api-stdio` and must not name the
+/// answer placeholder: its typed terminal message is written by Automonique.
 ///
 /// It exists for two stated reasons and no others. First, `-o` is the one flag
 /// in [`DEFAULT_ARGV`] this build has never watched a provider release honour,
@@ -415,8 +423,8 @@ pub struct ProviderConfig {
 }
 
 /// Protocol owner behind one configured executable. Omitted legacy configs
-/// remain the explicitly supported Codex fallback; production JCode configs
-/// opt into its supervised harness protocol.
+/// select the rollback-only Codex compatibility route during the production
+/// canary; production configs explicitly select the supervised JCode protocol.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderEngine {
     Codex,

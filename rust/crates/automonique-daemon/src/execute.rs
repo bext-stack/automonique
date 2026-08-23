@@ -900,7 +900,7 @@ impl ExecutionLane {
             let prompt_sha256 = Sha256::digest(&prompt_bytes).to_hex();
             let prompt =
                 String::from_utf8(prompt_bytes).map_err(|_| ExecuteRefusal::PromptUnresolvable)?;
-            PreparedAttempt::Jcode(
+            PreparedAttempt::Jcode(Box::new(
                 JcodePreparedRun::new(JcodePreparedParts {
                     helper: backend.helper().to_path_buf(),
                     run_id,
@@ -939,7 +939,7 @@ impl ExecutionLane {
                     },
                 })
                 .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?,
-            )
+            ))
         } else {
             // `prepare` creates the run cgroup and applies the document's
             // ceilings before any workload can enter it. Dropping the result
@@ -962,7 +962,7 @@ impl ExecutionLane {
             } else {
                 prepared
             };
-            PreparedAttempt::Direct(prepared)
+            PreparedAttempt::Direct(Box::new(prepared))
         };
         let observed = prepared.observed_sequence();
 
@@ -1222,8 +1222,8 @@ struct LiveClaim {
 }
 
 enum PreparedAttempt {
-    Direct(PreparedRun),
-    Jcode(JcodePreparedRun),
+    Direct(Box<PreparedRun>),
+    Jcode(Box<JcodePreparedRun>),
 }
 
 impl PreparedAttempt {
@@ -1236,7 +1236,7 @@ impl PreparedAttempt {
 
     fn execute(self, cancellation: &CancellationToken, timeout: Duration) -> AttemptExecution {
         match self {
-            Self::Direct(prepared) => match prepared.execute(cancellation, timeout) {
+            Self::Direct(prepared) => match (*prepared).execute(cancellation, timeout) {
                 Ok(report) => AttemptExecution {
                     state: spool_state(report.status().state()),
                     last_sequence: report.status().last_sequence(),
@@ -1532,17 +1532,11 @@ impl JcodePreparedRun {
                         request.description(),
                     );
                     let (decision, forced_state) = loop {
-                        loop {
-                            match control.receiver.try_recv() {
-                                Ok(command) => {
-                                    // Provider permission is a serialized protocol pause.
-                                    // Refuse concurrent steering immediately instead of
-                                    // leaving the lease holder to time out ambiguously.
-                                    let _ =
-                                        command.response.send(Err(SteerRefusal::ProviderRefused));
-                                }
-                                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-                            }
+                        while let Ok(command) = control.receiver.try_recv() {
+                            // Provider permission is a serialized protocol pause.
+                            // Refuse concurrent steering immediately instead of
+                            // leaving the lease holder to time out ambiguously.
+                            let _ = command.response.send(Err(SteerRefusal::ProviderRefused));
                         }
                         if cancellation.is_cancelled() {
                             break (
@@ -1698,10 +1692,10 @@ impl JcodeSpoolWriter {
         events: Vec<automonique_agents::JcodeEvent>,
     ) {
         for event in events {
-            if let Some(frame) = mapper.project_event(event) {
-                if self.append_frame(&frame).is_err() {
-                    self.stop_progress();
-                }
+            if let Some(frame) = mapper.project_event(event)
+                && self.append_frame(&frame).is_err()
+            {
+                self.stop_progress();
             }
         }
     }

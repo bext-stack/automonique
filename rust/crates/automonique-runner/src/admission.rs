@@ -154,8 +154,7 @@ pub const BROKER_PROXY_VARIABLES: [&str; 2] = ["HTTPS_PROXY", "HTTP_PROXY"];
 /// the same shape as the brokered-destination gap [`AdmissionContext`] documents,
 /// and it closes the same way: a `required_local_socket_families` field on the
 /// sandbox spec, which is a wire change deliberately not made here.
-pub const LOCAL_IPC_IS_NOT_EGRESS: &str =
-    "a brokered launch may create AF_UNIX sockets; an unbrokered one may create none";
+pub const LOCAL_IPC_IS_NOT_EGRESS: &str = "a brokered launch may create AF_UNIX sockets for local IPC, but the family grant names no filesystem path and grants no network destination; an unbrokered launch may create none";
 
 /// Reviewed integration mode whose client supervises a child server.
 ///
@@ -187,8 +186,10 @@ pub const JCODE_API_STDIO_INTEGRATION_MODE: &str = "jcode-api-stdio-v1";
 /// - `admission.io_reservation`, `admission.workspace_reservation`,
 ///   `admission.scheduler_reservation` — scheduler accounting. They record
 ///   what was promised to the run, not a ceiling any mechanism here applies.
+///
 /// `admission.integration_mode` is intentionally absent: the JCode harness
 /// mode maps to the local seqpacket capability its supervised child requires.
+///
 /// - `admission.context_manifest` — context composition, resolved before the
 ///   prompt reaches this bridge as bytes.
 /// - `admission.profile_digest`, `admission.model_routing_digest`,

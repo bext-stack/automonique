@@ -74,7 +74,11 @@ Each provider must run the same adapter conformance suite in both its preferred 
 - raw transcript retention limits, redaction, and normalized-event parity.
 - cross-tenant/account/workspace session-resume denial and immutable security-context binding.
 
-Provider-specific fixtures must cover Jcode ACP and daemon reload—including proof that daemon-spawned tools remain in the declared cgroup/sandbox or an equivalent per-context daemon boundary—Claude bidirectional stream-JSON and resume, Codex App Server threads/turns/approvals, and opencode HTTP/SSE session reconciliation plus ACP fallback.
+Provider-specific fixtures must cover supervised JCode `api-stdio` create/attach,
+resume, steering, approvals, cancellation and proof that every child remains in
+the declared cgroup/sandbox; Claude bidirectional stream-JSON and resume; Codex
+App Server threads/turns/approvals; and opencode HTTP/SSE session reconciliation
+plus ACP fallback.
 
 ### 4. Reload matrix
 
@@ -363,7 +367,12 @@ code.
 
 ### Stage B — runner and provider canaries
 
-TypeScript remains the daemon. Rust handles explicitly selected low-risk jobs one provider and one native mode at a time: Jcode ACP, Claude stream-JSON, Codex App Server, then opencode HTTP/SSE. Each provider advances only after session resume, approvals, cancellation, reconciliation, and fallback telemetry are demonstrated; the old transport remains available as an explicit fallback.
+TypeScript remains the daemon. Rust handles explicitly selected low-risk jobs
+one provider and one native mode at a time: supervised JCode `api-stdio`, Claude
+stream-JSON, Codex App Server, then opencode HTTP/SSE. Each provider advances
+only after session resume, approvals, cancellation, reconciliation and fallback
+telemetry are demonstrated; compatibility transports remain explicit and
+capability-reduced.
 
 ### Stage C — Rust shadow daemon
 

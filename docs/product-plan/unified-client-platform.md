@@ -2,7 +2,7 @@
 
 # Unified client platform
 
-**Status:** shared clients and production TUI deployed; JCode provider cutover in progress
+**Status:** shared clients and production TUI deployed; JCode provider implementation complete and cutover verification in progress
 
 ## Delivery status
 
@@ -13,9 +13,10 @@ job delivery through a registered Automonique node, the temporary pinned Codex
 CLI fallback and an ordered terminal receipt. Exact idempotent replay returns
 the original completed receipt, and the JCode-derived TUI, the ShellDeck
 client-only build and the hosted web surface agree on the authority-qualified
-provider model catalog. The target vertical slice through the maintained JCode
-engine remains incomplete until its provider adapter passes conformance and
-live verification.
+provider model catalog. The JCode adapter now passes local protocol,
+containment, session-resume, approval, steering and cancellation conformance.
+The target vertical slice remains incomplete until the immutable release is
+selected in production and the federated live run is verified.
 
 The maintained JCode cockpit is installed as the `automonique tui` managed
 client. Production verification submitted a new durable request, reconciled
@@ -64,7 +65,7 @@ direct Codex JSONL route is a temporary, capability-reduced fallback.
 | Automonique node | local intake and execution, sandbox/credential admission, provider hosts and sessions, local/provider approvals, ordered events, action receipts and controller leases | GitHub issue truth or an AI Operations job state it has not received |
 | GitHub | issue scope, checklist, discussion, pull requests and recorded delivery evidence | live execution or node health |
 | JCode engine/provider | target provider-native session execution and raw/provider events | work authority, external-effect approval or canonical job state |
-| Direct Codex fallback | temporary degraded provider execution while the JCode adapter is incomplete | changing the JCode production target or advertising unavailable native controls |
+| Direct Codex compatibility path | rollback-only degraded execution during the JCode production canary | changing the JCode production target or advertising unavailable native controls |
 | Clients | authorized projections, composition and explicit typed actions | durable authority, direct provider bypasses or private retry semantics |
 
 Every cross-authority record carries its authority, opaque resource ID,
@@ -94,6 +95,7 @@ The minimum shared service surface is:
 | `ListSessions` | Returns only authorized, attachable sessions with durable run/session/turn identities and negotiated capabilities. |
 | `Attach` / `Detach` | Creates or removes an observation subscription without affecting provider lifecycle. |
 | `ClaimControl` / `ReleaseControl` | Manages a short durable steering/input lease independently from observation and pane focus. |
+| `Execute(Steer)` | Injects bounded input into one active turn only when targeted at a current exclusive control lease; provider acknowledgement completes the durable receipt. |
 
 One connection may multiplex subscriptions, but each subscription owns its own
 cursor, backpressure state and resync lifecycle. Authoritative events are never
@@ -148,7 +150,7 @@ live availability rather than treating configured names as proof of access.
 - retain standalone mode while introducing a backend boundary for managed mode;
 - in Automonique mode, route start, follow-up, steering, approval, cancellation
   and model selection through the shared client with no direct-provider bypass;
-- expose its headless engine through the pinned Automonique provider/ACP
+- expose its headless engine through the supervised `api-stdio` protocol-v1
   adapter and supply the terminal interaction implementation for
   `automonique tui`.
 
@@ -170,10 +172,10 @@ are recorded in the third-party inventory before distribution.
    registered Automonique node.
 3. The node validates current assignment, local authorization, sandbox,
    credentials and provider capabilities before recording a local action.
-4. The node launches or reconnects the pinned JCode engine through its provider
-   adapter and durably records normalized events. Until cutover, the same
-   authority boundary may select the explicitly degraded direct Codex JSONL
-   fallback for eligible work.
+4. The node launches or reconnects the pinned JCode engine through a contained,
+   attempt-scoped `api-stdio` host and durably records normalized events. The
+   direct Codex JSONL path is rollback-only during the production canary and is
+   removed from production selection after live verification.
 5. AI Operations receives bounded authority-qualified projections and receipts;
    transport loss leaves the command unknown until receipt reconciliation.
 6. The TUI may connect directly to the node. ShellDeck and the web client may
