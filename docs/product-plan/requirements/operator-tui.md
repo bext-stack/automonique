@@ -5,8 +5,8 @@
 The maintained JCode fork provides the terminal runtime while Automonique owns
 the protocol and action semantics. The shipped slice includes the
 `automonique tui` launcher, authority-qualified overview/run/session/approval/
-model/failure/receipt views, exact server-advertised actions, durable new
-request and session-follow-up composition, receipt reconciliation,
+model/failure/receipt views, exact server-advertised action-registry resources,
+durable new request and session-follow-up composition, receipt reconciliation,
 observation attachments, controller leases, dynamic bounded panes, local
 owner-only workspace restoration, stale/read-only reconnect behavior and
 fixed-size/reducer/PTY conformance coverage. Unsupported future operations are
