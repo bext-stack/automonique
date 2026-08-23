@@ -180,8 +180,11 @@ impl Normalizer {
 
     fn item_completed(&mut self, object: &Map<String, Value>) -> Result<(), AdapterError> {
         exact(object, &["item", "type"])?;
-        self.require_active()?;
         let item = item(object)?;
+        if string(item, "type")? == "error" {
+            return self.provider_notice(item);
+        }
+        self.require_active()?;
         let item_id = string(item, "id")?;
         validate_coordinate(item_id, "provider_item_id")?;
         // Codex CLI 0.149 may publish a terminal assistant item without a
@@ -219,6 +222,25 @@ impl Normalizer {
         }
         self.active_item = None;
         Ok(())
+    }
+
+    /// Codex 0.149 emits bounded startup diagnostics as completed `error`
+    /// items after `thread.started` and before `turn.started`. They describe a
+    /// disabled optional feature; they are neither a turn failure nor an
+    /// unknown item. Validate the complete record, retain only a content-free
+    /// warning, and let an eventual `turn.failed` remain the terminal fault.
+    fn provider_notice(&mut self, item: &Map<String, Value>) -> Result<(), AdapterError> {
+        if self.session.is_none() || self.active_item.is_some() {
+            return Err(AdapterError::EventOrder);
+        }
+        exact(item, &["id", "message", "type"])?;
+        let item_id = string(item, "id")?;
+        validate_coordinate(item_id, "provider_item_id")?;
+        let _ = bounded_text(item, "message")?;
+        self.record(
+            RecordedKind::ProviderWarning,
+            Some("provider startup notice".to_owned()),
+        )
     }
 
     fn turn_completed(&mut self, object: &Map<String, Value>) -> Result<(), AdapterError> {

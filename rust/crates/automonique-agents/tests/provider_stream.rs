@@ -37,6 +37,18 @@ const CURRENT_CLI_SUCCESS_FIXTURE: &str = concat!(
     "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":2,\"cached_input_tokens\":1,\"cache_write_input_tokens\":0,\"output_tokens\":3,\"reasoning_output_tokens\":0}}\n",
 );
 
+/// Sanitized from a bounded Codex CLI 0.149 turn on 2026-08-23. The provider
+/// reports a disabled optional host feature as an `error` item before starting
+/// the actual turn, then completes normally. The diagnostic text is synthetic;
+/// only its placement and exact item schema are provenance-derived.
+const CURRENT_CLI_STARTUP_NOTICE_FIXTURE: &str = concat!(
+    "{\"type\":\"thread.started\",\"thread_id\":\"fixture-session\"}\n",
+    "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"error\",\"message\":\"optional feature unavailable\"}}\n",
+    "{\"type\":\"turn.started\"}\n",
+    "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_1\",\"type\":\"agent_message\",\"text\":\"final answer\"}}\n",
+    "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":2,\"cached_input_tokens\":1,\"cache_write_input_tokens\":0,\"output_tokens\":3,\"reasoning_output_tokens\":0}}\n",
+);
+
 /// Sanitized from a bounded Codex CLI 0.149 turn that emitted commentary,
 /// executed one command, and then emitted its final answer. Command payloads
 /// are synthetic fixture text; only their exact schema is provenance-derived.
@@ -209,6 +221,41 @@ fn current_cli_multi_message_command_lifecycle_is_fully_projected() {
             RecordedKind::AssistantMessageCompleted,
             RecordedKind::UsageUpdated,
             RecordedKind::TurnCompleted,
+        ]
+    );
+}
+
+#[test]
+fn current_cli_startup_notice_does_not_poison_a_successful_turn() {
+    let transcript = normalize_jsonl(
+        &coordinates(),
+        &ExecutionMode::NewSession,
+        CURRENT_CLI_STARTUP_NOTICE_FIXTURE.as_bytes(),
+    )
+    .expect("current startup notice fixture accepted");
+    let recorded = transcript
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            NormalizedEvent::Recorded(recorded) => Some((recorded.kind(), recorded.text())),
+            NormalizedEvent::Preview { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recorded,
+        vec![
+            (RecordedKind::SessionCreated, None),
+            (
+                RecordedKind::ProviderWarning,
+                Some("provider startup notice")
+            ),
+            (RecordedKind::TurnStarted, None),
+            (
+                RecordedKind::AssistantMessageCompleted,
+                Some("final answer")
+            ),
+            (RecordedKind::UsageUpdated, None),
+            (RecordedKind::TurnCompleted, None),
         ]
     );
 }

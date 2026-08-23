@@ -81,6 +81,7 @@ pub const fn frame_kind(kind: RecordedKind) -> EventKind {
     match kind {
         RecordedKind::SessionCreated => EventKind::SessionCreated,
         RecordedKind::SessionLoaded => EventKind::SessionLoaded,
+        RecordedKind::ProviderWarning => EventKind::ProviderWarning,
         RecordedKind::TurnStarted => EventKind::TurnStarted,
         RecordedKind::AssistantMessageCompleted => EventKind::AssistantMessageCompleted,
         RecordedKind::ToolCallStarted => EventKind::ToolCallStarted,
