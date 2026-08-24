@@ -6,6 +6,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 fn main() -> ExitCode {
     let mut arguments = std::env::args_os().skip(1);
     let command = arguments.next();
+    if command.as_deref() == Some(std::ffi::OsStr::new("__doctor-sandbox-probe")) {
+        if arguments.next().is_some() {
+            return ExitCode::from(2);
+        }
+        return ExitCode::from(automonique_cli::sandbox_probe_child(
+            std::io::stdout().lock(),
+        ));
+    }
     if command.as_deref() == Some(std::ffi::OsStr::new("improvement-activate")) {
         let values = arguments.collect::<Vec<_>>();
         if values.len() != 8

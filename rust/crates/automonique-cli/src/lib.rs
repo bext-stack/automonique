@@ -24,6 +24,7 @@ mod progress;
 mod release;
 mod run_submit;
 mod runs;
+mod sandbox_probe;
 mod supervisor;
 
 pub use diagnostics::{
@@ -37,6 +38,7 @@ pub use release::{
     InspectedRelease, InspectedVersionRange, MAX_RELEASE_MANIFEST_BYTES, ReleaseInspection,
     ReleaseInspectionStatus, ReleaseIssue, inspect_release_manifest_structure,
 };
+pub use sandbox_probe::{inspect_sandbox_enforcement, sandbox_probe_child};
 pub use supervisor::inspect_supervisor_adapter;
 
 #[cfg(unix)]
@@ -1156,6 +1158,7 @@ fn inspect_doctor(runtime: Option<&OsStr>) -> Result<DoctorReportV1, DoctorRepor
         inspect_cgroup_v2_delegation(),
         inspect_cgroup_v2_enabled_controllers(),
         inspect_landlock_support(),
+        inspect_sandbox_enforcement(),
         inspect_max_user_namespaces(Path::new("/proc/sys/user/max_user_namespaces")),
         inspect_local_release(),
         inspect_supervisor_adapter(),
