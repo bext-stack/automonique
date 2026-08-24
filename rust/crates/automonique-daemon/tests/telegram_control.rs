@@ -1852,7 +1852,7 @@ fn explicit_email_composes_one_body_and_sends_to_the_server_bound_recipient() {
     assert_eq!(sends.len(), 1);
     assert!(sends[0].action_id.starts_with("automonique-email:"));
     assert_eq!(sends[0].to, "owner@example.invalid");
-    assert_eq!(sends[0].subject, "Récapitulatif des travaux IA du jour");
+    assert_eq!(sends[0].subject, "Récapitulatif des travaux IA");
     assert_eq!(
         sends[0].body,
         "Bonjour Ben,\n\nVoici le récapitulatif vérifié."
@@ -1871,6 +1871,69 @@ fn explicit_email_composes_one_body_and_sends_to_the_server_bound_recipient() {
             .iter()
             .any(|message| message.contains("owner@example.invalid"))
     );
+}
+
+#[test]
+fn insufficient_email_draft_is_not_sent_and_stages_a_telegram_lookup_approval() {
+    let fixture = Fixture::new(&[]);
+    let lane = FakeRunLane::answering_sequence(&[
+        "I don't have any ticket, site, or activity content to summarize. The snapshot contains no ticket data. Please authorize one of those read sources.",
+        "Bonjour,\n\nVoici le récapitulatif complet établi à partir des sources approuvées.",
+    ]);
+    let actions = FakeEmailActions::default();
+    let outbound = FakeOutbound::default();
+    let client = FakeClient::new([updates(&[(
+        42,
+        OPERATOR,
+        "Send me a full recap at owner@example.invalid",
+    )])]);
+    let mut bridge = bridge_with_email_actions(
+        &fixture,
+        client.clone(),
+        outbound.clone(),
+        lane.clone(),
+        actions.clone(),
+    );
+
+    assert_eq!(
+        poll(&mut bridge)
+            .expect("email request dispatches")
+            .emails_queued,
+        1
+    );
+    let completed = await_email_completion(&mut bridge);
+    assert_eq!(completed.emails_sent, 0);
+    assert_eq!(completed.emails_failed, 1);
+    assert!(
+        actions.sends().is_empty(),
+        "the disclaimer must not be emailed"
+    );
+
+    let preview = outbound
+        .sent()
+        .into_iter()
+        .find(|call| call.method == "sendMessage" && call.body.contains("Nothing was emailed"))
+        .expect("Telegram approval card");
+    assert!(preview.body.contains("Approve to run a deep local lookup"));
+    let preview_json: serde_json::Value =
+        serde_json::from_str(&preview.body).expect("preview JSON");
+    let approve_callback = preview_json["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+        .as_str()
+        .expect("approve callback")
+        .to_owned();
+
+    client.push(callback_updates(&[(43, OPERATOR, &approve_callback)]));
+    poll(&mut bridge).expect("approved lookup queues");
+    assert_eq!(await_question_completion(&mut bridge).questions_answered, 1);
+    assert!(
+        outbound
+            .messages()
+            .iter()
+            .any(|message| message.contains("récapitulatif complet"))
+    );
+    assert!(actions.sends().is_empty(), "approval remains read-only");
+    assert!(lane.tasks()[0].contains("AUTOMONIQUE_EMAIL_COMPOSITION_V1"));
+    assert!(lane.tasks()[1].contains("AUTOMONIQUE_READ_ONLY_QA_V1"));
 }
 
 #[test]

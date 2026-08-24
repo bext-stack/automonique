@@ -55,6 +55,19 @@ not answer with what it cannot see. It raises an escalation: an approve/deny
 card naming the deeper lane (every local source plus configured GitHub issue
 reads on the intelligent model, or read-only public-web research). Nothing
 runs until an administrator approves; a denied or expired card runs nothing.
+The card is returned to the requester on Telegram, Slack, or the hosted
+dashboard as appropriate. Dashboard cards also contribute to the pending
+action count in AI Operations. Approval is scoped to the displayed read or
+contained task and does not authorize unrelated effects.
+
+Configured safe reads run automatically and never require a permission card.
+Conversely, an approval is not offered when the required integration,
+credential, or capability is absent and approval could not make it available;
+the reply names that configuration gap instead. A requested external effect,
+including an email, is not sent with an insufficient-data disclaimer in place
+of its requested content. Monique asks for the effective permission first and
+returns the resulting draft to the requester before any separately authorized
+external effect.
 
 Requests that genuinely need iterative code or computation may instead raise
 an `agentic_scratchpad` card. Its preview includes the exact task. Approval

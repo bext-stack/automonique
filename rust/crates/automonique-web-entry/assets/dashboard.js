@@ -3379,6 +3379,11 @@ function humanChatError(category) {
     manage_action_not_pending: "That Manage action is no longer pending. Nothing was run.",
     manage_action_expired: "That Manage action expired. Ask Monique to prepare it again.",
     manage_action_additional_approval_refused: "Manage requested another approval step, so execution stopped.",
+    permission_request_not_pending: "That permission request is no longer pending. Nothing was run.",
+    permission_request_expired: "That permission request expired. Ask Monique to prepare it again.",
+    permission_request_capacity: "Too many permission requests are awaiting decisions. Resolve one and try again.",
+    permission_request_unavailable: "Monique could not retain the permission request safely. Nothing further was run.",
+    shared_assistant_unavailable: "Monique’s shared approval lane is temporarily unavailable. Nothing further was run.",
   };
   return messages[category] || `The contained conversation lane refused this turn (${category}).`;
 }

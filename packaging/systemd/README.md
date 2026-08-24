@@ -58,8 +58,14 @@ same-origin server in `mcp/servers.json` are present, chat can also discover
 Manage AI Operations tools. Tools explicitly annotated as read-only can ground
 an answer immediately. Every other tool becomes an in-chat action card showing
 its proposed arguments and runs once only after the operator explicitly
-approves it. Denial and expiry change nothing. The retired hostname redirects
-to the canonical dashboard hostname.
+approves it. When dashboard chat discovers that its attached context is
+insufficient but the shared router can perform a deeper read or contained task,
+it likewise returns a scoped approve/deny card to the requester. These cards
+are included in the AI Operations pending-action projection. Safe configured
+reads remain automatic; a genuinely missing integration or credential produces
+a configuration instruction rather than an ineffective permission request.
+Denial and expiry change nothing. The retired hostname redirects to the
+canonical dashboard hostname.
 Every dashboard resource and API response on the canonical hostname requires
 HTTP Basic authentication over the Cloudflare TLS boundary. The strict private
 credential file is `%S/automonique/dashboard-auth.conf`; it stores a username
