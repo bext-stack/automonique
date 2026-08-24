@@ -2,6 +2,7 @@
 
 [workspace]
 members = [
+    "crates/automonique-acp",
     "crates/automonique-agents",
     "crates/automonique-backup",
     "crates/automonique",
@@ -39,7 +40,10 @@ license = "Elastic-2.0"
 publish = false
 
 [workspace.dependencies]
+agent-client-protocol = "=2.0.0"
 base64 = "=0.22.1"
+blocking = "=1.6.2"
+futures = "=0.3.32"
 hex = "=0.4.3"
 httparse = "=1.10.1"
 landlock = "=0.4.7"

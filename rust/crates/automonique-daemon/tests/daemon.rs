@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use automonique_daemon::{Daemon, DaemonConfig, DaemonError, run_foreground};
+use automonique_daemon::{
+    Daemon, DaemonConfig, DaemonError, MAX_ADMIN_PAYLOAD_BYTES, run_foreground,
+};
 use automonique_protocol::admin::{
     AdminCommand, AdminRequest, AdminResponse, DaemonState, OutboxReconciliation,
     OutboxReconciliationDecision, OutboxReconciliationParts, ReconciliationFailure,
@@ -996,8 +998,9 @@ fn oversized_admin_prefix_is_closed_without_stopping_the_daemon() {
     wait_for_socket(&config);
 
     let mut hostile = UnixStream::connect(config.admin_socket()).expect("connect hostile peer");
+    let oversized = u32::try_from(MAX_ADMIN_PAYLOAD_BYTES + 1).expect("payload ceiling fits u32");
     hostile
-        .write_all(&(70_000_u32).to_be_bytes())
+        .write_all(&oversized.to_be_bytes())
         .expect("write prefix");
     hostile
         .set_read_timeout(Some(Duration::from_secs(1)))

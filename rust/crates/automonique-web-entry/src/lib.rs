@@ -3444,6 +3444,8 @@ fn manage_arguments_preview(arguments: &Value) -> Result<String, &'static str> {
                             },
                         )
                     })
+                    .collect::<BTreeMap<_, _>>()
+                    .into_iter()
                     .collect(),
             ),
             Value::Array(values) => Value::Array(values.iter().map(redact).collect()),
@@ -4568,7 +4570,7 @@ fn response_bytes(response: Response, head_only: bool, session_cookie: Option<&s
          Content-Security-Policy: {}\r\n\
          Cross-Origin-Opener-Policy: same-origin\r\n\
          Cross-Origin-Resource-Policy: same-origin\r\n\
-         Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=()\r\n\
+         Permissions-Policy: camera=(), microphone=(self), geolocation=(), payment=(), usb=()\r\n\
          Referrer-Policy: no-referrer\r\n\
          X-Content-Type-Options: nosniff\r\n\
          X-Frame-Options: DENY\r\n\
@@ -5432,6 +5434,8 @@ mod tests {
             "status-refresh",
             "status-pulse",
             "data-chat-prompt",
+            "voice-input",
+            "voice-output",
             "memory-kind",
             "memory-status",
             "memory-sensitivity",
@@ -5478,6 +5482,9 @@ mod tests {
         assert!(DASHBOARD_JS.contains("monique-density"));
         assert!(DASHBOARD_JS.contains("monique-start-view"));
         assert!(DASHBOARD_JS.contains("monique-language"));
+        assert!(DASHBOARD_JS.contains("SpeechRecognition"));
+        assert!(DASHBOARD_JS.contains("speechSynthesis"));
+        assert!(DASHBOARD_JS.contains("monique-voice-replies"));
         assert!(DASHBOARD_JS.contains("monique-memory-view"));
         assert!(DASHBOARD_JS.contains("renderMemoryTimeline"));
         assert!(DASHBOARD_JS.contains("renderMemoryInspector"));
@@ -5491,6 +5498,20 @@ mod tests {
         ] {
             assert!(DASHBOARD_HTML.contains(&format!("value=\"{theme}\"")));
         }
+    }
+
+    #[test]
+    fn dashboard_allows_same_origin_microphone_for_opt_in_voice_input() {
+        let state = AppState::new(fixture_status());
+        let response = String::from_utf8(response_bytes(
+            response_for(Route::Dashboard, &state, &fixture_hosts()),
+            false,
+            None,
+        ))
+        .unwrap();
+        assert!(response.contains("Permissions-Policy: camera=(), microphone=(self)"));
+        assert!(DASHBOARD_HTML.contains("aria-label=\"Start voice input\""));
+        assert!(DASHBOARD_HTML.contains("aria-label=\"Turn on spoken replies\""));
     }
 
     #[test]

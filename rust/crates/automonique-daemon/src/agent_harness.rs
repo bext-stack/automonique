@@ -1001,7 +1001,7 @@ fn validate_text(value: &str, maximum: usize) -> Result<(), ()> {
 }
 
 /// Stable JSON rendering for call digests and byte accounting.
-fn canonical_json_bytes(value: &Value) -> Vec<u8> {
+pub(crate) fn canonical_json_bytes(value: &Value) -> Vec<u8> {
     let mut output = Vec::new();
     write_canonical_json(value, &mut output);
     output

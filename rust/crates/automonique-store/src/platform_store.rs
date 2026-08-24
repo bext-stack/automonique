@@ -443,7 +443,7 @@ impl PlatformStore {
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'accepted',?9,?10,NULL)",
             params![receipt_id, request.idempotency_key.as_str(), request.action.as_str(), request.target.authority.as_str(),
                 request.target.kind.as_str(), request.target.id.as_str(), request.expected_revision.map(to_db_revision).transpose()?,
-                request.parameter.as_ref().map(PlatformText::as_str), to_db_revision(revision)?, now_ms],
+                request.parameter.as_ref().map(|parameter| parameter.as_str()), to_db_revision(revision)?, now_ms],
         )?;
         let receipt = ActionReceipt {
             id: ReceiptId::new(receipt_id)
@@ -878,7 +878,11 @@ fn receipt_matches_request(stored: &StoredReceipt, request: &ExecuteRequest) -> 
         && stored.receipt.action == request.action
         && stored.receipt.target == request.target
         && stored.expected_revision == request.expected_revision
-        && stored.parameter.as_deref() == request.parameter.as_ref().map(PlatformText::as_str)
+        && stored.parameter.as_deref()
+            == request
+                .parameter
+                .as_ref()
+                .map(|parameter| parameter.as_str())
 }
 
 fn append_receipt_event(connection: &Connection, receipt: &ActionReceipt) -> Stored<()> {

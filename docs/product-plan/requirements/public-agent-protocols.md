@@ -14,6 +14,18 @@ The server maps ACP sessions to durable Automonique sessions and exposes chat, s
 
 Disconnect/restart resumes from durable session and event cursors. Host capabilities are negotiated, and unsupported rich events degrade to bounded text without losing authoritative records.
 
+### Implemented stable-v1 profile
+
+The production Rust adapter is exposed by `automonique acp` and uses the
+official ACP SDK. It implements initialization, durable new/load/list session
+mapping, 64 KiB baseline prompts, ordered message/thought/tool projection,
+allow-once/deny approval requests, exact run cancellation, and restart-safe
+provider-session continuation. Capability negotiation is fail-closed: media,
+client MCP servers, additional directories, and configuration/model controls
+are not advertised until their effects exist in the canonical Platform
+domain. ShellDeck consumes this same profile as an ACP client; it does not own
+an alternate provider runtime.
+
 ## OpenAI-compatible HTTP API
 
 Provide authenticated, versioned endpoints for:

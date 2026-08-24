@@ -64,6 +64,39 @@ fn main() -> ExitCode {
             }
         };
     }
+    if command.as_deref() == Some(std::ffi::OsStr::new("acp")) {
+        if arguments.next().is_some() {
+            eprintln!("usage: automonique acp");
+            return ExitCode::from(2);
+        }
+        let config = match automonique_daemon::DaemonConfig::from_environment() {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("automonique acp refused: {}", error.category());
+                return ExitCode::FAILURE;
+            }
+        };
+        let authority = match automonique_acp::PlatformAuthority::open(
+            automonique_acp::PlatformAuthorityConfig {
+                state_dir: config.state_dir(),
+                platform_socket: config.admin_socket(),
+                progress_socket: config.progress_socket(),
+            },
+        ) {
+            Ok(authority) => std::sync::Arc::new(authority),
+            Err(error) => {
+                eprintln!("automonique acp refused: {}", error.category());
+                return ExitCode::FAILURE;
+            }
+        };
+        return match automonique_acp::serve_stdio(authority) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("automonique acp refused: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if command.as_deref() == Some(std::ffi::OsStr::new("work-brief")) {
         return work_brief_command(arguments.collect());
     }

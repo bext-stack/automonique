@@ -3834,7 +3834,11 @@ impl Daemon {
                     .map_err(ExecuteRefusal::as_str)
             }
             PlatformAction::DecideApproval => {
-                let decision = match request.parameter.as_ref().map(PlatformText::as_str) {
+                let decision = match request
+                    .parameter
+                    .as_ref()
+                    .map(|parameter| parameter.as_str())
+                {
                     Some("grant") => ApprovalOutcome::Granted,
                     Some("deny") => ApprovalOutcome::Denied,
                     _ => {

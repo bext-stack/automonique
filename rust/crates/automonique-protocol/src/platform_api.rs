@@ -22,7 +22,7 @@ use crate::wire::{JsonValue, Message};
 pub const MAX_PLATFORM_CANONICAL_BYTES: usize = 512 * 1024;
 /// Maximum canonical request frame. Responses are wider because a bounded
 /// snapshot can carry many records; no request carries record payloads.
-pub const MAX_PLATFORM_REQUEST_CANONICAL_BYTES: usize = 64 * 1024;
+pub const MAX_PLATFORM_REQUEST_CANONICAL_BYTES: usize = 128 * 1024;
 
 /// Refusal while admitting or assembling a platform frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -172,6 +172,19 @@ fn optional_text(
     match value.get(field) {
         Some(JsonValue::Null) => Ok(None),
         Some(JsonValue::String(text)) => PlatformText::new(text.clone())
+            .map(Some)
+            .map_err(|error| PlatformError::Field(error).into()),
+        _ => Err(PlatformApiError::InvalidBody),
+    }
+}
+
+fn optional_parameter(
+    value: &JsonValue,
+    field: &'static str,
+) -> Result<Option<PlatformParameter>, PlatformApiError> {
+    match value.get(field) {
+        Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::String(text)) => PlatformParameter::new(text.clone())
             .map(Some)
             .map_err(|error| PlatformError::Field(error).into()),
         _ => Err(PlatformApiError::InvalidBody),
@@ -492,14 +505,16 @@ fn request_from_message(message: &Message) -> Result<PlatformRequest, PlatformAp
                     "target",
                 ],
             )?;
-            Ok(PlatformRequest::Execute(ExecuteRequest::new(
-                PlatformAction::parse(string(body, "action")?)?,
-                coordinate(body.get("target").ok_or(PlatformApiError::InvalidBody)?)?,
-                IdempotencyKey::new(string(body, "idempotency_key")?.to_owned())
-                    .map_err(PlatformError::Field)?,
-                optional_revision(body, "expected_revision")?,
-                optional_text(body, "parameter")?,
-            )?))
+            Ok(PlatformRequest::Execute(
+                ExecuteRequest::new_with_parameter(
+                    PlatformAction::parse(string(body, "action")?)?,
+                    coordinate(body.get("target").ok_or(PlatformApiError::InvalidBody)?)?,
+                    IdempotencyKey::new(string(body, "idempotency_key")?.to_owned())
+                        .map_err(PlatformError::Field)?,
+                    optional_revision(body, "expected_revision")?,
+                    optional_parameter(body, "parameter")?,
+                )?,
+            ))
         }
         "get_receipt" => {
             exact_fields(body, &["id", "idempotency_key"])?;

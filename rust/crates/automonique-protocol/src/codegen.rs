@@ -5933,6 +5933,11 @@ fn platform_module() -> GeneratedModule {
                 ),
             },
             Constant {
+                name: "MAX_PLATFORM_PARAMETER_BYTES".to_owned(),
+                doc: "Largest free-form platform action parameter.".to_owned(),
+                value: ConstantValue::Count(crate::platform::MAX_PLATFORM_PARAMETER_BYTES),
+            },
+            Constant {
                 name: "PLATFORM_PROTOCOL".to_owned(),
                 doc: "Stable platform protocol name.".to_owned(),
                 value: ConstantValue::Text(crate::platform::PLATFORM_PROTOCOL.to_owned()),
@@ -5967,6 +5972,11 @@ fn platform_module() -> GeneratedModule {
                 name: "PlatformText".to_owned(),
                 max_bytes: crate::platform::MAX_PLATFORM_FIELD_BYTES,
                 pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),
+            },
+            BoundedString {
+                name: "PlatformParameter".to_owned(),
+                max_bytes: crate::platform::MAX_PLATFORM_PARAMETER_BYTES,
+                pattern: Some("^[^\\u0000]+$".to_owned()),
             },
         ],
         bounded_integers: vec![
@@ -6042,7 +6052,7 @@ fn platform_module() -> GeneratedModule {
                     required("action", "PlatformAction"),
                     nullable("expected_revision", "PlatformRevision"),
                     required("idempotency_key", "IdempotencyKey"),
-                    nullable("parameter", "PlatformText"),
+                    nullable("parameter", "PlatformParameter"),
                     required("target", "ResourceCoordinate"),
                 ],
             },

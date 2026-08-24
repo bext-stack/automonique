@@ -147,6 +147,7 @@
                       <span><b id="chat-latency">—</b> last turn</span>
                       <span id="chat-manage-state" hidden>Actions ready</span>
                     </div>
+                    <button class="voice-output-button" id="voice-output" type="button" aria-pressed="false" aria-label="Turn on spoken replies" title="Voice replies are off">VOICE OFF</button>
                     <button class="new-chat-button" id="new-chat" type="button">＋ New chat</button>
                   </div>
                 </div>
@@ -164,10 +165,11 @@
                     </label>
                     <span class="composer-hint"><b id="chat-count">0</b>/8192 · <kbd>Enter</kbd> send</span>
                     <span id="chat-state" role="status">Ready</span>
+                    <button class="voice-input-button" id="voice-input" type="button" aria-pressed="false" aria-label="Start voice input" title="Start voice input">MIC</button>
                     <button class="send-button" id="chat-send" type="submit" aria-label="Send message">↑</button>
                   </div>
                 </form>
-                <p class="chat-disclaimer">Monique can make mistakes. Durable memory and live sources are labeled when they support an answer.</p>
+                <p class="chat-disclaimer">Monique can make mistakes. Durable memory and live sources are labeled when they support an answer. Voice uses your browser’s speech service and starts only when you use a voice control.</p>
               </article>
             </div>
           </section>

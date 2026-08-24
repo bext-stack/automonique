@@ -1,24 +1,23 @@
 # SPDX-License-Identifier: Elastic-2.0
 
 [package]
-name = "automonique"
+name = "automonique-acp"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
-automonique-acp = { path = "../automonique-acp" }
-automonique-backup = { path = "../automonique-backup" }
-automonique-cli = { path = "../automonique-cli" }
-automonique-daemon = { path = "../automonique-daemon" }
+agent-client-protocol.workspace = true
 automonique-platform-client = { path = "../../../sdk/rust/platform-client" }
 automonique-protocol = { path = "../automonique-protocol" }
-serde_json.workspace = true
+blocking.workspace = true
+futures.workspace = true
+nix.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
-automonique-store = { path = "../automonique-store" }
-rusqlite.workspace = true
 tempfile.workspace = true
 
 [lints]

@@ -9,6 +9,8 @@
 //! values: local Unix sockets and remote HTTPS/WebSocket endpoints carry the
 //! same values and differ only in framing and authentication.
 
+use core::fmt;
+
 use crate::primitives::{BoundedString, EpochMillis, IdDomain, OpaqueId, Revision, ValueError};
 
 /// Stable protocol name.
@@ -17,6 +19,8 @@ pub const PLATFORM_PROTOCOL: &str = "automonique.platform";
 pub const PLATFORM_SCHEMA_V1: &str = "automonique.platform/v1";
 /// Largest identifier, cursor topic, action parameter, or explanation.
 pub const MAX_PLATFORM_FIELD_BYTES: usize = 256;
+/// Largest free-form parameter accepted by one typed platform action.
+pub const MAX_PLATFORM_PARAMETER_BYTES: usize = 64 * 1024;
 /// Largest number of resources in a snapshot request or response.
 pub const MAX_SNAPSHOT_RESOURCES: usize = 512;
 /// Largest number of ordered events returned in one subscription page.
@@ -90,6 +94,47 @@ pub type ControlLeaseId = OpaqueId<ControlLeaseIdDomain, MAX_PLATFORM_FIELD_BYTE
 pub type CursorTopic = BoundedString<MAX_PLATFORM_FIELD_BYTES>;
 /// Bounded action parameter or human-readable refusal explanation.
 pub type PlatformText = BoundedString<MAX_PLATFORM_FIELD_BYTES>;
+/// Bounded free-form action input. Identifiers and display text retain the
+/// much smaller [`MAX_PLATFORM_FIELD_BYTES`] limit.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PlatformParameter(String);
+
+impl PlatformParameter {
+    pub const MAX_BYTES: usize = MAX_PLATFORM_PARAMETER_BYTES;
+
+    pub fn new(value: impl Into<String>) -> Result<Self, ValueError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(ValueError::Empty);
+        }
+        if value.len() > Self::MAX_BYTES {
+            return Err(ValueError::TooLong {
+                max_bytes: Self::MAX_BYTES,
+                actual_bytes: value.len(),
+            });
+        }
+        if value.contains('\0') {
+            return Err(ValueError::ControlCharacter);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for PlatformParameter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
 
 /// System whose evidence is authoritative for a resource.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -538,7 +583,7 @@ pub struct ExecuteRequest {
     pub target: ResourceCoordinate,
     pub idempotency_key: IdempotencyKey,
     pub expected_revision: Option<Revision>,
-    pub parameter: Option<PlatformText>,
+    pub parameter: Option<PlatformParameter>,
 }
 
 impl ExecuteRequest {
@@ -548,6 +593,22 @@ impl ExecuteRequest {
         idempotency_key: IdempotencyKey,
         expected_revision: Option<Revision>,
         parameter: Option<PlatformText>,
+    ) -> Result<Self, PlatformError> {
+        Self::new_with_parameter(
+            action,
+            target,
+            idempotency_key,
+            expected_revision,
+            parameter.map(|text| PlatformParameter(text.into_inner())),
+        )
+    }
+
+    pub fn new_with_parameter(
+        action: PlatformAction,
+        target: ResourceCoordinate,
+        idempotency_key: IdempotencyKey,
+        expected_revision: Option<Revision>,
+        parameter: Option<PlatformParameter>,
     ) -> Result<Self, PlatformError> {
         if action.authority() != target.authority {
             return Err(PlatformError::AuthorityMismatch);

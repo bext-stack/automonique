@@ -17,6 +17,9 @@ export const CONTROL_LEASE_TTL_MILLIS = 30000;
 /** Maximum methods advertised by one endpoint. */
 export const MAX_CAPABILITY_METHODS = 32;
 
+/** Largest free-form platform action parameter. */
+export const MAX_PLATFORM_PARAMETER_BYTES = 65536;
+
 /** Maximum resources carried by one snapshot. */
 export const MAX_SNAPSHOT_RESOURCES = 512;
 
@@ -93,6 +96,17 @@ export function CursorTopic(value: string): CursorTopic {
   if (byteLength(value) > 256) throw new ValidationError("CursorTopic", "too_long");
   if (!CursorTopic_PATTERN.test(value)) throw new ValidationError("CursorTopic", "invalid_character");
   return value as CursorTopic;
+}
+
+/** Bounded string, at most 65536 UTF-8 bytes. */
+export type PlatformParameter = string & {readonly __brand: "PlatformParameter"};
+export const PlatformParameter_MAX_BYTES = 65536;
+export const PlatformParameter_PATTERN = /^[^\u0000]+$/u;
+export function PlatformParameter(value: string): PlatformParameter {
+  if (value.length === 0) throw new ValidationError("PlatformParameter", "empty");
+  if (byteLength(value) > 65536) throw new ValidationError("PlatformParameter", "too_long");
+  if (!PlatformParameter_PATTERN.test(value)) throw new ValidationError("PlatformParameter", "invalid_character");
+  return value as PlatformParameter;
 }
 
 /** Bounded string, at most 256 UTF-8 bytes. */
@@ -261,7 +275,7 @@ export interface ExecuteRequest {
   readonly action: PlatformAction;
   readonly expected_revision: PlatformRevision | null;
   readonly idempotency_key: IdempotencyKey;
-  readonly parameter: PlatformText | null;
+  readonly parameter: PlatformParameter | null;
   readonly target: ResourceCoordinate;
 }
 export const ExecuteRequest_FIELDS: readonly string[] = [

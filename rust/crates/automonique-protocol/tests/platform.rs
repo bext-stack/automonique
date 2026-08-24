@@ -63,6 +63,23 @@ fn opaque_values_are_bounded_and_control_free() {
 }
 
 #[test]
+fn action_parameters_admit_multiline_prompts_without_widening_identifiers() {
+    let prompt = "inspect the workspace\nthen explain the result";
+    assert_eq!(PlatformParameter::new(prompt).unwrap().as_str(), prompt);
+    assert_eq!(
+        PlatformParameter::new("x".repeat(MAX_PLATFORM_PARAMETER_BYTES + 1)),
+        Err(ValueError::TooLong {
+            max_bytes: MAX_PLATFORM_PARAMETER_BYTES,
+            actual_bytes: MAX_PLATFORM_PARAMETER_BYTES + 1,
+        })
+    );
+    assert_eq!(
+        PlatformParameter::new("bad\0prompt"),
+        Err(ValueError::ControlCharacter)
+    );
+}
+
+#[test]
 fn snapshots_refuse_silent_truncation() {
     let resources = (0..=MAX_SNAPSHOT_RESOURCES)
         .map(|index| {
@@ -178,6 +195,20 @@ fn every_platform_request_has_one_canonical_round_trip() {
                 key.clone(),
                 Some(Revision::new(3).unwrap()),
                 Some(PlatformText::new("interactive").unwrap()),
+            )
+            .unwrap(),
+        ),
+        PlatformRequest::Execute(
+            ExecuteRequest::new_with_parameter(
+                PlatformAction::SubmitRequest,
+                ResourceCoordinate::new(
+                    ResourceAuthority::Automonique,
+                    ResourceKind::Node,
+                    ResourceId::new("node-1").unwrap(),
+                ),
+                IdempotencyKey::new("retry-long-prompt-1").unwrap(),
+                Some(Revision::new(5).unwrap()),
+                Some(PlatformParameter::new("first line\nsecond line").unwrap()),
             )
             .unwrap(),
         ),

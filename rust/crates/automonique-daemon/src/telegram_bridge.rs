@@ -13411,7 +13411,7 @@ fn bounded_mcp_result_text(value: &serde_json::Value, budget: usize) -> String {
                 .collect::<Vec<_>>()
                 .join("\n")
         })
-        .or_else(|| serde_json::to_string(value).ok())
+        .or_else(|| Some(canonical_json_text(value)))
         .unwrap_or_default();
     if text.len() <= budget {
         return text;
@@ -13427,6 +13427,15 @@ fn bounded_mcp_result_text(value: &serde_json::Value, budget: usize) -> String {
         "{}\n…[result truncated: {omitted} more bytes not shown]",
         &text[..cut]
     )
+}
+
+/// Serialize independently of `serde_json`'s workspace-unified map backend.
+///
+/// Protocol dependencies may enable `preserve_order` for their own schemas;
+/// router prompts remain canonical and byte-stable regardless of that feature.
+fn canonical_json_text(value: &serde_json::Value) -> String {
+    String::from_utf8(crate::agent_harness::canonical_json_bytes(value))
+        .expect("canonical JSON is UTF-8")
 }
 
 pub(crate) fn mcp_approval_preview(
@@ -13542,8 +13551,8 @@ fn question_intent_prompt(
     } else {
         "fast"
     };
-    let mcp_catalog = serde_json::to_string(
-        &mcp_tools
+    let mcp_catalog = canonical_json_text(&serde_json::Value::Array(
+        mcp_tools
             .iter()
             .map(|tool| {
                 serde_json::json!({
@@ -13554,9 +13563,8 @@ fn question_intent_prompt(
                 })
             })
             .collect::<Vec<_>>(),
-    )
-    .ok()?;
-    let github_action_catalog = serde_json::to_string(github_action_aliases).ok()?;
+    ));
+    let github_action_catalog = canonical_json_text(&serde_json::json!(github_action_aliases));
     let transport_context = trusted_transport_context.unwrap_or("surface=unspecified");
     let render = |memory: &str, baseline: &str| {
         format!(
