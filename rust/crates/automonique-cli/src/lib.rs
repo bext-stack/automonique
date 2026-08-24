@@ -18,6 +18,7 @@ mod automation;
 mod batch;
 mod cancel;
 mod diagnostics;
+mod journal;
 mod kernel;
 mod parity;
 mod progress;
@@ -30,6 +31,7 @@ mod supervisor;
 pub use diagnostics::{
     inspect_admin_socket, inspect_control_plane, inspect_process_control, inspect_state_filesystem,
 };
+pub use journal::inspect_structured_journal;
 pub use kernel::{
     inspect_cgroup_v2_controllers, inspect_cgroup_v2_delegation,
     inspect_cgroup_v2_enabled_controllers, inspect_landlock_support, inspect_max_user_namespaces,
@@ -1162,6 +1164,7 @@ fn inspect_doctor(runtime: Option<&OsStr>) -> Result<DoctorReportV1, DoctorRepor
         inspect_max_user_namespaces(Path::new("/proc/sys/user/max_user_namespaces")),
         inspect_local_release(),
         inspect_supervisor_adapter(runtime),
+        inspect_structured_journal(runtime),
     ])
 }
 

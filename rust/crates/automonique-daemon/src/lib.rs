@@ -42,8 +42,8 @@
 //! batch registry throttles nothing. It establishes no release trust —
 //! nothing in this crate calls `release_trust_root`, so a provider binary is
 //! admitted by pinned digest and workspace identity, never by an attested
-//! signature. It has no logger, and it cannot acknowledge a Telegram callback
-//! query.
+//! signature. Its only structured-log surface is a bounded readiness record,
+//! and it cannot acknowledge a Telegram callback query.
 
 use std::error::Error;
 use std::fmt;
@@ -210,6 +210,7 @@ pub mod shot;
 pub mod site_inventory;
 pub mod skill_runtime;
 pub mod slack;
+mod structured_log;
 mod synthetic;
 mod systemd;
 mod telegram;
@@ -2018,6 +2019,7 @@ impl Daemon {
         let result = match started {
             Err(error) => Err(error),
             Ok(()) => 'serving: {
+                let _ = structured_log::emit_readiness(GENERATION_ID, self.lease_epoch);
                 if let Some(notifier) = service_manager.as_mut()
                     && let Err(error) = notifier.ready()
                 {

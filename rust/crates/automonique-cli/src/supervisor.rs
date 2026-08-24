@@ -270,6 +270,15 @@ fn query_manager(runtime: Option<&OsStr>, unit: &str) -> Result<ManagerReadback,
     parse_manager_readback(&systemctl_output(runtime, &arguments)?)
 }
 
+pub(crate) fn active_service_identity(runtime: Option<&OsStr>) -> Result<(String, u32), ()> {
+    let unit = locate_service(runtime).map_err(|_| ())?;
+    let manager = query_manager(runtime, &unit)?;
+    if manager.active_state != "active" || manager.sub_state != "running" || manager.main_pid == 0 {
+        return Err(());
+    }
+    Ok((unit, manager.main_pid))
+}
+
 fn systemctl_output(runtime: &OsStr, arguments: &[&OsStr]) -> Result<Vec<u8>, ()> {
     let mut child = Command::new(SYSTEMCTL)
         .env_clear()
