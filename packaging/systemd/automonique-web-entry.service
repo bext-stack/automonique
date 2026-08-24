@@ -7,7 +7,7 @@ After=network.target
 [Service]
 Type=simple
 EnvironmentFile=-%S/automonique/dashboard-runtime.conf
-ExecStart=%S/automonique/web-entry/bin/automonique-web-entry --bind 127.0.0.1 --port 18082 --auth-config %S/automonique/dashboard-auth.conf --integration-config %S/automonique/dashboard-integration.conf --state-dir ${AUTOMONIQUE_DAEMON_STATE} --runtime-dir %t/automonique --agent-auth-dir %S/automonique/agent-auth --codex-binary %h/.local/bin/codex --claude-binary %h/.local/bin/claude
+ExecStart=%S/automonique/web-entry/bin/automonique-web-entry --bind 127.0.0.1 --port 18082 --auth-config %S/automonique/dashboard-auth.conf --manage-chat-auth-config %S/automonique/manage-chat-auth.conf --integration-config %S/automonique/dashboard-integration.conf --state-dir ${AUTOMONIQUE_DAEMON_STATE} --runtime-dir %t/automonique --agent-auth-dir %S/automonique/agent-auth --codex-binary %h/.local/bin/codex --claude-binary %h/.local/bin/claude
 # A clean process exit is not evidence that the public dashboard was
 # intentionally disabled. `systemctl stop` still suppresses restart, while an
 # unexpected graceful exit no longer leaves the Cloudflare tunnel serving 502s.

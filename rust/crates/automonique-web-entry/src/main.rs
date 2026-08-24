@@ -20,6 +20,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut bind = IpAddr::from([127, 0, 0, 1]);
     let mut port = 18_082_u16;
     let mut auth_config = None;
+    let mut manage_chat_auth_config = None;
     let mut integration_config = None;
     let mut state_dir = None;
     let mut runtime_dir = None;
@@ -34,6 +35,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--auth-config" => {
                 auth_config = Some(PathBuf::from(
                     arguments.next().ok_or("--auth-config requires a value")?,
+                ));
+            }
+            "--manage-chat-auth-config" => {
+                manage_chat_auth_config = Some(PathBuf::from(
+                    arguments
+                        .next()
+                        .ok_or("--manage-chat-auth-config requires a value")?,
                 ));
             }
             "--integration-config" => {
@@ -80,6 +88,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("port zero".into());
     }
     let auth_config = auth_config.ok_or("--auth-config is required")?;
+    let manage_chat_auth_config =
+        manage_chat_auth_config.ok_or("--manage-chat-auth-config is required")?;
     let integration_config = integration_config.ok_or("--integration-config is required")?;
     let state_dir = state_dir.ok_or("--state-dir is required")?;
     let runtime_dir = runtime_dir.ok_or("--runtime-dir is required")?;
@@ -88,6 +98,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let claude_binary = claude_binary.ok_or("--claude-binary is required")?;
     if [
         &auth_config,
+        &manage_chat_auth_config,
         &integration_config,
         &state_dir,
         &runtime_dir,
@@ -101,6 +112,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("dashboard paths must be absolute".into());
     }
     let auth = automonique_web_entry::BasicAuth::from_file(&auth_config)?;
+    let manage_chat_auth =
+        automonique_web_entry::ManageChatAuth::from_file(&manage_chat_auth_config)?;
     let integration_config =
         automonique_web_entry::IntegrationConfig::from_file(&integration_config)?;
     let agent_auth =
@@ -112,6 +125,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         agent_auth,
     )?;
     let listener = TcpListener::bind(SocketAddr::new(bind, port))?;
-    automonique_web_entry::serve(listener, auth, integration)?;
+    automonique_web_entry::serve(listener, auth, manage_chat_auth, integration)?;
     Ok(())
 }

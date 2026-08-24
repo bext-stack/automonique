@@ -83,6 +83,71 @@ hostnames. The hostnames are deployment configuration rather than repository
 identifiers; the tenant and actor remain absent from every web configuration
 response. Chat turns use the daemon's contained run lane and
 the canonical memory database, rather than a dashboard-specific provider path.
+
+Company Manager uses a separate server-to-server Manage chat API. It is not a
+dashboard alias and cannot be authorized by dashboard Basic credentials or the
+dashboard session cookie. Its four versioned JSON operations are
+`POST /api/v1/manage-chat/history`, `POST /api/v1/manage-chat/turn`,
+`POST /api/v1/manage-chat/new`, and `POST /api/v1/manage-chat/action`. The
+browser never receives its bearer token: Company Manager authenticates its own
+requester and calls these routes from its same-origin server. Automonique keeps
+the configured Monique tenant and actor while deriving a distinct conversation
+scope from the validated opaque Manage subject. Optional page context is a
+bounded typed reference under `/manage/ai-operations`, explicitly untrusted and
+never proof of resource state or authority. CORS and frame embedding remain
+disabled.
+
+Every request is `Content-Type: application/json` and carries
+`Authorization: Bearer <token>`. Unknown JSON fields are refused. The request
+and response contracts are:
+
+```text
+history request  {"subject":"<opaque>"}
+new request      {"subject":"<opaque>"}
+action request   {"subject":"<opaque>","action_id":"act-...","decision":"approve|deny"}
+turn request     {"subject":"<opaque>","message":"...","profile":"conversation|operational","context":{"kind":"...","id":"...","path":"/manage/ai-operations..."}}
+
+history/new response
+  {"schema":"automonique.manage-chat.history/v1","messages":[{"role":"user|assistant","content":"...","created_at_ms":0}],"pending_actions":[{"id":"act-...","title":"...","detail":"...","impact":"..."}]}
+
+turn/action response
+  {"schema":"automonique.manage-chat.turn/v1|automonique.manage-chat.action/v1","answer":"...","profile":"conversation|operational","memory_evidence":0,"live_sources":[],"duration_ms":0,"conversation_retained":true,"action":null|{"id":"act-...","title":"...","detail":"...","impact":"..."}}
+
+error response   {"error":"<bounded static category>"}
+```
+
+`profile`, `context`, and context `id` are optional. Context `kind` is one of
+`dashboard`, `run`, `session`, `agent`, `decision`, `workflow`, `task`,
+`event`, `tool`, `budget`, `analytics`, `activity`, `settings`,
+`circuit_breaker`, `preset`, `timeline`, `vertical`. Company Manager maps the
+snake-case wire names into its UI model; the service does not return a separate
+camel-case browser contract.
+
+The shared owner-only credential file is
+`%S/automonique/manage-chat-auth.conf`. It deliberately contains the raw bearer
+token so the web entry process and same-host Company Manager server can read
+the same file; neither service may log, project, return, or expose it to client
+JavaScript. Generate it without printing the token, then point Company Manager
+`AUTOMONIQUE_MANAGE_CHAT_AUTH_FILE` at that exact file:
+
+```sh
+automonique-manage-chat-auth \
+  "$XDG_STATE_HOME/automonique/manage-chat-auth.conf" company-manager
+```
+
+The file is created with mode `0600` and has this private schema:
+
+```text
+schema=automonique.manage-chat-auth/v1
+id=company-manager
+token=<URL-safe high-entropy bearer token>
+end=automonique.manage-chat-auth/v1
+```
+
+The `id` line is optional metadata. The token is required. Provisioning or
+rotating this production credential is a separate deployment operation; do not
+commit the file.
+
 The dashboard reuses the deployment's private Manage URL and MCP credentials;
 it never embeds a production address, token, app identity or header in source.
 When AI Operations is served from a different origin than the support/MCP
