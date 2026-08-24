@@ -208,6 +208,27 @@ fn busybox_provider(home: &Path, argv: &[&str]) -> String {
     body
 }
 
+#[test]
+fn one_legacy_engine_metadata_key_is_accepted_but_remains_bounded() {
+    let fixture = Fixture::new(None, None);
+    let path = fixture.state_dir().join(PROVIDER_CONFIG_NAME);
+    let provider = busybox_provider(&fixture.provider_home(), &[]);
+    write_private(&path, &format!("engine=codex\n{provider}"));
+    assert!(
+        ProviderConfig::load(&path)
+            .expect("configuration")
+            .is_some()
+    );
+
+    for engine in ["codex\nengine=codex", "../codex", "x y"] {
+        write_private(&path, &format!("engine={engine}\n{provider}"));
+        assert!(matches!(
+            ProviderConfig::load(&path),
+            Err(ComposeRefusal::NotConfigured)
+        ));
+    }
+}
+
 /// The invocation that copies this run's prompt into this run's answer file.
 ///
 /// Everything it executes is the granted busybox by absolute path, and the

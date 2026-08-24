@@ -352,6 +352,8 @@ impl std::error::Error for ComposeRefusal {}
 /// other line must parse completely — there is no key this reader skips.
 ///
 /// ```text
+/// # optional legacy metadata; validated but not used for routing or authority
+/// engine=codex
 /// # the provider binary, absolute
 /// binary=/home/owner/.local/bin/codex
 /// # an isolated CODEX_HOME: a copy of auth.json and a minimal config.toml
@@ -423,6 +425,7 @@ impl ProviderConfig {
         let mut binary: Option<PathBuf> = None;
         let mut home: Option<PathBuf> = None;
         let mut version: Option<String> = None;
+        let mut engine_seen = false;
         let mut argv: Vec<String> = Vec::new();
         for line in text.lines() {
             let line = line.trim();
@@ -435,6 +438,17 @@ impl ProviderConfig {
                 return Err(rejected());
             }
             let slot = match key.trim() {
+                // Older deployments wrote this informational selector before
+                // provider routing became path-bound. It grants nothing and
+                // is intentionally not retained, but accepting one bounded
+                // value keeps those private configurations forward-compatible.
+                "engine" => {
+                    if engine_seen || !is_safe_segment(value) {
+                        return Err(rejected());
+                    }
+                    engine_seen = true;
+                    continue;
+                }
                 "binary" => &mut binary,
                 "home" => &mut home,
                 "version" => {
