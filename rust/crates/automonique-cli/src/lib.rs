@@ -1161,7 +1161,7 @@ fn inspect_doctor(runtime: Option<&OsStr>) -> Result<DoctorReportV1, DoctorRepor
         inspect_sandbox_enforcement(),
         inspect_max_user_namespaces(Path::new("/proc/sys/user/max_user_namespaces")),
         inspect_local_release(),
-        inspect_supervisor_adapter(),
+        inspect_supervisor_adapter(runtime),
     ])
 }
 

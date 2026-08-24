@@ -65,7 +65,7 @@ fn doctor_human_mode_reports_an_unanswered_status_rpc_for_a_private_runtime() {
     assert!(stdout.contains("release.missing"), "{stdout}");
     assert!(stdout.contains("release.manifest-structure"), "{stdout}");
     assert!(
-        stdout.contains("supervisor.configuration-unavailable"),
+        stdout.contains("supervisor.socket-readback-unavailable"),
         "{stdout}"
     );
     assert!(stdout.contains("runtime"), "{stdout}");
@@ -106,7 +106,7 @@ fn doctor_json_mode_uses_the_versioned_schema() {
     );
     assert!(stdout.contains("\"id\":\"supervisor.adapter\""), "{stdout}");
     assert!(
-        stdout.contains("\"code\":\"supervisor.configuration-unavailable\""),
+        stdout.contains("\"code\":\"supervisor.socket-readback-unavailable\""),
         "{stdout}"
     );
 }

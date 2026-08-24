@@ -1,25 +1,22 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-#[path = "../src/supervisor.rs"]
-mod supervisor;
-
+use automonique_cli::inspect_supervisor_adapter;
 use automonique_protocol::CheckStatus;
-use supervisor::inspect_supervisor_adapter;
 
 #[test]
 fn unavailable_result_has_exact_typed_redacted_reason() {
-    let check = inspect_supervisor_adapter();
+    let check = inspect_supervisor_adapter(None);
     let reason = check.reason().expect("unavailable check has a reason");
 
     assert_eq!(check.code().as_str(), "supervisor.adapter");
     assert_eq!(check.status(), CheckStatus::Unavailable);
     assert_eq!(
         reason.code().as_str(),
-        "supervisor.configuration-unavailable"
+        "supervisor.socket-readback-unavailable"
     );
     assert_eq!(
         reason.message().as_str(),
-        "Supervisor adapter configuration is unavailable in this release"
+        "Supervisor readback is unavailable for the active admin socket"
     );
 }
 
@@ -34,8 +31,8 @@ fn repeated_inspection_is_deterministic_and_does_not_mutate_files() {
         .collect::<Vec<_>>();
     let before_marker = std::fs::read(&marker).expect("marker bytes");
 
-    let first = inspect_supervisor_adapter();
-    let second = inspect_supervisor_adapter();
+    let first = inspect_supervisor_adapter(None);
+    let second = inspect_supervisor_adapter(None);
 
     let after_entries = std::fs::read_dir(directory.path())
         .expect("entries")
