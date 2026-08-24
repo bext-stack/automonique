@@ -9,8 +9,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use automonique_agents::{
-    JCODE_API_VERSION, JcodeEvent, JcodeFrameDecoder, JcodeProtocolError, JcodeRequest,
-    JcodeTurnCollector, JcodeTurnResult, PermissionDecision, encode_jcode_request,
+    JCODE_API_SCHEMA_ID, JCODE_API_VERSION, JcodeEvent, JcodeExecutionIdentity, JcodeFrameDecoder,
+    JcodeInterruptedReason, JcodeNativeAdapter, JcodeNativeEnvelope, JcodeNegotiation,
+    JcodeProtocolError, JcodeRequest, JcodeTurnCollector, JcodeTurnResult, PermissionDecision,
+    RunCoordinates, SessionScope, encode_jcode_request,
 };
 use automonique_protocol::provenance::{CausationId, CorrelationId, Provenance, TraceId};
 use automonique_runner::{
@@ -38,6 +40,7 @@ pub enum JcodeHostError {
     Journal(ProviderJournalError),
     Containment(automonique_runner::ContainmentError),
     ProviderRefused,
+    ProviderEof { incomplete_frame: bool },
     TurnAlreadyOpen,
     NoOpenTurn,
     ApprovalMismatch,
@@ -54,6 +57,12 @@ impl fmt::Display for JcodeHostError {
             Self::Journal(error) => write!(formatter, "JCode journal: {error}"),
             Self::Containment(error) => write!(formatter, "JCode containment: {error}"),
             Self::ProviderRefused => formatter.write_str("JCode refused a correlated request"),
+            Self::ProviderEof { incomplete_frame } => {
+                write!(
+                    formatter,
+                    "JCode provider EOF (incomplete frame: {incomplete_frame})"
+                )
+            }
             Self::TurnAlreadyOpen => formatter.write_str("a JCode turn is already open"),
             Self::NoOpenTurn => formatter.write_str("no JCode turn is open"),
             Self::ApprovalMismatch => formatter.write_str("JCode approval request mismatch"),
@@ -94,6 +103,33 @@ pub struct JcodeApprovalRequest {
     description: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JcodeInputRequest {
+    request_id: String,
+    prompt: String,
+    is_password: bool,
+    tool_call_id: String,
+}
+
+impl JcodeInputRequest {
+    #[must_use]
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+    #[must_use]
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+    #[must_use]
+    pub const fn is_password(&self) -> bool {
+        self.is_password
+    }
+    #[must_use]
+    pub fn tool_call_id(&self) -> &str {
+        &self.tool_call_id
+    }
+}
+
 impl JcodeApprovalRequest {
     #[must_use]
     pub fn request_id(&self) -> &str {
@@ -114,7 +150,9 @@ pub enum JcodeTurnOutcome {
     Pending,
     Completed(JcodeTurnResult),
     ApprovalRequired(JcodeApprovalRequest),
+    InputRequired(JcodeInputRequest),
     Cancelled,
+    InterruptedUnknown(JcodeInterruptedReason),
 }
 
 struct PendingTurn {
@@ -123,10 +161,14 @@ struct PendingTurn {
     request_key: String,
     send_request_id: u64,
     collector: JcodeTurnCollector,
+    adapter: JcodeNativeAdapter,
     pending_approval: Option<JcodeApprovalRequest>,
     pending_approval_request_key: Option<String>,
+    pending_input: Option<JcodeInputRequest>,
+    pending_input_request_key: Option<String>,
     steering_request_keys: BTreeMap<u64, String>,
     cancelling: bool,
+    cancel_request_key: Option<String>,
 }
 
 /// One contained JCode process, one attached provider session, serialized
@@ -137,8 +179,10 @@ pub struct JcodeSessionHost {
     process: SandboxedSession,
     reader: BufReader<std::os::unix::net::UnixStream>,
     decoder: JcodeFrameDecoder,
-    queued: VecDeque<JcodeEvent>,
+    incomplete_frame: bool,
     observed_events: VecDeque<JcodeEvent>,
+    observed_native: VecDeque<JcodeNativeEnvelope>,
+    negotiation: JcodeNegotiation,
     containment: Option<RunContainment>,
     journal: ProviderJournal,
     process_id: i64,
@@ -164,6 +208,7 @@ impl JcodeSessionHost {
         working_dir: &Path,
         resume_session_id: Option<&str>,
         model: Option<&str>,
+        expected_server: &str,
         now_ms: i64,
         startup_timeout: Duration,
     ) -> Result<Self, JcodeHostError> {
@@ -174,6 +219,7 @@ impl JcodeSessionHost {
         if let Some(session_id) = resume_session_id {
             validate_key(session_id, "provider_session_id")?;
         }
+        validate_key(expected_server, "expected_server")?;
         // The launch helper executes a sealed copy of the provider. JCode's
         // client then starts its shared server as a child, so `current_exe()`
         // may point at a deleted memfd. Bind the exact already-pinned on-disk
@@ -190,6 +236,12 @@ impl JcodeSessionHost {
                 plan.program().as_os_str().as_encoded_bytes(),
             )?
         };
+        let configuration_sha256 = digest(&launch_plan.encode()?);
+        let identity = JcodeExecutionIdentity::pinned(
+            launch_plan.program_sha256(),
+            &configuration_sha256,
+            expected_server,
+        )?;
         let mut process = spawn_sandboxed_session(helper, &launch_plan, &containment)
             .map_err(JcodeHostError::Launch)?;
         let stream = match process.try_clone_stream() {
@@ -204,7 +256,7 @@ impl JcodeSessionHost {
             process,
             reader: BufReader::new(stream),
             decoder: JcodeFrameDecoder::new(),
-            queued: VecDeque::new(),
+            incomplete_frame: false,
             next_request_id: 1,
         };
         let hello_id = host.send(&JcodeRequest::Hello {
@@ -213,6 +265,7 @@ impl JcodeSessionHost {
             client: CLIENT_ID.to_owned(),
         })?;
         let hello_event = host.next_event()?;
+        let negotiation = JcodeNegotiation::accept(identity, hello_id, &hello_event)?;
         let (server, capabilities) = match &hello_event {
             JcodeEvent::HelloOk {
                 reply_to,
@@ -253,8 +306,9 @@ impl JcodeSessionHost {
             JcodeEvent::Attached { session_id, .. } => session_id.clone(),
             _ => unreachable!("the attach loop exits only on an attached event"),
         };
-        deferred.append(&mut host.queued);
-        host.queued = deferred;
+        let mut startup_events = VecDeque::from([hello_event.clone()]);
+        startup_events.extend(deferred);
+        startup_events.push_back(attached_event.clone());
         if resume_session_id.is_some_and(|expected| expected != provider_session_id) {
             return Err(JcodeHostError::Protocol(
                 JcodeProtocolError::SessionMismatch,
@@ -298,6 +352,13 @@ impl JcodeSessionHost {
             value_digest: &schema_digest,
             bound_ms: now_ms,
         })?;
+        journal.bind_capability(BindingRecord {
+            session_id: session.session_id,
+            name: "jcode-execution-config",
+            version: JCODE_API_SCHEMA_ID,
+            value_digest: &configuration_sha256,
+            bound_ms: now_ms,
+        })?;
 
         Ok(Self {
             logical_key: logical_key.to_owned(),
@@ -305,8 +366,10 @@ impl JcodeSessionHost {
             process: host.process,
             reader: host.reader,
             decoder: host.decoder,
-            queued: host.queued,
-            observed_events: VecDeque::from([hello_event, attached_event]),
+            incomplete_frame: host.incomplete_frame,
+            observed_events: startup_events,
+            observed_native: VecDeque::new(),
+            negotiation,
             containment: Some(containment),
             journal,
             process_id: process_receipt.process_id,
@@ -337,6 +400,11 @@ impl JcodeSessionHost {
     /// reparsing provider bytes or gaining access to the protocol stream.
     pub fn take_events(&mut self) -> Vec<JcodeEvent> {
         self.observed_events.drain(..).collect()
+    }
+
+    /// Automonique-owned native envelopes accepted since the previous drain.
+    pub fn take_native_envelopes(&mut self) -> Vec<JcodeNativeEnvelope> {
+        self.observed_native.drain(..).collect()
     }
 
     pub fn begin_turn(
@@ -410,20 +478,38 @@ impl JcodeSessionHost {
             created_ms: now_ms,
         })?;
         self.process.write_all(&encoded)?;
+        let coordinates = RunCoordinates::new(
+            self.logical_key.clone(),
+            turn_key,
+            SessionScope::new("automonique", "jcode", "api-stdio")
+                .map_err(|_| JcodeHostError::InvalidField("turn_coordinates"))?,
+        )
+        .map_err(|_| JcodeHostError::InvalidField("turn_coordinates"))?;
+        let adapter = JcodeNativeAdapter::after_negotiation(
+            self.negotiation.clone(),
+            &coordinates,
+            request_id,
+            &self.provider_session_id,
+        )?;
         // Bounds in `JcodeFrameDecoder` apply per turn, not to the lifetime of
         // a healthy reusable session. Every line consumed above ended with a
         // newline, so no partial frame crosses this reset.
         self.decoder = JcodeFrameDecoder::new();
+        self.incomplete_frame = false;
         self.pending = Some(PendingTurn {
             turn_id: opening.turn_id,
             turn_revision: opening.revision,
             request_key,
             send_request_id: request_id,
             collector: JcodeTurnCollector::new(&self.provider_session_id)?,
+            adapter,
             pending_approval: None,
             pending_approval_request_key: None,
+            pending_input: None,
+            pending_input_request_key: None,
             steering_request_keys: BTreeMap::new(),
             cancelling: false,
+            cancel_request_key: None,
         });
         Ok(())
     }
@@ -523,6 +609,73 @@ impl JcodeSessionHost {
         self.poll_turn(now_ms, read_timeout)
     }
 
+    /// Durably answer the exact provider stdin request currently blocking the
+    /// serialized turn. The journal stores only digests, never the input.
+    pub fn respond_stdin(
+        &mut self,
+        request_id: &str,
+        input: &str,
+        actor: &str,
+        now_ms: i64,
+        read_timeout: Duration,
+    ) -> Result<JcodeTurnOutcome, JcodeHostError> {
+        validate_key(actor, "actor")?;
+        let (turn_id, input_request_key) = {
+            let pending = self.pending.as_ref().ok_or(JcodeHostError::NoOpenTurn)?;
+            let request = pending
+                .pending_input
+                .as_ref()
+                .ok_or(JcodeHostError::ApprovalMismatch)?;
+            if request.request_id != request_id {
+                return Err(JcodeHostError::ApprovalMismatch);
+            }
+            (
+                pending.turn_id,
+                pending
+                    .pending_input_request_key
+                    .clone()
+                    .ok_or(JcodeHostError::ApprovalMismatch)?,
+            )
+        };
+        let encoded = encode_jcode_request(
+            self.next_request_id,
+            &JcodeRequest::StdinResponse {
+                session_id: self.provider_session_id.clone(),
+                request_id: request_id.to_owned(),
+                input: input.to_owned(),
+            },
+        )?;
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .ok_or(JcodeHostError::InvalidField("request_id"))?;
+        let approval_key = format!("stdin:{request_id}");
+        self.journal.record_approval(ApprovalRecord {
+            session_id: self.session_id,
+            approval_key: &approval_key,
+            decision: ApprovalDecision::Granted,
+            deciding_actor: actor,
+            decided_ms: now_ms,
+        })?;
+        self.process.write_all(&encoded)?;
+        self.journal.settle_request(RequestOutcomeCommit {
+            turn_id,
+            now_ms,
+            settlement: RequestSettlement {
+                request_key: &input_request_key,
+                expected_revision: 1,
+                outcome: SettledOutcome::Answered {
+                    response_digest: &digest(&encoded),
+                },
+            },
+        })?;
+        let pending = self.pending.as_mut().ok_or(JcodeHostError::NoOpenTurn)?;
+        pending.collector.resolve_input(request_id)?;
+        pending.pending_input = None;
+        pending.pending_input_request_key = None;
+        self.poll_turn(now_ms, read_timeout)
+    }
+
     pub fn soft_interrupt(
         &mut self,
         content: &str,
@@ -584,7 +737,7 @@ impl JcodeSessionHost {
         read_timeout: Duration,
     ) -> Result<JcodeTurnOutcome, JcodeHostError> {
         let pending = self.pending.as_mut().ok_or(JcodeHostError::NoOpenTurn)?;
-        if pending.pending_approval.is_some() {
+        if pending.pending_approval.is_some() || pending.pending_input.is_some() {
             // Resolve the exact provider request before cancellation so its
             // durable request row cannot be stranded as pending.
             return Err(JcodeHostError::ApprovalMismatch);
@@ -592,13 +745,35 @@ impl JcodeSessionHost {
         if pending.cancelling {
             return Err(JcodeHostError::NoOpenTurn);
         }
-        self.send(JcodeRequest::Cancel {
-            session_id: self.provider_session_id.clone(),
-        })?;
-        self.pending
-            .as_mut()
+        let request_id = self.next_request_id;
+        let encoded = encode_jcode_request(
+            request_id,
+            &JcodeRequest::Cancel {
+                session_id: self.provider_session_id.clone(),
+            },
+        )?;
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .ok_or(JcodeHostError::InvalidField("request_id"))?;
+        let request_key = format!("cancel:{request_id}");
+        let turn_id = self
+            .pending
+            .as_ref()
             .ok_or(JcodeHostError::NoOpenTurn)?
-            .cancelling = true;
+            .turn_id;
+        self.journal.record_request(RequestRecord {
+            turn_id,
+            request_key: &request_key,
+            direction: RequestDirection::ToProvider,
+            payload_digest: &digest(&encoded),
+            created_ms: now_ms,
+        })?;
+        self.process.write_all(&encoded)?;
+        let pending = self.pending.as_mut().ok_or(JcodeHostError::NoOpenTurn)?;
+        pending.adapter.mark_cancellation_requested()?;
+        pending.cancelling = true;
+        pending.cancel_request_key = Some(request_key);
         self.poll_turn(now_ms, read_timeout)
     }
 
@@ -635,8 +810,37 @@ impl JcodeSessionHost {
     }
 
     fn drive_one(&mut self, now_ms: i64) -> Result<JcodeTurnOutcome, JcodeHostError> {
-        let event = self.next_event()?;
+        let event = match self.next_event() {
+            Ok(event) => event,
+            Err(JcodeHostError::ProviderEof { incomplete_frame }) => {
+                let mut pending = self.pending.take().ok_or(JcodeHostError::NoOpenTurn)?;
+                let terminal = pending
+                    .adapter
+                    .finish_eof_with_pending_frame(incomplete_frame)?
+                    .ok_or(JcodeHostError::Protocol(JcodeProtocolError::EventOrder))?;
+                let reason = if incomplete_frame {
+                    JcodeInterruptedReason::IncompleteFrame
+                } else {
+                    JcodeInterruptedReason::ProviderEof
+                };
+                self.observed_native.push_back(terminal);
+                self.stream_sequence = self
+                    .stream_sequence
+                    .checked_add(1)
+                    .ok_or(JcodeHostError::InvalidField("event_sequence"))?;
+                self.abort_pending(pending, now_ms, "provider_eof_unknown")?;
+                return Ok(JcodeTurnOutcome::InterruptedUnknown(reason));
+            }
+            Err(error) => return Err(error),
+        };
         self.observed_events.push_back(event.clone());
+        let native = self
+            .pending
+            .as_mut()
+            .ok_or(JcodeHostError::NoOpenTurn)?
+            .adapter
+            .observe_decoded(event.clone())?;
+        self.observed_native.push_back(native);
         self.stream_sequence = self
             .stream_sequence
             .checked_add(1)
@@ -715,6 +919,40 @@ impl JcodeSessionHost {
             pending.pending_approval_request_key = Some(approval_request_key);
             return Ok(JcodeTurnOutcome::ApprovalRequired(approval));
         }
+        if let JcodeEvent::StdinRequest {
+            ref request_id,
+            ref prompt,
+            is_password,
+            ref tool_call_id,
+            ..
+        } = event
+        {
+            pending.collector.observe(&event)?;
+            let input = JcodeInputRequest {
+                request_id: request_id.clone(),
+                prompt: prompt.clone(),
+                is_password,
+                tool_call_id: tool_call_id.clone(),
+            };
+            let input_digest = digest(
+                format!(
+                    "{}\n{}\n{}\n{}",
+                    input.request_id, input.prompt, input.is_password, input.tool_call_id
+                )
+                .as_bytes(),
+            );
+            let input_request_key = format!("stdin:{}", input.request_id);
+            self.journal.record_request(RequestRecord {
+                turn_id: pending.turn_id,
+                request_key: &input_request_key,
+                direction: RequestDirection::FromProvider,
+                payload_digest: &input_digest,
+                created_ms: now_ms,
+            })?;
+            pending.pending_input = Some(input.clone());
+            pending.pending_input_request_key = Some(input_request_key);
+            return Ok(JcodeTurnOutcome::InputRequired(input));
+        }
         if pending.cancelling
             && let JcodeEvent::TurnDone { ref session_id } = event
         {
@@ -723,7 +961,20 @@ impl JcodeSessionHost {
                     JcodeProtocolError::SessionMismatch,
                 ));
             }
-            let pending = self.pending.take().ok_or(JcodeHostError::NoOpenTurn)?;
+            let mut pending = self.pending.take().ok_or(JcodeHostError::NoOpenTurn)?;
+            if let Some(request_key) = pending.cancel_request_key.take() {
+                self.journal.settle_request(RequestOutcomeCommit {
+                    turn_id: pending.turn_id,
+                    now_ms,
+                    settlement: RequestSettlement {
+                        request_key: &request_key,
+                        expected_revision: 1,
+                        outcome: SettledOutcome::Answered {
+                            response_digest: &digest(b"turn_done"),
+                        },
+                    },
+                })?;
+            }
             self.abort_pending(pending, now_ms, "cancelled")?;
             return Ok(JcodeTurnOutcome::Cancelled);
         }
@@ -780,37 +1031,32 @@ impl JcodeSessionHost {
         Ok(JcodeTurnOutcome::Pending)
     }
 
-    fn send(&mut self, request: JcodeRequest) -> Result<u64, JcodeHostError> {
-        let id = self.next_request_id;
-        let encoded = encode_jcode_request(id, &request)?;
-        self.next_request_id = self
-            .next_request_id
-            .checked_add(1)
-            .ok_or(JcodeHostError::InvalidField("request_id"))?;
-        self.process.write_all(&encoded)?;
-        Ok(id)
-    }
-
     fn next_event(&mut self) -> Result<JcodeEvent, JcodeHostError> {
-        if let Some(event) = self.queued.pop_front() {
-            return Ok(event);
-        }
         loop {
             let mut line = Vec::new();
             let read = self.reader.read_until(b'\n', &mut line)?;
             if read == 0 {
-                return Err(JcodeHostError::Io(std::io::ErrorKind::UnexpectedEof.into()));
+                return Err(JcodeHostError::ProviderEof {
+                    incomplete_frame: self.incomplete_frame,
+                });
             }
             if line.len() > MAX_EVENT_LINE_BYTES {
                 return Err(JcodeHostError::Protocol(JcodeProtocolError::FrameTooLarge));
             }
-            let mut events = self.decoder.push(&line)?;
+            if !line.ends_with(b"\n") {
+                self.incomplete_frame = true;
+            }
+            let events = self.decoder.push(&line)?;
             if events.is_empty() {
                 continue;
             }
-            let first = events.remove(0);
-            self.queued.extend(events);
-            return Ok(first);
+            if events.len() != 1 {
+                return Err(JcodeHostError::Protocol(JcodeProtocolError::InvalidFrame));
+            }
+            return events
+                .into_iter()
+                .next()
+                .ok_or(JcodeHostError::Protocol(JcodeProtocolError::InvalidFrame));
         }
     }
 
@@ -826,6 +1072,20 @@ impl JcodeSessionHost {
             outcome: SettledOutcome::Failed { reason },
         }];
         if let Some(request_key) = pending.pending_approval_request_key.as_deref() {
+            settlements.push(RequestSettlement {
+                request_key,
+                expected_revision: 1,
+                outcome: SettledOutcome::Failed { reason },
+            });
+        }
+        if let Some(request_key) = pending.pending_input_request_key.as_deref() {
+            settlements.push(RequestSettlement {
+                request_key,
+                expected_revision: 1,
+                outcome: SettledOutcome::Failed { reason },
+            });
+        }
+        if let Some(request_key) = pending.cancel_request_key.as_deref() {
             settlements.push(RequestSettlement {
                 request_key,
                 expected_revision: 1,
@@ -865,7 +1125,7 @@ struct StartupHost {
     process: SandboxedSession,
     reader: BufReader<std::os::unix::net::UnixStream>,
     decoder: JcodeFrameDecoder,
-    queued: VecDeque<JcodeEvent>,
+    incomplete_frame: bool,
     next_request_id: u64,
 }
 
@@ -882,21 +1142,24 @@ impl StartupHost {
     }
 
     fn next_event(&mut self) -> Result<JcodeEvent, JcodeHostError> {
-        if let Some(event) = self.queued.pop_front() {
-            return Ok(event);
-        }
         let mut line = Vec::new();
         let read = self.reader.read_until(b'\n', &mut line)?;
         if read == 0 {
-            return Err(JcodeHostError::Io(std::io::ErrorKind::UnexpectedEof.into()));
+            return Err(JcodeHostError::ProviderEof {
+                incomplete_frame: self.incomplete_frame,
+            });
         }
-        let mut events = self.decoder.push(&line)?;
-        if events.is_empty() {
+        if !line.ends_with(b"\n") {
+            self.incomplete_frame = true;
+        }
+        let events = self.decoder.push(&line)?;
+        if events.len() != 1 {
             return Err(JcodeHostError::Protocol(JcodeProtocolError::InvalidFrame));
         }
-        let first = events.remove(0);
-        self.queued.extend(events);
-        Ok(first)
+        events
+            .into_iter()
+            .next()
+            .ok_or(JcodeHostError::Protocol(JcodeProtocolError::InvalidFrame))
     }
 }
 

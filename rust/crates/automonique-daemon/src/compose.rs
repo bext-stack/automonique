@@ -370,8 +370,8 @@ impl std::error::Error for ComposeRefusal {}
 /// binary=/opt/automonique/jcode/versions/COMMIT/jcode
 /// # isolated JCODE_HOME/JCODE_RUNTIME_DIR
 /// home=/var/lib/automonique/jcode-home
-/// # optional, informational only; recorded as the pinned binary's version
-/// version=jcode-COMMIT
+/// # for JCode, the exact hello_ok.server identity expected from these bytes
+/// version=jcode/COMMIT
 /// # fixed supervised protocol invocation; repeated arg keys preserve order
 /// arg=--quiet
 /// arg=--no-update
@@ -569,7 +569,8 @@ impl ProviderConfig {
         &self.home
     }
 
-    /// The informational version recorded on the pinned binary.
+    /// The recorded binary version; for JCode this is also the exact expected
+    /// `hello_ok.server` identity used by the contained session host.
     #[must_use]
     pub fn version(&self) -> &str {
         &self.version

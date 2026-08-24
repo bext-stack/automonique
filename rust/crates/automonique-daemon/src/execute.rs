@@ -178,7 +178,7 @@ use nix::libc;
 use sha2::Digest as _;
 
 use crate::attempt_host::DaemonAttemptHost;
-use crate::jcode_session_host::{JcodeSessionHost, JcodeTurnOutcome};
+use crate::jcode_session_host::{JcodeInputRequest, JcodeSessionHost, JcodeTurnOutcome};
 use crate::progress::{JcodeProgressMapper, ProviderProgressMapper};
 use crate::progress_hub::ProgressHub;
 
@@ -909,6 +909,7 @@ impl ExecutionLane {
                     spool,
                     prompt,
                     resume_session_id: jcode_resume_session(spec)?,
+                    expected_server: spec.provider_binary().version().to_owned(),
                     journal_path: self.state_dir.join(crate::PROVIDER_JOURNAL_NAME),
                     answer_path: workspace.join(crate::compose::ANSWER_LEAF),
                     publisher: self.progress.publisher(run_id),
@@ -1100,9 +1101,11 @@ impl ExecutionLane {
     ///
     /// The version travels from the document because it is informational —
     /// [`BinaryProvenance::matches`] compares digests, not versions — and the
-    /// schema digest must be absent: this daemon speaks no provider protocol,
-    /// so it can observe no schema, and copying the document's own claim into
-    /// the observation would turn that half of the comparison into a mirror.
+    /// schema digest must be absent at admission: no process has been started,
+    /// so the daemon cannot yet observe a provider handshake, and copying the
+    /// document's own claim into the observation would turn that half of the
+    /// comparison into a mirror. The contained JCode host binds its negotiated
+    /// protocol identity separately after spawn.
     /// A document that pins a schema digest is therefore refused here rather
     /// than admitted on a check nobody performed.
     fn observe_provider_binary(&self, spec: &RunSpec) -> Result<BinaryProvenance, ExecuteRefusal> {
@@ -1264,6 +1267,7 @@ struct JcodePreparedParts<'a> {
     spool: Spool,
     prompt: String,
     resume_session_id: Option<String>,
+    expected_server: String,
     journal_path: PathBuf,
     answer_path: PathBuf,
     publisher: Box<dyn ProgressPublisher>,
@@ -1328,6 +1332,7 @@ struct JcodePreparedRun {
     spool: Spool,
     prompt: String,
     resume_session_id: Option<String>,
+    expected_server: String,
     journal_path: PathBuf,
     answer_path: PathBuf,
     publisher: Box<dyn ProgressPublisher>,
@@ -1358,6 +1363,7 @@ impl JcodePreparedRun {
             spool: parts.spool,
             prompt: parts.prompt,
             resume_session_id: parts.resume_session_id,
+            expected_server: parts.expected_server,
             journal_path: parts.journal_path,
             answer_path: parts.answer_path,
             publisher: parts.publisher,
@@ -1378,6 +1384,7 @@ impl JcodePreparedRun {
             spool,
             prompt,
             resume_session_id,
+            expected_server,
             journal_path,
             answer_path,
             publisher,
@@ -1407,6 +1414,7 @@ impl JcodePreparedRun {
             answer_path.parent().unwrap_or_else(|| Path::new("/")),
             resume_session_id.as_deref(),
             None,
+            &expected_server,
             now_ms,
             Duration::from_secs(30),
         ) {
@@ -1474,7 +1482,12 @@ impl JcodePreparedRun {
                     Ok(JcodeTurnOutcome::Cancelled | JcodeTurnOutcome::Completed(_)) => {
                         break RunSpoolState::Cancelled;
                     }
-                    Ok(JcodeTurnOutcome::Pending | JcodeTurnOutcome::ApprovalRequired(_)) => {}
+                    Ok(
+                        JcodeTurnOutcome::Pending
+                        | JcodeTurnOutcome::ApprovalRequired(_)
+                        | JcodeTurnOutcome::InputRequired(_),
+                    ) => {}
+                    Ok(JcodeTurnOutcome::InterruptedUnknown(_)) => break RunSpoolState::Failed,
                     Err(_) => break RunSpoolState::Failed,
                 }
             }
@@ -1519,6 +1532,88 @@ impl JcodePreparedRun {
                     };
                 }
                 Ok(JcodeTurnOutcome::Cancelled) => break RunSpoolState::Cancelled,
+                Ok(JcodeTurnOutcome::InterruptedUnknown(_)) => break RunSpoolState::Failed,
+                Ok(JcodeTurnOutcome::InputRequired(mut request)) => 'input: loop {
+                    writer.input_waiting(&request);
+                    if request.is_password() {
+                        // Platform action parameters are not a secret-input
+                        // channel. Never route a password through durable
+                        // control receipts; a dedicated secret broker is a
+                        // separate acceptance gate.
+                        break 'run RunSpoolState::Failed;
+                    }
+                    loop {
+                        let forced_state = if cancellation.is_cancelled() {
+                            Some(RunSpoolState::Cancelled)
+                        } else if started_at.elapsed() >= timeout {
+                            Some(RunSpoolState::TimedOut)
+                        } else {
+                            None
+                        };
+                        if let Some(state) = forced_state {
+                            let _ = host.respond_stdin(
+                                request.request_id(),
+                                "",
+                                "automonique-control-stop",
+                                crate::unix_millis().unwrap_or(now_ms),
+                                Duration::from_millis(100),
+                            );
+                            writer.project(&mut mapper, host.take_events());
+                            break 'run state;
+                        }
+                        match control.receiver.try_recv() {
+                            Ok(command) => {
+                                let response = host.respond_stdin(
+                                    request.request_id(),
+                                    &command.content,
+                                    "automonique-control-lease",
+                                    crate::unix_millis().unwrap_or(now_ms),
+                                    Duration::from_millis(100),
+                                );
+                                writer.project(&mut mapper, host.take_events());
+                                match response {
+                                    Ok(JcodeTurnOutcome::Pending) => {
+                                        let _ = command.response.send(Ok(()));
+                                        continue 'run;
+                                    }
+                                    Ok(JcodeTurnOutcome::InputRequired(next)) => {
+                                        let _ = command.response.send(Ok(()));
+                                        request = next;
+                                        continue 'input;
+                                    }
+                                    Ok(JcodeTurnOutcome::Completed(result)) => {
+                                        let _ = command.response.send(Ok(()));
+                                        if write_jcode_answer(&answer_path, result.text()).is_err()
+                                        {
+                                            break 'run RunSpoolState::Failed;
+                                        }
+                                        break 'run RunSpoolState::Completed;
+                                    }
+                                    Ok(JcodeTurnOutcome::Cancelled) => {
+                                        let _ = command.response.send(Ok(()));
+                                        break 'run RunSpoolState::Cancelled;
+                                    }
+                                    Ok(
+                                        JcodeTurnOutcome::ApprovalRequired(_)
+                                        | JcodeTurnOutcome::InterruptedUnknown(_),
+                                    )
+                                    | Err(_) => {
+                                        let _ = command
+                                            .response
+                                            .send(Err(SteerRefusal::ProviderRefused));
+                                        break 'run RunSpoolState::Failed;
+                                    }
+                                }
+                            }
+                            Err(TryRecvError::Empty) => {
+                                std::thread::sleep(Duration::from_millis(100));
+                            }
+                            Err(TryRecvError::Disconnected) => {
+                                break 'run RunSpoolState::Failed;
+                            }
+                        }
+                    }
+                },
                 Ok(JcodeTurnOutcome::ApprovalRequired(request)) => {
                     let requested_at = crate::unix_millis().unwrap_or(now_ms);
                     let (approvals, approval_key) =
@@ -1594,7 +1689,14 @@ impl JcodePreparedRun {
                             break RunSpoolState::Completed;
                         }
                         Ok(JcodeTurnOutcome::Cancelled) => break RunSpoolState::Cancelled,
-                        Ok(JcodeTurnOutcome::Pending | JcodeTurnOutcome::ApprovalRequired(_)) => {}
+                        Ok(
+                            JcodeTurnOutcome::Pending
+                            | JcodeTurnOutcome::ApprovalRequired(_)
+                            | JcodeTurnOutcome::InputRequired(_),
+                        ) => {}
+                        Ok(JcodeTurnOutcome::InterruptedUnknown(_)) => {
+                            break RunSpoolState::Failed;
+                        }
                         Err(_) => break RunSpoolState::Failed,
                     }
                 }
@@ -1638,6 +1740,41 @@ impl JcodeSpoolWriter {
 
     fn approval_waiting(&mut self, key: &str, tool: &str, description: &str) {
         let text = format!("approval {key}: {tool} — {description}");
+        let Some(text) = ProgressText::sanitized(&text) else {
+            return;
+        };
+        let Ok(body) = ProgressBody::new(
+            automonique_protocol::event::EventKind::ApprovalRequested,
+            ProgressBodyParts {
+                text: Some(text),
+                step: None,
+                retry: None,
+            },
+        ) else {
+            return;
+        };
+        if self
+            .append_frame(&CapturedFrame {
+                authority: FrameAuthority::Authoritative,
+                kind: automonique_protocol::event::EventKind::ApprovalRequested,
+                body,
+            })
+            .is_err()
+        {
+            self.stop_progress();
+        }
+    }
+
+    fn input_waiting(&mut self, request: &JcodeInputRequest) {
+        // The shared progress vocabulary does not yet have a provider-input
+        // event. ApprovalRequested is the only non-terminal pause frame and
+        // carries no authority: the control lease still gates the response.
+        let prompt = if request.is_password() {
+            "<password input>"
+        } else {
+            request.prompt()
+        };
+        let text = format!("provider input {}: {prompt}", request.request_id());
         let Some(text) = ProgressText::sanitized(&text) else {
             return;
         };
