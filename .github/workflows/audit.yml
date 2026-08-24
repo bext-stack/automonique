@@ -40,7 +40,7 @@ jobs:
       # A prebuilt binary at an exact version, never `cargo install`: building
       # the auditor from source pulls a dependency graph nothing audits, on
       # every run, to check a graph that has not changed.
-      - uses: taiki-e/install-action@v2.86.1
+      - uses: taiki-e/install-action@v2.86.5
         with:
           tool: cargo-deny@0.20.2
 
