@@ -127,7 +127,7 @@ install -m 0700 target/release/automonique-web-entry \
 mv "$XDG_STATE_HOME/automonique/web-entry/bin/automonique-web-entry.next" \
   "$XDG_STATE_HOME/automonique/web-entry/bin/automonique-web-entry"
 systemctl --user restart automonique-web-entry.service
-curl --fail --silent http://127.0.0.1:18082/health
+curl --fail --silent http://localhost:18082/healthz
 ```
 
 Rollback installs `automonique-web-entry.previous` through the same `.next`
