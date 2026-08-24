@@ -89,7 +89,7 @@
 //!   hidden policy, the plan is the review point, and what such a variable can
 //!   actually reach is bounded by the filesystem allowlist, not by this API.
 //! - **The main executable is pinned, not its dynamic loader or libraries.**
-//!   The executable bytes are copied, hashed, sealed, and executed from one
+//!   The executable bytes are copied, hashed, unlinked, and executed from one
 //!   descriptor. An ELF interpreter and shared libraries are still resolved by
 //!   path under the plan's Landlock read-execute grants. The executable's own
 //!   path grant therefore remains necessary even though `execveat` does not
@@ -161,8 +161,9 @@ use std::ffi::CString;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+use std::ops::Deref;
 use std::os::fd::{AsRawFd as _, OwnedFd};
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -358,7 +359,7 @@ impl LaunchPlan {
     /// Start a plan for `program`, bound to its expected SHA-256 digest.
     ///
     /// The helper opens `program` without following its final symlink, copies
-    /// and hashes the bytes into an immutable descriptor, compares them with
+    /// and hashes the bytes into a private staging file, compares them with
     /// `program_sha256`, and executes that descriptor. There is no `PATH`
     /// search or second path lookup.
     pub fn new(
@@ -1064,12 +1065,19 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
         drop(stdin_source);
     }
 
-    // 4. Open, copy, verify, and seal the program before filesystem policy is
-    //    installed. The immutable descriptor is the object execveat consumes;
-    //    the path is never resolved again.
-    let program_descriptor = sealed_verified_program_descriptor(&plan)?;
-    let allowlist = DescriptorAllowlist::new(&[0, 1, 2, program_descriptor.as_raw_fd()])
-        .map_err(|error| error.to_string())?;
+    // 4. Open, copy, and verify the program before filesystem policy is
+    //    installed. Landlock binds the staged inode, its name is removed, and
+    //    the retained descriptor is the object execveat consumes; the source
+    //    path is never resolved again.
+    let program_descriptor = staged_verified_program_descriptor(&plan)?;
+    let allowlist = DescriptorAllowlist::new(&[
+        0,
+        1,
+        2,
+        program_descriptor.as_raw_fd(),
+        program_descriptor.rule_descriptor().as_raw_fd(),
+    ])
+    .map_err(|error| error.to_string())?;
     close_all_except(&allowlist).map_err(|error| error.to_string())?;
     verify_only_allowlist_open(&allowlist).map_err(|error| error.to_string())?;
 
@@ -1096,7 +1104,10 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
         .map_err(|error| error.to_string())?;
     plan.filesystem_policy()
         .map_err(|error| error.to_string())?
-        .enforce_on_current_thread_with_executable(&program_descriptor)
+        .enforce_on_current_thread_with_executable(
+            program_descriptor.rule_descriptor(),
+            program_descriptor.staged_path(),
+        )
         .map_err(|error| error.to_string())?;
 
     // 7. The seccomp socket-family filter closes what Landlock cannot reach:
@@ -1187,14 +1198,43 @@ fn read_session_launch_frame() -> Result<Vec<u8>, String> {
     Err("plan frame exceeds bound".to_owned())
 }
 
-/// Copy the program from one no-follow open into an immutable executable fd.
+/// Copy the program from one no-follow open into a verified executable fd.
 ///
-/// The source path is resolved exactly once. Every byte that contributes to
-/// the digest is written to the memfd, the memfd is sealed against mutation,
-/// and that same object is retained until `execveat`. If this host does not
-/// permit execution from a memfd, the later syscall refuses; there is no path
-/// fallback.
-fn sealed_verified_program_descriptor(plan: &LaunchPlan) -> Result<File, String> {
+/// A random owner-only staging path lets Landlock bind an execute rule to the
+/// copied inode. The path is unlinked before restriction and `execveat`
+/// consumes the independently opened descriptor, so the source path is never
+/// resolved a second time and the workload receives no staging pathname.
+struct StagedProgram {
+    file: File,
+    rule_descriptor: File,
+    path: PathBuf,
+}
+
+impl StagedProgram {
+    fn rule_descriptor(&self) -> &File {
+        &self.rule_descriptor
+    }
+
+    fn staged_path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Deref for StagedProgram {
+    type Target = File;
+
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
+}
+
+impl Drop for StagedProgram {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn staged_verified_program_descriptor(plan: &LaunchPlan) -> Result<StagedProgram, String> {
     let mut source = OpenOptions::new()
         .read(true)
         .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
@@ -1212,13 +1252,19 @@ fn sealed_verified_program_descriptor(plan: &LaunchPlan) -> Result<File, String>
         return Err("program metadata rejected".to_owned());
     }
 
-    let name = CString::new("automonique-program").expect("literal has no interior NUL");
-    let descriptor = nix::sys::memfd::memfd_create(
-        &name,
-        MemFdCreateFlag::MFD_CLOEXEC | MemFdCreateFlag::MFD_ALLOW_SEALING,
-    )
-    .map_err(|error| format!("program descriptor unavailable: {error}"))?;
-    let mut sealed = File::from(descriptor);
+    let mut random = [0_u8; 16];
+    File::open("/dev/urandom")
+        .and_then(|mut entropy| entropy.read_exact(&mut random))
+        .map_err(|_| "program staging entropy unavailable".to_owned())?;
+    let staged_path = Path::new("/tmp").join(format!(".automonique-program-{}", hex(&random)));
+    let mut staged = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
+        .open(&staged_path)
+        .map_err(|_| "program staging file unavailable".to_owned())?;
     let mut hasher = Sha256::new();
     let mut copied = 0_u64;
     let mut buffer = [0_u8; 16 * 1024];
@@ -1236,7 +1282,7 @@ fn sealed_verified_program_descriptor(plan: &LaunchPlan) -> Result<File, String>
             return Err("program oversized".to_owned());
         }
         hasher.update(&buffer[..read]);
-        sealed
+        staged
             .write_all(&buffer[..read])
             .map_err(|_| "program could not be staged".to_owned())?;
     }
@@ -1247,11 +1293,29 @@ fn sealed_verified_program_descriptor(plan: &LaunchPlan) -> Result<File, String>
     if observed != plan.program_sha256 {
         return Err("program digest mismatch".to_owned());
     }
-    seal_descriptor(&sealed, "program")?;
-    sealed
-        .seek(SeekFrom::Start(0))
+    staged
+        .sync_all()
+        .map_err(|_| "program staging sync failed".to_owned())?;
+    std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o500))
+        .map_err(|_| "program staging permissions failed".to_owned())?;
+    drop(staged);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
+        .open(&staged_path)
+        .map_err(|_| "program staging reopen failed".to_owned())?;
+    let rule_descriptor = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_PATH | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(&staged_path)
+        .map_err(|_| "program rule descriptor unavailable".to_owned())?;
+    file.seek(SeekFrom::Start(0))
         .map_err(|_| "program rewind failed".to_owned())?;
-    Ok(sealed)
+    Ok(StagedProgram {
+        file,
+        rule_descriptor,
+        path: staged_path,
+    })
 }
 
 /// An anonymous, sealed, memory-backed descriptor holding `prompt`, rewound.
@@ -1400,7 +1464,6 @@ mod tests {
     use super::*;
     use nix::fcntl::FdFlag;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt as _;
     use std::process::Command;
 
     const BUSYBOX: &str = "/usr/bin/busybox";
@@ -1419,7 +1482,7 @@ mod tests {
         let original = fs::read(&program).unwrap();
         let original_sha256 = hex(&Sha256::digest(&original));
         let plan = LaunchPlan::new(&program, &original_sha256).unwrap();
-        let descriptor = sealed_verified_program_descriptor(&plan).unwrap();
+        let descriptor = staged_verified_program_descriptor(&plan).unwrap();
 
         // This is the old vulnerable window: the pathname now resolves to a
         // different executable after verification and before exec.

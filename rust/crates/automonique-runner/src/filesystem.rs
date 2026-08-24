@@ -69,7 +69,6 @@ use landlock::{
 };
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
@@ -484,14 +483,15 @@ impl FilesystemPolicy {
     /// loader, libraries, and provider-owned resources.
     pub(crate) fn enforce_on_current_thread_with_executable(
         &self,
-        executable: &File,
+        executable_rule: &File,
+        staged_path: &Path,
     ) -> Result<FilesystemIsolation, FilesystemPolicyError> {
-        self.enforce_on_current_thread_inner(Some(executable))
+        self.enforce_on_current_thread_inner(Some((executable_rule, staged_path)))
     }
 
     fn enforce_on_current_thread_inner(
         &self,
-        executable: Option<&File>,
+        executable: Option<(&File, &Path)>,
     ) -> Result<FilesystemIsolation, FilesystemPolicyError> {
         require_single_threaded()?;
 
@@ -519,15 +519,8 @@ impl FilesystemPolicy {
                 .map_err(|error| FilesystemPolicyError::RulesetRefused(error.to_string()))?;
         }
 
-        if let Some(executable) = executable {
-            // Landlock path-beneath rules require an O_PATH descriptor. Reopen
-            // this process's existing sealed memfd through procfs to obtain
-            // that rule handle; the numeric fd is private to this process and
-            // resolves to the same immutable inode that execveat will consume.
-            let descriptor = OpenOptions::new()
-                .read(true)
-                .custom_flags(nix::libc::O_PATH | nix::libc::O_CLOEXEC)
-                .open(format!("/proc/self/fd/{}", executable.as_raw_fd()))?;
+        if let Some((executable_rule, staged_path)) = executable {
+            let descriptor = executable_rule.try_clone()?;
             let metadata = descriptor.metadata()?;
             if !metadata.is_file() {
                 return Err(FilesystemPolicyError::RulesetRefused(
@@ -540,6 +533,10 @@ impl FilesystemPolicy {
                     AccessFs::ReadFile | AccessFs::Execute,
                 ))
                 .map_err(|error| FilesystemPolicyError::RulesetRefused(error.to_string()))?;
+            // The rule is now bound to the staged inode. Remove its only path
+            // before restriction so neither the workload nor another process
+            // can resolve it; execveat retains the independently opened file.
+            std::fs::remove_file(staged_path)?;
         }
 
         let status = created
