@@ -1,4 +1,4 @@
-{"v":1,"reply_to":11,"ev":"hello_ok","version":1,"server":"jcode/fixture-0.79.1","capabilities":["sessions","streaming","cancellation","soft_interrupt","stdin_requests","history","model_catalog","reasoning_effort","usage","runtime_info"]}
+{"v":1,"reply_to":11,"ev":"hello_ok","version":1,"server":"jcode/fixture-0.79.1","capabilities":["sessions","streaming","cancellation","soft_interrupt","permission_requests","history","model_catalog","reasoning_effort","usage","runtime_info"]}
 {"v":1,"reply_to":12,"ev":"attached","session":{"session_id":"session-1","status":"idle"}}
 {"v":1,"ev":"message_accepted","session_id":"session-1"}
 {"v":1,"ev":"turn_done","session_id":"session-1"}

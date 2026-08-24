@@ -33,7 +33,7 @@ pub const REQUIRED_JCODE_CAPABILITIES: [&str; 10] = [
     "streaming",
     "cancellation",
     "soft_interrupt",
-    "stdin_requests",
+    "permission_requests",
     "history",
     "model_catalog",
     "reasoning_effort",
