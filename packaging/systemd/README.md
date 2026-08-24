@@ -12,10 +12,10 @@ systemctl --user enable --now automonique-backup.timer
 systemctl --user status automonique.service
 ```
 
-The unit starts the current verified release from the product state directory,
-creates private XDG runtime/state directories, delegates its cgroup subtree,
-and waits for the daemon's real readiness notification. Upgrade switches the
-`improvement-code/current` release link; restarting the unit activates it.
+The unit starts the directly installed daemon binary from the product state
+directory, creates private XDG runtime/state directories, delegates its cgroup
+subtree, and waits for the daemon's real readiness notification. Upgrade
+replaces that binary atomically and restarts the unit.
 The timer writes an online recovery set every five minutes.
 `automonique-recovery.service` is started manually after a restore; it disables
 external transports and refuses provider starts.
@@ -24,8 +24,8 @@ claims confirmed jobs with bounded parallelism, and streams their progress back
 to AI Operations. It also publishes an owner-only dashboard projection with a
 bounded tail of parsed agent output and a link to the corresponding issue in
 the configured Manage origin. Raw provider frames, stderr, prompts and fleet
-credentials are not copied into that projection. It runs from the same
-immutable release as the daemon. The
+credentials are not copied into that projection. The worker keeps its own
+installed release path, independently of the directly installed daemon. The
 worker maintains a private `manage-fleet-worker/auth-health.json` projection:
 local credentials begin as `configured_unverified`, a successful provider turn
 proves `authenticated`, and recognized sign-out or token-refresh failures become
@@ -110,8 +110,8 @@ with owner authority for the public hostname and production change.
 Before replacing an installed unit, verify the checked-in file with
 `tools/verify_systemd_unit.sh`.
 
-The dashboard deliberately uses a direct binary install. It does not use the
-daemon's content-addressed release builder or a `current` symlink. Build it,
+The dashboard deliberately uses a direct binary install. It does not use a
+content-addressed release builder or a `current` symlink. Build it,
 stage one replacement beside the installed binary, retain one previous binary,
 rename the replacement atomically, and restart only the dashboard:
 
@@ -135,24 +135,27 @@ and rename sequence, then restarts and checks the service. Old dashboard
 release directories are not part of the procedure and may be removed later as
 a separately authorized cleanup.
 
-The daemon and fleet worker retain their immutable release path. For an
-owner-authorized daemon release, use the checked-in operator tool rather than
-creating an ad-hoc helper:
+The daemon uses the same direct, atomic replacement pattern. Build only the
+daemon executable, retain one previous binary, install through a `.next` file,
+and restart only the daemon after its zero-work deployment gates pass:
 
 ```sh
-cargo run --release -p automonique --bin automonique-release -- deploy \
-  --state-dir /private/state/automonique \
-  --worktree /path/to/clean/automonique \
-  --unit automonique.service \
-  --plan-digest sha256:<approved-plan-digest> \
-  --changed-path rust/crates/example/src/lib.rs
+cargo build --release --locked -p automonique --bin automonique
+install -d -m 0700 "$XDG_STATE_HOME/automonique/bin"
+if test -x "$XDG_STATE_HOME/automonique/bin/automonique"; then
+  install -m 0700 "$XDG_STATE_HOME/automonique/bin/automonique" \
+    "$XDG_STATE_HOME/automonique/bin/automonique.previous"
+fi
+install -m 0700 target/release/automonique \
+  "$XDG_STATE_HOME/automonique/bin/automonique.next"
+mv "$XDG_STATE_HOME/automonique/bin/automonique.next" \
+  "$XDG_STATE_HOME/automonique/bin/automonique"
+systemctl --user restart automonique.service
+"$XDG_STATE_HOME/automonique/bin/automonique" status --json
 ```
 
-Repeat `--changed-path` for every path in the release. `deploy` refuses a dirty
-worktree, derives the source commit and tree itself, builds the immutable
-release, then rechecks that the live daemon
-is ready with no running work, pending inbox/outbox effects, ambiguous outbound
-effect or reconciliation before activation. Activation uses the same atomic
-link switch, supervised restart and automatic rollback as the approved
-self-improvement path. `build` and `activate` subcommands are also available
-when an operator deliberately needs the two phases separated.
+Before the restart, recheck that the live daemon is ready with no running work,
+pending inbox/outbox effects, ambiguous outbound effect or reconciliation.
+Rollback installs `automonique.previous` through the same `.next` and rename
+sequence, then restarts and checks the service. The Manage fleet worker remains
+a separate service and is not restarted by a daemon-only deployment.

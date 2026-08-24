@@ -646,7 +646,8 @@ log_provider_line() {
 local_work_brief() {
     brief_job=$1
     brief_issue=$2
-    brief_binary=$(dirname -- "${BASH_SOURCE[0]}")/automonique
+    brief_binary=$state_dir/bin/automonique
+    [[ -x "$brief_binary" ]] || brief_binary=$(dirname -- "${BASH_SOURCE[0]}")/automonique
     [[ -x "$brief_binary" ]] || brief_binary=$state_dir/improvement-code/current/bin/automonique
     [[ -x "$brief_binary" ]] || return 1
     timeout 20s "$brief_binary" work-brief \

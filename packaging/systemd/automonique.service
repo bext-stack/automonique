@@ -8,7 +8,7 @@ StartLimitBurst=5
 [Service]
 Type=notify
 NotifyAccess=main
-ExecStart=%S/automonique/improvement-code/current/bin/automonique daemon --foreground
+ExecStart=%S/automonique/bin/automonique daemon --foreground
 Restart=on-failure
 RestartSec=5s
 WatchdogSec=30s

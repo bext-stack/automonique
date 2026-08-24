@@ -7,7 +7,7 @@ Conflicts=automonique.service
 [Service]
 Type=notify
 NotifyAccess=main
-ExecStart=%S/automonique/improvement-code/current/bin/automonique daemon --foreground --disconnected-recovery
+ExecStart=%S/automonique/bin/automonique daemon --foreground --disconnected-recovery
 Restart=on-failure
 RestartSec=5s
 WatchdogSec=30s

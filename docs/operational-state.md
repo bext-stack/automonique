@@ -19,7 +19,8 @@ different questions and must not be collapsed into one generic "running" or
 
 The dashboard, daemon, and fleet worker are separate services. Restart only the
 service whose executable changed. In particular, a dashboard-only deployment
-does not require restarting the daemon or fleet worker.
+does not require restarting the daemon or fleet worker, and a daemon-only
+deployment does not require restarting the dashboard or fleet worker.
 
 The dashboard's work-queue view keeps Support tickets and Manage issue work in
 one operator workspace but preserves their source on every row and filter.
