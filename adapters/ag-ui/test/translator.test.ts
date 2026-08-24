@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 import {describe, expect, test} from "bun:test";
-import {EventSchemas} from "@ag-ui/core";
+import {EventSchemas, EventType} from "@ag-ui/core";
 import manifest from "../package.json" with {type: "json"};
 import golden from "./fixtures/authoritative-turn.ag-ui.json" with {type: "json"};
 import native from "./fixtures/authoritative-turn.native.json" with {type: "json"};
@@ -47,10 +47,18 @@ describe("native event to AG-UI translation", () => {
       {...base, sequence: 2, cursor: "session:2", kind: "tool_call_started", toolCallId: "tool-1", toolName: "bounded_lookup"},
       {...base, sequence: 3, cursor: "session:3", kind: "tool_call_args", toolCallId: "tool-1", delta: "{}"},
       {...base, sequence: 4, cursor: "session:4", kind: "tool_call_ended", toolCallId: "tool-1"},
+      {...base, sequence: 5, cursor: "session:5", kind: "state_snapshot", snapshot: {status: "awaiting_approval"}},
       {
         ...base,
-        sequence: 5,
-        cursor: "session:5",
+        sequence: 6,
+        cursor: "session:6",
+        kind: "messages_snapshot",
+        messages: [{id: "message-1", role: "assistant", content: "Approval is required."}],
+      },
+      {
+        ...base,
+        sequence: 7,
+        cursor: "session:7",
         kind: "approval_requested",
         approvalId: "approval-1",
         reason: "tool_call",
@@ -145,5 +153,35 @@ describe("closed ordering and bounds", () => {
       messageId: "message-1",
       text: "x".repeat(65_537),
     })).toThrow("text is empty, oversized");
+  });
+
+  test("accepts only ordered finite RFC 6902 state deltas", () => {
+    const valid = [
+      {...base, sequence: 1, kind: "run_started"},
+      {...base, sequence: 2, cursor: "session:2", kind: "state_delta", delta: [
+        {op: "add", path: "/items/-", value: {name: "bounded"}},
+        {op: "test", path: "/status", value: "running"},
+        {op: "replace", path: "/status", value: "completed"},
+      ]},
+      {...base, sequence: 3, cursor: "session:3", kind: "run_finished"},
+    ] as NativeAdapterEvent[];
+    expect(translateNativeStream(valid).find((event) => event.type === EventType.STATE_DELTA)).toMatchObject({
+      delta: valid[1]?.kind === "state_delta" ? valid[1].delta : [],
+    });
+
+    const malformed = [
+      {op: "replace", path: "status", value: "completed"},
+      {op: "remove", path: "/status", value: "unexpected"},
+      {op: "merge", path: "/status", value: "completed"},
+      {op: "copy", from: "/source~2bad", path: "/target"},
+      {op: "replace", path: "/status", value: Number.POSITIVE_INFINITY},
+    ];
+    for (const delta of malformed) {
+      expect(() => translateNativeStream([
+        {...base, sequence: 1, kind: "run_started"},
+        {...base, sequence: 2, cursor: "session:2", kind: "state_delta", delta: [delta]} as NativeAdapterEvent,
+        {...base, sequence: 3, cursor: "session:3", kind: "run_finished"},
+      ])).toThrow();
+    }
   });
 });

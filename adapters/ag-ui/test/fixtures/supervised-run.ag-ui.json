@@ -1,0 +1,13 @@
+[
+  {"timestamp":1001,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:1","sequence":1},"type":"RUN_STARTED","threadId":"thread-1","runId":"run-1"},
+  {"timestamp":1002,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:2","sequence":2},"type":"TEXT_MESSAGE_START","messageId":"message-1","role":"assistant"},
+  {"timestamp":1002,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:2","sequence":2},"type":"TEXT_MESSAGE_CONTENT","messageId":"message-1","delta":"Authoritative answer."},
+  {"timestamp":1002,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:2","sequence":2},"type":"TEXT_MESSAGE_END","messageId":"message-1"},
+  {"timestamp":1003,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:3","sequence":3},"type":"TOOL_CALL_START","toolCallId":"tool-1","toolCallName":"lookup"},
+  {"timestamp":1004,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:4","sequence":4},"type":"TOOL_CALL_ARGS","toolCallId":"tool-1","delta":"{\"id\":1}"},
+  {"timestamp":1005,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:5","sequence":5},"type":"TOOL_CALL_END","toolCallId":"tool-1"},
+  {"timestamp":1006,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:6","sequence":6},"type":"TOOL_CALL_RESULT","messageId":"result-1","toolCallId":"tool-1","content":"open","role":"tool"},
+  {"timestamp":1007,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:7","sequence":7},"type":"STATE_SNAPSHOT","snapshot":{"status":"running"}},
+  {"timestamp":1008,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:8","sequence":8},"type":"STATE_DELTA","delta":[{"op":"replace","path":"/status","value":"completed"}]},
+  {"timestamp":1009,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:9","sequence":9},"type":"RUN_FINISHED","threadId":"thread-1","runId":"run-1","outcome":{"type":"success"}}
+]

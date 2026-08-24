@@ -31,6 +31,8 @@ export type RefusalCode =
   | "authorization_lost"
   | "capability_unsupported"
   | "internal_failure"
+  | "interrupt_expired"
+  | "interrupt_invalid"
   | "policy_refused"
   | "resync_required"
   | "stale_revision";
@@ -38,6 +40,8 @@ export type RefusalCode =
 export type NativeAdapterEvent =
   | (NativeEventBase & {
       readonly kind: "run_started";
+      /** Authority-validated append-only lineage; never taken directly from the client. */
+      readonly parentRunId?: string;
       /** Tool proposals from an interrupted parent run that this run may resolve. */
       readonly resumedToolCallIds?: readonly string[];
     })
@@ -75,6 +79,13 @@ export type NativeAdapterEvent =
   | (NativeEventBase & {
       readonly kind: "state_snapshot";
       readonly snapshot: JsonValue;
+    })
+  | (NativeEventBase & {
+      readonly kind: "messages_snapshot";
+      readonly messages: readonly (
+        | {readonly id: string; readonly role: "user" | "assistant"; readonly content: string}
+        | {readonly id: string; readonly role: "tool"; readonly toolCallId: string; readonly content: string}
+      )[];
     })
   | (NativeEventBase & {
       readonly kind: "state_delta";
