@@ -85,9 +85,9 @@ use std::time::{Duration, Instant};
 
 use automonique_daemon::compose::{
     ANSWER_LEAF, ANSWER_PLACEHOLDER, COMPOSE_MEMORY_BYTES, ComposeRefusal, Composition,
-    CompositionInputs, DEFAULT_ARGV, PROVIDER_CONFIG_NAME, ProviderConfig, ProviderRunProfile,
-    QUESTION_MEMORY_BYTES, QUESTION_MODEL_CONFIG, QUESTION_REASONING_CONFIG, WORKSPACE_PLACEHOLDER,
-    compose, compose_with_profile,
+    CompositionInputs, DEFAULT_ARGV, JCODE_DEFAULT_ARGV, PROVIDER_CONFIG_NAME, ProviderConfig,
+    ProviderRunProfile, QUESTION_MEMORY_BYTES, QUESTION_MODEL_CONFIG, QUESTION_REASONING_CONFIG,
+    WORKSPACE_PLACEHOLDER, compose, compose_with_profile,
 };
 use automonique_daemon::execute::{
     DAEMON_BACKEND_ID, DAEMON_WORKSPACE_REGISTRY, locate_launch_helper, offered_host_features,
@@ -226,6 +226,23 @@ fn one_legacy_engine_metadata_key_is_accepted_but_remains_bounded() {
             Err(ComposeRefusal::NotConfigured)
         ));
     }
+}
+
+#[test]
+fn jcode_engine_selects_its_reviewed_one_shot_invocation() {
+    let fixture = Fixture::new(None, None);
+    let path = fixture.state_dir().join(PROVIDER_CONFIG_NAME);
+    let provider = busybox_provider(&fixture.provider_home(), &[]);
+    write_private(&path, &format!("engine=jcode\n{provider}"));
+    let configured = ProviderConfig::load(&path)
+        .expect("configuration")
+        .expect("provider");
+    assert_eq!(
+        configured.argv(),
+        JCODE_DEFAULT_ARGV.map(str::to_owned).as_slice()
+    );
+    assert!(configured.argv().contains(&ANSWER_PLACEHOLDER.to_owned()));
+    assert!(!configured.argv().contains(&"exec".to_owned()));
 }
 
 /// The invocation that copies this run's prompt into this run's answer file.

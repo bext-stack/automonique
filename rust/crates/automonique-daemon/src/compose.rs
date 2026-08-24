@@ -173,6 +173,27 @@ pub const DEFAULT_ARGV: [&str; 12] = [
     ANSWER_PLACEHOLDER,
 ];
 
+/// Reviewed one-shot invocation for a JCode deployment.
+///
+/// JCode names the equivalent command `run`, accepts the prompt as `-`, and
+/// writes the final assistant message through `--output-last-message`. The
+/// outer Automonique sandbox owns tool and filesystem authority, while this
+/// invocation disables JCode's own tools and update check for a bounded
+/// completion.
+pub const JCODE_DEFAULT_ARGV: [&str; 11] = [
+    "run",
+    "-",
+    "-C",
+    WORKSPACE_PLACEHOLDER,
+    "--output-last-message",
+    ANSWER_PLACEHOLDER,
+    "--tool-profile",
+    "none",
+    "--no-update",
+    "--quiet",
+    "--no-selfdev",
+];
+
 /// Provider execution shape selected by a trusted caller.
 ///
 /// This is deliberately typed rather than inferred from prompt text: an
@@ -472,7 +493,12 @@ impl ProviderConfig {
         let binary = binary.ok_or_else(rejected)?;
         let home = home.ok_or_else(rejected)?;
         let argv = if argv.is_empty() {
-            DEFAULT_ARGV.iter().map(|arg| (*arg).to_owned()).collect()
+            let reviewed = if engine.as_deref() == Some("jcode") {
+                JCODE_DEFAULT_ARGV.as_slice()
+            } else {
+                DEFAULT_ARGV.as_slice()
+            };
+            reviewed.iter().map(|arg| (*arg).to_owned()).collect()
         } else {
             // A run whose invocation never names the answer file can never
             // reply, so an override that omits it is a configuration error
