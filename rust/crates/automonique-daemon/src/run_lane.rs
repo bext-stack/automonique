@@ -471,7 +471,10 @@ impl SocketRunLane {
             && deployments
                 .register(DeploymentRegistration {
                     deployment_id: PRIMARY_DEPLOYMENT,
-                    provider_kind: "codex",
+                    provider_kind: provider
+                        .as_ref()
+                        .and_then(ProviderConfig::engine)
+                        .unwrap_or("codex"),
                     primary_rank: Some(1),
                     context_window_rank: Some(0),
                 })

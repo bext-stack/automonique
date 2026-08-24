@@ -397,6 +397,7 @@ impl std::error::Error for ComposeRefusal {}
 /// program the owner already chose to execute what to do.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderConfig {
+    engine: Option<String>,
     binary: PathBuf,
     home: PathBuf,
     version: String,
@@ -425,7 +426,7 @@ impl ProviderConfig {
         let mut binary: Option<PathBuf> = None;
         let mut home: Option<PathBuf> = None;
         let mut version: Option<String> = None;
-        let mut engine_seen = false;
+        let mut engine: Option<String> = None;
         let mut argv: Vec<String> = Vec::new();
         for line in text.lines() {
             let line = line.trim();
@@ -438,15 +439,13 @@ impl ProviderConfig {
                 return Err(rejected());
             }
             let slot = match key.trim() {
-                // Older deployments wrote this informational selector before
-                // provider routing became path-bound. It grants nothing and
-                // is intentionally not retained, but accepting one bounded
-                // value keeps those private configurations forward-compatible.
+                // This bounded identity grants nothing. Retaining it lets the
+                // provider-routing registry recognize deployments configured
+                // before routing became path-bound.
                 "engine" => {
-                    if engine_seen || !is_safe_segment(value) {
+                    if !is_safe_segment(value) || engine.replace(value.to_owned()).is_some() {
                         return Err(rejected());
                     }
-                    engine_seen = true;
                     continue;
                 }
                 "binary" => &mut binary,
@@ -495,11 +494,18 @@ impl ProviderConfig {
             }
         }
         Ok(Some(Self {
+            engine,
             binary,
             home,
             version: version.unwrap_or_else(|| String::from("provider")),
             argv,
         }))
+    }
+
+    /// Optional legacy routing identity. It is metadata, not authority.
+    #[must_use]
+    pub fn engine(&self) -> Option<&str> {
+        self.engine.as_deref()
     }
 
     /// The provider binary this deployment runs.
