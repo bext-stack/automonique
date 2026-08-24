@@ -11,11 +11,15 @@ const MAX_IDENTIFIER_BYTES = 256;
 const MAX_CURSOR_BYTES = 512;
 const MAX_TEXT_BYTES = 64 * 1024;
 const MAX_STATE_BYTES = 128 * 1024;
+const MAX_JSON_DEPTH = 32;
+const MAX_JSON_NODES = 16_384;
 
 const refusalMessages: Readonly<Record<RefusalCode, string>> = {
   authorization_lost: "Authorization was lost before the run could continue.",
   capability_unsupported: "The requested capability is not supported.",
   internal_failure: "The run could not continue.",
+  interrupt_expired: "The interrupt expired before it could be resumed.",
+  interrupt_invalid: "The interrupt response did not match the pending request.",
   policy_refused: "The requested action was refused by policy.",
   resync_required: "The retained event cursor expired; resynchronization is required.",
   stale_revision: "The requested action targeted a stale resource revision.",
@@ -43,7 +47,12 @@ export function translateNativeEvent(event: NativeAdapterEvent): readonly AGUIEv
 
   switch (event.kind) {
     case "run_started":
-      return [emit({type: EventType.RUN_STARTED, threadId: event.threadId, runId: event.runId})];
+      return [emit({
+        type: EventType.RUN_STARTED,
+        threadId: event.threadId,
+        runId: event.runId,
+        ...(event.parentRunId === undefined ? {} : {parentRunId: event.parentRunId}),
+      })];
     case "assistant_message_preview":
       return [emit({
         type: EventType.CUSTOM,
@@ -77,6 +86,8 @@ export function translateNativeEvent(event: NativeAdapterEvent): readonly AGUIEv
       })];
     case "state_snapshot":
       return [emit({type: EventType.STATE_SNAPSHOT, snapshot: event.snapshot})];
+    case "messages_snapshot":
+      return [emit({type: EventType.MESSAGES_SNAPSHOT, messages: event.messages})];
     case "state_delta":
       return [emit({type: EventType.STATE_DELTA, delta: event.delta})];
     case "step_started":
@@ -132,71 +143,112 @@ export function translateNativeEvent(event: NativeAdapterEvent): readonly AGUIEv
 export function translateNativeStream(events: readonly NativeAdapterEvent[]): readonly AGUIEvent[] {
   if (events.length === 0) throw new TranslationError("empty_stream", "a run stream cannot be empty");
   if (events.length > MAX_EVENTS) throw new TranslationError("too_many_events", "native event page exceeds its bound");
+  const translator = new NativeStreamTranslator();
+  const output: AGUIEvent[] = [];
+  for (const event of events) output.push(...translator.push(event));
+  translator.finish();
+  return output;
+}
 
-  const first = events[0];
-  if (first?.kind !== "run_started") {
-    throw new TranslationError("missing_run_start", "the first retained event must start the run");
+/** Stateful ordering guard for live pages from the Platform authority. */
+export class NativeStreamTranslator {
+  readonly #openTools = new Set<string>();
+  readonly #awaitingToolResults = new Set<string>();
+  #first: NativeAdapterEvent | undefined;
+  #lastSequence = 0;
+  #eventCount = 0;
+  #terminal = false;
+  #lastCursor: string | undefined;
+  #stateCheckpointed = false;
+  #messagesCheckpointed = false;
+
+  public get terminal(): boolean {
+    return this.#terminal;
   }
 
-  let lastSequence = 0;
-  let terminal = false;
-  const openTools = new Set<string>();
-  const awaitingToolResults = new Set(first.resumedToolCallIds ?? []);
-  const output: AGUIEvent[] = [];
+  public get lastCursor(): string | undefined {
+    return this.#lastCursor;
+  }
 
-  for (const event of events) {
-    if (event.threadId !== first.threadId || event.runId !== first.runId) {
-      throw new TranslationError("mixed_run", "one stream page cannot mix native runs");
+  public push(event: NativeAdapterEvent): readonly AGUIEvent[] {
+    if (this.#eventCount >= MAX_EVENTS) {
+      throw new TranslationError("too_many_events", "native event stream exceeds its bound");
     }
-    if (event.sequence <= lastSequence) {
+    validateEvent(event);
+    const first = this.#first;
+    if (first === undefined) {
+      if (event.kind !== "run_started") {
+        throw new TranslationError("missing_run_start", "the first retained event must start the run");
+      }
+      this.#first = event;
+      for (const toolCallId of event.resumedToolCallIds ?? []) this.#awaitingToolResults.add(toolCallId);
+    } else {
+      if (event.threadId !== first.threadId || event.runId !== first.runId) {
+        throw new TranslationError("mixed_run", "one stream cannot mix native runs");
+      }
+      if (event.kind === "run_started") {
+        throw new TranslationError("duplicate_run_start", "a run may start exactly once");
+      }
+    }
+    if (event.sequence <= this.#lastSequence) {
       throw new TranslationError("sequence_not_increasing", "native event sequences must strictly increase");
     }
-    if (terminal) throw new TranslationError("event_after_terminal", "a native event followed a terminal event");
-    if (event !== first && event.kind === "run_started") {
-      throw new TranslationError("duplicate_run_start", "a run may start exactly once");
-    }
+    if (this.#terminal) throw new TranslationError("event_after_terminal", "a native event followed a terminal event");
 
     switch (event.kind) {
       case "tool_call_started":
-        if (openTools.has(event.toolCallId)) throw new TranslationError("duplicate_tool_start", "tool call is already open");
-        openTools.add(event.toolCallId);
+        if (this.#openTools.has(event.toolCallId)) throw new TranslationError("duplicate_tool_start", "tool call is already open");
+        this.#openTools.add(event.toolCallId);
         break;
       case "tool_call_args":
-        if (!openTools.has(event.toolCallId)) throw new TranslationError("tool_not_open", "tool arguments require an open call");
+        if (!this.#openTools.has(event.toolCallId)) throw new TranslationError("tool_not_open", "tool arguments require an open call");
         break;
       case "tool_call_ended":
-        if (!openTools.delete(event.toolCallId)) throw new TranslationError("tool_not_open", "tool end requires an open call");
-        awaitingToolResults.add(event.toolCallId);
+        if (!this.#openTools.delete(event.toolCallId)) throw new TranslationError("tool_not_open", "tool end requires an open call");
+        this.#awaitingToolResults.add(event.toolCallId);
         break;
       case "tool_call_result":
-        if (!awaitingToolResults.delete(event.toolCallId)) throw new TranslationError("tool_not_pending", "tool result requires an ended call or resumed proposal");
+        if (!this.#awaitingToolResults.delete(event.toolCallId)) throw new TranslationError("tool_not_pending", "tool result requires an ended call or resumed proposal");
+        break;
+      case "state_snapshot":
+        this.#stateCheckpointed = true;
+        break;
+      case "messages_snapshot":
+        this.#messagesCheckpointed = true;
         break;
       case "approval_requested":
-        if (openTools.size !== 0) throw new TranslationError("tool_still_open", "an interrupt requires ended tool arguments");
+        if (!this.#stateCheckpointed || !this.#messagesCheckpointed) {
+          throw new TranslationError("interrupt_not_checkpointed", "an interrupt requires state and message snapshots");
+        }
+        if (this.#openTools.size !== 0) throw new TranslationError("tool_still_open", "an interrupt requires ended tool arguments");
         if (event.toolCallId === undefined) {
-          if (awaitingToolResults.size !== 0) throw new TranslationError("tool_result_pending", "a non-tool interrupt cannot strand a tool result");
-        } else if (awaitingToolResults.size !== 1 || !awaitingToolResults.has(event.toolCallId)) {
+          if (this.#awaitingToolResults.size !== 0) throw new TranslationError("tool_result_pending", "a non-tool interrupt cannot strand a tool result");
+        } else if (this.#awaitingToolResults.size !== 1 || !this.#awaitingToolResults.has(event.toolCallId)) {
           throw new TranslationError("interrupt_tool_mismatch", "tool interrupt must identify the one pending proposal");
         }
-        terminal = true;
+        this.#terminal = true;
         break;
       case "run_finished":
       case "run_refused":
-        if (openTools.size !== 0 || awaitingToolResults.size !== 0) {
+        if (this.#openTools.size !== 0 || this.#awaitingToolResults.size !== 0) {
           throw new TranslationError("tool_still_open", "a successful or refused run cannot strand a tool call");
         }
-        terminal = true;
+        this.#terminal = true;
         break;
       default:
         break;
     }
 
-    output.push(...translateNativeEvent(event));
-    lastSequence = event.sequence;
+    this.#eventCount += 1;
+    this.#lastSequence = event.sequence;
+    this.#lastCursor = event.cursor;
+    return translateNativeEvent(event);
   }
 
-  if (!terminal) throw new TranslationError("missing_terminal", "a complete run stream needs exactly one terminal event");
-  return output;
+  public finish(): void {
+    if (this.#first === undefined) throw new TranslationError("empty_stream", "a run stream cannot be empty");
+    if (!this.#terminal) throw new TranslationError("missing_terminal", "a complete run stream needs exactly one terminal event");
+  }
 }
 
 function validateEvent(event: NativeAdapterEvent): void {
@@ -209,7 +261,27 @@ function validateEvent(event: NativeAdapterEvent): void {
 
   for (const value of eventStrings(event)) bounded(value.value, value.max, value.field);
   if (event.kind === "state_snapshot") boundedJson(event.snapshot, "snapshot");
-  if (event.kind === "state_delta") boundedJson(event.delta, "delta");
+  if (event.kind === "messages_snapshot") {
+    boundedJson(event.messages, "messages");
+    if (event.messages.length > 1_024) throw new TranslationError("too_many_messages", "message snapshot exceeds its bound");
+    const ids = new Set<string>();
+    for (const message of event.messages) {
+      if (message === null || typeof message !== "object" || Array.isArray(message)) {
+        throw new TranslationError("invalid_messages", "message snapshot contains a non-object entry");
+      }
+      const expected = message.role === "tool" ? ["content", "id", "role", "toolCallId"] : ["content", "id", "role"];
+      const keys = Object.keys(message).sort();
+      if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+        throw new TranslationError("invalid_messages", "message snapshot contains unsupported fields");
+      }
+      if (message.role !== "user" && message.role !== "assistant" && message.role !== "tool") {
+        throw new TranslationError("invalid_messages", "message snapshot contains an unsupported role");
+      }
+      if (ids.has(message.id)) throw new TranslationError("invalid_messages", "message snapshot identifiers must be unique");
+      ids.add(message.id);
+    }
+  }
+  if (event.kind === "state_delta") validateJsonPatch(event.delta);
   if (event.kind === "approval_requested") {
     if (!Number.isSafeInteger(event.expectedRevision) || event.expectedRevision <= 0) {
       throw new TranslationError("invalid_revision", "approval revision must be a positive safe integer");
@@ -261,7 +333,16 @@ function eventStrings(event: NativeAdapterEvent): readonly {field: string; max: 
       ];
     case "control_lost":
       return [{field: "reason", max: MAX_TEXT_BYTES, value: event.reason}];
+    case "messages_snapshot":
+      return event.messages.flatMap((message) => [
+        {field: "messageId", max: MAX_IDENTIFIER_BYTES, value: message.id},
+        {field: "messageContent", max: MAX_TEXT_BYTES, value: message.content},
+        ...(message.role === "tool" ? [{field: "toolCallId", max: MAX_IDENTIFIER_BYTES, value: message.toolCallId}] : []),
+      ]);
     case "run_started":
+      return event.parentRunId === undefined
+        ? []
+        : [{field: "parentRunId", max: MAX_IDENTIFIER_BYTES, value: event.parentRunId}];
     case "run_finished":
     case "run_refused":
     case "state_snapshot":
@@ -272,7 +353,10 @@ function eventStrings(event: NativeAdapterEvent): readonly {field: string; max: 
   }
 }
 
-function bounded(value: string, maxBytes: number, field: string): void {
+function bounded(value: unknown, maxBytes: number, field: string): void {
+  if (typeof value !== "string") {
+    throw new TranslationError("invalid_field", `${field} must be a string`);
+  }
   const bytes = new TextEncoder().encode(value).byteLength;
   if (bytes === 0 || bytes > maxBytes || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)) {
     throw new TranslationError("invalid_field", `${field} is empty, oversized, or contains a control character`);
@@ -280,6 +364,7 @@ function bounded(value: string, maxBytes: number, field: string): void {
 }
 
 function boundedJson(value: JsonValue | readonly unknown[], field: string): void {
+  validateJsonTree(value, field);
   let encoded: string;
   try {
     encoded = JSON.stringify(value);
@@ -288,6 +373,64 @@ function boundedJson(value: JsonValue | readonly unknown[], field: string): void
   }
   if (new TextEncoder().encode(encoded).byteLength > MAX_STATE_BYTES) {
     throw new TranslationError("state_too_large", `${field} exceeds the derived-state bound`);
+  }
+}
+
+function validateJsonTree(value: unknown, field: string): void {
+  let nodes = 0;
+  const visit = (candidate: unknown, depth: number): void => {
+    nodes += 1;
+    if (nodes > MAX_JSON_NODES || depth > MAX_JSON_DEPTH) {
+      throw new TranslationError("invalid_json", `${field} exceeds its structural bound`);
+    }
+    if (candidate === null || typeof candidate === "string" || typeof candidate === "boolean") return;
+    if (typeof candidate === "number" && Number.isFinite(candidate)) return;
+    if (Array.isArray(candidate)) {
+      for (const entry of candidate) visit(entry, depth + 1);
+      return;
+    }
+    if (typeof candidate === "object" && Object.getPrototypeOf(candidate) === Object.prototype) {
+      for (const [key, entry] of Object.entries(candidate as Record<string, unknown>)) {
+        if (/[ -]/u.test(key)) throw new TranslationError("invalid_json", `${field} contains an invalid key`);
+        visit(entry, depth + 1);
+      }
+      return;
+    }
+    throw new TranslationError("invalid_json", `${field} must contain finite plain JSON data`);
+  };
+  visit(value, 0);
+}
+
+function validateJsonPatch(delta: readonly unknown[]): void {
+  if (!Array.isArray(delta)) throw new TranslationError("invalid_state_delta", "state delta must be an ordered JSON Patch array");
+  for (const candidate of delta) {
+    if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate) || Object.getPrototypeOf(candidate) !== Object.prototype) {
+      throw new TranslationError("invalid_state_delta", "state delta contains a non-object operation");
+    }
+    const operation = candidate as Record<string, unknown>;
+    const op = operation.op;
+    const expected = op === "remove" ? ["op", "path"]
+      : op === "add" || op === "replace" || op === "test" ? ["op", "path", "value"]
+        : op === "copy" || op === "move" ? ["from", "op", "path"]
+          : null;
+    if (expected === null) throw new TranslationError("invalid_state_delta", "state delta contains an unsupported operation");
+    const keys = Object.keys(operation).sort();
+    if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+      throw new TranslationError("invalid_state_delta", "state delta operation fields do not match RFC 6902");
+    }
+    jsonPointer(operation.path, "path");
+    if (op === "copy" || op === "move") jsonPointer(operation.from, "from");
+    if (op === "add" || op === "replace" || op === "test") validateJsonTree(operation.value, "delta value");
+  }
+  boundedJson(delta, "delta");
+}
+
+function jsonPointer(value: unknown, field: string): void {
+  if (typeof value !== "string" || (value !== "" && !value.startsWith("/")) || /~(?:[^01]|$)/u.test(value)) {
+    throw new TranslationError("invalid_state_delta", `${field} is not an RFC 6901 JSON pointer`);
+  }
+  if (new TextEncoder().encode(value).byteLength > MAX_IDENTIFIER_BYTES || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new TranslationError("invalid_state_delta", `${field} exceeds its bound`);
   }
 }
 

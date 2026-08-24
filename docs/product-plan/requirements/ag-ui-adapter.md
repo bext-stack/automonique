@@ -1,6 +1,6 @@
 # AG-UI compatibility adapter
 
-**Status:** accepted architecture; bounded translator implementation started
+**Status:** accepted architecture; bounded translator and supervised runtime implemented
 
 ## Pinned compatibility contract
 
@@ -11,11 +11,22 @@ every translated output in both product code and golden tests. Changing that
 version, lockfile, or the emitted capability set is a reviewed compatibility
 change, not an ambient package update.
 
-The first bounded code slice lives in `adapters/ag-ui/`. It defines a sanitized
-adapter-internal native event projection and a deterministic, side-effect-free
-translator. It deliberately contains no listener, credentials, durable state,
-or mutation path. Separately supervised service scaffolding and health
-reporting remain the next delivery slice.
+The implementation lives in `adapters/ag-ui/`. It defines a sanitized
+adapter-internal native event projection, deterministic translator, strict
+`RunAgentInput` admission, and an injectable loopback HTTP/SSE runtime. The
+runtime contains no credential store, durable session state, provider client,
+or independent mutation path. Its `PlatformRunAuthority` dependency is the
+required seam for authorized replay, open-interrupt validation, receipts, and
+`stop_run`; a production daemon binding remains a separate delivery gate.
+
+The runtime semantics are pinned to the official AG-UI documentation for
+[events](https://docs.ag-ui.com/concepts/events),
+[state](https://docs.ag-ui.com/concepts/state),
+[interrupts](https://docs.ag-ui.com/concepts/interrupts),
+[serialization](https://docs.ag-ui.com/concepts/serialization), and
+[capabilities](https://docs.ag-ui.com/concepts/capabilities). Capability
+discovery declares only implemented behavior. Reasoning and client-provided
+tool authority are not advertised.
 
 ## Decision
 
@@ -123,6 +134,45 @@ are ignored unless a field is explicitly allowlisted and mapped to a native
 command. Streams have bounded messages, event rates, buffering, run duration,
 and subscriber counts. A slow client is disconnected with a resumable cursor
 before it can block daemon event consumption.
+
+## Supervised runtime contract
+
+The bounded runtime exposes these loopback-only routes when composed with a
+real `PlatformRunAuthority`:
+
+- `GET /healthz` proves only that the adapter process can answer;
+- `GET /readyz` proves that the injected Platform authority is ready;
+- authenticated `GET /capabilities` returns the pinned discovery snapshot;
+- authenticated `POST /agent` accepts exact JSON `RunAgentInput` and streams
+  canonical events as `text/event-stream`;
+- authenticated `POST /cancel` carries an exact revision and idempotency key
+  to the authority and returns its receipt identity.
+
+`Last-Event-ID` is an opaque adapter cursor containing the native cursor and
+the delivered AG-UI projection offset. This prevents a disconnect between the
+start, content, and end projections of one native message from skipping the
+remainder. The authority supplies a bounded retained native prefix through the
+cursor; the adapter validates it, restores translator state, emits only the
+missed projection suffix, then consumes Platform events after the native
+cursor. A cursor outside retention receives a bounded `409 resync_required`
+response with an authorized snapshot cursor. Disconnect and backpressure close
+only the subscriber and report its last delivered opaque cursor; neither is
+interpreted as cancellation.
+
+Run admission accepts either one plain bounded user message or a structural
+interrupt resume, never both. Client state, context, forwarded properties,
+message history, reasoning messages, multimodal content, and client tool
+declarations are refused. Resume entries must be unique and complete; the
+Platform authority remains responsible for same-thread correlation, covering
+every open interrupt, JSON-schema and expiry validation, revision binding, and
+replay-safe receipts.
+
+Every accepted stream begins with `RUN_STARTED` and ends once with
+`RUN_FINISHED` or `RUN_ERROR`. Interrupts require authority-derived
+`STATE_SNAPSHOT` and `MESSAGES_SNAPSHOT` checkpoints before their terminal
+`RUN_FINISHED` interrupt outcome. A resumed run may carry the authority-checked
+`parentRunId`, preserving append-only serialization lineage without accepting
+a client-owned history.
 
 ## Mutation safety
 
