@@ -108,12 +108,36 @@ Tunnel credentials and `config-monique-web.yml` are deployment state under
 with owner authority for the public hostname and production change.
 
 Before replacing an installed unit, verify the checked-in file with
-`tools/verify_systemd_unit.sh`. To roll back,
-restore the previous `current` link through the release activation procedure
-and restart the unit.
+`tools/verify_systemd_unit.sh`.
 
-For an owner-authorized local release, use the checked-in operator tool rather
-than creating an ad-hoc helper:
+The dashboard deliberately uses a direct binary install. It does not use the
+daemon's content-addressed release builder or a `current` symlink. Build it,
+stage one replacement beside the installed binary, retain one previous binary,
+rename the replacement atomically, and restart only the dashboard:
+
+```sh
+cargo build --release --locked -p automonique-web-entry
+install -d -m 0700 "$XDG_STATE_HOME/automonique/web-entry/bin"
+if test -x "$XDG_STATE_HOME/automonique/web-entry/bin/automonique-web-entry"; then
+  install -m 0700 "$XDG_STATE_HOME/automonique/web-entry/bin/automonique-web-entry" \
+    "$XDG_STATE_HOME/automonique/web-entry/bin/automonique-web-entry.previous"
+fi
+install -m 0700 target/release/automonique-web-entry \
+  "$XDG_STATE_HOME/automonique/web-entry/bin/automonique-web-entry.next"
+mv "$XDG_STATE_HOME/automonique/web-entry/bin/automonique-web-entry.next" \
+  "$XDG_STATE_HOME/automonique/web-entry/bin/automonique-web-entry"
+systemctl --user restart automonique-web-entry.service
+curl --fail --silent http://127.0.0.1:18082/health
+```
+
+Rollback installs `automonique-web-entry.previous` through the same `.next`
+and rename sequence, then restarts and checks the service. Old dashboard
+release directories are not part of the procedure and may be removed later as
+a separately authorized cleanup.
+
+The daemon and fleet worker retain their immutable release path. For an
+owner-authorized daemon release, use the checked-in operator tool rather than
+creating an ad-hoc helper:
 
 ```sh
 cargo run --release -p automonique --bin automonique-release -- deploy \

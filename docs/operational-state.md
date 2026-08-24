@@ -18,8 +18,8 @@ different questions and must not be collapsed into one generic "running" or
 | Canonical memory | Reviewed user/workspace facts and preferences | Durable context for future conversations | Current process or ticket state |
 
 The dashboard, daemon, and fleet worker are separate services. Restart only the
-service whose immutable release changed. In particular, a dashboard-only
-release does not require restarting the daemon or fleet worker.
+service whose executable changed. In particular, a dashboard-only deployment
+does not require restarting the daemon or fleet worker.
 
 The dashboard's work-queue view keeps Support tickets and Manage issue work in
 one operator workspace but preserves their source on every row and filter.

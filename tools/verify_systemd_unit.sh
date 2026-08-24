@@ -8,7 +8,7 @@ verify_state=$(mktemp -d)
 trap 'rm -rf -- "$verify_state"' EXIT HUP INT TERM
 
 release_bin="$verify_state/automonique/improvement-code/current/bin"
-web_entry_bin="$verify_state/automonique/web-entry/current/bin"
+web_entry_bin="$verify_state/automonique/web-entry/bin"
 tunnel_bin="$verify_state/bin"
 unit_dir="$verify_state/systemd"
 mkdir -p "$release_bin"
