@@ -741,14 +741,18 @@ fn read_only_question_profile_lowers_reasoning_without_reading_task_text() {
         COMPOSE_MEMORY_BYTES,
         "agentic work retains the bounded complex-work memory ceiling"
     );
-    assert!(
-        standard
-            .sandbox()
-            .path_grants()
-            .as_slice()
-            .iter()
-            .all(|grant| grant.access() != PathAccess::ReadExecute),
-        "ordinary work must not inherit scratchpad runtime execution"
+    let standard_runtime_exec = standard
+        .sandbox()
+        .path_grants()
+        .as_slice()
+        .iter()
+        .filter(|grant| grant.access() == PathAccess::ReadExecute)
+        .map(|grant| grant.path().as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        standard_runtime_exec,
+        ["/usr/lib"],
+        "ordinary work needs only the dynamic loader tree, never scratchpad binaries"
     );
 }
 

@@ -1028,11 +1028,15 @@ fn scratchpad_path_grants(
     let mut grants = vec![
         PathGrant::new(home, PathAccess::ReadWrite).map_err(rejected)?,
         PathGrant::new(CA_DIRECTORY, PathAccess::ReadOnly).map_err(rejected)?,
+        // A dynamically linked provider is executed from its verified staged
+        // descriptor, but the kernel still resolves its ELF interpreter and
+        // shared libraries by path. Without this non-writable execute grant,
+        // execveat correctly fails with EACCES before the provider starts.
+        PathGrant::new(SCRATCHPAD_RUNTIME_LIB, PathAccess::ReadExecute).map_err(rejected)?,
     ];
     if profile == ProviderRunProfile::AgenticScratchpad {
         grants.extend([
             PathGrant::new(SCRATCHPAD_RUNTIME_BIN, PathAccess::ReadExecute).map_err(rejected)?,
-            PathGrant::new(SCRATCHPAD_RUNTIME_LIB, PathAccess::ReadExecute).map_err(rejected)?,
             PathGrant::new(SCRATCHPAD_RUNTIME_SHARE, PathAccess::ReadOnly).map_err(rejected)?,
         ]);
     }
