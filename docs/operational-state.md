@@ -21,6 +21,11 @@ The dashboard, daemon, and fleet worker are separate services. Restart only the
 service whose immutable release changed. In particular, a dashboard-only
 release does not require restarting the daemon or fleet worker.
 
+The dashboard's work-queue view keeps Support tickets and Manage issue work in
+one operator workspace but preserves their source on every row and filter.
+Support lifecycle state must not be presented as Manage execution state, and a
+Manage terminal job must not be presented as GitHub delivery evidence.
+
 ## State vocabulary
 
 - `pending_approval`: a gate awaits an authorized decision. Nothing has been

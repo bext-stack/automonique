@@ -39,14 +39,18 @@ Configuration is optional at `<state>/mcp/servers.json`. If the file is absent, 
 
 Never commit this file. Tokens are retained only in the daemon process and redacted from debug output. Support and Designer service tokens must be provisioned in their corresponding site environments. For Business MCP, prefer the existing short-lived OAuth agent token rather than a static token.
 
-The hosted Monique dashboard attaches Manage automatically only when
-`manage/manage.conf` contains a validated console URL and exactly one MCP
-server has the same HTTPS origin. The server name is deployment-owned and does
-not need to be hard-coded. Tools that explicitly advertise MCP's
-`readOnlyHint=true` may ground chat immediately. Every other tool is treated as
-mutating: the dashboard stages it without calling it, shows an approval card,
-shows the proposed arguments with sensitive-looking values redacted, and calls
-it once only after approval. Pending cards expire after five minutes, are
-bounded in number, and are cleared when a new conversation starts.
+The hosted Monique dashboard discovers every configured MCP server
+independently, so Support and Manage remain available together when either one
+is temporarily unhealthy. `manage/manage.conf` still identifies the Manage
+console and, when exactly one MCP server has the same HTTPS origin, identifies
+which discovered tools and issue work belong to Manage. Read-only ticket tools
+from other configured servers remain separately sourced as Support work. The
+server labels are deployment-owned and do not need to be hard-coded. Tools that
+explicitly advertise MCP's `readOnlyHint=true` may ground chat immediately.
+Every other tool is treated as mutating: the dashboard stages it without
+calling it, shows an approval card, shows the proposed arguments with
+sensitive-looking values redacted, and calls it once only after approval.
+Pending cards expire after five minutes, are bounded in number, and are cleared
+when a new conversation starts.
 
 When a tool returns `input_required`, Telegram receives a context preview with Approve and Deny buttons. Approval replays the exact staged server, tool, arguments, and input-request keys once. Denial performs no call. A restart intentionally invalidates pending MCP buttons, so a stale approval fails closed.

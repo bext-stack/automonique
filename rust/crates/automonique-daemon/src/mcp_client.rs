@@ -100,6 +100,16 @@ impl McpRegistry {
         self.servers.iter().any(|server| server.name == name)
     }
 
+    /// Return the configured server labels without exposing endpoints,
+    /// credentials, or deployment headers.
+    #[must_use]
+    pub fn configured_server_names(&self) -> Vec<String> {
+        self.servers
+            .iter()
+            .map(|server| server.name.clone())
+            .collect()
+    }
+
     /// Return the one configured server on the same HTTPS origin as `url`.
     ///
     /// Ambiguous or malformed matches stay disabled. This lets an optional
@@ -513,6 +523,10 @@ mod tests {
         assert_eq!(
             registry.unique_server_for_https_origin("https://support.example.test/"),
             None
+        );
+        assert_eq!(
+            registry.configured_server_names(),
+            vec![String::from("business")]
         );
         registry.servers.push(server(
             "duplicate",

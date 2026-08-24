@@ -53,10 +53,13 @@ The optional hosted dashboard is deliberately separate from the daemon.
 loopback; `automonique-web-tunnel.service` publishes it through an
 operator-provisioned Cloudflare tunnel. The console reads a sanitized status
 projection through the same peer-authenticated local protocol as the CLI. Its
-Slack tool is strictly read-only. When both `manage/manage.conf` and a unique
-same-origin server in `mcp/servers.json` are present, chat can also discover
-Manage AI Operations tools. Tools explicitly annotated as read-only can ground
-an answer immediately. Every other tool becomes an in-chat action card showing
+Slack tool is strictly read-only. Configured MCP servers are discovered
+independently, so Support and Manage can both ground the dashboard and chat
+without one masking the other. A unique server sharing the validated
+`manage/manage.conf` console origin is classified as Manage; read-only ticket
+tools from other configured services remain separately sourced work queues.
+Tools explicitly annotated as read-only can ground an answer immediately.
+Every other tool becomes an in-chat action card showing
 its proposed arguments and runs once only after the operator explicitly
 approves it. When dashboard chat discovers that its attached context is
 insufficient but the shared router can perform a deeper read or contained task,
