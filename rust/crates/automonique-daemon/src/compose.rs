@@ -180,9 +180,10 @@ pub const DEFAULT_ARGV: [&str; 12] = [
 /// outer Automonique sandbox owns tool and filesystem authority, while this
 /// invocation disables JCode's own tools and update check for a bounded
 /// completion.
-pub const JCODE_DEFAULT_ARGV: [&str; 11] = [
+pub const JCODE_DEFAULT_ARGV: [&str; 12] = [
     "run",
     "-",
+    "--ndjson",
     "-C",
     WORKSPACE_PLACEHOLDER,
     "--output-last-message",
