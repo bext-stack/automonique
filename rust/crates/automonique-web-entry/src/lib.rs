@@ -39,6 +39,7 @@ use automonique_daemon::{
     site_inventory::{NGINX_SITES_ENABLED, enabled_hosts, manage_profiles, prism_sites},
 };
 use automonique_platform_client::{PLATFORM_CONTENT_TYPE, PlatformClient, UnixTransport};
+use automonique_protocol::codec::RequestId;
 use automonique_protocol::platform::{
     Capabilities, ListSessionsRequest, PlatformCursor, PlatformRequest, PlatformResponse,
     PlatformTransport, ResourceAuthority, ResourceCoordinate, ResourceRecord, SessionRecord,
@@ -580,19 +581,42 @@ impl ManageIntegration {
         else {
             return false;
         };
+        let Ok(request_id) = RequestId::new("platform-bearer-validation") else {
+            return false;
+        };
+        let request =
+            PlatformRequestMessage::new(request_id.clone(), PlatformRequest::Capabilities);
+        let Ok(request) = request.to_message() else {
+            return false;
+        };
+        let request = request.to_canonical_bytes();
         let response = ureq::Agent::config_builder()
             .timeout_global(Some(IO_TIMEOUT))
+            .max_redirects(0)
+            .proxy(None)
             .build()
             .new_agent()
             .post(endpoint)
             .header("authorization", authorization)
-            .header("content-type", "application/json")
-            .header("accept", "application/json")
-            .send(r#"{"method":"capabilities"}"#);
+            .header("content-type", PLATFORM_CONTENT_TYPE)
+            .header("accept", PLATFORM_CONTENT_TYPE)
+            .send(&request);
         let Ok(mut response) = response else {
             return false;
         };
         if response.status() != 200 {
+            return false;
+        }
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok());
+        if !content_type.is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|media_type| media_type.trim() == PLATFORM_CONTENT_TYPE)
+        }) {
             return false;
         }
         let mut body = Vec::new();
@@ -606,18 +630,17 @@ impl ManageIntegration {
         {
             return false;
         }
-        let Ok(value) = serde_json::from_slice::<Value>(&body) else {
+        let Ok(response) = PlatformResponseMessage::from_canonical_bytes(&body) else {
             return false;
         };
-        value.get("ok").and_then(Value::as_bool) == Some(true)
-            && value
-                .pointer("/capabilities/protocol")
-                .and_then(Value::as_str)
-                == Some(automonique_protocol::platform::PLATFORM_PROTOCOL)
-            && value
-                .pointer("/capabilities/schema")
-                .and_then(Value::as_str)
-                == Some(automonique_protocol::platform::PLATFORM_SCHEMA_V1)
+        response.request_id() == &request_id
+            && matches!(
+                response.response(),
+                PlatformResponse::Capabilities(capabilities)
+                    if capabilities.protocol == automonique_protocol::platform::PLATFORM_PROTOCOL
+                        && capabilities.schema
+                            == automonique_protocol::platform::PLATFORM_SCHEMA_V1
+            )
     }
 }
 
@@ -4614,19 +4637,46 @@ mod tests {
             stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
             let mut request = [0_u8; 4096];
             let count = stream.read(&mut request).unwrap();
-            let request = String::from_utf8_lossy(&request[..count]).to_ascii_lowercase();
-            assert!(request.starts_with("post /api/manage/automonique/platform http/1.1"));
-            assert!(request.contains("authorization: bearer fixture-token"));
-            let body = format!(
-                "{{\"ok\":true,\"capabilities\":{{\"protocol\":\"{}\",\"schema\":\"{}\"}}}}",
-                automonique_protocol::platform::PLATFORM_PROTOCOL,
-                automonique_protocol::platform::PLATFORM_SCHEMA_V1
-            );
+            let received = &request[..count];
+            let header_end = received
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|position| position + 4)
+                .unwrap();
+            let headers = String::from_utf8_lossy(&received[..header_end]).to_ascii_lowercase();
+            assert!(headers.starts_with("post /api/manage/automonique/platform http/1.1"));
+            assert!(headers.contains("authorization: bearer fixture-token"));
+            assert!(headers.contains(&format!("content-type: {PLATFORM_CONTENT_TYPE}")));
+            assert!(headers.contains(&format!("accept: {PLATFORM_CONTENT_TYPE}")));
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .expect("request content length");
+            let mut request_body = received[header_end..].to_vec();
+            while request_body.len() < content_length {
+                let mut chunk = [0_u8; 4096];
+                let count = stream.read(&mut chunk).unwrap();
+                assert_ne!(count, 0, "complete platform request body");
+                request_body.extend_from_slice(&chunk[..count]);
+            }
+            assert_eq!(request_body.len(), content_length);
+            let request = PlatformRequestMessage::from_canonical_bytes(&request_body)
+                .expect("canonical platform request");
+            assert_eq!(request.request(), &PlatformRequest::Capabilities);
+            let body = PlatformResponseMessage::new(
+                request.request_id().clone(),
+                PlatformResponse::Capabilities(Capabilities::platform_v1()),
+            )
+            .to_message()
+            .expect("platform response")
+            .to_canonical_bytes();
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 200 OK\r\nContent-Type: {PLATFORM_CONTENT_TYPE}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
             stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
         });
         let integration = ManageIntegration {
             console_url: Some(format!("http://{address}/manage")),
