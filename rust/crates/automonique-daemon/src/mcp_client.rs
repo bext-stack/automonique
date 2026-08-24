@@ -100,6 +100,16 @@ impl McpRegistry {
         self.servers.iter().any(|server| server.name == name)
     }
 
+    /// Return the configured server labels without exposing endpoints,
+    /// credentials, or deployment headers.
+    #[must_use]
+    pub fn configured_server_names(&self) -> Vec<String> {
+        self.servers
+            .iter()
+            .map(|server| server.name.clone())
+            .collect()
+    }
+
     /// Return the one configured server on the same HTTPS origin as `url`.
     ///
     /// Ambiguous or malformed matches stay disabled. This lets an optional
@@ -182,40 +192,58 @@ impl McpRegistry {
     pub fn discover(&mut self) -> Result<Vec<McpToolDescriptor>, McpFailure> {
         let mut output = Vec::new();
         let mut discovered = BTreeMap::new();
+        let mut first_failure = None;
+        let mut server_succeeded = false;
         for server in &self.servers {
-            let value = self.request(server, "tools/list", None, json!({}))?;
-            let tools = value
-                .pointer("/result/tools")
-                .and_then(Value::as_array)
-                .ok_or(McpFailure::Protocol)?;
-            let mut names = BTreeSet::new();
-            for tool in tools.iter().take(256) {
-                let name = tool
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .filter(|name| valid_label(name))
+            let server_result = (|| {
+                let value = self.request(server, "tools/list", None, json!({}))?;
+                let tools = value
+                    .pointer("/result/tools")
+                    .and_then(Value::as_array)
                     .ok_or(McpFailure::Protocol)?;
-                if !names.insert(name.to_owned()) {
-                    return Err(McpFailure::Protocol);
-                }
-                output.push(McpToolDescriptor {
-                    server: server.name.clone(),
-                    name: name.to_owned(),
-                    description: tool
-                        .get("description")
+                let mut names = BTreeSet::new();
+                let mut descriptors = Vec::new();
+                for tool in tools.iter().take(256) {
+                    let name = tool
+                        .get("name")
                         .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .chars()
-                        .take(500)
-                        .collect(),
-                    input_schema: bounded_input_schema(tool)?,
-                    read_only: tool
-                        .pointer("/annotations/readOnlyHint")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                });
+                        .filter(|name| valid_label(name))
+                        .ok_or(McpFailure::Protocol)?;
+                    if !names.insert(name.to_owned()) {
+                        return Err(McpFailure::Protocol);
+                    }
+                    descriptors.push(McpToolDescriptor {
+                        server: server.name.clone(),
+                        name: name.to_owned(),
+                        description: tool
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .chars()
+                            .take(500)
+                            .collect(),
+                        input_schema: bounded_input_schema(tool)?,
+                        read_only: tool
+                            .pointer("/annotations/readOnlyHint")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    });
+                }
+                Ok((descriptors, names))
+            })();
+            match server_result {
+                Ok((mut descriptors, names)) => {
+                    server_succeeded = true;
+                    output.append(&mut descriptors);
+                    discovered.insert(server.name.clone(), names);
+                }
+                Err(failure) => {
+                    first_failure.get_or_insert(failure);
+                }
             }
-            discovered.insert(server.name.clone(), names);
+        }
+        if !server_succeeded {
+            return Err(first_failure.unwrap_or(McpFailure::Unavailable));
         }
         self.discovered = discovered;
         Ok(output)
@@ -514,6 +542,10 @@ mod tests {
             registry.unique_server_for_https_origin("https://support.example.test/"),
             None
         );
+        assert_eq!(
+            registry.configured_server_names(),
+            vec![String::from("business")]
+        );
         registry.servers.push(server(
             "duplicate",
             "https://manage.example.test/another-mcp",
@@ -569,5 +601,45 @@ mod tests {
                 .contains("mcp-name: support_reply_to_ticket")
         );
         assert!(call.contains("\"io.modelcontextprotocol/clientCapabilities\""));
+    }
+
+    #[test]
+    fn general_discovery_keeps_healthy_servers_when_one_is_unavailable() {
+        let unavailable = TcpListener::bind("127.0.0.1:0").unwrap();
+        let unavailable_address = unavailable.local_addr().unwrap();
+        drop(unavailable);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            serve_once(
+                &listener,
+                r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"support_list_tickets","annotations":{"readOnlyHint":true}}]}}"#,
+            )
+        });
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("mcp")).unwrap();
+        let path = root.path().join(CONFIG_RELATIVE);
+        fs::write(
+            &path,
+            format!(
+                r#"{{"schema":"automonique.mcp-servers/v1","servers":[{{"name":"business","url":"http://127.0.0.1:{}/api/mcp","token":"0123456789abcdef"}},{{"name":"support","url":"http://127.0.0.1:{}/api/mcp","token":"0123456789abcdef"}}]}}"#,
+                unavailable_address.port(),
+                address.port()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut registry = McpRegistry::load(root.path()).unwrap();
+        let tools = registry.discover().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].server, "support");
+        assert_eq!(tools[0].name, "support_list_tickets");
+        assert!(tools[0].read_only);
+        assert!(matches!(
+            registry.call("business", "business_list_issues", json!({}), None),
+            Err(McpFailure::NotAllowed)
+        ));
+        server.join().unwrap();
     }
 }

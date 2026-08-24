@@ -13,53 +13,27 @@ source SHA, then immediately runs a pinned Codex App Server in an isolated
 worktree. The candidate receives model auth but no GitHub, SSH-agent,
 deployment, or production credential. The host runs its standard local checks,
 records their compact receipts, commits with the Automonique Candidate
-identity, builds an immutable release, pushes the exact candidate, and opens a
-source pull request.
+identity, builds a candidate, pushes the exact candidate, and opens a source
+pull request.
 
 The work brief is not published and does not require approval. It exists to
 give the agent a bounded task and to make retries reproducible. Remote CI
 status, check receipts, token usage, duration, and other metrics may be
 inspected or reported, but they are diagnostics rather than workflow keys.
 
-The only approval appears when the source pull request and built release are
+The only approval appears when the source pull request and built candidate are
 ready. The Telegram challenge is single-use and bound to the requesting actor,
-chat, durable revision, and release digest. Requesting changes returns the item
+chat, durable revision, and candidate digest. Requesting changes returns the item
 to draft; send guidance as `IMP-000001: keep this skill-only`. Approving merges
-only the recorded PR head and activates only the matching built release.
+only the recorded PR head.
 
-Skill-only releases switch an atomic digest link and are read again on every
-provider run. Code and
-mixed releases switch an atomic release link, restart the configured systemd
-user service, verify readiness, and restore the prior code and skill links if
-readiness fails.
-
-Code activation is automatic after owner approval and merge. The out-of-band
-activation helper switches the release link and asks
-the supervisor for an orderly restart. The daemon stops accepting new work and
-joins already accepted Telegram questions, provider attempts, Slack work and
-Support work before its process exits. Activation refuses before changing the
-link unless the configured service reports `TimeoutStopUSec=infinity`, which
-prevents systemd from turning a long drain into a kill.
-
-This is a **drain-and-restart**, not the generation handoff specified in
-[`reload-protocol.md`](product-plan/requirements/reload-protocol.md). Accepted
-work is preserved, but intake is briefly unavailable between the old process
-releasing its leases and the successor becoming ready. True overlap with zero
-intake gap still requires generation handoff.
-
-For code activation to switch the executable atomically, the configured unit's
-`ExecStart` must invoke
-`<state-directory>/improvement-code/current/bin/automonique daemon --foreground`.
-The code release also carries the pinned `automonique-chat-provider` and
-`automonique-launch-enter` companions. The conversation-provider configuration
-should name
-`<state-directory>/improvement-code/current/bin/automonique-chat-provider` so
-the same atomic link switches all three executables together; the daemon finds
-the launch helper beside its own executable.
-The initially installed executable may schedule the one-shot activation helper,
-but subsequent service starts must resolve the `current` release link. The unit
-must also set `TimeoutStopSec=infinity`; a bounded timeout makes code activation
-fail closed while leaving the current link and generation untouched.
+Skill-only releases may still switch their reviewed digest link and are read
+again on every provider run. Code and mixed candidates do not activate
+production automatically after merge. An owner deploys the merged daemon with
+the direct binary procedure in `packaging/systemd/README.md`, including the
+zero-work preflight, one-file rollback copy, supervised restart, and readiness
+verification. This keeps source approval separate from production authority
+without a content-addressed release tree or `current` symlink.
 
 ## Owner prerequisites
 

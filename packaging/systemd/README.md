@@ -12,10 +12,10 @@ systemctl --user enable --now automonique-backup.timer
 systemctl --user status automonique.service
 ```
 
-The unit starts the current verified release from the product state directory,
-creates private XDG runtime/state directories, delegates its cgroup subtree,
-and waits for the daemon's real readiness notification. Upgrade switches the
-`improvement-code/current` release link; restarting the unit activates it.
+The unit starts the directly installed daemon binary from the product state
+directory, creates private XDG runtime/state directories, delegates its cgroup
+subtree, and waits for the daemon's real readiness notification. Upgrade
+replaces that binary atomically and restarts the unit.
 The timer writes an online recovery set every five minutes.
 `automonique-recovery.service` is started manually after a restore; it disables
 external transports and refuses provider starts.
@@ -24,8 +24,8 @@ claims confirmed jobs with bounded parallelism, and streams their progress back
 to AI Operations. It also publishes an owner-only dashboard projection with a
 bounded tail of parsed agent output and a link to the corresponding issue in
 the configured Manage origin. Raw provider frames, stderr, prompts and fleet
-credentials are not copied into that projection. It runs from the same
-immutable release as the daemon. The
+credentials are not copied into that projection. The worker keeps its own
+installed release path, independently of the directly installed daemon. The
 worker maintains a private `manage-fleet-worker/auth-health.json` projection:
 local credentials begin as `configured_unverified`, a successful provider turn
 proves `authenticated`, and recognized sign-out or token-refresh failures become
@@ -53,13 +53,22 @@ The optional hosted dashboard is deliberately separate from the daemon.
 loopback; `automonique-web-tunnel.service` publishes it through an
 operator-provisioned Cloudflare tunnel. The console reads a sanitized status
 projection through the same peer-authenticated local protocol as the CLI. Its
-Slack tool is strictly read-only. When both `manage/manage.conf` and a unique
-same-origin server in `mcp/servers.json` are present, chat can also discover
-Manage AI Operations tools. Tools explicitly annotated as read-only can ground
-an answer immediately. Every other tool becomes an in-chat action card showing
+Slack tool is strictly read-only. Configured MCP servers are discovered
+independently, so Support and Manage can both ground the dashboard and chat
+without one masking the other. A unique server sharing the validated
+`manage/manage.conf` console origin is classified as Manage; read-only ticket
+tools from other configured services remain separately sourced work queues.
+Tools explicitly annotated as read-only can ground an answer immediately.
+Every other tool becomes an in-chat action card showing
 its proposed arguments and runs once only after the operator explicitly
-approves it. Denial and expiry change nothing. The retired hostname redirects
-to the canonical dashboard hostname.
+approves it. When dashboard chat discovers that its attached context is
+insufficient but the shared router can perform a deeper read or contained task,
+it likewise returns a scoped approve/deny card to the requester. These cards
+are included in the AI Operations pending-action projection. Safe configured
+reads remain automatic; a genuinely missing integration or credential produces
+a configuration instruction rather than an ineffective permission request.
+Denial and expiry change nothing. The retired hostname redirects to the
+canonical dashboard hostname.
 Every dashboard resource and API response on the canonical hostname requires
 HTTP Basic authentication over the Cloudflare TLS boundary. The strict private
 credential file is `%S/automonique/dashboard-auth.conf`; it stores a username
@@ -102,27 +111,64 @@ Tunnel credentials and `config-monique-web.yml` are deployment state under
 with owner authority for the public hostname and production change.
 
 Before replacing an installed unit, verify the checked-in file with
-`tools/verify_systemd_unit.sh`. To roll back,
-restore the previous `current` link through the release activation procedure
-and restart the unit.
+`tools/verify_systemd_unit.sh`.
 
-For an owner-authorized local release, use the checked-in operator tool rather
-than creating an ad-hoc helper:
+The dashboard deliberately uses a direct binary install. It does not use a
+content-addressed release builder or a `current` symlink. Build it,
+stage one replacement beside the installed binary, retain one previous binary,
+rename the replacement atomically, and restart only the dashboard:
 
 ```sh
-cargo run --release -p automonique --bin automonique-release -- deploy \
-  --state-dir /private/state/automonique \
-  --worktree /path/to/clean/automonique \
-  --unit automonique.service \
-  --plan-digest sha256:<approved-plan-digest> \
-  --changed-path rust/crates/example/src/lib.rs
+cargo build --release --locked -p automonique-web-entry
+install -d -m 0700 "$XDG_STATE_HOME/automonique/web-entry/bin"
+if test -x "$XDG_STATE_HOME/automonique/web-entry/bin/automonique-web-entry"; then
+  install -m 0700 "$XDG_STATE_HOME/automonique/web-entry/bin/automonique-web-entry" \
+    "$XDG_STATE_HOME/automonique/web-entry/bin/automonique-web-entry.previous"
+fi
+install -m 0700 target/release/automonique-web-entry \
+  "$XDG_STATE_HOME/automonique/web-entry/bin/automonique-web-entry.next"
+mv "$XDG_STATE_HOME/automonique/web-entry/bin/automonique-web-entry.next" \
+  "$XDG_STATE_HOME/automonique/web-entry/bin/automonique-web-entry"
+systemctl --user restart automonique-web-entry.service
+curl --fail --silent http://localhost:18082/healthz
 ```
 
-Repeat `--changed-path` for every path in the release. `deploy` refuses a dirty
-worktree, derives the source commit and tree itself, builds the immutable
-release, then rechecks that the live daemon
-is ready with no running work, pending inbox/outbox effects, ambiguous outbound
-effect or reconciliation before activation. Activation uses the same atomic
-link switch, supervised restart and automatic rollback as the approved
-self-improvement path. `build` and `activate` subcommands are also available
-when an operator deliberately needs the two phases separated.
+Rollback installs `automonique-web-entry.previous` through the same `.next`
+and rename sequence, then restarts and checks the service. Old dashboard
+release directories are not part of the procedure and may be removed later as
+a separately authorized cleanup.
+
+The daemon uses the same direct, atomic replacement pattern. Build the daemon
+and its sandbox entry helper, retain one previous copy of each, install through
+`.next` files, and restart only the daemon after its zero-work deployment gates
+pass:
+
+```sh
+cargo build --release --locked -p automonique --bin automonique
+cargo build --release --locked -p automonique-runner --bin automonique-launch-enter
+install -d -m 0700 "$XDG_STATE_HOME/automonique/bin"
+if test -x "$XDG_STATE_HOME/automonique/bin/automonique"; then
+  install -m 0700 "$XDG_STATE_HOME/automonique/bin/automonique" \
+    "$XDG_STATE_HOME/automonique/bin/automonique.previous"
+fi
+if test -x "$XDG_STATE_HOME/automonique/bin/automonique-launch-enter"; then
+  install -m 0700 "$XDG_STATE_HOME/automonique/bin/automonique-launch-enter" \
+    "$XDG_STATE_HOME/automonique/bin/automonique-launch-enter.previous"
+fi
+install -m 0700 target/release/automonique \
+  "$XDG_STATE_HOME/automonique/bin/automonique.next"
+install -m 0700 target/release/automonique-launch-enter \
+  "$XDG_STATE_HOME/automonique/bin/automonique-launch-enter.next"
+mv "$XDG_STATE_HOME/automonique/bin/automonique-launch-enter.next" \
+  "$XDG_STATE_HOME/automonique/bin/automonique-launch-enter"
+mv "$XDG_STATE_HOME/automonique/bin/automonique.next" \
+  "$XDG_STATE_HOME/automonique/bin/automonique"
+systemctl --user restart automonique.service
+"$XDG_STATE_HOME/automonique/bin/automonique" status --json
+```
+
+Before the restart, recheck that the live daemon is ready with no running work,
+pending inbox/outbox effects, ambiguous outbound effect or reconciliation.
+Rollback installs both `.previous` binaries through the same `.next` and rename
+sequence, then restarts and checks the service. The Manage fleet worker remains
+a separate service and is not restarted by a daemon-only deployment.

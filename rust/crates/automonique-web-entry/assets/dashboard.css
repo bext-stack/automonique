@@ -1066,6 +1066,11 @@ kbd { padding: 1px 4px; border: 1px solid var(--line-bright); border-bottom-colo
 .ticket-metric small { display: block; margin-top: 4px; overflow: hidden; color: var(--quiet); font-size: var(--font-xs); text-overflow: ellipsis; white-space: nowrap; }
 .ticket-metric:hover { border-color: var(--line-bright); transform: translateY(-1px); }
 .ticket-metric.is-active { border-color: var(--accent-border); background: linear-gradient(145deg, var(--accent-surface), var(--metric-end)); box-shadow: inset 0 2px 0 var(--green); }
+.ticket-sources { display: flex; gap: 6px; margin: 0 0 12px; }
+.ticket-sources button { display: inline-flex; min-height: 36px; gap: 8px; align-items: center; padding: 0 12px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); background: var(--panel); font-size: var(--font-sm); cursor: pointer; }
+.ticket-sources button:hover { border-color: var(--line-bright); color: var(--text); }
+.ticket-sources button.is-active { border-color: var(--accent-border); color: var(--green); background: var(--accent-surface); }
+.ticket-sources b { min-width: 22px; padding: 2px 6px; border-radius: 999px; color: var(--quiet); background: var(--panel-2); font: 600 var(--font-2xs) ui-monospace, monospace; text-align: center; }
 .operations-layout { display: grid; grid-template-columns: minmax(0, 1.85fr) minmax(270px, .75fr); gap: 14px; }
 .operations-catalog, .authority-panel { min-width: 0; }
 .tool-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; padding: 14px; }

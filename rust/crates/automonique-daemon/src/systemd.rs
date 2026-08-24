@@ -180,7 +180,7 @@ mod tests {
             "Environment=XDG_STATE_HOME=%S",
             "Delegate=yes",
             "Restart=on-failure",
-            "ExecStart=%S/automonique/improvement-code/current/bin/automonique daemon --foreground",
+            "ExecStart=%S/automonique/bin/automonique daemon --foreground",
         ] {
             assert!(
                 unit.lines().any(|line| line == directive),

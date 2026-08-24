@@ -35,6 +35,24 @@ pub struct AskOutcome {
     pub selected: Option<String>,
 }
 
+/// One exact deeper-lane request returned by the shared question router.
+///
+/// The escalation itself stays opaque to callers: an operator surface may
+/// render the preview and retain this value, but only [`AskHost`] can consume
+/// it after a decision. That keeps approval from becoming permission to
+/// substitute a different question or execution mode.
+pub struct AskApproval {
+    escalation: QuestionEscalation,
+}
+
+impl AskApproval {
+    /// The authority and scope the requester is being asked to grant.
+    #[must_use]
+    pub fn preview(&self) -> String {
+        self.escalation.preview()
+    }
+}
+
 /// Everything `ask` needs from the host, opened once.
 pub struct AskHost {
     surface: StoreControlSurface,
@@ -60,18 +78,25 @@ impl AskHost {
     /// surfaces: an absent GitHub or MCP configuration narrows what the router
     /// may select, it does not refuse the question.
     pub fn open(config: &crate::DaemonConfig) -> Result<Self, &'static str> {
-        let state_dir = config.state_dir();
-        let run_index_path = config.run_index_path();
-        let (administrators, configured) = crate::telegram::TelegramBotConfig::load(&state_dir)
+        Self::open_paths(&config.state_dir(), &config.runtime_dir())
+    }
+
+    /// Open the shared question path from already-resolved product paths.
+    ///
+    /// Hosted operator surfaces receive these exact paths from deployment
+    /// configuration and must not have to reconstruct their parent roots.
+    pub fn open_paths(state_dir: &Path, runtime_dir: &Path) -> Result<Self, &'static str> {
+        let run_index_path = state_dir.join(crate::RUN_INDEX_NAME);
+        let (administrators, configured) = crate::telegram::TelegramBotConfig::load(state_dir)
             .map_err(|_| "telegram_config_refused")?
             .map(|bot| bot.question_operator_ids())
             .unwrap_or_default();
-        let bot_id = crate::telegram::TelegramBotConfig::load(&state_dir)
+        let bot_id = crate::telegram::TelegramBotConfig::load(state_dir)
             .ok()
             .flatten()
             .map_or(0, |bot| bot.bot_id());
         let surface = StoreControlSurface::open_with_lease_time_source(
-            &config.database_path(),
+            &state_dir.join(crate::DATABASE_NAME),
             &run_index_path,
             HostFacts {
                 generation_id: crate::GENERATION_ID.to_owned(),
@@ -84,12 +109,12 @@ impl AskHost {
             Arc::new(crate::lease_time::BootTimeSource),
         )
         .map_err(|_| "control_surface_unavailable")?
-        .with_support_tickets(&config.support_tickets_path())
-        .with_operator_members(&config.operator_members_path())
+        .with_support_tickets(&state_dir.join(crate::SUPPORT_TICKETS_NAME))
+        .with_operator_members(&state_dir.join(crate::OPERATOR_MEMBERS_NAME))
         .with_prism_sites(Path::new(crate::site_inventory::NGINX_SITES_ENABLED))
-        .with_local_knowledge(&crate::local_knowledge::catalog_path(&state_dir))
-        .with_provider_state(&state_dir);
-        let surface = match crate::manage_config::ManageConfig::load(&state_dir)
+        .with_local_knowledge(&crate::local_knowledge::catalog_path(state_dir))
+        .with_provider_state(state_dir);
+        let surface = match crate::manage_config::ManageConfig::load(state_dir)
             .ok()
             .flatten()
             .and_then(|manage| manage.profile_app().cloned())
@@ -97,16 +122,20 @@ impl AskHost {
             Some(profile) => surface.with_manage_profiles(profile),
             None => surface,
         };
-        let lane = SocketRunLane::open(&state_dir, &config.admin_socket(), &run_index_path)
-            .map_err(|_| "run_lane_unavailable")?;
-        let github = crate::github::GitHubHost::load(&state_dir)
+        let lane = SocketRunLane::open(
+            state_dir,
+            &runtime_dir.join(crate::ADMIN_SOCKET_NAME),
+            &run_index_path,
+        )
+        .map_err(|_| "run_lane_unavailable")?;
+        let github = crate::github::GitHubHost::load(state_dir)
             .map_err(|_| "github_config_refused")?
             .into_surface();
         let github_configured = github.is_some();
-        let slack = crate::slack::SlackHost::open(&state_dir)
+        let slack = crate::slack::SlackHost::open(state_dir)
             .map_err(|_| "slack_config_refused")?
             .into_surface();
-        let slack_channels = crate::slack::SlackConfig::load(&state_dir)
+        let slack_channels = crate::slack::SlackConfig::load(state_dir)
             .ok()
             .flatten()
             .map(|slack| {
@@ -119,7 +148,7 @@ impl AskHost {
             })
             .unwrap_or_default();
         let mcp =
-            crate::mcp_client::McpRegistry::load(&state_dir).map_err(|_| "mcp_config_refused")?;
+            crate::mcp_client::McpRegistry::load(state_dir).map_err(|_| "mcp_config_refused")?;
         Ok(Self {
             surface,
             lane,
@@ -211,17 +240,33 @@ impl AskHost {
     /// Run the deeper lane for the escalation the last [`AskHost::ask`]
     /// produced, as an approved card would. `None` when there is none.
     pub fn approve_escalation(&mut self) -> Option<String> {
-        let escalation = self.pending.take()?;
-        Some(answer_approved_escalation(
+        let approval = self.take_pending_approval()?;
+        Some(self.decide_approval(approval, true))
+    }
+
+    /// Remove the exact escalation selected by the last question so another
+    /// operator surface can retain it behind its native approval UI.
+    pub fn take_pending_approval(&mut self) -> Option<AskApproval> {
+        self.pending
+            .take()
+            .map(|escalation| AskApproval { escalation })
+    }
+
+    /// Resolve one retained escalation. Denial performs no read or run.
+    pub fn decide_approval(&mut self, approval: AskApproval, granted: bool) -> String {
+        if !granted {
+            return String::from("Denied. The deeper investigation was not run.");
+        }
+        answer_approved_escalation(
             &mut self.surface,
             &mut self.lane,
             self.github
                 .as_deref_mut()
                 .map(|github| github as &mut dyn crate::github::GitHubSurface),
-            &escalation,
+            &approval.escalation,
             &self.administrators,
             &self.configured,
             "cli_ask",
-        ))
+        )
     }
 }

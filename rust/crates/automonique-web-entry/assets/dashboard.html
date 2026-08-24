@@ -28,7 +28,7 @@
           <button class="nav-item is-active" data-view="overview" title="Overview"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"></path></svg></span><span class="nav-label">Overview</span></button>
           <button class="nav-item" data-view="chat" title="Chat"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 5h14v11H9l-4 3z"></path></svg></span><span class="nav-label">Chat</span></button>
           <button class="nav-item" data-view="operations" title="AI Operations"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 7h14M5 12h14M5 17h14M8 4v6M16 9v6M11 14v6"></path></svg></span><span class="nav-label">AI Operations</span></button>
-          <button class="nav-item" data-view="tickets" title="Tickets"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 5h14v14H5zM8 9h8M8 13h5M8 17h3"></path></svg></span><span class="nav-label">Tickets</span></button>
+          <button class="nav-item" data-view="tickets" title="Work queues"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 5h14v14H5zM8 9h8M8 13h5M8 17h3"></path></svg></span><span class="nav-label">Work queues</span></button>
           <button class="nav-item" data-view="memory" title="Memory"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3 4.5 7v10L12 21l7.5-4V7zM4.5 7 12 11l7.5-4M12 11v10"></path></svg></span><span class="nav-label">Memory</span></button>
           <button class="nav-item" data-view="configuration" title="Configuration"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7zM19 12l2-1-2-3.5-2.2.5a8 8 0 0 0-1.7-1L14.5 5h-5L9 7a8 8 0 0 0-1.8 1L5 7.5 3 11l2 1v2l-2 1 2 3.5 2.2-.5a8 8 0 0 0 1.8 1l.5 2h5l.6-2a8 8 0 0 0 1.7-1l2.2.5 2-3.5-2-1z"></path></svg></span><span class="nav-label">Configuration</span></button>
         </nav>
@@ -174,7 +174,7 @@
 
           <section class="view" data-panel="operations" aria-labelledby="operations-title">
             <div class="page-heading compact">
-              <div><p class="kicker">DISCOVERED / AUTHORITY-AWARE / LIVE</p><h1 id="operations-title">AI Operations</h1><p class="page-lede">See every active and recent agent process, inspect its live output, and open the exact run in Manage. Every mutation remains staged for explicit approval.</p></div>
+              <div><p class="kicker">DISCOVERED / AUTHORITY-AWARE / LIVE</p><h1 id="operations-title">AI Operations</h1><p class="page-lede">Monitor agent execution and use the relevant capabilities discovered independently from Support and Manage. Every mutation remains staged for explicit approval.</p></div>
               <div class="heading-actions"><button class="button secondary" id="operations-refresh" type="button">Refresh</button><a class="button primary" id="operations-manage-link" data-manage-link rel="noreferrer" target="_blank" hidden>Open AI Operations ↗</a></div>
             </div>
             <div class="integration-banner" id="operations-banner" data-state="loading"><span class="integration-orb" aria-hidden="true"></span><div><strong id="operations-health">Connecting to AI Operations</strong><small id="operations-detail">Discovering the live capability catalog…</small></div><span class="tag" id="operations-authority">CHECKING</span></div>
@@ -214,7 +214,7 @@
             </article>
             <div class="operations-layout">
               <article class="panel operations-catalog">
-                <div class="panel-head"><div><p class="kicker">LIVE MCP CATALOG</p><h2>Connected capabilities</h2></div><span class="tag" id="operations-catalog-tag">DISCOVERING</span></div>
+                <div class="panel-head"><div><p class="kicker">SUPPORT + MANAGE</p><h2>Connected capabilities</h2></div><span class="tag" id="operations-catalog-tag">DISCOVERING</span></div>
                 <div class="tool-grid" id="operations-tool-grid"><div class="integration-empty">Loading AI Operations capabilities…</div></div>
               </article>
               <aside class="panel authority-panel">
@@ -227,9 +227,10 @@
 
           <section class="view" data-panel="tickets" aria-labelledby="tickets-title">
             <div class="page-heading compact">
-              <div><p class="kicker">LIVE / TRIAGED / ACTIONABLE</p><h1 id="tickets-title">Tickets</h1><p class="page-lede">A focused queue from AI Operations, with live status and safe handoff into Monique for follow-up.</p></div>
-              <div class="heading-actions"><button class="button secondary" id="tickets-refresh" type="button">Refresh</button><button class="button primary" type="button" data-open-chat="Review the current ticket queue, summarize priorities, and recommend the next action.">Review with Monique</button></div>
+              <div><p class="kicker">SUPPORT / MANAGE / DISTINCT STATE</p><h1 id="tickets-title">Work queues</h1><p class="page-lede">Support tickets and Manage issue work in one operator view, clearly sourced so customer support, execution, and delivery state never collapse into one status.</p></div>
+              <div class="heading-actions"><button class="button secondary" id="tickets-refresh" type="button">Refresh</button><a class="button secondary" data-manage-link rel="noreferrer" target="_blank" hidden>Open Manage ↗</a><button class="button primary" type="button" data-open-chat="Review the current Support and Manage work queues, summarize priorities by source, and recommend the next action.">Review with Monique</button></div>
             </div>
+            <div class="ticket-sources" role="group" aria-label="Filter by work source"><button class="is-active" type="button" data-ticket-surface="all">All sources <b id="ticket-source-all">0</b></button><button type="button" data-ticket-surface="support">Support <b id="ticket-source-support">0</b></button><button type="button" data-ticket-surface="manage">Manage <b id="ticket-source-manage">0</b></button></div>
             <div class="ticket-metrics" aria-label="Ticket counts">
               <button class="ticket-metric is-active" type="button" data-ticket-filter-shortcut="all"><span>TOTAL</span><strong id="tickets-total">—</strong><small>in the live queue</small></button>
               <button class="ticket-metric" type="button" data-ticket-filter-shortcut="open"><span>OPEN</span><strong id="tickets-open">—</strong><small>awaiting progress</small></button>
@@ -238,16 +239,16 @@
               <button class="ticket-metric" type="button" data-ticket-filter-shortcut="urgent"><span>URGENT</span><strong id="tickets-urgent">—</strong><small>highest priority</small></button>
             </div>
             <div class="ticket-controls panel">
-              <label class="ticket-search" for="tickets-search"><span>Search tickets</span><div><i aria-hidden="true">⌕</i><input id="tickets-search" type="search" maxlength="160" autocomplete="off" placeholder="ID, title, tenant, site or person"><button id="tickets-search-clear" type="button" aria-label="Clear ticket search" hidden>×</button></div></label>
+              <label class="ticket-search" for="tickets-search"><span>Search work items</span><div><i aria-hidden="true">⌕</i><input id="tickets-search" type="search" maxlength="160" autocomplete="off" placeholder="ID, title, source, tenant, site or person"><button id="tickets-search-clear" type="button" aria-label="Clear work search" hidden>×</button></div></label>
               <label class="ticket-sort" for="tickets-sort"><span>Sort by</span><select id="tickets-sort"><option value="updated_desc">Recently updated</option><option value="priority">Priority</option><option value="status">Status</option><option value="created_asc">Oldest first</option><option value="title">Title</option></select></label>
             </div>
             <div class="ticket-toolbar">
               <div class="ticket-filters" role="group" aria-label="Filter tickets"><button class="is-active" type="button" data-ticket-filter="all">All <b id="ticket-filter-all">0</b></button><button type="button" data-ticket-filter="open">Open <b id="ticket-filter-open">0</b></button><button type="button" data-ticket-filter="in_progress">In progress <b id="ticket-filter-progress">0</b></button><button type="button" data-ticket-filter="blocked">Blocked <b id="ticket-filter-blocked">0</b></button><button type="button" data-ticket-filter="urgent">Urgent <b id="ticket-filter-urgent">0</b></button><button type="button" data-ticket-filter="done">Done <b id="ticket-filter-done">0</b></button></div>
-              <div class="ticket-result-state"><strong id="tickets-state" role="status">Connecting to ticket intake…</strong><small id="tickets-source">Waiting for a live source</small></div>
+              <div class="ticket-result-state"><strong id="tickets-state" role="status">Connecting to work sources…</strong><small id="tickets-source">Waiting for live sources</small></div>
             </div>
             <div class="ticket-queue panel">
-              <div class="ticket-list-head" aria-hidden="true"><span>Ticket</span><span>Context</span><span>Lifecycle</span><span>Actions</span></div>
-              <div class="ticket-list" id="ticket-list"><div class="integration-empty">Loading the live ticket queue…</div></div>
+              <div class="ticket-list-head" aria-hidden="true"><span>Work item</span><span>Context</span><span>Lifecycle</span><span>Actions</span></div>
+              <div class="ticket-list" id="ticket-list"><div class="integration-empty">Loading the live work queues…</div></div>
             </div>
           </section>
 
@@ -309,7 +310,7 @@
                     <label class="config-field" for="configuration-language"><span><strong>Language</strong><small>Interface, labels and navigation</small></span><select id="configuration-language"><option value="en">English</option><option value="fr">Français</option></select></label>
                     <label class="config-field" for="configuration-text-scale"><span><strong>Text size</strong><small>Scalable typography across the whole app</small></span><select id="configuration-text-scale"><option value="compact">Compact</option><option value="standard">Standard</option><option value="comfortable">Comfortable</option><option value="large">Large</option><option value="extra-large">Extra large</option></select></label>
                     <label class="config-field" for="configuration-density"><span><strong>Interface density</strong><small>Control information spacing</small></span><select id="configuration-density"><option value="compact">Compact</option><option value="comfortable">Comfortable</option><option value="spacious">Spacious</option></select></label>
-                    <label class="config-field" for="configuration-startup"><span><strong>Start page</strong><small>Default destination when opening Monique</small></span><select id="configuration-startup"><option value="chat">Chat</option><option value="overview">Overview</option><option value="operations">AI Operations</option><option value="tickets">Tickets</option></select></label>
+                    <label class="config-field" for="configuration-startup"><span><strong>Start page</strong><small>Default destination when opening Monique</small></span><select id="configuration-startup"><option value="chat">Chat</option><option value="overview">Overview</option><option value="operations">AI Operations</option><option value="tickets">Work queues</option></select></label>
                     <label class="config-field switch-field" for="configuration-motion"><span><strong>Reduce motion</strong><small>Limit animation and interface transitions</small></span><input class="switch" id="configuration-motion" type="checkbox"></label>
                   </div>
                 </article>
@@ -380,7 +381,7 @@
       <div class="interface-settings">
         <label class="setting-row" for="language-select"><span><strong>Language</strong><small>Interface and navigation language</small></span><select id="language-select"><option value="en">English</option><option value="fr">Français</option></select></label>
         <div class="setting-block"><span>Interface density</span><div class="density-control" role="group" aria-label="Interface density"><button type="button" data-density-choice="compact">Compact</button><button type="button" data-density-choice="comfortable">Comfortable</button><button type="button" data-density-choice="spacious">Spacious</button></div></div>
-        <label class="setting-row" for="startup-view"><span><strong>Start page</strong><small>Default view when no direct link is used</small></span><select id="startup-view"><option value="chat">Chat</option><option value="overview">Overview</option><option value="operations">AI Operations</option><option value="tickets">Tickets</option></select></label>
+        <label class="setting-row" for="startup-view"><span><strong>Start page</strong><small>Default view when no direct link is used</small></span><select id="startup-view"><option value="chat">Chat</option><option value="overview">Overview</option><option value="operations">AI Operations</option><option value="tickets">Work queues</option></select></label>
         <label class="setting-row" for="reduce-motion"><span><strong>Reduce motion</strong><small>Limit interface animation and transitions</small></span><input class="switch" id="reduce-motion" type="checkbox"></label>
         <button class="reset-appearance" id="reset-appearance" type="button">Reset appearance defaults</button>
       </div>

@@ -24,6 +24,7 @@ let processesSnapshot = null;
 let processFilter = "all";
 const expandedProcesses = new Set();
 let ticketFilter = "all";
+let ticketSurface = "all";
 let ticketQuery = "";
 let ticketSort = "updated_desc";
 let lastObservedMs = null;
@@ -56,6 +57,8 @@ const frenchUi = Object.freeze({
   "CHAT": "DISCUSSION",
   "Tickets": "Tickets",
   "TICKETS": "TICKETS",
+  "Work queues": "Files de travail",
+  "WORK QUEUES": "FILES DE TRAVAIL",
   "Memory": "Mémoire",
   "MEMORY": "MÉMOIRE",
   "Configuration": "Configuration",
@@ -1315,7 +1318,7 @@ function showView(name) {
     node.classList.toggle("is-active", active);
     if (active) node.setAttribute("aria-current", "page"); else node.removeAttribute("aria-current");
   });
-  byId("current-view").textContent = name.toUpperCase();
+  byId("current-view").textContent = name === "tickets" ? "WORK QUEUES" : name.toUpperCase();
   if (window.location.hash !== `#${name}`) history.replaceState(null, "", `#${name}`);
   if (name === "memory") loadMemory(memoryQuery);
   if (name === "operations" || name === "tickets") loadOperations();
@@ -1682,10 +1685,11 @@ function operationLabel(value) {
 
 function operationsMessage(health) {
   const messages = {
-    attached: ["AI Operations connected", "Live tools are discovered from the authenticated control plane."],
-    not_attached: ["AI Operations is not attached", "Configure one same-origin Manage MCP server to enable live capabilities."],
-    unavailable: ["AI Operations is unavailable", "The configured control plane did not return a valid capability catalog."],
-    busy: ["AI Operations is busy", "Another contained request is using the live tool connection. Try again shortly."],
+    attached: ["Operational services connected", "Live capabilities are discovered independently from Support and Manage."],
+    degraded: ["Operational services partially available", "At least one configured service is connected while another needs attention."],
+    not_attached: ["Operational services are not attached", "Configure the Support and Manage MCP servers to enable their relevant capabilities."],
+    unavailable: ["Operational services are unavailable", "The configured services did not return a valid capability catalog."],
+    busy: ["Operational services are busy", "Another contained request is using the live tool connections. Try again shortly."],
   };
   return messages[health] || ["AI Operations state unknown", "Refresh to discover the current control-plane state."];
 }
@@ -2104,7 +2108,8 @@ function renderOperationsCatalog(tools) {
     card.className = "tool-card";
     const head = document.createElement("div");
     const category = document.createElement("span");
-    category.textContent = operationLabel(tool.category);
+    category.textContent = `${operationLabel(tool.surface)} · ${operationLabel(tool.category)}`;
+    category.title = `Configured server: ${tool.server}`;
     const authority = document.createElement("i");
     authority.className = tool.authority === "read_only" ? "safe" : "approval";
     authority.textContent = tool.authority === "read_only" ? "SAFE READ" : "APPROVAL";
@@ -2114,14 +2119,14 @@ function renderOperationsCatalog(tools) {
     title.textContent = operationLabel(tool.name);
     const description = document.createElement("p");
     if (tool.description) description.setAttribute("data-i18n-skip", "");
-    description.textContent = tool.description || "Live AI Operations capability.";
+    description.textContent = tool.description || "Live connected-service capability.";
     const footer = document.createElement("div");
     const input = document.createElement("small");
     input.textContent = tool.requires_input ? "Details required" : "Ready to plan";
     const use = document.createElement("button");
     use.type = "button";
     use.textContent = "Use with Monique →";
-    use.dataset.openChat = `Help me use the AI Operations capability “${operationLabel(tool.name)}”. Explain what it does, collect any required details, and stage any mutation for my approval.`;
+    use.dataset.openChat = `Help me use the ${operationLabel(tool.surface)} capability “${operationLabel(tool.name)}”. Explain what it does, collect any required details, and stage any mutation for my approval.`;
     footer.append(input, use);
     card.append(head, title, description, footer);
     root.append(card);
@@ -2186,9 +2191,10 @@ function filteredTickets() {
   const items = operationsSnapshot?.tickets?.items || [];
   const query = ticketQuery.trim().toLocaleLowerCase(localeTag());
   const visible = items.filter((ticket) => {
+    if (ticketSurface !== "all" && ticket.integration !== ticketSurface) return false;
     if (!ticketMatchesStatus(ticket, ticketFilter)) return false;
     if (!query) return true;
-    return [ticket.id, ticket.title, ticket.tenant, ticket.site, ticket.assignee, ticket.requester, ticket.source, ticket.status, ticket.workflow]
+    return [ticket.id, ticket.title, ticket.integration, ticket.integration_server, ticket.tenant, ticket.site, ticket.assignee, ticket.requester, ticket.source, ticket.status, ticket.workflow]
       .filter(Boolean)
       .some((value) => String(value).toLocaleLowerCase(localeTag()).includes(query));
   });
@@ -2203,6 +2209,15 @@ function filteredTickets() {
   });
 }
 
+function setTicketSurface(surface) {
+  ticketSurface = ["all", "support", "manage"].includes(surface) ? surface : "all";
+  document.querySelectorAll("[data-ticket-surface]").forEach((item) => {
+    const active = item.dataset.ticketSurface === ticketSurface;
+    item.classList.toggle("is-active", active);
+    item.setAttribute("aria-pressed", String(active));
+  });
+}
+
 function safeTicketLink(value) {
   try {
     const parsed = new URL(value);
@@ -2214,13 +2229,14 @@ function safeTicketLink(value) {
 
 function ticketEmptyMessage(health) {
   const messages = {
-    empty: "The connected ticket queue is currently empty.",
-    no_read_surface: "AI Operations is connected, but it does not advertise a zero-input read-only ticket list.",
-    input_required: "The ticket source needs additional scope. Ask Monique to retrieve the exact queue you need.",
-    unavailable: "The live ticket source is temporarily unavailable.",
-    not_attached: "Attach AI Operations to load the live ticket queue.",
+    empty: "The connected work queues are currently empty.",
+    no_read_surface: "The services are connected, but they do not advertise a zero-input read-only queue.",
+    input_required: "A work source needs additional scope. Ask Monique to retrieve the exact queue you need.",
+    unavailable: "The live work sources are temporarily unavailable.",
+    degraded: "One work source is unavailable; available items are shown below.",
+    not_attached: "Attach Support and Manage to load their work queues.",
   };
-  return messages[health] || "No tickets match this filter.";
+  return messages[health] || "No work items match this filter.";
 }
 
 function setTicketFilter(filter) {
@@ -2250,6 +2266,11 @@ function ticketDetail(labelText, value, title = null) {
 
 function renderTickets() {
   const tickets = operationsSnapshot?.tickets?.items || [];
+  const support = tickets.filter((ticket) => ticket.integration === "support").length;
+  const manage = tickets.filter((ticket) => ticket.integration === "manage").length;
+  byId("ticket-source-all").textContent = count(tickets.length);
+  byId("ticket-source-support").textContent = count(support);
+  byId("ticket-source-manage").textContent = count(manage);
   const open = tickets.filter((ticket) => ticketMatchesStatus(ticket, "open")).length;
   const progress = tickets.filter((ticket) => ticketMatchesStatus(ticket, "in_progress")).length;
   const blocked = tickets.filter((ticket) => ticketMatchesStatus(ticket, "blocked")).length;
@@ -2265,11 +2286,13 @@ function renderTickets() {
   });
   const visible = filteredTickets();
   const health = operationsSnapshot?.tickets?.health || "not_attached";
-  byId("tickets-state").textContent = health === "ready"
-    ? `${visible.length.toLocaleString(localeTag())} of ${tickets.length.toLocaleString(localeTag())} tickets`
+  byId("tickets-state").textContent = ["ready", "degraded"].includes(health)
+    ? `${visible.length.toLocaleString(localeTag())} of ${tickets.length.toLocaleString(localeTag())} work items`
     : ticketEmptyMessage(health);
-  const source = operationsSnapshot?.tickets?.source_tool;
-  byId("tickets-source").textContent = source ? `Live source · ${operationLabel(source)}` : "Waiting for a live source";
+  const sources = operationsSnapshot?.tickets?.sources || [];
+  byId("tickets-source").textContent = sources.length
+    ? sources.map((source) => `${operationLabel(source.surface)}: ${operationLabel(source.health)}`).join(" · ")
+    : "Waiting for live sources";
   const root = byId("ticket-list");
   root.replaceChildren();
   if (visible.length === 0) {
@@ -2279,9 +2302,10 @@ function renderTickets() {
     title.textContent = ticketEmptyMessage(health === "ready" ? "filtered" : health);
     const action = document.createElement("button");
     action.type = "button";
-    if (health === "ready" && (ticketFilter !== "all" || ticketQuery)) {
+    if (["ready", "degraded"].includes(health) && (ticketSurface !== "all" || ticketFilter !== "all" || ticketQuery)) {
       action.textContent = "Clear filters";
       action.addEventListener("click", () => {
+        setTicketSurface("all");
         setTicketFilter("all");
         ticketQuery = "";
         byId("tickets-search").value = "";
@@ -2289,8 +2313,8 @@ function renderTickets() {
         renderTickets();
       });
     } else {
-      action.textContent = "Ask Monique about tickets";
-      action.dataset.openChat = "Inspect the available AI Operations ticket capabilities and help me retrieve or review the right ticket queue.";
+      action.textContent = "Ask Monique about work";
+      action.dataset.openChat = "Inspect the available Support and Manage capabilities and help me retrieve or review the right work queue.";
     }
     empty.append(title, action);
     root.append(empty);
@@ -2322,7 +2346,7 @@ function renderTickets() {
     if (ticket.updated_at) meta.title = ticketDateLabel(ticket.updated_at);
     const facts = document.createElement("div");
     facts.className = "ticket-facts";
-    [ticket.tenant, ticket.site, ticket.requester ? `By ${ticket.requester}` : null, Number.isSafeInteger(ticket.comments) ? `${ticket.comments} comments` : null]
+    [ticket.integration ? operationLabel(ticket.integration) : null, ticket.tenant, ticket.site, ticket.requester ? `By ${ticket.requester}` : null, Number.isSafeInteger(ticket.comments) ? `${ticket.comments} comments` : null]
       .filter(Boolean)
       .slice(0, 3)
       .forEach((value) => {
@@ -2359,7 +2383,7 @@ function renderTickets() {
     const ask = document.createElement("button");
     ask.type = "button";
     ask.textContent = "Review";
-    ask.dataset.openChat = `Review ticket ${ticket.id}: “${ticket.title}”. Summarize its current state and recommend the next action.`;
+    ask.dataset.openChat = `Review this ${ticket.integration || "work"} item ${ticket.id}: “${ticket.title}”. Summarize its current state and recommend the next action without conflating Support, Manage, or GitHub state.`;
     actions.append(detailsButton, ask);
     const href = safeTicketLink(ticket.url);
     if (href) {
@@ -2376,6 +2400,8 @@ function renderTickets() {
     details.hidden = true;
     [
       ["Ticket ID", fullReference],
+      ["Integration", ticket.integration ? operationLabel(ticket.integration) : null],
+      ["Configured server", ticket.integration_server],
       ["Priority", operationLabel(ticket.priority)],
       ["Workflow", ticketStatusLabel(ticket.workflow)],
       ["Assignee", ticket.assignee || "Unassigned"],
@@ -2406,12 +2432,12 @@ function renderOperations(view) {
   byId("operations-banner").dataset.state = view.health;
   byId("operations-health").textContent = title;
   byId("operations-detail").textContent = detail;
-  byId("operations-authority").textContent = view.health === "attached" ? "AUTHORITY BOUNDED" : "NOT ATTACHED";
+  byId("operations-authority").textContent = ["attached", "degraded"].includes(view.health) ? "AUTHORITY BOUNDED" : "NOT ATTACHED";
   byId("operations-tools").textContent = count(view.tools_total);
   byId("operations-reads").textContent = count(view.read_only_tools);
   byId("operations-actions").textContent = count(view.approval_tools);
   byId("operations-pending").textContent = count(view.pending_actions);
-  byId("operations-catalog-tag").textContent = view.health === "attached" ? `${count(view.tools_total)} LIVE` : "UNAVAILABLE";
+  byId("operations-catalog-tag").textContent = ["attached", "degraded"].includes(view.health) ? `${count(view.tools_total)} LIVE` : "UNAVAILABLE";
   renderOperationsCatalog(view.tools || []);
   renderTickets();
 }
@@ -2426,7 +2452,7 @@ async function loadOperations(force = false) {
     byId("operations-banner").dataset.state = "unavailable";
     byId("operations-health").textContent = "AI Operations unavailable";
     byId("operations-detail").textContent = error.message;
-    byId("tickets-state").textContent = "Ticket intake unavailable";
+    byId("tickets-state").textContent = "Work queues unavailable";
     toast("AI Operations could not be refreshed.", "error");
   } finally {
     [byId("operations-refresh"), byId("tickets-refresh")].forEach((button) => { button.disabled = false; });
@@ -2451,6 +2477,10 @@ document.querySelectorAll("[data-process-filter]").forEach((button) => button.ad
   if (processesSnapshot) renderProcesses(processesSnapshot);
 }));
 byId("tickets-refresh").addEventListener("click", () => loadOperations(true));
+document.querySelectorAll("[data-ticket-surface]").forEach((button) => button.addEventListener("click", () => {
+  setTicketSurface(button.dataset.ticketSurface);
+  renderTickets();
+}));
 document.querySelectorAll("[data-ticket-filter]").forEach((button) => button.addEventListener("click", () => {
   setTicketFilter(button.dataset.ticketFilter);
   renderTickets();
@@ -3453,6 +3483,11 @@ function humanChatError(category) {
     manage_action_not_pending: "That Manage action is no longer pending. Nothing was run.",
     manage_action_expired: "That Manage action expired. Ask Monique to prepare it again.",
     manage_action_additional_approval_refused: "Manage requested another approval step, so execution stopped.",
+    permission_request_not_pending: "That permission request is no longer pending. Nothing was run.",
+    permission_request_expired: "That permission request expired. Ask Monique to prepare it again.",
+    permission_request_capacity: "Too many permission requests are awaiting decisions. Resolve one and try again.",
+    permission_request_unavailable: "Monique could not retain the permission request safely. Nothing further was run.",
+    shared_assistant_unavailable: "Monique’s shared approval lane is temporarily unavailable. Nothing further was run.",
   };
   return messages[category] || `The contained conversation lane refused this turn (${category}).`;
 }

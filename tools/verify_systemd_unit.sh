@@ -7,16 +7,18 @@ repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 verify_state=$(mktemp -d)
 trap 'rm -rf -- "$verify_state"' EXIT HUP INT TERM
 
-release_bin="$verify_state/automonique/improvement-code/current/bin"
-web_entry_bin="$verify_state/automonique/web-entry/current/bin"
+daemon_bin="$verify_state/automonique/bin"
+worker_bin="$verify_state/automonique/improvement-code/current/bin"
+web_entry_bin="$verify_state/automonique/web-entry/bin"
 tunnel_bin="$verify_state/bin"
 unit_dir="$verify_state/systemd"
-mkdir -p "$release_bin"
+mkdir -p "$daemon_bin"
+mkdir -p "$worker_bin"
 mkdir -p "$web_entry_bin"
 mkdir -p "$tunnel_bin"
 mkdir -p "$unit_dir"
-cp /bin/true "$release_bin/automonique"
-cp /bin/true "$release_bin/automonique-manage-worker"
+cp /bin/true "$daemon_bin/automonique"
+cp /bin/true "$worker_bin/automonique-manage-worker"
 cp /bin/true "$web_entry_bin/automonique-web-entry"
 cp /bin/true "$tunnel_bin/cloudflared"
 
