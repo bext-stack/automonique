@@ -3325,15 +3325,24 @@ fn ticket_approval_failure(reason: &str) -> String {
 }
 
 impl<P: SlackTicketPoster> SlackTicketRouter<P> {
-    fn poll_ticket_notifications(&mut self) {
+    fn poll_ticket_notifications(&mut self, stop: &AtomicBool) {
         let notifications = self.gates.lock().map_or_else(
             |_| Vec::new(),
             |gates| gates.pending_slack_notifications(MAX_SLACK_TICKET_STATUS_POLLS),
         );
         for notification in notifications {
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
             let Ok(status) = self.manage.ticket_status(&notification.job_id) else {
                 continue;
             };
+            // A status read already in flight is allowed to settle, but a
+            // stop observed after it starts no new Slack effect. The durable
+            // notification remains unclaimed for the successor to inspect.
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
             let Some(text) = slack_ticket_terminal_text(&notification, &status) else {
                 continue;
             };
@@ -5227,7 +5236,7 @@ fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
                 // connection: keep the established websocket and check the
                 // stop flag again instead of churning apps.connections.open.
                 SlackReceiveDisposition::Idle => {
-                    poll_slack_ticket_notifications(worker);
+                    poll_slack_ticket_notifications(worker, stop);
                     continue;
                 }
                 SlackReceiveDisposition::Reconnect => break,
@@ -5365,12 +5374,15 @@ fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
             if let Some(command) = monique_command {
                 worker.router.handle_monique_command(command, "");
             }
-            poll_slack_ticket_notifications(worker);
+            poll_slack_ticket_notifications(worker, stop);
         }
     }
 }
 
-fn poll_slack_ticket_notifications(worker: &mut SlackTicketWorker) {
+fn poll_slack_ticket_notifications(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
+    if stop.load(Ordering::Acquire) {
+        return;
+    }
     let now = Instant::now();
     if worker
         .last_ticket_status_poll
@@ -5379,7 +5391,7 @@ fn poll_slack_ticket_notifications(worker: &mut SlackTicketWorker) {
         return;
     }
     worker.last_ticket_status_poll = Some(now);
-    worker.router.poll_ticket_notifications();
+    worker.router.poll_ticket_notifications(stop);
 }
 
 fn generation_canary_message(
@@ -7127,6 +7139,7 @@ mod tests {
         status_reads: Arc<std::sync::Mutex<Vec<String>>>,
         status: Option<automonique_support_connector::TicketStatus>,
         canonical_source: Option<String>,
+        stop_after_status: Option<Arc<AtomicBool>>,
     }
 
     struct FakeQuestionAnswerer {
@@ -7402,6 +7415,9 @@ mod tests {
                 .lock()
                 .expect("status reads")
                 .push(job_id.to_owned());
+            if let Some(stop) = self.stop_after_status.take() {
+                stop.store(true, Ordering::Release);
+            }
             self.status.clone().ok_or_else(|| String::from("not used"))
         }
     }
@@ -8670,8 +8686,10 @@ mod tests {
     fn terminal_ticket_status_mentions_the_requester_and_links_the_completion_comment_once() {
         let poster = FakeTicketPoster::default();
         let messages = Arc::clone(&poster.messages);
+        let stop = Arc::new(AtomicBool::new(true));
         let manage = FakeManage {
             status: Some(done_ticket_status()),
+            stop_after_status: Some(Arc::clone(&stop)),
             ..FakeManage::default()
         };
         let status_reads = Arc::clone(&manage.status_reads);
@@ -8705,12 +8723,35 @@ mod tests {
             ),
             "",
         );
-        router.poll_ticket_notifications();
-        router.poll_ticket_notifications();
-
+        router.poll_ticket_notifications(&stop);
+        assert!(
+            status_reads.lock().expect("status reads").is_empty(),
+            "shutdown must not begin another Manage request"
+        );
+        stop.store(false, Ordering::Release);
+        router.poll_ticket_notifications(&stop);
         assert_eq!(
             status_reads.lock().expect("status reads").as_slice(),
             [String::from("job-fixture-123456")]
+        );
+        assert!(
+            !messages
+                .lock()
+                .expect("messages")
+                .iter()
+                .any(|message| message.contains("Monique completed the ticket work")),
+            "a stop observed after status must leave the durable notification for the successor"
+        );
+        stop.store(false, Ordering::Release);
+        router.poll_ticket_notifications(&stop);
+        router.poll_ticket_notifications(&stop);
+
+        assert_eq!(
+            status_reads.lock().expect("status reads").as_slice(),
+            [
+                String::from("job-fixture-123456"),
+                String::from("job-fixture-123456")
+            ]
         );
         let messages = messages.lock().expect("messages");
         let completions: Vec<_> = messages
