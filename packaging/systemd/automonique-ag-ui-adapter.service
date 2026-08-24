@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+[Unit]
+Description=Automonique AG-UI adapter
+After=automonique.service automonique-dev.service network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%S/automonique/ag-ui-adapter.conf
+ExecStart=%h/.bun/bin/bun %S/automonique/ag-ui-adapter/src/main.ts
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+MemoryMax=256M
+TasksMax=64
+StateDirectory=automonique
+StateDirectoryMode=0700
+Environment=XDG_RUNTIME_DIR=%t
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=read-only
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0077
+
+[Install]
+WantedBy=default.target

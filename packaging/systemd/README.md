@@ -113,6 +113,22 @@ with owner authority for the public hostname and production change.
 Before replacing an installed unit, verify the checked-in file with
 `tools/verify_systemd_unit.sh`.
 
+The AG-UI adapter is installed as its own immutable source bundle and supervised
+by `automonique-ag-ui-adapter.service`. Its private configuration supplies only
+deployment values: the peer-authenticated local Platform and progress sockets,
+the active node coordinate, the existing fleet token file, and optional port. Activate a staged bundle by
+switching `%S/automonique/ag-ui-adapter` atomically, then restart only the
+adapter and require both probes:
+
+```sh
+systemctl --user restart automonique-ag-ui-adapter.service
+curl --fail --silent http://127.0.0.1:18083/healthz
+adapter_token=$(sed -n 's/^token=//p' "$AUTOMONIQUE_AG_UI_TOKEN_FILE")
+curl --fail --silent --header "Authorization: Bearer $adapter_token" \
+  http://127.0.0.1:18083/readyz
+unset adapter_token
+```
+
 The dashboard deliberately uses a direct binary install. It does not use a
 content-addressed release builder or a `current` symlink. Build it,
 stage one replacement beside the installed binary, retain one previous binary,
