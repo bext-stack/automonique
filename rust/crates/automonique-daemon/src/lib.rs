@@ -42,8 +42,9 @@
 //! batch registry throttles nothing. It establishes no release trust —
 //! nothing in this crate calls `release_trust_root`, so a provider binary is
 //! admitted by pinned digest and workspace identity, never by an attested
-//! signature. Its only structured-log surface is a bounded readiness record,
-//! and it cannot acknowledge a Telegram callback query.
+//! signature. Its structured-log surface is limited to bounded, content-free
+//! readiness and shutdown-drain records, and it cannot acknowledge a Telegram
+//! callback query.
 
 use std::error::Error;
 use std::fmt;
@@ -455,6 +456,7 @@ const LEASE_RENEW_INTERVAL_MS: i64 = 10_000;
 const TELEGRAM_LEASE_TTL_MS: i64 = 20_000;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const ACCEPT_POLL: Duration = Duration::from_millis(25);
+const SHUTDOWN_WORKER_DIAGNOSTIC_BUDGET: Duration = Duration::from_secs(20);
 const STARTUP_TIMEOUT_EXTENSION: Duration = Duration::from_secs(5 * 60);
 
 /// Refusal category both intake lanes answer with while an operator pause is
@@ -2162,22 +2164,40 @@ impl Daemon {
         // [`progress_hub`] — and cancellation remains the explicit dispatcher
         // path through [`Daemon::cancel_run`].
         let mut shutdown_workers = Vec::new();
-        shutdown_workers.extend(self.managed_tui.begin_shutdown());
+        shutdown_workers.extend(named_shutdown_workers(
+            "managed_tui",
+            self.managed_tui.begin_shutdown(),
+        ));
         if let Some(progress_endpoint) = self.progress_endpoint.take() {
-            shutdown_workers.extend(progress_endpoint.begin_shutdown());
+            shutdown_workers.extend(named_shutdown_workers(
+                "progress_endpoint",
+                progress_endpoint.begin_shutdown(),
+            ));
         }
         if let Some(execution) = self.execution.take() {
-            shutdown_workers.extend(execution.begin_shutdown());
+            shutdown_workers.extend(named_shutdown_workers(
+                "execution",
+                execution.begin_shutdown(),
+            ));
         }
-        shutdown_workers.extend(self.slack_tickets.begin_shutdown());
+        shutdown_workers.extend(named_shutdown_workers(
+            "slack_tickets",
+            self.slack_tickets.begin_shutdown(),
+        ));
         // Support intake ends beside them, and for the same reason: its worker
         // writes to a durable sibling database this generation owns, so it must
         // stop and be joined while the generation is still held. It has no
         // durable lease of its own to release — it owns no cursor, so there is
         // nothing a second poller could double-advance — which is why this is a
         // join and not a lifecycle. See [`ticket_intake`].
-        shutdown_workers.extend(self.ticket_intake.begin_shutdown());
-        shutdown_workers.extend(self.telegram.begin_shutdown());
+        shutdown_workers.extend(named_shutdown_workers(
+            "ticket_intake",
+            self.ticket_intake.begin_shutdown(),
+        ));
+        shutdown_workers.extend(named_shutdown_workers(
+            "telegram",
+            self.telegram.begin_shutdown(),
+        ));
         // Every worker above may be blocked in a bounded transport operation,
         // and live attempts deliberately drain to their own document deadline.
         // Starting every drain before joining makes the independent deadlines
@@ -2190,6 +2210,7 @@ impl Daemon {
                 u64::try_from(LEASE_RENEW_INTERVAL_MS)
                     .expect("renewal interval is a positive constant"),
             ),
+            SHUTDOWN_WORKER_DIAGNOSTIC_BUDGET,
             || {
                 if self_end_kind == SelfEndKind::Expired {
                     return Ok(());
@@ -2199,6 +2220,15 @@ impl Daemon {
                         .renew()
                         .map_err(|error| DaemonError::TelegramRefused(error.category()))
                 })
+            },
+            |observation| {
+                let _ = structured_log::emit_shutdown_worker_drain(
+                    observation.worker_group,
+                    observation.worker_ordinal,
+                    observation.phase.as_str(),
+                    observation.elapsed_ms,
+                    observation.budget_ms,
+                );
             },
         );
         // Cancellation dispatch ends next, beneath the still-held generation
@@ -6769,15 +6799,109 @@ fn map_lease_authority_error(error: lease_time::LeaseAuthorityError) -> DaemonEr
 /// transport deadlines overlap. The first renewal error is retained, but every
 /// later renewal is still attempted until all workers have relinquished their
 /// durable-state authority.
+struct ShutdownWorker {
+    worker_group: &'static str,
+    worker_ordinal: usize,
+    handle: std::thread::JoinHandle<()>,
+    completion_reported: bool,
+    over_budget_reported: bool,
+}
+
+fn named_shutdown_workers(
+    worker_group: &'static str,
+    workers: impl IntoIterator<Item = std::thread::JoinHandle<()>>,
+) -> Vec<ShutdownWorker> {
+    workers
+        .into_iter()
+        .enumerate()
+        .map(|(worker_ordinal, handle)| ShutdownWorker {
+            worker_group,
+            worker_ordinal,
+            handle,
+            completion_reported: false,
+            over_budget_reported: false,
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DrainPhase {
+    Started,
+    Completed,
+    OverBudget,
+}
+
+impl DrainPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Completed => "completed",
+            Self::OverBudget => "over_budget",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DrainObservation {
+    worker_group: &'static str,
+    worker_ordinal: usize,
+    phase: DrainPhase,
+    elapsed_ms: u64,
+    budget_ms: u64,
+}
+
+fn duration_millis_bounded(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn drain_shutdown_workers<E>(
-    workers: Vec<std::thread::JoinHandle<()>>,
+    mut workers: Vec<ShutdownWorker>,
     renewal_interval: Duration,
+    diagnostic_budget: Duration,
     mut renew: impl FnMut() -> Result<(), E>,
+    mut observe: impl FnMut(DrainObservation),
 ) -> Result<(), E> {
     let mut first_failure = None;
-    let mut next_renewal = std::time::Instant::now();
-    while workers.iter().any(|worker| !worker.is_finished()) {
+    let started_at = std::time::Instant::now();
+    let mut next_renewal = started_at;
+    let budget_ms = duration_millis_bounded(diagnostic_budget);
+    for worker in &workers {
+        observe(DrainObservation {
+            worker_group: worker.worker_group,
+            worker_ordinal: worker.worker_ordinal,
+            phase: DrainPhase::Started,
+            elapsed_ms: 0,
+            budget_ms,
+        });
+    }
+    while workers.iter().any(|worker| !worker.completion_reported) {
         let now = std::time::Instant::now();
+        let elapsed = now.duration_since(started_at);
+        let elapsed_ms = duration_millis_bounded(elapsed);
+        for worker in &mut workers {
+            if !worker.completion_reported && worker.handle.is_finished() {
+                worker.completion_reported = true;
+                observe(DrainObservation {
+                    worker_group: worker.worker_group,
+                    worker_ordinal: worker.worker_ordinal,
+                    phase: DrainPhase::Completed,
+                    elapsed_ms,
+                    budget_ms,
+                });
+            } else if !worker.completion_reported
+                && !worker.over_budget_reported
+                && elapsed >= diagnostic_budget
+            {
+                worker.over_budget_reported = true;
+                observe(DrainObservation {
+                    worker_group: worker.worker_group,
+                    worker_ordinal: worker.worker_ordinal,
+                    phase: DrainPhase::OverBudget,
+                    elapsed_ms,
+                    budget_ms,
+                });
+            }
+        }
         if now >= next_renewal {
             if let Err(error) = renew()
                 && first_failure.is_none()
@@ -6789,7 +6913,7 @@ fn drain_shutdown_workers<E>(
         std::thread::sleep(ACCEPT_POLL);
     }
     for worker in workers {
-        let _ = worker.join();
+        let _ = worker.handle.join();
     }
     first_failure.map_or(Ok(()), Err)
 }
@@ -7523,8 +7647,8 @@ mod tests {
     use automonique_policy::approval::ApprovalRequirement;
 
     use super::{
-        Daemon, DaemonConfig, OperationalMetric, activated_listener_fd, drain_shutdown_workers,
-        durable_count,
+        Daemon, DaemonConfig, DrainPhase, OperationalMetric, activated_listener_fd,
+        drain_shutdown_workers, durable_count, named_shutdown_workers,
     };
 
     #[test]
@@ -7644,19 +7768,34 @@ mod tests {
     fn shutdown_drain_renews_until_workers_finish_and_retains_the_first_failure() {
         let worker = std::thread::spawn(|| std::thread::sleep(Duration::from_millis(85)));
         let renewals = AtomicUsize::new(0);
+        let mut observations = Vec::new();
 
-        let result = drain_shutdown_workers(vec![worker], Duration::from_millis(10), || {
-            match renewals.fetch_add(1, Ordering::Relaxed) {
+        let result = drain_shutdown_workers(
+            named_shutdown_workers("telegram", [worker]),
+            Duration::from_millis(10),
+            Duration::from_millis(30),
+            || match renewals.fetch_add(1, Ordering::Relaxed) {
                 0 => Err("first renewal failed"),
                 _ => Ok(()),
-            }
-        });
+            },
+            |observation| observations.push(observation),
+        );
 
         assert_eq!(result, Err("first renewal failed"));
         assert!(
             renewals.load(Ordering::Relaxed) >= 2,
             "a later renewal must still be attempted while the worker drains"
         );
+        assert_eq!(observations.len(), 3);
+        assert_eq!(observations[0].worker_group, "telegram");
+        assert_eq!(observations[0].worker_ordinal, 0);
+        assert_eq!(observations[0].phase, DrainPhase::Started);
+        assert_eq!(observations[0].elapsed_ms, 0);
+        assert_eq!(observations[0].budget_ms, 30);
+        assert_eq!(observations[1].phase, DrainPhase::OverBudget);
+        assert!(observations[1].elapsed_ms >= 30);
+        assert_eq!(observations[2].phase, DrainPhase::Completed);
+        assert!(observations[2].elapsed_ms >= observations[1].elapsed_ms);
     }
 
     /// The seam where a failed read becomes a reported value.
