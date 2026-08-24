@@ -1,0 +1,17 @@
+{
+  "name": "@automonique/ag-ui-adapter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "Elastic-2.0",
+  "scripts": {
+    "test": "bun test ./test",
+    "typecheck": "npx --offline tsc -p ./tsconfig.json"
+  },
+  "dependencies": {
+    "@ag-ui/core": "0.0.58"
+  },
+  "devDependencies": {
+    "typescript": "6.0.3"
+  }
+}
