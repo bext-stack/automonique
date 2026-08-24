@@ -842,7 +842,7 @@ fn document(parts: &DocumentParts<'_>) -> Result<Vec<u8>, ComposeRefusal> {
         // and this daemon is the registry. What it resolves to is
         // `run_workspace`, which is what the argv above already names.
         cwd_token: CwdToken::new(format!("{}-cwd", parts.run_id)).map_err(rejected)?,
-        environment: environment(home, parts.workspace),
+        environment: environment(parts.provider, home, parts.workspace),
         // The transport, not the bytes. `execute` reads the slot and hands the
         // bytes to admission, which delivers them on the workload's stdin —
         // which is what `exec -` reads its prompt from.
@@ -953,8 +953,12 @@ fn argv(
 /// [`automonique_runner::admission::AdmittedLaunch::with_broker`] to this run's
 /// own broker, and a document that bound either itself would be refused a
 /// broker outright — a plan refuses one name bound twice.
-fn environment(home: &str, workspace: &str) -> Vec<(OsString, OsString)> {
-    vec![
+fn environment(
+    provider: &ProviderConfig,
+    home: &str,
+    workspace: &str,
+) -> Vec<(OsString, OsString)> {
+    let mut environment = vec![
         (OsString::from("CODEX_HOME"), OsString::from(home)),
         // Provider-neutral coordinate used by small contained adapters. The
         // credential remains a file below this already-granted home; no secret
@@ -970,7 +974,14 @@ fn environment(home: &str, workspace: &str) -> Vec<(OsString, OsString)> {
         (OsString::from("TERM"), OsString::from("dumb")),
         (OsString::from("SSL_CERT_FILE"), OsString::from(CA_BUNDLE)),
         (OsString::from("SSL_CERT_DIR"), OsString::from(CA_DIRECTORY)),
-    ]
+    ];
+    if provider.engine() == Some("jcode") {
+        environment.extend([
+            (OsString::from("JCODE_HOME"), OsString::from(home)),
+            (OsString::from("JCODE_NO_TELEMETRY"), OsString::from("1")),
+        ]);
+    }
+    environment
 }
 
 /// The sandbox this composition declares.
