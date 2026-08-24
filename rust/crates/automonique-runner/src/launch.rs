@@ -1096,7 +1096,7 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
         .map_err(|error| error.to_string())?;
     plan.filesystem_policy()
         .map_err(|error| error.to_string())?
-        .enforce_on_current_thread()
+        .enforce_on_current_thread_with_executable(&program_descriptor)
         .map_err(|error| error.to_string())?;
 
     // 7. The seccomp socket-family filter closes what Landlock cannot reach:

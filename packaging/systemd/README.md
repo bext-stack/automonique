@@ -135,19 +135,29 @@ and rename sequence, then restarts and checks the service. Old dashboard
 release directories are not part of the procedure and may be removed later as
 a separately authorized cleanup.
 
-The daemon uses the same direct, atomic replacement pattern. Build only the
-daemon executable, retain one previous binary, install through a `.next` file,
-and restart only the daemon after its zero-work deployment gates pass:
+The daemon uses the same direct, atomic replacement pattern. Build the daemon
+and its sandbox entry helper, retain one previous copy of each, install through
+`.next` files, and restart only the daemon after its zero-work deployment gates
+pass:
 
 ```sh
 cargo build --release --locked -p automonique --bin automonique
+cargo build --release --locked -p automonique-runner --bin automonique-launch-enter
 install -d -m 0700 "$XDG_STATE_HOME/automonique/bin"
 if test -x "$XDG_STATE_HOME/automonique/bin/automonique"; then
   install -m 0700 "$XDG_STATE_HOME/automonique/bin/automonique" \
     "$XDG_STATE_HOME/automonique/bin/automonique.previous"
 fi
+if test -x "$XDG_STATE_HOME/automonique/bin/automonique-launch-enter"; then
+  install -m 0700 "$XDG_STATE_HOME/automonique/bin/automonique-launch-enter" \
+    "$XDG_STATE_HOME/automonique/bin/automonique-launch-enter.previous"
+fi
 install -m 0700 target/release/automonique \
   "$XDG_STATE_HOME/automonique/bin/automonique.next"
+install -m 0700 target/release/automonique-launch-enter \
+  "$XDG_STATE_HOME/automonique/bin/automonique-launch-enter.next"
+mv "$XDG_STATE_HOME/automonique/bin/automonique-launch-enter.next" \
+  "$XDG_STATE_HOME/automonique/bin/automonique-launch-enter"
 mv "$XDG_STATE_HOME/automonique/bin/automonique.next" \
   "$XDG_STATE_HOME/automonique/bin/automonique"
 systemctl --user restart automonique.service
@@ -156,6 +166,6 @@ systemctl --user restart automonique.service
 
 Before the restart, recheck that the live daemon is ready with no running work,
 pending inbox/outbox effects, ambiguous outbound effect or reconciliation.
-Rollback installs `automonique.previous` through the same `.next` and rename
+Rollback installs both `.previous` binaries through the same `.next` and rename
 sequence, then restarts and checks the service. The Manage fleet worker remains
 a separate service and is not restarted by a daemon-only deployment.

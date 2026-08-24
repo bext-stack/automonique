@@ -471,6 +471,27 @@ impl FilesystemPolicy {
     /// already run leaves a domain in place that cannot be removed, so the
     /// caller must exit rather than continue.
     pub fn enforce_on_current_thread(&self) -> Result<FilesystemIsolation, FilesystemPolicyError> {
+        self.enforce_on_current_thread_inner(None)
+    }
+
+    /// Install this allowlist while granting execute access to one already
+    /// opened, immutable program descriptor.
+    ///
+    /// The launch helper executes a sealed memfd rather than resolving the
+    /// provider path again. That detached inode must be named explicitly in
+    /// the Landlock ruleset; the ordinary path grants still cover the dynamic
+    /// loader, libraries, and provider-owned resources.
+    pub(crate) fn enforce_on_current_thread_with_executable(
+        &self,
+        executable: &File,
+    ) -> Result<FilesystemIsolation, FilesystemPolicyError> {
+        self.enforce_on_current_thread_inner(Some(executable))
+    }
+
+    fn enforce_on_current_thread_inner(
+        &self,
+        executable: Option<&File>,
+    ) -> Result<FilesystemIsolation, FilesystemPolicyError> {
         require_single_threaded()?;
 
         // HardRequirement is the whole point: with the crate's default
@@ -494,6 +515,22 @@ impl FilesystemPolicy {
             }
             created = created
                 .add_rule(PathBeneath::new(descriptor, rights))
+                .map_err(|error| FilesystemPolicyError::RulesetRefused(error.to_string()))?;
+        }
+
+        if let Some(executable) = executable {
+            let descriptor = executable.try_clone()?;
+            let metadata = descriptor.metadata()?;
+            if !metadata.is_file() {
+                return Err(FilesystemPolicyError::RulesetRefused(
+                    "executable descriptor is not a file".to_owned(),
+                ));
+            }
+            created = created
+                .add_rule(PathBeneath::new(
+                    descriptor,
+                    AccessFs::ReadFile | AccessFs::Execute,
+                ))
                 .map_err(|error| FilesystemPolicyError::RulesetRefused(error.to_string()))?;
         }
 
