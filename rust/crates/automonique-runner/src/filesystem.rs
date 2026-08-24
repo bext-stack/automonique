@@ -69,6 +69,7 @@ use landlock::{
 };
 use std::fmt;
 use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
@@ -519,7 +520,14 @@ impl FilesystemPolicy {
         }
 
         if let Some(executable) = executable {
-            let descriptor = executable.try_clone()?;
+            // Landlock path-beneath rules require an O_PATH descriptor. Reopen
+            // this process's existing sealed memfd through procfs to obtain
+            // that rule handle; the numeric fd is private to this process and
+            // resolves to the same immutable inode that execveat will consume.
+            let descriptor = OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_PATH | nix::libc::O_CLOEXEC)
+                .open(format!("/proc/self/fd/{}", executable.as_raw_fd()))?;
             let metadata = descriptor.metadata()?;
             if !metadata.is_file() {
                 return Err(FilesystemPolicyError::RulesetRefused(
