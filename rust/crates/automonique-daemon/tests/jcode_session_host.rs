@@ -134,7 +134,7 @@ fn contained_jcode_session_negotiates_approval_resumes_and_journals() {
         "IFS= read -r request; printf '%s\\n' '",
         "{\"v\":1,\"reply_to\":1,\"ev\":\"hello_ok\",\"version\":1,\"server\":\"jcode/fixture\",",
         "\"capabilities\":[\"sessions\",\"streaming\",\"cancellation\",\"soft_interrupt\",",
-        "\"permission_requests\",\"history\",\"model_catalog\",\"reasoning_effort\",\"usage\",\"runtime_info\"]}'; ",
+        "\"stdin_requests\",\"history\",\"model_catalog\",\"reasoning_effort\",\"usage\",\"runtime_info\"]}'; ",
         "IFS= read -r request; printf '%s\\n' '",
         "{\"v\":1,\"reply_to\":2,\"ev\":\"attached\",\"session\":{\"session_id\":\"jcode-session-1\",\"status\":\"idle\"}}'; ",
         "IFS= read -r request; printf '%s\\n' ",

@@ -38,7 +38,9 @@ mod types;
 
 pub use codex::{CodexAdapter, CodexInvocationPlan, ExecutableInspection, normalize_jsonl};
 pub use jcode::{
-    JCODE_API_VERSION, JcodeEvent, JcodeFrameDecoder, JcodeProtocolError, JcodeRequest,
+    JCODE_API_SCHEMA_ID, JCODE_API_STDIO_ARGUMENTS, JCODE_API_VERSION, JcodeEvent,
+    JcodeExecutionIdentity, JcodeFrameDecoder, JcodeInterruptedReason, JcodeNativeAdapter,
+    JcodeNativeEnvelope, JcodeNativeEvent, JcodeProtocolError, JcodeRequest, JcodeTerminalOutcome,
     JcodeTurnCollector, JcodeTurnResult, PermissionDecision, REQUIRED_JCODE_CAPABILITIES,
     encode_jcode_request,
 };

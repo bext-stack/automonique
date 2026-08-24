@@ -11,11 +11,15 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
+use crate::types::{RunCoordinates, validate_coordinate};
 use automonique_connector_substrate::json::strict_json;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
 pub const JCODE_API_VERSION: u32 = 1;
+pub const JCODE_API_SCHEMA_ID: &str = "jcode.harness-api/v1";
+pub const JCODE_API_STDIO_ARGUMENTS: [&str; 4] =
+    ["--quiet", "--no-update", "--no-selfdev", "api-stdio"];
 pub const MAX_JCODE_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_JCODE_STREAM_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_JCODE_EVENTS: usize = 16_384;
@@ -29,7 +33,7 @@ pub const REQUIRED_JCODE_CAPABILITIES: [&str; 10] = [
     "streaming",
     "cancellation",
     "soft_interrupt",
-    "permission_requests",
+    "stdin_requests",
     "history",
     "model_catalog",
     "reasoning_effort",
@@ -82,6 +86,11 @@ pub enum JcodeRequest {
         request_id: String,
         decision: PermissionDecision,
     },
+    StdinResponse {
+        session_id: String,
+        request_id: String,
+        input: String,
+    },
     GetHistory {
         session_id: String,
     },
@@ -124,7 +133,7 @@ pub fn encode_jcode_request(
     Ok(encoded)
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JcodeEvent {
     HelloOk {
         reply_to: u64,
@@ -189,6 +198,13 @@ pub enum JcodeEvent {
         tool_name: String,
         description: String,
     },
+    StdinRequest {
+        session_id: String,
+        request_id: String,
+        prompt: String,
+        is_password: bool,
+        tool_call_id: String,
+    },
     SessionStatus {
         session_id: String,
         status: String,
@@ -224,6 +240,9 @@ pub enum JcodeProtocolError {
     TooManyEvents,
     UnsupportedVersion,
     MissingCapability,
+    HandshakeRequired,
+    IdentityMismatch,
+    ReplyMismatch,
     SessionMismatch,
     EventOrder,
 }
@@ -239,6 +258,9 @@ impl JcodeProtocolError {
             Self::TooManyEvents => "too_many_events",
             Self::UnsupportedVersion => "unsupported_version",
             Self::MissingCapability => "missing_capability",
+            Self::HandshakeRequired => "handshake_required",
+            Self::IdentityMismatch => "identity_mismatch",
+            Self::ReplyMismatch => "reply_mismatch",
             Self::SessionMismatch => "session_mismatch",
             Self::EventOrder => "event_order",
         }
@@ -252,6 +274,294 @@ impl fmt::Display for JcodeProtocolError {
 }
 
 impl std::error::Error for JcodeProtocolError {}
+
+/// Immutable executable, configuration, schema, and reported-build identity
+/// required for one contained JCode process.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JcodeExecutionIdentity {
+    executable_sha256: String,
+    configuration_sha256: String,
+    expected_server: String,
+}
+
+impl JcodeExecutionIdentity {
+    /// Bind a process to reviewed executable/configuration digests and the
+    /// exact `hello_ok.server` identity expected from those bytes.
+    pub fn pinned(
+        executable_sha256: impl Into<String>,
+        configuration_sha256: impl Into<String>,
+        expected_server: impl Into<String>,
+    ) -> Result<Self, JcodeProtocolError> {
+        let executable_sha256 = executable_sha256.into();
+        let configuration_sha256 = configuration_sha256.into();
+        let expected_server = expected_server.into();
+        validate_sha256(&executable_sha256, "executable_sha256")?;
+        validate_sha256(&configuration_sha256, "configuration_sha256")?;
+        validate_field(&expected_server, "expected_server")?;
+        Ok(Self {
+            executable_sha256,
+            configuration_sha256,
+            expected_server,
+        })
+    }
+
+    #[must_use]
+    pub fn executable_sha256(&self) -> &str {
+        &self.executable_sha256
+    }
+
+    #[must_use]
+    pub fn configuration_sha256(&self) -> &str {
+        &self.configuration_sha256
+    }
+
+    #[must_use]
+    pub const fn schema_id(&self) -> &'static str {
+        JCODE_API_SCHEMA_ID
+    }
+
+    #[must_use]
+    pub fn expected_server(&self) -> &str {
+        &self.expected_server
+    }
+
+    /// Exact argument vector used after the pinned executable path.
+    #[must_use]
+    pub const fn arguments(&self) -> [&'static str; 4] {
+        JCODE_API_STDIO_ARGUMENTS
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JcodeInterruptedReason {
+    ProviderEof,
+    IncompleteFrame,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JcodeTerminalOutcome {
+    Completed,
+    ProviderFailed,
+    InterruptedUnknown(JcodeInterruptedReason),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JcodeNativeEvent {
+    Provider(JcodeEvent),
+    Terminal {
+        outcome: JcodeTerminalOutcome,
+        provider_code: Option<String>,
+    },
+}
+
+/// One Automonique-owned envelope in exact provider read order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JcodeNativeEnvelope {
+    sequence: u64,
+    run_id: String,
+    turn_id: String,
+    provider_session_id: Option<String>,
+    identity: JcodeExecutionIdentity,
+    event: JcodeNativeEvent,
+}
+
+impl JcodeNativeEnvelope {
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    #[must_use]
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    #[must_use]
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+
+    #[must_use]
+    pub fn provider_session_id(&self) -> Option<&str> {
+        self.provider_session_id.as_deref()
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> &JcodeExecutionIdentity {
+        &self.identity
+    }
+
+    #[must_use]
+    pub const fn event(&self) -> &JcodeNativeEvent {
+        &self.event
+    }
+}
+
+/// Per-turn fail-closed protocol state. It performs no process I/O: the runner
+/// owns the child and feeds stdout bytes here in the order read.
+pub struct JcodeNativeAdapter {
+    decoder: JcodeFrameDecoder,
+    identity: JcodeExecutionIdentity,
+    run_id: String,
+    turn_id: String,
+    hello_request_id: u64,
+    turn_request_id: u64,
+    provider_session_id: Option<String>,
+    negotiated: bool,
+    accepted: bool,
+    terminal: Option<JcodeTerminalOutcome>,
+    next_sequence: u64,
+}
+
+impl JcodeNativeAdapter {
+    pub fn new(
+        identity: JcodeExecutionIdentity,
+        coordinates: &RunCoordinates,
+        hello_request_id: u64,
+        turn_request_id: u64,
+    ) -> Result<Self, JcodeProtocolError> {
+        if hello_request_id == 0 || turn_request_id == 0 || hello_request_id == turn_request_id {
+            return Err(JcodeProtocolError::InvalidField("request_id"));
+        }
+        validate_coordinate(coordinates.run_id(), "run_id")
+            .map_err(|_| JcodeProtocolError::InvalidField("run_id"))?;
+        validate_coordinate(coordinates.turn_id(), "turn_id")
+            .map_err(|_| JcodeProtocolError::InvalidField("turn_id"))?;
+        Ok(Self {
+            decoder: JcodeFrameDecoder::new(),
+            identity,
+            run_id: coordinates.run_id().to_owned(),
+            turn_id: coordinates.turn_id().to_owned(),
+            hello_request_id,
+            turn_request_id,
+            provider_session_id: None,
+            negotiated: false,
+            accepted: false,
+            terminal: None,
+            next_sequence: 1,
+        })
+    }
+
+    /// Decode provider stdout and assign Automonique sequences in read order.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<JcodeNativeEnvelope>, JcodeProtocolError> {
+        let events = self.decoder.push(bytes)?;
+        let mut envelopes = Vec::with_capacity(events.len());
+        for event in events {
+            envelopes.push(self.observe(event)?);
+        }
+        Ok(envelopes)
+    }
+
+    /// Settle provider EOF once. EOF is never success: absent a prior terminal
+    /// frame it becomes one explicit interrupted/unknown terminal envelope.
+    pub fn finish_eof(&mut self) -> Result<Option<JcodeNativeEnvelope>, JcodeProtocolError> {
+        if self.terminal.is_some() {
+            return Ok(None);
+        }
+        let reason = if self.decoder.has_pending() {
+            JcodeInterruptedReason::IncompleteFrame
+        } else {
+            JcodeInterruptedReason::ProviderEof
+        };
+        let outcome = JcodeTerminalOutcome::InterruptedUnknown(reason);
+        self.terminal = Some(outcome);
+        Ok(Some(self.envelope(JcodeNativeEvent::Terminal {
+            outcome,
+            provider_code: None,
+        })?))
+    }
+
+    #[must_use]
+    pub const fn terminal(&self) -> Option<JcodeTerminalOutcome> {
+        self.terminal
+    }
+
+    fn observe(&mut self, event: JcodeEvent) -> Result<JcodeNativeEnvelope, JcodeProtocolError> {
+        if self.terminal.is_some() {
+            return Err(JcodeProtocolError::EventOrder);
+        }
+        if !self.negotiated {
+            let JcodeEvent::HelloOk {
+                reply_to, server, ..
+            } = &event
+            else {
+                return Err(JcodeProtocolError::HandshakeRequired);
+            };
+            if *reply_to != self.hello_request_id {
+                return Err(JcodeProtocolError::ReplyMismatch);
+            }
+            if server != self.identity.expected_server() {
+                return Err(JcodeProtocolError::IdentityMismatch);
+            }
+            self.negotiated = true;
+            return self.envelope(JcodeNativeEvent::Provider(event));
+        }
+        if matches!(event, JcodeEvent::HelloOk { .. }) {
+            return Err(JcodeProtocolError::EventOrder);
+        }
+
+        if let Some(session_id) = event_session(&event) {
+            match self.provider_session_id.as_deref() {
+                Some(bound) if bound != session_id => {
+                    return Err(JcodeProtocolError::SessionMismatch);
+                }
+                None => self.provider_session_id = Some(session_id.to_owned()),
+                _ => {}
+            }
+        }
+
+        let native = match &event {
+            JcodeEvent::MessageAccepted { .. } => {
+                if self.accepted {
+                    return Err(JcodeProtocolError::EventOrder);
+                }
+                self.accepted = true;
+                JcodeNativeEvent::Provider(event)
+            }
+            JcodeEvent::TurnDone { .. } => {
+                if !self.accepted {
+                    return Err(JcodeProtocolError::EventOrder);
+                }
+                self.terminal = Some(JcodeTerminalOutcome::Completed);
+                JcodeNativeEvent::Terminal {
+                    outcome: JcodeTerminalOutcome::Completed,
+                    provider_code: None,
+                }
+            }
+            JcodeEvent::Error {
+                reply_to: Some(reply_to),
+                code,
+            } if *reply_to == self.turn_request_id => {
+                self.terminal = Some(JcodeTerminalOutcome::ProviderFailed);
+                JcodeNativeEvent::Terminal {
+                    outcome: JcodeTerminalOutcome::ProviderFailed,
+                    provider_code: Some(code.clone()),
+                }
+            }
+            _ => JcodeNativeEvent::Provider(event),
+        };
+        self.envelope(native)
+    }
+
+    fn envelope(
+        &mut self,
+        event: JcodeNativeEvent,
+    ) -> Result<JcodeNativeEnvelope, JcodeProtocolError> {
+        let sequence = self.next_sequence;
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or(JcodeProtocolError::TooManyEvents)?;
+        Ok(JcodeNativeEnvelope {
+            sequence,
+            run_id: self.run_id.clone(),
+            turn_id: self.turn_id.clone(),
+            provider_session_id: self.provider_session_id.clone(),
+            identity: self.identity.clone(),
+            event,
+        })
+    }
+}
 
 /// Incremental NDJSON decoder. Unknown additive event kinds are surfaced only
 /// by their bounded schema token, matching JCode's forward-compatibility rule.
@@ -314,6 +624,10 @@ impl JcodeFrameDecoder {
             Err(JcodeProtocolError::InvalidFrame)
         }
     }
+
+    const fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
 }
 
 /// One serialized turn's authority-sensitive state.
@@ -327,6 +641,7 @@ pub struct JcodeTurnCollector {
     cache_read_input_tokens: u64,
     active_tools: BTreeSet<String>,
     pending_permissions: BTreeSet<String>,
+    pending_inputs: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -374,6 +689,7 @@ impl JcodeTurnCollector {
             cache_read_input_tokens: 0,
             active_tools: BTreeSet::new(),
             pending_permissions: BTreeSet::new(),
+            pending_inputs: BTreeSet::new(),
         })
     }
 
@@ -428,10 +744,16 @@ impl JcodeTurnCollector {
                     return Err(JcodeProtocolError::EventOrder);
                 }
             }
+            JcodeEvent::StdinRequest { request_id, .. } => {
+                if !self.pending_inputs.insert(request_id.clone()) {
+                    return Err(JcodeProtocolError::EventOrder);
+                }
+            }
             JcodeEvent::TurnDone { .. } => {
                 if !self.accepted
                     || !self.active_tools.is_empty()
                     || !self.pending_permissions.is_empty()
+                    || !self.pending_inputs.is_empty()
                 {
                     return Err(JcodeProtocolError::EventOrder);
                 }
@@ -444,6 +766,14 @@ impl JcodeTurnCollector {
 
     pub fn resolve_permission(&mut self, request_id: &str) -> Result<(), JcodeProtocolError> {
         if self.pending_permissions.remove(request_id) {
+            Ok(())
+        } else {
+            Err(JcodeProtocolError::EventOrder)
+        }
+    }
+
+    pub fn resolve_input(&mut self, request_id: &str) -> Result<(), JcodeProtocolError> {
+        if self.pending_inputs.remove(request_id) {
             Ok(())
         } else {
             Err(JcodeProtocolError::EventOrder)
@@ -517,6 +847,18 @@ fn validate_request(request: &JcodeRequest) -> Result<(), JcodeProtocolError> {
         } => {
             validate_field(session_id, "session_id")?;
             validate_field(request_id, "request_id")
+        }
+        JcodeRequest::StdinResponse {
+            session_id,
+            request_id,
+            input,
+        } => {
+            validate_field(session_id, "session_id")?;
+            validate_field(request_id, "request_id")?;
+            if input.len() > MAX_JCODE_TEXT_BYTES {
+                return Err(JcodeProtocolError::InvalidField("input"));
+            }
+            Ok(())
         }
         JcodeRequest::Ping => Ok(()),
     }
@@ -616,6 +958,17 @@ fn decode_server_frame(bytes: &[u8]) -> Result<JcodeEvent, JcodeProtocolError> {
             tool_name: bounded_string(object, "tool_name")?.to_owned(),
             description: text(object, "description")?.to_owned(),
         }),
+        "stdin_request" => Ok(JcodeEvent::StdinRequest {
+            session_id: session(object)?,
+            request_id: bounded_string(object, "request_id")?.to_owned(),
+            prompt: text(object, "prompt")?.to_owned(),
+            is_password: match object.get("is_password") {
+                None => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => return Err(JcodeProtocolError::InvalidField("is_password")),
+            },
+            tool_call_id: bounded_string(object, "tool_call_id")?.to_owned(),
+        }),
         "session_status" => Ok(JcodeEvent::SessionStatus {
             session_id: session(object)?,
             status: bounded_string(object, "status")?.to_owned(),
@@ -657,6 +1010,7 @@ fn event_session(event: &JcodeEvent) -> Option<&str> {
         | JcodeEvent::ToolDone { session_id, .. }
         | JcodeEvent::TokenUsage { session_id, .. }
         | JcodeEvent::PermissionRequest { session_id, .. }
+        | JcodeEvent::StdinRequest { session_id, .. }
         | JcodeEvent::SessionStatus { session_id, .. }
         | JcodeEvent::ConnectionPhase { session_id, .. }
         | JcodeEvent::ModelInfo { session_id, .. }
@@ -673,6 +1027,18 @@ fn validate_field(value: &str, field: &'static str) -> Result<(), JcodeProtocolE
         Err(JcodeProtocolError::InvalidField(field))
     } else {
         Ok(())
+    }
+}
+
+fn validate_sha256(value: &str, field: &'static str) -> Result<(), JcodeProtocolError> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        Ok(())
+    } else {
+        Err(JcodeProtocolError::InvalidField(field))
     }
 }
 
