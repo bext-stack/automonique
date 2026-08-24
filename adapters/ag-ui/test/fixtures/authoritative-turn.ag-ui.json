@@ -1,0 +1,16 @@
+[
+  {"timestamp":1000,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:1","sequence":1},"type":"RUN_STARTED","threadId":"thread-public-1","runId":"turn-public-1"},
+  {"timestamp":1001,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:2","sequence":2},"type":"CUSTOM","name":"automonique.preview","value":{"messageId":"message-1","text":"Draft","replace":true}},
+  {"timestamp":1002,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:3","sequence":3},"type":"TEXT_MESSAGE_START","messageId":"message-1","role":"assistant"},
+  {"timestamp":1002,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:3","sequence":3},"type":"TEXT_MESSAGE_CONTENT","messageId":"message-1","delta":"The authoritative answer."},
+  {"timestamp":1002,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:3","sequence":3},"type":"TEXT_MESSAGE_END","messageId":"message-1"},
+  {"timestamp":1003,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:4","sequence":4},"type":"TOOL_CALL_START","toolCallId":"tool-1","toolCallName":"lookup_status","parentMessageId":"message-1"},
+  {"timestamp":1004,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:5","sequence":5},"type":"TOOL_CALL_ARGS","toolCallId":"tool-1","delta":"{\"ticket\":103}"},
+  {"timestamp":1005,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:6","sequence":6},"type":"TOOL_CALL_END","toolCallId":"tool-1"},
+  {"timestamp":1006,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:7","sequence":7},"type":"TOOL_CALL_RESULT","messageId":"tool-result-1","toolCallId":"tool-1","content":"open","role":"tool"},
+  {"timestamp":1007,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:8","sequence":8},"type":"STATE_SNAPSHOT","snapshot":{"status":"running","revision":7}},
+  {"timestamp":1008,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:9","sequence":9},"type":"STATE_DELTA","delta":[{"op":"replace","path":"/status","value":"completed"}]},
+  {"timestamp":1009,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:10","sequence":10},"type":"STEP_STARTED","stepName":"finalize"},
+  {"timestamp":1010,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:11","sequence":11},"type":"STEP_FINISHED","stepName":"finalize"},
+  {"timestamp":1011,"automonique":{"schema":"automonique.ag-ui-event-meta/v1","cursor":"session:12","sequence":12},"type":"RUN_FINISHED","threadId":"thread-public-1","runId":"turn-public-1","outcome":{"type":"success"}}
+]

@@ -58,6 +58,10 @@ jobs:
             (cd "$package" && bun install --frozen-lockfile)
           done
 
+      - name: Install the pinned AG-UI adapter toolchain
+        working-directory: adapters/ag-ui
+        run: bun install --frozen-lockfile
+
       - name: The compiler is the pin, not whatever the runner supplies
         working-directory: sdk/typescript/packages/protocol
         run: |
@@ -95,6 +99,12 @@ jobs:
           (cd protocol && npm run typecheck)
           (cd lab && npm run typecheck)
           (cd lab && bun test ./test)
+
+      - name: AG-UI adapter contract
+        working-directory: adapters/ag-ui
+        run: |
+          npm run typecheck
+          bun test ./test
 
       # `generated/VERDICT.md` constraint 5. Reproducibility is asserted by the
       # crate's own tests; that the checked-in tree was regenerated is a claim
