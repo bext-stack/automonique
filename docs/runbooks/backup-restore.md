@@ -20,7 +20,7 @@ normal installed binary lives inside product state and is installed only after
 the data restore succeeds.
 
 ```sh
-systemctl --user stop automonique.service
+systemctl --user stop automonique.service automonique.socket
 /path/to/verified/automonique restore --from <recovery-set> --into "$XDG_STATE_HOME/automonique"
 # Install the verified release and activate its current link.
 systemctl --user start automonique-recovery.service
@@ -31,6 +31,8 @@ The recovery service reads no Slack, Telegram, or support configuration and
 refuses new intake and provider starts. Verify database and artifact state,
 transport offsets, outstanding outbox effects, and credential audiences before
 stopping recovery mode and starting `automonique.service`.
+The normal service requires its socket unit, so starting it restores both after
+recovery mode has released the endpoint.
 
 Plaintext credential files are deliberately not copied. Recover credentials
 through their separately escrowed key or external secret provider; never add

@@ -6,16 +6,21 @@ Install the units in this directory under `~/.config/systemd/user/`, then run:
 
 ```sh
 systemctl --user daemon-reload
-systemctl --user enable --now automonique.service
+systemctl --user enable --now automonique.socket automonique.service
 systemctl --user enable --now automonique-manage-worker.service
 systemctl --user enable --now automonique-backup.timer
 systemctl --user status automonique.service
 ```
 
-The unit starts the directly installed daemon binary from the product state
-directory, creates private XDG runtime/state directories, delegates its cgroup
-subtree, and waits for the daemon's real readiness notification. Upgrade
-replaces that binary atomically and restarts the unit.
+The socket unit owns the private admin listener across daemon restarts. The
+service adopts that one named descriptor, starts the directly installed daemon
+binary from the product state directory, creates private XDG runtime/state
+directories, delegates its cgroup subtree, and waits for the daemon's real
+readiness notification. A supervised reload sends SIGHUP and waits while the
+daemon atomically reloads `approvals/approvals.conf` without changing its PID;
+a refused replacement leaves the active policy intact and is reported in the
+unit status. Upgrade replaces that binary atomically and restarts the service
+without unbinding the admin endpoint.
 The timer writes an online recovery set every five minutes.
 `automonique-recovery.service` is started manually after a restore; it disables
 external transports and refuses provider starts.

@@ -48,6 +48,7 @@ sed "s|^ExecStart=%h/.bun/bin/bun |ExecStart=/bin/true |" "$ag_ui_unit" >"$verif
 # verified from the source directory, systemd may reload the packaged tunnel
 # by unit name and bypass the temporary executable substitution.
 for unit in \
+    automonique.socket \
     automonique.service \
     automonique-manage-worker.service \
     automonique-web-entry.service \
@@ -59,6 +60,7 @@ do
 done
 
 XDG_STATE_HOME="$verify_state" systemd-analyze --user verify \
+    "$unit_dir/automonique.socket" \
     "$unit_dir/automonique.service" \
     "$unit_dir/automonique-manage-worker.service" \
     "$unit_dir/automonique-web-entry.service" \

@@ -42,6 +42,7 @@ automonique-transport-runtime = { path = "../automonique-transport-runtime" }
 # crate defines, and does not re-export it: a host cannot construct a poller
 # without naming these types.
 automonique-transports = { path = "../automonique-transports" }
+listenfd.workspace = true
 nix.workspace = true
 rusqlite.workspace = true
 serde = { workspace = true, features = ["derive"] }

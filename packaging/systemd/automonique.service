@@ -2,11 +2,13 @@
 
 [Unit]
 Description=Automonique local automation daemon
+Requires=automonique.socket
+After=automonique.socket
 StartLimitIntervalSec=60s
 StartLimitBurst=5
 
 [Service]
-Type=notify
+Type=notify-reload
 NotifyAccess=main
 ExecStart=%S/automonique/bin/automonique daemon --foreground
 Restart=on-failure

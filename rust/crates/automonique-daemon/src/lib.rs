@@ -454,6 +454,7 @@ const LEASE_RENEW_INTERVAL_MS: i64 = 10_000;
 const TELEGRAM_LEASE_TTL_MS: i64 = 20_000;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const ACCEPT_POLL: Duration = Duration::from_millis(25);
+const STARTUP_TIMEOUT_EXTENSION: Duration = Duration::from_secs(5 * 60);
 
 /// Refusal category both intake lanes answer with while an operator pause is
 /// live.
@@ -939,6 +940,9 @@ pub enum DaemonError {
     InsecurePath(&'static str),
     /// Another daemon is accepting connections at the configured endpoint.
     AlreadyRunning,
+    /// systemd advertised an inherited listener that did not match the one
+    /// exact admin-socket contract this daemon accepts.
+    SocketActivationRefused,
     /// The connecting Unix peer is not the daemon's effective user.
     PeerDenied,
     /// The admin frame was incomplete, too large, or not admitted.
@@ -1079,6 +1083,7 @@ impl DaemonError {
             Self::EnvironmentMissing(_) => "environment_missing",
             Self::InsecurePath(_) => "insecure_path",
             Self::AlreadyRunning => "already_running",
+            Self::SocketActivationRefused => "socket_activation_refused",
             Self::PeerDenied => "peer_denied",
             Self::ProtocolRefused(_) => "protocol_refused",
             Self::Io(_) => "io",
@@ -1116,6 +1121,9 @@ impl fmt::Display for DaemonError {
             }
             Self::InsecurePath(kind) => write!(formatter, "{kind} path is not private and owned"),
             Self::AlreadyRunning => formatter.write_str("another Automonique daemon is running"),
+            Self::SocketActivationRefused => {
+                formatter.write_str("the inherited admin listener was refused")
+            }
             Self::PeerDenied => formatter.write_str("local administration peer was denied"),
             Self::ProtocolRefused(category) => {
                 write!(
@@ -1219,6 +1227,7 @@ pub struct Daemon {
     lease_expires_ms: i64,
     lease_time: lease_time::SuspendFence,
     socket_identity: (u64, u64),
+    remove_socket_on_drop: bool,
     controller: automonique_core::Controller,
     reconciliation_run_id: Option<i64>,
     telegram: telegram::TelegramHost,
@@ -1452,9 +1461,7 @@ impl Daemon {
         )?;
 
         let socket_path = config.admin_socket();
-        prepare_socket_path(&socket_path)?;
-        let listener = UnixListener::bind(&socket_path)?;
-        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+        let (listener, remove_socket_on_drop) = open_admin_listener(&socket_path)?;
         let socket_metadata = fs::symlink_metadata(&socket_path)?;
         if !socket_metadata.file_type().is_socket()
             || socket_metadata.uid() != geteuid().as_raw()
@@ -1467,7 +1474,7 @@ impl Daemon {
         let mut socket_cleanup = SocketCleanup {
             path: socket_path.clone(),
             identity: socket_identity,
-            armed: true,
+            armed: remove_socket_on_drop,
         };
 
         // Establish endpoint exclusion before changing durable ownership. A
@@ -1815,11 +1822,8 @@ impl Daemon {
         // gate every launch takes. It is read here, beside the other startup
         // gates, so a malformed file refuses a daemon rather than the first
         // launch that reaches the gate.
-        let configured_approval_requirement =
-            approval_policy::ApprovalPolicyConfig::requirement_or_default(&state_dir)
-                .map_err(|error| DaemonError::ApprovalPolicyRefused(error.category()))?;
-        let approval_lifetime =
-            approval_policy::ApprovalPolicyConfig::lifetime_or_default(&state_dir)
+        let (configured_approval_requirement, approval_lifetime) =
+            approval_policy::ApprovalPolicyConfig::values_or_default(&state_dir)
                 .map_err(|error| DaemonError::ApprovalPolicyRefused(error.category()))?;
         // THE PROGRESS ENDPOINT BINDS LAST, AND STARTS NO THREAD.
         //
@@ -1847,6 +1851,7 @@ impl Daemon {
             lease_expires_ms: lease.expires_ms,
             lease_time,
             socket_identity,
+            remove_socket_on_drop,
             controller: automonique_core::Controller::new(),
             reconciliation_run_id: None,
             telegram,
@@ -1931,9 +1936,19 @@ impl Daemon {
     ///
     /// Returns an I/O or durable-state failure. Individual hostile clients are
     /// closed and do not stop the daemon.
-    pub fn serve(mut self, stop: &AtomicBool) -> Result<(), DaemonError> {
-        let mut service_manager = systemd::Notifier::from_environment()
+    pub fn serve(self, stop: &AtomicBool) -> Result<(), DaemonError> {
+        let service_manager = systemd::Notifier::from_environment()
             .map_err(|error| DaemonError::ServiceManagerFailed(error.category()))?;
+        let reload = AtomicBool::new(false);
+        self.serve_with_control(stop, &reload, service_manager)
+    }
+
+    fn serve_with_control(
+        mut self,
+        stop: &AtomicBool,
+        reload: &AtomicBool,
+        mut service_manager: Option<systemd::Notifier>,
+    ) -> Result<(), DaemonError> {
         let initial_lease = self
             .lease_time
             .require_authority()
@@ -2027,6 +2042,36 @@ impl Daemon {
                     }
                     if stop.load(Ordering::Acquire) {
                         break 'serving Ok(());
+                    }
+                    if reload.swap(false, Ordering::AcqRel) {
+                        if let Some(notifier) = service_manager.as_ref()
+                            && let Err(error) = notifier.reloading()
+                        {
+                            break 'serving Err(DaemonError::ServiceManagerFailed(
+                                error.category(),
+                            ));
+                        }
+                        match self.reload_configuration() {
+                            Ok(()) => {
+                                if let Some(notifier) = service_manager.as_ref()
+                                    && let Err(error) = notifier.ready()
+                                {
+                                    break 'serving Err(DaemonError::ServiceManagerFailed(
+                                        error.category(),
+                                    ));
+                                }
+                            }
+                            Err(DaemonError::ApprovalPolicyRefused(category)) => {
+                                if let Some(notifier) = service_manager.as_ref()
+                                    && let Err(error) = notifier.reload_refused(category)
+                                {
+                                    break 'serving Err(DaemonError::ServiceManagerFailed(
+                                        error.category(),
+                                    ));
+                                }
+                            }
+                            Err(error) => break 'serving Err(error),
+                        }
                     }
                     if lease_now_ms >= next_renewal_boottime_ms {
                         if let Err(error) = self.renew_lease() {
@@ -2236,6 +2281,19 @@ impl Daemon {
                 .and(release)
                 .and(service_stopping),
         }
+    }
+
+    /// Replace the reloadable policy as one coherent value.
+    ///
+    /// All parsing finishes before either live field changes, so a refused
+    /// replacement leaves the running generation's policy intact.
+    fn reload_configuration(&mut self) -> Result<(), DaemonError> {
+        let (requirement, lifetime) =
+            approval_policy::ApprovalPolicyConfig::values_or_default(&self.state_dir)
+                .map_err(|error| DaemonError::ApprovalPolicyRefused(error.category()))?;
+        self.configured_approval_requirement = requirement;
+        self.approval_lifetime = lifetime;
+        Ok(())
     }
 
     /// Which operator decision surfaces are live on this host right now.
@@ -6875,7 +6933,9 @@ fn operational_status(projection: &StoreProjection) -> Result<OperationalStatus,
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        remove_socket_if_identity(&self.socket_path, self.socket_identity);
+        if self.remove_socket_on_drop {
+            remove_socket_if_identity(&self.socket_path, self.socket_identity);
+        }
     }
 }
 
@@ -6890,7 +6950,8 @@ fn remove_socket_if_identity(path: &Path, identity: (u64, u64)) {
 }
 
 /// Run the daemon with SIGINT/SIGTERM translated into the same orderly stop
-/// path as the local shutdown command.
+/// path as the local shutdown command and SIGHUP translated into a supervised
+/// configuration reload.
 ///
 /// # Errors
 ///
@@ -6910,6 +6971,7 @@ fn run_with_mode(config: &DaemonConfig, disconnected_recovery: bool) -> Result<(
     let mut signals = SigSet::empty();
     signals.add(Signal::SIGINT);
     signals.add(Signal::SIGTERM);
+    signals.add(Signal::SIGHUP);
     let mut old_signals = SigSet::empty();
     pthread_sigmask(
         SigmaskHow::SIG_BLOCK,
@@ -6919,6 +6981,8 @@ fn run_with_mode(config: &DaemonConfig, disconnected_recovery: bool) -> Result<(
     .map_err(DaemonError::Signal)?;
     let stop = Arc::new(AtomicBool::new(false));
     let signal_stop = Arc::clone(&stop);
+    let reload = Arc::new(AtomicBool::new(false));
+    let signal_reload = Arc::clone(&reload);
     let signal_fd = match SignalFd::with_flags(&signals, SfdFlags::SFD_NONBLOCK) {
         Ok(signal_fd) => signal_fd,
         Err(error) => {
@@ -6929,14 +6993,34 @@ fn run_with_mode(config: &DaemonConfig, disconnected_recovery: bool) -> Result<(
     let signal_thread = std::thread::spawn(move || {
         while !signal_stop.load(Ordering::Acquire) {
             match signal_fd.read_signal() {
-                Ok(Some(_)) => signal_stop.store(true, Ordering::Release),
+                Ok(Some(info)) => {
+                    let signal = i32::try_from(info.ssi_signo)
+                        .ok()
+                        .and_then(|number| Signal::try_from(number).ok());
+                    match signal {
+                        Some(Signal::SIGHUP) => signal_reload.store(true, Ordering::Release),
+                        Some(Signal::SIGINT | Signal::SIGTERM) | None => {
+                            signal_stop.store(true, Ordering::Release);
+                        }
+                        Some(_) => {}
+                    }
+                }
                 Ok(None) => std::thread::sleep(ACCEPT_POLL),
                 Err(_) => signal_stop.store(true, Ordering::Release),
             }
         }
     });
-    let result = Daemon::open_with_mode(config, disconnected_recovery)
-        .and_then(|daemon| daemon.serve(&stop));
+    let result = systemd::Notifier::from_environment()
+        .map_err(|error| DaemonError::ServiceManagerFailed(error.category()))
+        .and_then(|service_manager| {
+            if let Some(notifier) = service_manager.as_ref() {
+                notifier
+                    .extend_timeout(STARTUP_TIMEOUT_EXTENSION)
+                    .map_err(|error| DaemonError::ServiceManagerFailed(error.category()))?;
+            }
+            Daemon::open_with_mode(config, disconnected_recovery)
+                .and_then(|daemon| daemon.serve_with_control(&stop, &reload, service_manager))
+        });
     if !stop.load(Ordering::Acquire) {
         stop.store(true, Ordering::Release);
     }
@@ -7017,6 +7101,82 @@ fn authenticate_peer(stream: &UnixStream) -> Result<Admission, DaemonError> {
 /// construction cannot produce and which is refused rather than defaulted.
 fn local_peer_policy() -> Result<PeerPolicy, DaemonError> {
     PeerPolicy::new(&[geteuid().as_raw()]).map_err(|_| DaemonError::PeerDenied)
+}
+
+const SYSTEMD_LISTEN_FD_START: i32 = 3;
+const ADMIN_FD_NAME: &str = "admin";
+
+/// Open the self-bound foreground listener or adopt systemd's one exact fd.
+///
+/// Activation is all-or-nothing. A matching `LISTEN_PID` must advertise one
+/// descriptor, and an optional descriptor name must be `admin`; extra or
+/// malformed descriptors are refused rather than silently ignored. The
+/// activated pathname is compared with the configured endpoint and is never
+/// unlinked by the daemon, because the socket unit owns its lifetime.
+fn open_admin_listener(path: &Path) -> Result<(UnixListener, bool), DaemonError> {
+    let listen_pid = std::env::var_os("LISTEN_PID");
+    let listen_fds = std::env::var_os("LISTEN_FDS");
+    let listen_fdnames = std::env::var_os("LISTEN_FDNAMES");
+    let activated = activated_listener_fd(
+        listen_pid.as_deref(),
+        listen_fds.as_deref(),
+        listen_fdnames.as_deref(),
+        std::process::id(),
+    )?;
+    let Some(fd) = activated else {
+        prepare_socket_path(path)?;
+        let listener = UnixListener::bind(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        listener.set_nonblocking(true)?;
+        return Ok((listener, true));
+    };
+
+    let mut inherited = listenfd::ListenFd::from_env();
+    if inherited.len() != 1 || fd != SYSTEMD_LISTEN_FD_START {
+        return Err(DaemonError::SocketActivationRefused);
+    }
+    let listener = inherited
+        .take_unix_listener(0)
+        .map_err(|_| DaemonError::SocketActivationRefused)?
+        .ok_or(DaemonError::SocketActivationRefused)?;
+    let local = listener
+        .local_addr()
+        .map_err(|_| DaemonError::SocketActivationRefused)?;
+    if local.as_pathname() != Some(path) {
+        return Err(DaemonError::SocketActivationRefused);
+    }
+    listener.set_nonblocking(true)?;
+    Ok((listener, false))
+}
+
+fn activated_listener_fd(
+    listen_pid: Option<&std::ffi::OsStr>,
+    listen_fds: Option<&std::ffi::OsStr>,
+    listen_fdnames: Option<&std::ffi::OsStr>,
+    current_pid: u32,
+) -> Result<Option<i32>, DaemonError> {
+    let Some(listen_pid) = listen_pid else {
+        return if listen_fds.is_none() && listen_fdnames.is_none() {
+            Ok(None)
+        } else {
+            Err(DaemonError::SocketActivationRefused)
+        };
+    };
+    let parsed_pid = listen_pid
+        .to_str()
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or(DaemonError::SocketActivationRefused)?;
+    if parsed_pid != current_pid {
+        return Ok(None);
+    }
+    if listen_fds.and_then(std::ffi::OsStr::to_str) != Some("1")
+        || listen_fdnames
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name != ADMIN_FD_NAME)
+    {
+        return Err(DaemonError::SocketActivationRefused);
+    }
+    Ok(Some(SYSTEMD_LISTEN_FD_START))
 }
 
 fn prepare_socket_path(path: &Path) -> Result<(), DaemonError> {
@@ -7354,10 +7514,129 @@ mod approval_context_tests {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use super::{OperationalMetric, drain_shutdown_workers, durable_count};
+    use automonique_policy::approval::ApprovalRequirement;
+
+    use super::{
+        Daemon, DaemonConfig, OperationalMetric, activated_listener_fd, drain_shutdown_workers,
+        durable_count,
+    };
+
+    #[test]
+    fn socket_activation_environment_is_one_exact_named_descriptor() {
+        use std::ffi::OsStr;
+
+        assert_eq!(activated_listener_fd(None, None, None, 41).unwrap(), None);
+        assert_eq!(
+            activated_listener_fd(
+                Some(OsStr::new("40")),
+                Some(OsStr::new("99")),
+                Some(OsStr::new("foreign")),
+                41,
+            )
+            .unwrap(),
+            None,
+            "activation intended for another process is not ours to consume"
+        );
+        assert_eq!(
+            activated_listener_fd(
+                Some(OsStr::new("41")),
+                Some(OsStr::new("1")),
+                Some(OsStr::new("admin")),
+                41,
+            )
+            .unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            activated_listener_fd(Some(OsStr::new("41")), Some(OsStr::new("1")), None, 41,)
+                .unwrap(),
+            Some(3),
+            "LISTEN_FDNAMES is optional in the systemd protocol"
+        );
+
+        for refused in [
+            activated_listener_fd(None, Some(OsStr::new("1")), None, 41),
+            activated_listener_fd(
+                Some(OsStr::new("not-a-pid")),
+                Some(OsStr::new("1")),
+                None,
+                41,
+            ),
+            activated_listener_fd(Some(OsStr::new("41")), Some(OsStr::new("2")), None, 41),
+            activated_listener_fd(
+                Some(OsStr::new("41")),
+                Some(OsStr::new("1")),
+                Some(OsStr::new("other")),
+                41,
+            ),
+        ] {
+            assert_eq!(refused.unwrap_err().category(), "socket_activation_refused");
+        }
+    }
+
+    #[test]
+    fn configuration_reload_replaces_both_policy_fields_or_neither() {
+        let root = tempfile::tempdir().expect("temporary root");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private root");
+        let runtime_root = root.path().join("runtime");
+        let state_root = root.path().join("state");
+        for path in [&runtime_root, &state_root] {
+            std::fs::create_dir(path).expect("configuration root");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .expect("private configuration root");
+        }
+        let config = DaemonConfig {
+            runtime_root,
+            state_root,
+        };
+        let mut daemon = Daemon::open(&config).expect("daemon opens");
+        assert_eq!(
+            daemon.configured_approval_requirement,
+            ApprovalRequirement::Allowed
+        );
+        let default_lifetime = daemon.approval_lifetime;
+
+        let approval_dir = config.state_dir().join("approvals");
+        std::fs::create_dir(&approval_dir).expect("approval configuration directory");
+        std::fs::set_permissions(&approval_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("private approval configuration directory");
+        let approval_path = approval_dir.join("approvals.conf");
+        std::fs::write(
+            &approval_path,
+            "schema=automonique.approvals/v1\n\
+             requirement=approval_required\n\
+             ttl_ms=60000\n\
+             reminder_percent=20\n\
+             escalation_percent=70\n\
+             end=automonique.approvals/v1\n",
+        )
+        .expect("approval configuration");
+        std::fs::set_permissions(&approval_path, std::fs::Permissions::from_mode(0o600))
+            .expect("private approval configuration");
+        daemon.reload_configuration().expect("valid reload");
+        assert_eq!(
+            daemon.configured_approval_requirement,
+            ApprovalRequirement::ApprovalRequired
+        );
+        assert_eq!(daemon.approval_lifetime.ttl_ms(), 60_000);
+
+        std::fs::write(&approval_path, "not a configuration\n").expect("malformed replacement");
+        let error = daemon
+            .reload_configuration()
+            .expect_err("malformed reload is refused");
+        assert_eq!(error.category(), "approval_config_malformed");
+        assert_eq!(
+            daemon.configured_approval_requirement,
+            ApprovalRequirement::ApprovalRequired
+        );
+        assert_eq!(daemon.approval_lifetime.ttl_ms(), 60_000);
+        assert_ne!(daemon.approval_lifetime, default_lifetime);
+    }
 
     #[test]
     fn shutdown_drain_renews_until_workers_finish_and_retains_the_first_failure() {

@@ -234,6 +234,20 @@ impl ApprovalPolicyConfig {
         }
     }
 
+    /// The requirement and lifetime from one coherent configuration read.
+    ///
+    /// Reading the file once matters during reload: a rename between two
+    /// independent reads must not pair one generation's requirement with
+    /// another generation's lifetime.
+    pub fn values_or_default(
+        state_dir: &Path,
+    ) -> Result<(ApprovalRequirement, ApprovalLifetime), ApprovalPolicyConfigError> {
+        Ok(Self::load(state_dir)?.map_or(
+            (DEFAULT_APPROVAL_REQUIREMENT, ApprovalLifetime::DEFAULT),
+            |config| (config.requirement(), config.lifetime()),
+        ))
+    }
+
     /// The configured lifetime, defaulting to [`ApprovalLifetime::DEFAULT`]
     /// when nothing is configured.
     ///
@@ -244,7 +258,7 @@ impl ApprovalPolicyConfig {
     pub fn lifetime_or_default(
         state_dir: &Path,
     ) -> Result<ApprovalLifetime, ApprovalPolicyConfigError> {
-        Ok(Self::load(state_dir)?.map_or(ApprovalLifetime::DEFAULT, Self::lifetime))
+        Self::values_or_default(state_dir).map(|(_, lifetime)| lifetime)
     }
 
     /// The configured requirement, defaulting to
@@ -257,10 +271,7 @@ impl ApprovalPolicyConfig {
     pub fn requirement_or_default(
         state_dir: &Path,
     ) -> Result<ApprovalRequirement, ApprovalPolicyConfigError> {
-        Ok(
-            Self::load(state_dir)?
-                .map_or(DEFAULT_APPROVAL_REQUIREMENT, |config| config.requirement),
-        )
+        Self::values_or_default(state_dir).map(|(requirement, _)| requirement)
     }
 
     /// Load the configuration, distinguishing "deliberately not configured"

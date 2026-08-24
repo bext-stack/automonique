@@ -2,7 +2,7 @@
 
 [Unit]
 Description=Automonique disconnected recovery daemon
-Conflicts=automonique.service
+Conflicts=automonique.service automonique.socket
 
 [Service]
 Type=notify

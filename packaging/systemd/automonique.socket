@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+[Unit]
+Description=Automonique local administration socket
+
+[Socket]
+ListenStream=%t/automonique/admin.sock
+SocketMode=0600
+DirectoryMode=0700
+FileDescriptorName=admin
+Service=automonique.service
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target
