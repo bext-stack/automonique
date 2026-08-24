@@ -5253,6 +5253,13 @@ fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
                 }
                 SlackReceiveDisposition::Reconnect => break,
             };
+            // The stop flag can rise while the websocket read is blocked. An
+            // envelope returned after that boundary has not been acknowledged,
+            // so leave it for Slack to redeliver to the successor rather than
+            // beginning a potentially long synchronous handler while draining.
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
             let envelope_id = match socket_envelope_id(envelope.as_str()) {
                 Some(envelope_id) => envelope_id,
                 None if socket_hello(envelope.as_str()) => {
