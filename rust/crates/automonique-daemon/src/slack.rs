@@ -5224,10 +5224,22 @@ fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
                 continue;
             }
         };
+        // A stop may arrive while apps.connections.open is in flight. Do not
+        // spend a second network deadline connecting a URL this generation
+        // will never consume.
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
         let Ok(mut connection) = worker.connector.connect(&url) else {
             slack_backoff(stop);
             continue;
         };
+        // Likewise, a connect that settled after shutdown must not enter its
+        // first bounded websocket read. At every startup boundary shutdown is
+        // therefore limited to the one operation already in flight.
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
         while !stop.load(Ordering::Acquire) {
             let envelope = match slack_receive_disposition(connection.receive_envelope()) {
                 SlackReceiveDisposition::Envelope(envelope) => envelope,
