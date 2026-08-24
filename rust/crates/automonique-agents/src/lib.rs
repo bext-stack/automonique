@@ -40,9 +40,9 @@ pub use codex::{CodexAdapter, CodexInvocationPlan, ExecutableInspection, normali
 pub use jcode::{
     JCODE_API_SCHEMA_ID, JCODE_API_STDIO_ARGUMENTS, JCODE_API_VERSION, JcodeEvent,
     JcodeExecutionIdentity, JcodeFrameDecoder, JcodeInterruptedReason, JcodeNativeAdapter,
-    JcodeNativeEnvelope, JcodeNativeEvent, JcodeProtocolError, JcodeRequest, JcodeTerminalOutcome,
-    JcodeTurnCollector, JcodeTurnResult, PermissionDecision, REQUIRED_JCODE_CAPABILITIES,
-    encode_jcode_request,
+    JcodeNativeEnvelope, JcodeNativeEvent, JcodeNegotiation, JcodeProtocolError, JcodeRequest,
+    JcodeTerminalOutcome, JcodeTurnCollector, JcodeTurnResult, PermissionDecision,
+    REQUIRED_JCODE_CAPABILITIES, encode_jcode_request,
 };
 pub use spawn_plan::{
     MAX_LOADER_GRANTS, PromptDelivery, ProviderExecutable, ProviderKind, ProviderLaunchPlan,

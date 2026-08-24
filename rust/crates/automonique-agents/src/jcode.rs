@@ -341,6 +341,7 @@ pub enum JcodeInterruptedReason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JcodeTerminalOutcome {
     Completed,
+    Cancelled,
     ProviderFailed,
     InterruptedUnknown(JcodeInterruptedReason),
 }
@@ -352,6 +353,52 @@ pub enum JcodeNativeEvent {
         outcome: JcodeTerminalOutcome,
         provider_code: Option<String>,
     },
+}
+
+/// A successfully correlated protocol-v1 hello bound to one pinned process
+/// identity. Only this type can start an adapter after process-level
+/// negotiation has already completed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JcodeNegotiation {
+    identity: JcodeExecutionIdentity,
+}
+
+impl JcodeNegotiation {
+    pub fn accept(
+        identity: JcodeExecutionIdentity,
+        hello_request_id: u64,
+        event: &JcodeEvent,
+    ) -> Result<Self, JcodeProtocolError> {
+        if hello_request_id == 0 {
+            return Err(JcodeProtocolError::InvalidField("request_id"));
+        }
+        let JcodeEvent::HelloOk {
+            reply_to,
+            server,
+            capabilities,
+        } = event
+        else {
+            return Err(JcodeProtocolError::HandshakeRequired);
+        };
+        if *reply_to != hello_request_id {
+            return Err(JcodeProtocolError::ReplyMismatch);
+        }
+        if server != identity.expected_server() {
+            return Err(JcodeProtocolError::IdentityMismatch);
+        }
+        if REQUIRED_JCODE_CAPABILITIES
+            .iter()
+            .any(|required| !capabilities.iter().any(|actual| actual == required))
+        {
+            return Err(JcodeProtocolError::MissingCapability);
+        }
+        Ok(Self { identity })
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> &JcodeExecutionIdentity {
+        &self.identity
+    }
 }
 
 /// One Automonique-owned envelope in exact provider read order.
@@ -404,11 +451,12 @@ pub struct JcodeNativeAdapter {
     identity: JcodeExecutionIdentity,
     run_id: String,
     turn_id: String,
-    hello_request_id: u64,
+    hello_request_id: Option<u64>,
     turn_request_id: u64,
     provider_session_id: Option<String>,
     negotiated: bool,
     accepted: bool,
+    cancellation_requested: bool,
     terminal: Option<JcodeTerminalOutcome>,
     next_sequence: u64,
 }
@@ -432,11 +480,44 @@ impl JcodeNativeAdapter {
             identity,
             run_id: coordinates.run_id().to_owned(),
             turn_id: coordinates.turn_id().to_owned(),
-            hello_request_id,
+            hello_request_id: Some(hello_request_id),
             turn_request_id,
             provider_session_id: None,
             negotiated: false,
             accepted: false,
+            cancellation_requested: false,
+            terminal: None,
+            next_sequence: 1,
+        })
+    }
+
+    /// Start a turn after the process owner has already completed and retained
+    /// an exact [`JcodeNegotiation`].
+    pub fn after_negotiation(
+        negotiation: JcodeNegotiation,
+        coordinates: &RunCoordinates,
+        turn_request_id: u64,
+        provider_session_id: &str,
+    ) -> Result<Self, JcodeProtocolError> {
+        if turn_request_id == 0 {
+            return Err(JcodeProtocolError::InvalidField("request_id"));
+        }
+        validate_coordinate(coordinates.run_id(), "run_id")
+            .map_err(|_| JcodeProtocolError::InvalidField("run_id"))?;
+        validate_coordinate(coordinates.turn_id(), "turn_id")
+            .map_err(|_| JcodeProtocolError::InvalidField("turn_id"))?;
+        validate_field(provider_session_id, "session_id")?;
+        Ok(Self {
+            decoder: JcodeFrameDecoder::new(),
+            identity: negotiation.identity,
+            run_id: coordinates.run_id().to_owned(),
+            turn_id: coordinates.turn_id().to_owned(),
+            hello_request_id: None,
+            turn_request_id,
+            provider_session_id: Some(provider_session_id.to_owned()),
+            negotiated: true,
+            accepted: false,
+            cancellation_requested: false,
             terminal: None,
             next_sequence: 1,
         })
@@ -452,13 +533,32 @@ impl JcodeNativeAdapter {
         Ok(envelopes)
     }
 
+    /// Accept one event already produced by an upstream bounded
+    /// [`JcodeFrameDecoder`]. Process owners use this when one decoder is
+    /// shared across process-level negotiation and serialized turns.
+    pub fn observe_decoded(
+        &mut self,
+        event: JcodeEvent,
+    ) -> Result<JcodeNativeEnvelope, JcodeProtocolError> {
+        self.observe(event)
+    }
+
     /// Settle provider EOF once. EOF is never success: absent a prior terminal
     /// frame it becomes one explicit interrupted/unknown terminal envelope.
     pub fn finish_eof(&mut self) -> Result<Option<JcodeNativeEnvelope>, JcodeProtocolError> {
+        self.finish_eof_with_pending_frame(false)
+    }
+
+    /// Settle EOF when a process owner performed bounded framing upstream and
+    /// knows it retained an incomplete final frame.
+    pub fn finish_eof_with_pending_frame(
+        &mut self,
+        upstream_pending: bool,
+    ) -> Result<Option<JcodeNativeEnvelope>, JcodeProtocolError> {
         if self.terminal.is_some() {
             return Ok(None);
         }
-        let reason = if self.decoder.has_pending() {
+        let reason = if upstream_pending || self.decoder.has_pending() {
             JcodeInterruptedReason::IncompleteFrame
         } else {
             JcodeInterruptedReason::ProviderEof
@@ -469,6 +569,15 @@ impl JcodeNativeAdapter {
             outcome,
             provider_code: None,
         })?))
+    }
+
+    /// Bind a supervisor-issued cancellation to the next provider terminal.
+    pub fn mark_cancellation_requested(&mut self) -> Result<(), JcodeProtocolError> {
+        if self.terminal.is_some() || self.cancellation_requested {
+            return Err(JcodeProtocolError::EventOrder);
+        }
+        self.cancellation_requested = true;
+        Ok(())
     }
 
     #[must_use]
@@ -487,13 +596,14 @@ impl JcodeNativeAdapter {
             else {
                 return Err(JcodeProtocolError::HandshakeRequired);
             };
-            if *reply_to != self.hello_request_id {
+            if Some(*reply_to) != self.hello_request_id {
                 return Err(JcodeProtocolError::ReplyMismatch);
             }
             if server != self.identity.expected_server() {
                 return Err(JcodeProtocolError::IdentityMismatch);
             }
             self.negotiated = true;
+            self.hello_request_id = None;
             return self.envelope(JcodeNativeEvent::Provider(event));
         }
         if matches!(event, JcodeEvent::HelloOk { .. }) {
@@ -522,9 +632,14 @@ impl JcodeNativeAdapter {
                 if !self.accepted {
                     return Err(JcodeProtocolError::EventOrder);
                 }
-                self.terminal = Some(JcodeTerminalOutcome::Completed);
+                let outcome = if self.cancellation_requested {
+                    JcodeTerminalOutcome::Cancelled
+                } else {
+                    JcodeTerminalOutcome::Completed
+                };
+                self.terminal = Some(outcome);
                 JcodeNativeEvent::Terminal {
-                    outcome: JcodeTerminalOutcome::Completed,
+                    outcome,
                     provider_code: None,
                 }
             }

@@ -1221,7 +1221,7 @@ fn a_contained_jcode_protocol_turn_answers_through_the_production_lane() {
     write_private(
         &fixture.state_dir().join(PROVIDER_CONFIG_NAME),
         &format!(
-            "engine=jcode\nbinary={BUSYBOX}\nhome={}\nversion=jcode-production-fixture\narg=sh\narg=-c\narg={script}\narg=api-stdio\n",
+            "engine=jcode\nbinary={BUSYBOX}\nhome={}\nversion=jcode/production-fixture\narg=sh\narg=-c\narg={script}\narg=api-stdio\n",
             home.display()
         ),
     );
@@ -1277,7 +1277,7 @@ fn a_jcode_provider_permission_waits_for_the_durable_operator_decision() {
     write_private(
         &fixture.state_dir().join(PROVIDER_CONFIG_NAME),
         &format!(
-            "engine=jcode\nbinary={BUSYBOX}\nhome={}\nversion=jcode-approval-fixture\narg=sh\narg=-c\narg={script}\narg=api-stdio\n",
+            "engine=jcode\nbinary={BUSYBOX}\nhome={}\nversion=jcode/approval-fixture\narg=sh\narg=-c\narg={script}\narg=api-stdio\n",
             home.display()
         ),
     );
@@ -1358,7 +1358,7 @@ fn a_live_jcode_turn_cancels_through_the_production_control_lane() {
     write_private(
         &fixture.state_dir().join(PROVIDER_CONFIG_NAME),
         &format!(
-            "engine=jcode\nbinary={BUSYBOX}\nhome={}\nversion=jcode-cancel-fixture\narg=sh\narg=-c\narg={script}\narg=api-stdio\n",
+            "engine=jcode\nbinary={BUSYBOX}\nhome={}\nversion=jcode/cancel-fixture\narg=sh\narg=-c\narg={script}\narg=api-stdio\n",
             home.display()
         ),
     );
@@ -1419,11 +1419,21 @@ fn a_live_jcode_turn_cancels_through_the_production_control_lane() {
     let turns = journal
         .session_turns(session.session_id)
         .expect("provider turns");
+    let aborted = turns
+        .iter()
+        .find(|turn| turn.state == automonique_store::provider_journal::TurnState::Aborted)
+        .expect("the cancellation must abort an actual JCode turn");
     assert!(
-        turns
+        journal
+            .turn_requests(aborted.turn_id)
+            .expect("cancelled turn requests")
             .iter()
-            .any(|turn| turn.state == automonique_store::provider_journal::TurnState::Aborted),
-        "the cancellation must abort an actual JCode turn"
+            .any(|request| {
+                request.request_key.starts_with("cancel:")
+                    && request.outcome
+                        == automonique_store::provider_journal::RequestState::Answered
+            }),
+        "provider turn_done must durably acknowledge the cancel request"
     );
     serving.shutdown(&fixture.config);
 }
@@ -1449,12 +1459,18 @@ fn a_control_lease_steers_the_live_jcode_turn_and_nothing_after_it() {
         "{\"v\":1,\"reply_to\":2,\"ev\":\"attached\",\"session\":{\"session_id\":\"jcode-steer-session\",\"status\":\"idle\"}}'; ",
         "IFS= read -r request; printf '%s\\n' ",
         "'{\"v\":1,\"ev\":\"message_accepted\",\"session_id\":\"jcode-steer-session\"}' ",
+        "'{\"v\":1,\"ev\":\"stdin_request\",\"session_id\":\"jcode-steer-session\",\"request_id\":\"stdin-1\",\"prompt\":\"fixture input\",\"is_password\":false,\"tool_call_id\":\"tool-input-1\"}'; ",
+        "IFS= read -r request; case \"$request\" in ",
+        "*'\"req\":\"stdin_response\"'*'\"request_id\":\"stdin-1\"'*'\"input\":\"fixture-input\"'*) : ;; ",
+        "*) exit 18 ;; esac; ",
+        "printf '%s\\n' ",
+        "'{\"v\":1,\"reply_to\":4,\"ev\":\"ok\"}' ",
         "'{\"v\":1,\"ev\":\"tool_start\",\"session_id\":\"jcode-steer-session\",\"call_id\":\"tool-1\",\"name\":\"wait-for-steer\"}'; ",
         "IFS= read -r request; case \"$request\" in ",
         "*'\"req\":\"soft_interrupt\"'*'\"content\":\"replace-the-answer\"'*) : ;; ",
         "*) exit 19 ;; esac; ",
         "printf '%s\\n' ",
-        "'{\"v\":1,\"reply_to\":4,\"ev\":\"ok\"}' ",
+        "'{\"v\":1,\"reply_to\":5,\"ev\":\"ok\"}' ",
         "'{\"v\":1,\"ev\":\"tool_done\",\"session_id\":\"jcode-steer-session\",\"call_id\":\"tool-1\",\"name\":\"wait-for-steer\"}' ",
         "'{\"v\":1,\"ev\":\"text_delta\",\"session_id\":\"jcode-steer-session\",\"text\":\"JCODE-STEERED-OK\"}' ",
         "'{\"v\":1,\"ev\":\"turn_done\",\"session_id\":\"jcode-steer-session\"}'; ",
@@ -1463,7 +1479,7 @@ fn a_control_lease_steers_the_live_jcode_turn_and_nothing_after_it() {
     write_private(
         &fixture.state_dir().join(PROVIDER_CONFIG_NAME),
         &format!(
-            "engine=jcode\nbinary={BUSYBOX}\nhome={}\nversion=jcode-steer-fixture\narg=sh\narg=-c\narg={script}\narg=api-stdio\n",
+            "engine=jcode\nbinary={BUSYBOX}\nhome={}\nversion=jcode/steer-fixture\narg=sh\narg=-c\narg={script}\narg=api-stdio\n",
             home.display()
         ),
     );
@@ -1492,14 +1508,22 @@ fn a_control_lease_steers_the_live_jcode_turn_and_nothing_after_it() {
         .join(&run_id)
         .join("spool")
         .join("events.ndjson");
-    while std::fs::read_to_string(&events)
-        .map(|text| text.lines().count())
-        .unwrap_or_default()
-        < 5
+    while !automonique_runner::read_events(events.parent().expect("spool directory"), &run_id)
+        .is_ok_and(|projected| {
+            projected.iter().any(|event| {
+                ProgressFrame::from_canonical_bytes(event.payload()).is_ok_and(|frame| {
+                    frame.kind() == automonique_protocol::event::EventKind::ApprovalRequested
+                        && frame
+                            .body()
+                            .text()
+                            .is_some_and(|text| text.as_str().contains("provider input stdin-1"))
+                })
+            })
+        })
     {
         assert!(
             Instant::now() < deadline,
-            "JCode turn did not reach its live tool event"
+            "JCode turn did not expose its bounded stdin request"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -1526,6 +1550,38 @@ fn a_control_lease_steers_the_live_jcode_turn_and_nothing_after_it() {
         ResourceKind::ControlLease,
         ResourceId::new(lease.id.as_str()).expect("lease resource ID"),
     );
+    let PlatformResponse::Receipt(receipt) = platform(
+        &fixture.config,
+        "jcode-input-execute",
+        PlatformRequest::Execute(
+            PlatformExecuteRequest::new(
+                PlatformAction::Steer,
+                lease_target.clone(),
+                IdempotencyKey::new("jcode-input-execute-1").expect("input key"),
+                Some(lease.revision),
+                Some(PlatformText::new("fixture-input").expect("input text")),
+            )
+            .expect("input action"),
+        ),
+    ) else {
+        panic!("accepted stdin response must return its durable receipt")
+    };
+    assert_eq!(receipt.outcome, ReceiptOutcome::Completed);
+    while !automonique_runner::read_events(events.parent().expect("spool directory"), &run_id)
+        .is_ok_and(|projected| {
+            projected.iter().any(|event| {
+                ProgressFrame::from_canonical_bytes(event.payload()).is_ok_and(|frame| {
+                    frame.kind() == automonique_protocol::event::EventKind::ToolCallStarted
+                })
+            })
+        })
+    {
+        assert!(
+            Instant::now() < deadline,
+            "JCode turn did not continue to its live tool event"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let PlatformResponse::Receipt(receipt) = platform(
         &fixture.config,
         "jcode-steer-execute",
@@ -1559,6 +1615,30 @@ fn a_control_lease_steers_the_live_jcode_turn_and_nothing_after_it() {
         }),
         "provider acknowledgement must become an authoritative turn_steered event"
     );
+    let mut journal = automonique_store::provider_journal::ProviderJournal::open(
+        fixture
+            .state_dir()
+            .join(automonique_daemon::PROVIDER_JOURNAL_NAME),
+    )
+    .expect("provider journal");
+    let recovery = journal
+        .recover_attempt(&format!("{run_id}-attempt"))
+        .expect("JCode recovery");
+    let journal_session = recovery.session.expect("provider session");
+    let turn = journal
+        .session_turns(journal_session.session_id)
+        .expect("turns")
+        .pop()
+        .expect("turn");
+    let requests = journal.turn_requests(turn.turn_id).expect("requests");
+    assert!(requests.iter().any(|request| {
+        request.request_key == "stdin:stdin-1"
+            && request.outcome == automonique_store::provider_journal::RequestState::Answered
+    }));
+    assert!(requests.iter().any(|request| {
+        request.request_key.starts_with("steer:")
+            && request.outcome == automonique_store::provider_journal::RequestState::Answered
+    }));
 
     let PlatformResponse::Receipt(stale_host_receipt) = platform(
         &fixture.config,
@@ -1654,7 +1734,7 @@ fn managed_jcode_follow_up_attaches_the_exact_provider_session() {
     write_private(
         &fixture.state_dir().join(PROVIDER_CONFIG_NAME),
         &format!(
-            "engine=jcode\nbinary={BUSYBOX}\nhome={}\nversion=jcode-resume-fixture\narg=sh\narg=-c\narg={script}\narg=api-stdio\n",
+            "engine=jcode\nbinary={BUSYBOX}\nhome={}\nversion=jcode/resume-fixture\narg=sh\narg=-c\narg={script}\narg=api-stdio\n",
             home.display()
         ),
     );

@@ -3,8 +3,9 @@
 use automonique_agents::{
     JCODE_API_SCHEMA_ID, JCODE_API_STDIO_ARGUMENTS, JCODE_API_VERSION, JcodeEvent,
     JcodeExecutionIdentity, JcodeFrameDecoder, JcodeInterruptedReason, JcodeNativeAdapter,
-    JcodeNativeEvent, JcodeProtocolError, JcodeRequest, JcodeTerminalOutcome, JcodeTurnCollector,
-    REQUIRED_JCODE_CAPABILITIES, RunCoordinates, SessionScope, encode_jcode_request,
+    JcodeNativeEvent, JcodeNegotiation, JcodeProtocolError, JcodeRequest, JcodeTerminalOutcome,
+    JcodeTurnCollector, REQUIRED_JCODE_CAPABILITIES, RunCoordinates, SessionScope,
+    encode_jcode_request,
 };
 
 fn capabilities() -> String {
@@ -288,6 +289,81 @@ fn a_correlated_provider_error_is_one_failed_terminal() {
         }
     );
     assert_eq!(adapter.finish_eof().expect("EOF after terminal"), None);
+}
+
+#[test]
+fn a_process_negotiation_token_starts_a_bound_turn_and_preserves_upstream_eof_state() {
+    let mut decoder = JcodeFrameDecoder::new();
+    let hello = decoder
+        .push(include_bytes!(
+            "fixtures/jcode_api_stdio/eof_before_terminal.jsonl"
+        ))
+        .expect("fixture")
+        .remove(0);
+    let negotiation = JcodeNegotiation::accept(execution_identity(), 11, &hello)
+        .expect("exact hello creates token");
+    let mut adapter =
+        JcodeNativeAdapter::after_negotiation(negotiation, &coordinates(), 13, "session-1")
+            .expect("bound turn");
+    let accepted = adapter
+        .observe_decoded(JcodeEvent::MessageAccepted {
+            session_id: "session-1".to_owned(),
+        })
+        .expect("decoded event");
+    assert_eq!(accepted.sequence(), 1);
+    let terminal = adapter
+        .finish_eof_with_pending_frame(true)
+        .expect("EOF")
+        .expect("one terminal");
+    assert_eq!(terminal.sequence(), 2);
+    assert!(matches!(
+        terminal.event(),
+        JcodeNativeEvent::Terminal {
+            outcome: JcodeTerminalOutcome::InterruptedUnknown(
+                JcodeInterruptedReason::IncompleteFrame
+            ),
+            ..
+        }
+    ));
+    assert_eq!(adapter.finish_eof().expect("repeat EOF"), None);
+}
+
+#[test]
+fn a_supervisor_cancel_settles_the_native_turn_once_as_cancelled() {
+    let mut decoder = JcodeFrameDecoder::new();
+    let hello = decoder
+        .push(include_bytes!(
+            "fixtures/jcode_api_stdio/eof_before_terminal.jsonl"
+        ))
+        .expect("fixture")
+        .remove(0);
+    let negotiation = JcodeNegotiation::accept(execution_identity(), 11, &hello).expect("hello");
+    let mut adapter =
+        JcodeNativeAdapter::after_negotiation(negotiation, &coordinates(), 13, "session-1")
+            .expect("bound turn");
+    adapter
+        .observe_decoded(JcodeEvent::MessageAccepted {
+            session_id: "session-1".to_owned(),
+        })
+        .expect("accepted");
+    adapter.mark_cancellation_requested().expect("cancel bound");
+    assert_eq!(
+        adapter.mark_cancellation_requested().unwrap_err(),
+        JcodeProtocolError::EventOrder
+    );
+    let terminal = adapter
+        .observe_decoded(JcodeEvent::TurnDone {
+            session_id: "session-1".to_owned(),
+        })
+        .expect("terminal");
+    assert_eq!(
+        terminal.event(),
+        &JcodeNativeEvent::Terminal {
+            outcome: JcodeTerminalOutcome::Cancelled,
+            provider_code: None,
+        }
+    );
+    assert_eq!(adapter.finish_eof().expect("EOF"), None);
 }
 
 #[test]
