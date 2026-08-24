@@ -18,7 +18,6 @@ StateDirectoryMode=0700
 Environment=XDG_RUNTIME_DIR=%t
 NoNewPrivileges=yes
 PrivateTmp=yes
-PrivateDevices=yes
 ProtectHome=read-only
 ProtectSystem=strict
 RestrictAddressFamilies=AF_INET AF_UNIX

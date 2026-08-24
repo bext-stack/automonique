@@ -13,7 +13,7 @@ Run the composed entry point under the same unprivileged user as the daemon so
 Unix peer authentication admits `progress.sock`, on loopback and an
 unprivileged port. The service manager should enforce at least:
 
-- `NoNewPrivileges=yes`, `PrivateTmp=yes`, `PrivateDevices=yes`;
+- `NoNewPrivileges=yes` and `PrivateTmp=yes`;
 - `ProtectSystem=strict`, `ProtectHome=yes`, and an empty writable-path set;
 - no supplementary groups and no access to provider credential stores;
 - address-family restriction to the chosen loopback transport;
