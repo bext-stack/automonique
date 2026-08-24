@@ -1211,10 +1211,20 @@ impl ExecutionLane {
     /// bounded by each document's own timeout, which the backend enforces. No
     /// deadline is added here: abandoning a live attempt to meet one would
     /// leave exactly the orphaned tree the containment exists to prevent.
-    pub fn shutdown(mut self) {
-        for worker in self.workers.drain(..) {
+    pub fn shutdown(self) {
+        for worker in self.begin_shutdown() {
             let _ = worker.join();
         }
+    }
+
+    /// Return every live worker to an external drainer.
+    ///
+    /// Moving the handles out consumes the lane and releases its own attempt
+    /// host reference. Each worker retains its registration until it finishes,
+    /// so the daemon can keep the generation lease live while polling these
+    /// handles without weakening containment or cancellation custody.
+    pub(crate) fn begin_shutdown(mut self) -> Vec<JoinHandle<()>> {
+        self.workers.drain(..).collect()
     }
 }
 

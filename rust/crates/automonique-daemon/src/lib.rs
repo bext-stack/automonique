@@ -2114,21 +2114,46 @@ impl Daemon {
         // disconnect is not a cancellation, here or anywhere else — see
         // [`progress_hub`] — and cancellation remains the explicit dispatcher
         // path through [`Daemon::cancel_run`].
-        self.managed_tui.shutdown();
+        let mut shutdown_workers = Vec::new();
+        shutdown_workers.extend(self.managed_tui.begin_shutdown());
         if let Some(progress_endpoint) = self.progress_endpoint.take() {
-            progress_endpoint.shutdown();
+            shutdown_workers.extend(progress_endpoint.begin_shutdown());
         }
         if let Some(execution) = self.execution.take() {
-            execution.shutdown();
+            shutdown_workers.extend(execution.begin_shutdown());
         }
-        self.slack_tickets.shutdown();
+        shutdown_workers.extend(self.slack_tickets.begin_shutdown());
         // Support intake ends beside them, and for the same reason: its worker
         // writes to a durable sibling database this generation owns, so it must
         // stop and be joined while the generation is still held. It has no
         // durable lease of its own to release — it owns no cursor, so there is
         // nothing a second poller could double-advance — which is why this is a
         // join and not a lifecycle. See [`ticket_intake`].
-        self.ticket_intake.shutdown();
+        shutdown_workers.extend(self.ticket_intake.begin_shutdown());
+        shutdown_workers.extend(self.telegram.begin_shutdown());
+        // Every worker above may be blocked in a bounded transport operation,
+        // and live attempts deliberately drain to their own document deadline.
+        // Starting every drain before joining makes the independent deadlines
+        // overlap. More importantly, the serve thread remains the generation
+        // and bot-lease coordinator while it waits: neither lease may expire
+        // underneath a worker that still writes durable state.
+        let shutdown_renewal = drain_shutdown_workers(
+            shutdown_workers,
+            Duration::from_millis(
+                u64::try_from(LEASE_RENEW_INTERVAL_MS)
+                    .expect("renewal interval is a positive constant"),
+            ),
+            || {
+                if self_end_kind == SelfEndKind::Expired {
+                    return Ok(());
+                }
+                self.renew_lease().and_then(|()| {
+                    self.telegram
+                        .renew()
+                        .map_err(|error| DaemonError::TelegramRefused(error.category()))
+                })
+            },
+        );
         // Cancellation dispatch ends next, beneath the still-held generation
         // fence. The lease is what makes "one daemon is one dispatcher" true,
         // so this process stops owning the ledger before it stops owning the
@@ -2205,6 +2230,7 @@ impl Daemon {
                 Err(primary)
             }
             Ok(()) => attempt_host_disposal
+                .and(shutdown_renewal)
                 .and(telegram_release)
                 .and(tenure_close)
                 .and(release)
@@ -6677,6 +6703,37 @@ fn map_lease_authority_error(error: lease_time::LeaseAuthorityError) -> DaemonEr
     }
 }
 
+/// Join already-signalled workers while periodically maintaining their fence.
+///
+/// Workers start draining before this function is called, so independent
+/// transport deadlines overlap. The first renewal error is retained, but every
+/// later renewal is still attempted until all workers have relinquished their
+/// durable-state authority.
+fn drain_shutdown_workers<E>(
+    workers: Vec<std::thread::JoinHandle<()>>,
+    renewal_interval: Duration,
+    mut renew: impl FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    let mut first_failure = None;
+    let mut next_renewal = std::time::Instant::now();
+    while workers.iter().any(|worker| !worker.is_finished()) {
+        let now = std::time::Instant::now();
+        if now >= next_renewal {
+            if let Err(error) = renew()
+                && first_failure.is_none()
+            {
+                first_failure = Some(error);
+            }
+            next_renewal = now + renewal_interval;
+        }
+        std::thread::sleep(ACCEPT_POLL);
+    }
+    for worker in workers {
+        let _ = worker.join();
+    }
+    first_failure.map_or(Ok(()), Err)
+}
+
 /// Record this daemon's tenure over the generation it has just leased.
 ///
 /// # The decision is "has this generation any recorded history", not "is a tenure open"
@@ -7297,7 +7354,29 @@ mod approval_context_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{OperationalMetric, durable_count};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use super::{OperationalMetric, drain_shutdown_workers, durable_count};
+
+    #[test]
+    fn shutdown_drain_renews_until_workers_finish_and_retains_the_first_failure() {
+        let worker = std::thread::spawn(|| std::thread::sleep(Duration::from_millis(85)));
+        let renewals = AtomicUsize::new(0);
+
+        let result = drain_shutdown_workers(vec![worker], Duration::from_millis(10), || {
+            match renewals.fetch_add(1, Ordering::Relaxed) {
+                0 => Err("first renewal failed"),
+                _ => Ok(()),
+            }
+        });
+
+        assert_eq!(result, Err("first renewal failed"));
+        assert!(
+            renewals.load(Ordering::Relaxed) >= 2,
+            "a later renewal must still be attempted while the worker drains"
+        );
+    }
 
     /// The seam where a failed read becomes a reported value.
     ///

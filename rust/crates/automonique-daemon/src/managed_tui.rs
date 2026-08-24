@@ -129,10 +129,18 @@ impl ManagedTuiHost {
     }
 
     pub fn shutdown(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(worker) = self.worker.take() {
+        if let Some(worker) = self.begin_shutdown() {
             let _ = worker.join();
         }
+    }
+
+    /// Signal the worker and return its join handle to an external drainer.
+    ///
+    /// The daemon uses this form so all transport workers can drain together
+    /// while the serve thread keeps their shared generation lease renewed.
+    pub(crate) fn begin_shutdown(&mut self) -> Option<JoinHandle<()>> {
+        self.stop.store(true, Ordering::Release);
+        self.worker.take()
     }
 }
 

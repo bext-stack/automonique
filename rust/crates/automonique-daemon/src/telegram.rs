@@ -1046,7 +1046,9 @@ impl TelegramHost {
     /// the very lease being released, so returning while it still polls would
     /// leave a committer running under authority nobody holds.
     pub(crate) fn release(&mut self) -> Result<(), TelegramHostError> {
-        self.stop_polling();
+        if let Some(worker) = self.begin_shutdown() {
+            let _ = worker.join();
+        }
         match self {
             Self::Disabled => Ok(()),
             Self::LeaseOwned { coordinator } | Self::Live { coordinator, .. } => {
@@ -1055,21 +1057,15 @@ impl TelegramHost {
         }
     }
 
-    /// Ask the worker to finish its in-flight poll, then join it.
-    ///
-    /// Blocks for at most one long poll plus the transport's own allowance. The
-    /// in-flight request is deliberately not cancelled: letting it complete is
-    /// what commits its batch and advances the durable offset, so the updates it
-    /// already fetched are not re-delivered to a successor.
-    fn stop_polling(&mut self) {
+    /// Signal the poller and return its handle to the daemon's
+    /// lease-maintaining shutdown drainer.
+    pub(crate) fn begin_shutdown(&mut self) -> Option<JoinHandle<()>> {
         let Self::Live { control, .. } = self else {
-            return;
+            return None;
         };
         control.stop.store(true, Ordering::Release);
         control.prepared = None;
-        if let Some(worker) = control.worker.take() {
-            let _ = worker.join();
-        }
+        control.worker.take()
     }
 }
 

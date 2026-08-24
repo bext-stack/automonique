@@ -925,11 +925,20 @@ impl ProgressEndpoint {
     /// still holding a subscriber slot on a hub the daemon is about to drop. It
     /// cancels nothing — see this module's documentation — and every attempt
     /// that was running keeps running.
-    pub fn shutdown(mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(accept) = self.accept.take() {
+    pub fn shutdown(self) {
+        if let Some(accept) = self.begin_shutdown() {
             let _ = accept.join();
         }
+    }
+
+    /// Stop accepting and return the accept-loop handle to an external drainer.
+    ///
+    /// Dropping `self` after taking the handle also unlinks the exact socket
+    /// this endpoint created, preventing a new subscriber from entering while
+    /// the already-admitted writers finish.
+    pub(crate) fn begin_shutdown(mut self) -> Option<JoinHandle<()>> {
+        self.stop.store(true, Ordering::Release);
+        self.accept.take()
     }
 }
 

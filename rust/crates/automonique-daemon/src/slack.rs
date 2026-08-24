@@ -5184,13 +5184,19 @@ impl SlackTicketHost {
     }
 
     pub fn shutdown(&mut self) {
-        let Self::Configured { stop, worker, .. } = self else {
-            return;
-        };
-        stop.store(true, Ordering::Release);
-        if let Some(worker) = worker.take() {
+        if let Some(worker) = self.begin_shutdown() {
             let _ = worker.join();
         }
+    }
+
+    /// Signal the Socket Mode worker and return its handle to the daemon's
+    /// lease-maintaining shutdown drainer.
+    pub(crate) fn begin_shutdown(&mut self) -> Option<JoinHandle<()>> {
+        let Self::Configured { stop, worker, .. } = self else {
+            return None;
+        };
+        stop.store(true, Ordering::Release);
+        worker.take()
     }
 }
 

@@ -938,6 +938,14 @@ impl TicketIntakeHost {
     /// while it still polls would leave a writer running under authority nobody
     /// holds. Bounded by [`STOP_POLL`] plus one in-flight request budget.
     pub fn shutdown(&mut self) {
+        if let Some(worker) = self.begin_shutdown() {
+            let _ = worker.join();
+        }
+    }
+
+    /// Signal intake and return its handle to the daemon's lease-maintaining
+    /// shutdown drainer.
+    pub(crate) fn begin_shutdown(&mut self) -> Option<JoinHandle<()>> {
         let Self::Configured {
             intake,
             stop,
@@ -945,13 +953,11 @@ impl TicketIntakeHost {
             ..
         } = self
         else {
-            return;
+            return None;
         };
         stop.store(true, Ordering::Release);
         *intake = None;
-        if let Some(worker) = worker.take() {
-            let _ = worker.join();
-        }
+        worker.take()
     }
 }
 
