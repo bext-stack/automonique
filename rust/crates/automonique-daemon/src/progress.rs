@@ -511,6 +511,7 @@ impl JcodeProgressMapper {
             ),
             JcodeEvent::ReasoningDelta { .. }
             | JcodeEvent::ReasoningDone { .. }
+            | JcodeEvent::StdinRequest { .. }
             | JcodeEvent::Ok { .. }
             | JcodeEvent::Pong { .. }
             | JcodeEvent::Unknown { .. } => return None,

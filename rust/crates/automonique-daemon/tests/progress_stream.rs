@@ -347,12 +347,13 @@ mod jcode_normalization {
     use super::*;
 
     const JCODE_FIXTURE: &str = concat!(
-        "{\"v\":1,\"reply_to\":1,\"ev\":\"hello_ok\",\"version\":1,\"server\":\"jcode/fixture\",\"capabilities\":[\"sessions\",\"streaming\",\"cancellation\",\"soft_interrupt\",\"permission_requests\",\"history\",\"model_catalog\",\"reasoning_effort\",\"usage\",\"runtime_info\"]}\n",
+        "{\"v\":1,\"reply_to\":1,\"ev\":\"hello_ok\",\"version\":1,\"server\":\"jcode/fixture\",\"capabilities\":[\"sessions\",\"streaming\",\"cancellation\",\"soft_interrupt\",\"stdin_requests\",\"history\",\"model_catalog\",\"reasoning_effort\",\"usage\",\"runtime_info\"]}\n",
         "{\"v\":1,\"reply_to\":2,\"ev\":\"attached\",\"session\":{\"session_id\":\"session-1\",\"status\":\"idle\"}}\n",
         "{\"v\":1,\"ev\":\"message_accepted\",\"session_id\":\"session-1\"}\n",
         "{\"v\":1,\"ev\":\"session_status\",\"session_id\":\"session-1\",\"status\":\"generating\"}\n",
         "{\"v\":1,\"ev\":\"text_delta\",\"session_id\":\"session-1\",\"text\":\"hello\"}\n",
         "{\"v\":1,\"ev\":\"tool_start\",\"session_id\":\"session-1\",\"call_id\":\"call-1\",\"name\":\"read\"}\n",
+        "{\"v\":1,\"ev\":\"stdin_request\",\"session_id\":\"session-1\",\"request_id\":\"stdin-1\",\"prompt\":\"Continue?\",\"is_password\":false,\"tool_call_id\":\"call-1\"}\n",
         "{\"v\":1,\"ev\":\"tool_done\",\"session_id\":\"session-1\",\"call_id\":\"call-1\",\"name\":\"read\",\"output\":\"fixture\",\"error\":null}\n",
         "{\"v\":1,\"ev\":\"token_usage\",\"session_id\":\"session-1\",\"input\":10,\"output\":2}\n",
         "{\"v\":1,\"ev\":\"turn_done\",\"session_id\":\"session-1\"}\n",
