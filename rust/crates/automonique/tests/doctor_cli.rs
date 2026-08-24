@@ -69,6 +69,7 @@ fn doctor_human_mode_reports_an_unanswered_status_rpc_for_a_private_runtime() {
         "{stdout}"
     );
     assert!(stdout.contains("runtime"), "{stdout}");
+    assert!(stdout.contains("state.filesystem"), "{stdout}");
     // The kernel checks landed with the truthful Landlock/delegation work and
     // must not silently vanish from the assembled report.
     assert!(stdout.contains("kernel.landlock-support"), "{stdout}");

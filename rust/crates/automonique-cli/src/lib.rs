@@ -26,7 +26,9 @@ mod run_submit;
 mod runs;
 mod supervisor;
 
-pub use diagnostics::{inspect_admin_socket, inspect_control_plane, inspect_process_control};
+pub use diagnostics::{
+    inspect_admin_socket, inspect_control_plane, inspect_process_control, inspect_state_filesystem,
+};
 pub use kernel::{
     inspect_cgroup_v2_controllers, inspect_cgroup_v2_delegation,
     inspect_cgroup_v2_enabled_controllers, inspect_landlock_support, inspect_max_user_namespaces,
@@ -1141,6 +1143,7 @@ fn inspect_doctor(runtime: Option<&OsStr>) -> Result<DoctorReportV1, DoctorRepor
     let [database_health, foreground_generation] = inspect_control_plane(runtime, &admin_socket);
     DoctorReportV1::new([
         runtime_check(runtime),
+        inspect_state_filesystem(std::env::var_os("XDG_STATE_HOME").as_deref()),
         inspect_audit_chain(std::env::var_os("XDG_STATE_HOME").as_deref()),
         admin_socket.clone(),
         inspect_process_control(),

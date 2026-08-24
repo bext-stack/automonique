@@ -16,6 +16,21 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 const MAX_RUNTIME_PATH_BYTES: usize = 4_096;
 const MAX_RUNTIME_COMPONENTS: usize = 256;
 
+// Linux statfs magic values for filesystems whose locking and shared-memory
+// semantics are supplied by a remote server. SQLite WAL explicitly requires
+// every participant to share one host, so a healthy local mount check cannot
+// be inferred merely because opening a database succeeded once.
+const NETWORK_FILESYSTEM_TYPES: [u64; 8] = [
+    0x0000_564c, // NCP
+    0x0000_6969, // NFS
+    0x0000_517b, // SMB
+    0x0102_1997, // 9P
+    0x00c3_6400, // Ceph
+    0x5346_414f, // AFS
+    0x7375_7245, // Coda
+    0xff53_4d42, // CIFS
+];
+
 /// Check the admin socket's filesystem boundary without connecting to it.
 pub fn inspect_admin_socket(runtime: Option<&OsStr>) -> DoctorCheck {
     let Some(runtime) = runtime else {
@@ -80,6 +95,59 @@ pub fn inspect_process_control() -> DoctorCheck {
         "host.platform-unsupported",
         "Host process-control evidence is unavailable on this platform",
     )
+}
+
+/// Verify that the durable state path is not on a known network filesystem.
+///
+/// The product directory is preferred when it exists because it may itself be
+/// a mount point. Before first start, checking its existing state-home parent
+/// still gives a useful answer without creating anything. This diagnostic is
+/// read-only and reports an unavailable observation rather than guessing when
+/// the path cannot be inspected.
+pub fn inspect_state_filesystem(state: Option<&OsStr>) -> DoctorCheck {
+    let Some(state) = state else {
+        return unavailable_for(
+            "state.filesystem",
+            "state.environment-missing",
+            "State filesystem cannot be inspected without XDG_STATE_HOME",
+        );
+    };
+    let state = Path::new(state);
+    if !valid_absolute_path(state) {
+        return non_healthy(
+            "state.filesystem",
+            CheckStatus::Finding,
+            "state.path-invalid",
+            "State filesystem location is invalid",
+        );
+    }
+    let product = state.join("automonique");
+    let target = if product.exists() {
+        product.as_path()
+    } else {
+        state
+    };
+    match nix::sys::statfs::statfs(target) {
+        Ok(stat) => state_filesystem_type(stat.filesystem_type().0 as u64),
+        Err(_) => unavailable_for(
+            "state.filesystem",
+            "state.filesystem-unavailable",
+            "State filesystem type could not be read",
+        ),
+    }
+}
+
+fn state_filesystem_type(filesystem_type: u64) -> DoctorCheck {
+    if NETWORK_FILESYSTEM_TYPES.contains(&filesystem_type) {
+        non_healthy(
+            "state.filesystem",
+            CheckStatus::Finding,
+            "state.filesystem-network",
+            "State is on a network filesystem that cannot safely host SQLite WAL",
+        )
+    } else {
+        healthy("state.filesystem")
+    }
 }
 
 /// Read database and generation health from one authenticated status snapshot.
@@ -300,7 +368,7 @@ fn non_healthy(
 
 #[cfg(test)]
 mod tests {
-    use super::status_checks;
+    use super::{inspect_state_filesystem, state_filesystem_type, status_checks};
     use automonique_protocol::CheckStatus;
     use automonique_protocol::admin::{
         AdminInstanceId, DaemonState, DaemonStatus, DurableStateCounts, DurableStateCountsParts,
@@ -365,5 +433,61 @@ mod tests {
             "database.status-incomplete"
         );
         assert_eq!(generation.status(), CheckStatus::Healthy);
+    }
+
+    #[test]
+    fn every_known_network_filesystem_refuses_sqlite_wal_state() {
+        for filesystem_type in super::NETWORK_FILESYSTEM_TYPES {
+            let check = state_filesystem_type(filesystem_type);
+            assert_eq!(check.status(), CheckStatus::Finding);
+            assert_eq!(
+                check
+                    .reason()
+                    .expect("network filesystem reason")
+                    .code()
+                    .as_str(),
+                "state.filesystem-network"
+            );
+        }
+    }
+
+    #[test]
+    fn a_local_filesystem_type_is_healthy() {
+        // EXT4_SUPER_MAGIC. The classifier deliberately accepts local types it
+        // does not otherwise need to name; only known remote semantics are a
+        // finding.
+        assert_eq!(
+            state_filesystem_type(0x0000_ef53).status(),
+            CheckStatus::Healthy
+        );
+    }
+
+    #[test]
+    fn the_state_filesystem_probe_is_read_only_and_truthful_about_missing_input() {
+        let missing = inspect_state_filesystem(None);
+        assert_eq!(missing.status(), CheckStatus::Unavailable);
+        assert_eq!(
+            missing
+                .reason()
+                .expect("missing state reason")
+                .code()
+                .as_str(),
+            "state.environment-missing"
+        );
+
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let observed = inspect_state_filesystem(Some(directory.path().as_os_str()));
+        assert!(matches!(
+            observed.status(),
+            CheckStatus::Healthy | CheckStatus::Finding
+        ));
+        assert!(
+            directory
+                .path()
+                .read_dir()
+                .expect("read state directory")
+                .next()
+                .is_none()
+        );
     }
 }
