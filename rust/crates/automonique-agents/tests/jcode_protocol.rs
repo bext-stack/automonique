@@ -180,7 +180,7 @@ fn negotiation_is_first_correlated_and_bound_to_the_reported_server() {
         JcodeNativeAdapter::new(execution_identity(), &coordinates(), 11, 13).expect("adapter");
     assert_eq!(
         adapter
-            .push(b"{\"v\":1,\"reply_to\":12,\"ev\":\"hello_ok\",\"version\":1,\"server\":\"jcode/fixture-0.79.1\",\"capabilities\":[\"sessions\",\"streaming\",\"cancellation\",\"soft_interrupt\",\"stdin_requests\",\"history\",\"model_catalog\",\"reasoning_effort\",\"usage\",\"runtime_info\"]}\n")
+            .push(b"{\"v\":1,\"reply_to\":12,\"ev\":\"hello_ok\",\"version\":1,\"server\":\"jcode/fixture-0.79.1\",\"capabilities\":[\"sessions\",\"streaming\",\"cancellation\",\"soft_interrupt\",\"permission_requests\",\"history\",\"model_catalog\",\"reasoning_effort\",\"usage\",\"runtime_info\"]}\n")
             .unwrap_err(),
         JcodeProtocolError::ReplyMismatch
     );
@@ -189,7 +189,7 @@ fn negotiation_is_first_correlated_and_bound_to_the_reported_server() {
         JcodeNativeAdapter::new(execution_identity(), &coordinates(), 11, 13).expect("adapter");
     assert_eq!(
         adapter
-            .push(b"{\"v\":1,\"reply_to\":11,\"ev\":\"hello_ok\",\"version\":1,\"server\":\"jcode/drifted\",\"capabilities\":[\"sessions\",\"streaming\",\"cancellation\",\"soft_interrupt\",\"stdin_requests\",\"history\",\"model_catalog\",\"reasoning_effort\",\"usage\",\"runtime_info\"]}\n")
+            .push(b"{\"v\":1,\"reply_to\":11,\"ev\":\"hello_ok\",\"version\":1,\"server\":\"jcode/drifted\",\"capabilities\":[\"sessions\",\"streaming\",\"cancellation\",\"soft_interrupt\",\"permission_requests\",\"history\",\"model_catalog\",\"reasoning_effort\",\"usage\",\"runtime_info\"]}\n")
             .unwrap_err(),
         JcodeProtocolError::IdentityMismatch
     );
