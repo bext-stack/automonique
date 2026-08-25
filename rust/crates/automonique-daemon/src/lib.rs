@@ -1444,6 +1444,12 @@ enum StartupAuthority {
     },
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum LeaseDisposition {
+    Release,
+    Retain,
+}
+
 impl SocketCleanup {
     fn disarm(&mut self) {
         self.armed = false;
@@ -2146,7 +2152,23 @@ impl Daemon {
         let service_manager = systemd::Notifier::from_environment()
             .map_err(|error| DaemonError::ServiceManagerFailed(error.category()))?;
         let reload = AtomicBool::new(false);
-        self.serve_with_control(stop, &reload, service_manager)
+        let (_, result) = self.serve_with_control(
+            stop,
+            &reload,
+            service_manager,
+            LeaseDisposition::Release,
+            None,
+        );
+        result
+    }
+
+    fn serve_retaining_authority(
+        self,
+        stop: &AtomicBool,
+        ready: std::sync::mpsc::SyncSender<()>,
+    ) -> (Self, Result<(), DaemonError>) {
+        let reload = AtomicBool::new(false);
+        self.serve_with_control(stop, &reload, None, LeaseDisposition::Retain, Some(ready))
     }
 
     fn serve_with_control(
@@ -2154,7 +2176,9 @@ impl Daemon {
         stop: &AtomicBool,
         reload: &AtomicBool,
         mut service_manager: Option<systemd::Notifier>,
-    ) -> Result<(), DaemonError> {
+        lease_disposition: LeaseDisposition,
+        mut ready: Option<std::sync::mpsc::SyncSender<()>>,
+    ) -> (Self, Result<(), DaemonError>) {
         let initial_lease = self
             .lease_time
             .require_authority()
@@ -2236,6 +2260,9 @@ impl Daemon {
                     && let Err(error) = notifier.ready()
                 {
                     break 'serving Err(DaemonError::ServiceManagerFailed(error.category()));
+                }
+                if let Some(sender) = ready.take() {
+                    let _ = sender.send(());
                 }
                 loop {
                     let lease_now_ms = match self.lease_time.require_authority() {
@@ -2492,30 +2519,38 @@ impl Daemon {
         // longer claims continuous lease authority. A process that dies before
         // this point writes nothing; its successor closes the open row as
         // `superseded` when it observes the abandoned tenure.
-        let tenure_close = unix_millis().and_then(|now_ms| {
-            self.generation_audit
-                .end_tenure(TenureEnding {
-                    generation_id: GENERATION_ID,
-                    holder_id: self.instance_id.as_str(),
-                    lease_epoch: self.lease_epoch,
-                    expected_revision: self.tenure_revision,
-                    ended_at_ms: now_ms,
-                    end_kind: self_end_kind,
-                })
-                .map(|_| ())
-                .map_err(generation_audit_failed)
-        });
-        let release = unix_millis().and_then(|now_ms| {
-            self.store
-                .release_generation_lease(
-                    GENERATION_ID,
-                    self.instance_id.as_str(),
-                    self.lease_epoch,
-                    now_ms,
-                )
-                .map_err(DaemonError::Store)
-        });
-        match result {
+        let tenure_close = if lease_disposition == LeaseDisposition::Release {
+            unix_millis().and_then(|now_ms| {
+                self.generation_audit
+                    .end_tenure(TenureEnding {
+                        generation_id: GENERATION_ID,
+                        holder_id: self.instance_id.as_str(),
+                        lease_epoch: self.lease_epoch,
+                        expected_revision: self.tenure_revision,
+                        ended_at_ms: now_ms,
+                        end_kind: self_end_kind,
+                    })
+                    .map(|_| ())
+                    .map_err(generation_audit_failed)
+            })
+        } else {
+            Ok(())
+        };
+        let release = if lease_disposition == LeaseDisposition::Release {
+            unix_millis().and_then(|now_ms| {
+                self.store
+                    .release_generation_lease(
+                        GENERATION_ID,
+                        self.instance_id.as_str(),
+                        self.lease_epoch,
+                        now_ms,
+                    )
+                    .map_err(DaemonError::Store)
+            })
+        } else {
+            Ok(())
+        };
+        let outcome = match result {
             Err(primary) => {
                 let _ = attempt_host_disposal;
                 let _ = telegram_release;
@@ -2529,7 +2564,8 @@ impl Daemon {
                 .and(tenure_close)
                 .and(release)
                 .and(service_stopping),
-        }
+        };
+        (self, outcome)
     }
 
     /// Replace the reloadable policy as one coherent value.
@@ -7454,8 +7490,16 @@ fn run_with_mode(config: &DaemonConfig, disconnected_recovery: bool) -> Result<(
                     .extend_timeout(STARTUP_TIMEOUT_EXTENSION)
                     .map_err(|error| DaemonError::ServiceManagerFailed(error.category()))?;
             }
-            Daemon::open_with_mode(config, disconnected_recovery)
-                .and_then(|daemon| daemon.serve_with_control(&stop, &reload, service_manager))
+            Daemon::open_with_mode(config, disconnected_recovery).and_then(|daemon| {
+                let (_, result) = daemon.serve_with_control(
+                    &stop,
+                    &reload,
+                    service_manager,
+                    LeaseDisposition::Release,
+                    None,
+                );
+                result
+            })
         });
     if !stop.load(Ordering::Acquire) {
         stop.store(true, Ordering::Release);

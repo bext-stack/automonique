@@ -23,6 +23,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use automonique_store::generation_audit::GENERATION_AUDIT_SCHEMA_VERSION;
@@ -53,6 +55,8 @@ const CONTROL_STOP: u8 = b'S';
 const CONTROL_PREPARE_TRANSFER: u8 = b'T';
 const CONTROL_CONFIRM_AUTHORITY: u8 = b'A';
 const CONTROL_CONFIRM_RELINQUISHED: u8 = b'R';
+const CONTROL_ACTIVATE_SERVING: u8 = b'V';
+const CONTROL_QUIESCE: u8 = b'Q';
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidateSpec {
@@ -83,6 +87,8 @@ pub struct WarmCandidate {
     source_lease_epoch: u64,
     transfer_ready: bool,
     authority_ready: bool,
+    serving: bool,
+    quiesced: bool,
     relinquished: bool,
     stopped: bool,
 }
@@ -392,6 +398,8 @@ pub fn spawn_warm_candidate(
         source_lease_epoch: spec.source_lease_epoch,
         transfer_ready: false,
         authority_ready: false,
+        serving: false,
+        quiesced: false,
         relinquished: false,
         stopped: false,
     })
@@ -524,6 +532,7 @@ impl WarmCandidate {
             .checked_add(2)
             .ok_or(CandidateError::Protocol)?;
         if !self.authority_ready
+            || self.serving
             || self.relinquished
             || returned_lease.generation_id != super::GENERATION_ID
             || returned_lease.holder_id != self.source_holder_id
@@ -542,6 +551,43 @@ impl WarmCandidate {
         }
         self.identity = observed;
         self.relinquished = true;
+        Ok(())
+    }
+
+    /// Start the fully composed candidate and require readiness after every
+    /// worker and inherited accept loop has started.
+    pub fn activate_serving(&mut self) -> Result<(), CandidateError> {
+        if !self.authority_ready || self.serving || self.quiesced || self.relinquished {
+            return Err(CandidateError::Protocol);
+        }
+        send_control(&self.channel, CONTROL_ACTIVATE_SERVING, None)?;
+        let mut expected = self.identity.clone();
+        expected.event = "active".to_owned();
+        let observed: CandidateIdentity = read_message(&self.channel)?;
+        if observed != expected {
+            return Err(CandidateError::Protocol);
+        }
+        self.identity = observed;
+        self.serving = true;
+        Ok(())
+    }
+
+    /// Stop candidate intake and workers while retaining its generation lease
+    /// and inherited kernel capabilities for an explicit return transaction.
+    pub fn quiesce(&mut self) -> Result<(), CandidateError> {
+        if !self.serving || self.quiesced || self.relinquished {
+            return Err(CandidateError::Protocol);
+        }
+        send_control(&self.channel, CONTROL_QUIESCE, None)?;
+        let mut expected = self.identity.clone();
+        expected.event = "quiesced".to_owned();
+        let observed: CandidateIdentity = read_message(&self.channel)?;
+        if observed != expected {
+            return Err(CandidateError::Protocol);
+        }
+        self.identity = observed;
+        self.serving = false;
+        self.quiesced = true;
         Ok(())
     }
 
@@ -647,12 +693,60 @@ pub fn run_candidate(
                         .map_err(|error| CandidateError::Daemon(error.category()))?;
                     identity.event = "authority_ready".to_owned();
                     write_message(&mut writer, &identity)?;
-                    if !matches!(
-                        receive_control(reader.as_fd())?,
-                        CandidateControl::ConfirmRelinquished
-                    ) {
-                        return Err(CandidateError::Protocol);
-                    }
+                    let daemon = match receive_control(reader.as_fd())? {
+                        CandidateControl::ConfirmRelinquished => daemon,
+                        CandidateControl::ActivateServing => {
+                            let stop = Arc::new(AtomicBool::new(false));
+                            let thread_stop = Arc::clone(&stop);
+                            let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+                            let serving = std::thread::spawn(move || {
+                                daemon.serve_retaining_authority(&thread_stop, ready_sender)
+                            });
+                            if ready_receiver
+                                .recv_timeout(Duration::from_secs(20))
+                                .is_err()
+                            {
+                                stop.store(true, Ordering::Release);
+                                let (_, outcome) = serving.join().map_err(|_| {
+                                    CandidateError::Daemon("candidate_serve_panicked")
+                                })?;
+                                return match outcome {
+                                    Ok(()) => Err(CandidateError::Protocol),
+                                    Err(error) => Err(CandidateError::Daemon(error.category())),
+                                };
+                            }
+                            identity.event = "active".to_owned();
+                            write_message(&mut writer, &identity)?;
+                            if !matches!(
+                                receive_control(reader.as_fd())?,
+                                CandidateControl::Quiesce
+                            ) {
+                                stop.store(true, Ordering::Release);
+                                let _ = serving.join();
+                                return Err(CandidateError::Protocol);
+                            }
+                            stop.store(true, Ordering::Release);
+                            let (daemon, outcome) = serving
+                                .join()
+                                .map_err(|_| CandidateError::Daemon("candidate_serve_panicked"))?;
+                            outcome.map_err(|error| CandidateError::Daemon(error.category()))?;
+                            identity.event = "quiesced".to_owned();
+                            write_message(&mut writer, &identity)?;
+                            if !matches!(
+                                receive_control(reader.as_fd())?,
+                                CandidateControl::ConfirmRelinquished
+                            ) {
+                                return Err(CandidateError::Protocol);
+                            }
+                            daemon
+                        }
+                        CandidateControl::Stop
+                        | CandidateControl::PrepareTransfer(_)
+                        | CandidateControl::ConfirmAuthority
+                        | CandidateControl::Quiesce => {
+                            return Err(CandidateError::Protocol);
+                        }
+                    };
                     let returned: CandidateAuthority = read_message_from(&mut reader)?;
                     confirm_candidate_relinquished(
                         config,
@@ -668,13 +762,19 @@ pub fn run_candidate(
                     }
                     return write_stopped(&mut writer, identity);
                 }
-                CandidateControl::ConfirmRelinquished | CandidateControl::PrepareTransfer(_) => {
+                CandidateControl::ConfirmRelinquished
+                | CandidateControl::ActivateServing
+                | CandidateControl::Quiesce
+                | CandidateControl::PrepareTransfer(_) => {
                     return Err(CandidateError::Protocol);
                 }
             }
             Some(adopted)
         }
-        CandidateControl::ConfirmAuthority | CandidateControl::ConfirmRelinquished => {
+        CandidateControl::ConfirmAuthority
+        | CandidateControl::ConfirmRelinquished
+        | CandidateControl::ActivateServing
+        | CandidateControl::Quiesce => {
             return Err(CandidateError::Protocol);
         }
     };
@@ -695,6 +795,8 @@ enum CandidateControl {
     PrepareTransfer(CandidateTransferDescriptors),
     ConfirmAuthority,
     ConfirmRelinquished,
+    ActivateServing,
+    Quiesce,
 }
 
 fn send_control(
@@ -757,6 +859,8 @@ fn receive_control(fd: impl AsFd) -> Result<CandidateControl, CandidateError> {
         CONTROL_CONFIRM_RELINQUISHED if received.is_empty() => {
             Ok(CandidateControl::ConfirmRelinquished)
         }
+        CONTROL_ACTIVATE_SERVING if received.is_empty() => Ok(CandidateControl::ActivateServing),
+        CONTROL_QUIESCE if received.is_empty() => Ok(CandidateControl::Quiesce),
         CONTROL_PREPARE_TRANSFER if received.len() == 3 => {
             let control_lock = received.pop().expect("length checked");
             let progress_listener = received.pop().expect("length checked");

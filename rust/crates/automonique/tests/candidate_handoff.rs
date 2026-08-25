@@ -3,6 +3,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -145,6 +146,21 @@ fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
             .category(),
         "candidate_protocol"
     );
+    candidate
+        .activate_serving()
+        .expect("candidate starts inherited endpoints and workers");
+    let status = Command::new(env!("CARGO_BIN_EXE_automonique"))
+        .args(["status", "--json"])
+        .env("XDG_RUNTIME_DIR", &config.runtime_root)
+        .env("XDG_STATE_HOME", &config.state_root)
+        .output()
+        .expect("candidate status");
+    assert!(status.status.success(), "candidate serves admin status");
+    let status = String::from_utf8(status.stdout).expect("status UTF-8");
+    assert!(status.contains(&target.holder_id));
+    candidate
+        .quiesce()
+        .expect("candidate drains while retaining authority");
 
     let returned = store
         .transfer_generation_lease(LeaseTransferRequest {
