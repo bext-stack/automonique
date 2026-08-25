@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+# Its own workspace, deliberately — for the same reason `rust/fuzz` is.
+#
+# This is a feasibility spike, not product code. Keeping it out of
+# `rust/Cargo.toml`'s members keeps the product workspace, its lockfile and the
+# lockfile-reproducibility check untouched by the `fuser` dependency and by
+# anything else below. `automonique-runner` is a dev-dependency by path so the
+# containment proof drives the real entry helper rather than a stand-in.
+[workspace]
+members = ["."]
+
+[package]
+name = "automonique-tempfs-quota-spike"
+version = "0.0.0"
+edition = "2024"
+license = "Elastic-2.0"
+publish = false
+
+[[bin]]
+name = "automonique-tempfs-quota"
+path = "src/main.rs"
+
+[dependencies]
+# MIT. Default features only: nothing links libfuse. The kernel connection is a
+# plain `/dev/fuse` descriptor this crate obtains from `fusermount3` itself, so
+# the crate is used purely as a FUSE protocol codec and dispatch loop.
+fuser = { version = "=0.18.0", default-features = false }
+# `rustix` is the product workspace's exact pin; it receives the `SCM_RIGHTS`
+# descriptor from `fusermount3` as an `OwnedFd` without any `unsafe`. `nix` is
+# the version `fuser` already pulls in, so the graph holds one copy.
+nix = { version = "=0.31.3", default-features = false, features = ["fs", "signal", "user"] }
+rustix = { version = "=1.1.4", features = ["net"] }
+
+[dev-dependencies]
+automonique-runner = { path = "../../rust/crates/automonique-runner" }
+sha2 = "=0.10.9"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "forbid"
+todo = "forbid"
+unimplemented = "forbid"
