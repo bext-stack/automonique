@@ -1,0 +1,13 @@
+{"v":1,"reply_to":11,"ev":"hello_ok","version":1,"server":"jcode-harness-api-bridge/0.1.0","capabilities":["sessions","streaming","cancellation","soft_interrupt","stdin_requests","history","model_catalog","reasoning_effort","usage","persisted_session_discovery","runtime_info","api_key_provisioning","session_archive","session_retention","session_files"]}
+{"v":1,"ev":"session_status","session_id":"session-1","status":"attached"}
+{"v":1,"reply_to":12,"ev":"attached","session":{"session_id":"session-1","working_dir":"/workspace","status":"idle","transcript_bytes":0}}
+{"v":1,"ev":"model_info","session_id":"session-1","provider":"fixture","model":"fixture-model"}
+{"v":1,"ev":"message_accepted","session_id":"session-1"}
+{"v":1,"ev":"tool_start","session_id":"session-1","call_id":"call-1","name":"bash"}
+{"v":1,"ev":"tool_exec","session_id":"session-1","call_id":"call-1","name":"bash"}
+{"v":1,"ev":"stdin_request","session_id":"session-1","request_id":"stdin-1","prompt":"Passphrase:","is_password":true,"tool_call_id":"call-1"}
+{"v":1,"reply_to":14,"ev":"ok"}
+{"v":1,"ev":"tool_done","session_id":"session-1","call_id":"call-1","name":"bash","output":"fixture","error":null}
+{"v":1,"ev":"text_delta","session_id":"session-1","text":"fixture answer"}
+{"v":1,"ev":"token_usage","session_id":"session-1","input":12,"output":2,"cache_read_input":4}
+{"v":1,"ev":"turn_done","session_id":"session-1"}

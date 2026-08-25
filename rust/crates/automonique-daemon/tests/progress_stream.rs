@@ -347,7 +347,7 @@ mod jcode_normalization {
     use super::*;
 
     const JCODE_FIXTURE: &str = concat!(
-        "{\"v\":1,\"reply_to\":1,\"ev\":\"hello_ok\",\"version\":1,\"server\":\"jcode/fixture\",\"capabilities\":[\"sessions\",\"streaming\",\"cancellation\",\"soft_interrupt\",\"permission_requests\",\"history\",\"model_catalog\",\"reasoning_effort\",\"usage\",\"runtime_info\"]}\n",
+        "{\"v\":1,\"reply_to\":1,\"ev\":\"hello_ok\",\"version\":1,\"server\":\"jcode/fixture\",\"capabilities\":[\"sessions\",\"streaming\",\"cancellation\",\"soft_interrupt\",\"stdin_requests\",\"history\",\"model_catalog\",\"reasoning_effort\",\"usage\",\"persisted_session_discovery\",\"runtime_info\",\"api_key_provisioning\",\"session_archive\",\"session_retention\",\"session_files\"]}\n",
         "{\"v\":1,\"reply_to\":2,\"ev\":\"attached\",\"session\":{\"session_id\":\"session-1\",\"status\":\"idle\"}}\n",
         "{\"v\":1,\"ev\":\"message_accepted\",\"session_id\":\"session-1\"}\n",
         "{\"v\":1,\"ev\":\"session_status\",\"session_id\":\"session-1\",\"status\":\"generating\"}\n",
