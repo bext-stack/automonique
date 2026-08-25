@@ -1,0 +1,253 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import {describe, expect, test} from "bun:test";
+
+import {
+  MOBILE_AUTH_MEDIA_TYPE,
+  MobileFollowUpBytes,
+  MobilePageEvents,
+  MobileSessionId,
+  parseCanonical,
+  toCanonicalBytes,
+  type JsonValue,
+} from "../../protocol/src/index.ts";
+import {
+  MobileLifecycleClient,
+  MobileLifecycleError,
+  mobilePlatformClientId,
+} from "../src/mobile-auth-client.ts";
+
+const origin = "https://mobile.example.test";
+const identity = `sha256:${"a".repeat(64)}`;
+const access = `ma_${"A".repeat(43)}`;
+const refresh = `mr_${"B".repeat(43)}`;
+const rotatedAccess = `ma_${"C".repeat(43)}`;
+const rotatedRefresh = `mr_${"D".repeat(43)}`;
+
+function json(value: unknown): JsonValue {
+  if (value === null) return {kind: "null"};
+  if (typeof value === "boolean") return {kind: "bool", value};
+  if (typeof value === "bigint") return {kind: "integer", value};
+  if (typeof value === "number" && Number.isSafeInteger(value)) {
+    return {kind: "integer", value: BigInt(value)};
+  }
+  if (typeof value === "string") return {kind: "string", value};
+  if (Array.isArray(value)) return {kind: "array", items: value.map(json)};
+  if (typeof value === "object") {
+    return {
+      kind: "object",
+      entries: Object.entries(value)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, entry]) => [key, json(entry)] as const),
+    };
+  }
+  throw new Error("unsupported JSON fixture");
+}
+
+function response(value: unknown, status = 200): Response {
+  return new Response(new TextDecoder().decode(toCanonicalBytes(json(value))), {
+    status,
+    headers: {
+      "cache-control": "no-store",
+      "content-type": MOBILE_AUTH_MEDIA_TYPE,
+    },
+  });
+}
+
+function discovery(extra: Readonly<Record<string, unknown>> = {}): unknown {
+  return {
+    operator_provision_endpoint: `${origin}/api/mobile/operator-provision`,
+    origin,
+    platform_endpoint: `${origin}/api/platform`,
+    protocol: "automonique.mobile-auth",
+    schema: "automonique.mobile-auth/v1",
+    server_identity: identity,
+    supported_versions: [1],
+    ...extra,
+  };
+}
+
+function issued(
+  accessToken = access,
+  refreshToken = refresh,
+  credentialRevision = 1,
+  serverIdentity = identity,
+  expiresAt = 9_007_199_254_740_991n,
+  issuedAt = 1_777_000_000_000n,
+): unknown {
+  return {
+    access_token: accessToken,
+    authorization: {
+      actions: ["attach", "follow_up"],
+      actor: "operator:mobile",
+      authorization_revision: 1,
+      credential_id: `mc_${"E".repeat(43)}`,
+      credential_revision: credentialRevision,
+      expires_at_ms: expiresAt,
+      issued_at_ms: issuedAt,
+      limits: {max_follow_up_bytes: 4096, max_page_events: 128},
+      schema: "automonique.mobile-auth/v1",
+      server_identity: serverIdentity,
+      session_scope: ["session-a"],
+    },
+    refresh_token: refreshToken,
+  };
+}
+
+describe("mobile credential lifecycle client", () => {
+  test("discovers, provisions, refreshes, authorizes, and revokes with exact contracts", async () => {
+    const requests: {url: string; init: RequestInit | undefined}[] = [];
+    const responses = [
+      response(discovery()),
+      response(issued(), 201),
+      response(issued(rotatedAccess, rotatedRefresh, 2)),
+      response((issued(rotatedAccess, rotatedRefresh, 2) as {authorization: unknown}).authorization),
+      response({revoked: true, schema: "automonique.mobile-auth/v1"}),
+    ];
+    const fetcher = (async (input: string | URL | Request, init?: RequestInit) => {
+      requests.push({url: input.toString(), init});
+      const next = responses.shift();
+      if (next === undefined) throw new Error("unexpected request");
+      return next;
+    }) as typeof fetch;
+
+    const client = await MobileLifecycleClient.discover(origin, fetcher);
+    const provisioned = await client.provision({
+      actions: ["attach", "follow_up"],
+      limits: {
+        max_follow_up_bytes: MobileFollowUpBytes(4096n),
+        max_page_events: MobilePageEvents(128n),
+      },
+      session_scope: [MobileSessionId("session-a")],
+    }, "Basic fixture-operator");
+    expect(provisioned.authorization.expires_at_ms).toBe(9_007_199_254_740_991n);
+    expect(mobilePlatformClientId(provisioned.authorization))
+      .toBe(provisioned.authorization.credential_id);
+    const rotated = await client.refresh(provisioned.refresh_token);
+    expect(rotated.authorization.credential_revision).toBe(2n);
+    expect(rotated.access_token).toBe(rotatedAccess);
+    expect((await client.authorization(rotated.access_token)).credential_revision).toBe(2n);
+    expect((await client.revoke(rotated.refresh_token)).revoked).toBe(true);
+
+    expect(requests.map((request) => request.url)).toEqual([
+      `${origin}/.well-known/automonique-mobile`,
+      `${origin}/api/mobile/operator-provision`,
+      `${origin}/api/mobile/refresh`,
+      `${origin}/api/mobile/authorization`,
+      `${origin}/api/mobile/revoke`,
+    ]);
+    for (const request of requests) {
+      expect(request.init?.redirect).toBe("error");
+      expect(request.init?.credentials).toBe("omit");
+    }
+    expect(new Headers(requests[1]?.init?.headers).get("authorization"))
+      .toBe("Basic fixture-operator");
+    expect(new Headers(requests[2]?.init?.headers).get("content-type"))
+      .toBe(MOBILE_AUTH_MEDIA_TYPE);
+    const refreshBody = requests[2]?.init?.body;
+    if (typeof refreshBody !== "string") throw new Error("missing refresh body");
+    expect(parseCanonical(new TextEncoder().encode(refreshBody))).toEqual(json({
+      refresh_token: refresh,
+      server_identity: identity,
+    }));
+  });
+
+  test("fails closed on strict-schema, identity, media, caching, and bearer errors", async () => {
+    const extraField = (async () => response(discovery({unexpected: true}))) as typeof fetch;
+    await expect(MobileLifecycleClient.discover(origin, extraField))
+      .rejects.toMatchObject({category: "mobile_auth_invalid_body"});
+
+    const wrongIdentityResponses = [response(discovery()), response(issued(access, refresh, 1, `sha256:${"b".repeat(64)}`), 201)];
+    const wrongIdentity = (async () => wrongIdentityResponses.shift()!) as typeof fetch;
+    const client = await MobileLifecycleClient.discover(origin, wrongIdentity);
+    await expect(client.provision({
+      actions: ["attach"],
+      limits: {max_follow_up_bytes: MobileFollowUpBytes(1n), max_page_events: MobilePageEvents(1n)},
+      session_scope: [],
+    }, "Basic fixture"))
+      .rejects.toMatchObject({category: "mobile_server_identity_mismatch"});
+
+    const wrongMedia = (async () => new Response("{}", {
+      headers: {"cache-control": "no-store", "content-type": "application/json"},
+    })) as typeof fetch;
+    await expect(MobileLifecycleClient.discover(origin, wrongMedia))
+      .rejects.toMatchObject({category: "content_type_mismatch"});
+
+    const cacheable = (async () => new Response("{}", {
+      headers: {"content-type": MOBILE_AUTH_MEDIA_TYPE},
+    })) as typeof fetch;
+    await expect(MobileLifecycleClient.discover(origin, cacheable))
+      .rejects.toMatchObject({category: "cache_control_mismatch"});
+
+    await expect(MobileLifecycleClient.discover("http://mobile.example.test", fetch))
+      .rejects.toBeInstanceOf(MobileLifecycleError);
+  });
+
+  test("pins identity and rejects expired, redirected, and unexpected-success responses", async () => {
+    const pinned = await MobileLifecycleClient.discover(
+      origin,
+      (async () => response(discovery())) as typeof fetch,
+      undefined,
+      identity,
+    );
+    expect(pinned.discovery.server_identity).toBe(identity);
+
+    await expect(MobileLifecycleClient.discover(
+      origin,
+      (async () => response(discovery())) as typeof fetch,
+      undefined,
+      `sha256:${"b".repeat(64)}`,
+    )).rejects.toMatchObject({category: "mobile_discovery_mismatch"});
+    await expect(MobileLifecycleClient.discover(
+      origin,
+      (async () => response(discovery())) as typeof fetch,
+      undefined,
+      "not-an-identity",
+    )).rejects.toMatchObject({category: "mobile_server_identity_mismatch"});
+
+    await expect(MobileLifecycleClient.discover(
+      origin,
+      (async () => response(discovery(), 201)) as typeof fetch,
+    )).rejects.toMatchObject({category: "unexpected_success_status"});
+
+    const redirected = response(discovery());
+    Object.defineProperty(redirected, "url", {value: "https://attacker.example/redirected"});
+    await expect(MobileLifecycleClient.discover(
+      origin,
+      (async () => redirected) as typeof fetch,
+    )).rejects.toMatchObject({category: "response_url_mismatch"});
+
+    const expiredResponses = [
+      response(discovery()),
+      response(issued(access, refresh, 1, identity, BigInt(Date.now() - 1)), 201),
+    ];
+    const expired = (async () => expiredResponses.shift()!) as typeof fetch;
+    const expiredClient = await MobileLifecycleClient.discover(origin, expired);
+    await expect(expiredClient.provision({
+      actions: ["attach"],
+      limits: {max_follow_up_bytes: MobileFollowUpBytes(1n), max_page_events: MobilePageEvents(1n)},
+      session_scope: [],
+    }, "Basic fixture")).rejects.toMatchObject({category: "mobile_auth_invalid_body"});
+
+    const futureResponses = [
+      response(discovery()),
+      response(issued(access, refresh, 1, identity, 9_007_199_254_740_991n, BigInt(Date.now() + 60_000)), 201),
+    ];
+    const future = (async () => futureResponses.shift()!) as typeof fetch;
+    const futureClient = await MobileLifecycleClient.discover(origin, future);
+    await expect(futureClient.provision({
+      actions: ["attach"],
+      limits: {max_follow_up_bytes: MobileFollowUpBytes(1n), max_page_events: MobilePageEvents(1n)},
+      session_scope: [],
+    }, "Basic fixture")).rejects.toMatchObject({category: "mobile_auth_invalid_body"});
+
+    const wrongProvisionStatusResponses = [response(discovery()), response(issued())];
+    const wrongProvisionStatus = (async () => wrongProvisionStatusResponses.shift()!) as typeof fetch;
+    const wrongStatusClient = await MobileLifecycleClient.discover(origin, wrongProvisionStatus);
+    await expect(wrongStatusClient.provision({
+      actions: ["attach"],
+      limits: {max_follow_up_bytes: MobileFollowUpBytes(1n), max_page_events: MobilePageEvents(1n)},
+      session_scope: [],
+    }, "Basic fixture")).rejects.toMatchObject({category: "unexpected_success_status"});
+  });
+});

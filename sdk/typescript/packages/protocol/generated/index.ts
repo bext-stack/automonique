@@ -15,6 +15,7 @@ export * from "./approval.js";
 export * from "./automation.js";
 export * from "./batch.js";
 export * from "./doctor.js";
+export * from "./mobile-auth.js";
 export * from "./platform.js";
 export * from "./progress.js";
 export * from "./runs.js";
@@ -23,4 +24,4 @@ export * from "./runtime.js";
 // The digest of the surface re-exported above. It identifies the schema
 // these files were generated from; it is not a checksum of this file.
 export const SCHEMA_DIGEST_ALGORITHM = "sha256";
-export const SCHEMA_DIGEST = "e901f7fa25770027f3aea92f5a322e562539ac41d932dca87c9fc3b7b4c757b9";
+export const SCHEMA_DIGEST = "d826c9af0db4e1886160beb4d747640e2f67159571bc146e62d4a4eddb218932";
