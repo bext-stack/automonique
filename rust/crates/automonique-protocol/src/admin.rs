@@ -206,7 +206,10 @@ const _: () = assert!(
 ///   wired; the former `*_no_lane` values remain decode-only aliases.
 /// - **5** — added the ten-method `automonique.platform/v1` local endpoint.
 /// - **6** — added generation history and reload-status reads.
-pub const ADMIN_CAPABILITY: u32 = 6;
+/// - **7** — added authenticated generation reload execution.
+/// - **8** — added authenticated rollback to the retained compatible release.
+/// - **9** — added durable reload acceptance before asynchronous handoff.
+pub const ADMIN_CAPABILITY: u32 = 9;
 
 /// How much of a promise an endpoint is.
 ///
@@ -338,6 +341,8 @@ pub const ENDPOINT_MATURITY: &[(&str, Maturity)] = &[
     ),
     ("automonique.admin/metrics", Maturity::Experimental),
     ("automonique.admin/generations", Maturity::Experimental),
+    ("automonique.admin/reload", Maturity::Experimental),
+    ("automonique.admin/rollback", Maturity::Experimental),
     ("automonique.admin/reload_status", Maturity::Experimental),
     ("automonique.platform/capabilities", Maturity::Experimental),
     ("automonique.platform/snapshot", Maturity::Experimental),
@@ -603,6 +608,10 @@ pub enum AdminCommand {
     Metrics,
     /// Read the recent append-only generation tenure and handoff history.
     Generations,
+    /// Hand authority to one exact, locally verified immutable release.
+    Reload,
+    /// Hand authority back to the retained compatible release.
+    Rollback,
     /// Read one reload epoch and its append-only transitions.
     ReloadStatus,
     /// Durably enqueue a no-effect synthetic work item.
@@ -637,10 +646,12 @@ impl AdminCommand {
     /// Published so [`ENDPOINT_MATURITY`] can be held exhaustive over this lane
     /// by a test rather than by inspection: a command added here without a row
     /// there is a surface the daemon serves and never declared.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 15] = [
         Self::Status,
         Self::Metrics,
         Self::Generations,
+        Self::Reload,
+        Self::Rollback,
         Self::ReloadStatus,
         Self::SubmitSynthetic,
         Self::SubmitRun,
@@ -660,6 +671,8 @@ impl AdminCommand {
             Self::Status => "status",
             Self::Metrics => "metrics",
             Self::Generations => "generations",
+            Self::Reload => "reload",
+            Self::Rollback => "rollback",
             Self::ReloadStatus => "reload_status",
             Self::SubmitSynthetic => "submit_synthetic",
             Self::SubmitRun => "submit_run",
@@ -1354,6 +1367,30 @@ impl AdminRequest {
         }
     }
 
+    /// Construct a request to hand off to one exact immutable release.
+    pub fn reload(
+        request_id: RequestId,
+        target_release_digest: impl Into<String>,
+    ) -> Result<Self, AdminError> {
+        let target_release_digest = target_release_digest.into();
+        if !valid_release_digest(&target_release_digest) {
+            return Err(AdminError::InvalidBody);
+        }
+        Ok(Self {
+            request_id,
+            command: AdminCommand::Reload,
+            reload_id: Some(target_release_digest),
+            submission: None,
+            reconciliation_run_id: None,
+            reconciliation_failure: None,
+            outbox_id: None,
+            outbox_reconciliation: None,
+            run_submission: None,
+            intake_pause: None,
+            intake_resume: None,
+        })
+    }
+
     /// Construct a read-only lookup of one durable reload epoch.
     pub fn reload_status(
         request_id: RequestId,
@@ -1548,7 +1585,17 @@ impl AdminRequest {
     /// Reload identifier, present only for [`AdminCommand::ReloadStatus`].
     #[must_use]
     pub fn reload_id(&self) -> Option<&str> {
-        self.reload_id.as_deref()
+        (self.command == AdminCommand::ReloadStatus)
+            .then_some(self.reload_id.as_deref())
+            .flatten()
+    }
+
+    /// Target release digest, present only for [`AdminCommand::Reload`].
+    #[must_use]
+    pub fn reload_target_digest(&self) -> Option<&str> {
+        (self.command == AdminCommand::Reload)
+            .then_some(self.reload_id.as_deref())
+            .flatten()
     }
 
     /// Synthetic work body, present only for [`AdminCommand::SubmitSynthetic`].
@@ -1614,6 +1661,21 @@ impl AdminRequest {
             &self.intake_pause,
             &self.intake_resume,
         ) {
+            (
+                AdminCommand::Reload,
+                Some(target_release_digest),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ) => JsonValue::Object(vec![(
+                "target_release_digest".to_owned(),
+                JsonValue::String(target_release_digest.clone()),
+            )]),
             (
                 AdminCommand::SubmitSynthetic,
                 None,
@@ -1732,6 +1794,7 @@ impl AdminRequest {
                 AdminCommand::Status
                 | AdminCommand::Metrics
                 | AdminCommand::Generations
+                | AdminCommand::Rollback
                 | AdminCommand::Shutdown,
                 None,
                 None,
@@ -1805,7 +1868,14 @@ impl AdminRequest {
                     required_body_string(message.body(), "reload_id")?,
                 )
             }
-            "status" | "metrics" | "generations" | "shutdown" => {
+            "reload" => {
+                exact_fields(message.body(), &["target_release_digest"])?;
+                Self::reload(
+                    message.envelope().request_id().clone(),
+                    required_body_string(message.body(), "target_release_digest")?,
+                )
+            }
+            "status" | "metrics" | "generations" | "rollback" | "shutdown" => {
                 if !matches!(message.body(), JsonValue::Object(entries) if entries.is_empty()) {
                     return Err(AdminError::InvalidBody);
                 }
@@ -1813,6 +1883,7 @@ impl AdminRequest {
                     "status" => AdminCommand::Status,
                     "metrics" => AdminCommand::Metrics,
                     "generations" => AdminCommand::Generations,
+                    "rollback" => AdminCommand::Rollback,
                     _ => AdminCommand::Shutdown,
                 };
                 Ok(Self::new(message.envelope().request_id().clone(), command))
@@ -4035,6 +4106,26 @@ pub enum AdminResponse {
         request_id: RequestId,
         reload: ReloadStatusView,
     },
+    /// The exact release completed its durable generation handoff.
+    ReloadSucceeded {
+        request_id: RequestId,
+        reload_id: String,
+    },
+    /// The reload epoch is durable and the handoff is now executing.
+    ReloadAccepted {
+        request_id: RequestId,
+        reload_id: String,
+    },
+    /// The retained release completed its durable generation handoff.
+    RollbackSucceeded {
+        request_id: RequestId,
+        reload_id: String,
+    },
+    /// The rollback epoch is durable and the reverse handoff is now executing.
+    RollbackAccepted {
+        request_id: RequestId,
+        reload_id: String,
+    },
     /// A synthetic work item is durable, or the exact retry was replayed.
     SyntheticAccepted {
         /// Correlation identifier from the request.
@@ -4126,6 +4217,10 @@ impl AdminResponse {
             | Self::Metrics { request_id, .. }
             | Self::Generations { request_id, .. }
             | Self::ReloadStatus { request_id, .. }
+            | Self::ReloadSucceeded { request_id, .. }
+            | Self::ReloadAccepted { request_id, .. }
+            | Self::RollbackSucceeded { request_id, .. }
+            | Self::RollbackAccepted { request_id, .. }
             | Self::SyntheticAccepted { request_id, .. }
             | Self::RunAccepted { request_id, .. }
             | Self::ReconciliationInspected { request_id, .. }
@@ -4177,6 +4272,44 @@ impl AdminResponse {
                 envelope(request_id.clone(), "reload_status_result")?,
                 reload.to_body()?,
             )),
+            Self::ReloadSucceeded {
+                request_id,
+                reload_id,
+            } => {
+                if !valid_coordinate(reload_id, MAX_RELOAD_ID_BYTES) {
+                    return Err(AdminError::InvalidBody);
+                }
+                Ok(Message::new(
+                    envelope(request_id.clone(), "reload_succeeded")?,
+                    JsonValue::Object(vec![(
+                        "reload_id".to_owned(),
+                        JsonValue::String(reload_id.clone()),
+                    )]),
+                ))
+            }
+            Self::ReloadAccepted {
+                request_id,
+                reload_id,
+            } => reload_receipt(request_id, reload_id, "reload_accepted"),
+            Self::RollbackSucceeded {
+                request_id,
+                reload_id,
+            } => {
+                if !valid_coordinate(reload_id, MAX_RELOAD_ID_BYTES) {
+                    return Err(AdminError::InvalidBody);
+                }
+                Ok(Message::new(
+                    envelope(request_id.clone(), "rollback_succeeded")?,
+                    JsonValue::Object(vec![(
+                        "reload_id".to_owned(),
+                        JsonValue::String(reload_id.clone()),
+                    )]),
+                ))
+            }
+            Self::RollbackAccepted {
+                request_id,
+                reload_id,
+            } => reload_receipt(request_id, reload_id, "rollback_accepted"),
             Self::SyntheticAccepted {
                 request_id,
                 inbox_id,
@@ -4355,6 +4488,40 @@ impl AdminResponse {
                 request_id,
                 reload: ReloadStatusView::from_body(message.body())?,
             }),
+            "reload_succeeded" => {
+                exact_fields(message.body(), &["reload_id"])?;
+                let reload_id = required_body_string(message.body(), "reload_id")?;
+                if !valid_coordinate(&reload_id, MAX_RELOAD_ID_BYTES) {
+                    return Err(AdminError::InvalidBody);
+                }
+                Ok(Self::ReloadSucceeded {
+                    request_id,
+                    reload_id,
+                })
+            }
+            "reload_accepted" => {
+                decode_reload_receipt(message.body()).map(|reload_id| Self::ReloadAccepted {
+                    request_id,
+                    reload_id,
+                })
+            }
+            "rollback_succeeded" => {
+                exact_fields(message.body(), &["reload_id"])?;
+                let reload_id = required_body_string(message.body(), "reload_id")?;
+                if !valid_coordinate(&reload_id, MAX_RELOAD_ID_BYTES) {
+                    return Err(AdminError::InvalidBody);
+                }
+                Ok(Self::RollbackSucceeded {
+                    request_id,
+                    reload_id,
+                })
+            }
+            "rollback_accepted" => {
+                decode_reload_receipt(message.body()).map(|reload_id| Self::RollbackAccepted {
+                    request_id,
+                    reload_id,
+                })
+            }
             "synthetic_accepted" => {
                 exact_fields(message.body(), &["duplicate", "inbox_id"])?;
                 let duplicate = match message.body().get("duplicate") {
@@ -4480,6 +4647,32 @@ impl AdminResponse {
             _ => Err(AdminError::UnknownKind),
         }
     }
+}
+
+fn reload_receipt(
+    request_id: &RequestId,
+    reload_id: &str,
+    kind: &str,
+) -> Result<Message, AdminError> {
+    if !valid_coordinate(reload_id, MAX_RELOAD_ID_BYTES) {
+        return Err(AdminError::InvalidBody);
+    }
+    Ok(Message::new(
+        envelope(request_id.clone(), kind)?,
+        JsonValue::Object(vec![(
+            "reload_id".to_owned(),
+            JsonValue::String(reload_id.to_owned()),
+        )]),
+    ))
+}
+
+fn decode_reload_receipt(body: &JsonValue) -> Result<String, AdminError> {
+    exact_fields(body, &["reload_id"])?;
+    let reload_id = required_body_string(body, "reload_id")?;
+    if !valid_coordinate(&reload_id, MAX_RELOAD_ID_BYTES) {
+        return Err(AdminError::InvalidBody);
+    }
+    Ok(reload_id)
 }
 
 fn envelope(request_id: RequestId, kind: &str) -> Result<Envelope, AdminError> {

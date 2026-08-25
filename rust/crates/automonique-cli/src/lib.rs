@@ -9,6 +9,7 @@ use automonique_protocol::{
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 mod admin_client;
 mod approval;
@@ -50,7 +51,9 @@ use std::os::unix::fs::MetadataExt;
 
 const MAX_RUNTIME_PATH_BYTES: usize = 4_096;
 const MAX_RUNTIME_COMPONENTS: usize = 256;
-const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique metrics\n       automonique generations\n       automonique reload-status <reload-id>\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique run submit <idempotency-key> < run-spec.bin\n       automonique runs list [--state <state>]... [--cursor <submission-id>] [--page <size>]\n       automonique runs detail <run-id>\n       automonique runs tail <spool-root> <run-id> [cursor]\n       automonique automation register <automation-id> <actor>\n       automonique automation pause <automation-id> <revision> <actor> <cause>\n       automonique automation resume <automation-id> <revision> <actor>\n       automonique automation archive <automation-id> <revision> <actor> <cause>\n       automonique automation list [--state <state>]... [--cursor <entry-id>] [--page <size>]\n       automonique automation detail <automation-id>\n       automonique approval record <approval-key> <subject> <granted|denied> <decider>\n       automonique approval list [--cursor <entry-id>] [--page <size>]\n       automonique approval detail <approval-key>\n       automonique approval by-subject <subject> [--cursor <entry-id>] [--page <size>]\n       automonique batch register <batch-id> [--label <label>] [--sequential | --parallel <ceiling>] <member-key>...\n       automonique batch advance <batch-id> <member-key> <revision> <state> <last-sequence>\n       automonique batch list [--cursor <entry-id>] [--page <size>]\n       automonique batch detail <batch-id>\n       automonique parity compare <database> <scope> [--registry <path>] [--category <category>]\n       automonique parity score <database> <scope>\n       automonique parity gate <database> <scope> <decision-key> <decider> [--registry <path>]\n       automonique audit verify <database>\n       automonique cancel <run-id> <request-ref> [observed-sequence]\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique progress subscribe <socket-path> <run-id> [cursor]\n       automonique shutdown\n";
+const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique metrics\n       automonique generations\n       automonique reload <sha256:manifest-digest> [--wait]\n       automonique rollback [--wait]\n       automonique reload-status <reload-id>\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique run submit <idempotency-key> < run-spec.bin\n       automonique runs list [--state <state>]... [--cursor <submission-id>] [--page <size>]\n       automonique runs detail <run-id>\n       automonique runs tail <spool-root> <run-id> [cursor]\n       automonique automation register <automation-id> <actor>\n       automonique automation pause <automation-id> <revision> <actor> <cause>\n       automonique automation resume <automation-id> <revision> <actor>\n       automonique automation archive <automation-id> <revision> <actor> <cause>\n       automonique automation list [--state <state>]... [--cursor <entry-id>] [--page <size>]\n       automonique automation detail <automation-id>\n       automonique approval record <approval-key> <subject> <granted|denied> <decider>\n       automonique approval list [--cursor <entry-id>] [--page <size>]\n       automonique approval detail <approval-key>\n       automonique approval by-subject <subject> [--cursor <entry-id>] [--page <size>]\n       automonique batch register <batch-id> [--label <label>] [--sequential | --parallel <ceiling>] <member-key>...\n       automonique batch advance <batch-id> <member-key> <revision> <state> <last-sequence>\n       automonique batch list [--cursor <entry-id>] [--page <size>]\n       automonique batch detail <batch-id>\n       automonique parity compare <database> <scope> [--registry <path>] [--category <category>]\n       automonique parity score <database> <scope>\n       automonique parity gate <database> <scope> <decision-key> <decider> [--registry <path>]\n       automonique audit verify <database>\n       automonique cancel <run-id> <request-ref> [observed-sequence]\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique progress subscribe <socket-path> <run-id> [cursor]\n       automonique shutdown\n";
+const RELOAD_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+const RELOAD_WAIT_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 enum Command {
@@ -62,6 +65,13 @@ enum Command {
     },
     Metrics,
     Generations,
+    Reload {
+        target_release_digest: OsString,
+        wait: bool,
+    },
+    Rollback {
+        wait: bool,
+    },
     ReloadStatus {
         reload_id: OsString,
     },
@@ -146,6 +156,26 @@ where
         }
         (Some(command), None, None, None) if command == "metrics" => Command::Metrics,
         (Some(command), None, None, None) if command == "generations" => Command::Generations,
+        (Some(command), Some(target_release_digest), None, None) if command == "reload" => {
+            Command::Reload {
+                target_release_digest,
+                wait: false,
+            }
+        }
+        (Some(command), Some(target_release_digest), Some(flag), None)
+            if command == "reload" && flag == "--wait" =>
+        {
+            Command::Reload {
+                target_release_digest,
+                wait: true,
+            }
+        }
+        (Some(command), None, None, None) if command == "rollback" => {
+            Command::Rollback { wait: false }
+        }
+        (Some(command), Some(flag), None, None) if command == "rollback" && flag == "--wait" => {
+            Command::Rollback { wait: true }
+        }
         (Some(command), Some(reload_id), None, None) if command == "reload-status" => {
             Command::ReloadStatus { reload_id }
         }
@@ -518,6 +548,21 @@ where
         }
         Command::Generations => {
             return admin_generations(runtime.as_deref(), &mut stdout, &mut stderr);
+        }
+        Command::Reload {
+            target_release_digest,
+            wait,
+        } => {
+            return admin_reload(
+                runtime.as_deref(),
+                target_release_digest,
+                wait,
+                &mut stdout,
+                &mut stderr,
+            );
+        }
+        Command::Rollback { wait } => {
+            return admin_rollback(runtime.as_deref(), wait, &mut stdout, &mut stderr);
         }
         Command::ReloadStatus { reload_id } => {
             return admin_reload_status(runtime.as_deref(), reload_id, &mut stdout, &mut stderr);
@@ -1184,6 +1229,142 @@ fn admin_generations<W: Write, E: Write>(
             );
             1
         }
+    }
+}
+
+fn admin_reload<W: Write, E: Write>(
+    runtime: Option<&OsStr>,
+    target_release_digest: OsString,
+    wait: bool,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> u8 {
+    let Some(target_release_digest) = target_release_digest.to_str() else {
+        let _ = stderr.write_all(b"automonique reload refused: invalid_body\n");
+        return 2;
+    };
+    match admin_client::request(
+        runtime,
+        admin_client::Operation::Reload(target_release_digest.to_owned()),
+    ) {
+        Ok(automonique_protocol::admin::AdminResponse::ReloadAccepted { reload_id, .. }) => {
+            if wait {
+                wait_for_reload(runtime, &reload_id, "reload", stdout, stderr)
+            } else if writeln!(stdout, "reload {reload_id} accepted").is_ok() {
+                0
+            } else {
+                1
+            }
+        }
+        Ok(automonique_protocol::admin::AdminResponse::ReloadSucceeded { reload_id, .. }) => {
+            if writeln!(stdout, "reload {reload_id} succeeded").is_ok() {
+                0
+            } else {
+                1
+            }
+        }
+        Ok(_) => {
+            let _ = stderr.write_all(b"automonique reload refused: response_mismatch\n");
+            1
+        }
+        Err(error) => {
+            let _ = writeln!(stderr, "automonique reload refused: {}", error.category());
+            1
+        }
+    }
+}
+
+fn admin_rollback<W: Write, E: Write>(
+    runtime: Option<&OsStr>,
+    wait: bool,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> u8 {
+    match admin_client::request(runtime, admin_client::Operation::Rollback) {
+        Ok(automonique_protocol::admin::AdminResponse::RollbackAccepted { reload_id, .. }) => {
+            if wait {
+                wait_for_reload(runtime, &reload_id, "rollback", stdout, stderr)
+            } else if writeln!(stdout, "rollback {reload_id} accepted").is_ok() {
+                0
+            } else {
+                1
+            }
+        }
+        Ok(automonique_protocol::admin::AdminResponse::RollbackSucceeded { reload_id, .. }) => {
+            if writeln!(stdout, "rollback {reload_id} succeeded").is_ok() {
+                0
+            } else {
+                1
+            }
+        }
+        Ok(_) => {
+            let _ = stderr.write_all(b"automonique rollback refused: response_mismatch\n");
+            1
+        }
+        Err(error) => {
+            let _ = writeln!(stderr, "automonique rollback refused: {}", error.category());
+            1
+        }
+    }
+}
+
+fn wait_for_reload<W: Write, E: Write>(
+    runtime: Option<&OsStr>,
+    reload_id: &str,
+    operation: &str,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> u8 {
+    let deadline = Instant::now() + RELOAD_WAIT_TIMEOUT;
+    loop {
+        match admin_client::request(
+            runtime,
+            admin_client::Operation::ReloadStatus(reload_id.to_owned()),
+        ) {
+            Ok(automonique_protocol::admin::AdminResponse::ReloadStatus { reload, .. })
+                if reload.reload_id == reload_id =>
+            {
+                match reload.phase.as_str() {
+                    "succeeded" => {
+                        return if writeln!(stdout, "{operation} {reload_id} succeeded").is_ok() {
+                            0
+                        } else {
+                            1
+                        };
+                    }
+                    "failed" | "rolled_back" => {
+                        let category = reload
+                            .failure_category
+                            .as_deref()
+                            .unwrap_or("reload_failed");
+                        let _ = writeln!(stderr, "{operation} {reload_id} failed: {category}");
+                        return 1;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(_) => {
+                let _ = writeln!(stderr, "automonique {operation} refused: response_mismatch");
+                return 1;
+            }
+            Err(error) if Instant::now() >= deadline => {
+                let _ = writeln!(
+                    stderr,
+                    "automonique {operation} refused: {}",
+                    error.category()
+                );
+                return 1;
+            }
+            Err(_) => {}
+        }
+        if Instant::now() >= deadline {
+            let _ = writeln!(
+                stderr,
+                "automonique {operation} refused: reload_wait_timeout"
+            );
+            return 1;
+        }
+        std::thread::sleep(RELOAD_WAIT_POLL);
     }
 }
 

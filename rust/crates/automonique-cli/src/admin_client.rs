@@ -35,6 +35,7 @@ use nix::unistd::geteuid;
 
 const MAX_ADMIN_PAYLOAD_BYTES: usize = MAX_ADMIN_CANONICAL_BYTES;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
+const RELOAD_TIMEOUT: Duration = Duration::from_secs(60);
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
@@ -42,6 +43,8 @@ pub(crate) enum Operation {
     Status,
     Metrics,
     Generations,
+    Reload(String),
+    Rollback,
     ReloadStatus(String),
     Submit(SyntheticSubmission),
     SubmitRun(SubmittedRunSpec),
@@ -81,6 +84,8 @@ pub(crate) fn request(
         Operation::Status => "status",
         Operation::Metrics => "metrics",
         Operation::Generations => "generations",
+        Operation::Reload(_) => "reload",
+        Operation::Rollback => "rollback",
         Operation::ReloadStatus(_) => "reload-status",
         Operation::Submit(_) => "submit",
         Operation::SubmitRun(_) => "run-submit",
@@ -111,6 +116,11 @@ pub(crate) fn request(
         Operation::Status => AdminRequest::new(request_id, AdminCommand::Status),
         Operation::Metrics => AdminRequest::new(request_id, AdminCommand::Metrics),
         Operation::Generations => AdminRequest::new(request_id, AdminCommand::Generations),
+        Operation::Reload(target_release_digest) => {
+            AdminRequest::reload(request_id, target_release_digest)
+                .map_err(|error| ClientError::Protocol(error.category()))?
+        }
+        Operation::Rollback => AdminRequest::new(request_id, AdminCommand::Rollback),
         Operation::ReloadStatus(reload_id) => AdminRequest::reload_status(request_id, reload_id)
             .map_err(|error| ClientError::Protocol(error.category()))?,
         Operation::Shutdown => AdminRequest::new(request_id, AdminCommand::Shutdown),
@@ -120,7 +130,15 @@ pub(crate) fn request(
         .to_message()
         .map_err(|error| ClientError::Protocol(error.category()))?
         .to_canonical_bytes();
-    let payload = exchange(runtime, &payload)?;
+    let timeout = if matches!(
+        request.command(),
+        AdminCommand::Reload | AdminCommand::Rollback
+    ) {
+        RELOAD_TIMEOUT
+    } else {
+        IO_TIMEOUT
+    };
+    let payload = exchange_with_timeout(runtime, &payload, timeout)?;
     let response = AdminResponse::from_canonical_bytes(&payload)
         .map_err(|error| ClientError::Protocol(error.category()))?;
     if response.request_id().as_str() != request_id {
@@ -296,6 +314,14 @@ pub(crate) fn correlation(operation: &str) -> Result<RequestId, ClientError> {
 /// time in `automonique_protocol::admin` to be no larger than this one, so a
 /// legal message of either lane fits a frame this function will carry.
 fn exchange(runtime: Option<&OsStr>, payload: &[u8]) -> Result<Vec<u8>, ClientError> {
+    exchange_with_timeout(runtime, payload, IO_TIMEOUT)
+}
+
+fn exchange_with_timeout(
+    runtime: Option<&OsStr>,
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>, ClientError> {
     if payload.is_empty() || payload.len() > MAX_ADMIN_PAYLOAD_BYTES {
         return Err(ClientError::Protocol("frame_size"));
     }
@@ -318,10 +344,10 @@ fn exchange(runtime: Option<&OsStr>, payload: &[u8]) -> Result<Vec<u8>, ClientEr
     let mut stream = UnixStream::connect(&socket).map_err(|_| ClientError::Io)?;
     admit_peer(&stream)?;
     stream
-        .set_read_timeout(Some(IO_TIMEOUT))
+        .set_read_timeout(Some(timeout))
         .map_err(|_| ClientError::Io)?;
     stream
-        .set_write_timeout(Some(IO_TIMEOUT))
+        .set_write_timeout(Some(timeout))
         .map_err(|_| ClientError::Io)?;
     stream.write_all(&frame).map_err(|_| ClientError::Io)?;
 

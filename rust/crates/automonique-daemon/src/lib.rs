@@ -149,7 +149,7 @@ use automonique_store::generation_audit::{
 };
 use automonique_store::platform_store::{ActionAdmission, PlatformStore, PlatformStoreError};
 use automonique_store::provider_journal::ProviderJournal;
-use automonique_store::reload_audit::{ReloadAudit, ReloadAuditError};
+use automonique_store::reload_audit::{BeginReload, ReloadAudit, ReloadAuditError};
 use automonique_store::run_index::{
     RunIndex, RunIndexEntry, RunIndexError, RunIndexRecord, RunSpoolState,
 };
@@ -158,7 +158,7 @@ use automonique_store::run_submissions::{
 };
 use automonique_store::{
     GenerationLease, InboxSubmission, IntakePauseRequest, IntakeResumeRequest, LeaseExpiryRequest,
-    LeaseOwnerIdentity, LeaseRenewal, LeaseRequest,
+    LeaseOwnerIdentity, LeaseRenewal, LeaseRequest, LeaseTransferRequest,
     OutboxReconciliationDecision as StoreOutboxDecision, OutboxReconciliationRequest,
     ReconciliationDecision, ReconciliationRequest, StatusSnapshot, Store, StoreError,
 };
@@ -1253,6 +1253,7 @@ impl From<StoreError> for DaemonError {
 
 /// An opened daemon whose runtime and store are ready.
 pub struct Daemon {
+    config: DaemonConfig,
     listener: UnixListener,
     socket_path: PathBuf,
     store: Store,
@@ -1267,6 +1268,7 @@ pub struct Daemon {
     telegram: telegram::TelegramHost,
     /// Configured-channel Slack ticket intake and confirmation lifecycle.
     slack_tickets: slack::SlackTicketHost,
+    ticket_gates: Arc<Mutex<telegram_bridge::TicketGateRegistry>>,
     run_submissions: RunSubmissionLog,
     /// The listing read model derived from `run_submissions`.
     ///
@@ -1371,6 +1373,12 @@ pub struct Daemon {
     /// closing is compare-and-set on it, and a constant here would be this
     /// crate asserting a fact about another crate's schema.
     tenure_revision: u64,
+    handoff_quiesced: bool,
+    /// The successor owns the durable lease and inherited endpoints.
+    ///
+    /// Once true, the source serve loop exits without touching either: its
+    /// ordinary shutdown authority is stale by construction.
+    handoff_committed: bool,
     execution_state: automonique_protocol::admin::ExecutionState,
     /// The one settable input to the approval requirement every launch is
     /// composed against.
@@ -1445,10 +1453,260 @@ enum StartupAuthority {
     },
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
 enum LeaseDisposition {
     Release,
-    Retain,
+    ReleaseWhen(Arc<AtomicBool>),
+}
+
+struct ProcessReloadHooks<'a> {
+    daemon: &'a mut Daemon,
+    release: release_activation::VerifiedCodeRelease,
+    reload_id: String,
+    target_generation_id: String,
+    source_holder_id: String,
+    source_lease_epoch: u64,
+    candidate: Option<candidate::WarmCandidate>,
+    candidate_lease: Option<GenerationLease>,
+    adopted_runs: u64,
+    source_quiesced: bool,
+    authority_confirmed: bool,
+    candidate_active: bool,
+    cleanup_transferred: bool,
+    activation: Option<release_activation::HandoffActivationReceipt>,
+    rollback_selection: bool,
+}
+
+impl ProcessReloadHooks<'_> {
+    fn refuse(category: &'static str) -> reload::ReloadRefusal {
+        reload::ReloadRefusal::new(category)
+    }
+}
+
+impl reload::ReloadHooks for ProcessReloadHooks<'_> {
+    fn verify_target(&mut self) -> Result<(), reload::ReloadRefusal> {
+        Ok(())
+    }
+
+    fn spawn_candidate(&mut self) -> Result<(), reload::ReloadRefusal> {
+        let candidate = candidate::spawn_warm_candidate(
+            &self.daemon.config,
+            &self.release,
+            &candidate::CandidateSpec {
+                reload_id: self.reload_id.clone(),
+                source_holder_id: self.source_holder_id.clone(),
+                source_lease_epoch: self.source_lease_epoch,
+                target_generation_id: self.target_generation_id.clone(),
+                warm_timeout: Duration::from_secs(20),
+            },
+        )
+        .map_err(|error| Self::refuse(error.category()))?;
+        self.candidate = Some(candidate);
+        Ok(())
+    }
+
+    fn warm_candidate(&mut self) -> Result<(), reload::ReloadRefusal> {
+        let descriptors = self
+            .daemon
+            .candidate_transfer_descriptors()
+            .map_err(|error| Self::refuse(error.category()))?;
+        self.candidate
+            .as_mut()
+            .ok_or_else(|| Self::refuse("candidate_unavailable"))?
+            .prepare_transfer(descriptors)
+            .map_err(|error| Self::refuse(error.category()))
+    }
+
+    fn quiesce_source(&mut self) -> Result<(), reload::ReloadRefusal> {
+        let quiesced = self.daemon.quiesce_for_handoff();
+        self.source_quiesced = self.daemon.handoff_quiesced;
+        quiesced.map_err(|error| Self::refuse(error.category()))
+    }
+
+    fn transfer_leases(&mut self) -> Result<(), reload::ReloadRefusal> {
+        let target = self
+            .candidate
+            .as_ref()
+            .ok_or_else(|| Self::refuse("candidate_unavailable"))?
+            .lease_target();
+        let transferred = self
+            .daemon
+            .store
+            .transfer_generation_lease(LeaseTransferRequest {
+                generation_id: GENERATION_ID,
+                source_holder_id: &self.source_holder_id,
+                source_epoch: self.source_lease_epoch,
+                target_holder_id: &target.holder_id,
+                target_owner: LeaseOwnerIdentity {
+                    boot_id: &target.boot_id,
+                    pid: target.pid,
+                    starttime: target.starttime,
+                },
+                now_ms: unix_millis().map_err(|error| Self::refuse(error.category()))?,
+                ttl_ms: LEASE_TTL_MS,
+            })
+            .map_err(|error| Self::refuse(error.category()))?;
+        self.adopted_runs = transferred.adopted_runs;
+        self.candidate_lease = Some(transferred.lease);
+        Ok(())
+    }
+
+    fn activate_candidate(&mut self) -> Result<(), reload::ReloadRefusal> {
+        let lease = self
+            .candidate_lease
+            .as_ref()
+            .ok_or_else(|| Self::refuse("candidate_authority_unavailable"))?;
+        let candidate = self
+            .candidate
+            .as_mut()
+            .ok_or_else(|| Self::refuse("candidate_unavailable"))?;
+        candidate
+            .confirm_authority(lease, self.adopted_runs)
+            .map_err(|error| Self::refuse(error.category()))?;
+        self.authority_confirmed = true;
+        let cleanup = self
+            .daemon
+            .relinquish_endpoint_cleanup()
+            .map_err(|error| Self::refuse(error.category()))?;
+        self.cleanup_transferred = true;
+        candidate
+            .activate_serving(cleanup)
+            .map_err(|error| Self::refuse(error.category()))?;
+        self.candidate_active = true;
+        Ok(())
+    }
+
+    fn prove_active(&mut self) -> Result<(), reload::ReloadRefusal> {
+        let lease = self
+            .candidate_lease
+            .as_ref()
+            .ok_or_else(|| Self::refuse("candidate_authority_unavailable"))?;
+        let now_ms = unix_millis().map_err(|error| Self::refuse(error.category()))?;
+        let snapshot = self
+            .daemon
+            .store
+            .status_snapshot_at(GENERATION_ID, now_ms)
+            .map_err(|error| Self::refuse(error.category()))?;
+        let current = snapshot
+            .generation()
+            .ok_or_else(|| Self::refuse("candidate_active_proof_failed"))?;
+        if !self.candidate_active
+            || current.holder_id() != lease.holder_id
+            || current.lease_epoch() != lease.epoch
+            || current.boot_id() != lease.boot_id
+            || current.holder_pid() != lease.holder_pid
+            || current.holder_starttime() != lease.holder_starttime
+            || current.lease_expires_ms() <= snapshot.lease_observed_boottime_ms()
+        {
+            return Err(Self::refuse("candidate_active_proof_failed"));
+        }
+        Ok(())
+    }
+
+    fn drain_source(&mut self) -> Result<(), reload::ReloadRefusal> {
+        self.daemon
+            .retire_after_handoff()
+            .map_err(|error| Self::refuse(error.category()))?;
+        self.activation = Some(
+            if self.rollback_selection {
+                self.release.activate_for_rollback()
+            } else {
+                self.release.activate_for_handoff()
+            }
+            .map_err(|_| Self::refuse("release_activation_failed"))?,
+        );
+        self.candidate
+            .as_mut()
+            .ok_or_else(|| Self::refuse("candidate_unavailable"))?
+            .commit()
+            .map_err(|error| Self::refuse(error.category()))?;
+        self.candidate_active = false;
+        Ok(())
+    }
+
+    fn stop_candidate(&mut self) -> Result<(), reload::ReloadRefusal> {
+        self.candidate.as_mut().map_or(Ok(()), |candidate| {
+            candidate
+                .stop()
+                .map_err(|error| Self::refuse(error.category()))
+        })
+    }
+
+    fn resume_source(&mut self) -> Result<(), reload::ReloadRefusal> {
+        if !self.source_quiesced {
+            return Ok(());
+        }
+        self.daemon
+            .resume_after_handoff()
+            .map_err(|error| Self::refuse(error.category()))?;
+        self.source_quiesced = false;
+        Ok(())
+    }
+
+    fn return_leases(&mut self) -> Result<(), reload::ReloadRefusal> {
+        if self.candidate_active {
+            self.candidate
+                .as_mut()
+                .ok_or_else(|| Self::refuse("candidate_unavailable"))?
+                .quiesce()
+                .map_err(|error| Self::refuse(error.category()))?;
+            self.candidate_active = false;
+        }
+        let candidate_lease = self
+            .candidate_lease
+            .as_ref()
+            .ok_or_else(|| Self::refuse("candidate_authority_unavailable"))?;
+        let source_identity = lease_identity::ProcessIdentity::current()
+            .map_err(|_| Self::refuse("source_identity_unavailable"))?;
+        let returned = self
+            .daemon
+            .store
+            .transfer_generation_lease(LeaseTransferRequest {
+                generation_id: GENERATION_ID,
+                source_holder_id: &candidate_lease.holder_id,
+                source_epoch: candidate_lease.epoch,
+                target_holder_id: &self.source_holder_id,
+                target_owner: LeaseOwnerIdentity {
+                    boot_id: &source_identity.boot_id,
+                    pid: source_identity.pid,
+                    starttime: source_identity.starttime,
+                },
+                now_ms: unix_millis().map_err(|error| Self::refuse(error.category()))?,
+                ttl_ms: LEASE_TTL_MS,
+            })
+            .map_err(|error| Self::refuse(error.category()))?;
+        if self.authority_confirmed {
+            self.candidate
+                .as_mut()
+                .ok_or_else(|| Self::refuse("candidate_unavailable"))?
+                .confirm_relinquished(&returned.lease)
+                .map_err(|error| Self::refuse(error.category()))?;
+        }
+        self.daemon
+            .accept_returned_authority(&returned.lease)
+            .map_err(|error| Self::refuse(error.category()))?;
+        if self.cleanup_transferred {
+            self.daemon
+                .resume_endpoint_cleanup()
+                .map_err(|error| Self::refuse(error.category()))?;
+            self.cleanup_transferred = false;
+        }
+        if let Some(activation) = self.activation.take() {
+            activation
+                .rollback()
+                .map_err(|_| Self::refuse("release_rollback_failed"))?;
+        }
+        self.candidate_lease = None;
+        Ok(())
+    }
+}
+
+impl LeaseDisposition {
+    fn releases(&self) -> bool {
+        match self {
+            Self::Release => true,
+            Self::ReleaseWhen(release) => release.load(Ordering::Acquire),
+        }
+    }
 }
 
 impl SocketCleanup {
@@ -1796,7 +2054,7 @@ impl Daemon {
                     execution_state,
                 },
                 slack,
-                ticket_gates,
+                Arc::clone(&ticket_gates),
             )
             .map_err(|error| DaemonError::TelegramRefused(error.category()))?
         };
@@ -1995,6 +2253,7 @@ impl Daemon {
         socket_cleanup.disarm();
 
         Ok(Self {
+            config: config.clone(),
             listener,
             socket_path,
             store,
@@ -2008,6 +2267,7 @@ impl Daemon {
             reconciliation_run_id: None,
             telegram,
             slack_tickets,
+            ticket_gates,
             run_submissions,
             run_index,
             platform,
@@ -2024,6 +2284,8 @@ impl Daemon {
             generation_audit,
             reload_audit,
             tenure_revision: tenure.revision,
+            handoff_quiesced: false,
+            handoff_committed: false,
             execution_state,
             configured_approval_requirement,
             approval_lifetime,
@@ -2092,6 +2354,58 @@ impl Daemon {
             .map_err(|error| DaemonError::AttemptAdoptionFailed(error.category()))
     }
 
+    /// Execute the durable ten-phase handoff against one already verified
+    /// immutable release.
+    pub fn handoff_to_verified_release(
+        &mut self,
+        reload_id: &str,
+        release: release_activation::VerifiedCodeRelease,
+    ) -> Result<automonique_store::reload_audit::ReloadRecord, reload::ReloadExecutionError> {
+        self.handoff_to_verified_release_with_selection(reload_id, release, false)
+    }
+
+    fn handoff_to_verified_release_with_selection(
+        &mut self,
+        reload_id: &str,
+        release: release_activation::VerifiedCodeRelease,
+        rollback_selection: bool,
+    ) -> Result<automonique_store::reload_audit::ReloadRecord, reload::ReloadExecutionError> {
+        let target_generation_id = format!("foreground-{}", &release.source_sha[..12]);
+        let target_release_digest = release.manifest_digest.clone();
+        let source_holder_id = self.instance_id.as_str().to_owned();
+        let source_lease_epoch = self.lease_epoch;
+        let mut audit = ReloadAudit::open(self.config.reload_audit_path())?;
+        let mut hooks = ProcessReloadHooks {
+            daemon: self,
+            release,
+            reload_id: reload_id.to_owned(),
+            target_generation_id: target_generation_id.clone(),
+            source_holder_id: source_holder_id.clone(),
+            source_lease_epoch,
+            candidate: None,
+            candidate_lease: None,
+            adopted_runs: 0,
+            source_quiesced: false,
+            authority_confirmed: false,
+            candidate_active: false,
+            cleanup_transferred: false,
+            activation: None,
+            rollback_selection,
+        };
+        reload::execute_reload(
+            &mut audit,
+            reload::ReloadExecution {
+                reload_id,
+                source_generation_id: GENERATION_ID,
+                source_lease_epoch,
+                target_generation_id: &target_generation_id,
+                target_release_digest: &target_release_digest,
+            },
+            &mut hooks,
+            || unix_millis().map_err(|_| reload::ReloadRefusal::new("clock")),
+        )
+    }
+
     /// Duplicate the exact listener and locked open-file description for a
     /// warmed child. Possessing these descriptors grants no durable lease;
     /// candidate activation must still validate and transfer that authority.
@@ -2122,6 +2436,414 @@ impl Daemon {
             progress_listener,
             control_lock,
         ))
+    }
+
+    /// Transfer responsibility for unlinking the exact admin/progress socket
+    /// inodes to a candidate at its serving-readiness boundary.
+    pub fn relinquish_endpoint_cleanup(
+        &mut self,
+    ) -> Result<candidate::EndpointCleanupTransfer, DaemonError> {
+        let identity = validate_admin_listener(&self.listener, &self.socket_path)?;
+        if identity != self.socket_identity {
+            return Err(DaemonError::InsecurePath("admin socket"));
+        }
+        let progress =
+            self.progress_endpoint
+                .as_mut()
+                .ok_or(DaemonError::ProgressEndpointFailed(
+                    "progress_endpoint_unavailable",
+                ))?;
+        progress.disarm_cleanup();
+        self.remove_socket_on_drop = false;
+        Ok(candidate::EndpointCleanupTransfer::new())
+    }
+
+    /// Reclaim cleanup responsibility after the candidate proved an E+2
+    /// authority return and disarmed its own exact inode guards.
+    pub fn resume_endpoint_cleanup(&mut self) -> Result<(), DaemonError> {
+        self.arm_endpoint_cleanup()
+    }
+
+    /// Accept an E+2 lease returned by a failed candidate and make every
+    /// source-owned authority projection agree with it before resumption.
+    pub fn accept_returned_authority(
+        &mut self,
+        returned: &GenerationLease,
+    ) -> Result<(), DaemonError> {
+        let expected_epoch = self
+            .lease_epoch
+            .checked_add(2)
+            .ok_or(DaemonError::Store(StoreError::StaleEpoch))?;
+        let process_identity =
+            lease_identity::ProcessIdentity::current().map_err(|error| match error {
+                lease_identity::ProcessIdentityError::Io(error) => DaemonError::Io(error),
+                lease_identity::ProcessIdentityError::Malformed(category) => {
+                    DaemonError::ControlLockFailed(category)
+                }
+            })?;
+        let lease_now_ms = self
+            .lease_time
+            .require_authority()
+            .map_err(map_lease_authority_error)?;
+        if returned.generation_id != GENERATION_ID
+            || returned.holder_id != self.instance_id.as_str()
+            || returned.epoch != expected_epoch
+            || returned.expires_ms <= lease_now_ms
+            || returned.boot_id != process_identity.boot_id
+            || returned.holder_pid != process_identity.pid
+            || returned.holder_starttime != process_identity.starttime
+        {
+            return Err(DaemonError::Store(StoreError::StaleEpoch));
+        }
+
+        let now_ms = unix_millis()?;
+        let renewed = self.store.renew_generation_lease(LeaseRenewal {
+            generation_id: GENERATION_ID,
+            holder_id: self.instance_id.as_str(),
+            epoch: returned.epoch,
+            now_ms,
+            ttl_ms: LEASE_TTL_MS,
+        })?;
+        if renewed.generation_id != returned.generation_id
+            || renewed.holder_id != returned.holder_id
+            || renewed.epoch != returned.epoch
+            || renewed.boot_id != returned.boot_id
+            || renewed.holder_pid != returned.holder_pid
+            || renewed.holder_starttime != returned.holder_starttime
+        {
+            return Err(DaemonError::Store(StoreError::StaleEpoch));
+        }
+
+        let tenure = record_tenure(
+            &mut self.generation_audit,
+            self.instance_id.as_str(),
+            renewed.epoch,
+            now_ms,
+        )?;
+        self.lease_epoch = renewed.epoch;
+        self.lease_expires_ms = renewed.expires_ms;
+        self.tenure_revision = tenure.revision;
+        match (
+            self.execution.is_some(),
+            self.attempt_host.is_some(),
+            self.attempt_adoption.as_mut(),
+        ) {
+            (true, true, Some(adoption)) => adoption
+                .retarget(renewed.epoch)
+                .map_err(|error| DaemonError::AttemptAdoptionFailed(error.category()))?,
+            (false, false, None) => {}
+            _ => return Err(DaemonError::AttemptHostFailed("attempt_host_incoherent")),
+        }
+        Ok(())
+    }
+
+    /// Stop every source intake/transport worker while retaining only live
+    /// attempts and their epoch-pinned cancellation route for N+1 adoption.
+    pub fn quiesce_for_handoff(&mut self) -> Result<(), DaemonError> {
+        if self.disconnected_recovery || self.handoff_quiesced {
+            return Err(DaemonError::ProtocolRefused("handoff_state"));
+        }
+        self.handoff_quiesced = true;
+        let mut workers = Vec::new();
+        workers.extend(named_shutdown_workers(
+            "managed_tui",
+            self.managed_tui.begin_shutdown(),
+        ));
+        if let Some(progress_endpoint) = self.progress_endpoint.as_mut() {
+            workers.extend(named_shutdown_workers(
+                "progress_endpoint",
+                progress_endpoint.begin_shutdown_retaining(),
+            ));
+        }
+        workers.extend(named_shutdown_workers(
+            "slack_tickets",
+            self.slack_tickets.begin_shutdown(),
+        ));
+        workers.extend(named_shutdown_workers(
+            "ticket_intake",
+            self.ticket_intake.begin_shutdown(),
+        ));
+        workers.extend(named_shutdown_workers(
+            "telegram",
+            self.telegram.begin_shutdown(),
+        ));
+        let drained = drain_shutdown_workers(
+            workers,
+            Duration::from_millis(
+                u64::try_from(LEASE_RENEW_INTERVAL_MS)
+                    .expect("renewal interval is a positive constant"),
+            ),
+            SHUTDOWN_WORKER_DIAGNOSTIC_BUDGET,
+            || {
+                self.renew_lease().and_then(|()| {
+                    self.telegram
+                        .renew()
+                        .map_err(|error| DaemonError::TelegramRefused(error.category()))
+                })
+            },
+            |observation| {
+                let _ = structured_log::emit_shutdown_worker_drain(
+                    observation.worker_group,
+                    observation.worker_ordinal,
+                    observation.phase.as_str(),
+                    observation.elapsed_ms,
+                    observation.budget_ms,
+                );
+            },
+        );
+        let telegram_release = self
+            .telegram
+            .release()
+            .map_err(|error| DaemonError::TelegramRefused(error.category()));
+        drained.and(telegram_release)
+    }
+
+    /// Restore a quiesced source after pre-transfer failure or an accepted
+    /// E+2 authority return.
+    pub fn resume_after_handoff(&mut self) -> Result<(), DaemonError> {
+        if !self.handoff_quiesced {
+            return Err(DaemonError::ProtocolRefused("handoff_state"));
+        }
+        self.rebuild_execution_after_retirement()?;
+        self.rebuild_handoff_workers()?;
+        self.handoff_quiesced = false;
+        Ok(())
+    }
+
+    /// Drain source-owned attempts after N+1 proved active, then retire the
+    /// adoption route and its sole cancellation dispatcher.
+    pub fn retire_after_handoff(&mut self) -> Result<(), DaemonError> {
+        if !self.handoff_quiesced {
+            return Err(DaemonError::ProtocolRefused("handoff_state"));
+        }
+        let workers = self.execution.take().map_or_else(Vec::new, |execution| {
+            named_shutdown_workers("execution", execution.begin_shutdown())
+        });
+        drain_shutdown_workers(
+            workers,
+            Duration::from_millis(
+                u64::try_from(LEASE_RENEW_INTERVAL_MS)
+                    .expect("renewal interval is a positive constant"),
+            ),
+            SHUTDOWN_WORKER_DIAGNOSTIC_BUDGET,
+            || Ok::<(), DaemonError>(()),
+            |observation| {
+                let _ = structured_log::emit_shutdown_worker_drain(
+                    observation.worker_group,
+                    observation.worker_ordinal,
+                    observation.phase.as_str(),
+                    observation.elapsed_ms,
+                    observation.budget_ms,
+                );
+            },
+        )?;
+        if let Some(attempt_adoption) = self.attempt_adoption.take() {
+            drain_shutdown_workers(
+                named_shutdown_workers("attempt_adoption", attempt_adoption.begin_shutdown()),
+                Duration::from_millis(100),
+                SHUTDOWN_WORKER_DIAGNOSTIC_BUDGET,
+                || Ok::<(), DaemonError>(()),
+                |_| {},
+            )?;
+        }
+        self.attempt_host.take().map_or(Ok(()), |host| {
+            Arc::try_unwrap(host).map_or(
+                Err(DaemonError::AttemptHostFailed("attempt_host_still_shared")),
+                |host| {
+                    host.dispose()
+                        .map_err(|error| DaemonError::AttemptHostFailed(error.category()))
+                },
+            )
+        })
+    }
+
+    fn rebuild_execution_after_retirement(&mut self) -> Result<(), DaemonError> {
+        match (
+            self.execution.is_some(),
+            self.attempt_host.is_some(),
+            self.attempt_adoption.is_some(),
+        ) {
+            (true, true, true) => return Ok(()),
+            (false, false, false) => {}
+            _ => return Err(DaemonError::AttemptHostFailed("attempt_host_incoherent")),
+        }
+        let host = Arc::new(
+            DaemonAttemptHost::open(self.config.run_cancel_ledger_path())
+                .map_err(|error| DaemonError::AttemptHostFailed(error.category()))?,
+        );
+        let adoption_path =
+            attempt_adoption::socket_path(&self.config.runtime_dir(), self.instance_id.as_str())
+                .map_err(|error| DaemonError::AttemptAdoptionFailed(error.category()))?;
+        let mut adoption = attempt_adoption::AttemptAdoptionEndpoint::bind(
+            adoption_path,
+            self.instance_id.as_str(),
+            self.lease_epoch,
+            Arc::clone(&host),
+        )
+        .map_err(|error| DaemonError::AttemptAdoptionFailed(error.category()))?;
+        let execution = execute::ExecutionLane::open(
+            Arc::clone(&host),
+            self.state_dir.clone(),
+            self.config.run_index_path(),
+            matches!(
+                self.execution_state,
+                automonique_protocol::admin::ExecutionState::SandboxEnforceableLaneWired
+            ),
+        );
+        self.progress_endpoint
+            .as_mut()
+            .ok_or(DaemonError::ProgressEndpointFailed(
+                "progress_endpoint_unavailable",
+            ))?
+            .replace_hub(execution.progress())
+            .map_err(|error| DaemonError::ProgressEndpointFailed(error.category()))?;
+        adoption
+            .start()
+            .map_err(|error| DaemonError::AttemptAdoptionFailed(error.category()))?;
+        self.attempt_host = Some(host);
+        self.attempt_adoption = Some(adoption);
+        self.execution = Some(execution);
+        Ok(())
+    }
+
+    fn rebuild_handoff_workers(&mut self) -> Result<(), DaemonError> {
+        let now_ms = unix_millis()?;
+        let generation_queues_clean =
+            startup_queues_clean(&self.store.status_snapshot_at(GENERATION_ID, now_ms)?);
+        let telegram_configuration =
+            telegram::TelegramBotConfig::load(&self.state_dir).map_err(|error| {
+                DaemonError::TelegramRefused(telegram::TelegramHostError::Config(error).category())
+            })?;
+        let telegram_bot_id = telegram_configuration
+            .as_ref()
+            .map_or(0, telegram::TelegramBotConfig::bot_id);
+        let (question_administrators, question_configured) =
+            telegram_configuration.as_ref().map_or_else(
+                || (Vec::new(), Vec::new()),
+                |configuration| configuration.question_operator_ids(),
+            );
+        drop(telegram_configuration);
+
+        let mut slack_tickets = slack::SlackTicketHost::open(
+            &slack::SlackTicketHostParams {
+                state_dir: &self.state_dir,
+                database_path: &self.config.database_path(),
+                admin_socket: &self.config.admin_socket(),
+                run_index_path: &self.config.run_index_path(),
+                support_tickets_path: &self.config.support_tickets_path(),
+                operator_members_path: &self.config.operator_members_path(),
+                host_facts: telegram_bridge::HostFacts {
+                    generation_id: GENERATION_ID.to_owned(),
+                    holder_id: self.instance_id.as_str().to_owned(),
+                    lease_epoch: self.lease_epoch,
+                    bot_id: telegram_bot_id,
+                    execution_state: self.execution_state,
+                },
+                question_administrators,
+                question_configured,
+                generation_queues_clean,
+            },
+            Arc::clone(&self.ticket_gates),
+        )
+        .map_err(|error| DaemonError::SlackRefused(error.category()))?;
+        let slack = slack::SlackHost::open(&self.state_dir)
+            .map_err(|error| DaemonError::SlackRefused(error.category()))?;
+        let mut ticket_intake =
+            ticket_intake::TicketIntakeHost::open(&ticket_intake::TicketIntakeParams {
+                state_dir: &self.state_dir,
+                ticket_store_path: &self.config.support_tickets_path(),
+            })
+            .map_err(|error| DaemonError::TicketIntakeRefused(error.category()))?;
+        let mut managed_tui = managed_tui::ManagedTuiHost::open(&managed_tui::ManagedTuiParams {
+            database_path: &self.config.database_path(),
+            platform_store_path: &self.config.platform_store_path(),
+            managed_sessions_path: &self.config.managed_sessions_path(),
+            state_dir: &self.state_dir,
+            admin_socket: &self.config.admin_socket(),
+            run_index_path: &self.config.run_index_path(),
+            generation_id: GENERATION_ID,
+            holder_id: self.instance_id.as_str(),
+            lease_epoch: self.lease_epoch,
+            lease_time_source: Arc::new(lease_time::BootTimeSource),
+        })
+        .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+        let mut telegram = telegram::TelegramHost::open_with_ticket_gates(
+            &telegram::TelegramHostParams {
+                state_dir: &self.state_dir,
+                database_path: &self.config.database_path(),
+                lease_time_source: Arc::new(lease_time::BootTimeSource),
+                run_index_path: &self.config.run_index_path(),
+                support_tickets_path: &self.config.support_tickets_path(),
+                operator_members_path: &self.config.operator_members_path(),
+                admin_socket: &self.config.admin_socket(),
+                generation_id: GENERATION_ID,
+                holder_id: self.instance_id.as_str(),
+                authority_lease_epoch: self.lease_epoch,
+                ttl_ms: TELEGRAM_LEASE_TTL_MS,
+                execution_state: self.execution_state,
+            },
+            slack,
+            Arc::clone(&self.ticket_gates),
+        )
+        .map_err(|error| DaemonError::TelegramRefused(error.category()))?;
+        if let Some(progress) = self.progress() {
+            telegram.attach_progress(Arc::clone(&progress));
+            slack_tickets.attach_progress(progress);
+        }
+
+        let started = slack_tickets
+            .start()
+            .map_err(|error| DaemonError::SlackRefused(error.category()))
+            .and_then(|()| {
+                telegram
+                    .start()
+                    .map_err(|error| DaemonError::TelegramRefused(error.category()))
+            })
+            .and_then(|()| {
+                ticket_intake
+                    .start()
+                    .map_err(|error| DaemonError::TicketIntakeRefused(error.category()))
+            })
+            .and_then(|()| {
+                managed_tui
+                    .start()
+                    .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))
+            })
+            .and_then(|()| {
+                self.progress_endpoint.as_mut().map_or(Ok(()), |endpoint| {
+                    endpoint
+                        .resume()
+                        .map_err(|error| DaemonError::ProgressEndpointFailed(error.category()))
+                })
+            });
+        if let Err(error) = started {
+            slack_tickets.shutdown();
+            ticket_intake.shutdown();
+            managed_tui.shutdown();
+            let _ = telegram.release();
+            return Err(error);
+        }
+        self.slack_tickets = slack_tickets;
+        self.telegram = telegram;
+        self.ticket_intake = ticket_intake;
+        self.managed_tui = managed_tui;
+        Ok(())
+    }
+
+    fn arm_endpoint_cleanup(&mut self) -> Result<(), DaemonError> {
+        let identity = validate_admin_listener(&self.listener, &self.socket_path)?;
+        if identity != self.socket_identity {
+            return Err(DaemonError::InsecurePath("admin socket"));
+        }
+        self.progress_endpoint
+            .as_mut()
+            .ok_or(DaemonError::ProgressEndpointFailed(
+                "progress_endpoint_unavailable",
+            ))?
+            .arm_cleanup()
+            .map_err(|error| DaemonError::ProgressEndpointFailed(error.category()))?;
+        self.remove_socket_on_drop = true;
+        Ok(())
     }
 
     /// This daemon's live progress replay, when it has an execution lane.
@@ -2159,17 +2881,26 @@ impl Daemon {
             service_manager,
             LeaseDisposition::Release,
             None,
+            false,
         );
         result
     }
 
-    fn serve_retaining_authority(
+    fn serve_candidate(
         self,
         stop: &AtomicBool,
         ready: std::sync::mpsc::SyncSender<()>,
+        release_on_stop: Arc<AtomicBool>,
     ) -> (Self, Result<(), DaemonError>) {
         let reload = AtomicBool::new(false);
-        self.serve_with_control(stop, &reload, None, LeaseDisposition::Retain, Some(ready))
+        self.serve_with_control(
+            stop,
+            &reload,
+            None,
+            LeaseDisposition::ReleaseWhen(release_on_stop),
+            Some(ready),
+            true,
+        )
     }
 
     fn serve_with_control(
@@ -2179,6 +2910,7 @@ impl Daemon {
         mut service_manager: Option<systemd::Notifier>,
         lease_disposition: LeaseDisposition,
         mut ready: Option<std::sync::mpsc::SyncSender<()>>,
+        claim_endpoint_cleanup: bool,
     ) -> (Self, Result<(), DaemonError>) {
         let initial_lease = self
             .lease_time
@@ -2261,6 +2993,9 @@ impl Daemon {
                     && let Err(error) = notifier.ready()
                 {
                     break 'serving Err(DaemonError::ServiceManagerFailed(error.category()));
+                }
+                if claim_endpoint_cleanup && let Err(error) = self.arm_endpoint_cleanup() {
+                    break 'serving Err(error);
                 }
                 if let Some(sender) = ready.take() {
                     let _ = sender.send(());
@@ -2356,7 +3091,11 @@ impl Daemon {
                             // a consistent lease snapshot, so client polling must not
                             // turn into an fsync/lease-write storm.
                             match self.handle_stream(&mut stream, stop) {
-                                Ok(()) => {}
+                                Ok(()) => {
+                                    if self.handoff_committed {
+                                        break 'serving Ok(());
+                                    }
+                                }
                                 Err(DaemonError::Store(store_error)) => {
                                     if fatal_store_error(&store_error) {
                                         break Err(DaemonError::Store(store_error));
@@ -2382,6 +3121,7 @@ impl Daemon {
                 .stopping()
                 .map_err(|error| DaemonError::ServiceManagerFailed(error.category()))
         });
+        let release_authority = lease_disposition.releases() && !self.handoff_committed;
         // LIVE ATTEMPTS END FIRST, AND THEY END BY FINISHING.
         //
         // Every worker holds a registration on the attempt host and writes to
@@ -2412,7 +3152,14 @@ impl Daemon {
             "managed_tui",
             self.managed_tui.begin_shutdown(),
         ));
-        if let Some(progress_endpoint) = self.progress_endpoint.take() {
+        if !release_authority {
+            if let Some(progress_endpoint) = self.progress_endpoint.as_mut() {
+                shutdown_workers.extend(named_shutdown_workers(
+                    "progress_endpoint",
+                    progress_endpoint.begin_shutdown_retaining(),
+                ));
+            }
+        } else if let Some(progress_endpoint) = self.progress_endpoint.take() {
             shutdown_workers.extend(named_shutdown_workers(
                 "progress_endpoint",
                 progress_endpoint.begin_shutdown(),
@@ -2520,7 +3267,7 @@ impl Daemon {
         // longer claims continuous lease authority. A process that dies before
         // this point writes nothing; its successor closes the open row as
         // `superseded` when it observes the abandoned tenure.
-        let tenure_close = if lease_disposition == LeaseDisposition::Release {
+        let tenure_close = if release_authority {
             unix_millis().and_then(|now_ms| {
                 self.generation_audit
                     .end_tenure(TenureEnding {
@@ -2537,7 +3284,7 @@ impl Daemon {
         } else {
             Ok(())
         };
-        let release = if lease_disposition == LeaseDisposition::Release {
+        let release = if release_authority {
             unix_millis().and_then(|now_ms| {
                 self.store
                     .release_generation_lease(
@@ -2983,6 +3730,126 @@ impl Daemon {
                         handoffs,
                     },
                 }
+            }
+            automonique_protocol::admin::AdminCommand::Reload => {
+                if self.disconnected_recovery || self.handoff_quiesced {
+                    return self.write_refusal(stream, request.request_id(), "handoff_state");
+                }
+                let target_release_digest = request
+                    .reload_target_digest()
+                    .ok_or(DaemonError::ProtocolRefused("admin_invalid_body"))?;
+                let activator = match release_activation::CodeReleaseActivator::new(
+                    self.state_dir.join("improvement-code"),
+                    "automonique.service",
+                    release_activation::SystemdUserSupervisor,
+                ) {
+                    Ok(activator) => activator,
+                    Err(_) => {
+                        return self.write_refusal(
+                            stream,
+                            request.request_id(),
+                            "release_verification_failed",
+                        );
+                    }
+                };
+                let release = match activator.verify(target_release_digest) {
+                    Ok(release) => release,
+                    Err(_) => {
+                        return self.write_refusal(
+                            stream,
+                            request.request_id(),
+                            "release_verification_failed",
+                        );
+                    }
+                };
+                let digest_hex = target_release_digest
+                    .strip_prefix("sha256:")
+                    .ok_or(DaemonError::ProtocolRefused("admin_invalid_body"))?;
+                let reload_id = format!("reload-{}-{}", self.lease_epoch, &digest_hex[..16]);
+                let target_generation_id = format!("foreground-{}", &release.source_sha[..12]);
+                if let Err(error) = self.reload_audit.begin(BeginReload {
+                    reload_id: &reload_id,
+                    source_generation_id: GENERATION_ID,
+                    source_lease_epoch: self.lease_epoch,
+                    target_generation_id: &target_generation_id,
+                    target_release_digest,
+                    created_at_ms: unix_millis()?,
+                }) {
+                    return self.write_refusal(stream, request.request_id(), error.category());
+                }
+                self.write_admin_response(
+                    stream,
+                    &AdminResponse::ReloadAccepted {
+                        request_id: request.request_id().clone(),
+                        reload_id: reload_id.clone(),
+                    },
+                )?;
+                if self
+                    .handoff_to_verified_release(&reload_id, release)
+                    .is_ok()
+                {
+                    self.handoff_committed = true;
+                }
+                return Ok(());
+            }
+            automonique_protocol::admin::AdminCommand::Rollback => {
+                if self.disconnected_recovery || self.handoff_quiesced {
+                    return self.write_refusal(stream, request.request_id(), "handoff_state");
+                }
+                let activator = match release_activation::CodeReleaseActivator::new(
+                    self.state_dir.join("improvement-code"),
+                    "automonique.service",
+                    release_activation::SystemdUserSupervisor,
+                ) {
+                    Ok(activator) => activator,
+                    Err(_) => {
+                        return self.write_refusal(
+                            stream,
+                            request.request_id(),
+                            "rollback_unavailable",
+                        );
+                    }
+                };
+                let release = match activator.verify_previous() {
+                    Ok(release) => release,
+                    Err(_) => {
+                        return self.write_refusal(
+                            stream,
+                            request.request_id(),
+                            "rollback_unavailable",
+                        );
+                    }
+                };
+                let digest_hex = release
+                    .manifest_digest
+                    .strip_prefix("sha256:")
+                    .ok_or(DaemonError::ProtocolRefused("admin_invalid_body"))?;
+                let reload_id = format!("rollback-{}-{}", self.lease_epoch, &digest_hex[..16]);
+                let target_generation_id = format!("foreground-{}", &release.source_sha[..12]);
+                if let Err(error) = self.reload_audit.begin(BeginReload {
+                    reload_id: &reload_id,
+                    source_generation_id: GENERATION_ID,
+                    source_lease_epoch: self.lease_epoch,
+                    target_generation_id: &target_generation_id,
+                    target_release_digest: &release.manifest_digest,
+                    created_at_ms: unix_millis()?,
+                }) {
+                    return self.write_refusal(stream, request.request_id(), error.category());
+                }
+                self.write_admin_response(
+                    stream,
+                    &AdminResponse::RollbackAccepted {
+                        request_id: request.request_id().clone(),
+                        reload_id: reload_id.clone(),
+                    },
+                )?;
+                if self
+                    .handoff_to_verified_release_with_selection(&reload_id, release, true)
+                    .is_ok()
+                {
+                    self.handoff_committed = true;
+                }
+                return Ok(());
             }
             automonique_protocol::admin::AdminCommand::ReloadStatus => {
                 let reload_id = request
@@ -3525,6 +4392,21 @@ impl Daemon {
                 }
             }
         };
+        self.write_admin_response(stream, &response)?;
+        if matches!(
+            request.command(),
+            automonique_protocol::admin::AdminCommand::Shutdown
+        ) {
+            stop.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    fn write_admin_response(
+        &self,
+        stream: &mut UnixStream,
+        response: &AdminResponse,
+    ) -> Result<(), DaemonError> {
         let response = response
             .to_message()
             .map_err(|error| DaemonError::ProtocolRefused(error.category()))?
@@ -3534,12 +4416,6 @@ impl Daemon {
             .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
         stream.write_all(&frame)?;
         stream.flush()?;
-        if matches!(
-            request.command(),
-            automonique_protocol::admin::AdminCommand::Shutdown
-        ) {
-            stop.store(true, Ordering::Release);
-        }
         Ok(())
     }
 
@@ -6918,16 +7794,8 @@ impl Daemon {
             request_id: request_id.clone(),
             category: AdminRefusalCategory::new(category)
                 .map_err(|error| DaemonError::ProtocolRefused(error.category()))?,
-        }
-        .to_message()
-        .map_err(|error| DaemonError::ProtocolRefused(error.category()))?
-        .to_canonical_bytes();
-        let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + response.len());
-        encode_frame(&response, &mut frame)
-            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
-        stream.write_all(&frame)?;
-        stream.flush()?;
-        Ok(())
+        };
+        self.write_admin_response(stream, &response)
     }
 }
 
@@ -7852,6 +8720,7 @@ fn run_with_mode(config: &DaemonConfig, disconnected_recovery: bool) -> Result<(
                     service_manager,
                     LeaseDisposition::Release,
                     None,
+                    false,
                 );
                 result
             })
