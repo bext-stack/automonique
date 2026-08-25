@@ -22,11 +22,14 @@ use std::os::unix::fs::{FileTypeExt as _, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
-use automonique_store::SCHEMA_VERSION;
 use automonique_store::generation_audit::GENERATION_AUDIT_SCHEMA_VERSION;
 use automonique_store::reload_audit::RELOAD_AUDIT_SCHEMA_VERSION;
+use automonique_store::{
+    GenerationLease, LeaseRenewal, LeaseTimeSource, SCHEMA_VERSION, Store, StoreError,
+};
 use nix::unistd::{geteuid, getppid};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use rustix::net::{
@@ -43,11 +46,13 @@ use crate::control_lock::{ControlLock, ControlLockError};
 use crate::lease_identity::{ProcessIdentity, ProcessIdentityError};
 use crate::release_activation::VerifiedCodeRelease;
 
-const CHANNEL_SCHEMA: &str = "automonique.reload-candidate/v3";
+const CHANNEL_SCHEMA: &str = "automonique.reload-candidate/v4";
 const MAX_CHANNEL_LINE_BYTES: u64 = 4 * 1024;
 const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 const CONTROL_STOP: u8 = b'S';
 const CONTROL_PREPARE_TRANSFER: u8 = b'T';
+const CONTROL_CONFIRM_AUTHORITY: u8 = b'A';
+const CONTROL_CONFIRM_RELINQUISHED: u8 = b'R';
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidateSpec {
@@ -74,7 +79,11 @@ pub struct WarmCandidate {
     child: Child,
     channel: UnixStream,
     identity: CandidateIdentity,
+    source_holder_id: String,
+    source_lease_epoch: u64,
     transfer_ready: bool,
+    authority_ready: bool,
+    relinquished: bool,
     stopped: bool,
 }
 
@@ -175,6 +184,20 @@ struct CandidateIdentity {
     pid: u32,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateAuthority {
+    schema: String,
+    event: String,
+    generation_id: String,
+    holder_id: String,
+    lease_epoch: u64,
+    boot_id: String,
+    pid: u32,
+    starttime: u64,
+    adopted_runs: u64,
+}
+
 #[derive(Debug)]
 pub enum CandidateError {
     InvalidField(&'static str),
@@ -188,6 +211,7 @@ pub enum CandidateError {
     CandidateExited,
     Io(std::io::Error),
     Sqlite(rusqlite::Error),
+    Store(StoreError),
 }
 
 impl CandidateError {
@@ -205,6 +229,7 @@ impl CandidateError {
             Self::CandidateExited => "candidate_exited",
             Self::Io(_) => "candidate_io",
             Self::Sqlite(_) => "candidate_sqlite",
+            Self::Store(_) => "candidate_store",
         }
     }
 }
@@ -220,6 +245,7 @@ impl Error for CandidateError {
         match self {
             Self::Io(error) => Some(error),
             Self::Sqlite(error) => Some(error),
+            Self::Store(error) => Some(error),
             _ => None,
         }
     }
@@ -234,6 +260,12 @@ impl From<std::io::Error> for CandidateError {
 impl From<rusqlite::Error> for CandidateError {
     fn from(error: rusqlite::Error) -> Self {
         Self::Sqlite(error)
+    }
+}
+
+impl From<StoreError> for CandidateError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
     }
 }
 
@@ -319,7 +351,11 @@ pub fn spawn_warm_candidate(
         child,
         channel: parent,
         identity: observed,
+        source_holder_id: spec.source_holder_id.clone(),
+        source_lease_epoch: spec.source_lease_epoch,
         transfer_ready: false,
+        authority_ready: false,
+        relinquished: false,
         stopped: false,
     })
 }
@@ -401,8 +437,83 @@ impl WarmCandidate {
         self.transfer_ready
     }
 
-    /// End a still-non-owning candidate and require a matching acknowledgement.
-    pub fn stop(mut self) -> Result<(), CandidateError> {
+    /// Require the transferred candidate lease to match the child's measured
+    /// kernel identity, then require the child to renew that exact epoch.
+    pub fn confirm_authority(
+        &mut self,
+        lease: &GenerationLease,
+        adopted_runs: u64,
+    ) -> Result<(), CandidateError> {
+        if !self.transfer_ready || self.authority_ready || self.relinquished {
+            return Err(CandidateError::Protocol);
+        }
+        let expected_epoch = self
+            .source_lease_epoch
+            .checked_add(1)
+            .ok_or(CandidateError::Protocol)?;
+        let target = self.lease_target();
+        if lease.generation_id != super::GENERATION_ID
+            || lease.holder_id != target.holder_id
+            || lease.epoch != expected_epoch
+            || lease.boot_id != target.boot_id
+            || lease.holder_pid != target.pid
+            || lease.holder_starttime != target.starttime
+            || adopted_runs != u64::from(self.identity.attempt_count)
+        {
+            return Err(CandidateError::Protocol);
+        }
+        let authority = CandidateAuthority::from_lease("authority", lease, adopted_runs);
+        send_control(&self.channel, CONTROL_CONFIRM_AUTHORITY, None)?;
+        write_message(&mut self.channel, &authority)?;
+        let mut expected = self.identity.clone();
+        expected.event = "authority_ready".to_owned();
+        let observed: CandidateIdentity = read_message(&self.channel)?;
+        if observed != expected {
+            return Err(CandidateError::Protocol);
+        }
+        self.identity = observed;
+        self.authority_ready = true;
+        Ok(())
+    }
+
+    /// Prove rollback committed at the next epoch before a formerly
+    /// authoritative candidate is allowed to stop.
+    pub fn confirm_relinquished(
+        &mut self,
+        returned_lease: &GenerationLease,
+    ) -> Result<(), CandidateError> {
+        let expected_epoch = self
+            .source_lease_epoch
+            .checked_add(2)
+            .ok_or(CandidateError::Protocol)?;
+        if !self.authority_ready
+            || self.relinquished
+            || returned_lease.generation_id != super::GENERATION_ID
+            || returned_lease.holder_id != self.source_holder_id
+            || returned_lease.epoch != expected_epoch
+        {
+            return Err(CandidateError::Protocol);
+        }
+        let authority = CandidateAuthority::from_lease("relinquished", returned_lease, 0);
+        send_control(&self.channel, CONTROL_CONFIRM_RELINQUISHED, None)?;
+        write_message(&mut self.channel, &authority)?;
+        let mut expected = self.identity.clone();
+        expected.event = "relinquished".to_owned();
+        let observed: CandidateIdentity = read_message(&self.channel)?;
+        if observed != expected {
+            return Err(CandidateError::Protocol);
+        }
+        self.identity = observed;
+        self.relinquished = true;
+        Ok(())
+    }
+
+    /// End a non-owning candidate and require a matching acknowledgement.
+    /// A candidate that proved authority must first prove a fresh-epoch return.
+    pub fn stop(&mut self) -> Result<(), CandidateError> {
+        if self.stopped || (self.authority_ready && !self.relinquished) {
+            return Err(CandidateError::Protocol);
+        }
         send_control(&self.channel, CONTROL_STOP, None)?;
         let mut expected = self.identity.clone();
         expected.event = "stopped".to_owned();
@@ -415,6 +526,22 @@ impl WarmCandidate {
         }
         self.stopped = true;
         Ok(())
+    }
+}
+
+impl CandidateAuthority {
+    fn from_lease(event: &str, lease: &GenerationLease, adopted_runs: u64) -> Self {
+        Self {
+            schema: CHANNEL_SCHEMA.to_owned(),
+            event: event.to_owned(),
+            generation_id: lease.generation_id.clone(),
+            holder_id: lease.holder_id.clone(),
+            lease_epoch: lease.epoch,
+            boot_id: lease.boot_id.clone(),
+            pid: lease.holder_pid,
+            starttime: lease.holder_starttime,
+            adopted_runs,
+        }
     }
 }
 
@@ -431,7 +558,7 @@ impl Drop for WarmCandidate {
 pub fn run_candidate(
     config: &DaemonConfig,
     input: CandidateInput,
-    reader: impl Read + AsFd,
+    mut reader: impl Read + AsFd,
     mut writer: impl Write,
 ) -> Result<(), CandidateError> {
     validate_input(&input)?;
@@ -469,10 +596,45 @@ pub fn run_candidate(
             let adopted = AdoptedCandidateResources::adopt(config, descriptors)?;
             identity.event = "transfer_ready".to_owned();
             write_message(&mut writer, &identity)?;
-            if !matches!(receive_control(reader.as_fd())?, CandidateControl::Stop) {
-                return Err(CandidateError::Protocol);
+            match receive_control(reader.as_fd())? {
+                CandidateControl::Stop => {}
+                CandidateControl::ConfirmAuthority => {
+                    let authority: CandidateAuthority = read_message_from(&mut reader)?;
+                    confirm_candidate_authority(
+                        config,
+                        &authority,
+                        &identity,
+                        input.source_lease_epoch,
+                    )?;
+                    identity.event = "authority_ready".to_owned();
+                    write_message(&mut writer, &identity)?;
+                    if !matches!(
+                        receive_control(reader.as_fd())?,
+                        CandidateControl::ConfirmRelinquished
+                    ) {
+                        return Err(CandidateError::Protocol);
+                    }
+                    let returned: CandidateAuthority = read_message_from(&mut reader)?;
+                    confirm_candidate_relinquished(
+                        config,
+                        &returned,
+                        &input.source_holder_id,
+                        input.source_lease_epoch,
+                    )?;
+                    identity.event = "relinquished".to_owned();
+                    write_message(&mut writer, &identity)?;
+                    if !matches!(receive_control(reader.as_fd())?, CandidateControl::Stop) {
+                        return Err(CandidateError::Protocol);
+                    }
+                }
+                CandidateControl::ConfirmRelinquished | CandidateControl::PrepareTransfer(_) => {
+                    return Err(CandidateError::Protocol);
+                }
             }
             Some(adopted)
+        }
+        CandidateControl::ConfirmAuthority | CandidateControl::ConfirmRelinquished => {
+            return Err(CandidateError::Protocol);
         }
     };
     drop(adopted);
@@ -484,6 +646,8 @@ pub fn run_candidate(
 enum CandidateControl {
     Stop,
     PrepareTransfer(CandidateTransferDescriptors),
+    ConfirmAuthority,
+    ConfirmRelinquished,
 }
 
 fn send_control(
@@ -541,6 +705,10 @@ fn receive_control(fd: impl AsFd) -> Result<CandidateControl, CandidateError> {
     }
     match marker[0] {
         CONTROL_STOP if received.is_empty() => Ok(CandidateControl::Stop),
+        CONTROL_CONFIRM_AUTHORITY if received.is_empty() => Ok(CandidateControl::ConfirmAuthority),
+        CONTROL_CONFIRM_RELINQUISHED if received.is_empty() => {
+            Ok(CandidateControl::ConfirmRelinquished)
+        }
         CONTROL_PREPARE_TRANSFER if received.len() == 2 => {
             let control_lock = received.pop().expect("length checked");
             let admin_listener = received.pop().expect("length checked");
@@ -553,6 +721,106 @@ fn receive_control(fd: impl AsFd) -> Result<CandidateControl, CandidateError> {
         }
         _ => Err(CandidateError::Protocol),
     }
+}
+
+fn confirm_candidate_authority(
+    config: &DaemonConfig,
+    authority: &CandidateAuthority,
+    identity: &CandidateIdentity,
+    source_lease_epoch: u64,
+) -> Result<(), CandidateError> {
+    let expected_epoch = source_lease_epoch
+        .checked_add(1)
+        .ok_or(CandidateError::Protocol)?;
+    if authority.schema != CHANNEL_SCHEMA
+        || authority.event != "authority"
+        || authority.generation_id != super::GENERATION_ID
+        || authority.holder_id != identity.target_holder_id
+        || authority.lease_epoch != expected_epoch
+        || authority.boot_id != identity.boot_id
+        || authority.pid != identity.pid
+        || authority.starttime != identity.starttime
+        || authority.adopted_runs != u64::from(identity.attempt_count)
+    {
+        return Err(CandidateError::Protocol);
+    }
+    let mut store = Store::open_with_lease_time_source(
+        config.database_path(),
+        Arc::new(crate::lease_time::BootTimeSource),
+    )?;
+    let renewed = store.renew_generation_lease(LeaseRenewal {
+        generation_id: &authority.generation_id,
+        holder_id: &authority.holder_id,
+        epoch: authority.lease_epoch,
+        now_ms: super::unix_millis().map_err(|_| CandidateError::Integrity("clock"))?,
+        ttl_ms: super::LEASE_TTL_MS,
+    })?;
+    if renewed.holder_id != authority.holder_id
+        || renewed.epoch != authority.lease_epoch
+        || renewed.boot_id != authority.boot_id
+        || renewed.holder_pid != authority.pid
+        || renewed.holder_starttime != authority.starttime
+    {
+        return Err(CandidateError::Protocol);
+    }
+    Ok(())
+}
+
+fn confirm_candidate_relinquished(
+    config: &DaemonConfig,
+    returned: &CandidateAuthority,
+    source_holder_id: &str,
+    source_lease_epoch: u64,
+) -> Result<(), CandidateError> {
+    let expected_epoch = source_lease_epoch
+        .checked_add(2)
+        .ok_or(CandidateError::Protocol)?;
+    if returned.schema != CHANNEL_SCHEMA
+        || returned.event != "relinquished"
+        || returned.generation_id != super::GENERATION_ID
+        || returned.holder_id != source_holder_id
+        || returned.lease_epoch != expected_epoch
+        || returned.pid == 0
+        || returned.starttime == 0
+        || returned.adopted_runs != 0
+    {
+        return Err(CandidateError::Protocol);
+    }
+    let connection = read_only_database(&config.database_path(), SCHEMA_VERSION, "main")?;
+    let durable = connection
+        .query_row(
+            "SELECT lease_holder, lease_epoch, boot_id, holder_pid, holder_starttime,
+                    lease_expires_ms
+             FROM generations WHERE generation_id = ?1",
+            [&returned.generation_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u32>(3)?,
+                    row.get::<_, u64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((holder_id, epoch, boot_id, pid, starttime, expires_ms)) = durable else {
+        return Err(CandidateError::Protocol);
+    };
+    let lease_now_ms = crate::lease_time::BootTimeSource
+        .now_boottime_ms()
+        .map_err(|_| CandidateError::Integrity("clock"))?;
+    if holder_id != returned.holder_id
+        || epoch != returned.lease_epoch
+        || boot_id != returned.boot_id
+        || pid != returned.pid
+        || starttime != returned.starttime
+        || expires_ms <= lease_now_ms
+    {
+        return Err(CandidateError::Protocol);
+    }
+    Ok(())
 }
 
 fn process_identity(pid: u32) -> Result<ProcessIdentity, CandidateError> {
@@ -808,7 +1076,7 @@ mod tests {
             identity
         );
 
-        let unknown = br#"{"schema":"automonique.reload-candidate/v3","event":"warm","reload_id":"reload-1","target_generation_id":"generation-2","manifest_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binary_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","attempt_count":2,"attempt_inventory_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","target_holder_id":"daemon-42-reload-0123456789abcdef","boot_id":"01234567-89ab-cdef-0123-456789abcdef","starttime":100,"pid":42,"extra":true}\n"#;
+        let unknown = br#"{"schema":"automonique.reload-candidate/v4","event":"warm","reload_id":"reload-1","target_generation_id":"generation-2","manifest_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binary_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","attempt_count":2,"attempt_inventory_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","target_holder_id":"daemon-42-reload-0123456789abcdef","boot_id":"01234567-89ab-cdef-0123-456789abcdef","starttime":100,"pid":42,"extra":true}\n"#;
         assert!(matches!(
             read_message_from::<CandidateIdentity>(&mut unknown.as_slice()),
             Err(CandidateError::Protocol)

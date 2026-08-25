@@ -1975,6 +1975,21 @@ impl Daemon {
             .map(attempt_adoption::AttemptAdoptionEndpoint::route)
     }
 
+    /// Start only the holder-bound attempt route needed by candidate warm-up.
+    ///
+    /// The ordinary serving path starts this endpoint with every other worker.
+    /// Handoff coordinators may start it earlier so an exact candidate can
+    /// prove the source inventory before any listener or lease transfer.
+    pub fn start_candidate_warmup_route(&mut self) -> Result<(), DaemonError> {
+        self.attempt_adoption
+            .as_mut()
+            .ok_or(DaemonError::AttemptAdoptionFailed(
+                "attempt_adoption_unavailable",
+            ))?
+            .start()
+            .map_err(|error| DaemonError::AttemptAdoptionFailed(error.category()))
+    }
+
     /// Duplicate the exact listener and locked open-file description for a
     /// warmed child. Possessing these descriptors grants no durable lease;
     /// candidate activation must still validate and transfer that authority.

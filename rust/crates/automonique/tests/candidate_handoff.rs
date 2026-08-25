@@ -3,19 +3,20 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use automonique_daemon::candidate::{CandidateSpec, spawn_warm_candidate};
 use automonique_daemon::release_activation::{CodeReleaseActivator, SystemdUserSupervisor};
 use automonique_daemon::{Daemon, DaemonConfig};
+use automonique_store::{LeaseOwnerIdentity, LeaseTimeSource, LeaseTransferRequest, Store};
+use nix::sys::time::TimeValLike;
+use nix::time::ClockId;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 #[test]
-fn exact_release_candidate_warms_without_competing_for_source_authority() {
+fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
     let root = tempfile::tempdir().expect("temporary root");
     private_directory(root.path());
     let runtime_root = root.path().join("runtime");
@@ -27,15 +28,14 @@ fn exact_release_candidate_warms_without_competing_for_source_authority() {
         state_root,
     };
 
-    let source = Daemon::open(&config).expect("source daemon");
+    let mut source = Daemon::open(&config).expect("source daemon");
+    source
+        .start_candidate_warmup_route()
+        .expect("source attempt route");
     let transfer_descriptors = source
         .candidate_transfer_descriptors()
         .expect("transfer descriptors");
-    let stop = Arc::new(AtomicBool::new(false));
-    let serve_stop = Arc::clone(&stop);
-    let source = std::thread::spawn(move || source.serve(&serve_stop));
-    wait_ready(&config);
-    let (source_holder_id, source_lease_epoch) = read_source_lease(&config.database_path());
+    let source_lease = read_source_lease(&config.database_path());
 
     let release_root = root.path().join("code-releases");
     private_directory(&release_root);
@@ -78,8 +78,8 @@ fn exact_release_candidate_warms_without_competing_for_source_authority() {
         &release,
         &CandidateSpec {
             reload_id: "reload-process-test".to_owned(),
-            source_holder_id,
-            source_lease_epoch,
+            source_holder_id: source_lease.holder_id.clone(),
+            source_lease_epoch: source_lease.epoch,
             target_generation_id: "foreground-next".to_owned(),
             warm_timeout: Duration::from_secs(20),
         },
@@ -102,42 +102,106 @@ fn exact_release_candidate_warms_without_competing_for_source_authority() {
         .prepare_transfer(transfer_descriptors)
         .expect("candidate validates transferred listener and lock");
     assert!(candidate.is_transfer_ready());
+
+    let target = candidate.lease_target();
+    let mut store =
+        Store::open_with_lease_time_source(config.database_path(), Arc::new(ProcBootTime))
+            .expect("handoff store");
+    let transferred = store
+        .transfer_generation_lease(LeaseTransferRequest {
+            generation_id: "foreground",
+            source_holder_id: &source_lease.holder_id,
+            source_epoch: source_lease.epoch,
+            target_holder_id: &target.holder_id,
+            target_owner: LeaseOwnerIdentity {
+                boot_id: &target.boot_id,
+                pid: target.pid,
+                starttime: target.starttime,
+            },
+            now_ms: unix_millis(),
+            ttl_ms: 30_000,
+        })
+        .expect("transfer generation lease");
+    candidate
+        .confirm_authority(&transferred.lease, transferred.adopted_runs)
+        .expect("candidate renews transferred authority");
+    assert_eq!(
+        candidate
+            .stop()
+            .expect_err("authority cannot stop before return")
+            .category(),
+        "candidate_protocol"
+    );
+
+    let returned = store
+        .transfer_generation_lease(LeaseTransferRequest {
+            generation_id: "foreground",
+            source_holder_id: &transferred.lease.holder_id,
+            source_epoch: transferred.lease.epoch,
+            target_holder_id: &source_lease.holder_id,
+            target_owner: LeaseOwnerIdentity {
+                boot_id: &source_lease.boot_id,
+                pid: source_lease.pid,
+                starttime: source_lease.starttime,
+            },
+            now_ms: unix_millis(),
+            ttl_ms: 30_000,
+        })
+        .expect("return generation lease");
+    candidate
+        .confirm_relinquished(&returned.lease)
+        .expect("candidate observes returned authority");
     candidate.stop().expect("candidate stopped");
-    assert!(!source.is_finished(), "candidate did not stop the source");
-    stop.store(true, Ordering::Release);
-    source
-        .join()
-        .expect("source thread")
-        .expect("clean source stop");
 }
 
-fn read_source_lease(path: &Path) -> (String, u64) {
+struct SourceLease {
+    holder_id: String,
+    epoch: u64,
+    boot_id: String,
+    pid: u32,
+    starttime: u64,
+}
+
+fn read_source_lease(path: &Path) -> SourceLease {
     let connection = Connection::open(path).expect("main database");
     connection
         .query_row(
-            "SELECT lease_holder, lease_epoch FROM generations
+            "SELECT lease_holder, lease_epoch, boot_id, holder_pid, holder_starttime
+             FROM generations
              WHERE generation_id = 'foreground'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                Ok(SourceLease {
+                    holder_id: row.get(0)?,
+                    epoch: row.get(1)?,
+                    boot_id: row.get(2)?,
+                    pid: row.get(3)?,
+                    starttime: row.get(4)?,
+                })
+            },
         )
         .expect("source lease")
 }
 
-fn wait_ready(config: &DaemonConfig) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let status = Command::new(env!("CARGO_BIN_EXE_automonique"))
-            .args(["status", "--json"])
-            .env("XDG_RUNTIME_DIR", &config.runtime_root)
-            .env("XDG_STATE_HOME", &config.state_root)
-            .output()
-            .expect("status client");
-        if status.status.success() {
-            return;
-        }
-        assert!(Instant::now() < deadline, "daemon did not become ready");
-        std::thread::sleep(Duration::from_millis(25));
+struct ProcBootTime;
+
+impl LeaseTimeSource for ProcBootTime {
+    fn now_boottime_ms(&self) -> Result<i64, &'static str> {
+        ClockId::CLOCK_BOOTTIME
+            .now()
+            .map(|value| value.num_milliseconds())
+            .map_err(|_| "clock_gettime")
     }
+}
+
+fn unix_millis() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_millis(),
+    )
+    .expect("Unix milliseconds fit i64")
 }
 
 fn private_directory(path: &Path) {
