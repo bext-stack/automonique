@@ -258,3 +258,51 @@ pending inbox/outbox effects, ambiguous outbound effect or reconciliation.
 Rollback installs both `.previous` binaries through the same `.next` and rename
 sequence, then restarts and checks the service. The Manage fleet worker remains
 a separate service and is not restarted by a daemon-only deployment.
+
+## Shutdown drain budget
+
+`systemctl --user stop` or `restart automonique.service` delivers `SIGTERM`,
+and the daemon drains in one pass: it signals every worker group at the same
+moment, then joins them all while it keeps renewing its generation and bot
+leases, so the groups' independent transport deadlines overlap instead of
+adding up. A handoff quiesce drains the same way.
+
+Each worker carries a 20 s diagnostic budget. The daemon writes one structured
+journal observation per worker when the drain starts (`started`), one when
+that worker's thread ends (`completed`), and one more if the worker is still
+running at 20 s (`over_budget`). The records carry
+`AUTOMONIQUE_EVENT=shutdown_worker_drain` and name only the worker group, the
+worker's ordinal within its group, the phase, the elapsed milliseconds and the
+budget in milliseconds. No message content, credential, channel, user, ticket
+or job identifier is ever written to them. Read a drain back with:
+
+```sh
+journalctl --user -u automonique.service -o verbose \
+  AUTOMONIQUE_EVENT=shutdown_worker_drain
+```
+
+The budget is diagnostic, not a deadline: a worker that runs over it is named
+in the journal and is still joined. In particular a live contained attempt
+drains to its own document deadline rather than being abandoned, because an
+orphaned process tree is the outcome the containment exists to prevent.
+`TimeoutStopSec=90s` in `automonique.service` is the hard bound: a daemon still
+draining at 90 s is killed by systemd.
+
+The expected idle cadence — the longest a worker stays blocked before it
+looks at its stop flag when nothing is happening — is, per group:
+
+| Worker group | Idle cadence | What the worker is blocked in |
+| --- | --- | --- |
+| `attempt_adoption` | 20 ms | accept poll on the adoption socket; one request is bounded by a 2 s I/O timeout |
+| `progress_endpoint` | 25 ms | accept poll on the progress socket; a subscriber write is bounded by a 2 s I/O timeout |
+| `managed_tui` | 50 ms | idle poll of the managed terminal |
+| `execution` | 100 ms | command poll between provider turns, one thread per live attempt; a running turn drains to the document deadline |
+| `ticket_intake` | 100 ms | stop poll between support-API polls |
+| `slack_tickets` | 2 s | one idle Socket Mode read; connect, the handshakes, writes and an in-flight `apps.connections.open` keep their 10 s ceilings, and the stop flag is checked after each |
+| `telegram` | 3 s | one `getUpdates` long poll (the HTTP call is bounded at 8 s); retry back-off is sliced at 25 ms |
+
+With every group at or under a few seconds, a routine stop completes well
+inside the 20 s budget. `slack_tickets` used to be the last group by a wide
+margin because its idle read shared the connector's 10 s I/O ceiling; its read
+cadence is now separate from that ceiling, so a stop is observed within about
+2 s of an idle read while the notification poll keeps its own 3 s throttle.
