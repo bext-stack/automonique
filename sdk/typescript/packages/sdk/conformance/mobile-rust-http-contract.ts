@@ -15,7 +15,9 @@ const {
   MobileCredentialPageSize,
   MobileLifecycleClient,
   MobileLifecycleError,
+  MobileSessionClient,
   MobilePageEvents,
+  HttpsPlatformTransport,
   PlatformRequestId,
   MobileServerIdentity,
   MobileSessionId,
@@ -250,7 +252,7 @@ try {
 }
 
 const first = await client.provision({
-  actions: ["attach", "follow_up"],
+  actions: ["attach", "decide_approval", "follow_up", "stop_run"],
   limits: {
     max_follow_up_bytes: MobileFollowUpBytes(4096n),
     max_page_events: MobilePageEvents(128n),
@@ -318,12 +320,85 @@ await expectScopedPlatformDenial(second.access_token, "blind-follow-up", {
   method: "execute",
   request: {
     action: "follow_up",
-    client: null,
-    expected_revision: null,
+    client: admittedClient,
+    expected_revision: PlatformRevision(11n),
     idempotency_key: IdempotencyKey("mobile-blind-follow-up"),
     parameter: PlatformParameter("continue"),
     target: scopedSession,
   },
+});
+
+const commandClient = new MobileSessionClient(
+  new HttpsPlatformTransport(
+    client.discovery.platform_endpoint,
+    () => second.access_token,
+    routeFetch as typeof fetch,
+    () => "mobile-session-contract",
+  ),
+  second.authorization,
+  client.discovery.server_identity,
+);
+const commandState = await commandClient.commandState(scopedSession);
+if (commandState.session.freshness.revision !== 11n) {
+  throw new Error("session command state revision mismatch");
+}
+const ownedRun = commandState.run;
+const ownedApproval = commandState.pending_approvals[0];
+if (ownedRun === null || ownedRun.revision !== 12n || ownedRun.target.id !== "run-a") {
+  throw new Error("owned run command state mismatch");
+}
+if (ownedApproval === undefined
+  || ownedApproval.revision !== 13n
+  || ownedApproval.target.id !== "approval-a") {
+  throw new Error("owned approval command state mismatch");
+}
+const followReceipt = await commandClient.followUp({
+  session: scopedSession,
+  expectedSessionRevision: commandState.session.freshness.revision,
+  idempotencyKey: "mobile-follow-up",
+  text: "continue",
+});
+const stopReceipt = await commandClient.stopRun({
+  session: scopedSession,
+  expectedSessionRevision: commandState.session.freshness.revision,
+  run: ownedRun.target,
+  expectedRunRevision: ownedRun.revision,
+  idempotencyKey: "mobile-stop-run",
+});
+const approvalReceipt = await commandClient.decideApproval({
+  session: scopedSession,
+  expectedSessionRevision: commandState.session.freshness.revision,
+  approval: ownedApproval.target,
+  expectedApprovalRevision: ownedApproval.revision,
+  idempotencyKey: "mobile-decide-approval",
+  decision: "grant",
+});
+if (followReceipt.id !== "receipt-follow"
+  || stopReceipt.id !== "receipt-stop"
+  || approvalReceipt.id !== "receipt-approval") {
+  throw new Error("dedicated command receipt mismatch");
+}
+const reconciled = await commandClient.reconcileReceipt({
+  session: scopedSession,
+  idempotencyKey: "mobile-follow-up",
+  expectedAction: "follow_up",
+  expectedTarget: scopedSession,
+});
+if (reconciled.id !== followReceipt.id) {
+  throw new Error("credential-bound receipt reconciliation mismatch");
+}
+
+const disjoint = await client.provision({
+  actions: ["follow_up"],
+  limits: {
+    max_follow_up_bytes: MobileFollowUpBytes(4096n),
+    max_page_events: MobilePageEvents(128n),
+  },
+  session_scope: [MobileSessionId("session-b")],
+}, "Basic b3BzOmZpeHR1cmUtcGFzc3dvcmQ=");
+await expectScopedPlatformDenial(disjoint.access_token, "disjoint-command-state", {
+  method: "session_command_state",
+  request: {session: scopedSession},
 });
 await expectScopedPlatformDenial(second.access_token, "out-of-scope", {
   method: "execute",
@@ -367,5 +442,5 @@ try {
   if (!(error instanceof MobileLifecycleError) || error.status !== 401) throw error;
 }
 
-if (sawNoStore !== 24) throw new Error(`unexpected lifecycle exchange count: ${sawNoStore}`);
+if (sawNoStore !== 25) throw new Error(`unexpected lifecycle exchange count: ${sawNoStore}`);
 console.log("TypeScript SDK passed the live Rust mobile credential lifecycle contract");

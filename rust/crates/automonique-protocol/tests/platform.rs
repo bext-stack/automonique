@@ -4,6 +4,7 @@ use automonique_protocol::codec::RequestId;
 use automonique_protocol::platform::*;
 use automonique_protocol::platform_api::{PlatformRequestMessage, PlatformResponseMessage};
 use automonique_protocol::primitives::{EpochMillis, Revision, ValueError};
+use automonique_protocol::wire::{JsonValue, Message};
 
 fn coordinate(authority: ResourceAuthority, kind: ResourceKind) -> ResourceCoordinate {
     ResourceCoordinate::new(authority, kind, ResourceId::new("resource-1").unwrap())
@@ -77,6 +78,41 @@ fn action_parameters_admit_multiline_prompts_without_widening_identifiers() {
         PlatformParameter::new("bad\0prompt"),
         Err(ValueError::ControlCharacter)
     );
+    assert_eq!(
+        PlatformParameter::new("x".repeat(MAX_PLATFORM_PARAMETER_BYTES))
+            .unwrap()
+            .as_str()
+            .len(),
+        MAX_PLATFORM_PARAMETER_BYTES
+    );
+}
+
+#[test]
+fn session_command_state_is_bounded_and_kind_safe() {
+    let session = record(ResourceKind::Session, "session-command", 4);
+    let approval = SessionCommandTarget {
+        target: coordinate(ResourceAuthority::Automonique, ResourceKind::Approval),
+        revision: Revision::new(5).unwrap(),
+    };
+    assert_eq!(
+        SessionCommandState::new(
+            session.clone(),
+            None,
+            vec![approval; MAX_SESSION_COMMAND_APPROVALS + 1],
+        ),
+        Err(PlatformError::TooManyCommandApprovals)
+    );
+    assert_eq!(
+        SessionCommandState::new(
+            session,
+            Some(SessionCommandTarget {
+                target: coordinate(ResourceAuthority::Automonique, ResourceKind::Approval),
+                revision: Revision::new(5).unwrap(),
+            }),
+            Vec::new(),
+        ),
+        Err(PlatformError::CommandTargetInvalid)
+    );
 }
 
 #[test]
@@ -133,6 +169,12 @@ fn security_sensitive_enums_fail_closed() {
             field: "platform_action"
         })
     );
+    assert_eq!(
+        SessionApprovalDecision::parse("approve"),
+        Err(PlatformError::UnknownEnum {
+            field: "session_approval_decision"
+        })
+    );
 }
 
 #[test]
@@ -178,6 +220,8 @@ fn every_platform_request_has_one_canonical_round_trip() {
     let session = record(ResourceKind::Session, "session-1", 2).resource;
     let client = ClientId::new("client-1").unwrap();
     let key = IdempotencyKey::new("retry-1").unwrap();
+    let run = coordinate(ResourceAuthority::Automonique, ResourceKind::Run);
+    let approval = coordinate(ResourceAuthority::Automonique, ResourceKind::Approval);
     let requests = vec![
         PlatformRequest::Capabilities,
         PlatformRequest::Snapshot(SnapshotRequest::new(vec![session.clone()]).unwrap()),
@@ -232,6 +276,34 @@ fn every_platform_request_has_one_canonical_round_trip() {
         PlatformRequest::GetReceipt(GetReceiptRequest::by_idempotency_key(
             IdempotencyKey::new("retry-lookup").unwrap(),
         )),
+        PlatformRequest::SessionCommandState(SessionCommandStateRequest {
+            session: session.clone(),
+        }),
+        PlatformRequest::SessionFollowUp(SessionFollowUpRequest {
+            client: client.clone(),
+            session: session.clone(),
+            expected_session_revision: Revision::new(7).unwrap(),
+            idempotency_key: IdempotencyKey::new("retry-follow-up").unwrap(),
+            text: PlatformParameter::new("continue with the bounded task\nwithout raw output")
+                .unwrap(),
+        }),
+        PlatformRequest::SessionRunStop(SessionRunStopRequest {
+            client: client.clone(),
+            session: session.clone(),
+            expected_session_revision: Revision::new(7).unwrap(),
+            run,
+            expected_run_revision: Revision::new(8).unwrap(),
+            idempotency_key: IdempotencyKey::new("retry-stop").unwrap(),
+        }),
+        PlatformRequest::SessionApprovalDecision(SessionApprovalDecisionRequest {
+            client: client.clone(),
+            session: session.clone(),
+            expected_session_revision: Revision::new(7).unwrap(),
+            approval,
+            expected_approval_revision: Revision::new(9).unwrap(),
+            idempotency_key: IdempotencyKey::new("retry-approval").unwrap(),
+            decision: SessionApprovalDecision::Deny,
+        }),
         PlatformRequest::ListSessions(ListSessionsRequest {
             authority: ResourceAuthority::Automonique,
             cursor: None,
@@ -259,7 +331,7 @@ fn every_platform_request_has_one_canonical_round_trip() {
             SessionHistorySnapshotRequest::new(session.clone(), 2).unwrap(),
         ),
         PlatformRequest::SessionHistoryPage(
-            SessionHistoryPageRequest::new(session, 9_007_199_254_740_993, 2).unwrap(),
+            SessionHistoryPageRequest::new(session.clone(), 9_007_199_254_740_993, 2).unwrap(),
         ),
     ];
     for (index, request) in requests.into_iter().enumerate() {
@@ -273,6 +345,33 @@ fn every_platform_request_has_one_canonical_round_trip() {
             framed
         );
     }
+}
+
+#[test]
+fn session_command_requests_refuse_additional_fields() {
+    let request = PlatformRequestMessage::new(
+        RequestId::new("strict-session-command").unwrap(),
+        PlatformRequest::SessionFollowUp(SessionFollowUpRequest {
+            client: ClientId::new("client-1").unwrap(),
+            session: coordinate(ResourceAuthority::Automonique, ResourceKind::Session),
+            expected_session_revision: Revision::new(7).unwrap(),
+            idempotency_key: IdempotencyKey::new("retry-follow-up").unwrap(),
+            text: PlatformParameter::new("continue").unwrap(),
+        }),
+    )
+    .to_message()
+    .unwrap();
+    let JsonValue::Object(mut entries) = request.body().clone() else {
+        panic!("request body is an object");
+    };
+    entries.push((
+        "provider_payload".to_owned(),
+        JsonValue::String("raw".to_owned()),
+    ));
+    let malformed = Message::new(request.envelope().clone(), JsonValue::Object(entries));
+    let error = PlatformRequestMessage::from_canonical_bytes(&malformed.to_canonical_bytes())
+        .expect_err("an additional command field must be refused");
+    assert_eq!(error.category(), "platform_invalid_body");
 }
 
 #[test]
@@ -316,6 +415,20 @@ fn every_platform_response_has_one_canonical_round_trip() {
                     controllable: true,
                 }],
                 cursor(2),
+            )
+            .unwrap(),
+        ),
+        PlatformResponse::SessionCommandState(
+            SessionCommandState::new(
+                record(ResourceKind::Session, "session-command-1", 7),
+                Some(SessionCommandTarget {
+                    target: coordinate(ResourceAuthority::Automonique, ResourceKind::Run),
+                    revision: Revision::new(8).unwrap(),
+                }),
+                vec![SessionCommandTarget {
+                    target: coordinate(ResourceAuthority::Automonique, ResourceKind::Approval),
+                    revision: Revision::new(9).unwrap(),
+                }],
             )
             .unwrap(),
         ),

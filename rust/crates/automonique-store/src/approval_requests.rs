@@ -874,6 +874,35 @@ impl ApprovalRequests {
         Ok(records)
     }
 
+    /// Currently answerable rows owned by one run, oldest first.
+    ///
+    /// This is the bounded ownership lookup used by session-scoped command
+    /// projections. Filtering in SQLite ensures unrelated approvals cannot
+    /// consume the page and hide a target owned by the requested run.
+    pub fn pending_for_run(
+        &self,
+        run_id: &str,
+        now_ms: i64,
+        limit: usize,
+    ) -> Requested<Vec<ApprovalRequestRecord>> {
+        validate_identifier(run_id, "run_id")?;
+        validate_time(now_ms, "now_ms")?;
+        if limit == 0 || limit > MAX_APPROVAL_REQUEST_PAGE {
+            return Err(ApprovalRequestError::InvalidField("limit"));
+        }
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {RECORD_COLUMNS} FROM approval_requests
+             WHERE run_id = ?1 AND state = 'pending' AND expires_at_ms > ?2
+             ORDER BY request_entry_id LIMIT ?3"
+        ))?;
+        let rows = statement.query_map(params![run_id, now_ms, to_db_usize(limit)?], raw_record)?;
+        let mut records = Vec::new();
+        for raw in rows {
+            records.push(validated_record(raw?)?);
+        }
+        Ok(records)
+    }
+
     /// One bounded page of every row, oldest first.
     ///
     /// # Errors

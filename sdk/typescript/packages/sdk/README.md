@@ -29,4 +29,30 @@ const transport = new HttpsPlatformTransport(endpoint, token, expoFetch as typeo
 
 Protocol integer fields use JavaScript `bigint` so revisions and cursor sequences remain lossless above `Number.MAX_SAFE_INTEGER`. Resource summaries are deliberately opaque strings in Platform v1; consumers must not infer structured state from them.
 
+Mobile applications should use the dedicated session facade instead of the
+generic `PlatformClient` mutation method:
+
+```ts
+import {HttpsPlatformTransport, MobileSessionClient} from "@automonique/sdk";
+
+const mobile = new MobileSessionClient(
+  new HttpsPlatformTransport(discovery.platform_endpoint, () => accessToken),
+  authorization,
+  discovery.server_identity,
+);
+const state = await mobile.commandState(session);
+await mobile.followUp({
+  session,
+  expectedSessionRevision: state.session.freshness.revision,
+  idempotencyKey: "reply-018",
+  text: "Continue with the reviewed approach.",
+});
+```
+
+`MobileSessionClient` derives the Platform client identity from the admitted
+credential, checks identity, expiry, action, session scope, UTF-8 limits, and
+receipt bindings locally, and exposes no generic `execute` method. Its
+optional fourth constructor argument is an injectable millisecond clock for
+deterministic runtime integration and testing.
+
 This package is licensed under Apache-2.0. Automonique product code outside `sdk/` has a separate licensing boundary.

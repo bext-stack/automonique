@@ -60,6 +60,11 @@ const run: ResourceCoordinate = {
   id: ResourceId("run-1"),
   kind: "run",
 };
+const approval: ResourceCoordinate = {
+  authority: "automonique",
+  id: ResourceId("approval-1"),
+  kind: "approval",
+};
 const cursor = {authority: "provider" as const, sequence: 9007199254740993n, topic: "sessions"};
 const resource = {
   freshness: {observed_at: 9007199254740995n, revision: 9007199254740994n, state: "fresh"},
@@ -166,7 +171,7 @@ describe("canonical HTTPS Platform v1 transport", () => {
     expect(observedKind).toBe("capabilities");
   });
 
-  test("decodes every success result and exercises all twelve request methods", async () => {
+  test("decodes every success result and exercises all sixteen request methods", async () => {
     const historySession: ResourceCoordinate = {...session, authority: "automonique"};
     const cases: readonly {
       readonly method: string;
@@ -224,6 +229,50 @@ describe("canonical HTTPS Platform v1 transport", () => {
       {
         method: "release_control", responseKind: "control_released", body: {client: "client-1", lease: "lease-1", session}, expectedKind: "control_released",
         call: (client) => client.releaseControl(session, ClientId("client-1"), ControlLeaseId("lease-1"), IdempotencyKey("release-1")),
+      },
+      {
+        method: "session_command_state", responseKind: "session_command_state_result", body: {
+          pending_approvals: [{revision: 4n, target: approval}],
+          run: {revision: 3n, target: run},
+          session: {...resource, resource: historySession},
+        }, expectedKind: "session_command_state",
+        call: (client) => client.transport.request({
+          method: "session_command_state",
+          request: {session: historySession},
+        }),
+      },
+      {
+        method: "session_follow_up", responseKind: "receipt_result", body: {...receipt, action: "follow_up", target: historySession}, expectedKind: "receipt",
+        call: (client) => client.transport.request({
+          method: "session_follow_up",
+          request: {
+            client: ClientId("client-1"), expected_session_revision: PlatformRevision(2n),
+            idempotency_key: IdempotencyKey("follow-1"), session: historySession,
+            text: PlatformParameter("continue"),
+          },
+        }),
+      },
+      {
+        method: "session_run_stop", responseKind: "receipt_result", body: {...receipt, action: "stop_run", target: run}, expectedKind: "receipt",
+        call: (client) => client.transport.request({
+          method: "session_run_stop",
+          request: {
+            client: ClientId("client-1"), expected_run_revision: PlatformRevision(3n),
+            expected_session_revision: PlatformRevision(2n), idempotency_key: IdempotencyKey("stop-1"),
+            run, session: historySession,
+          },
+        }),
+      },
+      {
+        method: "session_approval_decision", responseKind: "receipt_result", body: {...receipt, action: "decide_approval", target: approval}, expectedKind: "receipt",
+        call: (client) => client.transport.request({
+          method: "session_approval_decision",
+          request: {
+            approval, client: ClientId("client-1"), decision: "grant",
+            expected_approval_revision: PlatformRevision(4n), expected_session_revision: PlatformRevision(2n),
+            idempotency_key: IdempotencyKey("approval-1"), session: historySession,
+          },
+        }),
       },
       {
         method: "session_history_snapshot", responseKind: "session_history_result", body: {

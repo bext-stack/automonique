@@ -15,11 +15,13 @@ use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse};
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
 use automonique_protocol::platform::{
     ClaimControlRequest, ClientId, ExecuteRequest, GetReceiptRequest, IdempotencyKey,
-    ListSessionsRequest, PlatformAction, PlatformRequest, PlatformResponse, PlatformText,
-    ReceiptOutcome, ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
-    SnapshotRequest,
+    ListSessionsRequest, PlatformAction, PlatformParameter, PlatformRequest, PlatformResponse,
+    PlatformText, ReceiptOutcome, ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
+    SessionApprovalDecision, SessionApprovalDecisionRequest, SessionCommandStateRequest,
+    SessionFollowUpRequest, SessionRunStopRequest, SnapshotRequest,
 };
 use automonique_protocol::platform_api::{PlatformRequestMessage, PlatformResponseMessage};
+use automonique_protocol::primitives::Revision;
 use automonique_store::approval_requests::{ApprovalContext, ApprovalProposal, ApprovalRequests};
 use automonique_store::provider_journal::{ProcessSpawn, ProviderJournal, SessionOpening};
 use automonique_store::run_index::{RunIndex, RunIndexEntry};
@@ -170,6 +172,272 @@ fn session() -> ResourceCoordinate {
     )
 }
 
+fn automonique_coordinate(kind: ResourceKind, id: &str) -> ResourceCoordinate {
+    ResourceCoordinate::new(
+        ResourceAuthority::Automonique,
+        kind,
+        ResourceId::new(id).expect("resource id"),
+    )
+}
+
+fn approval_proposal<'a>(key: &'a str, run_id: &'a str) -> ApprovalProposal<'a> {
+    ApprovalProposal {
+        request_key: key,
+        subject: "runspec:session-command-test",
+        run_id,
+        context: ApprovalContext {
+            spec_digest: "1111111111111111111111111111111111111111111111111111111111111111",
+            program_path: "/usr/bin/session-command-test",
+            program_sha256: "2222222222222222222222222222222222222222222222222222222222222222",
+            prompt_sha256: "3333333333333333333333333333333333333333333333333333333333333333",
+            cwd_token: "session-command-cwd",
+        },
+        requested_by: "session-command-test",
+        requested_at_ms: 1,
+        expires_at_ms: 9_000_000_000_000,
+    }
+}
+
+#[test]
+fn session_commands_are_fenced_to_the_managed_owner_before_receipt_admission() {
+    let (_root, config) = fixture();
+    std::fs::create_dir(config.state_dir()).expect("product state");
+    std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
+        .expect("private product state");
+
+    let mut run_index = RunIndex::open(config.run_index_path()).expect("run index");
+    for (submission_id, run_id) in [
+        (1, "owned-run"),
+        (2, "foreign-run"),
+        (3, "old-run"),
+        (4, "new-run"),
+    ] {
+        run_index
+            .register(RunIndexEntry {
+                submission_id,
+                run_id,
+                registered_at_ms: submission_id + 10,
+            })
+            .expect("register run");
+    }
+    drop(run_index);
+
+    let mut sessions = automonique_daemon::managed_sessions::ManagedSessionStore::open(
+        config.managed_sessions_path(),
+    )
+    .expect("managed sessions");
+    sessions
+        .observe("owned-session", "owned-run", 100)
+        .expect("owned binding");
+    sessions
+        .observe("foreign-session", "foreign-run", 101)
+        .expect("foreign binding");
+    sessions
+        .observe("rebound-session", "old-run", 102)
+        .expect("old binding");
+    let rebound = sessions
+        .observe("rebound-session", "new-run", 103)
+        .expect("rebound binding");
+    assert_eq!(rebound.revision, 2);
+    drop(sessions);
+
+    let owned_approval = "apr-11111111111111111111111111111111";
+    let foreign_approval = "apr-22222222222222222222222222222222";
+    let rebound_approval = "apr-33333333333333333333333333333333";
+    let mut approvals =
+        ApprovalRequests::open(config.approval_requests_path()).expect("approval requests");
+    for (key, run_id) in [
+        (owned_approval, "owned-run"),
+        (foreign_approval, "foreign-run"),
+        (rebound_approval, "old-run"),
+    ] {
+        approvals
+            .propose(approval_proposal(key, run_id))
+            .expect("approval proposal");
+    }
+    drop(approvals);
+
+    let serving = serve(&config);
+    let client = ClientId::new("mobile-credential-1").expect("client");
+    let owned_session = automonique_coordinate(ResourceKind::Session, "owned-session");
+    let PlatformResponse::SessionCommandState(state) = platform(
+        &config,
+        "owned-command-state",
+        PlatformRequest::SessionCommandState(SessionCommandStateRequest {
+            session: owned_session.clone(),
+        }),
+    ) else {
+        panic!("command state")
+    };
+    assert_eq!(state.session.freshness.revision.get(), 1);
+    assert_eq!(
+        state.run.as_ref().expect("owned run").target.id.as_str(),
+        "owned-run"
+    );
+    assert_eq!(state.pending_approvals.len(), 1);
+    assert_eq!(
+        state.pending_approvals[0].target.id.as_str(),
+        owned_approval
+    );
+
+    let follow_up_request = SessionFollowUpRequest {
+        client: client.clone(),
+        session: owned_session.clone(),
+        expected_session_revision: Revision::FIRST,
+        idempotency_key: IdempotencyKey::new("owned-follow-up").expect("key"),
+        text: PlatformParameter::new("continue with the bounded next step").expect("text"),
+    };
+    let PlatformResponse::Receipt(follow_up) = platform(
+        &config,
+        "owned-follow-up",
+        PlatformRequest::SessionFollowUp(follow_up_request.clone()),
+    ) else {
+        panic!("owned follow-up receipt")
+    };
+    assert_eq!(follow_up.action, PlatformAction::FollowUp);
+    assert_eq!(follow_up.target, owned_session);
+    let PlatformResponse::Receipt(follow_up_replay) = platform(
+        &config,
+        "owned-follow-up-replay",
+        PlatformRequest::SessionFollowUp(follow_up_request),
+    ) else {
+        panic!("owned follow-up replay")
+    };
+    assert_eq!(follow_up_replay.id, follow_up.id);
+
+    let stale_key = IdempotencyKey::new("stale-follow-up").expect("key");
+    let PlatformResponse::Refused {
+        outcome,
+        explanation,
+    } = platform(
+        &config,
+        "stale-follow-up",
+        PlatformRequest::SessionFollowUp(SessionFollowUpRequest {
+            client: client.clone(),
+            session: owned_session.clone(),
+            expected_session_revision: Revision::new(2).expect("revision"),
+            idempotency_key: stale_key.clone(),
+            text: PlatformParameter::new("must not be submitted").expect("text"),
+        }),
+    )
+    else {
+        panic!("stale refusal")
+    };
+    assert_eq!(outcome, ReceiptOutcome::Rejected);
+    assert_eq!(explanation.as_str(), "stale_revision");
+    let PlatformResponse::Refused { explanation, .. } = platform(
+        &config,
+        "stale-follow-up-receipt",
+        PlatformRequest::GetReceipt(
+            GetReceiptRequest::by_idempotency_key(stale_key).with_client(client.clone()),
+        ),
+    ) else {
+        panic!("missing receipt refusal")
+    };
+    assert_eq!(explanation.as_str(), "not_found");
+
+    for (label, session, session_revision, approval) in [
+        (
+            "foreign-approval",
+            owned_session.clone(),
+            1,
+            foreign_approval,
+        ),
+        (
+            "rebound-approval",
+            automonique_coordinate(ResourceKind::Session, "rebound-session"),
+            2,
+            rebound_approval,
+        ),
+    ] {
+        let PlatformResponse::Refused { explanation, .. } = platform(
+            &config,
+            label,
+            PlatformRequest::SessionApprovalDecision(SessionApprovalDecisionRequest {
+                client: client.clone(),
+                session,
+                expected_session_revision: Revision::new(session_revision).expect("revision"),
+                approval: automonique_coordinate(ResourceKind::Approval, approval),
+                expected_approval_revision: Revision::FIRST,
+                idempotency_key: IdempotencyKey::new(label).expect("key"),
+                decision: SessionApprovalDecision::Grant,
+            }),
+        ) else {
+            panic!("ownership refusal")
+        };
+        assert_eq!(explanation.as_str(), "target_not_owned");
+    }
+
+    let approval_request = SessionApprovalDecisionRequest {
+        client: client.clone(),
+        session: owned_session.clone(),
+        expected_session_revision: Revision::FIRST,
+        approval: automonique_coordinate(ResourceKind::Approval, owned_approval),
+        expected_approval_revision: Revision::FIRST,
+        idempotency_key: IdempotencyKey::new("owned-approval-decision").expect("key"),
+        decision: SessionApprovalDecision::Grant,
+    };
+    let PlatformResponse::Receipt(first) = platform(
+        &config,
+        "owned-approval-decision",
+        PlatformRequest::SessionApprovalDecision(approval_request.clone()),
+    ) else {
+        panic!("owned approval receipt")
+    };
+    assert_eq!(first.outcome, ReceiptOutcome::Completed);
+    let PlatformResponse::Receipt(replay) = platform(
+        &config,
+        "owned-approval-replay",
+        PlatformRequest::SessionApprovalDecision(approval_request),
+    ) else {
+        panic!("owned approval replay")
+    };
+    assert_eq!(replay, first);
+
+    let stop_request = SessionRunStopRequest {
+        client: client.clone(),
+        session: owned_session.clone(),
+        expected_session_revision: Revision::FIRST,
+        run: automonique_coordinate(ResourceKind::Run, "owned-run"),
+        expected_run_revision: Revision::FIRST,
+        idempotency_key: IdempotencyKey::new("owned-run-stop").expect("key"),
+    };
+    let PlatformResponse::Receipt(stop) = platform(
+        &config,
+        "owned-run-stop",
+        PlatformRequest::SessionRunStop(stop_request.clone()),
+    ) else {
+        panic!("owned stop receipt")
+    };
+    assert_eq!(stop.action, PlatformAction::StopRun);
+    assert_eq!(stop.target.id.as_str(), "owned-run");
+    let PlatformResponse::Receipt(stop_replay) = platform(
+        &config,
+        "owned-run-stop-replay",
+        PlatformRequest::SessionRunStop(stop_request),
+    ) else {
+        panic!("owned stop replay")
+    };
+    assert_eq!(stop_replay, stop);
+
+    let PlatformResponse::Refused { explanation, .. } = platform(
+        &config,
+        "foreign-run-stop",
+        PlatformRequest::SessionRunStop(SessionRunStopRequest {
+            client,
+            session: owned_session,
+            expected_session_revision: Revision::FIRST,
+            run: automonique_coordinate(ResourceKind::Run, "foreign-run"),
+            expected_run_revision: Revision::FIRST,
+            idempotency_key: IdempotencyKey::new("foreign-run-stop").expect("key"),
+        }),
+    ) else {
+        panic!("foreign run refusal")
+    };
+    assert_eq!(explanation.as_str(), "target_not_owned");
+    serving.shutdown(&config);
+}
+
 #[test]
 fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
     let (_root, config) = fixture();
@@ -235,7 +503,7 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
     else {
         panic!("capabilities response")
     };
-    assert_eq!(capabilities.methods.len(), 12);
+    assert_eq!(capabilities.methods.len(), 16);
     assert_eq!(capabilities.transports.len(), 1);
 
     let PlatformResponse::Snapshot(snapshot) = platform(

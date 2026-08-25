@@ -33,6 +33,7 @@ import {
   type SessionHistoryText,
   type SessionHistoryToolState,
   type SessionHistoryUnknownSource,
+  type SessionCommandState,
   type SessionList,
   type Snapshot,
   type Subscription,
@@ -68,6 +69,7 @@ export type PlatformClientResponse =
   | {readonly kind: "detached"; readonly session: ResourceCoordinate; readonly client: ClientIdType}
   | {readonly kind: "control_claimed"; readonly value: ControlLease}
   | {readonly kind: "control_released"; readonly session: ResourceCoordinate; readonly client: ClientIdType; readonly lease: ControlLeaseIdType}
+  | {readonly kind: "session_command_state"; readonly value: SessionCommandState}
   | {readonly kind: "session_history"; readonly value: SessionHistoryPage}
   | {readonly kind: "session_history_resync"; readonly session: ResourceCoordinate; readonly snapshotFrom: ReturnType<typeof SessionHistoryCursor>; readonly snapshotTo: ReturnType<typeof SessionHistoryCursor>}
   | {readonly kind: "refused"; readonly outcome: ReceiptOutcome; readonly explanation: string};
@@ -173,6 +175,10 @@ function projectResponse(response: DecodedPlatformResponse): PlatformClientRespo
     }
     case "control_released":
       return {kind: "control_released", session: response.value.session, client: response.value.client, lease: response.value.lease};
+    case "session_command_state_result": {
+      const {request_id: _, ...value} = response.value;
+      return {kind: "session_command_state", value};
+    }
     case "session_history_result":
       return {kind: "session_history", value: projectHistory(response.value)};
     case "session_history_resync":

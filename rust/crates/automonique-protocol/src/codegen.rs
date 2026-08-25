@@ -1188,6 +1188,13 @@ pub enum RequestValidation {
         action_authorities: Vec<(String, String)>,
         refusal_category: String,
     },
+    /// One dedicated request field must name an exact authority and resource kind.
+    ExactCoordinate {
+        field: String,
+        authority: String,
+        kind: String,
+        refusal_category: String,
+    },
 }
 
 /// How one response body field is decoded.
@@ -6202,6 +6209,54 @@ fn platform_client_session_fields() -> Vec<RequestField> {
     ]
 }
 
+fn platform_request_checked(name: &str, type_name: &str) -> RequestField {
+    RequestField {
+        name: name.to_owned(),
+        input_name: name.to_owned(),
+        value: RequestValue::Checked {
+            type_name: type_name.to_owned(),
+            refusal_category: PLATFORM_VALUE_INVALID.to_owned(),
+        },
+    }
+}
+
+fn platform_request_integer(name: &str, type_name: &str) -> RequestField {
+    RequestField {
+        name: name.to_owned(),
+        input_name: name.to_owned(),
+        value: RequestValue::Integer {
+            type_name: type_name.to_owned(),
+            refusal_category: "PLATFORM_COUNTER_OUT_OF_RANGE".to_owned(),
+        },
+    }
+}
+
+fn platform_request_object(name: &str, type_name: &str) -> RequestField {
+    RequestField {
+        name: name.to_owned(),
+        input_name: name.to_owned(),
+        value: RequestValue::Object {
+            type_name: type_name.to_owned(),
+        },
+    }
+}
+
+fn platform_exact_coordinate_validation(
+    request_kind: &str,
+    field: &str,
+    kind: &str,
+) -> (String, RequestValidation) {
+    (
+        request_kind.to_owned(),
+        RequestValidation::ExactCoordinate {
+            field: field.to_owned(),
+            authority: ResourceAuthority::Automonique.as_str().to_owned(),
+            kind: kind.to_owned(),
+            refusal_category: PLATFORM_VALUE_INVALID.to_owned(),
+        },
+    )
+}
+
 fn platform_body_object(name: &str, doc: &str, fields: Vec<ResponseField>) -> BodyObject {
     BodyObject {
         name: name.to_owned(),
@@ -6821,6 +6876,12 @@ fn platform_module() -> GeneratedModule {
                 value: ConstantValue::Count(crate::platform::MAX_SESSION_HISTORY_EVENTS),
             },
             Constant {
+                name: "MAX_SESSION_COMMAND_APPROVALS".to_owned(),
+                doc: "Maximum pending approvals carried by one session command-state read."
+                    .to_owned(),
+                value: ConstantValue::Count(crate::platform::MAX_SESSION_COMMAND_APPROVALS),
+            },
+            Constant {
                 name: "CONTROL_LEASE_TTL_MILLIS".to_owned(),
                 doc: "Lifetime of one exclusive interactive control lease.".to_owned(),
                 value: ConstantValue::Count(
@@ -6936,6 +6997,13 @@ fn platform_module() -> GeneratedModule {
             security_enum(
                 "PlatformMethod",
                 platform_values(&PlatformMethod::ALL, PlatformMethod::as_str),
+            ),
+            security_enum(
+                "SessionApprovalDecision",
+                platform_values(
+                    &crate::platform::SessionApprovalDecision::ALL,
+                    crate::platform::SessionApprovalDecision::as_str,
+                ),
             ),
             security_enum(
                 "PlatformTransport",
@@ -7104,6 +7172,23 @@ fn platform_module() -> GeneratedModule {
                 ],
             },
             Interface {
+                name: "SessionCommandTarget".to_owned(),
+                doc: "One session-owned command target and its exact revision.".to_owned(),
+                fields: vec![
+                    required("revision", "PlatformRevision"),
+                    required("target", "ResourceCoordinate"),
+                ],
+            },
+            Interface {
+                name: "SessionCommandState".to_owned(),
+                doc: "Minimal sanitized revision fences for session-bound commands.".to_owned(),
+                fields: vec![
+                    required("pending_approvals", "readonly SessionCommandTarget[]"),
+                    nullable("run", "SessionCommandTarget"),
+                    required("session", "ResourceRecord"),
+                ],
+            },
+            Interface {
                 name: "Attachment".to_owned(),
                 doc: "Observation-only session attachment.".to_owned(),
                 fields: vec![
@@ -7235,6 +7320,14 @@ fn platform_module() -> GeneratedModule {
                             },
                         ),
                         platform_field("session", platform_object("DecodedResourceRecord")),
+                    ],
+                ),
+                platform_body_object(
+                    "DecodedSessionCommandTarget",
+                    "Strictly decoded session-owned target and revision fence.",
+                    vec![
+                        platform_field("revision", platform_revision()),
+                        platform_field("target", platform_object("DecodedResourceCoordinate")),
                     ],
                 ),
                 platform_body_object(
@@ -7433,6 +7526,70 @@ fn platform_module() -> GeneratedModule {
                     coupling: None,
                 },
                 RequestCommand {
+                    kind: "session_command_state".to_owned(),
+                    name: "PlatformSessionCommandState".to_owned(),
+                    doc: "Read the bounded revision fences for one exact session.".to_owned(),
+                    fields: vec![RequestField {
+                        name: "session".to_owned(),
+                        input_name: "session".to_owned(),
+                        value: RequestValue::Object {
+                            type_name: "DecodedResourceCoordinate".to_owned(),
+                        },
+                    }],
+                    coupling: None,
+                },
+                RequestCommand {
+                    kind: "session_follow_up".to_owned(),
+                    name: "PlatformSessionFollowUp".to_owned(),
+                    doc: "Submit bounded follow-up text against one exact session revision."
+                        .to_owned(),
+                    fields: vec![
+                        platform_request_checked("client", "ClientId"),
+                        platform_request_integer("expected_session_revision", "PlatformRevision"),
+                        platform_request_checked("idempotency_key", "IdempotencyKey"),
+                        platform_request_object("session", "DecodedResourceCoordinate"),
+                        platform_request_checked("text", "PlatformParameter"),
+                    ],
+                    coupling: None,
+                },
+                RequestCommand {
+                    kind: "session_run_stop".to_owned(),
+                    name: "PlatformSessionRunStop".to_owned(),
+                    doc: "Stop the exact run owned by one exact fenced session.".to_owned(),
+                    fields: vec![
+                        platform_request_checked("client", "ClientId"),
+                        platform_request_integer("expected_run_revision", "PlatformRevision"),
+                        platform_request_integer("expected_session_revision", "PlatformRevision"),
+                        platform_request_checked("idempotency_key", "IdempotencyKey"),
+                        platform_request_object("run", "DecodedResourceCoordinate"),
+                        platform_request_object("session", "DecodedResourceCoordinate"),
+                    ],
+                    coupling: None,
+                },
+                RequestCommand {
+                    kind: "session_approval_decision".to_owned(),
+                    name: "PlatformSessionApprovalDecision".to_owned(),
+                    doc: "Decide an exact pending approval owned by one exact fenced session."
+                        .to_owned(),
+                    fields: vec![
+                        platform_request_object("approval", "DecodedResourceCoordinate"),
+                        platform_request_checked("client", "ClientId"),
+                        RequestField {
+                            name: "decision".to_owned(),
+                            input_name: "decision".to_owned(),
+                            value: RequestValue::Enum {
+                                type_name: "SessionApprovalDecision".to_owned(),
+                                unknown_category: PLATFORM_VALUE_INVALID.to_owned(),
+                            },
+                        },
+                        platform_request_integer("expected_approval_revision", "PlatformRevision"),
+                        platform_request_integer("expected_session_revision", "PlatformRevision"),
+                        platform_request_checked("idempotency_key", "IdempotencyKey"),
+                        platform_request_object("session", "DecodedResourceCoordinate"),
+                    ],
+                    coupling: None,
+                },
+                RequestCommand {
                     kind: "list_sessions".to_owned(),
                     name: "PlatformListSessions".to_owned(),
                     doc: "Read one bounded page of attachable sessions.".to_owned(),
@@ -7597,6 +7754,20 @@ fn platform_module() -> GeneratedModule {
                         refusal_category: PLATFORM_INVALID_BODY.to_owned(),
                     },
                 ),
+                platform_exact_coordinate_validation("session_command_state", "session", "session"),
+                platform_exact_coordinate_validation("session_follow_up", "session", "session"),
+                platform_exact_coordinate_validation("session_run_stop", "session", "session"),
+                platform_exact_coordinate_validation("session_run_stop", "run", "run"),
+                platform_exact_coordinate_validation(
+                    "session_approval_decision",
+                    "session",
+                    "session",
+                ),
+                platform_exact_coordinate_validation(
+                    "session_approval_decision",
+                    "approval",
+                    "approval",
+                ),
             ],
             request_response_kinds: vec![
                 ("capabilities".to_owned(), "capabilities_result".to_owned()),
@@ -7604,6 +7775,16 @@ fn platform_module() -> GeneratedModule {
                 ("subscribe".to_owned(), "subscription_result".to_owned()),
                 ("execute".to_owned(), "receipt_result".to_owned()),
                 ("get_receipt".to_owned(), "receipt_result".to_owned()),
+                (
+                    "session_command_state".to_owned(),
+                    "session_command_state_result".to_owned(),
+                ),
+                ("session_follow_up".to_owned(), "receipt_result".to_owned()),
+                ("session_run_stop".to_owned(), "receipt_result".to_owned()),
+                (
+                    "session_approval_decision".to_owned(),
+                    "receipt_result".to_owned(),
+                ),
                 ("list_sessions".to_owned(), "sessions_result".to_owned()),
                 ("attach".to_owned(), "attached".to_owned()),
                 ("detach".to_owned(), "detached".to_owned()),
@@ -7720,6 +7901,28 @@ fn platform_module() -> GeneratedModule {
                                 oversize_category: PLATFORM_VALUE_INVALID.to_owned(),
                             },
                         ),
+                    ],
+                ),
+                platform_response(
+                    "session_command_state_result",
+                    "PlatformSessionCommandStateResult",
+                    "Minimal sanitized revision fences for session-bound commands.",
+                    vec![
+                        platform_field(
+                            "pending_approvals",
+                            ResponseValue::ObjectArray {
+                                type_name: "DecodedSessionCommandTarget".to_owned(),
+                                max_items_constant: "MAX_SESSION_COMMAND_APPROVALS".to_owned(),
+                                oversize_category: PLATFORM_INVALID_BODY.to_owned(),
+                            },
+                        ),
+                        platform_field(
+                            "run",
+                            ResponseValue::NullableObject {
+                                type_name: "DecodedSessionCommandTarget".to_owned(),
+                            },
+                        ),
+                        platform_field("session", platform_object("DecodedResourceRecord")),
                     ],
                 ),
                 platform_response(
@@ -8482,6 +8685,17 @@ fn emit_request(out: &mut String, surface: &CommandSurface, request: &RequestCom
                 let _ = writeln!(
                     out,
                     "  if (body.{target_field}.authority !== expectedAuthority) {{\n    throw new RefusalError({refusal_category}, \"action and target authority disagree\");\n  }}"
+                );
+            }
+            RequestValidation::ExactCoordinate {
+                field,
+                authority,
+                kind,
+                refusal_category,
+            } => {
+                let _ = writeln!(
+                    out,
+                    "  if (body.{field}.authority !== \"{authority}\" || body.{field}.kind !== \"{kind}\") {{\n    throw new RefusalError({refusal_category}, \"{field} is not the required command coordinate\");\n  }}"
                 );
             }
         }

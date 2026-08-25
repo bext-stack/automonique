@@ -315,6 +315,35 @@ fn the_table_refuses_to_grow_past_its_capacity() {
     assert_eq!(replay.disposition, ProposalDisposition::AlreadyProposed);
 }
 
+#[test]
+fn pending_for_run_is_owned_bounded_and_excludes_the_expiry_boundary() {
+    let (_private, mut requests) = table();
+    requests
+        .propose(proposal(KEY, "runspec:owned"))
+        .expect("owned proposal");
+    let mut foreign = proposal(OTHER_KEY, "runspec:foreign");
+    foreign.run_id = "run-2";
+    requests.propose(foreign).expect("foreign proposal");
+
+    let owned = requests
+        .pending_for_run("run-1", 60_999, 1)
+        .expect("owned page");
+    assert_eq!(owned.len(), 1);
+    assert_eq!(owned[0].request_key, KEY);
+    assert!(
+        requests
+            .pending_for_run("run-1", 61_000, 1)
+            .expect("expiry boundary")
+            .is_empty()
+    );
+    assert!(
+        requests
+            .pending_for_run("run-3", 60_999, 1)
+            .expect("unowned run")
+            .is_empty()
+    );
+}
+
 // --- deciding -------------------------------------------------------------
 
 #[test]

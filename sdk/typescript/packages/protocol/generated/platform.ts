@@ -29,6 +29,9 @@ export const MAX_PLATFORM_PARAMETER_BYTES = 65536;
 /** Maximum canonical Platform request bytes. */
 export const MAX_PLATFORM_REQUEST_CANONICAL_BYTES = 131072;
 
+/** Maximum pending approvals carried by one session command-state read. */
+export const MAX_SESSION_COMMAND_APPROVALS = 128;
+
 /** Maximum sanitized events carried by one history page. */
 export const MAX_SESSION_HISTORY_EVENTS = 512;
 
@@ -220,8 +223,8 @@ export function decodePlatformAction(value: string): PlatformAction {
   return value as PlatformAction;
 }
 
-export type PlatformMethod = "attach" | "capabilities" | "claim_control" | "detach" | "execute" | "get_receipt" | "list_sessions" | "release_control" | "session_history_page" | "session_history_snapshot" | "snapshot" | "subscribe";
-export const PlatformMethod_VALUES: readonly PlatformMethod[] = ["attach", "capabilities", "claim_control", "detach", "execute", "get_receipt", "list_sessions", "release_control", "session_history_page", "session_history_snapshot", "snapshot", "subscribe"];
+export type PlatformMethod = "attach" | "capabilities" | "claim_control" | "detach" | "execute" | "get_receipt" | "list_sessions" | "release_control" | "session_approval_decision" | "session_command_state" | "session_follow_up" | "session_history_page" | "session_history_snapshot" | "session_run_stop" | "snapshot" | "subscribe";
+export const PlatformMethod_VALUES: readonly PlatformMethod[] = ["attach", "capabilities", "claim_control", "detach", "execute", "get_receipt", "list_sessions", "release_control", "session_approval_decision", "session_command_state", "session_follow_up", "session_history_page", "session_history_snapshot", "session_run_stop", "snapshot", "subscribe"];
 /** Security-sensitive: an undefined value is refused. */
 export function decodePlatformMethod(value: string): PlatformMethod {
   if (!(PlatformMethod_VALUES as readonly string[]).includes(value)) {
@@ -268,6 +271,16 @@ export function decodeResourceKind(value: string): ResourceKind {
     throw new ValidationError("ResourceKind", "unknown_enum_value");
   }
   return value as ResourceKind;
+}
+
+export type SessionApprovalDecision = "deny" | "grant";
+export const SessionApprovalDecision_VALUES: readonly SessionApprovalDecision[] = ["deny", "grant"];
+/** Security-sensitive: an undefined value is refused. */
+export function decodeSessionApprovalDecision(value: string): SessionApprovalDecision {
+  if (!(SessionApprovalDecision_VALUES as readonly string[]).includes(value)) {
+    throw new ValidationError("SessionApprovalDecision", "unknown_enum_value");
+  }
+  return value as SessionApprovalDecision;
 }
 
 export type SessionHistoryEvidence = "authoritative" | "synthetic";
@@ -456,6 +469,28 @@ export const ResourceRecord_FIELDS: readonly string[] = [
   "freshness",
   "resource",
   "summary",
+];
+
+/** Minimal sanitized revision fences for session-bound commands. */
+export interface SessionCommandState {
+  readonly pending_approvals: readonly SessionCommandTarget[];
+  readonly run: SessionCommandTarget | null;
+  readonly session: ResourceRecord;
+}
+export const SessionCommandState_FIELDS: readonly string[] = [
+  "pending_approvals",
+  "run",
+  "session",
+];
+
+/** One session-owned command target and its exact revision. */
+export interface SessionCommandTarget {
+  readonly revision: PlatformRevision;
+  readonly target: ResourceCoordinate;
+}
+export const SessionCommandTarget_FIELDS: readonly string[] = [
+  "revision",
+  "target",
 ];
 
 /** One bounded session page and its resume cursor. */
@@ -765,6 +800,26 @@ export function decodeDecodedResourceRecord(body: JsonValue): DecodedResourceRec
     freshness: decodeDecodedFreshness(bodyValue(fields, "freshness", PLATFORM_INVALID_BODY)),
     resource: decodeDecodedResourceCoordinate(bodyValue(fields, "resource", PLATFORM_INVALID_BODY)),
     summary: refuse(PLATFORM_VALUE_INVALID, () => PlatformText(bodyString(fields, "summary", PLATFORM_INVALID_BODY))),
+  };
+}
+
+/** Strictly decoded session-owned target and revision fence. */
+export interface DecodedSessionCommandTarget {
+  readonly revision: PlatformRevision;
+  readonly target: DecodedResourceCoordinate;
+}
+
+/** The exact key set this nested body carries. */
+export const DecodedSessionCommandTarget_FIELDS: readonly string[] = [
+  "revision",
+  "target",
+];
+
+export function decodeDecodedSessionCommandTarget(body: JsonValue): DecodedSessionCommandTarget {
+  const fields = exactFields(body, DecodedSessionCommandTarget_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    revision: refuse(PLATFORM_INVALID_BODY, () => PlatformRevision(bodyUnsigned(fields, "revision", PLATFORM_INVALID_BODY))),
+    target: decodeDecodedResourceCoordinate(bodyValue(fields, "target", PLATFORM_INVALID_BODY)),
   };
 }
 
@@ -1099,6 +1154,127 @@ export function encodePlatformReleaseControl(request_id: PlatformRequestId, body
   ]);
 }
 
+/** Decide an exact pending approval owned by one exact fenced session. */
+export const PLATFORM_SESSION_APPROVAL_DECISION_REQUEST_KIND = "session_approval_decision";
+export interface PlatformSessionApprovalDecisionBody {
+  readonly approval: DecodedResourceCoordinate;
+  readonly client: ClientId;
+  readonly decision: SessionApprovalDecision;
+  readonly expected_approval_revision: PlatformRevision;
+  readonly expected_session_revision: PlatformRevision;
+  readonly idempotency_key: IdempotencyKey;
+  readonly session: DecodedResourceCoordinate;
+}
+
+/** The exact key set this command's wire body carries. */
+export const PlatformSessionApprovalDecisionBody_FIELDS: readonly string[] = [
+  "approval",
+  "client",
+  "decision",
+  "expected_approval_revision",
+  "expected_session_revision",
+  "idempotency_key",
+  "session",
+];
+
+/** The exact key set accepted by this generated TypeScript builder. */
+export const PlatformSessionApprovalDecisionBody_INPUT_FIELDS: readonly string[] = [
+  "approval",
+  "client",
+  "decision",
+  "expected_approval_revision",
+  "expected_session_revision",
+  "idempotency_key",
+  "session",
+];
+
+export function encodePlatformSessionApprovalDecision(request_id: PlatformRequestId, body: PlatformSessionApprovalDecisionBody): Uint8Array {
+  exactInputFields(body, PlatformSessionApprovalDecisionBody_INPUT_FIELDS, PLATFORM_INVALID_BODY);
+  if (body.session.authority !== "automonique" || body.session.kind !== "session") {
+    throw new RefusalError(PLATFORM_VALUE_INVALID, "session is not the required command coordinate");
+  }
+  if (body.approval.authority !== "automonique" || body.approval.kind !== "approval") {
+    throw new RefusalError(PLATFORM_VALUE_INVALID, "approval is not the required command coordinate");
+  }
+  return encodePlatformRequest(request_id, PLATFORM_SESSION_APPROVAL_DECISION_REQUEST_KIND, [
+    ["approval", encodeDecodedResourceCoordinate(body.approval)],
+    ["client", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => ClientId(body.client))}],
+    ["decision", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => decodeSessionApprovalDecision(body.decision))}],
+    ["expected_approval_revision", {kind: "integer", value: refuse(PLATFORM_COUNTER_OUT_OF_RANGE, () => PlatformRevision(body.expected_approval_revision))}],
+    ["expected_session_revision", {kind: "integer", value: refuse(PLATFORM_COUNTER_OUT_OF_RANGE, () => PlatformRevision(body.expected_session_revision))}],
+    ["idempotency_key", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => IdempotencyKey(body.idempotency_key))}],
+    ["session", encodeDecodedResourceCoordinate(body.session)],
+  ]);
+}
+
+/** Read the bounded revision fences for one exact session. */
+export const PLATFORM_SESSION_COMMAND_STATE_REQUEST_KIND = "session_command_state";
+export interface PlatformSessionCommandStateBody {
+  readonly session: DecodedResourceCoordinate;
+}
+
+/** The exact key set this command's wire body carries. */
+export const PlatformSessionCommandStateBody_FIELDS: readonly string[] = [
+  "session",
+];
+
+/** The exact key set accepted by this generated TypeScript builder. */
+export const PlatformSessionCommandStateBody_INPUT_FIELDS: readonly string[] = [
+  "session",
+];
+
+export function encodePlatformSessionCommandState(request_id: PlatformRequestId, body: PlatformSessionCommandStateBody): Uint8Array {
+  exactInputFields(body, PlatformSessionCommandStateBody_INPUT_FIELDS, PLATFORM_INVALID_BODY);
+  if (body.session.authority !== "automonique" || body.session.kind !== "session") {
+    throw new RefusalError(PLATFORM_VALUE_INVALID, "session is not the required command coordinate");
+  }
+  return encodePlatformRequest(request_id, PLATFORM_SESSION_COMMAND_STATE_REQUEST_KIND, [
+    ["session", encodeDecodedResourceCoordinate(body.session)],
+  ]);
+}
+
+/** Submit bounded follow-up text against one exact session revision. */
+export const PLATFORM_SESSION_FOLLOW_UP_REQUEST_KIND = "session_follow_up";
+export interface PlatformSessionFollowUpBody {
+  readonly client: ClientId;
+  readonly expected_session_revision: PlatformRevision;
+  readonly idempotency_key: IdempotencyKey;
+  readonly session: DecodedResourceCoordinate;
+  readonly text: PlatformParameter;
+}
+
+/** The exact key set this command's wire body carries. */
+export const PlatformSessionFollowUpBody_FIELDS: readonly string[] = [
+  "client",
+  "expected_session_revision",
+  "idempotency_key",
+  "session",
+  "text",
+];
+
+/** The exact key set accepted by this generated TypeScript builder. */
+export const PlatformSessionFollowUpBody_INPUT_FIELDS: readonly string[] = [
+  "client",
+  "expected_session_revision",
+  "idempotency_key",
+  "session",
+  "text",
+];
+
+export function encodePlatformSessionFollowUp(request_id: PlatformRequestId, body: PlatformSessionFollowUpBody): Uint8Array {
+  exactInputFields(body, PlatformSessionFollowUpBody_INPUT_FIELDS, PLATFORM_INVALID_BODY);
+  if (body.session.authority !== "automonique" || body.session.kind !== "session") {
+    throw new RefusalError(PLATFORM_VALUE_INVALID, "session is not the required command coordinate");
+  }
+  return encodePlatformRequest(request_id, PLATFORM_SESSION_FOLLOW_UP_REQUEST_KIND, [
+    ["client", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => ClientId(body.client))}],
+    ["expected_session_revision", {kind: "integer", value: refuse(PLATFORM_COUNTER_OUT_OF_RANGE, () => PlatformRevision(body.expected_session_revision))}],
+    ["idempotency_key", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => IdempotencyKey(body.idempotency_key))}],
+    ["session", encodeDecodedResourceCoordinate(body.session)],
+    ["text", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => PlatformParameter(body.text))}],
+  ]);
+}
+
 /** Resume history strictly after an exclusive cursor. */
 export const PLATFORM_SESSION_HISTORY_PAGE_REQUEST_KIND = "session_history_page";
 export interface PlatformSessionHistoryPageBody {
@@ -1153,6 +1329,55 @@ export function encodePlatformSessionHistorySnapshot(request_id: PlatformRequest
   exactInputFields(body, PlatformSessionHistorySnapshotBody_INPUT_FIELDS, PLATFORM_INVALID_BODY);
   return encodePlatformRequest(request_id, PLATFORM_SESSION_HISTORY_SNAPSHOT_REQUEST_KIND, [
     ["limit", {kind: "integer", value: refuse(PLATFORM_COUNTER_OUT_OF_RANGE, () => SessionHistoryLimit(body.limit))}],
+    ["session", encodeDecodedResourceCoordinate(body.session)],
+  ]);
+}
+
+/** Stop the exact run owned by one exact fenced session. */
+export const PLATFORM_SESSION_RUN_STOP_REQUEST_KIND = "session_run_stop";
+export interface PlatformSessionRunStopBody {
+  readonly client: ClientId;
+  readonly expected_run_revision: PlatformRevision;
+  readonly expected_session_revision: PlatformRevision;
+  readonly idempotency_key: IdempotencyKey;
+  readonly run: DecodedResourceCoordinate;
+  readonly session: DecodedResourceCoordinate;
+}
+
+/** The exact key set this command's wire body carries. */
+export const PlatformSessionRunStopBody_FIELDS: readonly string[] = [
+  "client",
+  "expected_run_revision",
+  "expected_session_revision",
+  "idempotency_key",
+  "run",
+  "session",
+];
+
+/** The exact key set accepted by this generated TypeScript builder. */
+export const PlatformSessionRunStopBody_INPUT_FIELDS: readonly string[] = [
+  "client",
+  "expected_run_revision",
+  "expected_session_revision",
+  "idempotency_key",
+  "run",
+  "session",
+];
+
+export function encodePlatformSessionRunStop(request_id: PlatformRequestId, body: PlatformSessionRunStopBody): Uint8Array {
+  exactInputFields(body, PlatformSessionRunStopBody_INPUT_FIELDS, PLATFORM_INVALID_BODY);
+  if (body.session.authority !== "automonique" || body.session.kind !== "session") {
+    throw new RefusalError(PLATFORM_VALUE_INVALID, "session is not the required command coordinate");
+  }
+  if (body.run.authority !== "automonique" || body.run.kind !== "run") {
+    throw new RefusalError(PLATFORM_VALUE_INVALID, "run is not the required command coordinate");
+  }
+  return encodePlatformRequest(request_id, PLATFORM_SESSION_RUN_STOP_REQUEST_KIND, [
+    ["client", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => ClientId(body.client))}],
+    ["expected_run_revision", {kind: "integer", value: refuse(PLATFORM_COUNTER_OUT_OF_RANGE, () => PlatformRevision(body.expected_run_revision))}],
+    ["expected_session_revision", {kind: "integer", value: refuse(PLATFORM_COUNTER_OUT_OF_RANGE, () => PlatformRevision(body.expected_session_revision))}],
+    ["idempotency_key", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => IdempotencyKey(body.idempotency_key))}],
+    ["run", encodeDecodedResourceCoordinate(body.run)],
     ["session", encodeDecodedResourceCoordinate(body.session)],
   ]);
 }
@@ -1225,8 +1450,12 @@ export type PlatformRequest =
   | {readonly method: "get_receipt"; readonly request: PlatformGetReceiptBody}
   | {readonly method: "list_sessions"; readonly request: PlatformListSessionsBody}
   | {readonly method: "release_control"; readonly request: PlatformReleaseControlBody}
+  | {readonly method: "session_approval_decision"; readonly request: PlatformSessionApprovalDecisionBody}
+  | {readonly method: "session_command_state"; readonly request: PlatformSessionCommandStateBody}
+  | {readonly method: "session_follow_up"; readonly request: PlatformSessionFollowUpBody}
   | {readonly method: "session_history_page"; readonly request: PlatformSessionHistoryPageBody}
   | {readonly method: "session_history_snapshot"; readonly request: PlatformSessionHistorySnapshotBody}
+  | {readonly method: "session_run_stop"; readonly request: PlatformSessionRunStopBody}
   | {readonly method: "snapshot"; readonly request: PlatformSnapshotBody}
   | {readonly method: "subscribe"; readonly request: PlatformSubscribeBody};
 
@@ -1256,12 +1485,24 @@ export function encodePlatformRequestMessage(request_id: PlatformRequestId, requ
     case PLATFORM_RELEASE_CONTROL_REQUEST_KIND:
       exactInputFields(request, ["method", "request"], PLATFORM_INVALID_BODY);
       return encodePlatformReleaseControl(request_id, request.request);
+    case PLATFORM_SESSION_APPROVAL_DECISION_REQUEST_KIND:
+      exactInputFields(request, ["method", "request"], PLATFORM_INVALID_BODY);
+      return encodePlatformSessionApprovalDecision(request_id, request.request);
+    case PLATFORM_SESSION_COMMAND_STATE_REQUEST_KIND:
+      exactInputFields(request, ["method", "request"], PLATFORM_INVALID_BODY);
+      return encodePlatformSessionCommandState(request_id, request.request);
+    case PLATFORM_SESSION_FOLLOW_UP_REQUEST_KIND:
+      exactInputFields(request, ["method", "request"], PLATFORM_INVALID_BODY);
+      return encodePlatformSessionFollowUp(request_id, request.request);
     case PLATFORM_SESSION_HISTORY_PAGE_REQUEST_KIND:
       exactInputFields(request, ["method", "request"], PLATFORM_INVALID_BODY);
       return encodePlatformSessionHistoryPage(request_id, request.request);
     case PLATFORM_SESSION_HISTORY_SNAPSHOT_REQUEST_KIND:
       exactInputFields(request, ["method", "request"], PLATFORM_INVALID_BODY);
       return encodePlatformSessionHistorySnapshot(request_id, request.request);
+    case PLATFORM_SESSION_RUN_STOP_REQUEST_KIND:
+      exactInputFields(request, ["method", "request"], PLATFORM_INVALID_BODY);
+      return encodePlatformSessionRunStop(request_id, request.request);
     case PLATFORM_SNAPSHOT_REQUEST_KIND:
       exactInputFields(request, ["method", "request"], PLATFORM_INVALID_BODY);
       return encodePlatformSnapshot(request_id, request.request);
@@ -1282,8 +1523,12 @@ export function expectedPlatformResponseKind(method: PlatformRequest["method"]):
     case PLATFORM_GET_RECEIPT_REQUEST_KIND: return PLATFORM_RECEIPT_RESULT_RESPONSE_KIND;
     case PLATFORM_LIST_SESSIONS_REQUEST_KIND: return PLATFORM_SESSIONS_RESULT_RESPONSE_KIND;
     case PLATFORM_RELEASE_CONTROL_REQUEST_KIND: return PLATFORM_CONTROL_RELEASED_RESPONSE_KIND;
+    case PLATFORM_SESSION_APPROVAL_DECISION_REQUEST_KIND: return PLATFORM_RECEIPT_RESULT_RESPONSE_KIND;
+    case PLATFORM_SESSION_COMMAND_STATE_REQUEST_KIND: return PLATFORM_SESSION_COMMAND_STATE_RESULT_RESPONSE_KIND;
+    case PLATFORM_SESSION_FOLLOW_UP_REQUEST_KIND: return PLATFORM_RECEIPT_RESULT_RESPONSE_KIND;
     case PLATFORM_SESSION_HISTORY_PAGE_REQUEST_KIND: return PLATFORM_SESSION_HISTORY_RESULT_RESPONSE_KIND;
     case PLATFORM_SESSION_HISTORY_SNAPSHOT_REQUEST_KIND: return PLATFORM_SESSION_HISTORY_RESULT_RESPONSE_KIND;
+    case PLATFORM_SESSION_RUN_STOP_REQUEST_KIND: return PLATFORM_RECEIPT_RESULT_RESPONSE_KIND;
     case PLATFORM_SNAPSHOT_REQUEST_KIND: return PLATFORM_SNAPSHOT_RESULT_RESPONSE_KIND;
     case PLATFORM_SUBSCRIBE_REQUEST_KIND: return PLATFORM_SUBSCRIPTION_RESULT_RESPONSE_KIND;
   }
@@ -1492,6 +1737,34 @@ export function decodePlatformRefusedResult(request_id: PlatformRequestId, body:
   };
 }
 
+/** Minimal sanitized revision fences for session-bound commands. */
+export const PLATFORM_SESSION_COMMAND_STATE_RESULT_RESPONSE_KIND = "session_command_state_result";
+export interface PlatformSessionCommandStateResult {
+  readonly pending_approvals: readonly DecodedSessionCommandTarget[];
+  readonly request_id: PlatformRequestId;
+  readonly run: DecodedSessionCommandTarget | null;
+  readonly session: DecodedResourceRecord;
+}
+
+/** The exact key set this response's wire body carries; the correlation identifier is not among them, because it travels in the envelope. */
+export const PlatformSessionCommandStateResult_BODY_FIELDS: readonly string[] = [
+  "pending_approvals",
+  "run",
+  "session",
+];
+
+export function decodePlatformSessionCommandStateResult(request_id: PlatformRequestId, body: JsonValue): PlatformSessionCommandStateResult {
+  const fields = exactFields(body, PlatformSessionCommandStateResult_BODY_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    pending_approvals: bodyArray(fields, "pending_approvals", PLATFORM_INVALID_BODY, MAX_SESSION_COMMAND_APPROVALS, PLATFORM_INVALID_BODY).map(
+      decodeDecodedSessionCommandTarget,
+    ),
+    request_id: request_id,
+    run: mapNullable(bodyValueOrNull(fields, "run", PLATFORM_INVALID_BODY), decodeDecodedSessionCommandTarget),
+    session: decodeDecodedResourceRecord(bodyValue(fields, "session", PLATFORM_INVALID_BODY)),
+  };
+}
+
 /** One strict, exclusive-cursor history page. */
 export const PLATFORM_SESSION_HISTORY_RESULT_RESPONSE_KIND = "session_history_result";
 export interface PlatformSessionHistoryResult {
@@ -1670,6 +1943,7 @@ export type PlatformResponse =
   | {readonly kind: "detached"; readonly value: PlatformDetachedResult}
   | {readonly kind: "receipt_result"; readonly value: PlatformReceiptResult}
   | {readonly kind: "refused"; readonly value: PlatformRefusedResult}
+  | {readonly kind: "session_command_state_result"; readonly value: PlatformSessionCommandStateResult}
   | {readonly kind: "session_history_result"; readonly value: PlatformSessionHistoryResult}
   | {readonly kind: "session_history_resync"; readonly value: PlatformSessionHistoryResync}
   | {readonly kind: "sessions_result"; readonly value: PlatformSessionsResult}
@@ -1721,6 +1995,8 @@ export function decodePlatformResponse(payload: Uint8Array): PlatformResponse {
       return {kind: PLATFORM_RECEIPT_RESULT_RESPONSE_KIND, value: decodePlatformReceiptResult(request_id, message.body)};
     case PLATFORM_REFUSED_RESPONSE_KIND:
       return {kind: PLATFORM_REFUSED_RESPONSE_KIND, value: decodePlatformRefusedResult(request_id, message.body)};
+    case PLATFORM_SESSION_COMMAND_STATE_RESULT_RESPONSE_KIND:
+      return {kind: PLATFORM_SESSION_COMMAND_STATE_RESULT_RESPONSE_KIND, value: decodePlatformSessionCommandStateResult(request_id, message.body)};
     case PLATFORM_SESSION_HISTORY_RESULT_RESPONSE_KIND:
       return {kind: PLATFORM_SESSION_HISTORY_RESULT_RESPONSE_KIND, value: decodePlatformSessionHistoryResult(request_id, message.body)};
     case PLATFORM_SESSION_HISTORY_RESYNC_RESPONSE_KIND:
