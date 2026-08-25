@@ -14,6 +14,8 @@ pub(crate) const DRAIN_MESSAGE_ID: &str = "c64c8c969f2d43bb8baef5569fb69f96";
 pub(crate) const DRAIN_EVENT: &str = "shutdown_worker_drain";
 pub(crate) const WORKER_FAULT_MESSAGE_ID: &str = "5d3f0b7a9c1e4e0b8a6f2d9c4b1e7a35";
 pub(crate) const WORKER_FAULT_EVENT: &str = "worker_fault";
+pub(crate) const RENEWAL_DEFERRED_MESSAGE_ID: &str = "0b1c7d5e2a9f4b6c8d3e1f7a5c9b2d40";
+pub(crate) const RENEWAL_DEFERRED_EVENT: &str = "lease_renewal_deferred";
 const JOURNAL_SOCKET: &str = "/run/systemd/journal/socket";
 const MAX_EVENT_BYTES: usize = 1_024;
 const MAX_CATEGORY_BYTES: usize = 64;
@@ -49,6 +51,47 @@ fn emit_worker_fault_to(socket_path: &Path, worker_group: &str, category: &str) 
          AUTOMONIQUE_EVENT={WORKER_FAULT_EVENT}\n\
          AUTOMONIQUE_WORKER_GROUP={worker_group}\n\
          AUTOMONIQUE_FAULT_CATEGORY={category}\n"
+    );
+    emit_to(socket_path, &event)
+}
+
+/// A lease renewal failed on a store that would not answer while the lease
+/// is still ours by its TTL: the daemon backs off and retries instead of
+/// exiting. `lease` names which lease, `category` the store's refusal, and
+/// `remaining_ms` how long the lease stays valid without a renewal.
+pub(crate) fn emit_lease_renewal_deferred(
+    lease: &str,
+    category: &str,
+    remaining_ms: i64,
+) -> io::Result<()> {
+    if std::env::var_os("JOURNAL_STREAM").is_none() {
+        return Ok(());
+    }
+    emit_lease_renewal_deferred_to(Path::new(JOURNAL_SOCKET), lease, category, remaining_ms)
+}
+
+fn emit_lease_renewal_deferred_to(
+    socket_path: &Path,
+    lease: &str,
+    category: &str,
+    remaining_ms: i64,
+) -> io::Result<()> {
+    if !stable_vocabulary(lease) || !stable_vocabulary(category) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid renewal observation",
+        ));
+    }
+    let event = format!(
+        "MESSAGE=Automonique deferred a lease renewal on a transient store failure\n\
+         MESSAGE_ID={RENEWAL_DEFERRED_MESSAGE_ID}\n\
+         PRIORITY=4\n\
+         SYSLOG_IDENTIFIER=automonique\n\
+         AUTOMONIQUE_SCHEMA={READY_SCHEMA}\n\
+         AUTOMONIQUE_EVENT={RENEWAL_DEFERRED_EVENT}\n\
+         AUTOMONIQUE_LEASE={lease}\n\
+         AUTOMONIQUE_FAULT_CATEGORY={category}\n\
+         AUTOMONIQUE_LEASE_REMAINING_MS={remaining_ms}\n"
     );
     emit_to(socket_path, &event)
 }

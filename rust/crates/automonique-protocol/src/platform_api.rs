@@ -103,6 +103,31 @@ fn object(entries: Vec<(&str, JsonValue)>) -> JsonValue {
     )
 }
 
+/// Every `required` key present, no key outside `required` and `optional`.
+///
+/// The additive counterpart of [`exact_fields`]: a field introduced after a
+/// schema shipped may be absent without turning a conforming older client
+/// into an invalid body.
+fn fields_within(
+    value: &JsonValue,
+    required: &[&str],
+    optional: &[&str],
+) -> Result<(), PlatformApiError> {
+    let JsonValue::Object(entries) = value else {
+        return Err(PlatformApiError::InvalidBody);
+    };
+    if required
+        .iter()
+        .any(|field| !entries.iter().any(|(key, _)| key == field))
+        || entries.iter().any(|(key, _)| {
+            !required.iter().any(|field| key == field) && !optional.iter().any(|field| key == field)
+        })
+    {
+        return Err(PlatformApiError::InvalidBody);
+    }
+    Ok(())
+}
+
 fn exact_fields(value: &JsonValue, fields: &[&str]) -> Result<(), PlatformApiError> {
     let JsonValue::Object(entries) = value else {
         return Err(PlatformApiError::InvalidBody);
@@ -817,16 +842,19 @@ fn request_from_message(message: &Message) -> Result<PlatformRequest, PlatformAp
             }))
         }
         "execute" => {
-            exact_fields(
+            // `client` arrived after v1 shipped (additive evolution): a body
+            // without the key is the pre-existing wire shape and decodes as
+            // `None`, exactly like an explicit `null`.
+            fields_within(
                 body,
                 &[
                     "action",
-                    "client",
                     "expected_revision",
                     "idempotency_key",
                     "parameter",
                     "target",
                 ],
+                &["client"],
             )?;
             let mut request = ExecuteRequest::new_with_parameter(
                 PlatformAction::parse(string(body, "action")?)?,
@@ -836,18 +864,20 @@ fn request_from_message(message: &Message) -> Result<PlatformRequest, PlatformAp
                 optional_revision(body, "expected_revision")?,
                 optional_parameter(body, "parameter")?,
             )?;
-            if let Some(JsonValue::String(client)) = body.get("client") {
-                request = request
-                    .with_client(ClientId::new(client.clone()).map_err(PlatformError::Field)?);
-            } else if !matches!(body.get("client"), Some(JsonValue::Null)) {
-                return Err(PlatformApiError::InvalidBody);
+            match body.get("client") {
+                Some(JsonValue::String(client)) => {
+                    request = request
+                        .with_client(ClientId::new(client.clone()).map_err(PlatformError::Field)?);
+                }
+                None | Some(JsonValue::Null) => {}
+                Some(_) => return Err(PlatformApiError::InvalidBody),
             }
             Ok(PlatformRequest::Execute(request))
         }
         "get_receipt" => {
-            exact_fields(body, &["client", "id", "idempotency_key"])?;
+            fields_within(body, &["id", "idempotency_key"], &["client"])?;
             let client = match body.get("client") {
-                Some(JsonValue::Null) => None,
+                None | Some(JsonValue::Null) => None,
                 Some(JsonValue::String(value)) => {
                     Some(ClientId::new(value.clone()).map_err(PlatformError::Field)?)
                 }

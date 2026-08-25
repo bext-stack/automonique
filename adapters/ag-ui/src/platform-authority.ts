@@ -25,7 +25,13 @@ export interface ProductionAuthorityConfig {
   readonly platformToken?: () => string | Promise<string>;
   readonly platformSocket?: string;
   readonly progressSocket: string;
-  readonly nodeId: string;
+  /**
+   * Preferred node id. Optional: the adapter discovers the daemon's current
+   * `fresh` node from the Platform snapshot on every submission, so a
+   * generation change (daemon restart) does not strand it on a retired id
+   * (#131). When set and still fresh, this node is preferred.
+   */
+  readonly nodeId?: string;
   readonly fetcher?: typeof fetch;
 }
 
@@ -49,9 +55,14 @@ export class ProductionPlatformAuthority implements PlatformRunAuthority {
   async ready(signal?: AbortSignal): Promise<boolean> {
     try {
       const response = await this.platform.request("capabilities", {}, signal);
-      return response.kind === "capabilities_result"
-        && response.body.protocol === "automonique.platform"
-        && response.body.schema === "automonique.platform/v1";
+      if (response.kind !== "capabilities_result"
+        || response.body.protocol !== "automonique.platform"
+        || response.body.schema !== "automonique.platform/v1") return false;
+      // Readiness exercises the same node lookup `/agent` depends on, so a
+      // retired node makes the adapter report not-ready instead of 503-ing
+      // every run while `/readyz` stays green (#131).
+      await this.nodeTarget(signal);
+      return true;
     } catch {
       return false;
     }
@@ -142,6 +153,7 @@ export class ProductionPlatformAuthority implements PlatformRunAuthority {
   async cancel(request: PlatformCancelRequest, signal?: AbortSignal): Promise<PlatformCancelReceipt> {
     const response = await this.platform.request("execute", {
       action: "stop_run",
+      client: null,
       expected_revision: request.expectedRevision,
       idempotency_key: request.idempotencyKey,
       parameter: null,
@@ -158,31 +170,55 @@ export class ProductionPlatformAuthority implements PlatformRunAuthority {
   }
 
   private async submit(input: AdmittedRunInput, signal?: AbortSignal): Promise<Receipt> {
-    const target = input.parentRunId === undefined
-      ? await this.nodeTarget(signal)
-      : await this.sessionTarget(input.parentRunId, signal);
-    const response = await this.platform.request("execute", {
-      action: input.parentRunId === undefined ? "submit_request" : "follow_up",
-      expected_revision: target.revision,
-      idempotency_key: executionKey(input.runId),
-      parameter: input.prompt ?? null,
-      target: target.coordinate,
-    }, signal);
-    return receiptBody(response);
+    if (input.parentRunId !== undefined) {
+      const target = await this.sessionTarget(input.parentRunId, signal);
+      return receiptBody(await this.platform.request("execute", {
+        action: "follow_up",
+        client: null,
+        expected_revision: target.revision,
+        idempotency_key: executionKey(input.runId),
+        parameter: input.prompt ?? null,
+        target: target.coordinate,
+      }, signal));
+    }
+    // The node is resolved per submission and once more when the daemon
+    // says the node is unknown or no longer active: right after a restart
+    // the fresh node exists before its projection is refreshed, and one
+    // re-discovery closes that window without operator action (#131).
+    for (let attempt = 0; ; attempt += 1) {
+      const target = await this.nodeTarget(signal);
+      const response = await this.platform.request("execute", {
+        action: "submit_request",
+        client: null,
+        expected_revision: target.revision,
+        idempotency_key: executionKey(input.runId),
+        parameter: input.prompt ?? null,
+        target: target.coordinate,
+      }, signal);
+      if (attempt === 0 && response.kind === "refused" && plain(response.body)
+        && ["unknown_node", "target_not_active_node"].includes(String(response.body.explanation))) {
+        continue;
+      }
+      return receiptBody(response);
+    }
   }
 
   private async nodeTarget(signal?: AbortSignal): Promise<{coordinate: Coordinate; revision: number | null}> {
-    const response = await this.platform.request("snapshot", {resources: [
-      {authority: "automonique", id: this.config.nodeId, kind: "node"},
-    ]}, signal);
+    // An empty resource list asks the daemon for every resource it holds,
+    // which also makes it refresh and record its own node under the current
+    // generation; the fresh node of the Automonique authority is the target.
+    const response = await this.platform.request("snapshot", {resources: []}, signal);
     if (response.kind !== "snapshot_result" || !Array.isArray(response.body.resources)) throw new Error("platform node snapshot unavailable");
-    const records = response.body.resources.filter((value): value is Record<string, unknown> => plain(value))
-      .filter((record) => plain(record.resource)
+    const nodes = response.body.resources.filter((value): value is Record<string, unknown> => plain(value))
+      .filter((record) => plain(record.resource) && plain(record.freshness)
         && ["ai_operations", "automonique"].includes(String(record.resource.authority))
-        && record.resource.kind === "node")
+        && record.resource.kind === "node"
+        && record.freshness.state === "fresh")
       .sort((left, right) => observed(right) - observed(left));
-    const record = records[0];
-    if (record === undefined || !plain(record.resource) || !plain(record.freshness)) throw new Error("platform node unavailable");
+    const preferred = this.config.nodeId;
+    const record = (preferred === undefined ? undefined
+      : nodes.find((candidate) => plain(candidate.resource) && candidate.resource.id === preferred)) ?? nodes[0];
+    if (record === undefined || !plain(record.resource)) throw new Error("platform node unavailable");
     const projected = coordinate(record.resource);
     return {coordinate: {...projected, authority: "automonique"}, revision: null};
   }
@@ -208,6 +244,7 @@ export class ProductionPlatformAuthority implements PlatformRunAuthority {
         && (payload as Record<string, unknown>).approved === true;
       const response = await this.platform.request("execute", {
         action: "decide_approval",
+        client: null,
         expected_revision: null,
         idempotency_key: decisionKey(input.runId, decision.interruptId),
         parameter: approved ? "grant" : "deny",
@@ -342,7 +379,7 @@ export class ProductionPlatformAuthority implements PlatformRunAuthority {
     let receipt = initial;
     for (let count = 0; count < TERMINAL_POLLS && receipt.outcome === "accepted"; count += 1) {
       await delay(TERMINAL_POLL_MS, signal);
-      receipt = receiptBody(await this.platform.request("get_receipt", {id: null, idempotency_key: key}, signal));
+      receipt = receiptBody(await this.platform.request("get_receipt", {client: null, id: null, idempotency_key: key}, signal));
     }
     if (receipt.outcome === "accepted") throw new Error("platform receipt deadline exceeded");
     return receipt;

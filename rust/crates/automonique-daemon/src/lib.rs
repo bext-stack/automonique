@@ -79,9 +79,9 @@ use automonique_protocol::admin::{
     AdminInstanceId, AdminOutboxEvidence, AdminOutboxEvidenceParts, AdminReconciliationEvidence,
     AdminRefusalCategory, AdminRequest, AdminResponse, DaemonState, DaemonStatus,
     DurableStateCounts, DurableStateCountsParts, GenerationHandoffView, GenerationTenureView,
-    GenerationsView, LocalRequest, MAX_ADMIN_CANONICAL_BYTES, MAX_GENERATION_HISTORY_ENTRIES,
-    MAX_RELOAD_TRANSITIONS, OperationalMetric, OperationalStatus, OperationalStatusParts,
-    OutboxReconciliationDecision, ReloadStatusView, ReloadTransitionView,
+    GenerationsView, LocalRequest, LocalRequestError, MAX_ADMIN_CANONICAL_BYTES,
+    MAX_GENERATION_HISTORY_ENTRIES, MAX_RELOAD_TRANSITIONS, OperationalMetric, OperationalStatus,
+    OperationalStatusParts, OutboxReconciliationDecision, ReloadStatusView, ReloadTransitionView,
 };
 use automonique_protocol::approval_api::{
     ApprovalContinuation, ApprovalCursor, ApprovalDecision, ApprovalDisposition, ApprovalKey,
@@ -120,7 +120,8 @@ use automonique_protocol::platform::{
     SessionHistoryResync, SessionList, SessionRecord, Snapshot,
 };
 use automonique_protocol::platform_api::{
-    MAX_PLATFORM_REQUEST_CANONICAL_BYTES, PlatformRequestMessage, PlatformResponseMessage,
+    MAX_PLATFORM_REQUEST_CANONICAL_BYTES, PlatformApiError, PlatformRequestMessage,
+    PlatformResponseMessage,
 };
 use automonique_protocol::primitives::Revision;
 use automonique_protocol::provenance::{CausationId, CorrelationId, Provenance, TraceId};
@@ -3379,11 +3380,44 @@ impl Daemon {
                         // evidence, not a condition to poll through. A live host
                         // republishes the renewed lease to its poller here, which is
                         // what keeps the next long poll inside its own expiry.
-                        if let Err(error) = self.telegram.renew() {
-                            break 'serving Err(DaemonError::TelegramRefused(error.category()));
+                        //
+                        // A store that merely would not answer (busy, I/O, clock)
+                        // while the lease is still ours by its TTL is not lost
+                        // authority: the renewal is retried well inside the TTL
+                        // and the deferral is journaled. Only a lease another
+                        // holder took, one that expired, or a refusal that is not
+                        // transient ends the generation.
+                        match self.telegram.renew() {
+                            Ok(()) => {
+                                next_renewal_boottime_ms =
+                                    lease_now_ms.saturating_add(LEASE_RENEW_INTERVAL_MS);
+                            }
+                            Err(error) => {
+                                match telegram_renewal_disposition(
+                                    &error,
+                                    self.telegram.lease_expires_ms(),
+                                    lease_now_ms,
+                                ) {
+                                    RenewalDisposition::Retry {
+                                        after_ms,
+                                        remaining_ms,
+                                    } => {
+                                        let _ = structured_log::emit_lease_renewal_deferred(
+                                            "telegram_poller",
+                                            error.category(),
+                                            remaining_ms,
+                                        );
+                                        next_renewal_boottime_ms =
+                                            lease_now_ms.saturating_add(after_ms);
+                                    }
+                                    RenewalDisposition::Fatal => {
+                                        break 'serving Err(DaemonError::TelegramRefused(
+                                            error.category(),
+                                        ));
+                                    }
+                                }
+                            }
                         }
-                        next_renewal_boottime_ms =
-                            lease_now_ms.saturating_add(LEASE_RENEW_INTERVAL_MS);
                     }
                     if !self.disconnected_recovery
                         && self.reconciliation_run_id.is_none()
@@ -3828,9 +3862,23 @@ impl Daemon {
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
         let payload = read_payload(stream)?;
-        match LocalRequest::from_canonical_bytes(&payload)
-            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?
-        {
+        let request = match LocalRequest::from_canonical_bytes(&payload) {
+            Ok(request) => request,
+            Err(error) => {
+                // A Platform peer that sent a readable envelope with a body
+                // this lane refuses gets the typed `refused` frame the
+                // contract promises, not a bare EOF it cannot tell from a
+                // dead daemon. Lanes without a refusal frame, and payloads
+                // whose envelope itself is unreadable, close as before.
+                if let LocalRequestError::Platform(platform_error) = &error
+                    && let Some(frame) = platform_decode_refusal(&payload, platform_error)
+                {
+                    let _ = stream.write_all(&frame).and_then(|()| stream.flush());
+                }
+                return Err(DaemonError::ProtocolRefused(error.category()));
+            }
+        };
+        match request {
             LocalRequest::Admin(request) => self.handle_admin(stream, &request, stop),
             LocalRequest::Runs(request) => self.handle_runs(stream, &request),
             LocalRequest::Automation(request) => self.handle_automation(stream, &request),
@@ -8844,6 +8892,80 @@ fn platform_run_resource(record: &RunIndexRecord) -> Result<ResourceRecord, Daem
     })
 }
 
+/// The frame answering a Platform request whose body could not be decoded.
+///
+/// The envelope is re-read for its request id, so the refusal correlates
+/// with the request the peer sent. `None` when even the envelope is
+/// unreadable, or when the refusal itself cannot be encoded: then there is
+/// nothing typed to say and the connection closes as it always did.
+fn platform_decode_refusal(payload: &[u8], error: &PlatformApiError) -> Option<Vec<u8>> {
+    let request_id = automonique_protocol::wire::Message::from_canonical_bytes(payload)
+        .ok()?
+        .envelope()
+        .request_id()
+        .clone();
+    let explanation = PlatformText::new(format!("invalid_request:{}", error.category())).ok()?;
+    let response = PlatformResponse::Refused {
+        outcome: ReceiptOutcome::Rejected,
+        explanation,
+    };
+    let payload = PlatformResponseMessage::new(request_id, response)
+        .to_message()
+        .ok()?
+        .to_canonical_bytes();
+    let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + payload.len());
+    encode_frame(&payload, &mut frame).ok()?;
+    Some(frame)
+}
+
+/// What the serve loop does with a failed bot-lease renewal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenewalDisposition {
+    /// The failure was transient and the lease is still valid: renew again
+    /// `after_ms` from now; `remaining_ms` is how long the lease stays ours.
+    Retry { after_ms: i64, remaining_ms: i64 },
+    /// The lease is gone, or the refusal is not one a retry can change.
+    Fatal,
+}
+
+/// How soon a deferred renewal is retried: short enough for several tries
+/// inside the 20 s bot-lease TTL, long enough not to hammer a busy store.
+const RENEWAL_RETRY_INTERVAL_MS: i64 = 2_000;
+/// A retry needs at least this much lease left, or the renewal would land
+/// on an expired lease anyway.
+const RENEWAL_RETRY_MARGIN_MS: i64 = 1_000;
+
+/// Distinguish a store that would not answer from a lease that was lost.
+///
+/// Transient: the sink reported [`SinkFailure::Unavailable`] (SQLite busy,
+/// I/O, lease clock) and `lease_expires_ms` is still ahead of `now_ms` by
+/// more than the retry margin. Everything else, including a stale or held
+/// lease, a conflict, an already-expired lease and an unknown expiry, is
+/// fatal: fail-closed on lost authority is the point of the lease.
+fn telegram_renewal_disposition(
+    error: &telegram::TelegramHostError,
+    lease_expires_ms: Option<i64>,
+    now_ms: i64,
+) -> RenewalDisposition {
+    use automonique_transport_runtime::{RuntimeError, SinkFailure};
+    let transient = matches!(
+        error,
+        telegram::TelegramHostError::Runtime(RuntimeError::Sink(SinkFailure::Unavailable))
+    );
+    let Some(expires_ms) = lease_expires_ms else {
+        return RenewalDisposition::Fatal;
+    };
+    let remaining_ms = expires_ms.saturating_sub(now_ms);
+    if !transient || remaining_ms <= RENEWAL_RETRY_MARGIN_MS {
+        return RenewalDisposition::Fatal;
+    }
+    RenewalDisposition::Retry {
+        after_ms: RENEWAL_RETRY_INTERVAL_MS
+            .min(remaining_ms.saturating_sub(RENEWAL_RETRY_MARGIN_MS)),
+        remaining_ms,
+    }
+}
+
 fn platform_refusal(
     outcome: ReceiptOutcome,
     category: &str,
@@ -9773,6 +9895,71 @@ mod approval_context_tests {
 
 #[cfg(test)]
 mod adopted_attempts_tests;
+
+#[cfg(test)]
+mod renewal_disposition_tests {
+    use super::{
+        RENEWAL_RETRY_INTERVAL_MS, RENEWAL_RETRY_MARGIN_MS, RenewalDisposition,
+        telegram_renewal_disposition,
+    };
+    use crate::telegram::TelegramHostError;
+    use automonique_transport_runtime::{RuntimeError, SinkFailure};
+
+    fn unavailable() -> TelegramHostError {
+        TelegramHostError::Runtime(RuntimeError::Sink(SinkFailure::Unavailable))
+    }
+
+    #[test]
+    fn a_busy_store_inside_the_ttl_is_retried_not_fatal() {
+        let now = 1_000_000;
+        assert_eq!(
+            telegram_renewal_disposition(&unavailable(), Some(now + 15_000), now),
+            RenewalDisposition::Retry {
+                after_ms: RENEWAL_RETRY_INTERVAL_MS,
+                remaining_ms: 15_000
+            }
+        );
+        // Near the end of the TTL the retry lands before expiry, not after.
+        assert_eq!(
+            telegram_renewal_disposition(&unavailable(), Some(now + 2_500), now),
+            RenewalDisposition::Retry {
+                after_ms: 2_500 - RENEWAL_RETRY_MARGIN_MS,
+                remaining_ms: 2_500
+            }
+        );
+    }
+
+    #[test]
+    fn a_lost_or_expired_lease_still_ends_the_generation() {
+        let now = 1_000_000;
+        for error in [
+            TelegramHostError::Runtime(RuntimeError::Sink(SinkFailure::StaleLease)),
+            TelegramHostError::Runtime(RuntimeError::Sink(SinkFailure::Conflict)),
+            TelegramHostError::Runtime(RuntimeError::LeaseExpired),
+            TelegramHostError::Runtime(RuntimeError::SinkReceiptMismatch),
+            TelegramHostError::StoreUnavailable,
+        ] {
+            assert_eq!(
+                telegram_renewal_disposition(&error, Some(now + 15_000), now),
+                RenewalDisposition::Fatal,
+                "{error:?}"
+            );
+        }
+        // Transient, but the lease is already gone or about to be: fatal.
+        assert_eq!(
+            telegram_renewal_disposition(&unavailable(), Some(now - 1), now),
+            RenewalDisposition::Fatal
+        );
+        assert_eq!(
+            telegram_renewal_disposition(&unavailable(), Some(now + RENEWAL_RETRY_MARGIN_MS), now),
+            RenewalDisposition::Fatal
+        );
+        assert_eq!(
+            telegram_renewal_disposition(&unavailable(), None, now),
+            RenewalDisposition::Fatal
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
