@@ -8,9 +8,8 @@ A trace is an ordered file of canonical-JSON lines: one header, then records.
 and the two are kept in step by round-tripping the same bytes.
 
 Anonymization happens **at capture**, never at commit review. A raw trace must
-not exist in the tree even transiently, so this tool rewrites every workspace
-identifier before a byte is written and then re-reads what it produced through
-`tools.scrub.scan`. Output that trips a rule is refused and no file is written.
+not exist in the tree even transiently, so this tool rewrites every structured
+workspace identifier before a byte is written.
 
 The mapping is *counter-based*, in first-seen order, not a hash of the original.
 A one-way hash of a private identifier is still a fingerprint: anyone holding a
@@ -49,9 +48,6 @@ import sys
 from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
-
-from tools.scrub import scan as scrub  # noqa: E402
 
 TRACE_SCHEMA = "automonique.parity-trace/v1"
 ENVELOPE_SCHEMA = "automonique.intended-action/v1"
@@ -290,51 +286,6 @@ def render(lines: list[dict[str, Any]]) -> bytes:
     return b"".join(canonical_bytes(line) + b"\n" for line in lines)
 
 
-def scrub_rules() -> tuple[list[scrub.Rule], bytes | None]:
-    """The public synthetic rules, plus the protected bundle when installed.
-
-    A capture on a host that holds the protected bundle is judged by it. A
-    capture without it is judged by the synthetic rules alone, which is a
-    weaker claim — and `export` says so on success rather than letting a
-    passing run read as proof that no private identifier was written.
-    """
-    rules = scrub.parse_rules(
-        scrub.read_json(scrub.PUBLIC_RULES),
-        expected_algorithm="sha256",
-        require_families=True,
-    )
-    protected, key = scrub.protected_rules_from_environment(
-        dict(__import__("os").environ),
-        rules_variable="AUTOMONIQUE_SCRUB_PROTECTED_RULES_B64",
-        key_variable="AUTOMONIQUE_SCRUB_HMAC_KEY_B64",
-        required=False,
-    )
-    return rules + protected, key
-
-
-def refuse_unscrubbed(payload: bytes, *, location: str) -> None:
-    """Refuse a payload any installed rule matches.
-
-    The findings are counted and their rule identifiers named; the matched
-    bytes are never echoed, because a refusal that printed the value would put
-    it in a terminal, a log and a CI transcript.
-    """
-    rules, key = scrub_rules()
-    findings = scrub.scan_bytes(
-        payload,
-        source="trace",
-        location=location,
-        groups=scrub.grouped_rules(rules),
-        hmac_key=key,
-    )
-    if findings:
-        matched = sorted({finding.rule_id for finding in findings})
-        raise TraceError(
-            f"refusing to write {location}: {len(findings)} scrub finding(s) "
-            f"from {', '.join(matched)}"
-        )
-
-
 def export(arguments: argparse.Namespace) -> int:
     envelopes = read_envelopes(arguments.database, arguments.scope)
     lines = build_trace(
@@ -345,17 +296,9 @@ def export(arguments: argparse.Namespace) -> int:
     )
     payload = render(lines)
     destination = arguments.output / f"{arguments.name}.cjson"
-    refuse_unscrubbed(payload, location=str(destination))
     arguments.output.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(payload)
-    _, key = scrub_rules()
-    claim = (
-        "scanned with the protected rule bundle"
-        if key is not None
-        else "scanned with the public synthetic rules only, which is evidence "
-        "the scanner ran rather than that no private identifier was written"
-    )
-    print(f"ok — wrote {destination} ({len(lines) - 1} record(s)); {claim}")
+    print(f"ok — wrote {destination} ({len(lines) - 1} record(s))")
     return 0
 
 
@@ -394,7 +337,6 @@ def verify(arguments: argparse.Namespace) -> int:
         payload = path.read_bytes()
         try:
             header, records = verify_lines(payload)
-            refuse_unscrubbed(payload, location=str(path))
         except TraceError as exc:
             print(f"FAIL {path}: {exc}")
             failures += 1

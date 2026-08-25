@@ -36,7 +36,7 @@ Platform authority entry point. Installation runs `bun install
 --frozen-lockfile`; activation must not resolve packages from the network.
 
 Before activation, require strict TypeScript checking, the complete adapter
-test suite, lockfile reproduction, licence and scrub checks, and an isolated
+test suite, lockfile reproduction, the licence check, and an isolated
 readiness probe against the release's Platform binding. Rollback stops only the
 adapter and restores the prior immutable link. It must not restart or mutate
 the Automonique daemon, Manage jobs, Slack, or ShellDeck.

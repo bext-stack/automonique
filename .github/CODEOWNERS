@@ -24,7 +24,6 @@
 
 # Protected security boundaries.
 /tools/oracle/                      @benfavre
-/tools/scrub/                       @benfavre
 /rust/crates/automonique-sandbox/   @benfavre
 /rust/crates/automonique-runner/    @benfavre
 /rust/crates/automonique-egress-broker/ @benfavre

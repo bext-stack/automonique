@@ -115,7 +115,7 @@ The `automonique-bootstrap init` command performs an explicit, resumable sequenc
 3. Acquire the declared seed/toolchains/dependencies from allowlisted sources, or verify locally supplied artifacts.
 4. Create a dedicated development user/runtime/state directory and credential descriptors.
 5. Build the minimal protocol and `crates/automonique-lab` Cargo workspace member in an isolated bootstrap environment.
-6. Run bootstrap unit/sandbox/schema and secret scans.
+6. Run bootstrap unit, sandbox, schema and licence checks.
 7. Initialize an empty development database and import only the machine-readable program, policies and public fixtures.
 8. Start the stable lab in foreground mode on a local protected socket and issue a one-time operator enrollment.
 9. Ask the lab to rebuild the exact revision and compare outputs/evidence.

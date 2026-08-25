@@ -26,13 +26,13 @@
 //!
 //! One command: `python3 tools/parity/traces.py export --database <shadow db>
 //! --scope <scope> --parity-row <ledger key> --category <category> --output
-//! <this directory>/<scope>`. The tool anonymizes at capture and refuses to
-//! write anything the scrubber matches; the `.cjson` it produces is part of the
-//! corpus from the next run of this test with no other step. Note what an
-//! export carries and does not — `tools/parity/traces.py`'s own documentation
-//! states it: the shadow database retains intended actions, not the inbound
-//! events that provoked them, so an exported trace is a *comparison* trace and
-//! a *replay* trace additionally needs the events.
+//! <this directory>/<scope>`. The tool anonymizes structured identifiers at
+//! capture; the `.cjson` it produces is part of the corpus from the next run of
+//! this test with no other step. Note what an export carries and does not —
+//! `tools/parity/traces.py`'s own documentation states it: the shadow database
+//! retains intended actions, not the inbound events that provoked them, so an
+//! exported trace is a *comparison* trace and a *replay* trace additionally
+//! needs the events.
 
 use std::path::{Path, PathBuf};
 

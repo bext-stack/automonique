@@ -987,11 +987,11 @@ mod tests {
     fn any_conclusion_other_than_success_is_red() {
         for conclusion in ["failure", "timed_out", "cancelled", "stale", "neutral"] {
             let mut runs = all_required();
-            runs[2] = run("development-scrub", 3, "completed", json!(conclusion));
+            runs[1] = run("licence-boundary", 2, "completed", json!(conclusion));
             assert!(
                 matches!(
                     verdict(runs),
-                    Err(ImprovementGitHubError::CiRed("development-scrub"))
+                    Err(ImprovementGitHubError::CiRed("licence-boundary"))
                 ),
                 "{conclusion} was not treated as red"
             );

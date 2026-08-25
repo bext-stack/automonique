@@ -80,7 +80,6 @@ Useful checks include:
 
 ```sh
 python3 tools/check_licenses.py
-python3 tools/scrub/scan.py --scope tree
 cargo fmt --manifest-path rust/Cargo.toml --all -- --check
 cargo test --manifest-path rust/Cargo.toml --workspace --all-targets --locked
 cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --locked -- -D warnings

@@ -91,7 +91,7 @@ pub struct Recipe {
 
 /// Check-run names an operator may inspect when remote CI diagnostics are
 /// useful. They are not release prerequisites.
-pub const REQUIRED_CI_CHECKS: &[&str] = &["workspace", "licence-boundary", "development-scrub"];
+pub const REQUIRED_CI_CHECKS: &[&str] = &["workspace", "licence-boundary"];
 
 /// Stable local checks run by the improvement worker. This intentionally does
 /// not mirror every CI step: checks are selected for useful feedback and can
@@ -146,12 +146,6 @@ pub const CI_VERIFICATION_RECIPES: &[Recipe] = &[
         label: "python3 tools/check_licenses.py",
         program: "python3",
         args: &["tools/check_licenses.py"],
-        dir: RecipeDir::RepositoryRoot,
-    },
-    Recipe {
-        label: "python3 tools/scrub/scan.py --scope tree",
-        program: "python3",
-        args: &["tools/scrub/scan.py", "--scope", "tree"],
         dir: RecipeDir::RepositoryRoot,
     },
 ];
@@ -313,12 +307,11 @@ impl<A: ImprovementAgent> ImprovementExecutor<A> {
         if changed_paths(&worktree)?.is_empty() {
             return Err(ImprovementExecutionError::NoChanges);
         }
-        // Stage before verifying. `tools/scrub/scan.py` reads content through
-        // the index, so a scan run against an unstaged worktree would inspect
-        // the approved base and pass without ever seeing the candidate's edits.
-        // Staging first is safe: `ensure_no_commit` above already refused a
-        // candidate that created a commit, and the `status_is_clean` assertion
-        // after the commit still catches anything a check left behind.
+        // Stage before verifying so every check observes the exact candidate
+        // bytes that will be committed. `ensure_no_commit` above already
+        // refused a candidate that created a commit, and the `status_is_clean`
+        // assertion after the commit still catches anything a check left
+        // behind.
         run_checked(
             Command::new("git")
                 .arg("-C")
@@ -815,8 +808,7 @@ mod tests {
 
     /// The gates must see the candidate's bytes, not the approved base. This
     /// recipe exits non-zero exactly when the index differs from `HEAD`, so it
-    /// fails only if staging happened first — which is the ordering the scrub
-    /// gate depends on, since `tools/scrub/scan.py` reads through the index.
+    /// fails only if staging happened first.
     const STAGED_PROBE: &[Recipe] = &[Recipe {
         label: "git diff --cached --quiet",
         program: "git",

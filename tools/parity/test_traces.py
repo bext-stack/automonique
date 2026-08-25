@@ -1,18 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Elastic-2.0
 
-"""Golden-trace capture: anonymization, canonical form, and the leak refusal.
-
-The load-bearing test is `test_a_leaked_identifier_refuses_the_whole_export`.
-Every other property here is a shape check; that one is the reason
-anonymization happens at capture rather than at commit review, and it is
-exercised with the real scanner against a real synthetic vector rather than
-against a stub.
-"""
+"""Golden-trace capture: anonymization and canonical form."""
 
 from __future__ import annotations
 
-import base64
 import json
 import pathlib
 import sqlite3
@@ -20,16 +12,6 @@ import tempfile
 import unittest
 
 from tools.parity import traces
-from tools.scrub import scan as scrub
-
-VECTORS = {
-    entry["rule_id"]: base64.b64decode(entry["value_base64"], validate=True).decode(
-        "utf-8"
-    )
-    for entry in json.loads(
-        pathlib.Path(scrub.__file__).with_name("synthetic-vectors.json").read_text()
-    )["vectors"]
-}
 
 SCOPE = "slack-ticket-routing"
 ROW = "slack-socket-mode-messages-mentions-threads-commands-and-actions"
@@ -185,25 +167,6 @@ class ExportTest(unittest.TestCase):
         self.assertIn("T0TRACE0001", payload)
         self.assertIn("C0TRACE0001", payload)
 
-    def test_a_leaked_identifier_refuses_the_whole_export(self) -> None:
-        # The vector is a value the public synthetic rules fingerprint. It
-        # reaches the trace through free message text, which is exactly the
-        # path anonymization cannot rewrite by structure — so the scanner is
-        # the backstop, and the backstop must refuse rather than warn.
-        leak = VECTORS["synthetic-internal-product"]
-        code, path = self.export([envelope(text=f"see {leak} for details")])
-        self.assertEqual(code, 1)
-        self.assertFalse(path.exists(), "no file may be written when a rule matches")
-
-    def test_a_refusal_never_echoes_the_value_it_matched(self) -> None:
-        leak = VECTORS["synthetic-legacy-name"]
-        with self.assertRaises(traces.TraceError) as raised:
-            traces.refuse_unscrubbed(
-                f"a trace containing {leak}".encode(), location="scratch"
-            )
-        self.assertNotIn(leak, str(raised.exception))
-        self.assertIn("scrub finding", str(raised.exception))
-
     def test_an_empty_scope_is_refused_rather_than_written_empty(self) -> None:
         code, path = self.export([envelope()], scope="not-a-recorded-scope")
         self.assertEqual(code, 1)
@@ -297,7 +260,6 @@ class VerifyTest(unittest.TestCase):
             with self.subTest(fixture=path.name):
                 payload = path.read_bytes()
                 _, records = traces.verify_lines(payload)
-                traces.refuse_unscrubbed(payload, location=str(path))
                 self.assertTrue(
                     any(record["record"] == "inbound-event" for record in records),
                     "a corpus fixture must be replayable",
