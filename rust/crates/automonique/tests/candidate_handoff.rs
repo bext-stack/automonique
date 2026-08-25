@@ -165,6 +165,9 @@ fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
     assert!(status.status.success(), "candidate serves admin status");
     let status = String::from_utf8(status.stdout).expect("status UTF-8");
     assert!(status.contains(&target.holder_id));
+    source
+        .retire_after_handoff()
+        .expect("source drains before injected post-drain failure");
     candidate
         .quiesce()
         .expect("candidate drains while retaining authority");
@@ -190,6 +193,12 @@ fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
     source
         .accept_returned_authority(&returned.lease)
         .expect("source records and projects returned authority");
+    source
+        .resume_endpoint_cleanup()
+        .expect("source resumes exact socket cleanup");
+    source
+        .resume_after_handoff()
+        .expect("source rebuilds stopped workers at returned epoch");
     let returned_route = source
         .attempt_adoption_route()
         .expect("returned source attempt route");
@@ -217,12 +226,6 @@ fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
         returned_tenure,
         (source_lease.holder_id.clone(), returned.lease.epoch)
     );
-    source
-        .resume_endpoint_cleanup()
-        .expect("source resumes exact socket cleanup");
-    source
-        .resume_after_handoff()
-        .expect("source rebuilds stopped workers at returned epoch");
     candidate.stop().expect("candidate stopped");
     assert!(config.admin_socket().exists());
     assert!(config.progress_socket().exists());

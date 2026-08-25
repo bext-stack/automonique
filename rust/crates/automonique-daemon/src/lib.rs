@@ -2222,13 +2222,17 @@ impl Daemon {
         self.lease_epoch = renewed.epoch;
         self.lease_expires_ms = renewed.expires_ms;
         self.tenure_revision = tenure.revision;
-        self.attempt_adoption
-            .as_mut()
-            .ok_or(DaemonError::AttemptAdoptionFailed(
-                "attempt_adoption_unavailable",
-            ))?
-            .retarget(renewed.epoch)
-            .map_err(|error| DaemonError::AttemptAdoptionFailed(error.category()))?;
+        match (
+            self.execution.is_some(),
+            self.attempt_host.is_some(),
+            self.attempt_adoption.as_mut(),
+        ) {
+            (true, true, Some(adoption)) => adoption
+                .retarget(renewed.epoch)
+                .map_err(|error| DaemonError::AttemptAdoptionFailed(error.category()))?,
+            (false, false, None) => {}
+            _ => return Err(DaemonError::AttemptHostFailed("attempt_host_incoherent")),
+        }
         Ok(())
     }
 
@@ -2299,6 +2303,7 @@ impl Daemon {
         if !self.handoff_quiesced {
             return Err(DaemonError::ProtocolRefused("handoff_state"));
         }
+        self.rebuild_execution_after_retirement()?;
         self.rebuild_handoff_workers()?;
         self.handoff_quiesced = false;
         Ok(())
@@ -2349,6 +2354,55 @@ impl Daemon {
                 },
             )
         })
+    }
+
+    fn rebuild_execution_after_retirement(&mut self) -> Result<(), DaemonError> {
+        match (
+            self.execution.is_some(),
+            self.attempt_host.is_some(),
+            self.attempt_adoption.is_some(),
+        ) {
+            (true, true, true) => return Ok(()),
+            (false, false, false) => {}
+            _ => return Err(DaemonError::AttemptHostFailed("attempt_host_incoherent")),
+        }
+        let host = Arc::new(
+            DaemonAttemptHost::open(self.config.run_cancel_ledger_path())
+                .map_err(|error| DaemonError::AttemptHostFailed(error.category()))?,
+        );
+        let adoption_path =
+            attempt_adoption::socket_path(&self.config.runtime_dir(), self.instance_id.as_str())
+                .map_err(|error| DaemonError::AttemptAdoptionFailed(error.category()))?;
+        let mut adoption = attempt_adoption::AttemptAdoptionEndpoint::bind(
+            adoption_path,
+            self.instance_id.as_str(),
+            self.lease_epoch,
+            Arc::clone(&host),
+        )
+        .map_err(|error| DaemonError::AttemptAdoptionFailed(error.category()))?;
+        let execution = execute::ExecutionLane::open(
+            Arc::clone(&host),
+            self.state_dir.clone(),
+            self.config.run_index_path(),
+            matches!(
+                self.execution_state,
+                automonique_protocol::admin::ExecutionState::SandboxEnforceableLaneWired
+            ),
+        );
+        self.progress_endpoint
+            .as_mut()
+            .ok_or(DaemonError::ProgressEndpointFailed(
+                "progress_endpoint_unavailable",
+            ))?
+            .replace_hub(execution.progress())
+            .map_err(|error| DaemonError::ProgressEndpointFailed(error.category()))?;
+        adoption
+            .start()
+            .map_err(|error| DaemonError::AttemptAdoptionFailed(error.category()))?;
+        self.attempt_host = Some(host);
+        self.attempt_adoption = Some(adoption);
+        self.execution = Some(execution);
+        Ok(())
     }
 
     fn rebuild_handoff_workers(&mut self) -> Result<(), DaemonError> {

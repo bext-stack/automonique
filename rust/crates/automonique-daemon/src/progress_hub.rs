@@ -1007,6 +1007,19 @@ impl ProgressEndpoint {
         self.stop.store(false, Ordering::Release);
         self.start()
     }
+
+    /// Retarget a stopped retained listener to a freshly composed execution
+    /// hub after the old source lane finished every attempt and was disposed.
+    pub(crate) fn replace_hub(
+        &mut self,
+        hub: Arc<ProgressHub>,
+    ) -> Result<(), ProgressEndpointError> {
+        if self.accept.is_some() {
+            return Err(ProgressEndpointError::AlreadyStarted);
+        }
+        self.hub = hub;
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for ProgressEndpoint {
