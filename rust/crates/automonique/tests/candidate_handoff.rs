@@ -3,14 +3,14 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use automonique_daemon::DaemonConfig;
 use automonique_daemon::candidate::{CandidateSpec, spawn_warm_candidate};
 use automonique_daemon::release_activation::{CodeReleaseActivator, SystemdUserSupervisor};
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
+use automonique_daemon::{Daemon, DaemonConfig};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
@@ -27,16 +27,13 @@ fn exact_release_candidate_warms_without_competing_for_source_authority() {
         state_root,
     };
 
-    let source = Command::new(env!("CARGO_BIN_EXE_automonique"))
-        .args(["daemon", "--foreground"])
-        .env("XDG_RUNTIME_DIR", &config.runtime_root)
-        .env("XDG_STATE_HOME", &config.state_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("source daemon");
-    let mut source = ChildGuard(Some(source));
+    let source = Daemon::open(&config).expect("source daemon");
+    let transfer_descriptors = source
+        .candidate_transfer_descriptors()
+        .expect("transfer descriptors");
+    let stop = Arc::new(AtomicBool::new(false));
+    let serve_stop = Arc::clone(&stop);
+    let source = std::thread::spawn(move || source.serve(&serve_stop));
     wait_ready(&config);
     let (source_holder_id, source_lease_epoch) = read_source_lease(&config.database_path());
 
@@ -88,7 +85,8 @@ fn exact_release_candidate_warms_without_competing_for_source_authority() {
         },
     )
     .expect("warm candidate");
-    assert_ne!(candidate.pid(), source.id());
+    let mut candidate = candidate;
+    assert_ne!(candidate.pid(), std::process::id());
     let lease_target = candidate.lease_target();
     assert_eq!(lease_target.pid, candidate.pid());
     assert!(lease_target.starttime > 0);
@@ -100,14 +98,17 @@ fn exact_release_candidate_warms_without_competing_for_source_authority() {
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "candidate proved the empty live source-host inventory"
     );
+    candidate
+        .prepare_transfer(transfer_descriptors)
+        .expect("candidate validates transferred listener and lock");
+    assert!(candidate.is_transfer_ready());
     candidate.stop().expect("candidate stopped");
-    assert!(
-        source.try_wait().expect("source status").is_none(),
-        "non-owning candidate did not disturb the source daemon"
-    );
-
-    kill(source.pid(), Signal::SIGTERM).expect("stop source");
-    assert!(source.wait_deadlined(Duration::from_secs(20)).success());
+    assert!(!source.is_finished(), "candidate did not stop the source");
+    stop.store(true, Ordering::Release);
+    source
+        .join()
+        .expect("source thread")
+        .expect("clean source stop");
 }
 
 fn read_source_lease(path: &Path) -> (String, u64) {
@@ -152,41 +153,4 @@ fn hex(bytes: &[u8]) -> String {
         encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
     }
     encoded
-}
-
-struct ChildGuard(Option<Child>);
-
-impl ChildGuard {
-    fn id(&self) -> u32 {
-        self.0.as_ref().expect("live child").id()
-    }
-
-    fn pid(&self) -> Pid {
-        Pid::from_raw(i32::try_from(self.id()).expect("PID fits i32"))
-    }
-
-    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        self.0.as_mut().expect("live child").try_wait()
-    }
-
-    fn wait_deadlined(&mut self, timeout: Duration) -> std::process::ExitStatus {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(status) = self.try_wait().expect("child status") {
-                self.0 = None;
-                return status;
-            }
-            assert!(Instant::now() < deadline, "child did not stop on time");
-            std::thread::sleep(Duration::from_millis(25));
-        }
-    }
-}
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if let Some(child) = self.0.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
 }

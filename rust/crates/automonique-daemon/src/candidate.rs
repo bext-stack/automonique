@@ -15,8 +15,9 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::fd::OwnedFd;
+use std::io::{BufRead, BufReader, IoSlice, IoSliceMut, Read, Write};
+use std::mem::MaybeUninit;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -28,6 +29,10 @@ use automonique_store::generation_audit::GENERATION_AUDIT_SCHEMA_VERSION;
 use automonique_store::reload_audit::RELOAD_AUDIT_SCHEMA_VERSION;
 use nix::unistd::{geteuid, getppid};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rustix::net::{
+    RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer,
+    SendAncillaryMessage, SendFlags, recvmsg, sendmsg,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -38,9 +43,11 @@ use crate::control_lock::{ControlLock, ControlLockError};
 use crate::lease_identity::{ProcessIdentity, ProcessIdentityError};
 use crate::release_activation::VerifiedCodeRelease;
 
-const CHANNEL_SCHEMA: &str = "automonique.reload-candidate/v2";
+const CHANNEL_SCHEMA: &str = "automonique.reload-candidate/v3";
 const MAX_CHANNEL_LINE_BYTES: u64 = 4 * 1024;
 const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
+const CONTROL_STOP: u8 = b'S';
+const CONTROL_PREPARE_TRANSFER: u8 = b'T';
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidateSpec {
@@ -67,6 +74,7 @@ pub struct WarmCandidate {
     child: Child,
     channel: UnixStream,
     identity: CandidateIdentity,
+    transfer_ready: bool,
     stopped: bool,
 }
 
@@ -165,15 +173,6 @@ struct CandidateIdentity {
     boot_id: String,
     starttime: u64,
     pid: u32,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct CandidateControl {
-    schema: String,
-    command: String,
-    reload_id: String,
-    target_generation_id: String,
 }
 
 #[derive(Debug)]
@@ -320,6 +319,7 @@ pub fn spawn_warm_candidate(
         child,
         channel: parent,
         identity: observed,
+        transfer_ready: false,
         stopped: false,
     })
 }
@@ -375,15 +375,35 @@ impl WarmCandidate {
         }
     }
 
+    /// Send the duplicated listener and continuously-held lock over the private
+    /// parent/child channel and require the child to validate both.
+    pub fn prepare_transfer(
+        &mut self,
+        descriptors: CandidateTransferDescriptors,
+    ) -> Result<(), CandidateError> {
+        if self.transfer_ready {
+            return Err(CandidateError::Protocol);
+        }
+        send_control(&self.channel, CONTROL_PREPARE_TRANSFER, Some(descriptors))?;
+        let mut expected = self.identity.clone();
+        expected.event = "transfer_ready".to_owned();
+        let observed: CandidateIdentity = read_message(&self.channel)?;
+        if observed != expected {
+            return Err(CandidateError::Protocol);
+        }
+        self.identity = observed;
+        self.transfer_ready = true;
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn is_transfer_ready(&self) -> bool {
+        self.transfer_ready
+    }
+
     /// End a still-non-owning candidate and require a matching acknowledgement.
     pub fn stop(mut self) -> Result<(), CandidateError> {
-        let control = CandidateControl {
-            schema: CHANNEL_SCHEMA.to_owned(),
-            command: "stop".to_owned(),
-            reload_id: self.identity.reload_id.clone(),
-            target_generation_id: self.identity.target_generation_id.clone(),
-        };
-        write_message(&mut self.channel, &control)?;
+        send_control(&self.channel, CONTROL_STOP, None)?;
         let mut expected = self.identity.clone();
         expected.event = "stopped".to_owned();
         let observed: CandidateIdentity = read_message(&self.channel)?;
@@ -411,7 +431,7 @@ impl Drop for WarmCandidate {
 pub fn run_candidate(
     config: &DaemonConfig,
     input: CandidateInput,
-    mut reader: impl Read,
+    reader: impl Read + AsFd,
     mut writer: impl Write,
 ) -> Result<(), CandidateError> {
     validate_input(&input)?;
@@ -442,17 +462,97 @@ pub fn run_candidate(
         pid: process_identity.pid,
     };
     write_message(&mut writer, &identity)?;
-    let control: CandidateControl = read_message_from(&mut reader)?;
-    if control.schema != CHANNEL_SCHEMA
-        || control.command != "stop"
-        || control.reload_id != identity.reload_id
-        || control.target_generation_id != identity.target_generation_id
-    {
-        return Err(CandidateError::Protocol);
-    }
+    let mut identity = identity;
+    let adopted = match receive_control(reader.as_fd())? {
+        CandidateControl::Stop => None,
+        CandidateControl::PrepareTransfer(descriptors) => {
+            let adopted = AdoptedCandidateResources::adopt(config, descriptors)?;
+            identity.event = "transfer_ready".to_owned();
+            write_message(&mut writer, &identity)?;
+            if !matches!(receive_control(reader.as_fd())?, CandidateControl::Stop) {
+                return Err(CandidateError::Protocol);
+            }
+            Some(adopted)
+        }
+    };
+    drop(adopted);
     let mut stopped = identity;
     stopped.event = "stopped".to_owned();
     write_message(&mut writer, &stopped)
+}
+
+enum CandidateControl {
+    Stop,
+    PrepareTransfer(CandidateTransferDescriptors),
+}
+
+fn send_control(
+    channel: &UnixStream,
+    marker: u8,
+    descriptors: Option<CandidateTransferDescriptors>,
+) -> Result<(), CandidateError> {
+    let marker = [marker];
+    let vectors = [IoSlice::new(&marker)];
+    let sent = if let Some(descriptors) = descriptors {
+        let rights = [
+            descriptors.admin_listener.as_fd(),
+            descriptors.control_lock.as_fd(),
+        ];
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
+        let mut control = SendAncillaryBuffer::new(&mut space);
+        if !control.push(SendAncillaryMessage::ScmRights(&rights)) {
+            return Err(CandidateError::Protocol);
+        }
+        sendmsg(channel, &vectors, &mut control, SendFlags::NOSIGNAL)
+    } else {
+        sendmsg(
+            channel,
+            &vectors,
+            &mut SendAncillaryBuffer::default(),
+            SendFlags::NOSIGNAL,
+        )
+    }
+    .map_err(|error| CandidateError::Io(error.into()))?;
+    if sent != marker.len() {
+        return Err(CandidateError::Protocol);
+    }
+    Ok(())
+}
+
+fn receive_control(fd: impl AsFd) -> Result<CandidateControl, CandidateError> {
+    let mut marker = [0_u8; 1];
+    let mut received = Vec::new();
+    let (bytes, flags) = {
+        let mut vectors = [IoSliceMut::new(&mut marker)];
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
+        let mut control = RecvAncillaryBuffer::new(&mut space);
+        let message = recvmsg(fd, &mut vectors, &mut control, RecvFlags::CMSG_CLOEXEC)
+            .map_err(|error| CandidateError::Io(error.into()))?;
+        for message in control.drain() {
+            let RecvAncillaryMessage::ScmRights(rights) = message else {
+                return Err(CandidateError::Protocol);
+            };
+            received.extend(rights);
+        }
+        (message.bytes, message.flags)
+    };
+    if bytes != 1 || flags.contains(ReturnFlags::CTRUNC) || flags.contains(ReturnFlags::TRUNC) {
+        return Err(CandidateError::Protocol);
+    }
+    match marker[0] {
+        CONTROL_STOP if received.is_empty() => Ok(CandidateControl::Stop),
+        CONTROL_PREPARE_TRANSFER if received.len() == 2 => {
+            let control_lock = received.pop().expect("length checked");
+            let admin_listener = received.pop().expect("length checked");
+            Ok(CandidateControl::PrepareTransfer(
+                CandidateTransferDescriptors::new(
+                    UnixListener::from(admin_listener),
+                    File::from(control_lock),
+                ),
+            ))
+        }
+        _ => Err(CandidateError::Protocol),
+    }
 }
 
 fn process_identity(pid: u32) -> Result<ProcessIdentity, CandidateError> {
@@ -708,7 +808,7 @@ mod tests {
             identity
         );
 
-        let unknown = br#"{"schema":"automonique.reload-candidate/v2","event":"warm","reload_id":"reload-1","target_generation_id":"generation-2","manifest_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binary_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","attempt_count":2,"attempt_inventory_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","target_holder_id":"daemon-42-reload-0123456789abcdef","boot_id":"01234567-89ab-cdef-0123-456789abcdef","starttime":100,"pid":42,"extra":true}\n"#;
+        let unknown = br#"{"schema":"automonique.reload-candidate/v3","event":"warm","reload_id":"reload-1","target_generation_id":"generation-2","manifest_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binary_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","attempt_count":2,"attempt_inventory_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","target_holder_id":"daemon-42-reload-0123456789abcdef","boot_id":"01234567-89ab-cdef-0123-456789abcdef","starttime":100,"pid":42,"extra":true}\n"#;
         assert!(matches!(
             read_message_from::<CandidateIdentity>(&mut unknown.as_slice()),
             Err(CandidateError::Protocol)

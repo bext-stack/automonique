@@ -293,6 +293,7 @@ dependencies = [
  "listenfd",
  "nix",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
