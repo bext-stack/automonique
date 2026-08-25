@@ -14,37 +14,55 @@
 //!
 //! # What this surface does, stated before what it looks like
 //!
-//! **It records an operator's decision about whether an automation is in
-//! service, durably, and serves those decisions back.** That is the whole of
-//! it, and the honesty of the whole slice depends on saying so:
+//! **It registers an automation job — a canonical schedule, a serialization
+//! scope and a bounded prompt — records an operator's decisions about whether
+//! that job is in service, durably, and serves those decisions and the job's
+//! last and next execution back.** What consumes the record is the daemon's
+//! automation scheduler worker, which derives one occurrence per due instant,
+//! admits it through the durable scheduler core under the generation fence,
+//! and submits it as a normal run on the durable synthetic lane under the
+//! idempotency key [`AutomationOccurrenceKey`] derives. Two things this
+//! surface still does not do:
 //!
-//! - **Nothing here schedules.** No [`crate::automation::CanonicalSchedule`]
-//!   is carried, evaluated or stored; no next occurrence is computed; no timer
-//!   exists anywhere in this build.
-//! - **Nothing here fires an action.** The executor that would consume a
-//!   trigger and an action does not exist in this release, so **a `paused`
-//!   automation suppresses nothing today.** It is written now so that the
-//!   scheduler, when it lands, reads enablement out of a durable record rather
-//!   than inventing one.
+//! - **It carries no cron.** [`AutomationSchedule`] admits the one-shot and
+//!   fixed-interval forms of [`crate::automation::CanonicalSchedule`] and
+//!   refuses the five-field cron form with the typed
+//!   [`AutomationApiError::UnsupportedSchedule`], because no dependency-free
+//!   cron evaluator with a timezone database ships in this build and a schedule
+//!   that cannot be evaluated must not be accepted as if it could.
 //! - **Nothing here authenticates.** [`RegisterAutomation::actor`] and
 //!   [`SetEnablement::actor`] name who asked and are recorded verbatim. The
 //!   daemon's `SO_PEERCRED` check is the authentication; this string is not a
 //!   capability, exactly as [`crate::automation::AutomationActor`] says of
 //!   itself and as [`crate::admin::IntakePause`] says of the intake switch.
 //!
+//! # The bounds are the durable submit lane's
+//!
+//! An occurrence is submitted exactly as `automonique submit` submits synthetic
+//! work, so the job's three fields carry that lane's bounds rather than new
+//! ones: [`AutomationScope`] is bounded by
+//! [`crate::admin::MAX_SYNTHETIC_SCOPE_BYTES`], [`AutomationPrompt`] by
+//! [`crate::admin::MAX_SYNTHETIC_TASK_BYTES`] under the same no-NUL rule, and
+//! the occurrence key `automation:<automation_id>:<occurrence_instant>` by
+//! [`crate::admin::MAX_SYNTHETIC_KEY_BYTES`] — which is why an identity
+//! registered *with a schedule* is bounded by
+//! [`MAX_SCHEDULED_AUTOMATION_ID_BYTES`], derived from that key bound, while
+//! [`AutomationId`] itself keeps the registry's wider grammar so a row written
+//! before schedules existed is still readable.
+//!
 //! # The vocabulary is borrowed, not re-spelled
 //!
 //! [`crate::automation::EnablementState`], [`crate::automation::AutomationActor`]
 //! and [`crate::automation::PauseCause`] already define this product's
 //! enablement words, so this module *uses* them rather than writing a second
-//! set down. Only two bounded types are new — [`AutomationId`] and
-//! [`PauseReason`] — because the rich model spells a withdrawal as one
-//! `PauseCause` value carrying both halves, while `automonique_store`'s
-//! `automations` table stores the actor and the reason in separate columns and
-//! writes an actor on *every* transition including a resume. The wire follows
-//! the table, and [`AutomationRecordView::enablement`] reassembles the rich
-//! value so a reader can have either shape without this module choosing for
-//! them.
+//! set down. The bounded types that are new — [`AutomationId`],
+//! [`PauseReason`], [`AutomationScope`] and [`AutomationPrompt`] — exist
+//! because the rich model spells a withdrawal as one `PauseCause` value
+//! carrying both halves, while `automonique_store`'s `automations` table stores
+//! the actor and the reason in separate columns and writes an actor on *every*
+//! transition including a resume. The wire follows the table, and
+//! [`AutomationRecordView::enablement`] reassembles the rich value so a reader
+//! can have either shape without this module choosing for them.
 //!
 //! [`AutomationId`] deliberately does **not** reuse
 //! [`crate::automation::DurableId`], whose grammar additionally forbids
@@ -70,12 +88,16 @@
 //!
 //! Named rather than silently approximated:
 //!
-//! - **Only enablement is controlled.** `plan` gives an automation a schedule,
-//!   a trigger, an action, an overlap policy and a pre-approved effect scope.
-//!   None is representable in [`RegisterAutomation`], because none is durable:
-//!   the registry stores identity, revision, enablement and attribution and
-//!   nothing else. A field here that the store drops would be a promise the
-//!   next read breaks.
+//! - **A job is a schedule, a scope and a prompt.** `plan` also gives an
+//!   automation a trigger, an overlap policy, delivery targets and a
+//!   pre-approved effect scope. None of those is representable in
+//!   [`RegisterAutomation`], because none is durable: the registry stores the
+//!   three job fields beside identity, revision, enablement and attribution
+//!   and nothing else. The overlap policy is fixed rather than chosen — one
+//!   occurrence per automation is admitted at a time, and a fixed interval
+//!   that falls behind fires its oldest due instant once and skips the rest —
+//!   and an occurrence's only effect is the synthetic lane's, so no approved
+//!   effect set is recorded because nothing here spends one.
 //! - **There is no history.** The registry holds one row per automation,
 //!   overwritten in place, so a resume erases the cause of the pause it
 //!   resumed. [`AutomationRecordView`] answers "who withdrew this, and why" for
@@ -94,7 +116,8 @@ use core::fmt;
 use std::error::Error;
 
 use crate::automation::{
-    AutomationActor, AutomationEnablement, AutomationError, EnablementState, PauseCause,
+    AutomationActor, AutomationEnablement, AutomationError, CanonicalSchedule, EnablementState,
+    FixedInterval, PauseCause,
 };
 use crate::codec::{
     CodecError, Envelope, MajorVersion, MessageKind, ProtocolName, RequestId,
@@ -121,17 +144,68 @@ pub const MAX_AUTOMATION_CANONICAL_BYTES: usize = 64 * 1024;
 /// under. A value this protocol admits is a value that store holds.
 pub const MAX_AUTOMATION_API_FIELD_BYTES: usize = crate::automation::MAX_AUTOMATION_FIELD_BYTES;
 
+/// Maximum UTF-8 byte length of an automation's serialization scope.
+///
+/// The durable submit lane's own scope bound,
+/// [`crate::admin::MAX_SYNTHETIC_SCOPE_BYTES`], because an occurrence is
+/// submitted on that lane under this exact scope.
+pub const MAX_AUTOMATION_SCOPE_BYTES: usize = crate::admin::MAX_SYNTHETIC_SCOPE_BYTES;
+
+/// Maximum UTF-8 byte length of the prompt one occurrence submits.
+///
+/// The durable submit lane's own task bound,
+/// [`crate::admin::MAX_SYNTHETIC_TASK_BYTES`], under the same rule: non-empty,
+/// no NUL, and otherwise free text — a prompt may carry newlines.
+pub const MAX_AUTOMATION_PROMPT_BYTES: usize = crate::admin::MAX_SYNTHETIC_TASK_BYTES;
+
+/// Maximum UTF-8 byte length of an occurrence key.
+///
+/// The durable submit lane's own idempotency-key bound,
+/// [`crate::admin::MAX_SYNTHETIC_KEY_BYTES`]. That lane derives bounded receipt
+/// keys from the coordinate it is handed, and an occurrence key travels the
+/// same path, so it fits the same bound.
+pub const MAX_OCCURRENCE_KEY_BYTES: usize = crate::admin::MAX_SYNTHETIC_KEY_BYTES;
+
+/// The namespace every occurrence key opens with.
+///
+/// `automation:<automation_id>:<occurrence_instant>`, where the instant is the
+/// canonical decimal rendering of the scheduled Unix millisecond. Derived from
+/// the automation and its instant and nothing else, so a replayed tick, a
+/// restarted daemon or a re-elected generation derives the same key and the
+/// lane's own idempotency dedupes the firing.
+pub const OCCURRENCE_KEY_PREFIX: &str = "automation:";
+
+/// Longest canonical decimal rendering of a non-negative `i64` instant.
+const MAX_INSTANT_DIGITS: usize = 19;
+
+/// Longest automation identity that may be registered with a schedule.
+///
+/// Derived, not chosen: the occurrence key is the prefix, the identity, one
+/// colon and an instant of at most [`MAX_INSTANT_DIGITS`] digits, and the whole
+/// must fit [`MAX_OCCURRENCE_KEY_BYTES`]. [`AutomationId`] keeps the wider
+/// registry grammar so a row registered before schedules existed stays
+/// readable; [`RegisterAutomation::new`] applies this narrower bound.
+pub const MAX_SCHEDULED_AUTOMATION_ID_BYTES: usize =
+    MAX_OCCURRENCE_KEY_BYTES - OCCURRENCE_KEY_PREFIX.len() - 1 - MAX_INSTANT_DIGITS;
+
+/// Longest canonical rendering of a schedule this lane carries.
+///
+/// `every@` followed by at most [`MAX_INSTANT_DIGITS`] digits. A cron
+/// rendering is longer and is refused before its length matters.
+pub const MAX_AUTOMATION_SCHEDULE_BYTES: usize = "every@".len() + MAX_INSTANT_DIGITS;
+
 /// Maximum automations one listing page may carry.
 ///
-/// Thirty-two rather than the sixty-four [`crate::runs_api`] serves, because an
-/// automation row carries *three* maximal identifiers where a run summary
-/// carries one. The number is derived from the frame arithmetic below and not
-/// chosen: see [`RECORD_OVERHEAD_BYTES`].
+/// Twenty-four rather than the sixty-four [`crate::runs_api`] serves, because an
+/// automation row carries *four* maximal bounded strings — the identity, the
+/// actor, the cause and the scope — where a run summary carries one. The number
+/// is derived from the frame arithmetic below and not chosen: see
+/// [`RECORD_OVERHEAD_BYTES`].
 ///
 /// A page bound is not a paging hint. [`AutomationListPage::new`] refuses a
 /// longer vector rather than truncating it, because a truncated page that still
 /// answers `complete` is a silent drop.
-pub const MAX_AUTOMATION_PAGE_ITEMS: usize = 32;
+pub const MAX_AUTOMATION_PAGE_ITEMS: usize = 24;
 
 /// The two outcomes this protocol can never report.
 ///
@@ -144,12 +218,14 @@ pub const MAX_AUTOMATION_PAGE_ITEMS: usize = 32;
 pub const OUTCOMES_THIS_PROTOCOL_NEVER_PRODUCES: [ActionOutcome; 2] =
     [ActionOutcome::Unknown, ActionOutcome::ResyncRequired];
 
-/// Worst-case canonical bytes of one record, excluding its three identifiers.
+/// Worst-case canonical bytes of one record, excluding its four bounded
+/// strings.
 ///
-/// The eight quoted key names and their punctuation (108), four twenty-digit
-/// integers (80), the longest quoted enablement spelling (10), and the quote
-/// pairs around the three string members (6), rounded up.
-const RECORD_OVERHEAD_BYTES: usize = 224;
+/// The twelve quoted key names and their punctuation (168), six twenty-digit
+/// integers (120), the longest quoted enablement spelling (10), the longest
+/// quoted schedule rendering (27), and the quote pairs around the four string
+/// members (8), rounded up.
+const RECORD_OVERHEAD_BYTES: usize = 352;
 
 /// Worst-case canonical bytes of a page scaffold, excluding its items.
 const BODY_SCAFFOLD_BYTES: usize = 256;
@@ -164,8 +240,18 @@ const ENVELOPE_OVERHEAD_BYTES: usize = 480;
 /// quote or a backslash escapes to two.
 const FIELD_ENCODED_BYTES: usize = 2 * MAX_AUTOMATION_API_FIELD_BYTES;
 
-/// One record carries three of them: the identity, the actor, and the cause.
-const RECORD_FIELDS: usize = 3;
+/// One record carries four of them: the identity, the actor, the cause and the
+/// scope, whose bound is the same number of bytes.
+const RECORD_FIELDS: usize = 4;
+
+/// The prompt a detail read carries beside its record, at its escaped worst
+/// case plus its quoted key.
+const PROMPT_ENCODED_BYTES: usize = 2 * MAX_AUTOMATION_PROMPT_BYTES + 16;
+
+const _: () = assert!(
+    MAX_AUTOMATION_SCOPE_BYTES == MAX_AUTOMATION_API_FIELD_BYTES,
+    "the record arithmetic counts the scope as one more identifier-sized field"
+);
 
 const _: () = assert!(
     MAX_AUTOMATION_PAGE_ITEMS * (RECORD_FIELDS * FIELD_ENCODED_BYTES + RECORD_OVERHEAD_BYTES)
@@ -178,10 +264,17 @@ const _: () = assert!(
 const _: () = assert!(
     RECORD_FIELDS * FIELD_ENCODED_BYTES
         + RECORD_OVERHEAD_BYTES
+        + PROMPT_ENCODED_BYTES
         + BODY_SCAFFOLD_BYTES
         + ENVELOPE_OVERHEAD_BYTES
         <= MAX_AUTOMATION_CANONICAL_BYTES,
     "a maximal automation detail view must fit one automation frame"
+);
+
+const _: () = assert!(
+    OCCURRENCE_KEY_PREFIX.len() + MAX_SCHEDULED_AUTOMATION_ID_BYTES + 1 + MAX_INSTANT_DIGITS
+        <= MAX_OCCURRENCE_KEY_BYTES,
+    "a maximal occurrence key must fit the durable submit lane's key bound"
 );
 
 /// Position of a state in [`ENABLEMENT_STATES`].
@@ -361,6 +454,31 @@ pub enum AutomationApiError {
     /// A conflict named a durable revision equal to the expected one, which is
     /// agreement rather than a conflict.
     ConflictWithoutDisagreement,
+    /// A canonical schedule form this lane cannot evaluate was presented.
+    ///
+    /// Typed rather than folded into an invalid body: the schedule *is*
+    /// canonical, and the refusal names the form the daemon has no evaluator
+    /// for, so an operator learns that cron is not yet supported rather than
+    /// that their expression was malformed.
+    UnsupportedSchedule {
+        /// The canonical form that was refused.
+        kind: &'static str,
+    },
+    /// A schedule expression did not resolve to one canonical schedule.
+    InvalidSchedule,
+    /// A record's job fields disagreed with one another.
+    ///
+    /// A schedule and a scope imply each other, and a next or last execution
+    /// implies a schedule: a row with one half of the job is a row no writer
+    /// produced.
+    JobIncoherent,
+    /// An occurrence key would exceed the durable submit lane's key bound.
+    OccurrenceKeyTooLong {
+        /// Largest key that lane admits.
+        max_bytes: usize,
+    },
+    /// An occurrence key did not have the shape this lane derives.
+    OccurrenceKeyMalformed,
 }
 
 impl AutomationApiError {
@@ -389,6 +507,11 @@ impl AutomationApiError {
             Self::PageOutOfOrder => "automation_page_out_of_order",
             Self::PageOutsideFilter => "automation_page_outside_filter",
             Self::ConflictWithoutDisagreement => "automation_conflict_without_disagreement",
+            Self::UnsupportedSchedule { .. } => "automation_unsupported_schedule",
+            Self::InvalidSchedule => "automation_invalid_schedule",
+            Self::JobIncoherent => "automation_job_incoherent",
+            Self::OccurrenceKeyTooLong { .. } => "automation_occurrence_key_too_long",
+            Self::OccurrenceKeyMalformed => "automation_occurrence_key_malformed",
         }
     }
 }
@@ -467,6 +590,21 @@ impl fmt::Display for AutomationApiError {
             }
             Self::ConflictWithoutDisagreement => {
                 formatter.write_str("a revision conflict named the revision the caller expected")
+            }
+            Self::UnsupportedSchedule { kind } => {
+                write!(formatter, "the {kind} schedule form is not supported")
+            }
+            Self::InvalidSchedule => {
+                formatter.write_str("the expression is not one canonical schedule")
+            }
+            Self::JobIncoherent => {
+                formatter.write_str("a record's schedule, scope and execution fields disagree")
+            }
+            Self::OccurrenceKeyTooLong { max_bytes } => {
+                write!(formatter, "the occurrence key exceeds {max_bytes} bytes")
+            }
+            Self::OccurrenceKeyMalformed => {
+                formatter.write_str("the occurrence key is not automation:<id>:<instant>")
             }
         }
     }
@@ -569,6 +707,378 @@ impl PauseReason {
 }
 
 impl fmt::Display for PauseReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// The serialization scope every occurrence of one automation is submitted
+/// under.
+///
+/// What a scope *is* — a workspace, a conversation, a tenant — is a deployment
+/// decision; what this type fixes is that two occurrences sharing one never
+/// overlap, because the durable scheduler core serializes per scope and the
+/// synthetic lane locks the scope again for the run. The grammar is the
+/// durable submit lane's: non-empty, at most [`MAX_AUTOMATION_SCOPE_BYTES`],
+/// control-free.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AutomationScope(String);
+
+impl AutomationScope {
+    /// Longest scope this protocol carries.
+    pub const MAX_BYTES: usize = MAX_AUTOMATION_SCOPE_BYTES;
+
+    /// Validate and construct a scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationApiError::Field`] for an empty, over-long or
+    /// control-bearing value.
+    pub fn new(value: impl AsRef<str>) -> Result<Self, AutomationApiError> {
+        let value = value.as_ref();
+        crate::primitives::bounded_value(value, MAX_AUTOMATION_SCOPE_BYTES).map_err(|error| {
+            AutomationApiError::Field {
+                field: "scope",
+                error,
+            }
+        })?;
+        Ok(Self(value.to_owned()))
+    }
+
+    /// The validated scope.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AutomationScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// The prompt one occurrence submits as its task.
+///
+/// Free text under the durable submit lane's task rule: non-empty, at most
+/// [`MAX_AUTOMATION_PROMPT_BYTES`], and free of NUL. Newlines are admitted —
+/// a prompt is prose, not an identifier — which is why this does not share
+/// [`AutomationId`]'s control-free grammar.
+///
+/// It grants no provider or external-effect authority. It is the payload the
+/// synthetic lane's run receives, exactly as `automonique submit` hands one
+/// over.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AutomationPrompt(String);
+
+impl AutomationPrompt {
+    /// Longest prompt this protocol carries.
+    pub const MAX_BYTES: usize = MAX_AUTOMATION_PROMPT_BYTES;
+
+    /// Validate and construct a prompt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationApiError::Field`] for an empty or over-long value,
+    /// or one carrying a NUL.
+    pub fn new(value: impl AsRef<str>) -> Result<Self, AutomationApiError> {
+        let value = value.as_ref();
+        let refused = |error| AutomationApiError::Field {
+            field: "prompt",
+            error,
+        };
+        if value.is_empty() {
+            return Err(refused(ValueError::Empty));
+        }
+        if value.len() > MAX_AUTOMATION_PROMPT_BYTES {
+            return Err(refused(ValueError::TooLong {
+                max_bytes: MAX_AUTOMATION_PROMPT_BYTES,
+                actual_bytes: value.len(),
+            }));
+        }
+        if value.contains('\0') {
+            return Err(refused(ValueError::ControlCharacter));
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// The validated prompt.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The schedule forms this lane carries and the daemon evaluates.
+///
+/// A projection of [`crate::automation::CanonicalSchedule`] onto the two forms
+/// that need no timezone database: an exact instant, and a fixed interval. The
+/// cron form is refused by [`AutomationSchedule::from_canonical`] with the
+/// typed [`AutomationApiError::UnsupportedSchedule`] rather than accepted and
+/// never fired. The wire spelling is the canonical rendering itself —
+/// `once@<ms>` or `every@<ms>` — so what an operator previews is what is
+/// stored and what fires.
+///
+/// The occurrence arithmetic lives here rather than in the store or the
+/// daemon so that both derive the same instants:
+///
+/// - [`Self::first_occurrence`] is the instant a fresh registration fires at:
+///   the instant itself for a one-shot, one interval after registration for a
+///   fixed interval.
+/// - [`Self::next_after`] is the instant that follows a firing. A one-shot has
+///   none. A fixed interval that has fallen behind — the daemon was down, or
+///   the automation was paused across several instants — advances to the first
+///   instant *after* `now` and skips the ones between: the oldest due instant
+///   fires once, and a burst of catch-up firings is never produced.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AutomationSchedule {
+    /// Once, at an exact instant.
+    Once {
+        /// When.
+        at: EpochMillis,
+    },
+    /// Every fixed interval, starting one interval after registration.
+    Every {
+        /// The interval.
+        interval: FixedInterval,
+    },
+}
+
+impl AutomationSchedule {
+    /// The canonical spelling of the one-shot form.
+    pub const ONCE: &'static str = "once";
+
+    /// The canonical spelling of the fixed-interval form.
+    pub const EVERY: &'static str = "every";
+
+    /// The canonical spelling of the form this lane refuses.
+    pub const CRON: &'static str = "cron";
+
+    /// A one-shot schedule.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationApiError::TimeBeforeEpoch`] for an instant the
+    /// registry's `next_fire_at_ms >= 0` constraint cannot hold.
+    pub fn once(at: EpochMillis) -> Result<Self, AutomationApiError> {
+        if at.as_millis() < 0 {
+            return Err(AutomationApiError::TimeBeforeEpoch { field: "schedule" });
+        }
+        Ok(Self::Once { at })
+    }
+
+    /// A fixed-interval schedule.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationApiError::InvalidSchedule`] for a non-positive
+    /// interval.
+    pub fn every(interval_ms: i64) -> Result<Self, AutomationApiError> {
+        Ok(Self::Every {
+            interval: FixedInterval::new(interval_ms)
+                .map_err(|_| AutomationApiError::InvalidSchedule)?,
+        })
+    }
+
+    /// Project a canonical schedule onto the forms this lane carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationApiError::UnsupportedSchedule`] for the cron form
+    /// and [`AutomationApiError::TimeBeforeEpoch`] for a one-shot before the
+    /// epoch.
+    pub fn from_canonical(schedule: CanonicalSchedule) -> Result<Self, AutomationApiError> {
+        match schedule {
+            CanonicalSchedule::Once { at } => Self::once(at),
+            CanonicalSchedule::Every { interval } => Ok(Self::Every { interval }),
+            CanonicalSchedule::Cron { .. } => {
+                Err(AutomationApiError::UnsupportedSchedule { kind: Self::CRON })
+            }
+        }
+    }
+
+    /// Parse an operator's expression.
+    ///
+    /// Accepts what [`CanonicalSchedule::parse`] accepts — a canonical
+    /// rendering or one of the recognized natural-language phrases — and then
+    /// projects it. A phrase that resolves to cron (`daily`) is therefore a
+    /// typed [`AutomationApiError::UnsupportedSchedule`], not an ambiguity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationApiError::InvalidSchedule`] for anything that does
+    /// not resolve to exactly one canonical schedule, and the projection's own
+    /// refusals.
+    pub fn parse(expression: &str) -> Result<Self, AutomationApiError> {
+        let canonical = CanonicalSchedule::parse(expression)
+            .map_err(|_| AutomationApiError::InvalidSchedule)?;
+        Self::from_canonical(canonical)
+    }
+
+    /// Read a canonical rendering back.
+    ///
+    /// This is what the wire decoder uses: it accepts exactly what
+    /// [`Self::render`] writes, so an operator's prose has no way onto the wire.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::parse`], for a rendering rather than an expression.
+    pub fn from_rendering(rendered: &str) -> Result<Self, AutomationApiError> {
+        let canonical = CanonicalSchedule::from_rendering(rendered)
+            .map_err(|_| AutomationApiError::InvalidSchedule)?;
+        Self::from_canonical(canonical)
+    }
+
+    /// This schedule in the rich model's own type.
+    #[must_use]
+    pub fn canonical(&self) -> CanonicalSchedule {
+        match self {
+            Self::Once { at } => CanonicalSchedule::Once { at: *at },
+            Self::Every { interval } => CanonicalSchedule::Every {
+                interval: *interval,
+            },
+        }
+    }
+
+    /// The canonical rendering, which is also the wire spelling.
+    #[must_use]
+    pub fn render(&self) -> String {
+        self.canonical().render()
+    }
+
+    /// The canonical spelling of this schedule's form.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Once { .. } => Self::ONCE,
+            Self::Every { .. } => Self::EVERY,
+        }
+    }
+
+    /// The instant a registration at `registered_at` first fires at.
+    ///
+    /// `None` when a fixed interval would carry the instant past the end of
+    /// representable time, which is a schedule that never fires rather than
+    /// one that fires at a wrapped instant.
+    #[must_use]
+    pub fn first_occurrence(&self, registered_at: EpochMillis) -> Option<EpochMillis> {
+        match self {
+            Self::Once { at } => Some(*at),
+            Self::Every { interval } => registered_at
+                .as_millis()
+                .checked_add(interval.as_millis())
+                .map(EpochMillis::from_millis),
+        }
+    }
+
+    /// The instant that follows a firing at `fired_at`, as judged at `now`.
+    ///
+    /// A one-shot has no successor. A fixed interval's successor is the first
+    /// multiple of the interval after `fired_at` that is *later than* `now`:
+    /// when the lane has kept up that is simply the next instant, and when it
+    /// has fallen behind the instants in between are skipped rather than
+    /// fired in a burst.
+    #[must_use]
+    pub fn next_after(&self, fired_at: EpochMillis, now: EpochMillis) -> Option<EpochMillis> {
+        let Self::Every { interval } = self else {
+            return None;
+        };
+        let interval = interval.as_millis();
+        let mut next = fired_at.as_millis().checked_add(interval)?;
+        if next <= now.as_millis() {
+            let behind = now.as_millis() - next;
+            let skipped = (behind / interval).checked_add(1)?;
+            next = next.checked_add(skipped.checked_mul(interval)?)?;
+        }
+        Some(EpochMillis::from_millis(next))
+    }
+}
+
+impl fmt::Display for AutomationSchedule {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.render())
+    }
+}
+
+/// The identity of one firing: `automation:<automation_id>:<instant>`.
+///
+/// This is the idempotency key the occurrence is submitted under on the
+/// durable synthetic lane, and the work identity it is admitted under in the
+/// durable scheduler core. Both dedupe on it, which is what makes "an
+/// occurrence fires at most once" true across a replayed tick, a daemon
+/// restart and a re-elected generation: whoever derives it derives the same
+/// bytes.
+///
+/// The rich model's [`crate::automation::OccurrenceKey`] spells the same fact
+/// as `<id>@<ms>`; this lane's spelling is the one the durable submit lane's
+/// key grammar and namespace discipline call for, and the two are not mixed.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AutomationOccurrenceKey(String);
+
+impl AutomationOccurrenceKey {
+    /// Derive the key for one automation at one instant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationApiError::TimeBeforeEpoch`] for an instant before
+    /// the epoch and [`AutomationApiError::OccurrenceKeyTooLong`] when the
+    /// derived key would not fit the durable submit lane's key bound — which
+    /// [`RegisterAutomation::new`] already rules out for a scheduled identity.
+    pub fn derive(
+        automation_id: &AutomationId,
+        at: EpochMillis,
+    ) -> Result<Self, AutomationApiError> {
+        if at.as_millis() < 0 {
+            return Err(AutomationApiError::TimeBeforeEpoch {
+                field: "occurrence_instant",
+            });
+        }
+        let key = format!(
+            "{OCCURRENCE_KEY_PREFIX}{}:{}",
+            automation_id.as_str(),
+            at.as_millis()
+        );
+        if key.len() > MAX_OCCURRENCE_KEY_BYTES {
+            return Err(AutomationApiError::OccurrenceKeyTooLong {
+                max_bytes: MAX_OCCURRENCE_KEY_BYTES,
+            });
+        }
+        Ok(Self(key))
+    }
+
+    /// Read a key back into the automation and instant it names.
+    ///
+    /// The instant is the trailing canonical decimal, so an identity carrying
+    /// a colon reads back whole: the split is from the right, and an identity
+    /// cannot end in the digits-only tail because a colon separates them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationApiError::OccurrenceKeyMalformed`] for anything
+    /// [`Self::derive`] could not have produced.
+    pub fn parse(key: &str) -> Result<(AutomationId, EpochMillis), AutomationApiError> {
+        const MALFORMED: AutomationApiError = AutomationApiError::OccurrenceKeyMalformed;
+        if key.len() > MAX_OCCURRENCE_KEY_BYTES {
+            return Err(MALFORMED);
+        }
+        let rest = key.strip_prefix(OCCURRENCE_KEY_PREFIX).ok_or(MALFORMED)?;
+        let (identity, instant) = rest.rsplit_once(':').ok_or(MALFORMED)?;
+        let millis = instant.parse::<i64>().map_err(|_| MALFORMED)?;
+        if millis < 0 || millis.to_string() != instant {
+            return Err(MALFORMED);
+        }
+        let automation_id = AutomationId::new(identity).map_err(|_| MALFORMED)?;
+        Ok((automation_id, EpochMillis::from_millis(millis)))
+    }
+
+    /// The derived key.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AutomationOccurrenceKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
     }
@@ -685,27 +1195,60 @@ impl AutomationStateFilter {
     }
 }
 
-/// One automation presented for registration.
+/// One automation job presented for registration.
 ///
 /// The initial enablement is not a field: registration always writes `enabled`
 /// at revision one with no cause, which is
 /// [`crate::automation::AutomationEnablement::newly_declared`]. An operator who
 /// wants a paused automation registers it and pauses it, and the pause then
 /// carries the cause it owes.
+///
+/// The job is the schedule, the scope and the prompt, all three required: a
+/// registration that fires nothing is not a shape this lane offers. Rows
+/// registered before the job existed are still served — see
+/// [`AutomationRecordView::schedule`] — but no new one is written without one.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RegisterAutomation {
     automation_id: AutomationId,
     actor: AutomationActor,
+    schedule: AutomationSchedule,
+    scope: AutomationScope,
+    prompt: AutomationPrompt,
 }
 
 impl RegisterAutomation {
-    /// Declare one automation.
-    #[must_use]
-    pub const fn new(automation_id: AutomationId, actor: AutomationActor) -> Self {
-        Self {
+    /// Declare one automation job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationApiError::Field`] for `automation_id` when the
+    /// identity is longer than [`MAX_SCHEDULED_AUTOMATION_ID_BYTES`]: the
+    /// occurrence key derived from it must fit the durable submit lane's key
+    /// bound, and an identity that cannot fire is refused before a frame is
+    /// spent rather than registered and never fired.
+    pub fn new(
+        automation_id: AutomationId,
+        actor: AutomationActor,
+        schedule: AutomationSchedule,
+        scope: AutomationScope,
+        prompt: AutomationPrompt,
+    ) -> Result<Self, AutomationApiError> {
+        if automation_id.as_str().len() > MAX_SCHEDULED_AUTOMATION_ID_BYTES {
+            return Err(AutomationApiError::Field {
+                field: "automation_id",
+                error: ValueError::TooLong {
+                    max_bytes: MAX_SCHEDULED_AUTOMATION_ID_BYTES,
+                    actual_bytes: automation_id.as_str().len(),
+                },
+            });
+        }
+        Ok(Self {
             automation_id,
             actor,
-        }
+            schedule,
+            scope,
+            prompt,
+        })
     }
 
     /// Identity to register.
@@ -720,6 +1263,24 @@ impl RegisterAutomation {
         &self.actor
     }
 
+    /// When occurrences fire.
+    #[must_use]
+    pub const fn schedule(&self) -> &AutomationSchedule {
+        &self.schedule
+    }
+
+    /// The scope every occurrence is serialized under.
+    #[must_use]
+    pub const fn scope(&self) -> &AutomationScope {
+        &self.scope
+    }
+
+    /// The task every occurrence submits.
+    #[must_use]
+    pub const fn prompt(&self) -> &AutomationPrompt {
+        &self.prompt
+    }
+
     fn to_body(&self) -> JsonValue {
         JsonValue::Object(vec![
             (
@@ -730,15 +1291,33 @@ impl RegisterAutomation {
                 "automation_id".to_owned(),
                 JsonValue::String(self.automation_id.as_str().to_owned()),
             ),
+            (
+                "prompt".to_owned(),
+                JsonValue::String(self.prompt.as_str().to_owned()),
+            ),
+            (
+                "schedule".to_owned(),
+                JsonValue::String(self.schedule.render()),
+            ),
+            (
+                "scope".to_owned(),
+                JsonValue::String(self.scope.as_str().to_owned()),
+            ),
         ])
     }
 
     fn from_body(body: &JsonValue) -> Result<Self, AutomationApiError> {
-        exact_fields(body, &["actor", "automation_id"])?;
-        Ok(Self::new(
+        exact_fields(
+            body,
+            &["actor", "automation_id", "prompt", "schedule", "scope"],
+        )?;
+        Self::new(
             AutomationId::new(required_string(body, "automation_id")?)?,
             actor(&required_string(body, "actor")?)?,
-        ))
+            AutomationSchedule::from_rendering(&required_string(body, "schedule")?)?,
+            AutomationScope::new(required_string(body, "scope")?)?,
+            AutomationPrompt::new(required_string(body, "prompt")?)?,
+        )
     }
 }
 
@@ -1091,6 +1670,11 @@ impl AutomationReceiptView {
 }
 
 /// One validated `automations` row, as a listing or a detail read reports it.
+///
+/// The prompt is deliberately not a column here: at its bound it is thirty
+/// times the size of every other field together, and a listing that carried
+/// it would hold three rows per frame. A detail read carries it beside the
+/// record — see [`AutomationResponse::AutomationDetail`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AutomationRecordView {
     entry_id: u64,
@@ -1101,20 +1685,27 @@ pub struct AutomationRecordView {
     cause: Option<PauseReason>,
     created_at: EpochMillis,
     updated_at: EpochMillis,
+    schedule: Option<AutomationSchedule>,
+    scope: Option<AutomationScope>,
+    next_fire_at: Option<EpochMillis>,
+    last_fired_at: Option<EpochMillis>,
 }
 
 impl AutomationRecordView {
     /// Record one automation, refusing every row this product could not have
     /// written.
     ///
-    /// The same three cross-column invariants the store re-derives on every
-    /// read are re-derived here, because a wire value is read by clients the
-    /// store never sees:
+    /// The same cross-column invariants the store re-derives on every read are
+    /// re-derived here, because a wire value is read by clients the store
+    /// never sees:
     ///
     /// - a withdrawn state and a stated cause imply each other;
     /// - a withdrawn state implies revision two or above, because registration
-    ///   is the only writer of revision one and it always writes `enabled`; and
-    /// - both timestamps are at or after the epoch.
+    ///   is the only writer of revision one and it always writes `enabled`;
+    /// - every timestamp is at or after the epoch; and
+    /// - a schedule and a scope imply each other, and a next or last execution
+    ///   implies a schedule. A row with neither is a registration from before
+    ///   jobs existed: served, listed, and never fired.
     ///
     /// The converse of the second is deliberately not checked: an `enabled` row
     /// above revision one is a *resumed* automation, which is legal and is
@@ -1126,8 +1717,9 @@ impl AutomationRecordView {
     /// [`AutomationApiError::UnwrittenRevision`],
     /// [`AutomationApiError::CauseRequired`],
     /// [`AutomationApiError::CauseForbidden`],
-    /// [`AutomationApiError::WithdrawnAtFirstRevision`] or
-    /// [`AutomationApiError::TimeBeforeEpoch`].
+    /// [`AutomationApiError::WithdrawnAtFirstRevision`],
+    /// [`AutomationApiError::TimeBeforeEpoch`] or
+    /// [`AutomationApiError::JobIncoherent`].
     pub fn new(parts: AutomationRecordParts) -> Result<Self, AutomationApiError> {
         let AutomationRecordParts {
             entry_id,
@@ -1138,6 +1730,10 @@ impl AutomationRecordView {
             cause,
             created_at,
             updated_at,
+            schedule,
+            scope,
+            next_fire_at,
+            last_fired_at,
         } = parts;
         if entry_id == 0 {
             return Err(AutomationApiError::UnwrittenRow { field: "entry_id" });
@@ -1153,15 +1749,20 @@ impl AutomationRecordView {
         if requires_cause(enablement) && revision < 2 {
             return Err(AutomationApiError::WithdrawnAtFirstRevision);
         }
-        if created_at.as_millis() < 0 {
-            return Err(AutomationApiError::TimeBeforeEpoch {
-                field: "created_at_ms",
-            });
+        for (field, instant) in [
+            ("created_at_ms", Some(created_at)),
+            ("updated_at_ms", Some(updated_at)),
+            ("next_fire_at_ms", next_fire_at),
+            ("last_fired_at_ms", last_fired_at),
+        ] {
+            if instant.is_some_and(|instant| instant.as_millis() < 0) {
+                return Err(AutomationApiError::TimeBeforeEpoch { field });
+            }
         }
-        if updated_at.as_millis() < 0 {
-            return Err(AutomationApiError::TimeBeforeEpoch {
-                field: "updated_at_ms",
-            });
+        if schedule.is_some() != scope.is_some()
+            || (schedule.is_none() && (next_fire_at.is_some() || last_fired_at.is_some()))
+        {
+            return Err(AutomationApiError::JobIncoherent);
         }
         Ok(Self {
             entry_id,
@@ -1172,7 +1773,45 @@ impl AutomationRecordView {
             cause,
             created_at,
             updated_at,
+            schedule,
+            scope,
+            next_fire_at,
+            last_fired_at,
         })
+    }
+
+    /// When occurrences fire, or `None` for a row registered before jobs
+    /// existed — which is listed truthfully and fires nothing.
+    #[must_use]
+    pub const fn schedule(&self) -> Option<&AutomationSchedule> {
+        self.schedule.as_ref()
+    }
+
+    /// The scope occurrences are serialized under. `Some` exactly when
+    /// [`Self::schedule`] is.
+    #[must_use]
+    pub const fn scope(&self) -> Option<&AutomationScope> {
+        self.scope.as_ref()
+    }
+
+    /// The instant the next occurrence is due, or `None` when nothing further
+    /// is scheduled: a one-shot that has fired, or a row with no job.
+    #[must_use]
+    pub const fn next_fire_at(&self) -> Option<EpochMillis> {
+        self.next_fire_at
+    }
+
+    /// The scheduled instant of the last occurrence the daemon submitted, or
+    /// `None` when none has been.
+    #[must_use]
+    pub const fn last_fired_at(&self) -> Option<EpochMillis> {
+        self.last_fired_at
+    }
+
+    /// Whether this row carries a job at all.
+    #[must_use]
+    pub const fn is_scheduled(&self) -> bool {
+        self.schedule.is_some()
     }
 
     /// Row identity, monotonic in registration order.
@@ -1226,9 +1865,11 @@ impl AutomationRecordView {
 
     /// Whether the automation may fire.
     ///
-    /// As weak a claim as [`crate::automation::EnablementState::admits_occurrence`]:
-    /// it says the operator has not withdrawn this automation, never that
-    /// anything will run it. Nothing in this build runs one.
+    /// The enablement half of the question, exactly as
+    /// [`crate::automation::EnablementState::admits_occurrence`] answers it: the
+    /// operator has not withdrawn this automation. Whether anything is *due*
+    /// is [`Self::next_fire_at`], and a row with no job admits an occurrence
+    /// it will never have.
     #[must_use]
     pub const fn admits_occurrence(&self) -> bool {
         self.enablement.admits_occurrence()
@@ -1277,8 +1918,12 @@ impl AutomationRecordView {
         }
     }
 
-    fn to_body(&self) -> Result<JsonValue, AutomationApiError> {
-        Ok(JsonValue::Object(vec![
+    /// The record's members, in canonical key order.
+    ///
+    /// One list for both the page item and the detail body, so the two cannot
+    /// disagree about a column; the detail body appends its prompt to this.
+    fn body_members(&self) -> Result<Vec<(String, JsonValue)>, AutomationApiError> {
+        Ok(vec![
             (
                 "actor".to_owned(),
                 JsonValue::String(self.actor.as_str().to_owned()),
@@ -1303,31 +1948,76 @@ impl AutomationRecordView {
                 JsonValue::String(self.enablement.as_str().to_owned()),
             ),
             ("entry_id".to_owned(), integer("entry_id", self.entry_id)?),
+            (
+                "last_fired_at_ms".to_owned(),
+                optional_instant(self.last_fired_at),
+            ),
+            (
+                "next_fire_at_ms".to_owned(),
+                optional_instant(self.next_fire_at),
+            ),
             ("revision".to_owned(), integer("revision", self.revision)?),
+            (
+                "schedule".to_owned(),
+                self.schedule.as_ref().map_or(JsonValue::Null, |schedule| {
+                    JsonValue::String(schedule.render())
+                }),
+            ),
+            (
+                "scope".to_owned(),
+                self.scope.as_ref().map_or(JsonValue::Null, |scope| {
+                    JsonValue::String(scope.as_str().to_owned())
+                }),
+            ),
             (
                 "updated_at_ms".to_owned(),
                 JsonValue::Integer(self.updated_at.as_millis()),
             ),
-        ]))
+        ])
     }
 
-    fn from_body(body: &JsonValue) -> Result<Self, AutomationApiError> {
-        exact_fields(
-            body,
-            &[
-                "actor",
-                "automation_id",
-                "cause",
-                "created_at_ms",
-                "enablement",
-                "entry_id",
-                "revision",
-                "updated_at_ms",
-            ],
-        )?;
+    /// The exact key set a record body carries.
+    const FIELDS: [&'static str; 12] = [
+        "actor",
+        "automation_id",
+        "cause",
+        "created_at_ms",
+        "enablement",
+        "entry_id",
+        "last_fired_at_ms",
+        "next_fire_at_ms",
+        "revision",
+        "schedule",
+        "scope",
+        "updated_at_ms",
+    ];
+
+    fn to_body(&self) -> Result<JsonValue, AutomationApiError> {
+        Ok(JsonValue::Object(self.body_members()?))
+    }
+
+    /// Read the record members out of a body that may carry more than them.
+    ///
+    /// The caller has already judged the exact key set, so this reads by name
+    /// and never by position.
+    fn from_members(body: &JsonValue) -> Result<Self, AutomationApiError> {
         let cause = match body.get("cause") {
             Some(JsonValue::Null) => None,
             Some(JsonValue::String(_)) => Some(PauseReason::new(required_string(body, "cause")?)?),
+            _ => return Err(AutomationApiError::InvalidBody),
+        };
+        let schedule = match body.get("schedule") {
+            Some(JsonValue::Null) => None,
+            Some(JsonValue::String(rendered)) => {
+                Some(AutomationSchedule::from_rendering(rendered)?)
+            }
+            _ => return Err(AutomationApiError::InvalidBody),
+        };
+        let scope = match body.get("scope") {
+            Some(JsonValue::Null) => None,
+            Some(JsonValue::String(_)) => {
+                Some(AutomationScope::new(required_string(body, "scope")?)?)
+            }
             _ => return Err(AutomationApiError::InvalidBody),
         };
         Self::new(AutomationRecordParts {
@@ -1339,14 +2029,23 @@ impl AutomationRecordView {
             cause,
             created_at: EpochMillis::from_millis(signed(body, "created_at_ms")?),
             updated_at: EpochMillis::from_millis(signed(body, "updated_at_ms")?),
+            schedule,
+            scope,
+            next_fire_at: optional_signed(body, "next_fire_at_ms")?.map(EpochMillis::from_millis),
+            last_fired_at: optional_signed(body, "last_fired_at_ms")?.map(EpochMillis::from_millis),
         })
+    }
+
+    fn from_body(body: &JsonValue) -> Result<Self, AutomationApiError> {
+        exact_fields(body, &Self::FIELDS)?;
+        Self::from_members(body)
     }
 }
 
-/// The eight columns one automation row carries.
+/// The twelve columns one automation row carries.
 ///
-/// A parameter object rather than eight positional arguments: two `u64`
-/// revisions and two `EpochMillis` instants sit beside one another, and a
+/// A parameter object rather than twelve positional arguments: two `u64`
+/// revisions and four `EpochMillis` instants sit beside one another, and a
 /// transposed pair would type-check.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AutomationRecordParts {
@@ -1366,6 +2065,15 @@ pub struct AutomationRecordParts {
     pub created_at: EpochMillis,
     /// When its enablement last changed.
     pub updated_at: EpochMillis,
+    /// When occurrences fire. `None` for a row registered before jobs existed.
+    pub schedule: Option<AutomationSchedule>,
+    /// The scope occurrences are serialized under. `Some` exactly when
+    /// `schedule` is.
+    pub scope: Option<AutomationScope>,
+    /// The instant the next occurrence is due, when one is.
+    pub next_fire_at: Option<EpochMillis>,
+    /// The scheduled instant of the last submitted occurrence, when one was.
+    pub last_fired_at: Option<EpochMillis>,
 }
 
 /// Whether a page is the end of the listing.
@@ -1763,11 +2471,19 @@ pub enum AutomationResponse {
         page: AutomationListPage,
     },
     /// One automation in full.
+    ///
+    /// The prompt travels here and only here: a listing omits it because at
+    /// its bound it dwarfs every other column, and a detail read is the one
+    /// answer an operator asks for one row at a time. `Some` exactly when the
+    /// record carries a job; [`AutomationResponse::detail`] refuses the other
+    /// pairings and the decoder re-decides them.
     AutomationDetail {
         /// Correlation identifier from the request.
         request_id: RequestId,
         /// The record.
         record: AutomationRecordView,
+        /// The task every occurrence submits, when the record has a job.
+        prompt: Option<AutomationPrompt>,
     },
     /// The caller's expected revision did not match the durable one. Nothing
     /// was written.
@@ -1805,11 +2521,12 @@ impl AutomationResponse {
     ///
     /// A delivered read is `completed`: there is no later completion to wait
     /// for. A landed write is `accepted` rather than `completed`, and the
-    /// distinction is the honest one — the durable row *is* committed, but what
-    /// the row authorizes has not happened and cannot: no scheduler reads it
-    /// and no executor exists. `accepted` says "recorded"; `completed` would
-    /// say the decision took effect, which would be a claim about a component
-    /// this release does not contain.
+    /// distinction is the honest one — the durable row *is* committed, and what
+    /// it authorizes happens later and elsewhere: the scheduler worker reads
+    /// the row on its next tick, and an occurrence it derives is a run with
+    /// its own durable outcome. `accepted` says "recorded"; `completed` would
+    /// say the decision took effect, which no write on this lane can know at
+    /// the moment it answers.
     ///
     /// See [`OUTCOMES_THIS_PROTOCOL_NEVER_PRODUCES`] for the two this protocol
     /// cannot produce and why.
@@ -1854,6 +2571,29 @@ impl AutomationResponse {
             return Err(AutomationApiError::PageOutsideFilter);
         }
         Ok(Self::AutomationList { request_id, page })
+    }
+
+    /// Answer a detail read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationApiError::JobIncoherent`] when the prompt and the
+    /// record's job disagree about whether there is one: a scheduled row with
+    /// no prompt would be a job that submits nothing, and a prompt on a row
+    /// with no schedule would be a task nothing ever fires.
+    pub fn detail(
+        request_id: RequestId,
+        record: AutomationRecordView,
+        prompt: Option<AutomationPrompt>,
+    ) -> Result<Self, AutomationApiError> {
+        if record.is_scheduled() != prompt.is_some() {
+            return Err(AutomationApiError::JobIncoherent);
+        }
+        Ok(Self::AutomationDetail {
+            request_id,
+            record,
+            prompt,
+        })
     }
 
     /// Report a stale expected revision.
@@ -1901,10 +2641,32 @@ impl AutomationResponse {
                 envelope(request_id.clone(), "automation_list_result")?,
                 page.to_body()?,
             )),
-            Self::AutomationDetail { request_id, record } => Ok(Message::new(
-                envelope(request_id.clone(), "automation_detail_result")?,
-                record.to_body()?,
-            )),
+            Self::AutomationDetail {
+                request_id,
+                record,
+                prompt,
+            } => {
+                let mut members = record.body_members()?;
+                // Canonical key order: `prompt` sorts between `next_fire_at_ms`
+                // and `revision`, and the codec insists on the sorted order.
+                let position = members
+                    .iter()
+                    .position(|(name, _)| name.as_str() > "prompt")
+                    .unwrap_or(members.len());
+                members.insert(
+                    position,
+                    (
+                        "prompt".to_owned(),
+                        prompt.as_ref().map_or(JsonValue::Null, |prompt| {
+                            JsonValue::String(prompt.as_str().to_owned())
+                        }),
+                    ),
+                );
+                Ok(Message::new(
+                    envelope(request_id.clone(), "automation_detail_result")?,
+                    JsonValue::Object(members),
+                ))
+            }
             Self::Conflict {
                 request_id,
                 expected_revision,
@@ -1952,10 +2714,24 @@ impl AutomationResponse {
                 request_id,
                 page: AutomationListPage::from_body(message.body())?,
             }),
-            "automation_detail_result" => Ok(Self::AutomationDetail {
-                request_id,
-                record: AutomationRecordView::from_body(message.body())?,
-            }),
+            "automation_detail_result" => {
+                let mut fields: Vec<&str> = AutomationRecordView::FIELDS.to_vec();
+                fields.push("prompt");
+                exact_fields(message.body(), &fields)?;
+                let prompt = match message.body().get("prompt") {
+                    Some(JsonValue::Null) => None,
+                    Some(JsonValue::String(_)) => Some(AutomationPrompt::new(required_string(
+                        message.body(),
+                        "prompt",
+                    )?)?),
+                    _ => return Err(AutomationApiError::InvalidBody),
+                };
+                Self::detail(
+                    request_id,
+                    AutomationRecordView::from_members(message.body())?,
+                    prompt,
+                )
+            }
             "revision_conflict" => {
                 exact_fields(message.body(), &["durable_revision", "expected_revision"])?;
                 Self::conflict(
@@ -2022,6 +2798,24 @@ fn signed(body: &JsonValue, field: &'static str) -> Result<i64, AutomationApiErr
     body.get(field)
         .and_then(JsonValue::as_integer)
         .ok_or(AutomationApiError::InvalidBody)
+}
+
+/// A member that is always present and is either an integer or `null`.
+fn optional_signed(
+    body: &JsonValue,
+    field: &'static str,
+) -> Result<Option<i64>, AutomationApiError> {
+    match body.get(field) {
+        Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::Integer(value)) => Ok(Some(*value)),
+        _ => Err(AutomationApiError::InvalidBody),
+    }
+}
+
+fn optional_instant(instant: Option<EpochMillis>) -> JsonValue {
+    instant.map_or(JsonValue::Null, |instant| {
+        JsonValue::Integer(instant.as_millis())
+    })
 }
 
 fn required_string(body: &JsonValue, field: &'static str) -> Result<String, AutomationApiError> {

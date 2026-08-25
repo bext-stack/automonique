@@ -11,13 +11,18 @@
 use std::fs;
 use std::path::PathBuf;
 
-use automonique_protocol::automation::{AutomationActor, AutomationEnablement, EnablementState};
+use automonique_protocol::automation::{
+    AutomationActor, AutomationEnablement, CanonicalSchedule, DstPolicy, EnablementState,
+};
 use automonique_protocol::automation_api::{
     AUTOMATION_API_SCHEMA_V1, AUTOMATION_PROTOCOL, AutomationApiError, AutomationContinuation,
-    AutomationCursor, AutomationId, AutomationListPage, AutomationPageSize, AutomationReceiptView,
-    AutomationRecordParts, AutomationRecordView, AutomationRefusal, AutomationRequest,
-    AutomationResponse, AutomationStateFilter, ENABLEMENT_STATES, ListAutomations,
+    AutomationCursor, AutomationId, AutomationListPage, AutomationOccurrenceKey,
+    AutomationPageSize, AutomationPrompt, AutomationReceiptView, AutomationRecordParts,
+    AutomationRecordView, AutomationRefusal, AutomationRequest, AutomationResponse,
+    AutomationSchedule, AutomationScope, AutomationStateFilter, ENABLEMENT_STATES, ListAutomations,
     MAX_AUTOMATION_API_FIELD_BYTES, MAX_AUTOMATION_CANONICAL_BYTES, MAX_AUTOMATION_PAGE_ITEMS,
+    MAX_AUTOMATION_PROMPT_BYTES, MAX_AUTOMATION_SCOPE_BYTES, MAX_OCCURRENCE_KEY_BYTES,
+    MAX_SCHEDULED_AUTOMATION_ID_BYTES, OCCURRENCE_KEY_PREFIX,
     OUTCOMES_THIS_PROTOCOL_NEVER_PRODUCES, PauseReason, RegisterAutomation, SetEnablement,
     decode_enablement, permits_transition, requires_cause,
 };
@@ -42,7 +47,32 @@ fn why(value: &str) -> PauseReason {
     PauseReason::new(value).expect("valid cause")
 }
 
-/// One record at whatever coordinates a test needs.
+fn every(interval_ms: i64) -> AutomationSchedule {
+    AutomationSchedule::every(interval_ms).expect("valid interval")
+}
+
+fn scope(value: &str) -> AutomationScope {
+    AutomationScope::new(value).expect("valid scope")
+}
+
+fn prompt(value: &str) -> AutomationPrompt {
+    AutomationPrompt::new(value).expect("valid prompt")
+}
+
+/// A registration carrying one representative job.
+fn registration(automation: &str) -> RegisterAutomation {
+    RegisterAutomation::new(
+        id(automation),
+        who("ben"),
+        every(60_000),
+        scope("workspace:reports"),
+        prompt("summarize the night"),
+    )
+    .expect("a scheduled registration")
+}
+
+/// One record at whatever coordinates a test needs, with no job: the shape of
+/// a row registered before schedules existed.
 fn record(
     entry_id: u64,
     automation: &str,
@@ -60,8 +90,31 @@ fn record(
         cause: cause.map(why),
         created_at: EpochMillis::from_millis(1_700_000_000_000),
         updated_at: EpochMillis::from_millis(1_700_000_001_000),
+        schedule: None,
+        scope: None,
+        next_fire_at: None,
+        last_fired_at: None,
     })
     .expect("coherent record")
+}
+
+/// One scheduled record: enabled, at revision one, due once and fired never.
+fn scheduled(entry_id: u64, automation: &str) -> AutomationRecordView {
+    AutomationRecordView::new(AutomationRecordParts {
+        entry_id,
+        automation_id: id(automation),
+        revision: 1,
+        enablement: EnablementState::Enabled,
+        actor: who("ben"),
+        cause: None,
+        created_at: EpochMillis::from_millis(1_700_000_000_000),
+        updated_at: EpochMillis::from_millis(1_700_000_000_000),
+        schedule: Some(every(60_000)),
+        scope: Some(scope("workspace:reports")),
+        next_fire_at: Some(EpochMillis::from_millis(1_700_000_060_000)),
+        last_fired_at: None,
+    })
+    .expect("coherent scheduled record")
 }
 
 /// A freshly registered automation: enabled, revision one, no cause.
@@ -369,7 +422,19 @@ mod framing {
         for request in [
             AutomationRequest::RegisterAutomation {
                 request_id: request_id(),
-                registration: RegisterAutomation::new(id("nightly-report"), who("ben")),
+                registration: registration("nightly-report"),
+            },
+            AutomationRequest::RegisterAutomation {
+                request_id: request_id(),
+                registration: RegisterAutomation::new(
+                    id("nightly-report"),
+                    who("ben"),
+                    AutomationSchedule::once(EpochMillis::from_millis(1_700_000_000_000))
+                        .expect("valid instant"),
+                    scope("workspace:reports"),
+                    prompt("a prompt\nwith a newline"),
+                )
+                .expect("a one-shot registration"),
             },
             AutomationRequest::SetEnablement {
                 request_id: request_id(),
@@ -443,6 +508,21 @@ mod framing {
                     "dana",
                     Some("superseded"),
                 ),
+                prompt: None,
+            },
+            AutomationResponse::detail(
+                request_id(),
+                scheduled(5, "nightly-report"),
+                Some(prompt("summarize the night")),
+            )
+            .expect("a coherent detail"),
+            AutomationResponse::AutomationList {
+                request_id: request_id(),
+                page: AutomationListPage::new(
+                    vec![scheduled(1, "a"), enabled(2, "b")],
+                    AutomationContinuation::Complete,
+                )
+                .expect("a page mixing scheduled and unscheduled rows"),
             },
             AutomationResponse::conflict(request_id(), 1, 4).expect("conflict"),
             AutomationResponse::Refused {
@@ -488,9 +568,9 @@ mod framing {
     fn a_body_that_is_not_the_exact_declared_shape_is_refused() {
         for payload in [
             // register: extra member.
-            br#"{"body":{"actor":"ben","automation_id":"a","schedule":"daily"},"kind":"register_automation","protocol":"automonique.automation","request_id":"r","version":1}"#.as_slice(),
-            // register: missing member.
-            br#"{"body":{"automation_id":"a"},"kind":"register_automation","protocol":"automonique.automation","request_id":"r","version":1}"#.as_slice(),
+            br#"{"body":{"actor":"ben","automation_id":"a","prompt":"p","schedule":"every@1000","scope":"s","trigger":"manual"},"kind":"register_automation","protocol":"automonique.automation","request_id":"r","version":1}"#.as_slice(),
+            // register: missing members — the job is not optional.
+            br#"{"body":{"actor":"ben","automation_id":"a"},"kind":"register_automation","protocol":"automonique.automation","request_id":"r","version":1}"#.as_slice(),
             // set_enablement: missing `cause`, which is required *as a member*
             // even when its value is null.
             br#"{"body":{"actor":"ben","automation_id":"a","expected_revision":1,"target":"enabled"},"kind":"set_enablement","protocol":"automonique.automation","request_id":"r","version":1}"#.as_slice(),
@@ -507,6 +587,31 @@ mod framing {
         }
     }
 
+    /// A detail answer without its `prompt` member is not a record that
+    /// happens to lack a prompt; it is a body of the wrong shape. And a page
+    /// item carrying one is a record of the wrong shape the other way.
+    #[test]
+    fn a_detail_answer_carries_its_prompt_member_even_when_null() {
+        let without = br#"{"body":{"actor":"ben","automation_id":"a","cause":null,"created_at_ms":0,"enablement":"enabled","entry_id":1,"last_fired_at_ms":null,"next_fire_at_ms":null,"revision":1,"schedule":null,"scope":null,"updated_at_ms":0},"kind":"automation_detail_result","protocol":"automonique.automation","request_id":"r","version":1}"#;
+        assert_eq!(
+            AutomationResponse::from_canonical_bytes(without),
+            Err(AutomationApiError::InvalidBody),
+        );
+        let with_null = br#"{"body":{"actor":"ben","automation_id":"a","cause":null,"created_at_ms":0,"enablement":"enabled","entry_id":1,"last_fired_at_ms":null,"next_fire_at_ms":null,"prompt":null,"revision":1,"schedule":null,"scope":null,"updated_at_ms":0},"kind":"automation_detail_result","protocol":"automonique.automation","request_id":"r","version":1}"#;
+        let AutomationResponse::AutomationDetail { record, prompt, .. } =
+            AutomationResponse::from_canonical_bytes(with_null).expect("an unscheduled detail")
+        else {
+            panic!("a detail answer decoded as something else")
+        };
+        assert!(!record.is_scheduled());
+        assert_eq!(prompt, None);
+        let page = br#"{"body":{"automations":[{"actor":"ben","automation_id":"a","cause":null,"created_at_ms":0,"enablement":"enabled","entry_id":1,"last_fired_at_ms":null,"next_fire_at_ms":null,"prompt":null,"revision":1,"schedule":null,"scope":null,"updated_at_ms":0}],"more":false,"next_cursor":null},"kind":"automation_list_result","protocol":"automonique.automation","request_id":"r","version":1}"#;
+        assert_eq!(
+            AutomationResponse::from_canonical_bytes(page),
+            Err(AutomationApiError::InvalidBody),
+        );
+    }
+
     #[test]
     fn a_refusal_word_this_build_does_not_define_fails_closed() {
         let payload = br#"{"body":{"refusal":"not_authorized"},"kind":"refused","protocol":"automonique.automation","request_id":"r","version":1}"#;
@@ -520,8 +625,8 @@ mod framing {
 
     /// The compile-time frame arithmetic, measured rather than restated.
     ///
-    /// A maximal page is built from real records carrying three maximal
-    /// identifiers each, encoded by the real codec and framed the way the
+    /// A maximal page is built from real records carrying four maximal
+    /// bounded strings each, encoded by the real codec and framed the way the
     /// socket frames it. Restating the constant would prove only that the
     /// constant equals itself.
     #[test]
@@ -529,6 +634,7 @@ mod framing {
         // Every byte a quote, which JSON-escapes to two: the worst case the
         // arithmetic budgets for.
         let long = "\"".repeat(MAX_AUTOMATION_API_FIELD_BYTES);
+        let long_scope = "\"".repeat(MAX_AUTOMATION_SCOPE_BYTES);
         let maximal = |entry_id: u64| {
             AutomationRecordView::new(AutomationRecordParts {
                 entry_id,
@@ -539,6 +645,10 @@ mod framing {
                 cause: Some(why(&long)),
                 created_at: EpochMillis::from_millis(i64::MAX),
                 updated_at: EpochMillis::from_millis(i64::MAX),
+                schedule: Some(every(i64::MAX)),
+                scope: Some(scope(&long_scope)),
+                next_fire_at: Some(EpochMillis::from_millis(i64::MAX)),
+                last_fired_at: Some(EpochMillis::from_millis(i64::MAX)),
             })
             .expect("maximal record")
         };
@@ -586,6 +696,48 @@ mod framing {
         assert!(
             frame.len() <= MAX_AUTOMATION_CANONICAL_BYTES,
             "a maximal transition framed to {} bytes",
+            frame.len(),
+        );
+
+        // And a detail read, which is the one answer that carries the prompt.
+        let payload = AutomationResponse::detail(
+            RequestId::new("r".repeat(RequestId::MAX_BYTES)).expect("request id"),
+            maximal(1),
+            Some(prompt(&"\"".repeat(MAX_AUTOMATION_PROMPT_BYTES))),
+        )
+        .expect("a coherent detail")
+        .to_message()
+        .expect("encodable")
+        .to_canonical_bytes();
+        let mut frame = Vec::new();
+        encode_frame(&payload, &mut frame).expect("a maximal detail fits one frame");
+        assert!(
+            frame.len() <= MAX_AUTOMATION_CANONICAL_BYTES,
+            "a maximal detail framed to {} bytes",
+            frame.len(),
+        );
+
+        // And the largest registration, whose identity is bounded by the key
+        // it must derive rather than by the identity grammar.
+        let payload = AutomationRequest::RegisterAutomation {
+            request_id: RequestId::new("r".repeat(RequestId::MAX_BYTES)).expect("request id"),
+            registration: RegisterAutomation::new(
+                id(&"\"".repeat(MAX_SCHEDULED_AUTOMATION_ID_BYTES)),
+                who(&long),
+                every(i64::MAX),
+                scope(&long_scope),
+                prompt(&"\"".repeat(MAX_AUTOMATION_PROMPT_BYTES)),
+            )
+            .expect("maximal registration"),
+        }
+        .to_message()
+        .expect("encodable")
+        .to_canonical_bytes();
+        let mut frame = Vec::new();
+        encode_frame(&payload, &mut frame).expect("a maximal registration fits one frame");
+        assert!(
+            frame.len() <= MAX_AUTOMATION_CANONICAL_BYTES,
+            "a maximal registration framed to {} bytes",
             frame.len(),
         );
     }
@@ -675,6 +827,10 @@ mod coupling {
             cause: cause.map(why),
             created_at: EpochMillis::EPOCH,
             updated_at: EpochMillis::EPOCH,
+            schedule: None,
+            scope: None,
+            next_fire_at: None,
+            last_fired_at: None,
         };
         assert_eq!(
             AutomationRecordView::new(parts(EnablementState::Paused, 2, None)),
@@ -946,6 +1102,7 @@ mod outcomes {
             AutomationResponse::AutomationDetail {
                 request_id: request_id(),
                 record: enabled(1, "a"),
+                prompt: None,
             }
             .outcome(),
             ActionOutcome::Completed,
@@ -981,6 +1138,7 @@ mod outcomes {
             AutomationResponse::AutomationDetail {
                 request_id: request_id(),
                 record: enabled(1, "a"),
+                prompt: None,
             },
             AutomationResponse::conflict(request_id(), 1, 2).expect("conflict"),
             AutomationResponse::Refused {
@@ -1057,7 +1215,7 @@ mod outcomes {
         assert!(
             AutomationRequest::RegisterAutomation {
                 request_id: request_id(),
-                registration: RegisterAutomation::new(id("a"), who("ben")),
+                registration: registration("a"),
             }
             .is_mutation()
         );
@@ -1161,6 +1319,10 @@ mod bounds {
                 cause: None,
                 created_at: EpochMillis::EPOCH,
                 updated_at: EpochMillis::EPOCH,
+                schedule: None,
+                scope: None,
+                next_fire_at: None,
+                last_fired_at: None,
             }),
             Err(AutomationApiError::UnwrittenRow { field: "entry_id" }),
         );
@@ -1184,6 +1346,10 @@ mod bounds {
                     cause: None,
                     created_at: EpochMillis::from_millis(-1),
                     updated_at: EpochMillis::EPOCH,
+                    schedule: None,
+                    scope: None,
+                    next_fire_at: None,
+                    last_fired_at: None,
                 },
             ),
             (
@@ -1197,6 +1363,44 @@ mod bounds {
                     cause: None,
                     created_at: EpochMillis::EPOCH,
                     updated_at: EpochMillis::from_millis(-1),
+                    schedule: None,
+                    scope: None,
+                    next_fire_at: None,
+                    last_fired_at: None,
+                },
+            ),
+            (
+                "next_fire_at_ms",
+                AutomationRecordParts {
+                    entry_id: 1,
+                    automation_id: id("a"),
+                    revision: 1,
+                    enablement: EnablementState::Enabled,
+                    actor: who("ben"),
+                    cause: None,
+                    created_at: EpochMillis::EPOCH,
+                    updated_at: EpochMillis::EPOCH,
+                    schedule: Some(every(1_000)),
+                    scope: Some(scope("s")),
+                    next_fire_at: Some(EpochMillis::from_millis(-1)),
+                    last_fired_at: None,
+                },
+            ),
+            (
+                "last_fired_at_ms",
+                AutomationRecordParts {
+                    entry_id: 1,
+                    automation_id: id("a"),
+                    revision: 1,
+                    enablement: EnablementState::Enabled,
+                    actor: who("ben"),
+                    cause: None,
+                    created_at: EpochMillis::EPOCH,
+                    updated_at: EpochMillis::EPOCH,
+                    schedule: Some(every(1_000)),
+                    scope: Some(scope("s")),
+                    next_fire_at: None,
+                    last_fired_at: Some(EpochMillis::from_millis(-1)),
                 },
             ),
         ] {
@@ -1220,6 +1424,11 @@ mod bounds {
             AutomationApiError::PageOutOfOrder.category(),
             AutomationApiError::PageOutsideFilter.category(),
             AutomationApiError::ConflictWithoutDisagreement.category(),
+            AutomationApiError::UnsupportedSchedule { kind: "cron" }.category(),
+            AutomationApiError::InvalidSchedule.category(),
+            AutomationApiError::JobIncoherent.category(),
+            AutomationApiError::OccurrenceKeyTooLong { max_bytes: 0 }.category(),
+            AutomationApiError::OccurrenceKeyMalformed.category(),
         ];
         let mut unique = categories.to_vec();
         unique.sort_unstable();
@@ -1231,5 +1440,453 @@ mod bounds {
                 "{category} is not namespaced to this lane",
             );
         }
+    }
+}
+
+/// The job: schedule, scope, prompt, and the occurrence key they derive.
+mod job {
+    use super::*;
+
+    #[test]
+    fn a_schedule_round_trips_through_its_canonical_rendering() {
+        for (schedule, rendering) in [
+            (every(60_000), "every@60000"),
+            (
+                AutomationSchedule::once(EpochMillis::from_millis(1_700_000_000_000))
+                    .expect("instant"),
+                "once@1700000000000",
+            ),
+            (
+                AutomationSchedule::once(EpochMillis::EPOCH).expect("the epoch itself"),
+                "once@0",
+            ),
+        ] {
+            assert_eq!(schedule.render(), rendering);
+            assert_eq!(schedule.to_string(), rendering);
+            assert_eq!(
+                AutomationSchedule::from_rendering(rendering).expect("its own rendering"),
+                schedule,
+            );
+            assert_eq!(
+                AutomationSchedule::parse(rendering).expect("a rendering is an expression"),
+                schedule,
+            );
+            // The projection is lossless in both directions.
+            assert_eq!(
+                AutomationSchedule::from_canonical(schedule.canonical()).expect("projected"),
+                schedule,
+            );
+            assert_eq!(
+                CanonicalSchedule::from_rendering(rendering).expect("canonical"),
+                schedule.canonical(),
+            );
+        }
+        assert_eq!(every(1).kind(), "every");
+        assert_eq!(
+            AutomationSchedule::once(EpochMillis::EPOCH)
+                .expect("instant")
+                .kind(),
+            "once"
+        );
+    }
+
+    #[test]
+    fn the_recognized_phrases_resolve_and_prose_does_not() {
+        assert_eq!(
+            AutomationSchedule::parse("hourly").expect("hourly"),
+            every(60 * 60 * 1_000)
+        );
+        assert_eq!(
+            AutomationSchedule::parse("every hour").expect("every hour"),
+            every(60 * 60 * 1_000)
+        );
+        for prose in [
+            "",
+            "soon",
+            "every@",
+            "every@-1",
+            "every@0",
+            "every@+5",
+            "every@007",
+            "once@",
+            "once@1.5",
+            "once@ 5",
+            "weekly",
+        ] {
+            assert_eq!(
+                AutomationSchedule::parse(prose),
+                Err(AutomationApiError::InvalidSchedule),
+                "{prose:?} resolved to a schedule",
+            );
+        }
+        assert_eq!(
+            AutomationSchedule::once(EpochMillis::from_millis(-1)),
+            Err(AutomationApiError::TimeBeforeEpoch { field: "schedule" }),
+        );
+        assert_eq!(
+            AutomationSchedule::from_rendering("once@-1"),
+            Err(AutomationApiError::TimeBeforeEpoch { field: "schedule" }),
+        );
+    }
+
+    /// Cron is canonical and is refused anyway, by name.
+    #[test]
+    fn a_cron_schedule_is_refused_with_a_typed_unsupported_refusal() {
+        let cron = CanonicalSchedule::cron("0 0 * * *", "UTC", DstPolicy::SkipMissingFireFirst)
+            .expect("a canonical cron schedule");
+        assert_eq!(
+            AutomationSchedule::from_canonical(cron.clone()),
+            Err(AutomationApiError::UnsupportedSchedule { kind: "cron" }),
+        );
+        assert_eq!(
+            AutomationSchedule::from_rendering(&cron.render()),
+            Err(AutomationApiError::UnsupportedSchedule { kind: "cron" }),
+        );
+        // `daily` is a recognized phrase that resolves to cron, so it is
+        // unsupported rather than ambiguous.
+        assert_eq!(
+            AutomationSchedule::parse("daily"),
+            Err(AutomationApiError::UnsupportedSchedule { kind: "cron" }),
+        );
+        // And a hand-rolled frame carrying one is refused by the decoder under
+        // the same typed category, never admitted as a job that fires nothing.
+        let payload = br#"{"body":{"actor":"ben","automation_id":"a","prompt":"p","schedule":"cron@0 0 * * *@UTC@skip_missing_fire_first","scope":"s"},"kind":"register_automation","protocol":"automonique.automation","request_id":"r","version":1}"#;
+        assert_eq!(
+            AutomationRequest::from_canonical_bytes(payload),
+            Err(AutomationApiError::UnsupportedSchedule { kind: "cron" }),
+        );
+        assert_eq!(
+            AutomationApiError::UnsupportedSchedule { kind: "cron" }.category(),
+            "automation_unsupported_schedule"
+        );
+    }
+
+    #[test]
+    fn the_first_occurrence_is_the_instant_or_one_interval_after_registration() {
+        let registered = EpochMillis::from_millis(1_000);
+        assert_eq!(
+            every(250).first_occurrence(registered),
+            Some(EpochMillis::from_millis(1_250))
+        );
+        let at = EpochMillis::from_millis(5);
+        assert_eq!(
+            AutomationSchedule::once(at)
+                .expect("instant")
+                .first_occurrence(registered),
+            Some(at),
+            "a one-shot fires at its instant whenever it was registered",
+        );
+        assert_eq!(
+            every(i64::MAX).first_occurrence(registered),
+            None,
+            "an interval past the end of time never fires rather than wrapping",
+        );
+    }
+
+    /// The catch-up policy: the oldest due instant fires once, the instants
+    /// the lane missed are skipped, and the successor is the first one after
+    /// `now`.
+    #[test]
+    fn the_next_occurrence_skips_what_was_missed_and_never_bursts() {
+        let interval = every(10);
+        let fired = EpochMillis::from_millis(100);
+        let at = |ms| EpochMillis::from_millis(ms);
+        // Kept up: the very next instant.
+        assert_eq!(interval.next_after(fired, at(100)), Some(at(110)));
+        assert_eq!(interval.next_after(fired, at(109)), Some(at(110)));
+        // Exactly on the successor: `now` is not later than it, so skip it.
+        assert_eq!(interval.next_after(fired, at(110)), Some(at(120)));
+        // Far behind: 110, 120, 130 are skipped and 140 is first after 135.
+        assert_eq!(interval.next_after(fired, at(135)), Some(at(140)));
+        assert_eq!(interval.next_after(fired, at(140)), Some(at(150)));
+        // The successor is always strictly later than `now`, on the grid, and
+        // never further than one interval past `now` once the lane is behind.
+        for now in 90..200 {
+            let next = interval.next_after(fired, at(now)).expect("a successor");
+            assert!(next.as_millis() > now, "next {next:?} is not after {now}");
+            assert_eq!((next.as_millis() - fired.as_millis()) % 10, 0);
+            if now >= 110 {
+                assert!(
+                    next.as_millis() - now <= 10,
+                    "a whole interval was skipped needlessly at {now}"
+                );
+            } else {
+                assert_eq!(
+                    next,
+                    at(110),
+                    "ahead of schedule, the successor is simply next"
+                );
+            }
+        }
+        // A one-shot has no successor.
+        assert_eq!(
+            AutomationSchedule::once(fired)
+                .expect("instant")
+                .next_after(fired, at(5_000)),
+            None
+        );
+        // Past the end of time is exhaustion, not a wrapped instant.
+        assert_eq!(
+            every(10).next_after(EpochMillis::from_millis(i64::MAX - 5), at(0)),
+            None
+        );
+    }
+
+    #[test]
+    fn an_occurrence_key_is_derived_from_the_identity_and_instant_alone() {
+        let instant = EpochMillis::from_millis(1_700_000_000_000);
+        let key = AutomationOccurrenceKey::derive(&id("nightly-report"), instant).expect("a key");
+        assert_eq!(key.as_str(), "automation:nightly-report:1700000000000");
+        assert_eq!(key.to_string(), key.as_str());
+        assert!(key.as_str().starts_with(OCCURRENCE_KEY_PREFIX));
+        // The same inputs derive the same bytes: that is the whole property.
+        assert_eq!(
+            AutomationOccurrenceKey::derive(&id("nightly-report"), instant).expect("a key"),
+            key,
+        );
+        // And it reads back, including an identity carrying a colon: the
+        // instant is the trailing decimal, split from the right.
+        assert_eq!(
+            AutomationOccurrenceKey::parse(key.as_str()).expect("its own key"),
+            (id("nightly-report"), instant),
+        );
+        let colon =
+            AutomationOccurrenceKey::derive(&id("ws:reports:nightly"), EpochMillis::from_millis(7))
+                .expect("a key");
+        assert_eq!(colon.as_str(), "automation:ws:reports:nightly:7");
+        assert_eq!(
+            AutomationOccurrenceKey::parse(colon.as_str()).expect("split from the right"),
+            (id("ws:reports:nightly"), EpochMillis::from_millis(7)),
+        );
+        for malformed in [
+            "",
+            "automation:",
+            "automation:a",
+            "automation:a:",
+            "automation::5",
+            "automation:a:-5",
+            "automation:a:05",
+            "automation:a:+5",
+            "automation:a:5 ",
+            "automatio:a:5",
+            "a:5",
+        ] {
+            assert_eq!(
+                AutomationOccurrenceKey::parse(malformed),
+                Err(AutomationApiError::OccurrenceKeyMalformed),
+                "{malformed:?} parsed as an occurrence key",
+            );
+        }
+        assert_eq!(
+            AutomationOccurrenceKey::derive(&id("a"), EpochMillis::from_millis(-1)),
+            Err(AutomationApiError::TimeBeforeEpoch {
+                field: "occurrence_instant"
+            }),
+        );
+    }
+
+    /// The key fits the durable submit lane's bound, and the identity bound
+    /// that guarantees it is the derived one.
+    #[test]
+    fn a_scheduled_identity_is_bounded_by_the_key_it_must_derive() {
+        assert_eq!(
+            MAX_SCHEDULED_AUTOMATION_ID_BYTES,
+            MAX_OCCURRENCE_KEY_BYTES - OCCURRENCE_KEY_PREFIX.len() - 1 - 19,
+        );
+        assert!(MAX_SCHEDULED_AUTOMATION_ID_BYTES < MAX_AUTOMATION_API_FIELD_BYTES);
+        let widest = "a".repeat(MAX_SCHEDULED_AUTOMATION_ID_BYTES);
+        let key = AutomationOccurrenceKey::derive(&id(&widest), EpochMillis::from_millis(i64::MAX))
+            .expect("the widest identity at the latest instant still fits");
+        assert_eq!(key.as_str().len(), MAX_OCCURRENCE_KEY_BYTES);
+        let over = "a".repeat(MAX_SCHEDULED_AUTOMATION_ID_BYTES + 1);
+        assert_eq!(
+            AutomationOccurrenceKey::derive(&id(&over), EpochMillis::from_millis(i64::MAX)),
+            Err(AutomationApiError::OccurrenceKeyTooLong {
+                max_bytes: MAX_OCCURRENCE_KEY_BYTES
+            }),
+        );
+        // The registration is where an operator meets the bound: an identity
+        // the registry could hold but the lane could never fire is refused
+        // before a frame is spent.
+        assert!(
+            RegisterAutomation::new(id(&widest), who("ben"), every(1), scope("s"), prompt("p"))
+                .is_ok()
+        );
+        assert!(matches!(
+            RegisterAutomation::new(id(&over), who("ben"), every(1), scope("s"), prompt("p")),
+            Err(AutomationApiError::Field {
+                field: "automation_id",
+                error: automonique_protocol::primitives::ValueError::TooLong { .. },
+            }),
+        ));
+        // And the wire re-decides it.
+        let payload = format!(
+            r#"{{"body":{{"actor":"ben","automation_id":"{over}","prompt":"p","schedule":"every@1","scope":"s"}},"kind":"register_automation","protocol":"automonique.automation","request_id":"r","version":1}}"#
+        );
+        assert!(matches!(
+            AutomationRequest::from_canonical_bytes(payload.as_bytes()),
+            Err(AutomationApiError::Field {
+                field: "automation_id",
+                ..
+            }),
+        ));
+    }
+
+    #[test]
+    fn the_scope_and_prompt_carry_the_durable_submit_lane_s_bounds() {
+        assert_eq!(
+            MAX_AUTOMATION_SCOPE_BYTES,
+            automonique_protocol::admin::MAX_SYNTHETIC_SCOPE_BYTES
+        );
+        assert_eq!(
+            MAX_AUTOMATION_PROMPT_BYTES,
+            automonique_protocol::admin::MAX_SYNTHETIC_TASK_BYTES
+        );
+        assert_eq!(
+            MAX_OCCURRENCE_KEY_BYTES,
+            automonique_protocol::admin::MAX_SYNTHETIC_KEY_BYTES
+        );
+        assert_eq!(AutomationScope::MAX_BYTES, MAX_AUTOMATION_SCOPE_BYTES);
+        assert_eq!(AutomationPrompt::MAX_BYTES, MAX_AUTOMATION_PROMPT_BYTES);
+
+        // A scope is an identifier: control-free.
+        assert!(AutomationScope::new("a".repeat(MAX_AUTOMATION_SCOPE_BYTES)).is_ok());
+        for bad in ["", "ws\n1", &"a".repeat(MAX_AUTOMATION_SCOPE_BYTES + 1)] {
+            assert!(
+                matches!(
+                    AutomationScope::new(bad),
+                    Err(AutomationApiError::Field { field: "scope", .. })
+                ),
+                "{bad:?} was admitted as a scope",
+            );
+        }
+
+        // A prompt is prose: a newline is text, a NUL is not.
+        assert_eq!(prompt("line one\nline two").as_str(), "line one\nline two");
+        assert!(AutomationPrompt::new("a".repeat(MAX_AUTOMATION_PROMPT_BYTES)).is_ok());
+        for bad in ["", "a\0b", &"a".repeat(MAX_AUTOMATION_PROMPT_BYTES + 1)] {
+            assert!(
+                matches!(
+                    AutomationPrompt::new(bad),
+                    Err(AutomationApiError::Field {
+                        field: "prompt",
+                        ..
+                    })
+                ),
+                "{bad:?} was admitted as a prompt",
+            );
+        }
+        // The same lane's own constructor agrees on every one of them.
+        for (scope_text, task) in [("s", "p"), ("s", "line one\nline two")] {
+            assert!(
+                automonique_protocol::admin::SyntheticSubmission::new(scope_text, "k", task)
+                    .is_ok()
+            );
+        }
+        assert!(automonique_protocol::admin::SyntheticSubmission::new("s", "k", "a\0b").is_err());
+        assert!(automonique_protocol::admin::SyntheticSubmission::new("ws\n1", "k", "p").is_err());
+    }
+
+    #[test]
+    fn a_record_s_job_fields_imply_one_another() {
+        let parts = |schedule: Option<AutomationSchedule>,
+                     scope_text: Option<&str>,
+                     next: Option<i64>,
+                     last: Option<i64>| AutomationRecordParts {
+            entry_id: 1,
+            automation_id: id("a"),
+            revision: 1,
+            enablement: EnablementState::Enabled,
+            actor: who("ben"),
+            cause: None,
+            created_at: EpochMillis::EPOCH,
+            updated_at: EpochMillis::EPOCH,
+            schedule,
+            scope: scope_text.map(scope),
+            next_fire_at: next.map(EpochMillis::from_millis),
+            last_fired_at: last.map(EpochMillis::from_millis),
+        };
+        for incoherent in [
+            parts(Some(every(1)), None, None, None),
+            parts(None, Some("s"), None, None),
+            parts(None, None, Some(1), None),
+            parts(None, None, None, Some(1)),
+        ] {
+            assert_eq!(
+                AutomationRecordView::new(incoherent),
+                Err(AutomationApiError::JobIncoherent)
+            );
+        }
+        let bare = AutomationRecordView::new(parts(None, None, None, None)).expect("no job");
+        assert!(!bare.is_scheduled());
+        assert_eq!(bare.next_fire_at(), None);
+        assert!(
+            bare.admits_occurrence(),
+            "enablement is the other half of the question"
+        );
+        let exhausted = AutomationRecordView::new(parts(Some(every(1)), Some("s"), None, Some(9)))
+            .expect("a fired job with nothing further scheduled");
+        assert!(exhausted.is_scheduled());
+        assert_eq!(exhausted.last_fired_at(), Some(EpochMillis::from_millis(9)));
+        assert_eq!(exhausted.scope().map(AutomationScope::as_str), Some("s"));
+        assert_eq!(exhausted.schedule(), Some(&every(1)));
+
+        // The wire re-decides the coupling.
+        let scope_without_schedule = br#"{"body":{"automations":[{"actor":"ben","automation_id":"a","cause":null,"created_at_ms":0,"enablement":"enabled","entry_id":1,"last_fired_at_ms":null,"next_fire_at_ms":null,"revision":1,"schedule":null,"scope":"s","updated_at_ms":0}],"more":false,"next_cursor":null},"kind":"automation_list_result","protocol":"automonique.automation","request_id":"r","version":1}"#;
+        assert_eq!(
+            AutomationResponse::from_canonical_bytes(scope_without_schedule),
+            Err(AutomationApiError::JobIncoherent),
+        );
+    }
+
+    #[test]
+    fn a_detail_s_prompt_and_its_record_s_job_imply_one_another() {
+        assert_eq!(
+            AutomationResponse::detail(request_id(), scheduled(1, "a"), None),
+            Err(AutomationApiError::JobIncoherent),
+        );
+        assert_eq!(
+            AutomationResponse::detail(request_id(), enabled(1, "a"), Some(prompt("p"))),
+            Err(AutomationApiError::JobIncoherent),
+        );
+        let answer = AutomationResponse::detail(request_id(), scheduled(1, "a"), Some(prompt("p")))
+            .expect("coherent");
+        let payload = answer.to_message().expect("encode").to_canonical_bytes();
+        let text = std::str::from_utf8(&payload).expect("canonical JSON is UTF-8");
+        assert!(text.contains(
+            r#""next_fire_at_ms":1700000060000,"prompt":"p","revision":1,"schedule":"every@60000","scope":"workspace:reports""#
+        ));
+        assert_eq!(
+            AutomationResponse::from_canonical_bytes(&payload).expect("decode"),
+            answer
+        );
+        // A prompt on an unscheduled record is refused on the way in too.
+        let prompt_without_job = br#"{"body":{"actor":"ben","automation_id":"a","cause":null,"created_at_ms":0,"enablement":"enabled","entry_id":1,"last_fired_at_ms":null,"next_fire_at_ms":null,"prompt":"p","revision":1,"schedule":null,"scope":null,"updated_at_ms":0},"kind":"automation_detail_result","protocol":"automonique.automation","request_id":"r","version":1}"#;
+        assert_eq!(
+            AutomationResponse::from_canonical_bytes(prompt_without_job),
+            Err(AutomationApiError::JobIncoherent),
+        );
+    }
+
+    #[test]
+    fn a_registration_carries_its_job_in_canonical_order() {
+        let payload = AutomationRequest::RegisterAutomation {
+            request_id: request_id(),
+            registration: registration("nightly-report"),
+        }
+        .to_message()
+        .expect("encode")
+        .to_canonical_bytes();
+        assert_eq!(
+            std::str::from_utf8(&payload).expect("UTF-8"),
+            r#"{"body":{"actor":"ben","automation_id":"nightly-report","prompt":"summarize the night","schedule":"every@60000","scope":"workspace:reports"},"kind":"register_automation","protocol":"automonique.automation","request_id":"automation-1","version":1}"#,
+        );
+        let decoded = AutomationRequest::from_canonical_bytes(&payload).expect("decode");
+        let AutomationRequest::RegisterAutomation { registration, .. } = decoded else {
+            panic!("a registration decoded as something else")
+        };
+        assert_eq!(registration.schedule(), &every(60_000));
+        assert_eq!(registration.scope().as_str(), "workspace:reports");
+        assert_eq!(registration.prompt().as_str(), "summarize the night");
     }
 }

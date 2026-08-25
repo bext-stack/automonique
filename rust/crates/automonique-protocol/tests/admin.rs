@@ -1716,8 +1716,9 @@ mod local_dispatch {
     use automonique_protocol::automation::{AutomationActor, EnablementState};
     use automonique_protocol::automation_api::{
         AUTOMATION_PROTOCOL, AutomationApiError, AutomationCursor, AutomationId,
-        AutomationPageSize, AutomationRequest, AutomationStateFilter, ListAutomations,
-        MAX_AUTOMATION_CANONICAL_BYTES, PauseReason, RegisterAutomation, SetEnablement,
+        AutomationPageSize, AutomationPrompt, AutomationRequest, AutomationSchedule,
+        AutomationScope, AutomationStateFilter, ListAutomations, MAX_AUTOMATION_CANONICAL_BYTES,
+        PauseReason, RegisterAutomation, SetEnablement,
     };
     use automonique_protocol::batch_api::{
         AdvanceMember, BATCH_CONTROL_PROTOCOL, BatchApiError, BatchCursor, BatchPageSize,
@@ -1833,7 +1834,11 @@ mod local_dispatch {
                 registration: RegisterAutomation::new(
                     automation_id("nightly-report"),
                     AutomationActor::new("ben").expect("actor"),
-                ),
+                    AutomationSchedule::every(60_000).expect("interval"),
+                    AutomationScope::new("workspace:reports").expect("scope"),
+                    AutomationPrompt::new("summarize the night").expect("prompt"),
+                )
+                .expect("a scheduled registration"),
             },
             AutomationRequest::SetEnablement {
                 request_id: request_id(),
