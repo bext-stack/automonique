@@ -87,9 +87,10 @@ use automonique_slack_connector::{
     HomeView, MAX_PAGE_LIMIT, MessageBlocks, MessagePage, MessageText, MessageTs, ModalView,
     OpenViewRequest, PostMessageRequest, PublishViewRequest, SlackAppToken, SlackBase, SlackClient,
     SlackErrorKind, SlackFailure, SlackMessage, SlackOutcome, SlackRejection,
-    SlackSocketModeConnector, SlackToken, SlackUser, SocketModeFailure, StartStreamRequest,
-    StopStreamRequest, StreamChunks, StreamMessage, StreamText, TriggerId, UpdateMessageRequest,
-    UserId, UsersInfoRequest,
+    SlackSocketModeConnector, SlackSocketUrl, SlackToken, SlackUser, SocketModeConnection,
+    SocketModeEnvelope, SocketModeFailure, StartStreamRequest, StopStreamRequest, StreamChunks,
+    StreamMessage, StreamText, SynchronousWebSocket, TriggerId, UpdateMessageRequest, UserId,
+    UsersInfoRequest,
 };
 use automonique_store::agent_memory::{
     AgentMemoryStore, ConversationScope, ExternalIdentity, MessageInput, redact_content,
@@ -164,6 +165,32 @@ const MAX_CHANNEL_TICKET_AUDIT_PAGES: usize = 20;
 const SLACK_TICKET_STATUS_POLL: Duration = Duration::from_secs(3);
 /// Most outstanding ticket jobs one Socket Mode cadence may inspect.
 const MAX_SLACK_TICKET_STATUS_POLLS: usize = 8;
+/// How long the Socket Mode worker blocks in one idle envelope read before it
+/// returns to observe its stop flag.
+///
+/// This is the worker's shutdown cadence and nothing else. A read that ends in
+/// silence is [`SlackReceiveDisposition::Idle`] — the websocket is kept and
+/// read again — so shortening it changes how often the worker looks at `stop`,
+/// not how the connection is judged. Connect, the TLS and websocket handshakes
+/// and every write, a pong included, keep the connector's full
+/// [`automonique_slack_connector::SOCKET_MODE_IO_TIMEOUT_SECONDS`] ceiling.
+///
+/// Two seconds is chosen because:
+///
+/// - it is the daemon's existing bound for one blocking transport wait (the
+///   admin socket, progress endpoint and attempt-adoption listeners all use a
+///   2 s I/O timeout), so `slack_tickets` drains on the same scale as every
+///   other worker group instead of being the last one by a 10 s read;
+/// - it sits well inside the 20 s per-worker drain diagnostic budget and the
+///   unit's 90 s `TimeoutStopSec`, leaving both for real work rather than
+///   for an idle read that has nothing to finish;
+/// - it is shorter than [`SLACK_TICKET_STATUS_POLL`], so the terminal-job
+///   monitor is still governed by its own 3 s throttle and never by the read
+///   cadence; and
+/// - an idle wake-up every 2 s is one bounded syscall return on a socket that
+///   would otherwise be parked, which is not a measurable cost against the
+///   pings Slack already sends on the same connection.
+const SLACK_SOCKET_SHUTDOWN_CADENCE: Duration = Duration::from_secs(2);
 
 /// Independently staged Slack product capabilities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4864,9 +4891,85 @@ pub(crate) fn replay_slack_trace(
     Ok(recorder.envelopes())
 }
 
-pub(crate) struct SlackTicketWorker {
+/// One established Socket Mode websocket as the ticket worker drives it.
+///
+/// Exactly the two operations the worker performs on a connection, so a test
+/// can stand in a silent loopback socket without reaching Slack.
+pub(crate) trait SlackSocketConnection {
+    fn receive_envelope(&mut self) -> Result<SocketModeEnvelope, SocketModeFailure>;
+    fn acknowledge(&mut self, envelope_id: &str) -> Result<(), SocketModeFailure>;
+}
+
+impl<S: SynchronousWebSocket> SlackSocketConnection for SocketModeConnection<S> {
+    fn receive_envelope(&mut self) -> Result<SocketModeEnvelope, SocketModeFailure> {
+        Self::receive_envelope(self)
+    }
+
+    fn acknowledge(&mut self, envelope_id: &str) -> Result<(), SocketModeFailure> {
+        Self::acknowledge(self, envelope_id)
+    }
+}
+
+/// The two-step Socket Mode transport the ticket worker drives.
+///
+/// Production pairs `apps.connections.open` with the Rustls connector. The
+/// steps stay separate on the trait because the worker re-checks its stop
+/// flag between them: a temporary URL obtained after a stop must not be spent
+/// on a websocket this generation will never read.
+pub(crate) trait SlackSocketTransport: Send {
+    /// Obtain one temporary Socket Mode URL, or `None` when Slack refused or
+    /// the request failed; the worker backs off either way.
+    fn open_url(&mut self) -> Option<SlackSocketUrl>;
+
+    /// Open one bounded websocket to a URL from [`Self::open_url`].
+    fn connect(
+        &mut self,
+        url: &SlackSocketUrl,
+    ) -> Result<Box<dyn SlackSocketConnection>, SocketModeFailure>;
+}
+
+/// The production transport: an app-level token against `apps.connections.open`
+/// and the Rustls connector paced at [`SLACK_SOCKET_SHUTDOWN_CADENCE`].
+struct LiveSlackSocketTransport {
     app: AppsConnectionsOpenClient,
     connector: SlackSocketModeConnector,
+}
+
+impl LiveSlackSocketTransport {
+    fn new(app_token: SlackAppToken) -> Self {
+        Self {
+            app: AppsConnectionsOpenClient::new(app_token),
+            connector: slack_socket_connector(),
+        }
+    }
+}
+
+/// The connector every production Socket Mode connection is opened with:
+/// idle reads at the shutdown cadence, everything else at the I/O ceiling.
+fn slack_socket_connector() -> SlackSocketModeConnector {
+    SlackSocketModeConnector::with_read_cadence(SLACK_SOCKET_SHUTDOWN_CADENCE)
+}
+
+impl SlackSocketTransport for LiveSlackSocketTransport {
+    fn open_url(&mut self) -> Option<SlackSocketUrl> {
+        match self.app.open() {
+            Ok(SlackOutcome::Accepted(url)) => Some(url),
+            Ok(SlackOutcome::Rejected(_)) | Err(_) => None,
+        }
+    }
+
+    fn connect(
+        &mut self,
+        url: &SlackSocketUrl,
+    ) -> Result<Box<dyn SlackSocketConnection>, SocketModeFailure> {
+        self.connector
+            .connect(url)
+            .map(|connection| Box::new(connection) as Box<dyn SlackSocketConnection>)
+    }
+}
+
+pub(crate) struct SlackTicketWorker {
+    transport: Box<dyn SlackSocketTransport>,
     router: SlackTicketRouter<LiveSlackTicketPoster>,
     memory: AgentMemoryStore,
     interactions: SlackInteractionStore,
@@ -5097,8 +5200,7 @@ impl SlackTicketHost {
         Ok(Self::Configured {
             prepared: Some(Box::new(SlackTicketWorker {
                 legacy,
-                app: AppsConnectionsOpenClient::new(app_token),
-                connector: SlackSocketModeConnector::new(),
+                transport: Box::new(LiveSlackSocketTransport::new(app_token)),
                 memory: AgentMemoryStore::open(state_dir.join("agent-memory.sqlite3"))
                     .map_err(|_| SlackConfigError::TicketActionsUnavailable)?,
                 interactions: SlackInteractionStore::open(
@@ -5217,12 +5319,9 @@ impl Drop for SlackTicketHost {
 
 fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
     while !stop.load(Ordering::Acquire) {
-        let url = match worker.app.open() {
-            Ok(SlackOutcome::Accepted(url)) => url,
-            Ok(SlackOutcome::Rejected(_)) | Err(_) => {
-                slack_backoff(stop);
-                continue;
-            }
+        let Some(url) = worker.transport.open_url() else {
+            slack_backoff(stop);
+            continue;
         };
         // A stop may arrive while apps.connections.open is in flight. Do not
         // spend a second network deadline connecting a URL this generation
@@ -5230,7 +5329,7 @@ fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
         if stop.load(Ordering::Acquire) {
             break;
         }
-        let Ok(mut connection) = worker.connector.connect(&url) else {
+        let Ok(mut connection) = worker.transport.connect(&url) else {
             slack_backoff(stop);
             continue;
         };
@@ -5243,10 +5342,13 @@ fn run_slack_ticket_worker(worker: &mut SlackTicketWorker, stop: &AtomicBool) {
         while !stop.load(Ordering::Acquire) {
             let envelope = match slack_receive_disposition(connection.receive_envelope()) {
                 SlackReceiveDisposition::Envelope(envelope) => envelope,
-                // The connector's bounded read timeout is also the worker's
-                // shutdown cadence. Silence is not a failed Socket Mode
-                // connection: keep the established websocket and check the
-                // stop flag again instead of churning apps.connections.open.
+                // An idle read returns at [`SLACK_SOCKET_SHUTDOWN_CADENCE`],
+                // which is the worker's shutdown cadence and is independent
+                // of the connector's write and handshake ceiling. Silence is
+                // not a failed Socket Mode connection: keep the established
+                // websocket and check the stop flag again instead of churning
+                // apps.connections.open. The notification poll below keeps
+                // its own, longer throttle.
                 SlackReceiveDisposition::Idle => {
                     poll_slack_ticket_notifications(worker, stop);
                     continue;
@@ -6246,8 +6348,12 @@ fn streaming_is_unsupported(rejection: &SlackRejection) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
-    use automonique_slack_connector::{MessageTs, SlackErrorCode};
+    use automonique_slack_connector::{
+        MessageTs, SOCKET_MODE_IO_TIMEOUT_SECONDS, SlackErrorCode, SocketFrame, SocketIoFailure,
+    };
 
     const SECRET: &str = "xoxb-0000000000-fixture-secret-never-print";
 
@@ -8207,6 +8313,162 @@ mod tests {
                 "{failure:?}"
             );
         }
+    }
+
+    /// A websocket that never speaks: every read sleeps for exactly the
+    /// deadline it was asked to honour and then reports silence, which is what
+    /// a parked production socket does at its kernel read timeout.
+    struct IdleSocket {
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl SynchronousWebSocket for IdleSocket {
+        fn receive(&mut self, timeout: Duration) -> Result<SocketFrame, SocketIoFailure> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(timeout);
+            Err(SocketIoFailure::TimedOut)
+        }
+
+        fn send(&mut self, _frame: SocketFrame, _timeout: Duration) -> Result<(), SocketIoFailure> {
+            Ok(())
+        }
+    }
+
+    /// A transport that hands out silent connections paced exactly as the
+    /// production connector paces them.
+    struct IdleSocketTransport {
+        reads: Arc<AtomicUsize>,
+        connects: Arc<AtomicUsize>,
+    }
+
+    impl SlackSocketTransport for IdleSocketTransport {
+        fn open_url(&mut self) -> Option<SlackSocketUrl> {
+            Some(
+                SlackSocketUrl::new("wss://wss.slack.com/link/?ticket=fixture")
+                    .expect("fixture socket URL"),
+            )
+        }
+
+        fn connect(
+            &mut self,
+            _url: &SlackSocketUrl,
+        ) -> Result<Box<dyn SlackSocketConnection>, SocketModeFailure> {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            let connector = slack_socket_connector();
+            Ok(Box::new(SocketModeConnection::with_timeouts(
+                IdleSocket {
+                    reads: Arc::clone(&self.reads),
+                },
+                connector.timeout(),
+                connector.read_cadence(),
+            )))
+        }
+    }
+
+    /// A worker whose only live part is the transport it is given.
+    fn idle_ticket_worker(root: &Path, transport: IdleSocketTransport) -> SlackTicketWorker {
+        // A loopback origin nothing listens on: an idle connection never
+        // posts, and were a regression to make it try, the call would fail on
+        // this host rather than reach Slack.
+        let client = Arc::new(SlackClient::new(
+            SlackBase::new("http://127.0.0.1:9").expect("loopback base"),
+            SlackToken::new(SECRET.as_bytes().to_vec()).expect("fixture token"),
+        ));
+        SlackTicketWorker {
+            transport: Box::new(transport),
+            router: SlackTicketRouter {
+                poster: LiveSlackTicketPoster::new(client),
+                manage: Box::new(FakeManage::default()),
+                manage_url: None,
+                memory_tenant: String::from("primary"),
+                channels: ChannelMap(Vec::new()),
+                admins: Vec::new(),
+                members: Vec::new(),
+                features: Vec::new(),
+                interactive_decisions: false,
+                gates: Arc::new(std::sync::Mutex::new(
+                    crate::telegram_bridge::TicketGateRegistry::default(),
+                )),
+                github_actions: None,
+                approvals: None,
+                approval_lane: None,
+                question_answerer: None,
+            },
+            memory: AgentMemoryStore::open(root.join("agent-memory.sqlite3"))
+                .expect("memory store"),
+            interactions: SlackInteractionStore::open(
+                root.join("slack-ticket-interactions.sqlite3"),
+            )
+            .expect("interaction store"),
+            generation_canary: None,
+            last_ticket_status_poll: None,
+            legacy: None,
+        }
+    }
+
+    #[test]
+    fn production_socket_connector_paces_idle_reads_under_the_full_ceiling() {
+        let connector = slack_socket_connector();
+        let ceiling = Duration::from_secs(SOCKET_MODE_IO_TIMEOUT_SECONDS);
+        assert_eq!(connector.read_cadence(), SLACK_SOCKET_SHUTDOWN_CADENCE);
+        assert_eq!(connector.timeout(), ceiling);
+        // The cadence is a shutdown property, not a throttle: it must sit
+        // under the notification poll so the poll keeps its own 3 s throttle,
+        // and under the ceiling so it actually shortens an idle read.
+        assert!(SLACK_SOCKET_SHUTDOWN_CADENCE < SLACK_TICKET_STATUS_POLL);
+        assert!(SLACK_SOCKET_SHUTDOWN_CADENCE < ceiling);
+    }
+
+    #[test]
+    fn begin_shutdown_joins_an_idle_socket_mode_worker_within_the_cadence() {
+        let root = tempfile::tempdir().expect("state directory");
+        std::fs::set_permissions(
+            root.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("private state root");
+        let reads = Arc::new(AtomicUsize::new(0));
+        let connects = Arc::new(AtomicUsize::new(0));
+        let worker = idle_ticket_worker(
+            root.path(),
+            IdleSocketTransport {
+                reads: Arc::clone(&reads),
+                connects: Arc::clone(&connects),
+            },
+        );
+        let mut host = SlackTicketHost::Configured {
+            prepared: Some(Box::new(worker)),
+            stop: Arc::new(AtomicBool::new(false)),
+            worker: None,
+            approvals_enabled: false,
+        };
+        host.start().expect("worker starts");
+
+        // Wait until the worker is parked inside an idle read, which is the
+        // state a production drain finds it in.
+        let armed = Instant::now();
+        while reads.load(Ordering::SeqCst) == 0 {
+            assert!(
+                armed.elapsed() < Duration::from_secs(5),
+                "worker never entered an idle read"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let signalled = Instant::now();
+        let handle = host.begin_shutdown().expect("running worker handle");
+        handle.join().expect("worker thread");
+        let drained = signalled.elapsed();
+
+        // At most the one idle read already in flight plus scheduling. The
+        // former 10 s read ceiling fails this bound by a wide margin, and a
+        // second cadence tick would mean the stop was looked at and missed.
+        let bound = SLACK_SOCKET_SHUTDOWN_CADENCE * 2;
+        assert!(drained < bound, "drain took {drained:?}, bound {bound:?}");
+        // The stop was honoured on the established websocket rather than by
+        // reconnecting, and a second begin_shutdown has nothing left to hand out.
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+        assert!(host.begin_shutdown().is_none());
     }
 
     #[test]
