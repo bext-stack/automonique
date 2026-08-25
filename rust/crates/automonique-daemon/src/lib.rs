@@ -107,7 +107,7 @@ use automonique_protocol::platform::{
     Capabilities as PlatformCapabilities, Freshness, FreshnessState, PlatformAction,
     PlatformMethod, PlatformRequest, PlatformResponse, PlatformText, PlatformTransport,
     ReceiptOutcome, ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
-    ResourceRecord, SessionList, SessionRecord, Snapshot,
+    ResourceRecord, SessionHistoryPage, SessionHistoryResync, SessionList, SessionRecord, Snapshot,
 };
 use automonique_protocol::platform_api::{
     MAX_PLATFORM_REQUEST_CANONICAL_BYTES, PlatformRequestMessage, PlatformResponseMessage,
@@ -3595,10 +3595,11 @@ impl Daemon {
             PlatformRequest::Execute(request) => {
                 self.platform_execute(request, &snapshot, now_ms)?
             }
-            PlatformRequest::GetReceipt(request) => match self
-                .platform
-                .receipt(request.id.as_ref(), request.idempotency_key.as_ref())
-            {
+            PlatformRequest::GetReceipt(request) => match self.platform.receipt(
+                request.id.as_ref(),
+                request.idempotency_key.as_ref(),
+                request.client.as_ref(),
+            ) {
                 Ok(receipt) => PlatformResponse::Receipt(receipt),
                 Err(error) => platform_store_response(&error),
             },
@@ -3635,6 +3636,12 @@ impl Daemon {
                         )
                     }
                 }
+            }
+            PlatformRequest::SessionHistorySnapshot(request) => {
+                self.platform_session_history_snapshot(&request.session, request.limit)?
+            }
+            PlatformRequest::SessionHistoryPage(request) => {
+                self.platform_session_history(&request.session, request.after, request.limit)?
             }
             PlatformRequest::Attach(request) => {
                 self.refresh_platform_sessions(now_ms)?;
@@ -3706,6 +3713,90 @@ impl Daemon {
         stream.write_all(&frame)?;
         stream.flush()?;
         Ok(())
+    }
+
+    fn platform_session_history(
+        &self,
+        session: &ResourceCoordinate,
+        after: u64,
+        limit: u16,
+    ) -> Result<PlatformResponse, DaemonError> {
+        use managed_sessions::ManagedHistoryRead;
+        let read = self
+            .managed_sessions
+            .history(session.id.as_str(), after, limit)
+            .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+        match read {
+            ManagedHistoryRead::Page {
+                events,
+                head: _,
+                has_more,
+            } => {
+                let terminal = events.last().map_or(
+                    after,
+                    automonique_protocol::platform::SessionHistoryEvent::cursor,
+                );
+                Ok(PlatformResponse::SessionHistory(
+                    SessionHistoryPage::new(
+                        session.clone(),
+                        limit,
+                        limit,
+                        after,
+                        terminal,
+                        has_more,
+                        events,
+                    )
+                    .map_err(|_| DaemonError::ProtocolRefused("platform_session_history"))?,
+                ))
+            }
+            ManagedHistoryRead::Resync {
+                snapshot_from,
+                snapshot_to,
+            } => Ok(PlatformResponse::SessionHistoryResync(
+                SessionHistoryResync::new(session.clone(), snapshot_from, snapshot_to)
+                    .map_err(|_| DaemonError::ProtocolRefused("platform_session_history"))?,
+            )),
+        }
+    }
+
+    fn platform_session_history_snapshot(
+        &self,
+        session: &ResourceCoordinate,
+        limit: u16,
+    ) -> Result<PlatformResponse, DaemonError> {
+        use managed_sessions::ManagedHistoryRead;
+        let read = self
+            .managed_sessions
+            .history_snapshot(session.id.as_str(), limit)
+            .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+        match read {
+            ManagedHistoryRead::Page {
+                events, has_more, ..
+            } => {
+                let from = events
+                    .first()
+                    .map_or(0, |event| event.cursor().saturating_sub(1));
+                let terminal = events.last().map_or(
+                    from,
+                    automonique_protocol::platform::SessionHistoryEvent::cursor,
+                );
+                Ok(PlatformResponse::SessionHistory(
+                    SessionHistoryPage::new(
+                        session.clone(),
+                        limit,
+                        limit,
+                        from,
+                        terminal,
+                        has_more,
+                        events,
+                    )
+                    .map_err(|_| DaemonError::ProtocolRefused("platform_session_history"))?,
+                ))
+            }
+            ManagedHistoryRead::Resync { .. } => {
+                Err(DaemonError::ProtocolRefused("platform_session_snapshot"))
+            }
+        }
     }
 
     fn refresh_platform_sessions(&mut self, now_ms: i64) -> Result<(), DaemonError> {

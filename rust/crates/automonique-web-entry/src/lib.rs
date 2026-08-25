@@ -5781,7 +5781,9 @@ mod tests {
     use automonique_protocol::platform::{
         ActionReceipt, Attachment, ControlLease, ControlLeaseId, CursorTopic, Freshness,
         FreshnessState, PlatformAction, PlatformEvent, PlatformText, ReceiptId, ReceiptOutcome,
-        ResourceId, ResourceKind, SessionList, Snapshot, Subscription,
+        ResourceId, ResourceKind, SessionHistoryEvent, SessionHistoryEvidence, SessionHistoryPage,
+        SessionHistoryResync, SessionHistoryRole, SessionHistoryRunState, SessionHistoryText,
+        SessionHistoryToolState, SessionHistoryUnknownSource, SessionList, Snapshot, Subscription,
     };
     use automonique_protocol::primitives::{EpochMillis, Revision};
     use std::collections::VecDeque;
@@ -6238,7 +6240,8 @@ mod tests {
 
     #[test]
     fn typescript_sdk_passes_the_live_platform_http_contract() {
-        const EXCHANGES: usize = 16;
+        const PLATFORM_EXCHANGES: usize = 19;
+        const HTTP_EXCHANGES: usize = 20;
         const LARGE_SEQUENCE: u64 = 9_007_199_254_740_993;
 
         fn read_http_body(stream: &mut TcpStream) -> Vec<u8> {
@@ -6277,7 +6280,7 @@ mod tests {
         let platform_listener = UnixListener::bind(runtime_dir.path().join("admin.sock"))
             .expect("fixture platform socket");
         let platform_server = thread::spawn(move || {
-            for index in 1..=EXCHANGES {
+            for index in 1..=PLATFORM_EXCHANGES {
                 let (mut stream, _) = platform_listener.accept().expect("platform connection");
                 let mut prefix = [0_u8; 4];
                 stream
@@ -6298,6 +6301,11 @@ mod tests {
                     ResourceAuthority::Automonique,
                     ResourceKind::Run,
                     ResourceId::new("run-1").unwrap(),
+                );
+                let history_session = ResourceCoordinate::new(
+                    ResourceAuthority::Automonique,
+                    ResourceKind::Session,
+                    ResourceId::new("session-history-1").unwrap(),
                 );
                 let snapshot_cursor = PlatformCursor {
                     authority: ResourceAuthority::Provider,
@@ -6326,7 +6334,7 @@ mod tests {
                     recorded_at: EpochMillis::from_millis(9_007_199_254_740_996),
                     explanation: None,
                 };
-                let response = if index > 10 {
+                let response = if index > 13 {
                     let outcomes = [
                         ReceiptOutcome::Accepted,
                         ReceiptOutcome::Completed,
@@ -6336,7 +6344,7 @@ mod tests {
                         ReceiptOutcome::Unknown,
                     ];
                     PlatformResponse::Refused {
-                        outcome: outcomes[index - 11],
+                        outcome: outcomes[index - 14],
                         explanation: PlatformText::new("not completed").unwrap(),
                     }
                 } else {
@@ -6397,6 +6405,74 @@ mod tests {
                                 lease: value.lease.clone(),
                             }
                         }
+                        PlatformRequest::SessionHistorySnapshot(value) => {
+                            assert_eq!(value.session, history_session);
+                            assert_eq!(value.limit, 2);
+                            PlatformResponse::SessionHistory(
+                                SessionHistoryPage::new(
+                                    value.session.clone(),
+                                    value.limit,
+                                    value.limit,
+                                    9,
+                                    11,
+                                    true,
+                                    vec![
+                                        SessionHistoryEvent::Message {
+                                            cursor: 10,
+                                            at: EpochMillis::from_millis(10),
+                                            evidence: SessionHistoryEvidence::Authoritative,
+                                            role: SessionHistoryRole::User,
+                                            text: SessionHistoryText::new("hello").unwrap(),
+                                            truncated: false,
+                                        },
+                                        SessionHistoryEvent::ToolState {
+                                            cursor: 11,
+                                            at: EpochMillis::from_millis(11),
+                                            evidence: SessionHistoryEvidence::Synthetic,
+                                            state: SessionHistoryToolState::InProgress,
+                                            label: Some(SessionHistoryText::new("search").unwrap()),
+                                            truncated: false,
+                                        },
+                                    ],
+                                )
+                                .unwrap(),
+                            )
+                        }
+                        PlatformRequest::SessionHistoryPage(value) => {
+                            assert_eq!(value.session, history_session);
+                            assert_eq!(value.limit, 2);
+                            if value.after == 11 {
+                                PlatformResponse::SessionHistory(
+                                    SessionHistoryPage::new(
+                                        value.session.clone(),
+                                        value.limit,
+                                        value.limit,
+                                        11,
+                                        13,
+                                        false,
+                                        vec![
+                                            SessionHistoryEvent::RunState {
+                                                cursor: 12,
+                                                at: EpochMillis::from_millis(12),
+                                                state: SessionHistoryRunState::Completed,
+                                            },
+                                            SessionHistoryEvent::Unknown {
+                                                cursor: 13,
+                                                at: EpochMillis::from_millis(13),
+                                                source: SessionHistoryUnknownSource::AdapterEvent,
+                                            },
+                                        ],
+                                    )
+                                    .unwrap(),
+                                )
+                            } else {
+                                assert_eq!(value.after, 0);
+                                PlatformResponse::SessionHistoryResync(
+                                    SessionHistoryResync::new(value.session.clone(), 9, 13)
+                                        .unwrap(),
+                                )
+                            }
+                        }
                     }
                 };
                 let response = PlatformResponseMessage::new(request.request_id().clone(), response)
@@ -6413,7 +6489,7 @@ mod tests {
         let manage_listener = TcpListener::bind("127.0.0.1:0").expect("manage listener");
         let manage_address = manage_listener.local_addr().unwrap();
         let manage_server = thread::spawn(move || {
-            for _ in 0..EXCHANGES {
+            for _ in 0..HTTP_EXCHANGES {
                 let (mut stream, _) = manage_listener.accept().expect("Manage connection");
                 let body = read_http_body(&mut stream);
                 let request = PlatformRequestMessage::from_canonical_bytes(&body)
@@ -6456,7 +6532,7 @@ mod tests {
             let integration = Arc::clone(&integration);
             let state = Arc::clone(&web_state);
             thread::spawn(move || {
-                for _ in 0..EXCHANGES {
+                for _ in 0..HTTP_EXCHANGES {
                     let (stream, _) = web_listener.accept().expect("HTTP connection");
                     handle(
                         stream,

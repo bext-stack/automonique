@@ -250,11 +250,17 @@ fn every_platform_request_has_one_canonical_round_trip() {
             idempotency_key: key.clone(),
         }),
         PlatformRequest::ReleaseControl(ReleaseControlRequest {
-            session,
+            session: session.clone(),
             client,
             lease: ControlLeaseId::new("lease-1").unwrap(),
             idempotency_key: key,
         }),
+        PlatformRequest::SessionHistorySnapshot(
+            SessionHistorySnapshotRequest::new(session.clone(), 2).unwrap(),
+        ),
+        PlatformRequest::SessionHistoryPage(
+            SessionHistoryPageRequest::new(session, 9_007_199_254_740_993, 2).unwrap(),
+        ),
     ];
     for (index, request) in requests.into_iter().enumerate() {
         let framed = PlatformRequestMessage::new(
@@ -330,10 +336,50 @@ fn every_platform_response_has_one_canonical_round_trip() {
             revision: Revision::new(4).unwrap(),
         }),
         PlatformResponse::ControlReleased {
-            session,
+            session: session.clone(),
             client,
             lease: ControlLeaseId::new("lease-1").unwrap(),
         },
+        PlatformResponse::SessionHistory(
+            SessionHistoryPage::new(
+                session.clone(),
+                4,
+                4,
+                9_007_199_254_740_993,
+                9_007_199_254_740_997,
+                false,
+                vec![
+                    SessionHistoryEvent::Message {
+                        cursor: 9_007_199_254_740_994,
+                        at: EpochMillis::from_millis(1),
+                        evidence: SessionHistoryEvidence::Authoritative,
+                        role: SessionHistoryRole::User,
+                        text: SessionHistoryText::new("hello").unwrap(),
+                        truncated: false,
+                    },
+                    SessionHistoryEvent::ToolState {
+                        cursor: 9_007_199_254_740_995,
+                        at: EpochMillis::from_millis(2),
+                        evidence: SessionHistoryEvidence::Synthetic,
+                        state: SessionHistoryToolState::InProgress,
+                        label: Some(SessionHistoryText::new("search").unwrap()),
+                        truncated: false,
+                    },
+                    SessionHistoryEvent::RunState {
+                        cursor: 9_007_199_254_740_996,
+                        at: EpochMillis::from_millis(3),
+                        state: SessionHistoryRunState::Completed,
+                    },
+                    SessionHistoryEvent::Unknown {
+                        cursor: 9_007_199_254_740_997,
+                        at: EpochMillis::from_millis(4),
+                        source: SessionHistoryUnknownSource::AdapterEvent,
+                    },
+                ],
+            )
+            .unwrap(),
+        ),
+        PlatformResponse::SessionHistoryResync(SessionHistoryResync::new(session, 20, 40).unwrap()),
         PlatformResponse::Refused {
             outcome: ReceiptOutcome::ResyncRequired,
             explanation: PlatformText::new("fresh snapshot required").unwrap(),

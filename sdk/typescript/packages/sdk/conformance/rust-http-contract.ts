@@ -13,6 +13,8 @@ import {
 import {
   HttpsPlatformTransport,
   PlatformClient,
+  PlatformTransportError,
+  SessionHistoryResyncError,
   emptyPlatformView,
   reduceSnapshot,
   reduceSubscription,
@@ -32,6 +34,7 @@ const client = new PlatformClient(new HttpsPlatformTransport(
 ));
 
 const session: ResourceCoordinate = {authority: "provider", id: ResourceId("session-1"), kind: "session"};
+const historySession: ResourceCoordinate = {authority: "automonique", id: ResourceId("session-history-1"), kind: "session"};
 const run: ResourceCoordinate = {authority: "automonique", id: ResourceId("run-1"), kind: "run"};
 
 const capabilities = await client.capabilities();
@@ -51,6 +54,7 @@ if (subscription.value.cursor.sequence !== 9007199254740994n) throw new Error("s
 
 const executed = await client.execute({
   action: "start_run",
+  client: null,
   expected_revision: PlatformRevision(9007199254740993n),
   idempotency_key: IdempotencyKey("execute-1"),
   parameter: PlatformParameter("start"),
@@ -60,7 +64,7 @@ if (executed.kind !== "receipt" || executed.value.revision !== 9007199254740994n
   throw new Error("execute receipt mismatch");
 }
 
-if ((await client.getReceipt({id: ReceiptId("receipt-1"), idempotency_key: null})).kind !== "receipt") {
+if ((await client.getReceipt({client: null, id: ReceiptId("receipt-1"), idempotency_key: null})).kind !== "receipt") {
   throw new Error("receipt lookup mismatch");
 }
 if ((await client.listSessions("provider", null)).kind !== "sessions") throw new Error("session list mismatch");
@@ -75,6 +79,39 @@ if ((await client.releaseControl(
   ControlLeaseId("lease-1"),
   IdempotencyKey("release-1"),
 )).kind !== "control_released") throw new Error("control release mismatch");
+
+const historySnapshot = await client.sessionHistorySnapshot(historySession, 2n);
+if (
+  historySnapshot.from_cursor !== 9n
+  || historySnapshot.terminal_cursor !== 11n
+  || !historySnapshot.has_more
+  || historySnapshot.events.map((event) => `${event.cursor}:${event.kind}`).join(",")
+    !== "10:message,11:tool_state"
+) {
+  throw new Error("history snapshot ordering or cursor mismatch");
+}
+const historyPage = await client.sessionHistoryPage(historySession, historySnapshot.terminal_cursor, 2n);
+if (
+  historyPage.from_cursor !== 11n
+  || historyPage.terminal_cursor !== 13n
+  || historyPage.has_more
+  || historyPage.events.map((event) => `${event.cursor}:${event.kind}`).join(",")
+    !== "12:run_state,13:unknown"
+) {
+  throw new Error("history page resume mismatch");
+}
+const staleHistory = await client.sessionHistoryPage(historySession, 0n, 2n).catch((error: unknown) => error);
+if (
+  !(staleHistory instanceof SessionHistoryResyncError)
+  || staleHistory.snapshotFrom !== 9n
+  || staleHistory.snapshotTo !== 13n
+) {
+  throw new Error("stale history did not return an exact no-partial resync");
+}
+const wrongAuthority = await client.sessionHistorySnapshot(session, 2n).catch((error: unknown) => error);
+if (!(wrongAuthority instanceof PlatformTransportError) || wrongAuthority.status !== 400) {
+  throw new Error("history authority/session boundary did not fail closed");
+}
 
 let view = reduceSnapshot(emptyPlatformView(), snapshot.value);
 view = reduceSubscription(view, subscription.value);

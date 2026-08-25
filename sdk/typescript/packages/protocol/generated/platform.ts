@@ -29,6 +29,9 @@ export const MAX_PLATFORM_PARAMETER_BYTES = 65536;
 /** Maximum canonical Platform request bytes. */
 export const MAX_PLATFORM_REQUEST_CANONICAL_BYTES = 131072;
 
+/** Maximum sanitized events carried by one history page. */
+export const MAX_SESSION_HISTORY_EVENTS = 512;
+
 /** Maximum resources carried by one snapshot. */
 export const MAX_SNAPSHOT_RESOURCES = 512;
 
@@ -149,6 +152,18 @@ export function PlatformText(value: string): PlatformText {
   return value as PlatformText;
 }
 
+/** Bounded string, at most 512 UTF-8 bytes. */
+export type SessionHistoryText = string & {readonly __brand: "SessionHistoryText"};
+export const SessionHistoryText_MAX_BYTES = 512;
+export const SessionHistoryText_PATTERN = /^[^\u0000]+$/u;
+export function SessionHistoryText(value: string): SessionHistoryText {
+  if (value.length === 0) throw new ValidationError("SessionHistoryText", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("SessionHistoryText", "invalid_character");
+  if (byteLength(value) > 512) throw new ValidationError("SessionHistoryText", "too_long");
+  if (!SessionHistoryText_PATTERN.test(value)) throw new ValidationError("SessionHistoryText", "invalid_character");
+  return value as SessionHistoryText;
+}
+
 /** Bounded integer in [-9223372036854775808, 9223372036854775807]. */
 export type PlatformEpochMillis = bigint & {readonly __brand: "PlatformEpochMillis"};
 export const PlatformEpochMillis_MIN = -9223372036854775808n;
@@ -165,6 +180,24 @@ export const PlatformRevision_MAX = 9223372036854775807n;
 export function PlatformRevision(value: bigint): PlatformRevision {
   if (typeof value !== "bigint" || value < 1n || value > 9223372036854775807n) throw new ValidationError("PlatformRevision", "out_of_range");
   return value as PlatformRevision;
+}
+
+/** Bounded integer in [0, 9223372036854775807]. */
+export type SessionHistoryCursor = bigint & {readonly __brand: "SessionHistoryCursor"};
+export const SessionHistoryCursor_MIN = 0n;
+export const SessionHistoryCursor_MAX = 9223372036854775807n;
+export function SessionHistoryCursor(value: bigint): SessionHistoryCursor {
+  if (typeof value !== "bigint" || value < 0n || value > 9223372036854775807n) throw new ValidationError("SessionHistoryCursor", "out_of_range");
+  return value as SessionHistoryCursor;
+}
+
+/** Bounded integer in [1, 512]. */
+export type SessionHistoryLimit = bigint & {readonly __brand: "SessionHistoryLimit"};
+export const SessionHistoryLimit_MIN = 1n;
+export const SessionHistoryLimit_MAX = 512n;
+export function SessionHistoryLimit(value: bigint): SessionHistoryLimit {
+  if (typeof value !== "bigint" || value < 1n || value > 512n) throw new ValidationError("SessionHistoryLimit", "out_of_range");
+  return value as SessionHistoryLimit;
 }
 
 export type FreshnessState = "fresh" | "stale" | "unknown";
@@ -187,8 +220,8 @@ export function decodePlatformAction(value: string): PlatformAction {
   return value as PlatformAction;
 }
 
-export type PlatformMethod = "attach" | "capabilities" | "claim_control" | "detach" | "execute" | "get_receipt" | "list_sessions" | "release_control" | "snapshot" | "subscribe";
-export const PlatformMethod_VALUES: readonly PlatformMethod[] = ["attach", "capabilities", "claim_control", "detach", "execute", "get_receipt", "list_sessions", "release_control", "snapshot", "subscribe"];
+export type PlatformMethod = "attach" | "capabilities" | "claim_control" | "detach" | "execute" | "get_receipt" | "list_sessions" | "release_control" | "session_history_page" | "session_history_snapshot" | "snapshot" | "subscribe";
+export const PlatformMethod_VALUES: readonly PlatformMethod[] = ["attach", "capabilities", "claim_control", "detach", "execute", "get_receipt", "list_sessions", "release_control", "session_history_page", "session_history_snapshot", "snapshot", "subscribe"];
 /** Security-sensitive: an undefined value is refused. */
 export function decodePlatformMethod(value: string): PlatformMethod {
   if (!(PlatformMethod_VALUES as readonly string[]).includes(value)) {
@@ -235,6 +268,56 @@ export function decodeResourceKind(value: string): ResourceKind {
     throw new ValidationError("ResourceKind", "unknown_enum_value");
   }
   return value as ResourceKind;
+}
+
+export type SessionHistoryEvidence = "authoritative" | "synthetic";
+export const SessionHistoryEvidence_VALUES: readonly SessionHistoryEvidence[] = ["authoritative", "synthetic"];
+/** Security-sensitive: an undefined value is refused. */
+export function decodeSessionHistoryEvidence(value: string): SessionHistoryEvidence {
+  if (!(SessionHistoryEvidence_VALUES as readonly string[]).includes(value)) {
+    throw new ValidationError("SessionHistoryEvidence", "unknown_enum_value");
+  }
+  return value as SessionHistoryEvidence;
+}
+
+export type SessionHistoryRole = "assistant" | "user";
+export const SessionHistoryRole_VALUES: readonly SessionHistoryRole[] = ["assistant", "user"];
+/** Security-sensitive: an undefined value is refused. */
+export function decodeSessionHistoryRole(value: string): SessionHistoryRole {
+  if (!(SessionHistoryRole_VALUES as readonly string[]).includes(value)) {
+    throw new ValidationError("SessionHistoryRole", "unknown_enum_value");
+  }
+  return value as SessionHistoryRole;
+}
+
+export type SessionHistoryRunState = "cancel_requested" | "cancelled" | "completed" | "failed" | "started" | "timed_out";
+export const SessionHistoryRunState_VALUES: readonly SessionHistoryRunState[] = ["cancel_requested", "cancelled", "completed", "failed", "started", "timed_out"];
+/** Security-sensitive: an undefined value is refused. */
+export function decodeSessionHistoryRunState(value: string): SessionHistoryRunState {
+  if (!(SessionHistoryRunState_VALUES as readonly string[]).includes(value)) {
+    throw new ValidationError("SessionHistoryRunState", "unknown_enum_value");
+  }
+  return value as SessionHistoryRunState;
+}
+
+export type SessionHistoryToolState = "completed" | "error" | "in_progress" | "pending";
+export const SessionHistoryToolState_VALUES: readonly SessionHistoryToolState[] = ["completed", "error", "in_progress", "pending"];
+/** Security-sensitive: an undefined value is refused. */
+export function decodeSessionHistoryToolState(value: string): SessionHistoryToolState {
+  if (!(SessionHistoryToolState_VALUES as readonly string[]).includes(value)) {
+    throw new ValidationError("SessionHistoryToolState", "unknown_enum_value");
+  }
+  return value as SessionHistoryToolState;
+}
+
+export type SessionHistoryUnknownSource = "adapter_event" | "simulation_event";
+export const SessionHistoryUnknownSource_VALUES: readonly SessionHistoryUnknownSource[] = ["adapter_event", "simulation_event"];
+/** Security-sensitive: an undefined value is refused. */
+export function decodeSessionHistoryUnknownSource(value: string): SessionHistoryUnknownSource {
+  if (!(SessionHistoryUnknownSource_VALUES as readonly string[]).includes(value)) {
+    throw new ValidationError("SessionHistoryUnknownSource", "unknown_enum_value");
+  }
+  return value as SessionHistoryUnknownSource;
 }
 
 /** Durable result of one idempotent action. */
@@ -302,6 +385,7 @@ export const ControlLease_FIELDS: readonly string[] = [
 /** The only general mutation request in the public contract. */
 export interface ExecuteRequest {
   readonly action: PlatformAction;
+  readonly client: ClientId | null;
   readonly expected_revision: PlatformRevision | null;
   readonly idempotency_key: IdempotencyKey;
   readonly parameter: PlatformParameter | null;
@@ -309,6 +393,7 @@ export interface ExecuteRequest {
 }
 export const ExecuteRequest_FIELDS: readonly string[] = [
   "action",
+  "client",
   "expected_revision",
   "idempotency_key",
   "parameter",
@@ -461,6 +546,118 @@ export function decodeDecodedFreshness(body: JsonValue): DecodedFreshness {
     observed_at: refuse(PLATFORM_INVALID_BODY, () => PlatformEpochMillis(bodyInteger(fields, "observed_at", PLATFORM_INVALID_BODY))),
     revision: refuse(PLATFORM_INVALID_BODY, () => PlatformRevision(bodyUnsigned(fields, "revision", PLATFORM_INVALID_BODY))),
     state: refuse(PLATFORM_VALUE_INVALID, () => decodeFreshnessState(bodyString(fields, "state", PLATFORM_INVALID_BODY))),
+  };
+}
+
+/** One sanitized authoritative message. */
+export interface DecodedHistoryMessage {
+  readonly at: PlatformEpochMillis;
+  readonly cursor: SessionHistoryCursor;
+  readonly evidence: SessionHistoryEvidence;
+  readonly role: SessionHistoryRole;
+  readonly text: SessionHistoryText;
+  readonly truncated: boolean;
+}
+
+/** The exact key set this nested body carries. */
+export const DecodedHistoryMessage_FIELDS: readonly string[] = [
+  "at",
+  "cursor",
+  "evidence",
+  "role",
+  "text",
+  "truncated",
+];
+
+export function decodeDecodedHistoryMessage(body: JsonValue): DecodedHistoryMessage {
+  const fields = exactFields(body, DecodedHistoryMessage_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    at: refuse(PLATFORM_INVALID_BODY, () => PlatformEpochMillis(bodyInteger(fields, "at", PLATFORM_INVALID_BODY))),
+    cursor: refuse(PLATFORM_COUNTER_OUT_OF_RANGE, () => SessionHistoryCursor(bodyUnsigned(fields, "cursor", PLATFORM_INVALID_BODY))),
+    evidence: refuse(PLATFORM_VALUE_INVALID, () => decodeSessionHistoryEvidence(bodyString(fields, "evidence", PLATFORM_INVALID_BODY))),
+    role: refuse(PLATFORM_VALUE_INVALID, () => decodeSessionHistoryRole(bodyString(fields, "role", PLATFORM_INVALID_BODY))),
+    text: refuse(PLATFORM_VALUE_INVALID, () => SessionHistoryText(bodyString(fields, "text", PLATFORM_INVALID_BODY))),
+    truncated: bodyBool(fields, "truncated", PLATFORM_INVALID_BODY),
+  };
+}
+
+/** One closed public run state. */
+export interface DecodedHistoryRunState {
+  readonly at: PlatformEpochMillis;
+  readonly cursor: SessionHistoryCursor;
+  readonly state: SessionHistoryRunState;
+}
+
+/** The exact key set this nested body carries. */
+export const DecodedHistoryRunState_FIELDS: readonly string[] = [
+  "at",
+  "cursor",
+  "state",
+];
+
+export function decodeDecodedHistoryRunState(body: JsonValue): DecodedHistoryRunState {
+  const fields = exactFields(body, DecodedHistoryRunState_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    at: refuse(PLATFORM_INVALID_BODY, () => PlatformEpochMillis(bodyInteger(fields, "at", PLATFORM_INVALID_BODY))),
+    cursor: refuse(PLATFORM_COUNTER_OUT_OF_RANGE, () => SessionHistoryCursor(bodyUnsigned(fields, "cursor", PLATFORM_INVALID_BODY))),
+    state: refuse(PLATFORM_VALUE_INVALID, () => decodeSessionHistoryRunState(bodyString(fields, "state", PLATFORM_INVALID_BODY))),
+  };
+}
+
+/** One sanitized public tool state without input or output. */
+export interface DecodedHistoryToolState {
+  readonly at: PlatformEpochMillis;
+  readonly cursor: SessionHistoryCursor;
+  readonly evidence: SessionHistoryEvidence;
+  readonly label: SessionHistoryText | null;
+  readonly state: SessionHistoryToolState;
+  readonly truncated: boolean;
+}
+
+/** The exact key set this nested body carries. */
+export const DecodedHistoryToolState_FIELDS: readonly string[] = [
+  "at",
+  "cursor",
+  "evidence",
+  "label",
+  "state",
+  "truncated",
+];
+
+export function decodeDecodedHistoryToolState(body: JsonValue): DecodedHistoryToolState {
+  const fields = exactFields(body, DecodedHistoryToolState_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    at: refuse(PLATFORM_INVALID_BODY, () => PlatformEpochMillis(bodyInteger(fields, "at", PLATFORM_INVALID_BODY))),
+    cursor: refuse(PLATFORM_COUNTER_OUT_OF_RANGE, () => SessionHistoryCursor(bodyUnsigned(fields, "cursor", PLATFORM_INVALID_BODY))),
+    evidence: refuse(PLATFORM_VALUE_INVALID, () => decodeSessionHistoryEvidence(bodyString(fields, "evidence", PLATFORM_INVALID_BODY))),
+    label: mapNullable(bodyStringOrNull(fields, "label", PLATFORM_INVALID_BODY), (value) =>
+      refuse(PLATFORM_VALUE_INVALID, () => SessionHistoryText(value)),
+    ),
+    state: refuse(PLATFORM_VALUE_INVALID, () => decodeSessionHistoryToolState(bodyString(fields, "state", PLATFORM_INVALID_BODY))),
+    truncated: bodyBool(fields, "truncated", PLATFORM_INVALID_BODY),
+  };
+}
+
+/** A forward-compatible source marker with no opaque payload. */
+export interface DecodedHistoryUnknown {
+  readonly at: PlatformEpochMillis;
+  readonly cursor: SessionHistoryCursor;
+  readonly source: SessionHistoryUnknownSource;
+}
+
+/** The exact key set this nested body carries. */
+export const DecodedHistoryUnknown_FIELDS: readonly string[] = [
+  "at",
+  "cursor",
+  "source",
+];
+
+export function decodeDecodedHistoryUnknown(body: JsonValue): DecodedHistoryUnknown {
+  const fields = exactFields(body, DecodedHistoryUnknown_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    at: refuse(PLATFORM_INVALID_BODY, () => PlatformEpochMillis(bodyInteger(fields, "at", PLATFORM_INVALID_BODY))),
+    cursor: refuse(PLATFORM_COUNTER_OUT_OF_RANGE, () => SessionHistoryCursor(bodyUnsigned(fields, "cursor", PLATFORM_INVALID_BODY))),
+    source: refuse(PLATFORM_VALUE_INVALID, () => decodeSessionHistoryUnknownSource(bodyString(fields, "source", PLATFORM_INVALID_BODY))),
   };
 }
 
@@ -729,6 +926,7 @@ export function encodePlatformDetach(request_id: PlatformRequestId, body: Platfo
 export const PLATFORM_EXECUTE_REQUEST_KIND = "execute";
 export interface PlatformExecuteBody {
   readonly action: PlatformAction;
+  readonly client: ClientId | null;
   readonly expected_revision: PlatformRevision | null;
   readonly idempotency_key: IdempotencyKey;
   readonly parameter: PlatformParameter | null;
@@ -738,6 +936,7 @@ export interface PlatformExecuteBody {
 /** The exact key set this command's wire body carries. */
 export const PlatformExecuteBody_FIELDS: readonly string[] = [
   "action",
+  "client",
   "expected_revision",
   "idempotency_key",
   "parameter",
@@ -747,6 +946,7 @@ export const PlatformExecuteBody_FIELDS: readonly string[] = [
 /** The exact key set accepted by this generated TypeScript builder. */
 export const PlatformExecuteBody_INPUT_FIELDS: readonly string[] = [
   "action",
+  "client",
   "expected_revision",
   "idempotency_key",
   "parameter",
@@ -772,10 +972,14 @@ export function encodePlatformExecute(request_id: PlatformRequestId, body: Platf
   if (body.target.authority !== expectedAuthority) {
     throw new RefusalError(PLATFORM_VALUE_INVALID, "action and target authority disagree");
   }
+  const client = body.client;
   const expected_revision = body.expected_revision;
   const parameter = body.parameter;
   return encodePlatformRequest(request_id, PLATFORM_EXECUTE_REQUEST_KIND, [
     ["action", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => decodePlatformAction(body.action))}],
+    ["client", client === null
+        ? {kind: "null"}
+        : {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => ClientId(client))}],
     ["expected_revision", expected_revision === null
         ? {kind: "null"}
         : {kind: "integer", value: refuse(PLATFORM_COUNTER_OUT_OF_RANGE, () => PlatformRevision(expected_revision))}],
@@ -790,18 +994,21 @@ export function encodePlatformExecute(request_id: PlatformRequestId, body: Platf
 /** Read one receipt by exactly one durable coordinate. */
 export const PLATFORM_GET_RECEIPT_REQUEST_KIND = "get_receipt";
 export interface PlatformGetReceiptBody {
+  readonly client: ClientId | null;
   readonly id: ReceiptId | null;
   readonly idempotency_key: IdempotencyKey | null;
 }
 
 /** The exact key set this command's wire body carries. */
 export const PlatformGetReceiptBody_FIELDS: readonly string[] = [
+  "client",
   "id",
   "idempotency_key",
 ];
 
 /** The exact key set accepted by this generated TypeScript builder. */
 export const PlatformGetReceiptBody_INPUT_FIELDS: readonly string[] = [
+  "client",
   "id",
   "idempotency_key",
 ];
@@ -811,9 +1018,13 @@ export function encodePlatformGetReceipt(request_id: PlatformRequestId, body: Pl
   if ((body.id === null) === (body.idempotency_key === null)) {
     throw new RefusalError(PLATFORM_INVALID_BODY, "exactly one of id and idempotency_key is required");
   }
+  const client = body.client;
   const id = body.id;
   const idempotency_key = body.idempotency_key;
   return encodePlatformRequest(request_id, PLATFORM_GET_RECEIPT_REQUEST_KIND, [
+    ["client", client === null
+        ? {kind: "null"}
+        : {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => ClientId(client))}],
     ["id", id === null
         ? {kind: "null"}
         : {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => ReceiptId(id))}],
@@ -888,6 +1099,64 @@ export function encodePlatformReleaseControl(request_id: PlatformRequestId, body
   ]);
 }
 
+/** Resume history strictly after an exclusive cursor. */
+export const PLATFORM_SESSION_HISTORY_PAGE_REQUEST_KIND = "session_history_page";
+export interface PlatformSessionHistoryPageBody {
+  readonly after: SessionHistoryCursor;
+  readonly limit: SessionHistoryLimit;
+  readonly session: DecodedResourceCoordinate;
+}
+
+/** The exact key set this command's wire body carries. */
+export const PlatformSessionHistoryPageBody_FIELDS: readonly string[] = [
+  "after",
+  "limit",
+  "session",
+];
+
+/** The exact key set accepted by this generated TypeScript builder. */
+export const PlatformSessionHistoryPageBody_INPUT_FIELDS: readonly string[] = [
+  "after",
+  "limit",
+  "session",
+];
+
+export function encodePlatformSessionHistoryPage(request_id: PlatformRequestId, body: PlatformSessionHistoryPageBody): Uint8Array {
+  exactInputFields(body, PlatformSessionHistoryPageBody_INPUT_FIELDS, PLATFORM_INVALID_BODY);
+  return encodePlatformRequest(request_id, PLATFORM_SESSION_HISTORY_PAGE_REQUEST_KIND, [
+    ["after", {kind: "integer", value: refuse(PLATFORM_COUNTER_OUT_OF_RANGE, () => SessionHistoryCursor(body.after))}],
+    ["limit", {kind: "integer", value: refuse(PLATFORM_COUNTER_OUT_OF_RANGE, () => SessionHistoryLimit(body.limit))}],
+    ["session", encodeDecodedResourceCoordinate(body.session)],
+  ]);
+}
+
+/** Read the first retained history page for one exact session. */
+export const PLATFORM_SESSION_HISTORY_SNAPSHOT_REQUEST_KIND = "session_history_snapshot";
+export interface PlatformSessionHistorySnapshotBody {
+  readonly limit: SessionHistoryLimit;
+  readonly session: DecodedResourceCoordinate;
+}
+
+/** The exact key set this command's wire body carries. */
+export const PlatformSessionHistorySnapshotBody_FIELDS: readonly string[] = [
+  "limit",
+  "session",
+];
+
+/** The exact key set accepted by this generated TypeScript builder. */
+export const PlatformSessionHistorySnapshotBody_INPUT_FIELDS: readonly string[] = [
+  "limit",
+  "session",
+];
+
+export function encodePlatformSessionHistorySnapshot(request_id: PlatformRequestId, body: PlatformSessionHistorySnapshotBody): Uint8Array {
+  exactInputFields(body, PlatformSessionHistorySnapshotBody_INPUT_FIELDS, PLATFORM_INVALID_BODY);
+  return encodePlatformRequest(request_id, PLATFORM_SESSION_HISTORY_SNAPSHOT_REQUEST_KIND, [
+    ["limit", {kind: "integer", value: refuse(PLATFORM_COUNTER_OUT_OF_RANGE, () => SessionHistoryLimit(body.limit))}],
+    ["session", encodeDecodedResourceCoordinate(body.session)],
+  ]);
+}
+
 /** Read one bounded point-in-time resource collection. */
 export const PLATFORM_SNAPSHOT_REQUEST_KIND = "snapshot";
 export interface PlatformSnapshotBody {
@@ -956,6 +1225,8 @@ export type PlatformRequest =
   | {readonly method: "get_receipt"; readonly request: PlatformGetReceiptBody}
   | {readonly method: "list_sessions"; readonly request: PlatformListSessionsBody}
   | {readonly method: "release_control"; readonly request: PlatformReleaseControlBody}
+  | {readonly method: "session_history_page"; readonly request: PlatformSessionHistoryPageBody}
+  | {readonly method: "session_history_snapshot"; readonly request: PlatformSessionHistorySnapshotBody}
   | {readonly method: "snapshot"; readonly request: PlatformSnapshotBody}
   | {readonly method: "subscribe"; readonly request: PlatformSubscribeBody};
 
@@ -985,6 +1256,12 @@ export function encodePlatformRequestMessage(request_id: PlatformRequestId, requ
     case PLATFORM_RELEASE_CONTROL_REQUEST_KIND:
       exactInputFields(request, ["method", "request"], PLATFORM_INVALID_BODY);
       return encodePlatformReleaseControl(request_id, request.request);
+    case PLATFORM_SESSION_HISTORY_PAGE_REQUEST_KIND:
+      exactInputFields(request, ["method", "request"], PLATFORM_INVALID_BODY);
+      return encodePlatformSessionHistoryPage(request_id, request.request);
+    case PLATFORM_SESSION_HISTORY_SNAPSHOT_REQUEST_KIND:
+      exactInputFields(request, ["method", "request"], PLATFORM_INVALID_BODY);
+      return encodePlatformSessionHistorySnapshot(request_id, request.request);
     case PLATFORM_SNAPSHOT_REQUEST_KIND:
       exactInputFields(request, ["method", "request"], PLATFORM_INVALID_BODY);
       return encodePlatformSnapshot(request_id, request.request);
@@ -1005,6 +1282,8 @@ export function expectedPlatformResponseKind(method: PlatformRequest["method"]):
     case PLATFORM_GET_RECEIPT_REQUEST_KIND: return PLATFORM_RECEIPT_RESULT_RESPONSE_KIND;
     case PLATFORM_LIST_SESSIONS_REQUEST_KIND: return PLATFORM_SESSIONS_RESULT_RESPONSE_KIND;
     case PLATFORM_RELEASE_CONTROL_REQUEST_KIND: return PLATFORM_CONTROL_RELEASED_RESPONSE_KIND;
+    case PLATFORM_SESSION_HISTORY_PAGE_REQUEST_KIND: return PLATFORM_SESSION_HISTORY_RESULT_RESPONSE_KIND;
+    case PLATFORM_SESSION_HISTORY_SNAPSHOT_REQUEST_KIND: return PLATFORM_SESSION_HISTORY_RESULT_RESPONSE_KIND;
     case PLATFORM_SNAPSHOT_REQUEST_KIND: return PLATFORM_SNAPSHOT_RESULT_RESPONSE_KIND;
     case PLATFORM_SUBSCRIBE_REQUEST_KIND: return PLATFORM_SUBSCRIPTION_RESULT_RESPONSE_KIND;
   }
@@ -1213,6 +1492,87 @@ export function decodePlatformRefusedResult(request_id: PlatformRequestId, body:
   };
 }
 
+/** One strict, exclusive-cursor history page. */
+export const PLATFORM_SESSION_HISTORY_RESULT_RESPONSE_KIND = "session_history_result";
+export interface PlatformSessionHistoryResult {
+  readonly applied_limit: SessionHistoryLimit;
+  readonly from_cursor: SessionHistoryCursor;
+  readonly has_more: boolean;
+  readonly messages: readonly DecodedHistoryMessage[];
+  readonly request_id: PlatformRequestId;
+  readonly requested_limit: SessionHistoryLimit;
+  readonly run_states: readonly DecodedHistoryRunState[];
+  readonly session: DecodedResourceCoordinate;
+  readonly terminal_cursor: SessionHistoryCursor;
+  readonly tool_states: readonly DecodedHistoryToolState[];
+  readonly unknown_events: readonly DecodedHistoryUnknown[];
+}
+
+/** The exact key set this response's wire body carries; the correlation identifier is not among them, because it travels in the envelope. */
+export const PlatformSessionHistoryResult_BODY_FIELDS: readonly string[] = [
+  "applied_limit",
+  "from_cursor",
+  "has_more",
+  "messages",
+  "requested_limit",
+  "run_states",
+  "session",
+  "terminal_cursor",
+  "tool_states",
+  "unknown_events",
+];
+
+export function decodePlatformSessionHistoryResult(request_id: PlatformRequestId, body: JsonValue): PlatformSessionHistoryResult {
+  const fields = exactFields(body, PlatformSessionHistoryResult_BODY_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    applied_limit: refuse(PLATFORM_COUNTER_OUT_OF_RANGE, () => SessionHistoryLimit(bodyUnsigned(fields, "applied_limit", PLATFORM_INVALID_BODY))),
+    from_cursor: refuse(PLATFORM_COUNTER_OUT_OF_RANGE, () => SessionHistoryCursor(bodyUnsigned(fields, "from_cursor", PLATFORM_INVALID_BODY))),
+    has_more: bodyBool(fields, "has_more", PLATFORM_INVALID_BODY),
+    messages: bodyArray(fields, "messages", PLATFORM_INVALID_BODY, MAX_SESSION_HISTORY_EVENTS, PLATFORM_INVALID_BODY).map(
+      decodeDecodedHistoryMessage,
+    ),
+    request_id: request_id,
+    requested_limit: refuse(PLATFORM_COUNTER_OUT_OF_RANGE, () => SessionHistoryLimit(bodyUnsigned(fields, "requested_limit", PLATFORM_INVALID_BODY))),
+    run_states: bodyArray(fields, "run_states", PLATFORM_INVALID_BODY, MAX_SESSION_HISTORY_EVENTS, PLATFORM_INVALID_BODY).map(
+      decodeDecodedHistoryRunState,
+    ),
+    session: decodeDecodedResourceCoordinate(bodyValue(fields, "session", PLATFORM_INVALID_BODY)),
+    terminal_cursor: refuse(PLATFORM_COUNTER_OUT_OF_RANGE, () => SessionHistoryCursor(bodyUnsigned(fields, "terminal_cursor", PLATFORM_INVALID_BODY))),
+    tool_states: bodyArray(fields, "tool_states", PLATFORM_INVALID_BODY, MAX_SESSION_HISTORY_EVENTS, PLATFORM_INVALID_BODY).map(
+      decodeDecodedHistoryToolState,
+    ),
+    unknown_events: bodyArray(fields, "unknown_events", PLATFORM_INVALID_BODY, MAX_SESSION_HISTORY_EVENTS, PLATFORM_INVALID_BODY).map(
+      decodeDecodedHistoryUnknown,
+    ),
+  };
+}
+
+/** Explicit retention refusal with no partial page. */
+export const PLATFORM_SESSION_HISTORY_RESYNC_RESPONSE_KIND = "session_history_resync";
+export interface PlatformSessionHistoryResync {
+  readonly request_id: PlatformRequestId;
+  readonly session: DecodedResourceCoordinate;
+  readonly snapshot_from: SessionHistoryCursor;
+  readonly snapshot_to: SessionHistoryCursor;
+}
+
+/** The exact key set this response's wire body carries; the correlation identifier is not among them, because it travels in the envelope. */
+export const PlatformSessionHistoryResync_BODY_FIELDS: readonly string[] = [
+  "session",
+  "snapshot_from",
+  "snapshot_to",
+];
+
+export function decodePlatformSessionHistoryResync(request_id: PlatformRequestId, body: JsonValue): PlatformSessionHistoryResync {
+  const fields = exactFields(body, PlatformSessionHistoryResync_BODY_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    request_id: request_id,
+    session: decodeDecodedResourceCoordinate(bodyValue(fields, "session", PLATFORM_INVALID_BODY)),
+    snapshot_from: refuse(PLATFORM_COUNTER_OUT_OF_RANGE, () => SessionHistoryCursor(bodyUnsigned(fields, "snapshot_from", PLATFORM_INVALID_BODY))),
+    snapshot_to: refuse(PLATFORM_COUNTER_OUT_OF_RANGE, () => SessionHistoryCursor(bodyUnsigned(fields, "snapshot_to", PLATFORM_INVALID_BODY))),
+  };
+}
+
 /** One bounded attachable-session page. */
 export const PLATFORM_SESSIONS_RESULT_RESPONSE_KIND = "sessions_result";
 export interface PlatformSessionsResult {
@@ -1310,6 +1670,8 @@ export type PlatformResponse =
   | {readonly kind: "detached"; readonly value: PlatformDetachedResult}
   | {readonly kind: "receipt_result"; readonly value: PlatformReceiptResult}
   | {readonly kind: "refused"; readonly value: PlatformRefusedResult}
+  | {readonly kind: "session_history_result"; readonly value: PlatformSessionHistoryResult}
+  | {readonly kind: "session_history_resync"; readonly value: PlatformSessionHistoryResync}
   | {readonly kind: "sessions_result"; readonly value: PlatformSessionsResult}
   | {readonly kind: "snapshot_result"; readonly value: PlatformSnapshotResult}
   | {readonly kind: "subscription_result"; readonly value: PlatformSubscriptionResult}
@@ -1359,6 +1721,10 @@ export function decodePlatformResponse(payload: Uint8Array): PlatformResponse {
       return {kind: PLATFORM_RECEIPT_RESULT_RESPONSE_KIND, value: decodePlatformReceiptResult(request_id, message.body)};
     case PLATFORM_REFUSED_RESPONSE_KIND:
       return {kind: PLATFORM_REFUSED_RESPONSE_KIND, value: decodePlatformRefusedResult(request_id, message.body)};
+    case PLATFORM_SESSION_HISTORY_RESULT_RESPONSE_KIND:
+      return {kind: PLATFORM_SESSION_HISTORY_RESULT_RESPONSE_KIND, value: decodePlatformSessionHistoryResult(request_id, message.body)};
+    case PLATFORM_SESSION_HISTORY_RESYNC_RESPONSE_KIND:
+      return {kind: PLATFORM_SESSION_HISTORY_RESYNC_RESPONSE_KIND, value: decodePlatformSessionHistoryResync(request_id, message.body)};
     case PLATFORM_SESSIONS_RESULT_RESPONSE_KIND:
       return {kind: PLATFORM_SESSIONS_RESULT_RESPONSE_KIND, value: decodePlatformSessionsResult(request_id, message.body)};
     case PLATFORM_SNAPSHOT_RESULT_RESPONSE_KIND:

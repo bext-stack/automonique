@@ -432,6 +432,17 @@ pub struct SocketRunLane {
 }
 
 impl SocketRunLane {
+    /// Verified committed runner events for history projection. An absent or
+    /// incomplete spool is reported as no optional progress; the accepted
+    /// prompt and final answer remain authoritative independently.
+    pub fn recorded_events(&self, run_id: &str) -> Vec<automonique_runner::Event> {
+        automonique_runner::read_events(
+            crate::execute::run_spool_root(&self.state_dir, run_id),
+            run_id,
+        )
+        .unwrap_or_default()
+    }
+
     /// Open one lane over this daemon's own state directory and admin socket.
     ///
     /// A deployment with no provider configuration, an unreadable one, or no

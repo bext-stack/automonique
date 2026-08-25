@@ -113,13 +113,13 @@ fn duplicate_execute_replays_one_durable_receipt() {
     assert_eq!(replayed, completed);
     assert_eq!(
         reopened
-            .receipt(None, Some(&request.idempotency_key))
+            .receipt(None, Some(&request.idempotency_key), None)
             .expect("receipt by key"),
         completed
     );
     assert_eq!(
         reopened
-            .receipt(Some(&completed.id), None)
+            .receipt(Some(&completed.id), None, None)
             .expect("receipt by id"),
         completed
     );
@@ -128,6 +128,39 @@ fn duplicate_execute_replays_one_durable_receipt() {
         .subscribe(None, "receipts")
         .expect("receipt events");
     assert_eq!(receipts.events.len(), 2, "accepted and completed only");
+}
+
+#[test]
+fn mobile_receipt_owner_is_bound_atomically_and_lookups_do_not_cross_credentials() {
+    let private = PrivateStore::new();
+    let mut store = PlatformStore::open(private.path()).expect("open store");
+    let owner = ClientId::new("credential-1").expect("owner");
+    let other = ClientId::new("credential-2").expect("other");
+    let request = execute("owned-receipt", Some(7)).with_client(owner.clone());
+    store
+        .prepare_execute(&request, revision(7), 1_000)
+        .expect("admit action");
+    let receipt = store
+        .finalize_execute(
+            &request.idempotency_key,
+            ReceiptOutcome::Completed,
+            None,
+            1_001,
+        )
+        .expect("finalize");
+    assert_eq!(
+        store
+            .receipt(Some(&receipt.id), None, Some(&owner))
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(
+        store
+            .receipt(Some(&receipt.id), None, Some(&other))
+            .unwrap_err()
+            .category(),
+        "not_found"
+    );
 }
 
 #[test]
@@ -162,7 +195,7 @@ fn idempotency_binding_conflict_and_stale_revision_write_nothing() {
     assert_eq!(store.revision().expect("revision"), after_first);
     assert_eq!(
         store
-            .receipt(None, Some(&stale.idempotency_key))
+            .receipt(None, Some(&stale.idempotency_key), None)
             .expect_err("no stale receipt")
             .category(),
         "not_found"

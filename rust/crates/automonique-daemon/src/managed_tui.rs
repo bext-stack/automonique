@@ -294,14 +294,12 @@ impl ManagedTuiWorker {
             };
             let outcome = self.lane.run_managed(&inner_run_id, task, mode);
             match outcome {
-                Ok(_) => {
+                Ok(answer) => {
                     let session = self
                         .sessions
                         .by_run(&inner_run_id)
                         .map_err(|error| ManagedTuiError::Session(error.category()))?;
-                    let session_id = session
-                        .as_ref()
-                        .map(|value| value.provider_session_id.as_str());
+                    let session_id = session.map(|value| value.provider_session_id);
                     if session_id.is_none() {
                         self.finish(
                             claim.run_id,
@@ -311,11 +309,21 @@ impl ManagedTuiWorker {
                             Err("provider_session_missing"),
                         )?;
                     } else {
+                        self.sessions
+                            .record_completed_turn(
+                                session_id.as_deref().expect("checked session id"),
+                                &inbox.transport_key,
+                                task,
+                                &answer,
+                                &self.lane.recorded_events(&inner_run_id),
+                                now_ms,
+                            )
+                            .map_err(|error| ManagedTuiError::Session(error.category()))?;
                         self.finish(
                             claim.run_id,
                             &inbox.transport_key,
                             &inner_run_id,
-                            session_id,
+                            session_id.as_deref(),
                             Ok(()),
                         )?;
                     }

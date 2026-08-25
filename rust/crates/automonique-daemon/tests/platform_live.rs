@@ -235,7 +235,7 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
     else {
         panic!("capabilities response")
     };
-    assert_eq!(capabilities.methods.len(), 10);
+    assert_eq!(capabilities.methods.len(), 12);
     assert_eq!(capabilities.transports.len(), 1);
 
     let PlatformResponse::Snapshot(snapshot) = platform(
