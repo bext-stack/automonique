@@ -16,6 +16,7 @@
 use automonique_store::cancel_ledger::CANCEL_LEDGER_SCHEMA_VERSION;
 use automonique_store::generation_audit::GENERATION_AUDIT_SCHEMA_VERSION;
 use automonique_store::provider_journal::PROVIDER_JOURNAL_SCHEMA_VERSION;
+use automonique_store::reload_audit::RELOAD_AUDIT_SCHEMA_VERSION;
 use automonique_store::run_submissions::RUN_SUBMISSIONS_SCHEMA_VERSION;
 use automonique_store::slack_ingress::SLACK_INGRESS_SCHEMA_VERSION;
 
@@ -37,6 +38,10 @@ fn the_schema_versions_this_crate_owns_match_the_compat_matrix_rows() {
     assert_eq!(
         GENERATION_AUDIT_SCHEMA_VERSION, 1,
         "generation audit schema moved: update the compat matrix row and this pin"
+    );
+    assert_eq!(
+        RELOAD_AUDIT_SCHEMA_VERSION, 1,
+        "reload audit schema moved: update the compat matrix row and this pin"
     );
     assert_eq!(
         SLACK_INGRESS_SCHEMA_VERSION, 2,

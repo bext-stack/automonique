@@ -146,6 +146,7 @@ use automonique_store::generation_audit::{
 };
 use automonique_store::platform_store::{ActionAdmission, PlatformStore, PlatformStoreError};
 use automonique_store::provider_journal::ProviderJournal;
+use automonique_store::reload_audit::ReloadAudit;
 use automonique_store::run_index::{
     RunIndex, RunIndexEntry, RunIndexError, RunIndexRecord, RunSpoolState,
 };
@@ -204,6 +205,7 @@ pub mod provider_health;
 pub mod provider_session_host;
 pub mod release_activation;
 pub mod release_builder;
+pub mod reload;
 pub mod run_lane;
 pub mod shadow;
 pub mod shadow_config;
@@ -417,6 +419,11 @@ pub const OPERATOR_MEMBERS_NAME: &str = concat!("operator-members", ".sqlite3");
 /// proves only that a claim was recorded.
 pub const GENERATION_AUDIT_NAME: &str = concat!("generation-audit", ".sqlite3");
 
+/// Durable reload epochs and phase transitions, kept separate from generation
+/// tenure history so an adjacent rollback release can continue reading its v1
+/// generation-audit database unchanged.
+pub const RELOAD_AUDIT_NAME: &str = concat!("reload-audit", ".sqlite3");
+
 /// This deployment's brokered-egress destination policy, a sibling of
 /// [`DATABASE_NAME`].
 ///
@@ -609,6 +616,12 @@ impl DaemonConfig {
     #[must_use]
     pub fn generation_audit_path(&self) -> PathBuf {
         self.state_dir().join(GENERATION_AUDIT_NAME)
+    }
+
+    /// Durable reload epoch and transition audit path.
+    #[must_use]
+    pub fn reload_audit_path(&self) -> PathBuf {
+        self.state_dir().join(RELOAD_AUDIT_NAME)
     }
 
     /// Durable support ticket record path.
@@ -1024,6 +1037,8 @@ pub enum DaemonError {
     /// No client can cause this and no client is told about it: the audit is
     /// never on a request path.
     GenerationAuditFailed(&'static str),
+    /// The durable reload state machine could not be opened or validated.
+    ReloadAuditFailed(&'static str),
     /// The support fleet configuration, the ticket store, or the intake worker
     /// thread was refused. The payload is the stable category from
     /// [`ticket_intake`].
@@ -1103,6 +1118,7 @@ impl DaemonError {
             Self::ApprovalLedgerFailed(category) => category,
             Self::BatchRegistryFailed(category) => category,
             Self::GenerationAuditFailed(category) => category,
+            Self::ReloadAuditFailed(category) => category,
             Self::TicketIntakeRefused(category) => category,
             Self::SlackRefused(category) => category,
             Self::ApprovalRequestsFailed(category) => category,
@@ -1169,6 +1185,9 @@ impl fmt::Display for DaemonError {
             }
             Self::GenerationAuditFailed(category) => {
                 write!(formatter, "generation audit failed: {category}")
+            }
+            Self::ReloadAuditFailed(category) => {
+                write!(formatter, "reload audit failed: {category}")
             }
             Self::TicketIntakeRefused(category) => {
                 write!(formatter, "support ticket intake refused: {category}")
@@ -1329,6 +1348,8 @@ pub struct Daemon {
     /// generation lease that authorized it is still held — which
     /// [`Daemon::serve`] performs explicitly rather than leaving to `Drop`.
     generation_audit: GenerationAudit,
+    /// Durable reload epochs and their append-only transition history.
+    _reload_audit: ReloadAudit,
     /// Durable revision of this daemon's own open tenure row.
     ///
     /// Recorded from what the audit returned rather than assumed to be one:
@@ -1571,6 +1592,8 @@ impl Daemon {
             lease.epoch,
             now_ms,
         )?;
+        let reload_audit = ReloadAudit::open(config.reload_audit_path())
+            .map_err(|error| DaemonError::ReloadAuditFailed(error.category()))?;
         let generation_queues_clean =
             startup_queues_clean(&store.status_snapshot_at(GENERATION_ID, now_ms)?);
 
@@ -1872,6 +1895,7 @@ impl Daemon {
             batches,
             attempt_host: Some(attempt_host),
             generation_audit,
+            _reload_audit: reload_audit,
             tenure_revision: tenure.revision,
             execution_state,
             configured_approval_requirement,

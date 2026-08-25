@@ -530,10 +530,11 @@ mod versions {
     /// The components whose live constant lives in a crate this one cannot
     /// depend on. Restated here rather than derived, so adding a foreign
     /// component without acknowledging the gap fails this file.
-    const KNOWN_FOREIGN: [Component; 7] = [
+    const KNOWN_FOREIGN: [Component; 8] = [
         Component::StoreSchema,
         Component::CancelLedgerSchema,
         Component::GenerationAuditSchema,
+        Component::ReloadAuditSchema,
         Component::ProviderJournalSchema,
         Component::RunSubmissionsSchema,
         Component::SlackIngressSchema,
@@ -1035,6 +1036,7 @@ mod versions {
                 (Component::StoreSchema, 1, 10),
                 (Component::CancelLedgerSchema, 1, 1),
                 (Component::GenerationAuditSchema, 1, 1),
+                (Component::ReloadAuditSchema, 1, 1),
                 (Component::ProviderJournalSchema, 1, 4),
                 (Component::RunSubmissionsSchema, 1, 1),
                 (Component::SlackIngressSchema, 1, 2),

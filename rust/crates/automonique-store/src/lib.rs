@@ -23,6 +23,7 @@ pub mod operator_members;
 pub mod platform_store;
 pub mod provider_deployments;
 pub mod provider_journal;
+pub mod reload_audit;
 pub mod run_index;
 pub mod run_submissions;
 pub mod shadow_comparisons;

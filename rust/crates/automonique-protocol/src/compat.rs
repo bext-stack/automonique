@@ -1041,6 +1041,8 @@ pub enum Component {
     CancelLedgerSchema,
     /// The generation audit sibling database schema.
     GenerationAuditSchema,
+    /// The reload epoch audit sibling database schema.
+    ReloadAuditSchema,
     /// The provider journal sibling database schema.
     ProviderJournalSchema,
     /// The run submissions sibling database schema.
@@ -1053,13 +1055,14 @@ pub enum Component {
 
 impl Component {
     /// Every component, for coverage checks.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::AdminProtocol,
         Self::ReleaseManifestSchema,
         Self::TypeScriptSdkSurface,
         Self::StoreSchema,
         Self::CancelLedgerSchema,
         Self::GenerationAuditSchema,
+        Self::ReloadAuditSchema,
         Self::ProviderJournalSchema,
         Self::RunSubmissionsSchema,
         Self::SlackIngressSchema,
@@ -1079,6 +1082,7 @@ impl Component {
             Self::StoreSchema => "store_schema",
             Self::CancelLedgerSchema => "cancel_ledger_schema",
             Self::GenerationAuditSchema => "generation_audit_schema",
+            Self::ReloadAuditSchema => "reload_audit_schema",
             Self::ProviderJournalSchema => "provider_journal_schema",
             Self::RunSubmissionsSchema => "run_submissions_schema",
             Self::SlackIngressSchema => "slack_ingress_schema",
@@ -1096,10 +1100,11 @@ impl Component {
             Self::StoreSchema => 3,
             Self::CancelLedgerSchema => 4,
             Self::GenerationAuditSchema => 5,
-            Self::ProviderJournalSchema => 6,
-            Self::RunSubmissionsSchema => 7,
-            Self::SlackIngressSchema => 8,
-            Self::RunSpecDocument => 9,
+            Self::ReloadAuditSchema => 6,
+            Self::ProviderJournalSchema => 7,
+            Self::RunSubmissionsSchema => 8,
+            Self::SlackIngressSchema => 9,
+            Self::RunSpecDocument => 10,
         }
     }
 
@@ -1127,6 +1132,9 @@ impl Component {
             },
             Self::GenerationAuditSchema => VersionAuthority::Foreign {
                 symbol: "automonique_store::generation_audit::GENERATION_AUDIT_SCHEMA_VERSION",
+            },
+            Self::ReloadAuditSchema => VersionAuthority::Foreign {
+                symbol: "automonique_store::reload_audit::RELOAD_AUDIT_SCHEMA_VERSION",
             },
             Self::ProviderJournalSchema => VersionAuthority::Foreign {
                 symbol: "automonique_store::provider_journal::PROVIDER_JOURNAL_SCHEMA_VERSION",
@@ -1161,9 +1169,10 @@ impl Component {
             // unbroken v1 -> v2 -> ... -> v10 chain, so a v1 file still opens.
             Self::StoreSchema => (1, 10),
             // These sibling databases remain on their first schema.
-            Self::CancelLedgerSchema | Self::GenerationAuditSchema | Self::RunSubmissionsSchema => {
-                (1, 1)
-            }
+            Self::CancelLedgerSchema
+            | Self::GenerationAuditSchema
+            | Self::ReloadAuditSchema
+            | Self::RunSubmissionsSchema => (1, 1),
             // Slack ingress v2 adds provenance and migrates v1 files in place.
             Self::SlackIngressSchema => (1, 2),
             // Provider journal v4 adds deterministic replay after v3 provenance.
