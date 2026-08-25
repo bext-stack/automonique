@@ -9,8 +9,6 @@
 //! back through the store crate's own readers, so what a test asserts is what
 //! the next generation would find on disk.
 
-#![allow(dead_code)]
-
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt as _;
@@ -23,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use automonique_daemon::execute::{DAEMON_WORKSPACE_REGISTRY, offered_host_features};
 use automonique_daemon::{Daemon, DaemonConfig, DaemonError};
-use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse, SubmittedRunSpec};
+use automonique_protocol::admin::{AdminRequest, AdminResponse, SubmittedRunSpec};
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
 use automonique_protocol::context::{ContextManifest, TokenBudget};
 use automonique_protocol::digest::Sha256 as ProtocolSha256;
@@ -67,6 +65,8 @@ pub const PROCESSES: u64 = 64;
 pub const TIMEOUT_MILLIS: u64 = 60_000;
 pub const SPOOL_BYTES: u64 = 1024 * 1024;
 /// Ceiling a proof re-opens a finished spool under; well above `SPOOL_BYTES`.
+// Used by `handoff_live_run`; `reload_failure_matrix` compiles it unused.
+#[allow(dead_code)]
 pub const READ_SPOOL_BYTES: u64 = 8 * 1024 * 1024;
 
 // --- filesystem -----------------------------------------------------------
@@ -171,6 +171,8 @@ pub struct InstalledReleases {
     /// an exact retry of a terminal reload is answered with its recorded
     /// outcome rather than started again, so a proof that reloads twice from
     /// one epoch needs two targets.
+    // Used by `reload_failure_matrix`; `handoff_live_run` compiles it unused.
+    #[allow(dead_code)]
     pub retry: String,
 }
 
@@ -214,6 +216,8 @@ pub fn cli(config: &DaemonConfig, args: &[&str]) -> Output {
         .expect("product binary runs")
 }
 
+// Used by `handoff_live_run`; `reload_failure_matrix` compiles it unused.
+#[allow(dead_code)]
 pub fn spawn_cli(config: &DaemonConfig, args: &[&str]) -> Child {
     cli_command(config)
         .args(args)
@@ -274,9 +278,10 @@ pub fn wait_for_reload_phase(
 pub struct SourceLease {
     pub holder_id: String,
     pub epoch: u64,
-    pub boot_id: String,
     pub pid: u32,
-    pub starttime: u64,
+    /// Read by the failure-matrix proofs, which assert the row did not move;
+    /// the live-run proof reads the phases instead.
+    #[allow(dead_code)]
     pub revision: u64,
 }
 
@@ -297,7 +302,7 @@ pub fn try_read_source_lease(path: &Path) -> Option<SourceLease> {
         .expect("busy timeout");
     connection
         .query_row(
-            "SELECT lease_holder, lease_epoch, boot_id, holder_pid, holder_starttime, revision
+            "SELECT lease_holder, lease_epoch, holder_pid, revision
              FROM generations
              WHERE generation_id = 'foreground'",
             [],
@@ -305,10 +310,8 @@ pub fn try_read_source_lease(path: &Path) -> Option<SourceLease> {
                 Ok(SourceLease {
                     holder_id: row.get(0)?,
                     epoch: row.get(1)?,
-                    boot_id: row.get(2)?,
-                    pid: row.get(3)?,
-                    starttime: row.get(4)?,
-                    revision: row.get(5)?,
+                    pid: row.get(2)?,
+                    revision: row.get(3)?,
                 })
             },
         )
@@ -316,6 +319,8 @@ pub fn try_read_source_lease(path: &Path) -> Option<SourceLease> {
 }
 
 /// Wait until a daemon at `config` holds the generation, and return its lease.
+// Used by `reload_failure_matrix`; `handoff_live_run` compiles it unused.
+#[allow(dead_code)]
 pub fn wait_for_generation(config: &DaemonConfig) -> SourceLease {
     wait_for_socket(config);
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -352,6 +357,8 @@ pub fn process_exited(pid: u32) -> bool {
 }
 
 /// PIDs of live reload-candidate processes spawned for `reload_id`.
+// Used by `reload_failure_matrix`; `handoff_live_run` compiles it unused.
+#[allow(dead_code)]
 pub fn candidate_processes(reload_id: &str) -> Vec<u32> {
     let Ok(entries) = fs::read_dir("/proc") else {
         return Vec::new();
@@ -371,6 +378,8 @@ pub fn candidate_processes(reload_id: &str) -> Vec<u32> {
 
 /// The lease clock the daemon itself uses, for a store handle a test opens
 /// beside a running daemon.
+// Used by `reload_failure_matrix`; `handoff_live_run` compiles it unused.
+#[allow(dead_code)]
 pub struct ProcBootTime;
 
 impl automonique_store::LeaseTimeSource for ProcBootTime {
@@ -383,6 +392,8 @@ impl automonique_store::LeaseTimeSource for ProcBootTime {
     }
 }
 
+// Used by `reload_failure_matrix`; `handoff_live_run` compiles it unused.
+#[allow(dead_code)]
 pub fn unix_millis() -> i64 {
     i64::try_from(
         std::time::SystemTime::now()
@@ -428,26 +439,6 @@ impl Serving {
             .expect("serving")
             .join()
             .expect("serve thread")
-    }
-
-    /// Ask the daemon to stop over its socket and wait for a clean return.
-    pub fn shutdown(mut self, config: &DaemonConfig) {
-        assert!(matches!(
-            admin(
-                config,
-                AdminRequest::new(
-                    RequestId::new("shutdown").expect("request ID"),
-                    AdminCommand::Shutdown,
-                ),
-            ),
-            AdminResponse::ShutdownAccepted { .. }
-        ));
-        self.thread
-            .take()
-            .expect("running")
-            .join()
-            .expect("daemon thread")
-            .expect("clean stop");
     }
 }
 
@@ -506,6 +497,8 @@ pub fn admin(config: &DaemonConfig, request: AdminRequest) -> AdminResponse {
     AdminResponse::from_canonical_bytes(&response).expect("admitted response")
 }
 
+// Used by `handoff_live_run`; `reload_failure_matrix` compiles it unused.
+#[allow(dead_code)]
 pub fn execute(config: &DaemonConfig, label: &str, run: &str) -> ExecuteResponse {
     let request = ExecuteRequest::ExecuteRun {
         request_id: RequestId::new(label).expect("request ID"),
@@ -514,6 +507,8 @@ pub fn execute(config: &DaemonConfig, label: &str, run: &str) -> ExecuteResponse
     execute_exchange(config, &request)
 }
 
+// Used by `reload_failure_matrix`; `handoff_live_run` compiles it unused.
+#[allow(dead_code)]
 pub fn cancel(
     config: &DaemonConfig,
     label: &str,
@@ -546,6 +541,8 @@ fn execute_exchange(config: &DaemonConfig, request: &ExecuteRequest) -> ExecuteR
     response
 }
 
+// Used by `handoff_live_run`; `reload_failure_matrix` compiles it unused.
+#[allow(dead_code)]
 pub fn runs(config: &DaemonConfig, request: &RunsRequest) -> RunsResponse {
     let payload = request
         .to_message()
@@ -555,6 +552,8 @@ pub fn runs(config: &DaemonConfig, request: &RunsRequest) -> RunsResponse {
     RunsResponse::from_canonical_bytes(&response).expect("admitted runs response")
 }
 
+// Used by `handoff_live_run`; `reload_failure_matrix` compiles it unused.
+#[allow(dead_code)]
 pub fn listed_state(config: &DaemonConfig, label: &str, run: &str) -> RunState {
     let response = runs(
         config,
@@ -593,10 +592,8 @@ pub fn submit(config: &DaemonConfig, spec: &RunSpec, key: &str) -> u64 {
     submission_id
 }
 
-pub fn spool_root(config: &DaemonConfig, run: &str) -> PathBuf {
-    config.state_dir().join("runs").join(run).join("spool")
-}
-
+// Used by `handoff_live_run`; `reload_failure_matrix` compiles it unused.
+#[allow(dead_code)]
 pub fn workspace_root(config: &DaemonConfig, run: &str) -> PathBuf {
     config.state_dir().join("runs").join(run).join("workspace")
 }
