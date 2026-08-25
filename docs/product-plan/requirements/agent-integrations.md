@@ -133,6 +133,43 @@ events over inherited stdio, with bounded frames and no terminal scraping.
 Every process, session, turn, provider request and terminal settlement is
 committed to the provider journal before it is projected.
 
+### Capability contract
+
+A `hello_ok` negotiates only when it advertises every base capability
+(`sessions`, `streaming`, `cancellation`, `soft_interrupt`, `history`,
+`model_catalog`, `reasoning_effort`, `usage`, `runtime_info`) plus one
+input-request capability:
+
+- `stdin_requests` is the maintained harness API. The engine forwards
+  `stdin_request` events (session, request, prompt, password mask, tool-call
+  identity) and accepts the correlated `stdin_response` request.
+- `permission_requests` is the advertisement of pinned builds that predate the
+  maintained harness exposing stdin requests. It is accepted only when
+  `stdin_requests` is absent, so the daemon carrying this contract is deployed
+  first and the engine pin moves afterwards with no flag day.
+- A build advertising neither is refused as `missing_capability`.
+
+Additive capabilities are ignored. Both `permission_request` and
+`stdin_request` events are bridged whichever mode negotiated: Automonique
+answers the request it observes, not the one advertised.
+
+The negotiated capability list is recorded exactly as the write-once
+`jcode-harness-api` binding of the journal session each process opens, next to
+the `jcode-server` identity and `jcode-execution-config` bindings. Those
+bindings are evidence, not version pins. The journal's resume and replay drift
+tuple is what Automonique presents to the engine — prompt version, tool schema
+version and model — and it deliberately excludes the executable digest, so an
+engine build may change beneath one attempt. An exact-session resume whose new
+`hello_ok` still negotiates is therefore compatible even when its capability
+list, including the input-request mode, differs from the recorded one; the
+change stays auditable through the differing session bindings. Only a hello
+that fails the contract above refuses the resume.
+
+The composed sandbox environment sets `JCODE_NO_TELEMETRY=1` for a JCode
+workload. The sandbox has no telemetry egress, so the opt-out changes nothing
+the engine can reach; it only keeps the engine's opt-out notice out of every
+contained run's journal.
+
 ### Integration work
 
 - Pin the executable digest, reported build revision and protocol version.

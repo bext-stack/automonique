@@ -38,11 +38,12 @@ mod types;
 
 pub use codex::{CodexAdapter, CodexInvocationPlan, ExecutableInspection, normalize_jsonl};
 pub use jcode::{
-    JCODE_API_SCHEMA_ID, JCODE_API_STDIO_ARGUMENTS, JCODE_API_VERSION, JcodeEvent,
-    JcodeExecutionIdentity, JcodeFrameDecoder, JcodeInterruptedReason, JcodeNativeAdapter,
-    JcodeNativeEnvelope, JcodeNativeEvent, JcodeNegotiation, JcodeProtocolError, JcodeRequest,
-    JcodeTerminalOutcome, JcodeTurnCollector, JcodeTurnResult, PermissionDecision,
-    REQUIRED_JCODE_CAPABILITIES, encode_jcode_request,
+    JCODE_API_SCHEMA_ID, JCODE_API_STDIO_ARGUMENTS, JCODE_API_VERSION,
+    JCODE_INPUT_REQUEST_CAPABILITY, JcodeEvent, JcodeExecutionIdentity, JcodeFrameDecoder,
+    JcodeInputRequestMode, JcodeInterruptedReason, JcodeNativeAdapter, JcodeNativeEnvelope,
+    JcodeNativeEvent, JcodeNegotiation, JcodeProtocolError, JcodeRequest, JcodeTerminalOutcome,
+    JcodeTurnCollector, JcodeTurnResult, LEGACY_JCODE_INPUT_REQUEST_CAPABILITY, PermissionDecision,
+    REQUIRED_JCODE_CAPABILITIES, encode_jcode_request, negotiate_jcode_capabilities,
 };
 pub use spawn_plan::{
     MAX_LOADER_GRANTS, PromptDelivery, ProviderExecutable, ProviderKind, ProviderLaunchPlan,

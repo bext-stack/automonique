@@ -8,6 +8,16 @@
 //! `wss` hosts and redacted like a credential, connection and I/O deadlines are
 //! clamped, only text envelopes are admitted, websocket control payloads are
 //! checked, and an acknowledgement has one canonical JSON spelling.
+//!
+//! Two deadlines govern one connection. The *ceiling*
+//! ([`SOCKET_MODE_IO_TIMEOUT_SECONDS`]) bounds every operation that must make
+//! progress to be healthy: DNS, TCP connect, the TLS and websocket handshakes,
+//! and every write, a pong included. The *read cadence*
+//! ([`SlackSocketModeConnector::with_read_cadence`]) bounds one idle envelope
+//! read and may be shorter, because a read that ends in silence is not a
+//! failure of the connection — it is how a synchronous worker returns to its
+//! caller to observe a stop flag. A read timeout is therefore reported as
+//! [`SocketModeFailure::TimedOut`] and the websocket remains usable.
 
 use std::fmt;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -29,7 +39,11 @@ pub const MAX_SOCKET_MODE_URL_BYTES: usize = 2_048;
 /// frame beyond this limit is refused rather than partially retained.
 pub const MAX_SOCKET_MODE_ENVELOPE_BYTES: usize = 256 * 1024;
 
-/// Whole-operation deadline ceiling for one synchronous websocket read/write.
+/// Whole-operation deadline ceiling for one synchronous websocket operation.
+///
+/// Connect, the handshakes and every write are bounded by exactly this value.
+/// An envelope read is bounded by the connection's read cadence, which is
+/// clamped to this ceiling and defaults to it.
 pub const SOCKET_MODE_IO_TIMEOUT_SECONDS: u64 = 10;
 
 /// Most control frames skipped while waiting for one application envelope.
@@ -287,7 +301,10 @@ impl std::error::Error for SocketModeFailure {}
 /// Bounded synchronous protocol over one injected websocket connection.
 pub struct SocketModeConnection<S> {
     socket: S,
+    /// Deadline for every write, the pong answering a ping included.
     timeout: Duration,
+    /// Deadline for one idle envelope read; never wider than `timeout`.
+    read_timeout: Duration,
 }
 
 impl<S> SocketModeConnection<S>
@@ -300,20 +317,50 @@ where
     }
 
     /// Bind one socket with a timeout no wider than the connector ceiling.
+    ///
+    /// Reads and writes share the one deadline, as they did before the read
+    /// cadence existed.
     #[must_use]
     pub fn with_timeout(socket: S, timeout: Duration) -> Self {
-        let ceiling = Duration::from_secs(SOCKET_MODE_IO_TIMEOUT_SECONDS);
-        let timeout = if timeout.is_zero() {
-            ceiling
-        } else {
-            timeout.min(ceiling)
-        };
-        Self { socket, timeout }
+        let timeout = clamp_to_ceiling(timeout);
+        Self {
+            socket,
+            timeout,
+            read_timeout: timeout,
+        }
     }
 
+    /// Bind one socket with a write deadline and a separate idle-read cadence.
+    ///
+    /// `timeout` is clamped to the connector ceiling and bounds every write.
+    /// `read_cadence` bounds one envelope read and is clamped to `timeout`, so
+    /// the cadence can only ever shorten a read; zero means "no separate
+    /// cadence" for either value.
+    #[must_use]
+    pub fn with_timeouts(socket: S, timeout: Duration, read_cadence: Duration) -> Self {
+        let timeout = clamp_to_ceiling(timeout);
+        let read_timeout = if read_cadence.is_zero() {
+            timeout
+        } else {
+            read_cadence.min(timeout)
+        };
+        Self {
+            socket,
+            timeout,
+            read_timeout,
+        }
+    }
+
+    /// Deadline applied to writes and, absent a separate cadence, to reads.
     #[must_use]
     pub const fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    /// Deadline applied to one envelope read.
+    #[must_use]
+    pub const fn read_timeout(&self) -> Duration {
+        self.read_timeout
     }
 
     pub fn into_inner(self) -> S {
@@ -321,6 +368,11 @@ where
     }
 
     /// Receive one application text envelope, handling bounded ping/pong noise.
+    ///
+    /// Each read waits at most [`Self::read_timeout`]; a pong answering a ping
+    /// is a write and gets the full [`Self::timeout`]. A read that ends in
+    /// silence is [`SocketModeFailure::TimedOut`] and leaves the connection
+    /// usable, so a caller may treat it as an idle tick rather than a fault.
     ///
     /// # Errors
     ///
@@ -330,7 +382,10 @@ where
     /// is refused as unavailable instead of spinning forever.
     pub fn receive_envelope(&mut self) -> Result<SocketModeEnvelope, SocketModeFailure> {
         for _ in 0..=MAX_CONTROL_FRAMES_PER_RECEIVE {
-            let frame = self.socket.receive(self.timeout).map_err(map_io_failure)?;
+            let frame = self
+                .socket
+                .receive(self.read_timeout)
+                .map_err(map_io_failure)?;
             match frame {
                 SocketFrame::Text(bytes) => return envelope(bytes),
                 SocketFrame::Binary(_) => return Err(SocketModeFailure::BinaryFrame),
@@ -386,13 +441,16 @@ impl fmt::Debug for ProductionSocketModeSocket {
 }
 
 impl SynchronousWebSocket for ProductionSocketModeSocket {
+    /// Arm only the read direction: a short idle-read cadence must not shorten
+    /// the deadline a pong flushed from inside the read is written under.
     fn receive(&mut self, timeout: Duration) -> Result<SocketFrame, SocketIoFailure> {
-        set_stream_timeout(self.socket.get_mut(), timeout)?;
+        set_read_deadline(self.socket.get_mut(), timeout)?;
         message_to_frame(self.socket.read().map_err(map_tungstenite_io)?)
     }
 
+    /// Arm only the write direction, leaving the read cadence in place.
     fn send(&mut self, frame: SocketFrame, timeout: Duration) -> Result<(), SocketIoFailure> {
-        set_stream_timeout(self.socket.get_mut(), timeout)?;
+        set_write_deadline(self.socket.get_mut(), timeout)?;
         self.socket
             .send(frame_to_message(frame)?)
             .map_err(map_tungstenite_io)
@@ -408,7 +466,10 @@ impl SynchronousWebSocket for ProductionSocketModeSocket {
 /// configuration independently caps both frames and reassembled messages.
 #[derive(Clone, Copy, Debug)]
 pub struct SlackSocketModeConnector {
+    /// Connect, handshake and write deadline.
     timeout: Duration,
+    /// Idle envelope-read deadline on every connection this opens.
+    read_cadence: Duration,
 }
 
 impl Default for SlackSocketModeConnector {
@@ -418,30 +479,54 @@ impl Default for SlackSocketModeConnector {
 }
 
 impl SlackSocketModeConnector {
-    /// Construct with the connector-wide I/O deadline ceiling.
+    /// Construct with the connector-wide I/O deadline ceiling for everything.
     #[must_use]
     pub fn new() -> Self {
+        let ceiling = Duration::from_secs(SOCKET_MODE_IO_TIMEOUT_SECONDS);
         Self {
-            timeout: Duration::from_secs(SOCKET_MODE_IO_TIMEOUT_SECONDS),
+            timeout: ceiling,
+            read_cadence: ceiling,
         }
     }
 
     /// Construct with a tighter connect, handshake, read and write timeout.
     #[must_use]
     pub fn with_timeout(timeout: Duration) -> Self {
-        let ceiling = Duration::from_secs(SOCKET_MODE_IO_TIMEOUT_SECONDS);
+        let timeout = clamp_to_ceiling(timeout);
         Self {
-            timeout: if timeout.is_zero() {
-                ceiling
-            } else {
-                timeout.min(ceiling)
-            },
+            timeout,
+            read_cadence: timeout,
         }
     }
 
+    /// Construct with the full ceiling for connect, handshakes and writes, and
+    /// a shorter cadence for idle envelope reads.
+    ///
+    /// The cadence is the longest a synchronous worker blocks in
+    /// [`SocketModeConnection::receive_envelope`] while Slack is silent before
+    /// the read returns [`SocketModeFailure::TimedOut`] and the worker can look
+    /// at its stop flag. It changes nothing about how the connection is judged:
+    /// a timed-out read is not a reconnect, a ping is still answered with a
+    /// pong under the full write ceiling, and an envelope that arrives is
+    /// delivered whole. Zero or anything above the ceiling means the ceiling.
+    #[must_use]
+    pub fn with_read_cadence(read_cadence: Duration) -> Self {
+        Self {
+            timeout: Duration::from_secs(SOCKET_MODE_IO_TIMEOUT_SECONDS),
+            read_cadence: clamp_to_ceiling(read_cadence),
+        }
+    }
+
+    /// Connect, handshake and write deadline.
     #[must_use]
     pub const fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    /// Idle envelope-read deadline every opened connection starts with.
+    #[must_use]
+    pub const fn read_cadence(&self) -> Duration {
+        self.read_cadence
     }
 
     /// Open a verified Rustls websocket to this exact temporary Slack URL.
@@ -474,11 +559,29 @@ impl SlackSocketModeConnector {
         let result = url.with_url(|exact| {
             tungstenite::client_tls_with_config(exact, stream, Some(websocket_config()), None)
         });
-        let (socket, _) = result.map_err(map_handshake_error)?;
-        Ok(SocketModeConnection::with_timeout(
+        let (mut socket, _) = result.map_err(map_handshake_error)?;
+        // The handshake ran under what remained of the connect deadline. The
+        // established stream is re-armed with its steady-state deadlines so
+        // the first idle read and the first write, a pong flushed from inside
+        // that read included, are each bounded by their own value.
+        set_read_deadline(socket.get_mut(), self.read_cadence)
+            .and_then(|()| set_write_deadline(socket.get_mut(), self.timeout))
+            .map_err(|_| SocketModeFailure::Unavailable)?;
+        Ok(SocketModeConnection::with_timeouts(
             ProductionSocketModeSocket { socket },
             self.timeout,
+            self.read_cadence,
         ))
+    }
+}
+
+/// Clamp one deadline to the connector ceiling, reading zero as the ceiling.
+fn clamp_to_ceiling(timeout: Duration) -> Duration {
+    let ceiling = Duration::from_secs(SOCKET_MODE_IO_TIMEOUT_SECONDS);
+    if timeout.is_zero() {
+        ceiling
+    } else {
+        timeout.min(ceiling)
     }
 }
 
@@ -543,17 +646,29 @@ fn remaining(deadline: Instant) -> Result<Duration, SocketModeFailure> {
         .ok_or(SocketModeFailure::TimedOut)
 }
 
-fn set_stream_timeout(
+fn tcp_stream(stream: &mut MaybeTlsStream<TcpStream>) -> Result<&mut TcpStream, SocketIoFailure> {
+    match stream {
+        MaybeTlsStream::Plain(tcp) => Ok(tcp),
+        MaybeTlsStream::Rustls(tls) => Ok(&mut tls.sock),
+        _ => Err(SocketIoFailure::Unavailable),
+    }
+}
+
+fn set_read_deadline(
     stream: &mut MaybeTlsStream<TcpStream>,
     timeout: Duration,
 ) -> Result<(), SocketIoFailure> {
-    let tcp = match stream {
-        MaybeTlsStream::Plain(tcp) => tcp,
-        MaybeTlsStream::Rustls(tls) => &mut tls.sock,
-        _ => return Err(SocketIoFailure::Unavailable),
-    };
-    tcp.set_read_timeout(Some(timeout))
-        .and_then(|()| tcp.set_write_timeout(Some(timeout)))
+    tcp_stream(stream)?
+        .set_read_timeout(Some(timeout))
+        .map_err(|_| SocketIoFailure::Unavailable)
+}
+
+fn set_write_deadline(
+    stream: &mut MaybeTlsStream<TcpStream>,
+    timeout: Duration,
+) -> Result<(), SocketIoFailure> {
+    tcp_stream(stream)?
+        .set_write_timeout(Some(timeout))
         .map_err(|_| SocketIoFailure::Unavailable)
 }
 
@@ -699,10 +814,13 @@ mod tests {
     struct FakeSocket {
         received: VecDeque<Result<SocketFrame, SocketIoFailure>>,
         sent: Vec<(SocketFrame, Duration)>,
+        /// The deadline each read was asked to honour, in order.
+        read_deadlines: Vec<Duration>,
     }
 
     impl SynchronousWebSocket for FakeSocket {
-        fn receive(&mut self, _timeout: Duration) -> Result<SocketFrame, SocketIoFailure> {
+        fn receive(&mut self, timeout: Duration) -> Result<SocketFrame, SocketIoFailure> {
+            self.read_deadlines.push(timeout);
             self.received
                 .pop_front()
                 .unwrap_or(Err(SocketIoFailure::Unavailable))
@@ -718,13 +836,25 @@ mod tests {
         SocketModeConnection::with_timeout(
             FakeSocket {
                 received: frames.into_iter().map(Ok).collect(),
-                sent: Vec::new(),
+                ..FakeSocket::default()
             },
             Duration::from_millis(250),
         )
     }
 
     fn concrete_pair() -> (
+        SocketModeConnection<ProductionSocketModeSocket>,
+        WebSocket<TcpStream>,
+    ) {
+        concrete_pair_with(Duration::from_millis(500), Duration::ZERO)
+    }
+
+    /// A loopback client/server pair whose client carries the given write
+    /// deadline and idle-read cadence.
+    fn concrete_pair_with(
+        timeout: Duration,
+        read_cadence: Duration,
+    ) -> (
         SocketModeConnection<ProductionSocketModeSocket>,
         WebSocket<TcpStream>,
     ) {
@@ -757,12 +887,26 @@ mod tests {
         .expect("client handshake");
         let server = server.join().expect("server thread");
         (
-            SocketModeConnection::with_timeout(
+            SocketModeConnection::with_timeouts(
                 ProductionSocketModeSocket { socket: client },
-                Duration::from_millis(500),
+                timeout,
+                read_cadence,
             ),
             server,
         )
+    }
+
+    /// The kernel-level deadlines currently set on a plaintext loopback client.
+    fn stream_deadlines(
+        connection: &mut SocketModeConnection<ProductionSocketModeSocket>,
+    ) -> (Option<Duration>, Option<Duration>) {
+        match connection.socket.socket.get_ref() {
+            MaybeTlsStream::Plain(tcp) => (
+                tcp.read_timeout().expect("read timeout"),
+                tcp.write_timeout().expect("write timeout"),
+            ),
+            _ => panic!("loopback fixture is plaintext"),
+        }
     }
 
     #[test]
@@ -891,7 +1035,7 @@ mod tests {
         );
         let mut connection = SocketModeConnection::new(FakeSocket {
             received: [Err(SocketIoFailure::TimedOut)].into_iter().collect(),
-            sent: Vec::new(),
+            ..FakeSocket::default()
         });
         assert_eq!(
             connection.receive_envelope().err(),
@@ -918,6 +1062,172 @@ mod tests {
         assert_eq!(
             SlackSocketModeConnector::with_timeout(Duration::from_secs(60)).timeout(),
             ceiling
+        );
+    }
+
+    #[test]
+    fn read_cadence_is_clamped_to_the_write_ceiling_and_never_widens_it() {
+        let ceiling = Duration::from_secs(SOCKET_MODE_IO_TIMEOUT_SECONDS);
+        let cadence = Duration::from_secs(2);
+
+        // The existing constructors keep one shared deadline for both.
+        let shared = SlackSocketModeConnector::new();
+        assert_eq!(
+            (shared.timeout(), shared.read_cadence()),
+            (ceiling, ceiling)
+        );
+        let tight = SlackSocketModeConnector::with_timeout(Duration::from_secs(3));
+        assert_eq!(
+            (tight.timeout(), tight.read_cadence()),
+            (Duration::from_secs(3), Duration::from_secs(3))
+        );
+
+        // The cadence constructor leaves the ceiling alone and only shortens reads.
+        let paced = SlackSocketModeConnector::with_read_cadence(cadence);
+        assert_eq!((paced.timeout(), paced.read_cadence()), (ceiling, cadence));
+        for widened in [Duration::ZERO, Duration::from_secs(60)] {
+            let connector = SlackSocketModeConnector::with_read_cadence(widened);
+            assert_eq!(
+                (connector.timeout(), connector.read_cadence()),
+                (ceiling, ceiling),
+                "{widened:?}"
+            );
+        }
+
+        // On a connection the cadence is further bounded by that connection's
+        // own write deadline, so a tighter connector wins.
+        let connection =
+            SocketModeConnection::with_timeouts(FakeSocket::default(), Duration::ZERO, cadence);
+        assert_eq!(
+            (connection.timeout(), connection.read_timeout()),
+            (ceiling, cadence)
+        );
+        let connection = SocketModeConnection::with_timeouts(
+            FakeSocket::default(),
+            Duration::from_secs(1),
+            cadence,
+        );
+        assert_eq!(
+            (connection.timeout(), connection.read_timeout()),
+            (Duration::from_secs(1), Duration::from_secs(1))
+        );
+        let connection = SocketModeConnection::with_timeouts(
+            FakeSocket::default(),
+            Duration::from_secs(5),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            (connection.timeout(), connection.read_timeout()),
+            (Duration::from_secs(5), Duration::from_secs(5))
+        );
+        let connection = SocketModeConnection::with_timeout(FakeSocket::default(), cadence);
+        assert_eq!(
+            (connection.timeout(), connection.read_timeout()),
+            (cadence, cadence)
+        );
+    }
+
+    #[test]
+    fn reads_wait_for_the_cadence_while_pongs_and_acks_get_the_full_ceiling() {
+        let ceiling = Duration::from_secs(SOCKET_MODE_IO_TIMEOUT_SECONDS);
+        let cadence = Duration::from_millis(250);
+        let mut connection = SocketModeConnection::with_timeouts(
+            FakeSocket {
+                received: [
+                    Ok(SocketFrame::Ping(b"probe".to_vec())),
+                    Err(SocketIoFailure::TimedOut),
+                    Ok(SocketFrame::Text(br#"{"type":"hello"}"#.to_vec())),
+                ]
+                .into_iter()
+                .collect(),
+                ..FakeSocket::default()
+            },
+            ceiling,
+            cadence,
+        );
+
+        // Silence after an answered ping is a timeout, not a dead connection…
+        assert_eq!(
+            connection.receive_envelope().err(),
+            Some(SocketModeFailure::TimedOut)
+        );
+        // …and the same connection then delivers the next envelope.
+        let envelope = connection
+            .receive_envelope()
+            .expect("envelope after idle read");
+        assert_eq!(envelope.as_bytes(), br#"{"type":"hello"}"#);
+        connection.acknowledge("E1").expect("acknowledgement");
+
+        let inner = connection.into_inner();
+        assert_eq!(inner.read_deadlines, vec![cadence; 3]);
+        assert_eq!(
+            inner.sent,
+            vec![
+                (SocketFrame::Pong(b"probe".to_vec()), ceiling),
+                (
+                    SocketFrame::Text(br#"{"envelope_id":"E1"}"#.to_vec()),
+                    ceiling
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn concrete_silent_socket_times_out_at_the_cadence_and_stays_usable() {
+        // The fixture arms the raw stream at 2 s in both directions; the
+        // connection's own write deadline is deliberately different so the
+        // assertions can tell "left alone" from "re-armed".
+        let fixture_deadline = Duration::from_secs(2);
+        let write_deadline = Duration::from_secs(1);
+        let cadence = Duration::from_millis(300);
+        let (mut connection, mut server) = concrete_pair_with(write_deadline, cadence);
+        assert_eq!(
+            stream_deadlines(&mut connection),
+            (Some(fixture_deadline), Some(fixture_deadline))
+        );
+
+        // Nothing is sent: the read must come back at the cadence, well before
+        // either wider deadline, and as a timeout rather than a closed
+        // connection. Only the read direction was re-armed.
+        let started = Instant::now();
+        assert_eq!(
+            connection.receive_envelope().err(),
+            Some(SocketModeFailure::TimedOut)
+        );
+        let idle = started.elapsed();
+        assert!(idle >= cadence, "idle read returned early: {idle:?}");
+        assert!(
+            idle < write_deadline,
+            "idle read waited past the cadence: {idle:?}"
+        );
+        assert_eq!(
+            stream_deadlines(&mut connection),
+            (Some(cadence), Some(fixture_deadline))
+        );
+
+        // A write on the same connection is armed with the connection's full
+        // write deadline and leaves the read cadence alone; the websocket is
+        // still the same open one, so the acknowledgement and a later envelope
+        // both cross it.
+        connection.acknowledge("E1").expect("ack after idle read");
+        assert_eq!(
+            stream_deadlines(&mut connection),
+            (Some(cadence), Some(write_deadline))
+        );
+        assert_eq!(
+            server.read().expect("read acknowledgement"),
+            Message::text(r#"{"envelope_id":"E1"}"#)
+        );
+        server
+            .send(Message::text(r#"{"type":"events_api"}"#))
+            .expect("send envelope");
+        let envelope = connection
+            .receive_envelope()
+            .expect("envelope after idle read");
+        assert_eq!(envelope.as_str(), r#"{"type":"events_api"}"#);
+        assert_eq!(
+            stream_deadlines(&mut connection),
+            (Some(cadence), Some(write_deadline))
         );
     }
 

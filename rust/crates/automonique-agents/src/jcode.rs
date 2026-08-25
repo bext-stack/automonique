@@ -7,6 +7,37 @@
 //! run state. This module is the pure protocol seam between them. It builds
 //! typed protocol-v1 requests and decodes the additive NDJSON event contract;
 //! it starts no process and grants no capability.
+//!
+//! # Capability contract
+//!
+//! A `hello_ok` negotiates only when it advertises every entry of
+//! [`REQUIRED_JCODE_CAPABILITIES`] plus one input-request capability:
+//!
+//! * [`JCODE_INPUT_REQUEST_CAPABILITY`] (`stdin_requests`) is the maintained
+//!   harness API. The engine forwards `stdin_request` events and accepts the
+//!   correlated `stdin_response` request.
+//! * [`LEGACY_JCODE_INPUT_REQUEST_CAPABILITY`] (`permission_requests`) is the
+//!   advertisement of pinned builds that predate that harness change. It is
+//!   accepted only when `stdin_requests` is absent, so a daemon carrying this
+//!   contract can be deployed before the engine pin moves.
+//! * A build advertising neither is refused with
+//!   [`JcodeProtocolError::MissingCapability`].
+//!
+//! Additive capabilities are ignored. Both `permission_request` and
+//! `stdin_request` events are decoded whichever mode negotiated, because
+//! Automonique bridges the request it observes, not the one advertised.
+//!
+//! # Capability changes across an exact resume
+//!
+//! The negotiated capability list is recorded exactly, as a write-once
+//! per-session binding in the provider journal. It is evidence, not a version
+//! pin: the journal's resume/replay drift tuple is the prompt version, the
+//! tool schema Automonique presents and the model, and it deliberately excludes
+//! the executable digest so an engine build may change beneath one attempt.
+//! An exact-session resume whose new `hello_ok` still negotiates is therefore
+//! compatible even when its capability list — including the input-request
+//! mode — differs from the recorded one. Only a hello that fails the contract
+//! above refuses the resume.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -27,19 +58,76 @@ pub const MAX_JCODE_TEXT_BYTES: usize = 256 * 1024;
 const MAX_JCODE_FIELD_BYTES: usize = 512;
 
 /// Capabilities required before Automonique will entrust a managed turn to the
-/// engine. Additive capabilities may be present and are ignored.
-pub const REQUIRED_JCODE_CAPABILITIES: [&str; 10] = [
+/// engine, independent of how it surfaces interactive input requests. One
+/// input-request capability is required on top of these; see
+/// [`negotiate_jcode_capabilities`]. Additive capabilities may be present and
+/// are ignored.
+pub const REQUIRED_JCODE_CAPABILITIES: [&str; 9] = [
     "sessions",
     "streaming",
     "cancellation",
     "soft_interrupt",
-    "permission_requests",
     "history",
     "model_catalog",
     "reasoning_effort",
     "usage",
     "runtime_info",
 ];
+
+/// The input-request capability of the maintained harness API: the engine
+/// forwards `stdin_request` events and accepts the correlated `stdin_response`.
+pub const JCODE_INPUT_REQUEST_CAPABILITY: &str = "stdin_requests";
+
+/// The advertisement of pinned builds that predate the maintained harness
+/// exposing interactive stdin requests. It negotiates only when
+/// [`JCODE_INPUT_REQUEST_CAPABILITY`] is absent, which lets a daemon carrying
+/// this contract be deployed before the engine pin moves.
+pub const LEGACY_JCODE_INPUT_REQUEST_CAPABILITY: &str = "permission_requests";
+
+/// How a negotiated engine advertised interactive input requests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JcodeInputRequestMode {
+    /// [`JCODE_INPUT_REQUEST_CAPABILITY`] was advertised.
+    StdinRequests,
+    /// Only [`LEGACY_JCODE_INPUT_REQUEST_CAPABILITY`] was advertised: a pinned
+    /// build from before the maintained harness change.
+    LegacyPermissionRequests,
+}
+
+impl JcodeInputRequestMode {
+    /// The exact capability token that selected this mode.
+    #[must_use]
+    pub const fn capability(self) -> &'static str {
+        match self {
+            Self::StdinRequests => JCODE_INPUT_REQUEST_CAPABILITY,
+            Self::LegacyPermissionRequests => LEGACY_JCODE_INPUT_REQUEST_CAPABILITY,
+        }
+    }
+}
+
+/// Check one advertised capability list against the closed contract.
+///
+/// Every entry of [`REQUIRED_JCODE_CAPABILITIES`] must be present, plus
+/// `stdin_requests` or — only in its absence — the legacy
+/// `permission_requests`. Anything else advertised is ignored.
+pub fn negotiate_jcode_capabilities(
+    capabilities: &[impl AsRef<str>],
+) -> Result<JcodeInputRequestMode, JcodeProtocolError> {
+    let advertised = |wanted: &str| capabilities.iter().any(|found| found.as_ref() == wanted);
+    if REQUIRED_JCODE_CAPABILITIES
+        .iter()
+        .any(|required| !advertised(required))
+    {
+        return Err(JcodeProtocolError::MissingCapability);
+    }
+    if advertised(JCODE_INPUT_REQUEST_CAPABILITY) {
+        Ok(JcodeInputRequestMode::StdinRequests)
+    } else if advertised(LEGACY_JCODE_INPUT_REQUEST_CAPABILITY) {
+        Ok(JcodeInputRequestMode::LegacyPermissionRequests)
+    } else {
+        Err(JcodeProtocolError::MissingCapability)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -361,6 +449,7 @@ pub enum JcodeNativeEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JcodeNegotiation {
     identity: JcodeExecutionIdentity,
+    input_request_mode: JcodeInputRequestMode,
 }
 
 impl JcodeNegotiation {
@@ -386,18 +475,22 @@ impl JcodeNegotiation {
         if server != identity.expected_server() {
             return Err(JcodeProtocolError::IdentityMismatch);
         }
-        if REQUIRED_JCODE_CAPABILITIES
-            .iter()
-            .any(|required| !capabilities.iter().any(|actual| actual == required))
-        {
-            return Err(JcodeProtocolError::MissingCapability);
-        }
-        Ok(Self { identity })
+        let input_request_mode = negotiate_jcode_capabilities(capabilities)?;
+        Ok(Self {
+            identity,
+            input_request_mode,
+        })
     }
 
     #[must_use]
     pub const fn identity(&self) -> &JcodeExecutionIdentity {
         &self.identity
+    }
+
+    /// The input-request capability this engine advertised.
+    #[must_use]
+    pub const fn input_request_mode(&self) -> JcodeInputRequestMode {
+        self.input_request_mode
     }
 }
 
@@ -997,12 +1090,7 @@ fn decode_server_frame(bytes: &[u8]) -> Result<JcodeEvent, JcodeProtocolError> {
             }
             let server = bounded_string(object, "server")?.to_owned();
             let capabilities = strings(object, "capabilities")?;
-            if REQUIRED_JCODE_CAPABILITIES
-                .iter()
-                .any(|required| !capabilities.iter().any(|found| found == required))
-            {
-                return Err(JcodeProtocolError::MissingCapability);
-            }
+            negotiate_jcode_capabilities(&capabilities)?;
             Ok(JcodeEvent::HelloOk {
                 reply_to,
                 server,

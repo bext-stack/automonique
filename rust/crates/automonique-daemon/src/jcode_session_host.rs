@@ -1,6 +1,20 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 //! Contained, journalled ownership of one JCode harness-API process.
+//!
+//! # What a resume may cross
+//!
+//! Every spawn records the negotiated `hello_ok` capability list exactly, as
+//! the write-once `jcode-harness-api` binding of the journal session it opens,
+//! and the reported server identity as the `jcode-server` schema binding. The
+//! journal's resume drift check is the process tuple (prompt version, tool
+//! schema version, model); it excludes the executable digest and the
+//! per-session bindings on purpose. An exact-session resume therefore stays
+//! compatible across an engine build whose capability list — including the
+//! `stdin_requests` versus legacy `permission_requests` input-request mode —
+//! differs from the recorded one, provided the new hello still negotiates.
+//! The change remains auditable: the two sessions carry different binding
+//! digests, and the two process rows carry different executable digests.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -10,9 +24,9 @@ use std::time::Duration;
 
 use automonique_agents::{
     JCODE_API_SCHEMA_ID, JCODE_API_VERSION, JcodeEvent, JcodeExecutionIdentity, JcodeFrameDecoder,
-    JcodeInterruptedReason, JcodeNativeAdapter, JcodeNativeEnvelope, JcodeNegotiation,
-    JcodeProtocolError, JcodeRequest, JcodeTurnCollector, JcodeTurnResult, PermissionDecision,
-    RunCoordinates, SessionScope, encode_jcode_request,
+    JcodeInputRequestMode, JcodeInterruptedReason, JcodeNativeAdapter, JcodeNativeEnvelope,
+    JcodeNegotiation, JcodeProtocolError, JcodeRequest, JcodeTurnCollector, JcodeTurnResult,
+    PermissionDecision, RunCoordinates, SessionScope, encode_jcode_request,
 };
 use automonique_protocol::provenance::{CausationId, CorrelationId, Provenance, TraceId};
 use automonique_runner::{
@@ -402,6 +416,12 @@ impl JcodeSessionHost {
     #[must_use]
     pub fn operating_system_process_id(&self) -> u32 {
         self.process.id()
+    }
+
+    /// The input-request capability the contained engine advertised.
+    #[must_use]
+    pub const fn input_request_mode(&self) -> JcodeInputRequestMode {
+        self.negotiation.input_request_mode()
     }
 
     /// Provider events accepted since the previous drain, in wire order.

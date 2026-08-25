@@ -178,6 +178,18 @@ and no provider child exists, there is nothing to stop. Do not stop the
 long-lived daemon, dashboard, or fleet poller merely to clear a historical
 record.
 
+### Stop or restart the daemon itself
+
+A daemon stop is a separate, owner-authorized operation from stopping work.
+On `SIGTERM` the daemon signals every worker group at once and joins them
+together while it keeps its leases renewed; each worker has a 20 s diagnostic
+budget, and a worker still running at 20 s is named by group in an
+`over_budget` journal observation and still joined. `TimeoutStopSec=90s` is
+the hard bound. The per-group idle cadences, the journal fields (which carry
+no content or identifiers), and how to read a drain back are in
+[`packaging/systemd/README.md`](../packaging/systemd/README.md) under
+"Shutdown drain budget".
+
 ### Reconcile a disagreement
 
 Do not edit state databases or translate a completed GitHub delivery into a

@@ -530,6 +530,13 @@ fn managed_new_and_follow_up_argv_preserve_and_resume_one_exact_session() {
     assert!(new_spec.arguments().iter().any(|value| value == "--json"));
     assert!(
         !new_spec
+            .environment()
+            .iter()
+            .any(|(name, _)| name == "JCODE_RUNTIME_DIR" || name == "JCODE_NO_TELEMETRY"),
+        "JCode-only variables never reach a Codex workload"
+    );
+    assert!(
+        !new_spec
             .arguments()
             .iter()
             .any(|value| value == "--ephemeral")
@@ -614,6 +621,13 @@ fn jcode_composition_selects_the_supervised_protocol_and_exact_resume_binding() 
             .environment()
             .iter()
             .any(|(name, value)| name == "JCODE_HOME" && value == home.as_os_str())
+    );
+    assert!(
+        new_spec
+            .environment()
+            .iter()
+            .any(|(name, value)| name == "JCODE_NO_TELEMETRY" && value == "1"),
+        "the sandbox has no telemetry egress; the opt-out keeps the notice out of the journal"
     );
     assert!(
         !new_spec
@@ -1207,7 +1221,7 @@ fn a_contained_jcode_protocol_turn_answers_through_the_production_lane() {
         "IFS= read -r request; printf '%s\\n' '",
         "{\"v\":1,\"reply_to\":1,\"ev\":\"hello_ok\",\"version\":1,\"server\":\"jcode/production-fixture\",",
         "\"capabilities\":[\"sessions\",\"streaming\",\"cancellation\",\"soft_interrupt\",",
-        "\"permission_requests\",\"history\",\"model_catalog\",\"reasoning_effort\",\"usage\",\"runtime_info\"]}'; ",
+        "\"stdin_requests\",\"history\",\"model_catalog\",\"reasoning_effort\",\"usage\",\"runtime_info\"]}'; ",
         "IFS= read -r request; printf '%s\\n' '",
         "{\"v\":1,\"reply_to\":2,\"ev\":\"attached\",\"session\":{\"session_id\":\"jcode-production-session\",\"status\":\"idle\"}}'; ",
         "IFS= read -r request; printf '%s\\n' ",
@@ -1454,7 +1468,7 @@ fn a_control_lease_steers_the_live_jcode_turn_and_nothing_after_it() {
         "IFS= read -r request; printf '%s\\n' '",
         "{\"v\":1,\"reply_to\":1,\"ev\":\"hello_ok\",\"version\":1,\"server\":\"jcode/steer-fixture\",",
         "\"capabilities\":[\"sessions\",\"streaming\",\"cancellation\",\"soft_interrupt\",",
-        "\"permission_requests\",\"history\",\"model_catalog\",\"reasoning_effort\",\"usage\",\"runtime_info\"]}'; ",
+        "\"stdin_requests\",\"history\",\"model_catalog\",\"reasoning_effort\",\"usage\",\"runtime_info\"]}'; ",
         "IFS= read -r request; printf '%s\\n' '",
         "{\"v\":1,\"reply_to\":2,\"ev\":\"attached\",\"session\":{\"session_id\":\"jcode-steer-session\",\"status\":\"idle\"}}'; ",
         "IFS= read -r request; printf '%s\\n' ",
@@ -1718,7 +1732,7 @@ fn managed_jcode_follow_up_attaches_the_exact_provider_session() {
         "IFS= read -r request; printf '%s\\n' '",
         "{\"v\":1,\"reply_to\":1,\"ev\":\"hello_ok\",\"version\":1,\"server\":\"jcode/resume-fixture\",",
         "\"capabilities\":[\"sessions\",\"streaming\",\"cancellation\",\"soft_interrupt\",",
-        "\"permission_requests\",\"history\",\"model_catalog\",\"reasoning_effort\",\"usage\",\"runtime_info\"]}'; ",
+        "\"stdin_requests\",\"history\",\"model_catalog\",\"reasoning_effort\",\"usage\",\"runtime_info\"]}'; ",
         "IFS= read -r request; case \"$request\" in ",
         "*'\"req\":\"create_session\"'*) answer=JCODE-NEW-OK ;; ",
         "*'\"req\":\"attach_session\"'*'jcode-resume-session'*) answer=JCODE-RESUME-OK ;; ",

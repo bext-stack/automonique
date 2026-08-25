@@ -1,19 +1,64 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 use automonique_agents::{
-    JCODE_API_SCHEMA_ID, JCODE_API_STDIO_ARGUMENTS, JCODE_API_VERSION, JcodeEvent,
-    JcodeExecutionIdentity, JcodeFrameDecoder, JcodeInterruptedReason, JcodeNativeAdapter,
-    JcodeNativeEvent, JcodeNegotiation, JcodeProtocolError, JcodeRequest, JcodeTerminalOutcome,
-    JcodeTurnCollector, REQUIRED_JCODE_CAPABILITIES, RunCoordinates, SessionScope,
-    encode_jcode_request,
+    JCODE_API_SCHEMA_ID, JCODE_API_STDIO_ARGUMENTS, JCODE_API_VERSION,
+    JCODE_INPUT_REQUEST_CAPABILITY, JcodeEvent, JcodeExecutionIdentity, JcodeFrameDecoder,
+    JcodeInputRequestMode, JcodeInterruptedReason, JcodeNativeAdapter, JcodeNativeEvent,
+    JcodeNegotiation, JcodeProtocolError, JcodeRequest, JcodeTerminalOutcome, JcodeTurnCollector,
+    LEGACY_JCODE_INPUT_REQUEST_CAPABILITY, REQUIRED_JCODE_CAPABILITIES, RunCoordinates,
+    SessionScope, encode_jcode_request, negotiate_jcode_capabilities,
 };
 
-fn capabilities() -> String {
-    REQUIRED_JCODE_CAPABILITIES
+/// The exact `hello_ok` capability list of the maintained fork build
+/// (`jcode-harness-api-bridge/0.1.0`).
+const MAINTAINED_HARNESS_CAPABILITIES: [&str; 15] = [
+    "sessions",
+    "streaming",
+    "cancellation",
+    "soft_interrupt",
+    "stdin_requests",
+    "history",
+    "model_catalog",
+    "reasoning_effort",
+    "usage",
+    "persisted_session_discovery",
+    "runtime_info",
+    "api_key_provisioning",
+    "session_archive",
+    "session_retention",
+    "session_files",
+];
+
+/// The advertisement of pinned builds that predate the maintained harness
+/// exposing stdin requests.
+const LEGACY_HARNESS_CAPABILITIES: [&str; 10] = [
+    "sessions",
+    "streaming",
+    "cancellation",
+    "soft_interrupt",
+    "permission_requests",
+    "history",
+    "model_catalog",
+    "reasoning_effort",
+    "usage",
+    "runtime_info",
+];
+
+fn hello_line(capabilities: &[&str]) -> String {
+    let capabilities = capabilities
         .iter()
         .map(|capability| format!("\"{capability}\""))
         .collect::<Vec<_>>()
-        .join(",")
+        .join(",");
+    format!(
+        "{{\"v\":1,\"reply_to\":1,\"ev\":\"hello_ok\",\"version\":1,\"server\":\"jcode/fixture\",\"capabilities\":[{capabilities}]}}\n"
+    )
+}
+
+fn with_input_capability(capability: &str) -> Vec<&str> {
+    let mut capabilities = REQUIRED_JCODE_CAPABILITIES.to_vec();
+    capabilities.push(capability);
+    capabilities
 }
 
 #[test]
@@ -49,16 +94,30 @@ fn typed_requests_are_single_protocol_v1_frames() {
 
 #[test]
 fn handshake_requires_version_and_every_execution_capability() {
-    let line = format!(
-        "{{\"v\":1,\"reply_to\":1,\"ev\":\"hello_ok\",\"version\":1,\"server\":\"jcode/fixture\",\"capabilities\":[{}]}}\n",
-        capabilities()
+    assert_eq!(JCODE_INPUT_REQUEST_CAPABILITY, "stdin_requests");
+    assert_eq!(LEGACY_JCODE_INPUT_REQUEST_CAPABILITY, "permission_requests");
+    assert!(
+        !REQUIRED_JCODE_CAPABILITIES.contains(&JCODE_INPUT_REQUEST_CAPABILITY)
+            && !REQUIRED_JCODE_CAPABILITIES.contains(&LEGACY_JCODE_INPUT_REQUEST_CAPABILITY)
     );
+
+    let line = hello_line(&MAINTAINED_HARNESS_CAPABILITIES);
     let mut decoder = JcodeFrameDecoder::new();
     let events = decoder.push(line.as_bytes()).expect("compatible hello");
-    assert!(matches!(
-        events.as_slice(),
-        [JcodeEvent::HelloOk { reply_to: 1, .. }]
-    ));
+    match events.as_slice() {
+        [
+            JcodeEvent::HelloOk {
+                reply_to: 1,
+                capabilities,
+                ..
+            },
+        ] => assert_eq!(
+            capabilities,
+            &MAINTAINED_HARNESS_CAPABILITIES.map(str::to_owned),
+            "the advertised list is recorded exactly, additive entries included"
+        ),
+        other => panic!("unexpected hello decode: {other:?}"),
+    }
 
     let missing = line.replace("\"cancellation\",", "");
     let error = JcodeFrameDecoder::new()
@@ -71,6 +130,155 @@ fn handshake_requires_version_and_every_execution_capability() {
         .push(incompatible.as_bytes())
         .unwrap_err();
     assert_eq!(error, JcodeProtocolError::UnsupportedVersion);
+}
+
+#[test]
+fn the_input_request_capability_negotiates_maintained_first_then_legacy_then_refuses() {
+    assert_eq!(
+        negotiate_jcode_capabilities(&MAINTAINED_HARNESS_CAPABILITIES),
+        Ok(JcodeInputRequestMode::StdinRequests)
+    );
+    assert_eq!(
+        negotiate_jcode_capabilities(&LEGACY_HARNESS_CAPABILITIES),
+        Ok(JcodeInputRequestMode::LegacyPermissionRequests)
+    );
+    assert_eq!(
+        negotiate_jcode_capabilities(&with_input_capability(JCODE_INPUT_REQUEST_CAPABILITY)),
+        Ok(JcodeInputRequestMode::StdinRequests)
+    );
+    assert_eq!(
+        negotiate_jcode_capabilities(&with_input_capability(
+            LEGACY_JCODE_INPUT_REQUEST_CAPABILITY
+        )),
+        Ok(JcodeInputRequestMode::LegacyPermissionRequests)
+    );
+    let mut both = with_input_capability(JCODE_INPUT_REQUEST_CAPABILITY);
+    both.push(LEGACY_JCODE_INPUT_REQUEST_CAPABILITY);
+    assert_eq!(
+        negotiate_jcode_capabilities(&both),
+        Ok(JcodeInputRequestMode::StdinRequests),
+        "the maintained capability wins whenever it is advertised"
+    );
+    assert_eq!(
+        negotiate_jcode_capabilities(&REQUIRED_JCODE_CAPABILITIES),
+        Err(JcodeProtocolError::MissingCapability),
+        "neither input-request capability is a refusal"
+    );
+    let mut without_base = with_input_capability(JCODE_INPUT_REQUEST_CAPABILITY);
+    without_base.retain(|capability| *capability != "history");
+    assert_eq!(
+        negotiate_jcode_capabilities(&without_base),
+        Err(JcodeProtocolError::MissingCapability)
+    );
+    assert_eq!(
+        JcodeInputRequestMode::StdinRequests.capability(),
+        JCODE_INPUT_REQUEST_CAPABILITY
+    );
+    assert_eq!(
+        JcodeInputRequestMode::LegacyPermissionRequests.capability(),
+        LEGACY_JCODE_INPUT_REQUEST_CAPABILITY
+    );
+
+    // The decoder applies the same rule to every hello it accepts.
+    for (capabilities, expected) in [
+        (
+            LEGACY_HARNESS_CAPABILITIES.as_slice(),
+            Ok(JcodeInputRequestMode::LegacyPermissionRequests),
+        ),
+        (
+            REQUIRED_JCODE_CAPABILITIES.as_slice(),
+            Err(JcodeProtocolError::MissingCapability),
+        ),
+    ] {
+        let decoded = JcodeFrameDecoder::new().push(hello_line(capabilities).as_bytes());
+        match expected {
+            Ok(mode) => {
+                let hello = decoded.expect("legacy hello decodes").remove(0);
+                let negotiation =
+                    JcodeNegotiation::accept(fixture_identity("jcode/fixture"), 1, &hello)
+                        .expect("legacy hello negotiates");
+                assert_eq!(negotiation.input_request_mode(), mode);
+            }
+            Err(error) => assert_eq!(decoded.unwrap_err(), error),
+        }
+    }
+}
+
+fn fixture_identity(expected_server: &str) -> JcodeExecutionIdentity {
+    JcodeExecutionIdentity::pinned("a".repeat(64), "b".repeat(64), expected_server)
+        .expect("pinned identity")
+}
+
+#[test]
+fn the_maintained_harness_fixture_negotiates_stdin_requests_and_binds_an_input_turn() {
+    let fixture = include_bytes!("fixtures/jcode_api_stdio/stdin_request_turn.jsonl");
+    let mut decoder = JcodeFrameDecoder::new();
+    let mut events = decoder.push(fixture).expect("fixture decodes");
+    let hello = events.remove(0);
+    assert!(matches!(
+        &hello,
+        JcodeEvent::HelloOk { server, .. } if server == "jcode-harness-api-bridge/0.1.0"
+    ));
+    let negotiation = JcodeNegotiation::accept(
+        fixture_identity("jcode-harness-api-bridge/0.1.0"),
+        11,
+        &hello,
+    )
+    .expect("maintained hello negotiates");
+    assert_eq!(
+        negotiation.input_request_mode(),
+        JcodeInputRequestMode::StdinRequests
+    );
+    assert_eq!(
+        JcodeNegotiation::accept(fixture_identity("jcode/fixture-0.79.1"), 11, &hello).unwrap_err(),
+        JcodeProtocolError::IdentityMismatch,
+        "a fork-master build still has to match its pinned server identity"
+    );
+
+    let mut adapter =
+        JcodeNativeAdapter::after_negotiation(negotiation, &coordinates(), 13, "session-1")
+            .expect("bound turn");
+    let mut turn = JcodeTurnCollector::new("session-1").expect("collector");
+    let mut input_requested = false;
+    for event in events.iter().filter(|event| {
+        !matches!(
+            event,
+            JcodeEvent::Attached { .. } | JcodeEvent::Ok { .. } | JcodeEvent::SessionStatus { .. }
+        )
+    }) {
+        adapter.observe_decoded(event.clone()).expect("read order");
+        turn.observe(event).expect("event accepted");
+        if let JcodeEvent::StdinRequest {
+            request_id,
+            prompt,
+            is_password,
+            tool_call_id,
+            ..
+        } = event
+        {
+            assert_eq!(
+                (request_id.as_str(), prompt.as_str()),
+                ("stdin-1", "Passphrase:")
+            );
+            assert!(*is_password);
+            assert_eq!(tool_call_id, "call-1");
+            turn.resolve_input(request_id)
+                .expect("authority answered it");
+            input_requested = true;
+        }
+    }
+    assert!(input_requested, "the fixture must exercise a stdin request");
+    assert_eq!(adapter.terminal(), Some(JcodeTerminalOutcome::Completed));
+    let result = turn.finish().expect("terminal turn");
+    assert_eq!(result.text(), "fixture answer");
+    assert_eq!(
+        (
+            result.input_tokens(),
+            result.output_tokens(),
+            result.cache_read_input_tokens()
+        ),
+        (12, 2, 4)
+    );
 }
 
 #[test]
@@ -302,6 +510,11 @@ fn a_process_negotiation_token_starts_a_bound_turn_and_preserves_upstream_eof_st
         .remove(0);
     let negotiation = JcodeNegotiation::accept(execution_identity(), 11, &hello)
         .expect("exact hello creates token");
+    assert_eq!(
+        negotiation.input_request_mode(),
+        JcodeInputRequestMode::LegacyPermissionRequests,
+        "the history-only fixtures pin a build from before the harness change"
+    );
     let mut adapter =
         JcodeNativeAdapter::after_negotiation(negotiation, &coordinates(), 13, "session-1")
             .expect("bound turn");
