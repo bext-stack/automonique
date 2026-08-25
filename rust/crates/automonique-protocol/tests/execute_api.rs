@@ -289,7 +289,7 @@ fn a_cancellation_reference_is_bounded_non_empty_and_control_free() {
 
 #[test]
 fn every_refusal_round_trips_its_exact_spelling_and_none_is_shared() {
-    assert_eq!(ExecuteRefusal::ALL.len(), 24);
+    assert_eq!(ExecuteRefusal::ALL.len(), 25);
     let mut spellings: Vec<&str> = ExecuteRefusal::ALL
         .into_iter()
         .map(ExecuteRefusal::as_str)
@@ -373,6 +373,23 @@ fn the_two_cancellation_refusals_are_about_the_run_not_about_the_host() {
     assert_eq!(
         ExecuteRefusal::CancelNotDelivered.as_str(),
         "cancel_not_delivered"
+    );
+}
+
+#[test]
+fn an_unanswering_source_route_is_its_own_refusal_about_the_run() {
+    // A successor that cannot reach the generation still hosting a run's
+    // attempt says so, in its own word: neither "already executing" (it does
+    // not know) nor "no live attempt" (it does not know that either). It is
+    // about the named run, so a different run is not refused by it.
+    assert!(!ExecuteRefusal::SourceRouteUnavailable.is_host_wide());
+    assert_eq!(
+        ExecuteRefusal::SourceRouteUnavailable.as_str(),
+        "source_route_unavailable"
+    );
+    assert_eq!(
+        ExecuteRefusal::from_spelling("source_route_unavailable"),
+        Some(ExecuteRefusal::SourceRouteUnavailable)
     );
 }
 

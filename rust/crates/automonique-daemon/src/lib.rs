@@ -1103,6 +1103,30 @@ pub enum DaemonError {
     LeaseSuspended,
 }
 
+/// The categories [`DaemonError::category`] spells itself, as one closed list.
+///
+/// A candidate that could not open or serve the daemon it was handed reports
+/// the daemon's category over the private channel, and the source admits a
+/// reported category only from a closed set. This list is that set's
+/// daemon-side half; variants that carry a category from another module
+/// ([`DaemonError::Store`], [`DaemonError::AttemptHostFailed`] and their
+/// siblings) contribute the categories those modules define, of which the
+/// attempt route's are chained in beside this list because a transferred
+/// daemon binds one on startup.
+pub(crate) const DAEMON_ERROR_CATEGORIES: [&str; 11] = [
+    "environment_missing",
+    "insecure_path",
+    "already_running",
+    "socket_activation_refused",
+    "peer_denied",
+    "protocol_refused",
+    "io",
+    "reconciliation_required",
+    "signal",
+    "lease_clock",
+    "lease_suspended",
+];
+
 impl DaemonError {
     /// Stable machine-readable category.
     #[must_use]
@@ -6365,7 +6389,7 @@ impl Daemon {
             .attempt_id()
             .as_str()
             .to_owned();
-        if self.source_hosts_attempt(&attempt_id).is_some() {
+        if self.source_hosts_attempt(&attempt_id)?.is_some() {
             return Err(ExecuteRefusal::AlreadyExecuting);
         }
         self.admit_approval(&record.run_id, &entry.spec_digest, &entry.document, now_ms)?;
@@ -6378,29 +6402,48 @@ impl Daemon {
 
     /// The route to the source generation still hosting `attempt_id`, if any.
     ///
-    /// `Some` only while the attempt is in the adopted snapshot *and* the
-    /// source's route still answers at its pinned identity. The route is the
-    /// liveness signal on purpose: the source retires it only after every
-    /// worker it hosted has finished and advanced the read model, so an
-    /// unreachable route means there is nothing left to adopt, and the
-    /// snapshot is dropped. A snapshot member the route no longer lists is
-    /// still reported as hosted — its worker may be between releasing its
-    /// registration and advancing the row, and a second attempt in that gap is
-    /// exactly what this exists to refuse.
+    /// `Ok(Some)` while the attempt is in the adopted snapshot *and* the
+    /// source's route answers at its pinned identity. `Ok(None)` when the
+    /// attempt was never the source's, or when the route is provably gone:
+    /// the source removes its socket only after every worker it hosted has
+    /// finished and advanced the read model, and a socket nobody listens on
+    /// belongs to a process that is no longer there, so either proves there is
+    /// nothing left to adopt and the snapshot is dropped.
+    ///
+    /// # This fails closed
+    ///
+    /// Every other failure of the probe — the route's I/O timeout, a reset, an
+    /// answer that is malformed or pinned to another identity, a refusal from
+    /// the source's host — is [`ExecuteRefusal::SourceRouteUnavailable`], and
+    /// the snapshot is **kept**. Reading such a failure as "the source has
+    /// retired" would admit a second attempt for a run whose first attempt may
+    /// still be running under the source — same attempt identifier, a second
+    /// contained process and worker on the same spool and workspace — and
+    /// would answer a cancellation with "no live attempt" while the source's
+    /// sink is live. The next request for the run probes again; a source that
+    /// was merely slow answers then, and one that has since retired is found
+    /// gone then.
+    ///
+    /// A snapshot member the route no longer lists is still reported as
+    /// hosted — its worker may be between releasing its registration and
+    /// advancing the row, and a second attempt in that gap is exactly what
+    /// this exists to refuse.
     fn source_hosts_attempt(
         &mut self,
         attempt_id: &str,
-    ) -> Option<attempt_adoption::AttemptAdoptionClient> {
-        let adopted = self.adopted_source_attempts.as_ref()?;
-        if !adopted.contains(attempt_id) {
-            return None;
-        }
-        let client = adopted.client().ok()?;
-        match client.inventory() {
-            Ok(_) => Some(client),
-            Err(_) => {
+    ) -> Result<Option<attempt_adoption::AttemptAdoptionClient>, ExecuteRefusal> {
+        let Some(adopted) = self.adopted_source_attempts.as_ref() else {
+            return Ok(None);
+        };
+        match adopted.probe(attempt_id) {
+            attempt_adoption::SourceAttemptProbe::NotAdopted => Ok(None),
+            attempt_adoption::SourceAttemptProbe::Hosted(client) => Ok(Some(client)),
+            attempt_adoption::SourceAttemptProbe::Gone => {
                 self.adopted_source_attempts = None;
-                None
+                Ok(None)
+            }
+            attempt_adoption::SourceAttemptProbe::Unavailable(_) => {
+                Err(ExecuteRefusal::SourceRouteUnavailable)
             }
         }
     }
@@ -7116,19 +7159,39 @@ impl Daemon {
             // own the sink. That delivery runs under the source's dispatcher
             // over the same durable ledger, so it is still exactly one
             // reservation and at most one delivery for this reference.
-            DispatchOutcome::UnknownAttempt => match self.source_hosts_attempt(&attempt_id) {
-                Some(route) => route
-                    .cancel(&attempt_id, request_ref, observed_sequence)
-                    .map_err(|error| match error {
-                        // The source answered, and refused: its host could
-                        // not state an outcome.
-                        attempt_adoption::AttemptAdoptionError::HostUnavailable => {
-                            ExecuteRefusal::ExecutionUnavailable
-                        }
-                        // The request did not provably reach a sink. Saying
-                        // "no live attempt" would be a guess; this is not.
-                        _ => ExecuteRefusal::CancelNotDelivered,
-                    })?,
+            //
+            // The probe fails closed: a source route that does not answer is
+            // `source_route_unavailable`, never "no live attempt", because the
+            // sink it owns may be live and nothing here can say otherwise.
+            DispatchOutcome::UnknownAttempt => match self.source_hosts_attempt(&attempt_id)? {
+                Some(route) => match route.cancel(&attempt_id, request_ref, observed_sequence) {
+                    Ok(outcome) => outcome,
+                    // The source retired its route between the probe and
+                    // this delivery. It does that only after its last worker
+                    // has finished and advanced the read model, so there is no
+                    // sink left anywhere for this attempt.
+                    Err(attempt_adoption::AttemptAdoptionError::RouteGone) => {
+                        self.adopted_source_attempts = None;
+                        return Err(ExecuteRefusal::NoLiveAttempt);
+                    }
+                    // The source answered, and refused: its host could not
+                    // state an outcome.
+                    Err(attempt_adoption::AttemptAdoptionError::HostUnavailable) => {
+                        return Err(ExecuteRefusal::ExecutionUnavailable);
+                    }
+                    // The route stopped answering mid-exchange. The request
+                    // may or may not have reached the source's ledger; the
+                    // same `request_ref` presented again is answered from
+                    // that ledger, so retrying is safe and is the answer.
+                    Err(attempt_adoption::AttemptAdoptionError::Io(_)) => {
+                        return Err(ExecuteRefusal::SourceRouteUnavailable);
+                    }
+                    // The source answered something this daemon could not
+                    // read as an outcome. Nothing provably reached a sink;
+                    // saying "no live attempt" would be a guess, and this is
+                    // not.
+                    Err(_) => return Err(ExecuteRefusal::CancelNotDelivered),
+                },
                 None => return Err(ExecuteRefusal::NoLiveAttempt),
             },
             outcome => outcome,
@@ -9484,6 +9547,9 @@ mod approval_context_tests {
         assert!(APPROVAL_KEY_DOMAIN.ends_with(b"\0"));
     }
 }
+
+#[cfg(test)]
+mod adopted_attempts_tests;
 
 #[cfg(test)]
 mod tests {

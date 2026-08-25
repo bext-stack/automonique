@@ -353,6 +353,18 @@ pub enum ExecuteRefusal {
     /// daemon could not consult its own state, and this one says it did and the
     /// delivery failed.
     CancelNotDelivered,
+    /// The run's attempt was still hosted by the generation this daemon
+    /// succeeded when authority transferred, and that generation's private
+    /// route did not answer just now.
+    ///
+    /// Nothing was started and nothing was cancelled. Whether the attempt is
+    /// still live is a fact only the source can state; until its route
+    /// answers, or is provably gone — its socket removed at retirement, or
+    /// refused because its process is — this daemon neither starts a second
+    /// attempt for the run nor reports the first one finished. A timeout, a
+    /// malformed answer and a refusal all earn this rather than a guess in
+    /// either direction. The next request for the run probes the route again.
+    SourceRouteUnavailable,
     /// The composed approval policy forbids this launch outright, and no
     /// decision can change that.
     ///
@@ -450,7 +462,7 @@ impl fmt::Display for ApprovalContextField {
 
 impl ExecuteRefusal {
     /// Every refusal, in canonical order.
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::UnknownRun,
         Self::RunNotReady,
         Self::AlreadyExecuting,
@@ -466,6 +478,7 @@ impl ExecuteRefusal {
         Self::ExecutionUnavailable,
         Self::NoLiveAttempt,
         Self::CancelNotDelivered,
+        Self::SourceRouteUnavailable,
         Self::ApprovalForbidden,
         Self::ApprovalRequired,
         Self::ApprovalDenied,
@@ -506,6 +519,7 @@ impl ExecuteRefusal {
             Self::ExecutionUnavailable => "execution_unavailable",
             Self::NoLiveAttempt => "no_live_attempt",
             Self::CancelNotDelivered => "cancel_not_delivered",
+            Self::SourceRouteUnavailable => "source_route_unavailable",
             Self::ApprovalForbidden => "approval_forbidden",
             Self::ApprovalRequired => "approval_required",
             Self::ApprovalDenied => "approval_denied",
