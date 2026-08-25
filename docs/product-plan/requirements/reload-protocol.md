@@ -234,6 +234,19 @@ release link, start it. The zero-downtime `reload`/`rollback` verbs apply
 within a channel version, and a version change is a restart-based deployment
 by design rather than a negotiated one.
 
+## Service-manager adoption
+
+Under `Type=notify-reload` with `NotifyAccess=main`, the source is the
+unit's main process. Once the candidate holds authority and before it starts
+serving, the source sends `MAINPID=<candidate>`; the candidate's own
+`READY=1` and `WATCHDOG=1` are then the unit's, and the source's exit is a
+completed handoff rather than the unit stopping. The candidate is spawned
+without `WATCHDOG_PID` (the manager set it to the source's pid) so it keeps
+the `WATCHDOG_USEC` cadence from the start. A source that cannot deliver the
+main-pid message refuses activation and the reload rolls back: without it the
+manager kills the candidate at `TimeoutStopSec` and restarts the unit, which is
+a delayed restart, not a reload.
+
 ## Crash recovery without a cooperative old generation
 
 On ordinary startup or candidate takeover:

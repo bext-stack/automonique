@@ -95,6 +95,19 @@ impl Notifier {
         self.send(format!("RELOADING=1\nMONOTONIC_USEC={monotonic_usec}").as_bytes())
     }
 
+    /// Hand the service's main process over to `pid`.
+    ///
+    /// Sent by the current main process (the only sender `NotifyAccess=main`
+    /// admits) once a warmed reload candidate holds authority and before it
+    /// starts serving. Without it the manager reads the source's exit as the
+    /// unit stopping, kills the candidate at `TimeoutStopSec` and restarts
+    /// the unit: a zero-downtime handoff turned into a delayed restart. After
+    /// this message the candidate's own `READY=1` and `WATCHDOG=1` are the
+    /// ones the manager counts.
+    pub(crate) fn main_pid(&self, pid: u32) -> Result<(), NotifyError> {
+        self.send(format!("MAINPID={pid}").as_bytes())
+    }
+
     pub(crate) fn reload_refused(&self, category: &str) -> Result<(), NotifyError> {
         self.send(format!("READY=1\nSTATUS=Reload refused: {category}").as_bytes())
     }
@@ -193,6 +206,8 @@ mod tests {
         notifier.next_watchdog = Some(Instant::now());
         notifier.watchdog_if_due().expect("watchdog");
         assert_eq!(receive(&receiver), b"WATCHDOG=1");
+        notifier.main_pid(424_242).expect("main pid handover");
+        assert_eq!(receive(&receiver), b"MAINPID=424242");
         notifier.stopping().expect("stopping");
         assert_eq!(receive(&receiver), b"STOPPING=1\nSTATUS=Stopping");
     }

@@ -1761,6 +1761,19 @@ impl reload::ReloadHooks for ProcessReloadHooks<'_> {
             .relinquish_endpoint_cleanup()
             .map_err(|error| Self::refuse(error.category()))?;
         self.cleanup_transferred = true;
+        // Under a notifying service manager this process is the unit's main
+        // process; hand that role to the candidate now, so the manager reads
+        // the candidate's readiness and watchdog pings as the unit's and does
+        // not treat this process's later exit as the unit stopping. Refused
+        // (and rolled back) rather than skipped when the manager cannot be
+        // told: a handoff the manager will kill in ninety seconds is not one.
+        match systemd::Notifier::from_environment() {
+            Ok(Some(notifier)) => notifier
+                .main_pid(candidate.pid())
+                .map_err(|_| Self::refuse("service_manager_main_pid"))?,
+            Ok(None) => {}
+            Err(_) => return Err(Self::refuse("service_manager_unavailable")),
+        }
         candidate
             .activate_serving(cleanup)
             .map_err(|error| Self::refuse(error.category()))?;
