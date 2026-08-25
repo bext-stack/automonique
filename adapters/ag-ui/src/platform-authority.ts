@@ -204,10 +204,13 @@ export class ProductionPlatformAuthority implements PlatformRunAuthority {
   }
 
   private async nodeTarget(signal?: AbortSignal): Promise<{coordinate: Coordinate; revision: number | null}> {
-    // An empty resource list asks the daemon for every resource it holds,
-    // which also makes it refresh and record its own node under the current
-    // generation; the fresh node of the Automonique authority is the target.
-    const response = await this.platform.request("snapshot", {resources: []}, signal);
+    // `node/current` is resolved by the daemon to whichever generation is
+    // live, and asking for it makes the daemon refresh and record that node;
+    // a configured preference rides along so it is honoured while fresh.
+    const preferred = this.config.nodeId;
+    const resources: Coordinate[] = [{authority: "automonique", id: "current", kind: "node"}];
+    if (preferred !== undefined && preferred !== "current") resources.push({authority: "automonique", id: preferred, kind: "node"});
+    const response = await this.platform.request("snapshot", {resources}, signal);
     if (response.kind !== "snapshot_result" || !Array.isArray(response.body.resources)) throw new Error("platform node snapshot unavailable");
     const nodes = response.body.resources.filter((value): value is Record<string, unknown> => plain(value))
       .filter((record) => plain(record.resource) && plain(record.freshness)
@@ -215,7 +218,6 @@ export class ProductionPlatformAuthority implements PlatformRunAuthority {
         && record.resource.kind === "node"
         && record.freshness.state === "fresh")
       .sort((left, right) => observed(right) - observed(left));
-    const preferred = this.config.nodeId;
     const record = (preferred === undefined ? undefined
       : nodes.find((candidate) => plain(candidate.resource) && candidate.resource.id === preferred)) ?? nodes[0];
     if (record === undefined || !plain(record.resource)) throw new Error("platform node unavailable");

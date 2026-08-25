@@ -4845,12 +4845,20 @@ impl Daemon {
                 transports: vec![PlatformTransport::LocalUnix],
             }),
             PlatformRequest::Snapshot(request) => {
-                self.refresh_platform_resources(&request.resources, now_ms)?;
-                match self.platform.snapshot(&request.resources, "resources") {
-                    Ok((resources, cursor)) => PlatformResponse::Snapshot(
-                        Snapshot::new(resources, cursor)
-                            .map_err(|_| DaemonError::ProtocolRefused("platform_snapshot"))?,
-                    ),
+                // A client that wants *this* daemon's node need not know the
+                // generation-specific holder id: `node/current` resolves to
+                // the live instance, so an adapter survives every restart
+                // without a rebound configuration (#131).
+                let resources = self.resolve_node_alias(&request.resources)?;
+                self.refresh_platform_resources(&resources, now_ms)?;
+                match self.platform.snapshot(&resources, "resources") {
+                    Ok((resources, cursor)) => match Snapshot::new(resources, cursor) {
+                        Ok(snapshot) => PlatformResponse::Snapshot(snapshot),
+                        // More records than one response may carry (an
+                        // empty request asks for everything): a typed
+                        // refusal, not a closed connection.
+                        Err(_) => platform_refusal(ReceiptOutcome::Rejected, "snapshot_too_large")?,
+                    },
                     Err(error) => platform_store_response(&error),
                 }
             }
@@ -5449,6 +5457,32 @@ impl Daemon {
             ResourceKind::Run,
             id,
         )))
+    }
+
+    /// Replace the `node/current` alias with this daemon's own node
+    /// coordinate. Every other coordinate passes through unchanged.
+    fn resolve_node_alias(
+        &self,
+        requested: &[ResourceCoordinate],
+    ) -> Result<Vec<ResourceCoordinate>, DaemonError> {
+        requested
+            .iter()
+            .map(|resource| {
+                if resource.authority == ResourceAuthority::Automonique
+                    && resource.kind == ResourceKind::Node
+                    && resource.id.as_str() == CURRENT_NODE_ALIAS
+                {
+                    Ok(ResourceCoordinate::new(
+                        ResourceAuthority::Automonique,
+                        ResourceKind::Node,
+                        ResourceId::new(self.instance_id.as_str())
+                            .map_err(|_| DaemonError::ProtocolRefused("platform_node_id"))?,
+                    ))
+                } else {
+                    Ok(resource.clone())
+                }
+            })
+            .collect()
     }
 
     fn refresh_platform_resources(
@@ -8917,6 +8951,11 @@ fn platform_decode_refusal(payload: &[u8], error: &PlatformApiError) -> Option<V
     encode_frame(&payload, &mut frame).ok()?;
     Some(frame)
 }
+
+/// The node id a Platform client may name to mean "whichever daemon
+/// generation is live now". Resolved in the snapshot path only; an execute
+/// target still names the exact node the snapshot returned.
+pub const CURRENT_NODE_ALIAS: &str = "current";
 
 /// What the serve loop does with a failed bot-lease renewal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
