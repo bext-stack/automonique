@@ -247,6 +247,22 @@ impl DaemonAttemptHost {
             .map_err(AttemptHostError::from)
     }
 
+    /// Sorted inventory of attempts whose cancellation sinks are live here.
+    ///
+    /// This is the adoption view for a successor generation. It intentionally
+    /// carries identifiers only: sink implementations, references, and process
+    /// details remain private to the source host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttemptHostError::Poisoned`] when the dispatcher cannot state
+    /// a trustworthy inventory.
+    pub fn registered_attempts(&self) -> Result<Vec<String>, AttemptHostError> {
+        self.dispatcher
+            .registered_attempts()
+            .map_err(AttemptHostError::from)
+    }
+
     /// Couple one attempt identifier to the sink that cancels it.
     ///
     /// The returned handle owns the registration: dropping it releases the

@@ -175,6 +175,7 @@ pub mod agent_runtime;
 pub mod agent_tool_broker;
 pub mod approval_policy;
 pub mod ask;
+pub mod attempt_adoption;
 pub mod attempt_host;
 pub mod cancel_custody;
 pub mod candidate;
@@ -1001,6 +1002,9 @@ pub enum DaemonError {
     /// disposed cleanly. The payload is the stable category from
     /// [`attempt_host`].
     AttemptHostFailed(&'static str),
+    /// The private cross-generation attempt route could not be bound or
+    /// started. The payload is the stable category from [`attempt_adoption`].
+    AttemptAdoptionFailed(&'static str),
     /// The durable automation registry failed in a way no client caused. The
     /// payload is the stable category from that module.
     ///
@@ -1117,6 +1121,7 @@ impl DaemonError {
             Self::PlatformStoreFailed(category) => category,
             Self::AuditChainFailed(category) => category,
             Self::AttemptHostFailed(category) => category,
+            Self::AttemptAdoptionFailed(category) => category,
             Self::AutomationStoreFailed(category) => category,
             Self::ApprovalLedgerFailed(category) => category,
             Self::BatchRegistryFailed(category) => category,
@@ -1176,6 +1181,9 @@ impl fmt::Display for DaemonError {
             }
             Self::AttemptHostFailed(category) => {
                 write!(formatter, "attempt host refused: {category}")
+            }
+            Self::AttemptAdoptionFailed(category) => {
+                write!(formatter, "attempt adoption endpoint refused: {category}")
             }
             Self::AutomationStoreFailed(category) => {
                 write!(formatter, "automation registry failed: {category}")
@@ -1343,6 +1351,9 @@ pub struct Daemon {
     /// `Arc` to dispose of it, so disposal still happens exactly once and only
     /// when nothing can still register.
     attempt_host: Option<Arc<DaemonAttemptHost>>,
+    /// Holder- and epoch-bound route a successor uses for source-owned
+    /// attempts during generation overlap.
+    attempt_adoption: Option<attempt_adoption::AttemptAdoptionEndpoint>,
     /// The durable history of who has held this generation.
     ///
     /// A plain field, like [`Daemon::run_index`]: it owns no dispatcher, and
@@ -1786,6 +1797,16 @@ impl Daemon {
             DaemonAttemptHost::open(config.run_cancel_ledger_path())
                 .map_err(|error| DaemonError::AttemptHostFailed(error.category()))?,
         );
+        let attempt_adoption_path =
+            attempt_adoption::socket_path(&runtime_dir, instance_id.as_str())
+                .map_err(|error| DaemonError::AttemptAdoptionFailed(error.category()))?;
+        let attempt_adoption = attempt_adoption::AttemptAdoptionEndpoint::bind(
+            attempt_adoption_path,
+            instance_id.as_str(),
+            lease.epoch,
+            Arc::clone(&attempt_host),
+        )
+        .map_err(|error| DaemonError::AttemptAdoptionFailed(error.category()))?;
 
         // The execution lane opens last, beneath the same fence, and probes
         // nothing: it reads one environment variable and remembers the
@@ -1897,6 +1918,7 @@ impl Daemon {
             state_dir,
             batches,
             attempt_host: Some(attempt_host),
+            attempt_adoption: Some(attempt_adoption),
             generation_audit,
             reload_audit,
             tenure_revision: tenure.revision,
@@ -1939,6 +1961,18 @@ impl Daemon {
     #[must_use]
     pub fn attempt_host(&self) -> Option<&DaemonAttemptHost> {
         self.attempt_host.as_deref()
+    }
+
+    /// Holder- and epoch-bound route to attempts this process still hosts.
+    ///
+    /// A candidate records this route during warm-up and must reject any reply
+    /// whose identity differs. `None` is reachable only after ordered shutdown,
+    /// which consumes the daemon and is not externally observable.
+    #[must_use]
+    pub fn attempt_adoption_route(&self) -> Option<attempt_adoption::AttemptHostRoute> {
+        self.attempt_adoption
+            .as_ref()
+            .map(attempt_adoption::AttemptAdoptionEndpoint::route)
     }
 
     /// This daemon's live progress replay, when it has an execution lane.
@@ -2043,6 +2077,13 @@ impl Daemon {
                     endpoint
                         .start()
                         .map_err(|error| DaemonError::ProgressEndpointFailed(error.category()))
+                })
+            })
+            .and_then(|()| {
+                self.attempt_adoption.as_mut().map_or(Ok(()), |endpoint| {
+                    endpoint
+                        .start()
+                        .map_err(|error| DaemonError::AttemptAdoptionFailed(error.category()))
                 })
             });
         let result = match started {
@@ -2191,6 +2232,12 @@ impl Daemon {
         // [`progress_hub`] — and cancellation remains the explicit dispatcher
         // path through [`Daemon::cancel_run`].
         let mut shutdown_workers = Vec::new();
+        if let Some(attempt_adoption) = self.attempt_adoption.take() {
+            shutdown_workers.extend(named_shutdown_workers(
+                "attempt_adoption",
+                attempt_adoption.begin_shutdown(),
+            ));
+        }
         shutdown_workers.extend(named_shutdown_workers(
             "managed_tui",
             self.managed_tui.begin_shutdown(),
@@ -2259,12 +2306,13 @@ impl Daemon {
             },
         );
         // Cancellation dispatch ends next, beneath the still-held generation
-        // fence. The lease is what makes "one daemon is one dispatcher" true,
-        // so this process stops owning the ledger before it stops owning the
-        // generation: no successor can hold the generation while our dispatcher
-        // is still live over the same file. Disposal reports exactly one state
-        // — a host a panicking sink poisoned, whose last delivery is unknown —
-        // and reporting it is why shutdown does not simply drop the field.
+        // fence. A reload successor may route cancellation back to this source
+        // while its old attempts drain, but the adoption endpoint has now
+        // stopped and all source workers have joined. This process can therefore
+        // stop owning its dispatcher without stranding a live source sink.
+        // Disposal reports exactly one state — a host a panicking sink poisoned,
+        // whose last delivery is unknown — and reporting it is why shutdown does
+        // not simply drop the field.
         //
         // Unwrapping the `Arc` is the proof that the join above did its job: a
         // surviving clone means a worker is still live, which is a state this

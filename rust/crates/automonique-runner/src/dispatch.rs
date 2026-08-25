@@ -430,6 +430,24 @@ impl CancelDispatcher {
         Ok(self.core.locked()?.registrations.len())
     }
 
+    /// Stable inventory of currently registered attempt identifiers.
+    ///
+    /// Sorted before return so a handoff peer can compare inventories without
+    /// depending on hash-map iteration order. The result is bounded by this
+    /// dispatcher's registration capacity and contains no cancellation
+    /// references or sink details.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError::Poisoned`] when a sink panic made the registry
+    /// untrustworthy.
+    pub fn registered_attempts(&self) -> Result<Vec<String>, DispatchError> {
+        let guard = self.core.locked()?;
+        let mut attempts = guard.registrations.keys().cloned().collect::<Vec<_>>();
+        attempts.sort_unstable();
+        Ok(attempts)
+    }
+
     /// Couple one attempt identifier to the sink that cancels it.
     ///
     /// The returned handle owns the registration: dropping it releases the
