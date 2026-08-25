@@ -373,7 +373,7 @@ mod anti_drift {
             }
         }
         assert_eq!(
-            checked, 5,
+            checked, 6,
             "the mutating commands stopped declaring the coordinates they used to"
         );
     }
@@ -462,9 +462,9 @@ mod seeded_registry {
                 "pause_intake",
                 "reconcile_outbox",
                 "reload",
-                "rollback",
                 "reload_status",
                 "resume_intake",
+                "rollback",
                 "shutdown",
                 "status",
                 "submit_run",

@@ -152,6 +152,7 @@ pub struct MobileDiscovery {
     pub protocol: &'static str,
     pub schema: &'static str,
     pub server_identity: String,
+    pub session_history_endpoint: String,
     pub supported_versions: Vec<u16>,
 }
 
@@ -431,6 +432,7 @@ impl MobileCredentialAuthority {
             protocol: MOBILE_AUTH_PROTOCOL,
             schema: MOBILE_AUTH_SCHEMA_V1,
             platform_endpoint: format!("{origin}/api/platform"),
+            session_history_endpoint: format!("{origin}/api/mobile/session-history"),
             operator_provision_endpoint: format!("{origin}/api/mobile/operator-provision"),
             pairing_create_endpoint: format!("{origin}/api/mobile/pairings"),
             pairing_exchange_endpoint: format!("{origin}/api/mobile/pairings/exchange"),

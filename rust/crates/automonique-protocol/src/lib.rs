@@ -28,6 +28,7 @@ pub mod identity;
 pub mod interaction;
 pub mod journal;
 pub mod memory_api;
+pub mod mobile_session;
 pub mod models;
 pub mod parity;
 pub mod platform;

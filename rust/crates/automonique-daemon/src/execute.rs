@@ -142,6 +142,9 @@ use automonique_egress_broker::{BrokerConfig, EgressBroker};
 use automonique_protocol::digest::{ALGORITHM, Sha256};
 use automonique_protocol::event::{Authority as FrameAuthority, RetryCategory, RetryContext};
 use automonique_protocol::execute_api::ExecuteRefusal;
+use automonique_protocol::mobile_session::{
+    MobileHistoryBody, MobileRunState, MobileUnknownEventKind,
+};
 use automonique_protocol::primitives::EpochMillis;
 use automonique_protocol::progress_api::{
     ProgressBody, ProgressBodyParts, ProgressFrame, ProgressFrameParts, ProgressText,
@@ -167,7 +170,7 @@ use automonique_runner::dispatch::RegistrationHandle;
 use automonique_runner::{
     Authority as SpoolAuthority, CancellationToken, ContainmentDomain, Controller,
     EventKind as SpoolEventKind, LaunchPlan, PromptDeliveryPlan, RunContainment, RunSpec, Spool,
-    WorkspaceRegistryId,
+    WorkspaceRegistryId, read_events,
 };
 use automonique_store::approval_requests::{
     ApprovalContext, ApprovalProposal, ApprovalRequests, ApprovalState, REQUEST_KEY_HEX_BYTES,
@@ -982,6 +985,7 @@ impl ExecutionLane {
             broker,
             session_capture,
             managed_sessions_path: self.managed_sessions_path.clone(),
+            spool_root,
         })
     }
 
@@ -2009,6 +2013,8 @@ struct Attempt {
     session_capture: Arc<Mutex<Option<String>>>,
     /// Independent durable connection opened after the run becomes terminal.
     managed_sessions_path: PathBuf,
+    /// Exact durable spool imported only after its writer has closed.
+    spool_root: PathBuf,
 }
 
 impl Attempt {
@@ -2034,6 +2040,7 @@ impl Attempt {
             broker,
             session_capture,
             managed_sessions_path,
+            spool_root,
         } = self;
 
         let report = prepared.execute(&cancellation, timeout);
@@ -2073,6 +2080,13 @@ impl Attempt {
                 crate::managed_sessions::ManagedSessionStore::open(&managed_sessions_path)
         {
             let _ = sessions.observe(provider_session_id, &run_id, now_ms);
+            import_mobile_history(
+                &mut sessions,
+                provider_session_id,
+                &run_id,
+                &spool_root,
+                state,
+            );
         }
         advance(index_path, submission_id, revision, state, last_sequence);
         // The process and spool are terminal and the registration is already
@@ -2080,6 +2094,56 @@ impl Attempt {
         // retains replay evidence and only costs bounded-ledger capacity.
         let _ = attempt_host.prune_terminal_attempt(&attempt_id);
     }
+}
+
+fn import_mobile_history(
+    sessions: &mut crate::managed_sessions::ManagedSessionStore,
+    provider_session_id: &str,
+    run_id: &str,
+    spool_root: &Path,
+    terminal_state: RunSpoolState,
+) {
+    let Ok(events) = read_events(spool_root, run_id) else {
+        return;
+    };
+    for event in events {
+        let body = match event.kind() {
+            SpoolEventKind::Started => Some(MobileHistoryBody::RunState {
+                state: MobileRunState::Running,
+            }),
+            SpoolEventKind::AdapterEvent => ProgressFrame::from_canonical_bytes(event.payload())
+                .ok()
+                .and_then(|frame| MobileHistoryBody::from_progress_frame(&frame)),
+            SpoolEventKind::SimulationEvent => mobile_unknown("simulation_event"),
+            SpoolEventKind::CancelRequested => mobile_unknown("cancel_requested"),
+            SpoolEventKind::Terminal => Some(MobileHistoryBody::RunState {
+                state: match terminal_state {
+                    RunSpoolState::Completed => MobileRunState::Completed,
+                    RunSpoolState::Cancelled => MobileRunState::Cancelled,
+                    RunSpoolState::TimedOut => MobileRunState::TimedOut,
+                    RunSpoolState::Failed | RunSpoolState::Ready | RunSpoolState::Running => {
+                        MobileRunState::Failed
+                    }
+                },
+            }),
+        };
+        let (Some(body), Ok(at_ms)) = (body, i64::try_from(event.at_millis())) else {
+            continue;
+        };
+        let _ = sessions.append_history_event(
+            provider_session_id,
+            run_id,
+            event.sequence(),
+            at_ms,
+            body,
+        );
+    }
+}
+
+fn mobile_unknown(kind: &str) -> Option<MobileHistoryBody> {
+    MobileUnknownEventKind::new(kind)
+        .ok()
+        .map(|event_kind| MobileHistoryBody::Unknown { event_kind })
 }
 
 /// The argument that makes a workload's stdout the normalized event grammar.

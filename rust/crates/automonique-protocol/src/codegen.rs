@@ -829,6 +829,8 @@ pub const PROGRESS_MODULE: &str = "progress";
 pub const PLATFORM_MODULE: &str = "platform";
 /// Generated mobile authentication and authorization module stem.
 pub const MOBILE_AUTH_MODULE: &str = "mobile-auth";
+/// Generated mobile session-history module basename.
+pub const MOBILE_SESSION_MODULE: &str = "mobile-session";
 
 /// The file one module is written to.
 #[must_use]
@@ -6347,6 +6349,10 @@ fn mobile_auth_json_surface() -> JsonSurface {
                     ),
                     field("platform_endpoint", checked("MobilePlatformEndpoint")),
                     field(
+                        "session_history_endpoint",
+                        checked("MobileSessionHistoryEndpoint"),
+                    ),
+                    field(
                         "protocol",
                         exact(
                             "typeof MOBILE_AUTH_PROTOCOL",
@@ -6701,6 +6707,13 @@ fn mobile_auth_module() -> GeneratedModule {
                 pattern: Some("^https:\\/\\/[^?#@]+\\/api\\/platform$".to_owned()),
             },
             BoundedString {
+                name: "MobileSessionHistoryEndpoint".to_owned(),
+                max_bytes: 2048,
+                pattern: Some(
+                    "^https:\\/\\/[^?#@]+\\/api\\/mobile\\/session-history$".to_owned(),
+                ),
+            },
+            BoundedString {
                 name: "MobileOperatorProvisionEndpoint".to_owned(),
                 max_bytes: 2048,
                 pattern: Some(
@@ -6783,6 +6796,251 @@ fn mobile_auth_module() -> GeneratedModule {
             wire_order: None,
         }],
         json_surface: Some(mobile_auth_json_surface()),
+        ..GeneratedModule::default()
+    }
+}
+
+/// Sanitized mobile session history carried directly over HTTPS.
+fn mobile_session_module() -> GeneratedModule {
+    const INVALID: &str = "MOBILE_HISTORY_INVALID_BODY";
+    const VALUE: &str = "MOBILE_HISTORY_VALUE_INVALID";
+    let field = |name: &str, value: ResponseValue| ResponseField {
+        name: name.to_owned(),
+        value,
+    };
+    let checked = |name: &str| ResponseValue::Checked {
+        type_name: name.to_owned(),
+        refusal_category: VALUE.to_owned(),
+    };
+    let nullable = |name: &str| ResponseValue::NullableChecked {
+        type_name: name.to_owned(),
+        refusal_category: VALUE.to_owned(),
+    };
+    let integer = |name: &str| ResponseValue::Integer {
+        type_name: name.to_owned(),
+        refusal_category: VALUE.to_owned(),
+        unsigned: true,
+    };
+    let schema = || ResponseValue::ExactString {
+        type_name: "typeof MOBILE_SESSION_SCHEMA_V1".to_owned(),
+        expected_constant: "MOBILE_SESSION_SCHEMA_V1".to_owned(),
+        mismatch_category: "MOBILE_HISTORY_SCHEMA_MISMATCH".to_owned(),
+    };
+    let document = |name: &str, doc: &str, encode: bool, fields: Vec<ResponseField>| JsonDocument {
+        body: BodyObject {
+            name: name.to_owned(),
+            doc: doc.to_owned(),
+            fields,
+        },
+        encode,
+    };
+
+    GeneratedModule {
+        file_name: module_file_name(MOBILE_SESSION_MODULE),
+        doc: "Sanitized, bounded, remotely resumable mobile session history values.".to_owned(),
+        source: "automonique_protocol::mobile_session".to_owned(),
+        constants: vec![
+            Constant {
+                name: "MOBILE_SESSION_PROTOCOL".to_owned(),
+                doc: "Stable mobile session protocol name.".to_owned(),
+                value: ConstantValue::Text(
+                    crate::mobile_session::MOBILE_SESSION_PROTOCOL.to_owned(),
+                ),
+            },
+            Constant {
+                name: "MOBILE_SESSION_SCHEMA_V1".to_owned(),
+                doc: "Stable version-one mobile session schema.".to_owned(),
+                value: ConstantValue::Text(
+                    crate::mobile_session::MOBILE_SESSION_SCHEMA_V1.to_owned(),
+                ),
+            },
+            Constant {
+                name: "MOBILE_SESSION_MEDIA_TYPE".to_owned(),
+                doc: "Exact media type for mobile session history documents.".to_owned(),
+                value: ConstantValue::Text(
+                    crate::mobile_session::MOBILE_SESSION_MEDIA_TYPE.to_owned(),
+                ),
+            },
+            Constant {
+                name: "MAX_MOBILE_HISTORY_EVENTS".to_owned(),
+                doc: "Maximum events returned in one history page.".to_owned(),
+                value: ConstantValue::Count(crate::mobile_session::MAX_MOBILE_HISTORY_EVENTS),
+            },
+            Constant {
+                name: INVALID.to_owned(),
+                doc: "A history document was not its exact schema.".to_owned(),
+                value: ConstantValue::Text("mobile_history_invalid_body".to_owned()),
+            },
+            Constant {
+                name: VALUE.to_owned(),
+                doc: "A history field fell outside its public value domain.".to_owned(),
+                value: ConstantValue::Text("mobile_history_value_invalid".to_owned()),
+            },
+            Constant {
+                name: "MOBILE_HISTORY_SCHEMA_MISMATCH".to_owned(),
+                doc: "A history response names another schema.".to_owned(),
+                value: ConstantValue::Text("mobile_history_schema_mismatch".to_owned()),
+            },
+        ],
+        branded_ids: vec![
+            BrandedId {
+                name: "MobileHistorySessionId".to_owned(),
+                max_bytes: 256,
+                pattern: Some("^[A-Za-z0-9._:-]+$".to_owned()),
+            },
+            BrandedId {
+                name: "MobileHistoryRunId".to_owned(),
+                max_bytes: 256,
+                pattern: Some("^[A-Za-z0-9._:-]+$".to_owned()),
+            },
+        ],
+        bounded_strings: vec![
+            BoundedString {
+                name: "MobileHistoryCursor".to_owned(),
+                max_bytes: 16,
+                pattern: Some("^(0|[1-9][0-9]{0,15})$".to_owned()),
+            },
+            BoundedString {
+                name: "MobileHistoryEpochMillis".to_owned(),
+                max_bytes: 16,
+                pattern: Some("^(0|[1-9][0-9]{0,15})$".to_owned()),
+            },
+            BoundedString {
+                name: "MobileHistoryEventKind".to_owned(),
+                max_bytes: 10,
+                pattern: Some("^(message|tool_state|run_state|unknown)$".to_owned()),
+            },
+            BoundedString {
+                name: "MobileHistoryMessageRole".to_owned(),
+                max_bytes: 9,
+                pattern: Some("^assistant$".to_owned()),
+            },
+            BoundedString {
+                name: "MobileHistoryMessage".to_owned(),
+                max_bytes: crate::mobile_session::MAX_MOBILE_HISTORY_MESSAGE_BYTES,
+                pattern: Some(
+                    "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f-\\u009f]+$".to_owned(),
+                ),
+            },
+            BoundedString {
+                name: "MobileHistoryToolState".to_owned(),
+                max_bytes: 9,
+                pattern: Some("^(pending|running|succeeded|failed|cancelled)$".to_owned()),
+            },
+            BoundedString {
+                name: "MobileHistoryRunState".to_owned(),
+                max_bytes: 9,
+                pattern: Some("^(running|completed|failed|cancelled|timed_out)$".to_owned()),
+            },
+            BoundedString {
+                name: "MobileHistoryUnknownKind".to_owned(),
+                max_bytes: crate::mobile_session::MAX_MOBILE_HISTORY_KIND_BYTES,
+                pattern: Some("^[a-z][a-z0-9_]{0,63}$".to_owned()),
+            },
+            BoundedString {
+                name: "MobileHistoryOperation".to_owned(),
+                max_bytes: 8,
+                pattern: Some("^(snapshot|page)$".to_owned()),
+            },
+            BoundedString {
+                name: "MobileHistoryResyncReason".to_owned(),
+                max_bytes: 17,
+                pattern: Some("^(retention_expired|cursor_gap)$".to_owned()),
+            },
+            BoundedString {
+                name: "MobileHistoryErrorCode".to_owned(),
+                max_bytes: 64,
+                pattern: Some("^[a-z][a-z0-9_]{0,63}$".to_owned()),
+            },
+        ],
+        bounded_integers: vec![
+            BoundedInteger {
+                name: "MobileHistoryRequestedLimit".to_owned(),
+                min: 1,
+                max: 65_535,
+            },
+            BoundedInteger {
+                name: "MobileHistoryAppliedLimit".to_owned(),
+                min: 1,
+                max: i64::try_from(crate::mobile_session::MAX_MOBILE_HISTORY_EVENTS).unwrap_or(512),
+            },
+        ],
+        json_surface: Some(JsonSurface {
+            invalid_body_category: INVALID.to_owned(),
+            documents: vec![
+                document(
+                    "MobileHistoryRequest",
+                    "One exact actor-authorized session snapshot or continuation request.",
+                    true,
+                    vec![
+                        field("cursor", nullable("MobileHistoryCursor")),
+                        field("limit", integer("MobileHistoryRequestedLimit")),
+                        field("operation", checked("MobileHistoryOperation")),
+                        field("session_id", checked("MobileHistorySessionId")),
+                    ],
+                ),
+                document(
+                    "MobileHistoryEvent",
+                    "One sanitized public event; exactly one kind-specific nullable field set is populated.",
+                    false,
+                    vec![
+                        field("at_ms", checked("MobileHistoryEpochMillis")),
+                        field("cursor", checked("MobileHistoryCursor")),
+                        field("kind", checked("MobileHistoryEventKind")),
+                        field("message_role", nullable("MobileHistoryMessageRole")),
+                        field("message_text", nullable("MobileHistoryMessage")),
+                        field("run_id", checked("MobileHistoryRunId")),
+                        field("run_state", nullable("MobileHistoryRunState")),
+                        field("tool_state", nullable("MobileHistoryToolState")),
+                        field("unknown_kind", nullable("MobileHistoryUnknownKind")),
+                    ],
+                ),
+                document(
+                    "MobileHistoryPage",
+                    "A bounded contiguous page with its requested and applied ceilings.",
+                    false,
+                    vec![
+                        field("applied_limit", integer("MobileHistoryAppliedLimit")),
+                        field(
+                            "events",
+                            ResponseValue::ObjectArray {
+                                type_name: "MobileHistoryEvent".to_owned(),
+                                max_items_constant: "MAX_MOBILE_HISTORY_EVENTS".to_owned(),
+                                oversize_category: VALUE.to_owned(),
+                            },
+                        ),
+                        field("exclusive_cursor", checked("MobileHistoryCursor")),
+                        field("has_more", ResponseValue::Bool),
+                        field("requested_limit", integer("MobileHistoryRequestedLimit")),
+                        field("schema", schema()),
+                        field("session_id", checked("MobileHistorySessionId")),
+                        field("terminal_cursor", checked("MobileHistoryCursor")),
+                    ],
+                ),
+                document(
+                    "MobileHistoryResync",
+                    "Typed refusal when a continuation cannot be served without a gap.",
+                    false,
+                    vec![
+                        field("earliest_cursor", checked("MobileHistoryCursor")),
+                        field("reason", checked("MobileHistoryResyncReason")),
+                        field("requested_cursor", checked("MobileHistoryCursor")),
+                        field("schema", schema()),
+                        field("session_id", checked("MobileHistorySessionId")),
+                        field("terminal_cursor", checked("MobileHistoryCursor")),
+                    ],
+                ),
+                document(
+                    "MobileHistoryError",
+                    "Strict bounded mobile session refusal.",
+                    false,
+                    vec![
+                        field("error", checked("MobileHistoryErrorCode")),
+                        field("schema", schema()),
+                    ],
+                ),
+            ],
+        }),
         ..GeneratedModule::default()
     }
 }
@@ -7620,6 +7878,7 @@ pub fn maintained_modules() -> Vec<GeneratedModule> {
         approval_module(),
         batch_module(),
         mobile_auth_module(),
+        mobile_session_module(),
         platform_module(),
         progress_module(),
     ];
