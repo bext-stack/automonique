@@ -1035,7 +1035,7 @@ mod versions {
                 (Component::StoreSchema, 1, 10),
                 (Component::CancelLedgerSchema, 1, 1),
                 (Component::GenerationAuditSchema, 1, 1),
-                (Component::ProviderJournalSchema, 1, 3),
+                (Component::ProviderJournalSchema, 1, 4),
                 (Component::RunSubmissionsSchema, 1, 1),
                 (Component::SlackIngressSchema, 1, 2),
                 (Component::RunSpecDocument, 1, 1),
