@@ -89,6 +89,13 @@ fn exact_release_candidate_warms_without_competing_for_source_authority() {
     )
     .expect("warm candidate");
     assert_ne!(candidate.pid(), source.id());
+    let attempt_inventory = candidate.attempt_inventory_proof();
+    assert_eq!(attempt_inventory.count, 0);
+    assert_eq!(
+        attempt_inventory.sha256,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "candidate proved the empty live source-host inventory"
+    );
     candidate.stop().expect("candidate stopped");
     assert!(
         source.try_wait().expect("source status").is_none(),

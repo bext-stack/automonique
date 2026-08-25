@@ -32,9 +32,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::DaemonConfig;
+use crate::attempt_adoption::{AttemptAdoptionClient, socket_path as attempt_adoption_socket_path};
+use crate::attempt_host::MAX_ATTEMPT_REGISTRATIONS;
 use crate::release_activation::VerifiedCodeRelease;
 
-const CHANNEL_SCHEMA: &str = "automonique.reload-candidate/v1";
+const CHANNEL_SCHEMA: &str = "automonique.reload-candidate/v2";
 const MAX_CHANNEL_LINE_BYTES: u64 = 4 * 1024;
 const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -66,6 +68,13 @@ pub struct WarmCandidate {
     stopped: bool,
 }
 
+/// Bounded proof of the source attempt inventory observed during warm-up.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttemptInventoryProof {
+    pub count: u32,
+    pub sha256: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CandidateIdentity {
@@ -75,6 +84,8 @@ struct CandidateIdentity {
     target_generation_id: String,
     manifest_digest: String,
     binary_sha256: String,
+    attempt_count: u32,
+    attempt_inventory_sha256: String,
     pid: u32,
 }
 
@@ -179,15 +190,6 @@ pub fn spawn_warm_candidate(
         .stdout(Stdio::from(child_stdout))
         .stderr(Stdio::null())
         .spawn()?;
-    let expected = CandidateIdentity {
-        schema: CHANNEL_SCHEMA.to_owned(),
-        event: "warm".to_owned(),
-        reload_id: spec.reload_id.clone(),
-        target_generation_id: spec.target_generation_id.clone(),
-        manifest_digest: release.manifest_digest.clone(),
-        binary_sha256: release.binary_sha256.clone(),
-        pid: child.id(),
-    };
     let observed: CandidateIdentity = match read_message(&parent) {
         Ok(observed) => observed,
         Err(error) => {
@@ -195,6 +197,30 @@ pub fn spawn_warm_candidate(
             let _ = child.wait();
             return Err(error);
         }
+    };
+    if validate_digest(
+        &observed.attempt_inventory_sha256,
+        false,
+        "attempt_inventory_sha256",
+    )
+    .is_err()
+        || usize::try_from(observed.attempt_count)
+            .map_or(true, |count| count > MAX_ATTEMPT_REGISTRATIONS)
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(CandidateError::Protocol);
+    }
+    let expected = CandidateIdentity {
+        schema: CHANNEL_SCHEMA.to_owned(),
+        event: "warm".to_owned(),
+        reload_id: spec.reload_id.clone(),
+        target_generation_id: spec.target_generation_id.clone(),
+        manifest_digest: release.manifest_digest.clone(),
+        binary_sha256: release.binary_sha256.clone(),
+        attempt_count: observed.attempt_count,
+        attempt_inventory_sha256: observed.attempt_inventory_sha256.clone(),
+        pid: child.id(),
     };
     if observed != expected {
         let _ = child.kill();
@@ -238,6 +264,15 @@ impl WarmCandidate {
     #[must_use]
     pub const fn pid(&self) -> u32 {
         self.identity.pid
+    }
+
+    /// Source-host inventory the candidate reached through the pinned route.
+    #[must_use]
+    pub fn attempt_inventory_proof(&self) -> AttemptInventoryProof {
+        AttemptInventoryProof {
+            count: self.identity.attempt_count,
+            sha256: self.identity.attempt_inventory_sha256.clone(),
+        }
     }
 
     /// End a still-non-owning candidate and require a matching acknowledgement.
@@ -285,6 +320,8 @@ pub fn run_candidate(
     }
     verify_own_binary(&input.binary_sha256)?;
     warm_state(config, &input.source_holder_id, input.source_lease_epoch)?;
+    let (attempt_count, attempt_inventory_sha256) =
+        warm_attempt_host(config, &input.source_holder_id, input.source_lease_epoch)?;
     if getppid().as_raw() as u32 != input.expected_parent_pid {
         return Err(CandidateError::ParentChanged);
     }
@@ -295,6 +332,8 @@ pub fn run_candidate(
         target_generation_id: input.target_generation_id,
         manifest_digest: input.manifest_digest,
         binary_sha256: input.binary_sha256,
+        attempt_count,
+        attempt_inventory_sha256,
         pid: std::process::id(),
     };
     write_message(&mut writer, &identity)?;
@@ -309,6 +348,29 @@ pub fn run_candidate(
     let mut stopped = identity;
     stopped.event = "stopped".to_owned();
     write_message(&mut writer, &stopped)
+}
+
+fn warm_attempt_host(
+    config: &DaemonConfig,
+    source_holder_id: &str,
+    source_lease_epoch: u64,
+) -> Result<(u32, String), CandidateError> {
+    let socket_path = attempt_adoption_socket_path(&config.runtime_dir(), source_holder_id)
+        .map_err(|_| CandidateError::UnsafePath("attempt_adoption"))?;
+    let inventory = AttemptAdoptionClient::new(socket_path, source_holder_id, source_lease_epoch)
+        .map_err(|_| CandidateError::Protocol)?
+        .inventory()
+        .map_err(|_| CandidateError::Protocol)?;
+    let attempt_count = u32::try_from(inventory.attempt_ids.len())
+        .map_err(|_| CandidateError::InvalidField("attempt_count"))?;
+    let mut digest = Sha256::new();
+    for attempt_id in inventory.attempt_ids {
+        let length = u32::try_from(attempt_id.len())
+            .map_err(|_| CandidateError::InvalidField("attempt_id"))?;
+        digest.update(length.to_be_bytes());
+        digest.update(attempt_id.as_bytes());
+    }
+    Ok((attempt_count, encode_hex(&digest.finalize())))
 }
 
 fn validate_input(input: &CandidateInput) -> Result<(), CandidateError> {
@@ -513,6 +575,8 @@ mod tests {
             target_generation_id: "generation-2".to_owned(),
             manifest_digest: format!("sha256:{}", "a".repeat(64)),
             binary_sha256: "b".repeat(64),
+            attempt_count: 2,
+            attempt_inventory_sha256: "c".repeat(64),
             pid: 42,
         };
         let mut bytes = Vec::new();
@@ -522,7 +586,7 @@ mod tests {
             identity
         );
 
-        let unknown = br#"{"schema":"automonique.reload-candidate/v1","event":"warm","reload_id":"reload-1","target_generation_id":"generation-2","manifest_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binary_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","pid":42,"extra":true}\n"#;
+        let unknown = br#"{"schema":"automonique.reload-candidate/v2","event":"warm","reload_id":"reload-1","target_generation_id":"generation-2","manifest_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binary_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","attempt_count":2,"attempt_inventory_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","pid":42,"extra":true}\n"#;
         assert!(matches!(
             read_message_from::<CandidateIdentity>(&mut unknown.as_slice()),
             Err(CandidateError::Protocol)
