@@ -23,9 +23,9 @@ export {
   encodeMessage,
   toCanonicalBytes,
   type JsonValue,
-} from "../src/canonical.ts";
+} from "../src/canonical.js";
 
-import {type JsonValue} from "../src/canonical.ts";
+import {type JsonValue} from "../src/canonical.js";
 
 const encoder = new TextEncoder();
 
@@ -399,6 +399,28 @@ export function bodyValue(
   return value;
 }
 
+/** A nested body that is always present and may be `null`. */
+export function bodyValueOrNull(
+  fields: ReadonlyMap<string, JsonValue>,
+  name: string,
+  category: string,
+): JsonValue | null {
+  const value = fields.get(name);
+  if (value === undefined) throw new RefusalError(category, `${name} is absent`);
+  return value.kind === "null" ? null : value;
+}
+
+/** Retain one string only when it is the exact protocol literal expected. */
+export function exactString<T extends string>(
+  value: string,
+  expected: T,
+  category: string,
+  field: string,
+): T {
+  if (value !== expected) throw new RefusalError(category, `${field} is incompatible`);
+  return expected;
+}
+
 /**
  * A bounded array field.
  *
@@ -425,6 +447,22 @@ export function bodyArray(
     );
   }
   return value.items;
+}
+
+/** A bounded array whose every member must be a string. */
+export function bodyStrings(
+  fields: ReadonlyMap<string, JsonValue>,
+  name: string,
+  category: string,
+  maxItems: number,
+  oversizeCategory: string,
+): readonly string[] {
+  return bodyArray(fields, name, category, maxItems, oversizeCategory).map((value) => {
+    if (value.kind !== "string") {
+      throw new RefusalError(category, `${name} contains a non-string member`);
+    }
+    return value.value;
+  });
 }
 
 /** Apply a reader to a nullable field, keeping `null` the distinct fact it is. */

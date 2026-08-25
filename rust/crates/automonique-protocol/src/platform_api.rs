@@ -802,7 +802,9 @@ fn response_from_message(message: &Message) -> Result<PlatformResponse, Platform
                         .and_then(|value| PlatformTransport::parse(value).map_err(Into::into))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            if methods.len() > MAX_CAPABILITY_METHODS {
+            if methods.len() > MAX_CAPABILITY_METHODS
+                || transports.len() > MAX_CAPABILITY_TRANSPORTS
+            {
                 return Err(PlatformApiError::InvalidBody);
             }
             Ok(PlatformResponse::Capabilities(Capabilities {

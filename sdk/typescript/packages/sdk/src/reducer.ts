@@ -7,7 +7,7 @@ import type {
   ResourceRecord,
   Snapshot,
   Subscription,
-} from "../../protocol/src/index.ts";
+} from "../../protocol/src/index.js";
 
 export interface PlatformViewState {
   readonly resources: ReadonlyMap<string, ResourceRecord>;

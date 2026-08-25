@@ -9,18 +9,18 @@
 // Rust is the wire source of truth. Hand-written SDK code may add
 // ergonomics; it may not redefine anything in this file.
 
-export * from "./admin-command.ts";
-export * from "./admin-status.ts";
-export * from "./approval.ts";
-export * from "./automation.ts";
-export * from "./batch.ts";
-export * from "./doctor.ts";
-export * from "./platform.ts";
-export * from "./progress.ts";
-export * from "./runs.ts";
-export * from "./runtime.ts";
+export * from "./admin-command.js";
+export * from "./admin-status.js";
+export * from "./approval.js";
+export * from "./automation.js";
+export * from "./batch.js";
+export * from "./doctor.js";
+export * from "./platform.js";
+export * from "./progress.js";
+export * from "./runs.js";
+export * from "./runtime.js";
 
 // The digest of the surface re-exported above. It identifies the schema
 // these files were generated from; it is not a checksum of this file.
 export const SCHEMA_DIGEST_ALGORITHM = "sha256";
-export const SCHEMA_DIGEST = "f7c8c5a700b1e8b2271aa304945cc966199303450187c45ec6243f80b0beb95f";
+export const SCHEMA_DIGEST = "a4fac4e7d5897e9058094b1cb53e8ec362ed6b61c83442e5f0032f7d2f8f6a6d";

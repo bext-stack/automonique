@@ -9,8 +9,8 @@
 // Rust is the wire source of truth. Hand-written SDK code may add
 // ergonomics; it may not redefine anything in this file.
 
-import {ADMIN_PROTOCOL, MAX_ADMIN_CANONICAL_BYTES} from "./admin-status.ts";
-import {RefusalError, ValidationError, bodyBool, bodyInteger, bodyString, boundedBytes, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, hexEncode, refuse, refuseField, type JsonValue} from "./runtime.ts";
+import {ADMIN_PROTOCOL, MAX_ADMIN_CANONICAL_BYTES} from "./admin-status.js";
+import {RefusalError, ValidationError, bodyBool, bodyInteger, bodyString, boundedBytes, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, hexEncode, refuse, refuseField, type JsonValue} from "./runtime.js";
 
 /** Maximum raw RunSpec document bytes this lane carries. The wire spends twice this, because the document travels hex-encoded. */
 export const MAX_SUBMITTED_RUN_SPEC_BYTES = 24576;

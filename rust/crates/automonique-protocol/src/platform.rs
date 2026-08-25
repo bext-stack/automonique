@@ -27,6 +27,8 @@ pub const MAX_SNAPSHOT_RESOURCES: usize = 512;
 pub const MAX_SUBSCRIPTION_EVENTS: usize = 512;
 /// Largest number of service methods advertised by one endpoint.
 pub const MAX_CAPABILITY_METHODS: usize = 32;
+/// Maximum transport projections advertised by one endpoint.
+pub const MAX_CAPABILITY_TRANSPORTS: usize = PlatformTransport::ALL.len();
 /// Default and maximum lifetime of one interactive controller lease.
 pub const CONTROL_LEASE_TTL_MILLIS: i64 = 30_000;
 

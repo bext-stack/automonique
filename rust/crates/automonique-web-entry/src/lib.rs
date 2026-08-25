@@ -5376,9 +5376,17 @@ pub fn serve(
 mod tests {
     use super::*;
     use automonique_github_connector::IssueLocator;
+    use automonique_protocol::platform::{
+        ActionReceipt, Attachment, ControlLease, ControlLeaseId, CursorTopic, Freshness,
+        FreshnessState, PlatformAction, PlatformEvent, PlatformText, ReceiptId, ReceiptOutcome,
+        ResourceId, ResourceKind, SessionList, Snapshot, Subscription,
+    };
+    use automonique_protocol::primitives::{EpochMillis, Revision};
     use std::collections::VecDeque;
     use std::net::Shutdown;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    use std::process::Command;
 
     const CANONICAL_HOST: &str = concat!("dashboard", ".", "example", ".", "invalid");
     const LEGACY_HOST: &str = concat!("retired", ".", "example", ".", "invalid");
@@ -5684,6 +5692,261 @@ mod tests {
             Some("https://manage.example.test/api/manage/automonique/platform")
         );
         assert!(manage_platform_endpoint("http://manage.example.test/").is_none());
+    }
+
+    #[test]
+    fn typescript_sdk_passes_the_live_platform_http_contract() {
+        const EXCHANGES: usize = 16;
+        const LARGE_SEQUENCE: u64 = 9_007_199_254_740_993;
+
+        fn read_http_body(stream: &mut TcpStream) -> Vec<u8> {
+            stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+            let mut received = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let header_end = loop {
+                let count = stream.read(&mut chunk).unwrap();
+                assert_ne!(count, 0, "request ended before its headers");
+                received.extend_from_slice(&chunk[..count]);
+                if let Some(position) = received.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break position + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&received[..header_end]).to_ascii_lowercase();
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .expect("content length");
+            while received.len() < header_end + content_length {
+                let count = stream.read(&mut chunk).unwrap();
+                assert_ne!(count, 0, "request ended before its body");
+                received.extend_from_slice(&chunk[..count]);
+            }
+            received[header_end..header_end + content_length].to_vec()
+        }
+
+        let state_dir = tempfile::tempdir().expect("temporary state");
+        let runtime_dir = tempfile::tempdir().expect("temporary runtime");
+        std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private state");
+        std::fs::set_permissions(runtime_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private runtime");
+
+        let platform_listener = UnixListener::bind(runtime_dir.path().join("admin.sock"))
+            .expect("fixture platform socket");
+        let platform_server = thread::spawn(move || {
+            for index in 1..=EXCHANGES {
+                let (mut stream, _) = platform_listener.accept().expect("platform connection");
+                let mut prefix = [0_u8; 4];
+                stream
+                    .read_exact(&mut prefix)
+                    .expect("platform frame prefix");
+                let length = usize::try_from(u32::from_be_bytes(prefix)).unwrap();
+                let mut payload = vec![0_u8; length];
+                stream.read_exact(&mut payload).expect("platform request");
+                let request = PlatformRequestMessage::from_canonical_bytes(&payload)
+                    .expect("canonical platform request");
+
+                let session = ResourceCoordinate::new(
+                    ResourceAuthority::Provider,
+                    ResourceKind::Session,
+                    ResourceId::new("session-1").unwrap(),
+                );
+                let run = ResourceCoordinate::new(
+                    ResourceAuthority::Automonique,
+                    ResourceKind::Run,
+                    ResourceId::new("run-1").unwrap(),
+                );
+                let snapshot_cursor = PlatformCursor {
+                    authority: ResourceAuthority::Provider,
+                    topic: CursorTopic::new("sessions").unwrap(),
+                    sequence: Revision::new(LARGE_SEQUENCE).unwrap(),
+                };
+                let subscription_cursor = PlatformCursor {
+                    sequence: Revision::new(LARGE_SEQUENCE + 1).unwrap(),
+                    ..snapshot_cursor.clone()
+                };
+                let record = ResourceRecord {
+                    resource: session.clone(),
+                    freshness: Freshness {
+                        state: FreshnessState::Fresh,
+                        observed_at: EpochMillis::from_millis(9_007_199_254_740_995),
+                        revision: Revision::new(LARGE_SEQUENCE + 1).unwrap(),
+                    },
+                    summary: PlatformText::new("ready").unwrap(),
+                };
+                let receipt = ActionReceipt {
+                    id: ReceiptId::new("receipt-1").unwrap(),
+                    action: PlatformAction::StartRun,
+                    target: run.clone(),
+                    outcome: ReceiptOutcome::Completed,
+                    revision: Revision::new(LARGE_SEQUENCE + 1).unwrap(),
+                    recorded_at: EpochMillis::from_millis(9_007_199_254_740_996),
+                    explanation: None,
+                };
+                let response = if index > 10 {
+                    let outcomes = [
+                        ReceiptOutcome::Accepted,
+                        ReceiptOutcome::Completed,
+                        ReceiptOutcome::Conflict,
+                        ReceiptOutcome::Rejected,
+                        ReceiptOutcome::ResyncRequired,
+                        ReceiptOutcome::Unknown,
+                    ];
+                    PlatformResponse::Refused {
+                        outcome: outcomes[index - 11],
+                        explanation: PlatformText::new("not completed").unwrap(),
+                    }
+                } else {
+                    match request.request() {
+                        PlatformRequest::Capabilities => {
+                            PlatformResponse::Capabilities(Capabilities::platform_v1())
+                        }
+                        PlatformRequest::Snapshot(_) => PlatformResponse::Snapshot(
+                            Snapshot::new(vec![record.clone()], snapshot_cursor.clone()).unwrap(),
+                        ),
+                        PlatformRequest::Subscribe(_) => PlatformResponse::Subscription(
+                            Subscription::new(
+                                vec![PlatformEvent {
+                                    cursor: subscription_cursor.clone(),
+                                    resource: record.clone(),
+                                }],
+                                subscription_cursor.clone(),
+                            )
+                            .unwrap(),
+                        ),
+                        PlatformRequest::Execute(_) | PlatformRequest::GetReceipt(_) => {
+                            PlatformResponse::Receipt(receipt.clone())
+                        }
+                        PlatformRequest::ListSessions(_) => PlatformResponse::Sessions(
+                            SessionList::new(
+                                vec![SessionRecord {
+                                    session: record.clone(),
+                                    run: Some(run.clone()),
+                                    attachable: true,
+                                    controllable: true,
+                                }],
+                                snapshot_cursor.clone(),
+                            )
+                            .unwrap(),
+                        ),
+                        PlatformRequest::Attach(value) => PlatformResponse::Attached(Attachment {
+                            session: value.session.clone(),
+                            client: value.client.clone(),
+                            cursor: snapshot_cursor.clone(),
+                        }),
+                        PlatformRequest::Detach(value) => PlatformResponse::Detached {
+                            session: value.session.clone(),
+                            client: value.client.clone(),
+                        },
+                        PlatformRequest::ClaimControl(value) => {
+                            PlatformResponse::ControlClaimed(ControlLease {
+                                id: ControlLeaseId::new("lease-1").unwrap(),
+                                session: value.session.clone(),
+                                client: value.client.clone(),
+                                expires_at: EpochMillis::from_millis(9_007_199_254_740_997),
+                                revision: Revision::new(LARGE_SEQUENCE + 1).unwrap(),
+                            })
+                        }
+                        PlatformRequest::ReleaseControl(value) => {
+                            PlatformResponse::ControlReleased {
+                                session: value.session.clone(),
+                                client: value.client.clone(),
+                                lease: value.lease.clone(),
+                            }
+                        }
+                    }
+                };
+                let response = PlatformResponseMessage::new(request.request_id().clone(), response)
+                    .to_message()
+                    .unwrap()
+                    .to_canonical_bytes();
+                stream
+                    .write_all(&u32::try_from(response.len()).unwrap().to_be_bytes())
+                    .unwrap();
+                stream.write_all(&response).unwrap();
+            }
+        });
+
+        let manage_listener = TcpListener::bind("127.0.0.1:0").expect("manage listener");
+        let manage_address = manage_listener.local_addr().unwrap();
+        let manage_server = thread::spawn(move || {
+            for _ in 0..EXCHANGES {
+                let (mut stream, _) = manage_listener.accept().expect("Manage connection");
+                let body = read_http_body(&mut stream);
+                let request = PlatformRequestMessage::from_canonical_bytes(&body)
+                    .expect("canonical authorization probe");
+                assert!(matches!(request.request(), PlatformRequest::Capabilities));
+                let response = PlatformResponseMessage::new(
+                    request.request_id().clone(),
+                    PlatformResponse::Capabilities(Capabilities::platform_v1()),
+                )
+                .to_message()
+                .unwrap()
+                .to_canonical_bytes();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: {PLATFORM_CONTENT_TYPE}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.len(),
+                ).unwrap();
+                stream.write_all(&response).unwrap();
+            }
+        });
+
+        let mut integration = WebIntegration::open(
+            IntegrationConfig {
+                tenant: String::from("operator"),
+                actor: String::from("operator:typescript-contract"),
+                hosts: fixture_hosts(),
+            },
+            state_dir.path(),
+            runtime_dir.path(),
+        )
+        .expect("web integration");
+        integration.manage.platform_url =
+            Some(format!("http://localhost:{}/", manage_address.port()));
+        let integration = Arc::new(integration);
+
+        let web_listener = TcpListener::bind("127.0.0.1:0").expect("web listener");
+        let web_address = web_listener.local_addr().unwrap();
+        let web_state = Arc::new(AppState::new(fixture_status()));
+        let web_server = {
+            let integration = Arc::clone(&integration);
+            let state = Arc::clone(&web_state);
+            thread::spawn(move || {
+                for _ in 0..EXCHANGES {
+                    let (stream, _) = web_listener.accept().expect("HTTP connection");
+                    handle(
+                        stream,
+                        &state,
+                        &fixture_auth(),
+                        &fixture_manage_chat_auth(),
+                        Some(&integration),
+                        &fixture_hosts(),
+                    )
+                    .expect("Platform HTTP route");
+                }
+            })
+        };
+
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let script =
+            repository.join("sdk/typescript/packages/sdk/conformance/rust-http-contract.ts");
+        let status = Command::new("bun")
+            .arg("run")
+            .arg(script)
+            .arg(format!(
+                "http://localhost:{}/api/platform",
+                web_address.port()
+            ))
+            .current_dir(repository)
+            .status()
+            .expect("run TypeScript contract client");
+        assert!(status.success(), "TypeScript contract client failed");
+
+        web_server.join().expect("web server");
+        manage_server.join().expect("Manage server");
+        platform_server.join().expect("platform server");
     }
 
     #[test]

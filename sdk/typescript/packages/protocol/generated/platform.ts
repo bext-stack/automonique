@@ -9,7 +9,7 @@
 // Rust is the wire source of truth. Hand-written SDK code may add
 // ergonomics; it may not redefine anything in this file.
 
-import {ValidationError, byteLength} from "./runtime.ts";
+import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyString, bodyStringOrNull, bodyStrings, bodyUnsigned, bodyValue, bodyValueOrNull, byteLength, decodeMessageAdmitted, exactFields, exactString, mapNullable, refuse, refuseField, type JsonValue} from "./runtime.js";
 
 /** Lifetime of one exclusive interactive control lease. */
 export const CONTROL_LEASE_TTL_MILLIS = 30000;
@@ -17,8 +17,17 @@ export const CONTROL_LEASE_TTL_MILLIS = 30000;
 /** Maximum methods advertised by one endpoint. */
 export const MAX_CAPABILITY_METHODS = 32;
 
+/** Maximum transport projections advertised by one endpoint. */
+export const MAX_CAPABILITY_TRANSPORTS = 3;
+
+/** Maximum canonical Platform response bytes. */
+export const MAX_PLATFORM_CANONICAL_BYTES = 524288;
+
 /** Largest free-form platform action parameter. */
 export const MAX_PLATFORM_PARAMETER_BYTES = 65536;
+
+/** Maximum canonical Platform request bytes. */
+export const MAX_PLATFORM_REQUEST_CANONICAL_BYTES = 131072;
 
 /** Maximum resources carried by one snapshot. */
 export const MAX_SNAPSHOT_RESOURCES = 512;
@@ -63,6 +72,17 @@ export function IdempotencyKey(value: string): IdempotencyKey {
   if (byteLength(value) > 256) throw new ValidationError("IdempotencyKey", "too_long");
   if (!IdempotencyKey_PATTERN.test(value)) throw new ValidationError("IdempotencyKey", "invalid_character");
   return value as IdempotencyKey;
+}
+
+/** Branded identifier, at most 128 UTF-8 bytes. */
+export type PlatformRequestId = string & {readonly __brand: "PlatformRequestId"};
+export const PlatformRequestId_MAX_BYTES = 128;
+export const PlatformRequestId_PATTERN = /^[A-Za-z0-9._:-]+$/u;
+export function PlatformRequestId(value: string): PlatformRequestId {
+  if (value.length === 0) throw new ValidationError("PlatformRequestId", "empty");
+  if (byteLength(value) > 128) throw new ValidationError("PlatformRequestId", "too_long");
+  if (!PlatformRequestId_PATTERN.test(value)) throw new ValidationError("PlatformRequestId", "invalid_character");
+  return value as PlatformRequestId;
 }
 
 /** Branded identifier, at most 256 UTF-8 bytes. */
@@ -387,3 +407,519 @@ export const Subscription_FIELDS: readonly string[] = [
   "cursor",
   "events",
 ];
+
+/** The only major version of this protocol these helpers speak. */
+export const PLATFORM_PROTOCOL_VERSION = 1;
+
+/** An envelope field violates its grammar. */
+export const PLATFORM_FIELD_GRAMMAR = "field_grammar";
+
+/** An envelope field violates its shared bounded-value rules. */
+export const PLATFORM_FIELD_INVALID = "field_invalid";
+
+/** The canonical response exceeds its transport ceiling. */
+export const PLATFORM_FRAME_TOO_LARGE = "frame_too_large";
+
+/** The response body is not the exact shape its kind defines. */
+export const PLATFORM_INVALID_BODY = "platform_invalid_body";
+
+/** The message kind is not defined by Platform v1. */
+export const PLATFORM_UNKNOWN_KIND = "platform_unknown_kind";
+
+/** A bounded Platform value or closed vocabulary was refused. */
+export const PLATFORM_VALUE_INVALID = "platform_value_invalid";
+
+/** Strictly decoded revision and observation time. */
+export interface DecodedFreshness {
+  readonly observed_at: PlatformEpochMillis;
+  readonly revision: PlatformRevision;
+  readonly state: FreshnessState;
+}
+
+/** The exact key set this nested body carries. */
+export const DecodedFreshness_FIELDS: readonly string[] = [
+  "observed_at",
+  "revision",
+  "state",
+];
+
+export function decodeDecodedFreshness(body: JsonValue): DecodedFreshness {
+  const fields = exactFields(body, DecodedFreshness_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    observed_at: refuse(PLATFORM_INVALID_BODY, () => PlatformEpochMillis(bodyInteger(fields, "observed_at", PLATFORM_INVALID_BODY))),
+    revision: refuse(PLATFORM_INVALID_BODY, () => PlatformRevision(bodyUnsigned(fields, "revision", PLATFORM_INVALID_BODY))),
+    state: refuse(PLATFORM_VALUE_INVALID, () => decodeFreshnessState(bodyString(fields, "state", PLATFORM_INVALID_BODY))),
+  };
+}
+
+/** Strictly decoded resume coordinate. */
+export interface DecodedPlatformCursor {
+  readonly authority: ResourceAuthority;
+  readonly sequence: PlatformRevision;
+  readonly topic: CursorTopic;
+}
+
+/** The exact key set this nested body carries. */
+export const DecodedPlatformCursor_FIELDS: readonly string[] = [
+  "authority",
+  "sequence",
+  "topic",
+];
+
+export function decodeDecodedPlatformCursor(body: JsonValue): DecodedPlatformCursor {
+  const fields = exactFields(body, DecodedPlatformCursor_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    authority: refuse(PLATFORM_VALUE_INVALID, () => decodeResourceAuthority(bodyString(fields, "authority", PLATFORM_INVALID_BODY))),
+    sequence: refuse(PLATFORM_INVALID_BODY, () => PlatformRevision(bodyUnsigned(fields, "sequence", PLATFORM_INVALID_BODY))),
+    topic: refuse(PLATFORM_VALUE_INVALID, () => CursorTopic(bodyString(fields, "topic", PLATFORM_INVALID_BODY))),
+  };
+}
+
+/** Strictly decoded ordered resource change. */
+export interface DecodedPlatformEvent {
+  readonly cursor: DecodedPlatformCursor;
+  readonly resource: DecodedResourceRecord;
+}
+
+/** The exact key set this nested body carries. */
+export const DecodedPlatformEvent_FIELDS: readonly string[] = [
+  "cursor",
+  "resource",
+];
+
+export function decodeDecodedPlatformEvent(body: JsonValue): DecodedPlatformEvent {
+  const fields = exactFields(body, DecodedPlatformEvent_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    cursor: decodeDecodedPlatformCursor(bodyValue(fields, "cursor", PLATFORM_INVALID_BODY)),
+    resource: decodeDecodedResourceRecord(bodyValue(fields, "resource", PLATFORM_INVALID_BODY)),
+  };
+}
+
+/** Strictly decoded authority-qualified resource identity. */
+export interface DecodedResourceCoordinate {
+  readonly authority: ResourceAuthority;
+  readonly id: ResourceId;
+  readonly kind: ResourceKind;
+}
+
+/** The exact key set this nested body carries. */
+export const DecodedResourceCoordinate_FIELDS: readonly string[] = [
+  "authority",
+  "id",
+  "kind",
+];
+
+export function decodeDecodedResourceCoordinate(body: JsonValue): DecodedResourceCoordinate {
+  const fields = exactFields(body, DecodedResourceCoordinate_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    authority: refuse(PLATFORM_VALUE_INVALID, () => decodeResourceAuthority(bodyString(fields, "authority", PLATFORM_INVALID_BODY))),
+    id: refuse(PLATFORM_VALUE_INVALID, () => ResourceId(bodyString(fields, "id", PLATFORM_INVALID_BODY))),
+    kind: refuse(PLATFORM_VALUE_INVALID, () => decodeResourceKind(bodyString(fields, "kind", PLATFORM_INVALID_BODY))),
+  };
+}
+
+/** Strictly decoded bounded resource projection. */
+export interface DecodedResourceRecord {
+  readonly freshness: DecodedFreshness;
+  readonly resource: DecodedResourceCoordinate;
+  readonly summary: PlatformText;
+}
+
+/** The exact key set this nested body carries. */
+export const DecodedResourceRecord_FIELDS: readonly string[] = [
+  "freshness",
+  "resource",
+  "summary",
+];
+
+export function decodeDecodedResourceRecord(body: JsonValue): DecodedResourceRecord {
+  const fields = exactFields(body, DecodedResourceRecord_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    freshness: decodeDecodedFreshness(bodyValue(fields, "freshness", PLATFORM_INVALID_BODY)),
+    resource: decodeDecodedResourceCoordinate(bodyValue(fields, "resource", PLATFORM_INVALID_BODY)),
+    summary: refuse(PLATFORM_VALUE_INVALID, () => PlatformText(bodyString(fields, "summary", PLATFORM_INVALID_BODY))),
+  };
+}
+
+/** Strictly decoded attachable session projection. */
+export interface DecodedSessionRecord {
+  readonly attachable: boolean;
+  readonly controllable: boolean;
+  readonly run: DecodedResourceCoordinate | null;
+  readonly session: DecodedResourceRecord;
+}
+
+/** The exact key set this nested body carries. */
+export const DecodedSessionRecord_FIELDS: readonly string[] = [
+  "attachable",
+  "controllable",
+  "run",
+  "session",
+];
+
+export function decodeDecodedSessionRecord(body: JsonValue): DecodedSessionRecord {
+  const fields = exactFields(body, DecodedSessionRecord_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    attachable: bodyBool(fields, "attachable", PLATFORM_INVALID_BODY),
+    controllable: bodyBool(fields, "controllable", PLATFORM_INVALID_BODY),
+    run: mapNullable(bodyValueOrNull(fields, "run", PLATFORM_INVALID_BODY), decodeDecodedResourceCoordinate),
+    session: decodeDecodedResourceRecord(bodyValue(fields, "session", PLATFORM_INVALID_BODY)),
+  };
+}
+
+/** An observation-only session attachment. */
+export const PLATFORM_ATTACHED_RESPONSE_KIND = "attached";
+export interface PlatformAttachedResult {
+  readonly client: ClientId;
+  readonly cursor: DecodedPlatformCursor;
+  readonly request_id: PlatformRequestId;
+  readonly session: DecodedResourceCoordinate;
+}
+
+/** The exact key set this response's wire body carries; the correlation identifier is not among them, because it travels in the envelope. */
+export const PlatformAttachedResult_BODY_FIELDS: readonly string[] = [
+  "client",
+  "cursor",
+  "session",
+];
+
+export function decodePlatformAttachedResult(request_id: PlatformRequestId, body: JsonValue): PlatformAttachedResult {
+  const fields = exactFields(body, PlatformAttachedResult_BODY_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    client: refuse(PLATFORM_VALUE_INVALID, () => ClientId(bodyString(fields, "client", PLATFORM_INVALID_BODY))),
+    cursor: decodeDecodedPlatformCursor(bodyValue(fields, "cursor", PLATFORM_INVALID_BODY)),
+    request_id: request_id,
+    session: decodeDecodedResourceCoordinate(bodyValue(fields, "session", PLATFORM_INVALID_BODY)),
+  };
+}
+
+/** Capabilities returned by the admitted Platform v1 peer. */
+export const PLATFORM_CAPABILITIES_RESULT_RESPONSE_KIND = "capabilities_result";
+export interface PlatformCapabilitiesResult {
+  readonly methods: readonly PlatformMethod[];
+  readonly protocol: typeof PLATFORM_PROTOCOL;
+  readonly request_id: PlatformRequestId;
+  readonly schema: typeof PLATFORM_SCHEMA_V1;
+  readonly transports: readonly PlatformTransport[];
+}
+
+/** The exact key set this response's wire body carries; the correlation identifier is not among them, because it travels in the envelope. */
+export const PlatformCapabilitiesResult_BODY_FIELDS: readonly string[] = [
+  "methods",
+  "protocol",
+  "schema",
+  "transports",
+];
+
+export function decodePlatformCapabilitiesResult(request_id: PlatformRequestId, body: JsonValue): PlatformCapabilitiesResult {
+  const fields = exactFields(body, PlatformCapabilitiesResult_BODY_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    methods: bodyStrings(fields, "methods", PLATFORM_INVALID_BODY, MAX_CAPABILITY_METHODS, PLATFORM_INVALID_BODY).map((value) =>
+      refuse(PLATFORM_VALUE_INVALID, () => decodePlatformMethod(value)),
+    ),
+    protocol: exactString(bodyString(fields, "protocol", PLATFORM_INVALID_BODY), PLATFORM_PROTOCOL, PLATFORM_INVALID_BODY, "protocol"),
+    request_id: request_id,
+    schema: exactString(bodyString(fields, "schema", PLATFORM_INVALID_BODY), PLATFORM_SCHEMA_V1, PLATFORM_INVALID_BODY, "schema"),
+    transports: bodyStrings(fields, "transports", PLATFORM_INVALID_BODY, MAX_CAPABILITY_TRANSPORTS, PLATFORM_INVALID_BODY).map((value) =>
+      refuse(PLATFORM_VALUE_INVALID, () => decodePlatformTransport(value)),
+    ),
+  };
+}
+
+/** A short exclusive interactive control lease. */
+export const PLATFORM_CONTROL_CLAIMED_RESPONSE_KIND = "control_claimed";
+export interface PlatformControlClaimedResult {
+  readonly client: ClientId;
+  readonly expires_at: PlatformEpochMillis;
+  readonly id: ControlLeaseId;
+  readonly request_id: PlatformRequestId;
+  readonly revision: PlatformRevision;
+  readonly session: DecodedResourceCoordinate;
+}
+
+/** The exact key set this response's wire body carries; the correlation identifier is not among them, because it travels in the envelope. */
+export const PlatformControlClaimedResult_BODY_FIELDS: readonly string[] = [
+  "client",
+  "expires_at",
+  "id",
+  "revision",
+  "session",
+];
+
+export function decodePlatformControlClaimedResult(request_id: PlatformRequestId, body: JsonValue): PlatformControlClaimedResult {
+  const fields = exactFields(body, PlatformControlClaimedResult_BODY_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    client: refuse(PLATFORM_VALUE_INVALID, () => ClientId(bodyString(fields, "client", PLATFORM_INVALID_BODY))),
+    expires_at: refuse(PLATFORM_INVALID_BODY, () => PlatformEpochMillis(bodyInteger(fields, "expires_at", PLATFORM_INVALID_BODY))),
+    id: refuse(PLATFORM_VALUE_INVALID, () => ControlLeaseId(bodyString(fields, "id", PLATFORM_INVALID_BODY))),
+    request_id: request_id,
+    revision: refuse(PLATFORM_INVALID_BODY, () => PlatformRevision(bodyUnsigned(fields, "revision", PLATFORM_INVALID_BODY))),
+    session: decodeDecodedResourceCoordinate(bodyValue(fields, "session", PLATFORM_INVALID_BODY)),
+  };
+}
+
+/** A completed release of an exact control lease. */
+export const PLATFORM_CONTROL_RELEASED_RESPONSE_KIND = "control_released";
+export interface PlatformControlReleasedResult {
+  readonly client: ClientId;
+  readonly lease: ControlLeaseId;
+  readonly request_id: PlatformRequestId;
+  readonly session: DecodedResourceCoordinate;
+}
+
+/** The exact key set this response's wire body carries; the correlation identifier is not among them, because it travels in the envelope. */
+export const PlatformControlReleasedResult_BODY_FIELDS: readonly string[] = [
+  "client",
+  "lease",
+  "session",
+];
+
+export function decodePlatformControlReleasedResult(request_id: PlatformRequestId, body: JsonValue): PlatformControlReleasedResult {
+  const fields = exactFields(body, PlatformControlReleasedResult_BODY_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    client: refuse(PLATFORM_VALUE_INVALID, () => ClientId(bodyString(fields, "client", PLATFORM_INVALID_BODY))),
+    lease: refuse(PLATFORM_VALUE_INVALID, () => ControlLeaseId(bodyString(fields, "lease", PLATFORM_INVALID_BODY))),
+    request_id: request_id,
+    session: decodeDecodedResourceCoordinate(bodyValue(fields, "session", PLATFORM_INVALID_BODY)),
+  };
+}
+
+/** A completed observation-only session detachment. */
+export const PLATFORM_DETACHED_RESPONSE_KIND = "detached";
+export interface PlatformDetachedResult {
+  readonly client: ClientId;
+  readonly request_id: PlatformRequestId;
+  readonly session: DecodedResourceCoordinate;
+}
+
+/** The exact key set this response's wire body carries; the correlation identifier is not among them, because it travels in the envelope. */
+export const PlatformDetachedResult_BODY_FIELDS: readonly string[] = [
+  "client",
+  "session",
+];
+
+export function decodePlatformDetachedResult(request_id: PlatformRequestId, body: JsonValue): PlatformDetachedResult {
+  const fields = exactFields(body, PlatformDetachedResult_BODY_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    client: refuse(PLATFORM_VALUE_INVALID, () => ClientId(bodyString(fields, "client", PLATFORM_INVALID_BODY))),
+    request_id: request_id,
+    session: decodeDecodedResourceCoordinate(bodyValue(fields, "session", PLATFORM_INVALID_BODY)),
+  };
+}
+
+/** A durable idempotent-action receipt. */
+export const PLATFORM_RECEIPT_RESULT_RESPONSE_KIND = "receipt_result";
+export interface PlatformReceiptResult {
+  readonly action: PlatformAction;
+  readonly explanation: PlatformText | null;
+  readonly id: ReceiptId;
+  readonly outcome: ReceiptOutcome;
+  readonly recorded_at: PlatformEpochMillis;
+  readonly request_id: PlatformRequestId;
+  readonly revision: PlatformRevision;
+  readonly target: DecodedResourceCoordinate;
+}
+
+/** The exact key set this response's wire body carries; the correlation identifier is not among them, because it travels in the envelope. */
+export const PlatformReceiptResult_BODY_FIELDS: readonly string[] = [
+  "action",
+  "explanation",
+  "id",
+  "outcome",
+  "recorded_at",
+  "revision",
+  "target",
+];
+
+export function decodePlatformReceiptResult(request_id: PlatformRequestId, body: JsonValue): PlatformReceiptResult {
+  const fields = exactFields(body, PlatformReceiptResult_BODY_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    action: refuse(PLATFORM_VALUE_INVALID, () => decodePlatformAction(bodyString(fields, "action", PLATFORM_INVALID_BODY))),
+    explanation: mapNullable(bodyStringOrNull(fields, "explanation", PLATFORM_INVALID_BODY), (value) =>
+      refuse(PLATFORM_VALUE_INVALID, () => PlatformText(value)),
+    ),
+    id: refuse(PLATFORM_VALUE_INVALID, () => ReceiptId(bodyString(fields, "id", PLATFORM_INVALID_BODY))),
+    outcome: refuse(PLATFORM_VALUE_INVALID, () => decodeReceiptOutcome(bodyString(fields, "outcome", PLATFORM_INVALID_BODY))),
+    recorded_at: refuse(PLATFORM_INVALID_BODY, () => PlatformEpochMillis(bodyInteger(fields, "recorded_at", PLATFORM_INVALID_BODY))),
+    request_id: request_id,
+    revision: refuse(PLATFORM_INVALID_BODY, () => PlatformRevision(bodyUnsigned(fields, "revision", PLATFORM_INVALID_BODY))),
+    target: decodeDecodedResourceCoordinate(bodyValue(fields, "target", PLATFORM_INVALID_BODY)),
+  };
+}
+
+/** A typed Platform refusal that never implies success. */
+export const PLATFORM_REFUSED_RESPONSE_KIND = "refused";
+export interface PlatformRefusedResult {
+  readonly explanation: PlatformText;
+  readonly outcome: ReceiptOutcome;
+  readonly request_id: PlatformRequestId;
+}
+
+/** The exact key set this response's wire body carries; the correlation identifier is not among them, because it travels in the envelope. */
+export const PlatformRefusedResult_BODY_FIELDS: readonly string[] = [
+  "explanation",
+  "outcome",
+];
+
+export function decodePlatformRefusedResult(request_id: PlatformRequestId, body: JsonValue): PlatformRefusedResult {
+  const fields = exactFields(body, PlatformRefusedResult_BODY_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    explanation: refuse(PLATFORM_VALUE_INVALID, () => PlatformText(bodyString(fields, "explanation", PLATFORM_INVALID_BODY))),
+    outcome: refuse(PLATFORM_VALUE_INVALID, () => decodeReceiptOutcome(bodyString(fields, "outcome", PLATFORM_INVALID_BODY))),
+    request_id: request_id,
+  };
+}
+
+/** One bounded attachable-session page. */
+export const PLATFORM_SESSIONS_RESULT_RESPONSE_KIND = "sessions_result";
+export interface PlatformSessionsResult {
+  readonly cursor: DecodedPlatformCursor;
+  readonly request_id: PlatformRequestId;
+  readonly sessions: readonly DecodedSessionRecord[];
+}
+
+/** The exact key set this response's wire body carries; the correlation identifier is not among them, because it travels in the envelope. */
+export const PlatformSessionsResult_BODY_FIELDS: readonly string[] = [
+  "cursor",
+  "sessions",
+];
+
+export function decodePlatformSessionsResult(request_id: PlatformRequestId, body: JsonValue): PlatformSessionsResult {
+  const fields = exactFields(body, PlatformSessionsResult_BODY_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    cursor: decodeDecodedPlatformCursor(bodyValue(fields, "cursor", PLATFORM_INVALID_BODY)),
+    request_id: request_id,
+    sessions: bodyArray(fields, "sessions", PLATFORM_INVALID_BODY, MAX_SNAPSHOT_RESOURCES, PLATFORM_VALUE_INVALID).map(
+      decodeDecodedSessionRecord,
+    ),
+  };
+}
+
+/** A bounded point-in-time Platform resource collection. */
+export const PLATFORM_SNAPSHOT_RESULT_RESPONSE_KIND = "snapshot_result";
+export interface PlatformSnapshotResult {
+  readonly cursor: DecodedPlatformCursor;
+  readonly request_id: PlatformRequestId;
+  readonly resources: readonly DecodedResourceRecord[];
+}
+
+/** The exact key set this response's wire body carries; the correlation identifier is not among them, because it travels in the envelope. */
+export const PlatformSnapshotResult_BODY_FIELDS: readonly string[] = [
+  "cursor",
+  "resources",
+];
+
+export function decodePlatformSnapshotResult(request_id: PlatformRequestId, body: JsonValue): PlatformSnapshotResult {
+  const fields = exactFields(body, PlatformSnapshotResult_BODY_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    cursor: decodeDecodedPlatformCursor(bodyValue(fields, "cursor", PLATFORM_INVALID_BODY)),
+    request_id: request_id,
+    resources: bodyArray(fields, "resources", PLATFORM_INVALID_BODY, MAX_SNAPSHOT_RESOURCES, PLATFORM_VALUE_INVALID).map(
+      decodeDecodedResourceRecord,
+    ),
+  };
+}
+
+/** A bounded, gap-free Platform event page. */
+export const PLATFORM_SUBSCRIPTION_RESULT_RESPONSE_KIND = "subscription_result";
+export interface PlatformSubscriptionResult {
+  readonly cursor: DecodedPlatformCursor;
+  readonly events: readonly DecodedPlatformEvent[];
+  readonly request_id: PlatformRequestId;
+}
+
+/** The exact key set this response's wire body carries; the correlation identifier is not among them, because it travels in the envelope. */
+export const PlatformSubscriptionResult_BODY_FIELDS: readonly string[] = [
+  "cursor",
+  "events",
+];
+
+export function decodePlatformSubscriptionResult(request_id: PlatformRequestId, body: JsonValue): PlatformSubscriptionResult {
+  const fields = exactFields(body, PlatformSubscriptionResult_BODY_FIELDS, PLATFORM_INVALID_BODY);
+  return {
+    cursor: decodeDecodedPlatformCursor(bodyValue(fields, "cursor", PLATFORM_INVALID_BODY)),
+    events: bodyArray(fields, "events", PLATFORM_INVALID_BODY, MAX_SUBSCRIPTION_EVENTS, PLATFORM_VALUE_INVALID).map(
+      decodeDecodedPlatformEvent,
+    ),
+    request_id: request_id,
+  };
+}
+
+/**
+ * Kinds this protocol version defines that this file does not decode.
+ *
+ * They are neither refused nor guessed at: a peer that sent one sent something
+ * defined, and a client told otherwise might act on the lie. The body is not
+ * handed back, because nothing here has validated it.
+ */
+export const PLATFORM_RESPONSE_KINDS_NOT_DECODED = [] as const;
+export type UndecodedPlatformResponseKind = (typeof PLATFORM_RESPONSE_KINDS_NOT_DECODED)[number];
+export function isUndecodedPlatformResponseKind(value: string): value is UndecodedPlatformResponseKind {
+  return (PLATFORM_RESPONSE_KINDS_NOT_DECODED as readonly string[]).includes(value);
+}
+
+/** Every response this file can hand a caller. */
+export type PlatformResponse =
+  | {readonly kind: "attached"; readonly value: PlatformAttachedResult}
+  | {readonly kind: "capabilities_result"; readonly value: PlatformCapabilitiesResult}
+  | {readonly kind: "control_claimed"; readonly value: PlatformControlClaimedResult}
+  | {readonly kind: "control_released"; readonly value: PlatformControlReleasedResult}
+  | {readonly kind: "detached"; readonly value: PlatformDetachedResult}
+  | {readonly kind: "receipt_result"; readonly value: PlatformReceiptResult}
+  | {readonly kind: "refused"; readonly value: PlatformRefusedResult}
+  | {readonly kind: "sessions_result"; readonly value: PlatformSessionsResult}
+  | {readonly kind: "snapshot_result"; readonly value: PlatformSnapshotResult}
+  | {readonly kind: "subscription_result"; readonly value: PlatformSubscriptionResult}
+  | {readonly kind: "undecoded"; readonly request_id: PlatformRequestId; readonly response_kind: UndecodedPlatformResponseKind};
+
+export function assertNeverPlatformResponse(value: never): never {
+  throw new ValidationError("PlatformResponse", `unhandled variant: ${JSON.stringify(value)}`);
+}
+
+/**
+ * Decode one canonical response payload.
+ *
+ * The payload is the framed transport's payload, without its length prefix.
+ * The envelope is admitted first and on both axes: a name this file does not
+ * implement and a major version outside its range are different refusals, and
+ * neither is downgraded into the other.
+ */
+export function decodePlatformResponse(payload: Uint8Array): PlatformResponse {
+  const message = decodeMessageAdmitted(payload, [
+    {protocol: PLATFORM_PROTOCOL, minVersion: PLATFORM_PROTOCOL_VERSION, maxVersion: PLATFORM_PROTOCOL_VERSION},
+  ]);
+  const request_id = refuseField(PLATFORM_FIELD_INVALID, PLATFORM_FIELD_GRAMMAR, () =>
+    PlatformRequestId(message.envelope.requestId),
+  );
+  const kind = message.envelope.kind;
+  if (isUndecodedPlatformResponseKind(kind)) {
+    return {kind: "undecoded", request_id, response_kind: kind};
+  }
+  switch (kind) {
+    case PLATFORM_ATTACHED_RESPONSE_KIND:
+      return {kind: PLATFORM_ATTACHED_RESPONSE_KIND, value: decodePlatformAttachedResult(request_id, message.body)};
+    case PLATFORM_CAPABILITIES_RESULT_RESPONSE_KIND:
+      return {kind: PLATFORM_CAPABILITIES_RESULT_RESPONSE_KIND, value: decodePlatformCapabilitiesResult(request_id, message.body)};
+    case PLATFORM_CONTROL_CLAIMED_RESPONSE_KIND:
+      return {kind: PLATFORM_CONTROL_CLAIMED_RESPONSE_KIND, value: decodePlatformControlClaimedResult(request_id, message.body)};
+    case PLATFORM_CONTROL_RELEASED_RESPONSE_KIND:
+      return {kind: PLATFORM_CONTROL_RELEASED_RESPONSE_KIND, value: decodePlatformControlReleasedResult(request_id, message.body)};
+    case PLATFORM_DETACHED_RESPONSE_KIND:
+      return {kind: PLATFORM_DETACHED_RESPONSE_KIND, value: decodePlatformDetachedResult(request_id, message.body)};
+    case PLATFORM_RECEIPT_RESULT_RESPONSE_KIND:
+      return {kind: PLATFORM_RECEIPT_RESULT_RESPONSE_KIND, value: decodePlatformReceiptResult(request_id, message.body)};
+    case PLATFORM_REFUSED_RESPONSE_KIND:
+      return {kind: PLATFORM_REFUSED_RESPONSE_KIND, value: decodePlatformRefusedResult(request_id, message.body)};
+    case PLATFORM_SESSIONS_RESULT_RESPONSE_KIND:
+      return {kind: PLATFORM_SESSIONS_RESULT_RESPONSE_KIND, value: decodePlatformSessionsResult(request_id, message.body)};
+    case PLATFORM_SNAPSHOT_RESULT_RESPONSE_KIND:
+      return {kind: PLATFORM_SNAPSHOT_RESULT_RESPONSE_KIND, value: decodePlatformSnapshotResult(request_id, message.body)};
+    case PLATFORM_SUBSCRIPTION_RESULT_RESPONSE_KIND:
+      return {kind: PLATFORM_SUBSCRIPTION_RESULT_RESPONSE_KIND, value: decodePlatformSubscriptionResult(request_id, message.body)};
+    default:
+      throw new RefusalError(
+        PLATFORM_UNKNOWN_KIND,
+        "message kind is not defined by this protocol version",
+      );
+  }
+}

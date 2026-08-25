@@ -817,6 +817,10 @@ pub fn module_file_name(module: &str) -> String {
     format!("{module}{MODULE_EXTENSION}")
 }
 
+fn module_specifier(module: &str) -> String {
+    format!("{module}.js")
+}
+
 /// TypeScript name of the branded counter every wire integer uses.
 const WIRE_COUNTER: &str = "WireCounter";
 
@@ -1202,8 +1206,33 @@ pub enum ResponseValue {
         /// Category answered for a spelling this build does not define.
         unknown_category: String,
     },
+    /// A bounded array of closed enumeration spellings.
+    EnumArray {
+        /// Generated enumeration type of each item.
+        type_name: String,
+        /// Generated constant naming the largest admissible length.
+        max_items_constant: String,
+        /// Category answered above that length.
+        oversize_category: String,
+        /// Category answered for a spelling this build does not define.
+        unknown_category: String,
+    },
+    /// One exact protocol literal, typed as the generated constant.
+    ExactString {
+        /// TypeScript type, normally `typeof SOME_CONSTANT`.
+        type_name: String,
+        /// Generated constant carrying the only accepted spelling.
+        expected_constant: String,
+        /// Category answered when the spelling differs.
+        mismatch_category: String,
+    },
     /// A nested body decoded by a [`BodyObject`] declared on the same surface.
     Object {
+        /// Generated object type.
+        type_name: String,
+    },
+    /// A nested body that is always present and may be `null`.
+    NullableObject {
         /// Generated object type.
         type_name: String,
     },
@@ -1594,9 +1623,9 @@ export {
   encodeMessage,
   toCanonicalBytes,
   type JsonValue,
-} from "../src/canonical.ts";
+} from "../src/canonical.js";
 
-import {type JsonValue} from "../src/canonical.ts";
+import {type JsonValue} from "../src/canonical.js";
 
 const encoder = new TextEncoder();
 
@@ -1970,6 +1999,28 @@ export function bodyValue(
   return value;
 }
 
+/** A nested body that is always present and may be `null`. */
+export function bodyValueOrNull(
+  fields: ReadonlyMap<string, JsonValue>,
+  name: string,
+  category: string,
+): JsonValue | null {
+  const value = fields.get(name);
+  if (value === undefined) throw new RefusalError(category, `${name} is absent`);
+  return value.kind === "null" ? null : value;
+}
+
+/** Retain one string only when it is the exact protocol literal expected. */
+export function exactString<T extends string>(
+  value: string,
+  expected: T,
+  category: string,
+  field: string,
+): T {
+  if (value !== expected) throw new RefusalError(category, `${field} is incompatible`);
+  return expected;
+}
+
 /**
  * A bounded array field.
  *
@@ -1996,6 +2047,22 @@ export function bodyArray(
     );
   }
   return value.items;
+}
+
+/** A bounded array whose every member must be a string. */
+export function bodyStrings(
+  fields: ReadonlyMap<string, JsonValue>,
+  name: string,
+  category: string,
+  maxItems: number,
+  oversizeCategory: string,
+): readonly string[] {
+  return bodyArray(fields, name, category, maxItems, oversizeCategory).map((value) => {
+    if (value.kind !== "string") {
+      throw new RefusalError(category, `${name} contains a non-string member`);
+    }
+    return value.value;
+  });
 }
 
 /** Apply a reader to a nullable field, keeping `null` the distinct fact it is. */
@@ -5895,6 +5962,81 @@ fn platform_values<T: Copy>(values: &[T], spelling: impl Fn(T) -> &'static str) 
         .collect()
 }
 
+const PLATFORM_INVALID_BODY: &str = "PLATFORM_INVALID_BODY";
+const PLATFORM_VALUE_INVALID: &str = "PLATFORM_VALUE_INVALID";
+
+fn platform_checked(type_name: &str) -> ResponseValue {
+    ResponseValue::Checked {
+        type_name: type_name.to_owned(),
+        refusal_category: PLATFORM_VALUE_INVALID.to_owned(),
+    }
+}
+
+fn platform_nullable_checked(type_name: &str) -> ResponseValue {
+    ResponseValue::NullableChecked {
+        type_name: type_name.to_owned(),
+        refusal_category: PLATFORM_VALUE_INVALID.to_owned(),
+    }
+}
+
+fn platform_enum(type_name: &str) -> ResponseValue {
+    ResponseValue::Enum {
+        type_name: type_name.to_owned(),
+        unknown_category: PLATFORM_VALUE_INVALID.to_owned(),
+    }
+}
+
+fn platform_revision() -> ResponseValue {
+    ResponseValue::Integer {
+        type_name: "PlatformRevision".to_owned(),
+        refusal_category: PLATFORM_INVALID_BODY.to_owned(),
+        unsigned: true,
+    }
+}
+
+fn platform_epoch_millis() -> ResponseValue {
+    ResponseValue::Integer {
+        type_name: "PlatformEpochMillis".to_owned(),
+        refusal_category: PLATFORM_INVALID_BODY.to_owned(),
+        unsigned: false,
+    }
+}
+
+fn platform_object(type_name: &str) -> ResponseValue {
+    ResponseValue::Object {
+        type_name: type_name.to_owned(),
+    }
+}
+
+fn platform_field(name: &str, value: ResponseValue) -> ResponseField {
+    ResponseField {
+        name: name.to_owned(),
+        value,
+    }
+}
+
+fn platform_body_object(name: &str, doc: &str, fields: Vec<ResponseField>) -> BodyObject {
+    BodyObject {
+        name: name.to_owned(),
+        doc: doc.to_owned(),
+        fields,
+    }
+}
+
+fn platform_response(
+    kind: &str,
+    name: &str,
+    doc: &str,
+    fields: Vec<ResponseField>,
+) -> ResponseDecoder {
+    ResponseDecoder {
+        kind: kind.to_owned(),
+        name: name.to_owned(),
+        doc: doc.to_owned(),
+        fields,
+    }
+}
+
 /// The shared platform identities and service descriptions.
 fn platform_module() -> GeneratedModule {
     let security_enum = |name: &str, values: Vec<String>| GeneratedEnum {
@@ -5913,6 +6055,11 @@ fn platform_module() -> GeneratedModule {
                 name: "MAX_CAPABILITY_METHODS".to_owned(),
                 doc: "Maximum methods advertised by one endpoint.".to_owned(),
                 value: ConstantValue::Count(crate::platform::MAX_CAPABILITY_METHODS),
+            },
+            Constant {
+                name: "MAX_CAPABILITY_TRANSPORTS".to_owned(),
+                doc: "Maximum transport projections advertised by one endpoint.".to_owned(),
+                value: ConstantValue::Count(crate::platform::MAX_CAPABILITY_TRANSPORTS),
             },
             Constant {
                 name: "MAX_SNAPSHOT_RESOURCES".to_owned(),
@@ -5938,6 +6085,18 @@ fn platform_module() -> GeneratedModule {
                 value: ConstantValue::Count(crate::platform::MAX_PLATFORM_PARAMETER_BYTES),
             },
             Constant {
+                name: "MAX_PLATFORM_CANONICAL_BYTES".to_owned(),
+                doc: "Maximum canonical Platform response bytes.".to_owned(),
+                value: ConstantValue::Count(crate::platform_api::MAX_PLATFORM_CANONICAL_BYTES),
+            },
+            Constant {
+                name: "MAX_PLATFORM_REQUEST_CANONICAL_BYTES".to_owned(),
+                doc: "Maximum canonical Platform request bytes.".to_owned(),
+                value: ConstantValue::Count(
+                    crate::platform_api::MAX_PLATFORM_REQUEST_CANONICAL_BYTES,
+                ),
+            },
+            Constant {
                 name: "PLATFORM_PROTOCOL".to_owned(),
                 doc: "Stable platform protocol name.".to_owned(),
                 value: ConstantValue::Text(crate::platform::PLATFORM_PROTOCOL.to_owned()),
@@ -5952,14 +6111,23 @@ fn platform_module() -> GeneratedModule {
             "ClientId",
             "ControlLeaseId",
             "IdempotencyKey",
+            "PlatformRequestId",
             "ReceiptId",
             "ResourceId",
         ]
         .into_iter()
         .map(|name| BrandedId {
             name: name.to_owned(),
-            max_bytes: crate::platform::MAX_PLATFORM_FIELD_BYTES,
-            pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),
+            max_bytes: if name == "PlatformRequestId" {
+                crate::codec::MAX_REQUEST_ID_BYTES
+            } else {
+                crate::platform::MAX_PLATFORM_FIELD_BYTES
+            },
+            pattern: Some(if name == "PlatformRequestId" {
+                "^[A-Za-z0-9._:-]+$".to_owned()
+            } else {
+                NO_CONTROL_CHARACTERS.to_owned()
+            }),
         })
         .collect(),
         bounded_strings: vec![
@@ -6155,6 +6323,274 @@ fn platform_module() -> GeneratedModule {
                 ],
             },
         ],
+        command_surface: Some(CommandSurface {
+            name: "Platform".to_owned(),
+            protocol_constant: "PLATFORM_PROTOCOL".to_owned(),
+            protocol: crate::platform::PLATFORM_PROTOCOL.to_owned(),
+            version: 1,
+            max_message_bytes_constant: "MAX_PLATFORM_CANONICAL_BYTES".to_owned(),
+            request_id_type: "PlatformRequestId".to_owned(),
+            categories: vec![
+                Constant {
+                    name: PLATFORM_INVALID_BODY.to_owned(),
+                    doc: "The response body is not the exact shape its kind defines.".to_owned(),
+                    value: ConstantValue::Text("platform_invalid_body".to_owned()),
+                },
+                Constant {
+                    name: PLATFORM_VALUE_INVALID.to_owned(),
+                    doc: "A bounded Platform value or closed vocabulary was refused.".to_owned(),
+                    value: ConstantValue::Text("platform_value_invalid".to_owned()),
+                },
+                Constant {
+                    name: "PLATFORM_UNKNOWN_KIND".to_owned(),
+                    doc: "The message kind is not defined by Platform v1.".to_owned(),
+                    value: ConstantValue::Text("platform_unknown_kind".to_owned()),
+                },
+                Constant {
+                    name: "PLATFORM_FRAME_TOO_LARGE".to_owned(),
+                    doc: "The canonical response exceeds its transport ceiling.".to_owned(),
+                    value: ConstantValue::Text("frame_too_large".to_owned()),
+                },
+                Constant {
+                    name: "PLATFORM_FIELD_INVALID".to_owned(),
+                    doc: "An envelope field violates its shared bounded-value rules.".to_owned(),
+                    value: ConstantValue::Text("field_invalid".to_owned()),
+                },
+                Constant {
+                    name: "PLATFORM_FIELD_GRAMMAR".to_owned(),
+                    doc: "An envelope field violates its grammar.".to_owned(),
+                    value: ConstantValue::Text("field_grammar".to_owned()),
+                },
+            ],
+            invalid_body_category: PLATFORM_INVALID_BODY.to_owned(),
+            unknown_kind_category: "PLATFORM_UNKNOWN_KIND".to_owned(),
+            oversize_category: "PLATFORM_FRAME_TOO_LARGE".to_owned(),
+            field_invalid_category: "PLATFORM_FIELD_INVALID".to_owned(),
+            field_grammar_category: "PLATFORM_FIELD_GRAMMAR".to_owned(),
+            discriminated_bodies: Vec::new(),
+            body_objects: vec![
+                platform_body_object(
+                    "DecodedFreshness",
+                    "Strictly decoded revision and observation time.",
+                    vec![
+                        platform_field("observed_at", platform_epoch_millis()),
+                        platform_field("revision", platform_revision()),
+                        platform_field("state", platform_enum("FreshnessState")),
+                    ],
+                ),
+                platform_body_object(
+                    "DecodedPlatformCursor",
+                    "Strictly decoded resume coordinate.",
+                    vec![
+                        platform_field("authority", platform_enum("ResourceAuthority")),
+                        platform_field("sequence", platform_revision()),
+                        platform_field("topic", platform_checked("CursorTopic")),
+                    ],
+                ),
+                platform_body_object(
+                    "DecodedResourceCoordinate",
+                    "Strictly decoded authority-qualified resource identity.",
+                    vec![
+                        platform_field("authority", platform_enum("ResourceAuthority")),
+                        platform_field("id", platform_checked("ResourceId")),
+                        platform_field("kind", platform_enum("ResourceKind")),
+                    ],
+                ),
+                platform_body_object(
+                    "DecodedResourceRecord",
+                    "Strictly decoded bounded resource projection.",
+                    vec![
+                        platform_field("freshness", platform_object("DecodedFreshness")),
+                        platform_field("resource", platform_object("DecodedResourceCoordinate")),
+                        platform_field("summary", platform_checked("PlatformText")),
+                    ],
+                ),
+                platform_body_object(
+                    "DecodedPlatformEvent",
+                    "Strictly decoded ordered resource change.",
+                    vec![
+                        platform_field("cursor", platform_object("DecodedPlatformCursor")),
+                        platform_field("resource", platform_object("DecodedResourceRecord")),
+                    ],
+                ),
+                platform_body_object(
+                    "DecodedSessionRecord",
+                    "Strictly decoded attachable session projection.",
+                    vec![
+                        platform_field("attachable", ResponseValue::Bool),
+                        platform_field("controllable", ResponseValue::Bool),
+                        platform_field(
+                            "run",
+                            ResponseValue::NullableObject {
+                                type_name: "DecodedResourceCoordinate".to_owned(),
+                            },
+                        ),
+                        platform_field("session", platform_object("DecodedResourceRecord")),
+                    ],
+                ),
+            ],
+            requests: Vec::new(),
+            request_kinds_not_generated: PlatformMethod::ALL
+                .iter()
+                .map(|method| method.as_str().to_owned())
+                .collect(),
+            responses: vec![
+                platform_response(
+                    "capabilities_result",
+                    "PlatformCapabilitiesResult",
+                    "Capabilities returned by the admitted Platform v1 peer.",
+                    vec![
+                        platform_field(
+                            "methods",
+                            ResponseValue::EnumArray {
+                                type_name: "PlatformMethod".to_owned(),
+                                max_items_constant: "MAX_CAPABILITY_METHODS".to_owned(),
+                                oversize_category: PLATFORM_INVALID_BODY.to_owned(),
+                                unknown_category: PLATFORM_VALUE_INVALID.to_owned(),
+                            },
+                        ),
+                        platform_field(
+                            "protocol",
+                            ResponseValue::ExactString {
+                                type_name: "typeof PLATFORM_PROTOCOL".to_owned(),
+                                expected_constant: "PLATFORM_PROTOCOL".to_owned(),
+                                mismatch_category: PLATFORM_INVALID_BODY.to_owned(),
+                            },
+                        ),
+                        platform_field(
+                            "schema",
+                            ResponseValue::ExactString {
+                                type_name: "typeof PLATFORM_SCHEMA_V1".to_owned(),
+                                expected_constant: "PLATFORM_SCHEMA_V1".to_owned(),
+                                mismatch_category: PLATFORM_INVALID_BODY.to_owned(),
+                            },
+                        ),
+                        platform_field(
+                            "transports",
+                            ResponseValue::EnumArray {
+                                type_name: "PlatformTransport".to_owned(),
+                                max_items_constant: "MAX_CAPABILITY_TRANSPORTS".to_owned(),
+                                oversize_category: PLATFORM_INVALID_BODY.to_owned(),
+                                unknown_category: PLATFORM_VALUE_INVALID.to_owned(),
+                            },
+                        ),
+                    ],
+                ),
+                platform_response(
+                    "snapshot_result",
+                    "PlatformSnapshotResult",
+                    "A bounded point-in-time Platform resource collection.",
+                    vec![
+                        platform_field("cursor", platform_object("DecodedPlatformCursor")),
+                        platform_field(
+                            "resources",
+                            ResponseValue::ObjectArray {
+                                type_name: "DecodedResourceRecord".to_owned(),
+                                max_items_constant: "MAX_SNAPSHOT_RESOURCES".to_owned(),
+                                oversize_category: PLATFORM_VALUE_INVALID.to_owned(),
+                            },
+                        ),
+                    ],
+                ),
+                platform_response(
+                    "subscription_result",
+                    "PlatformSubscriptionResult",
+                    "A bounded, gap-free Platform event page.",
+                    vec![
+                        platform_field("cursor", platform_object("DecodedPlatformCursor")),
+                        platform_field(
+                            "events",
+                            ResponseValue::ObjectArray {
+                                type_name: "DecodedPlatformEvent".to_owned(),
+                                max_items_constant: "MAX_SUBSCRIPTION_EVENTS".to_owned(),
+                                oversize_category: PLATFORM_VALUE_INVALID.to_owned(),
+                            },
+                        ),
+                    ],
+                ),
+                platform_response(
+                    "receipt_result",
+                    "PlatformReceiptResult",
+                    "A durable idempotent-action receipt.",
+                    vec![
+                        platform_field("action", platform_enum("PlatformAction")),
+                        platform_field("explanation", platform_nullable_checked("PlatformText")),
+                        platform_field("id", platform_checked("ReceiptId")),
+                        platform_field("outcome", platform_enum("ReceiptOutcome")),
+                        platform_field("recorded_at", platform_epoch_millis()),
+                        platform_field("revision", platform_revision()),
+                        platform_field("target", platform_object("DecodedResourceCoordinate")),
+                    ],
+                ),
+                platform_response(
+                    "sessions_result",
+                    "PlatformSessionsResult",
+                    "One bounded attachable-session page.",
+                    vec![
+                        platform_field("cursor", platform_object("DecodedPlatformCursor")),
+                        platform_field(
+                            "sessions",
+                            ResponseValue::ObjectArray {
+                                type_name: "DecodedSessionRecord".to_owned(),
+                                max_items_constant: "MAX_SNAPSHOT_RESOURCES".to_owned(),
+                                oversize_category: PLATFORM_VALUE_INVALID.to_owned(),
+                            },
+                        ),
+                    ],
+                ),
+                platform_response(
+                    "attached",
+                    "PlatformAttachedResult",
+                    "An observation-only session attachment.",
+                    vec![
+                        platform_field("client", platform_checked("ClientId")),
+                        platform_field("cursor", platform_object("DecodedPlatformCursor")),
+                        platform_field("session", platform_object("DecodedResourceCoordinate")),
+                    ],
+                ),
+                platform_response(
+                    "detached",
+                    "PlatformDetachedResult",
+                    "A completed observation-only session detachment.",
+                    vec![
+                        platform_field("client", platform_checked("ClientId")),
+                        platform_field("session", platform_object("DecodedResourceCoordinate")),
+                    ],
+                ),
+                platform_response(
+                    "control_claimed",
+                    "PlatformControlClaimedResult",
+                    "A short exclusive interactive control lease.",
+                    vec![
+                        platform_field("client", platform_checked("ClientId")),
+                        platform_field("expires_at", platform_epoch_millis()),
+                        platform_field("id", platform_checked("ControlLeaseId")),
+                        platform_field("revision", platform_revision()),
+                        platform_field("session", platform_object("DecodedResourceCoordinate")),
+                    ],
+                ),
+                platform_response(
+                    "control_released",
+                    "PlatformControlReleasedResult",
+                    "A completed release of an exact control lease.",
+                    vec![
+                        platform_field("client", platform_checked("ClientId")),
+                        platform_field("lease", platform_checked("ControlLeaseId")),
+                        platform_field("session", platform_object("DecodedResourceCoordinate")),
+                    ],
+                ),
+                platform_response(
+                    "refused",
+                    "PlatformRefusedResult",
+                    "A typed Platform refusal that never implies success.",
+                    vec![
+                        platform_field("explanation", platform_checked("PlatformText")),
+                        platform_field("outcome", platform_enum("ReceiptOutcome")),
+                    ],
+                ),
+            ],
+            response_kinds_not_decoded: Vec::new(),
+        }),
         ..GeneratedModule::default()
     }
 }
@@ -6291,6 +6727,12 @@ fn runtime_imports(module: &GeneratedModule) -> (Vec<&'static str>, Vec<&'static
                 ResponseValue::Checked { .. } | ResponseValue::Enum { .. } => {
                     names.extend(["bodyString", "refuse"]);
                 }
+                ResponseValue::EnumArray { .. } => {
+                    names.extend(["bodyStrings", "refuse"]);
+                }
+                ResponseValue::ExactString { .. } => {
+                    names.extend(["bodyString", "exactString"]);
+                }
                 ResponseValue::NullableChecked { .. } => {
                     names.extend(["bodyStringOrNull", "mapNullable", "refuse"]);
                 }
@@ -6318,6 +6760,9 @@ fn runtime_imports(module: &GeneratedModule) -> (Vec<&'static str>, Vec<&'static
                     names.extend(["bodyIntegerOrNull", "mapNullable", "refuse"]);
                 }
                 ResponseValue::Object { .. } => names.push("bodyValue"),
+                ResponseValue::NullableObject { .. } => {
+                    names.extend(["bodyValueOrNull", "mapNullable"]);
+                }
                 ResponseValue::ObjectArray { .. } => names.push("bodyArray"),
             }
         }
@@ -6343,7 +6788,7 @@ fn emit_imports(out: &mut String, module: &GeneratedModule) {
         .iter()
         .map(|import| {
             (
-                module_file_name(&import.module),
+                module_specifier(&import.module),
                 import.values.clone(),
                 import.types.clone(),
             )
@@ -6352,7 +6797,7 @@ fn emit_imports(out: &mut String, module: &GeneratedModule) {
     let (values, types) = runtime_imports(module);
     if !values.is_empty() || !types.is_empty() {
         lines.push((
-            module_file_name(RUNTIME_MODULE),
+            module_specifier(RUNTIME_MODULE),
             values.iter().map(|name| (*name).to_owned()).collect(),
             types.iter().map(|name| (*name).to_owned()).collect(),
         ));
@@ -6440,9 +6885,9 @@ fn emit_barrel(modules: &[GeneratedModule], digest: &str) -> String {
         "Every maintained module, re-exported as one import surface.",
     );
     out.push('\n');
-    let mut names: Vec<&str> = modules
+    let mut names: Vec<String> = modules
         .iter()
-        .map(|module| module.file_name.as_str())
+        .map(|module| module_specifier(module.file_name.trim_end_matches(MODULE_EXTENSION)))
         .collect();
     names.sort_unstable();
     for name in names {
@@ -7013,11 +7458,14 @@ fn response_field_type(value: &ResponseValue) -> String {
         | ResponseValue::Integer { type_name, .. }
         | ResponseValue::RangedInteger { type_name, .. }
         | ResponseValue::Enum { type_name, .. }
+        | ResponseValue::ExactString { type_name, .. }
         | ResponseValue::Object { type_name } => type_name.clone(),
         ResponseValue::NullableChecked { type_name, .. }
-        | ResponseValue::NullableInteger { type_name, .. } => format!("{type_name} | null"),
+        | ResponseValue::NullableInteger { type_name, .. }
+        | ResponseValue::NullableObject { type_name } => format!("{type_name} | null"),
         ResponseValue::Bool => "boolean".to_owned(),
-        ResponseValue::ObjectArray { type_name, .. } => format!("readonly {type_name}[]"),
+        ResponseValue::EnumArray { type_name, .. }
+        | ResponseValue::ObjectArray { type_name, .. } => format!("readonly {type_name}[]"),
     }
 }
 
@@ -7083,9 +7531,30 @@ fn response_field_reader(surface: &CommandSurface, field: &ResponseField) -> Str
             "refuse({unknown_category}, () => decode{type_name}(bodyString(fields, \"{name}\", \
              {invalid})))"
         ),
+        ResponseValue::EnumArray {
+            type_name,
+            max_items_constant,
+            oversize_category,
+            unknown_category,
+        } => format!(
+            "bodyStrings(fields, \"{name}\", {invalid}, {max_items_constant}, \
+             {oversize_category}).map((value) =>\n      \
+             refuse({unknown_category}, () => decode{type_name}(value)),\n    )"
+        ),
+        ResponseValue::ExactString {
+            expected_constant,
+            mismatch_category,
+            ..
+        } => format!(
+            "exactString(bodyString(fields, \"{name}\", {invalid}), {expected_constant}, \
+             {mismatch_category}, \"{name}\")"
+        ),
         ResponseValue::Object { type_name } => {
             format!("decode{type_name}(bodyValue(fields, \"{name}\", {invalid}))")
         }
+        ResponseValue::NullableObject { type_name } => format!(
+            "mapNullable(bodyValueOrNull(fields, \"{name}\", {invalid}), decode{type_name})"
+        ),
         ResponseValue::ObjectArray {
             type_name,
             max_items_constant,

@@ -9,7 +9,7 @@
 // Rust is the wire source of truth. Hand-written SDK code may add
 // ergonomics; it may not redefine anything in this file.
 
-import {ValidationError, byteLength} from "./runtime.ts";
+import {ValidationError, byteLength} from "./runtime.js";
 
 /** What this build's local endpoints can do, as one monotonic integer. A client compares it against the number it was written for; it never assumes the two must be equal. */
 export const ADMIN_CAPABILITY = 5;

@@ -9,9 +9,9 @@
 // Rust is the wire source of truth. Hand-written SDK code may add
 // ergonomics; it may not redefine anything in this file.
 
-import {DurableRowId, RequestId} from "./admin-command.ts";
-import {EpochMillis} from "./runs.ts";
-import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyUnsigned, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, mapNullable, refuse, refuseField, type JsonValue} from "./runtime.ts";
+import {DurableRowId, RequestId} from "./admin-command.js";
+import {EpochMillis} from "./runs.js";
+import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyUnsigned, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, mapNullable, refuse, refuseField, type JsonValue} from "./runtime.js";
 
 /** Stable schema identifier for the version-one decision surface. */
 export const APPROVAL_API_SCHEMA_V1 = "automonique.approval/v1";

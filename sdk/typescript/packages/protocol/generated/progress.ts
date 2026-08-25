@@ -9,10 +9,10 @@
 // Rust is the wire source of truth. Hand-written SDK code may add
 // ergonomics; it may not redefine anything in this file.
 
-import {RunId} from "./admin-command.ts";
-import {WireCounter} from "./admin-status.ts";
-import {Authority, EpochMillis, SpoolSequence} from "./runs.ts";
-import {ValidationError, byteLength} from "./runtime.ts";
+import {RunId} from "./admin-command.js";
+import {WireCounter} from "./admin-status.js";
+import {Authority, EpochMillis, SpoolSequence} from "./runs.js";
+import {ValidationError, byteLength} from "./runtime.js";
 
 /** Maximum canonical bytes of one encoded frame. It is inside the runner spool's own payload ceiling, because a frame is stored as one spool event's payload. */
 export const MAX_PROGRESS_CANONICAL_BYTES = 40960;

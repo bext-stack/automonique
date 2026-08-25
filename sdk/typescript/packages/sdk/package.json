@@ -1,13 +1,20 @@
 {
   "name": "@automonique/sdk",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
   "type": "module",
   "license": "Apache-2.0",
+  "files": [
+    "dist"
+  ],
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/sdk/src/index.d.ts",
+      "import": "./dist/sdk/src/index.js",
+      "default": "./dist/sdk/src/index.js"
+    }
   },
   "scripts": {
+    "build": "bunx tsc -p ./tsconfig.build.json",
     "test": "bun test",
     "typecheck": "bunx tsc -p ./tsconfig.json"
   },

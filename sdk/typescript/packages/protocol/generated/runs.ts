@@ -9,8 +9,8 @@
 // Rust is the wire source of truth. Hand-written SDK code may add
 // ergonomics; it may not redefine anything in this file.
 
-import {DurableRowId, RequestId, RunId, SpecDigest} from "./admin-command.ts";
-import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyStringOrNull, bodyUnsigned, bodyValue, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, mapNullable, orderedEnumSet, refuse, refuseField, type JsonValue} from "./runtime.ts";
+import {DurableRowId, RequestId, RunId, SpecDigest} from "./admin-command.js";
+import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyStringOrNull, bodyUnsigned, bodyValue, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, mapNullable, orderedEnumSet, refuse, refuseField, type JsonValue} from "./runtime.js";
 
 /** Maximum lifecycle events one detail view may carry. */
 export const MAX_LIFECYCLE_EVENTS = 128;

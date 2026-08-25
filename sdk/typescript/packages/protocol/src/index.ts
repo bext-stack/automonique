@@ -3,7 +3,7 @@
 // The generated read surface. Its module list is generator-owned, so this is a
 // wildcard rather than a hand-kept list that would go stale the first time a
 // schema is added. See `generated/index.ts`.
-export * from "../generated/index.ts";
+export * from "../generated/index.js";
 
 export {
   MAX_JSON_ENTRIES,
@@ -21,4 +21,4 @@ export {
   type JsonValue,
   type Message,
   type WireCategory,
-} from "./canonical.ts";
+} from "./canonical.js";

@@ -335,7 +335,9 @@ fn referenced_categories(surface: &automonique_protocol::codegen::CommandSurface
         )
     {
         match &field.value {
-            ResponseValue::Bool | ResponseValue::Object { .. } => {}
+            ResponseValue::Bool
+            | ResponseValue::Object { .. }
+            | ResponseValue::NullableObject { .. } => {}
             ResponseValue::Checked {
                 refusal_category, ..
             }
@@ -351,6 +353,14 @@ fn referenced_categories(surface: &automonique_protocol::codegen::CommandSurface
             ResponseValue::Enum {
                 unknown_category, ..
             } => referenced.push(unknown_category.clone()),
+            ResponseValue::EnumArray {
+                oversize_category,
+                unknown_category,
+                ..
+            } => referenced.extend([oversize_category.clone(), unknown_category.clone()]),
+            ResponseValue::ExactString {
+                mismatch_category, ..
+            } => referenced.push(mismatch_category.clone()),
             ResponseValue::RangedInteger {
                 below_category,
                 above_category,
@@ -1410,7 +1420,8 @@ mod maintained_surface {
         let name = module_file_name(BARREL_MODULE);
         let barrel = file(BARREL_MODULE);
         for module in maintained_modules() {
-            let line = format!("export * from \"./{}\";", module.file_name);
+            let specifier = module.file_name.trim_end_matches(".ts");
+            let line = format!("export * from \"./{specifier}.js\";");
             assert!(
                 barrel.contains(&line),
                 "{name} does not re-export {}, so nothing importing the package can reach \

@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 target/
+sdk/typescript/packages/sdk/dist/
 .automonique/state/
 artifacts/
 __pycache__/

@@ -9,9 +9,9 @@
 // Rust is the wire source of truth. Hand-written SDK code may add
 // ergonomics; it may not redefine anything in this file.
 
-import {DurableRowId, RequestId} from "./admin-command.ts";
-import {EpochMillis, LastSequence} from "./runs.ts";
-import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyStringOrNull, bodyUnsigned, bodyValue, boundedItems, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, mapNullable, rangedInteger, refuse, refuseField, type JsonValue} from "./runtime.ts";
+import {DurableRowId, RequestId} from "./admin-command.js";
+import {EpochMillis, LastSequence} from "./runs.js";
+import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyStringOrNull, bodyUnsigned, bodyValue, boundedItems, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, mapNullable, rangedInteger, refuse, refuseField, type JsonValue} from "./runtime.js";
 
 /** Stable schema identifier for the version-one batch control surface. */
 export const BATCH_CONTROL_API_SCHEMA_V1 = "automonique.batch.control/v1";

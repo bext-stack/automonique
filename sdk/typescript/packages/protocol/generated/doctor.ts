@@ -9,7 +9,7 @@
 // Rust is the wire source of truth. Hand-written SDK code may add
 // ergonomics; it may not redefine anything in this file.
 
-import {ValidationError, byteLength} from "./runtime.ts";
+import {ValidationError, byteLength} from "./runtime.js";
 
 /** Stable schema identifier for the version-one report. */
 export const DOCTOR_REPORT_SCHEMA_V1 = "automonique.doctor/v1";
