@@ -223,17 +223,28 @@ export class HttpsPlatformTransport implements PlatformAdapter {
 
     const response = await this.fetcher(this.endpoint, {
       method: "POST",
+      credentials: "omit",
       headers: {
         accept: PLATFORM_MEDIA_TYPE,
         authorization: `Bearer ${bearerToken(await this.token())}`,
         "content-type": PLATFORM_MEDIA_TYPE,
       },
       body: new TextDecoder().decode(payload),
+      redirect: "error",
       ...(signal === undefined ? {} : {signal}),
     });
+    if (typeof response.url === "string" && response.url !== "" && response.url !== this.endpoint) {
+      throw new PlatformTransportError(response.status, "response_url_mismatch");
+    }
     if (!response.ok) throw new PlatformTransportError(response.status, "remote_refusal");
     if (response.headers.get("content-type")?.trim() !== PLATFORM_MEDIA_TYPE) {
       throw new PlatformTransportError(response.status, "content_type_mismatch");
+    }
+    const cacheControl = response.headers.get("cache-control")
+      ?.split(",")
+      .map((value) => value.trim().toLowerCase());
+    if (!cacheControl?.includes("no-store")) {
+      throw new PlatformTransportError(response.status, "cache_control_mismatch");
     }
     const responsePayload = await readBoundedResponse(response, MAX_PLATFORM_CANONICAL_BYTES);
 

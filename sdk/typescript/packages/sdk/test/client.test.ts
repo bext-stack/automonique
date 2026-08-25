@@ -80,7 +80,7 @@ function canonicalResponse(requestId: string, kind: string, body: unknown, statu
   });
   return new Response(new TextDecoder().decode(bytes), {
     status,
-    headers: {"content-type": PLATFORM_MEDIA_TYPE},
+    headers: {"cache-control": "no-store", "content-type": PLATFORM_MEDIA_TYPE},
   });
 }
 
@@ -88,11 +88,11 @@ function clientFor(
   requestId: string,
   responseKind: string,
   responseBody: unknown,
-  observe?: (message: ReturnType<typeof decodeMessage>, headers: Headers) => void,
+  observe?: (message: ReturnType<typeof decodeMessage>, headers: Headers, init: RequestInit) => void,
 ): PlatformClient {
   const fetcher = (async (_input: string | URL | Request, init?: RequestInit) => {
     if (typeof init?.body !== "string") throw new Error("expected canonical request string");
-    observe?.(decodeMessage(new TextEncoder().encode(init.body)), new Headers(init.headers));
+    observe?.(decodeMessage(new TextEncoder().encode(init.body)), new Headers(init.headers), init);
     return canonicalResponse(requestId, responseKind, responseBody);
   }) as typeof fetch;
   return new PlatformClient(new HttpsPlatformTransport(
@@ -111,7 +111,7 @@ describe("canonical HTTPS Platform v1 transport", () => {
       protocol: "automonique.platform",
       schema: "automonique.platform/v1",
       transports: ["remote_https"],
-    }, (message, headers) => {
+    }, (message, headers, init) => {
       observedKind = message.envelope.kind;
       expect(message.envelope).toEqual({
         protocol: "automonique.platform",
@@ -123,6 +123,8 @@ describe("canonical HTTPS Platform v1 transport", () => {
       expect(headers.get("authorization")).toBe("Bearer token");
       expect(headers.get("accept")).toBe(PLATFORM_MEDIA_TYPE);
       expect(headers.get("content-type")).toBe(PLATFORM_MEDIA_TYPE);
+      expect(init.credentials).toBe("omit");
+      expect(init.redirect).toBe("error");
     });
     expect((await client.capabilities()).kind).toBe("capabilities");
     expect(observedKind).toBe("capabilities");
@@ -242,10 +244,44 @@ describe("canonical HTTPS Platform v1 transport", () => {
   });
 
   test("requires the exact response media type", async () => {
-    const fetcher = (async () => new Response("{}", {headers: {"content-type": "application/json"}})) as typeof fetch;
+    const fetcher = (async () => new Response("{}", {headers: {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+    }})) as typeof fetch;
     const client = new PlatformClient(new HttpsPlatformTransport("https://manage.example/api/platform", () => "token", fetcher));
     await expect(client.capabilities()).rejects.toBeInstanceOf(PlatformTransportError);
     await expect(client.capabilities()).rejects.toMatchObject({category: "content_type_mismatch"});
+  });
+
+  test("rejects cacheable and final-URL-mismatched responses", async () => {
+    const cacheable = (async () => new Response("{}", {
+      headers: {"content-type": PLATFORM_MEDIA_TYPE},
+    })) as typeof fetch;
+    const cacheableClient = new PlatformClient(new HttpsPlatformTransport(
+      "https://manage.example/api/platform",
+      () => "token",
+      cacheable,
+    ));
+    await expect(cacheableClient.capabilities()).rejects.toMatchObject({
+      category: "cache_control_mismatch",
+    });
+
+    const redirectedResponse = canonicalResponse("redirected", "capabilities_result", {
+      methods: ["capabilities"],
+      protocol: "automonique.platform",
+      schema: "automonique.platform/v1",
+      transports: ["remote_https"],
+    });
+    Object.defineProperty(redirectedResponse, "url", {value: "https://attacker.example/platform"});
+    const redirected = new PlatformClient(new HttpsPlatformTransport(
+      "https://manage.example/api/platform",
+      () => "token",
+      (async () => redirectedResponse) as typeof fetch,
+      () => "redirected",
+    ));
+    await expect(redirected.capabilities()).rejects.toMatchObject({
+      category: "response_url_mismatch",
+    });
   });
 
   test("refuses embedded credentials, invalid bearer values, and oversized requests", async () => {
@@ -294,7 +330,7 @@ describe("canonical HTTPS Platform v1 transport", () => {
       },
     });
     const streamedFetcher = (async () => new Response(body, {
-      headers: {"content-type": PLATFORM_MEDIA_TYPE},
+      headers: {"cache-control": "no-store", "content-type": PLATFORM_MEDIA_TYPE},
     })) as typeof fetch;
     const streamed = new PlatformClient(new HttpsPlatformTransport(
       "https://manage.example/api/platform",
@@ -307,6 +343,7 @@ describe("canonical HTTPS Platform v1 transport", () => {
     const declaredFetcher = (async () => new Response("", {
       headers: {
         "content-length": String(MAX_PLATFORM_CANONICAL_BYTES + 1),
+        "cache-control": "no-store",
         "content-type": PLATFORM_MEDIA_TYPE,
       },
     })) as typeof fetch;
@@ -322,7 +359,7 @@ describe("canonical HTTPS Platform v1 transport", () => {
 
     const nonStreamingFetcher = (async () => ({
       arrayBuffer: async () => new ArrayBuffer(0),
-      headers: new Headers({"content-type": PLATFORM_MEDIA_TYPE}),
+      headers: new Headers({"cache-control": "no-store", "content-type": PLATFORM_MEDIA_TYPE}),
       ok: true,
       status: 200,
     }) as Response) as typeof fetch;

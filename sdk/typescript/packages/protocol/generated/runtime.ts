@@ -365,6 +365,19 @@ export function bodyUnsigned(
   return value.value;
 }
 
+/** Read one integer array member. */
+export function jsonInteger(value: JsonValue, category: string): bigint {
+  if (value.kind !== "integer") throw new RefusalError(category, "array member is not an integer");
+  return value.value;
+}
+
+/** Read one non-negative integer array member. */
+export function jsonUnsigned(value: JsonValue, category: string): bigint {
+  const integer = jsonInteger(value, category);
+  if (integer < 0n) throw new RefusalError(category, "array member is negative");
+  return integer;
+}
+
 /**
  * A string field that is always present and may be `null`.
  *

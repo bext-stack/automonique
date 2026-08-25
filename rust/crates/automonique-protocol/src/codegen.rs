@@ -827,6 +827,8 @@ pub const PROGRESS_MODULE: &str = "progress";
 
 /// The federated `automonique.platform/v1` client contract.
 pub const PLATFORM_MODULE: &str = "platform";
+/// Generated mobile authentication and authorization module stem.
+pub const MOBILE_AUTH_MODULE: &str = "mobile-auth";
 
 /// The file one module is written to.
 #[must_use]
@@ -1277,6 +1279,30 @@ pub enum ResponseValue {
         /// Category answered for a spelling this build does not define.
         unknown_category: String,
     },
+    /// A bounded array of checked strings.
+    CheckedArray {
+        /// Generated checked-string type of each item.
+        type_name: String,
+        /// Generated constant naming the largest admissible length.
+        max_items_constant: String,
+        /// Category answered above that length.
+        oversize_category: String,
+        /// Category answered when an item fails its checked-string constructor.
+        refusal_category: String,
+    },
+    /// A bounded array of checked integers.
+    IntegerArray {
+        /// Generated bounded-integer type of each item.
+        type_name: String,
+        /// Generated constant naming the largest admissible length.
+        max_items_constant: String,
+        /// Category answered above that length.
+        oversize_category: String,
+        /// Category answered when an item falls outside the integer domain.
+        refusal_category: String,
+        /// Whether negative wire integers are malformed before domain validation.
+        unsigned: bool,
+    },
     /// One exact protocol literal, typed as the generated constant.
     ExactString {
         /// TypeScript type, normally `typeof SOME_CONSTANT`.
@@ -1330,6 +1356,24 @@ pub struct BodyObject {
     pub doc: String,
     /// Fields, emitted in sorted order.
     pub fields: Vec<ResponseField>,
+}
+
+/// One standalone exact JSON document and whether clients may encode it.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct JsonDocument {
+    /// The exact object schema.
+    pub body: BodyObject,
+    /// Whether the generated surface emits an encoder as well as a decoder.
+    pub encode: bool,
+}
+
+/// Exact JSON request/response documents carried directly over HTTP.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsonSurface {
+    /// Refusal category for missing, additional, duplicated, or mistyped fields.
+    pub invalid_body_category: String,
+    /// Standalone documents emitted in dependency-safe order.
+    pub documents: Vec<JsonDocument>,
 }
 
 /// A nested wire body whose discriminant decides its payload.
@@ -1494,6 +1538,8 @@ pub struct GeneratedModule {
     pub unions: Vec<Union>,
     /// Object types.
     pub interfaces: Vec<Interface>,
+    /// Exact standalone JSON documents carried without a protocol envelope.
+    pub json_surface: Option<JsonSurface>,
     /// The request builders and response decoders this module carries.
     pub command_surface: Option<CommandSurface>,
 }
@@ -2033,6 +2079,19 @@ export function bodyUnsigned(
   }
   if (value.value < 0n) throw new RefusalError(category, `${name} is negative`);
   return value.value;
+}
+
+/** Read one integer array member. */
+export function jsonInteger(value: JsonValue, category: string): bigint {
+  if (value.kind !== "integer") throw new RefusalError(category, "array member is not an integer");
+  return value.value;
+}
+
+/** Read one non-negative integer array member. */
+export function jsonUnsigned(value: JsonValue, category: string): bigint {
+  const integer = jsonInteger(value, category);
+  if (integer < 0n) throw new RefusalError(category, "array member is negative");
+  return integer;
 }
 
 /**
@@ -6165,6 +6224,390 @@ fn platform_response(
     }
 }
 
+/// Server-owned mobile credential and actor-authorization vocabulary.
+fn mobile_auth_json_surface() -> JsonSurface {
+    const INVALID: &str = "MOBILE_AUTH_INVALID_BODY";
+    const VALUE: &str = "MOBILE_AUTH_VALUE_INVALID";
+    let field = |name: &str, value: ResponseValue| ResponseField {
+        name: name.to_owned(),
+        value,
+    };
+    let checked = |name: &str| ResponseValue::Checked {
+        type_name: name.to_owned(),
+        refusal_category: VALUE.to_owned(),
+    };
+    let integer = |name: &str| ResponseValue::Integer {
+        type_name: name.to_owned(),
+        refusal_category: VALUE.to_owned(),
+        unsigned: true,
+    };
+    let exact = |type_name: &str, expected: &str, mismatch: &str| ResponseValue::ExactString {
+        type_name: type_name.to_owned(),
+        expected_constant: expected.to_owned(),
+        mismatch_category: mismatch.to_owned(),
+    };
+    let document = |name: &str, doc: &str, encode: bool, fields: Vec<ResponseField>| JsonDocument {
+        body: BodyObject {
+            name: name.to_owned(),
+            doc: doc.to_owned(),
+            fields,
+        },
+        encode,
+    };
+
+    JsonSurface {
+        invalid_body_category: INVALID.to_owned(),
+        documents: vec![
+            document(
+                "MobileLimits",
+                "Server-negotiated per-credential mobile ceilings.",
+                true,
+                vec![
+                    field("max_follow_up_bytes", integer("MobileFollowUpBytes")),
+                    field("max_page_events", integer("MobilePageEvents")),
+                ],
+            ),
+            document(
+                "MobileAuthorization",
+                "Complete actor authorization admitted before Platform access.",
+                false,
+                vec![
+                    field(
+                        "actions",
+                        ResponseValue::EnumArray {
+                            type_name: "MobileAction".to_owned(),
+                            max_items_constant: "MAX_MOBILE_ACTIONS".to_owned(),
+                            oversize_category: VALUE.to_owned(),
+                            unknown_category: VALUE.to_owned(),
+                        },
+                    ),
+                    field("actor", checked("MobileActor")),
+                    field("authorization_revision", integer("MobileRevision")),
+                    field("credential_id", checked("MobileCredentialId")),
+                    field("credential_revision", integer("MobileRevision")),
+                    field("expires_at_ms", integer("MobileEpochMillis")),
+                    field("issued_at_ms", integer("MobileEpochMillis")),
+                    field(
+                        "limits",
+                        ResponseValue::Object {
+                            type_name: "MobileLimits".to_owned(),
+                        },
+                    ),
+                    field(
+                        "schema",
+                        exact(
+                            "typeof MOBILE_AUTH_SCHEMA_V1",
+                            "MOBILE_AUTH_SCHEMA_V1",
+                            "MOBILE_AUTH_SCHEMA_MISMATCH",
+                        ),
+                    ),
+                    field("server_identity", checked("MobileServerIdentity")),
+                    field(
+                        "session_scope",
+                        ResponseValue::CheckedArray {
+                            type_name: "MobileSessionId".to_owned(),
+                            max_items_constant: "MAX_MOBILE_SESSIONS".to_owned(),
+                            oversize_category: VALUE.to_owned(),
+                            refusal_category: VALUE.to_owned(),
+                        },
+                    ),
+                ],
+            ),
+            document(
+                "MobileDiscovery",
+                "HTTPS-origin-bound discovery document.",
+                false,
+                vec![
+                    field("origin", checked("MobileHttpsOrigin")),
+                    field(
+                        "operator_provision_endpoint",
+                        checked("MobileOperatorProvisionEndpoint"),
+                    ),
+                    field("platform_endpoint", checked("MobilePlatformEndpoint")),
+                    field(
+                        "protocol",
+                        exact(
+                            "typeof MOBILE_AUTH_PROTOCOL",
+                            "MOBILE_AUTH_PROTOCOL",
+                            "MOBILE_AUTH_PROTOCOL_MISMATCH",
+                        ),
+                    ),
+                    field(
+                        "schema",
+                        exact(
+                            "typeof MOBILE_AUTH_SCHEMA_V1",
+                            "MOBILE_AUTH_SCHEMA_V1",
+                            "MOBILE_AUTH_SCHEMA_MISMATCH",
+                        ),
+                    ),
+                    field("server_identity", checked("MobileServerIdentity")),
+                    field(
+                        "supported_versions",
+                        ResponseValue::IntegerArray {
+                            type_name: "MobileProtocolVersion".to_owned(),
+                            max_items_constant: "MAX_MOBILE_PROTOCOL_VERSIONS".to_owned(),
+                            oversize_category: VALUE.to_owned(),
+                            refusal_category: VALUE.to_owned(),
+                            unsigned: true,
+                        },
+                    ),
+                ],
+            ),
+            document(
+                "IssuedMobileCredentials",
+                "Rotating scoped credentials and their admitted authorization.",
+                false,
+                vec![
+                    field("access_token", checked("MobileAccessToken")),
+                    field(
+                        "authorization",
+                        ResponseValue::Object {
+                            type_name: "MobileAuthorization".to_owned(),
+                        },
+                    ),
+                    field("refresh_token", checked("MobileRefreshToken")),
+                ],
+            ),
+            document(
+                "MobileOperatorProvisionRequest",
+                "Scope an operator explicitly provisions to one mobile client.",
+                true,
+                vec![
+                    field(
+                        "actions",
+                        ResponseValue::EnumArray {
+                            type_name: "MobileAction".to_owned(),
+                            max_items_constant: "MAX_MOBILE_ACTIONS".to_owned(),
+                            oversize_category: VALUE.to_owned(),
+                            unknown_category: VALUE.to_owned(),
+                        },
+                    ),
+                    field(
+                        "limits",
+                        ResponseValue::Object {
+                            type_name: "MobileLimits".to_owned(),
+                        },
+                    ),
+                    field(
+                        "session_scope",
+                        ResponseValue::CheckedArray {
+                            type_name: "MobileSessionId".to_owned(),
+                            max_items_constant: "MAX_MOBILE_SESSIONS".to_owned(),
+                            oversize_category: VALUE.to_owned(),
+                            refusal_category: VALUE.to_owned(),
+                        },
+                    ),
+                ],
+            ),
+            document(
+                "MobileRefreshRequest",
+                "Origin-pinned refresh or revocation request.",
+                true,
+                vec![
+                    field("refresh_token", checked("MobileRefreshToken")),
+                    field("server_identity", checked("MobileServerIdentity")),
+                ],
+            ),
+            document(
+                "MobileRevocation",
+                "Confirmation that revocation completed server-side.",
+                false,
+                vec![
+                    field("revoked", ResponseValue::Bool),
+                    field(
+                        "schema",
+                        exact(
+                            "typeof MOBILE_AUTH_SCHEMA_V1",
+                            "MOBILE_AUTH_SCHEMA_V1",
+                            "MOBILE_AUTH_SCHEMA_MISMATCH",
+                        ),
+                    ),
+                ],
+            ),
+            document(
+                "MobileError",
+                "Strict bounded mobile lifecycle refusal.",
+                false,
+                vec![field("error", checked("MobileErrorCode"))],
+            ),
+        ],
+    }
+}
+
+fn mobile_auth_module() -> GeneratedModule {
+    GeneratedModule {
+        file_name: module_file_name(MOBILE_AUTH_MODULE),
+        doc: "Origin-bound mobile discovery, scoped credential lifecycle, and actor authorization values."
+            .to_owned(),
+        source: "automonique_protocol::codegen::mobile_auth_module".to_owned(),
+        constants: vec![
+            Constant {
+                name: "MOBILE_AUTH_PROTOCOL".to_owned(),
+                doc: "Stable mobile authentication protocol name.".to_owned(),
+                value: ConstantValue::Text("automonique.mobile-auth".to_owned()),
+            },
+            Constant {
+                name: "MOBILE_AUTH_SCHEMA_V1".to_owned(),
+                doc: "Stable version-one mobile authentication schema.".to_owned(),
+                value: ConstantValue::Text("automonique.mobile-auth/v1".to_owned()),
+            },
+            Constant {
+                name: "MOBILE_AUTH_MEDIA_TYPE".to_owned(),
+                doc: "Exact media type for mobile lifecycle documents.".to_owned(),
+                value: ConstantValue::Text(
+                    "application/vnd.automonique.mobile-auth.v1+json".to_owned(),
+                ),
+            },
+            Constant {
+                name: "MOBILE_AUTH_INVALID_BODY".to_owned(),
+                doc: "A mobile lifecycle document was not its exact bounded schema.".to_owned(),
+                value: ConstantValue::Text("mobile_auth_invalid_body".to_owned()),
+            },
+            Constant {
+                name: "MOBILE_AUTH_VALUE_INVALID".to_owned(),
+                doc: "A mobile lifecycle field fell outside its value domain.".to_owned(),
+                value: ConstantValue::Text("mobile_auth_value_invalid".to_owned()),
+            },
+            Constant {
+                name: "MOBILE_AUTH_SCHEMA_MISMATCH".to_owned(),
+                doc: "A mobile lifecycle document names another schema.".to_owned(),
+                value: ConstantValue::Text("mobile_auth_schema_mismatch".to_owned()),
+            },
+            Constant {
+                name: "MOBILE_AUTH_PROTOCOL_MISMATCH".to_owned(),
+                doc: "A discovery document names another protocol.".to_owned(),
+                value: ConstantValue::Text("mobile_auth_protocol_mismatch".to_owned()),
+            },
+            Constant {
+                name: "MAX_MOBILE_HTTP_BODY_BYTES".to_owned(),
+                doc: "Maximum accepted mobile lifecycle response body.".to_owned(),
+                value: ConstantValue::Count(65_536),
+            },
+            Constant {
+                name: "MAX_MOBILE_PROTOCOL_VERSIONS".to_owned(),
+                doc: "Maximum protocol versions in discovery.".to_owned(),
+                value: ConstantValue::Count(8),
+            },
+            Constant {
+                name: "MAX_MOBILE_ACTIONS".to_owned(),
+                doc: "Maximum independently granted mobile actions.".to_owned(),
+                value: ConstantValue::Count(4),
+            },
+            Constant {
+                name: "MAX_MOBILE_SESSIONS".to_owned(),
+                doc: "Maximum exact session identifiers in one credential scope.".to_owned(),
+                value: ConstantValue::Count(100),
+            },
+            Constant {
+                name: "MAX_MOBILE_PAGE_EVENTS".to_owned(),
+                doc: "Maximum negotiated event-page ceiling.".to_owned(),
+                value: ConstantValue::Count(512),
+            },
+            Constant {
+                name: "MAX_MOBILE_FOLLOW_UP_BYTES".to_owned(),
+                doc: "Maximum negotiated UTF-8 follow-up bytes.".to_owned(),
+                value: ConstantValue::Count(65_536),
+            },
+        ],
+        branded_ids: vec![
+            BrandedId {
+                name: "MobileCredentialId".to_owned(),
+                max_bytes: 46,
+                pattern: Some("^mc_[A-Za-z0-9_-]{43}$".to_owned()),
+            },
+            BrandedId {
+                name: "MobileSessionId".to_owned(),
+                max_bytes: 256,
+                pattern: Some("^[A-Za-z0-9._:-]+$".to_owned()),
+            },
+        ],
+        bounded_strings: vec![
+            BoundedString {
+                name: "MobileActor".to_owned(),
+                max_bytes: 256,
+                pattern: Some("^[A-Za-z0-9._:-]+$".to_owned()),
+            },
+            BoundedString {
+                name: "MobileAccessToken".to_owned(),
+                max_bytes: 46,
+                pattern: Some("^ma_[A-Za-z0-9_-]{43}$".to_owned()),
+            },
+            BoundedString {
+                name: "MobileRefreshToken".to_owned(),
+                max_bytes: 46,
+                pattern: Some("^mr_[A-Za-z0-9_-]{43}$".to_owned()),
+            },
+            BoundedString {
+                name: "MobileServerIdentity".to_owned(),
+                max_bytes: 71,
+                pattern: Some("^sha256:[0-9a-f]{64}$".to_owned()),
+            },
+            BoundedString {
+                name: "MobileHttpsOrigin".to_owned(),
+                max_bytes: 2048,
+                pattern: Some("^https:\\/\\/[^\\/?#@]+$".to_owned()),
+            },
+            BoundedString {
+                name: "MobilePlatformEndpoint".to_owned(),
+                max_bytes: 2048,
+                pattern: Some("^https:\\/\\/[^?#@]+\\/api\\/platform$".to_owned()),
+            },
+            BoundedString {
+                name: "MobileOperatorProvisionEndpoint".to_owned(),
+                max_bytes: 2048,
+                pattern: Some(
+                    "^https:\\/\\/[^?#@]+\\/api\\/mobile\\/operator-provision$".to_owned(),
+                ),
+            },
+            BoundedString {
+                name: "MobileErrorCode".to_owned(),
+                max_bytes: 64,
+                pattern: Some("^[a-z][a-z0-9_]{0,63}$".to_owned()),
+            },
+        ],
+        bounded_integers: vec![
+            BoundedInteger {
+                name: "MobileEpochMillis".to_owned(),
+                min: 0,
+                max: 9_007_199_254_740_991,
+            },
+            BoundedInteger {
+                name: "MobileRevision".to_owned(),
+                min: 1,
+                max: 9_007_199_254_740_991,
+            },
+            BoundedInteger {
+                name: "MobilePageEvents".to_owned(),
+                min: 1,
+                max: 512,
+            },
+            BoundedInteger {
+                name: "MobileFollowUpBytes".to_owned(),
+                min: 1,
+                max: 65_536,
+            },
+            BoundedInteger {
+                name: "MobileProtocolVersion".to_owned(),
+                min: 1,
+                max: 1,
+            },
+        ],
+        enums: vec![GeneratedEnum {
+            name: "MobileAction".to_owned(),
+            sensitivity: EnumSensitivity::SecuritySensitive,
+            values: vec![
+                "attach".to_owned(),
+                "decide_approval".to_owned(),
+                "follow_up".to_owned(),
+                "stop_run".to_owned(),
+            ],
+            wire_order: None,
+        }],
+        json_surface: Some(mobile_auth_json_surface()),
+        ..GeneratedModule::default()
+    }
+}
+
 /// The shared platform identities and service descriptions.
 fn platform_module() -> GeneratedModule {
     let security_enum = |name: &str, values: Vec<String>| GeneratedEnum {
@@ -6997,6 +7440,7 @@ pub fn maintained_modules() -> Vec<GeneratedModule> {
         automation_module(),
         approval_module(),
         batch_module(),
+        mobile_auth_module(),
         platform_module(),
         progress_module(),
     ];
@@ -7012,6 +7456,57 @@ pub fn maintained_modules() -> Vec<GeneratedModule> {
 /// are separated from values because the generated files are run by TypeScript
 /// implementations that only erase types: a type imported as a value leaves a
 /// binding behind that does not exist.
+fn response_runtime_imports(value: &ResponseValue, names: &mut Vec<&'static str>) {
+    match value {
+        ResponseValue::Bool => names.push("bodyBool"),
+        ResponseValue::Checked { .. } | ResponseValue::Enum { .. } => {
+            names.extend(["bodyString", "refuse"]);
+        }
+        ResponseValue::EnumArray { .. } | ResponseValue::CheckedArray { .. } => {
+            names.extend(["bodyStrings", "refuse"]);
+        }
+        ResponseValue::IntegerArray { unsigned, .. } => names.extend([
+            "bodyArray",
+            if *unsigned {
+                "jsonUnsigned"
+            } else {
+                "jsonInteger"
+            },
+            "refuse",
+        ]),
+        ResponseValue::ExactString { .. } => {
+            names.extend(["bodyString", "exactString"]);
+        }
+        ResponseValue::NullableChecked { .. } => {
+            names.extend(["bodyStringOrNull", "mapNullable", "refuse"]);
+        }
+        ResponseValue::Integer { unsigned, .. } => names.extend([
+            if *unsigned {
+                "bodyUnsigned"
+            } else {
+                "bodyInteger"
+            },
+            "refuse",
+        ]),
+        ResponseValue::RangedInteger { unsigned, .. } => names.extend([
+            if *unsigned {
+                "bodyUnsigned"
+            } else {
+                "bodyInteger"
+            },
+            "rangedInteger",
+        ]),
+        ResponseValue::NullableInteger { .. } => {
+            names.extend(["bodyIntegerOrNull", "mapNullable", "refuse"]);
+        }
+        ResponseValue::Object { .. } => names.push("bodyValue"),
+        ResponseValue::NullableObject { .. } => {
+            names.extend(["bodyValueOrNull", "mapNullable"]);
+        }
+        ResponseValue::ObjectArray { .. } => names.push("bodyArray"),
+    }
+}
+
 fn runtime_imports(module: &GeneratedModule) -> (Vec<&'static str>, Vec<&'static str>) {
     let measures_bytes = !module.branded_ids.is_empty() || !module.bounded_strings.is_empty();
     let mut refuses_values = measures_bytes
@@ -7088,49 +7583,20 @@ fn runtime_imports(module: &GeneratedModule) -> (Vec<&'static str>, Vec<&'static
                     .flat_map(|object| &object.fields),
             )
         {
-            match &field.value {
-                ResponseValue::Bool => names.push("bodyBool"),
-                ResponseValue::Checked { .. } | ResponseValue::Enum { .. } => {
-                    names.extend(["bodyString", "refuse"]);
-                }
-                ResponseValue::EnumArray { .. } => {
-                    names.extend(["bodyStrings", "refuse"]);
-                }
-                ResponseValue::ExactString { .. } => {
-                    names.extend(["bodyString", "exactString"]);
-                }
-                ResponseValue::NullableChecked { .. } => {
-                    names.extend(["bodyStringOrNull", "mapNullable", "refuse"]);
-                }
-                ResponseValue::Integer { unsigned, .. } => {
-                    names.extend([
-                        if *unsigned {
-                            "bodyUnsigned"
-                        } else {
-                            "bodyInteger"
-                        },
-                        "refuse",
-                    ]);
-                }
-                ResponseValue::RangedInteger { unsigned, .. } => {
-                    names.extend([
-                        if *unsigned {
-                            "bodyUnsigned"
-                        } else {
-                            "bodyInteger"
-                        },
-                        "rangedInteger",
-                    ]);
-                }
-                ResponseValue::NullableInteger { .. } => {
-                    names.extend(["bodyIntegerOrNull", "mapNullable", "refuse"]);
-                }
-                ResponseValue::Object { .. } => names.push("bodyValue"),
-                ResponseValue::NullableObject { .. } => {
-                    names.extend(["bodyValueOrNull", "mapNullable"]);
-                }
-                ResponseValue::ObjectArray { .. } => names.push("bodyArray"),
-            }
+            response_runtime_imports(&field.value, &mut names);
+        }
+    }
+
+    if let Some(surface) = &module.json_surface {
+        refuses_values = true;
+        names.extend(["RefusalError", "exactFields", "exactInputFields"]);
+        types.push("JsonValue");
+        for field in surface
+            .documents
+            .iter()
+            .flat_map(|document| &document.body.fields)
+        {
+            response_runtime_imports(&field.value, &mut names);
         }
     }
 
@@ -7785,11 +8251,10 @@ fn emit_correlated_request_surface(out: &mut String, surface: &CommandSurface) {
 /// body is a value inside its carrier's body rather than a message of its own.
 /// Its own exact field set is applied here, so a summary carrying one key too
 /// many is refused wherever it is nested.
-fn emit_body_object(out: &mut String, surface: &CommandSurface, object: &BodyObject, encode: bool) {
+fn emit_body_object(out: &mut String, invalid: &str, object: &BodyObject, encode: bool) {
     let BodyObject { name, doc, fields } = object;
     let mut fields = fields.clone();
     fields.sort_by(|left, right| left.name.cmp(&right.name));
-    let invalid = &surface.invalid_body_category;
 
     let _ = writeln!(out, "\n/** {doc} */");
     let _ = writeln!(out, "export interface {name} {{");
@@ -7824,7 +8289,7 @@ fn emit_body_object(out: &mut String, surface: &CommandSurface, object: &BodyObj
                 out,
                 "    [\"{field_name}\", {value}],",
                 field_name = field.name,
-                value = body_object_field_writer(surface, field)
+                value = body_object_field_writer(invalid, field)
             );
         }
         out.push_str("  ]};\n}\n");
@@ -7844,7 +8309,7 @@ fn emit_body_object(out: &mut String, surface: &CommandSurface, object: &BodyObj
             out,
             "    {field_name}: {value},",
             field_name = field.name,
-            value = response_field_reader(surface, field)
+            value = response_field_reader(invalid, field)
         );
     }
     out.push_str("  };\n}\n");
@@ -8053,13 +8518,14 @@ fn response_field_type(value: &ResponseValue) -> String {
         | ResponseValue::NullableObject { type_name } => format!("{type_name} | null"),
         ResponseValue::Bool => "boolean".to_owned(),
         ResponseValue::EnumArray { type_name, .. }
+        | ResponseValue::CheckedArray { type_name, .. }
+        | ResponseValue::IntegerArray { type_name, .. }
         | ResponseValue::ObjectArray { type_name, .. } => format!("readonly {type_name}[]"),
     }
 }
 
 /// The expression that reads one decoded response field out of a field map.
-fn response_field_reader(surface: &CommandSurface, field: &ResponseField) -> String {
-    let invalid = &surface.invalid_body_category;
+fn response_field_reader(invalid: &str, field: &ResponseField) -> String {
     let name = &field.name;
     match &field.value {
         ResponseValue::Bool => format!("bodyBool(fields, \"{name}\", {invalid})"),
@@ -8129,6 +8595,32 @@ fn response_field_reader(surface: &CommandSurface, field: &ResponseField) -> Str
              {oversize_category}).map((value) =>\n      \
              refuse({unknown_category}, () => decode{type_name}(value)),\n    )"
         ),
+        ResponseValue::CheckedArray {
+            type_name,
+            max_items_constant,
+            oversize_category,
+            refusal_category,
+        } => format!(
+            "bodyStrings(fields, \"{name}\", {invalid}, {max_items_constant}, \
+             {oversize_category}).map((value) =>\n      \
+             refuse({refusal_category}, () => {type_name}(value)),\n    )"
+        ),
+        ResponseValue::IntegerArray {
+            type_name,
+            max_items_constant,
+            oversize_category,
+            refusal_category,
+            unsigned,
+        } => format!(
+            "bodyArray(fields, \"{name}\", {invalid}, {max_items_constant}, \
+             {oversize_category}).map((value) =>\n      \
+             refuse({refusal_category}, () => {type_name}({reader}(value, {invalid}))),\n    )",
+            reader = if *unsigned {
+                "jsonUnsigned"
+            } else {
+                "jsonInteger"
+            }
+        ),
         ResponseValue::ExactString {
             expected_constant,
             mismatch_category,
@@ -8155,8 +8647,7 @@ fn response_field_reader(surface: &CommandSurface, field: &ResponseField) -> Str
 }
 
 /// The expression that writes one nested exact-object field to canonical JSON.
-fn body_object_field_writer(surface: &CommandSurface, field: &ResponseField) -> String {
-    let invalid = &surface.invalid_body_category;
+fn body_object_field_writer(invalid: &str, field: &ResponseField) -> String {
     let input = format!("value.{}", field.name);
     match &field.value {
         ResponseValue::Bool => format!(
@@ -8219,6 +8710,31 @@ fn body_object_field_writer(surface: &CommandSurface, field: &ResponseField) -> 
              throw new RefusalError({oversize_category}, \"array exceeds its ceiling\");\n        \
              return {{kind: \"array\", items: {input}.map((item): JsonValue => ({{kind: \
              \"string\", value: refuse({unknown_category}, () => decode{type_name}(item))}}))}};\n      \
+             }})()"
+        ),
+        ResponseValue::CheckedArray {
+            type_name,
+            max_items_constant,
+            oversize_category,
+            refusal_category,
+        } => format!(
+            "((): JsonValue => {{\n        if ({input}.length > {max_items_constant}) \
+             throw new RefusalError({oversize_category}, \"array exceeds its ceiling\");\n        \
+             return {{kind: \"array\", items: {input}.map((item): JsonValue => ({{kind: \
+             \"string\", value: refuse({refusal_category}, () => {type_name}(item))}}))}};\n      \
+             }})()"
+        ),
+        ResponseValue::IntegerArray {
+            type_name,
+            max_items_constant,
+            oversize_category,
+            refusal_category,
+            ..
+        } => format!(
+            "((): JsonValue => {{\n        if ({input}.length > {max_items_constant}) \
+             throw new RefusalError({oversize_category}, \"array exceeds its ceiling\");\n        \
+             return {{kind: \"array\", items: {input}.map((item): JsonValue => ({{kind: \
+             \"integer\", value: refuse({refusal_category}, () => {type_name}(item))}}))}};\n      \
              }})()"
         ),
         ResponseValue::ExactString {
@@ -8305,7 +8821,7 @@ fn emit_response(out: &mut String, surface: &CommandSurface, response: &Response
     out.push_str("  return {\n");
     let mut entries: Vec<(String, String)> = fields
         .iter()
-        .map(|field| (field.name.clone(), response_field_reader(surface, field)))
+        .map(|field| (field.name.clone(), response_field_reader(invalid, field)))
         .collect();
     entries.push(("request_id".to_owned(), "request_id".to_owned()));
     entries.sort();
@@ -8478,7 +8994,7 @@ fn emit_command_surface(out: &mut String, surface: &CommandSurface) {
     for object in &objects {
         emit_body_object(
             out,
-            surface,
+            &surface.invalid_body_category,
             object,
             request_object_types.contains(&object.name),
         );
@@ -8571,6 +9087,19 @@ pub fn emit_module(module: &GeneratedModule) -> String {
     interfaces.sort_by(|left, right| left.name.cmp(&right.name));
     for interface in &interfaces {
         emit_interface(&mut out, interface);
+    }
+
+    if let Some(surface) = &module.json_surface {
+        let mut documents = surface.documents.clone();
+        documents.sort_by(|left, right| left.body.name.cmp(&right.body.name));
+        for document in &documents {
+            emit_body_object(
+                &mut out,
+                &surface.invalid_body_category,
+                &document.body,
+                document.encode,
+            );
+        }
     }
 
     if let Some(surface) = &module.command_surface {
