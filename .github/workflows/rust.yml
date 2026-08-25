@@ -54,7 +54,7 @@ jobs:
       - name: Install the pinned JavaScript toolchain
         working-directory: sdk/typescript/packages
         run: |
-          for package in protocol lab sdk; do
+          for package in protocol lab; do
             (cd "$package" && bun install --frozen-lockfile)
           done
 
@@ -99,9 +99,51 @@ jobs:
           (cd protocol && npm run typecheck)
           (cd lab && npm run typecheck)
           (cd lab && bun test ./test)
-          (cd sdk && npm run typecheck)
-          (cd sdk && npm test)
-          (cd sdk && npm run build)
+
+      - name: AG-UI adapter contract
+        working-directory: adapters/ag-ui
+        run: |
+          npm run typecheck
+          bun test ./test
+
+      # `generated/VERDICT.md` constraint 5. Reproducibility is asserted by the
+      # crate's own tests; that the checked-in tree was regenerated is a claim
+      # no test inside the tree can make, because a test cannot see the commit.
+      - name: Regenerate the TypeScript surface
+        working-directory: rust
+        env:
+          AUTOMONIQUE_PROTOCOL_REGENERATE: "1"
+        run: cargo test --offline --locked -p automonique-protocol --test codegen
+
+      - name: Regeneration changed nothing
+        run: git diff --exit-code -- sdk/typescript/packages/protocol/generated/
+
+      - name: Verify the systemd user service
+        run: tools/verify_systemd_unit.sh
+
+  typescript-sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.19.0
+
+      - name: Install the pinned TypeScript SDK toolchain
+        working-directory: sdk/typescript/packages/sdk
+        run: bun install --frozen-lockfile
+
+      - name: TypeScript SDK checks
+        working-directory: sdk/typescript/packages/sdk
+        run: |
+          npm run typecheck
+          npm test
+          npm run build
 
       - name: TypeScript SDK distribution contract
         working-directory: sdk/typescript/packages/sdk
@@ -138,27 +180,6 @@ jobs:
             })')
           bun build "$consumer_dir/node_modules/@automonique/sdk/dist/sdk/src/index.js" \
             --target=browser --outdir="$browser_dir"
-
-      - name: AG-UI adapter contract
-        working-directory: adapters/ag-ui
-        run: |
-          npm run typecheck
-          bun test ./test
-
-      # `generated/VERDICT.md` constraint 5. Reproducibility is asserted by the
-      # crate's own tests; that the checked-in tree was regenerated is a claim
-      # no test inside the tree can make, because a test cannot see the commit.
-      - name: Regenerate the TypeScript surface
-        working-directory: rust
-        env:
-          AUTOMONIQUE_PROTOCOL_REGENERATE: "1"
-        run: cargo test --offline --locked -p automonique-protocol --test codegen
-
-      - name: Regeneration changed nothing
-        run: git diff --exit-code -- sdk/typescript/packages/protocol/generated/
-
-      - name: Verify the systemd user service
-        run: tools/verify_systemd_unit.sh
 
   # Report-only, and deliberately not in the required-check set: the floor is a
   # decision to make once the number is known, and an instrumented rebuild of
