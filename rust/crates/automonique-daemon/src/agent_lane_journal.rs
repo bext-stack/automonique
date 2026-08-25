@@ -19,7 +19,6 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use nix::unistd::geteuid;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -30,7 +29,6 @@ use crate::agent_harness::MAX_PROVIDER_TOOL_CALLS_PER_BATCH;
 pub const AGENT_LANE_JOURNAL_SCHEMA_VERSION: u32 = 3;
 pub const AGENT_LANE_JOURNAL_NAME: &str = "agent-lanes.sqlite3";
 
-const BUSY_TIMEOUT: Duration = Duration::from_millis(2_000);
 const MAX_KEY_BYTES: usize = 256;
 const MAX_TOOL_NAME_BYTES: usize = 128;
 const MAX_APPROVAL_SUMMARY_BYTES: usize = 16 * 1024;
@@ -442,14 +440,7 @@ impl AgentLaneJournal {
             | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
         let mut connection = Connection::open_with_flags(path, flags)?;
-        connection.busy_timeout(BUSY_TIMEOUT)?;
-        connection.pragma_update(None, "foreign_keys", "ON")?;
-        let journal: String =
-            connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
-        if !journal.eq_ignore_ascii_case("wal") {
-            return Err(AgentLaneJournalError::Sqlite(rusqlite::Error::InvalidQuery));
-        }
-        connection.pragma_update(None, "synchronous", "FULL")?;
+        automonique_store::sqlite_policy::configure_authoritative(&connection)?;
         initialize(&mut connection)?;
         Ok(Self {
             connection,

@@ -27,6 +27,7 @@ pub mod run_submissions;
 pub mod shadow_comparisons;
 pub mod slack_ingress;
 pub mod slack_interactions;
+pub mod sqlite_policy;
 pub mod support_tickets;
 
 use std::error::Error;
@@ -46,7 +47,7 @@ use rusqlite::{
 /// The only database schema this build can read and write.
 pub const SCHEMA_VERSION: u32 = 10;
 /// SQLite lock contention is bounded rather than waiting indefinitely.
-pub const BUSY_TIMEOUT: Duration = Duration::from_millis(2_000);
+pub const BUSY_TIMEOUT: Duration = sqlite_policy::AUTHORITY_BUSY_TIMEOUT;
 
 /// Longest accepted inbox `transport_key`, in bytes.
 ///
@@ -1535,14 +1536,7 @@ impl Store {
             | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
         let mut connection = Connection::open_with_flags(path, open_flags)?;
-        connection.busy_timeout(BUSY_TIMEOUT)?;
-        connection.pragma_update(None, "foreign_keys", "ON")?;
-        let journal: String =
-            connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
-        if !journal.eq_ignore_ascii_case("wal") {
-            return Err(StoreError::Sqlite(rusqlite::Error::InvalidQuery));
-        }
-        connection.pragma_update(None, "synchronous", "FULL")?;
+        crate::sqlite_policy::configure_authoritative(&connection)?;
         initialize_or_validate_schema(&mut connection)?;
 
         Ok(Self {

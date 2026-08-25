@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
-use crate::{BUSY_TIMEOUT, StoreError, validate_database_path};
+use crate::{StoreError, validate_database_path};
 
 pub const SLACK_INTERACTION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_INTERACTION_KEY_BYTES: usize = 640;
@@ -180,9 +180,7 @@ impl SlackInteractionStore {
             | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
         let connection = Connection::open_with_flags(path, flags)?;
-        connection.busy_timeout(BUSY_TIMEOUT)?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.pragma_update(None, "synchronous", "FULL")?;
+        crate::sqlite_policy::configure_authoritative(&connection)?;
         let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version == 0 {
             connection.execute_batch(SCHEMA)?;

@@ -198,6 +198,7 @@ dependencies = [
  "agent-client-protocol",
  "automonique-platform-client",
  "automonique-protocol",
+ "automonique-store",
  "blocking",
  "futures",
  "nix",

@@ -198,7 +198,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 use crate::run_index::RunSpoolState;
-use crate::{BUSY_TIMEOUT, StoreError, validate_database_path};
+use crate::{StoreError, validate_database_path};
 
 /// The only batch registry schema this build can read and write.
 pub const BATCH_REGISTRY_SCHEMA_VERSION: u32 = 1;
@@ -1058,14 +1058,7 @@ impl BatchRegistry {
             | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
         let mut connection = Connection::open_with_flags(path, open_flags)?;
-        connection.busy_timeout(BUSY_TIMEOUT)?;
-        connection.pragma_update(None, "foreign_keys", "ON")?;
-        let journal: String =
-            connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
-        if !journal.eq_ignore_ascii_case("wal") {
-            return Err(BatchRegistryError::Sqlite(rusqlite::Error::InvalidQuery));
-        }
-        connection.pragma_update(None, "synchronous", "FULL")?;
+        crate::sqlite_policy::configure_authoritative(&connection)?;
         initialize_or_validate_schema(&mut connection)?;
 
         Ok(Self {

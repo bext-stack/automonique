@@ -11,6 +11,7 @@ publish.workspace = true
 agent-client-protocol.workspace = true
 automonique-platform-client = { path = "../../../sdk/rust/platform-client" }
 automonique-protocol = { path = "../automonique-protocol" }
+automonique-store = { path = "../automonique-store" }
 blocking.workspace = true
 futures.workspace = true
 nix.workspace = true

@@ -20,7 +20,7 @@ use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 
-use crate::{BUSY_TIMEOUT, StoreError, validate_database_path};
+use crate::{StoreError, validate_database_path};
 
 pub const IMPROVEMENT_STORE_SCHEMA_VERSION: u32 = 2;
 pub const MAX_IMPROVEMENTS: usize = 65_536;
@@ -473,14 +473,7 @@ impl ImprovementStore {
             | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
         let mut connection = Connection::open_with_flags(path, flags)?;
-        connection.busy_timeout(BUSY_TIMEOUT)?;
-        connection.pragma_update(None, "foreign_keys", "ON")?;
-        let journal: String =
-            connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
-        if !journal.eq_ignore_ascii_case("wal") {
-            return Err(ImprovementStoreError::Sqlite(rusqlite::Error::InvalidQuery));
-        }
-        connection.pragma_update(None, "synchronous", "FULL")?;
+        crate::sqlite_policy::configure_authoritative(&connection)?;
         initialize_or_validate_schema(&mut connection)?;
         Ok(Self {
             connection,

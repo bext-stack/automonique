@@ -117,13 +117,7 @@ impl ManagedSessionStore {
             | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
         let mut connection = Connection::open_with_flags(path, flags)?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        let journal: String =
-            connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
-        if !journal.eq_ignore_ascii_case("wal") {
-            return Err(ManagedSessionError::SchemaVersion);
-        }
-        connection.pragma_update(None, "synchronous", "FULL")?;
+        automonique_store::sqlite_policy::configure_authoritative(&connection)?;
         initialize(&mut connection)?;
         Ok(Self {
             connection,

@@ -21,9 +21,6 @@ use crate::{AuthorityError, Session};
 pub const DATABASE_NAME: &str = "acp-sessions.sqlite3";
 const PAGE_SIZE: usize = 100;
 const SCHEMA: &str = r#"
-PRAGMA trusted_schema = OFF;
-PRAGMA synchronous = FULL;
-PRAGMA journal_mode = WAL;
 CREATE TABLE IF NOT EXISTS acp_sessions (
     session_id TEXT PRIMARY KEY,
     cwd BLOB NOT NULL,
@@ -79,9 +76,8 @@ impl SessionStore {
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
         let connection = Connection::open_with_flags(path, flags)
             .map_err(|_| AuthorityError::new("acp_mapping_open"))?;
-        connection
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|_| AuthorityError::new("acp_mapping_busy_timeout"))?;
+        automonique_store::sqlite_policy::configure_authoritative(&connection)
+            .map_err(|_| AuthorityError::new("acp_mapping_sqlite_policy"))?;
         connection
             .execute_batch(SCHEMA)
             .map_err(|_| AuthorityError::new("acp_mapping_schema"))?;

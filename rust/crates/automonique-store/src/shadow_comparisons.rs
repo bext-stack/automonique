@@ -70,7 +70,7 @@ use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 
-use crate::{BUSY_TIMEOUT, MAX_TRANSPORT_KEY_BYTES, StoreError, validate_database_path};
+use crate::{MAX_TRANSPORT_KEY_BYTES, StoreError, validate_database_path};
 
 /// The only shadow-comparison schema this build can read and write.
 pub const SHADOW_COMPARISONS_SCHEMA_VERSION: u32 = 1;
@@ -614,14 +614,7 @@ impl ShadowComparisonStore {
             | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
         let mut connection = Connection::open_with_flags(path, open_flags)?;
-        connection.busy_timeout(BUSY_TIMEOUT)?;
-        connection.pragma_update(None, "foreign_keys", "ON")?;
-        let journal: String =
-            connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
-        if !journal.eq_ignore_ascii_case("wal") {
-            return Err(ShadowError::Sqlite(rusqlite::Error::InvalidQuery));
-        }
-        connection.pragma_update(None, "synchronous", "FULL")?;
+        crate::sqlite_policy::configure_authoritative(&connection)?;
         migrate(&mut connection)?;
 
         Ok(Self {
