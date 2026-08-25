@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+# The product workspace's pin, repeated here because rustup reads the nearest
+# toolchain file and this directory is outside `rust/`.
+[toolchain]
+channel = "1.93.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
