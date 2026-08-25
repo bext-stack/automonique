@@ -44,8 +44,8 @@ pub trait ReloadHooks {
     fn activate_candidate(&mut self) -> Result<(), ReloadRefusal>;
     fn prove_active(&mut self) -> Result<(), ReloadRefusal>;
     fn drain_source(&mut self) -> Result<(), ReloadRefusal>;
-    fn stop_candidate(&mut self);
-    fn resume_source(&mut self);
+    fn stop_candidate(&mut self) -> Result<(), ReloadRefusal>;
+    fn resume_source(&mut self) -> Result<(), ReloadRefusal>;
     fn return_leases(&mut self) -> Result<(), ReloadRefusal>;
 }
 
@@ -178,8 +178,14 @@ fn fail_for_phase(
     if phase_rank(record.phase) >= phase_rank(ReloadPhase::Transferred) {
         fail_after_transfer(audit, record, error, hooks, now_ms)
     } else {
-        hooks.resume_source();
-        hooks.stop_candidate();
+        if hooks.resume_source().is_err() || hooks.stop_candidate().is_err() {
+            return fail_before_transfer(
+                audit,
+                record,
+                ReloadRefusal::new("reload_recovery_required"),
+                now_ms,
+            );
+        }
         fail_before_transfer(audit, record, error, now_ms)
     }
 }
@@ -209,8 +215,18 @@ fn fail_after_transfer(
 ) -> Result<ReloadRecord, ReloadExecutionError> {
     match hooks.return_leases() {
         Ok(()) => {
-            hooks.resume_source();
-            hooks.stop_candidate();
+            if hooks.resume_source().is_err() || hooks.stop_candidate().is_err() {
+                let _ = advance(
+                    audit,
+                    record,
+                    ReloadPhase::Failed,
+                    Some("reload_recovery_required"),
+                    now_ms,
+                )?;
+                return Err(ReloadExecutionError::Refused(
+                    "reload_recovery_required".to_owned(),
+                ));
+            }
             advance(
                 audit,
                 record,

@@ -157,7 +157,7 @@ use automonique_store::run_submissions::{
 };
 use automonique_store::{
     GenerationLease, InboxSubmission, IntakePauseRequest, IntakeResumeRequest, LeaseExpiryRequest,
-    LeaseOwnerIdentity, LeaseRenewal, LeaseRequest,
+    LeaseOwnerIdentity, LeaseRenewal, LeaseRequest, LeaseTransferRequest,
     OutboxReconciliationDecision as StoreOutboxDecision, OutboxReconciliationRequest,
     ReconciliationDecision, ReconciliationRequest, StatusSnapshot, Store, StoreError,
 };
@@ -1452,6 +1452,233 @@ enum LeaseDisposition {
     ReleaseWhen(Arc<AtomicBool>),
 }
 
+struct ProcessReloadHooks<'a> {
+    daemon: &'a mut Daemon,
+    release: release_activation::VerifiedCodeRelease,
+    reload_id: String,
+    target_generation_id: String,
+    source_holder_id: String,
+    source_lease_epoch: u64,
+    candidate: Option<candidate::WarmCandidate>,
+    candidate_lease: Option<GenerationLease>,
+    adopted_runs: u64,
+    source_quiesced: bool,
+    authority_confirmed: bool,
+    candidate_active: bool,
+    cleanup_transferred: bool,
+}
+
+impl ProcessReloadHooks<'_> {
+    fn refuse(category: &'static str) -> reload::ReloadRefusal {
+        reload::ReloadRefusal::new(category)
+    }
+}
+
+impl reload::ReloadHooks for ProcessReloadHooks<'_> {
+    fn verify_target(&mut self) -> Result<(), reload::ReloadRefusal> {
+        Ok(())
+    }
+
+    fn spawn_candidate(&mut self) -> Result<(), reload::ReloadRefusal> {
+        let candidate = candidate::spawn_warm_candidate(
+            &self.daemon.config,
+            &self.release,
+            &candidate::CandidateSpec {
+                reload_id: self.reload_id.clone(),
+                source_holder_id: self.source_holder_id.clone(),
+                source_lease_epoch: self.source_lease_epoch,
+                target_generation_id: self.target_generation_id.clone(),
+                warm_timeout: Duration::from_secs(20),
+            },
+        )
+        .map_err(|error| Self::refuse(error.category()))?;
+        self.candidate = Some(candidate);
+        Ok(())
+    }
+
+    fn warm_candidate(&mut self) -> Result<(), reload::ReloadRefusal> {
+        let descriptors = self
+            .daemon
+            .candidate_transfer_descriptors()
+            .map_err(|error| Self::refuse(error.category()))?;
+        self.candidate
+            .as_mut()
+            .ok_or_else(|| Self::refuse("candidate_unavailable"))?
+            .prepare_transfer(descriptors)
+            .map_err(|error| Self::refuse(error.category()))
+    }
+
+    fn quiesce_source(&mut self) -> Result<(), reload::ReloadRefusal> {
+        let quiesced = self.daemon.quiesce_for_handoff();
+        self.source_quiesced = self.daemon.handoff_quiesced;
+        quiesced.map_err(|error| Self::refuse(error.category()))
+    }
+
+    fn transfer_leases(&mut self) -> Result<(), reload::ReloadRefusal> {
+        let target = self
+            .candidate
+            .as_ref()
+            .ok_or_else(|| Self::refuse("candidate_unavailable"))?
+            .lease_target();
+        let transferred = self
+            .daemon
+            .store
+            .transfer_generation_lease(LeaseTransferRequest {
+                generation_id: GENERATION_ID,
+                source_holder_id: &self.source_holder_id,
+                source_epoch: self.source_lease_epoch,
+                target_holder_id: &target.holder_id,
+                target_owner: LeaseOwnerIdentity {
+                    boot_id: &target.boot_id,
+                    pid: target.pid,
+                    starttime: target.starttime,
+                },
+                now_ms: unix_millis().map_err(|error| Self::refuse(error.category()))?,
+                ttl_ms: LEASE_TTL_MS,
+            })
+            .map_err(|error| Self::refuse(error.category()))?;
+        self.adopted_runs = transferred.adopted_runs;
+        self.candidate_lease = Some(transferred.lease);
+        Ok(())
+    }
+
+    fn activate_candidate(&mut self) -> Result<(), reload::ReloadRefusal> {
+        let lease = self
+            .candidate_lease
+            .as_ref()
+            .ok_or_else(|| Self::refuse("candidate_authority_unavailable"))?;
+        let candidate = self
+            .candidate
+            .as_mut()
+            .ok_or_else(|| Self::refuse("candidate_unavailable"))?;
+        candidate
+            .confirm_authority(lease, self.adopted_runs)
+            .map_err(|error| Self::refuse(error.category()))?;
+        self.authority_confirmed = true;
+        let cleanup = self
+            .daemon
+            .relinquish_endpoint_cleanup()
+            .map_err(|error| Self::refuse(error.category()))?;
+        self.cleanup_transferred = true;
+        candidate
+            .activate_serving(cleanup)
+            .map_err(|error| Self::refuse(error.category()))?;
+        self.candidate_active = true;
+        Ok(())
+    }
+
+    fn prove_active(&mut self) -> Result<(), reload::ReloadRefusal> {
+        let lease = self
+            .candidate_lease
+            .as_ref()
+            .ok_or_else(|| Self::refuse("candidate_authority_unavailable"))?;
+        let now_ms = unix_millis().map_err(|error| Self::refuse(error.category()))?;
+        let snapshot = self
+            .daemon
+            .store
+            .status_snapshot_at(GENERATION_ID, now_ms)
+            .map_err(|error| Self::refuse(error.category()))?;
+        let current = snapshot
+            .generation()
+            .ok_or_else(|| Self::refuse("candidate_active_proof_failed"))?;
+        if !self.candidate_active
+            || current.holder_id() != lease.holder_id
+            || current.lease_epoch() != lease.epoch
+            || current.boot_id() != lease.boot_id
+            || current.holder_pid() != lease.holder_pid
+            || current.holder_starttime() != lease.holder_starttime
+            || current.lease_expires_ms() <= snapshot.lease_observed_boottime_ms()
+        {
+            return Err(Self::refuse("candidate_active_proof_failed"));
+        }
+        Ok(())
+    }
+
+    fn drain_source(&mut self) -> Result<(), reload::ReloadRefusal> {
+        self.daemon
+            .retire_after_handoff()
+            .map_err(|error| Self::refuse(error.category()))?;
+        self.candidate
+            .as_mut()
+            .ok_or_else(|| Self::refuse("candidate_unavailable"))?
+            .commit()
+            .map_err(|error| Self::refuse(error.category()))?;
+        self.candidate_active = false;
+        Ok(())
+    }
+
+    fn stop_candidate(&mut self) -> Result<(), reload::ReloadRefusal> {
+        self.candidate.as_mut().map_or(Ok(()), |candidate| {
+            candidate
+                .stop()
+                .map_err(|error| Self::refuse(error.category()))
+        })
+    }
+
+    fn resume_source(&mut self) -> Result<(), reload::ReloadRefusal> {
+        if !self.source_quiesced {
+            return Ok(());
+        }
+        self.daemon
+            .resume_after_handoff()
+            .map_err(|error| Self::refuse(error.category()))?;
+        self.source_quiesced = false;
+        Ok(())
+    }
+
+    fn return_leases(&mut self) -> Result<(), reload::ReloadRefusal> {
+        if self.candidate_active {
+            self.candidate
+                .as_mut()
+                .ok_or_else(|| Self::refuse("candidate_unavailable"))?
+                .quiesce()
+                .map_err(|error| Self::refuse(error.category()))?;
+            self.candidate_active = false;
+        }
+        let candidate_lease = self
+            .candidate_lease
+            .as_ref()
+            .ok_or_else(|| Self::refuse("candidate_authority_unavailable"))?;
+        let source_identity = lease_identity::ProcessIdentity::current()
+            .map_err(|_| Self::refuse("source_identity_unavailable"))?;
+        let returned = self
+            .daemon
+            .store
+            .transfer_generation_lease(LeaseTransferRequest {
+                generation_id: GENERATION_ID,
+                source_holder_id: &candidate_lease.holder_id,
+                source_epoch: candidate_lease.epoch,
+                target_holder_id: &self.source_holder_id,
+                target_owner: LeaseOwnerIdentity {
+                    boot_id: &source_identity.boot_id,
+                    pid: source_identity.pid,
+                    starttime: source_identity.starttime,
+                },
+                now_ms: unix_millis().map_err(|error| Self::refuse(error.category()))?,
+                ttl_ms: LEASE_TTL_MS,
+            })
+            .map_err(|error| Self::refuse(error.category()))?;
+        if self.authority_confirmed {
+            self.candidate
+                .as_mut()
+                .ok_or_else(|| Self::refuse("candidate_unavailable"))?
+                .confirm_relinquished(&returned.lease)
+                .map_err(|error| Self::refuse(error.category()))?;
+        }
+        self.daemon
+            .accept_returned_authority(&returned.lease)
+            .map_err(|error| Self::refuse(error.category()))?;
+        if self.cleanup_transferred {
+            self.daemon
+                .resume_endpoint_cleanup()
+                .map_err(|error| Self::refuse(error.category()))?;
+            self.cleanup_transferred = false;
+        }
+        self.candidate_lease = None;
+        Ok(())
+    }
+}
+
 impl LeaseDisposition {
     fn releases(&self) -> bool {
         match self {
@@ -2103,6 +2330,47 @@ impl Daemon {
             ))?
             .start()
             .map_err(|error| DaemonError::AttemptAdoptionFailed(error.category()))
+    }
+
+    /// Execute the durable ten-phase handoff against one already verified
+    /// immutable release.
+    pub fn handoff_to_verified_release(
+        &mut self,
+        reload_id: &str,
+        release: release_activation::VerifiedCodeRelease,
+    ) -> Result<automonique_store::reload_audit::ReloadRecord, reload::ReloadExecutionError> {
+        let target_generation_id = format!("foreground-{}", &release.source_sha[..12]);
+        let target_release_digest = release.manifest_digest.clone();
+        let source_holder_id = self.instance_id.as_str().to_owned();
+        let source_lease_epoch = self.lease_epoch;
+        let mut audit = ReloadAudit::open(self.config.reload_audit_path())?;
+        let mut hooks = ProcessReloadHooks {
+            daemon: self,
+            release,
+            reload_id: reload_id.to_owned(),
+            target_generation_id: target_generation_id.clone(),
+            source_holder_id: source_holder_id.clone(),
+            source_lease_epoch,
+            candidate: None,
+            candidate_lease: None,
+            adopted_runs: 0,
+            source_quiesced: false,
+            authority_confirmed: false,
+            candidate_active: false,
+            cleanup_transferred: false,
+        };
+        reload::execute_reload(
+            &mut audit,
+            reload::ReloadExecution {
+                reload_id,
+                source_generation_id: GENERATION_ID,
+                source_lease_epoch,
+                target_generation_id: &target_generation_id,
+                target_release_digest: &target_release_digest,
+            },
+            &mut hooks,
+            || unix_millis().map_err(|_| reload::ReloadRefusal::new("clock")),
+        )
     }
 
     /// Duplicate the exact listener and locked open-file description for a

@@ -12,6 +12,8 @@ struct RecordingHooks {
     calls: Vec<&'static str>,
     fail_at: Option<&'static str>,
     rollback_fails: bool,
+    resume_fails: bool,
+    stop_fails: bool,
 }
 
 impl RecordingHooks {
@@ -58,12 +60,22 @@ impl ReloadHooks for RecordingHooks {
         self.operation("source_drain_failed")
     }
 
-    fn stop_candidate(&mut self) {
+    fn stop_candidate(&mut self) -> Result<(), ReloadRefusal> {
         self.calls.push("stop_candidate");
+        if self.stop_fails {
+            Err(ReloadRefusal::new("candidate_stop_failed"))
+        } else {
+            Ok(())
+        }
     }
 
-    fn resume_source(&mut self) {
+    fn resume_source(&mut self) -> Result<(), ReloadRefusal> {
         self.calls.push("resume_source");
+        if self.resume_fails {
+            Err(ReloadRefusal::new("source_resume_failed"))
+        } else {
+            Ok(())
+        }
     }
 
     fn return_leases(&mut self) -> Result<(), ReloadRefusal> {
@@ -242,6 +254,31 @@ fn failed_lease_return_never_claims_that_the_source_resumed() {
     assert_eq!(hooks.calls[hooks.calls.len() - 1], "return_leases");
     assert!(!hooks.calls.contains(&"resume_source"));
     assert!(!hooks.calls.contains(&"stop_candidate"));
+    let record = fixture
+        .audit
+        .get("reload-1")
+        .expect("record")
+        .expect("reload");
+    assert_eq!(record.phase, ReloadPhase::Failed);
+    assert_eq!(
+        record.failure_category.as_deref(),
+        Some("reload_recovery_required")
+    );
+}
+
+#[test]
+fn failed_source_resume_never_records_a_clean_rollback() {
+    let mut fixture = Fixture::new();
+    let mut hooks = RecordingHooks {
+        fail_at: Some("active_proof_failed"),
+        resume_fails: true,
+        ..RecordingHooks::default()
+    };
+
+    assert_eq!(
+        fixture.execute(&mut hooks).expect_err("recovery required"),
+        "reload_recovery_required"
+    );
     let record = fixture
         .audit
         .get("reload-1")

@@ -11,6 +11,7 @@ use automonique_daemon::attempt_adoption::AttemptAdoptionClient;
 use automonique_daemon::candidate::{CandidateSpec, spawn_warm_candidate};
 use automonique_daemon::release_activation::{CodeReleaseActivator, SystemdUserSupervisor};
 use automonique_daemon::{Daemon, DaemonConfig};
+use automonique_store::reload_audit::ReloadPhase;
 use automonique_store::{LeaseOwnerIdentity, LeaseTimeSource, LeaseTransferRequest, Store};
 use nix::sys::time::TimeValLike;
 use nix::time::ClockId;
@@ -230,61 +231,12 @@ fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
     assert!(config.admin_socket().exists());
     assert!(config.progress_socket().exists());
 
-    let committed_source_lease = read_source_lease(&config.database_path());
-    let committed_descriptors = source
-        .candidate_transfer_descriptors()
-        .expect("second transfer descriptors");
-    let mut committed_candidate = spawn_warm_candidate(
-        &config,
-        &release,
-        &CandidateSpec {
-            reload_id: "reload-process-commit".to_owned(),
-            source_holder_id: committed_source_lease.holder_id.clone(),
-            source_lease_epoch: committed_source_lease.epoch,
-            target_generation_id: "foreground-committed".to_owned(),
-            warm_timeout: Duration::from_secs(20),
-        },
-    )
-    .expect("second warm candidate");
-    committed_candidate
-        .prepare_transfer(committed_descriptors)
-        .expect("second candidate validates capabilities");
-    source
-        .quiesce_for_handoff()
-        .expect("source quiesces for committed handoff");
-    let committed_target = committed_candidate.lease_target();
-    let committed_transfer = store
-        .transfer_generation_lease(LeaseTransferRequest {
-            generation_id: "foreground",
-            source_holder_id: &committed_source_lease.holder_id,
-            source_epoch: committed_source_lease.epoch,
-            target_holder_id: &committed_target.holder_id,
-            target_owner: LeaseOwnerIdentity {
-                boot_id: &committed_target.boot_id,
-                pid: committed_target.pid,
-                starttime: committed_target.starttime,
-            },
-            now_ms: unix_millis(),
-            ttl_ms: 30_000,
-        })
-        .expect("second generation lease transfer");
-    committed_candidate
-        .confirm_authority(&committed_transfer.lease, committed_transfer.adopted_runs)
-        .expect("second candidate proves authority");
-    let committed_cleanup = source
-        .relinquish_endpoint_cleanup()
-        .expect("source transfers cleanup to committed candidate");
-    committed_candidate
-        .activate_serving(committed_cleanup)
-        .expect("committed candidate serves");
-    source
-        .retire_after_handoff()
-        .expect("source drains attempts and retires adoption route");
-    committed_candidate
-        .commit()
-        .expect("candidate detaches as committed generation");
+    let committed = source
+        .handoff_to_verified_release("reload-process-commit", release)
+        .expect("ten-phase process handoff succeeds");
+    assert_eq!(committed.phase, ReloadPhase::Succeeded);
+    let committed_holder = read_source_lease(&config.database_path()).holder_id;
     drop(source);
-    drop(committed_candidate);
 
     let committed_status = Command::new(env!("CARGO_BIN_EXE_automonique"))
         .args(["status", "--json"])
@@ -299,7 +251,7 @@ fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
     assert!(
         String::from_utf8(committed_status.stdout)
             .expect("committed status UTF-8")
-            .contains(&committed_target.holder_id)
+            .contains(&committed_holder)
     );
     let shutdown = Command::new(env!("CARGO_BIN_EXE_automonique"))
         .arg("shutdown")
