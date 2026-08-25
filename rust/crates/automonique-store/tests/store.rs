@@ -10,12 +10,12 @@ use std::time::{Duration, Instant};
 
 use automonique_store::{
     InboxSubmission, IntakePauseRequest, IntakeResumeRequest, LeaseExpiryRequest,
-    LeaseOwnerIdentity, LeaseRenewal, LeaseRequest, LeaseTimeSource, MAX_TRANSPORT_KEY_BYTES,
-    OutboxClaimRequest, OutboxDelivery, OutboxEnqueue, OutboxFailure, OutboxFailureDecision,
-    OutboxPayloadRequest, OutboxReconciliationDecision, OutboxReconciliationRequest,
-    ReconciliationDecision, ReconciliationInboxState, ReconciliationRequest,
-    ReconciliationRunState, SCHEMA_VERSION, SchedulerClaim, Store, StoreError,
-    TelegramBatchIngestion, TelegramPollerCommit, TelegramPollerLeaseIdentity,
+    LeaseOwnerIdentity, LeaseRenewal, LeaseRequest, LeaseTimeSource, LeaseTransferRequest,
+    MAX_TRANSPORT_KEY_BYTES, OutboxClaimRequest, OutboxDelivery, OutboxEnqueue, OutboxFailure,
+    OutboxFailureDecision, OutboxPayloadRequest, OutboxReconciliationDecision,
+    OutboxReconciliationRequest, ReconciliationDecision, ReconciliationInboxState,
+    ReconciliationRequest, ReconciliationRunState, SCHEMA_VERSION, SchedulerClaim, Store,
+    StoreError, TelegramBatchIngestion, TelegramPollerCommit, TelegramPollerLeaseIdentity,
     TelegramPollerLeaseRenewal, TelegramPollerLeaseRequest, TelegramStoreDisposition,
     TelegramStoreUpdate, TerminalRun, TerminalState, TransportPauseRequest, WorkClaim,
 };
@@ -847,6 +847,216 @@ fn a_sigstopped_old_holder_cannot_commit_after_its_epoch_is_replaced() {
         "running"
     );
     assert_eq!(successor_store.outbox_count().expect("no zombie outbox"), 0);
+}
+
+#[test]
+fn cooperative_transfer_adopts_running_work_and_fences_the_source_atomically() {
+    let database = PrivateDatabase::new();
+    let clock = Arc::new(FixedLeaseClock(AtomicI64::new(10)));
+    let mut store = Store::open_with_lease_time_source(database.path(), clock).expect("store");
+    let source = store
+        .acquire_generation_lease_owned(
+            LeaseRequest {
+                generation_id: "generation-a",
+                holder_id: "holder-a",
+                now_ms: 1,
+                ttl_ms: 100,
+            },
+            LeaseOwnerIdentity {
+                boot_id: "boot-a",
+                pid: 10,
+                starttime: 100,
+            },
+        )
+        .expect("source lease");
+    let inbox_id = submit(&mut store, "handoff-run", "handoff-scope");
+    let run_id = claim(
+        &mut store,
+        inbox_id,
+        source.epoch,
+        "handoff-claim",
+        "handoff-scope",
+    );
+    let transfer_request = LeaseTransferRequest {
+        generation_id: "generation-a",
+        source_holder_id: "holder-a",
+        source_epoch: source.epoch,
+        target_holder_id: "holder-b",
+        target_owner: LeaseOwnerIdentity {
+            boot_id: "boot-a",
+            pid: 11,
+            starttime: 200,
+        },
+        now_ms: 3,
+        ttl_ms: 100,
+    };
+    let transferred = store
+        .transfer_generation_lease(transfer_request)
+        .expect("transfer");
+    assert_eq!(transferred.lease.epoch, source.epoch + 1);
+    assert_eq!(transferred.adopted_runs, 1);
+    assert!(!transferred.duplicate);
+
+    let replay = store
+        .transfer_generation_lease(LeaseTransferRequest {
+            generation_id: "generation-a",
+            source_holder_id: "holder-a",
+            source_epoch: source.epoch,
+            target_holder_id: "holder-b",
+            target_owner: LeaseOwnerIdentity {
+                boot_id: "boot-a",
+                pid: 11,
+                starttime: 200,
+            },
+            now_ms: 4,
+            ttl_ms: 100,
+        })
+        .expect("idempotent replay");
+    assert!(replay.duplicate);
+    assert_eq!(replay.lease, transferred.lease);
+
+    assert!(matches!(
+        store.finish_run(TerminalRun {
+            run_id,
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: source.epoch,
+            expected_revision: 1,
+            now_ms: 5,
+            state: TerminalState::Succeeded,
+            event_kind: "run.succeeded",
+            event_payload: b"old",
+            outbox_intent_key: "handoff-old",
+            outbox_kind: "test.effect",
+            outbox_payload: b"old",
+        }),
+        Err(StoreError::StaleEpoch)
+    ));
+    store
+        .finish_run(TerminalRun {
+            run_id,
+            generation_id: "generation-a",
+            holder_id: "holder-b",
+            lease_epoch: transferred.lease.epoch,
+            expected_revision: 1,
+            now_ms: 6,
+            state: TerminalState::Succeeded,
+            event_kind: "run.succeeded",
+            event_payload: b"new",
+            outbox_intent_key: "handoff-new",
+            outbox_kind: "test.effect",
+            outbox_payload: b"new",
+        })
+        .expect("successor finishes adopted run");
+
+    let returned = store
+        .transfer_generation_lease(LeaseTransferRequest {
+            generation_id: "generation-a",
+            source_holder_id: "holder-b",
+            source_epoch: transferred.lease.epoch,
+            target_holder_id: "holder-a",
+            target_owner: LeaseOwnerIdentity {
+                boot_id: "boot-a",
+                pid: 10,
+                starttime: 100,
+            },
+            now_ms: 7,
+            ttl_ms: 100,
+        })
+        .expect("return authority");
+    assert_eq!(returned.lease.epoch, transferred.lease.epoch + 1);
+    assert_eq!(returned.adopted_runs, 0);
+    store
+        .renew_generation_lease(LeaseRenewal {
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            epoch: returned.lease.epoch,
+            now_ms: 8,
+            ttl_ms: 100,
+        })
+        .expect("returned source renews authority");
+    assert!(matches!(
+        store.renew_generation_lease(LeaseRenewal {
+            generation_id: "generation-a",
+            holder_id: "holder-b",
+            epoch: transferred.lease.epoch,
+            now_ms: 8,
+            ttl_ms: 100,
+        }),
+        Err(StoreError::StaleEpoch)
+    ));
+}
+
+#[test]
+fn cooperative_transfer_refuses_live_transport_or_effect_ownership() {
+    let database = PrivateDatabase::new();
+    let clock = Arc::new(FixedLeaseClock(AtomicI64::new(10)));
+    let mut store = Store::open_with_lease_time_source(database.path(), clock).expect("store");
+    let source = store
+        .acquire_generation_lease_owned(
+            LeaseRequest {
+                generation_id: "generation-a",
+                holder_id: "holder-a",
+                now_ms: 1,
+                ttl_ms: 100,
+            },
+            LeaseOwnerIdentity {
+                boot_id: "boot-a",
+                pid: 10,
+                starttime: 100,
+            },
+        )
+        .expect("source lease");
+    let poller = acquire_poller(
+        &mut store,
+        7,
+        "generation-a",
+        "holder-a",
+        source.epoch,
+        2,
+        50,
+    );
+    let transfer = || LeaseTransferRequest {
+        generation_id: "generation-a",
+        source_holder_id: "holder-a",
+        source_epoch: source.epoch,
+        target_holder_id: "holder-b",
+        target_owner: LeaseOwnerIdentity {
+            boot_id: "boot-a",
+            pid: 11,
+            starttime: 200,
+        },
+        now_ms: 3,
+        ttl_ms: 100,
+    };
+    assert!(matches!(
+        store
+            .transfer_generation_lease(transfer())
+            .expect_err("live poller blocks"),
+        StoreError::HandoffBlocked("telegram_poller_live")
+    ));
+
+    store
+        .release_telegram_poller_lease(poller_identity(&poller, 3))
+        .expect("release poller");
+    let effect_id = add_effect(&mut store, source.epoch, "handoff", 4);
+    assert!(effect_id > 0);
+    claim_effect(&mut store, "holder-a", source.epoch, 7);
+    assert!(matches!(
+        store
+            .transfer_generation_lease(transfer())
+            .expect_err("in-flight effect blocks"),
+        StoreError::HandoffBlocked("outbox_in_flight")
+    ));
+    store
+        .renew_generation_lease(LeaseRenewal {
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            epoch: source.epoch,
+            now_ms: 8,
+            ttl_ms: 100,
+        })
+        .expect("blocked transfer changed no authority");
 }
 
 #[test]

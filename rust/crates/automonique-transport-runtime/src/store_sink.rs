@@ -267,6 +267,7 @@ fn map_read_error(error: StoreError) -> SinkFailure {
         StoreError::InvalidField(_)
         | StoreError::IdempotencyConflict(_)
         | StoreError::ScopeLocked
+        | StoreError::HandoffBlocked(_)
         | StoreError::ReconciliationRequired { .. }
         | StoreError::OutboxReconciliationRequired { .. }
         | StoreError::NotFound(_)
@@ -291,6 +292,7 @@ fn map_lifecycle_error(error: StoreError) -> SinkFailure {
         StoreError::InvalidField(_)
         | StoreError::IdempotencyConflict(_)
         | StoreError::ScopeLocked
+        | StoreError::HandoffBlocked(_)
         | StoreError::ReconciliationRequired { .. }
         | StoreError::OutboxReconciliationRequired { .. }
         | StoreError::NotFound(_)
@@ -315,6 +317,7 @@ fn map_commit_error(error: StoreError) -> SinkFailure {
         StoreError::InvalidField(_)
         | StoreError::IdempotencyConflict(_)
         | StoreError::ScopeLocked
+        | StoreError::HandoffBlocked(_)
         | StoreError::ReconciliationRequired { .. }
         | StoreError::OutboxReconciliationRequired { .. }
         | StoreError::NotFound(_)

@@ -544,6 +544,9 @@ pub enum StoreError {
     LeaseClock(&'static str),
     /// Another live run holds the requested scope.
     ScopeLocked,
+    /// A live transport/effect lease or inconsistent run lock prevents an
+    /// atomic generation handoff.
+    HandoffBlocked(&'static str),
     /// A prior run's scope lease expired and its execution must be reconciled.
     ReconciliationRequired { run_id: i64 },
     /// An in-flight external effect expired with an ambiguous outcome.
@@ -582,6 +585,7 @@ impl StoreError {
             Self::AuthorityLost => "authority_lost",
             Self::LeaseClock(_) => "lease_clock",
             Self::ScopeLocked => "scope_locked",
+            Self::HandoffBlocked(_) => "handoff_blocked",
             Self::ReconciliationRequired { .. } => "reconciliation_required",
             Self::OutboxReconciliationRequired { .. } => "outbox_reconciliation_required",
             Self::NotFound(_) => "not_found",
@@ -620,6 +624,9 @@ impl fmt::Display for StoreError {
             Self::AuthorityLost => formatter.write_str("current generation authority was lost"),
             Self::LeaseClock(category) => write!(formatter, "lease clock failed: {category}"),
             Self::ScopeLocked => formatter.write_str("work scope is locked"),
+            Self::HandoffBlocked(reason) => {
+                write!(formatter, "generation handoff is blocked: {reason}")
+            }
             Self::ReconciliationRequired { run_id } => {
                 write!(
                     formatter,
@@ -710,6 +717,26 @@ pub struct LeaseRenewal<'a> {
     /// Unix audit time; never a production lease-authority input.
     pub now_ms: i64,
     pub ttl_ms: i64,
+}
+
+/// Exact source and successor coordinates for one cooperative lease handoff.
+pub struct LeaseTransferRequest<'a> {
+    pub generation_id: &'a str,
+    pub source_holder_id: &'a str,
+    pub source_epoch: u64,
+    pub target_holder_id: &'a str,
+    pub target_owner: LeaseOwnerIdentity<'a>,
+    /// Unix audit time; lease arithmetic uses the configured lease clock.
+    pub now_ms: i64,
+    pub ttl_ms: i64,
+}
+
+/// What one atomic generation lease handoff committed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaseTransferReceipt {
+    pub lease: GenerationLease,
+    pub adopted_runs: u64,
+    pub duplicate: bool,
 }
 
 /// Exact generation owner a startup sweep has proved is no longer live.
@@ -1787,6 +1814,222 @@ impl Store {
             holder_pid: u32::try_from(owner.1)
                 .map_err(|_| StoreError::MigrationInvariant("holder_pid"))?,
             holder_starttime: from_db_u64(owner.2, "holder_starttime")?,
+        })
+    }
+
+    /// Cooperatively transfer one live generation lease to a warmed successor.
+    ///
+    /// The generation row, every current running run and its scope lock move to
+    /// the next fencing epoch in one immediate transaction. The transfer
+    /// refuses while an outbox effect is in flight or a Telegram poller still
+    /// owns a live long-poll lease: those boundaries require their explicit
+    /// drain/offset handshakes and cannot safely be inferred here.
+    pub fn transfer_generation_lease(
+        &mut self,
+        request: LeaseTransferRequest<'_>,
+    ) -> Result<LeaseTransferReceipt, StoreError> {
+        validate_id(request.generation_id, "generation_id")?;
+        validate_id(request.source_holder_id, "source_holder_id")?;
+        validate_id(request.target_holder_id, "target_holder_id")?;
+        validate_id(request.target_owner.boot_id, "target_boot_id")?;
+        validate_time(request.now_ms)?;
+        if request.source_epoch == 0 {
+            return Err(StoreError::InvalidField("source_epoch"));
+        }
+        if request.source_holder_id == request.target_holder_id {
+            return Err(StoreError::InvalidField("target_holder_id"));
+        }
+        if request.target_owner.pid == 0 || request.target_owner.starttime == 0 {
+            return Err(StoreError::InvalidField("target_owner"));
+        }
+        let lease_now_ms = self.lease_now_ms(request.now_ms)?;
+        let target_expiry = checked_expiry(lease_now_ms, request.ttl_ms)?;
+        let source_epoch = to_db_u64(request.source_epoch, "source_epoch")?;
+        let target_epoch = request
+            .source_epoch
+            .checked_add(1)
+            .ok_or(StoreError::StaleEpoch)?;
+        let target_epoch_db = to_db_u64(target_epoch, "target_epoch")?;
+        let target_starttime =
+            to_db_u64(request.target_owner.starttime, "target_holder_starttime")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = transaction
+            .query_row(
+                "SELECT revision, lease_holder, lease_epoch, lease_expires_ms,
+                        boot_id, holder_pid, holder_starttime
+                 FROM generations WHERE generation_id = ?1",
+                [request.generation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::StaleEpoch)?;
+
+        if current.1 == request.target_holder_id
+            && current.2 == target_epoch_db
+            && current.3 > lease_now_ms
+            && current.4 == request.target_owner.boot_id
+            && current.5 == i64::from(request.target_owner.pid)
+            && current.6 == target_starttime
+        {
+            let adopted_runs: i64 = transaction.query_row(
+                "SELECT count(*) FROM runs
+                 WHERE generation_id = ?1 AND lease_epoch = ?2 AND state = 'running'",
+                params![request.generation_id, target_epoch_db],
+                |row| row.get(0),
+            )?;
+            transaction.commit()?;
+            return Ok(LeaseTransferReceipt {
+                lease: GenerationLease {
+                    generation_id: request.generation_id.to_owned(),
+                    holder_id: request.target_holder_id.to_owned(),
+                    epoch: target_epoch,
+                    expires_ms: current.3,
+                    boot_id: request.target_owner.boot_id.to_owned(),
+                    holder_pid: request.target_owner.pid,
+                    holder_starttime: request.target_owner.starttime,
+                },
+                adopted_runs: from_db_u64(adopted_runs, "adopted_runs")?,
+                duplicate: true,
+            });
+        }
+        if current.1 != request.source_holder_id
+            || current.2 != source_epoch
+            || current.3 <= lease_now_ms
+        {
+            return Err(StoreError::StaleEpoch);
+        }
+
+        let outbox_in_flight: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM outbox
+                WHERE state = 'in_flight' AND lease_generation_id = ?1
+            )",
+            [request.generation_id],
+            |row| row.get(0),
+        )?;
+        if outbox_in_flight {
+            return Err(StoreError::HandoffBlocked("outbox_in_flight"));
+        }
+        let telegram_poll_live: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM telegram_poller_leases
+                WHERE generation_id = ?1 AND expires_ms > ?2
+            )",
+            params![request.generation_id, lease_now_ms],
+            |row| row.get(0),
+        )?;
+        if telegram_poll_live {
+            return Err(StoreError::HandoffBlocked("telegram_poller_live"));
+        }
+        let inconsistent_run_lock: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM runs r
+                LEFT JOIN work_locks w ON w.run_id = r.run_id
+                WHERE r.generation_id = ?1 AND r.lease_epoch = ?2
+                  AND r.state = 'running'
+                  AND (w.run_id IS NULL OR w.generation_id <> ?1
+                       OR w.lease_epoch <> ?2 OR w.expires_ms <= ?3)
+            )",
+            params![request.generation_id, source_epoch, lease_now_ms],
+            |row| row.get(0),
+        )?;
+        if inconsistent_run_lock {
+            return Err(StoreError::HandoffBlocked("run_lock_inconsistent"));
+        }
+        let inconsistent_lock_run: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM work_locks w
+                JOIN runs r ON r.run_id = w.run_id
+                WHERE w.generation_id = ?1 AND w.lease_epoch = ?2
+                  AND (r.generation_id <> ?1 OR r.lease_epoch <> ?2
+                       OR r.state <> 'running')
+            )",
+            params![request.generation_id, source_epoch],
+            |row| row.get(0),
+        )?;
+        if inconsistent_lock_run {
+            return Err(StoreError::HandoffBlocked("run_lock_inconsistent"));
+        }
+
+        let next_revision = from_db_u64(current.0, "generation_revision")?
+            .checked_add(1)
+            .ok_or(StoreError::InvalidField("generation_revision"))?;
+        let changed = transaction.execute(
+            "UPDATE generations SET revision = ?4, lease_holder = ?5,
+                    lease_epoch = ?6, lease_expires_ms = ?7, boot_id = ?8,
+                    holder_pid = ?9, holder_starttime = ?10
+             WHERE generation_id = ?1 AND lease_holder = ?2 AND lease_epoch = ?3
+               AND lease_expires_ms > ?11",
+            params![
+                request.generation_id,
+                request.source_holder_id,
+                source_epoch,
+                to_db_u64(next_revision, "generation_revision")?,
+                request.target_holder_id,
+                target_epoch_db,
+                target_expiry,
+                request.target_owner.boot_id,
+                i64::from(request.target_owner.pid),
+                target_starttime,
+                lease_now_ms,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::StaleEpoch);
+        }
+        let adopted_runs = transaction.execute(
+            "UPDATE runs SET lease_epoch = ?3
+             WHERE generation_id = ?1 AND lease_epoch = ?2 AND state = 'running'",
+            params![request.generation_id, source_epoch, target_epoch_db],
+        )?;
+        let adopted_locks = transaction.execute(
+            "UPDATE work_locks SET lease_epoch = ?3, expires_ms = ?4
+             WHERE generation_id = ?1 AND lease_epoch = ?2",
+            params![
+                request.generation_id,
+                source_epoch,
+                target_epoch_db,
+                target_expiry
+            ],
+        )?;
+        if adopted_runs != adopted_locks {
+            return Err(StoreError::HandoffBlocked("run_lock_inconsistent"));
+        }
+        append_event(
+            &transaction,
+            "generation",
+            request.generation_id,
+            next_revision,
+            request.now_ms,
+            "generation.lease_transferred",
+            request.target_holder_id.as_bytes(),
+        )?;
+        transaction.commit()?;
+        Ok(LeaseTransferReceipt {
+            lease: GenerationLease {
+                generation_id: request.generation_id.to_owned(),
+                holder_id: request.target_holder_id.to_owned(),
+                epoch: target_epoch,
+                expires_ms: target_expiry,
+                boot_id: request.target_owner.boot_id.to_owned(),
+                holder_pid: request.target_owner.pid,
+                holder_starttime: request.target_owner.starttime,
+            },
+            adopted_runs: u64::try_from(adopted_runs)
+                .map_err(|_| StoreError::MigrationInvariant("adopted_runs"))?,
+            duplicate: false,
         })
     }
 
