@@ -42,9 +42,12 @@ stage, or plan update is required to start or finish repository work.
   Call work running only from a fresh `running` job and matching worker/runtime
   evidence. A worker being `online` only means its polling service is healthy.
 - Determine delivery from the canonical GitHub issue, its checklist, trusted
-  completion comments, merged changes, and live verification. Report the
-  issue's formal open/closed state separately: an issue may intentionally stay
-  open after completed delivery.
+  completion comments, merged changes, and live verification. Once delivery is
+  verified, check every completed checklist item, post a concise completion
+  comment, and close the issue. Keep it open only when work or verification is
+  incomplete, an owner decision remains, an epic still has unfinished child
+  work, or the user explicitly asks to keep it open. Report delivery and the
+  issue's formal open/closed state separately whenever they differ.
 - Slack replies and dashboard projections are presentation state. When they
   disagree with GitHub or fresh runtime evidence, report the discrepancy; do
   not silently cancel, complete, close, or restart anything.
