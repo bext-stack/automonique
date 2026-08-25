@@ -146,8 +146,11 @@ fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
             .category(),
         "candidate_protocol"
     );
+    let cleanup = source
+        .relinquish_endpoint_cleanup()
+        .expect("source transfers exact socket cleanup");
     candidate
-        .activate_serving()
+        .activate_serving(cleanup)
         .expect("candidate starts inherited endpoints and workers");
     let status = Command::new(env!("CARGO_BIN_EXE_automonique"))
         .args(["status", "--json"])
@@ -180,7 +183,15 @@ fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
     candidate
         .confirm_relinquished(&returned.lease)
         .expect("candidate observes returned authority");
+    source
+        .resume_endpoint_cleanup()
+        .expect("source resumes exact socket cleanup");
     candidate.stop().expect("candidate stopped");
+    assert!(config.admin_socket().exists());
+    assert!(config.progress_socket().exists());
+    drop(source);
+    assert!(!config.admin_socket().exists());
+    assert!(!config.progress_socket().exists());
 }
 
 struct SourceLease {

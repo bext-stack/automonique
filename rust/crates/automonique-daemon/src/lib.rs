@@ -2123,6 +2123,48 @@ impl Daemon {
         ))
     }
 
+    /// Transfer responsibility for unlinking the exact admin/progress socket
+    /// inodes to a candidate at its serving-readiness boundary.
+    pub fn relinquish_endpoint_cleanup(
+        &mut self,
+    ) -> Result<candidate::EndpointCleanupTransfer, DaemonError> {
+        let identity = validate_admin_listener(&self.listener, &self.socket_path)?;
+        if identity != self.socket_identity {
+            return Err(DaemonError::InsecurePath("admin socket"));
+        }
+        let progress =
+            self.progress_endpoint
+                .as_mut()
+                .ok_or(DaemonError::ProgressEndpointFailed(
+                    "progress_endpoint_unavailable",
+                ))?;
+        progress.disarm_cleanup();
+        self.remove_socket_on_drop = false;
+        Ok(candidate::EndpointCleanupTransfer::new())
+    }
+
+    /// Reclaim cleanup responsibility after the candidate proved an E+2
+    /// authority return and disarmed its own exact inode guards.
+    pub fn resume_endpoint_cleanup(&mut self) -> Result<(), DaemonError> {
+        self.arm_endpoint_cleanup()
+    }
+
+    fn arm_endpoint_cleanup(&mut self) -> Result<(), DaemonError> {
+        let identity = validate_admin_listener(&self.listener, &self.socket_path)?;
+        if identity != self.socket_identity {
+            return Err(DaemonError::InsecurePath("admin socket"));
+        }
+        self.progress_endpoint
+            .as_mut()
+            .ok_or(DaemonError::ProgressEndpointFailed(
+                "progress_endpoint_unavailable",
+            ))?
+            .arm_cleanup()
+            .map_err(|error| DaemonError::ProgressEndpointFailed(error.category()))?;
+        self.remove_socket_on_drop = true;
+        Ok(())
+    }
+
     /// This daemon's live progress replay, when it has an execution lane.
     ///
     /// The seam a renderer holds. Shared rather than lent: a chat bridge polls
@@ -2158,6 +2200,7 @@ impl Daemon {
             service_manager,
             LeaseDisposition::Release,
             None,
+            false,
         );
         result
     }
@@ -2168,7 +2211,14 @@ impl Daemon {
         ready: std::sync::mpsc::SyncSender<()>,
     ) -> (Self, Result<(), DaemonError>) {
         let reload = AtomicBool::new(false);
-        self.serve_with_control(stop, &reload, None, LeaseDisposition::Retain, Some(ready))
+        self.serve_with_control(
+            stop,
+            &reload,
+            None,
+            LeaseDisposition::Retain,
+            Some(ready),
+            true,
+        )
     }
 
     fn serve_with_control(
@@ -2178,6 +2228,7 @@ impl Daemon {
         mut service_manager: Option<systemd::Notifier>,
         lease_disposition: LeaseDisposition,
         mut ready: Option<std::sync::mpsc::SyncSender<()>>,
+        claim_endpoint_cleanup: bool,
     ) -> (Self, Result<(), DaemonError>) {
         let initial_lease = self
             .lease_time
@@ -2260,6 +2311,9 @@ impl Daemon {
                     && let Err(error) = notifier.ready()
                 {
                     break 'serving Err(DaemonError::ServiceManagerFailed(error.category()));
+                }
+                if claim_endpoint_cleanup && let Err(error) = self.arm_endpoint_cleanup() {
+                    break 'serving Err(error);
                 }
                 if let Some(sender) = ready.take() {
                     let _ = sender.send(());
@@ -2411,7 +2465,14 @@ impl Daemon {
             "managed_tui",
             self.managed_tui.begin_shutdown(),
         ));
-        if let Some(progress_endpoint) = self.progress_endpoint.take() {
+        if lease_disposition == LeaseDisposition::Retain {
+            if let Some(progress_endpoint) = self.progress_endpoint.as_mut() {
+                shutdown_workers.extend(named_shutdown_workers(
+                    "progress_endpoint",
+                    progress_endpoint.begin_shutdown_retaining(),
+                ));
+            }
+        } else if let Some(progress_endpoint) = self.progress_endpoint.take() {
             shutdown_workers.extend(named_shutdown_workers(
                 "progress_endpoint",
                 progress_endpoint.begin_shutdown(),
@@ -7497,6 +7558,7 @@ fn run_with_mode(config: &DaemonConfig, disconnected_recovery: bool) -> Result<(
                     service_manager,
                     LeaseDisposition::Release,
                     None,
+                    false,
                 );
                 result
             })

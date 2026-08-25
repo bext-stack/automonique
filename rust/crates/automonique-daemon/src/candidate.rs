@@ -116,6 +116,17 @@ pub struct CandidateTransferDescriptors {
     control_lock: File,
 }
 
+/// One-use proof that the source disarmed cleanup of the transferred sockets.
+pub struct EndpointCleanupTransfer {
+    _private: (),
+}
+
+impl EndpointCleanupTransfer {
+    pub(crate) const fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
 impl CandidateTransferDescriptors {
     pub(crate) const fn new(
         admin_listener: UnixListener,
@@ -556,7 +567,10 @@ impl WarmCandidate {
 
     /// Start the fully composed candidate and require readiness after every
     /// worker and inherited accept loop has started.
-    pub fn activate_serving(&mut self) -> Result<(), CandidateError> {
+    pub fn activate_serving(
+        &mut self,
+        _cleanup: EndpointCleanupTransfer,
+    ) -> Result<(), CandidateError> {
         if !self.authority_ready || self.serving || self.quiesced || self.relinquished {
             return Err(CandidateError::Protocol);
         }
@@ -693,7 +707,7 @@ pub fn run_candidate(
                         .map_err(|error| CandidateError::Daemon(error.category()))?;
                     identity.event = "authority_ready".to_owned();
                     write_message(&mut writer, &identity)?;
-                    let daemon = match receive_control(reader.as_fd())? {
+                    let mut daemon = match receive_control(reader.as_fd())? {
                         CandidateControl::ConfirmRelinquished => daemon,
                         CandidateControl::ActivateServing => {
                             let stop = Arc::new(AtomicBool::new(false));
@@ -754,6 +768,9 @@ pub fn run_candidate(
                         &input.source_holder_id,
                         input.source_lease_epoch,
                     )?;
+                    let _ = daemon
+                        .relinquish_endpoint_cleanup()
+                        .map_err(|error| CandidateError::Daemon(error.category()))?;
                     drop(daemon);
                     identity.event = "relinquished".to_owned();
                     write_message(&mut writer, &identity)?;

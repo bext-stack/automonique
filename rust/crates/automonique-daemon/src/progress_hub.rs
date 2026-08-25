@@ -904,6 +904,23 @@ impl ProgressEndpoint {
         self.listener.try_clone().map_err(ProgressEndpointError::Io)
     }
 
+    pub(crate) fn disarm_cleanup(&mut self) {
+        self.remove_socket_on_drop = false;
+    }
+
+    pub(crate) fn arm_cleanup(&mut self) -> Result<(), ProgressEndpointError> {
+        let metadata = fs::symlink_metadata(&self.socket_path)?;
+        if !metadata.file_type().is_socket()
+            || metadata.uid() != geteuid().as_raw()
+            || metadata.mode() & 0o7777 != 0o600
+            || (metadata.dev(), metadata.ino()) != self.socket_identity
+        {
+            return Err(ProgressEndpointError::UnsafeSocket);
+        }
+        self.remove_socket_on_drop = true;
+        Ok(())
+    }
+
     /// Adopt the exact listener supplied by the source generation.
     pub(crate) fn adopt(
         socket_path: impl Into<PathBuf>,
@@ -971,6 +988,13 @@ impl ProgressEndpoint {
     /// this endpoint created, preventing a new subscriber from entering while
     /// the already-admitted writers finish.
     pub(crate) fn begin_shutdown(mut self) -> Option<JoinHandle<()>> {
+        self.stop.store(true, Ordering::Release);
+        self.accept.take()
+    }
+
+    /// Stop and join through the external drainer without dropping the bound
+    /// listener or its exact-inode cleanup guard.
+    pub(crate) fn begin_shutdown_retaining(&mut self) -> Option<JoinHandle<()>> {
         self.stop.store(true, Ordering::Release);
         self.accept.take()
     }
