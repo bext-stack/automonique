@@ -149,20 +149,38 @@ fence; and the generic suite runs against that implementation. Generated
 operation sequences additionally compare it with the reference model across
 reopens.
 
-That binding proves the scheduler core and restart persistence, not an
-automation executor. The live Automation request currently carries only an ID
-and actor, while its registry deliberately stores no schedule, scope, trigger,
-action or approved-effect set. Until that wire and storage decision is made, the
-daemon cannot truthfully derive work to submit or an effect to emit. A committed
-`running` row is also never silently requeued after a crash: it remains an
-ambiguous start for the caller to reconcile, which is how the store preserves
-the no-duplicate-start property.
+That binding proves the scheduler core and restart persistence. The daemon
+integration (M8 #45) is `automonique_daemon::automation_scheduler`: a worker
+that opens the production store above under the generation fence, derives one
+occurrence per due instant from the durable automation registry — whose
+`RegisterAutomation` now carries a canonical schedule, a scope and a bounded
+prompt — admits it as work identified by
+`automation:<automation_id>:<instant>`, and submits what `tick` starts as a
+normal item on the durable synthetic lane under the same key. The three
+properties reach the live surface unchanged: the core's limit bounds how many
+occurrences are on the lane at once, the automation's scope is the core's
+scope, and an operator's pause or archive on the control lane is answered with
+the core's own `cancel` verbs — queued work never starts, running work keeps
+its slot until the lane's terminal commit. A committed `running` row is still
+never silently requeued after a crash: the worker reads the lane back by key
+and either waits on the delivery it finds or hands over the one it never made,
+which is how the no-duplicate-start property survives a restart. The worker
+is also bound by the daemon's three intake gates — disconnected recovery, a
+degraded generation, an operator pause — exactly as the socket's intake arms
+are: under a closed intake it derives nothing and starts nothing, and what
+was due fires once when intake reopens.
+`requirements/automation-goals-and-triggers.md` § *The occurrence key and the
+fence, as built* states the derivation, the catch-up policy, the intake
+gates, the interval floor, retention and what still does not ship (cron,
+triggers, a provider executor behind the prompt).
 
-M8 #45 therefore remains the daemon integration tracker. It inherits
-obligations this document does not restate: fencing writes as well as work
-(#50), boot- and suspend-aware lease time (#51), and the durable cancellation
-ledger (#49). `automonique_protocol::safety_conformance::PENDING_BINDINGS`
-carries that remaining live-surface gap as checkable data.
+The remaining obligations this document does not restate — fencing writes as
+well as work (#50), boot- and suspend-aware lease time (#51), and the durable
+cancellation ledger (#49) — are tracked on their own issues.
+`automonique_protocol::safety_conformance::PENDING_BINDINGS` still names the
+live surface, because the conformance suite itself is bound to the store and
+not to the worker: the worker is proved by its own deterministic tests under a
+fake clock rather than by the generic suite.
 
 ## Provenance
 

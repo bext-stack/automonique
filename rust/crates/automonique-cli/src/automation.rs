@@ -1,32 +1,62 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Operator control of automation enablement.
+//! Operator control of automation jobs.
 //!
-//! `automation register`, `pause`, `resume` and `archive` write one durable
-//! row each; `list` and `detail` read them back. They travel under the
-//! Automation protocol rather than as administration commands — the daemon
-//! places a frame by the protocol its envelope declares — so nothing here
-//! widens the admin lane's closed command set.
+//! `automation register` declares a job — a schedule, a scope and a prompt —
+//! and `pause`, `resume` and `archive` move it along the enablement lattice,
+//! one durable row each; `list` and `detail` read them back with the job's
+//! last and next execution. They travel under the Automation protocol rather
+//! than as administration commands — the daemon places a frame by the protocol
+//! its envelope declares — so nothing here widens the admin lane's closed
+//! command set.
 //!
 //! # What these verbs actually do
 //!
-//! **They record an operator's decision about whether an automation is in
-//! service, and nothing else.** There is no scheduler in this build and no
-//! executor, so:
+//! **They record a job and an operator's decisions about it; the daemon's
+//! scheduler worker acts on the record.** A registered, enabled job fires on
+//! the worker's next tick after its instant is due, as a run on the durable
+//! synthetic lane under the key `automation:<automation-id>:<instant>`; a
+//! paused one derives no new occurrence and has a queued one cancelled; an
+//! archived one never resumes. An accepted write is reported as `accepted`
+//! rather than `done` for exactly that reason: the row is committed and
+//! survives a restart, and what it authorizes happens later and elsewhere.
 //!
-//! - `register` starts nothing;
-//! - `pause` suppresses nothing, because nothing was running to suppress; and
-//! - `resume` resumes nothing.
+//! `--schedule` takes a canonical rendering (`once@<unix-ms>` or
+//! `every@<ms>`) or one of the recognized phrases (`hourly`, `every hour`).
+//! A phrase that resolves to the five-field cron form (`daily`) is refused as
+//! `unsupported_schedule`: the daemon has no cron evaluator, and a schedule it
+//! could not fire is not registered. A fixed interval shorter than one second
+//! (`every@999`) is refused as `interval_too_short`: every firing is a durable
+//! row in the scheduler core and a durable delivery on the run lane, neither
+//! of which is pruned, and the worker looks for due instants four times a
+//! second, so a sub-second interval would grow two tables while mostly
+//! skipping its own instants.
 //!
-//! An accepted write is reported as `accepted` rather than `done` for exactly
-//! that reason: the row is committed and survives a restart, and the decision
-//! it records has nowhere to take effect yet.
+//! # What a pause costs, stated plainly
+//!
+//! `pause` stops new occurrences from being derived and cancels one that is
+//! queued but not yet started; that instant is **skipped for good**, not held
+//! for the resume. For a fixed interval that is one grid instant. For a
+//! `once@` job there is only one instant, so a one-shot paused after its
+//! instant was admitted and before it started is consumed: it shows
+//! `next_fire_at_ms=-` afterwards and does not fire on resume. Register it
+//! again under a new identity to fire it later. An occurrence the lane is
+//! already running is not stopped by a pause — `archive` requests a stop —
+//! and a paused interval automation resumes from its next grid instant, never
+//! with a burst of the instants it spent paused.
+//!
+//! An operator intake pause (the admin lane's `pause_intake`, reported by
+//! `automonique status` as `intake paused: true`) is a different switch: it
+//! closes the run lane to everything, automations included, and a due
+//! occurrence simply waits — unskipped — until intake is resumed, then fires
+//! once.
 //!
 //! # The discipline, mirroring the other verbs
 //!
 //! - **Arguments are judged before the connection.** A misspelled state word, a
-//!   non-numeric revision or a page size outside the protocol's range is an
-//!   operator mistake to report, not a frame to spend. Nothing is clamped.
+//!   non-numeric revision, a page size outside the protocol's range or a
+//!   schedule that is prose is an operator mistake to report, not a frame to
+//!   spend. Nothing is clamped.
 //! - **The cause coupling is judged before the connection too.** `pause` and
 //!   `archive` require a reason and the protocol's own constructor refuses a
 //!   causeless one, so an operator learns immediately rather than after a round
@@ -48,8 +78,9 @@ use std::io::Write;
 
 use automonique_protocol::automation::{AutomationActor, EnablementState};
 use automonique_protocol::automation_api::{
-    AutomationCursor, AutomationId, AutomationPageSize, AutomationRecordView, AutomationRequest,
-    AutomationResponse, AutomationStateFilter, ListAutomations, PauseReason, RegisterAutomation,
+    AutomationApiError, AutomationCursor, AutomationId, AutomationPageSize, AutomationPrompt,
+    AutomationRecordView, AutomationRequest, AutomationResponse, AutomationSchedule,
+    AutomationScope, AutomationStateFilter, ListAutomations, PauseReason, RegisterAutomation,
     SetEnablement, decode_enablement,
 };
 
@@ -58,12 +89,14 @@ use crate::admin_client;
 /// One automation control operation, as argv named it.
 #[derive(Clone)]
 pub(crate) enum Operation {
-    /// Declare one automation, enabled, at revision one.
+    /// Declare one automation job, enabled, at revision one.
     Register {
         /// The identity, then the actor.
         automation_id: OsString,
         /// Who declared it.
         actor: OsString,
+        /// `--schedule`, `--scope` and `--prompt`, each exactly once.
+        flags: Vec<OsString>,
     },
     /// Withdraw one automation from service, resumably.
     Pause {
@@ -172,10 +205,34 @@ fn build(operation: &Operation) -> Result<AutomationRequest, AutomationCliError>
         Operation::Register {
             automation_id,
             actor,
-        } => Ok(AutomationRequest::RegisterAutomation {
-            request_id: correlation("register")?,
-            registration: RegisterAutomation::new(identity(automation_id)?, who(actor)?),
-        }),
+            flags,
+        } => {
+            // The positional words are judged first, in their own order: an
+            // operator who typed nothing where the identity goes hears about
+            // the identity, whatever the flags after it say.
+            let automation_id = identity(automation_id)?;
+            let actor = who(actor)?;
+            let job = job_flags(flags)?;
+            Ok(AutomationRequest::RegisterAutomation {
+                request_id: correlation("register")?,
+                registration: RegisterAutomation::new(
+                    automation_id,
+                    actor,
+                    job.schedule,
+                    job.scope,
+                    job.prompt,
+                )
+                // The two refusals the constructor adds over its parts: an
+                // identity too long to derive an occurrence key from, and a
+                // fixed interval below the registration floor.
+                .map_err(|error| match error {
+                    AutomationApiError::IntervalTooShort { .. } => {
+                        AutomationCliError::Field("interval_too_short")
+                    }
+                    _ => AutomationCliError::Field("invalid_automation_id"),
+                })?,
+            })
+        }
         Operation::Pause {
             automation_id,
             revision,
@@ -247,6 +304,71 @@ fn transition(
             cause,
         )
         .map_err(|_| AutomationCliError::Field("invalid_transition"))?,
+    })
+}
+
+/// The three job flags, each judged by the protocol's own constructor.
+struct JobFlags {
+    schedule: AutomationSchedule,
+    scope: AutomationScope,
+    prompt: AutomationPrompt,
+}
+
+/// Judge `automation register`'s flags and build the job they name.
+///
+/// Each of the three is required exactly once: a job with no schedule fires
+/// never, one with no scope serializes under nothing, and one with no prompt
+/// submits nothing, and none of those is a registration this lane offers a
+/// default for.
+fn job_flags(flags: &[OsString]) -> Result<JobFlags, AutomationCliError> {
+    let mut schedule: Option<AutomationSchedule> = None;
+    let mut scope: Option<AutomationScope> = None;
+    let mut prompt: Option<AutomationPrompt> = None;
+    let mut flags = flags.iter();
+    while let Some(flag) = flags.next() {
+        match flag.to_str() {
+            Some("--schedule") => {
+                if schedule.is_some() {
+                    return Err(AutomationCliError::Field("repeated_flag"));
+                }
+                let expression =
+                    flag_value(&mut flags).ok_or(AutomationCliError::Field("invalid_schedule"))?;
+                schedule = Some(AutomationSchedule::parse(expression).map_err(
+                    |error| match error {
+                        AutomationApiError::UnsupportedSchedule { .. } => {
+                            AutomationCliError::Field("unsupported_schedule")
+                        }
+                        _ => AutomationCliError::Field("invalid_schedule"),
+                    },
+                )?);
+            }
+            Some("--scope") => {
+                if scope.is_some() {
+                    return Err(AutomationCliError::Field("repeated_flag"));
+                }
+                scope = Some(
+                    flag_value(&mut flags)
+                        .and_then(|value| AutomationScope::new(value).ok())
+                        .ok_or(AutomationCliError::Field("invalid_scope"))?,
+                );
+            }
+            Some("--prompt") => {
+                if prompt.is_some() {
+                    return Err(AutomationCliError::Field("repeated_flag"));
+                }
+                prompt = Some(
+                    flag_value(&mut flags)
+                        .and_then(|value| AutomationPrompt::new(value).ok())
+                        .ok_or(AutomationCliError::Field("invalid_prompt"))?,
+                );
+            }
+            _ => return Err(AutomationCliError::Field("invalid_flag")),
+        }
+    }
+    Ok(JobFlags {
+        schedule: schedule.ok_or(AutomationCliError::Field("missing_schedule"))?,
+        scope: scope.ok_or(AutomationCliError::Field("missing_scope"))?,
+        prompt: prompt.ok_or(AutomationCliError::Field("missing_prompt"))?,
     })
 }
 
@@ -351,10 +473,11 @@ fn render(
         }
         (
             AutomationRequest::AutomationDetail { .. },
-            AutomationResponse::AutomationDetail { record, .. },
+            AutomationResponse::AutomationDetail { record, prompt, .. },
         ) => Ok(format!(
-            "Automonique automation: {}\n",
-            render_record(&record)
+            "Automonique automation: {}\nprompt: {}\n",
+            render_record(&record),
+            prompt.as_ref().map_or("-", AutomationPrompt::as_str),
         )),
         (
             AutomationRequest::RegisterAutomation { .. } | AutomationRequest::SetEnablement { .. },
@@ -370,15 +493,16 @@ fn render(
     }
 }
 
-/// One record, every column the daemon reported.
+/// One record, every column the daemon reported but the prompt.
 ///
 /// `resumed_by` is derived rather than stored, and it is printed because it is
 /// the one question the flat columns do not answer at a glance: an `enabled`
 /// row above revision one was put back by somebody, and a never-paused one was
-/// not.
+/// not. The job columns print `-` together for a row registered before jobs
+/// existed, and an execution instant prints `-` until there is one.
 fn render_record(record: &AutomationRecordView) -> String {
     format!(
-        "automation_id={} entry_id={} revision={} enablement={} actor={} cause={} resumed_by={} created_at_ms={} updated_at_ms={}",
+        "automation_id={} entry_id={} revision={} enablement={} actor={} cause={} resumed_by={} created_at_ms={} updated_at_ms={} schedule={} scope={} next_fire_at_ms={} last_fired_at_ms={}",
         record.automation_id(),
         record.entry_id(),
         record.revision(),
@@ -391,6 +515,16 @@ fn render_record(record: &AutomationRecordView) -> String {
         record.resumed_by().map_or("-", AutomationActor::as_str),
         record.created_at().as_millis(),
         record.updated_at().as_millis(),
+        record
+            .schedule()
+            .map_or_else(|| "-".to_owned(), AutomationSchedule::render),
+        record.scope().map_or("-", AutomationScope::as_str),
+        record
+            .next_fire_at()
+            .map_or_else(|| "-".to_owned(), |instant| instant.as_millis().to_string()),
+        record
+            .last_fired_at()
+            .map_or_else(|| "-".to_owned(), |instant| instant.as_millis().to_string()),
     )
 }
 
@@ -446,7 +580,8 @@ mod tests {
 
     use automonique_protocol::automation_api::{
         AutomationContinuation, AutomationListPage, AutomationReceiptView, AutomationRecordParts,
-        AutomationRefusal, MAX_AUTOMATION_API_FIELD_BYTES,
+        AutomationRefusal, MAX_AUTOMATION_API_FIELD_BYTES, MAX_AUTOMATION_PAGE_ITEMS,
+        MAX_SCHEDULED_AUTOMATION_ID_BYTES,
     };
     use automonique_protocol::codec::{RequestId, encode_frame};
     use automonique_protocol::primitives::EpochMillis;
@@ -558,6 +693,24 @@ mod tests {
         }
     }
 
+    /// A registration with the three job flags in the order given.
+    fn register(automation_id: &str, actor: &str, flags: &[&str]) -> Operation {
+        Operation::Register {
+            automation_id: OsString::from(automation_id),
+            actor: OsString::from(actor),
+            flags: flags.iter().map(OsString::from).collect(),
+        }
+    }
+
+    const JOB_FLAGS: [&str; 6] = [
+        "--schedule",
+        "every@60000",
+        "--scope",
+        "workspace:reports",
+        "--prompt",
+        "summarize the night",
+    ];
+
     fn receipt(enablement: EnablementState, revision: u64) -> AutomationReceiptView {
         AutomationReceiptView::new(
             7,
@@ -569,6 +722,7 @@ mod tests {
         .expect("receipt")
     }
 
+    /// A row registered before jobs existed: every job column absent.
     fn row(
         entry_id: u64,
         automation: &str,
@@ -586,6 +740,29 @@ mod tests {
             cause: cause.map(|cause| PauseReason::new(cause).expect("cause")),
             created_at: EpochMillis::from_millis(1_700_000_000_000),
             updated_at: EpochMillis::from_millis(1_700_000_001_000),
+            schedule: None,
+            scope: None,
+            next_fire_at: None,
+            last_fired_at: None,
+        })
+        .expect("record")
+    }
+
+    /// A scheduled row: a one-minute interval that has fired once.
+    fn scheduled_row(entry_id: u64, automation: &str) -> AutomationRecordView {
+        AutomationRecordView::new(AutomationRecordParts {
+            entry_id,
+            automation_id: AutomationId::new(automation).expect("identity"),
+            revision: 1,
+            enablement: EnablementState::Enabled,
+            actor: AutomationActor::new("ben").expect("actor"),
+            cause: None,
+            created_at: EpochMillis::from_millis(1_700_000_000_000),
+            updated_at: EpochMillis::from_millis(1_700_000_000_000),
+            schedule: Some(AutomationSchedule::every(60_000).expect("interval")),
+            scope: Some(AutomationScope::new("workspace:reports").expect("scope")),
+            next_fire_at: Some(EpochMillis::from_millis(1_700_000_120_000)),
+            last_fired_at: Some(EpochMillis::from_millis(1_700_000_060_000)),
         })
         .expect("record")
     }
@@ -598,13 +775,8 @@ mod tests {
             receipt: receipt(EnablementState::Enabled, 1),
         });
 
-        let (exit, stdout, stderr) = invoke(
-            &runtime,
-            &Operation::Register {
-                automation_id: OsString::from("nightly-report"),
-                actor: OsString::from("ben"),
-            },
-        );
+        let (exit, stdout, stderr) =
+            invoke(&runtime, &register("nightly-report", "ben", &JOB_FLAGS));
         assert_eq!(exit, 0, "stderr: {stderr}");
         assert!(stderr.is_empty());
         assert_eq!(
@@ -613,7 +785,7 @@ mod tests {
              enablement=enabled revision=1 updated_at_ms=1700000000000\n",
         );
 
-        // The request the daemon received is the one argv named.
+        // The request the daemon received is the one argv named, job and all.
         let AutomationRequest::RegisterAutomation { registration, .. } =
             server.join().expect("server").expect("served")
         else {
@@ -621,6 +793,48 @@ mod tests {
         };
         assert_eq!(registration.automation_id().as_str(), "nightly-report");
         assert_eq!(registration.actor().as_str(), "ben");
+        assert_eq!(registration.schedule().render(), "every@60000");
+        assert_eq!(registration.scope().as_str(), "workspace:reports");
+        assert_eq!(registration.prompt().as_str(), "summarize the night");
+    }
+
+    /// The flags are judged by the protocol's constructors, in any order, and
+    /// a recognized phrase reaches the wire as its canonical rendering.
+    #[test]
+    fn the_job_flags_are_parsed_in_any_order_and_a_phrase_is_canonicalized() {
+        let runtime = runtime_root();
+        let server = serve_once(listener(&runtime), |request| AutomationResponse::Accepted {
+            request_id: request.request_id().clone(),
+            receipt: receipt(EnablementState::Enabled, 1),
+        });
+        let (exit, _, stderr) = invoke(
+            &runtime,
+            &register(
+                "nightly-report",
+                "ben",
+                &[
+                    "--prompt",
+                    "line one\nline two",
+                    "--scope",
+                    "ws",
+                    "--schedule",
+                    "hourly",
+                ],
+            ),
+        );
+        assert_eq!(exit, 0, "stderr: {stderr}");
+        let AutomationRequest::RegisterAutomation { registration, .. } =
+            server.join().expect("server").expect("served")
+        else {
+            panic!("the client sent something other than a registration")
+        };
+        assert_eq!(registration.schedule().render(), "every@3600000");
+        assert_eq!(registration.scope().as_str(), "ws");
+        assert_eq!(
+            registration.prompt().as_str(),
+            "line one\nline two",
+            "a prompt is prose and keeps its newline"
+        );
     }
 
     #[test]
@@ -700,8 +914,9 @@ mod tests {
                             Some("provider outage"),
                         ),
                         row(3, "gamma", 4, EnablementState::Enabled, "dana", None),
+                        scheduled_row(4, "delta"),
                     ],
-                    AutomationContinuation::More(AutomationCursor::new(3)),
+                    AutomationContinuation::More(AutomationCursor::new(4)),
                 )
                 .expect("page"),
             }
@@ -711,10 +926,11 @@ mod tests {
         assert_eq!(exit, 0, "stderr: {stderr}");
         assert_eq!(
             stdout,
-            "Automonique automations: count=3 more=true next_cursor=3\n\
-             automation_id=alpha entry_id=1 revision=1 enablement=enabled actor=ben cause=- resumed_by=- created_at_ms=1700000000000 updated_at_ms=1700000001000\n\
-             automation_id=beta entry_id=2 revision=2 enablement=paused actor=dana cause=provider outage resumed_by=- created_at_ms=1700000000000 updated_at_ms=1700000001000\n\
-             automation_id=gamma entry_id=3 revision=4 enablement=enabled actor=dana cause=- resumed_by=dana created_at_ms=1700000000000 updated_at_ms=1700000001000\n",
+            "Automonique automations: count=4 more=true next_cursor=4\n\
+             automation_id=alpha entry_id=1 revision=1 enablement=enabled actor=ben cause=- resumed_by=- created_at_ms=1700000000000 updated_at_ms=1700000001000 schedule=- scope=- next_fire_at_ms=- last_fired_at_ms=-\n\
+             automation_id=beta entry_id=2 revision=2 enablement=paused actor=dana cause=provider outage resumed_by=- created_at_ms=1700000000000 updated_at_ms=1700000001000 schedule=- scope=- next_fire_at_ms=- last_fired_at_ms=-\n\
+             automation_id=gamma entry_id=3 revision=4 enablement=enabled actor=dana cause=- resumed_by=dana created_at_ms=1700000000000 updated_at_ms=1700000001000 schedule=- scope=- next_fire_at_ms=- last_fired_at_ms=-\n\
+             automation_id=delta entry_id=4 revision=1 enablement=enabled actor=ben cause=- resumed_by=- created_at_ms=1700000000000 updated_at_ms=1700000000000 schedule=every@60000 scope=workspace:reports next_fire_at_ms=1700000120000 last_fired_at_ms=1700000060000\n",
         );
 
         // Defaults, where argv said nothing.
@@ -781,6 +997,7 @@ mod tests {
                     "dana",
                     Some("provider outage"),
                 ),
+                prompt: None,
             }
         });
         let (exit, stdout, stderr) = invoke(
@@ -794,7 +1011,8 @@ mod tests {
             stdout,
             "Automonique automation: automation_id=beta entry_id=2 revision=2 enablement=paused \
              actor=dana cause=provider outage resumed_by=- created_at_ms=1700000000000 \
-             updated_at_ms=1700000001000\n",
+             updated_at_ms=1700000001000 schedule=- scope=- next_fire_at_ms=- last_fired_at_ms=-\n\
+             prompt: -\n",
         );
         let AutomationRequest::AutomationDetail { automation_id, .. } =
             server.join().expect("server").expect("served")
@@ -802,6 +1020,37 @@ mod tests {
             panic!("the client sent something other than a detail read")
         };
         assert_eq!(automation_id.as_str(), "beta");
+    }
+
+    /// The prompt is the one column a listing omits, and a detail read prints
+    /// it on its own line — it is prose and may carry newlines of its own.
+    #[test]
+    fn a_detail_read_renders_the_job_and_its_prompt() {
+        let runtime = runtime_root();
+        let server = serve_once(listener(&runtime), |request| {
+            AutomationResponse::detail(
+                request.request_id().clone(),
+                scheduled_row(4, "delta"),
+                Some(AutomationPrompt::new("summarize\nthe night").expect("prompt")),
+            )
+            .expect("a coherent detail")
+        });
+        let (exit, stdout, stderr) = invoke(
+            &runtime,
+            &Operation::Detail {
+                automation_id: OsString::from("delta"),
+            },
+        );
+        assert_eq!(exit, 0, "stderr: {stderr}");
+        assert_eq!(
+            stdout,
+            "Automonique automation: automation_id=delta entry_id=4 revision=1 enablement=enabled \
+             actor=ben cause=- resumed_by=- created_at_ms=1700000000000 \
+             updated_at_ms=1700000000000 schedule=every@60000 scope=workspace:reports \
+             next_fire_at_ms=1700000120000 last_fired_at_ms=1700000060000\n\
+             prompt: summarize\nthe night\n",
+        );
+        server.join().expect("server").expect("served");
     }
 
     #[test]
@@ -849,6 +1098,7 @@ mod tests {
             AutomationResponse::AutomationDetail {
                 request_id: request.request_id().clone(),
                 record: row(1, "alpha", 1, EnablementState::Enabled, "ben", None),
+                prompt: None,
             }
         });
         let (exit, stdout, stderr) = invoke(&runtime, &list(&[]));
@@ -868,13 +1118,8 @@ mod tests {
             request_id: RequestId::new("somebody-elses-question").expect("request ID"),
             receipt: receipt(EnablementState::Enabled, 1),
         });
-        let (exit, stdout, stderr) = invoke(
-            &runtime,
-            &Operation::Register {
-                automation_id: OsString::from("nightly-report"),
-                actor: OsString::from("ben"),
-            },
-        );
+        let (exit, stdout, stderr) =
+            invoke(&runtime, &register("nightly-report", "ben", &JOB_FLAGS));
         assert_eq!(exit, 1);
         assert!(stdout.is_empty());
         assert_eq!(
@@ -887,26 +1132,21 @@ mod tests {
     #[test]
     fn arguments_outside_their_grammar_are_refused_before_any_connection() {
         let over_long = "a".repeat(MAX_AUTOMATION_API_FIELD_BYTES + 1);
+        let over_scheduled = "a".repeat(MAX_SCHEDULED_AUTOMATION_ID_BYTES + 1);
         for (operation, expected) in [
+            (register("", "ben", &JOB_FLAGS), "invalid_automation_id"),
             (
-                Operation::Register {
-                    automation_id: OsString::new(),
-                    actor: OsString::from("ben"),
-                },
+                register("night\nly", "ben", &JOB_FLAGS),
                 "invalid_automation_id",
             ),
             (
-                Operation::Register {
-                    automation_id: OsString::from("night\nly"),
-                    actor: OsString::from("ben"),
-                },
+                register(&over_long, "ben", &JOB_FLAGS),
                 "invalid_automation_id",
             ),
+            // An identity the registry could hold but no occurrence key could
+            // carry is refused by the registration itself.
             (
-                Operation::Register {
-                    automation_id: OsString::from(over_long.clone()),
-                    actor: OsString::from("ben"),
-                },
+                register(&over_scheduled, "ben", &JOB_FLAGS),
                 "invalid_automation_id",
             ),
             (
@@ -916,15 +1156,146 @@ mod tests {
                 Operation::Register {
                     automation_id: OsString::from_vec(vec![b'a', 0xff]),
                     actor: OsString::from("ben"),
+                    flags: JOB_FLAGS.iter().map(OsString::from).collect(),
                 },
                 "invalid_automation_id",
             ),
+            (register("nightly-report", "", &JOB_FLAGS), "invalid_actor"),
+            // The job flags: each required once, each judged by grammar.
             (
-                Operation::Register {
-                    automation_id: OsString::from("nightly-report"),
-                    actor: OsString::new(),
-                },
-                "invalid_actor",
+                register("nightly-report", "ben", &["--scope", "ws", "--prompt", "p"]),
+                "missing_schedule",
+            ),
+            (
+                register(
+                    "nightly-report",
+                    "ben",
+                    &["--schedule", "hourly", "--prompt", "p"],
+                ),
+                "missing_scope",
+            ),
+            (
+                register(
+                    "nightly-report",
+                    "ben",
+                    &["--schedule", "hourly", "--scope", "ws"],
+                ),
+                "missing_prompt",
+            ),
+            (
+                register(
+                    "nightly-report",
+                    "ben",
+                    &[
+                        "--schedule",
+                        "hourly",
+                        "--schedule",
+                        "hourly",
+                        "--scope",
+                        "ws",
+                        "--prompt",
+                        "p",
+                    ],
+                ),
+                "repeated_flag",
+            ),
+            (
+                register("nightly-report", "ben", &["--trigger", "manual"]),
+                "invalid_flag",
+            ),
+            (
+                register("nightly-report", "ben", &["--schedule"]),
+                "invalid_schedule",
+            ),
+            (
+                register(
+                    "nightly-report",
+                    "ben",
+                    &[
+                        "--schedule",
+                        "every day at nine",
+                        "--scope",
+                        "ws",
+                        "--prompt",
+                        "p",
+                    ],
+                ),
+                "invalid_schedule",
+            ),
+            (
+                register(
+                    "nightly-report",
+                    "ben",
+                    &["--schedule", "every@0", "--scope", "ws", "--prompt", "p"],
+                ),
+                "invalid_schedule",
+            ),
+            // Below the registration floor: a well-formed schedule the lane
+            // refuses to register, by its own name.
+            (
+                register(
+                    "nightly-report",
+                    "ben",
+                    &["--schedule", "every@999", "--scope", "ws", "--prompt", "p"],
+                ),
+                "interval_too_short",
+            ),
+            // Cron is canonical and is refused by name: the daemon has no
+            // evaluator for it, and `daily` resolves to it.
+            (
+                register(
+                    "nightly-report",
+                    "ben",
+                    &["--schedule", "daily", "--scope", "ws", "--prompt", "p"],
+                ),
+                "unsupported_schedule",
+            ),
+            (
+                register(
+                    "nightly-report",
+                    "ben",
+                    &[
+                        "--schedule",
+                        "cron@0 0 * * *@UTC@skip_missing_fire_first",
+                        "--scope",
+                        "ws",
+                        "--prompt",
+                        "p",
+                    ],
+                ),
+                "unsupported_schedule",
+            ),
+            (
+                register(
+                    "nightly-report",
+                    "ben",
+                    &["--schedule", "hourly", "--scope", "", "--prompt", "p"],
+                ),
+                "invalid_scope",
+            ),
+            (
+                register(
+                    "nightly-report",
+                    "ben",
+                    &["--schedule", "hourly", "--scope", "ws\n1", "--prompt", "p"],
+                ),
+                "invalid_scope",
+            ),
+            (
+                register(
+                    "nightly-report",
+                    "ben",
+                    &["--schedule", "hourly", "--scope", "ws", "--prompt", ""],
+                ),
+                "invalid_prompt",
+            ),
+            (
+                register(
+                    "nightly-report",
+                    "ben",
+                    &["--schedule", "hourly", "--scope", "ws", "--prompt", "a\0b"],
+                ),
+                "invalid_prompt",
             ),
             (
                 Operation::Pause {
@@ -978,7 +1349,10 @@ mod tests {
             (list(&["--cursor", "-1"]), "invalid_cursor"),
             (list(&["--cursor", "1", "--cursor", "2"]), "repeated_flag"),
             (list(&["--page", "0"]), "invalid_page"),
-            (list(&["--page", "33"]), "invalid_page"),
+            (
+                list(&["--page", &(MAX_AUTOMATION_PAGE_ITEMS + 1).to_string()]),
+                "invalid_page",
+            ),
         ] {
             let runtime = runtime_root();
             let listener = listener(&runtime);
@@ -995,8 +1369,9 @@ mod tests {
 
     #[test]
     fn a_page_size_is_reported_rather_than_clamped_into_range() {
-        // `--page 200` is above the protocol ceiling. Serving thirty-two
-        // instead would look identical to a registry that held thirty-two.
+        // `--page 200` is above the protocol ceiling. Serving the ceiling
+        // instead would look identical to a registry that held exactly that
+        // many.
         let runtime = runtime_root();
         let listener = listener(&runtime);
         let (exit, stdout, stderr) = invoke(&runtime, &list(&["--page", "200"]));
@@ -1012,7 +1387,10 @@ mod tests {
             page: AutomationListPage::new(Vec::new(), AutomationContinuation::Complete)
                 .expect("page"),
         });
-        let (exit, _, _) = invoke(&runtime, &list(&["--page", "32"]));
+        let (exit, _, _) = invoke(
+            &runtime,
+            &list(&["--page", &MAX_AUTOMATION_PAGE_ITEMS.to_string()]),
+        );
         assert_eq!(exit, 0);
         server.join().expect("server").expect("served");
     }

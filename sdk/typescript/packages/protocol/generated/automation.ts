@@ -4,7 +4,7 @@
 // Regenerate with: AUTOMONIQUE_PROTOCOL_REGENERATE=1 cargo test -p automonique-protocol --test codegen
 //
 // Source of truth: automonique_protocol::automation_api
-// The native Automation control surface: register an automation, move it along the enablement lattice, read back what an operator decided.
+// The native Automation control surface: register an automation job — a canonical schedule, a serialization scope and a bounded prompt — move it along the enablement lattice, and read back what an operator decided and when the job last fired and next fires.
 //
 // Rust is the wire source of truth. Hand-written SDK code may add
 // ergonomics; it may not redefine anything in this file.
@@ -25,8 +25,8 @@ export const ENABLEMENT_STATES_REQUIRING_CAUSE: readonly string[] = ["paused", "
 /** Maximum canonical message bytes this protocol will assemble or admit. */
 export const MAX_AUTOMATION_CANONICAL_BYTES = 65536;
 
-/** Maximum automations one listing page may carry. Thirty-two rather than the sixty-four the Runs API serves, because an automation row carries three maximal identifiers where a run summary carries one. A longer page is refused rather than truncated: a truncated page that still answered `complete` is a silent drop. */
-export const MAX_AUTOMATION_PAGE_ITEMS = 32;
+/** Maximum automations one listing page may carry. Twenty-four rather than the sixty-four the Runs API serves, because an automation row carries four maximal bounded strings — identity, actor, cause and scope — where a run summary carries one. A longer page is refused rather than truncated: a truncated page that still answered `complete` is a silent drop. */
+export const MAX_AUTOMATION_PAGE_ITEMS = 24;
 
 /** Branded identifier, at most 256 UTF-8 bytes. */
 export type AutomationId = string & {readonly __brand: "AutomationId"};
@@ -40,6 +40,18 @@ export function AutomationId(value: string): AutomationId {
   return value as AutomationId;
 }
 
+/** Branded identifier, at most 97 UTF-8 bytes. */
+export type ScheduledAutomationId = string & {readonly __brand: "ScheduledAutomationId"};
+export const ScheduledAutomationId_MAX_BYTES = 97;
+export const ScheduledAutomationId_PATTERN = /^[^\p{Cc}]+$/u;
+export function ScheduledAutomationId(value: string): ScheduledAutomationId {
+  if (value.length === 0) throw new ValidationError("ScheduledAutomationId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("ScheduledAutomationId", "invalid_character");
+  if (byteLength(value) > 97) throw new ValidationError("ScheduledAutomationId", "too_long");
+  if (!ScheduledAutomationId_PATTERN.test(value)) throw new ValidationError("ScheduledAutomationId", "invalid_character");
+  return value as ScheduledAutomationId;
+}
+
 /** Bounded string, at most 256 UTF-8 bytes. */
 export type AutomationActor = string & {readonly __brand: "AutomationActor"};
 export const AutomationActor_MAX_BYTES = 256;
@@ -50,6 +62,42 @@ export function AutomationActor(value: string): AutomationActor {
   if (byteLength(value) > 256) throw new ValidationError("AutomationActor", "too_long");
   if (!AutomationActor_PATTERN.test(value)) throw new ValidationError("AutomationActor", "invalid_character");
   return value as AutomationActor;
+}
+
+/** Bounded string, at most 8192 UTF-8 bytes. */
+export type AutomationPrompt = string & {readonly __brand: "AutomationPrompt"};
+export const AutomationPrompt_MAX_BYTES = 8192;
+export const AutomationPrompt_PATTERN = /^[^\u0000]+$/u;
+export function AutomationPrompt(value: string): AutomationPrompt {
+  if (value.length === 0) throw new ValidationError("AutomationPrompt", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("AutomationPrompt", "invalid_character");
+  if (byteLength(value) > 8192) throw new ValidationError("AutomationPrompt", "too_long");
+  if (!AutomationPrompt_PATTERN.test(value)) throw new ValidationError("AutomationPrompt", "invalid_character");
+  return value as AutomationPrompt;
+}
+
+/** Bounded string, at most 25 UTF-8 bytes. */
+export type AutomationSchedule = string & {readonly __brand: "AutomationSchedule"};
+export const AutomationSchedule_MAX_BYTES = 25;
+export const AutomationSchedule_PATTERN = /^(once@(0|[1-9][0-9]{0,18})|every@[1-9][0-9]{0,18})$/u;
+export function AutomationSchedule(value: string): AutomationSchedule {
+  if (value.length === 0) throw new ValidationError("AutomationSchedule", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("AutomationSchedule", "invalid_character");
+  if (byteLength(value) > 25) throw new ValidationError("AutomationSchedule", "too_long");
+  if (!AutomationSchedule_PATTERN.test(value)) throw new ValidationError("AutomationSchedule", "invalid_character");
+  return value as AutomationSchedule;
+}
+
+/** Bounded string, at most 160 UTF-8 bytes. */
+export type AutomationScope = string & {readonly __brand: "AutomationScope"};
+export const AutomationScope_MAX_BYTES = 160;
+export const AutomationScope_PATTERN = /^[^\p{Cc}]+$/u;
+export function AutomationScope(value: string): AutomationScope {
+  if (value.length === 0) throw new ValidationError("AutomationScope", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("AutomationScope", "invalid_character");
+  if (byteLength(value) > 160) throw new ValidationError("AutomationScope", "too_long");
+  if (!AutomationScope_PATTERN.test(value)) throw new ValidationError("AutomationScope", "invalid_character");
+  return value as AutomationScope;
 }
 
 /** Bounded string, at most 256 UTF-8 bytes. */
@@ -73,12 +121,12 @@ export function AutomationCursor(value: bigint): AutomationCursor {
   return value as AutomationCursor;
 }
 
-/** Bounded integer in [1, 32]. */
+/** Bounded integer in [1, 24]. */
 export type AutomationPageSize = bigint & {readonly __brand: "AutomationPageSize"};
 export const AutomationPageSize_MIN = 1n;
-export const AutomationPageSize_MAX = 32n;
+export const AutomationPageSize_MAX = 24n;
 export function AutomationPageSize(value: bigint): AutomationPageSize {
-  if (typeof value !== "bigint" || value < 1n || value > 32n) throw new ValidationError("AutomationPageSize", "out_of_range");
+  if (typeof value !== "bigint" || value < 1n || value > 24n) throw new ValidationError("AutomationPageSize", "out_of_range");
   return value as AutomationPageSize;
 }
 
@@ -135,8 +183,11 @@ export const AUTOMATION_FRAME_SIZE = "frame_size";
 /** A body was not the exact shape defined for its kind. */
 export const AUTOMATION_INVALID_BODY = "automation_invalid_body";
 
-/** A bounded identifier, actor or cause was empty, over-long or control-bearing. */
+/** A bounded identifier, actor, cause, scope or prompt was empty, over-long or control-bearing — or an identity too long to derive an occurrence key from. */
 export const AUTOMATION_INVALID_FIELD = "automation_invalid_field";
+
+/** A schedule was not one canonical `once@<ms>` or `every@<ms>` rendering. Rust additionally refuses a canonical cron rendering under its own `automation_unsupported_schedule`; this surface's grammar excludes cron outright and reports it here. */
+export const AUTOMATION_INVALID_SCHEDULE = "automation_invalid_schedule";
 
 /** A requested page size was zero — a page that admits nothing cannot make progress — or above the largest page this protocol serves. */
 export const AUTOMATION_PAGE_SIZE_OUT_OF_RANGE = "automation_page_size_out_of_range";
@@ -165,7 +216,7 @@ export const AUTOMATION_UNWRITTEN_REVISION = "automation_unwritten_revision";
 /** A durable row identity was zero, which names a row no writer produced. */
 export const AUTOMATION_UNWRITTEN_ROW = "automation_unwritten_row";
 
-/** One validated `automations` row. `actor` is the last operator to change enablement, or the registrant while the row is still at revision one; `cause` is present exactly when the state is withdrawn, which only the Rust constructor enforces. There is no history: a resume overwrites the cause of the pause it resumed. */
+/** One validated `automations` row. `actor` is the last operator to change enablement, or the registrant while the row is still at revision one; `cause` is present exactly when the state is withdrawn, which only the Rust constructor enforces. `schedule` and `scope` are present together for a row registered with a job and null together for one registered before jobs existed; `next_fire_at_ms` is the instant the next occurrence is due and `last_fired_at_ms` the scheduled instant of the last one submitted, both null when there is none. There is no history: a resume overwrites the cause of the pause it resumed. */
 export interface AutomationRecord {
   readonly actor: AutomationActor;
   readonly automation_id: AutomationId;
@@ -173,7 +224,11 @@ export interface AutomationRecord {
   readonly created_at_ms: EpochMillis;
   readonly enablement: EnablementState;
   readonly entry_id: DurableRowId;
+  readonly last_fired_at_ms: EpochMillis | null;
+  readonly next_fire_at_ms: EpochMillis | null;
   readonly revision: DurableRowId;
+  readonly schedule: AutomationSchedule | null;
+  readonly scope: AutomationScope | null;
   readonly updated_at_ms: EpochMillis;
 }
 
@@ -185,7 +240,11 @@ export const AutomationRecord_FIELDS: readonly string[] = [
   "created_at_ms",
   "enablement",
   "entry_id",
+  "last_fired_at_ms",
+  "next_fire_at_ms",
   "revision",
+  "schedule",
+  "scope",
   "updated_at_ms",
 ];
 
@@ -200,7 +259,19 @@ export function decodeAutomationRecord(body: JsonValue): AutomationRecord {
     created_at_ms: refuse(AUTOMATION_TIME_BEFORE_EPOCH, () => EpochMillis(bodyInteger(fields, "created_at_ms", AUTOMATION_INVALID_BODY))),
     enablement: refuse(AUTOMATION_UNKNOWN_ENUM_VALUE, () => decodeEnablementState(bodyString(fields, "enablement", AUTOMATION_INVALID_BODY))),
     entry_id: refuse(AUTOMATION_UNWRITTEN_ROW, () => DurableRowId(bodyUnsigned(fields, "entry_id", AUTOMATION_INVALID_BODY))),
+    last_fired_at_ms: mapNullable(bodyIntegerOrNull(fields, "last_fired_at_ms", AUTOMATION_INVALID_BODY), (value) =>
+      refuse(AUTOMATION_TIME_BEFORE_EPOCH, () => EpochMillis(value)),
+    ),
+    next_fire_at_ms: mapNullable(bodyIntegerOrNull(fields, "next_fire_at_ms", AUTOMATION_INVALID_BODY), (value) =>
+      refuse(AUTOMATION_TIME_BEFORE_EPOCH, () => EpochMillis(value)),
+    ),
     revision: refuse(AUTOMATION_UNWRITTEN_REVISION, () => DurableRowId(bodyUnsigned(fields, "revision", AUTOMATION_INVALID_BODY))),
+    schedule: mapNullable(bodyStringOrNull(fields, "schedule", AUTOMATION_INVALID_BODY), (value) =>
+      refuse(AUTOMATION_INVALID_SCHEDULE, () => AutomationSchedule(value)),
+    ),
+    scope: mapNullable(bodyStringOrNull(fields, "scope", AUTOMATION_INVALID_BODY), (value) =>
+      refuse(AUTOMATION_INVALID_FIELD, () => AutomationScope(value)),
+    ),
     updated_at_ms: refuse(AUTOMATION_TIME_BEFORE_EPOCH, () => EpochMillis(bodyInteger(fields, "updated_at_ms", AUTOMATION_INVALID_BODY))),
   };
 }
@@ -306,34 +377,46 @@ export function encodeListAutomations(request_id: RequestId, body: ListAutomatio
   ]);
 }
 
-/** Declare one automation, enabled, at revision one. The initial enablement is not a field: an operator who wants a paused automation registers it and pauses it, and the pause then carries the cause it owes. */
+/** Declare one automation job, enabled, at revision one: a canonical schedule (`once@<ms>` or `every@<ms>`), the scope every occurrence is serialized under, and the prompt every occurrence submits. The initial enablement is not a field: an operator who wants a paused automation registers it and pauses it, and the pause then carries the cause it owes. The identity is bounded by the occurrence key it must derive, which is narrower than the identity a detail read accepts. */
 export const AUTOMATION_REGISTER_AUTOMATION_REQUEST_KIND = "register_automation";
 export interface RegisterAutomationBody {
   readonly actor: AutomationActor;
-  readonly automation_id: AutomationId;
+  readonly automation_id: ScheduledAutomationId;
+  readonly prompt: AutomationPrompt;
+  readonly schedule: AutomationSchedule;
+  readonly scope: AutomationScope;
 }
 
 /** The exact key set this command's wire body carries. */
 export const RegisterAutomationBody_FIELDS: readonly string[] = [
   "actor",
   "automation_id",
+  "prompt",
+  "schedule",
+  "scope",
 ];
 
 /** The exact key set accepted by this generated TypeScript builder. */
 export const RegisterAutomationBody_INPUT_FIELDS: readonly string[] = [
   "actor",
   "automation_id",
+  "prompt",
+  "schedule",
+  "scope",
 ];
 
 export function encodeRegisterAutomation(request_id: RequestId, body: RegisterAutomationBody): Uint8Array {
   exactInputFields(body, RegisterAutomationBody_INPUT_FIELDS, AUTOMATION_INVALID_BODY);
   return encodeAutomationRequest(request_id, AUTOMATION_REGISTER_AUTOMATION_REQUEST_KIND, [
     ["actor", {kind: "string", value: refuse(AUTOMATION_INVALID_FIELD, () => AutomationActor(body.actor))}],
-    ["automation_id", {kind: "string", value: refuse(AUTOMATION_INVALID_FIELD, () => AutomationId(body.automation_id))}],
+    ["automation_id", {kind: "string", value: refuse(AUTOMATION_INVALID_FIELD, () => ScheduledAutomationId(body.automation_id))}],
+    ["prompt", {kind: "string", value: refuse(AUTOMATION_INVALID_FIELD, () => AutomationPrompt(body.prompt))}],
+    ["schedule", {kind: "string", value: refuse(AUTOMATION_INVALID_SCHEDULE, () => AutomationSchedule(body.schedule))}],
+    ["scope", {kind: "string", value: refuse(AUTOMATION_INVALID_FIELD, () => AutomationScope(body.scope))}],
   ]);
 }
 
-/** Move one automation along the enablement lattice, fencing on the revision the caller believes it is moving. Nothing here suppresses anything today: no scheduler reads these rows, and this release contains no executor to stop. */
+/** Move one automation along the enablement lattice, fencing on the revision the caller believes it is moving. The daemon's scheduler worker reads the row on its next tick: a paused or archived automation has its queued occurrence cancelled and no further one derived, and an occurrence already submitted as a run completes on its own. */
 export const AUTOMATION_SET_ENABLEMENT_REQUEST_KIND = "set_enablement";
 export interface SetEnablementBody {
   readonly actor: AutomationActor;
@@ -385,7 +468,7 @@ export function encodeSetEnablement(request_id: RequestId, body: SetEnablementBo
 export const AUTOMATION_REQUEST_KINDS_NOT_GENERATED: readonly string[] = [
 ];
 
-/** One durable write landed. `accepted` rather than `completed`, and the distinction is the honest one: the row is committed, but what it authorizes has not happened and cannot, because no scheduler reads it and no executor exists. */
+/** One durable write landed. `accepted` rather than `completed`, and the distinction is the honest one: the row is committed, and what it authorizes happens later and elsewhere — on the scheduler worker's next tick, as a run with its own durable outcome. */
 export const AUTOMATION_AUTOMATION_ACCEPTED_RESPONSE_KIND = "automation_accepted";
 export interface AutomationAccepted {
   readonly automation_id: AutomationId;
@@ -417,7 +500,7 @@ export function decodeAutomationAccepted(request_id: RequestId, body: JsonValue)
   };
 }
 
-/** One automation in full. The body is a record with no wrapper: what a listing carries in an array is what a detail read answers on its own. */
+/** One automation in full. The body is a record with no wrapper, plus the one column a listing omits: `prompt`, the task every occurrence submits, present exactly when the record carries a job — which only the Rust constructor enforces. */
 export const AUTOMATION_AUTOMATION_DETAIL_RESULT_RESPONSE_KIND = "automation_detail_result";
 export interface AutomationDetailView {
   readonly actor: AutomationActor;
@@ -426,8 +509,13 @@ export interface AutomationDetailView {
   readonly created_at_ms: EpochMillis;
   readonly enablement: EnablementState;
   readonly entry_id: DurableRowId;
+  readonly last_fired_at_ms: EpochMillis | null;
+  readonly next_fire_at_ms: EpochMillis | null;
+  readonly prompt: AutomationPrompt | null;
   readonly request_id: RequestId;
   readonly revision: DurableRowId;
+  readonly schedule: AutomationSchedule | null;
+  readonly scope: AutomationScope | null;
   readonly updated_at_ms: EpochMillis;
 }
 
@@ -439,7 +527,12 @@ export const AutomationDetailView_BODY_FIELDS: readonly string[] = [
   "created_at_ms",
   "enablement",
   "entry_id",
+  "last_fired_at_ms",
+  "next_fire_at_ms",
+  "prompt",
   "revision",
+  "schedule",
+  "scope",
   "updated_at_ms",
 ];
 
@@ -454,8 +547,23 @@ export function decodeAutomationDetailView(request_id: RequestId, body: JsonValu
     created_at_ms: refuse(AUTOMATION_TIME_BEFORE_EPOCH, () => EpochMillis(bodyInteger(fields, "created_at_ms", AUTOMATION_INVALID_BODY))),
     enablement: refuse(AUTOMATION_UNKNOWN_ENUM_VALUE, () => decodeEnablementState(bodyString(fields, "enablement", AUTOMATION_INVALID_BODY))),
     entry_id: refuse(AUTOMATION_UNWRITTEN_ROW, () => DurableRowId(bodyUnsigned(fields, "entry_id", AUTOMATION_INVALID_BODY))),
+    last_fired_at_ms: mapNullable(bodyIntegerOrNull(fields, "last_fired_at_ms", AUTOMATION_INVALID_BODY), (value) =>
+      refuse(AUTOMATION_TIME_BEFORE_EPOCH, () => EpochMillis(value)),
+    ),
+    next_fire_at_ms: mapNullable(bodyIntegerOrNull(fields, "next_fire_at_ms", AUTOMATION_INVALID_BODY), (value) =>
+      refuse(AUTOMATION_TIME_BEFORE_EPOCH, () => EpochMillis(value)),
+    ),
+    prompt: mapNullable(bodyStringOrNull(fields, "prompt", AUTOMATION_INVALID_BODY), (value) =>
+      refuse(AUTOMATION_INVALID_FIELD, () => AutomationPrompt(value)),
+    ),
     request_id: request_id,
     revision: refuse(AUTOMATION_UNWRITTEN_REVISION, () => DurableRowId(bodyUnsigned(fields, "revision", AUTOMATION_INVALID_BODY))),
+    schedule: mapNullable(bodyStringOrNull(fields, "schedule", AUTOMATION_INVALID_BODY), (value) =>
+      refuse(AUTOMATION_INVALID_SCHEDULE, () => AutomationSchedule(value)),
+    ),
+    scope: mapNullable(bodyStringOrNull(fields, "scope", AUTOMATION_INVALID_BODY), (value) =>
+      refuse(AUTOMATION_INVALID_FIELD, () => AutomationScope(value)),
+    ),
     updated_at_ms: refuse(AUTOMATION_TIME_BEFORE_EPOCH, () => EpochMillis(bodyInteger(fields, "updated_at_ms", AUTOMATION_INVALID_BODY))),
   };
 }

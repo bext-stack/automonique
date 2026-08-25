@@ -501,6 +501,7 @@ mod tests {
                 status.with_durable_state(
                     DurableStateCounts::new(DurableStateCountsParts {
                         approvals_recorded: OperationalMetric::Measured(0),
+                        automation_scheduler_workers: OperationalMetric::Measured(1),
                         automations_registered: OperationalMetric::Measured(0),
                         // The generation above is one, and the tenure open over
                         // it has to say the same.

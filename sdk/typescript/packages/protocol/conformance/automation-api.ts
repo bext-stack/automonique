@@ -58,10 +58,14 @@ import {
   AutomationCursor,
   AutomationId,
   AutomationPageSize,
+  AutomationPrompt,
+  AutomationSchedule,
+  AutomationScope,
   DurableRowId,
   PauseReason,
   RefusalError,
   RequestId,
+  ScheduledAutomationId,
   ValidationError,
   assertNeverAutomationResponse,
   decodeAutomationResponse,
@@ -80,6 +84,9 @@ interface Params {
   readonly cause?: string | null;
   readonly expected_revision?: string;
   readonly page_size?: string;
+  readonly prompt?: string;
+  readonly schedule?: string;
+  readonly scope?: string;
   readonly since?: string;
   readonly states?: readonly string[] | null;
   readonly target?: string;
@@ -180,7 +187,16 @@ function branded<T>(make: (value: never) => T, value: unknown, brand: boolean): 
 
 function requiredText(
   params: Params,
-  name: "actor" | "automation_id" | "expected_revision" | "page_size" | "since" | "target",
+  name:
+    | "actor"
+    | "automation_id"
+    | "expected_revision"
+    | "page_size"
+    | "prompt"
+    | "schedule"
+    | "scope"
+    | "since"
+    | "target",
 ): string {
   const value = params[name];
   if (value === undefined) throw new Error(`fixture parameter ${name} is missing`);
@@ -218,7 +234,16 @@ function encodeFixture(
     case AUTOMATION_REGISTER_AUTOMATION_REQUEST_KIND:
       return encodeRegisterAutomation(id, {
         actor: branded(AutomationActor, requiredText(params, "actor"), brand),
-        automation_id: branded(AutomationId, requiredText(params, "automation_id"), brand),
+        // A registration's identity is the narrower brand: the occurrence key
+        // it derives has to fit the durable submit lane's key bound.
+        automation_id: branded(
+          ScheduledAutomationId,
+          requiredText(params, "automation_id"),
+          brand,
+        ),
+        prompt: branded(AutomationPrompt, requiredText(params, "prompt"), brand),
+        schedule: branded(AutomationSchedule, requiredText(params, "schedule"), brand),
+        scope: branded(AutomationScope, requiredText(params, "scope"), brand),
       });
     case AUTOMATION_SET_ENABLEMENT_REQUEST_KIND:
       return encodeSetEnablement(id, {
@@ -253,7 +278,16 @@ function recordSpelling(prefix: string, value: AutomationRecord): Record<string,
     [`${prefix}created_at_ms`]: value.created_at_ms.toString(),
     [`${prefix}enablement`]: value.enablement,
     [`${prefix}entry_id`]: value.entry_id.toString(),
+    // The job columns are null together for a row registered before jobs
+    // existed, and an execution instant is null until there is one. Each
+    // absence is spelled rather than dropped, for the reason the cause's is.
+    [`${prefix}last_fired_at_ms`]:
+      value.last_fired_at_ms === null ? "null" : value.last_fired_at_ms.toString(),
+    [`${prefix}next_fire_at_ms`]:
+      value.next_fire_at_ms === null ? "null" : value.next_fire_at_ms.toString(),
     [`${prefix}revision`]: value.revision.toString(),
+    [`${prefix}schedule`]: value.schedule === null ? "null" : value.schedule,
+    [`${prefix}scope`]: value.scope === null ? "null" : value.scope,
     [`${prefix}updated_at_ms`]: value.updated_at_ms.toString(),
   };
 }
@@ -287,7 +321,14 @@ function spelling(response: AutomationResponse): Record<string, string> {
     }
     case "automation_detail_result": {
       const value = response.value;
-      return {...recordSpelling("", value), request_id: value.request_id};
+      return {
+        ...recordSpelling("", value),
+        // The one column a listing omits, present exactly when the record
+        // carries a job — a relation this surface does not hold and the corpus
+        // records as rust-only.
+        prompt: value.prompt === null ? "null" : value.prompt,
+        request_id: value.request_id,
+      };
     }
     case "revision_conflict":
       return {
@@ -431,8 +472,12 @@ for (const fixture of corpus.rust_only_refusals) {
 const stringConstructors: Readonly<Record<string, (value: string) => string>> = {
   AutomationActor,
   AutomationId,
+  AutomationPrompt,
+  AutomationSchedule,
+  AutomationScope,
   PauseReason,
   RequestId,
+  ScheduledAutomationId,
 };
 const counterConstructors: Readonly<Record<string, (value: bigint) => bigint>> = {
   AutomationCursor,

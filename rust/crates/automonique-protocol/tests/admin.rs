@@ -385,6 +385,56 @@ fn status_response_is_exact_and_round_trips() {
     assert_eq!(durable.open_tenures(), OperationalMetric::Measured(1));
     assert_eq!(durable.open_tenure_epoch(), OperationalMetric::Measured(7));
     assert_eq!(durable.tenures_recorded(), OperationalMetric::Unavailable);
+    assert_eq!(
+        durable.automation_scheduler_workers(),
+        OperationalMetric::Measured(1)
+    );
+}
+
+/// A daemon composes at most one automation scheduler worker, so a status
+/// claiming two is a status describing a daemon that does not exist. Zero (it
+/// stopped) and unavailable (none was composed) are both readings.
+#[test]
+fn the_scheduler_worker_reading_is_at_most_one() {
+    for workers in [
+        OperationalMetric::Measured(0),
+        OperationalMetric::Measured(1),
+        OperationalMetric::Unavailable,
+    ] {
+        let counts = DurableStateCounts::new(DurableStateCountsParts {
+            automation_scheduler_workers: workers,
+            ..parts()
+        })
+        .expect("a reading of zero, one or nothing is coherent");
+        assert_eq!(counts.automation_scheduler_workers(), workers);
+        let bytes = AdminResponse::Status {
+            request_id: request_id(),
+            status: status().with_durable_state(counts).expect("coherent"),
+        }
+        .to_message()
+        .expect("encodes")
+        .to_canonical_bytes();
+        let decoded = AdminResponse::from_canonical_bytes(&bytes).expect("decodes");
+        let AdminResponse::Status { status, .. } = decoded else {
+            panic!("a status decodes as a status")
+        };
+        assert_eq!(
+            status
+                .durable_state()
+                .expect("carried")
+                .automation_scheduler_workers(),
+            workers,
+            "the reading survives the wire unchanged"
+        );
+    }
+    assert_eq!(
+        DurableStateCounts::new(DurableStateCountsParts {
+            automation_scheduler_workers: OperationalMetric::Measured(2),
+            ..parts()
+        })
+        .expect_err("two workers is a daemon that does not exist"),
+        AdminError::InvalidBody
+    );
 }
 
 /// An unread store and an empty store are different facts, and stay different
@@ -474,6 +524,10 @@ fn a_durable_count_missing_from_the_status_body_refuses_the_whole_decode() {
     // would prove much less.
     for (field, renamed_to) in [
         ("approvals_recorded", "approvals_recordex"),
+        (
+            "automation_scheduler_workers",
+            "automation_scheduler_workerx",
+        ),
         ("automations_registered", "automations_registerex"),
         ("open_tenure_epoch", "open_tenure_epocx"),
         ("open_tenures", "open_tenurex"),
@@ -640,6 +694,7 @@ fn status_without_durable_counts_cannot_be_encoded() {
 fn parts() -> DurableStateCountsParts {
     DurableStateCountsParts {
         approvals_recorded: OperationalMetric::Measured(4),
+        automation_scheduler_workers: OperationalMetric::Measured(1),
         automations_registered: OperationalMetric::Measured(0),
         open_tenure_epoch: OperationalMetric::Measured(7),
         open_tenures: OperationalMetric::Measured(1),
@@ -1716,8 +1771,9 @@ mod local_dispatch {
     use automonique_protocol::automation::{AutomationActor, EnablementState};
     use automonique_protocol::automation_api::{
         AUTOMATION_PROTOCOL, AutomationApiError, AutomationCursor, AutomationId,
-        AutomationPageSize, AutomationRequest, AutomationStateFilter, ListAutomations,
-        MAX_AUTOMATION_CANONICAL_BYTES, PauseReason, RegisterAutomation, SetEnablement,
+        AutomationPageSize, AutomationPrompt, AutomationRequest, AutomationSchedule,
+        AutomationScope, AutomationStateFilter, ListAutomations, MAX_AUTOMATION_CANONICAL_BYTES,
+        PauseReason, RegisterAutomation, SetEnablement,
     };
     use automonique_protocol::batch_api::{
         AdvanceMember, BATCH_CONTROL_PROTOCOL, BatchApiError, BatchCursor, BatchPageSize,
@@ -1833,7 +1889,11 @@ mod local_dispatch {
                 registration: RegisterAutomation::new(
                     automation_id("nightly-report"),
                     AutomationActor::new("ben").expect("actor"),
-                ),
+                    AutomationSchedule::every(60_000).expect("interval"),
+                    AutomationScope::new("workspace:reports").expect("scope"),
+                    AutomationPrompt::new("summarize the night").expect("prompt"),
+                )
+                .expect("a scheduled registration"),
             },
             AutomationRequest::SetEnablement {
                 request_id: request_id(),
@@ -2419,6 +2479,10 @@ mod capability {
             "authenticated rollback to the retained compatible release",
         ),
         (9, "durable reload acceptance before asynchronous handoff"),
+        (
+            10,
+            "automation scheduler worker health in the durable-state counts",
+        ),
     ];
 
     /// Every endpoint, at the maturity it had when it landed.

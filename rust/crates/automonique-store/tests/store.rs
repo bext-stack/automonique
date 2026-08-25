@@ -4182,3 +4182,99 @@ fn a_transport_pause_is_fenced_and_refuses_every_malformed_field() {
         "invalid_field"
     );
 }
+
+/// A delivery is located by the coordinate it was submitted under, and its
+/// disposition follows the lane from acceptance to a terminal state — without
+/// a second submission, which the key would dedupe, and without a run
+/// identity the reader may never have seen.
+#[test]
+fn an_inbox_disposition_is_read_by_transport_key_across_the_whole_lane() {
+    let database = PrivateDatabase::new();
+    let mut store = Store::open(database.path()).expect("open");
+    let epoch = lease(&mut store, "holder-a", 1);
+
+    assert_eq!(
+        store
+            .inbox_disposition("local-test", "occurrence:1")
+            .expect("read"),
+        None,
+        "nothing was ever accepted under that key"
+    );
+    let inbox_id = submit(&mut store, "occurrence:1", "scope:a");
+    let pending = store
+        .inbox_disposition("local-test", "occurrence:1")
+        .expect("read")
+        .expect("accepted");
+    assert_eq!(pending.inbox_id, inbox_id);
+    assert_eq!(pending.state, automonique_store::InboxState::Pending);
+    assert_eq!(pending.claimed_run_id, None);
+    assert!(!pending.state.is_terminal());
+    // The key is per transport: another transport's namespace is empty.
+    assert_eq!(
+        store
+            .inbox_disposition("local-other", "occurrence:1")
+            .expect("read"),
+        None
+    );
+
+    let run = claim_next(&mut store, "holder-a", epoch, 2).expect("claim");
+    let claimed = store
+        .inbox_disposition("local-test", "occurrence:1")
+        .expect("read")
+        .expect("still there");
+    assert_eq!(claimed.state, automonique_store::InboxState::Claimed);
+    assert_eq!(claimed.claimed_run_id, Some(run.run_id));
+    assert!(!claimed.state.is_terminal());
+
+    finish_scheduled(&mut store, run.run_id, epoch, 3, "1");
+    let completed = store
+        .inbox_disposition("local-test", "occurrence:1")
+        .expect("read")
+        .expect("still there");
+    assert_eq!(completed.state, automonique_store::InboxState::Completed);
+    assert_eq!(completed.claimed_run_id, Some(run.run_id));
+    assert!(completed.state.is_terminal());
+
+    // A failed run is terminal the other way.
+    submit(&mut store, "occurrence:2", "scope:b");
+    let failing = claim_next(&mut store, "holder-a", epoch, 4).expect("claim");
+    store
+        .finish_run(TerminalRun {
+            run_id: failing.run_id,
+            generation_id: "generation-a",
+            holder_id: "holder-a",
+            lease_epoch: epoch,
+            expected_revision: 1,
+            now_ms: 5,
+            state: TerminalState::Failed,
+            event_kind: "run.failed",
+            event_payload: b"2",
+            outbox_intent_key: "intent:2",
+            outbox_kind: "test.effect",
+            outbox_payload: b"2",
+        })
+        .expect("finish as failed");
+    let failed = store
+        .inbox_disposition("local-test", "occurrence:2")
+        .expect("read")
+        .expect("still there");
+    assert_eq!(failed.state, automonique_store::InboxState::Failed);
+    assert!(failed.state.is_terminal());
+
+    // The coordinate is validated like a submission's, so a key the inbox
+    // could not hold is refused rather than looked up.
+    assert_eq!(
+        store
+            .inbox_disposition("local-test", "")
+            .expect_err("empty key")
+            .category(),
+        "invalid_field"
+    );
+    assert_eq!(
+        store
+            .inbox_disposition("local-test", &"k".repeat(MAX_TRANSPORT_KEY_BYTES + 1))
+            .expect_err("over-long key")
+            .category(),
+        "invalid_field"
+    );
+}

@@ -9,7 +9,7 @@
 //! file and returns only bounded model identifiers.
 
 use std::fs;
-use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::io::{BufRead as _, BufReader, ErrorKind, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -264,27 +264,38 @@ fn read_codex_catalog(provider: &ProviderConfig) -> ModelCatalogRead {
         }
     };
 
-    let request = concat!(
-        "{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"automonique\",\"version\":\"0.1.0\"}}}\n",
-        "{\"method\":\"initialized\"}\n",
-        "{\"id\":2,\"method\":\"model/list\",\"params\":{\"limit\":100,\"includeHidden\":false}}\n"
-    );
-    let Some(mut stdin) = child.stdin.take() else {
+    let Some(stdin) = child.stdin.take() else {
         let _ = child.kill();
         let _ = child.wait();
         return ModelCatalogRead::Unavailable(ModelCatalogUnavailable::ProviderRefused);
     };
-    if stdin.write_all(request.as_bytes()).is_err() || stdin.flush().is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
-        return ModelCatalogRead::Unavailable(ModelCatalogUnavailable::ProviderRefused);
-    }
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
         return ModelCatalogRead::Unavailable(ModelCatalogUnavailable::ProviderRefused);
     };
+    let (result, reader) = exchange_codex_catalog(stdin, stdout);
+    let _ = child.kill();
+    let _ = child.wait();
+    if let Some(reader) = reader {
+        let _ = reader.join();
+    }
+    result
+}
 
+/// Drive the `model/list` exchange over an already-open pipe pair.
+///
+/// The reader thread is draining `stdout` before the request is written. A
+/// provider that answers from its own configuration and exits before it ever
+/// reads the request closes its end of the stdin pipe first, and the write
+/// then fails with `BrokenPipe` while the complete response is already in
+/// flight — so a broken pipe is not a refusal; the bounded read decides. Any
+/// other write failure still is one. Returns the read outcome plus the reader
+/// thread for the caller to join once the provider process is gone.
+fn exchange_codex_catalog(
+    mut stdin: impl Write,
+    stdout: impl Read + Send + 'static,
+) -> (ModelCatalogRead, Option<std::thread::JoinHandle<()>>) {
     let (sender, receiver) = mpsc::sync_channel(1);
     let reader = std::thread::Builder::new()
         .name(String::from("automonique-codex-model-catalog-read"))
@@ -318,6 +329,23 @@ fn read_codex_catalog(provider: &ProviderConfig) -> ModelCatalogRead {
                 }
             }
         });
+    let reader = reader.ok();
+    let request = concat!(
+        "{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"automonique\",\"version\":\"0.1.0\"}}}\n",
+        "{\"method\":\"initialized\"}\n",
+        "{\"id\":2,\"method\":\"model/list\",\"params\":{\"limit\":100,\"includeHidden\":false}}\n"
+    );
+    if let Err(error) = stdin
+        .write_all(request.as_bytes())
+        .and_then(|()| stdin.flush())
+        && error.kind() != ErrorKind::BrokenPipe
+    {
+        drop(stdin);
+        return (
+            ModelCatalogRead::Unavailable(ModelCatalogUnavailable::ProviderRefused),
+            reader,
+        );
+    }
     let result = match receiver.recv_timeout(CATALOG_READ_TIMEOUT) {
         Ok(Some(value)) => decode_codex_catalog_response(&value),
         Ok(None) => ModelCatalogRead::Unavailable(ModelCatalogUnavailable::InvalidResponse),
@@ -328,13 +356,8 @@ fn read_codex_catalog(provider: &ProviderConfig) -> ModelCatalogRead {
             ModelCatalogRead::Unavailable(ModelCatalogUnavailable::ProviderRefused)
         }
     };
-    let _ = child.kill();
-    let _ = child.wait();
     drop(stdin);
-    if let Ok(reader) = reader {
-        let _ = reader.join();
-    }
-    result
+    (result, reader)
 }
 
 fn decode_codex_catalog_response(value: &Value) -> ModelCatalogRead {
@@ -726,6 +749,64 @@ mod tests {
         assert_eq!(
             fs::read_to_string(home.join("invocation")).expect("invocation marker"),
             "app-server --stdio"
+        );
+    }
+
+    /// A request sink that fails every write with one fixed error kind, the
+    /// way a provider that already exited closes its end of the stdin pipe.
+    struct RefusingWriter(ErrorKind);
+
+    impl Write for RefusingWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(self.0))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const ANSWERED_CATALOG: &[u8] = b"{\"id\":2,\"result\":{\"data\":[{\"id\":\"gpt-5.6-sol\",\"model\":\"gpt-5.6-sol\",\"hidden\":false,\"isDefault\":true}],\"nextCursor\":null}}\n";
+
+    #[test]
+    fn a_provider_that_answers_and_exits_before_reading_the_request_is_not_refused() {
+        let (read, reader) = exchange_codex_catalog(
+            RefusingWriter(ErrorKind::BrokenPipe),
+            std::io::Cursor::new(ANSWERED_CATALOG.to_vec()),
+        );
+        reader
+            .expect("reader thread")
+            .join()
+            .expect("reader thread joins");
+        let ModelCatalogRead::Available(catalog) = &read else {
+            panic!("an answered catalog must survive the closed request pipe: {read:?}");
+        };
+        assert_eq!(
+            &catalog.models,
+            vec![AvailableModel {
+                id: String::from("gpt-5.6-sol"),
+                is_default: true,
+            }]
+            .as_slice()
+        );
+    }
+
+    #[test]
+    fn any_other_request_write_failure_remains_a_provider_refusal() {
+        let (read, reader) = exchange_codex_catalog(
+            RefusingWriter(ErrorKind::Other),
+            std::io::Cursor::new(ANSWERED_CATALOG.to_vec()),
+        );
+        reader
+            .expect("reader thread")
+            .join()
+            .expect("reader thread joins");
+        assert!(
+            matches!(
+                read,
+                ModelCatalogRead::Unavailable(ModelCatalogUnavailable::ProviderRefused)
+            ),
+            "{read:?}"
         );
     }
 

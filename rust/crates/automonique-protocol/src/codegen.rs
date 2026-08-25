@@ -100,9 +100,10 @@
 //! `identity` and `workspace`. The rich `automation` model is absent too: only
 //! the two vocabularies `automation_api` borrows from it —
 //! [`crate::automation::EnablementState`] and
-//! [`crate::automation::AutomationActor`] — reach the generated surface, and a
-//! schedule, a trigger and an action do not, because the control API carries
-//! none of them. Within `admin`, the synthetic
+//! [`crate::automation::AutomationActor`] — reach the generated surface, plus
+//! the schedule *rendering* the control API carries as a bounded string
+//! (`once@<ms>` or `every@<ms>`); a trigger, an action and the cron form do
+//! not, because the control API carries none of them. Within `admin`, the synthetic
 //! intake, the reconciliation and outbox commands, and the evidence bodies
 //! their responses carry are all absent — as is the `status_result` body
 //! decoder, whose *types* `admin-status.ts` carries without a decoder that
@@ -2463,10 +2464,14 @@ fn admin_status_module() -> GeneratedModule {
                 doc: "What the daemon's durable stores hold, counted while the status was \
                       answered. Each field is one read of one store and they are not one \
                       transaction; a store that could not be counted is `unavailable`, never \
-                      zero."
+                      zero. `automation_scheduler_workers` reads the worker with custody of \
+                      the automation registry and the scheduler core rather than a store: one \
+                      on its thread, zero when it stopped on a fault, `unavailable` when none \
+                      was composed."
                     .to_owned(),
                 fields: vec![
                     required("approvals_recorded", "OperationalMetric"),
+                    required("automation_scheduler_workers", "OperationalMetric"),
                     required("automations_registered", "OperationalMetric"),
                     required("open_tenure_epoch", "OperationalMetric"),
                     required("open_tenures", "OperationalMetric"),
@@ -3643,18 +3648,54 @@ fn automation_integer_field(
 /// TypeScript name of the branded automation identity.
 const AUTOMATION_ID: &str = "AutomationId";
 
+/// TypeScript name of the narrower identity a registration accepts.
+///
+/// A scheduled identity is bounded by the occurrence key it must derive rather
+/// than by the registry grammar, so the register builder re-applies this brand
+/// and not [`AUTOMATION_ID`]; a detail read still takes the wider one, because
+/// a row registered before schedules existed is still readable.
+const SCHEDULED_AUTOMATION_ID: &str = "ScheduledAutomationId";
+
+/// TypeScript name of the serialization scope.
+const AUTOMATION_SCOPE: &str = "AutomationScope";
+
+/// TypeScript name of the occurrence prompt.
+const AUTOMATION_PROMPT: &str = "AutomationPrompt";
+
+/// TypeScript name of the canonical schedule rendering.
+const AUTOMATION_SCHEDULE: &str = "AutomationSchedule";
+
+/// The two schedule forms this lane carries, as one grammar.
+///
+/// `once@` followed by a non-negative canonical decimal, or `every@` followed
+/// by a positive one: no sign, no leading zero, at most nineteen digits. The
+/// cron form is outside it, so a generated builder refuses it before a frame
+/// is spent — under this lane's invalid-schedule category rather than Rust's
+/// typed unsupported one, which is the one place the two sides spell the same
+/// refusal differently and is documented beside the corpus.
+const SCHEDULE_RENDERING: &str = "^(once@(0|[1-9][0-9]{0,18})|every@[1-9][0-9]{0,18})$";
+
+/// Free text under the durable submit lane's task rule: anything but NUL.
+const NO_NUL: &str = "^[^\\u0000]+$";
+
 /// TypeScript name of the branded listing position.
 const AUTOMATION_CURSOR: &str = "AutomationCursor";
 
 /// TypeScript name of the withdrawal reason.
 const PAUSE_REASON: &str = "PauseReason";
 
-/// The eight columns one `automations` row carries, as a reader decodes them.
+/// The twelve columns one `automations` row carries, as a reader decodes them.
 ///
-/// One list, used twice: a record travels inside a listing page and *as* a
-/// detail answer's whole body, and the two readings cannot be allowed to drift
-/// into disagreeing about a column. The Rust side has the same shape for the
-/// same reason — `AutomationRecordView::from_body` is what both go through.
+/// One list, used twice: a record travels inside a listing page and as the
+/// whole of a detail answer's body but its prompt, and the two readings cannot
+/// be allowed to drift into disagreeing about a column. The Rust side has the
+/// same shape for the same reason — `AutomationRecordView::from_members` is
+/// what both go through.
+///
+/// The job columns are nullable on the wire because a row registered before
+/// schedules existed carries none; that they are null *together* is a
+/// cross-field rule the Rust constructor holds and this surface does not, and
+/// `tests/codegen.rs` records that gap as a rust-only refusal.
 fn automation_record_fields() -> Vec<ResponseField> {
     vec![
         automation_checked_field("actor", "AutomationActor"),
@@ -3674,12 +3715,40 @@ fn automation_record_fields() -> Vec<ResponseField> {
         ),
         automation_enum_field("enablement", "EnablementState"),
         automation_integer_field("entry_id", DURABLE_ROW_ID, "AUTOMATION_UNWRITTEN_ROW", true),
+        ResponseField {
+            name: "last_fired_at_ms".to_owned(),
+            value: ResponseValue::NullableInteger {
+                type_name: EPOCH_MILLIS.to_owned(),
+                refusal_category: "AUTOMATION_TIME_BEFORE_EPOCH".to_owned(),
+            },
+        },
+        ResponseField {
+            name: "next_fire_at_ms".to_owned(),
+            value: ResponseValue::NullableInteger {
+                type_name: EPOCH_MILLIS.to_owned(),
+                refusal_category: "AUTOMATION_TIME_BEFORE_EPOCH".to_owned(),
+            },
+        },
         automation_integer_field(
             "revision",
             DURABLE_ROW_ID,
             "AUTOMATION_UNWRITTEN_REVISION",
             true,
         ),
+        ResponseField {
+            name: "schedule".to_owned(),
+            value: ResponseValue::NullableChecked {
+                type_name: AUTOMATION_SCHEDULE.to_owned(),
+                refusal_category: "AUTOMATION_INVALID_SCHEDULE".to_owned(),
+            },
+        },
+        ResponseField {
+            name: "scope".to_owned(),
+            value: ResponseValue::NullableChecked {
+                type_name: AUTOMATION_SCOPE.to_owned(),
+                refusal_category: "AUTOMATION_INVALID_FIELD".to_owned(),
+            },
+        },
         automation_integer_field(
             "updated_at_ms",
             EPOCH_MILLIS,
@@ -3689,13 +3758,35 @@ fn automation_record_fields() -> Vec<ResponseField> {
     ]
 }
 
+/// A detail answer's body: the record's twelve columns and the prompt.
+fn automation_detail_fields() -> Vec<ResponseField> {
+    let mut fields = automation_record_fields();
+    let position = fields
+        .iter()
+        .position(|field| field.name.as_str() > "prompt")
+        .unwrap_or(fields.len());
+    fields.insert(
+        position,
+        ResponseField {
+            name: "prompt".to_owned(),
+            value: ResponseValue::NullableChecked {
+                type_name: AUTOMATION_PROMPT.to_owned(),
+                refusal_category: "AUTOMATION_INVALID_FIELD".to_owned(),
+            },
+        },
+    );
+    fields
+}
+
 /// The `automonique.automation` control surface: what an operator asks, and
 /// what it decodes.
 fn automation_module() -> GeneratedModule {
     GeneratedModule {
         file_name: module_file_name(AUTOMATION_MODULE),
-        doc: "The native Automation control surface: register an automation, move it along the \
-              enablement lattice, read back what an operator decided."
+        doc: "The native Automation control surface: register an automation job — a canonical \
+              schedule, a serialization scope and a bounded prompt — move it along the \
+              enablement lattice, and read back what an operator decided and when the job last \
+              fired and next fires."
             .to_owned(),
         source: "automonique_protocol::automation_api".to_owned(),
         // A name is declared in exactly one module. A correlation identifier, a
@@ -3755,25 +3846,35 @@ fn automation_module() -> GeneratedModule {
             },
             Constant {
                 name: "MAX_AUTOMATION_PAGE_ITEMS".to_owned(),
-                doc: "Maximum automations one listing page may carry. Thirty-two rather than the \
-                      sixty-four the Runs API serves, because an automation row carries three \
-                      maximal identifiers where a run summary carries one. A longer page is \
-                      refused rather than truncated: a truncated page that still answered \
-                      `complete` is a silent drop."
+                doc: "Maximum automations one listing page may carry. Twenty-four rather than the \
+                      sixty-four the Runs API serves, because an automation row carries four \
+                      maximal bounded strings — identity, actor, cause and scope — where a run \
+                      summary carries one. A longer page is refused rather than truncated: a \
+                      truncated page that still answered `complete` is a silent drop."
                     .to_owned(),
                 value: ConstantValue::Count(crate::automation_api::MAX_AUTOMATION_PAGE_ITEMS),
             },
         ],
-        branded_ids: vec![BrandedId {
-            // Deliberately *not* the `DurableId` grammar, which additionally
-            // forbids whitespace. The registry stores any non-empty, bounded,
-            // control-free identifier, and a wire type stricter than the table
-            // would make a stored row unreadable through the only surface that
-            // serves it.
-            name: AUTOMATION_ID.to_owned(),
-            max_bytes: crate::automation_api::MAX_AUTOMATION_API_FIELD_BYTES,
-            pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),
-        }],
+        branded_ids: vec![
+            BrandedId {
+                // Deliberately *not* the `DurableId` grammar, which additionally
+                // forbids whitespace. The registry stores any non-empty, bounded,
+                // control-free identifier, and a wire type stricter than the table
+                // would make a stored row unreadable through the only surface that
+                // serves it.
+                name: AUTOMATION_ID.to_owned(),
+                max_bytes: crate::automation_api::MAX_AUTOMATION_API_FIELD_BYTES,
+                pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),
+            },
+            BrandedId {
+                // The same grammar at the narrower bound a registration
+                // applies: the occurrence key derived from the identity must
+                // fit the durable submit lane's key bound.
+                name: SCHEDULED_AUTOMATION_ID.to_owned(),
+                max_bytes: crate::automation_api::MAX_SCHEDULED_AUTOMATION_ID_BYTES,
+                pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),
+            },
+        ],
         bounded_strings: vec![
             BoundedString {
                 name: "AutomationActor".to_owned(),
@@ -3786,6 +3887,26 @@ fn automation_module() -> GeneratedModule {
                 name: PAUSE_REASON.to_owned(),
                 max_bytes: crate::automation_api::MAX_AUTOMATION_API_FIELD_BYTES,
                 pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),
+            },
+            BoundedString {
+                // The durable submit lane's scope grammar, at the scheduler
+                // core's narrower identifier ceiling: an occurrence's scope is
+                // admitted by both.
+                name: AUTOMATION_SCOPE.to_owned(),
+                max_bytes: crate::automation_api::MAX_AUTOMATION_SCOPE_BYTES,
+                pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),
+            },
+            BoundedString {
+                // Prose, not an identifier: a newline is text and only NUL is
+                // refused, which is the durable submit lane's task rule.
+                name: AUTOMATION_PROMPT.to_owned(),
+                max_bytes: crate::automation_api::MAX_AUTOMATION_PROMPT_BYTES,
+                pattern: Some(NO_NUL.to_owned()),
+            },
+            BoundedString {
+                name: AUTOMATION_SCHEDULE.to_owned(),
+                max_bytes: crate::automation_api::MAX_AUTOMATION_SCHEDULE_BYTES,
+                pattern: Some(SCHEDULE_RENDERING.to_owned()),
             },
         ],
         bounded_integers: vec![
@@ -3853,12 +3974,20 @@ fn automation_module() -> GeneratedModule {
                 ),
                 automation_category(
                     "AUTOMATION_INVALID_FIELD",
-                    "A bounded identifier, actor or cause was empty, over-long or \
-                     control-bearing.",
+                    "A bounded identifier, actor, cause, scope or prompt was empty, over-long or \
+                     control-bearing — or an identity too long to derive an occurrence key from.",
                     &AutomationApiError::Field {
                         field: "automation_id",
                         error: ValueError::Empty,
                     },
+                ),
+                automation_category(
+                    "AUTOMATION_INVALID_SCHEDULE",
+                    "A schedule was not one canonical `once@<ms>` or `every@<ms>` rendering. \
+                     Rust additionally refuses a canonical cron rendering under its own \
+                     `automation_unsupported_schedule`; this surface's grammar excludes cron \
+                     outright and reports it here.",
+                    &AutomationApiError::InvalidSchedule,
                 ),
                 automation_category(
                     "AUTOMATION_PAGE_SIZE_OUT_OF_RANGE",
@@ -3962,8 +4091,12 @@ fn automation_module() -> GeneratedModule {
                 doc: "One validated `automations` row. `actor` is the last operator to change \
                       enablement, or the registrant while the row is still at revision one; \
                       `cause` is present exactly when the state is withdrawn, which only the Rust \
-                      constructor enforces. There is no history: a resume overwrites the cause of \
-                      the pause it resumed."
+                      constructor enforces. `schedule` and `scope` are present together for a \
+                      row registered with a job and null together for one registered before \
+                      jobs existed; `next_fire_at_ms` is the instant the next occurrence is due \
+                      and `last_fired_at_ms` the scheduled instant of the last one submitted, \
+                      both null when there is none. There is no history: a resume overwrites \
+                      the cause of the pause it resumed."
                     .to_owned(),
                 fields: automation_record_fields(),
             }],
@@ -3971,14 +4104,28 @@ fn automation_module() -> GeneratedModule {
                 RequestCommand {
                     kind: "register_automation".to_owned(),
                     name: "RegisterAutomation".to_owned(),
-                    doc: "Declare one automation, enabled, at revision one. The initial \
+                    doc: "Declare one automation job, enabled, at revision one: a canonical \
+                          schedule (`once@<ms>` or `every@<ms>`), the scope every occurrence is \
+                          serialized under, and the prompt every occurrence submits. The initial \
                           enablement is not a field: an operator who wants a paused automation \
                           registers it and pauses it, and the pause then carries the cause it \
-                          owes."
+                          owes. The identity is bounded by the occurrence key it must derive, \
+                          which is narrower than the identity a detail read accepts."
                         .to_owned(),
                     fields: vec![
                         checked_field("actor", "AutomationActor", "AUTOMATION_INVALID_FIELD"),
-                        checked_field("automation_id", AUTOMATION_ID, "AUTOMATION_INVALID_FIELD"),
+                        checked_field(
+                            "automation_id",
+                            SCHEDULED_AUTOMATION_ID,
+                            "AUTOMATION_INVALID_FIELD",
+                        ),
+                        checked_field("prompt", AUTOMATION_PROMPT, "AUTOMATION_INVALID_FIELD"),
+                        checked_field(
+                            "schedule",
+                            AUTOMATION_SCHEDULE,
+                            "AUTOMATION_INVALID_SCHEDULE",
+                        ),
+                        checked_field("scope", AUTOMATION_SCOPE, "AUTOMATION_INVALID_FIELD"),
                     ],
                     coupling: None,
                 },
@@ -3986,9 +4133,10 @@ fn automation_module() -> GeneratedModule {
                     kind: "set_enablement".to_owned(),
                     name: "SetEnablement".to_owned(),
                     doc: "Move one automation along the enablement lattice, fencing on the \
-                          revision the caller believes it is moving. Nothing here suppresses \
-                          anything today: no scheduler reads these rows, and this release \
-                          contains no executor to stop."
+                          revision the caller believes it is moving. The daemon's scheduler \
+                          worker reads the row on its next tick: a paused or archived automation \
+                          has its queued occurrence cancelled and no further one derived, and an \
+                          occurrence already submitted as a run completes on its own."
                         .to_owned(),
                     fields: vec![
                         checked_field("actor", "AutomationActor", "AUTOMATION_INVALID_FIELD"),
@@ -4089,9 +4237,9 @@ fn automation_module() -> GeneratedModule {
                     kind: "automation_accepted".to_owned(),
                     name: "AutomationAccepted".to_owned(),
                     doc: "One durable write landed. `accepted` rather than `completed`, and the \
-                          distinction is the honest one: the row is committed, but what it \
-                          authorizes has not happened and cannot, because no scheduler reads it \
-                          and no executor exists."
+                          distinction is the honest one: the row is committed, and what it \
+                          authorizes happens later and elsewhere — on the scheduler worker's \
+                          next tick, as a run with its own durable outcome."
                         .to_owned(),
                     fields: vec![
                         automation_checked_field("automation_id", AUTOMATION_ID),
@@ -4148,14 +4296,16 @@ fn automation_module() -> GeneratedModule {
                 ResponseDecoder {
                     kind: "automation_detail_result".to_owned(),
                     name: "AutomationDetailView".to_owned(),
-                    // The body *is* a record: unlike a run detail, there is no
-                    // wrapper key and nothing nested beside it. The fields come
+                    // The body is a record plus its prompt: unlike a run
+                    // detail, there is no wrapper key. The record fields come
                     // from the same list the nested body object is built from,
                     // so the two readings cannot drift apart.
-                    doc: "One automation in full. The body is a record with no wrapper: what a \
-                          listing carries in an array is what a detail read answers on its own."
+                    doc: "One automation in full. The body is a record with no wrapper, plus the \
+                          one column a listing omits: `prompt`, the task every occurrence \
+                          submits, present exactly when the record carries a job — which only \
+                          the Rust constructor enforces."
                         .to_owned(),
-                    fields: automation_record_fields(),
+                    fields: automation_detail_fields(),
                 },
                 ResponseDecoder {
                     kind: "revision_conflict".to_owned(),

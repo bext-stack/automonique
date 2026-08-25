@@ -18,9 +18,10 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use automonique_store::automation_store::{
-    AUTOMATION_STORE_SCHEMA_VERSION, AutomationRecord, AutomationRegistration, AutomationStore,
-    EnablementState, EnablementTransition, MAX_AUTOMATION_PAGE, MAX_AUTOMATIONS,
-    MAX_IDENTIFIER_BYTES,
+    AUTOMATION_STORE_SCHEMA_VERSION, AutomationJob, AutomationJobSpec, AutomationRecord,
+    AutomationRegistration, AutomationSchedule, AutomationStore, EnablementState,
+    EnablementTransition, MAX_AUTOMATION_PAGE, MAX_AUTOMATIONS, MAX_IDENTIFIER_BYTES,
+    MAX_PROMPT_BYTES,
 };
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -53,12 +54,36 @@ fn registry() -> (PrivateRegistry, AutomationStore) {
     (private, opened)
 }
 
+/// The one representative job every registration here carries: a fixed
+/// interval of one minute, first due one minute after the registration instant.
+fn job() -> AutomationJobSpec<'static> {
+    AutomationJobSpec {
+        schedule: AutomationSchedule::Every {
+            interval_ms: 60_000,
+        },
+        scope: "workspace:reports",
+        prompt: "summarize the night",
+        first_fire_at_ms: 61_000,
+    }
+}
+
 fn declared(automation_id: &str) -> AutomationRegistration<'_> {
     AutomationRegistration {
         automation_id,
         actor: "ops:ada",
         now_ms: 1_000,
+        job: job(),
     }
+}
+
+/// The job half of one row, or a panic naming the row that lost it.
+fn job_of(store: &AutomationStore, automation_id: &str) -> AutomationJob {
+    store
+        .entry(automation_id)
+        .expect("entry")
+        .expect("a row")
+        .job
+        .expect("a row registered with a job")
 }
 
 fn change<'a>(
@@ -229,6 +254,21 @@ fn a_registered_automation_reads_back_enabled_at_revision_one() {
         None,
         "a freshly declared automation was never paused, so nobody resumed it"
     );
+    // The job reads back whole, first due where the caller said, with no
+    // occurrence active and none fired.
+    assert_eq!(
+        record.job,
+        Some(AutomationJob {
+            schedule: AutomationSchedule::Every {
+                interval_ms: 60_000
+            },
+            scope: "workspace:reports".to_owned(),
+            prompt: "summarize the night".to_owned(),
+            next_fire_at_ms: Some(61_000),
+            last_fired_at_ms: None,
+            active_occurrence_ms: None,
+        })
+    );
 
     assert_eq!(store.automation_count().expect("count"), 1);
     assert!(store.entry("auto:absent").expect("absent").is_none());
@@ -300,6 +340,7 @@ fn identifiers_and_times_outside_the_grammar_are_refused() {
                 automation_id: "auto:nightly",
                 actor,
                 now_ms: 1_000,
+                job: job(),
             })
             .expect_err("actor refusal");
         assert_eq!(error.category(), "invalid_field");
@@ -311,6 +352,7 @@ fn identifiers_and_times_outside_the_grammar_are_refused() {
             automation_id: "auto:nightly",
             actor: "ops:ada",
             now_ms: -1,
+            job: job(),
         })
         .expect_err("time refusal");
     assert_eq!(error.category(), "invalid_field");
@@ -365,6 +407,7 @@ fn identifiers_and_times_outside_the_grammar_are_refused() {
             automation_id: &exact,
             actor: &exact,
             now_ms: 1_000,
+            job: job(),
         })
         .expect("boundary register");
     store
@@ -1429,4 +1472,728 @@ fn a_null_never_slips_the_cause_coupling() {
         raw.execute(&statement, [])
             .unwrap_or_else(|error| panic!("the database must admit {what}: {error}"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// The job, and where its occurrences have got to
+// ---------------------------------------------------------------------------
+
+/// The v1 table, exactly as the previous build created it, so a migration
+/// starts from what is really on disk rather than from a stand-in.
+const SCHEMA_V1_AS_SHIPPED: &str = r#"
+CREATE TABLE automations (
+    entry_id INTEGER PRIMARY KEY,
+    automation_id TEXT NOT NULL UNIQUE,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    enablement TEXT NOT NULL CHECK (
+        enablement IN ('enabled', 'paused', 'archived')
+    ),
+    actor TEXT NOT NULL,
+    cause TEXT,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0),
+    CHECK ((enablement = 'enabled') = (cause IS NULL))
+) STRICT;
+
+CREATE INDEX automations_by_enablement ON automations(enablement, entry_id);
+"#;
+
+/// A registry the previous build wrote: two rows, one of them paused, and no
+/// job column anywhere.
+fn v1_registry() -> PrivateRegistry {
+    let private = PrivateRegistry::new();
+    let raw = Connection::open(private.path()).expect("create v1 registry");
+    raw.execute_batch(SCHEMA_V1_AS_SHIPPED).expect("v1 schema");
+    raw.pragma_update(None, "user_version", 1u32)
+        .expect("stamp v1");
+    raw.execute(
+        "INSERT INTO automations
+         (automation_id, revision, enablement, actor, cause, created_at_ms, updated_at_ms)
+         VALUES ('legacy:enabled', 1, 'enabled', 'ops:ada', NULL, 10, 10),
+                ('legacy:paused', 2, 'paused', 'ops:bob', 'held', 10, 20)",
+        [],
+    )
+    .expect("v1 rows");
+    drop(raw);
+    // A raw connection creates the file world-readable; the previous build
+    // created it private, and the registry refuses anything else.
+    fs::set_permissions(private.path(), fs::Permissions::from_mode(0o600))
+        .expect("private registry file");
+    private
+}
+
+#[test]
+fn a_version_one_registry_migrates_forward_and_its_rows_read_back_without_a_job() {
+    let private = v1_registry();
+    let mut store = AutomationStore::open(private.path()).expect("open migrates");
+    let version: u32 = Connection::open(private.path())
+        .expect("raw read")
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("user_version");
+    assert_eq!(version, AUTOMATION_STORE_SCHEMA_VERSION);
+
+    // Every column the previous build wrote is exactly where it was, and the
+    // job half is absent rather than defaulted.
+    let enabled = store
+        .entry("legacy:enabled")
+        .expect("entry")
+        .expect("the legacy row survived");
+    assert_eq!(enabled.revision, 1);
+    assert_eq!(enabled.enablement, EnablementState::Enabled);
+    assert_eq!(enabled.actor, "ops:ada");
+    assert_eq!(enabled.job, None);
+    assert!(enabled.admits_occurrence());
+    let paused = store
+        .entry("legacy:paused")
+        .expect("entry")
+        .expect("the paused legacy row survived");
+    assert_eq!(paused.enablement, EnablementState::Paused);
+    assert_eq!(paused.cause.as_deref(), Some("held"));
+    assert_eq!(paused.job, None);
+
+    // A row with no job is never due and admits nothing, whatever `now` is.
+    assert!(store.due(i64::MAX, 8).expect("due").is_empty());
+    assert!(store.active_occurrences(8).expect("active").is_empty());
+    assert_eq!(
+        store
+            .admit_occurrence("legacy:enabled", 0)
+            .expect_err("no job to admit under")
+            .category(),
+        "unscheduled"
+    );
+
+    // It still moves along the lattice exactly as before.
+    store
+        .transition(change(
+            "legacy:paused",
+            2,
+            EnablementState::Enabled,
+            "ops:ada",
+            None,
+        ))
+        .expect("a legacy row resumes");
+
+    // And the widened table takes a new registration, which is due and lists
+    // after the legacy rows in registration order.
+    store.register(declared("auto:nightly")).expect("register");
+    let due = store.due(61_000, 8).expect("due");
+    assert_eq!(identities(&due), vec!["auto:nightly"]);
+    assert_eq!(
+        identities(&store.page(0, 8).expect("page").entries),
+        vec!["legacy:enabled", "legacy:paused", "auto:nightly"]
+    );
+
+    // Reopening does not migrate twice.
+    drop(store);
+    let reopened = AutomationStore::open(private.path()).expect("reopen a v2 registry");
+    assert_eq!(reopened.automation_count().expect("count"), 3);
+}
+
+/// The couplings a fresh registry holds as table constraints cannot be added
+/// to a migrated one, so the read path holds them there instead.
+#[test]
+fn a_migrated_registry_refuses_half_a_job_on_read() {
+    let private = v1_registry();
+    drop(AutomationStore::open(private.path()).expect("migrate"));
+
+    let raw = Connection::open(private.path()).expect("raw write");
+    raw.execute(
+        "UPDATE automations SET scope = 'workspace:reports' WHERE automation_id = 'legacy:enabled'",
+        [],
+    )
+    .expect("a migrated table has no coupling constraint to refuse this");
+    drop(raw);
+
+    let store = AutomationStore::open(private.path()).expect("reopen");
+    let error = store
+        .entry("legacy:enabled")
+        .expect_err("half a job is corruption");
+    assert_eq!(error.category(), "corrupt");
+    assert!(error.to_string().contains("job"));
+    // The untouched row beside it still reads.
+    assert!(store.entry("legacy:paused").expect("entry").is_some());
+}
+
+#[test]
+fn a_fresh_registry_refuses_half_a_job_in_the_database_itself() {
+    let (private, store) = registry();
+    drop(store);
+
+    let raw = Connection::open(private.path()).expect("raw write");
+    let row = |automation_id: &str, job_columns: &str| {
+        format!(
+            "INSERT INTO automations
+                 (automation_id, revision, enablement, actor, cause, created_at_ms, updated_at_ms,
+                  schedule_kind, schedule_at_ms, schedule_interval_ms, scope, prompt,
+                  next_fire_at_ms, last_fired_at_ms, active_occurrence_ms)
+             VALUES ('{automation_id}', 1, 'enabled', 'operator', NULL, 0, 0, {job_columns})"
+        )
+    };
+    for (what, columns) in [
+        (
+            "a scope with no schedule",
+            "NULL, NULL, NULL, 'ws', NULL, NULL, NULL, NULL",
+        ),
+        (
+            "a prompt with no schedule",
+            "NULL, NULL, NULL, NULL, 'p', NULL, NULL, NULL",
+        ),
+        (
+            "a next instant with no schedule",
+            "NULL, NULL, NULL, NULL, NULL, 5, NULL, NULL",
+        ),
+        (
+            "a one-shot with no instant",
+            "'once', NULL, NULL, 'ws', 'p', 5, NULL, NULL",
+        ),
+        (
+            "an interval carrying a one-shot instant",
+            "'every', 5, 60000, 'ws', 'p', 5, NULL, NULL",
+        ),
+        (
+            "an interval of zero",
+            "'every', NULL, 0, 'ws', 'p', 5, NULL, NULL",
+        ),
+        (
+            "a schedule kind outside the vocabulary",
+            "'cron', NULL, NULL, 'ws', 'p', 5, NULL, NULL",
+        ),
+        (
+            "a scheduled row with no scope",
+            "'every', NULL, 60000, NULL, 'p', 5, NULL, NULL",
+        ),
+    ] {
+        assert!(
+            raw.execute(&row("auto:bad", columns), []).is_err(),
+            "the database must refuse {what}"
+        );
+    }
+    // Tightness: both legal shapes still land.
+    raw.execute(
+        &row("auto:once", "'once', 5, NULL, 'ws', 'p', 5, NULL, NULL"),
+        [],
+    )
+    .expect("a one-shot lands");
+    raw.execute(
+        &row("auto:every", "'every', NULL, 60000, 'ws', 'p', 5, 0, 5"),
+        [],
+    )
+    .expect("an interval with an active occurrence lands");
+    raw.execute(
+        &row(
+            "auto:bare",
+            "NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL",
+        ),
+        [],
+    )
+    .expect("a row with no job lands");
+    drop(raw);
+
+    let store = AutomationStore::open(private.path()).expect("reopen");
+    assert_eq!(
+        job_of(&store, "auto:once").schedule,
+        AutomationSchedule::Once { at_ms: 5 }
+    );
+    assert_eq!(job_of(&store, "auto:every").active_occurrence_ms, Some(5));
+    assert_eq!(
+        store.entry("auto:bare").expect("entry").expect("a row").job,
+        None
+    );
+}
+
+#[test]
+fn a_job_outside_its_grammar_is_refused_before_a_row_is_written() {
+    let (_private, mut store) = registry();
+    let over_long_prompt = "p".repeat(MAX_PROMPT_BYTES + 1);
+    let over_long_scope = "s".repeat(MAX_IDENTIFIER_BYTES + 1);
+    fn with(job: AutomationJobSpec<'_>) -> AutomationRegistration<'_> {
+        AutomationRegistration {
+            automation_id: "auto:nightly",
+            actor: "ops:ada",
+            now_ms: 1_000,
+            job,
+        }
+    }
+    for (field, spec) in [
+        ("scope", AutomationJobSpec { scope: "", ..job() }),
+        (
+            "scope",
+            AutomationJobSpec {
+                scope: "ws\n1",
+                ..job()
+            },
+        ),
+        (
+            "scope",
+            AutomationJobSpec {
+                scope: &over_long_scope,
+                ..job()
+            },
+        ),
+        (
+            "prompt",
+            AutomationJobSpec {
+                prompt: "",
+                ..job()
+            },
+        ),
+        (
+            "prompt",
+            AutomationJobSpec {
+                prompt: "a\0b",
+                ..job()
+            },
+        ),
+        (
+            "prompt",
+            AutomationJobSpec {
+                prompt: &over_long_prompt,
+                ..job()
+            },
+        ),
+        (
+            "schedule",
+            AutomationJobSpec {
+                schedule: AutomationSchedule::Every { interval_ms: 0 },
+                ..job()
+            },
+        ),
+        (
+            "schedule",
+            AutomationJobSpec {
+                schedule: AutomationSchedule::Once { at_ms: -1 },
+                ..job()
+            },
+        ),
+        (
+            "first_fire_at_ms",
+            AutomationJobSpec {
+                first_fire_at_ms: -1,
+                ..job()
+            },
+        ),
+    ] {
+        let error = store
+            .register(with(spec))
+            .expect_err("a job outside its grammar is refused");
+        assert_eq!(error.category(), "invalid_field", "{field}");
+        assert!(error.to_string().contains(field), "{field}: {error}");
+    }
+    assert_eq!(store.automation_count().expect("count"), 0);
+
+    // A prompt is prose: a newline is text, and the bound itself is admitted.
+    store
+        .register(with(AutomationJobSpec {
+            prompt: "line one\nline two",
+            ..job()
+        }))
+        .expect("a multi-line prompt");
+    let exact = "p".repeat(MAX_PROMPT_BYTES);
+    store
+        .register(AutomationRegistration {
+            automation_id: "auto:maximal",
+            actor: "ops:ada",
+            now_ms: 1_000,
+            job: AutomationJobSpec {
+                prompt: &exact,
+                ..job()
+            },
+        })
+        .expect("a prompt at the bound");
+    assert_eq!(
+        job_of(&store, "auto:maximal").prompt.len(),
+        MAX_PROMPT_BYTES
+    );
+}
+
+#[test]
+fn due_answers_from_the_caller_s_clock_oldest_instant_first() {
+    let (_private, mut store) = registry();
+    fn at(automation_id: &str, first_fire_at_ms: i64) -> AutomationRegistration<'_> {
+        AutomationRegistration {
+            automation_id,
+            actor: "ops:ada",
+            now_ms: 1_000,
+            job: AutomationJobSpec {
+                first_fire_at_ms,
+                ..job()
+            },
+        }
+    }
+    store.register(at("auto:late", 3_000)).expect("register");
+    store.register(at("auto:early", 2_000)).expect("register");
+    store.register(at("auto:later", 4_000)).expect("register");
+    store.register(at("auto:same", 2_000)).expect("register");
+
+    // Nothing is due before its instant; at the instant it is.
+    assert!(store.due(1_999, 8).expect("due").is_empty());
+    assert_eq!(
+        identities(&store.due(2_000, 8).expect("due")),
+        vec!["auto:early", "auto:same"],
+        "equal instants order by registration"
+    );
+    assert_eq!(
+        identities(&store.due(5_000, 8).expect("due")),
+        vec!["auto:early", "auto:same", "auto:late", "auto:later"]
+    );
+    // The batch is bounded, and the bound is the page bound.
+    assert_eq!(
+        identities(&store.due(5_000, 2).expect("due")),
+        vec!["auto:early", "auto:same"]
+    );
+    for limit in [0, MAX_AUTOMATION_PAGE + 1] {
+        assert_eq!(
+            store
+                .due(5_000, limit)
+                .expect_err("limit refusal")
+                .category(),
+            "invalid_field"
+        );
+    }
+    assert_eq!(
+        store.due(-1, 8).expect_err("time refusal").category(),
+        "invalid_field"
+    );
+
+    // A withdrawn automation is not due, and neither is one with an
+    // occurrence already active.
+    store
+        .transition(change(
+            "auto:early",
+            1,
+            EnablementState::Paused,
+            "ops:ada",
+            Some("held"),
+        ))
+        .expect("pause");
+    store.admit_occurrence("auto:same", 2_000).expect("admit");
+    assert_eq!(
+        identities(&store.due(5_000, 8).expect("due")),
+        vec!["auto:late", "auto:later"]
+    );
+    assert_eq!(
+        identities(&store.active_occurrences(8).expect("active")),
+        vec!["auto:same"]
+    );
+}
+
+#[test]
+fn an_occurrence_is_admitted_advanced_and_settled_by_compare_and_set() {
+    let (_private, mut store) = registry();
+    store.register(declared("auto:nightly")).expect("register");
+
+    // Admission names the instant that is due, and nothing else.
+    assert_eq!(
+        store
+            .admit_occurrence("auto:nightly", 60_999)
+            .expect_err("not the due instant")
+            .category(),
+        "occurrence_mismatch"
+    );
+    store
+        .admit_occurrence("auto:nightly", 61_000)
+        .expect("admit the due instant");
+    let admitted = job_of(&store, "auto:nightly");
+    assert_eq!(admitted.active_occurrence_ms, Some(61_000));
+    assert_eq!(
+        admitted.next_fire_at_ms,
+        Some(61_000),
+        "admission advances nothing"
+    );
+    assert_eq!(admitted.last_fired_at_ms, None);
+    // A second admission — a replayed tick — is a mismatch, not a second
+    // occurrence.
+    assert_eq!(
+        store
+            .admit_occurrence("auto:nightly", 61_000)
+            .expect_err("already active")
+            .category(),
+        "occurrence_mismatch"
+    );
+    assert!(store.due(i64::MAX, 8).expect("due").is_empty());
+
+    // Settling as fired before the advance is refused: the instant would stay
+    // due and fire again.
+    assert_eq!(
+        store
+            .settle_occurrence("auto:nightly", 61_000, true)
+            .expect_err("advance first")
+            .category(),
+        "occurrence_mismatch"
+    );
+
+    // The advance applies once; its replay answers false and changes nothing.
+    assert!(
+        store
+            .advance_after_start("auto:nightly", 61_000, Some(121_000))
+            .expect("advance")
+    );
+    assert!(
+        !store
+            .advance_after_start("auto:nightly", 61_000, Some(181_000))
+            .expect("a replayed advance")
+    );
+    assert_eq!(
+        job_of(&store, "auto:nightly").next_fire_at_ms,
+        Some(121_000),
+        "the replay kept the first successor"
+    );
+    // A successor that does not follow the instant is refused outright.
+    assert_eq!(
+        store
+            .advance_after_start("auto:nightly", 61_000, Some(61_000))
+            .expect_err("a successor is later than its instant")
+            .category(),
+        "invalid_field"
+    );
+    // And the advance is about the active instant, not any instant.
+    assert_eq!(
+        store
+            .advance_after_start("auto:nightly", 121_000, Some(181_000))
+            .expect_err("not the active instant")
+            .category(),
+        "occurrence_mismatch"
+    );
+
+    // Settling as fired clears the active occurrence and records the instant.
+    store
+        .settle_occurrence("auto:nightly", 61_000, true)
+        .expect("settle");
+    let settled = job_of(&store, "auto:nightly");
+    assert_eq!(settled.active_occurrence_ms, None);
+    assert_eq!(settled.last_fired_at_ms, Some(61_000));
+    assert_eq!(settled.next_fire_at_ms, Some(121_000));
+    // A replayed settle is a mismatch: nothing is active to settle.
+    assert_eq!(
+        store
+            .settle_occurrence("auto:nightly", 61_000, true)
+            .expect_err("nothing active")
+            .category(),
+        "occurrence_mismatch"
+    );
+    // The row is due again at its successor and nowhere before it.
+    assert!(store.due(120_999, 8).expect("due").is_empty());
+    assert_eq!(
+        identities(&store.due(121_000, 8).expect("due")),
+        vec!["auto:nightly"]
+    );
+
+    // A one-shot advances to nothing further, and settles.
+    store
+        .register(AutomationRegistration {
+            automation_id: "auto:once",
+            actor: "ops:ada",
+            now_ms: 1_000,
+            job: AutomationJobSpec {
+                schedule: AutomationSchedule::Once { at_ms: 5_000 },
+                first_fire_at_ms: 5_000,
+                ..job()
+            },
+        })
+        .expect("register a one-shot");
+    store.admit_occurrence("auto:once", 5_000).expect("admit");
+    assert!(
+        store
+            .advance_after_start("auto:once", 5_000, None)
+            .expect("advance to nothing")
+    );
+    store
+        .settle_occurrence("auto:once", 5_000, true)
+        .expect("settle");
+    let exhausted = job_of(&store, "auto:once");
+    assert_eq!(exhausted.next_fire_at_ms, None);
+    assert_eq!(exhausted.last_fired_at_ms, Some(5_000));
+    assert!(
+        store
+            .due(i64::MAX, 8)
+            .expect("due")
+            .iter()
+            .all(|record| record.automation_id != "auto:once"),
+        "an exhausted one-shot is never due again"
+    );
+    assert_eq!(
+        store
+            .admit_occurrence("auto:once", 5_000)
+            .expect_err("nothing is due")
+            .category(),
+        "occurrence_mismatch"
+    );
+}
+
+/// An occurrence that never started keeps the instant it was due at, unless
+/// the caller advanced past it on purpose; either way the row is no longer
+/// active and nothing is recorded as fired.
+#[test]
+fn settling_an_occurrence_that_never_fired_records_no_firing() {
+    let (_private, mut store) = registry();
+    store.register(declared("auto:kept")).expect("register");
+    store.register(declared("auto:skipped")).expect("register");
+    store.admit_occurrence("auto:kept", 61_000).expect("admit");
+    store
+        .admit_occurrence("auto:skipped", 61_000)
+        .expect("admit");
+
+    // Kept: the instant stays due, so a resume fires it.
+    store
+        .settle_occurrence("auto:kept", 61_000, false)
+        .expect("settle unfired");
+    let kept = job_of(&store, "auto:kept");
+    assert_eq!(kept.active_occurrence_ms, None);
+    assert_eq!(kept.last_fired_at_ms, None);
+    assert_eq!(kept.next_fire_at_ms, Some(61_000));
+
+    // Skipped: the caller advanced first, so the instant is gone for good.
+    assert!(
+        store
+            .advance_after_start("auto:skipped", 61_000, Some(121_000))
+            .expect("advance")
+    );
+    store
+        .settle_occurrence("auto:skipped", 61_000, false)
+        .expect("settle unfired");
+    let skipped = job_of(&store, "auto:skipped");
+    assert_eq!(skipped.active_occurrence_ms, None);
+    assert_eq!(skipped.last_fired_at_ms, None);
+    assert_eq!(skipped.next_fire_at_ms, Some(121_000));
+}
+
+#[test]
+fn occurrence_verbs_name_what_they_refuse() {
+    let (_private, mut store) = registry();
+    for (what, error) in [
+        (
+            "admit an unregistered automation",
+            store
+                .admit_occurrence("auto:absent", 0)
+                .expect_err("absent"),
+        ),
+        (
+            "advance an unregistered automation",
+            store
+                .advance_after_start("auto:absent", 0, None)
+                .expect_err("absent"),
+        ),
+        (
+            "settle an unregistered automation",
+            store
+                .settle_occurrence("auto:absent", 0, false)
+                .expect_err("absent"),
+        ),
+    ] {
+        assert_eq!(error.category(), "not_found", "{what}");
+    }
+    store.register(declared("auto:nightly")).expect("register");
+    for (what, error) in [
+        (
+            "admit at a negative instant",
+            store
+                .admit_occurrence("auto:nightly", -1)
+                .expect_err("negative"),
+        ),
+        (
+            "advance to a negative successor",
+            store
+                .advance_after_start("auto:nightly", 61_000, Some(-1))
+                .expect_err("negative"),
+        ),
+        (
+            "admit an ungrammatical identity",
+            store
+                .admit_occurrence("", 61_000)
+                .expect_err("empty identity"),
+        ),
+    ] {
+        assert_eq!(error.category(), "invalid_field", "{what}");
+    }
+    // A paused automation admits nothing, and says the row is not where the
+    // caller believed rather than that it is unregistered.
+    store
+        .transition(change(
+            "auto:nightly",
+            1,
+            EnablementState::Paused,
+            "ops:ada",
+            Some("held"),
+        ))
+        .expect("pause");
+    assert_eq!(
+        store
+            .admit_occurrence("auto:nightly", 61_000)
+            .expect_err("withdrawn")
+            .category(),
+        "occurrence_mismatch"
+    );
+    // The occurrence bookkeeping survived the pause untouched, and the row is
+    // still not due because it is withdrawn.
+    assert_eq!(job_of(&store, "auto:nightly").next_fire_at_ms, Some(61_000));
+    assert!(store.due(i64::MAX, 8).expect("due").is_empty());
+}
+
+/// The bookkeeping is durable: what one handle admitted, a fresh handle on the
+/// same file finds active, which is what a restarted worker reconciles from.
+#[test]
+fn an_active_occurrence_survives_close_and_reopen() {
+    let private = PrivateRegistry::new();
+    let mut store = AutomationStore::open(private.path()).expect("open");
+    store.register(declared("auto:nightly")).expect("register");
+    store
+        .admit_occurrence("auto:nightly", 61_000)
+        .expect("admit");
+    assert!(
+        store
+            .advance_after_start("auto:nightly", 61_000, Some(121_000))
+            .expect("advance")
+    );
+    drop(store);
+
+    let mut reopened = AutomationStore::open(private.path()).expect("reopen");
+    let active = reopened.active_occurrences(8).expect("active");
+    assert_eq!(identities(&active), vec!["auto:nightly"]);
+    let job = active[0].job.clone().expect("a job");
+    assert_eq!(job.active_occurrence_ms, Some(61_000));
+    assert_eq!(job.next_fire_at_ms, Some(121_000));
+    assert!(reopened.due(i64::MAX, 8).expect("due").is_empty());
+    reopened
+        .settle_occurrence("auto:nightly", 61_000, true)
+        .expect("the reopened handle settles what the first admitted");
+    assert_eq!(
+        job_of(&reopened, "auto:nightly").last_fired_at_ms,
+        Some(61_000)
+    );
+}
+
+#[test]
+fn the_two_schedule_spellings_are_the_stored_vocabulary() {
+    assert_eq!(AutomationSchedule::Once { at_ms: 0 }.kind(), "once");
+    assert_eq!(AutomationSchedule::Every { interval_ms: 1 }.kind(), "every");
+    let (private, mut store) = registry();
+    store.register(declared("auto:every")).expect("register");
+    store
+        .register(AutomationRegistration {
+            automation_id: "auto:once",
+            actor: "ops:ada",
+            now_ms: 1_000,
+            job: AutomationJobSpec {
+                schedule: AutomationSchedule::Once { at_ms: 5_000 },
+                first_fire_at_ms: 5_000,
+                ..job()
+            },
+        })
+        .expect("register");
+    drop(store);
+    let raw = Connection::open(private.path()).expect("raw read");
+    let kinds: Vec<(String, String)> = raw
+        .prepare("SELECT automation_id, schedule_kind FROM automations ORDER BY entry_id")
+        .expect("statement")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("rows")
+        .collect::<Result<_, _>>()
+        .expect("kinds");
+    assert_eq!(
+        kinds,
+        vec![
+            ("auto:every".to_owned(), "every".to_owned()),
+            ("auto:once".to_owned(), "once".to_owned()),
+        ]
+    );
 }
