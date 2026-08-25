@@ -1252,6 +1252,7 @@ impl From<StoreError> for DaemonError {
 
 /// An opened daemon whose runtime and store are ready.
 pub struct Daemon {
+    config: DaemonConfig,
     listener: UnixListener,
     socket_path: PathBuf,
     store: Store,
@@ -1266,6 +1267,7 @@ pub struct Daemon {
     telegram: telegram::TelegramHost,
     /// Configured-channel Slack ticket intake and confirmation lifecycle.
     slack_tickets: slack::SlackTicketHost,
+    ticket_gates: Arc<Mutex<telegram_bridge::TicketGateRegistry>>,
     run_submissions: RunSubmissionLog,
     /// The listing read model derived from `run_submissions`.
     ///
@@ -1370,6 +1372,7 @@ pub struct Daemon {
     /// closing is compare-and-set on it, and a constant here would be this
     /// crate asserting a fact about another crate's schema.
     tenure_revision: u64,
+    handoff_quiesced: bool,
     execution_state: automonique_protocol::admin::ExecutionState,
     /// The one settable input to the approval requirement every launch is
     /// composed against.
@@ -1803,7 +1806,7 @@ impl Daemon {
                     execution_state,
                 },
                 slack,
-                ticket_gates,
+                Arc::clone(&ticket_gates),
             )
             .map_err(|error| DaemonError::TelegramRefused(error.category()))?
         };
@@ -2002,6 +2005,7 @@ impl Daemon {
         socket_cleanup.disarm();
 
         Ok(Self {
+            config: config.clone(),
             listener,
             socket_path,
             store,
@@ -2015,6 +2019,7 @@ impl Daemon {
             reconciliation_run_id: None,
             telegram,
             slack_tickets,
+            ticket_gates,
             run_submissions,
             run_index,
             platform,
@@ -2031,6 +2036,7 @@ impl Daemon {
             generation_audit,
             reload_audit,
             tenure_revision: tenure.revision,
+            handoff_quiesced: false,
             execution_state,
             configured_approval_requirement,
             approval_lifetime,
@@ -2223,6 +2229,249 @@ impl Daemon {
             ))?
             .retarget(renewed.epoch)
             .map_err(|error| DaemonError::AttemptAdoptionFailed(error.category()))?;
+        Ok(())
+    }
+
+    /// Stop every source intake/transport worker while retaining only live
+    /// attempts and their epoch-pinned cancellation route for N+1 adoption.
+    pub fn quiesce_for_handoff(&mut self) -> Result<(), DaemonError> {
+        if self.disconnected_recovery || self.handoff_quiesced {
+            return Err(DaemonError::ProtocolRefused("handoff_state"));
+        }
+        self.handoff_quiesced = true;
+        let mut workers = Vec::new();
+        workers.extend(named_shutdown_workers(
+            "managed_tui",
+            self.managed_tui.begin_shutdown(),
+        ));
+        if let Some(progress_endpoint) = self.progress_endpoint.as_mut() {
+            workers.extend(named_shutdown_workers(
+                "progress_endpoint",
+                progress_endpoint.begin_shutdown_retaining(),
+            ));
+        }
+        workers.extend(named_shutdown_workers(
+            "slack_tickets",
+            self.slack_tickets.begin_shutdown(),
+        ));
+        workers.extend(named_shutdown_workers(
+            "ticket_intake",
+            self.ticket_intake.begin_shutdown(),
+        ));
+        workers.extend(named_shutdown_workers(
+            "telegram",
+            self.telegram.begin_shutdown(),
+        ));
+        let drained = drain_shutdown_workers(
+            workers,
+            Duration::from_millis(
+                u64::try_from(LEASE_RENEW_INTERVAL_MS)
+                    .expect("renewal interval is a positive constant"),
+            ),
+            SHUTDOWN_WORKER_DIAGNOSTIC_BUDGET,
+            || {
+                self.renew_lease().and_then(|()| {
+                    self.telegram
+                        .renew()
+                        .map_err(|error| DaemonError::TelegramRefused(error.category()))
+                })
+            },
+            |observation| {
+                let _ = structured_log::emit_shutdown_worker_drain(
+                    observation.worker_group,
+                    observation.worker_ordinal,
+                    observation.phase.as_str(),
+                    observation.elapsed_ms,
+                    observation.budget_ms,
+                );
+            },
+        );
+        let telegram_release = self
+            .telegram
+            .release()
+            .map_err(|error| DaemonError::TelegramRefused(error.category()));
+        drained.and(telegram_release)
+    }
+
+    /// Restore a quiesced source after pre-transfer failure or an accepted
+    /// E+2 authority return.
+    pub fn resume_after_handoff(&mut self) -> Result<(), DaemonError> {
+        if !self.handoff_quiesced {
+            return Err(DaemonError::ProtocolRefused("handoff_state"));
+        }
+        self.rebuild_handoff_workers()?;
+        self.handoff_quiesced = false;
+        Ok(())
+    }
+
+    /// Drain source-owned attempts after N+1 proved active, then retire the
+    /// adoption route and its sole cancellation dispatcher.
+    pub fn retire_after_handoff(&mut self) -> Result<(), DaemonError> {
+        if !self.handoff_quiesced {
+            return Err(DaemonError::ProtocolRefused("handoff_state"));
+        }
+        let workers = self.execution.take().map_or_else(Vec::new, |execution| {
+            named_shutdown_workers("execution", execution.begin_shutdown())
+        });
+        drain_shutdown_workers(
+            workers,
+            Duration::from_millis(
+                u64::try_from(LEASE_RENEW_INTERVAL_MS)
+                    .expect("renewal interval is a positive constant"),
+            ),
+            SHUTDOWN_WORKER_DIAGNOSTIC_BUDGET,
+            || Ok::<(), DaemonError>(()),
+            |observation| {
+                let _ = structured_log::emit_shutdown_worker_drain(
+                    observation.worker_group,
+                    observation.worker_ordinal,
+                    observation.phase.as_str(),
+                    observation.elapsed_ms,
+                    observation.budget_ms,
+                );
+            },
+        )?;
+        if let Some(attempt_adoption) = self.attempt_adoption.take() {
+            drain_shutdown_workers(
+                named_shutdown_workers("attempt_adoption", attempt_adoption.begin_shutdown()),
+                Duration::from_millis(100),
+                SHUTDOWN_WORKER_DIAGNOSTIC_BUDGET,
+                || Ok::<(), DaemonError>(()),
+                |_| {},
+            )?;
+        }
+        self.attempt_host.take().map_or(Ok(()), |host| {
+            Arc::try_unwrap(host).map_or(
+                Err(DaemonError::AttemptHostFailed("attempt_host_still_shared")),
+                |host| {
+                    host.dispose()
+                        .map_err(|error| DaemonError::AttemptHostFailed(error.category()))
+                },
+            )
+        })
+    }
+
+    fn rebuild_handoff_workers(&mut self) -> Result<(), DaemonError> {
+        let now_ms = unix_millis()?;
+        let generation_queues_clean =
+            startup_queues_clean(&self.store.status_snapshot_at(GENERATION_ID, now_ms)?);
+        let telegram_configuration =
+            telegram::TelegramBotConfig::load(&self.state_dir).map_err(|error| {
+                DaemonError::TelegramRefused(telegram::TelegramHostError::Config(error).category())
+            })?;
+        let telegram_bot_id = telegram_configuration
+            .as_ref()
+            .map_or(0, telegram::TelegramBotConfig::bot_id);
+        let (question_administrators, question_configured) =
+            telegram_configuration.as_ref().map_or_else(
+                || (Vec::new(), Vec::new()),
+                |configuration| configuration.question_operator_ids(),
+            );
+        drop(telegram_configuration);
+
+        let mut slack_tickets = slack::SlackTicketHost::open(
+            &slack::SlackTicketHostParams {
+                state_dir: &self.state_dir,
+                database_path: &self.config.database_path(),
+                admin_socket: &self.config.admin_socket(),
+                run_index_path: &self.config.run_index_path(),
+                support_tickets_path: &self.config.support_tickets_path(),
+                operator_members_path: &self.config.operator_members_path(),
+                host_facts: telegram_bridge::HostFacts {
+                    generation_id: GENERATION_ID.to_owned(),
+                    holder_id: self.instance_id.as_str().to_owned(),
+                    lease_epoch: self.lease_epoch,
+                    bot_id: telegram_bot_id,
+                    execution_state: self.execution_state,
+                },
+                question_administrators,
+                question_configured,
+                generation_queues_clean,
+            },
+            Arc::clone(&self.ticket_gates),
+        )
+        .map_err(|error| DaemonError::SlackRefused(error.category()))?;
+        let slack = slack::SlackHost::open(&self.state_dir)
+            .map_err(|error| DaemonError::SlackRefused(error.category()))?;
+        let mut ticket_intake =
+            ticket_intake::TicketIntakeHost::open(&ticket_intake::TicketIntakeParams {
+                state_dir: &self.state_dir,
+                ticket_store_path: &self.config.support_tickets_path(),
+            })
+            .map_err(|error| DaemonError::TicketIntakeRefused(error.category()))?;
+        let mut managed_tui = managed_tui::ManagedTuiHost::open(&managed_tui::ManagedTuiParams {
+            database_path: &self.config.database_path(),
+            platform_store_path: &self.config.platform_store_path(),
+            managed_sessions_path: &self.config.managed_sessions_path(),
+            state_dir: &self.state_dir,
+            admin_socket: &self.config.admin_socket(),
+            run_index_path: &self.config.run_index_path(),
+            generation_id: GENERATION_ID,
+            holder_id: self.instance_id.as_str(),
+            lease_epoch: self.lease_epoch,
+            lease_time_source: Arc::new(lease_time::BootTimeSource),
+        })
+        .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+        let mut telegram = telegram::TelegramHost::open_with_ticket_gates(
+            &telegram::TelegramHostParams {
+                state_dir: &self.state_dir,
+                database_path: &self.config.database_path(),
+                lease_time_source: Arc::new(lease_time::BootTimeSource),
+                run_index_path: &self.config.run_index_path(),
+                support_tickets_path: &self.config.support_tickets_path(),
+                operator_members_path: &self.config.operator_members_path(),
+                admin_socket: &self.config.admin_socket(),
+                generation_id: GENERATION_ID,
+                holder_id: self.instance_id.as_str(),
+                authority_lease_epoch: self.lease_epoch,
+                ttl_ms: TELEGRAM_LEASE_TTL_MS,
+                execution_state: self.execution_state,
+            },
+            slack,
+            Arc::clone(&self.ticket_gates),
+        )
+        .map_err(|error| DaemonError::TelegramRefused(error.category()))?;
+        if let Some(progress) = self.progress() {
+            telegram.attach_progress(Arc::clone(&progress));
+            slack_tickets.attach_progress(progress);
+        }
+
+        let started = slack_tickets
+            .start()
+            .map_err(|error| DaemonError::SlackRefused(error.category()))
+            .and_then(|()| {
+                telegram
+                    .start()
+                    .map_err(|error| DaemonError::TelegramRefused(error.category()))
+            })
+            .and_then(|()| {
+                ticket_intake
+                    .start()
+                    .map_err(|error| DaemonError::TicketIntakeRefused(error.category()))
+            })
+            .and_then(|()| {
+                managed_tui
+                    .start()
+                    .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))
+            })
+            .and_then(|()| {
+                self.progress_endpoint.as_mut().map_or(Ok(()), |endpoint| {
+                    endpoint
+                        .resume()
+                        .map_err(|error| DaemonError::ProgressEndpointFailed(error.category()))
+                })
+            });
+        if let Err(error) = started {
+            slack_tickets.shutdown();
+            ticket_intake.shutdown();
+            managed_tui.shutdown();
+            let _ = telegram.release();
+            return Err(error);
+        }
+        self.slack_tickets = slack_tickets;
+        self.telegram = telegram;
+        self.ticket_intake = ticket_intake;
+        self.managed_tui = managed_tui;
         Ok(())
     }
 

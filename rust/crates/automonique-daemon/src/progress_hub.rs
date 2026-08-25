@@ -998,6 +998,15 @@ impl ProgressEndpoint {
         self.stop.store(true, Ordering::Release);
         self.accept.take()
     }
+
+    /// Restart the retained listener after a source-side handoff rollback.
+    pub(crate) fn resume(&mut self) -> Result<(), ProgressEndpointError> {
+        if self.accept.is_some() {
+            return Err(ProgressEndpointError::AlreadyStarted);
+        }
+        self.stop.store(false, Ordering::Release);
+        self.start()
+    }
 }
 
 impl std::fmt::Debug for ProgressEndpoint {

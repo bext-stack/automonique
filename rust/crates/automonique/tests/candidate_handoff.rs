@@ -104,6 +104,9 @@ fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
         .prepare_transfer(transfer_descriptors)
         .expect("candidate validates transferred listener and lock");
     assert!(candidate.is_transfer_ready());
+    source
+        .quiesce_for_handoff()
+        .expect("source stops intake while retaining attempts");
 
     let target = candidate.lease_target();
     let mut store =
@@ -217,6 +220,9 @@ fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
     source
         .resume_endpoint_cleanup()
         .expect("source resumes exact socket cleanup");
+    source
+        .resume_after_handoff()
+        .expect("source rebuilds stopped workers at returned epoch");
     candidate.stop().expect("candidate stopped");
     assert!(config.admin_socket().exists());
     assert!(config.progress_socket().exists());
@@ -240,6 +246,9 @@ fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
     committed_candidate
         .prepare_transfer(committed_descriptors)
         .expect("second candidate validates capabilities");
+    source
+        .quiesce_for_handoff()
+        .expect("source quiesces for committed handoff");
     let committed_target = committed_candidate.lease_target();
     let committed_transfer = store
         .transfer_generation_lease(LeaseTransferRequest {
@@ -265,6 +274,9 @@ fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
     committed_candidate
         .activate_serving(committed_cleanup)
         .expect("committed candidate serves");
+    source
+        .retire_after_handoff()
+        .expect("source drains attempts and retires adoption route");
     committed_candidate
         .commit()
         .expect("candidate detaches as committed generation");
