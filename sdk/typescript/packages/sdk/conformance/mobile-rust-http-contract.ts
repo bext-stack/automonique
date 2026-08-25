@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import {
+export {};
+
+type SdkModule = typeof import("../src/index.ts");
+
+// Keep the clean-tree typecheck independent of build output while the live
+// Rust contract still exercises the package that `bun run build` emitted.
+const builtSdkEntry: string = "../dist/sdk/src/index.js";
+const {
   MOBILE_AUTH_MEDIA_TYPE,
   ClientId,
   IdempotencyKey,
@@ -19,7 +26,7 @@ import {
   PlatformRevision,
   ResourceId,
   toCanonicalBytes,
-} from "../dist/sdk/src/index.js";
+} = await import(builtSdkEntry) as SdkModule;
 
 declare const process: {readonly argv: readonly string[]};
 
