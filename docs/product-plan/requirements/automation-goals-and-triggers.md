@@ -21,6 +21,75 @@ Jobs can:
 
 Unattended mutations require pre-approved scope or produce an approval request; schedule creation is never blanket authority for future arbitrary effects.
 
+### The occurrence key and the fence, as built
+
+The slice that ships (`automonique-daemon::automation_scheduler`, tracked as
+M8 #45) implements the durable half of the paragraph above and names what it
+does not:
+
+- **What a registered job is.** `RegisterAutomation` carries a canonical
+  schedule, a scope and a bounded prompt. The schedule is the one-shot
+  (`once@<unix-ms>`) or fixed-interval (`every@<ms>`) form of
+  `CanonicalSchedule`; the five-field cron form is canonical and is refused
+  with the typed `automation_unsupported_schedule`, because no
+  dependency-free cron evaluator with a timezone database ships, and a
+  schedule the daemon could not fire is not registered. Natural-language
+  phrases are parsed to a rendering before the wire (`hourly`), never stored
+  as typed. The scope and the prompt carry the durable submit lane's bounds:
+  the prompt is that lane's task (non-empty, at most 8 KiB, free of NUL), and
+  the scope is bounded by the scheduler core's 160-byte identifier ceiling
+  because an occurrence is admitted by both.
+- **The occurrence key.** Every occurrence is identified by
+  `automation:<automation_id>:<occurrence_instant>`, where the instant is the
+  scheduled Unix millisecond — never the instant the daemon happened to
+  notice it. The same key is the work identity in the durable scheduler core
+  and the transport key on the synthetic lane; both dedupe on it. A replayed
+  tick, a restarted daemon or a re-elected generation derives the same bytes
+  and is refused (`duplicate_work` by the core, `duplicate: true` by the
+  lane) rather than firing again. Because the key has to fit the lane's
+  128-byte idempotency-key bound at any instant, an identity registered with
+  a schedule is bounded to 97 bytes; the registry's wider identity grammar
+  still serves rows registered before schedules existed.
+- **The fence.** Every tick is judged under the generation fence twice: the
+  product store's generation row must name the worker's holder and epoch with
+  a live lease, and the scheduler core checks the `SchedulerFence` installed
+  at open on every operation. A stale tick starts nothing. The worker is
+  rebuilt with the new epoch when a handoff returns authority.
+- **Exactly one per instant.** The registry keeps at most one active
+  occurrence per automation (`active_occurrence_ms`) and its `next_fire_at_ms`
+  is advanced past an instant the moment that instant is handed to the lane.
+  Every occurrence verb on the registry is a compare-and-set on the instant it
+  names, so a worker replaying a crashed tick re-admits nothing and re-submits
+  nothing; the lane and the core dedupe the rest.
+- **Catch-up.** A fixed interval that fell behind — the daemon was down, or
+  the automation was paused across several instants — fires its oldest due
+  instant once and continues from the first grid instant after `now`. A burst
+  of catch-up firings is never produced. A one-shot fires once and is then
+  exhausted (`next_fire_at_ms` null).
+- **Pause, resume, archive.** A withdrawn automation derives no new
+  occurrence. One already queued in the core is cancelled (`never_started`)
+  and its instant skipped, because the core remembers the identity as
+  terminal. One the lane is already running is left to finish — pause is not
+  cancel — except that an archived automation, which nothing can resume,
+  requests a stop; custody stays with the core until the lane's terminal
+  commit lands. On resume, the automation continues from its next due
+  instant.
+- **What fires.** The occurrence is a normal item on the daemon's durable
+  synthetic lane — the same lane `automonique submit` uses — claimed and
+  completed by the serve loop's controller with that lane's own outbox
+  intent. There is no second outbox and no second executor, and therefore no
+  provider runs the prompt yet: the effect of an occurrence in this slice is
+  the synthetic lane's fixture receipt, which is what "unattended mutations
+  need pre-approved scope" costs nothing to keep true.
+- **Restart.** A due-but-unfired occurrence fires once after restart; a
+  running occurrence is found active in the registry, running in the core and
+  present on the lane, and is waited on rather than resubmitted; a paused
+  automation is still paused, because the registry is what says so.
+
+Not built: trigger evaluation, delivery targets, run-now, history, clone,
+natural-language schedules beyond the two recognized phrases, and the cron
+form.
+
 ## Persistent goals
 
 A `Goal` is a durable user objective with owner, text, completion contract, criteria/subgoals, budget, deadline, policy, active session/work graph and status. It differs from a ticket: it may drive multiple turns and waits, while every concrete effect remains a normal action.

@@ -34,11 +34,16 @@ refuses to start rather than degrading quietly.
 What the daemon still does not do, and says so at the sites that would have to
 change:
 
-- **No scheduler, no executor, no acting on anyone's behalf.** The automation
-  store, approval ledger, and batch registry record decisions durably and
-  truthfully, and nothing reads them to decide anything. Registering an
-  automation starts nothing, a recorded approval permits nothing, and a batch's
-  concurrency ceiling throttles nothing.
+- **No executor behind an automation's prompt, and no acting on anyone's
+  behalf.** A registered automation now fires: the scheduler worker derives one
+  occurrence per due instant under the generation fence and submits it on the
+  durable synthetic lane under `automation:<id>:<instant>`, bounded and
+  serialized per scope by the durable scheduler core. What that occurrence
+  *does* is the synthetic lane's fixture receipt and nothing more — no provider
+  runs the prompt. The approval ledger and batch registry still record
+  decisions durably and truthfully without anything reading them to decide: a
+  recorded approval permits nothing, and a batch's concurrency ceiling
+  throttles nothing.
 - **No release trust.** A provider binary is admitted by pinned digest and by
   the daemon's own workspace registry, never by a verified signature. The
   signature seam is structurally unconstructible, not merely unimplemented.
