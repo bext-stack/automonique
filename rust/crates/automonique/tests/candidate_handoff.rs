@@ -235,6 +235,10 @@ fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
         .handoff_to_verified_release("reload-process-commit", release)
         .expect("ten-phase process handoff succeeds");
     assert_eq!(committed.phase, ReloadPhase::Succeeded);
+    assert_eq!(
+        fs::read_link(release_root.join("current")).expect("selected release link"),
+        Path::new("releases").join(&manifest_digest)
+    );
     let committed_holder = read_source_lease(&config.database_path()).holder_id;
     drop(source);
 

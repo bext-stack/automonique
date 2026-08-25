@@ -93,8 +93,28 @@ pub struct VerifiedCodeRelease {
     pub binary_sha256: String,
     pub kind: ReleaseKind,
     pub skill_manifest_digest: Option<String>,
+    activation_root: PathBuf,
     release_target: PathBuf,
     binary_path: PathBuf,
+}
+
+pub struct HandoffActivationReceipt {
+    root: PathBuf,
+    previous_target: Option<PathBuf>,
+    state_dir: PathBuf,
+    skill_receipt: Option<crate::skill_runtime::SkillActivationReceipt>,
+}
+
+impl HandoffActivationReceipt {
+    /// Restore both code and skill selectors after a failed generation handoff.
+    pub fn rollback(&self) -> Result<(), ReleaseActivationError> {
+        restore_link(&self.root, self.previous_target.as_deref())?;
+        if let Some(receipt) = self.skill_receipt.as_ref() {
+            crate::skill_runtime::rollback(&self.state_dir, receipt)
+                .map_err(|_| ReleaseActivationError::RollbackFailed)?;
+        }
+        Ok(())
+    }
 }
 
 impl VerifiedCodeRelease {
@@ -106,6 +126,49 @@ impl VerifiedCodeRelease {
     #[must_use]
     pub fn binary_path(&self) -> &Path {
         &self.binary_path
+    }
+
+    /// Atomically select this verified release without invoking a supervisor.
+    /// The caller owns the live generation handoff and must retain the receipt
+    /// until N+1 commits so it can reverse both selectors on rollback.
+    pub fn activate_for_handoff(&self) -> Result<HandoffActivationReceipt, ReleaseActivationError> {
+        if self.kind == ReleaseKind::SkillOnly {
+            return Err(ReleaseActivationError::WrongActivator);
+        }
+        let current = self.activation_root.join(CURRENT_NAME);
+        let previous_target = read_current_target(&current)?;
+        let state_dir = self
+            .activation_root
+            .parent()
+            .ok_or(ReleaseActivationError::UnsafePath("release root"))?
+            .to_path_buf();
+        let skill_receipt = match self.kind {
+            ReleaseKind::Mixed => Some(
+                crate::skill_runtime::activate_with_receipt(
+                    &state_dir,
+                    self.skill_manifest_digest.as_deref().ok_or(
+                        ReleaseActivationError::InvalidManifest("skill_manifest_digest"),
+                    )?,
+                )
+                .map_err(|_| ReleaseActivationError::Supervisor)?,
+            ),
+            ReleaseKind::Code => None,
+            ReleaseKind::SkillOnly => return Err(ReleaseActivationError::WrongActivator),
+        };
+        if let Err(error) = install_link(&self.activation_root, &self.release_target, "handoff") {
+            if let Some(receipt) = skill_receipt.as_ref()
+                && crate::skill_runtime::rollback(&state_dir, receipt).is_err()
+            {
+                return Err(ReleaseActivationError::RollbackFailed);
+            }
+            return Err(error);
+        }
+        Ok(HandoffActivationReceipt {
+            root: self.activation_root.clone(),
+            previous_target,
+            state_dir,
+            skill_receipt,
+        })
     }
 }
 
@@ -431,6 +494,7 @@ impl<S: ReleaseSupervisor> CodeReleaseActivator<S> {
             binary_sha256: manifest.binary_sha256,
             kind,
             skill_manifest_digest: manifest.skill_manifest_digest,
+            activation_root: self.root.clone(),
             release_target: relative,
             binary_path: binary,
         })
@@ -873,6 +937,47 @@ mod tests {
         );
         assert_eq!(receipt.previous_target.as_deref(), Some(&*previous_target));
         assert_eq!(receipt.release.manifest_digest, candidate);
+    }
+
+    #[test]
+    fn handoff_selection_switches_without_supervisor_and_is_reversible() {
+        let root = tempfile::tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("private");
+        fs::create_dir(root.path().join(RELEASES_NAME)).expect("releases");
+        fs::set_permissions(
+            root.path().join(RELEASES_NAME),
+            fs::Permissions::from_mode(0o700),
+        )
+        .expect("private");
+        let previous = add_release(root.path(), 'a');
+        let candidate = add_release(root.path(), 'c');
+        let previous_target = Path::new(RELEASES_NAME).join(previous.trim_start_matches("sha256:"));
+        let candidate_target =
+            Path::new(RELEASES_NAME).join(candidate.trim_start_matches("sha256:"));
+        symlink(&previous_target, root.path().join(CURRENT_NAME)).expect("current");
+        let activator = CodeReleaseActivator::new(
+            root.path(),
+            "automonique.service",
+            RecordingSupervisor {
+                calls: Vec::new(),
+                readiness: VecDeque::new(),
+            },
+        )
+        .expect("activator");
+        let release = activator.verify(&candidate).expect("verified");
+
+        let receipt = release.activate_for_handoff().expect("handoff selection");
+        assert_eq!(
+            fs::read_link(root.path().join(CURRENT_NAME)).expect("current"),
+            candidate_target
+        );
+        assert!(activator.supervisor.calls.is_empty());
+
+        receipt.rollback().expect("handoff rollback");
+        assert_eq!(
+            fs::read_link(root.path().join(CURRENT_NAME)).expect("current"),
+            previous_target
+        );
     }
 
     #[test]

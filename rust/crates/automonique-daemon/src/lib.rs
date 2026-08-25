@@ -1466,6 +1466,7 @@ struct ProcessReloadHooks<'a> {
     authority_confirmed: bool,
     candidate_active: bool,
     cleanup_transferred: bool,
+    activation: Option<release_activation::HandoffActivationReceipt>,
 }
 
 impl ProcessReloadHooks<'_> {
@@ -1598,6 +1599,11 @@ impl reload::ReloadHooks for ProcessReloadHooks<'_> {
         self.daemon
             .retire_after_handoff()
             .map_err(|error| Self::refuse(error.category()))?;
+        self.activation = Some(
+            self.release
+                .activate_for_handoff()
+                .map_err(|_| Self::refuse("release_activation_failed"))?,
+        );
         self.candidate
             .as_mut()
             .ok_or_else(|| Self::refuse("candidate_unavailable"))?
@@ -1673,6 +1679,11 @@ impl reload::ReloadHooks for ProcessReloadHooks<'_> {
                 .resume_endpoint_cleanup()
                 .map_err(|error| Self::refuse(error.category()))?;
             self.cleanup_transferred = false;
+        }
+        if let Some(activation) = self.activation.take() {
+            activation
+                .rollback()
+                .map_err(|_| Self::refuse("release_rollback_failed"))?;
         }
         self.candidate_lease = None;
         Ok(())
@@ -2358,6 +2369,7 @@ impl Daemon {
             authority_confirmed: false,
             candidate_active: false,
             cleanup_transferred: false,
+            activation: None,
         };
         reload::execute_reload(
             &mut audit,
