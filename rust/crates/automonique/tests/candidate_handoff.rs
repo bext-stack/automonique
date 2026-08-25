@@ -318,11 +318,32 @@ fn authenticated_reload_command_hands_off_and_retires_the_source() {
     );
     let output = String::from_utf8(reload.stdout).expect("reload output UTF-8");
     assert!(output.starts_with("reload reload-1-"));
-    assert!(output.ends_with(" succeeded\n"));
+    assert!(output.ends_with(" accepted\n"));
+    let reload_id = output
+        .strip_prefix("reload ")
+        .and_then(|output| output.strip_suffix(" accepted\n"))
+        .expect("accepted reload ID");
     source
         .join()
         .expect("source serve thread")
         .expect("source retires without releasing transferred authority");
+
+    let reload_status = Command::new(env!("CARGO_BIN_EXE_automonique"))
+        .args(["reload-status", reload_id])
+        .env("XDG_RUNTIME_DIR", &config.runtime_root)
+        .env("XDG_STATE_HOME", &config.state_root)
+        .output()
+        .expect("reload status command");
+    assert!(
+        reload_status.status.success(),
+        "reload status failed: {}",
+        String::from_utf8_lossy(&reload_status.stderr)
+    );
+    assert!(
+        String::from_utf8(reload_status.stdout)
+            .expect("reload status UTF-8")
+            .contains(" phase=succeeded ")
+    );
 
     assert_eq!(
         fs::read_link(release_root.join("current")).expect("selected release link"),
@@ -333,7 +354,7 @@ fn authenticated_reload_command_hands_off_and_retires_the_source() {
         Path::new("releases").join(&previous_digest)
     );
     let rollback = Command::new(env!("CARGO_BIN_EXE_automonique"))
-        .arg("rollback")
+        .args(["rollback", "--wait"])
         .env("XDG_RUNTIME_DIR", &config.runtime_root)
         .env("XDG_STATE_HOME", &config.state_root)
         .output()

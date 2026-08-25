@@ -1568,6 +1568,36 @@ fn generation_and_reload_reads_are_exact_bounded_and_round_trip() {
         reload
     );
 
+    for receipt in [
+        AdminResponse::ReloadAccepted {
+            request_id: request_id(),
+            reload_id: "reload-7".to_owned(),
+        },
+        AdminResponse::RollbackAccepted {
+            request_id: request_id(),
+            reload_id: "rollback-8".to_owned(),
+        },
+    ] {
+        let bytes = receipt
+            .to_message()
+            .expect("encode durable acceptance")
+            .to_canonical_bytes();
+        assert_eq!(
+            AdminResponse::from_canonical_bytes(&bytes).expect("decode durable acceptance"),
+            receipt
+        );
+    }
+    for widened in [
+        br#"{"body":{"future":true,"reload_id":"reload-7"},"kind":"reload_accepted","protocol":"automonique.admin","request_id":"r","version":1}"#.as_slice(),
+        br#"{"body":{},"kind":"rollback_accepted","protocol":"automonique.admin","request_id":"r","version":1}"#.as_slice(),
+    ] {
+        assert_eq!(
+            AdminResponse::from_canonical_bytes(widened)
+                .expect_err("acceptance body must stay exact"),
+            AdminError::InvalidBody
+        );
+    }
+
     let unknown_phase = String::from_utf8(reload_bytes)
         .expect("canonical UTF-8")
         .replace(
@@ -2388,6 +2418,7 @@ mod capability {
             8,
             "authenticated rollback to the retained compatible release",
         ),
+        (9, "durable reload acceptance before asynchronous handoff"),
     ];
 
     /// Every endpoint, at the maturity it had when it landed.

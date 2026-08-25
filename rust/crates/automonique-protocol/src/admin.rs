@@ -208,7 +208,8 @@ const _: () = assert!(
 /// - **6** — added generation history and reload-status reads.
 /// - **7** — added authenticated generation reload execution.
 /// - **8** — added authenticated rollback to the retained compatible release.
-pub const ADMIN_CAPABILITY: u32 = 8;
+/// - **9** — added durable reload acceptance before asynchronous handoff.
+pub const ADMIN_CAPABILITY: u32 = 9;
 
 /// How much of a promise an endpoint is.
 ///
@@ -4110,8 +4111,18 @@ pub enum AdminResponse {
         request_id: RequestId,
         reload_id: String,
     },
+    /// The reload epoch is durable and the handoff is now executing.
+    ReloadAccepted {
+        request_id: RequestId,
+        reload_id: String,
+    },
     /// The retained release completed its durable generation handoff.
     RollbackSucceeded {
+        request_id: RequestId,
+        reload_id: String,
+    },
+    /// The rollback epoch is durable and the reverse handoff is now executing.
+    RollbackAccepted {
         request_id: RequestId,
         reload_id: String,
     },
@@ -4207,7 +4218,9 @@ impl AdminResponse {
             | Self::Generations { request_id, .. }
             | Self::ReloadStatus { request_id, .. }
             | Self::ReloadSucceeded { request_id, .. }
+            | Self::ReloadAccepted { request_id, .. }
             | Self::RollbackSucceeded { request_id, .. }
+            | Self::RollbackAccepted { request_id, .. }
             | Self::SyntheticAccepted { request_id, .. }
             | Self::RunAccepted { request_id, .. }
             | Self::ReconciliationInspected { request_id, .. }
@@ -4274,6 +4287,10 @@ impl AdminResponse {
                     )]),
                 ))
             }
+            Self::ReloadAccepted {
+                request_id,
+                reload_id,
+            } => reload_receipt(request_id, reload_id, "reload_accepted"),
             Self::RollbackSucceeded {
                 request_id,
                 reload_id,
@@ -4289,6 +4306,10 @@ impl AdminResponse {
                     )]),
                 ))
             }
+            Self::RollbackAccepted {
+                request_id,
+                reload_id,
+            } => reload_receipt(request_id, reload_id, "rollback_accepted"),
             Self::SyntheticAccepted {
                 request_id,
                 inbox_id,
@@ -4478,6 +4499,12 @@ impl AdminResponse {
                     reload_id,
                 })
             }
+            "reload_accepted" => {
+                decode_reload_receipt(message.body()).map(|reload_id| Self::ReloadAccepted {
+                    request_id,
+                    reload_id,
+                })
+            }
             "rollback_succeeded" => {
                 exact_fields(message.body(), &["reload_id"])?;
                 let reload_id = required_body_string(message.body(), "reload_id")?;
@@ -4485,6 +4512,12 @@ impl AdminResponse {
                     return Err(AdminError::InvalidBody);
                 }
                 Ok(Self::RollbackSucceeded {
+                    request_id,
+                    reload_id,
+                })
+            }
+            "rollback_accepted" => {
+                decode_reload_receipt(message.body()).map(|reload_id| Self::RollbackAccepted {
                     request_id,
                     reload_id,
                 })
@@ -4614,6 +4647,32 @@ impl AdminResponse {
             _ => Err(AdminError::UnknownKind),
         }
     }
+}
+
+fn reload_receipt(
+    request_id: &RequestId,
+    reload_id: &str,
+    kind: &str,
+) -> Result<Message, AdminError> {
+    if !valid_coordinate(reload_id, MAX_RELOAD_ID_BYTES) {
+        return Err(AdminError::InvalidBody);
+    }
+    Ok(Message::new(
+        envelope(request_id.clone(), kind)?,
+        JsonValue::Object(vec![(
+            "reload_id".to_owned(),
+            JsonValue::String(reload_id.to_owned()),
+        )]),
+    ))
+}
+
+fn decode_reload_receipt(body: &JsonValue) -> Result<String, AdminError> {
+    exact_fields(body, &["reload_id"])?;
+    let reload_id = required_body_string(body, "reload_id")?;
+    if !valid_coordinate(&reload_id, MAX_RELOAD_ID_BYTES) {
+        return Err(AdminError::InvalidBody);
+    }
+    Ok(reload_id)
 }
 
 fn envelope(request_id: RequestId, kind: &str) -> Result<Envelope, AdminError> {

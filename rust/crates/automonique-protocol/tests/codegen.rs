@@ -2868,9 +2868,17 @@ mod command_surface {
                 request_id: id.clone(),
                 reload_id: "reload-1".to_owned(),
             },
+            AdminResponse::ReloadAccepted {
+                request_id: id.clone(),
+                reload_id: "reload-accepted-1".to_owned(),
+            },
             AdminResponse::RollbackSucceeded {
                 request_id: id.clone(),
                 reload_id: "reload-2".to_owned(),
+            },
+            AdminResponse::RollbackAccepted {
+                request_id: id.clone(),
+                reload_id: "rollback-accepted-1".to_owned(),
             },
             AdminResponse::Refused {
                 request_id: id.clone(),
@@ -2887,7 +2895,9 @@ mod command_surface {
                 | AdminResponse::Generations { .. }
                 | AdminResponse::ReloadStatus { .. }
                 | AdminResponse::ReloadSucceeded { .. }
+                | AdminResponse::ReloadAccepted { .. }
                 | AdminResponse::RollbackSucceeded { .. }
+                | AdminResponse::RollbackAccepted { .. }
                 | AdminResponse::SyntheticAccepted { .. }
                 | AdminResponse::RunAccepted { .. }
                 | AdminResponse::ReconciliationInspected { .. }

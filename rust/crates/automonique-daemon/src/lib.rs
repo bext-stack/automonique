@@ -148,7 +148,7 @@ use automonique_store::generation_audit::{
 };
 use automonique_store::platform_store::{ActionAdmission, PlatformStore, PlatformStoreError};
 use automonique_store::provider_journal::ProviderJournal;
-use automonique_store::reload_audit::{ReloadAudit, ReloadAuditError};
+use automonique_store::reload_audit::{BeginReload, ReloadAudit, ReloadAuditError};
 use automonique_store::run_index::{
     RunIndex, RunIndexEntry, RunIndexError, RunIndexRecord, RunSpoolState,
 };
@@ -3765,18 +3765,31 @@ impl Daemon {
                     .strip_prefix("sha256:")
                     .ok_or(DaemonError::ProtocolRefused("admin_invalid_body"))?;
                 let reload_id = format!("reload-{}-{}", self.lease_epoch, &digest_hex[..16]);
-                match self.handoff_to_verified_release(&reload_id, release) {
-                    Ok(_) => {
-                        self.handoff_committed = true;
-                        AdminResponse::ReloadSucceeded {
-                            request_id: request.request_id().clone(),
-                            reload_id,
-                        }
-                    }
-                    Err(error) => {
-                        return self.write_refusal(stream, request.request_id(), error.category());
-                    }
+                let target_generation_id = format!("foreground-{}", &release.source_sha[..12]);
+                if let Err(error) = self.reload_audit.begin(BeginReload {
+                    reload_id: &reload_id,
+                    source_generation_id: GENERATION_ID,
+                    source_lease_epoch: self.lease_epoch,
+                    target_generation_id: &target_generation_id,
+                    target_release_digest,
+                    created_at_ms: unix_millis()?,
+                }) {
+                    return self.write_refusal(stream, request.request_id(), error.category());
                 }
+                self.write_admin_response(
+                    stream,
+                    &AdminResponse::ReloadAccepted {
+                        request_id: request.request_id().clone(),
+                        reload_id: reload_id.clone(),
+                    },
+                )?;
+                if self
+                    .handoff_to_verified_release(&reload_id, release)
+                    .is_ok()
+                {
+                    self.handoff_committed = true;
+                }
+                return Ok(());
             }
             automonique_protocol::admin::AdminCommand::Rollback => {
                 if self.disconnected_recovery || self.handoff_quiesced {
@@ -3811,18 +3824,31 @@ impl Daemon {
                     .strip_prefix("sha256:")
                     .ok_or(DaemonError::ProtocolRefused("admin_invalid_body"))?;
                 let reload_id = format!("rollback-{}-{}", self.lease_epoch, &digest_hex[..16]);
-                match self.handoff_to_verified_release_with_selection(&reload_id, release, true) {
-                    Ok(_) => {
-                        self.handoff_committed = true;
-                        AdminResponse::RollbackSucceeded {
-                            request_id: request.request_id().clone(),
-                            reload_id,
-                        }
-                    }
-                    Err(error) => {
-                        return self.write_refusal(stream, request.request_id(), error.category());
-                    }
+                let target_generation_id = format!("foreground-{}", &release.source_sha[..12]);
+                if let Err(error) = self.reload_audit.begin(BeginReload {
+                    reload_id: &reload_id,
+                    source_generation_id: GENERATION_ID,
+                    source_lease_epoch: self.lease_epoch,
+                    target_generation_id: &target_generation_id,
+                    target_release_digest: &release.manifest_digest,
+                    created_at_ms: unix_millis()?,
+                }) {
+                    return self.write_refusal(stream, request.request_id(), error.category());
                 }
+                self.write_admin_response(
+                    stream,
+                    &AdminResponse::RollbackAccepted {
+                        request_id: request.request_id().clone(),
+                        reload_id: reload_id.clone(),
+                    },
+                )?;
+                if self
+                    .handoff_to_verified_release_with_selection(&reload_id, release, true)
+                    .is_ok()
+                {
+                    self.handoff_committed = true;
+                }
+                return Ok(());
             }
             automonique_protocol::admin::AdminCommand::ReloadStatus => {
                 let reload_id = request
@@ -4365,6 +4391,21 @@ impl Daemon {
                 }
             }
         };
+        self.write_admin_response(stream, &response)?;
+        if matches!(
+            request.command(),
+            automonique_protocol::admin::AdminCommand::Shutdown
+        ) {
+            stop.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    fn write_admin_response(
+        &self,
+        stream: &mut UnixStream,
+        response: &AdminResponse,
+    ) -> Result<(), DaemonError> {
         let response = response
             .to_message()
             .map_err(|error| DaemonError::ProtocolRefused(error.category()))?
@@ -4374,12 +4415,6 @@ impl Daemon {
             .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
         stream.write_all(&frame)?;
         stream.flush()?;
-        if matches!(
-            request.command(),
-            automonique_protocol::admin::AdminCommand::Shutdown
-        ) {
-            stop.store(true, Ordering::Release);
-        }
         Ok(())
     }
 
@@ -7404,16 +7439,8 @@ impl Daemon {
             request_id: request_id.clone(),
             category: AdminRefusalCategory::new(category)
                 .map_err(|error| DaemonError::ProtocolRefused(error.category()))?,
-        }
-        .to_message()
-        .map_err(|error| DaemonError::ProtocolRefused(error.category()))?
-        .to_canonical_bytes();
-        let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + response.len());
-        encode_frame(&response, &mut frame)
-            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
-        stream.write_all(&frame)?;
-        stream.flush()?;
-        Ok(())
+        };
+        self.write_admin_response(stream, &response)
     }
 }
 

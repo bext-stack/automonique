@@ -12,7 +12,7 @@
 import {ValidationError, byteLength, isWellFormedUnicode} from "./runtime.js";
 
 /** What this build's local endpoints can do, as one monotonic integer. A client compares it against the number it was written for; it never assumes the two must be equal. */
-export const ADMIN_CAPABILITY = 8;
+export const ADMIN_CAPABILITY = 9;
 
 /** Stable protocol name for local daemon administration. */
 export const ADMIN_PROTOCOL = "automonique.admin";
