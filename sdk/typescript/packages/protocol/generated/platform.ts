@@ -9,7 +9,7 @@
 // Rust is the wire source of truth. Hand-written SDK code may add
 // ergonomics; it may not redefine anything in this file.
 
-import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyString, bodyStringOrNull, bodyStrings, bodyUnsigned, bodyValue, bodyValueOrNull, byteLength, decodeMessageAdmitted, exactFields, exactString, mapNullable, refuse, refuseField, type JsonValue} from "./runtime.js";
+import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyString, bodyStringOrNull, bodyStrings, bodyUnsigned, bodyValue, bodyValueOrNull, byteLength, decodeMessageAdmitted, exactFields, exactString, isWellFormedUnicode, mapNullable, refuse, refuseField, type JsonValue} from "./runtime.js";
 
 /** Lifetime of one exclusive interactive control lease. */
 export const CONTROL_LEASE_TTL_MILLIS = 30000;
@@ -47,6 +47,7 @@ export const ClientId_MAX_BYTES = 256;
 export const ClientId_PATTERN = /^[^\p{Cc}]+$/u;
 export function ClientId(value: string): ClientId {
   if (value.length === 0) throw new ValidationError("ClientId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("ClientId", "invalid_character");
   if (byteLength(value) > 256) throw new ValidationError("ClientId", "too_long");
   if (!ClientId_PATTERN.test(value)) throw new ValidationError("ClientId", "invalid_character");
   return value as ClientId;
@@ -58,6 +59,7 @@ export const ControlLeaseId_MAX_BYTES = 256;
 export const ControlLeaseId_PATTERN = /^[^\p{Cc}]+$/u;
 export function ControlLeaseId(value: string): ControlLeaseId {
   if (value.length === 0) throw new ValidationError("ControlLeaseId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("ControlLeaseId", "invalid_character");
   if (byteLength(value) > 256) throw new ValidationError("ControlLeaseId", "too_long");
   if (!ControlLeaseId_PATTERN.test(value)) throw new ValidationError("ControlLeaseId", "invalid_character");
   return value as ControlLeaseId;
@@ -69,6 +71,7 @@ export const IdempotencyKey_MAX_BYTES = 256;
 export const IdempotencyKey_PATTERN = /^[^\p{Cc}]+$/u;
 export function IdempotencyKey(value: string): IdempotencyKey {
   if (value.length === 0) throw new ValidationError("IdempotencyKey", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("IdempotencyKey", "invalid_character");
   if (byteLength(value) > 256) throw new ValidationError("IdempotencyKey", "too_long");
   if (!IdempotencyKey_PATTERN.test(value)) throw new ValidationError("IdempotencyKey", "invalid_character");
   return value as IdempotencyKey;
@@ -80,6 +83,7 @@ export const PlatformRequestId_MAX_BYTES = 128;
 export const PlatformRequestId_PATTERN = /^[A-Za-z0-9._:-]+$/u;
 export function PlatformRequestId(value: string): PlatformRequestId {
   if (value.length === 0) throw new ValidationError("PlatformRequestId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("PlatformRequestId", "invalid_character");
   if (byteLength(value) > 128) throw new ValidationError("PlatformRequestId", "too_long");
   if (!PlatformRequestId_PATTERN.test(value)) throw new ValidationError("PlatformRequestId", "invalid_character");
   return value as PlatformRequestId;
@@ -91,6 +95,7 @@ export const ReceiptId_MAX_BYTES = 256;
 export const ReceiptId_PATTERN = /^[^\p{Cc}]+$/u;
 export function ReceiptId(value: string): ReceiptId {
   if (value.length === 0) throw new ValidationError("ReceiptId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("ReceiptId", "invalid_character");
   if (byteLength(value) > 256) throw new ValidationError("ReceiptId", "too_long");
   if (!ReceiptId_PATTERN.test(value)) throw new ValidationError("ReceiptId", "invalid_character");
   return value as ReceiptId;
@@ -102,6 +107,7 @@ export const ResourceId_MAX_BYTES = 256;
 export const ResourceId_PATTERN = /^[^\p{Cc}]+$/u;
 export function ResourceId(value: string): ResourceId {
   if (value.length === 0) throw new ValidationError("ResourceId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("ResourceId", "invalid_character");
   if (byteLength(value) > 256) throw new ValidationError("ResourceId", "too_long");
   if (!ResourceId_PATTERN.test(value)) throw new ValidationError("ResourceId", "invalid_character");
   return value as ResourceId;
@@ -113,6 +119,7 @@ export const CursorTopic_MAX_BYTES = 256;
 export const CursorTopic_PATTERN = /^[^\p{Cc}]+$/u;
 export function CursorTopic(value: string): CursorTopic {
   if (value.length === 0) throw new ValidationError("CursorTopic", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("CursorTopic", "invalid_character");
   if (byteLength(value) > 256) throw new ValidationError("CursorTopic", "too_long");
   if (!CursorTopic_PATTERN.test(value)) throw new ValidationError("CursorTopic", "invalid_character");
   return value as CursorTopic;
@@ -124,6 +131,7 @@ export const PlatformParameter_MAX_BYTES = 65536;
 export const PlatformParameter_PATTERN = /^[^\u0000]+$/u;
 export function PlatformParameter(value: string): PlatformParameter {
   if (value.length === 0) throw new ValidationError("PlatformParameter", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("PlatformParameter", "invalid_character");
   if (byteLength(value) > 65536) throw new ValidationError("PlatformParameter", "too_long");
   if (!PlatformParameter_PATTERN.test(value)) throw new ValidationError("PlatformParameter", "invalid_character");
   return value as PlatformParameter;
@@ -135,6 +143,7 @@ export const PlatformText_MAX_BYTES = 256;
 export const PlatformText_PATTERN = /^[^\p{Cc}]+$/u;
 export function PlatformText(value: string): PlatformText {
   if (value.length === 0) throw new ValidationError("PlatformText", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("PlatformText", "invalid_character");
   if (byteLength(value) > 256) throw new ValidationError("PlatformText", "too_long");
   if (!PlatformText_PATTERN.test(value)) throw new ValidationError("PlatformText", "invalid_character");
   return value as PlatformText;
@@ -885,6 +894,12 @@ export function assertNeverPlatformResponse(value: never): never {
  * neither is downgraded into the other.
  */
 export function decodePlatformResponse(payload: Uint8Array): PlatformResponse {
+  if (payload.length > MAX_PLATFORM_CANONICAL_BYTES) {
+    throw new RefusalError(
+      PLATFORM_FRAME_TOO_LARGE,
+      `canonical payload is ${payload.length} bytes; maximum is ${MAX_PLATFORM_CANONICAL_BYTES}`,
+    );
+  }
   const message = decodeMessageAdmitted(payload, [
     {protocol: PLATFORM_PROTOCOL, minVersion: PLATFORM_PROTOCOL_VERSION, maxVersion: PLATFORM_PROTOCOL_VERSION},
   ]);

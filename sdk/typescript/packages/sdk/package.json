@@ -1,8 +1,21 @@
 {
   "name": "@automonique/sdk",
   "version": "0.1.0",
+  "description": "Canonical Automonique Platform client for browsers, React Native, and server-side JavaScript",
   "type": "module",
   "license": "Apache-2.0",
+  "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bext-stack/automonique.git",
+    "directory": "sdk/typescript/packages/sdk"
+  },
+  "automonique": {
+    "protocol": "automonique.platform",
+    "protocolRange": "1",
+    "schema": "automonique.platform/v1",
+    "schemaDigest": "sha256:98537dd2e12be80ba1fa2246753d6862f6129a860097f2c39c5b8fff8c5b9240"
+  },
   "files": [
     "dist"
   ],
@@ -15,6 +28,7 @@
   },
   "scripts": {
     "build": "bunx tsc -p ./tsconfig.build.json",
+    "prepack": "bun run build",
     "test": "bun test",
     "typecheck": "bunx tsc -p ./tsconfig.json"
   },

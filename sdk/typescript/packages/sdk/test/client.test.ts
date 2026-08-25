@@ -6,11 +6,14 @@ import {
   ClientId,
   ControlLeaseId,
   IdempotencyKey,
+  MAX_JSON_STRING_BYTES,
+  MAX_PLATFORM_CANONICAL_BYTES,
   PlatformParameter,
   PlatformRevision,
   ReceiptId,
   ResourceId,
   decodeMessage,
+  decodePlatformResponse,
   encodeMessage,
   type JsonValue,
   type ResourceCoordinate,
@@ -33,6 +36,15 @@ function json(value: unknown): JsonValue {
     return {kind: "object", entries: Object.entries(value).map(([key, entry]) => [key, json(entry)] as const)};
   }
   throw new Error("unsupported test JSON value");
+}
+
+function thrownBy(operation: () => unknown): unknown {
+  try {
+    operation();
+  } catch (error) {
+    return error;
+  }
+  throw new Error("expected operation to throw");
 }
 
 const session: ResourceCoordinate = {
@@ -238,6 +250,11 @@ describe("canonical HTTPS Platform v1 transport", () => {
 
   test("refuses embedded credentials, invalid bearer values, and oversized requests", async () => {
     expect(() => new HttpsPlatformTransport(
+      "ftp://localhost/api/platform",
+      () => "token",
+    )).toThrow(PlatformTransportError);
+
+    expect(() => new HttpsPlatformTransport(
       "https://user:password@manage.example/api/platform",
       () => "token",
     )).toThrow(PlatformTransportError);
@@ -264,5 +281,76 @@ describe("canonical HTTPS Platform v1 transport", () => {
     ));
     await expect(oversized.snapshot(Array.from({length: 512}, () => largeSession)))
       .rejects.toMatchObject({category: "frame_too_large"});
+  });
+
+  test("refuses oversized responses before buffering or decoding them", async () => {
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(new Uint8Array(300_000));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const streamedFetcher = (async () => new Response(body, {
+      headers: {"content-type": PLATFORM_MEDIA_TYPE},
+    })) as typeof fetch;
+    const streamed = new PlatformClient(new HttpsPlatformTransport(
+      "https://manage.example/api/platform",
+      () => "token",
+      streamedFetcher,
+    ));
+    await expect(streamed.capabilities()).rejects.toMatchObject({category: "frame_too_large"});
+    expect(cancelled).toBe(true);
+
+    const declaredFetcher = (async () => new Response("", {
+      headers: {
+        "content-length": String(MAX_PLATFORM_CANONICAL_BYTES + 1),
+        "content-type": PLATFORM_MEDIA_TYPE,
+      },
+    })) as typeof fetch;
+    const declared = new PlatformClient(new HttpsPlatformTransport(
+      "https://manage.example/api/platform",
+      () => "token",
+      declaredFetcher,
+    ));
+    await expect(declared.capabilities()).rejects.toMatchObject({category: "frame_too_large"});
+
+    expect(thrownBy(() => decodePlatformResponse(new Uint8Array(MAX_PLATFORM_CANONICAL_BYTES + 1))))
+      .toMatchObject({category: "frame_too_large"});
+
+    const nonStreamingFetcher = (async () => ({
+      arrayBuffer: async () => new ArrayBuffer(0),
+      headers: new Headers({"content-type": PLATFORM_MEDIA_TYPE}),
+      ok: true,
+      status: 200,
+    }) as Response) as typeof fetch;
+    const nonStreaming = new PlatformClient(new HttpsPlatformTransport(
+      "https://manage.example/api/platform",
+      () => "token",
+      nonStreamingFetcher,
+    ));
+    await expect(nonStreaming.capabilities()).rejects.toMatchObject({
+      category: "response_stream_unavailable",
+    });
+  });
+
+  test("rejects lossy Unicode and parses near-limit strings in linear time", () => {
+    expect(PlatformParameter("mobile 😀")).toBe("mobile 😀");
+    expect(thrownBy(() => PlatformParameter("\ud800"))).toMatchObject({violation: "invalid_character"});
+    expect(thrownBy(() => PlatformParameter("\udc00"))).toMatchObject({violation: "invalid_character"});
+    expect(thrownBy(() => encodeMessage({
+      envelope: {protocol: "automonique.platform", version: 1, requestId: "unicode", kind: "execute"},
+      body: json("\ud800"),
+    }))).toMatchObject({category: "malformed_json"});
+
+    const nearLimit = encodeMessage({
+      envelope: {protocol: "automonique.platform", version: 1, requestId: "near-limit", kind: "test"},
+      body: json("x".repeat(MAX_JSON_STRING_BYTES)),
+    });
+    const startedAt = performance.now();
+    expect(decodeMessage(nearLimit).body).toEqual(json("x".repeat(MAX_JSON_STRING_BYTES)));
+    expect(performance.now() - startedAt).toBeLessThan(5_000);
   });
 });

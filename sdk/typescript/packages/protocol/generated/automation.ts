@@ -11,7 +11,7 @@
 
 import {DurableRowId, DurableRowId_MIN, RequestId} from "./admin-command.js";
 import {EpochMillis} from "./runs.js";
-import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyStringOrNull, bodyUnsigned, byteLength, coupledField, decodeMessageAdmitted, encodeMessage, exactFields, mapNullable, orderedEnumSet, rangedInteger, refuse, refuseField, type JsonValue} from "./runtime.js";
+import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyStringOrNull, bodyUnsigned, byteLength, coupledField, decodeMessageAdmitted, encodeMessage, exactFields, isWellFormedUnicode, mapNullable, orderedEnumSet, rangedInteger, refuse, refuseField, type JsonValue} from "./runtime.js";
 
 /** Stable schema identifier for the version-one control surface. */
 export const AUTOMATION_API_SCHEMA_V1 = "automonique.automation/v1";
@@ -34,6 +34,7 @@ export const AutomationId_MAX_BYTES = 256;
 export const AutomationId_PATTERN = /^[^\p{Cc}]+$/u;
 export function AutomationId(value: string): AutomationId {
   if (value.length === 0) throw new ValidationError("AutomationId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("AutomationId", "invalid_character");
   if (byteLength(value) > 256) throw new ValidationError("AutomationId", "too_long");
   if (!AutomationId_PATTERN.test(value)) throw new ValidationError("AutomationId", "invalid_character");
   return value as AutomationId;
@@ -45,6 +46,7 @@ export const AutomationActor_MAX_BYTES = 256;
 export const AutomationActor_PATTERN = /^[^\p{Cc}]+$/u;
 export function AutomationActor(value: string): AutomationActor {
   if (value.length === 0) throw new ValidationError("AutomationActor", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("AutomationActor", "invalid_character");
   if (byteLength(value) > 256) throw new ValidationError("AutomationActor", "too_long");
   if (!AutomationActor_PATTERN.test(value)) throw new ValidationError("AutomationActor", "invalid_character");
   return value as AutomationActor;
@@ -56,6 +58,7 @@ export const PauseReason_MAX_BYTES = 256;
 export const PauseReason_PATTERN = /^[^\p{Cc}]+$/u;
 export function PauseReason(value: string): PauseReason {
   if (value.length === 0) throw new ValidationError("PauseReason", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("PauseReason", "invalid_character");
   if (byteLength(value) > 256) throw new ValidationError("PauseReason", "too_long");
   if (!PauseReason_PATTERN.test(value)) throw new ValidationError("PauseReason", "invalid_character");
   return value as PauseReason;
@@ -534,6 +537,12 @@ export function assertNeverAutomationResponse(value: never): never {
  * neither is downgraded into the other.
  */
 export function decodeAutomationResponse(payload: Uint8Array): AutomationResponse {
+  if (payload.length > MAX_AUTOMATION_CANONICAL_BYTES) {
+    throw new RefusalError(
+      AUTOMATION_FRAME_SIZE,
+      `canonical payload is ${payload.length} bytes; maximum is ${MAX_AUTOMATION_CANONICAL_BYTES}`,
+    );
+  }
   const message = decodeMessageAdmitted(payload, [
     {protocol: AUTOMATION_PROTOCOL, minVersion: AUTOMATION_PROTOCOL_VERSION, maxVersion: AUTOMATION_PROTOCOL_VERSION},
   ]);

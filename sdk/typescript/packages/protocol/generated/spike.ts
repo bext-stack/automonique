@@ -11,6 +11,20 @@ function byteLength(value: string): number {
   return encoder.encode(value).length;
 }
 
+function isWellFormedUnicode(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      index += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export class ValidationError extends Error {
   readonly field: string;
   readonly violation: string;
@@ -27,6 +41,7 @@ export type SessionId = string & {readonly __brand: "SessionId"};
 export const SessionId_MAX_BYTES = 128;
 export function SessionId(value: string): SessionId {
   if (value.length === 0) throw new ValidationError("SessionId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("SessionId", "invalid_character");
   if (byteLength(value) > 128) throw new ValidationError("SessionId", "too_long");
   return value as SessionId;
 }
@@ -36,6 +51,7 @@ export type TurnId = string & {readonly __brand: "TurnId"};
 export const TurnId_MAX_BYTES = 64;
 export function TurnId(value: string): TurnId {
   if (value.length === 0) throw new ValidationError("TurnId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("TurnId", "invalid_character");
   if (byteLength(value) > 64) throw new ValidationError("TurnId", "too_long");
   return value as TurnId;
 }
@@ -45,6 +61,7 @@ export type MessageKind = string & {readonly __brand: "MessageKind"};
 export const MessageKind_MAX_BYTES = 64;
 export function MessageKind(value: string): MessageKind {
   if (value.length === 0) throw new ValidationError("MessageKind", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("MessageKind", "invalid_character");
   if (byteLength(value) > 64) throw new ValidationError("MessageKind", "too_long");
   return value as MessageKind;
 }

@@ -352,6 +352,59 @@ function defaultRequestId(): string {
   return `platform-${Date.now()}-${nextRequestSequence}`;
 }
 
+async function readBoundedResponse(response: Response, maximumBytes: number): Promise<Uint8Array> {
+  const declaredLength = response.headers.get("content-length");
+  if (declaredLength !== null) {
+    if (!/^[0-9]+$/u.test(declaredLength)) {
+      void response.body?.cancel().catch(() => undefined);
+      throw new PlatformTransportError(response.status, "invalid_response");
+    }
+    if (BigInt(declaredLength) > BigInt(maximumBytes)) {
+      void response.body?.cancel().catch(() => undefined);
+      throw new PlatformTransportError(response.status, "frame_too_large");
+    }
+  }
+
+  const body = response.body as ReadableStream<Uint8Array> | null | undefined;
+  if (body === null) return new Uint8Array();
+  if (body === undefined || typeof body.getReader !== "function") {
+    throw new PlatformTransportError(response.status, "response_stream_unavailable");
+  }
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      if (value.byteLength > maximumBytes - length) {
+        try {
+          await reader.cancel();
+        } catch {
+          // The size refusal is authoritative even if the transport cannot cancel cleanly.
+        }
+        throw new PlatformTransportError(response.status, "frame_too_large");
+      }
+      chunks.push(value);
+      length += value.byteLength;
+    }
+  } catch (error) {
+    if (error instanceof PlatformTransportError) throw error;
+    throw new PlatformTransportError(response.status, "response_read_failed", {cause: error});
+  } finally {
+    reader.releaseLock();
+  }
+
+  const payload = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    payload.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return payload;
+}
+
 /** HTTPS projection used by browsers, PWAs, React Native, and server-side clients. */
 export class HttpsPlatformTransport implements PlatformAdapter {
   readonly endpoint: string;
@@ -366,8 +419,10 @@ export class HttpsPlatformTransport implements PlatformAdapter {
     requestId: () => string = defaultRequestId,
   ) {
     const parsed = new URL(endpoint);
+    const localHttp = parsed.protocol === "http:"
+      && (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1");
     if (
-      (parsed.protocol !== "https:" && parsed.hostname !== "localhost" && parsed.hostname !== "127.0.0.1")
+      (parsed.protocol !== "https:" && !localHttp)
       || parsed.username !== ""
       || parsed.password !== ""
     ) {
@@ -411,10 +466,7 @@ export class HttpsPlatformTransport implements PlatformAdapter {
     if (response.headers.get("content-type")?.trim() !== PLATFORM_MEDIA_TYPE) {
       throw new PlatformTransportError(response.status, "content_type_mismatch");
     }
-    const responsePayload = new Uint8Array(await response.arrayBuffer());
-    if (responsePayload.byteLength > MAX_PLATFORM_CANONICAL_BYTES) {
-      throw new PlatformTransportError(response.status, "frame_too_large");
-    }
+    const responsePayload = await readBoundedResponse(response, MAX_PLATFORM_CANONICAL_BYTES);
 
     try {
       const decoded = decodePlatformResponse(responsePayload);

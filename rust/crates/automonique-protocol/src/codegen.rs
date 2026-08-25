@@ -497,6 +497,19 @@ pub fn emit_typescript(schema: &SpikeSchema) -> String {
     out.push_str("function byteLength(value: string): number {\n");
     out.push_str("  return encoder.encode(value).length;\n");
     out.push_str("}\n\n");
+    out.push_str("function isWellFormedUnicode(value: string): boolean {\n");
+    out.push_str("  for (let index = 0; index < value.length; index += 1) {\n");
+    out.push_str("    const codeUnit = value.charCodeAt(index);\n");
+    out.push_str("    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {\n");
+    out.push_str("      const next = value.charCodeAt(index + 1);\n");
+    out.push_str("      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;\n");
+    out.push_str("      index += 1;\n");
+    out.push_str("    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {\n");
+    out.push_str("      return false;\n");
+    out.push_str("    }\n");
+    out.push_str("  }\n");
+    out.push_str("  return true;\n");
+    out.push_str("}\n\n");
     out.push_str("export class ValidationError extends Error {\n");
     // Keep the output executable by runtimes that implement TypeScript by
     // erasing types only. Constructor parameter properties require a transform
@@ -598,6 +611,10 @@ fn emit_checked_string(out: &mut String, name: &str, max_bytes: usize, pattern: 
     let _ = writeln!(
         out,
         "  if (value.length === 0) throw new ValidationError(\"{name}\", \"empty\");"
+    );
+    let _ = writeln!(
+        out,
+        "  if (!isWellFormedUnicode(value)) throw new ValidationError(\"{name}\", \"invalid_character\");"
     );
     let _ = writeln!(
         out,
@@ -1621,11 +1638,12 @@ export {
   WireError,
   decodeMessageAdmitted,
   encodeMessage,
+  isWellFormedUnicode,
   toCanonicalBytes,
   type JsonValue,
 } from "../src/canonical.js";
 
-import {type JsonValue} from "../src/canonical.js";
+import {isWellFormedUnicode, type JsonValue} from "../src/canonical.js";
 
 const encoder = new TextEncoder();
 
@@ -6772,7 +6790,7 @@ fn runtime_imports(module: &GeneratedModule) -> (Vec<&'static str>, Vec<&'static
         names.push("ValidationError");
     }
     if measures_bytes {
-        names.push("byteLength");
+        names.extend(["byteLength", "isWellFormedUnicode"]);
     }
     names.sort_unstable();
     names.dedup();
@@ -7646,6 +7664,8 @@ fn emit_response_dispatch(out: &mut String, surface: &CommandSurface) {
         name,
         protocol_constant,
         request_id_type,
+        max_message_bytes_constant,
+        oversize_category,
         unknown_kind_category,
         field_invalid_category,
         field_grammar_category,
@@ -7717,6 +7737,13 @@ fn emit_response_dispatch(out: &mut String, surface: &CommandSurface) {
          * neither is downgraded into the other.\n \
          */\n\
          export function decode{union}(payload: Uint8Array): {union} {{\n  \
+         if (payload.length > {max_message_bytes_constant}) {{\n    \
+         throw new RefusalError(\n      \
+         {oversize_category},\n      \
+         `canonical payload is ${{payload.length}} bytes; maximum is \
+         ${{{max_message_bytes_constant}}}`,\n    \
+         );\n  \
+         }}\n  \
          const message = decodeMessageAdmitted(payload, [\n    \
          {{protocol: {protocol_constant}, minVersion: {version}, maxVersion: {version}}},\n  \
          ]);\n  \

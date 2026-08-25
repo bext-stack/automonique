@@ -10,7 +10,7 @@
 // ergonomics; it may not redefine anything in this file.
 
 import {DurableRowId, RequestId, RunId, SpecDigest} from "./admin-command.js";
-import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyStringOrNull, bodyUnsigned, bodyValue, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, mapNullable, orderedEnumSet, refuse, refuseField, type JsonValue} from "./runtime.js";
+import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyStringOrNull, bodyUnsigned, bodyValue, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, isWellFormedUnicode, mapNullable, orderedEnumSet, refuse, refuseField, type JsonValue} from "./runtime.js";
 
 /** Maximum lifecycle events one detail view may carry. */
 export const MAX_LIFECYCLE_EVENTS = 128;
@@ -33,6 +33,7 @@ export const CausationId_MAX_BYTES = 256;
 export const CausationId_PATTERN = /^[A-Za-z0-9._:-]+$/u;
 export function CausationId(value: string): CausationId {
   if (value.length === 0) throw new ValidationError("CausationId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("CausationId", "invalid_character");
   if (byteLength(value) > 256) throw new ValidationError("CausationId", "too_long");
   if (!CausationId_PATTERN.test(value)) throw new ValidationError("CausationId", "invalid_character");
   return value as CausationId;
@@ -44,6 +45,7 @@ export const CorrelationId_MAX_BYTES = 256;
 export const CorrelationId_PATTERN = /^[A-Za-z0-9._:-]+$/u;
 export function CorrelationId(value: string): CorrelationId {
   if (value.length === 0) throw new ValidationError("CorrelationId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("CorrelationId", "invalid_character");
   if (byteLength(value) > 256) throw new ValidationError("CorrelationId", "too_long");
   if (!CorrelationId_PATTERN.test(value)) throw new ValidationError("CorrelationId", "invalid_character");
   return value as CorrelationId;
@@ -55,6 +57,7 @@ export const TraceId_MAX_BYTES = 256;
 export const TraceId_PATTERN = /^[A-Za-z0-9._:-]+$/u;
 export function TraceId(value: string): TraceId {
   if (value.length === 0) throw new ValidationError("TraceId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("TraceId", "invalid_character");
   if (byteLength(value) > 256) throw new ValidationError("TraceId", "too_long");
   if (!TraceId_PATTERN.test(value)) throw new ValidationError("TraceId", "invalid_character");
   return value as TraceId;
@@ -530,6 +533,12 @@ export function assertNeverRunsResponse(value: never): never {
  * neither is downgraded into the other.
  */
 export function decodeRunsResponse(payload: Uint8Array): RunsResponse {
+  if (payload.length > MAX_RUNS_CANONICAL_BYTES) {
+    throw new RefusalError(
+      RUNS_FRAME_SIZE,
+      `canonical payload is ${payload.length} bytes; maximum is ${MAX_RUNS_CANONICAL_BYTES}`,
+    );
+  }
   const message = decodeMessageAdmitted(payload, [
     {protocol: RUNS_PROTOCOL, minVersion: RUNS_PROTOCOL_VERSION, maxVersion: RUNS_PROTOCOL_VERSION},
   ]);

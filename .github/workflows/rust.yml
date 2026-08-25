@@ -54,7 +54,7 @@ jobs:
       - name: Install the pinned JavaScript toolchain
         working-directory: sdk/typescript/packages
         run: |
-          for package in protocol lab; do
+          for package in protocol lab sdk; do
             (cd "$package" && bun install --frozen-lockfile)
           done
 
@@ -99,6 +99,45 @@ jobs:
           (cd protocol && npm run typecheck)
           (cd lab && npm run typecheck)
           (cd lab && bun test ./test)
+          (cd sdk && npm run typecheck)
+          (cd sdk && npm test)
+          (cd sdk && npm run build)
+
+      - name: TypeScript SDK distribution contract
+        working-directory: sdk/typescript/packages/sdk
+        run: |
+          set -euo pipefail
+          package_dir="$(mktemp -d)"
+          second_package_dir="$(mktemp -d)"
+          consumer_dir="$(mktemp -d)"
+          browser_dir="$(mktemp -d)"
+          test -d dist
+          mv dist "$package_dir/prebuilt-dist"
+          npm pack --pack-destination "$package_dir"
+          archive="$(find "$package_dir" -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+          test -n "$archive"
+          npm pack --pack-destination "$second_package_dir"
+          second_archive="$(find "$second_package_dir" -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+          test -n "$second_archive"
+          cmp "$archive" "$second_archive"
+          archive_listing="$package_dir/contents.txt"
+          tar -tzf "$archive" > "$archive_listing"
+          grep -Fxq 'package/LICENSE' "$archive_listing"
+          grep -Fxq 'package/README.md' "$archive_listing"
+          node --input-type=module -e \
+            'Promise.all([
+              import("./package.json", {with: {type: "json"}}),
+              import("./dist/sdk/src/index.js"),
+            ]).then(([{default: sdkPackage}, sdk]) => {
+              if (`sha256:${sdk.SCHEMA_DIGEST}` !== sdkPackage.automonique.schemaDigest) process.exit(1);
+            })'
+          npm install --prefix "$consumer_dir" "$archive"
+          (cd "$consumer_dir" && node --input-type=module -e \
+            'import("@automonique/sdk").then((sdk) => {
+              if (typeof sdk.PlatformClient !== "function") process.exit(1);
+            })')
+          bun build "$consumer_dir/node_modules/@automonique/sdk/dist/sdk/src/index.js" \
+            --target=browser --outdir="$browser_dir"
 
       - name: AG-UI adapter contract
         working-directory: adapters/ag-ui

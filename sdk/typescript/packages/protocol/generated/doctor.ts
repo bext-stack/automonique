@@ -9,7 +9,7 @@
 // Rust is the wire source of truth. Hand-written SDK code may add
 // ergonomics; it may not redefine anything in this file.
 
-import {ValidationError, byteLength} from "./runtime.js";
+import {ValidationError, byteLength, isWellFormedUnicode} from "./runtime.js";
 
 /** Stable schema identifier for the version-one report. */
 export const DOCTOR_REPORT_SCHEMA_V1 = "automonique.doctor/v1";
@@ -23,6 +23,7 @@ export const FindingCode_MAX_BYTES = 64;
 export const FindingCode_PATTERN = /^[a-z][a-z0-9._-]*$/u;
 export function FindingCode(value: string): FindingCode {
   if (value.length === 0) throw new ValidationError("FindingCode", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("FindingCode", "invalid_character");
   if (byteLength(value) > 64) throw new ValidationError("FindingCode", "too_long");
   if (!FindingCode_PATTERN.test(value)) throw new ValidationError("FindingCode", "invalid_character");
   return value as FindingCode;
@@ -34,6 +35,7 @@ export const FindingMessage_MAX_BYTES = 512;
 export const FindingMessage_PATTERN = /^[^\p{Cc}]+$/u;
 export function FindingMessage(value: string): FindingMessage {
   if (value.length === 0) throw new ValidationError("FindingMessage", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("FindingMessage", "invalid_character");
   if (byteLength(value) > 512) throw new ValidationError("FindingMessage", "too_long");
   if (!FindingMessage_PATTERN.test(value)) throw new ValidationError("FindingMessage", "invalid_character");
   return value as FindingMessage;

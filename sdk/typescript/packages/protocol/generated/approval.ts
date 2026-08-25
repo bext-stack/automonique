@@ -11,7 +11,7 @@
 
 import {DurableRowId, RequestId} from "./admin-command.js";
 import {EpochMillis} from "./runs.js";
-import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyUnsigned, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, mapNullable, refuse, refuseField, type JsonValue} from "./runtime.js";
+import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyUnsigned, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, isWellFormedUnicode, mapNullable, refuse, refuseField, type JsonValue} from "./runtime.js";
 
 /** Stable schema identifier for the version-one decision surface. */
 export const APPROVAL_API_SCHEMA_V1 = "automonique.approval/v1";
@@ -31,6 +31,7 @@ export const ApprovalKey_MAX_BYTES = 256;
 export const ApprovalKey_PATTERN = /^[^\p{Cc}]+$/u;
 export function ApprovalKey(value: string): ApprovalKey {
   if (value.length === 0) throw new ValidationError("ApprovalKey", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("ApprovalKey", "invalid_character");
   if (byteLength(value) > 256) throw new ValidationError("ApprovalKey", "too_long");
   if (!ApprovalKey_PATTERN.test(value)) throw new ValidationError("ApprovalKey", "invalid_character");
   return value as ApprovalKey;
@@ -42,6 +43,7 @@ export const ApprovalSubject_MAX_BYTES = 256;
 export const ApprovalSubject_PATTERN = /^[^\p{Cc}]+$/u;
 export function ApprovalSubject(value: string): ApprovalSubject {
   if (value.length === 0) throw new ValidationError("ApprovalSubject", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("ApprovalSubject", "invalid_character");
   if (byteLength(value) > 256) throw new ValidationError("ApprovalSubject", "too_long");
   if (!ApprovalSubject_PATTERN.test(value)) throw new ValidationError("ApprovalSubject", "invalid_character");
   return value as ApprovalSubject;
@@ -53,6 +55,7 @@ export const Decider_MAX_BYTES = 256;
 export const Decider_PATTERN = /^[^\p{Cc}]+$/u;
 export function Decider(value: string): Decider {
   if (value.length === 0) throw new ValidationError("Decider", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("Decider", "invalid_character");
   if (byteLength(value) > 256) throw new ValidationError("Decider", "too_long");
   if (!Decider_PATTERN.test(value)) throw new ValidationError("Decider", "invalid_character");
   return value as Decider;
@@ -538,6 +541,12 @@ export function assertNeverApprovalResponse(value: never): never {
  * neither is downgraded into the other.
  */
 export function decodeApprovalResponse(payload: Uint8Array): ApprovalResponse {
+  if (payload.length > MAX_APPROVAL_CANONICAL_BYTES) {
+    throw new RefusalError(
+      APPROVAL_FRAME_SIZE,
+      `canonical payload is ${payload.length} bytes; maximum is ${MAX_APPROVAL_CANONICAL_BYTES}`,
+    );
+  }
   const message = decodeMessageAdmitted(payload, [
     {protocol: APPROVAL_PROTOCOL, minVersion: APPROVAL_PROTOCOL_VERSION, maxVersion: APPROVAL_PROTOCOL_VERSION},
   ]);

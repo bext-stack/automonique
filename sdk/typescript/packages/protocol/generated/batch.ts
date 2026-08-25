@@ -11,7 +11,7 @@
 
 import {DurableRowId, RequestId} from "./admin-command.js";
 import {EpochMillis, LastSequence} from "./runs.js";
-import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyStringOrNull, bodyUnsigned, bodyValue, boundedItems, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, mapNullable, rangedInteger, refuse, refuseField, type JsonValue} from "./runtime.js";
+import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyStringOrNull, bodyUnsigned, bodyValue, boundedItems, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, isWellFormedUnicode, mapNullable, rangedInteger, refuse, refuseField, type JsonValue} from "./runtime.js";
 
 /** Stable schema identifier for the version-one batch control surface. */
 export const BATCH_CONTROL_API_SCHEMA_V1 = "automonique.batch.control/v1";
@@ -34,6 +34,7 @@ export const BatchId_MAX_BYTES = 128;
 export const BatchId_PATTERN = /^[^\p{Cc}]+$/u;
 export function BatchId(value: string): BatchId {
   if (value.length === 0) throw new ValidationError("BatchId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("BatchId", "invalid_character");
   if (byteLength(value) > 128) throw new ValidationError("BatchId", "too_long");
   if (!BatchId_PATTERN.test(value)) throw new ValidationError("BatchId", "invalid_character");
   return value as BatchId;
@@ -45,6 +46,7 @@ export const BatchMemberKey_MAX_BYTES = 128;
 export const BatchMemberKey_PATTERN = /^[^\p{Cc}]+$/u;
 export function BatchMemberKey(value: string): BatchMemberKey {
   if (value.length === 0) throw new ValidationError("BatchMemberKey", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("BatchMemberKey", "invalid_character");
   if (byteLength(value) > 128) throw new ValidationError("BatchMemberKey", "too_long");
   if (!BatchMemberKey_PATTERN.test(value)) throw new ValidationError("BatchMemberKey", "invalid_character");
   return value as BatchMemberKey;
@@ -56,6 +58,7 @@ export const BatchLabel_MAX_BYTES = 128;
 export const BatchLabel_PATTERN = /^[^\p{Cc}]+$/u;
 export function BatchLabel(value: string): BatchLabel {
   if (value.length === 0) throw new ValidationError("BatchLabel", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("BatchLabel", "invalid_character");
   if (byteLength(value) > 128) throw new ValidationError("BatchLabel", "too_long");
   if (!BatchLabel_PATTERN.test(value)) throw new ValidationError("BatchLabel", "invalid_character");
   return value as BatchLabel;
@@ -737,6 +740,12 @@ export function assertNeverBatchResponse(value: never): never {
  * neither is downgraded into the other.
  */
 export function decodeBatchResponse(payload: Uint8Array): BatchResponse {
+  if (payload.length > MAX_BATCH_CONTROL_CANONICAL_BYTES) {
+    throw new RefusalError(
+      BATCH_FRAME_SIZE,
+      `canonical payload is ${payload.length} bytes; maximum is ${MAX_BATCH_CONTROL_CANONICAL_BYTES}`,
+    );
+  }
   const message = decodeMessageAdmitted(payload, [
     {protocol: BATCH_CONTROL_PROTOCOL, minVersion: BATCH_PROTOCOL_VERSION, maxVersion: BATCH_PROTOCOL_VERSION},
   ]);

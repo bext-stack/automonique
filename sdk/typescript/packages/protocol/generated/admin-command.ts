@@ -10,7 +10,7 @@
 // ergonomics; it may not redefine anything in this file.
 
 import {ADMIN_PROTOCOL, MAX_ADMIN_CANONICAL_BYTES} from "./admin-status.js";
-import {RefusalError, ValidationError, bodyBool, bodyInteger, bodyString, boundedBytes, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, hexEncode, refuse, refuseField, type JsonValue} from "./runtime.js";
+import {RefusalError, ValidationError, bodyBool, bodyInteger, bodyString, boundedBytes, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, hexEncode, isWellFormedUnicode, refuse, refuseField, type JsonValue} from "./runtime.js";
 
 /** Maximum raw RunSpec document bytes this lane carries. The wire spends twice this, because the document travels hex-encoded. */
 export const MAX_SUBMITTED_RUN_SPEC_BYTES = 24576;
@@ -21,6 +21,7 @@ export const AdminRefusalCategory_MAX_BYTES = 64;
 export const AdminRefusalCategory_PATTERN = /^[a-z0-9_]+$/u;
 export function AdminRefusalCategory(value: string): AdminRefusalCategory {
   if (value.length === 0) throw new ValidationError("AdminRefusalCategory", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("AdminRefusalCategory", "invalid_character");
   if (byteLength(value) > 64) throw new ValidationError("AdminRefusalCategory", "too_long");
   if (!AdminRefusalCategory_PATTERN.test(value)) throw new ValidationError("AdminRefusalCategory", "invalid_character");
   return value as AdminRefusalCategory;
@@ -32,6 +33,7 @@ export const IntakeActor_MAX_BYTES = 128;
 export const IntakeActor_PATTERN = /^[^\p{Cc}]+$/u;
 export function IntakeActor(value: string): IntakeActor {
   if (value.length === 0) throw new ValidationError("IntakeActor", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("IntakeActor", "invalid_character");
   if (byteLength(value) > 128) throw new ValidationError("IntakeActor", "too_long");
   if (!IntakeActor_PATTERN.test(value)) throw new ValidationError("IntakeActor", "invalid_character");
   return value as IntakeActor;
@@ -43,6 +45,7 @@ export const IntakeReason_MAX_BYTES = 256;
 export const IntakeReason_PATTERN = /^[^\p{Cc}]+$/u;
 export function IntakeReason(value: string): IntakeReason {
   if (value.length === 0) throw new ValidationError("IntakeReason", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("IntakeReason", "invalid_character");
   if (byteLength(value) > 256) throw new ValidationError("IntakeReason", "too_long");
   if (!IntakeReason_PATTERN.test(value)) throw new ValidationError("IntakeReason", "invalid_character");
   return value as IntakeReason;
@@ -54,6 +57,7 @@ export const RequestId_MAX_BYTES = 128;
 export const RequestId_PATTERN = /^[A-Za-z0-9._:-]+$/u;
 export function RequestId(value: string): RequestId {
   if (value.length === 0) throw new ValidationError("RequestId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("RequestId", "invalid_character");
   if (byteLength(value) > 128) throw new ValidationError("RequestId", "too_long");
   if (!RequestId_PATTERN.test(value)) throw new ValidationError("RequestId", "invalid_character");
   return value as RequestId;
@@ -65,6 +69,7 @@ export const RunId_MAX_BYTES = 256;
 export const RunId_PATTERN = /^[^\p{Cc}]+$/u;
 export function RunId(value: string): RunId {
   if (value.length === 0) throw new ValidationError("RunId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("RunId", "invalid_character");
   if (byteLength(value) > 256) throw new ValidationError("RunId", "too_long");
   if (!RunId_PATTERN.test(value)) throw new ValidationError("RunId", "invalid_character");
   return value as RunId;
@@ -76,6 +81,7 @@ export const RunSubmissionKey_MAX_BYTES = 128;
 export const RunSubmissionKey_PATTERN = /^[^\p{Cc}]+$/u;
 export function RunSubmissionKey(value: string): RunSubmissionKey {
   if (value.length === 0) throw new ValidationError("RunSubmissionKey", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("RunSubmissionKey", "invalid_character");
   if (byteLength(value) > 128) throw new ValidationError("RunSubmissionKey", "too_long");
   if (!RunSubmissionKey_PATTERN.test(value)) throw new ValidationError("RunSubmissionKey", "invalid_character");
   return value as RunSubmissionKey;
@@ -87,6 +93,7 @@ export const SpecDigest_MAX_BYTES = 71;
 export const SpecDigest_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 export function SpecDigest(value: string): SpecDigest {
   if (value.length === 0) throw new ValidationError("SpecDigest", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("SpecDigest", "invalid_character");
   if (byteLength(value) > 71) throw new ValidationError("SpecDigest", "too_long");
   if (!SpecDigest_PATTERN.test(value)) throw new ValidationError("SpecDigest", "invalid_character");
   return value as SpecDigest;
@@ -395,6 +402,12 @@ export function assertNeverAdminResponse(value: never): never {
  * neither is downgraded into the other.
  */
 export function decodeAdminResponse(payload: Uint8Array): AdminResponse {
+  if (payload.length > MAX_ADMIN_CANONICAL_BYTES) {
+    throw new RefusalError(
+      ADMIN_FRAME_SIZE,
+      `canonical payload is ${payload.length} bytes; maximum is ${MAX_ADMIN_CANONICAL_BYTES}`,
+    );
+  }
   const message = decodeMessageAdmitted(payload, [
     {protocol: ADMIN_PROTOCOL, minVersion: ADMIN_PROTOCOL_VERSION, maxVersion: ADMIN_PROTOCOL_VERSION},
   ]);

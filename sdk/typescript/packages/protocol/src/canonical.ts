@@ -77,7 +77,23 @@ export type JsonValue =
 const encoder = new TextEncoder();
 const strictDecoder = new TextDecoder("utf-8", {fatal: true});
 
+/** Whether a JavaScript string can be encoded without replacing lone surrogates. */
+export function isWellFormedUnicode(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      index += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function utf8(value: string): Uint8Array {
+  if (!isWellFormedUnicode(value)) throw new WireError("malformed_json", "lone surrogate");
   return encoder.encode(value);
 }
 
@@ -342,6 +358,14 @@ class Parser {
   private parseString(): string {
     this.expect('"');
     let value = "";
+    let bytes = 0;
+    const append = (fragment: string, fragmentBytes: number): void => {
+      value += fragment;
+      bytes += fragmentBytes;
+      if (bytes > MAX_JSON_STRING_BYTES) {
+        throw new WireError("field_invalid", "string exceeds its ceiling");
+      }
+    };
     for (;;) {
       const character = this.peek();
       if (character === undefined) throw new WireError("malformed_json", "unterminated string");
@@ -353,28 +377,28 @@ class Parser {
         this.position += 1;
         switch (escape) {
           case '"':
-            value += '"';
+            append('"', 1);
             break;
           case "\\":
-            value += "\\";
+            append("\\", 1);
             break;
           case "/":
-            value += "/";
+            append("/", 1);
             break;
           case "b":
-            value += "\b";
+            append("\b", 1);
             break;
           case "f":
-            value += "\f";
+            append("\f", 1);
             break;
           case "n":
-            value += "\n";
+            append("\n", 1);
             break;
           case "r":
-            value += "\r";
+            append("\r", 1);
             break;
           case "t":
-            value += "\t";
+            append("\t", 1);
             break;
           case "u": {
             const hex = this.text.slice(this.position, this.position + 4);
@@ -388,19 +412,27 @@ class Parser {
               throw new WireError("malformed_json", "lone surrogate");
             }
             this.position += 4;
-            value += String.fromCodePoint(code);
+            append(String.fromCodePoint(code), code <= 0x7f ? 1 : code <= 0x7ff ? 2 : 3);
             break;
           }
           default:
             throw new WireError("malformed_json", "unknown escape");
         }
-      } else if (character.codePointAt(0)! < 0x20) {
-        throw new WireError("malformed_json", "raw control character");
       } else {
-        value += character;
-      }
-      if (utf8(value).length > MAX_JSON_STRING_BYTES) {
-        throw new WireError("field_invalid", "string exceeds its ceiling");
+        const codeUnit = character.charCodeAt(0);
+        if (codeUnit < 0x20) throw new WireError("malformed_json", "raw control character");
+        if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+          const low = this.text.charCodeAt(this.position);
+          if (!(low >= 0xdc00 && low <= 0xdfff)) {
+            throw new WireError("malformed_json", "lone surrogate");
+          }
+          append(character + this.text[this.position], 4);
+          this.position += 1;
+        } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+          throw new WireError("malformed_json", "lone surrogate");
+        } else {
+          append(character, codeUnit <= 0x7f ? 1 : codeUnit <= 0x7ff ? 2 : 3);
+        }
       }
     }
     return value;

@@ -21,11 +21,12 @@ export {
   WireError,
   decodeMessageAdmitted,
   encodeMessage,
+  isWellFormedUnicode,
   toCanonicalBytes,
   type JsonValue,
 } from "../src/canonical.js";
 
-import {type JsonValue} from "../src/canonical.js";
+import {isWellFormedUnicode, type JsonValue} from "../src/canonical.js";
 
 const encoder = new TextEncoder();
 

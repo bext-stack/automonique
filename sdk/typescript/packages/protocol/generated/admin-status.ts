@@ -9,7 +9,7 @@
 // Rust is the wire source of truth. Hand-written SDK code may add
 // ergonomics; it may not redefine anything in this file.
 
-import {ValidationError, byteLength} from "./runtime.js";
+import {ValidationError, byteLength, isWellFormedUnicode} from "./runtime.js";
 
 /** What this build's local endpoints can do, as one monotonic integer. A client compares it against the number it was written for; it never assumes the two must be equal. */
 export const ADMIN_CAPABILITY = 5;
@@ -35,6 +35,7 @@ export const AdminInstanceId_MAX_BYTES = 128;
 export const AdminInstanceId_PATTERN = /^[^\p{Cc}]+$/u;
 export function AdminInstanceId(value: string): AdminInstanceId {
   if (value.length === 0) throw new ValidationError("AdminInstanceId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("AdminInstanceId", "invalid_character");
   if (byteLength(value) > 128) throw new ValidationError("AdminInstanceId", "too_long");
   if (!AdminInstanceId_PATTERN.test(value)) throw new ValidationError("AdminInstanceId", "invalid_character");
   return value as AdminInstanceId;

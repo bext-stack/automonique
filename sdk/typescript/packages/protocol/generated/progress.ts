@@ -12,7 +12,7 @@
 import {RunId} from "./admin-command.js";
 import {WireCounter} from "./admin-status.js";
 import {Authority, EpochMillis, SpoolSequence} from "./runs.js";
-import {ValidationError, byteLength} from "./runtime.js";
+import {ValidationError, byteLength, isWellFormedUnicode} from "./runtime.js";
 
 /** Maximum canonical bytes of one encoded frame. It is inside the runner spool's own payload ceiling, because a frame is stored as one spool event's payload. */
 export const MAX_PROGRESS_CANONICAL_BYTES = 40960;
@@ -44,6 +44,7 @@ export const ProgressText_MAX_BYTES = 16384;
 export const ProgressText_PATTERN = /^(?:[^\p{Cc}]|[\n\t])+$/u;
 export function ProgressText(value: string): ProgressText {
   if (value.length === 0) throw new ValidationError("ProgressText", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("ProgressText", "invalid_character");
   if (byteLength(value) > 16384) throw new ValidationError("ProgressText", "too_long");
   if (!ProgressText_PATTERN.test(value)) throw new ValidationError("ProgressText", "invalid_character");
   return value as ProgressText;
