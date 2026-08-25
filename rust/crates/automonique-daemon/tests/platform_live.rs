@@ -518,6 +518,38 @@ fn platform_decode_failures_are_typed_refusals_and_absent_client_is_accepted() {
         other => panic!("unexpected response {other:?}"),
     }
 
+    // #131: `node/current` names the live generation's node without the
+    // client knowing the holder id.
+    let response = platform(
+        &config,
+        "snapshot-current-node",
+        PlatformRequest::Snapshot(
+            SnapshotRequest::new(vec![automonique_coordinate(
+                ResourceKind::Node,
+                automonique_daemon::CURRENT_NODE_ALIAS,
+            )])
+            .expect("request"),
+        ),
+    );
+    let PlatformResponse::Snapshot(snapshot) = response else {
+        panic!("unexpected response {response:?}");
+    };
+    let nodes: Vec<_> = snapshot
+        .resources
+        .iter()
+        .filter(|record| record.resource.kind == ResourceKind::Node)
+        .collect();
+    assert_eq!(nodes.len(), 1, "exactly the live node: {snapshot:?}");
+    assert_ne!(
+        nodes[0].resource.id.as_str(),
+        automonique_daemon::CURRENT_NODE_ALIAS
+    );
+    assert!(nodes[0].resource.id.as_str().starts_with("daemon-"));
+    assert_eq!(
+        nodes[0].freshness.state,
+        automonique_protocol::platform::FreshnessState::Fresh
+    );
+
     serving.shutdown(&config);
 }
 

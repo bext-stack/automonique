@@ -327,7 +327,10 @@ describe("node discovery across daemon generations", () => {
     expect(execute?.body.target).toEqual({authority: "automonique", kind: "node", id: "daemon-new"});
     expect(execute?.body.client).toBeNull();
     const snapshot = platform.sent.find((request) => request.kind === "snapshot");
-    expect(snapshot?.body).toEqual({resources: []});
+    expect(snapshot?.body).toEqual({resources: [
+      {authority: "automonique", id: "current", kind: "node"},
+      {authority: "automonique", id: "daemon-old", kind: "node"},
+    ]});
   });
 
   test("prefers the configured node while it is still fresh", async () => {
