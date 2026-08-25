@@ -34,6 +34,7 @@ use sha2::{Digest, Sha256};
 use crate::DaemonConfig;
 use crate::attempt_adoption::{AttemptAdoptionClient, socket_path as attempt_adoption_socket_path};
 use crate::attempt_host::MAX_ATTEMPT_REGISTRATIONS;
+use crate::lease_identity::{ProcessIdentity, ProcessIdentityError};
 use crate::release_activation::VerifiedCodeRelease;
 
 const CHANNEL_SCHEMA: &str = "automonique.reload-candidate/v2";
@@ -75,6 +76,15 @@ pub struct AttemptInventoryProof {
     pub sha256: String,
 }
 
+/// Exact candidate identity the source binds into a transferred lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateLeaseTarget {
+    pub holder_id: String,
+    pub boot_id: String,
+    pub pid: u32,
+    pub starttime: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CandidateIdentity {
@@ -86,6 +96,9 @@ struct CandidateIdentity {
     binary_sha256: String,
     attempt_count: u32,
     attempt_inventory_sha256: String,
+    target_holder_id: String,
+    boot_id: String,
+    starttime: u64,
     pid: u32,
 }
 
@@ -211,6 +224,14 @@ pub fn spawn_warm_candidate(
         let _ = child.wait();
         return Err(CandidateError::Protocol);
     }
+    let measured = match process_identity(child.id()) {
+        Ok(measured) => measured,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
     let expected = CandidateIdentity {
         schema: CHANNEL_SCHEMA.to_owned(),
         event: "warm".to_owned(),
@@ -220,6 +241,9 @@ pub fn spawn_warm_candidate(
         binary_sha256: release.binary_sha256.clone(),
         attempt_count: observed.attempt_count,
         attempt_inventory_sha256: observed.attempt_inventory_sha256.clone(),
+        target_holder_id: candidate_holder_id(child.id(), &spec.reload_id),
+        boot_id: measured.boot_id,
+        starttime: measured.starttime,
         pid: child.id(),
     };
     if observed != expected {
@@ -275,6 +299,17 @@ impl WarmCandidate {
         }
     }
 
+    /// Kernel-bound coordinates the source writes into the successor lease.
+    #[must_use]
+    pub fn lease_target(&self) -> CandidateLeaseTarget {
+        CandidateLeaseTarget {
+            holder_id: self.identity.target_holder_id.clone(),
+            boot_id: self.identity.boot_id.clone(),
+            pid: self.identity.pid,
+            starttime: self.identity.starttime,
+        }
+    }
+
     /// End a still-non-owning candidate and require a matching acknowledgement.
     pub fn stop(mut self) -> Result<(), CandidateError> {
         let control = CandidateControl {
@@ -322,6 +357,8 @@ pub fn run_candidate(
     warm_state(config, &input.source_holder_id, input.source_lease_epoch)?;
     let (attempt_count, attempt_inventory_sha256) =
         warm_attempt_host(config, &input.source_holder_id, input.source_lease_epoch)?;
+    let process_identity = process_identity(std::process::id())?;
+    let target_holder_id = candidate_holder_id(process_identity.pid, &input.reload_id);
     if getppid().as_raw() as u32 != input.expected_parent_pid {
         return Err(CandidateError::ParentChanged);
     }
@@ -334,7 +371,10 @@ pub fn run_candidate(
         binary_sha256: input.binary_sha256,
         attempt_count,
         attempt_inventory_sha256,
-        pid: std::process::id(),
+        target_holder_id,
+        boot_id: process_identity.boot_id,
+        starttime: process_identity.starttime,
+        pid: process_identity.pid,
     };
     write_message(&mut writer, &identity)?;
     let control: CandidateControl = read_message_from(&mut reader)?;
@@ -348,6 +388,20 @@ pub fn run_candidate(
     let mut stopped = identity;
     stopped.event = "stopped".to_owned();
     write_message(&mut writer, &stopped)
+}
+
+fn process_identity(pid: u32) -> Result<ProcessIdentity, CandidateError> {
+    ProcessIdentity::for_pid(pid)
+        .map_err(|error| match error {
+            ProcessIdentityError::Io(error) => CandidateError::Io(error),
+            ProcessIdentityError::Malformed(category) => CandidateError::UnsafePath(category),
+        })?
+        .ok_or(CandidateError::CandidateExited)
+}
+
+fn candidate_holder_id(pid: u32, reload_id: &str) -> String {
+    let digest = encode_hex(&Sha256::digest(reload_id.as_bytes()));
+    format!("daemon-{pid}-reload-{}", &digest[..16])
 }
 
 fn warm_attempt_host(
@@ -577,6 +631,9 @@ mod tests {
             binary_sha256: "b".repeat(64),
             attempt_count: 2,
             attempt_inventory_sha256: "c".repeat(64),
+            target_holder_id: "daemon-42-reload-0123456789abcdef".to_owned(),
+            boot_id: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            starttime: 100,
             pid: 42,
         };
         let mut bytes = Vec::new();
@@ -586,7 +643,7 @@ mod tests {
             identity
         );
 
-        let unknown = br#"{"schema":"automonique.reload-candidate/v2","event":"warm","reload_id":"reload-1","target_generation_id":"generation-2","manifest_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binary_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","attempt_count":2,"attempt_inventory_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","pid":42,"extra":true}\n"#;
+        let unknown = br#"{"schema":"automonique.reload-candidate/v2","event":"warm","reload_id":"reload-1","target_generation_id":"generation-2","manifest_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binary_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","attempt_count":2,"attempt_inventory_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","target_holder_id":"daemon-42-reload-0123456789abcdef","boot_id":"01234567-89ab-cdef-0123-456789abcdef","starttime":100,"pid":42,"extra":true}\n"#;
         assert!(matches!(
             read_message_from::<CandidateIdentity>(&mut unknown.as_slice()),
             Err(CandidateError::Protocol)

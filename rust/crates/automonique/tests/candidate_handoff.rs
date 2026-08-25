@@ -89,6 +89,10 @@ fn exact_release_candidate_warms_without_competing_for_source_authority() {
     )
     .expect("warm candidate");
     assert_ne!(candidate.pid(), source.id());
+    let lease_target = candidate.lease_target();
+    assert_eq!(lease_target.pid, candidate.pid());
+    assert!(lease_target.starttime > 0);
+    assert!(lease_target.holder_id.starts_with("daemon-"));
     let attempt_inventory = candidate.attempt_inventory_proof();
     assert_eq!(attempt_inventory.count, 0);
     assert_eq!(

@@ -26,13 +26,22 @@ pub enum ProcessIdentityError {
 impl ProcessIdentity {
     /// Measure this process from kernel-owned sources.
     pub fn current() -> Result<Self, ProcessIdentityError> {
-        let pid = std::process::id();
-        Ok(Self {
+        Self::for_pid(std::process::id())?
+            .ok_or(ProcessIdentityError::Malformed("self_stat_disappeared"))
+    }
+
+    /// Measure one live process from kernel-owned sources.
+    ///
+    /// `None` means the PID does not exist at the instant of measurement.
+    pub fn for_pid(pid: u32) -> Result<Option<Self>, ProcessIdentityError> {
+        let Some(starttime) = read_starttime(pid)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
             boot_id: read_boot_id()?,
             pid,
-            starttime: read_starttime(pid)?
-                .ok_or(ProcessIdentityError::Malformed("self_stat_disappeared"))?,
-        })
+            starttime,
+        }))
     }
 
     /// Whether the kernel still reports this exact process on this exact boot.
@@ -100,6 +109,10 @@ mod tests {
         assert!(identity.pid > 0);
         assert!(identity.starttime > 0);
         assert!(identity.is_live().expect("liveness"));
+        assert_eq!(
+            ProcessIdentity::for_pid(identity.pid).expect("measure by PID"),
+            Some(identity)
+        );
     }
 
     #[test]
