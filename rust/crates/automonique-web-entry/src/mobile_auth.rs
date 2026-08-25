@@ -22,7 +22,7 @@ use automonique_protocol::platform::{
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -37,6 +37,10 @@ pub const ACCESS_TTL_MILLIS: i64 = 15 * 60 * 1_000;
 pub const REFRESH_TTL_MILLIS: i64 = 30 * 24 * 60 * 60 * 1_000;
 pub const REVOKED_FAMILY_RETENTION_MILLIS: i64 = 30 * 24 * 60 * 60 * 1_000;
 pub const MAX_CREDENTIAL_REVISIONS: u64 = 4_096;
+pub const PAIRING_TTL_MILLIS: i64 = 5 * 60 * 1_000;
+pub const PAIRING_RETENTION_MILLIS: i64 = 24 * 60 * 60 * 1_000;
+pub const MAX_OUTSTANDING_PAIRINGS: u64 = 32;
+pub const MAX_CREDENTIAL_PAGE_SIZE: u16 = 100;
 
 const TOKEN_BYTES: usize = 32;
 const MAX_IDENTIFIER_BYTES: usize = 256;
@@ -75,6 +79,19 @@ CREATE TABLE IF NOT EXISTS mobile_refresh_history (
   rotated_at_ms INTEGER NOT NULL CHECK(rotated_at_ms BETWEEN 0 AND 9007199254740991),
   UNIQUE(credential_id, credential_revision),
   FOREIGN KEY(credential_id) REFERENCES mobile_credentials(credential_id) ON DELETE CASCADE
+) STRICT;
+CREATE TABLE IF NOT EXISTS mobile_pairings (
+  pairing_id TEXT PRIMARY KEY CHECK(length(pairing_id) = 46),
+  pairing_sha256 BLOB NOT NULL UNIQUE CHECK(length(pairing_sha256) = 32),
+  actor TEXT NOT NULL CHECK(length(actor) BETWEEN 1 AND 256),
+  server_identity TEXT NOT NULL CHECK(length(server_identity) = 71),
+  created_at_ms INTEGER NOT NULL CHECK(created_at_ms BETWEEN 0 AND 9007199254740991),
+  expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms BETWEEN 0 AND 9007199254740991),
+  consumed_at_ms INTEGER CHECK(consumed_at_ms BETWEEN 0 AND 9007199254740991),
+  actions_json TEXT NOT NULL CHECK(length(actions_json) BETWEEN 1 AND 128),
+  sessions_json TEXT NOT NULL CHECK(length(sessions_json) BETWEEN 2 AND 26000),
+  max_page_events INTEGER NOT NULL CHECK(max_page_events BETWEEN 1 AND 512),
+  max_follow_up_bytes INTEGER NOT NULL CHECK(max_follow_up_bytes BETWEEN 1 AND 65536)
 ) STRICT;
 "#;
 
@@ -125,13 +142,116 @@ impl MobileAuthorization {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MobileDiscovery {
+    pub credential_inventory_endpoint: String,
+    pub credential_revoke_endpoint: String,
     pub operator_provision_endpoint: String,
     pub origin: String,
+    pub pairing_create_endpoint: String,
+    pub pairing_exchange_endpoint: String,
     pub platform_endpoint: String,
     pub protocol: &'static str,
     pub schema: &'static str,
     pub server_identity: String,
     pub supported_versions: Vec<u16>,
+}
+
+#[derive(Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MobilePairingOffer {
+    pub exchange_endpoint: String,
+    pub expires_at_ms: i64,
+    pub origin: String,
+    pub pairing_id: String,
+    pub pairing_token: String,
+    pub schema: &'static str,
+    pub server_identity: String,
+}
+
+impl Drop for MobilePairingOffer {
+    fn drop(&mut self) {
+        self.pairing_token.zeroize();
+    }
+}
+
+impl std::fmt::Debug for MobilePairingOffer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MobilePairingOffer")
+            .field("exchange_endpoint", &self.exchange_endpoint)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("origin", &self.origin)
+            .field("pairing_id", &self.pairing_id)
+            .field("pairing_token", &"<redacted>")
+            .field("schema", &self.schema)
+            .field("server_identity", &self.server_identity)
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MobilePairingExchangeRequest {
+    pub pairing_id: String,
+    pub pairing_token: String,
+    pub server_identity: String,
+}
+
+impl Drop for MobilePairingExchangeRequest {
+    fn drop(&mut self) {
+        self.pairing_token.zeroize();
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MobileCredentialInventoryRequest {
+    pub cursor: Option<String>,
+    pub page_size: u16,
+}
+
+impl<'de> Deserialize<'de> for MobileCredentialInventoryRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            cursor: serde_json::Value,
+            page_size: u16,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let cursor = match wire.cursor {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(value) => Some(value),
+            _ => return Err(de::Error::custom("cursor must be a string or null")),
+        };
+        Ok(Self {
+            cursor,
+            page_size: wire.page_size,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MobileCredentialRevokeRequest {
+    pub credential_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MobileCredentialSummary {
+    pub authorization: MobileAuthorization,
+    pub refresh_expires_at_ms: i64,
+    pub revoked_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MobileCredentialInventory {
+    pub credentials: Vec<MobileCredentialSummary>,
+    pub next_cursor: Option<String>,
+    pub schema: &'static str,
 }
 
 #[derive(Eq, PartialEq, Serialize)]
@@ -203,6 +323,8 @@ pub enum MobileAuthError {
     InvalidOrigin,
     InvalidRequest,
     InvalidCredential,
+    InvalidPairing,
+    PairingLimit,
     Expired,
     Revoked,
     ServerIdentityMismatch,
@@ -218,6 +340,8 @@ impl MobileAuthError {
             Self::InvalidOrigin => "mobile_origin_invalid",
             Self::InvalidRequest => "mobile_request_invalid",
             Self::InvalidCredential => "mobile_credential_invalid",
+            Self::InvalidPairing => "mobile_pairing_invalid",
+            Self::PairingLimit => "mobile_pairing_limit",
             Self::Expired => "mobile_credential_expired",
             Self::Revoked => "mobile_credential_revoked",
             Self::ServerIdentityMismatch => "mobile_server_identity_mismatch",
@@ -244,6 +368,8 @@ impl std::error::Error for MobileAuthError {
             Self::InvalidOrigin
             | Self::InvalidRequest
             | Self::InvalidCredential
+            | Self::InvalidPairing
+            | Self::PairingLimit
             | Self::Expired
             | Self::Revoked
             | Self::ServerIdentityMismatch
@@ -306,6 +432,10 @@ impl MobileCredentialAuthority {
             schema: MOBILE_AUTH_SCHEMA_V1,
             platform_endpoint: format!("{origin}/api/platform"),
             operator_provision_endpoint: format!("{origin}/api/mobile/operator-provision"),
+            pairing_create_endpoint: format!("{origin}/api/mobile/pairings"),
+            pairing_exchange_endpoint: format!("{origin}/api/mobile/pairings/exchange"),
+            credential_inventory_endpoint: format!("{origin}/api/mobile/credentials/list"),
+            credential_revoke_endpoint: format!("{origin}/api/mobile/credentials/revoke"),
             origin,
             server_identity,
             supported_versions: vec![1],
@@ -332,68 +462,231 @@ impl MobileCredentialAuthority {
         cleanup_retired_families(&self.connection, now_ms)?;
         let (actions, sessions) = admit_scope(request.actions, request.session_scope)?;
         validate_limits(&request.limits)?;
-        let mut access = random_secret_token("ma")?;
-        let mut refresh = random_secret_token("mr")?;
-        let credential_id = random_token("mc")?;
-        let access_digest = token_digest(
-            b"automonique.mobile-access/v1\0",
+        issue_credential(
+            &self.connection,
             &self.discovery.server_identity,
-            &access,
-        );
-        let refresh_digest = token_digest(
-            b"automonique.mobile-refresh/v1\0",
+            &self.actor,
+            actions,
+            sessions,
+            request.limits,
+            now_ms,
+        )
+    }
+
+    pub fn create_pairing(
+        &mut self,
+        request: MobileOperatorProvisionRequest,
+        now_ms: i64,
+    ) -> Result<MobilePairingOffer, MobileAuthError> {
+        validate_time(now_ms)?;
+        let (actions, sessions) = admit_scope(request.actions, request.session_scope)?;
+        validate_limits(&request.limits)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        cleanup_pairings(&transaction, now_ms)?;
+        let outstanding = transaction.query_row(
+            "SELECT COUNT(*) FROM mobile_pairings
+             WHERE consumed_at_ms IS NULL AND expires_at_ms > ?1",
+            params![now_ms],
+            |row| row.get::<_, u64>(0),
+        )?;
+        if outstanding >= MAX_OUTSTANDING_PAIRINGS {
+            return Err(MobileAuthError::PairingLimit);
+        }
+        let pairing_id = random_token("pi")?;
+        let mut pairing_token = random_secret_token("mp")?;
+        let pairing_digest = token_digest(
+            b"automonique.mobile-pairing/v1\0",
             &self.discovery.server_identity,
-            &refresh,
+            &pairing_token,
         );
-        let actions_json = serde_json::to_string(&actions)?;
-        let sessions_json = serde_json::to_string(&sessions)?;
-        let access_expires_at_ms = now_ms
-            .checked_add(ACCESS_TTL_MILLIS)
+        let expires_at_ms = now_ms
+            .checked_add(PAIRING_TTL_MILLIS)
             .ok_or(MobileAuthError::InvalidRequest)?;
-        let refresh_expires_at_ms = now_ms
-            .checked_add(REFRESH_TTL_MILLIS)
-            .ok_or(MobileAuthError::InvalidRequest)?;
-        validate_time(access_expires_at_ms)?;
-        validate_time(refresh_expires_at_ms)?;
-        let inserted = self.connection.execute(
-            "INSERT INTO mobile_credentials(
-               credential_id,access_sha256,refresh_sha256,actor,server_identity,
-               credential_revision,authorization_revision,issued_at_ms,
-               access_expires_at_ms,refresh_expires_at_ms,revoked_at_ms,
-               actions_json,sessions_json,max_page_events,max_follow_up_bytes
-             ) VALUES(?1,?2,?3,?4,?5,1,1,?6,?7,?8,NULL,?9,?10,?11,?12)",
+        validate_time(expires_at_ms)?;
+        transaction.execute(
+            "INSERT INTO mobile_pairings(
+               pairing_id,pairing_sha256,actor,server_identity,created_at_ms,expires_at_ms,
+               consumed_at_ms,actions_json,sessions_json,max_page_events,max_follow_up_bytes
+             ) VALUES(?1,?2,?3,?4,?5,?6,NULL,?7,?8,?9,?10)",
             params![
-                credential_id,
-                access_digest.as_slice(),
-                refresh_digest.as_slice(),
+                pairing_id,
+                pairing_digest.as_slice(),
                 self.actor,
                 self.discovery.server_identity,
                 now_ms,
-                access_expires_at_ms,
-                refresh_expires_at_ms,
-                actions_json,
-                sessions_json,
+                expires_at_ms,
+                serde_json::to_string(&actions)?,
+                serde_json::to_string(&sessions)?,
                 request.limits.max_page_events,
                 request.limits.max_follow_up_bytes,
             ],
+        )?;
+        transaction.commit()?;
+        Ok(MobilePairingOffer {
+            exchange_endpoint: self.discovery.pairing_exchange_endpoint.clone(),
+            expires_at_ms,
+            origin: self.discovery.origin.clone(),
+            pairing_id,
+            pairing_token: std::mem::take(&mut *pairing_token),
+            schema: MOBILE_AUTH_SCHEMA_V1,
+            server_identity: self.discovery.server_identity.clone(),
+        })
+    }
+
+    pub fn exchange_pairing(
+        &mut self,
+        request: &mut MobilePairingExchangeRequest,
+        now_ms: i64,
+    ) -> Result<IssuedMobileCredentials, MobileAuthError> {
+        let token = take_secret(&mut request.pairing_token);
+        validate_time(now_ms).map_err(|_| MobileAuthError::InvalidPairing)?;
+        validate_token(&request.pairing_id, "pi").map_err(|_| MobileAuthError::InvalidPairing)?;
+        validate_token(&token, "mp").map_err(|_| MobileAuthError::InvalidPairing)?;
+        if request.server_identity != self.discovery.server_identity {
+            return Err(MobileAuthError::InvalidPairing);
+        }
+        let digest = token_digest(
+            b"automonique.mobile-pairing/v1\0",
+            &self.discovery.server_identity,
+            &token,
         );
-        inserted?;
-        Ok(IssuedMobileCredentials {
-            access_token: std::mem::take(&mut *access),
-            refresh_token: std::mem::take(&mut *refresh),
-            authorization: MobileAuthorization {
-                schema: MOBILE_AUTH_SCHEMA_V1,
-                server_identity: self.discovery.server_identity.clone(),
-                actor: self.actor.clone(),
-                credential_id,
-                credential_revision: 1,
-                authorization_revision: 1,
-                issued_at_ms: now_ms,
-                expires_at_ms: access_expires_at_ms,
-                actions,
-                session_scope: sessions,
-                limits: request.limits,
-            },
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row = transaction
+            .query_row(
+                "SELECT actor,actions_json,sessions_json,max_page_events,max_follow_up_bytes
+                 FROM mobile_pairings
+                 WHERE pairing_id=?1 AND pairing_sha256=?2 AND server_identity=?3
+                   AND consumed_at_ms IS NULL AND expires_at_ms > ?4",
+                params![
+                    request.pairing_id,
+                    digest.as_slice(),
+                    self.discovery.server_identity,
+                    now_ms
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(MobileAuthError::InvalidPairing)?;
+        validate_identifier(&row.0).map_err(|_| MobileAuthError::InvalidPairing)?;
+        if row.0 != self.actor {
+            return Err(MobileAuthError::InvalidPairing);
+        }
+        let actions = serde_json::from_str::<Vec<MobileAction>>(&row.1)
+            .map_err(|_| MobileAuthError::InvalidPairing)?;
+        let sessions = serde_json::from_str::<Vec<String>>(&row.2)
+            .map_err(|_| MobileAuthError::InvalidPairing)?;
+        let (actions, sessions) =
+            admit_scope(actions, sessions).map_err(|_| MobileAuthError::InvalidPairing)?;
+        let limits = MobileLimits {
+            max_page_events: u16::try_from(row.3).map_err(|_| MobileAuthError::InvalidPairing)?,
+            max_follow_up_bytes: u32::try_from(row.4)
+                .map_err(|_| MobileAuthError::InvalidPairing)?,
+        };
+        validate_limits(&limits).map_err(|_| MobileAuthError::InvalidPairing)?;
+        let issued = issue_credential(
+            &transaction,
+            &self.discovery.server_identity,
+            &row.0,
+            actions,
+            sessions,
+            limits,
+            now_ms,
+        )?;
+        let consumed = transaction.execute(
+            "UPDATE mobile_pairings SET consumed_at_ms=?1
+             WHERE pairing_id=?2 AND pairing_sha256=?3 AND consumed_at_ms IS NULL
+               AND expires_at_ms > ?1",
+            params![now_ms, request.pairing_id, digest.as_slice()],
+        )?;
+        if consumed != 1 {
+            return Err(MobileAuthError::InvalidPairing);
+        }
+        transaction.commit()?;
+        Ok(issued)
+    }
+
+    pub fn credential_inventory(
+        &mut self,
+        request: MobileCredentialInventoryRequest,
+        now_ms: i64,
+    ) -> Result<MobileCredentialInventory, MobileAuthError> {
+        validate_time(now_ms)?;
+        cleanup_retired_families(&self.connection, now_ms)?;
+        if request.page_size == 0 || request.page_size > MAX_CREDENTIAL_PAGE_SIZE {
+            return Err(MobileAuthError::InvalidRequest);
+        }
+        if let Some(cursor) = request.cursor.as_deref() {
+            validate_token(cursor, "mc")?;
+        }
+        let cursor = request.cursor.unwrap_or_default();
+        let query_limit = u64::from(request.page_size) + 1;
+        let mut statement = self.connection.prepare(
+            "SELECT credential_id,access_sha256 FROM mobile_credentials
+             WHERE credential_id > ?1 ORDER BY credential_id ASC LIMIT ?2",
+        )?;
+        let candidates = statement
+            .query_map(params![cursor, query_limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = candidates.len() > usize::from(request.page_size);
+        let mut credentials = Vec::with_capacity(usize::from(request.page_size));
+        for (_, digest) in candidates.into_iter().take(usize::from(request.page_size)) {
+            let digest: [u8; 32] = digest
+                .try_into()
+                .map_err(|_| MobileAuthError::InvalidRequest)?;
+            let row = read_by_digest(&self.connection, "access_sha256", &digest)?
+                .ok_or(MobileAuthError::InvalidRequest)?;
+            credentials.push(MobileCredentialSummary {
+                authorization: row.descriptor(),
+                refresh_expires_at_ms: row.refresh_expires_at_ms,
+                revoked_at_ms: row.revoked_at_ms,
+            });
+        }
+        let next_cursor = has_more
+            .then(|| {
+                credentials
+                    .last()
+                    .map(|value| value.authorization.credential_id.clone())
+            })
+            .flatten();
+        Ok(MobileCredentialInventory {
+            credentials,
+            next_cursor,
+            schema: MOBILE_AUTH_SCHEMA_V1,
+        })
+    }
+
+    pub fn revoke_credential_id(
+        &mut self,
+        request: MobileCredentialRevokeRequest,
+        now_ms: i64,
+    ) -> Result<MobileRevocation, MobileAuthError> {
+        validate_time(now_ms)?;
+        validate_token(&request.credential_id, "mc")?;
+        let changed = self.connection.execute(
+            "UPDATE mobile_credentials SET revoked_at_ms=COALESCE(revoked_at_ms,?1)
+             WHERE credential_id=?2",
+            params![now_ms, request.credential_id],
+        )?;
+        if changed != 1 {
+            return Err(MobileAuthError::InvalidRequest);
+        }
+        Ok(MobileRevocation {
+            revoked: true,
+            schema: MOBILE_AUTH_SCHEMA_V1,
         })
     }
 
@@ -600,6 +893,73 @@ impl MobileCredentialAuthority {
     }
 }
 
+fn issue_credential(
+    connection: &Connection,
+    server_identity: &str,
+    actor: &str,
+    actions: Vec<MobileAction>,
+    sessions: Vec<String>,
+    limits: MobileLimits,
+    now_ms: i64,
+) -> Result<IssuedMobileCredentials, MobileAuthError> {
+    let mut access = random_secret_token("ma")?;
+    let mut refresh = random_secret_token("mr")?;
+    let credential_id = random_token("mc")?;
+    let access_digest = token_digest(b"automonique.mobile-access/v1\0", server_identity, &access);
+    let refresh_digest = token_digest(
+        b"automonique.mobile-refresh/v1\0",
+        server_identity,
+        &refresh,
+    );
+    let access_expires_at_ms = now_ms
+        .checked_add(ACCESS_TTL_MILLIS)
+        .ok_or(MobileAuthError::InvalidRequest)?;
+    let refresh_expires_at_ms = now_ms
+        .checked_add(REFRESH_TTL_MILLIS)
+        .ok_or(MobileAuthError::InvalidRequest)?;
+    validate_time(access_expires_at_ms)?;
+    validate_time(refresh_expires_at_ms)?;
+    connection.execute(
+        "INSERT INTO mobile_credentials(
+           credential_id,access_sha256,refresh_sha256,actor,server_identity,
+           credential_revision,authorization_revision,issued_at_ms,
+           access_expires_at_ms,refresh_expires_at_ms,revoked_at_ms,
+           actions_json,sessions_json,max_page_events,max_follow_up_bytes
+         ) VALUES(?1,?2,?3,?4,?5,1,1,?6,?7,?8,NULL,?9,?10,?11,?12)",
+        params![
+            credential_id,
+            access_digest.as_slice(),
+            refresh_digest.as_slice(),
+            actor,
+            server_identity,
+            now_ms,
+            access_expires_at_ms,
+            refresh_expires_at_ms,
+            serde_json::to_string(&actions)?,
+            serde_json::to_string(&sessions)?,
+            limits.max_page_events,
+            limits.max_follow_up_bytes,
+        ],
+    )?;
+    Ok(IssuedMobileCredentials {
+        access_token: std::mem::take(&mut *access),
+        refresh_token: std::mem::take(&mut *refresh),
+        authorization: MobileAuthorization {
+            schema: MOBILE_AUTH_SCHEMA_V1,
+            server_identity: server_identity.to_owned(),
+            actor: actor.to_owned(),
+            credential_id,
+            credential_revision: 1,
+            authorization_revision: 1,
+            issued_at_ms: now_ms,
+            expires_at_ms: access_expires_at_ms,
+            actions,
+            session_scope: sessions,
+            limits,
+        },
+    })
+}
+
 #[derive(Debug)]
 struct CredentialRow {
     credential_id: String,
@@ -617,6 +977,22 @@ struct CredentialRow {
 }
 
 impl CredentialRow {
+    fn descriptor(&self) -> MobileAuthorization {
+        MobileAuthorization {
+            schema: MOBILE_AUTH_SCHEMA_V1,
+            server_identity: self.server_identity.clone(),
+            actor: self.actor.clone(),
+            credential_id: self.credential_id.clone(),
+            credential_revision: self.credential_revision,
+            authorization_revision: self.authorization_revision,
+            issued_at_ms: self.issued_at_ms,
+            expires_at_ms: self.access_expires_at_ms,
+            actions: self.actions.clone(),
+            session_scope: self.sessions.clone(),
+            limits: self.limits.clone(),
+        }
+    }
+
     fn authorization(
         &self,
         server_identity: &str,
@@ -637,19 +1013,7 @@ impl CredentialRow {
         if expiry <= now_ms {
             return Err(MobileAuthError::Expired);
         }
-        Ok(MobileAuthorization {
-            schema: MOBILE_AUTH_SCHEMA_V1,
-            server_identity: self.server_identity.clone(),
-            actor: self.actor.clone(),
-            credential_id: self.credential_id.clone(),
-            credential_revision: self.credential_revision,
-            authorization_revision: self.authorization_revision,
-            issued_at_ms: self.issued_at_ms,
-            expires_at_ms: self.access_expires_at_ms,
-            actions: self.actions.clone(),
-            session_scope: self.sessions.clone(),
-            limits: self.limits.clone(),
-        })
+        Ok(self.descriptor())
     }
 }
 
@@ -824,6 +1188,17 @@ fn cleanup_retired_families(connection: &Connection, now_ms: i64) -> Result<(), 
          WHERE (access_expires_at_ms <= ?1 AND refresh_expires_at_ms <= ?1)
             OR (revoked_at_ms IS NOT NULL AND revoked_at_ms <= ?2)",
         params![now_ms, revoked_before],
+    )?;
+    Ok(())
+}
+
+fn cleanup_pairings(connection: &Connection, now_ms: i64) -> Result<(), MobileAuthError> {
+    let retained_after = now_ms.saturating_sub(PAIRING_RETENTION_MILLIS);
+    connection.execute(
+        "DELETE FROM mobile_pairings
+         WHERE (consumed_at_ms IS NOT NULL AND consumed_at_ms <= ?1)
+            OR (consumed_at_ms IS NULL AND expires_at_ms <= ?1)",
+        params![retained_after],
     )?;
     Ok(())
 }
@@ -1079,6 +1454,22 @@ mod tests {
         assert_eq!(
             auth.discovery().operator_provision_endpoint,
             "https://ops.example.test/api/mobile/operator-provision"
+        );
+        assert_eq!(
+            auth.discovery().pairing_create_endpoint,
+            "https://ops.example.test/api/mobile/pairings"
+        );
+        assert_eq!(
+            auth.discovery().pairing_exchange_endpoint,
+            "https://ops.example.test/api/mobile/pairings/exchange"
+        );
+        assert_eq!(
+            auth.discovery().credential_inventory_endpoint,
+            "https://ops.example.test/api/mobile/credentials/list"
+        );
+        assert_eq!(
+            auth.discovery().credential_revoke_endpoint,
+            "https://ops.example.test/api/mobile/credentials/revoke"
         );
         assert!(auth.discovery().server_identity.starts_with("sha256:"));
         let first = auth.discovery().server_identity.clone();
@@ -1634,5 +2025,367 @@ mod tests {
     fn strict_request_json_rejects_unknown_fields() {
         let value = r#"{"actions":["attach"],"session_scope":[],"limits":{"max_page_events":1,"max_follow_up_bytes":1},"token":"secret"}"#;
         assert!(serde_json::from_str::<MobileOperatorProvisionRequest>(value).is_err());
+        assert!(
+            serde_json::from_str::<MobileCredentialInventoryRequest>(r#"{"page_size":10}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<MobileCredentialInventoryRequest>(
+                r#"{"cursor":null,"page_size":10,"unexpected":true}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<MobilePairingExchangeRequest>(
+                r#"{"pairing_id":"pi_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","pairing_token":"mp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","server_identity":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","unexpected":true}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pairing_is_digest_only_restart_safe_single_use_and_boundary_exact() {
+        let (root, mut auth) = authority();
+        let offer = auth.create_pairing(request(), NOW).expect("pairing");
+        assert_eq!(offer.expires_at_ms, NOW + PAIRING_TTL_MILLIS);
+        assert_eq!(offer.origin, "https://ops.example.test");
+        assert_eq!(
+            offer.exchange_endpoint,
+            "https://ops.example.test/api/mobile/pairings/exchange"
+        );
+        let token = offer.pairing_token.clone();
+        let pairing_id = offer.pairing_id.clone();
+        let identity = offer.server_identity.clone();
+        let debug = format!("{offer:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains(&token));
+        drop(auth);
+
+        for entry in fs::read_dir(root.path()).expect("credential store files") {
+            let entry = entry.expect("store entry");
+            if entry.file_type().expect("entry type").is_file() {
+                let bytes = fs::read(entry.path()).expect("store bytes");
+                assert!(
+                    !bytes
+                        .windows(token.len())
+                        .any(|window| window == token.as_bytes())
+                );
+            }
+        }
+
+        let mut changed_actor = MobileCredentialAuthority::open(
+            root.path().join("mobile.sqlite3"),
+            "ops.example.test",
+            "operator:changed",
+        )
+        .expect("changed-actor reopen");
+        let mut actor_confusion = MobilePairingExchangeRequest {
+            pairing_id: pairing_id.clone(),
+            pairing_token: token.clone(),
+            server_identity: identity.clone(),
+        };
+        assert!(matches!(
+            changed_actor.exchange_pairing(&mut actor_confusion, NOW + 1),
+            Err(MobileAuthError::InvalidPairing)
+        ));
+        drop(changed_actor);
+
+        let mut reopened = MobileCredentialAuthority::open(
+            root.path().join("mobile.sqlite3"),
+            "ops.example.test",
+            "operator:mobile",
+        )
+        .expect("reopen");
+        let mut exchange = MobilePairingExchangeRequest {
+            pairing_id: pairing_id.clone(),
+            pairing_token: token.clone(),
+            server_identity: identity.clone(),
+        };
+        let issued = reopened
+            .exchange_pairing(&mut exchange, NOW + 1)
+            .expect("exchange after restart");
+        assert!(exchange.pairing_token.is_empty());
+        assert_eq!(
+            issued.authorization.actions,
+            vec![MobileAction::Attach, MobileAction::FollowUp]
+        );
+        let mut replay = MobilePairingExchangeRequest {
+            pairing_id,
+            pairing_token: token,
+            server_identity: identity,
+        };
+        assert!(matches!(
+            reopened.exchange_pairing(&mut replay, NOW + 2),
+            Err(MobileAuthError::InvalidPairing)
+        ));
+
+        let boundary = reopened
+            .create_pairing(request(), NOW)
+            .expect("boundary pairing");
+        let mut boundary_request = MobilePairingExchangeRequest {
+            pairing_id: boundary.pairing_id.clone(),
+            pairing_token: boundary.pairing_token.clone(),
+            server_identity: boundary.server_identity.clone(),
+        };
+        assert!(matches!(
+            reopened.exchange_pairing(&mut boundary_request, NOW + PAIRING_TTL_MILLIS),
+            Err(MobileAuthError::InvalidPairing)
+        ));
+    }
+
+    #[test]
+    fn pairing_unknown_wrong_expired_and_consumed_are_indistinguishable() {
+        let (_root, mut auth) = authority();
+        let offer = auth.create_pairing(request(), NOW).expect("pairing");
+        let identity = offer.server_identity.clone();
+        let cases = [
+            MobilePairingExchangeRequest {
+                pairing_id: random_token("pi").expect("unknown id"),
+                pairing_token: random_token("mp").expect("unknown token"),
+                server_identity: identity.clone(),
+            },
+            MobilePairingExchangeRequest {
+                pairing_id: offer.pairing_id.clone(),
+                pairing_token: random_token("mp").expect("wrong token"),
+                server_identity: identity.clone(),
+            },
+            MobilePairingExchangeRequest {
+                pairing_id: offer.pairing_id.clone(),
+                pairing_token: offer.pairing_token.clone(),
+                server_identity: format!("sha256:{}", "f".repeat(64)),
+            },
+            MobilePairingExchangeRequest {
+                pairing_id: offer.pairing_id.clone(),
+                pairing_token: format!("mp_{}", "X".repeat(4096)),
+                server_identity: identity.clone(),
+            },
+        ];
+        for mut case in cases {
+            let error = auth
+                .exchange_pairing(&mut case, NOW + 1)
+                .expect_err("refusal");
+            assert_eq!(error.category(), "mobile_pairing_invalid");
+            assert!(case.pairing_token.is_empty());
+        }
+        let mut expired = MobilePairingExchangeRequest {
+            pairing_id: offer.pairing_id.clone(),
+            pairing_token: offer.pairing_token.clone(),
+            server_identity: identity,
+        };
+        assert_eq!(
+            auth.exchange_pairing(&mut expired, NOW + PAIRING_TTL_MILLIS)
+                .expect_err("expired")
+                .category(),
+            "mobile_pairing_invalid"
+        );
+    }
+
+    #[test]
+    fn pairing_credential_insert_failure_rolls_back_consumption() {
+        let (_root, mut auth) = authority();
+        let offer = auth.create_pairing(request(), NOW).expect("pairing");
+        auth.connection
+            .execute_batch(
+                "CREATE TRIGGER fail_pairing_credential BEFORE INSERT ON mobile_credentials
+                 BEGIN SELECT RAISE(ABORT, 'fixture insertion failure'); END;",
+            )
+            .expect("failure trigger");
+        let mut first = MobilePairingExchangeRequest {
+            pairing_id: offer.pairing_id.clone(),
+            pairing_token: offer.pairing_token.clone(),
+            server_identity: offer.server_identity.clone(),
+        };
+        assert!(matches!(
+            auth.exchange_pairing(&mut first, NOW + 1),
+            Err(MobileAuthError::Sqlite(_))
+        ));
+        auth.connection
+            .execute_batch("DROP TRIGGER fail_pairing_credential;")
+            .expect("drop trigger");
+        let mut retry = MobilePairingExchangeRequest {
+            pairing_id: offer.pairing_id.clone(),
+            pairing_token: offer.pairing_token.clone(),
+            server_identity: offer.server_identity.clone(),
+        };
+        auth.exchange_pairing(&mut retry, NOW + 2)
+            .expect("unconsumed retry");
+    }
+
+    #[test]
+    fn pairing_cap_cleanup_and_operator_inventory_revocation_are_bounded() {
+        let (_root, mut auth) = authority();
+        for _ in 0..MAX_OUTSTANDING_PAIRINGS {
+            auth.create_pairing(request(), NOW)
+                .expect("bounded pairing");
+        }
+        assert!(matches!(
+            auth.create_pairing(request(), NOW),
+            Err(MobileAuthError::PairingLimit)
+        ));
+        auth.create_pairing(request(), NOW + PAIRING_TTL_MILLIS)
+            .expect("expired pairings do not consume outstanding capacity");
+        auth.create_pairing(
+            request(),
+            NOW + PAIRING_TTL_MILLIS + PAIRING_RETENTION_MILLIS,
+        )
+        .expect("retained pairings are cleaned");
+        assert!(
+            auth.connection
+                .query_row("SELECT COUNT(*) FROM mobile_pairings", [], |row| row
+                    .get::<_, u64>(0))
+                .expect("pairing count")
+                <= 2
+        );
+
+        let first = auth.operator_provision(request(), NOW).expect("first");
+        let second = auth.operator_provision(request(), NOW + 1).expect("second");
+        let third = auth.operator_provision(request(), NOW + 2).expect("third");
+        let page = auth
+            .credential_inventory(
+                MobileCredentialInventoryRequest {
+                    cursor: None,
+                    page_size: 2,
+                },
+                NOW + 3,
+            )
+            .expect("first page");
+        assert_eq!(page.credentials.len(), 2);
+        assert!(page.next_cursor.is_some());
+        let next = auth
+            .credential_inventory(
+                MobileCredentialInventoryRequest {
+                    cursor: page.next_cursor.clone(),
+                    page_size: 2,
+                },
+                NOW + 3,
+            )
+            .expect("second page");
+        assert_eq!(next.credentials.len(), 1);
+        assert!(next.next_cursor.is_none());
+        let serialized = serde_json::to_vec(&page).expect("inventory JSON");
+        for secret in [
+            &first.access_token,
+            &first.refresh_token,
+            &second.access_token,
+            &third.refresh_token,
+        ] {
+            assert!(
+                !serialized
+                    .windows(secret.len())
+                    .any(|window| window == secret.as_bytes())
+            );
+        }
+        auth.revoke_credential_id(
+            MobileCredentialRevokeRequest {
+                credential_id: second.authorization.credential_id.clone(),
+            },
+            NOW + 4,
+        )
+        .expect("operator revoke");
+        assert!(matches!(
+            auth.authorize_access(
+                &second.access_token,
+                &second.authorization.server_identity,
+                NOW + 4
+            ),
+            Err(MobileAuthError::Revoked)
+        ));
+    }
+
+    #[test]
+    fn consumed_pairings_are_retained_then_cleaned_at_the_exact_boundary() {
+        let (_root, mut auth) = authority();
+        let offer = auth.create_pairing(request(), NOW).expect("pairing");
+        let mut exchange = MobilePairingExchangeRequest {
+            pairing_id: offer.pairing_id.clone(),
+            pairing_token: offer.pairing_token.clone(),
+            server_identity: offer.server_identity.clone(),
+        };
+        auth.exchange_pairing(&mut exchange, NOW + 1)
+            .expect("consume pairing");
+        auth.create_pairing(request(), NOW + PAIRING_RETENTION_MILLIS)
+            .expect("before cleanup boundary");
+        assert_eq!(
+            auth.connection
+                .query_row(
+                    "SELECT COUNT(*) FROM mobile_pairings WHERE pairing_id=?1",
+                    params![offer.pairing_id],
+                    |row| row.get::<_, u64>(0),
+                )
+                .expect("retained consumed pairing"),
+            1
+        );
+        auth.create_pairing(request(), NOW + 1 + PAIRING_RETENTION_MILLIS)
+            .expect("cleanup boundary");
+        assert_eq!(
+            auth.connection
+                .query_row(
+                    "SELECT COUNT(*) FROM mobile_pairings WHERE pairing_id=?1",
+                    params![offer.pairing_id],
+                    |row| row.get::<_, u64>(0),
+                )
+                .expect("cleaned consumed pairing"),
+            0
+        );
+    }
+
+    #[test]
+    fn concurrent_pairing_exchange_has_exactly_one_winner() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let (root, mut auth) = authority();
+        let offer = auth.create_pairing(request(), NOW).expect("pairing");
+        let path = auth.path().to_path_buf();
+        let barrier = Arc::new(Barrier::new(2));
+        drop(auth);
+        let workers = (0..2)
+            .map(|offset| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                let pairing_id = offer.pairing_id.clone();
+                let pairing_token = offer.pairing_token.clone();
+                let server_identity = offer.server_identity.clone();
+                thread::spawn(move || {
+                    let mut auth = MobileCredentialAuthority::open(
+                        path,
+                        "ops.example.test",
+                        "operator:mobile",
+                    )
+                    .expect("authority");
+                    let mut exchange = MobilePairingExchangeRequest {
+                        pairing_id,
+                        pairing_token,
+                        server_identity,
+                    };
+                    barrier.wait();
+                    auth.exchange_pairing(&mut exchange, NOW + offset + 1)
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut successes = 0;
+        let mut refusals = 0;
+        for worker in workers {
+            match worker.join().expect("worker") {
+                Ok(_) => successes += 1,
+                Err(MobileAuthError::InvalidPairing) => refusals += 1,
+                Err(error) => panic!("unexpected exchange error: {error}"),
+            }
+        }
+        assert_eq!((successes, refusals), (1, 1));
+        let reopened = MobileCredentialAuthority::open(
+            root.path().join("mobile.sqlite3"),
+            "ops.example.test",
+            "operator:mobile",
+        )
+        .expect("reopen");
+        assert_eq!(
+            reopened
+                .connection
+                .query_row("SELECT COUNT(*) FROM mobile_credentials", [], |row| row
+                    .get::<_, u64>(0))
+                .expect("credential count"),
+            1
+        );
     }
 }

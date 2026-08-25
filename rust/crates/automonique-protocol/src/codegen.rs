@@ -6318,10 +6318,26 @@ fn mobile_auth_json_surface() -> JsonSurface {
                 "HTTPS-origin-bound discovery document.",
                 false,
                 vec![
+                    field(
+                        "credential_inventory_endpoint",
+                        checked("MobileCredentialInventoryEndpoint"),
+                    ),
+                    field(
+                        "credential_revoke_endpoint",
+                        checked("MobileCredentialRevokeEndpoint"),
+                    ),
                     field("origin", checked("MobileHttpsOrigin")),
                     field(
                         "operator_provision_endpoint",
                         checked("MobileOperatorProvisionEndpoint"),
+                    ),
+                    field(
+                        "pairing_create_endpoint",
+                        checked("MobilePairingCreateEndpoint"),
+                    ),
+                    field(
+                        "pairing_exchange_endpoint",
+                        checked("MobilePairingExchangeEndpoint"),
                     ),
                     field("platform_endpoint", checked("MobilePlatformEndpoint")),
                     field(
@@ -6350,6 +6366,112 @@ fn mobile_auth_json_surface() -> JsonSurface {
                             refusal_category: VALUE.to_owned(),
                             unsigned: true,
                         },
+                    ),
+                ],
+            ),
+            document(
+                "MobilePairingOffer",
+                "Copy-safe origin and identity-bound one-time pairing offer.",
+                false,
+                vec![
+                    field(
+                        "exchange_endpoint",
+                        checked("MobilePairingExchangeEndpoint"),
+                    ),
+                    field("expires_at_ms", integer("MobileEpochMillis")),
+                    field("origin", checked("MobileHttpsOrigin")),
+                    field("pairing_id", checked("MobilePairingId")),
+                    field("pairing_token", checked("MobilePairingToken")),
+                    field(
+                        "schema",
+                        exact(
+                            "typeof MOBILE_AUTH_SCHEMA_V1",
+                            "MOBILE_AUTH_SCHEMA_V1",
+                            "MOBILE_AUTH_SCHEMA_MISMATCH",
+                        ),
+                    ),
+                    field("server_identity", checked("MobileServerIdentity")),
+                ],
+            ),
+            document(
+                "MobilePairingExchangeRequest",
+                "Strict one-time pairing exchange proof.",
+                true,
+                vec![
+                    field("pairing_id", checked("MobilePairingId")),
+                    field("pairing_token", checked("MobilePairingToken")),
+                    field("server_identity", checked("MobileServerIdentity")),
+                ],
+            ),
+            document(
+                "MobileCredentialInventoryRequest",
+                "Bounded operator credential inventory page request.",
+                true,
+                vec![
+                    field(
+                        "cursor",
+                        ResponseValue::NullableChecked {
+                            type_name: "MobileCredentialId".to_owned(),
+                            refusal_category: VALUE.to_owned(),
+                        },
+                    ),
+                    field("page_size", integer("MobileCredentialPageSize")),
+                ],
+            ),
+            document(
+                "MobileCredentialRevokeRequest",
+                "Operator revocation of one exact credential family.",
+                true,
+                vec![field("credential_id", checked("MobileCredentialId"))],
+            ),
+            document(
+                "MobileCredentialSummary",
+                "Secret-free operator inventory projection for one credential family.",
+                false,
+                vec![
+                    field(
+                        "authorization",
+                        ResponseValue::Object {
+                            type_name: "MobileAuthorization".to_owned(),
+                        },
+                    ),
+                    field("refresh_expires_at_ms", integer("MobileEpochMillis")),
+                    field(
+                        "revoked_at_ms",
+                        ResponseValue::NullableInteger {
+                            type_name: "MobileEpochMillis".to_owned(),
+                            refusal_category: VALUE.to_owned(),
+                        },
+                    ),
+                ],
+            ),
+            document(
+                "MobileCredentialInventory",
+                "Bounded secret-free operator credential inventory page.",
+                false,
+                vec![
+                    field(
+                        "credentials",
+                        ResponseValue::ObjectArray {
+                            type_name: "MobileCredentialSummary".to_owned(),
+                            max_items_constant: "MAX_MOBILE_CREDENTIAL_PAGE_SIZE".to_owned(),
+                            oversize_category: VALUE.to_owned(),
+                        },
+                    ),
+                    field(
+                        "next_cursor",
+                        ResponseValue::NullableChecked {
+                            type_name: "MobileCredentialId".to_owned(),
+                            refusal_category: VALUE.to_owned(),
+                        },
+                    ),
+                    field(
+                        "schema",
+                        exact(
+                            "typeof MOBILE_AUTH_SCHEMA_V1",
+                            "MOBILE_AUTH_SCHEMA_V1",
+                            "MOBILE_AUTH_SCHEMA_MISMATCH",
+                        ),
                     ),
                 ],
             ),
@@ -6508,12 +6630,27 @@ fn mobile_auth_module() -> GeneratedModule {
                 doc: "Maximum negotiated UTF-8 follow-up bytes.".to_owned(),
                 value: ConstantValue::Count(65_536),
             },
+            Constant {
+                name: "MAX_MOBILE_CREDENTIAL_PAGE_SIZE".to_owned(),
+                doc: "Maximum secret-free credential summaries in one operator page.".to_owned(),
+                value: ConstantValue::Count(100),
+            },
+            Constant {
+                name: "MOBILE_PAIRING_TTL_MILLIS".to_owned(),
+                doc: "Absolute maximum lifetime of a one-time pairing offer.".to_owned(),
+                value: ConstantValue::Count(300_000),
+            },
         ],
         branded_ids: vec![
             BrandedId {
                 name: "MobileCredentialId".to_owned(),
                 max_bytes: 46,
                 pattern: Some("^mc_[A-Za-z0-9_-]{43}$".to_owned()),
+            },
+            BrandedId {
+                name: "MobilePairingId".to_owned(),
+                max_bytes: 46,
+                pattern: Some("^pi_[A-Za-z0-9_-]{43}$".to_owned()),
             },
             BrandedId {
                 name: "MobileSessionId".to_owned(),
@@ -6538,6 +6675,11 @@ fn mobile_auth_module() -> GeneratedModule {
                 pattern: Some("^mr_[A-Za-z0-9_-]{43}$".to_owned()),
             },
             BoundedString {
+                name: "MobilePairingToken".to_owned(),
+                max_bytes: 46,
+                pattern: Some("^mp_[A-Za-z0-9_-]{43}$".to_owned()),
+            },
+            BoundedString {
                 name: "MobileServerIdentity".to_owned(),
                 max_bytes: 71,
                 pattern: Some("^sha256:[0-9a-f]{64}$".to_owned()),
@@ -6557,6 +6699,32 @@ fn mobile_auth_module() -> GeneratedModule {
                 max_bytes: 2048,
                 pattern: Some(
                     "^https:\\/\\/[^?#@]+\\/api\\/mobile\\/operator-provision$".to_owned(),
+                ),
+            },
+            BoundedString {
+                name: "MobilePairingCreateEndpoint".to_owned(),
+                max_bytes: 2048,
+                pattern: Some("^https:\\/\\/[^?#@]+\\/api\\/mobile\\/pairings$".to_owned()),
+            },
+            BoundedString {
+                name: "MobilePairingExchangeEndpoint".to_owned(),
+                max_bytes: 2048,
+                pattern: Some(
+                    "^https:\\/\\/[^?#@]+\\/api\\/mobile\\/pairings\\/exchange$".to_owned(),
+                ),
+            },
+            BoundedString {
+                name: "MobileCredentialInventoryEndpoint".to_owned(),
+                max_bytes: 2048,
+                pattern: Some(
+                    "^https:\\/\\/[^?#@]+\\/api\\/mobile\\/credentials\\/list$".to_owned(),
+                ),
+            },
+            BoundedString {
+                name: "MobileCredentialRevokeEndpoint".to_owned(),
+                max_bytes: 2048,
+                pattern: Some(
+                    "^https:\\/\\/[^?#@]+\\/api\\/mobile\\/credentials\\/revoke$".to_owned(),
                 ),
             },
             BoundedString {
@@ -6590,6 +6758,11 @@ fn mobile_auth_module() -> GeneratedModule {
                 name: "MobileProtocolVersion".to_owned(),
                 min: 1,
                 max: 1,
+            },
+            BoundedInteger {
+                name: "MobileCredentialPageSize".to_owned(),
+                min: 1,
+                max: 100,
             },
         ],
         enums: vec![GeneratedEnum {
@@ -8666,8 +8839,8 @@ fn body_object_field_writer(invalid: &str, field: &ResponseField) -> String {
             type_name,
             refusal_category,
         } => format!(
-            "{input} === null\n        ? {{kind: \"null\"}}\n        : {{kind: \"string\", value: \
-             refuse({refusal_category}, () => {type_name}({input}))}}"
+            "((entry) => entry === null\n        ? {{kind: \"null\"}}\n        : {{kind: \"string\", value: \
+             refuse({refusal_category}, () => {type_name}(entry))}})({input})"
         ),
         ResponseValue::Integer {
             type_name,
@@ -8690,8 +8863,8 @@ fn body_object_field_writer(invalid: &str, field: &ResponseField) -> String {
             type_name,
             refusal_category,
         } => format!(
-            "{input} === null\n        ? {{kind: \"null\"}}\n        : {{kind: \"integer\", value: \
-             refuse({refusal_category}, () => {type_name}({input}))}}"
+            "((entry) => entry === null\n        ? {{kind: \"null\"}}\n        : {{kind: \"integer\", value: \
+             refuse({refusal_category}, () => {type_name}(entry))}})({input})"
         ),
         ResponseValue::Enum {
             type_name,
