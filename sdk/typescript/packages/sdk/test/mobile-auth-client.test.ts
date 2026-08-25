@@ -64,7 +64,6 @@ function discovery(extra: Readonly<Record<string, unknown>> = {}): unknown {
     pairing_create_endpoint: `${origin}/api/mobile/pairings`,
     pairing_exchange_endpoint: `${origin}/api/mobile/pairings/exchange`,
     platform_endpoint: `${origin}/api/platform`,
-    session_history_endpoint: `${origin}/api/mobile/session-history`,
     protocol: "automonique.mobile-auth",
     schema: "automonique.mobile-auth/v1",
     server_identity: identity,

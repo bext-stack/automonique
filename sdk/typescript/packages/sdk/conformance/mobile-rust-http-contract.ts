@@ -318,6 +318,7 @@ await expectScopedPlatformDenial(second.access_token, "blind-follow-up", {
   method: "execute",
   request: {
     action: "follow_up",
+    client: null,
     expected_revision: null,
     idempotency_key: IdempotencyKey("mobile-blind-follow-up"),
     parameter: PlatformParameter("continue"),
@@ -328,6 +329,7 @@ await expectScopedPlatformDenial(second.access_token, "out-of-scope", {
   method: "execute",
   request: {
     action: "follow_up",
+    client: null,
     expected_revision: PlatformRevision(1n),
     idempotency_key: IdempotencyKey("mobile-out-of-scope"),
     parameter: PlatformParameter("continue"),

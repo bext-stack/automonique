@@ -148,6 +148,22 @@ fn unsigned(value: &JsonValue, field: &'static str) -> Result<u64, PlatformApiEr
     u64::try_from(number).map_err(|_| PlatformApiError::CounterOutOfRange { field })
 }
 
+fn history_limit(value: &JsonValue, field: &'static str) -> Result<u16, PlatformApiError> {
+    let value = unsigned(value, field)?;
+    let limit = u16::try_from(value).map_err(|_| PlatformApiError::CounterOutOfRange { field })?;
+    if limit == 0 || usize::from(limit) > MAX_SESSION_HISTORY_EVENTS {
+        return Err(PlatformError::HistoryLimitOutOfRange.into());
+    }
+    Ok(limit)
+}
+
+fn boolean(value: &JsonValue, field: &'static str) -> Result<bool, PlatformApiError> {
+    match value.get(field) {
+        Some(JsonValue::Bool(value)) => Ok(*value),
+        _ => Err(PlatformApiError::InvalidBody),
+    }
+}
+
 fn optional_revision(
     value: &JsonValue,
     field: &'static str,
@@ -357,6 +373,150 @@ fn receipt(value: &JsonValue) -> Result<ActionReceipt, PlatformApiError> {
     })
 }
 
+fn history_text(value: &str) -> Result<SessionHistoryText, PlatformApiError> {
+    SessionHistoryText::new(value.to_owned()).map_err(|error| PlatformError::Field(error).into())
+}
+
+type HistoryEventArrays = (
+    Vec<JsonValue>,
+    Vec<JsonValue>,
+    Vec<JsonValue>,
+    Vec<JsonValue>,
+);
+
+fn history_event_arrays(
+    events: &[SessionHistoryEvent],
+) -> Result<HistoryEventArrays, PlatformApiError> {
+    let mut messages = Vec::new();
+    let mut tools = Vec::new();
+    let mut runs = Vec::new();
+    let mut unknown = Vec::new();
+    for event in events {
+        match event {
+            SessionHistoryEvent::Message {
+                cursor,
+                at,
+                evidence,
+                role,
+                text,
+                truncated,
+            } => messages.push(object(vec![
+                ("at", JsonValue::Integer(at.as_millis())),
+                ("cursor", integer(*cursor, "cursor")?),
+                ("evidence", JsonValue::String(evidence.as_str().to_owned())),
+                ("role", JsonValue::String(role.as_str().to_owned())),
+                ("text", JsonValue::String(text.as_str().to_owned())),
+                ("truncated", JsonValue::Bool(*truncated)),
+            ])),
+            SessionHistoryEvent::ToolState {
+                cursor,
+                at,
+                evidence,
+                state,
+                label,
+                truncated,
+            } => tools.push(object(vec![
+                ("at", JsonValue::Integer(at.as_millis())),
+                ("cursor", integer(*cursor, "cursor")?),
+                ("evidence", JsonValue::String(evidence.as_str().to_owned())),
+                (
+                    "label",
+                    label.as_ref().map_or(JsonValue::Null, |label| {
+                        JsonValue::String(label.as_str().to_owned())
+                    }),
+                ),
+                ("state", JsonValue::String(state.as_str().to_owned())),
+                ("truncated", JsonValue::Bool(*truncated)),
+            ])),
+            SessionHistoryEvent::RunState { cursor, at, state } => runs.push(object(vec![
+                ("at", JsonValue::Integer(at.as_millis())),
+                ("cursor", integer(*cursor, "cursor")?),
+                ("state", JsonValue::String(state.as_str().to_owned())),
+            ])),
+            SessionHistoryEvent::Unknown { cursor, at, source } => unknown.push(object(vec![
+                ("at", JsonValue::Integer(at.as_millis())),
+                ("cursor", integer(*cursor, "cursor")?),
+                ("source", JsonValue::String(source.as_str().to_owned())),
+            ])),
+        }
+    }
+    Ok((messages, tools, runs, unknown))
+}
+
+fn decode_history_events(value: &JsonValue) -> Result<Vec<SessionHistoryEvent>, PlatformApiError> {
+    let mut events = Vec::new();
+    for item in array(value, "messages")? {
+        exact_fields(
+            item,
+            &["at", "cursor", "evidence", "role", "text", "truncated"],
+        )?;
+        events.push(SessionHistoryEvent::Message {
+            cursor: unsigned(item, "cursor")?,
+            at: EpochMillis::from_millis(
+                item.get("at")
+                    .and_then(JsonValue::as_integer)
+                    .ok_or(PlatformApiError::InvalidBody)?,
+            ),
+            evidence: SessionHistoryEvidence::parse(string(item, "evidence")?)?,
+            role: SessionHistoryRole::parse(string(item, "role")?)?,
+            text: history_text(string(item, "text")?)?,
+            truncated: boolean(item, "truncated")?,
+        });
+    }
+    for item in array(value, "tool_states")? {
+        exact_fields(
+            item,
+            &["at", "cursor", "evidence", "label", "state", "truncated"],
+        )?;
+        let label = match item.get("label") {
+            Some(JsonValue::Null) => None,
+            Some(JsonValue::String(label)) => Some(history_text(label)?),
+            _ => return Err(PlatformApiError::InvalidBody),
+        };
+        events.push(SessionHistoryEvent::ToolState {
+            cursor: unsigned(item, "cursor")?,
+            at: EpochMillis::from_millis(
+                item.get("at")
+                    .and_then(JsonValue::as_integer)
+                    .ok_or(PlatformApiError::InvalidBody)?,
+            ),
+            evidence: SessionHistoryEvidence::parse(string(item, "evidence")?)?,
+            state: SessionHistoryToolState::parse(string(item, "state")?)?,
+            label,
+            truncated: boolean(item, "truncated")?,
+        });
+    }
+    for item in array(value, "run_states")? {
+        exact_fields(item, &["at", "cursor", "state"])?;
+        events.push(SessionHistoryEvent::RunState {
+            cursor: unsigned(item, "cursor")?,
+            at: EpochMillis::from_millis(
+                item.get("at")
+                    .and_then(JsonValue::as_integer)
+                    .ok_or(PlatformApiError::InvalidBody)?,
+            ),
+            state: SessionHistoryRunState::parse(string(item, "state")?)?,
+        });
+    }
+    for item in array(value, "unknown_events")? {
+        exact_fields(item, &["at", "cursor", "source"])?;
+        events.push(SessionHistoryEvent::Unknown {
+            cursor: unsigned(item, "cursor")?,
+            at: EpochMillis::from_millis(
+                item.get("at")
+                    .and_then(JsonValue::as_integer)
+                    .ok_or(PlatformApiError::InvalidBody)?,
+            ),
+            source: SessionHistoryUnknownSource::parse(string(item, "source")?)?,
+        });
+    }
+    if events.len() > MAX_SESSION_HISTORY_EVENTS {
+        return Err(PlatformError::TooManyEvents.into());
+    }
+    events.sort_by_key(SessionHistoryEvent::cursor);
+    Ok(events)
+}
+
 fn request_kind(request: &PlatformRequest) -> &'static str {
     match request {
         PlatformRequest::Capabilities => "capabilities",
@@ -369,6 +529,8 @@ fn request_kind(request: &PlatformRequest) -> &'static str {
         PlatformRequest::Detach(_) => "detach",
         PlatformRequest::ClaimControl(_) => "claim_control",
         PlatformRequest::ReleaseControl(_) => "release_control",
+        PlatformRequest::SessionHistorySnapshot(_) => "session_history_snapshot",
+        PlatformRequest::SessionHistoryPage(_) => "session_history_page",
     }
 }
 
@@ -387,6 +549,12 @@ fn request_body(request: &PlatformRequest) -> Result<JsonValue, PlatformApiError
             (
                 "action",
                 JsonValue::String(request.action.as_str().to_owned()),
+            ),
+            (
+                "client",
+                request.client.as_ref().map_or(JsonValue::Null, |client| {
+                    JsonValue::String(client.as_str().to_owned())
+                }),
             ),
             (
                 "expected_revision",
@@ -409,6 +577,12 @@ fn request_body(request: &PlatformRequest) -> Result<JsonValue, PlatformApiError
             ("target", coordinate_json(&request.target)),
         ])),
         PlatformRequest::GetReceipt(request) => Ok(object(vec![
+            (
+                "client",
+                request.client.as_ref().map_or(JsonValue::Null, |client| {
+                    JsonValue::String(client.as_str().to_owned())
+                }),
+            ),
             (
                 "id",
                 optional_json(request.id.as_ref(), |id| {
@@ -460,6 +634,15 @@ fn request_body(request: &PlatformRequest) -> Result<JsonValue, PlatformApiError
             ),
             ("session", coordinate_json(&request.session)),
         ])),
+        PlatformRequest::SessionHistorySnapshot(request) => Ok(object(vec![
+            ("limit", integer(u64::from(request.limit), "limit")?),
+            ("session", coordinate_json(&request.session)),
+        ])),
+        PlatformRequest::SessionHistoryPage(request) => Ok(object(vec![
+            ("after", integer(request.after, "after")?),
+            ("limit", integer(u64::from(request.limit), "limit")?),
+            ("session", coordinate_json(&request.session)),
+        ])),
     }
 }
 
@@ -499,25 +682,38 @@ fn request_from_message(message: &Message) -> Result<PlatformRequest, PlatformAp
                 body,
                 &[
                     "action",
+                    "client",
                     "expected_revision",
                     "idempotency_key",
                     "parameter",
                     "target",
                 ],
             )?;
-            Ok(PlatformRequest::Execute(
-                ExecuteRequest::new_with_parameter(
-                    PlatformAction::parse(string(body, "action")?)?,
-                    coordinate(body.get("target").ok_or(PlatformApiError::InvalidBody)?)?,
-                    IdempotencyKey::new(string(body, "idempotency_key")?.to_owned())
-                        .map_err(PlatformError::Field)?,
-                    optional_revision(body, "expected_revision")?,
-                    optional_parameter(body, "parameter")?,
-                )?,
-            ))
+            let mut request = ExecuteRequest::new_with_parameter(
+                PlatformAction::parse(string(body, "action")?)?,
+                coordinate(body.get("target").ok_or(PlatformApiError::InvalidBody)?)?,
+                IdempotencyKey::new(string(body, "idempotency_key")?.to_owned())
+                    .map_err(PlatformError::Field)?,
+                optional_revision(body, "expected_revision")?,
+                optional_parameter(body, "parameter")?,
+            )?;
+            if let Some(JsonValue::String(client)) = body.get("client") {
+                request = request
+                    .with_client(ClientId::new(client.clone()).map_err(PlatformError::Field)?);
+            } else if !matches!(body.get("client"), Some(JsonValue::Null)) {
+                return Err(PlatformApiError::InvalidBody);
+            }
+            Ok(PlatformRequest::Execute(request))
         }
         "get_receipt" => {
-            exact_fields(body, &["id", "idempotency_key"])?;
+            exact_fields(body, &["client", "id", "idempotency_key"])?;
+            let client = match body.get("client") {
+                Some(JsonValue::Null) => None,
+                Some(JsonValue::String(value)) => {
+                    Some(ClientId::new(value.clone()).map_err(PlatformError::Field)?)
+                }
+                _ => return Err(PlatformApiError::InvalidBody),
+            };
             let id = match body.get("id") {
                 Some(JsonValue::Null) => None,
                 Some(JsonValue::String(value)) => {
@@ -536,6 +732,7 @@ fn request_from_message(message: &Message) -> Result<PlatformRequest, PlatformAp
                 return Err(PlatformApiError::InvalidBody);
             }
             Ok(PlatformRequest::GetReceipt(GetReceiptRequest {
+                client,
                 id,
                 idempotency_key,
             }))
@@ -579,6 +776,25 @@ fn request_from_message(message: &Message) -> Result<PlatformRequest, PlatformAp
                 idempotency_key: IdempotencyKey::new(string(body, "idempotency_key")?.to_owned())
                     .map_err(PlatformError::Field)?,
             }))
+        }
+        "session_history_snapshot" => {
+            exact_fields(body, &["limit", "session"])?;
+            Ok(PlatformRequest::SessionHistorySnapshot(
+                SessionHistorySnapshotRequest::new(
+                    coordinate(body.get("session").ok_or(PlatformApiError::InvalidBody)?)?,
+                    history_limit(body, "limit")?,
+                )?,
+            ))
+        }
+        "session_history_page" => {
+            exact_fields(body, &["after", "limit", "session"])?;
+            Ok(PlatformRequest::SessionHistoryPage(
+                SessionHistoryPageRequest::new(
+                    coordinate(body.get("session").ok_or(PlatformApiError::InvalidBody)?)?,
+                    unsigned(body, "after")?,
+                    history_limit(body, "limit")?,
+                )?,
+            ))
         }
         _ => Err(PlatformApiError::UnknownKind),
     }
@@ -641,6 +857,8 @@ fn response_kind(response: &PlatformResponse) -> &'static str {
         PlatformResponse::Detached { .. } => "detached",
         PlatformResponse::ControlClaimed(_) => "control_claimed",
         PlatformResponse::ControlReleased { .. } => "control_released",
+        PlatformResponse::SessionHistory(_) => "session_history_result",
+        PlatformResponse::SessionHistoryResync(_) => "session_history_resync",
         PlatformResponse::Refused { .. } => "refused",
     }
 }
@@ -760,6 +978,39 @@ fn response_body(response: &PlatformResponse) -> Result<JsonValue, PlatformApiEr
             ("client", JsonValue::String(client.as_str().to_owned())),
             ("lease", JsonValue::String(lease.as_str().to_owned())),
             ("session", coordinate_json(session)),
+        ])),
+        PlatformResponse::SessionHistory(page) => {
+            let (messages, tool_states, run_states, unknown_events) =
+                history_event_arrays(&page.events)?;
+            Ok(object(vec![
+                (
+                    "applied_limit",
+                    integer(u64::from(page.applied_limit), "applied_limit")?,
+                ),
+                ("from_cursor", integer(page.from_cursor, "from_cursor")?),
+                ("has_more", JsonValue::Bool(page.has_more)),
+                ("messages", JsonValue::Array(messages)),
+                (
+                    "requested_limit",
+                    integer(u64::from(page.requested_limit), "requested_limit")?,
+                ),
+                ("run_states", JsonValue::Array(run_states)),
+                ("session", coordinate_json(&page.session)),
+                (
+                    "terminal_cursor",
+                    integer(page.terminal_cursor, "terminal_cursor")?,
+                ),
+                ("tool_states", JsonValue::Array(tool_states)),
+                ("unknown_events", JsonValue::Array(unknown_events)),
+            ]))
+        }
+        PlatformResponse::SessionHistoryResync(resync) => Ok(object(vec![
+            ("session", coordinate_json(&resync.session)),
+            (
+                "snapshot_from",
+                integer(resync.snapshot_from, "snapshot_from")?,
+            ),
+            ("snapshot_to", integer(resync.snapshot_to, "snapshot_to")?),
         ])),
         PlatformResponse::Refused {
             outcome,
@@ -922,6 +1173,43 @@ fn response_from_message(message: &Message) -> Result<PlatformResponse, Platform
                 lease: ControlLeaseId::new(string(body, "lease")?.to_owned())
                     .map_err(PlatformError::Field)?,
             })
+        }
+        "session_history_result" => {
+            exact_fields(
+                body,
+                &[
+                    "applied_limit",
+                    "from_cursor",
+                    "has_more",
+                    "messages",
+                    "requested_limit",
+                    "run_states",
+                    "session",
+                    "terminal_cursor",
+                    "tool_states",
+                    "unknown_events",
+                ],
+            )?;
+            let events = decode_history_events(body)?;
+            Ok(PlatformResponse::SessionHistory(SessionHistoryPage::new(
+                coordinate(body.get("session").ok_or(PlatformApiError::InvalidBody)?)?,
+                history_limit(body, "requested_limit")?,
+                history_limit(body, "applied_limit")?,
+                unsigned(body, "from_cursor")?,
+                unsigned(body, "terminal_cursor")?,
+                boolean(body, "has_more")?,
+                events,
+            )?))
+        }
+        "session_history_resync" => {
+            exact_fields(body, &["session", "snapshot_from", "snapshot_to"])?;
+            Ok(PlatformResponse::SessionHistoryResync(
+                SessionHistoryResync::new(
+                    coordinate(body.get("session").ok_or(PlatformApiError::InvalidBody)?)?,
+                    unsigned(body, "snapshot_from")?,
+                    unsigned(body, "snapshot_to")?,
+                )?,
+            ))
         }
         "refused" => {
             exact_fields(body, &["explanation", "outcome"])?;

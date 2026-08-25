@@ -25,6 +25,10 @@ pub const MAX_PLATFORM_PARAMETER_BYTES: usize = 64 * 1024;
 pub const MAX_SNAPSHOT_RESOURCES: usize = 512;
 /// Largest number of ordered events returned in one subscription page.
 pub const MAX_SUBSCRIPTION_EVENTS: usize = 512;
+/// Largest number of sanitized session-history events returned in one page.
+pub const MAX_SESSION_HISTORY_EVENTS: usize = 512;
+/// Largest display text retained in one mobile-safe history event.
+pub const MAX_SESSION_HISTORY_TEXT_BYTES: usize = 512;
 /// Largest number of service methods advertised by one endpoint.
 pub const MAX_CAPABILITY_METHODS: usize = 32;
 /// Maximum transport projections advertised by one endpoint.
@@ -96,6 +100,9 @@ pub type ControlLeaseId = OpaqueId<ControlLeaseIdDomain, MAX_PLATFORM_FIELD_BYTE
 pub type CursorTopic = BoundedString<MAX_PLATFORM_FIELD_BYTES>;
 /// Bounded action parameter or human-readable refusal explanation.
 pub type PlatformText = BoundedString<MAX_PLATFORM_FIELD_BYTES>;
+/// Sanitized display text carried by session history. Raw provider payloads,
+/// prompts, tool inputs, and credentials have no representation in this type.
+pub type SessionHistoryText = BoundedString<MAX_SESSION_HISTORY_TEXT_BYTES>;
 /// Bounded free-form action input. Identifiers and display text retain the
 /// much smaller [`MAX_PLATFORM_FIELD_BYTES`] limit.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -324,10 +331,12 @@ pub enum PlatformMethod {
     Detach,
     ClaimControl,
     ReleaseControl,
+    SessionHistorySnapshot,
+    SessionHistoryPage,
 }
 
 impl PlatformMethod {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::Capabilities,
         Self::Snapshot,
         Self::Subscribe,
@@ -338,6 +347,8 @@ impl PlatformMethod {
         Self::Detach,
         Self::ClaimControl,
         Self::ReleaseControl,
+        Self::SessionHistorySnapshot,
+        Self::SessionHistoryPage,
     ];
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -352,11 +363,331 @@ impl PlatformMethod {
             Self::Detach => "detach",
             Self::ClaimControl => "claim_control",
             Self::ReleaseControl => "release_control",
+            Self::SessionHistorySnapshot => "session_history_snapshot",
+            Self::SessionHistoryPage => "session_history_page",
         }
     }
 
     pub fn parse(value: &str) -> Result<Self, PlatformError> {
         parse_closed(&Self::ALL, value, Self::as_str, "platform_method")
+    }
+}
+
+/// Evidence class retained by the normalized history projection.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SessionHistoryEvidence {
+    Authoritative,
+    Synthetic,
+}
+
+impl SessionHistoryEvidence {
+    pub const ALL: [Self; 2] = [Self::Authoritative, Self::Synthetic];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Authoritative => "authoritative",
+            Self::Synthetic => "synthetic",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, PlatformError> {
+        parse_closed(&Self::ALL, value, Self::as_str, "session_history_evidence")
+    }
+}
+
+/// Speaker of one sanitized retained message.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SessionHistoryRole {
+    Assistant,
+    User,
+}
+
+impl SessionHistoryRole {
+    pub const ALL: [Self; 2] = [Self::Assistant, Self::User];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Assistant => "assistant",
+            Self::User => "user",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, PlatformError> {
+        parse_closed(&Self::ALL, value, Self::as_str, "session_history_role")
+    }
+}
+
+/// Public lifecycle of one tool step. Tool input and output are absent.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SessionHistoryToolState {
+    Pending,
+    InProgress,
+    Completed,
+    Error,
+}
+
+impl SessionHistoryToolState {
+    pub const ALL: [Self; 4] = [
+        Self::Pending,
+        Self::InProgress,
+        Self::Completed,
+        Self::Error,
+    ];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+            Self::Error => "error",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, PlatformError> {
+        parse_closed(
+            &Self::ALL,
+            value,
+            Self::as_str,
+            "session_history_tool_state",
+        )
+    }
+}
+
+/// Public run state derived only from the runner's closed terminal vocabulary.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SessionHistoryRunState {
+    Started,
+    CancelRequested,
+    Completed,
+    Failed,
+    Cancelled,
+    TimedOut,
+}
+
+impl SessionHistoryRunState {
+    pub const ALL: [Self; 6] = [
+        Self::Started,
+        Self::CancelRequested,
+        Self::Completed,
+        Self::Failed,
+        Self::Cancelled,
+        Self::TimedOut,
+    ];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::CancelRequested => "cancel_requested",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, PlatformError> {
+        parse_closed(&Self::ALL, value, Self::as_str, "session_history_run_state")
+    }
+}
+
+/// Closed source class for an event this schema intentionally does not expose.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SessionHistoryUnknownSource {
+    AdapterEvent,
+    SimulationEvent,
+}
+
+impl SessionHistoryUnknownSource {
+    pub const ALL: [Self; 2] = [Self::AdapterEvent, Self::SimulationEvent];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AdapterEvent => "adapter_event",
+            Self::SimulationEvent => "simulation_event",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, PlatformError> {
+        parse_closed(
+            &Self::ALL,
+            value,
+            Self::as_str,
+            "session_history_unknown_source",
+        )
+    }
+}
+
+/// Mobile-safe projection of one hash-chained runner event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionHistoryEvent {
+    Message {
+        cursor: u64,
+        at: EpochMillis,
+        evidence: SessionHistoryEvidence,
+        role: SessionHistoryRole,
+        text: SessionHistoryText,
+        truncated: bool,
+    },
+    ToolState {
+        cursor: u64,
+        at: EpochMillis,
+        evidence: SessionHistoryEvidence,
+        state: SessionHistoryToolState,
+        label: Option<SessionHistoryText>,
+        truncated: bool,
+    },
+    RunState {
+        cursor: u64,
+        at: EpochMillis,
+        state: SessionHistoryRunState,
+    },
+    Unknown {
+        cursor: u64,
+        at: EpochMillis,
+        source: SessionHistoryUnknownSource,
+    },
+}
+
+impl SessionHistoryEvent {
+    #[must_use]
+    pub const fn cursor(&self) -> u64 {
+        match self {
+            Self::Message { cursor, .. }
+            | Self::ToolState { cursor, .. }
+            | Self::RunState { cursor, .. }
+            | Self::Unknown { cursor, .. } => *cursor,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionHistorySnapshotRequest {
+    pub session: ResourceCoordinate,
+    pub limit: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionHistoryPageRequest {
+    pub session: ResourceCoordinate,
+    pub after: u64,
+    pub limit: u16,
+}
+
+fn validate_history_request(session: &ResourceCoordinate, limit: u16) -> Result<(), PlatformError> {
+    if session.authority != ResourceAuthority::Automonique || session.kind != ResourceKind::Session
+    {
+        return Err(PlatformError::AuthorityMismatch);
+    }
+    if limit == 0 || usize::from(limit) > MAX_SESSION_HISTORY_EVENTS {
+        return Err(PlatformError::HistoryLimitOutOfRange);
+    }
+    Ok(())
+}
+
+impl SessionHistorySnapshotRequest {
+    pub fn new(session: ResourceCoordinate, limit: u16) -> Result<Self, PlatformError> {
+        validate_history_request(&session, limit)?;
+        Ok(Self { session, limit })
+    }
+}
+
+impl SessionHistoryPageRequest {
+    pub fn new(session: ResourceCoordinate, after: u64, limit: u16) -> Result<Self, PlatformError> {
+        validate_history_request(&session, limit)?;
+        Ok(Self {
+            session,
+            after,
+            limit,
+        })
+    }
+}
+
+/// One exclusive-cursor, gap-free page. Every retained source event has one
+/// projection, including `Unknown`, so cursor advancement cannot hide a gap.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionHistoryPage {
+    pub session: ResourceCoordinate,
+    pub requested_limit: u16,
+    pub applied_limit: u16,
+    pub from_cursor: u64,
+    pub terminal_cursor: u64,
+    pub has_more: bool,
+    pub events: Vec<SessionHistoryEvent>,
+}
+
+impl SessionHistoryPage {
+    pub fn new(
+        session: ResourceCoordinate,
+        requested_limit: u16,
+        applied_limit: u16,
+        from_cursor: u64,
+        terminal_cursor: u64,
+        has_more: bool,
+        events: Vec<SessionHistoryEvent>,
+    ) -> Result<Self, PlatformError> {
+        validate_history_request(&session, requested_limit)?;
+        validate_history_request(&session, applied_limit)?;
+        if applied_limit > requested_limit
+            || events.len() > usize::from(applied_limit)
+            || terminal_cursor < from_cursor
+        {
+            return Err(PlatformError::HistoryPageInvalid);
+        }
+        let mut previous = from_cursor;
+        for event in &events {
+            let cursor = event.cursor();
+            if cursor <= previous || cursor > terminal_cursor {
+                return Err(PlatformError::HistoryPageInvalid);
+            }
+            previous = cursor;
+        }
+        if events
+            .last()
+            .map_or(from_cursor, SessionHistoryEvent::cursor)
+            != terminal_cursor
+        {
+            return Err(PlatformError::HistoryPageInvalid);
+        }
+        Ok(Self {
+            session,
+            requested_limit,
+            applied_limit,
+            from_cursor,
+            terminal_cursor,
+            has_more,
+            events,
+        })
+    }
+}
+
+/// Explicit retention refusal. It never carries a partial event page.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionHistoryResync {
+    pub session: ResourceCoordinate,
+    pub snapshot_from: u64,
+    pub snapshot_to: u64,
+}
+
+impl SessionHistoryResync {
+    pub fn new(
+        session: ResourceCoordinate,
+        snapshot_from: u64,
+        snapshot_to: u64,
+    ) -> Result<Self, PlatformError> {
+        validate_history_request(&session, 1)?;
+        if snapshot_from > snapshot_to {
+            return Err(PlatformError::HistoryPageInvalid);
+        }
+        Ok(Self {
+            session,
+            snapshot_from,
+            snapshot_to,
+        })
     }
 }
 
@@ -581,6 +912,9 @@ pub struct SubscribeRequest {
 /// or provider-direct escape hatch exists in the public contract.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecuteRequest {
+    /// Authenticated remote principal. Gateways verify this value against the
+    /// presented credential; local operator requests carry `None`.
+    pub client: Option<ClientId>,
     pub action: PlatformAction,
     pub target: ResourceCoordinate,
     pub idempotency_key: IdempotencyKey,
@@ -616,12 +950,19 @@ impl ExecuteRequest {
             return Err(PlatformError::AuthorityMismatch);
         }
         Ok(Self {
+            client: None,
             action,
             target,
             idempotency_key,
             expected_revision,
             parameter,
         })
+    }
+
+    #[must_use]
+    pub fn with_client(mut self, client: ClientId) -> Self {
+        self.client = Some(client);
+        self
     }
 }
 
@@ -638,6 +979,8 @@ pub struct ActionReceipt {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GetReceiptRequest {
+    /// Authenticated owner required for credential-scoped lookup.
+    pub client: Option<ClientId>,
     pub id: Option<ReceiptId>,
     pub idempotency_key: Option<IdempotencyKey>,
 }
@@ -646,6 +989,7 @@ impl GetReceiptRequest {
     #[must_use]
     pub const fn by_id(id: ReceiptId) -> Self {
         Self {
+            client: None,
             id: Some(id),
             idempotency_key: None,
         }
@@ -654,9 +998,16 @@ impl GetReceiptRequest {
     #[must_use]
     pub const fn by_idempotency_key(idempotency_key: IdempotencyKey) -> Self {
         Self {
+            client: None,
             id: None,
             idempotency_key: Some(idempotency_key),
         }
+    }
+
+    #[must_use]
+    pub fn with_client(mut self, client: ClientId) -> Self {
+        self.client = Some(client);
+        self
     }
 }
 
@@ -755,6 +1106,8 @@ pub enum PlatformRequest {
     Detach(DetachRequest),
     ClaimControl(ClaimControlRequest),
     ReleaseControl(ReleaseControlRequest),
+    SessionHistorySnapshot(SessionHistorySnapshotRequest),
+    SessionHistoryPage(SessionHistoryPageRequest),
 }
 
 /// Complete response vocabulary shared by local and remote transports.
@@ -776,6 +1129,8 @@ pub enum PlatformResponse {
         client: ClientId,
         lease: ControlLeaseId,
     },
+    SessionHistory(SessionHistoryPage),
+    SessionHistoryResync(SessionHistoryResync),
     Refused {
         outcome: ReceiptOutcome,
         explanation: PlatformText,
@@ -788,6 +1143,8 @@ pub enum PlatformError {
     TooManyResources,
     TooManyEvents,
     AuthorityMismatch,
+    HistoryLimitOutOfRange,
+    HistoryPageInvalid,
     UnknownEnum { field: &'static str },
 }
 

@@ -248,18 +248,6 @@ export function MobileServerIdentity(value: string): MobileServerIdentity {
   return value as MobileServerIdentity;
 }
 
-/** Bounded string, at most 2048 UTF-8 bytes. */
-export type MobileSessionHistoryEndpoint = string & {readonly __brand: "MobileSessionHistoryEndpoint"};
-export const MobileSessionHistoryEndpoint_MAX_BYTES = 2048;
-export const MobileSessionHistoryEndpoint_PATTERN = /^https:\/\/[^?#@]+\/api\/mobile\/session-history$/u;
-export function MobileSessionHistoryEndpoint(value: string): MobileSessionHistoryEndpoint {
-  if (value.length === 0) throw new ValidationError("MobileSessionHistoryEndpoint", "empty");
-  if (!isWellFormedUnicode(value)) throw new ValidationError("MobileSessionHistoryEndpoint", "invalid_character");
-  if (byteLength(value) > 2048) throw new ValidationError("MobileSessionHistoryEndpoint", "too_long");
-  if (!MobileSessionHistoryEndpoint_PATTERN.test(value)) throw new ValidationError("MobileSessionHistoryEndpoint", "invalid_character");
-  return value as MobileSessionHistoryEndpoint;
-}
-
 /** Bounded integer in [1, 100]. */
 export type MobileCredentialPageSize = bigint & {readonly __brand: "MobileCredentialPageSize"};
 export const MobileCredentialPageSize_MIN = 1n;
@@ -518,7 +506,6 @@ export interface MobileDiscovery {
   readonly protocol: typeof MOBILE_AUTH_PROTOCOL;
   readonly schema: typeof MOBILE_AUTH_SCHEMA_V1;
   readonly server_identity: MobileServerIdentity;
-  readonly session_history_endpoint: MobileSessionHistoryEndpoint;
   readonly supported_versions: readonly MobileProtocolVersion[];
 }
 
@@ -534,7 +521,6 @@ export const MobileDiscovery_FIELDS: readonly string[] = [
   "protocol",
   "schema",
   "server_identity",
-  "session_history_endpoint",
   "supported_versions",
 ];
 
@@ -551,7 +537,6 @@ export function decodeMobileDiscovery(body: JsonValue): MobileDiscovery {
     protocol: exactString(bodyString(fields, "protocol", MOBILE_AUTH_INVALID_BODY), MOBILE_AUTH_PROTOCOL, MOBILE_AUTH_PROTOCOL_MISMATCH, "protocol"),
     schema: exactString(bodyString(fields, "schema", MOBILE_AUTH_INVALID_BODY), MOBILE_AUTH_SCHEMA_V1, MOBILE_AUTH_SCHEMA_MISMATCH, "schema"),
     server_identity: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobileServerIdentity(bodyString(fields, "server_identity", MOBILE_AUTH_INVALID_BODY))),
-    session_history_endpoint: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobileSessionHistoryEndpoint(bodyString(fields, "session_history_endpoint", MOBILE_AUTH_INVALID_BODY))),
     supported_versions: bodyArray(fields, "supported_versions", MOBILE_AUTH_INVALID_BODY, MAX_MOBILE_PROTOCOL_VERSIONS, MOBILE_AUTH_VALUE_INVALID).map((value) =>
       refuse(MOBILE_AUTH_VALUE_INVALID, () => MobileProtocolVersion(jsonUnsigned(value, MOBILE_AUTH_INVALID_BODY))),
     ),

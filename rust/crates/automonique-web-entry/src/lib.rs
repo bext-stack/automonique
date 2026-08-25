@@ -42,10 +42,6 @@ use automonique_daemon::{
 };
 use automonique_platform_client::{PLATFORM_CONTENT_TYPE, PlatformClient, UnixTransport};
 use automonique_protocol::codec::RequestId;
-use automonique_protocol::mobile_session::{
-    MOBILE_SESSION_MEDIA_TYPE, MOBILE_SESSION_SCHEMA_V1, MobileHistoryBody, MobileHistoryCursor,
-    MobileHistoryEvent, MobileHistoryPage, MobileHistoryResync,
-};
 use automonique_protocol::platform::{
     Capabilities, ListSessionsRequest, PlatformCursor, PlatformRequest, PlatformResponse,
     PlatformTransport, ResourceAuthority, ResourceCoordinate, ResourceRecord, SessionRecord,
@@ -123,7 +119,6 @@ pub enum Route {
     ApiOperations,
     ApiPlatform,
     ApiPlatformRemote,
-    MobileSessionHistory,
     MobileDiscovery,
     MobileOperatorProvision,
     MobilePairingCreate,
@@ -1580,123 +1575,6 @@ struct ChatHistoryView {
     pending_actions: Vec<ChatActionView>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum MobileHistoryOperation {
-    Snapshot,
-    Page,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MobileHistoryRequest {
-    cursor: Option<String>,
-    limit: usize,
-    operation: MobileHistoryOperation,
-    session_id: String,
-}
-
-#[derive(Serialize)]
-struct MobileHistoryEventView {
-    at_ms: String,
-    cursor: String,
-    kind: &'static str,
-    message_role: Option<&'static str>,
-    message_text: Option<String>,
-    run_id: String,
-    run_state: Option<&'static str>,
-    tool_state: Option<&'static str>,
-    unknown_kind: Option<String>,
-}
-
-impl From<MobileHistoryEvent> for MobileHistoryEventView {
-    fn from(value: MobileHistoryEvent) -> Self {
-        let kind = value.body.kind();
-        let (message_role, message_text, tool_state, run_state, unknown_kind) = match value.body {
-            MobileHistoryBody::Message { role, text } => (
-                Some(role.as_str()),
-                Some(text.into_inner()),
-                None,
-                None,
-                None,
-            ),
-            MobileHistoryBody::ToolState { state } => {
-                (None, None, Some(state.as_str()), None, None)
-            }
-            MobileHistoryBody::RunState { state } => (None, None, None, Some(state.as_str()), None),
-            MobileHistoryBody::Unknown { event_kind } => {
-                (None, None, None, None, Some(event_kind.into_inner()))
-            }
-        };
-        Self {
-            at_ms: value.at_ms.as_millis().to_string(),
-            cursor: value.cursor.to_string(),
-            kind,
-            message_role,
-            message_text,
-            run_id: value.run_id.as_str().to_owned(),
-            run_state,
-            tool_state,
-            unknown_kind,
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct MobileHistoryPageView {
-    applied_limit: usize,
-    events: Vec<MobileHistoryEventView>,
-    exclusive_cursor: String,
-    has_more: bool,
-    requested_limit: usize,
-    schema: &'static str,
-    session_id: String,
-    terminal_cursor: String,
-}
-
-impl From<MobileHistoryPage> for MobileHistoryPageView {
-    fn from(value: MobileHistoryPage) -> Self {
-        Self {
-            applied_limit: value.applied_limit,
-            events: value.events.into_iter().map(Into::into).collect(),
-            exclusive_cursor: value.exclusive_cursor.to_string(),
-            has_more: value.has_more,
-            requested_limit: value.requested_limit,
-            schema: value.schema,
-            session_id: value.session_id,
-            terminal_cursor: value.terminal_cursor.to_string(),
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct MobileHistoryResyncView {
-    earliest_cursor: String,
-    reason: &'static str,
-    requested_cursor: String,
-    schema: &'static str,
-    session_id: String,
-    terminal_cursor: String,
-}
-
-impl From<MobileHistoryResync> for MobileHistoryResyncView {
-    fn from(value: MobileHistoryResync) -> Self {
-        Self {
-            earliest_cursor: value.earliest_cursor.to_string(),
-            reason: value.reason.as_str(),
-            requested_cursor: value.requested_cursor.to_string(),
-            schema: value.schema,
-            session_id: value.session_id,
-            terminal_cursor: value.terminal_cursor.to_string(),
-        }
-    }
-}
-
-enum MobileHistoryResponse {
-    Page(MobileHistoryPageView),
-    Resync(MobileHistoryResyncView),
-}
-
 #[derive(Serialize)]
 struct ChatMessageView {
     role: String,
@@ -1980,47 +1858,6 @@ impl WebIntegration {
         authority
             .authorize_access(token, &server_identity, now_ms_i64())
             .map_err(|error| error.category())
-    }
-
-    fn mobile_session_history(
-        &self,
-        request: MobileHistoryRequest,
-        authorization: &MobileAuthorization,
-    ) -> Result<MobileHistoryResponse, &'static str> {
-        if authorization.expires_at_ms <= now_ms_i64()
-            || !authorization.allows_session(&request.session_id)
-            || !(1..=65_535).contains(&request.limit)
-        {
-            return Err("mobile_history_unauthorized");
-        }
-        let cursor = match (request.operation, request.cursor.as_deref()) {
-            (MobileHistoryOperation::Snapshot, None) => None,
-            (MobileHistoryOperation::Page, Some(value)) => Some(
-                MobileHistoryCursor::parse(value).map_err(|_| "mobile_history_cursor_invalid")?,
-            ),
-            _ => return Err("mobile_history_request_invalid"),
-        };
-        let store = automonique_daemon::managed_sessions::ManagedSessionStore::open(
-            self.state_dir
-                .join(automonique_daemon::MANAGED_SESSIONS_NAME),
-        )
-        .map_err(|_| "mobile_history_unavailable")?;
-        match store
-            .history_page(
-                &request.session_id,
-                cursor,
-                request.limit,
-                usize::from(authorization.limits.max_page_events),
-            )
-            .map_err(|_| "mobile_history_unavailable")?
-        {
-            automonique_daemon::managed_sessions::ManagedHistoryPage::Page(page) => {
-                Ok(MobileHistoryResponse::Page(page.into()))
-            }
-            automonique_daemon::managed_sessions::ManagedHistoryPage::Resync(resync) => {
-                Ok(MobileHistoryResponse::Resync(resync.into()))
-            }
-        }
     }
 
     fn memory(&self, query: Option<&str>) -> Result<MemoryView, &'static str> {
@@ -4793,7 +4630,6 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 "/api/mobile/refresh" => Route::MobileRefresh,
                 "/api/mobile/revoke" => Route::MobileRevoke,
                 "/api/mobile/authorization" => Route::MobileAuthorization,
-                "/api/mobile/session-history" => Route::MobileSessionHistory,
                 "/api/processes" => Route::ApiProcesses,
                 "/api/chat" => Route::ApiChat,
                 "/api/chat/action" => Route::ApiChatAction,
@@ -4818,7 +4654,6 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                     | Route::MobileCredentialRevoke
                     | Route::MobileRefresh
                     | Route::MobileRevoke
-                    | Route::MobileSessionHistory
                     | Route::ApiChat
                     | Route::ApiChatAction
                     | Route::ApiChatNew
@@ -5267,8 +5102,7 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         | Route::MobileCredentialRevoke
         | Route::MobileRefresh
         | Route::MobileRevoke
-        | Route::MobileAuthorization
-        | Route::MobileSessionHistory => empty_response("500 Internal Server Error"),
+        | Route::MobileAuthorization => empty_response("500 Internal Server Error"),
         Route::MobileUnauthorized => {
             mobile_error("401 Unauthorized", "mobile_operator_authorization_required")
         }
@@ -5447,29 +5281,6 @@ fn api_response(
             || mobile_error("401 Unauthorized", "mobile_credential_invalid"),
             |authorization| mobile_response("200 OK", authorization),
         ),
-        Route::MobileSessionHistory => {
-            let Some(authorization) = mobile_authorization else {
-                return mobile_session_error("401 Unauthorized", "mobile_credential_invalid");
-            };
-            match serde_json::from_slice::<MobileHistoryRequest>(body) {
-                Ok(request) => match integration.mobile_session_history(request, authorization) {
-                    Ok(MobileHistoryResponse::Page(page)) => {
-                        mobile_session_response("200 OK", &page)
-                    }
-                    Ok(MobileHistoryResponse::Resync(resync)) => {
-                        mobile_session_response("409 Conflict", &resync)
-                    }
-                    Err("mobile_history_unauthorized") => {
-                        mobile_session_error("403 Forbidden", "mobile_history_unauthorized")
-                    }
-                    Err("mobile_history_cursor_invalid" | "mobile_history_request_invalid") => {
-                        mobile_session_error("400 Bad Request", "mobile_history_request_invalid")
-                    }
-                    Err(category) => mobile_session_error("503 Service Unavailable", category),
-                },
-                Err(_) => mobile_session_error("400 Bad Request", "mobile_history_request_invalid"),
-            }
-        }
         Route::ApiProcesses => json_response("200 OK", &integration.processes()),
         Route::ApiChat => match serde_json::from_slice::<ChatRequest>(body) {
             Ok(request) => match integration.chat(request, &state.snapshot()) {
@@ -5559,32 +5370,6 @@ fn mobile_error(status: &'static str, category: &'static str) -> Response {
     mobile_response(status, &ErrorBody { error: category })
 }
 
-fn mobile_session_response<T: Serialize>(status: &'static str, value: &T) -> Response {
-    Response {
-        status,
-        content_type: Some(MOBILE_SESSION_MEDIA_TYPE),
-        cache_control: "no-store",
-        location: None,
-        retry_after: None,
-        body: serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec()),
-    }
-}
-
-fn mobile_session_error(status: &'static str, category: &'static str) -> Response {
-    #[derive(Serialize)]
-    struct ErrorBody {
-        error: &'static str,
-        schema: &'static str,
-    }
-    mobile_session_response(
-        status,
-        &ErrorBody {
-            error: category,
-            schema: MOBILE_SESSION_SCHEMA_V1,
-        },
-    )
-}
-
 fn json_error(status: &'static str, category: &'static str) -> Response {
     #[derive(Serialize)]
     struct ErrorBody {
@@ -5662,9 +5447,7 @@ fn response_bytes(
             headers.push_str("WWW-Authenticate: Bearer realm=\"Monique Manage Chat\"\r\n");
         } else if matches!(
             route,
-            Route::MobileAccessUnauthorized
-                | Route::MobileAuthorization
-                | Route::MobileSessionHistory
+            Route::MobileAccessUnauthorized | Route::MobileAuthorization
         ) {
             headers.push_str("WWW-Authenticate: Bearer realm=\"Automonique Mobile\"\r\n");
         } else if matches!(route, Route::MobileUnauthorized | Route::Unauthorized) {
@@ -5737,7 +5520,6 @@ fn handle(
                 let local_health = normalize_host(request.host) == Some("localhost")
                     && requested_route == Route::Health;
                 let remote_platform = requested_route == Route::ApiPlatformRemote;
-                let mobile_session_history = requested_route == Route::MobileSessionHistory;
                 let operator_mobile = matches!(
                     requested_route,
                     Route::MobileOperatorProvision
@@ -5756,7 +5538,6 @@ fn handle(
                         | Route::MobileRefresh
                         | Route::MobileRevoke
                         | Route::MobileAuthorization
-                        | Route::MobileSessionHistory
                 );
                 let needs_auth = !local_health
                     && !matches!(
@@ -5774,7 +5555,6 @@ fn handle(
                 let basic_authorized = auth.authorize(request.authorization);
                 let session_authorized = auth.authorize_session(request.cookie);
                 let mobile_authorization = (remote_platform
-                    || mobile_session_history
                     || requested_route == Route::MobileAuthorization)
                     .then(|| {
                         integration.and_then(|integration| {
@@ -5782,19 +5562,18 @@ fn handle(
                         })
                     })
                     .flatten();
-                let mobile_access_presented = (remote_platform || mobile_session_history)
-                    && presents_mobile_access_token(request.authorization);
-                let bearer_authorized = (remote_platform || mobile_session_history)
+                let mobile_access_presented =
+                    remote_platform && presents_mobile_access_token(request.authorization);
+                let bearer_authorized = remote_platform
                     && authorize_remote_bearer(
                         request.authorization,
                         mobile_authorization.is_some(),
                         || {
-                            remote_platform
-                                && integration.is_some_and(|integration| {
-                                    integration
-                                        .manage
-                                        .authorize_platform_bearer(request.authorization)
-                                })
+                            integration.is_some_and(|integration| {
+                                integration
+                                    .manage
+                                    .authorize_platform_bearer(request.authorization)
+                            })
                         },
                     );
                 let credentials_authorized = request_credentials_authorized(
@@ -5817,8 +5596,6 @@ fn handle(
                     Route::ManageUnauthorized
                 } else if operator_mobile && !basic_authorized {
                     Route::MobileUnauthorized
-                } else if mobile_session_history && mobile_authorization.is_none() {
-                    Route::MobileAccessUnauthorized
                 } else if needs_auth && !manage_chat_route && !credentials_authorized {
                     if mobile_access_presented {
                         Route::MobileAccessUnauthorized
@@ -5831,8 +5608,6 @@ fn handle(
                         || !request.content_type.is_some_and(|value| {
                             value.eq_ignore_ascii_case(if remote_platform {
                                 PLATFORM_CONTENT_TYPE
-                            } else if mobile_session_history {
-                                MOBILE_SESSION_MEDIA_TYPE
                             } else if mobile_lifecycle {
                                 MOBILE_AUTH_MEDIA_TYPE
                             } else {
@@ -5901,7 +5676,6 @@ fn handle(
             | Route::MobileRefresh
             | Route::MobileRevoke
             | Route::MobileAuthorization
-            | Route::MobileSessionHistory
     ) {
         integration.map_or_else(
             || json_error("503 Service Unavailable", "integration_unavailable"),
@@ -6007,7 +5781,9 @@ mod tests {
     use automonique_protocol::platform::{
         ActionReceipt, Attachment, ControlLease, ControlLeaseId, CursorTopic, Freshness,
         FreshnessState, PlatformAction, PlatformEvent, PlatformText, ReceiptId, ReceiptOutcome,
-        ResourceId, ResourceKind, SessionList, Snapshot, Subscription,
+        ResourceId, ResourceKind, SessionHistoryEvent, SessionHistoryEvidence, SessionHistoryPage,
+        SessionHistoryResync, SessionHistoryRole, SessionHistoryRunState, SessionHistoryText,
+        SessionHistoryToolState, SessionHistoryUnknownSource, SessionList, Snapshot, Subscription,
     };
     use automonique_protocol::primitives::{EpochMillis, Revision};
     use std::collections::VecDeque;
@@ -6246,7 +6022,6 @@ mod tests {
             ),
             ("/api/mobile/refresh", Route::MobileRefresh),
             ("/api/mobile/revoke", Route::MobileRevoke),
-            ("/api/mobile/session-history", Route::MobileSessionHistory),
         ] {
             let bytes = format!(
                 "POST {path} HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nContent-Length: 2\r\nContent-Type: {MOBILE_AUTH_MEDIA_TYPE}\r\n\r\n{{}}"
@@ -6256,198 +6031,6 @@ mod tests {
                 route(&parse_request(bytes.as_bytes()).unwrap(), &fixture_hosts())
             );
         }
-    }
-
-    #[test]
-    fn built_typescript_sdk_passes_live_rust_mobile_session_history_contract() {
-        const EXCHANGES: usize = 3;
-        let state_dir = tempfile::tempdir().expect("temporary state");
-        let runtime_dir = tempfile::tempdir().expect("temporary runtime");
-        std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))
-            .expect("private state");
-        std::fs::set_permissions(runtime_dir.path(), std::fs::Permissions::from_mode(0o700))
-            .expect("private runtime");
-        let _platform_listener = UnixListener::bind(runtime_dir.path().join("admin.sock"))
-            .expect("fixture platform socket");
-        let integration = Arc::new(
-            WebIntegration::open(
-                IntegrationConfig {
-                    tenant: String::from("operator"),
-                    actor: String::from("operator:mobile-history-contract"),
-                    hosts: fixture_hosts(),
-                },
-                state_dir.path(),
-                runtime_dir.path(),
-            )
-            .expect("web integration"),
-        );
-        let access_token = integration
-            .mobile_auth
-            .lock()
-            .unwrap()
-            .operator_provision(
-                mobile_auth::MobileOperatorProvisionRequest {
-                    actions: vec![mobile_auth::MobileAction::Attach],
-                    session_scope: vec![String::from("session-a")],
-                    limits: mobile_auth::MobileLimits {
-                        max_follow_up_bytes: 1,
-                        max_page_events: 2,
-                    },
-                },
-                now_ms_i64(),
-            )
-            .unwrap()
-            .access_token
-            .clone();
-        let mut history = automonique_daemon::managed_sessions::ManagedSessionStore::open(
-            state_dir
-                .path()
-                .join(automonique_daemon::MANAGED_SESSIONS_NAME),
-        )
-        .unwrap();
-        history.observe("session-a", "run-1", 1).unwrap();
-        history
-            .append_history_event(
-                "session-a",
-                "run-1",
-                1,
-                1,
-                MobileHistoryBody::RunState {
-                    state: automonique_protocol::mobile_session::MobileRunState::Running,
-                },
-            )
-            .unwrap();
-        history
-            .append_history_event(
-                "session-a",
-                "run-1",
-                2,
-                2,
-                MobileHistoryBody::Message {
-                    role: automonique_protocol::mobile_session::MobileMessageRole::Assistant,
-                    text: automonique_protocol::mobile_session::MobileHistoryMessage::new(
-                        "sanitized answer",
-                    )
-                    .unwrap(),
-                },
-            )
-            .unwrap();
-        history
-            .append_history_event(
-                "session-a",
-                "run-1",
-                3,
-                3,
-                MobileHistoryBody::Unknown {
-                    event_kind: automonique_protocol::mobile_session::MobileUnknownEventKind::new(
-                        "future_event",
-                    )
-                    .unwrap(),
-                },
-            )
-            .unwrap();
-        drop(history);
-
-        let web_listener = TcpListener::bind("127.0.0.1:0").expect("web listener");
-        let web_address = web_listener.local_addr().unwrap();
-        let web_state = Arc::new(AppState::new(fixture_status()));
-        let web_server = {
-            let integration = Arc::clone(&integration);
-            let state = Arc::clone(&web_state);
-            thread::spawn(move || {
-                for _ in 0..EXCHANGES {
-                    let (stream, _) = web_listener.accept().expect("HTTP connection");
-                    handle(
-                        stream,
-                        &state,
-                        &fixture_auth(),
-                        &fixture_manage_chat_auth(),
-                        Some(&integration),
-                        &fixture_hosts(),
-                    )
-                    .expect("mobile history HTTP route");
-                }
-            })
-        };
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-        let sdk = repository.join("sdk/typescript/packages/sdk");
-        let build = Command::new("bun")
-            .args(["run", "build"])
-            .current_dir(&sdk)
-            .status()
-            .expect("build TypeScript SDK");
-        assert!(build.success(), "TypeScript SDK build failed");
-        let status = Command::new("bun")
-            .arg("run")
-            .arg(sdk.join("conformance/mobile-session-rust-http-contract.ts"))
-            .arg(format!(
-                "http://localhost:{}/api/mobile/session-history",
-                web_address.port()
-            ))
-            .arg(access_token)
-            .current_dir(repository)
-            .status()
-            .expect("run TypeScript mobile history client");
-        assert!(status.success(), "TypeScript mobile history client failed");
-        web_server.join().expect("web server");
-    }
-
-    #[test]
-    fn mobile_history_serialization_cannot_carry_raw_provider_or_tool_payloads() {
-        const SENTINEL: &str = "SENTINEL_RAW_PROVIDER_SECRET_DO_NOT_SERIALIZE";
-        let kind = automonique_protocol::event::EventKind::ProviderFault;
-        let body = automonique_protocol::progress_api::ProgressBody::new(
-            kind,
-            automonique_protocol::progress_api::ProgressBodyParts {
-                text: Some(
-                    automonique_protocol::progress_api::ProgressText::new(SENTINEL).unwrap(),
-                ),
-                step: None,
-                retry: Some(
-                    automonique_protocol::event::RetryContext::new(
-                        automonique_protocol::event::RetryCategory::Internal,
-                        false,
-                        None,
-                        1,
-                    )
-                    .unwrap(),
-                ),
-            },
-        )
-        .unwrap();
-        let frame = automonique_protocol::progress_api::ProgressFrame::new(
-            automonique_protocol::progress_api::ProgressFrameParts {
-                run_id: automonique_protocol::tools::RunId::new("run-1").unwrap(),
-                sequence: 1,
-                at_ms: automonique_protocol::primitives::EpochMillis::from_millis(1),
-                authority: automonique_protocol::event::Authority::Authoritative,
-                kind,
-                body,
-            },
-        )
-        .unwrap();
-        let public = MobileHistoryBody::from_progress_frame(&frame).unwrap();
-        let wire = serde_json::to_vec(&MobileHistoryEventView::from(MobileHistoryEvent {
-            cursor: MobileHistoryCursor::new(1),
-            at_ms: automonique_protocol::primitives::EpochMillis::from_millis(1),
-            run_id: automonique_protocol::tools::RunId::new("run-1").unwrap(),
-            body: public,
-        }))
-        .unwrap();
-        assert!(
-            !wire
-                .windows(SENTINEL.len())
-                .any(|part| part == SENTINEL.as_bytes())
-        );
-        assert!(
-            wire.windows(b"provider_fault".len())
-                .any(|part| part == b"provider_fault")
-        );
-        assert!(
-            !wire
-                .windows(b"credential".len())
-                .any(|part| part == b"credential")
-        );
     }
 
     #[test]
@@ -6657,7 +6240,8 @@ mod tests {
 
     #[test]
     fn typescript_sdk_passes_the_live_platform_http_contract() {
-        const EXCHANGES: usize = 16;
+        const PLATFORM_EXCHANGES: usize = 19;
+        const HTTP_EXCHANGES: usize = 20;
         const LARGE_SEQUENCE: u64 = 9_007_199_254_740_993;
 
         fn read_http_body(stream: &mut TcpStream) -> Vec<u8> {
@@ -6696,7 +6280,7 @@ mod tests {
         let platform_listener = UnixListener::bind(runtime_dir.path().join("admin.sock"))
             .expect("fixture platform socket");
         let platform_server = thread::spawn(move || {
-            for index in 1..=EXCHANGES {
+            for index in 1..=PLATFORM_EXCHANGES {
                 let (mut stream, _) = platform_listener.accept().expect("platform connection");
                 let mut prefix = [0_u8; 4];
                 stream
@@ -6717,6 +6301,11 @@ mod tests {
                     ResourceAuthority::Automonique,
                     ResourceKind::Run,
                     ResourceId::new("run-1").unwrap(),
+                );
+                let history_session = ResourceCoordinate::new(
+                    ResourceAuthority::Automonique,
+                    ResourceKind::Session,
+                    ResourceId::new("session-history-1").unwrap(),
                 );
                 let snapshot_cursor = PlatformCursor {
                     authority: ResourceAuthority::Provider,
@@ -6745,7 +6334,7 @@ mod tests {
                     recorded_at: EpochMillis::from_millis(9_007_199_254_740_996),
                     explanation: None,
                 };
-                let response = if index > 10 {
+                let response = if index > 13 {
                     let outcomes = [
                         ReceiptOutcome::Accepted,
                         ReceiptOutcome::Completed,
@@ -6755,7 +6344,7 @@ mod tests {
                         ReceiptOutcome::Unknown,
                     ];
                     PlatformResponse::Refused {
-                        outcome: outcomes[index - 11],
+                        outcome: outcomes[index - 14],
                         explanation: PlatformText::new("not completed").unwrap(),
                     }
                 } else {
@@ -6816,6 +6405,74 @@ mod tests {
                                 lease: value.lease.clone(),
                             }
                         }
+                        PlatformRequest::SessionHistorySnapshot(value) => {
+                            assert_eq!(value.session, history_session);
+                            assert_eq!(value.limit, 2);
+                            PlatformResponse::SessionHistory(
+                                SessionHistoryPage::new(
+                                    value.session.clone(),
+                                    value.limit,
+                                    value.limit,
+                                    9,
+                                    11,
+                                    true,
+                                    vec![
+                                        SessionHistoryEvent::Message {
+                                            cursor: 10,
+                                            at: EpochMillis::from_millis(10),
+                                            evidence: SessionHistoryEvidence::Authoritative,
+                                            role: SessionHistoryRole::User,
+                                            text: SessionHistoryText::new("hello").unwrap(),
+                                            truncated: false,
+                                        },
+                                        SessionHistoryEvent::ToolState {
+                                            cursor: 11,
+                                            at: EpochMillis::from_millis(11),
+                                            evidence: SessionHistoryEvidence::Synthetic,
+                                            state: SessionHistoryToolState::InProgress,
+                                            label: Some(SessionHistoryText::new("search").unwrap()),
+                                            truncated: false,
+                                        },
+                                    ],
+                                )
+                                .unwrap(),
+                            )
+                        }
+                        PlatformRequest::SessionHistoryPage(value) => {
+                            assert_eq!(value.session, history_session);
+                            assert_eq!(value.limit, 2);
+                            if value.after == 11 {
+                                PlatformResponse::SessionHistory(
+                                    SessionHistoryPage::new(
+                                        value.session.clone(),
+                                        value.limit,
+                                        value.limit,
+                                        11,
+                                        13,
+                                        false,
+                                        vec![
+                                            SessionHistoryEvent::RunState {
+                                                cursor: 12,
+                                                at: EpochMillis::from_millis(12),
+                                                state: SessionHistoryRunState::Completed,
+                                            },
+                                            SessionHistoryEvent::Unknown {
+                                                cursor: 13,
+                                                at: EpochMillis::from_millis(13),
+                                                source: SessionHistoryUnknownSource::AdapterEvent,
+                                            },
+                                        ],
+                                    )
+                                    .unwrap(),
+                                )
+                            } else {
+                                assert_eq!(value.after, 0);
+                                PlatformResponse::SessionHistoryResync(
+                                    SessionHistoryResync::new(value.session.clone(), 9, 13)
+                                        .unwrap(),
+                                )
+                            }
+                        }
                     }
                 };
                 let response = PlatformResponseMessage::new(request.request_id().clone(), response)
@@ -6832,7 +6489,7 @@ mod tests {
         let manage_listener = TcpListener::bind("127.0.0.1:0").expect("manage listener");
         let manage_address = manage_listener.local_addr().unwrap();
         let manage_server = thread::spawn(move || {
-            for _ in 0..EXCHANGES {
+            for _ in 0..HTTP_EXCHANGES {
                 let (mut stream, _) = manage_listener.accept().expect("Manage connection");
                 let body = read_http_body(&mut stream);
                 let request = PlatformRequestMessage::from_canonical_bytes(&body)
@@ -6875,7 +6532,7 @@ mod tests {
             let integration = Arc::clone(&integration);
             let state = Arc::clone(&web_state);
             thread::spawn(move || {
-                for _ in 0..EXCHANGES {
+                for _ in 0..HTTP_EXCHANGES {
                     let (stream, _) = web_listener.accept().expect("HTTP connection");
                     handle(
                         stream,

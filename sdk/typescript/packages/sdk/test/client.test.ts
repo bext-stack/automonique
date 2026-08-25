@@ -12,6 +12,8 @@ import {
   PlatformRevision,
   ReceiptId,
   ResourceId,
+  SessionHistoryCursor,
+  SessionHistoryLimit,
   decodeMessage,
   decodePlatformResponse,
   encodeMessage,
@@ -23,6 +25,7 @@ import {
   PLATFORM_MEDIA_TYPE,
   PlatformClient,
   PlatformTransportError,
+  SessionHistoryResyncError,
   type PlatformClientResponse,
 } from "../src/platform-client.ts";
 
@@ -104,6 +107,39 @@ function clientFor(
 }
 
 describe("canonical HTTPS Platform v1 transport", () => {
+  test("projects ordered history above the JavaScript safe-integer range", async () => {
+    const scopedSession: ResourceCoordinate = {...session, authority: "automonique"};
+    const from = 9007199254740993n;
+    const client = clientFor("request-history", "session_history_result", {
+      applied_limit: 2n,
+      from_cursor: from,
+      has_more: false,
+      messages: [{at: 10n, cursor: from + 1n, evidence: "authoritative", role: "user", text: "hello", truncated: false}],
+      requested_limit: 2n,
+      run_states: [{at: 11n, cursor: from + 2n, state: "completed"}],
+      session: scopedSession,
+      terminal_cursor: from + 2n,
+      tool_states: [],
+      unknown_events: [],
+    });
+    const page = await client.sessionHistoryPage(scopedSession, from, 2n);
+    expect(page.events.map((event) => event.kind)).toEqual(["message", "run_state"]);
+    expect(page.terminal_cursor).toBe(from + 2n);
+  });
+
+  test("turns retention into a typed resync error without yielding a partial page", async () => {
+    const scopedSession: ResourceCoordinate = {...session, authority: "automonique"};
+    const client = clientFor("request-history-resync", "session_history_resync", {
+      session: scopedSession,
+      snapshot_from: 20n,
+      snapshot_to: 40n,
+    });
+    const error = await client.sessionHistoryPage(scopedSession, 1n, 10n).catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(SessionHistoryResyncError);
+    expect((error as SessionHistoryResyncError).snapshotFrom).toBe(20n);
+    expect((error as SessionHistoryResyncError).snapshotTo).toBe(40n);
+  });
+
   test("sends the exact media type and canonical envelope", async () => {
     let observedKind = "";
     const client = clientFor("request-capabilities", "capabilities_result", {
@@ -130,7 +166,8 @@ describe("canonical HTTPS Platform v1 transport", () => {
     expect(observedKind).toBe("capabilities");
   });
 
-  test("decodes every success result and exercises all ten request methods", async () => {
+  test("decodes every success result and exercises all twelve request methods", async () => {
+    const historySession: ResourceCoordinate = {...session, authority: "automonique"};
     const cases: readonly {
       readonly method: string;
       readonly responseKind: string;
@@ -157,6 +194,7 @@ describe("canonical HTTPS Platform v1 transport", () => {
         method: "execute", responseKind: "receipt_result", body: receipt, expectedKind: "receipt",
         call: (client) => client.execute({
           action: "start_run",
+          client: null,
           expected_revision: PlatformRevision(9007199254740993n),
           idempotency_key: IdempotencyKey("execute-1"),
           parameter: PlatformParameter("start"),
@@ -165,7 +203,7 @@ describe("canonical HTTPS Platform v1 transport", () => {
       },
       {
         method: "get_receipt", responseKind: "receipt_result", body: receipt, expectedKind: "receipt",
-        call: (client) => client.getReceipt({id: ReceiptId("receipt-1"), idempotency_key: null}),
+        call: (client) => client.getReceipt({client: null, id: ReceiptId("receipt-1"), idempotency_key: null}),
       },
       {
         method: "list_sessions", responseKind: "sessions_result", body: {cursor, sessions: [{attachable: true, controllable: true, run, session: resource}]}, expectedKind: "sessions",
@@ -186,6 +224,26 @@ describe("canonical HTTPS Platform v1 transport", () => {
       {
         method: "release_control", responseKind: "control_released", body: {client: "client-1", lease: "lease-1", session}, expectedKind: "control_released",
         call: (client) => client.releaseControl(session, ClientId("client-1"), ControlLeaseId("lease-1"), IdempotencyKey("release-1")),
+      },
+      {
+        method: "session_history_snapshot", responseKind: "session_history_result", body: {
+          applied_limit: 1n, from_cursor: 0n, has_more: false, messages: [], requested_limit: 1n,
+          run_states: [], session: historySession, terminal_cursor: 0n, tool_states: [], unknown_events: [],
+        }, expectedKind: "session_history",
+        call: (client) => client.transport.request({
+          method: "session_history_snapshot",
+          request: {limit: SessionHistoryLimit(1n), session: historySession},
+        }),
+      },
+      {
+        method: "session_history_page", responseKind: "session_history_result", body: {
+          applied_limit: 1n, from_cursor: 1n, has_more: false, messages: [], requested_limit: 1n,
+          run_states: [], session: historySession, terminal_cursor: 1n, tool_states: [], unknown_events: [],
+        }, expectedKind: "session_history",
+        call: (client) => client.transport.request({
+          method: "session_history_page",
+          request: {after: SessionHistoryCursor(1n), limit: SessionHistoryLimit(1n), session: historySession},
+        }),
       },
     ];
 
