@@ -53,7 +53,7 @@
 //!
 //! # Where the seeded registry comes from
 //!
-//! [`admin_command_registry`] describes the thirteen commands
+//! [`admin_command_registry`] describes the fourteen commands
 //! [`crate::admin::AdminCommand`] actually admits, with the field names those
 //! bodies actually encode and the byte bounds `crate::admin` actually enforces
 //! — imported from that module rather than restated here, so a widened bound
@@ -1325,7 +1325,7 @@ impl CommandRegistry {
 
 /// The registry describing the local administration commands this build ships.
 ///
-/// Thirteen commands, matching [`crate::admin::AdminCommand`]'s variants, with
+/// Fourteen commands, matching [`crate::admin::AdminCommand`]'s variants, with
 /// the field names and byte bounds `crate::admin` actually encodes and
 /// enforces.
 ///
@@ -1343,6 +1343,7 @@ pub fn admin_command_registry() -> Result<CommandRegistry, CommandRegistryError>
         status_spec()?,
         metrics_spec()?,
         generations_spec()?,
+        reload_spec()?,
         reload_status_spec()?,
         submit_synthetic_spec()?,
         submit_run_spec()?,
@@ -1449,6 +1450,23 @@ fn generations_spec() -> Result<CommandSpec, CommandRegistryError> {
         approval: ApprovalPolicy::None,
         dry_run: DryRun::Unsupported,
         mutation: MutationDiscipline::ReadOnly,
+    })
+}
+
+fn reload_spec() -> Result<CommandSpec, CommandRegistryError> {
+    CommandSpec::new(CommandSpecParts {
+        id: CommandId::new("reload")?,
+        aliases: Vec::new(),
+        summary: help("Hand authority to one exact verified immutable release.")?,
+        fields: vec![required(
+            "target_release_digest",
+            FieldType::bounded_string(DIGEST_SPELLING_BYTES)?,
+            "The canonical SHA-256 digest of the target release manifest.",
+        )?],
+        authorization: AuthorizationRequirement::LocalPeer,
+        approval: ApprovalPolicy::OperatorConfirmation,
+        dry_run: DryRun::Unsupported,
+        mutation: keyed(Some("target_release_digest"), None)?,
     })
 }
 

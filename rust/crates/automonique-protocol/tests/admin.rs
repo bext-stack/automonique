@@ -2383,6 +2383,7 @@ mod capability {
         (4, "execution status reports the wired lane"),
         (5, "the ten-method platform v1 local endpoint"),
         (6, "generation history and reload-status reads"),
+        (7, "authenticated generation reload execution"),
     ];
 
     /// Every endpoint, at the maturity it had when it landed.
@@ -2424,6 +2425,7 @@ mod capability {
         "automonique.progress.stream/subscribe",
         "automonique.admin/metrics",
         "automonique.admin/generations",
+        "automonique.admin/reload",
         "automonique.admin/reload_status",
         "automonique.platform/capabilities",
         "automonique.platform/snapshot",
@@ -2489,7 +2491,7 @@ mod capability {
     /// closed set rather than by reading the table.
     #[test]
     fn every_admin_command_is_declared() {
-        assert_eq!(AdminCommand::ALL.len(), 13);
+        assert_eq!(AdminCommand::ALL.len(), 14);
         for command in AdminCommand::ALL {
             let endpoint = format!("automonique.admin/{}", command.kind());
             assert!(

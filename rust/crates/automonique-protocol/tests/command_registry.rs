@@ -101,13 +101,14 @@ fn spec_with(
 // ---------------------------------------------------------------------------
 
 /// How many commands the closed [`AdminCommand`] enum carries.
-const ADMIN_COMMAND_COUNT: usize = 13;
+const ADMIN_COMMAND_COUNT: usize = 14;
 
 /// Every admin command, in the order the enum declares them.
 const EVERY_ADMIN_COMMAND: [AdminCommand; ADMIN_COMMAND_COUNT] = [
     AdminCommand::Status,
     AdminCommand::Metrics,
     AdminCommand::Generations,
+    AdminCommand::Reload,
     AdminCommand::ReloadStatus,
     AdminCommand::SubmitSynthetic,
     AdminCommand::SubmitRun,
@@ -132,16 +133,17 @@ fn position(command: AdminCommand) -> usize {
         AdminCommand::Status => 0,
         AdminCommand::Metrics => 1,
         AdminCommand::Generations => 2,
-        AdminCommand::ReloadStatus => 3,
-        AdminCommand::SubmitSynthetic => 4,
-        AdminCommand::SubmitRun => 5,
-        AdminCommand::InspectReconciliation => 6,
-        AdminCommand::FailReconciliation => 7,
-        AdminCommand::InspectOutbox => 8,
-        AdminCommand::ReconcileOutbox => 9,
-        AdminCommand::PauseIntake => 10,
-        AdminCommand::ResumeIntake => 11,
-        AdminCommand::Shutdown => 12,
+        AdminCommand::Reload => 3,
+        AdminCommand::ReloadStatus => 4,
+        AdminCommand::SubmitSynthetic => 5,
+        AdminCommand::SubmitRun => 6,
+        AdminCommand::InspectReconciliation => 7,
+        AdminCommand::FailReconciliation => 8,
+        AdminCommand::InspectOutbox => 9,
+        AdminCommand::ReconcileOutbox => 10,
+        AdminCommand::PauseIntake => 11,
+        AdminCommand::ResumeIntake => 12,
+        AdminCommand::Shutdown => 13,
     }
 }
 
@@ -158,6 +160,13 @@ fn representative_requests(command: AdminCommand) -> Vec<AdminRequest> {
         AdminCommand::Generations => {
             vec![AdminRequest::new(request_id(), AdminCommand::Generations)]
         }
+        AdminCommand::Reload => vec![
+            AdminRequest::reload(
+                request_id(),
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .expect("a valid release digest"),
+        ],
         AdminCommand::ReloadStatus => vec![
             AdminRequest::reload_status(request_id(), "reload-1").expect("a valid reload lookup"),
         ],
@@ -364,7 +373,7 @@ mod anti_drift {
         );
     }
 
-    /// The three disciplines partition the thirteen commands, and the partition is
+    /// The three disciplines partition the fourteen commands, and the partition is
     /// stated rather than derived, so reclassifying a command — describing a
     /// write as a read, or dropping a retry key — fails here.
     #[test]
@@ -396,6 +405,7 @@ mod anti_drift {
             [
                 "fail_reconciliation",
                 "reconcile_outbox",
+                "reload",
                 "submit_run",
                 "submit_synthetic"
             ],
@@ -446,6 +456,7 @@ mod seeded_registry {
                 "metrics",
                 "pause_intake",
                 "reconcile_outbox",
+                "reload",
                 "reload_status",
                 "resume_intake",
                 "shutdown",
@@ -523,6 +534,7 @@ mod seeded_registry {
                 "fail_reconciliation",
                 "pause_intake",
                 "reconcile_outbox",
+                "reload",
                 "shutdown"
             ]
         );

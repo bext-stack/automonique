@@ -2622,6 +2622,11 @@ mod command_surface {
             AdminRequest::new(id.clone(), AdminCommand::Status),
             AdminRequest::new(id.clone(), AdminCommand::Metrics),
             AdminRequest::new(id.clone(), AdminCommand::Generations),
+            AdminRequest::reload(
+                id.clone(),
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .expect("a reload request"),
             AdminRequest::reload_status(id.clone(), "reload-1").expect("a reload lookup"),
             AdminRequest::new(id.clone(), AdminCommand::Shutdown),
             AdminRequest::submit(
@@ -2667,6 +2672,7 @@ mod command_surface {
             AdminCommand::Status,
             AdminCommand::Metrics,
             AdminCommand::Generations,
+            AdminCommand::Reload,
             AdminCommand::ReloadStatus,
             AdminCommand::SubmitSynthetic,
             AdminCommand::SubmitRun,
@@ -2682,6 +2688,7 @@ mod command_surface {
                 AdminCommand::Status
                 | AdminCommand::Metrics
                 | AdminCommand::Generations
+                | AdminCommand::Reload
                 | AdminCommand::ReloadStatus
                 | AdminCommand::SubmitSynthetic
                 | AdminCommand::SubmitRun
@@ -2854,6 +2861,10 @@ mod command_surface {
                 pause_id: 1,
                 revision: 2,
             },
+            AdminResponse::ReloadSucceeded {
+                request_id: id.clone(),
+                reload_id: "reload-1".to_owned(),
+            },
             AdminResponse::Refused {
                 request_id: id.clone(),
                 category: AdminRefusalCategory::new("intake_paused").expect("a category"),
@@ -2868,6 +2879,7 @@ mod command_surface {
                 | AdminResponse::Metrics { .. }
                 | AdminResponse::Generations { .. }
                 | AdminResponse::ReloadStatus { .. }
+                | AdminResponse::ReloadSucceeded { .. }
                 | AdminResponse::SyntheticAccepted { .. }
                 | AdminResponse::RunAccepted { .. }
                 | AdminResponse::ReconciliationInspected { .. }

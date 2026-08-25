@@ -5,6 +5,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use automonique_daemon::attempt_adoption::AttemptAdoptionClient;
@@ -263,6 +264,106 @@ fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
         .env("XDG_STATE_HOME", &config.state_root)
         .output()
         .expect("committed candidate shutdown");
+    assert!(shutdown.status.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (config.admin_socket().exists() || config.progress_socket().exists())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!config.admin_socket().exists());
+    assert!(!config.progress_socket().exists());
+}
+
+#[test]
+fn authenticated_reload_command_hands_off_and_retires_the_source() {
+    let root = tempfile::tempdir().expect("temporary root");
+    private_directory(root.path());
+    let runtime_root = root.path().join("runtime");
+    let state_root = root.path().join("state");
+    private_directory(&runtime_root);
+    private_directory(&state_root);
+    let config = DaemonConfig {
+        runtime_root,
+        state_root,
+    };
+    let daemon = Daemon::open(&config).expect("source daemon");
+
+    let release_root = config.state_dir().join("improvement-code");
+    private_directory(&release_root);
+    private_directory(&release_root.join("releases"));
+    let executable = fs::read(env!("CARGO_BIN_EXE_automonique")).expect("candidate binary");
+    let binary_sha256 = hex(&Sha256::digest(&executable));
+    let manifest = serde_json::json!({
+        "schema": "automonique.code-release/v1",
+        "source_sha": "c".repeat(40),
+        "plan_digest": format!("sha256:{}", "d".repeat(64)),
+        "binary_path": "bin/automonique",
+        "binary_sha256": binary_sha256,
+        "changed_paths": ["rust/crates/automonique-cli/src/lib.rs"]
+    });
+    let manifest = serde_json::to_vec(&manifest).expect("manifest");
+    let manifest_digest = hex(&Sha256::digest(&manifest));
+    let release_dir = release_root.join("releases").join(&manifest_digest);
+    private_directory(&release_dir);
+    private_directory(&release_dir.join("bin"));
+    fs::write(release_dir.join("manifest.json"), manifest).expect("manifest file");
+    fs::write(release_dir.join("bin/automonique"), executable).expect("binary file");
+    fs::set_permissions(
+        release_dir.join("manifest.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("manifest mode");
+    fs::set_permissions(
+        release_dir.join("bin/automonique"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .expect("binary mode");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let serve_stop = Arc::clone(&stop);
+    let source = std::thread::spawn(move || daemon.serve(&serve_stop));
+    let digest = format!("sha256:{manifest_digest}");
+    let reload = Command::new(env!("CARGO_BIN_EXE_automonique"))
+        .args(["reload", &digest])
+        .env("XDG_RUNTIME_DIR", &config.runtime_root)
+        .env("XDG_STATE_HOME", &config.state_root)
+        .output()
+        .expect("reload command");
+    assert!(
+        reload.status.success(),
+        "reload command failed: {}",
+        String::from_utf8_lossy(&reload.stderr)
+    );
+    let output = String::from_utf8(reload.stdout).expect("reload output UTF-8");
+    assert!(output.starts_with("reload reload-1-"));
+    assert!(output.ends_with(" succeeded\n"));
+    source
+        .join()
+        .expect("source serve thread")
+        .expect("source retires without releasing transferred authority");
+
+    assert_eq!(
+        fs::read_link(release_root.join("current")).expect("selected release link"),
+        Path::new("releases").join(&manifest_digest)
+    );
+    let status = Command::new(env!("CARGO_BIN_EXE_automonique"))
+        .args(["status", "--json"])
+        .env("XDG_RUNTIME_DIR", &config.runtime_root)
+        .env("XDG_STATE_HOME", &config.state_root)
+        .output()
+        .expect("candidate status");
+    assert!(
+        status.status.success(),
+        "candidate owns the inherited endpoint"
+    );
+
+    let shutdown = Command::new(env!("CARGO_BIN_EXE_automonique"))
+        .arg("shutdown")
+        .env("XDG_RUNTIME_DIR", &config.runtime_root)
+        .env("XDG_STATE_HOME", &config.state_root)
+        .output()
+        .expect("candidate shutdown");
     assert!(shutdown.status.success());
     let deadline = Instant::now() + Duration::from_secs(5);
     while (config.admin_socket().exists() || config.progress_socket().exists())

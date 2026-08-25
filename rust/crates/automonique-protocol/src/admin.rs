@@ -206,7 +206,8 @@ const _: () = assert!(
 ///   wired; the former `*_no_lane` values remain decode-only aliases.
 /// - **5** — added the ten-method `automonique.platform/v1` local endpoint.
 /// - **6** — added generation history and reload-status reads.
-pub const ADMIN_CAPABILITY: u32 = 6;
+/// - **7** — added authenticated generation reload execution.
+pub const ADMIN_CAPABILITY: u32 = 7;
 
 /// How much of a promise an endpoint is.
 ///
@@ -338,6 +339,7 @@ pub const ENDPOINT_MATURITY: &[(&str, Maturity)] = &[
     ),
     ("automonique.admin/metrics", Maturity::Experimental),
     ("automonique.admin/generations", Maturity::Experimental),
+    ("automonique.admin/reload", Maturity::Experimental),
     ("automonique.admin/reload_status", Maturity::Experimental),
     ("automonique.platform/capabilities", Maturity::Experimental),
     ("automonique.platform/snapshot", Maturity::Experimental),
@@ -603,6 +605,8 @@ pub enum AdminCommand {
     Metrics,
     /// Read the recent append-only generation tenure and handoff history.
     Generations,
+    /// Hand authority to one exact, locally verified immutable release.
+    Reload,
     /// Read one reload epoch and its append-only transitions.
     ReloadStatus,
     /// Durably enqueue a no-effect synthetic work item.
@@ -637,10 +641,11 @@ impl AdminCommand {
     /// Published so [`ENDPOINT_MATURITY`] can be held exhaustive over this lane
     /// by a test rather than by inspection: a command added here without a row
     /// there is a surface the daemon serves and never declared.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Status,
         Self::Metrics,
         Self::Generations,
+        Self::Reload,
         Self::ReloadStatus,
         Self::SubmitSynthetic,
         Self::SubmitRun,
@@ -660,6 +665,7 @@ impl AdminCommand {
             Self::Status => "status",
             Self::Metrics => "metrics",
             Self::Generations => "generations",
+            Self::Reload => "reload",
             Self::ReloadStatus => "reload_status",
             Self::SubmitSynthetic => "submit_synthetic",
             Self::SubmitRun => "submit_run",
@@ -1354,6 +1360,30 @@ impl AdminRequest {
         }
     }
 
+    /// Construct a request to hand off to one exact immutable release.
+    pub fn reload(
+        request_id: RequestId,
+        target_release_digest: impl Into<String>,
+    ) -> Result<Self, AdminError> {
+        let target_release_digest = target_release_digest.into();
+        if !valid_release_digest(&target_release_digest) {
+            return Err(AdminError::InvalidBody);
+        }
+        Ok(Self {
+            request_id,
+            command: AdminCommand::Reload,
+            reload_id: Some(target_release_digest),
+            submission: None,
+            reconciliation_run_id: None,
+            reconciliation_failure: None,
+            outbox_id: None,
+            outbox_reconciliation: None,
+            run_submission: None,
+            intake_pause: None,
+            intake_resume: None,
+        })
+    }
+
     /// Construct a read-only lookup of one durable reload epoch.
     pub fn reload_status(
         request_id: RequestId,
@@ -1548,7 +1578,17 @@ impl AdminRequest {
     /// Reload identifier, present only for [`AdminCommand::ReloadStatus`].
     #[must_use]
     pub fn reload_id(&self) -> Option<&str> {
-        self.reload_id.as_deref()
+        (self.command == AdminCommand::ReloadStatus)
+            .then_some(self.reload_id.as_deref())
+            .flatten()
+    }
+
+    /// Target release digest, present only for [`AdminCommand::Reload`].
+    #[must_use]
+    pub fn reload_target_digest(&self) -> Option<&str> {
+        (self.command == AdminCommand::Reload)
+            .then_some(self.reload_id.as_deref())
+            .flatten()
     }
 
     /// Synthetic work body, present only for [`AdminCommand::SubmitSynthetic`].
@@ -1614,6 +1654,21 @@ impl AdminRequest {
             &self.intake_pause,
             &self.intake_resume,
         ) {
+            (
+                AdminCommand::Reload,
+                Some(target_release_digest),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ) => JsonValue::Object(vec![(
+                "target_release_digest".to_owned(),
+                JsonValue::String(target_release_digest.clone()),
+            )]),
             (
                 AdminCommand::SubmitSynthetic,
                 None,
@@ -1803,6 +1858,13 @@ impl AdminRequest {
                 Self::reload_status(
                     message.envelope().request_id().clone(),
                     required_body_string(message.body(), "reload_id")?,
+                )
+            }
+            "reload" => {
+                exact_fields(message.body(), &["target_release_digest"])?;
+                Self::reload(
+                    message.envelope().request_id().clone(),
+                    required_body_string(message.body(), "target_release_digest")?,
                 )
             }
             "status" | "metrics" | "generations" | "shutdown" => {
@@ -4035,6 +4097,11 @@ pub enum AdminResponse {
         request_id: RequestId,
         reload: ReloadStatusView,
     },
+    /// The exact release completed its durable generation handoff.
+    ReloadSucceeded {
+        request_id: RequestId,
+        reload_id: String,
+    },
     /// A synthetic work item is durable, or the exact retry was replayed.
     SyntheticAccepted {
         /// Correlation identifier from the request.
@@ -4126,6 +4193,7 @@ impl AdminResponse {
             | Self::Metrics { request_id, .. }
             | Self::Generations { request_id, .. }
             | Self::ReloadStatus { request_id, .. }
+            | Self::ReloadSucceeded { request_id, .. }
             | Self::SyntheticAccepted { request_id, .. }
             | Self::RunAccepted { request_id, .. }
             | Self::ReconciliationInspected { request_id, .. }
@@ -4177,6 +4245,21 @@ impl AdminResponse {
                 envelope(request_id.clone(), "reload_status_result")?,
                 reload.to_body()?,
             )),
+            Self::ReloadSucceeded {
+                request_id,
+                reload_id,
+            } => {
+                if !valid_coordinate(reload_id, MAX_RELOAD_ID_BYTES) {
+                    return Err(AdminError::InvalidBody);
+                }
+                Ok(Message::new(
+                    envelope(request_id.clone(), "reload_succeeded")?,
+                    JsonValue::Object(vec![(
+                        "reload_id".to_owned(),
+                        JsonValue::String(reload_id.clone()),
+                    )]),
+                ))
+            }
             Self::SyntheticAccepted {
                 request_id,
                 inbox_id,
@@ -4355,6 +4438,17 @@ impl AdminResponse {
                 request_id,
                 reload: ReloadStatusView::from_body(message.body())?,
             }),
+            "reload_succeeded" => {
+                exact_fields(message.body(), &["reload_id"])?;
+                let reload_id = required_body_string(message.body(), "reload_id")?;
+                if !valid_coordinate(&reload_id, MAX_RELOAD_ID_BYTES) {
+                    return Err(AdminError::InvalidBody);
+                }
+                Ok(Self::ReloadSucceeded {
+                    request_id,
+                    reload_id,
+                })
+            }
             "synthetic_accepted" => {
                 exact_fields(message.body(), &["duplicate", "inbox_id"])?;
                 let duplicate = match message.body().get("duplicate") {

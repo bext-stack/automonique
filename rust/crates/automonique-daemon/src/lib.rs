@@ -1373,6 +1373,11 @@ pub struct Daemon {
     /// crate asserting a fact about another crate's schema.
     tenure_revision: u64,
     handoff_quiesced: bool,
+    /// The successor owns the durable lease and inherited endpoints.
+    ///
+    /// Once true, the source serve loop exits without touching either: its
+    /// ordinary shutdown authority is stale by construction.
+    handoff_committed: bool,
     execution_state: automonique_protocol::admin::ExecutionState,
     /// The one settable input to the approval requirement every launch is
     /// composed against.
@@ -2275,6 +2280,7 @@ impl Daemon {
             reload_audit,
             tenure_revision: tenure.revision,
             handoff_quiesced: false,
+            handoff_committed: false,
             execution_state,
             configured_approval_requirement,
             approval_lifetime,
@@ -3070,7 +3076,11 @@ impl Daemon {
                             // a consistent lease snapshot, so client polling must not
                             // turn into an fsync/lease-write storm.
                             match self.handle_stream(&mut stream, stop) {
-                                Ok(()) => {}
+                                Ok(()) => {
+                                    if self.handoff_committed {
+                                        break 'serving Ok(());
+                                    }
+                                }
                                 Err(DaemonError::Store(store_error)) => {
                                     if fatal_store_error(&store_error) {
                                         break Err(DaemonError::Store(store_error));
@@ -3096,7 +3106,7 @@ impl Daemon {
                 .stopping()
                 .map_err(|error| DaemonError::ServiceManagerFailed(error.category()))
         });
-        let release_authority = lease_disposition.releases();
+        let release_authority = lease_disposition.releases() && !self.handoff_committed;
         // LIVE ATTEMPTS END FIRST, AND THEY END BY FINISHING.
         //
         // Every worker holds a registration on the attempt host and writes to
@@ -3704,6 +3714,54 @@ impl Daemon {
                         tenures,
                         handoffs,
                     },
+                }
+            }
+            automonique_protocol::admin::AdminCommand::Reload => {
+                if self.disconnected_recovery || self.handoff_quiesced {
+                    return self.write_refusal(stream, request.request_id(), "handoff_state");
+                }
+                let target_release_digest = request
+                    .reload_target_digest()
+                    .ok_or(DaemonError::ProtocolRefused("admin_invalid_body"))?;
+                let activator = match release_activation::CodeReleaseActivator::new(
+                    self.state_dir.join("improvement-code"),
+                    "automonique.service",
+                    release_activation::SystemdUserSupervisor,
+                ) {
+                    Ok(activator) => activator,
+                    Err(_) => {
+                        return self.write_refusal(
+                            stream,
+                            request.request_id(),
+                            "release_verification_failed",
+                        );
+                    }
+                };
+                let release = match activator.verify(target_release_digest) {
+                    Ok(release) => release,
+                    Err(_) => {
+                        return self.write_refusal(
+                            stream,
+                            request.request_id(),
+                            "release_verification_failed",
+                        );
+                    }
+                };
+                let digest_hex = target_release_digest
+                    .strip_prefix("sha256:")
+                    .ok_or(DaemonError::ProtocolRefused("admin_invalid_body"))?;
+                let reload_id = format!("reload-{}-{}", self.lease_epoch, &digest_hex[..16]);
+                match self.handoff_to_verified_release(&reload_id, release) {
+                    Ok(_) => {
+                        self.handoff_committed = true;
+                        AdminResponse::ReloadSucceeded {
+                            request_id: request.request_id().clone(),
+                            reload_id,
+                        }
+                    }
+                    Err(error) => {
+                        return self.write_refusal(stream, request.request_id(), error.category());
+                    }
                 }
             }
             automonique_protocol::admin::AdminCommand::ReloadStatus => {
