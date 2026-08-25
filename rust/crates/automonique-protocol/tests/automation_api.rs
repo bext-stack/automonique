@@ -1734,9 +1734,18 @@ mod job {
 
     #[test]
     fn the_scope_and_prompt_carry_the_durable_submit_lane_s_bounds() {
-        assert_eq!(
-            MAX_AUTOMATION_SCOPE_BYTES,
-            automonique_protocol::admin::MAX_SYNTHETIC_SCOPE_BYTES
+        // The scope is admitted by two lanes and carries the narrower bound:
+        // the scheduler core's identifier ceiling, which this crate cannot
+        // import and so pins against the core's own source.
+        assert!(
+            MAX_AUTOMATION_SCOPE_BYTES <= automonique_protocol::admin::MAX_SYNTHETIC_SCOPE_BYTES
+        );
+        let core = sibling_source("automonique-core/src/lib.rs");
+        assert!(
+            core.contains(&format!(
+                "const MAX_ID_BYTES: usize = {MAX_AUTOMATION_SCOPE_BYTES};"
+            )),
+            "the scope bound is not the scheduler core's identifier ceiling",
         );
         assert_eq!(
             MAX_AUTOMATION_PROMPT_BYTES,

@@ -146,10 +146,19 @@ pub const MAX_AUTOMATION_API_FIELD_BYTES: usize = crate::automation::MAX_AUTOMAT
 
 /// Maximum UTF-8 byte length of an automation's serialization scope.
 ///
-/// The durable submit lane's own scope bound,
-/// [`crate::admin::MAX_SYNTHETIC_SCOPE_BYTES`], because an occurrence is
-/// submitted on that lane under this exact scope.
-pub const MAX_AUTOMATION_SCOPE_BYTES: usize = crate::admin::MAX_SYNTHETIC_SCOPE_BYTES;
+/// An occurrence is serialized under this scope twice: admitted by the
+/// scheduler core in `automonique-core`, whose identifier ceiling is 160
+/// bytes, and then run on the durable submit lane, whose scope bound is
+/// [`crate::admin::MAX_SYNTHETIC_SCOPE_BYTES`]. The scope has to be admitted
+/// by both, so this is the narrower of the two — spelled here as a literal
+/// because this crate does not depend on the core, and pinned against the
+/// core's source in `tests/automation_api.rs`.
+pub const MAX_AUTOMATION_SCOPE_BYTES: usize = 160;
+
+const _: () = assert!(
+    MAX_AUTOMATION_SCOPE_BYTES <= crate::admin::MAX_SYNTHETIC_SCOPE_BYTES,
+    "a scope the scheduler core admits must also be one the durable submit lane admits"
+);
 
 /// Maximum UTF-8 byte length of the prompt one occurrence submits.
 ///
@@ -249,8 +258,8 @@ const RECORD_FIELDS: usize = 4;
 const PROMPT_ENCODED_BYTES: usize = 2 * MAX_AUTOMATION_PROMPT_BYTES + 16;
 
 const _: () = assert!(
-    MAX_AUTOMATION_SCOPE_BYTES == MAX_AUTOMATION_API_FIELD_BYTES,
-    "the record arithmetic counts the scope as one more identifier-sized field"
+    MAX_AUTOMATION_SCOPE_BYTES <= MAX_AUTOMATION_API_FIELD_BYTES,
+    "the record arithmetic budgets the scope as one more identifier-sized field"
 );
 
 const _: () = assert!(

@@ -88,14 +88,14 @@ export function AutomationSchedule(value: string): AutomationSchedule {
   return value as AutomationSchedule;
 }
 
-/** Bounded string, at most 256 UTF-8 bytes. */
+/** Bounded string, at most 160 UTF-8 bytes. */
 export type AutomationScope = string & {readonly __brand: "AutomationScope"};
-export const AutomationScope_MAX_BYTES = 256;
+export const AutomationScope_MAX_BYTES = 160;
 export const AutomationScope_PATTERN = /^[^\p{Cc}]+$/u;
 export function AutomationScope(value: string): AutomationScope {
   if (value.length === 0) throw new ValidationError("AutomationScope", "empty");
   if (!isWellFormedUnicode(value)) throw new ValidationError("AutomationScope", "invalid_character");
-  if (byteLength(value) > 256) throw new ValidationError("AutomationScope", "too_long");
+  if (byteLength(value) > 160) throw new ValidationError("AutomationScope", "too_long");
   if (!AutomationScope_PATTERN.test(value)) throw new ValidationError("AutomationScope", "invalid_character");
   return value as AutomationScope;
 }

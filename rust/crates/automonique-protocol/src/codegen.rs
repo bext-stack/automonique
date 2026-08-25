@@ -3885,7 +3885,9 @@ fn automation_module() -> GeneratedModule {
                 pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),
             },
             BoundedString {
-                // The durable submit lane's scope grammar, unchanged.
+                // The durable submit lane's scope grammar, at the scheduler
+                // core's narrower identifier ceiling: an occurrence's scope is
+                // admitted by both.
                 name: AUTOMATION_SCOPE.to_owned(),
                 max_bytes: crate::automation_api::MAX_AUTOMATION_SCOPE_BYTES,
                 pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),

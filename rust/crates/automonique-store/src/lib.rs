@@ -851,6 +851,53 @@ pub struct InboxReceipt {
     pub duplicate: bool,
 }
 
+/// Where one accepted transport delivery has got to.
+///
+/// The closed four-word inbox vocabulary: accepted and unclaimed, claimed by a
+/// run that is still running, or terminal in one of two ways. Read by a
+/// caller that submitted under a stable key and needs to learn, after a
+/// restart, whether the lane has finished with it — without a second
+/// submission, which the key would dedupe anyway, and without a run
+/// identity, which the caller may never have seen.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InboxState {
+    /// Accepted and not yet claimed by a run.
+    Pending,
+    /// Claimed by a run that has not reached a terminal state.
+    Claimed,
+    /// Its run succeeded.
+    Completed,
+    /// Its run failed.
+    Failed,
+}
+
+impl InboxState {
+    /// Whether the lane has finished with the delivery, either way.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed)
+    }
+
+    fn from_spelling(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "claimed" => Some(Self::Claimed),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// One accepted delivery, located by the coordinate it was submitted under.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InboxDisposition {
+    pub inbox_id: i64,
+    pub state: InboxState,
+    /// The run the delivery is or was bound to, once one claimed it.
+    pub claimed_run_id: Option<i64>,
+}
+
 /// Provenance persisted on one durable record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredProvenance {
@@ -2571,6 +2618,47 @@ impl Store {
             inbox_id,
             duplicate: false,
         })
+    }
+
+    /// Locate one accepted delivery by the coordinate it was submitted under.
+    ///
+    /// `None` when nothing was ever accepted under that key. A caller that
+    /// holds a stable key — the automation scheduler worker, whose occurrence
+    /// key is derived rather than remembered — reads this after a restart to
+    /// learn whether an occurrence it admitted was ever submitted and whether
+    /// the lane has finished with it, without resubmitting to find out.
+    pub fn inbox_disposition(
+        &self,
+        transport: &str,
+        transport_key: &str,
+    ) -> Result<Option<InboxDisposition>, StoreError> {
+        validate_id(transport, "transport")?;
+        validate_bounded_id(transport_key, MAX_TRANSPORT_KEY_BYTES, "transport_key")?;
+        let row = self
+            .connection
+            .query_row(
+                "SELECT inbox_id, state, claimed_run_id FROM inbox
+                 WHERE transport = ?1 AND transport_key = ?2",
+                params![transport, transport_key],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((inbox_id, state, claimed_run_id)) = row else {
+            return Ok(None);
+        };
+        let state = InboxState::from_spelling(&state)
+            .ok_or(StoreError::MigrationInvariant("inbox_state"))?;
+        Ok(Some(InboxDisposition {
+            inbox_id,
+            state,
+            claimed_run_id,
+        }))
     }
 
     /// Acquire an absent or expired bot poller lease under live generation authority.
