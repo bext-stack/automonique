@@ -148,6 +148,69 @@ mod body_rules {
             Some("upstream said no")
         );
     }
+
+    /// A paused turn names what it is waiting on, and the name survives the
+    /// wire. A masked input request is the same kind with no label at all —
+    /// not a placeholder — and that shape must be admitted too, or a producer
+    /// that refuses to show a secret prompt would have no frame to send.
+    #[test]
+    fn a_pause_frame_carries_its_label_across_the_wire_or_none_at_all() {
+        let labelled = [
+            (
+                EventKind::ApprovalRequested,
+                "approval apr-0123456789abcdef: shell — inspect status",
+            ),
+            (
+                EventKind::InputRequested,
+                "Which branch should be deployed?",
+            ),
+        ];
+        for (sequence, (kind, label)) in (1..).zip(labelled) {
+            let body = ProgressBody::new(
+                kind,
+                ProgressBodyParts {
+                    text: Some(ProgressText::new(label).expect("a label")),
+                    step: None,
+                    retry: None,
+                },
+            )
+            .unwrap_or_else(|error| panic!("{}: {error}", kind.as_str()));
+            let frame = ProgressFrame::new(ProgressFrameParts {
+                run_id: run_id(),
+                sequence,
+                at_ms: EpochMillis::from_millis(1_700_000_000_000),
+                authority: Authority::Authoritative,
+                kind,
+                body,
+            })
+            .expect("a stamped pause frame");
+            let decoded =
+                ProgressFrame::from_canonical_bytes(&frame.to_canonical_bytes().expect("encodes"))
+                    .expect("decodes");
+            assert_eq!(decoded, frame);
+            assert_eq!(decoded.body().text().map(ProgressText::as_str), Some(label));
+            assert!(ProgressBody::empty(kind).is_ok(), "{}", kind.as_str());
+        }
+        for kind in [EventKind::ApprovalRequested, EventKind::InputRequested] {
+            let error = ProgressBody::new(
+                kind,
+                ProgressBodyParts {
+                    text: None,
+                    step: Some(StepStatus::Pending),
+                    retry: None,
+                },
+            )
+            .expect_err("a wait is not a step");
+            assert_eq!(
+                error,
+                EventError::BodyMemberRefused {
+                    member: "step",
+                    kind,
+                    rule: MemberRule::Forbidden,
+                }
+            );
+        }
+    }
 }
 
 /// What [`ProgressText`] admits, drops, and refuses.

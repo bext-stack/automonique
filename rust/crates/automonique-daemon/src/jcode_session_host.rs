@@ -111,6 +111,13 @@ impl From<ProviderJournalError> for JcodeHostError {
     }
 }
 
+/// The journal's reason for a request left pending when its host closed in the
+/// ordinary course of a turn: the provider went away, or the lane gave up on it.
+///
+/// The one reason [`JcodeSessionHost::close`] records; a caller with a more
+/// specific story uses [`JcodeSessionHost::close_with_reason`].
+pub const HOST_CLOSED_REASON: &str = "host_closed";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JcodeApprovalRequest {
     request_id: String,
@@ -821,12 +828,28 @@ impl JcodeSessionHost {
         self.poll_turn(now_ms, read_timeout)
     }
 
-    pub fn close(mut self, now_ms: i64) -> Result<(), JcodeHostError> {
+    pub fn close(self, now_ms: i64) -> Result<(), JcodeHostError> {
+        self.close_with_reason(now_ms, HOST_CLOSED_REASON)
+    }
+
+    /// Close, recording `reason` against every request the open turn still
+    /// held pending.
+    ///
+    /// The reason is the one durable word a successor reads about a request
+    /// nobody answered: a host closed because its daemon was draining left a
+    /// request the operator may still expect to see, and a host closed because
+    /// its turn was over did not. `reason` is a bounded static spelling chosen
+    /// by this crate, never caller or provider text.
+    pub fn close_with_reason(
+        mut self,
+        now_ms: i64,
+        reason: &'static str,
+    ) -> Result<(), JcodeHostError> {
         if self.closed {
             return Ok(());
         }
         if let Some(pending) = self.pending.take() {
-            self.abort_pending(pending, now_ms, "host_closed")?;
+            self.abort_pending(pending, now_ms, reason)?;
         }
         let session = self.journal.close_session(SessionClosing {
             session_id: self.session_id,

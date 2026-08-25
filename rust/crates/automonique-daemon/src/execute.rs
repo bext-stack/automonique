@@ -132,7 +132,7 @@ use std::fs;
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -178,7 +178,9 @@ use nix::libc;
 use sha2::Digest as _;
 
 use crate::attempt_host::DaemonAttemptHost;
-use crate::jcode_session_host::{JcodeInputRequest, JcodeSessionHost, JcodeTurnOutcome};
+use crate::jcode_session_host::{
+    HOST_CLOSED_REASON, JcodeInputRequest, JcodeSessionHost, JcodeTurnOutcome,
+};
 use crate::progress::{JcodeProgressMapper, ProviderProgressMapper};
 use crate::progress_hub::ProgressHub;
 
@@ -500,10 +502,30 @@ pub struct ExecutionLane {
     progress: Arc<ProgressHub>,
     /// Lease-authorized input queues for currently attached JCode sessions.
     jcode_controls: Arc<JcodeControlRegistry>,
+    /// Set once, by [`ExecutionLane::begin_shutdown`], and read by every
+    /// worker that is waiting on an operator rather than on its workload.
+    ///
+    /// A running turn drains to its own document deadline, and that is the
+    /// contract [`ExecutionLane::shutdown`] states. A turn paused on a provider
+    /// request is different: nothing is executing, and the wait is for a
+    /// person who may not answer before the deadline. A daemon that blocked its
+    /// own stop on that wait would hold its generation, its cgroup tree and its
+    /// listener for as long as the document allows, so a worker that sees this
+    /// flag abandons the wait instead — leaving the request durably unanswered
+    /// for the record, never answering it on the operator's behalf.
+    draining: Arc<AtomicBool>,
 }
 
 const MAX_PENDING_JCODE_STEERS: usize = 16;
 const JCODE_STEER_ACK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The journal's reason for a request left pending because this daemon was
+/// draining while the turn waited on an operator.
+///
+/// Public so a successor — or a test standing in for one — can tell a wait the
+/// daemon abandoned from one the provider ended, which is the whole point of
+/// recording the reason rather than only the outcome.
+pub const DAEMON_DRAINING_REASON: &str = "daemon_draining";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SteerRefusal {
@@ -656,6 +678,7 @@ impl ExecutionLane {
             workers: Vec::new(),
             progress: Arc::new(ProgressHub::new()),
             jcode_controls: Arc::new(JcodeControlRegistry::default()),
+            draining: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -984,6 +1007,7 @@ impl ExecutionLane {
             broker,
             session_capture,
             managed_sessions_path: self.managed_sessions_path.clone(),
+            draining: Arc::clone(&self.draining),
         })
     }
 
@@ -1226,6 +1250,10 @@ impl ExecutionLane {
     /// so the daemon can keep the generation lease live while polling these
     /// handles without weakening containment or cancellation custody.
     pub(crate) fn begin_shutdown(mut self) -> Vec<JoinHandle<()>> {
+        // Raised before the handles move, so no worker can be handed to a
+        // drainer while still believing an operator's answer is worth waiting
+        // for. A running turn ignores this; see the field.
+        self.draining.store(true, Ordering::Release);
         self.workers.drain(..).collect()
     }
 }
@@ -1249,7 +1277,17 @@ impl PreparedAttempt {
         }
     }
 
-    fn execute(self, cancellation: &CancellationToken, timeout: Duration) -> AttemptExecution {
+    /// Run to a terminal state.
+    ///
+    /// `draining` is read only by a JCode attempt paused on a provider request;
+    /// a direct workload has no operator wait to abandon and drains to its own
+    /// deadline, as [`ExecutionLane::shutdown`] states.
+    fn execute(
+        self,
+        cancellation: &CancellationToken,
+        timeout: Duration,
+        draining: &AtomicBool,
+    ) -> AttemptExecution {
         match self {
             Self::Direct(prepared) => match (*prepared).execute(cancellation, timeout) {
                 Ok(report) => AttemptExecution {
@@ -1261,7 +1299,7 @@ impl PreparedAttempt {
                     last_sequence: 0,
                 },
             },
-            Self::Jcode(prepared) => prepared.execute(cancellation, timeout),
+            Self::Jcode(prepared) => prepared.execute(cancellation, timeout, draining),
         }
     }
 }
@@ -1386,7 +1424,12 @@ impl JcodePreparedRun {
         })
     }
 
-    fn execute(self, cancellation: &CancellationToken, timeout: Duration) -> AttemptExecution {
+    fn execute(
+        self,
+        cancellation: &CancellationToken,
+        timeout: Duration,
+        draining: &AtomicBool,
+    ) -> AttemptExecution {
         let Self {
             helper,
             run_id,
@@ -1405,6 +1448,10 @@ impl JcodePreparedRun {
             approval,
             observed,
         } = self;
+        // Why the host was closed, as the journal will record it against any
+        // request still pending. Only the drain path changes it: every other
+        // exit either answered the request or lost the provider.
+        let mut close_reason = HOST_CLOSED_REASON;
         let mut writer = JcodeSpoolWriter {
             spool,
             frame_run_id,
@@ -1555,6 +1602,17 @@ impl JcodePreparedRun {
                         break 'run RunSpoolState::Failed;
                     }
                     loop {
+                        if draining.load(Ordering::Acquire) {
+                            // The daemon is stopping and nobody is executing:
+                            // this turn is waiting for a person. The request
+                            // is not answered on their behalf — an empty line
+                            // is an answer, and a fabricated one — and it is
+                            // not cancelled either, which the host refuses
+                            // while a request is pending. It is left exactly
+                            // as it was, and the close below records why.
+                            close_reason = DAEMON_DRAINING_REASON;
+                            break 'run RunSpoolState::Cancelled;
+                        }
                         let forced_state = if cancellation.is_cancelled() {
                             Some(RunSpoolState::Cancelled)
                         } else if started_at.elapsed() >= timeout {
@@ -1645,6 +1703,15 @@ impl JcodePreparedRun {
                             // leaving the lease holder to time out ambiguously.
                             let _ = command.response.send(Err(SteerRefusal::ProviderRefused));
                         }
+                        if draining.load(Ordering::Acquire) {
+                            // Same rule as the input wait: a stopping daemon
+                            // decides nothing for the operator. The durable
+                            // approval stays pending in its store, where it
+                            // was proposed, and the journal records that this
+                            // host abandoned the wait.
+                            close_reason = DAEMON_DRAINING_REASON;
+                            break 'run RunSpoolState::Cancelled;
+                        }
                         if cancellation.is_cancelled() {
                             break (
                                 automonique_agents::PermissionDecision::Deny,
@@ -1719,7 +1786,10 @@ impl JcodePreparedRun {
             let _ = response.send(Err(SteerRefusal::SessionNotLive));
         }
         drop(control);
-        let final_state = if host.close(crate::unix_millis().unwrap_or(now_ms)).is_err() {
+        let final_state = if host
+            .close_with_reason(crate::unix_millis().unwrap_or(now_ms), close_reason)
+            .is_err()
+        {
             RunSpoolState::Failed
         } else {
             final_state
@@ -1750,60 +1820,66 @@ impl JcodeSpoolWriter {
         Ok(())
     }
 
+    /// Surface a durable provider approval as the pause frame its kind admits.
+    ///
+    /// The label leads with the approval key, because the key is what a
+    /// consumer acts on — the ACP bridge and the AG-UI adapter both read it
+    /// from this exact prefix and then resolve the approval through the
+    /// approval lane, never from the frame alone. The tool and its description
+    /// are provider-originated and travel only as the bounded, sanitized label
+    /// every other kind's text is.
     fn approval_waiting(&mut self, key: &str, tool: &str, description: &str) {
-        let text = format!("approval {key}: {tool} — {description}");
-        let Some(text) = ProgressText::sanitized(&text) else {
-            return;
-        };
-        let Ok(body) = ProgressBody::new(
+        let text = ProgressText::sanitized(&format!("approval {key}: {tool} — {description}"));
+        self.pause_frame(
             automonique_protocol::event::EventKind::ApprovalRequested,
-            ProgressBodyParts {
-                text: Some(text),
-                step: None,
-                retry: None,
-            },
-        ) else {
-            return;
-        };
-        if self
-            .append_frame(&CapturedFrame {
-                authority: FrameAuthority::Authoritative,
-                kind: automonique_protocol::event::EventKind::ApprovalRequested,
-                body,
-            })
-            .is_err()
-        {
-            self.stop_progress();
-        }
+            text,
+        );
     }
 
+    /// Surface the provider input request now blocking the turn.
+    ///
+    /// The prompt is the label, sanitized and bounded like any other. A masked
+    /// request carries no label at all: the protocol admits the absence, and a
+    /// placeholder would be a second thing a renderer had to know not to show.
+    /// No identifier travels either — the lease holder's next input answers
+    /// the request the lane is waiting on, and the journal holds the request
+    /// key for anyone reconstructing the wait.
     fn input_waiting(&mut self, request: &JcodeInputRequest) {
-        // The shared progress vocabulary does not yet have a provider-input
-        // event. ApprovalRequested is the only non-terminal pause frame and
-        // carries no authority: the control lease still gates the response.
-        let prompt = if request.is_password() {
-            "<password input>"
+        let text = if request.is_password() {
+            None
         } else {
-            request.prompt()
+            ProgressText::sanitized(request.prompt())
         };
-        let text = format!("provider input {}: {prompt}", request.request_id());
-        let Some(text) = ProgressText::sanitized(&text) else {
-            return;
-        };
-        let Ok(body) = ProgressBody::new(
-            automonique_protocol::event::EventKind::ApprovalRequested,
+        self.pause_frame(automonique_protocol::event::EventKind::InputRequested, text);
+    }
+
+    /// Append one authoritative pause frame, with or without its label.
+    ///
+    /// Unlike a projected provider event, a wait the lane cannot surface is a
+    /// wait the operator never learns about, so the body is built the way the
+    /// kind declares rather than guessed: a label the kind refuses is dropped
+    /// and the bare frame still goes out.
+    fn pause_frame(
+        &mut self,
+        kind: automonique_protocol::event::EventKind,
+        text: Option<ProgressText>,
+    ) {
+        let body = ProgressBody::new(
+            kind,
             ProgressBodyParts {
-                text: Some(text),
+                text,
                 step: None,
                 retry: None,
             },
-        ) else {
+        )
+        .or_else(|_| ProgressBody::empty(kind));
+        let Ok(body) = body else {
             return;
         };
         if self
             .append_frame(&CapturedFrame {
                 authority: FrameAuthority::Authoritative,
-                kind: automonique_protocol::event::EventKind::ApprovalRequested,
+                kind,
                 body,
             })
             .is_err()
@@ -2011,6 +2087,8 @@ struct Attempt {
     session_capture: Arc<Mutex<Option<String>>>,
     /// Independent durable connection opened after the run becomes terminal.
     managed_sessions_path: PathBuf,
+    /// The lane's drain flag; see [`ExecutionLane::begin_shutdown`].
+    draining: Arc<AtomicBool>,
 }
 
 impl Attempt {
@@ -2036,9 +2114,10 @@ impl Attempt {
             broker,
             session_capture,
             managed_sessions_path,
+            draining,
         } = self;
 
-        let report = prepared.execute(&cancellation, timeout);
+        let report = prepared.execute(&cancellation, timeout, &draining);
         // The spool's lock is free from here, so the durable record is readable
         // and strictly better than the window this hub was holding: complete,
         // hash-chain verified, and not subject to eviction.
