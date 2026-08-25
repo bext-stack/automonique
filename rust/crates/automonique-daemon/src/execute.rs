@@ -417,6 +417,11 @@ const PROVIDER_APPROVAL_PROPOSER: &str = "automonique.jcode";
 /// The run's authoritative spool directory, outside every grant.
 const SPOOL_LEAF: &str = "spool";
 
+#[must_use]
+pub fn run_spool_root(state_dir: &Path, run_id: &str) -> PathBuf {
+    state_dir.join(RUNS_DIRECTORY).join(run_id).join(SPOOL_LEAF)
+}
+
 /// Where this daemon resolves one run's `cwd_token` to, as a pure function of
 /// the state directory and the run identity.
 ///
@@ -691,10 +696,7 @@ impl ExecutionLane {
     /// directory there, and the caller's `Spool::open` is what discovers that.
     #[must_use]
     pub fn spool_root(&self, run_id: &str) -> PathBuf {
-        self.state_dir
-            .join(RUNS_DIRECTORY)
-            .join(run_id)
-            .join(SPOOL_LEAF)
+        run_spool_root(&self.state_dir, run_id)
     }
 
     /// Where one run's workspace resolves, through this lane's own state

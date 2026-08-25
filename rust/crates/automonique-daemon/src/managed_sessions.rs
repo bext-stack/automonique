@@ -12,12 +12,22 @@ use std::fs::{self, OpenOptions};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
-use automonique_protocol::platform::{IdempotencyKey, PlatformText, ReceiptOutcome, ResourceId};
+use automonique_protocol::platform::{
+    IdempotencyKey, PlatformText, ReceiptOutcome, ResourceId, SessionHistoryEvent,
+    SessionHistoryEvidence, SessionHistoryRole, SessionHistoryRunState, SessionHistoryText,
+    SessionHistoryToolState, SessionHistoryUnknownSource,
+};
+use automonique_protocol::primitives::EpochMillis;
+use automonique_protocol::progress_api::ProgressFrame;
 use automonique_protocol::tools::RunId;
+use automonique_runner::backend::{
+    TERMINAL_CANCELLED, TERMINAL_COMPLETED, TERMINAL_FAILED, TERMINAL_TIMED_OUT,
+};
+use automonique_runner::{Authority as SpoolAuthority, Event as SpoolEvent, EventKind};
 use nix::unistd::geteuid;
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, TransactionBehavior, params};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const MAX_SESSIONS: usize = automonique_protocol::platform::MAX_SNAPSHOT_RESOURCES;
 
 const SCHEMA: &str = r#"
@@ -37,6 +47,29 @@ CREATE TABLE managed_receipt_intents (
     explanation TEXT,
     created_ms INTEGER NOT NULL CHECK (created_ms >= 0)
 ) STRICT;
+"#;
+
+const SCHEMA_V2: &str = r#"
+CREATE TABLE managed_session_history (
+    provider_session_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL CHECK (sequence >= 1),
+    source_key TEXT NOT NULL UNIQUE,
+    at_ms INTEGER NOT NULL CHECK (at_ms >= 0),
+    role TEXT CHECK (role IN ('user', 'assistant')),
+    text TEXT,
+    truncated INTEGER CHECK (truncated IN (0, 1)),
+    evidence TEXT CHECK (evidence IN ('authoritative','synthetic')),
+    tool_state TEXT CHECK (tool_state IN ('pending','in_progress','completed','error')),
+    unknown_source TEXT CHECK (unknown_source IN ('adapter_event','simulation_event')),
+    run_state TEXT CHECK (run_state IN ('started','cancel_requested','completed','failed','cancelled','timed_out')),
+    CHECK ((role IS NOT NULL AND text IS NOT NULL AND truncated IS NOT NULL AND evidence IS NOT NULL AND tool_state IS NULL AND unknown_source IS NULL AND run_state IS NULL)
+        OR (role IS NULL AND truncated IS NOT NULL AND evidence IS NOT NULL AND tool_state IS NOT NULL AND unknown_source IS NULL AND run_state IS NULL)
+        OR (role IS NULL AND text IS NULL AND truncated IS NULL AND evidence IS NULL AND tool_state IS NULL AND unknown_source IS NULL AND run_state IS NOT NULL)
+        OR (role IS NULL AND text IS NULL AND truncated IS NULL AND evidence IS NULL AND tool_state IS NULL AND unknown_source IS NOT NULL AND run_state IS NULL)),
+    PRIMARY KEY(provider_session_id, sequence)
+) STRICT;
+CREATE INDEX managed_session_history_page
+    ON managed_session_history(provider_session_id, sequence);
 "#;
 
 #[derive(Debug)]
@@ -92,6 +125,38 @@ pub struct ManagedReceiptIntent {
     pub outcome: ReceiptOutcome,
     pub explanation: Option<String>,
     pub created_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ManagedHistoryRead {
+    Page {
+        events: Vec<SessionHistoryEvent>,
+        head: u64,
+        has_more: bool,
+    },
+    Resync {
+        snapshot_from: u64,
+        snapshot_to: u64,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PendingHistoryEvent {
+    ToolState {
+        at_ms: i64,
+        evidence: SessionHistoryEvidence,
+        state: SessionHistoryToolState,
+        label: Option<SessionHistoryText>,
+        truncated: bool,
+    },
+    RunState {
+        at_ms: i64,
+        state: SessionHistoryRunState,
+    },
+    Unknown {
+        at_ms: i64,
+        source: SessionHistoryUnknownSource,
+    },
 }
 
 pub struct ManagedSessionStore {
@@ -251,6 +316,333 @@ impl ManagedSessionStore {
             .map_err(|_| ManagedSessionError::InvalidField("outbox_key"))?;
         read_receipt_intent(&self.connection, outbox_key)
     }
+
+    /// Atomically append the authoritative accepted prompt and final answer.
+    /// `source_key` is server-produced and makes crash replay idempotent.
+    pub fn record_completed_turn(
+        &mut self,
+        provider_session_id: &str,
+        source_key: &str,
+        user_text: &str,
+        assistant_text: &str,
+        spool_events: &[SpoolEvent],
+        at_ms: i64,
+    ) -> Managed<()> {
+        ResourceId::new(provider_session_id)
+            .map_err(|_| ManagedSessionError::InvalidField("provider_session_id"))?;
+        IdempotencyKey::new(source_key)
+            .map_err(|_| ManagedSessionError::InvalidField("source_key"))?;
+        if at_ms < 0 {
+            return Err(ManagedSessionError::InvalidField("at_ms"));
+        }
+        let (user_text, user_truncated) = sanitize_history_text(user_text)?;
+        let (assistant_text, assistant_truncated) = sanitize_history_text(assistant_text)?;
+        let projected = project_spool_events(spool_events)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<(String, i64, String, i64)> = transaction
+            .query_row(
+                "SELECT user.text,user.truncated,assistant.text,assistant.truncated
+                 FROM managed_session_history user
+                 JOIN managed_session_history assistant ON assistant.source_key=?3
+                 WHERE user.source_key=?2 AND user.provider_session_id=?1
+                   AND assistant.provider_session_id=?1",
+                params![
+                    provider_session_id,
+                    format!("{source_key}:user"),
+                    format!("{source_key}:assistant")
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        if let Some((
+            stored_user,
+            stored_user_truncated,
+            stored_assistant,
+            stored_assistant_truncated,
+        )) = existing
+        {
+            if stored_user != user_text.as_str()
+                || stored_user_truncated != i64::from(user_truncated)
+                || stored_assistant != assistant_text.as_str()
+                || stored_assistant_truncated != i64::from(assistant_truncated)
+            {
+                return Err(ManagedSessionError::InvalidField("history_replay_conflict"));
+            }
+            transaction.commit()?;
+            return Ok(());
+        }
+        let mut sequence: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(sequence),0) FROM managed_session_history WHERE provider_session_id=?1",
+            [provider_session_id],
+            |row| row.get(0),
+        )?;
+        sequence = sequence
+            .checked_add(1)
+            .ok_or(ManagedSessionError::InvalidField("sequence"))?;
+        let user_key = format!("{source_key}:user");
+        transaction.execute(
+            "INSERT INTO managed_session_history(provider_session_id,sequence,source_key,at_ms,role,text,truncated,evidence,tool_state,unknown_source,run_state)
+             VALUES(?1,?2,?3,?4,'user',?5,?6,'authoritative',NULL,NULL,NULL) ON CONFLICT(source_key) DO NOTHING",
+            params![provider_session_id, sequence, user_key, at_ms, user_text.as_str(), user_truncated],
+        )?;
+        for (index, event) in projected.iter().enumerate() {
+            sequence = sequence
+                .checked_add(1)
+                .ok_or(ManagedSessionError::InvalidField("sequence"))?;
+            let key = format!("{source_key}:spool:{index}");
+            match event {
+                PendingHistoryEvent::ToolState { at_ms, evidence, state, label, truncated } => transaction.execute(
+                    "INSERT INTO managed_session_history(provider_session_id,sequence,source_key,at_ms,role,text,truncated,evidence,tool_state,unknown_source,run_state)
+                     VALUES(?1,?2,?3,?4,NULL,?5,?6,?7,?8,NULL,NULL) ON CONFLICT(source_key) DO NOTHING",
+                    params![provider_session_id, sequence, key, at_ms, label.as_ref().map(SessionHistoryText::as_str), truncated, evidence.as_str(), state.as_str()],
+                )?,
+                PendingHistoryEvent::RunState { at_ms, state } => transaction.execute(
+                    "INSERT INTO managed_session_history(provider_session_id,sequence,source_key,at_ms,role,text,truncated,evidence,tool_state,unknown_source,run_state)
+                     VALUES(?1,?2,?3,?4,NULL,NULL,NULL,NULL,NULL,NULL,?5) ON CONFLICT(source_key) DO NOTHING",
+                    params![provider_session_id, sequence, key, at_ms, state.as_str()],
+                )?,
+                PendingHistoryEvent::Unknown { at_ms, source } => transaction.execute(
+                    "INSERT INTO managed_session_history(provider_session_id,sequence,source_key,at_ms,role,text,truncated,evidence,tool_state,unknown_source,run_state)
+                     VALUES(?1,?2,?3,?4,NULL,NULL,NULL,NULL,NULL,?5,NULL) ON CONFLICT(source_key) DO NOTHING",
+                    params![provider_session_id, sequence, key, at_ms, source.as_str()],
+                )?,
+            };
+        }
+        sequence = sequence
+            .checked_add(1)
+            .ok_or(ManagedSessionError::InvalidField("sequence"))?;
+        transaction.execute(
+            "INSERT INTO managed_session_history(provider_session_id,sequence,source_key,at_ms,role,text,truncated,evidence,tool_state,unknown_source,run_state)
+             VALUES(?1,?2,?3,?4,'assistant',?5,?6,'authoritative',NULL,NULL,NULL) ON CONFLICT(source_key) DO NOTHING",
+            params![provider_session_id, sequence, format!("{source_key}:assistant"), at_ms, assistant_text.as_str(), assistant_truncated],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn history(
+        &self,
+        provider_session_id: &str,
+        after: u64,
+        limit: u16,
+    ) -> Managed<ManagedHistoryRead> {
+        ResourceId::new(provider_session_id)
+            .map_err(|_| ManagedSessionError::InvalidField("provider_session_id"))?;
+        if limit == 0
+            || usize::from(limit) > automonique_protocol::platform::MAX_SESSION_HISTORY_EVENTS
+        {
+            return Err(ManagedSessionError::InvalidField("limit"));
+        }
+        let (floor, head): (i64, i64) = self.connection.query_row(
+            "SELECT COALESCE(MIN(sequence),0),COALESCE(MAX(sequence),0) FROM managed_session_history WHERE provider_session_id=?1",
+            [provider_session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let after_i64 =
+            i64::try_from(after).map_err(|_| ManagedSessionError::InvalidField("after"))?;
+        if after_i64 > head || (floor > 1 && after_i64 < floor - 1) {
+            return Ok(ManagedHistoryRead::Resync {
+                snapshot_from: u64::try_from(floor.saturating_sub(1)).unwrap_or(0),
+                snapshot_to: u64::try_from(head).unwrap_or(0),
+            });
+        }
+        let query_limit = i64::from(limit) + 1;
+        let mut statement = self.connection.prepare(
+            "SELECT sequence,at_ms,role,text,truncated,evidence,tool_state,unknown_source,run_state FROM managed_session_history
+             WHERE provider_session_id=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![provider_session_id, after_i64, query_limit],
+            decode_history,
+        )?;
+        let mut events = rows.collect::<Result<Vec<_>, _>>()?;
+        let has_more = events.len() > usize::from(limit);
+        if has_more {
+            events.pop();
+        }
+        Ok(ManagedHistoryRead::Page {
+            events,
+            head: u64::try_from(head).map_err(|_| ManagedSessionError::InvalidField("head"))?,
+            has_more,
+        })
+    }
+
+    /// Start at the oldest retained event. Unlike a stale page resume, a fresh
+    /// snapshot is itself the recovery operation and therefore cannot demand
+    /// another snapshot when retention has advanced.
+    pub fn history_snapshot(
+        &self,
+        provider_session_id: &str,
+        limit: u16,
+    ) -> Managed<ManagedHistoryRead> {
+        ResourceId::new(provider_session_id)
+            .map_err(|_| ManagedSessionError::InvalidField("provider_session_id"))?;
+        let floor: i64 = self.connection.query_row(
+            "SELECT COALESCE(MIN(sequence),0) FROM managed_session_history WHERE provider_session_id=?1",
+            [provider_session_id],
+            |row| row.get(0),
+        )?;
+        let after = u64::try_from(floor.saturating_sub(1)).unwrap_or(0);
+        self.history(provider_session_id, after, limit)
+    }
+}
+
+fn sanitize_history_text(value: &str) -> Managed<(SessionHistoryText, bool)> {
+    let normalized: String = value
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let mut end = normalized
+        .len()
+        .min(automonique_protocol::platform::MAX_SESSION_HISTORY_TEXT_BYTES);
+    while !normalized.is_char_boundary(end) {
+        end -= 1;
+    }
+    let truncated = end < normalized.len();
+    let text = SessionHistoryText::new(&normalized[..end])
+        .map_err(|_| ManagedSessionError::InvalidField("history_text"))?;
+    Ok((text, truncated))
+}
+
+fn project_spool_events(events: &[SpoolEvent]) -> Managed<Vec<PendingHistoryEvent>> {
+    events
+        .iter()
+        .map(|event| {
+            let at_ms = i64::try_from(event.at_millis())
+                .map_err(|_| ManagedSessionError::InvalidField("event_at_ms"))?;
+            Ok(match event.kind() {
+                EventKind::Started => PendingHistoryEvent::RunState {
+                    at_ms,
+                    state: SessionHistoryRunState::Started,
+                },
+                EventKind::CancelRequested => PendingHistoryEvent::RunState {
+                    at_ms,
+                    state: SessionHistoryRunState::CancelRequested,
+                },
+                EventKind::Terminal => PendingHistoryEvent::RunState {
+                    at_ms,
+                    state: match event.payload() {
+                        TERMINAL_COMPLETED => SessionHistoryRunState::Completed,
+                        TERMINAL_FAILED => SessionHistoryRunState::Failed,
+                        TERMINAL_CANCELLED => SessionHistoryRunState::Cancelled,
+                        TERMINAL_TIMED_OUT => SessionHistoryRunState::TimedOut,
+                        _ => return Err(ManagedSessionError::InvalidField("terminal_state")),
+                    },
+                },
+                EventKind::SimulationEvent => PendingHistoryEvent::Unknown {
+                    at_ms,
+                    source: SessionHistoryUnknownSource::SimulationEvent,
+                },
+                EventKind::AdapterEvent => {
+                    let frame = ProgressFrame::from_canonical_bytes(event.payload()).ok();
+                    if let Some(frame) = frame.filter(|frame| {
+                        matches!(
+                            frame.kind(),
+                            automonique_protocol::event::EventKind::ToolCallStarted
+                                | automonique_protocol::event::EventKind::ToolCallUpdated
+                                | automonique_protocol::event::EventKind::ToolCallCompleted
+                        ) && frame.body().step().is_some()
+                    }) {
+                        let (label, truncated) =
+                            frame.body().text().map_or(Ok((None, false)), |text| {
+                                sanitize_history_text(text.as_str())
+                                    .map(|(text, truncated)| (Some(text), truncated))
+                            })?;
+                        let state = match frame.body().step().expect("filtered step") {
+                            automonique_protocol::event::StepStatus::Pending => {
+                                SessionHistoryToolState::Pending
+                            }
+                            automonique_protocol::event::StepStatus::InProgress => {
+                                SessionHistoryToolState::InProgress
+                            }
+                            automonique_protocol::event::StepStatus::Completed => {
+                                SessionHistoryToolState::Completed
+                            }
+                            automonique_protocol::event::StepStatus::Error => {
+                                SessionHistoryToolState::Error
+                            }
+                        };
+                        PendingHistoryEvent::ToolState {
+                            at_ms,
+                            evidence: match event.authority() {
+                                SpoolAuthority::Authoritative => {
+                                    SessionHistoryEvidence::Authoritative
+                                }
+                                SpoolAuthority::Synthetic => SessionHistoryEvidence::Synthetic,
+                            },
+                            state,
+                            label,
+                            truncated,
+                        }
+                    } else {
+                        PendingHistoryEvent::Unknown {
+                            at_ms,
+                            source: SessionHistoryUnknownSource::AdapterEvent,
+                        }
+                    }
+                }
+            })
+        })
+        .collect()
+}
+
+fn decode_history(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionHistoryEvent> {
+    let cursor = u64::try_from(row.get::<_, i64>(0)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })?;
+    let at = EpochMillis::from_millis(row.get(1)?);
+    let role: Option<String> = row.get(2)?;
+    if let Some(role) = role {
+        let role = SessionHistoryRole::parse(&role).map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let text: String = row.get(3)?;
+        let text = SessionHistoryText::new(&text).map_err(|_| rusqlite::Error::InvalidQuery)?;
+        return Ok(SessionHistoryEvent::Message {
+            cursor,
+            at,
+            evidence: SessionHistoryEvidence::parse(&row.get::<_, String>(5)?)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+            role,
+            text,
+            truncated: row.get(4)?,
+        });
+    }
+    if let Some(state) = row.get::<_, Option<String>>(6)? {
+        return Ok(SessionHistoryEvent::ToolState {
+            cursor,
+            at,
+            evidence: SessionHistoryEvidence::parse(&row.get::<_, String>(5)?)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+            state: SessionHistoryToolState::parse(&state)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+            label: row
+                .get::<_, Option<String>>(3)?
+                .map(|label| {
+                    SessionHistoryText::new(&label).map_err(|_| rusqlite::Error::InvalidQuery)
+                })
+                .transpose()?,
+            truncated: row.get(4)?,
+        });
+    }
+    if let Some(source) = row.get::<_, Option<String>>(7)? {
+        return Ok(SessionHistoryEvent::Unknown {
+            cursor,
+            at,
+            source: SessionHistoryUnknownSource::parse(&source)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        });
+    }
+    let state: String = row.get(8)?;
+    Ok(SessionHistoryEvent::RunState {
+        cursor,
+        at,
+        state: SessionHistoryRunState::parse(&state).map_err(|_| rusqlite::Error::InvalidQuery)?,
+    })
 }
 
 fn validate(provider_session_id: &str, run_id: &str, now_ms: i64) -> Managed<()> {
@@ -362,6 +754,12 @@ fn initialize(connection: &mut Connection) -> Managed<()> {
     if version == 0 {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA)?;
+        transaction.execute_batch(SCHEMA_V2)?;
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        transaction.commit()?;
+    } else if version == 1 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SCHEMA_V2)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
     } else if version != SCHEMA_VERSION {
@@ -457,6 +855,160 @@ mod tests {
                     12,
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn history_is_gap_free_idempotent_and_resumes_exclusively() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let mut store = ManagedSessionStore::open(root.path().join("managed.sqlite3")).unwrap();
+        store
+            .record_completed_turn("session-1", "turn-1", "hello", "world", &[], 10)
+            .unwrap();
+        assert!(
+            store
+                .record_completed_turn("session-1", "turn-1", "changed", "world", &[], 10)
+                .is_err()
+        );
+        store
+            .record_completed_turn("session-1", "turn-1", "hello", "world", &[], 10)
+            .unwrap();
+        let ManagedHistoryRead::Page {
+            events,
+            head,
+            has_more,
+        } = store.history("session-1", 0, 1).unwrap()
+        else {
+            panic!("page");
+        };
+        assert_eq!(
+            events
+                .iter()
+                .map(SessionHistoryEvent::cursor)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(head, 2);
+        assert!(has_more);
+        let ManagedHistoryRead::Page {
+            events, has_more, ..
+        } = store.history("session-1", 1, 2).unwrap()
+        else {
+            panic!("page");
+        };
+        assert_eq!(
+            events
+                .iter()
+                .map(SessionHistoryEvent::cursor)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert!(!has_more);
+    }
+
+    #[test]
+    fn retention_gap_returns_resync_without_partial_events() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let mut store = ManagedSessionStore::open(root.path().join("managed.sqlite3")).unwrap();
+        store
+            .record_completed_turn("session-1", "turn-1", "hello", "world", &[], 10)
+            .unwrap();
+        store.connection.execute(
+            "DELETE FROM managed_session_history WHERE provider_session_id='session-1' AND sequence < 2",
+            [],
+        ).unwrap();
+        assert_eq!(
+            store.history("session-1", 0, 2).unwrap(),
+            ManagedHistoryRead::Resync {
+                snapshot_from: 1,
+                snapshot_to: 2
+            }
+        );
+        let ManagedHistoryRead::Page { events, .. } =
+            store.history_snapshot("session-1", 2).unwrap()
+        else {
+            panic!("snapshot");
+        };
+        assert_eq!(
+            events
+                .iter()
+                .map(SessionHistoryEvent::cursor)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn history_text_is_utf8_bounded_and_control_free() {
+        let input = format!("{}\0secret", "é".repeat(300));
+        let (text, truncated) = sanitize_history_text(&input).unwrap();
+        assert!(truncated);
+        assert!(
+            text.as_str().len() <= automonique_protocol::platform::MAX_SESSION_HISTORY_TEXT_BYTES
+        );
+        assert!(!text.as_str().chars().any(char::is_control));
+    }
+
+    #[test]
+    fn opaque_spool_payload_never_enters_the_history_serialization() {
+        use automonique_protocol::codec::RequestId;
+        use automonique_protocol::platform::{
+            PlatformResponse, ResourceAuthority, ResourceCoordinate, ResourceKind,
+            SessionHistoryPage,
+        };
+        use automonique_protocol::platform_api::PlatformResponseMessage;
+        use automonique_runner::{Authority, EventKind, Spool};
+
+        const FORBIDDEN: &[u8] = b"FORBIDDEN_PROVIDER_PROMPT_TOOL_CREDENTIAL_BYTES";
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let mut spool = Spool::open(root.path().join("spool"), "run-1", 1_000_000).unwrap();
+        spool
+            .append(EventKind::Started, Authority::Authoritative, FORBIDDEN)
+            .unwrap();
+        spool
+            .append(EventKind::AdapterEvent, Authority::Authoritative, FORBIDDEN)
+            .unwrap();
+        spool
+            .append(
+                EventKind::Terminal,
+                Authority::Authoritative,
+                TERMINAL_COMPLETED,
+            )
+            .unwrap();
+        drop(spool);
+        let events = automonique_runner::read_events(root.path().join("spool"), "run-1").unwrap();
+
+        let mut store = ManagedSessionStore::open(root.path().join("managed.sqlite3")).unwrap();
+        store
+            .record_completed_turn("session-1", "turn-1", "hello", "world", &events, 10)
+            .unwrap();
+        let ManagedHistoryRead::Page {
+            events, has_more, ..
+        } = store.history("session-1", 0, 10).unwrap()
+        else {
+            panic!("page");
+        };
+        let session = ResourceCoordinate::new(
+            ResourceAuthority::Automonique,
+            ResourceKind::Session,
+            ResourceId::new("session-1").unwrap(),
+        );
+        let terminal = events.last().map_or(0, SessionHistoryEvent::cursor);
+        let page = SessionHistoryPage::new(session, 10, 10, 0, terminal, has_more, events).unwrap();
+        let bytes = PlatformResponseMessage::new(
+            RequestId::new("history-sentinel").unwrap(),
+            PlatformResponse::SessionHistory(page),
+        )
+        .to_message()
+        .unwrap()
+        .to_canonical_bytes();
+        assert!(
+            !bytes
+                .windows(FORBIDDEN.len())
+                .any(|window| window == FORBIDDEN)
         );
     }
 }

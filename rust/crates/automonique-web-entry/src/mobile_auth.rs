@@ -1130,6 +1130,10 @@ pub fn authorize_platform_request(
         PlatformRequest::Execute(request) => match request.action {
             PlatformAction::FollowUp => {
                 authorization.allows(MobileAction::FollowUp)
+                    && request
+                        .client
+                        .as_ref()
+                        .is_some_and(|client| client.as_str() == authorization.credential_id)
                     && request.target.authority == ResourceAuthority::Automonique
                     && request.target.kind == ResourceKind::Session
                     && authorization.allows_session(request.target.id.as_str())
@@ -1151,12 +1155,29 @@ pub fn authorize_platform_request(
             | PlatformAction::ApproveRelease
             | PlatformAction::RegisterNode => false,
         },
+        PlatformRequest::GetReceipt(request) => request
+            .client
+            .as_ref()
+            .is_some_and(|client| client.as_str() == authorization.credential_id),
+        PlatformRequest::SessionHistorySnapshot(request) => {
+            authorization.allows(MobileAction::Attach)
+                && request.session.authority == ResourceAuthority::Automonique
+                && request.session.kind == ResourceKind::Session
+                && authorization.allows_session(request.session.id.as_str())
+                && request.limit <= authorization.limits.max_page_events
+        }
+        PlatformRequest::SessionHistoryPage(request) => {
+            authorization.allows(MobileAction::Attach)
+                && request.session.authority == ResourceAuthority::Automonique
+                && request.session.kind == ResourceKind::Session
+                && authorization.allows_session(request.session.id.as_str())
+                && request.limit <= authorization.limits.max_page_events
+        }
         // These reads lack actor/session coordinates in Platform v1. They must
         // remain closed until the caller's receipt/cursor/resource ownership is
         // provable at this boundary.
         PlatformRequest::Snapshot(_)
         | PlatformRequest::Subscribe(_)
-        | PlatformRequest::GetReceipt(_)
         | PlatformRequest::ClaimControl(_)
         | PlatformRequest::ReleaseControl(_) => false,
     };
@@ -1926,7 +1947,8 @@ mod tests {
                 Some(Revision::new(1).expect("revision")),
                 Some(PlatformParameter::new("continue").expect("parameter")),
             )
-            .expect("execute"),
+            .expect("execute")
+            .with_client(ClientId::new(&issued.authorization.credential_id).expect("client")),
         );
         assert!(authorize_platform_request(&issued.authorization, &follow_up, NOW).is_ok());
         let blind_follow_up = PlatformRequest::Execute(
@@ -1937,7 +1959,8 @@ mod tests {
                 None,
                 Some(PlatformParameter::new("continue").expect("parameter")),
             )
-            .expect("execute"),
+            .expect("execute")
+            .with_client(ClientId::new(&issued.authorization.credential_id).expect("client")),
         );
         assert!(authorize_platform_request(&issued.authorization, &blind_follow_up, NOW).is_err());
         let stale_shape = PlatformRequest::Execute(
@@ -1948,7 +1971,8 @@ mod tests {
                 Some(Revision::new(1).expect("revision")),
                 Some(PlatformParameter::new("continue").expect("parameter")),
             )
-            .expect("execute"),
+            .expect("execute")
+            .with_client(ClientId::new(&issued.authorization.credential_id).expect("client")),
         );
         assert!(authorize_platform_request(&issued.authorization, &stale_shape, NOW).is_err());
         let mut restrictive = issued.authorization.clone();
@@ -1961,7 +1985,8 @@ mod tests {
                 Some(Revision::new(1).expect("revision")),
                 Some(PlatformParameter::new("continued").expect("bounded parameter")),
             )
-            .expect("execute"),
+            .expect("execute")
+            .with_client(ClientId::new(&issued.authorization.credential_id).expect("client")),
         );
         assert!(authorize_platform_request(&restrictive, &oversized_follow_up, NOW).is_err());
         assert!(

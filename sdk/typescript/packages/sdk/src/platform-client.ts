@@ -3,6 +3,8 @@
 import {
   MAX_PLATFORM_CANONICAL_BYTES,
   PlatformRequestId,
+  SessionHistoryCursor,
+  SessionHistoryLimit,
   RefusalError,
   ValidationError,
   WireError,
@@ -16,6 +18,7 @@ import {
   type ControlLease,
   type ControlLeaseId as ControlLeaseIdType,
   type ExecuteRequest,
+  type PlatformEpochMillis,
   type IdempotencyKey as IdempotencyKeyType,
   type PlatformCursor,
   type PlatformRequest,
@@ -24,6 +27,12 @@ import {
   type ReceiptOutcome,
   type ResourceAuthority,
   type ResourceCoordinate,
+  type SessionHistoryEvidence,
+  type SessionHistoryRole,
+  type SessionHistoryRunState,
+  type SessionHistoryText,
+  type SessionHistoryToolState,
+  type SessionHistoryUnknownSource,
   type SessionList,
   type Snapshot,
   type Subscription,
@@ -32,6 +41,22 @@ import {
 export const PLATFORM_MEDIA_TYPE = "application/vnd.automonique.platform.v1+json";
 
 export type {PlatformRequest};
+
+export type SessionHistoryEvent =
+  | {readonly kind: "message"; readonly at: PlatformEpochMillis; readonly cursor: ReturnType<typeof SessionHistoryCursor>; readonly evidence: SessionHistoryEvidence; readonly role: SessionHistoryRole; readonly text: SessionHistoryText; readonly truncated: boolean}
+  | {readonly kind: "tool_state"; readonly at: PlatformEpochMillis; readonly cursor: ReturnType<typeof SessionHistoryCursor>; readonly evidence: SessionHistoryEvidence; readonly label: SessionHistoryText | null; readonly state: SessionHistoryToolState; readonly truncated: boolean}
+  | {readonly kind: "run_state"; readonly at: PlatformEpochMillis; readonly cursor: ReturnType<typeof SessionHistoryCursor>; readonly state: SessionHistoryRunState}
+  | {readonly kind: "unknown"; readonly at: PlatformEpochMillis; readonly cursor: ReturnType<typeof SessionHistoryCursor>; readonly source: SessionHistoryUnknownSource};
+
+export interface SessionHistoryPage {
+  readonly session: ResourceCoordinate;
+  readonly requested_limit: ReturnType<typeof SessionHistoryLimit>;
+  readonly applied_limit: ReturnType<typeof SessionHistoryLimit>;
+  readonly from_cursor: ReturnType<typeof SessionHistoryCursor>;
+  readonly terminal_cursor: ReturnType<typeof SessionHistoryCursor>;
+  readonly has_more: boolean;
+  readonly events: readonly SessionHistoryEvent[];
+}
 
 export type PlatformClientResponse =
   | {readonly kind: "capabilities"; readonly value: Capabilities}
@@ -43,6 +68,8 @@ export type PlatformClientResponse =
   | {readonly kind: "detached"; readonly session: ResourceCoordinate; readonly client: ClientIdType}
   | {readonly kind: "control_claimed"; readonly value: ControlLease}
   | {readonly kind: "control_released"; readonly session: ResourceCoordinate; readonly client: ClientIdType; readonly lease: ControlLeaseIdType}
+  | {readonly kind: "session_history"; readonly value: SessionHistoryPage}
+  | {readonly kind: "session_history_resync"; readonly session: ResourceCoordinate; readonly snapshotFrom: ReturnType<typeof SessionHistoryCursor>; readonly snapshotTo: ReturnType<typeof SessionHistoryCursor>}
   | {readonly kind: "refused"; readonly outcome: ReceiptOutcome; readonly explanation: string};
 
 export interface PlatformAdapter {
@@ -59,6 +86,45 @@ export class PlatformTransportError extends Error {
     this.status = status;
     this.category = category;
   }
+}
+
+export class SessionHistoryResyncError extends Error {
+  readonly session: ResourceCoordinate;
+  readonly snapshotFrom: ReturnType<typeof SessionHistoryCursor>;
+  readonly snapshotTo: ReturnType<typeof SessionHistoryCursor>;
+
+  constructor(session: ResourceCoordinate, snapshotFrom: ReturnType<typeof SessionHistoryCursor>, snapshotTo: ReturnType<typeof SessionHistoryCursor>) {
+    super("session history retention requires a fresh snapshot");
+    this.name = "SessionHistoryResyncError";
+    this.session = session;
+    this.snapshotFrom = snapshotFrom;
+    this.snapshotTo = snapshotTo;
+  }
+}
+
+function projectHistory(response: Extract<DecodedPlatformResponse, {readonly kind: "session_history_result"}>["value"]): SessionHistoryPage {
+  const events: SessionHistoryEvent[] = [
+    ...response.messages.map((event) => ({kind: "message" as const, ...event})),
+    ...response.tool_states.map((event) => ({kind: "tool_state" as const, ...event})),
+    ...response.run_states.map((event) => ({kind: "run_state" as const, ...event})),
+    ...response.unknown_events.map((event) => ({kind: "unknown" as const, ...event})),
+  ].sort((left, right) => left.cursor < right.cursor ? -1 : left.cursor > right.cursor ? 1 : 0);
+  if (events.length > Number(response.applied_limit)) throw new PlatformTransportError(502, "history_page_invalid");
+  let expected = response.from_cursor;
+  for (const event of events) {
+    expected = SessionHistoryCursor(expected + 1n);
+    if (event.cursor !== expected) throw new PlatformTransportError(502, "history_gap_or_duplicate");
+  }
+  if (expected !== response.terminal_cursor) throw new PlatformTransportError(502, "history_terminal_mismatch");
+  return {
+    session: response.session,
+    requested_limit: response.requested_limit,
+    applied_limit: response.applied_limit,
+    from_cursor: response.from_cursor,
+    terminal_cursor: response.terminal_cursor,
+    has_more: response.has_more,
+    events,
+  };
 }
 
 function bearerToken(value: unknown): string {
@@ -107,6 +173,10 @@ function projectResponse(response: DecodedPlatformResponse): PlatformClientRespo
     }
     case "control_released":
       return {kind: "control_released", session: response.value.session, client: response.value.client, lease: response.value.lease};
+    case "session_history_result":
+      return {kind: "session_history", value: projectHistory(response.value)};
+    case "session_history_resync":
+      return {kind: "session_history_resync", session: response.value.session, snapshotFrom: response.value.snapshot_from, snapshotTo: response.value.snapshot_to};
     case "refused":
       return {kind: "refused", outcome: response.value.outcome, explanation: response.value.explanation};
     case "undecoded":
@@ -253,7 +323,9 @@ export class HttpsPlatformTransport implements PlatformAdapter {
       const decodedRequestId = decoded.kind === "undecoded" ? decoded.request_id : decoded.value.request_id;
       if (decodedRequestId !== requestId) throw new PlatformTransportError(response.status, "request_id_mismatch");
       const expected = expectedPlatformResponseKind(request.method);
-      if (decoded.kind !== "refused" && decoded.kind !== expected) {
+      const historyResync = (request.method === "session_history_snapshot" || request.method === "session_history_page")
+        && decoded.kind === "session_history_resync";
+      if (decoded.kind !== "refused" && decoded.kind !== expected && !historyResync) {
         throw new PlatformTransportError(response.status, "response_kind_mismatch");
       }
       return projectResponse(decoded);
@@ -294,7 +366,7 @@ export class PlatformClient {
     return this.transport.request({method: "execute", request}, signal);
   }
 
-  getReceipt(request: {readonly id: ReceiptIdType | null; readonly idempotency_key: IdempotencyKeyType | null}, signal?: AbortSignal): Promise<PlatformClientResponse> {
+  getReceipt(request: {readonly client: ClientIdType | null; readonly id: ReceiptIdType | null; readonly idempotency_key: IdempotencyKeyType | null}, signal?: AbortSignal): Promise<PlatformClientResponse> {
     if ((request.id === null) === (request.idempotency_key === null)) throw new PlatformTransportError(0, "receipt_lookup_invalid");
     return this.transport.request({method: "get_receipt", request}, signal);
   }
@@ -317,5 +389,31 @@ export class PlatformClient {
 
   releaseControl(session: ResourceCoordinate, client: ClientIdType, lease: ControlLeaseIdType, idempotency_key: IdempotencyKeyType, signal?: AbortSignal): Promise<PlatformClientResponse> {
     return this.transport.request({method: "release_control", request: {session, client, lease, idempotency_key}}, signal);
+  }
+
+  async sessionHistorySnapshot(session: ResourceCoordinate, limit: bigint, signal?: AbortSignal): Promise<SessionHistoryPage> {
+    return this.requireHistory(await this.transport.request({method: "session_history_snapshot", request: {session, limit: SessionHistoryLimit(limit)}}, signal));
+  }
+
+  async sessionHistoryPage(session: ResourceCoordinate, afterExclusive: bigint, limit: bigint, signal?: AbortSignal): Promise<SessionHistoryPage> {
+    return this.requireHistory(await this.transport.request({method: "session_history_page", request: {session, after: SessionHistoryCursor(afterExclusive), limit: SessionHistoryLimit(limit)}}, signal));
+  }
+
+  async *iterateSessionHistory(session: ResourceCoordinate, limit: bigint, signal?: AbortSignal): AsyncGenerator<SessionHistoryEvent, void, void> {
+    let page = await this.sessionHistorySnapshot(session, limit, signal);
+    while (true) {
+      for (const event of page.events) yield event;
+      if (!page.has_more) return;
+      page = await this.sessionHistoryPage(session, page.terminal_cursor, limit, signal);
+    }
+  }
+
+  private requireHistory(response: PlatformClientResponse): SessionHistoryPage {
+    if (response.kind === "session_history") return response.value;
+    if (response.kind === "session_history_resync") {
+      throw new SessionHistoryResyncError(response.session, response.snapshotFrom, response.snapshotTo);
+    }
+    if (response.kind === "refused") throw new PlatformTransportError(403, response.explanation);
+    throw new PlatformTransportError(502, "response_kind_mismatch");
   }
 }

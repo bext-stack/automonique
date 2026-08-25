@@ -6822,6 +6822,11 @@ fn platform_module() -> GeneratedModule {
                 value: ConstantValue::Count(crate::platform::MAX_SUBSCRIPTION_EVENTS),
             },
             Constant {
+                name: "MAX_SESSION_HISTORY_EVENTS".to_owned(),
+                doc: "Maximum sanitized events carried by one history page.".to_owned(),
+                value: ConstantValue::Count(crate::platform::MAX_SESSION_HISTORY_EVENTS),
+            },
+            Constant {
                 name: "CONTROL_LEASE_TTL_MILLIS".to_owned(),
                 doc: "Lifetime of one exclusive interactive control lease.".to_owned(),
                 value: ConstantValue::Count(
@@ -6896,6 +6901,11 @@ fn platform_module() -> GeneratedModule {
                 max_bytes: crate::platform::MAX_PLATFORM_PARAMETER_BYTES,
                 pattern: Some("^[^\\u0000]+$".to_owned()),
             },
+            BoundedString {
+                name: "SessionHistoryText".to_owned(),
+                max_bytes: crate::platform::MAX_SESSION_HISTORY_TEXT_BYTES,
+                pattern: Some("^[^\\u0000]+$".to_owned()),
+            },
         ],
         bounded_integers: vec![
             BoundedInteger {
@@ -6907,6 +6917,17 @@ fn platform_module() -> GeneratedModule {
                 name: "PlatformRevision".to_owned(),
                 min: 1,
                 max: i64::MAX,
+            },
+            BoundedInteger {
+                name: "SessionHistoryCursor".to_owned(),
+                min: 0,
+                max: i64::MAX,
+            },
+            BoundedInteger {
+                name: "SessionHistoryLimit".to_owned(),
+                min: 1,
+                max: i64::try_from(crate::platform::MAX_SESSION_HISTORY_EVENTS)
+                    .expect("history limit"),
             },
         ],
         enums: vec![
@@ -6938,6 +6959,41 @@ fn platform_module() -> GeneratedModule {
                 "ResourceKind",
                 platform_values(&ResourceKind::ALL, ResourceKind::as_str),
             ),
+            security_enum(
+                "SessionHistoryEvidence",
+                platform_values(
+                    &crate::platform::SessionHistoryEvidence::ALL,
+                    crate::platform::SessionHistoryEvidence::as_str,
+                ),
+            ),
+            security_enum(
+                "SessionHistoryRole",
+                platform_values(
+                    &crate::platform::SessionHistoryRole::ALL,
+                    crate::platform::SessionHistoryRole::as_str,
+                ),
+            ),
+            security_enum(
+                "SessionHistoryToolState",
+                platform_values(
+                    &crate::platform::SessionHistoryToolState::ALL,
+                    crate::platform::SessionHistoryToolState::as_str,
+                ),
+            ),
+            security_enum(
+                "SessionHistoryRunState",
+                platform_values(
+                    &crate::platform::SessionHistoryRunState::ALL,
+                    crate::platform::SessionHistoryRunState::as_str,
+                ),
+            ),
+            security_enum(
+                "SessionHistoryUnknownSource",
+                platform_values(
+                    &crate::platform::SessionHistoryUnknownSource::ALL,
+                    crate::platform::SessionHistoryUnknownSource::as_str,
+                ),
+            ),
         ],
         interfaces: vec![
             Interface {
@@ -6968,6 +7024,7 @@ fn platform_module() -> GeneratedModule {
                 doc: "The only general mutation request in the public contract.".to_owned(),
                 fields: vec![
                     required("action", "PlatformAction"),
+                    nullable("client", "ClientId"),
                     nullable("expected_revision", "PlatformRevision"),
                     required("idempotency_key", "IdempotencyKey"),
                     nullable("parameter", "PlatformParameter"),
@@ -7186,6 +7243,76 @@ fn platform_module() -> GeneratedModule {
                         platform_field("session", platform_object("DecodedResourceRecord")),
                     ],
                 ),
+                platform_body_object(
+                    "DecodedHistoryMessage",
+                    "One sanitized authoritative message.",
+                    vec![
+                        platform_field("at", platform_epoch_millis()),
+                        platform_field(
+                            "cursor",
+                            ResponseValue::Integer {
+                                type_name: "SessionHistoryCursor".to_owned(),
+                                refusal_category: "PLATFORM_COUNTER_OUT_OF_RANGE".to_owned(),
+                                unsigned: true,
+                            },
+                        ),
+                        platform_field("evidence", platform_enum("SessionHistoryEvidence")),
+                        platform_field("role", platform_enum("SessionHistoryRole")),
+                        platform_field("text", platform_checked("SessionHistoryText")),
+                        platform_field("truncated", ResponseValue::Bool),
+                    ],
+                ),
+                platform_body_object(
+                    "DecodedHistoryToolState",
+                    "One sanitized public tool state without input or output.",
+                    vec![
+                        platform_field("at", platform_epoch_millis()),
+                        platform_field(
+                            "cursor",
+                            ResponseValue::Integer {
+                                type_name: "SessionHistoryCursor".to_owned(),
+                                refusal_category: "PLATFORM_COUNTER_OUT_OF_RANGE".to_owned(),
+                                unsigned: true,
+                            },
+                        ),
+                        platform_field("evidence", platform_enum("SessionHistoryEvidence")),
+                        platform_field("label", platform_nullable_checked("SessionHistoryText")),
+                        platform_field("state", platform_enum("SessionHistoryToolState")),
+                        platform_field("truncated", ResponseValue::Bool),
+                    ],
+                ),
+                platform_body_object(
+                    "DecodedHistoryRunState",
+                    "One closed public run state.",
+                    vec![
+                        platform_field("at", platform_epoch_millis()),
+                        platform_field(
+                            "cursor",
+                            ResponseValue::Integer {
+                                type_name: "SessionHistoryCursor".to_owned(),
+                                refusal_category: "PLATFORM_COUNTER_OUT_OF_RANGE".to_owned(),
+                                unsigned: true,
+                            },
+                        ),
+                        platform_field("state", platform_enum("SessionHistoryRunState")),
+                    ],
+                ),
+                platform_body_object(
+                    "DecodedHistoryUnknown",
+                    "A forward-compatible source marker with no opaque payload.",
+                    vec![
+                        platform_field("at", platform_epoch_millis()),
+                        platform_field(
+                            "cursor",
+                            ResponseValue::Integer {
+                                type_name: "SessionHistoryCursor".to_owned(),
+                                refusal_category: "PLATFORM_COUNTER_OUT_OF_RANGE".to_owned(),
+                                unsigned: true,
+                            },
+                        ),
+                        platform_field("source", platform_enum("SessionHistoryUnknownSource")),
+                    ],
+                ),
             ],
             requests: vec![
                 RequestCommand {
@@ -7229,6 +7356,14 @@ fn platform_module() -> GeneratedModule {
                     name: "PlatformExecute".to_owned(),
                     doc: "Request one authority-bound idempotent Platform action.".to_owned(),
                     fields: vec![
+                        RequestField {
+                            name: "client".to_owned(),
+                            input_name: "client".to_owned(),
+                            value: RequestValue::NullableChecked {
+                                type_name: "ClientId".to_owned(),
+                                refusal_category: PLATFORM_VALUE_INVALID.to_owned(),
+                            },
+                        },
                         RequestField {
                             name: "action".to_owned(),
                             input_name: "action".to_owned(),
@@ -7276,6 +7411,14 @@ fn platform_module() -> GeneratedModule {
                     name: "PlatformGetReceipt".to_owned(),
                     doc: "Read one receipt by exactly one durable coordinate.".to_owned(),
                     fields: vec![
+                        RequestField {
+                            name: "client".to_owned(),
+                            input_name: "client".to_owned(),
+                            value: RequestValue::NullableChecked {
+                                type_name: "ClientId".to_owned(),
+                                refusal_category: PLATFORM_VALUE_INVALID.to_owned(),
+                            },
+                        },
                         RequestField {
                             name: "id".to_owned(),
                             input_name: "id".to_owned(),
@@ -7378,6 +7521,60 @@ fn platform_module() -> GeneratedModule {
                     },
                     coupling: None,
                 },
+                RequestCommand {
+                    kind: "session_history_snapshot".to_owned(),
+                    name: "PlatformSessionHistorySnapshot".to_owned(),
+                    doc: "Read the first retained history page for one exact session.".to_owned(),
+                    fields: vec![
+                        RequestField {
+                            name: "limit".to_owned(),
+                            input_name: "limit".to_owned(),
+                            value: RequestValue::Integer {
+                                type_name: "SessionHistoryLimit".to_owned(),
+                                refusal_category: "PLATFORM_COUNTER_OUT_OF_RANGE".to_owned(),
+                            },
+                        },
+                        RequestField {
+                            name: "session".to_owned(),
+                            input_name: "session".to_owned(),
+                            value: RequestValue::Object {
+                                type_name: "DecodedResourceCoordinate".to_owned(),
+                            },
+                        },
+                    ],
+                    coupling: None,
+                },
+                RequestCommand {
+                    kind: "session_history_page".to_owned(),
+                    name: "PlatformSessionHistoryPage".to_owned(),
+                    doc: "Resume history strictly after an exclusive cursor.".to_owned(),
+                    fields: vec![
+                        RequestField {
+                            name: "after".to_owned(),
+                            input_name: "after".to_owned(),
+                            value: RequestValue::Integer {
+                                type_name: "SessionHistoryCursor".to_owned(),
+                                refusal_category: "PLATFORM_COUNTER_OUT_OF_RANGE".to_owned(),
+                            },
+                        },
+                        RequestField {
+                            name: "limit".to_owned(),
+                            input_name: "limit".to_owned(),
+                            value: RequestValue::Integer {
+                                type_name: "SessionHistoryLimit".to_owned(),
+                                refusal_category: "PLATFORM_COUNTER_OUT_OF_RANGE".to_owned(),
+                            },
+                        },
+                        RequestField {
+                            name: "session".to_owned(),
+                            input_name: "session".to_owned(),
+                            value: RequestValue::Object {
+                                type_name: "DecodedResourceCoordinate".to_owned(),
+                            },
+                        },
+                    ],
+                    coupling: None,
+                },
             ],
             request_kinds_not_generated: Vec::new(),
             request_validations: vec![
@@ -7418,6 +7615,14 @@ fn platform_module() -> GeneratedModule {
                 ("detach".to_owned(), "detached".to_owned()),
                 ("claim_control".to_owned(), "control_claimed".to_owned()),
                 ("release_control".to_owned(), "control_released".to_owned()),
+                (
+                    "session_history_snapshot".to_owned(),
+                    "session_history_result".to_owned(),
+                ),
+                (
+                    "session_history_page".to_owned(),
+                    "session_history_result".to_owned(),
+                ),
             ],
             responses: vec![
                 platform_response(
@@ -7562,6 +7767,103 @@ fn platform_module() -> GeneratedModule {
                         platform_field("client", platform_checked("ClientId")),
                         platform_field("lease", platform_checked("ControlLeaseId")),
                         platform_field("session", platform_object("DecodedResourceCoordinate")),
+                    ],
+                ),
+                platform_response(
+                    "session_history_result",
+                    "PlatformSessionHistoryResult",
+                    "One strict, exclusive-cursor history page.",
+                    vec![
+                        platform_field(
+                            "applied_limit",
+                            ResponseValue::Integer {
+                                type_name: "SessionHistoryLimit".to_owned(),
+                                refusal_category: "PLATFORM_COUNTER_OUT_OF_RANGE".to_owned(),
+                                unsigned: true,
+                            },
+                        ),
+                        platform_field(
+                            "from_cursor",
+                            ResponseValue::Integer {
+                                type_name: "SessionHistoryCursor".to_owned(),
+                                refusal_category: "PLATFORM_COUNTER_OUT_OF_RANGE".to_owned(),
+                                unsigned: true,
+                            },
+                        ),
+                        platform_field("has_more", ResponseValue::Bool),
+                        platform_field(
+                            "messages",
+                            ResponseValue::ObjectArray {
+                                type_name: "DecodedHistoryMessage".to_owned(),
+                                max_items_constant: "MAX_SESSION_HISTORY_EVENTS".to_owned(),
+                                oversize_category: PLATFORM_INVALID_BODY.to_owned(),
+                            },
+                        ),
+                        platform_field(
+                            "requested_limit",
+                            ResponseValue::Integer {
+                                type_name: "SessionHistoryLimit".to_owned(),
+                                refusal_category: "PLATFORM_COUNTER_OUT_OF_RANGE".to_owned(),
+                                unsigned: true,
+                            },
+                        ),
+                        platform_field(
+                            "run_states",
+                            ResponseValue::ObjectArray {
+                                type_name: "DecodedHistoryRunState".to_owned(),
+                                max_items_constant: "MAX_SESSION_HISTORY_EVENTS".to_owned(),
+                                oversize_category: PLATFORM_INVALID_BODY.to_owned(),
+                            },
+                        ),
+                        platform_field("session", platform_object("DecodedResourceCoordinate")),
+                        platform_field(
+                            "terminal_cursor",
+                            ResponseValue::Integer {
+                                type_name: "SessionHistoryCursor".to_owned(),
+                                refusal_category: "PLATFORM_COUNTER_OUT_OF_RANGE".to_owned(),
+                                unsigned: true,
+                            },
+                        ),
+                        platform_field(
+                            "tool_states",
+                            ResponseValue::ObjectArray {
+                                type_name: "DecodedHistoryToolState".to_owned(),
+                                max_items_constant: "MAX_SESSION_HISTORY_EVENTS".to_owned(),
+                                oversize_category: PLATFORM_INVALID_BODY.to_owned(),
+                            },
+                        ),
+                        platform_field(
+                            "unknown_events",
+                            ResponseValue::ObjectArray {
+                                type_name: "DecodedHistoryUnknown".to_owned(),
+                                max_items_constant: "MAX_SESSION_HISTORY_EVENTS".to_owned(),
+                                oversize_category: PLATFORM_INVALID_BODY.to_owned(),
+                            },
+                        ),
+                    ],
+                ),
+                platform_response(
+                    "session_history_resync",
+                    "PlatformSessionHistoryResync",
+                    "Explicit retention refusal with no partial page.",
+                    vec![
+                        platform_field("session", platform_object("DecodedResourceCoordinate")),
+                        platform_field(
+                            "snapshot_from",
+                            ResponseValue::Integer {
+                                type_name: "SessionHistoryCursor".to_owned(),
+                                refusal_category: "PLATFORM_COUNTER_OUT_OF_RANGE".to_owned(),
+                                unsigned: true,
+                            },
+                        ),
+                        platform_field(
+                            "snapshot_to",
+                            ResponseValue::Integer {
+                                type_name: "SessionHistoryCursor".to_owned(),
+                                refusal_category: "PLATFORM_COUNTER_OUT_OF_RANGE".to_owned(),
+                                unsigned: true,
+                            },
+                        ),
                     ],
                 ),
                 platform_response(

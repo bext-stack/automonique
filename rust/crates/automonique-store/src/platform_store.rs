@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{StoreError, validate_database_path};
 
-pub const PLATFORM_STORE_SCHEMA_VERSION: u32 = 1;
+pub const PLATFORM_STORE_SCHEMA_VERSION: u32 = 2;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE platform_meta (
@@ -115,6 +115,14 @@ CREATE TABLE platform_control_receipts (
     revision INTEGER NOT NULL CHECK (revision >= 1),
     recorded_at_ms INTEGER NOT NULL
 ) STRICT;
+"#;
+
+const SCHEMA_V2: &str = r#"
+ALTER TABLE platform_receipts ADD COLUMN client_id TEXT;
+CREATE INDEX platform_receipts_by_client_key
+    ON platform_receipts(client_id,idempotency_key);
+CREATE INDEX platform_receipts_by_client_id
+    ON platform_receipts(client_id,receipt_id);
 "#;
 
 #[derive(Debug)]
@@ -432,11 +440,12 @@ impl PlatformStore {
         let receipt_id = deterministic_id("receipt", request.idempotency_key.as_str());
         transaction.execute(
             "INSERT INTO platform_receipts(receipt_id,idempotency_key,action,target_authority,target_kind,target_id,
-             expected_revision,parameter,outcome,revision,recorded_at_ms,explanation)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'accepted',?9,?10,NULL)",
+             expected_revision,parameter,outcome,revision,recorded_at_ms,explanation,client_id)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'accepted',?9,?10,NULL,?11)",
             params![receipt_id, request.idempotency_key.as_str(), request.action.as_str(), request.target.authority.as_str(),
                 request.target.kind.as_str(), request.target.id.as_str(), request.expected_revision.map(to_db_revision).transpose()?,
-                request.parameter.as_ref().map(|parameter| parameter.as_str()), to_db_revision(revision)?, now_ms],
+                request.parameter.as_ref().map(|parameter| parameter.as_str()), to_db_revision(revision)?, now_ms,
+                request.client.as_ref().map(|client| client.as_str())],
         )?;
         let receipt = ActionReceipt {
             id: ReceiptId::new(receipt_id)
@@ -497,15 +506,20 @@ impl PlatformStore {
         &self,
         id: Option<&ReceiptId>,
         key: Option<&IdempotencyKey>,
+        client: Option<&ClientId>,
     ) -> Stored<ActionReceipt> {
         let stored = match (id, key) {
             (Some(id), None) => read_receipt_by_id(&self.connection, id.as_str())?,
             (None, Some(key)) => read_receipt_by_key(&self.connection, key.as_str())?,
             _ => return Err(PlatformStoreError::InvalidField("receipt_lookup")),
         };
-        stored
-            .map(|value| value.receipt)
-            .ok_or(PlatformStoreError::NotFound)
+        let stored = stored.ok_or(PlatformStoreError::NotFound)?;
+        if let Some(client) = client
+            && stored.client.as_ref() != Some(client)
+        {
+            return Err(PlatformStoreError::NotFound);
+        }
+        Ok(stored.receipt)
     }
 
     pub fn attach(
@@ -763,6 +777,7 @@ struct StoredReceipt {
     idempotency_key: String,
     expected_revision: Option<Revision>,
     parameter: Option<String>,
+    client: Option<ClientId>,
 }
 
 type RawReceiptRow = (
@@ -777,6 +792,7 @@ type RawReceiptRow = (
     String,
     i64,
     i64,
+    Option<String>,
     Option<String>,
 );
 
@@ -803,7 +819,7 @@ fn read_receipt(
     value: &str,
 ) -> Stored<Option<StoredReceipt>> {
     let sql = format!(
-        "SELECT receipt_id,idempotency_key,action,target_authority,target_kind,target_id,expected_revision,parameter,outcome,revision,recorded_at_ms,explanation FROM platform_receipts WHERE {column}=?1"
+        "SELECT receipt_id,idempotency_key,action,target_authority,target_kind,target_id,expected_revision,parameter,outcome,revision,recorded_at_ms,explanation,client_id FROM platform_receipts WHERE {column}=?1"
     );
     let raw: Option<RawReceiptRow> = connection
         .query_row(&sql, [value], |row| {
@@ -820,6 +836,7 @@ fn read_receipt(
                 row.get(9)?,
                 row.get(10)?,
                 row.get(11)?,
+                row.get(12)?,
             ))
         })
         .optional()?;
@@ -837,6 +854,7 @@ fn read_receipt(
             rev,
             recorded,
             explanation,
+            client,
         )| {
             Ok(StoredReceipt {
                 receipt: ActionReceipt {
@@ -860,6 +878,10 @@ fn read_receipt(
                 idempotency_key: key,
                 expected_revision: expected.map(revision).transpose()?,
                 parameter,
+                client: client
+                    .map(ClientId::new)
+                    .transpose()
+                    .map_err(|_| PlatformStoreError::Corrupt("client_id"))?,
             })
         },
     )
@@ -876,6 +898,7 @@ fn receipt_matches_request(stored: &StoredReceipt, request: &ExecuteRequest) -> 
                 .parameter
                 .as_ref()
                 .map(|parameter| parameter.as_str())
+        && stored.client.as_ref() == request.client.as_ref()
 }
 
 fn append_receipt_event(connection: &Connection, receipt: &ActionReceipt) -> Stored<()> {
@@ -989,6 +1012,13 @@ fn initialize(connection: &mut Connection) -> Stored<()> {
     if version == PLATFORM_STORE_SCHEMA_VERSION {
         return Ok(());
     }
+    if version == 1 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SCHEMA_V2)?;
+        transaction.pragma_update(None, "user_version", PLATFORM_STORE_SCHEMA_VERSION)?;
+        transaction.commit()?;
+        return Ok(());
+    }
     if version != 0 {
         return Err(PlatformStoreError::SchemaVersion {
             found: version,
@@ -1008,6 +1038,7 @@ fn initialize(connection: &mut Connection) -> Stored<()> {
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(SCHEMA_V1)?;
+    transaction.execute_batch(SCHEMA_V2)?;
     transaction.pragma_update(None, "user_version", PLATFORM_STORE_SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
