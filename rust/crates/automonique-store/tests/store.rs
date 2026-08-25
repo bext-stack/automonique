@@ -755,6 +755,14 @@ fn external_lease_deadlines_ignore_every_wall_clock_value() {
     assert_eq!(successor.expires_ms, 1_350);
 }
 
+/// The SQLITE_BUSY (5) and SQLITE_LOCKED (6) families, including their
+/// extended forms such as `SQLITE_BUSY_RECOVERY` (261) and
+/// `SQLITE_BUSY_SNAPSHOT` (517): a lock another connection still holds for a
+/// moment, never a fencing decision.
+fn transient_sqlite_lock(code: rusqlite::ffi::Error) -> bool {
+    matches!(code.extended_code & 0xff, 5 | 6)
+}
+
 #[test]
 fn a_sigstopped_old_holder_cannot_commit_after_its_epoch_is_replaced() {
     let database = PrivateDatabase::new();
@@ -789,13 +797,30 @@ fn a_sigstopped_old_holder_cannot_commit_after_its_epoch_is_replaced() {
     // The helper publishes readiness only after closing its database handle.
     // Open the successor now so it cannot retain a pre-takeover WAL snapshot
     // while the old holder performs its final write before SIGSTOP.
-    let mut successor_store = Store::open(database.path()).expect("successor opens store");
-
+    //
     // A loaded CI filesystem can briefly retain SQLite's WAL writer lock after
-    // the helper closes its connection. That lock is not authority and the
-    // production connection already has a bounded busy timeout, so retry only
-    // SQLITE_BUSY/SQLITE_LOCKED while preserving the fencing assertion.
+    // the helper closes its connection, and the open itself (journal-mode
+    // pragma, migration check) can meet WAL recovery still in progress
+    // (`SQLITE_BUSY_RECOVERY`, extended code 261). Neither lock is authority
+    // and the production connection already has a bounded busy timeout, so
+    // retry only the SQLITE_BUSY/SQLITE_LOCKED family, here and at the
+    // takeover below, while preserving the fencing assertion.
     let takeover_deadline = Instant::now() + Duration::from_secs(10);
+    let mut successor_store = loop {
+        match Store::open(database.path()) {
+            Ok(store) => break store,
+            Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(code, _)))
+                if transient_sqlite_lock(code) =>
+            {
+                assert!(
+                    Instant::now() < takeover_deadline,
+                    "successor could not open the store past a transient SQLite lock"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("successor opens store: {error}"),
+        }
+    };
     let successor = loop {
         match successor_store.acquire_generation_lease_owned(
             LeaseRequest {
@@ -812,7 +837,7 @@ fn a_sigstopped_old_holder_cannot_commit_after_its_epoch_is_replaced() {
         ) {
             Ok(successor) => break successor,
             Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(code, _)))
-                if code.extended_code == 5 || code.extended_code == 6 =>
+                if transient_sqlite_lock(code) =>
             {
                 assert!(
                     Instant::now() < takeover_deadline,
