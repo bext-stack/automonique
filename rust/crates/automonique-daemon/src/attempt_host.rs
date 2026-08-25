@@ -3,20 +3,14 @@
 //! The daemon's single host-wide owner of cancellation dispatch.
 //!
 //! [`CancelDispatcher`] serialises `classify -> deliver -> record` for every
-//! caller it owns, and states plainly the one thing it cannot establish by
-//! itself:
-//!
-//! > **Host-wide means one dispatcher instance.** Two dispatchers over one
-//! > durable ledger file still interleave exactly as two bare servers did: this
-//! > type serialises the callers it owns, not the file. Closing that needs one
-//! > process to own custody for the host — composition policy the daemon
-//! > decides, not a property this type can carry.
+//! caller it owns. [`StoreCancelCustody`] additionally reserves a fresh
+//! reference in SQLite before delivery, extending the one-delivery guarantee
+//! across two reservation-aware processes.
 //!
 //! This module is that composition policy. [`DaemonAttemptHost`] owns exactly
 //! one [`CancelDispatcher`], constructed over exactly one
 //! [`StoreCancelCustody`] on exactly one [`CancelLedger`] file, and the daemon
-//! holds exactly one of these. Nothing here adds a lock or a protocol: the two
-//! halves already existed and were never joined.
+//! holds exactly one of these.
 //!
 //! # What the composition establishes
 //!
@@ -24,21 +18,19 @@
 //!   reference delivered before a restart is answered `already_delivered`
 //!   afterwards, by a new process over the same file. The runner supplies no
 //!   fallback custody; opening this durable owner is required.
-//! - **Idempotency is host-wide within this process.** Every caller — a direct
-//!   [`DaemonAttemptHost::cancel`], and every
+//! - **Idempotency is host-wide and reservation-overlap-safe.** Every caller —
+//!   a direct [`DaemonAttemptHost::cancel`], and every
 //!   [`ControlServer`](automonique_runner::control::ControlServer) seated
 //!   through [`DaemonAttemptHost::seat`] — runs the whole sequence under the one
-//!   dispatcher's lock, so one reference reaches one sink once however many
-//!   callers race for it.
+//!   dispatcher's lock, while the durable reservation prevents another
+//!   generation's dispatcher from reaching its sink for the same reference.
 //!
-//! One daemon is one process is one dispatcher, so "host-wide within this
-//! process" and "host-wide" coincide exactly as far as the exclusion below
-//! holds.
+//! # Ordinary single-daemon exclusion and deliberate overlap
 //!
-//! # Why "one daemon" is true: the lease fence, not a new lock
-//!
-//! The dispatcher's single-instance requirement is satisfied by exclusion this
-//! daemon already enforces, so nothing here takes a lock of its own.
+//! Ordinary startup still enforces one active daemon. Generation handoff is the
+//! one deliberate overlap. Its cancellation lane is safe only after both
+//! generations implement the reservation contract; handoff from an older
+//! classify-without-write binary still requires quiescence before activation.
 //! [`Daemon::open`](crate::Daemon::open) refuses to start a second daemon over
 //! one state directory twice over:
 //!
@@ -48,17 +40,10 @@
 //!    held by another instance refuses startup rather than being seized;
 //!    take-over happens only through expiry.
 //!
-//! The cancel ledger path is derived from that same state directory, so "one
-//! daemon over this state directory" and "one dispatcher over this ledger file"
-//! are the same statement. Two daemons cannot be the two dispatchers the
-//! dispatcher module warns about.
-//!
-//! What that argument does **not** cover, stated rather than implied: nothing
-//! on the filesystem stops some other program from opening the same SQLite file
-//! and writing to it. SQLite will serialise the transactions, but a foreign
-//! writer is outside this product's composition, and against one the dispatcher
-//! degrades to exactly what it documents — a `record` that returns
-//! [`DispatchOutcome::Conflict`] after a delivery that did happen.
+//! The cancel ledger path is derived from that same state directory. A foreign
+//! writer remains outside this product's composition. Among well-formed,
+//! reservation-aware product dispatchers, the unique reserved row is committed
+//! before any registered sink is touched.
 //!
 //! # Who reaches this host
 //!
@@ -382,8 +367,8 @@ const fn ledger_category(error: &CancelLedgerError) -> &'static str {
         CancelLedgerError::Corrupt(_) => "attempt_host_ledger_corrupt",
         CancelLedgerError::Io(_) => "attempt_host_ledger_io",
         CancelLedgerError::Sqlite(_) => "attempt_host_ledger_sqlite",
-        CancelLedgerError::Conflict { .. } | CancelLedgerError::LedgerFull { .. } => {
-            "attempt_host_ledger_unavailable"
-        }
+        CancelLedgerError::Conflict { .. }
+        | CancelLedgerError::LedgerFull { .. }
+        | CancelLedgerError::InFlight => "attempt_host_ledger_unavailable",
     }
 }

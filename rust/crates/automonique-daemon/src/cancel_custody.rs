@@ -14,6 +14,9 @@
 //!
 //! # What this establishes, and what it does not
 //!
+//! - A fresh `classify` commits a `reserved` row before any sink is touched.
+//!   Another reservation-aware process therefore cannot classify the same
+//!   reference as fresh during N/N+1 overlap.
 //! - A `record` that returns [`CustodyVerdict::Fresh`] means the binding
 //!   `request_ref -> (attempt_id, observed_sequence)` is durable: committed in
 //!   one immediate transaction, visible to any later reader of that file,
@@ -22,6 +25,9 @@
 //!   about custody's memory, never about a process exiting or a run reaching a
 //!   terminal state. The control server delivers to its own sink; this ledger
 //!   only remembers that it did.
+//! - A crash after reservation but before completion remains `reserved` and is
+//!   reported unavailable. It is ambiguous evidence for reconciliation, never
+//!   permission to deliver again.
 //! - Idempotency holds for exactly as long as the row is live. The ledger's own
 //!   `prune` forgets rows, and a forgotten reference is answered `Fresh` a
 //!   second time.
@@ -41,14 +47,15 @@
 //! observe and retry against, so it keeps its own
 //! [`CustodyFailure::Full`] category and reaches the wire as `ledger_full`.
 
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use automonique_runner::control::{
     CancelClaim, CancelCustody, CustodyFailure, CustodyVerdict, MAX_IDENTIFIER_BYTES,
 };
 use automonique_store::cancel_ledger::{
-    CancelDisposition, CancelLedger, CancelLedgerError, CancelRequest,
-    MAX_IDENTIFIER_BYTES as LEDGER_MAX_IDENTIFIER_BYTES,
+    CancelDisposition, CancelLedger, CancelLedgerError, CancelRequest, CancelReservation,
+    CancelReserveDisposition, MAX_IDENTIFIER_BYTES as LEDGER_MAX_IDENTIFIER_BYTES,
 };
 
 // The control endpoint validates every identifier against its own stricter
@@ -59,12 +66,14 @@ const _: () = assert!(MAX_IDENTIFIER_BYTES <= LEDGER_MAX_IDENTIFIER_BYTES);
 
 /// Durable, host-wide cancel custody backed by [`CancelLedger`].
 ///
-/// Two control servers over one ledger file deduplicate against each other, and
-/// a server that restarts over the same file answers `already_delivered` for
-/// every reference its predecessor recorded.
+/// Two reservation-aware control servers over one ledger file reserve against
+/// each other before delivery, and a server that restarts over the same file
+/// answers `already_delivered` for every completed reference its predecessor
+/// recorded.
 #[derive(Debug)]
 pub struct StoreCancelCustody {
     ledger: CancelLedger,
+    reservations: HashMap<String, CancelReservation>,
 }
 
 impl StoreCancelCustody {
@@ -75,11 +84,18 @@ impl StoreCancelCustody {
     /// handle's capacity is whatever it was opened with; this type never
     /// widens it.
     #[must_use]
-    pub const fn new(ledger: CancelLedger) -> Self {
-        Self { ledger }
+    pub fn new(ledger: CancelLedger) -> Self {
+        Self {
+            ledger,
+            reservations: HashMap::new(),
+        }
     }
 
     /// Recover the owned ledger for controlled shutdown, pruning or tests.
+    ///
+    /// Consuming custody does not abandon outstanding reservations. They stay
+    /// durably ambiguous and fail closed after reopen, exactly like a process
+    /// exit between reservation and completion.
     #[must_use]
     pub fn into_ledger(self) -> CancelLedger {
         self.ledger
@@ -90,65 +106,62 @@ impl StoreCancelCustody {
     pub const fn ledger(&self) -> &CancelLedger {
         &self.ledger
     }
-
-    /// Decide one claim against a row the ledger already holds.
-    ///
-    /// The comparison is the ledger's own binding rule, restated here because
-    /// `classify` must not write: `attempt_id` and `observed_sequence` both
-    /// bind, and `requested_at_ms` does not — a retry naturally carries a later
-    /// clock and is still an exact replay.
-    fn verdict_for_recorded(
-        recorded_attempt_id: &str,
-        recorded_observed_sequence: u64,
-        claim: CancelClaim<'_>,
-    ) -> CustodyVerdict {
-        if recorded_attempt_id == claim.attempt_id
-            && recorded_observed_sequence == claim.observed_sequence
-        {
-            CustodyVerdict::Replay
-        } else {
-            CustodyVerdict::Conflict
-        }
-    }
 }
 
 impl CancelCustody for StoreCancelCustody {
-    fn classify(&self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure> {
-        if let Some(entry) = self
-            .ledger
-            .entry(claim.request_ref)
-            .map_err(|error| custody_failure(&error))?
-        {
-            return Ok(Self::verdict_for_recorded(
-                &entry.attempt_id,
-                entry.observed_sequence,
-                claim,
-            ));
+    fn classify(&mut self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure> {
+        if self.reservations.contains_key(claim.request_ref) {
+            return Err(CustodyFailure::Unavailable);
         }
-        // Lookup precedes the capacity check, exactly as the ledger's own
-        // recording does: a replay writes nothing and must never degrade into a
-        // refusal because the ledger happens to be full.
-        let live = self
-            .ledger
-            .entry_count()
-            .map_err(|error| custody_failure(&error))?;
-        if live >= self.ledger.capacity() {
-            return Err(CustodyFailure::Full);
-        }
-        Ok(CustodyVerdict::Fresh)
-    }
-
-    fn record(&mut self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure> {
-        // The clock is ours, never the wire's: a client cannot backdate a
-        // durable row by sending a timestamp, because there is no field for one.
-        let requested_at_ms = now_ms()?;
         let request = CancelRequest {
             request_ref: claim.request_ref,
             attempt_id: claim.attempt_id,
             observed_sequence: claim.observed_sequence,
-            requested_at_ms,
+            requested_at_ms: now_ms()?,
         };
-        match self.ledger.record(request) {
+        match self.ledger.reserve(request) {
+            Err(CancelLedgerError::Conflict { .. }) => Ok(CustodyVerdict::Conflict),
+            Err(error) => Err(custody_failure(&error)),
+            Ok(CancelReserveDisposition::Reserved(reservation)) => {
+                self.reservations
+                    .insert(claim.request_ref.to_owned(), reservation);
+                Ok(CustodyVerdict::Fresh)
+            }
+            Ok(CancelReserveDisposition::AlreadyDelivered(_)) => Ok(CustodyVerdict::Replay),
+        }
+    }
+
+    fn record(&mut self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure> {
+        let receipt = if let Some(reservation) = self.reservations.remove(claim.request_ref) {
+            self.ledger.complete(reservation)
+        } else {
+            // A replay or conflict can still be answered when a caller follows
+            // an earlier non-fresh classification with `record`. An absent row
+            // is never inserted here: fresh delivery requires a reservation.
+            if self
+                .ledger
+                .entry(claim.request_ref)
+                .map_err(|error| custody_failure(&error))?
+                .is_none()
+            {
+                if self
+                    .ledger
+                    .entry_count()
+                    .map_err(|error| custody_failure(&error))?
+                    >= self.ledger.capacity()
+                {
+                    return Err(CustodyFailure::Full);
+                }
+                return Err(CustodyFailure::Unavailable);
+            }
+            self.ledger.record(CancelRequest {
+                request_ref: claim.request_ref,
+                attempt_id: claim.attempt_id,
+                observed_sequence: claim.observed_sequence,
+                requested_at_ms: now_ms()?,
+            })
+        };
+        match receipt {
             Ok(receipt) => Ok(match receipt.disposition {
                 CancelDisposition::Delivered => CustodyVerdict::Fresh,
                 CancelDisposition::AlreadyDelivered => CustodyVerdict::Replay,
@@ -156,6 +169,16 @@ impl CancelCustody for StoreCancelCustody {
             Err(CancelLedgerError::Conflict { .. }) => Ok(CustodyVerdict::Conflict),
             Err(error) => Err(custody_failure(&error)),
         }
+    }
+
+    fn abandon(&mut self, claim: CancelClaim<'_>) -> Result<(), CustodyFailure> {
+        let reservation = self
+            .reservations
+            .remove(claim.request_ref)
+            .ok_or(CustodyFailure::Unavailable)?;
+        self.ledger
+            .abandon(reservation)
+            .map_err(|error| custody_failure(&error))
     }
 }
 
@@ -172,6 +195,7 @@ impl CancelCustody for StoreCancelCustody {
 const fn custody_failure(error: &CancelLedgerError) -> CustodyFailure {
     match error {
         CancelLedgerError::LedgerFull { .. } => CustodyFailure::Full,
+        CancelLedgerError::InFlight => CustodyFailure::Unavailable,
         CancelLedgerError::Conflict { .. }
         | CancelLedgerError::InvalidField(_)
         | CancelLedgerError::InsecurePath(_)

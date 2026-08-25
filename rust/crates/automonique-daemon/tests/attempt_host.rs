@@ -8,16 +8,10 @@
 //!    `already_delivered` by a *different* host object, over the same ledger
 //!    file, after the first was disposed. Every restart test here tears the
 //!    host down and reopens the file; none of them clears a map.
-//! 2. **One owner.** One reference reaches one sink once, however many callers
-//!    race for it — including a caller on a real control socket racing a caller
-//!    holding the host directly.
-//!
-//! [`two_hosts_over_one_ledger_file_double_deliver`] is the negative control
-//! for the second claim, and it is why the racing tests mean anything: it opens
-//! *two* hosts over one file, races them identically, and asserts the double
-//! delivery **is** observable. The file does not serialise anything; the
-//! daemon's decision to hold exactly one host does. A harness that could not
-//! see the failure would not be evidence that the failure is absent.
+//! 2. **Overlap safety.** One reference reaches one sink once, however many
+//!    callers race for it — including a caller on a real control socket racing
+//!    a direct caller, and two reservation-aware process-local hosts sharing
+//!    the durable ledger during bounded generation overlap.
 //!
 //! Refusals are asserted by exact category throughout. Two guards that both
 //! refuse are not interchangeable: `attempt_host_ledger_insecure_path` says
@@ -130,6 +124,18 @@ impl CancelSink for CountingSink {
         self.refs.lock().expect("refs").push(request_ref.to_owned());
         self.deliveries.fetch_add(1, Ordering::Release);
         Ok(CancelDelivery::Accepted)
+    }
+}
+
+struct RefusingSink;
+
+impl CancelSink for RefusingSink {
+    fn deliver(
+        &self,
+        _attempt_id: &str,
+        _request_ref: &str,
+    ) -> Result<CancelDelivery, CancelSinkError> {
+        Err(CancelSinkError::Unavailable)
     }
 }
 
@@ -662,7 +668,7 @@ fn a_wire_cancel_racing_a_direct_cancel_of_one_reference_delivers_once() {
 }
 
 #[test]
-fn two_hosts_over_one_ledger_file_double_deliver() {
+fn two_hosts_over_one_ledger_file_reserve_before_delivery() {
     let root = PrivateRoot::new();
     // Exactly what the daemon refuses to compose: two owners, one file.
     let first = root.host();
@@ -673,12 +679,11 @@ fn two_hosts_over_one_ledger_file_double_deliver() {
         .register("attempt-two", probe.sink("attempt-two", false))
         .expect("register second");
 
-    let mut double_delivered = 0_usize;
     for iteration in 0..RACE_ITERATIONS {
         let request_ref = format!("ref-{iteration}");
         let before = probe.deliveries();
         let barrier = Barrier::new(2);
-        std::thread::scope(|scope| {
+        let (left, right) = std::thread::scope(|scope| {
             let left = scope.spawn(|| {
                 barrier.wait();
                 first.cancel("attempt-two", &request_ref, 7)
@@ -687,27 +692,61 @@ fn two_hosts_over_one_ledger_file_double_deliver() {
                 barrier.wait();
                 second.cancel("attempt-two", &request_ref, 7)
             });
-            let _ = (left.join().expect("left"), right.join().expect("right"));
+            (left.join().expect("left"), right.join().expect("right"))
         });
-        if probe.deliveries() - before > 1 {
-            double_delivered += 1;
-        }
+        assert_eq!(
+            probe.deliveries() - before,
+            1,
+            "iteration {iteration}: one reference reached two process-local sinks"
+        );
+        assert!(
+            matches!(
+                (left, right),
+                (
+                    DispatchOutcome::Delivered,
+                    DispatchOutcome::AlreadyDelivered | DispatchOutcome::CustodyUnavailable
+                ) | (
+                    DispatchOutcome::AlreadyDelivered | DispatchOutcome::CustodyUnavailable,
+                    DispatchOutcome::Delivered
+                )
+            ),
+            "iteration {iteration}: unexpected outcomes {left:?}/{right:?}"
+        );
     }
+    assert_eq!(probe.deliveries(), RACE_ITERATIONS);
+}
 
-    // Reported rather than merely asserted: a rate this test cannot observe is
-    // a harness that has stopped proving anything about the single-host tests.
-    eprintln!(
-        "two hosts over one ledger: {double_delivered}/{RACE_ITERATIONS} iterations \
-         double-delivered"
+#[test]
+fn a_refusing_sink_releases_the_durable_reservation_for_retry() {
+    let root = PrivateRoot::new();
+    let host = root.host();
+    let refusing = host
+        .register("attempt-retry", Box::new(RefusingSink))
+        .expect("register refusing sink");
+
+    assert_eq!(
+        host.cancel("attempt-retry", "ref-retry", 7),
+        DispatchOutcome::SinkUnavailable
     );
     assert!(
-        double_delivered > 0,
-        "two hosts over one ledger never raced in {RACE_ITERATIONS} iterations, so the \
-         single-host tests' passing means nothing; raise the iteration count"
+        recorded(&root.ledger_path(), "attempt-retry").is_empty(),
+        "a sink refusal must leave no durable reservation"
     );
-    // The tell that this is the real bug: the sink fired more often than there
-    // are references. The durable file deduplicates nothing on its own.
-    assert!(probe.deliveries() > RACE_ITERATIONS);
+
+    drop(refusing);
+    let (sink, probe) = SinkProbe::boxed("attempt-retry");
+    let _available = host
+        .register("attempt-retry", sink)
+        .expect("register retry sink");
+    assert_eq!(
+        host.cancel("attempt-retry", "ref-retry", 7),
+        DispatchOutcome::Delivered
+    );
+    assert_eq!(probe.deliveries(), 1);
+    assert_eq!(
+        recorded(&root.ledger_path(), "attempt-retry"),
+        vec![("ref-retry".to_owned(), 7)]
+    );
 }
 
 // --- registration lifecycle and bounds ------------------------------------

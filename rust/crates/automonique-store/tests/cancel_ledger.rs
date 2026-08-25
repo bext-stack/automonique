@@ -13,8 +13,9 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use automonique_store::cancel_ledger::{
-    CANCEL_LEDGER_SCHEMA_VERSION, CancelDisposition, CancelLedger, CancelRequest,
-    MAX_IDENTIFIER_BYTES, MAX_LEDGER_ENTRIES, Retention,
+    CANCEL_LEDGER_SCHEMA_VERSION, CancelDisposition, CancelEntryState, CancelLedger,
+    CancelLedgerError, CancelRequest, CancelReserveDisposition, MAX_IDENTIFIER_BYTES,
+    MAX_LEDGER_ENTRIES, Retention,
 };
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -73,6 +74,126 @@ fn a_fresh_ledger_stamps_its_schema_version() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("user_version");
     assert_eq!(version, CANCEL_LEDGER_SCHEMA_VERSION);
+}
+
+#[test]
+fn a_v1_ledger_migrates_existing_deliveries_in_place() {
+    let private = PrivateLedger::new();
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(private.path())
+        .expect("private file");
+    let raw = Connection::open(private.path()).expect("v1 database");
+    raw.execute_batch(
+        "CREATE TABLE cancel_requests (
+            entry_id INTEGER PRIMARY KEY,
+            request_ref TEXT NOT NULL UNIQUE,
+            attempt_id TEXT NOT NULL,
+            observed_sequence INTEGER NOT NULL CHECK (observed_sequence >= 0),
+            requested_at_ms INTEGER NOT NULL CHECK (requested_at_ms >= 0)
+         ) STRICT;
+         CREATE INDEX cancel_requests_by_attempt
+            ON cancel_requests(attempt_id, entry_id);
+         INSERT INTO cancel_requests
+            (request_ref, attempt_id, observed_sequence, requested_at_ms)
+            VALUES ('ref:v1', 'attempt:v1', 7, 100);
+         PRAGMA user_version = 1;",
+    )
+    .expect("v1 schema and row");
+    drop(raw);
+
+    let ledger = CancelLedger::open(private.path()).expect("migrate v1");
+    let entry = ledger.entry("ref:v1").expect("read").expect("entry");
+    assert_eq!(entry.delivery_state, CancelEntryState::Delivered);
+    let raw = Connection::open(private.path()).expect("inspect migrated schema");
+    let version: u32 = raw
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("version");
+    assert_eq!(version, CANCEL_LEDGER_SCHEMA_VERSION);
+}
+
+#[test]
+fn a_reservation_excludes_another_process_before_sink_delivery() {
+    assert_eq!(CancelEntryState::Reserved.as_str(), "reserved");
+    assert_eq!(CancelEntryState::Delivered.as_str(), "delivered");
+    let private = PrivateLedger::new();
+    let mut first = CancelLedger::open(private.path()).expect("first ledger");
+    let mut second = CancelLedger::open(private.path()).expect("second ledger");
+    let reservation = match first
+        .reserve(request("ref:reserved", "attempt:a", 7))
+        .expect("reserve")
+    {
+        CancelReserveDisposition::Reserved(reservation) => reservation,
+        CancelReserveDisposition::AlreadyDelivered(_) => panic!("fresh reference replayed"),
+    };
+    assert!(matches!(
+        second
+            .reserve(request("ref:reserved", "attempt:a", 7))
+            .expect_err("second reservation must fail"),
+        CancelLedgerError::InFlight
+    ));
+    assert_eq!(
+        first
+            .entry("ref:reserved")
+            .expect("entry")
+            .expect("reserved row")
+            .delivery_state,
+        CancelEntryState::Reserved
+    );
+
+    let receipt = first.complete(reservation).expect("complete reservation");
+    assert_eq!(receipt.disposition, CancelDisposition::Delivered);
+    match second
+        .reserve(request("ref:reserved", "attempt:a", 7))
+        .expect("completed replay")
+    {
+        CancelReserveDisposition::AlreadyDelivered(replay) => {
+            assert_eq!(replay.disposition, CancelDisposition::AlreadyDelivered);
+        }
+        CancelReserveDisposition::Reserved(_) => panic!("completed reference reserved again"),
+    }
+}
+
+#[test]
+fn an_abandoned_reservation_can_be_claimed_again() {
+    let private = PrivateLedger::new();
+    let mut first = CancelLedger::open(private.path()).expect("first ledger");
+    let reservation = match first
+        .reserve(request("ref:retry", "attempt:a", 7))
+        .expect("reserve")
+    {
+        CancelReserveDisposition::Reserved(reservation) => reservation,
+        CancelReserveDisposition::AlreadyDelivered(_) => panic!("fresh reference replayed"),
+    };
+    first.abandon(reservation).expect("abandon");
+    assert!(first.entry("ref:retry").expect("lookup").is_none());
+    assert!(matches!(
+        first
+            .reserve(request("ref:retry", "attempt:a", 7))
+            .expect("reserve retry"),
+        CancelReserveDisposition::Reserved(_)
+    ));
+}
+
+#[test]
+fn a_crashed_reservation_stays_ambiguous_after_reopen() {
+    let private = PrivateLedger::new();
+    let mut first = CancelLedger::open(private.path()).expect("first ledger");
+    let _reservation = first
+        .reserve(request("ref:crash", "attempt:a", 7))
+        .expect("reserve");
+    drop(first);
+
+    let mut reopened = CancelLedger::open(private.path()).expect("reopen");
+    assert!(matches!(
+        reopened
+            .reserve(request("ref:crash", "attempt:a", 7))
+            .expect_err("ambiguous reservation"),
+        CancelLedgerError::InFlight
+    ));
 }
 
 #[test]

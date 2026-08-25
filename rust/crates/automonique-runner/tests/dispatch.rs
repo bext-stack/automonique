@@ -229,7 +229,7 @@ impl CustodyProbe {
 struct ProbeCustody(Arc<Mutex<CustodyState>>);
 
 impl CancelCustody for ProbeCustody {
-    fn classify(&self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure> {
+    fn classify(&mut self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure> {
         let mut state = self.0.lock().unwrap();
         state.classify_calls += 1;
         if let Some(failure) = state.classify_failure {
@@ -762,7 +762,7 @@ fn a_stale_seat_sink_cannot_cross_route_into_a_later_registration() {
     // registration epoch is then the only thing standing between it and its
     // successor's sink, so this test fails if that pin is removed rather than
     // passing on an earlier check.
-    let seat_custody = seat.custody();
+    let mut seat_custody = seat.custody();
     let claim = CancelClaim {
         attempt_id: "attempt-churn",
         request_ref: "ref-a",
@@ -1173,7 +1173,7 @@ fn a_seat_sink_reached_without_its_own_classify_refuses() {
 
     // With its own classify first, the same call completes — and only once:
     // the claim is consumed, so a repeated delivery for one classify refuses.
-    let seat_custody = seat.custody();
+    let mut seat_custody = seat.custody();
     let claim = CancelClaim {
         attempt_id: "attempt-seat",
         request_ref: "ref-a",

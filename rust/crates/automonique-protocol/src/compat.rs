@@ -1168,11 +1168,13 @@ impl Component {
             // `SCHEMA_VERSION` is 10, and the numbered migrations run an
             // unbroken v1 -> v2 -> ... -> v10 chain, so a v1 file still opens.
             Self::StoreSchema => (1, 10),
+            // Cancel ledger v2 adds an expand-only delivery reservation state
+            // and migrates v1's already-delivered rows in place.
+            Self::CancelLedgerSchema => (1, 2),
             // These sibling databases remain on their first schema.
-            Self::CancelLedgerSchema
-            | Self::GenerationAuditSchema
-            | Self::ReloadAuditSchema
-            | Self::RunSubmissionsSchema => (1, 1),
+            Self::GenerationAuditSchema | Self::ReloadAuditSchema | Self::RunSubmissionsSchema => {
+                (1, 1)
+            }
             // Slack ingress v2 adds provenance and migrates v1 files in place.
             Self::SlackIngressSchema => (1, 2),
             // Provider journal v4 adds deterministic replay after v3 provenance.

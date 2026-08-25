@@ -23,11 +23,14 @@
 //! ```
 //!
 //! Idempotency was claimed and not held: one reference reached a sink twice.
-//! [`CancelDispatcher::cancel`] makes that interleaving unspellable — B cannot
-//! observe `Fresh` while A is between its own classify and its own record,
-//! because both sequences run under the same lock. Exactly one caller is told
-//! [`DispatchOutcome::Delivered`]; every other caller of that reference is told
-//! [`DispatchOutcome::AlreadyDelivered`] and the sink fires once.
+//! [`CancelDispatcher::cancel`] makes that interleaving unspellable inside one
+//! dispatcher. Exactly one caller is told [`DispatchOutcome::Delivered`]; every
+//! later caller of that reference is told
+//! [`DispatchOutcome::AlreadyDelivered`], and the sink fires once. A custody
+//! implementation that durably reserves during `classify` extends sink
+//! exclusion across dispatcher processes; an overlapping caller may fail
+//! closed as [`DispatchOutcome::CustodyUnavailable`] while the winner is still
+//! in flight, then observe `AlreadyDelivered` after completion.
 //!
 //! # Lock discipline
 //!
@@ -79,9 +82,9 @@
 //! So the atomicity lives in the *sink* instead. A [`ControlSeat`] hands one
 //! server a custody adapter and one sink adapter per attempt:
 //!
-//! - the custody adapter classifies against the dispatcher's real custody, so a
-//!   replay is still answered `already_delivered` and a conflict still refuses
-//!   `cancel_conflict` **without the sink being touched**;
+//! - the custody adapter remembers a syntactically valid claim but deliberately
+//!   defers authoritative classification to the sink adapter, avoiding a second
+//!   reservation of the same reference;
 //! - the sink adapter runs the entire serialized sequence — re-classify,
 //!   deliver, record — so a request that lost the race between the server's
 //!   classify and its deliver is not delivered a second time;
@@ -101,11 +104,10 @@
 //!
 //! # What this does **not** establish
 //!
-//! - **Host-wide means one dispatcher instance.** Two dispatchers over one
-//!   durable ledger file still interleave exactly as two bare servers did: this
-//!   type serialises the callers it owns, not the file. Closing that needs one
-//!   process to own custody for the host — composition policy the daemon
-//!   decides, not a property this type can carry.
+//! - **Cross-process exclusion belongs to custody.** This type serialises the
+//!   callers it owns. Two dispatchers are safe only when their shared durable
+//!   custody reserves a fresh claim before either sink is touched; a purely
+//!   in-memory custody remains process-local.
 //! - **It is not exit evidence.** [`DispatchOutcome::Delivered`] says a request
 //!   reached a sink once. Whether a process exited, whether descendants were
 //!   reaped and whether the run reached a terminal state remain separate
@@ -339,7 +341,10 @@ impl DispatchCore {
         if registration.sink.deliver(attempt_id, request_ref).is_err() {
             // Nothing recorded: a delivery that was refused must never be
             // remembered as one, or the retry becomes a false replay.
-            return DispatchOutcome::SinkUnavailable;
+            return match custody.abandon(claim) {
+                Ok(()) => DispatchOutcome::SinkUnavailable,
+                Err(failure) => custody_outcome(failure),
+            };
         }
         match custody.record(claim) {
             Ok(CustodyVerdict::Fresh | CustodyVerdict::Replay) => DispatchOutcome::Delivered,
@@ -611,9 +616,9 @@ pub struct ControlSeat {
 impl ControlSeat {
     /// Custody for [`ControlServer::bind`](crate::control::ControlServer::bind).
     ///
-    /// It classifies and records against the dispatcher's real custody, and it
-    /// remembers the claim it classified so this seat's sinks can complete it.
-    /// Bind exactly one server with it.
+    /// It remembers the claim so this seat's sink can run authoritative
+    /// classification and delivery through the dispatcher in one serialized
+    /// operation. Bind exactly one server with it.
     #[must_use]
     pub fn custody(&self) -> Box<dyn CancelCustody> {
         Box::new(SeatCustody {
@@ -672,17 +677,13 @@ impl SeatCustody {
 }
 
 impl CancelCustody for SeatCustody {
-    fn classify(&self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure> {
-        let core = self.core.upgrade().ok_or(CustodyFailure::Unavailable)?;
-        let verdict = {
-            let guard = core.state.lock().map_err(|_| CustodyFailure::Unavailable)?;
-            guard.custody.classify(claim)
-        };
-        self.remember(match verdict {
-            Ok(CustodyVerdict::Fresh) => Some(&claim),
-            _ => None,
-        });
-        verdict
+    fn classify(&mut self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure> {
+        self.core.upgrade().ok_or(CustodyFailure::Unavailable)?;
+        // The sink adapter performs the authoritative classification inside
+        // the dispatcher's serialized section. Remembering the claim here
+        // supplies its observed sequence without reserving it twice.
+        self.remember(Some(&claim));
+        Ok(CustodyVerdict::Fresh)
     }
 
     fn record(&mut self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure> {
@@ -692,6 +693,11 @@ impl CancelCustody for SeatCustody {
         self.remember(None);
         let mut guard = core.state.lock().map_err(|_| CustodyFailure::Unavailable)?;
         guard.custody.record(claim)
+    }
+
+    fn abandon(&mut self, _claim: CancelClaim<'_>) -> Result<(), CustodyFailure> {
+        self.remember(None);
+        Ok(())
     }
 }
 

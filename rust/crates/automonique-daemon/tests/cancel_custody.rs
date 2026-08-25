@@ -153,6 +153,10 @@ fn reusing_a_reference_conflicts_on_either_bound_coordinate() {
     let root = PrivateRoot::new();
     let mut custody = root.custody();
     assert_eq!(
+        custody.classify(claim("attempt-1", "ref-a", 7)),
+        Ok(CustodyVerdict::Fresh)
+    );
+    assert_eq!(
         custody.record(claim("attempt-1", "ref-a", 7)),
         Ok(CustodyVerdict::Fresh)
     );
@@ -193,7 +197,7 @@ fn reusing_a_reference_conflicts_on_either_bound_coordinate() {
 
     // And it survives a reopen as a conflict, not as a fresh claim.
     drop(custody);
-    let custody = root.custody();
+    let mut custody = root.custody();
     assert_eq!(
         custody.classify(claim("attempt-2", "ref-a", 7)),
         Ok(CustodyVerdict::Conflict)
@@ -247,6 +251,10 @@ fn a_full_ledger_refuses_a_new_binding_before_delivery_and_still_replays() {
         CancelLedger::open_with_capacity(root.ledger_path(), 1).expect("open bounded ledger"),
     );
 
+    assert_eq!(
+        custody.classify(claim("attempt-1", "ref-a", 7)),
+        Ok(CustodyVerdict::Fresh)
+    );
     assert_eq!(
         custody.record(claim("attempt-1", "ref-a", 7)),
         Ok(CustodyVerdict::Fresh)

@@ -32,7 +32,7 @@ fn the_schema_versions_this_crate_owns_match_the_compat_matrix_rows() {
          row in automonique-protocol/src/compat.rs together with this pin"
     );
     assert_eq!(
-        CANCEL_LEDGER_SCHEMA_VERSION, 1,
+        CANCEL_LEDGER_SCHEMA_VERSION, 2,
         "cancel ledger schema moved: update the compat matrix row and this pin"
     );
     assert_eq!(

@@ -396,8 +396,9 @@ pub struct CancelClaim<'a> {
 /// What custody holds for one claim.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CustodyVerdict {
-    /// Custody holds no binding for this reference and has room to record one.
-    /// From [`CancelCustody::record`] it means the binding is now held.
+    /// Custody admitted this reference as new. From
+    /// [`CancelCustody::classify`] the implementation may already hold a
+    /// reservation; from [`CancelCustody::record`] the delivery is complete.
     Fresh,
     /// Custody already holds this exact binding. The sink must not be called
     /// again, and [`CancelCustody::record`] wrote nothing.
@@ -441,27 +442,28 @@ impl std::error::Error for CustodyFailure {}
 /// holds one implementation for its whole lifetime and consults it around every
 /// `cancel`; it keeps no idempotency state of its own.
 ///
-/// The two methods exist because the server delivers between them:
+/// The three methods exist because the server delivers between them:
 ///
-/// 1. [`classify`](CancelCustody::classify) decides one claim and writes
-///    nothing. A [`CustodyVerdict::Replay`] answers the client without the sink
-///    ever being called, which is what makes idempotency observable rather than
-///    merely claimed.
+/// 1. [`classify`](CancelCustody::classify) decides one claim and may reserve it
+///    atomically. A [`CustodyVerdict::Replay`] answers the client without the
+///    sink ever being called.
 /// 2. [`record`](CancelCustody::record) is called only after a sink accepted
-///    delivery, so a delivery that never happened is never remembered as one.
+///    delivery and completes that reservation.
+/// 3. [`abandon`](CancelCustody::abandon) releases the reservation when the
+///    sink refused, so a later retry is genuinely fresh.
 ///
-/// The ordering costs exactly one thing, and it is stated rather than hidden: a
-/// crash between the two loses the record, and a later replay delivers a second
-/// time. The alternative — record first — turns every crash into a
-/// cancellation that was recorded but never delivered, which is worse for a
-/// caller that reads the ledger to decide whether to act.
+/// A durable implementation keeps a crash between reservation and completion
+/// as an explicit ambiguous state. A retry must fail closed rather than deliver
+/// twice or claim that delivery completed.
 ///
-/// An implementation must be consistent across the pair: a claim that
+/// An implementation must be consistent across the sequence: a claim that
 /// `classify` called [`CustodyVerdict::Fresh`] must not become a
 /// [`CustodyVerdict::Conflict`] on `record` unless something outside this
-/// server wrote in between.
+/// server wrote in between. An implementation that reserves during `classify`
+/// must override `abandon`; the no-op default exists only for implementations
+/// whose classification writes nothing.
 pub trait CancelCustody: Send {
-    /// Decide one claim without recording anything.
+    /// Decide one claim and reserve fresh delivery when custody supports it.
     ///
     /// # Errors
     ///
@@ -469,7 +471,7 @@ pub trait CancelCustody: Send {
     /// binding — refused *before* delivery, because a delivery custody cannot
     /// record would lose idempotency for every later replay — and
     /// [`CustodyFailure::Unavailable`] when custody could not be consulted.
-    fn classify(&self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure>;
+    fn classify(&mut self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure>;
 
     /// Record one claim whose delivery a sink accepted.
     ///
@@ -477,6 +479,16 @@ pub trait CancelCustody: Send {
     ///
     /// Same categories as [`classify`](CancelCustody::classify).
     fn record(&mut self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure>;
+
+    /// Release any reservation created by [`Self::classify`] when the sink
+    /// refused delivery.
+    ///
+    /// Implementations whose classification reserves durable state must
+    /// override this method. The default is correct only when classification
+    /// writes nothing.
+    fn abandon(&mut self, _claim: CancelClaim<'_>) -> Result<(), CustodyFailure> {
+        Ok(())
+    }
 }
 
 /// Closed set of refusal categories that reach the wire.
@@ -1018,11 +1030,17 @@ impl ControlServer {
             CustodyVerdict::Conflict => return Err(Refusal::CancelConflict),
             CustodyVerdict::Fresh => {}
         }
-        let delivery = self
+        let delivery = match self
             .binding(attempt_id)?
             .cancel
             .deliver(attempt_id, request_ref)
-            .map_err(cancel_sink_refusal)?;
+        {
+            Ok(delivery) => delivery,
+            Err(error) => {
+                self.custody.abandon(claim).map_err(custody_refusal)?;
+                return Err(cancel_sink_refusal(error));
+            }
+        };
         match delivery {
             CancelDelivery::Delivered => return Ok(DELIVERED_LINE.to_owned()),
             CancelDelivery::AlreadyDelivered => {
@@ -1030,8 +1048,8 @@ impl ControlServer {
             }
             CancelDelivery::Accepted => {}
         }
-        // Recorded only now: an unavailable delivery leaves custody untouched,
-        // so a retry is a real second attempt rather than a false replay.
+        // Completed only now. A refused sink released any reservation above,
+        // so its retry remains a real second attempt rather than a false replay.
         match self.custody.record(claim).map_err(custody_refusal)? {
             // A record that replays means another writer bound the same claim
             // between the two calls. This server's sink did fire, so the answer

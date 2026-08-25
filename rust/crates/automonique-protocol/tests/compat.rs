@@ -1034,7 +1034,7 @@ mod versions {
             let matrix = shipped_matrix();
             let recorded = [
                 (Component::StoreSchema, 1, 10),
-                (Component::CancelLedgerSchema, 1, 1),
+                (Component::CancelLedgerSchema, 1, 2),
                 (Component::GenerationAuditSchema, 1, 1),
                 (Component::ReloadAuditSchema, 1, 1),
                 (Component::ProviderJournalSchema, 1, 4),

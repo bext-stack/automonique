@@ -17,12 +17,16 @@
 //! request_ref -> (attempt_id, observed_sequence, requested_at_ms)
 //! ```
 //!
-//! and answers three ways and only three ways:
+//! and supports a two-phase delivery discipline:
 //!
-//! - the reference is new: the binding is recorded, [`CancelDisposition::Delivered`];
-//! - the reference is present with the *same* attempt and sequence: it is an
-//!   exact replay, [`CancelDisposition::AlreadyDelivered`], and not one byte of
-//!   the durable row changes;
+//! - the reference is new: [`CancelLedger::reserve`] commits it as `reserved`
+//!   before a sink is touched;
+//! - [`CancelLedger::complete`] changes that exact reservation to `delivered`;
+//! - another writer observing a reservation receives
+//!   [`CancelLedgerError::InFlight`] and must not deliver;
+//! - the reference is present, `delivered`, and has the *same* attempt and
+//!   sequence: it is an exact replay, [`CancelDisposition::AlreadyDelivered`],
+//!   and not one byte of the durable row changes;
 //! - the reference is present with a different attempt or a different observed
 //!   sequence: [`CancelLedgerError::Conflict`], and nothing is written.
 //!
@@ -36,11 +40,10 @@
 //!   died. It does not establish that the process exited, that descendants were
 //!   reaped, or that a run reached a terminal state; those remain separate
 //!   observations elsewhere.
-//! - It does not establish that any cancellation sink ever saw the request. A
-//!   caller that records first and delivers second may crash in between; a
-//!   caller that delivers first and records second may deliver twice. Which
-//!   order to use is the caller's decision, and this module states the choice
-//!   rather than hiding it: recording is the cheap, replay-safe half.
+//! - A `reserved` row does not establish that any cancellation sink saw the
+//!   request. It explicitly records the crash-ambiguous window and prevents an
+//!   automatic second delivery. A `delivered` row says the caller completed
+//!   the reservation after its sink accepted the request.
 //! - `observed_sequence` is the requester's claim about what it had seen. The
 //!   ledger stores and compares it; it never checks it against a spool, and a
 //!   sequence ahead of reality is recorded, not detected.
@@ -59,9 +62,9 @@
 //!
 //! The ledger owns its own SQLite database with its own `user_version`, opened
 //! under the same privacy, WAL and `synchronous = FULL` rules as [`crate::Store`].
-//! Recording one request is one immediate transaction, so a reader after a
-//! crash sees the whole entry or no entry. Every read re-validates the row it
-//! loaded rather than trusting the database.
+//! Reserving, completing and abandoning each use one immediate transaction, so
+//! a reader after a crash sees one whole state. Every read re-validates the row
+//! it loaded rather than trusting the database.
 
 use std::error::Error;
 use std::fmt;
@@ -76,7 +79,7 @@ use rusqlite::{
 use crate::{StoreError, validate_database_path};
 
 /// The only cancel ledger schema this build can read and write.
-pub const CANCEL_LEDGER_SCHEMA_VERSION: u32 = 1;
+pub const CANCEL_LEDGER_SCHEMA_VERSION: u32 = 2;
 
 /// Largest number of live entries any ledger will hold.
 pub const MAX_LEDGER_ENTRIES: usize = 65_536;
@@ -93,24 +96,31 @@ pub const MAX_BATCH_REQUESTS: usize = 1_024;
 /// Largest terminal-attempt list [`CancelLedger::prune`] will accept.
 pub const MAX_TERMINAL_ATTEMPTS: usize = 1_024;
 
-/// Schema v1.
+/// Schema v2.
 ///
 /// Uniqueness of `request_ref` and the non-negative ranges are database
 /// constraints so a second writer cannot introduce a duplicate binding. The
 /// identifier grammar and length bound are deliberately *not* database
 /// constraints: they are enforced on write and re-checked on every read, so a
 /// row written around this API is refused rather than believed.
-const SCHEMA_V1: &str = r#"
+const SCHEMA_V2: &str = r#"
 CREATE TABLE cancel_requests (
     entry_id INTEGER PRIMARY KEY,
     request_ref TEXT NOT NULL UNIQUE,
     attempt_id TEXT NOT NULL,
     observed_sequence INTEGER NOT NULL CHECK (observed_sequence >= 0),
-    requested_at_ms INTEGER NOT NULL CHECK (requested_at_ms >= 0)
+    requested_at_ms INTEGER NOT NULL CHECK (requested_at_ms >= 0),
+    delivery_state TEXT NOT NULL DEFAULT 'delivered'
+        CHECK (delivery_state IN ('reserved', 'delivered'))
 ) STRICT;
 
 CREATE INDEX cancel_requests_by_attempt
     ON cancel_requests(attempt_id, entry_id);
+"#;
+
+const MIGRATE_V1_TO_V2: &str = r#"
+ALTER TABLE cancel_requests ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'delivered'
+    CHECK (delivery_state IN ('reserved', 'delivered'));
 "#;
 
 /// A cancel ledger error with stable refusal categories.
@@ -140,6 +150,8 @@ pub enum CancelLedgerError {
     /// Recording is refused *before* delivery, because a delivery this ledger
     /// cannot record would lose idempotency for every later replay.
     LedgerFull { capacity: usize },
+    /// The exact reference is currently reserved by another dispatcher.
+    InFlight,
     /// A stored row violates an invariant this API can only have written once.
     Corrupt(&'static str),
     /// Filesystem failure while establishing the private ledger.
@@ -158,6 +170,7 @@ impl CancelLedgerError {
             Self::InvalidField(_) => "invalid_field",
             Self::Conflict { .. } => "conflict",
             Self::LedgerFull { .. } => "ledger_full",
+            Self::InFlight => "in_flight",
             Self::Corrupt(_) => "corrupt",
             Self::Io(_) => "io",
             Self::Sqlite(_) => "sqlite",
@@ -188,6 +201,7 @@ impl fmt::Display for CancelLedgerError {
             Self::LedgerFull { capacity } => {
                 write!(formatter, "cancel ledger holds its capacity of {capacity}")
             }
+            Self::InFlight => formatter.write_str("cancellation delivery is already in flight"),
             Self::Corrupt(invariant) => {
                 write!(formatter, "stored row violates invariant: {invariant}")
             }
@@ -274,8 +288,44 @@ pub struct CancelEntry {
     pub request_ref: String,
     pub attempt_id: String,
     pub observed_sequence: u64,
-    /// When the *first* delivery of this reference was recorded.
+    /// When the first reservation or legacy delivery of this reference was
+    /// recorded.
     pub requested_at_ms: i64,
+    /// Whether a dispatcher is between durable reservation and delivery proof.
+    pub delivery_state: CancelEntryState,
+}
+
+/// Durable cancellation delivery state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CancelEntryState {
+    Reserved,
+    Delivered,
+}
+
+impl CancelEntryState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reserved => "reserved",
+            Self::Delivered => "delivered",
+        }
+    }
+}
+
+/// An opaque, single-owner reservation returned before sink delivery.
+#[derive(Debug)]
+pub struct CancelReservation {
+    entry_id: i64,
+    request_ref: String,
+    attempt_id: String,
+    observed_sequence: u64,
+}
+
+/// Result of trying to reserve one cancellation delivery.
+#[derive(Debug)]
+pub enum CancelReserveDisposition {
+    Reserved(CancelReservation),
+    AlreadyDelivered(CancelReceipt),
 }
 
 /// Bounded retention window for [`CancelLedger::prune`].
@@ -371,6 +421,10 @@ impl CancelLedger {
 
     /// Record one cancellation request.
     ///
+    /// This is the legacy direct-delivered path for callers that do no sink IO.
+    /// Cancellation dispatchers must use [`Self::reserve`] and
+    /// [`Self::complete`] so another process is excluded before delivery.
+    ///
     /// One immediate transaction: after a crash a reader sees the whole entry
     /// or no entry, never half of one.
     ///
@@ -392,7 +446,110 @@ impl CancelLedger {
         Ok(receipt)
     }
 
+    /// Atomically reserve one reference before its cancellation sink is touched.
+    ///
+    /// A second writer observing the same exact reservation receives
+    /// [`CancelLedgerError::InFlight`]; it must not deliver. A completed exact
+    /// binding is returned as [`CancelReserveDisposition::AlreadyDelivered`].
+    pub fn reserve(&mut self, request: CancelRequest<'_>) -> Ledgered<CancelReserveDisposition> {
+        validate_request(&request)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let live = count_entries(&transaction)?;
+        if let Some(recorded) = read_entry_by_ref(&transaction, request.request_ref)? {
+            validate_same_binding(&recorded, &request)?;
+            return match recorded.delivery_state {
+                CancelEntryState::Delivered => {
+                    Ok(CancelReserveDisposition::AlreadyDelivered(CancelReceipt {
+                        entry_id: recorded.entry_id,
+                        disposition: CancelDisposition::AlreadyDelivered,
+                    }))
+                }
+                CancelEntryState::Reserved => Err(CancelLedgerError::InFlight),
+            };
+        }
+        if live >= self.capacity {
+            return Err(CancelLedgerError::LedgerFull {
+                capacity: self.capacity,
+            });
+        }
+        transaction.execute(
+            "INSERT INTO cancel_requests
+             (request_ref, attempt_id, observed_sequence, requested_at_ms, delivery_state)
+             VALUES (?1, ?2, ?3, ?4, 'reserved')",
+            params![
+                request.request_ref,
+                request.attempt_id,
+                to_db_u64(request.observed_sequence, "observed_sequence")?,
+                request.requested_at_ms,
+            ],
+        )?;
+        let reservation = CancelReservation {
+            entry_id: transaction.last_insert_rowid(),
+            request_ref: request.request_ref.to_owned(),
+            attempt_id: request.attempt_id.to_owned(),
+            observed_sequence: request.observed_sequence,
+        };
+        transaction.commit()?;
+        Ok(CancelReserveDisposition::Reserved(reservation))
+    }
+
+    /// Mark a sink-accepted reservation as delivered.
+    pub fn complete(&mut self, reservation: CancelReservation) -> Ledgered<CancelReceipt> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let recorded = read_entry_by_ref(&transaction, &reservation.request_ref)?
+            .ok_or(CancelLedgerError::Corrupt("reservation_missing"))?;
+        validate_reservation(&recorded, &reservation)?;
+        if recorded.delivery_state == CancelEntryState::Delivered {
+            return Ok(CancelReceipt {
+                entry_id: recorded.entry_id,
+                disposition: CancelDisposition::AlreadyDelivered,
+            });
+        }
+        let changed = transaction.execute(
+            "UPDATE cancel_requests SET delivery_state = 'delivered'
+             WHERE entry_id = ?1 AND delivery_state = 'reserved'",
+            [reservation.entry_id],
+        )?;
+        if changed != 1 {
+            return Err(CancelLedgerError::Corrupt("reservation_state"));
+        }
+        transaction.commit()?;
+        Ok(CancelReceipt {
+            entry_id: recorded.entry_id,
+            disposition: CancelDisposition::Delivered,
+        })
+    }
+
+    /// Release a reservation after the sink refused delivery.
+    pub fn abandon(&mut self, reservation: CancelReservation) -> Ledgered<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let recorded = read_entry_by_ref(&transaction, &reservation.request_ref)?
+            .ok_or(CancelLedgerError::Corrupt("reservation_missing"))?;
+        validate_reservation(&recorded, &reservation)?;
+        if recorded.delivery_state != CancelEntryState::Reserved {
+            return Err(CancelLedgerError::Corrupt("reservation_state"));
+        }
+        let removed = transaction.execute(
+            "DELETE FROM cancel_requests WHERE entry_id = ?1 AND delivery_state = 'reserved'",
+            [reservation.entry_id],
+        )?;
+        if removed != 1 {
+            return Err(CancelLedgerError::Corrupt("reservation_state"));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Record a batch of cancellation requests atomically.
+    ///
+    /// This is the batch form of the legacy direct-delivered path. It must not
+    /// wrap sink IO; dispatchers use the reservation API instead.
     ///
     /// Every request commits together. A refusal anywhere — a malformed field,
     /// a conflicting reference, the capacity boundary reached part-way —
@@ -502,19 +659,9 @@ fn record_row(
     live: &mut usize,
 ) -> Ledgered<CancelReceipt> {
     if let Some(recorded) = read_entry_by_ref(transaction, request.request_ref)? {
-        if recorded.attempt_id != request.attempt_id {
-            return Err(CancelLedgerError::Conflict {
-                field: "attempt_id",
-                recorded_attempt_id: recorded.attempt_id,
-                recorded_observed_sequence: recorded.observed_sequence,
-            });
-        }
-        if recorded.observed_sequence != request.observed_sequence {
-            return Err(CancelLedgerError::Conflict {
-                field: "observed_sequence",
-                recorded_attempt_id: recorded.attempt_id,
-                recorded_observed_sequence: recorded.observed_sequence,
-            });
+        validate_same_binding(&recorded, request)?;
+        if recorded.delivery_state == CancelEntryState::Reserved {
+            return Err(CancelLedgerError::InFlight);
         }
         // Exact replay. `requested_at_ms` stays at the first delivery's value.
         return Ok(CancelReceipt {
@@ -551,9 +698,11 @@ struct RawEntry {
     attempt_id: String,
     observed_sequence: i64,
     requested_at_ms: i64,
+    delivery_state: String,
 }
 
-const ENTRY_COLUMNS: &str = "entry_id, request_ref, attempt_id, observed_sequence, requested_at_ms";
+const ENTRY_COLUMNS: &str =
+    "entry_id, request_ref, attempt_id, observed_sequence, requested_at_ms, delivery_state";
 
 fn raw_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawEntry> {
     Ok(RawEntry {
@@ -562,6 +711,7 @@ fn raw_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawEntry> {
         attempt_id: row.get(2)?,
         observed_sequence: row.get(3)?,
         requested_at_ms: row.get(4)?,
+        delivery_state: row.get(5)?,
     })
 }
 
@@ -573,7 +723,40 @@ fn validated_entry(raw: RawEntry) -> Ledgered<CancelEntry> {
         observed_sequence: from_db_u64(raw.observed_sequence, "observed_sequence")
             .map_err(|_| corrupt_field("observed_sequence"))?,
         requested_at_ms: checked_time(raw.requested_at_ms, "requested_at_ms")?,
+        delivery_state: match raw.delivery_state.as_str() {
+            "reserved" => CancelEntryState::Reserved,
+            "delivered" => CancelEntryState::Delivered,
+            _ => return Err(corrupt_field("delivery_state")),
+        },
     })
+}
+
+fn validate_same_binding(recorded: &CancelEntry, request: &CancelRequest<'_>) -> Ledgered<()> {
+    if recorded.attempt_id != request.attempt_id {
+        return Err(CancelLedgerError::Conflict {
+            field: "attempt_id",
+            recorded_attempt_id: recorded.attempt_id.clone(),
+            recorded_observed_sequence: recorded.observed_sequence,
+        });
+    }
+    if recorded.observed_sequence != request.observed_sequence {
+        return Err(CancelLedgerError::Conflict {
+            field: "observed_sequence",
+            recorded_attempt_id: recorded.attempt_id.clone(),
+            recorded_observed_sequence: recorded.observed_sequence,
+        });
+    }
+    Ok(())
+}
+
+fn validate_reservation(recorded: &CancelEntry, reservation: &CancelReservation) -> Ledgered<()> {
+    if recorded.entry_id != reservation.entry_id
+        || recorded.attempt_id != reservation.attempt_id
+        || recorded.observed_sequence != reservation.observed_sequence
+    {
+        return Err(CancelLedgerError::Corrupt("reservation_binding"));
+    }
+    Ok(())
 }
 
 fn read_entry_by_ref(connection: &Connection, request_ref: &str) -> Ledgered<Option<CancelEntry>> {
@@ -618,6 +801,13 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Ledgered<()> {
     if version == CANCEL_LEDGER_SCHEMA_VERSION {
         return Ok(());
     }
+    if version == 1 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(MIGRATE_V1_TO_V2)?;
+        transaction.pragma_update(None, "user_version", CANCEL_LEDGER_SCHEMA_VERSION)?;
+        transaction.commit()?;
+        return Ok(());
+    }
     if version != 0 {
         return Err(CancelLedgerError::SchemaVersion {
             found: version,
@@ -636,7 +826,7 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Ledgered<()> {
         });
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(SCHEMA_V1)?;
+    transaction.execute_batch(SCHEMA_V2)?;
     transaction.pragma_update(None, "user_version", CANCEL_LEDGER_SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())

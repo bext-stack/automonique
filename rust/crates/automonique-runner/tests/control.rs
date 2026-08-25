@@ -197,7 +197,7 @@ impl ScriptedCustody {
 }
 
 impl CancelCustody for ScriptedCustody {
-    fn classify(&self, claim: CancelClaim<'_>) -> CustodyAnswer {
+    fn classify(&mut self, claim: CancelClaim<'_>) -> CustodyAnswer {
         self.note(CustodyCall::Classify, claim);
         // An unscripted call is a failure the test can see rather than a
         // silently plausible verdict.
@@ -252,7 +252,7 @@ impl MemoryCancelCustody {
 }
 
 impl CancelCustody for MemoryCancelCustody {
-    fn classify(&self, claim: CancelClaim<'_>) -> CustodyAnswer {
+    fn classify(&mut self, claim: CancelClaim<'_>) -> CustodyAnswer {
         self.verdict(claim)
     }
 

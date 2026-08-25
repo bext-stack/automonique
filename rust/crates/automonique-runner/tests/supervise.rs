@@ -252,7 +252,7 @@ impl TestCustody {
 }
 
 impl CancelCustody for TestCustody {
-    fn classify(&self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure> {
+    fn classify(&mut self, claim: CancelClaim<'_>) -> Result<CustodyVerdict, CustodyFailure> {
         Ok(self.verdict(claim))
     }
 
