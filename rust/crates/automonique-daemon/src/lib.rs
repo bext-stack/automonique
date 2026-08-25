@@ -69,8 +69,10 @@ use automonique_policy::peer::{Admission, PeerCredential, PeerPolicy};
 use automonique_protocol::admin::{
     AdminInstanceId, AdminOutboxEvidence, AdminOutboxEvidenceParts, AdminReconciliationEvidence,
     AdminRefusalCategory, AdminRequest, AdminResponse, DaemonState, DaemonStatus,
-    DurableStateCounts, DurableStateCountsParts, LocalRequest, MAX_ADMIN_CANONICAL_BYTES,
-    OperationalMetric, OperationalStatus, OperationalStatusParts, OutboxReconciliationDecision,
+    DurableStateCounts, DurableStateCountsParts, GenerationHandoffView, GenerationTenureView,
+    GenerationsView, LocalRequest, MAX_ADMIN_CANONICAL_BYTES, MAX_GENERATION_HISTORY_ENTRIES,
+    MAX_RELOAD_TRANSITIONS, OperationalMetric, OperationalStatus, OperationalStatusParts,
+    OutboxReconciliationDecision, ReloadStatusView, ReloadTransitionView,
 };
 use automonique_protocol::approval_api::{
     ApprovalContinuation, ApprovalCursor, ApprovalDecision, ApprovalDisposition, ApprovalKey,
@@ -146,7 +148,7 @@ use automonique_store::generation_audit::{
 };
 use automonique_store::platform_store::{ActionAdmission, PlatformStore, PlatformStoreError};
 use automonique_store::provider_journal::ProviderJournal;
-use automonique_store::reload_audit::ReloadAudit;
+use automonique_store::reload_audit::{ReloadAudit, ReloadAuditError};
 use automonique_store::run_index::{
     RunIndex, RunIndexEntry, RunIndexError, RunIndexRecord, RunSpoolState,
 };
@@ -1350,7 +1352,7 @@ pub struct Daemon {
     /// [`Daemon::serve`] performs explicitly rather than leaving to `Drop`.
     generation_audit: GenerationAudit,
     /// Durable reload epochs and their append-only transition history.
-    _reload_audit: ReloadAudit,
+    reload_audit: ReloadAudit,
     /// Durable revision of this daemon's own open tenure row.
     ///
     /// Recorded from what the audit returned rather than assumed to be one:
@@ -1896,7 +1898,7 @@ impl Daemon {
             batches,
             attempt_host: Some(attempt_host),
             generation_audit,
-            _reload_audit: reload_audit,
+            reload_audit,
             tenure_revision: tenure.revision,
             execution_state,
             configured_approval_requirement,
@@ -2711,6 +2713,99 @@ impl Daemon {
                 AdminResponse::Metrics {
                     request_id: request.request_id().clone(),
                     exposition: render_exposition(projection.metrics(), env!("CARGO_PKG_VERSION")),
+                }
+            }
+            automonique_protocol::admin::AdminCommand::Generations => {
+                let since_epoch = self
+                    .lease_epoch
+                    .saturating_sub(MAX_GENERATION_HISTORY_ENTRIES as u64);
+                let history = self
+                    .generation_audit
+                    .history(GENERATION_ID, since_epoch, MAX_GENERATION_HISTORY_ENTRIES)
+                    .map_err(generation_audit_failed)?;
+                let tenures = history
+                    .tenures
+                    .into_iter()
+                    .map(|tenure| {
+                        Ok(GenerationTenureView {
+                            holder_id: tenure.holder_id,
+                            lease_epoch: tenure.lease_epoch,
+                            started_at_ms: wire_millis(tenure.started_at_ms)?,
+                            ended_at_ms: tenure.ended_at_ms.map(wire_millis).transpose()?,
+                            end_kind: tenure.end_kind.map(|kind| kind.as_str().to_owned()),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, DaemonError>>()?;
+                let handoffs = history
+                    .handoffs
+                    .into_iter()
+                    .map(|handoff| {
+                        Ok(GenerationHandoffView {
+                            predecessor_epoch: handoff.predecessor_epoch,
+                            successor_epoch: handoff.successor_epoch,
+                            predecessor_end_kind: handoff.predecessor_end_kind.as_str().to_owned(),
+                            observed_at_ms: wire_millis(handoff.observed_at_ms)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, DaemonError>>()?;
+                AdminResponse::Generations {
+                    request_id: request.request_id().clone(),
+                    generations: GenerationsView {
+                        generation_id: GENERATION_ID.to_owned(),
+                        tenures,
+                        handoffs,
+                    },
+                }
+            }
+            automonique_protocol::admin::AdminCommand::ReloadStatus => {
+                let reload_id = request
+                    .reload_id()
+                    .ok_or(DaemonError::ProtocolRefused("admin_invalid_body"))?;
+                let history = match self
+                    .reload_audit
+                    .history(reload_id, 0, MAX_RELOAD_TRANSITIONS)
+                {
+                    Ok(history) => history,
+                    Err(ReloadAuditError::NotFound) => {
+                        return self.write_refusal(
+                            stream,
+                            request.request_id(),
+                            "reload_not_found",
+                        );
+                    }
+                    Err(error) => {
+                        return Err(DaemonError::ReloadAuditFailed(error.category()));
+                    }
+                };
+                let record = history.record;
+                let transitions = history
+                    .transitions
+                    .into_iter()
+                    .map(|transition| {
+                        Ok(ReloadTransitionView {
+                            revision: transition.revision,
+                            phase: transition.phase.as_str().to_owned(),
+                            observed_at_ms: wire_millis(transition.observed_at_ms)?,
+                            failure_category: transition.failure_category,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, DaemonError>>()?;
+                AdminResponse::ReloadStatus {
+                    request_id: request.request_id().clone(),
+                    reload: ReloadStatusView {
+                        reload_id: record.reload_id,
+                        source_generation_id: record.source_generation_id,
+                        source_lease_epoch: record.source_lease_epoch,
+                        target_generation_id: record.target_generation_id,
+                        target_release_digest: record.target_release_digest,
+                        phase: record.phase.as_str().to_owned(),
+                        failure_category: record.failure_category,
+                        created_at_ms: wire_millis(record.created_at_ms)?,
+                        updated_at_ms: wire_millis(record.updated_at_ms)?,
+                        terminal_at_ms: record.terminal_at_ms.map(wire_millis).transpose()?,
+                        revision: record.revision,
+                        transitions,
+                    },
                 }
             }
             automonique_protocol::admin::AdminCommand::SubmitSynthetic => {
@@ -7417,6 +7512,10 @@ fn unix_millis() -> Result<i64, DaemonError> {
         .map_err(|_| DaemonError::ProtocolRefused("clock_before_epoch"))?;
     i64::try_from(duration.as_millis())
         .map_err(|_| DaemonError::ProtocolRefused("clock_out_of_range"))
+}
+
+fn wire_millis(value: i64) -> Result<u64, DaemonError> {
+    u64::try_from(value).map_err(|_| DaemonError::ProtocolRefused("counter_out_of_range"))
 }
 
 fn fatal_store_error(error: &StoreError) -> bool {

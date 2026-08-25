@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use automonique_store::{
     InboxSubmission, LeaseRequest, OutboxClaimRequest, SchedulerClaim, Store, TerminalRun,
     TerminalState,
+    reload_audit::{BeginReload, ReloadAudit},
 };
 
 fn roots() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -91,6 +92,71 @@ fn wait_ready(runtime: &std::path::Path, state: &std::path::Path) {
         assert!(Instant::now() < deadline, "daemon did not become ready");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn cli_reads_generation_history_and_one_durable_reload_epoch() {
+    let (_root, runtime, state) = roots();
+    let mut daemon = launch(&runtime, &state);
+    wait_ready(&runtime, &state);
+
+    let generations = run(&runtime, &state, &["generations"]);
+    assert!(
+        generations.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generations.stderr)
+    );
+    let generations = String::from_utf8(generations.stdout).expect("generation history");
+    assert!(
+        generations.contains("generation foreground\n"),
+        "{generations}"
+    );
+    assert!(generations.contains("tenure epoch=1 "), "{generations}");
+    assert!(generations.contains("ended_ms=- end=open"), "{generations}");
+
+    let missing = run(&runtime, &state, &["reload-status", "reload-missing"]);
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("reload_not_found"),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+
+    let product = state.join("automonique");
+    let mut audit = ReloadAudit::open(product.join("reload-audit.sqlite3"))
+        .expect("open reload audit beside daemon");
+    audit
+        .begin(BeginReload {
+            reload_id: "reload-operator-read",
+            source_generation_id: "foreground",
+            source_lease_epoch: 1,
+            target_generation_id: "foreground-candidate",
+            target_release_digest: concat!(
+                "sha256:",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            created_at_ms: 123,
+        })
+        .expect("record reload epoch");
+
+    let status = run(&runtime, &state, &["reload-status", "reload-operator-read"]);
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status = String::from_utf8(status.stdout).expect("reload status");
+    assert!(
+        status.contains("reload reload-operator-read phase=created revision=1 source=foreground@1 target=foreground-candidate"),
+        "{status}"
+    );
+    assert!(
+        status.contains("transition revision=1 phase=created observed_ms=123 failure=-"),
+        "{status}"
+    );
+
+    assert!(run(&runtime, &state, &["shutdown"]).status.success());
+    assert!(daemon.wait().expect("wait daemon").success());
 }
 
 fn seed_expired_outbox(state: &std::path::Path) -> (u64, String, u64, u64, u64) {

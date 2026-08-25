@@ -41,6 +41,8 @@ static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub(crate) enum Operation {
     Status,
     Metrics,
+    Generations,
+    ReloadStatus(String),
     Submit(SyntheticSubmission),
     SubmitRun(SubmittedRunSpec),
     InspectReconciliation(u64),
@@ -78,6 +80,8 @@ pub(crate) fn request(
     let operation_name = match &operation {
         Operation::Status => "status",
         Operation::Metrics => "metrics",
+        Operation::Generations => "generations",
+        Operation::ReloadStatus(_) => "reload-status",
         Operation::Submit(_) => "submit",
         Operation::SubmitRun(_) => "run-submit",
         Operation::InspectReconciliation(_) => "reconcile-inspect",
@@ -106,6 +110,9 @@ pub(crate) fn request(
         }
         Operation::Status => AdminRequest::new(request_id, AdminCommand::Status),
         Operation::Metrics => AdminRequest::new(request_id, AdminCommand::Metrics),
+        Operation::Generations => AdminRequest::new(request_id, AdminCommand::Generations),
+        Operation::ReloadStatus(reload_id) => AdminRequest::reload_status(request_id, reload_id)
+            .map_err(|error| ClientError::Protocol(error.category()))?,
         Operation::Shutdown => AdminRequest::new(request_id, AdminCommand::Shutdown),
     };
     let request_id = request.request_id().as_str().to_owned();

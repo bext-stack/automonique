@@ -101,12 +101,14 @@ fn spec_with(
 // ---------------------------------------------------------------------------
 
 /// How many commands the closed [`AdminCommand`] enum carries.
-const ADMIN_COMMAND_COUNT: usize = 11;
+const ADMIN_COMMAND_COUNT: usize = 13;
 
 /// Every admin command, in the order the enum declares them.
 const EVERY_ADMIN_COMMAND: [AdminCommand; ADMIN_COMMAND_COUNT] = [
     AdminCommand::Status,
     AdminCommand::Metrics,
+    AdminCommand::Generations,
+    AdminCommand::ReloadStatus,
     AdminCommand::SubmitSynthetic,
     AdminCommand::SubmitRun,
     AdminCommand::InspectReconciliation,
@@ -129,15 +131,17 @@ fn position(command: AdminCommand) -> usize {
     match command {
         AdminCommand::Status => 0,
         AdminCommand::Metrics => 1,
-        AdminCommand::SubmitSynthetic => 2,
-        AdminCommand::SubmitRun => 3,
-        AdminCommand::InspectReconciliation => 4,
-        AdminCommand::FailReconciliation => 5,
-        AdminCommand::InspectOutbox => 6,
-        AdminCommand::ReconcileOutbox => 7,
-        AdminCommand::PauseIntake => 8,
-        AdminCommand::ResumeIntake => 9,
-        AdminCommand::Shutdown => 10,
+        AdminCommand::Generations => 2,
+        AdminCommand::ReloadStatus => 3,
+        AdminCommand::SubmitSynthetic => 4,
+        AdminCommand::SubmitRun => 5,
+        AdminCommand::InspectReconciliation => 6,
+        AdminCommand::FailReconciliation => 7,
+        AdminCommand::InspectOutbox => 8,
+        AdminCommand::ReconcileOutbox => 9,
+        AdminCommand::PauseIntake => 10,
+        AdminCommand::ResumeIntake => 11,
+        AdminCommand::Shutdown => 12,
     }
 }
 
@@ -151,6 +155,12 @@ fn representative_requests(command: AdminCommand) -> Vec<AdminRequest> {
     match command {
         AdminCommand::Status => vec![AdminRequest::new(request_id(), AdminCommand::Status)],
         AdminCommand::Metrics => vec![AdminRequest::new(request_id(), AdminCommand::Metrics)],
+        AdminCommand::Generations => {
+            vec![AdminRequest::new(request_id(), AdminCommand::Generations)]
+        }
+        AdminCommand::ReloadStatus => vec![
+            AdminRequest::reload_status(request_id(), "reload-1").expect("a valid reload lookup"),
+        ],
         AdminCommand::Shutdown => vec![AdminRequest::new(request_id(), AdminCommand::Shutdown)],
         AdminCommand::SubmitSynthetic => vec![AdminRequest::submit(
             request_id(),
@@ -354,7 +364,7 @@ mod anti_drift {
         );
     }
 
-    /// The three disciplines partition the eleven commands, and the partition is
+    /// The three disciplines partition the thirteen commands, and the partition is
     /// stated rather than derived, so reclassifying a command — describing a
     /// write as a read, or dropping a retry key — fails here.
     #[test]
@@ -372,9 +382,11 @@ mod anti_drift {
         assert_eq!(
             named(|mutation| matches!(mutation, MutationDiscipline::ReadOnly)),
             [
+                "generations",
                 "inspect_outbox",
                 "inspect_reconciliation",
                 "metrics",
+                "reload_status",
                 "status"
             ],
             "the set of read-only admin commands changed"
@@ -400,7 +412,7 @@ mod anti_drift {
                 .iter()
                 .filter(|spec| spec.mutation().mutates())
                 .count(),
-            ADMIN_COMMAND_COUNT - 4,
+            ADMIN_COMMAND_COUNT - 6,
             "a command belongs to no discipline"
         );
     }
@@ -428,11 +440,13 @@ mod seeded_registry {
             ids,
             [
                 "fail_reconciliation",
+                "generations",
                 "inspect_outbox",
                 "inspect_reconciliation",
                 "metrics",
                 "pause_intake",
                 "reconcile_outbox",
+                "reload_status",
                 "resume_intake",
                 "shutdown",
                 "status",
@@ -462,6 +476,7 @@ mod seeded_registry {
                 ("outbox-inspect", "inspect_outbox"),
                 ("reconcile-inspect", "inspect_reconciliation"),
                 ("outbox-reconcile", "reconcile_outbox"),
+                ("reload-status", "reload_status"),
                 ("run-submit", "submit_run"),
                 ("submit", "submit_synthetic"),
             ]
@@ -528,7 +543,7 @@ mod seeded_registry {
                 resolved += 1;
             }
         }
-        assert_eq!(resolved, 6, "the alias population changed");
+        assert_eq!(resolved, 7, "the alias population changed");
     }
 }
 

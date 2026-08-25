@@ -50,7 +50,7 @@ use std::os::unix::fs::MetadataExt;
 
 const MAX_RUNTIME_PATH_BYTES: usize = 4_096;
 const MAX_RUNTIME_COMPONENTS: usize = 256;
-const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique metrics\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique run submit <idempotency-key> < run-spec.bin\n       automonique runs list [--state <state>]... [--cursor <submission-id>] [--page <size>]\n       automonique runs detail <run-id>\n       automonique runs tail <spool-root> <run-id> [cursor]\n       automonique automation register <automation-id> <actor>\n       automonique automation pause <automation-id> <revision> <actor> <cause>\n       automonique automation resume <automation-id> <revision> <actor>\n       automonique automation archive <automation-id> <revision> <actor> <cause>\n       automonique automation list [--state <state>]... [--cursor <entry-id>] [--page <size>]\n       automonique automation detail <automation-id>\n       automonique approval record <approval-key> <subject> <granted|denied> <decider>\n       automonique approval list [--cursor <entry-id>] [--page <size>]\n       automonique approval detail <approval-key>\n       automonique approval by-subject <subject> [--cursor <entry-id>] [--page <size>]\n       automonique batch register <batch-id> [--label <label>] [--sequential | --parallel <ceiling>] <member-key>...\n       automonique batch advance <batch-id> <member-key> <revision> <state> <last-sequence>\n       automonique batch list [--cursor <entry-id>] [--page <size>]\n       automonique batch detail <batch-id>\n       automonique parity compare <database> <scope> [--registry <path>] [--category <category>]\n       automonique parity score <database> <scope>\n       automonique parity gate <database> <scope> <decision-key> <decider> [--registry <path>]\n       automonique audit verify <database>\n       automonique cancel <run-id> <request-ref> [observed-sequence]\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique progress subscribe <socket-path> <run-id> [cursor]\n       automonique shutdown\n";
+const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique metrics\n       automonique generations\n       automonique reload-status <reload-id>\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique run submit <idempotency-key> < run-spec.bin\n       automonique runs list [--state <state>]... [--cursor <submission-id>] [--page <size>]\n       automonique runs detail <run-id>\n       automonique runs tail <spool-root> <run-id> [cursor]\n       automonique automation register <automation-id> <actor>\n       automonique automation pause <automation-id> <revision> <actor> <cause>\n       automonique automation resume <automation-id> <revision> <actor>\n       automonique automation archive <automation-id> <revision> <actor> <cause>\n       automonique automation list [--state <state>]... [--cursor <entry-id>] [--page <size>]\n       automonique automation detail <automation-id>\n       automonique approval record <approval-key> <subject> <granted|denied> <decider>\n       automonique approval list [--cursor <entry-id>] [--page <size>]\n       automonique approval detail <approval-key>\n       automonique approval by-subject <subject> [--cursor <entry-id>] [--page <size>]\n       automonique batch register <batch-id> [--label <label>] [--sequential | --parallel <ceiling>] <member-key>...\n       automonique batch advance <batch-id> <member-key> <revision> <state> <last-sequence>\n       automonique batch list [--cursor <entry-id>] [--page <size>]\n       automonique batch detail <batch-id>\n       automonique parity compare <database> <scope> [--registry <path>] [--category <category>]\n       automonique parity score <database> <scope>\n       automonique parity gate <database> <scope> <decision-key> <decider> [--registry <path>]\n       automonique audit verify <database>\n       automonique cancel <run-id> <request-ref> [observed-sequence]\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique progress subscribe <socket-path> <run-id> [cursor]\n       automonique shutdown\n";
 
 #[derive(Clone)]
 enum Command {
@@ -61,6 +61,10 @@ enum Command {
         json: bool,
     },
     Metrics,
+    Generations,
+    ReloadStatus {
+        reload_id: OsString,
+    },
     Submit {
         scope: OsString,
         idempotency_key: OsString,
@@ -141,6 +145,10 @@ where
             Command::Status { json: true }
         }
         (Some(command), None, None, None) if command == "metrics" => Command::Metrics,
+        (Some(command), None, None, None) if command == "generations" => Command::Generations,
+        (Some(command), Some(reload_id), None, None) if command == "reload-status" => {
+            Command::ReloadStatus { reload_id }
+        }
         (Some(command), Some(scope), Some(idempotency_key), None) if command == "submit" => {
             Command::Submit {
                 scope,
@@ -507,6 +515,12 @@ where
         }
         Command::Metrics => {
             return admin_metrics(runtime.as_deref(), &mut stdout, &mut stderr);
+        }
+        Command::Generations => {
+            return admin_generations(runtime.as_deref(), &mut stdout, &mut stderr);
+        }
+        Command::ReloadStatus { reload_id } => {
+            return admin_reload_status(runtime.as_deref(), reload_id, &mut stdout, &mut stderr);
         }
         Command::Submit {
             scope,
@@ -1108,6 +1122,131 @@ fn admin_metrics<W: Write, E: Write>(
             let _ = writeln!(
                 stderr,
                 "automonique metrics unavailable: {}",
+                error.category()
+            );
+            1
+        }
+    }
+}
+
+fn admin_generations<W: Write, E: Write>(
+    runtime: Option<&OsStr>,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> u8 {
+    match admin_client::request(runtime, admin_client::Operation::Generations) {
+        Ok(automonique_protocol::admin::AdminResponse::Generations { generations, .. }) => {
+            if writeln!(stdout, "generation {}", generations.generation_id).is_err() {
+                return 1;
+            }
+            for tenure in generations.tenures {
+                if writeln!(
+                    stdout,
+                    "tenure epoch={} holder={} started_ms={} ended_ms={} end={}",
+                    tenure.lease_epoch,
+                    tenure.holder_id,
+                    tenure.started_at_ms,
+                    tenure
+                        .ended_at_ms
+                        .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+                    tenure.end_kind.as_deref().unwrap_or("open"),
+                )
+                .is_err()
+                {
+                    return 1;
+                }
+            }
+            for handoff in generations.handoffs {
+                if writeln!(
+                    stdout,
+                    "handoff {}->{} predecessor_end={} observed_ms={}",
+                    handoff.predecessor_epoch,
+                    handoff.successor_epoch,
+                    handoff.predecessor_end_kind,
+                    handoff.observed_at_ms,
+                )
+                .is_err()
+                {
+                    return 1;
+                }
+            }
+            0
+        }
+        Ok(_) => {
+            let _ = stderr.write_all(b"automonique generations refused: response_mismatch\n");
+            1
+        }
+        Err(error) => {
+            let _ = writeln!(
+                stderr,
+                "automonique generations refused: {}",
+                error.category()
+            );
+            1
+        }
+    }
+}
+
+fn admin_reload_status<W: Write, E: Write>(
+    runtime: Option<&OsStr>,
+    reload_id: OsString,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> u8 {
+    let Some(reload_id) = reload_id.to_str() else {
+        let _ = stderr.write_all(b"automonique reload-status refused: invalid_body\n");
+        return 2;
+    };
+    match admin_client::request(
+        runtime,
+        admin_client::Operation::ReloadStatus(reload_id.to_owned()),
+    ) {
+        Ok(automonique_protocol::admin::AdminResponse::ReloadStatus { reload, .. }) => {
+            if writeln!(
+                stdout,
+                "reload {} phase={} revision={} source={}@{} target={} release={} created_ms={} updated_ms={} terminal_ms={} failure={}",
+                reload.reload_id,
+                reload.phase,
+                reload.revision,
+                reload.source_generation_id,
+                reload.source_lease_epoch,
+                reload.target_generation_id,
+                reload.target_release_digest,
+                reload.created_at_ms,
+                reload.updated_at_ms,
+                reload
+                    .terminal_at_ms
+                    .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+                reload.failure_category.as_deref().unwrap_or("-"),
+            )
+            .is_err()
+            {
+                return 1;
+            }
+            for transition in reload.transitions {
+                if writeln!(
+                    stdout,
+                    "transition revision={} phase={} observed_ms={} failure={}",
+                    transition.revision,
+                    transition.phase,
+                    transition.observed_at_ms,
+                    transition.failure_category.as_deref().unwrap_or("-"),
+                )
+                .is_err()
+                {
+                    return 1;
+                }
+            }
+            0
+        }
+        Ok(_) => {
+            let _ = stderr.write_all(b"automonique reload-status refused: response_mismatch\n");
+            1
+        }
+        Err(error) => {
+            let _ = writeln!(
+                stderr,
+                "automonique reload-status refused: {}",
                 error.category()
             );
             1

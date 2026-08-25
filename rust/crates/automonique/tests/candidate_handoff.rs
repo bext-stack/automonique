@@ -37,7 +37,7 @@ fn exact_release_candidate_warms_without_competing_for_source_authority() {
         .spawn()
         .expect("source daemon");
     let mut source = ChildGuard(Some(source));
-    wait_for_path(&config.admin_socket());
+    wait_ready(&config);
     let (source_holder_id, source_lease_epoch) = read_source_lease(&config.database_path());
 
     let release_root = root.path().join("code-releases");
@@ -111,10 +111,19 @@ fn read_source_lease(path: &Path) -> (String, u64) {
         .expect("source lease")
 }
 
-fn wait_for_path(path: &Path) {
+fn wait_ready(config: &DaemonConfig) {
     let deadline = Instant::now() + Duration::from_secs(20);
-    while !path.exists() {
-        assert!(Instant::now() < deadline, "daemon endpoint did not appear");
+    loop {
+        let status = Command::new(env!("CARGO_BIN_EXE_automonique"))
+            .args(["status", "--json"])
+            .env("XDG_RUNTIME_DIR", &config.runtime_root)
+            .env("XDG_STATE_HOME", &config.state_root)
+            .output()
+            .expect("status client");
+        if status.status.success() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "daemon did not become ready");
         std::thread::sleep(Duration::from_millis(25));
     }
 }

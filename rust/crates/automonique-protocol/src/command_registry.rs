@@ -53,7 +53,7 @@
 //!
 //! # Where the seeded registry comes from
 //!
-//! [`admin_command_registry`] describes the eleven commands
+//! [`admin_command_registry`] describes the thirteen commands
 //! [`crate::admin::AdminCommand`] actually admits, with the field names those
 //! bodies actually encode and the byte bounds `crate::admin` actually enforces
 //! — imported from that module rather than restated here, so a widened bound
@@ -74,8 +74,8 @@ use std::fmt;
 
 use crate::admin::{
     MAX_INTAKE_ACTOR_BYTES, MAX_INTAKE_REASON_BYTES, MAX_RECONCILIATION_FIELD_BYTES,
-    MAX_RUN_SUBMISSION_KEY_BYTES, MAX_SUBMITTED_RUN_SPEC_BYTES, MAX_SYNTHETIC_KEY_BYTES,
-    MAX_SYNTHETIC_SCOPE_BYTES, MAX_SYNTHETIC_TASK_BYTES,
+    MAX_RELOAD_ID_BYTES, MAX_RUN_SUBMISSION_KEY_BYTES, MAX_SUBMITTED_RUN_SPEC_BYTES,
+    MAX_SYNTHETIC_KEY_BYTES, MAX_SYNTHETIC_SCOPE_BYTES, MAX_SYNTHETIC_TASK_BYTES,
 };
 use crate::digest::{ALGORITHM, DIGEST_BYTES};
 use crate::primitives::{BoundedString, ValueError};
@@ -1325,7 +1325,7 @@ impl CommandRegistry {
 
 /// The registry describing the local administration commands this build ships.
 ///
-/// Ten commands, matching [`crate::admin::AdminCommand`]'s ten variants, with
+/// Thirteen commands, matching [`crate::admin::AdminCommand`]'s variants, with
 /// the field names and byte bounds `crate::admin` actually encodes and
 /// enforces.
 ///
@@ -1342,6 +1342,8 @@ pub fn admin_command_registry() -> Result<CommandRegistry, CommandRegistryError>
     CommandRegistry::new([
         status_spec()?,
         metrics_spec()?,
+        generations_spec()?,
+        reload_status_spec()?,
         submit_synthetic_spec()?,
         submit_run_spec()?,
         inspect_reconciliation_spec()?,
@@ -1430,6 +1432,36 @@ fn metrics_spec() -> Result<CommandSpec, CommandRegistryError> {
         aliases: Vec::new(),
         summary: help("Read a Prometheus metrics snapshot.")?,
         fields: Vec::new(),
+        authorization: AuthorizationRequirement::LocalPeer,
+        approval: ApprovalPolicy::None,
+        dry_run: DryRun::Unsupported,
+        mutation: MutationDiscipline::ReadOnly,
+    })
+}
+
+fn generations_spec() -> Result<CommandSpec, CommandRegistryError> {
+    CommandSpec::new(CommandSpecParts {
+        id: CommandId::new("generations")?,
+        aliases: Vec::new(),
+        summary: help("Read recent generation tenure and handoff history.")?,
+        fields: Vec::new(),
+        authorization: AuthorizationRequirement::LocalPeer,
+        approval: ApprovalPolicy::None,
+        dry_run: DryRun::Unsupported,
+        mutation: MutationDiscipline::ReadOnly,
+    })
+}
+
+fn reload_status_spec() -> Result<CommandSpec, CommandRegistryError> {
+    CommandSpec::new(CommandSpecParts {
+        id: CommandId::new("reload_status")?,
+        aliases: vec![CommandAlias::new("reload-status")?],
+        summary: help("Read one reload epoch and its append-only transitions.")?,
+        fields: vec![required(
+            "reload_id",
+            FieldType::bounded_string(MAX_RELOAD_ID_BYTES)?,
+            "The durable reload epoch to inspect.",
+        )?],
         authorization: AuthorizationRequirement::LocalPeer,
         approval: ApprovalPolicy::None,
         dry_run: DryRun::Unsupported,

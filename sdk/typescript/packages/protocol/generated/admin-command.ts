@@ -270,9 +270,11 @@ export function encodeSubmitRun(request_id: RequestId, body: SubmitRunBody): Uin
 /** Command kinds this protocol version defines that no builder above produces. A client needing one of these builds it by hand or waits for the generator to describe it. */
 export const ADMIN_REQUEST_KINDS_NOT_GENERATED: readonly string[] = [
   "fail_reconciliation",
+  "generations",
   "inspect_outbox",
   "inspect_reconciliation",
   "reconcile_outbox",
+  "reload_status",
   "submit_synthetic",
 ];
 
@@ -395,7 +397,7 @@ export function decodeShutdownAccepted(request_id: RequestId, body: JsonValue): 
  * defined, and a client told otherwise might act on the lie. The body is not
  * handed back, because nothing here has validated it.
  */
-export const ADMIN_RESPONSE_KINDS_NOT_DECODED = ["metrics_result", "outbox_inspected", "outbox_reconciled", "reconciliation_failed", "reconciliation_inspected", "status_result", "synthetic_accepted"] as const;
+export const ADMIN_RESPONSE_KINDS_NOT_DECODED = ["generations_result", "metrics_result", "outbox_inspected", "outbox_reconciled", "reconciliation_failed", "reconciliation_inspected", "reload_status_result", "status_result", "synthetic_accepted"] as const;
 export type UndecodedAdminResponseKind = (typeof ADMIN_RESPONSE_KINDS_NOT_DECODED)[number];
 export function isUndecodedAdminResponseKind(value: string): value is UndecodedAdminResponseKind {
   return (ADMIN_RESPONSE_KINDS_NOT_DECODED as readonly string[]).includes(value);

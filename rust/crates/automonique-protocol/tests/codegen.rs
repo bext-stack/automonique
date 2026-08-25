@@ -1680,10 +1680,11 @@ mod command_surface {
 
     use automonique_protocol::admin::{
         ADMIN_PROTOCOL, AdminCommand, AdminError, AdminOutboxEvidence, AdminOutboxEvidenceParts,
-        AdminReconciliationEvidence, AdminRefusalCategory, AdminRequest, IntakePause, IntakeResume,
-        MAX_INTAKE_REASON_BYTES, MAX_RUN_SUBMISSION_KEY_BYTES, MAX_SUBMITTED_RUN_SPEC_BYTES,
-        OutboxReconciliation, OutboxReconciliationDecision, OutboxReconciliationParts,
-        ReconciliationFailure, SubmittedRunSpec, SyntheticSubmission,
+        AdminReconciliationEvidence, AdminRefusalCategory, AdminRequest, GenerationHandoffView,
+        GenerationTenureView, GenerationsView, IntakePause, IntakeResume, MAX_INTAKE_REASON_BYTES,
+        MAX_RUN_SUBMISSION_KEY_BYTES, MAX_SUBMITTED_RUN_SPEC_BYTES, OutboxReconciliation,
+        OutboxReconciliationDecision, OutboxReconciliationParts, ReconciliationFailure,
+        ReloadStatusView, ReloadTransitionView, SubmittedRunSpec, SyntheticSubmission,
     };
     use automonique_protocol::codec::{
         Envelope, MAX_REQUEST_ID_BYTES, MajorVersion, MessageKind, ProtocolName,
@@ -2620,6 +2621,8 @@ mod command_surface {
         let requests = vec![
             AdminRequest::new(id.clone(), AdminCommand::Status),
             AdminRequest::new(id.clone(), AdminCommand::Metrics),
+            AdminRequest::new(id.clone(), AdminCommand::Generations),
+            AdminRequest::reload_status(id.clone(), "reload-1").expect("a reload lookup"),
             AdminRequest::new(id.clone(), AdminCommand::Shutdown),
             AdminRequest::submit(
                 id.clone(),
@@ -2663,6 +2666,8 @@ mod command_surface {
         for command in [
             AdminCommand::Status,
             AdminCommand::Metrics,
+            AdminCommand::Generations,
+            AdminCommand::ReloadStatus,
             AdminCommand::SubmitSynthetic,
             AdminCommand::SubmitRun,
             AdminCommand::InspectReconciliation,
@@ -2676,6 +2681,8 @@ mod command_surface {
             match command {
                 AdminCommand::Status
                 | AdminCommand::Metrics
+                | AdminCommand::Generations
+                | AdminCommand::ReloadStatus
                 | AdminCommand::SubmitSynthetic
                 | AdminCommand::SubmitRun
                 | AdminCommand::InspectReconciliation
@@ -2739,6 +2746,42 @@ mod command_surface {
             AdminResponse::Metrics {
                 request_id: id.clone(),
                 exposition: "automonique_ready 1\n".to_owned(),
+            },
+            AdminResponse::Generations {
+                request_id: id.clone(),
+                generations: GenerationsView {
+                    generation_id: "foreground".to_owned(),
+                    tenures: vec![GenerationTenureView {
+                        holder_id: "holder-1".to_owned(),
+                        lease_epoch: 1,
+                        started_at_ms: 1,
+                        ended_at_ms: None,
+                        end_kind: None,
+                    }],
+                    handoffs: Vec::<GenerationHandoffView>::new(),
+                },
+            },
+            AdminResponse::ReloadStatus {
+                request_id: id.clone(),
+                reload: ReloadStatusView {
+                    reload_id: "reload-1".to_owned(),
+                    source_generation_id: "foreground".to_owned(),
+                    source_lease_epoch: 1,
+                    target_generation_id: "foreground-next".to_owned(),
+                    target_release_digest: format!("sha256:{}", "a".repeat(64)),
+                    phase: "created".to_owned(),
+                    failure_category: None,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                    terminal_at_ms: None,
+                    revision: 1,
+                    transitions: vec![ReloadTransitionView {
+                        revision: 1,
+                        phase: "created".to_owned(),
+                        observed_at_ms: 1,
+                        failure_category: None,
+                    }],
+                },
             },
             AdminResponse::SyntheticAccepted {
                 request_id: id.clone(),
@@ -2823,6 +2866,8 @@ mod command_surface {
             match response {
                 AdminResponse::Status { .. }
                 | AdminResponse::Metrics { .. }
+                | AdminResponse::Generations { .. }
+                | AdminResponse::ReloadStatus { .. }
                 | AdminResponse::SyntheticAccepted { .. }
                 | AdminResponse::RunAccepted { .. }
                 | AdminResponse::ReconciliationInspected { .. }

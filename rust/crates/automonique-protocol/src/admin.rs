@@ -95,6 +95,15 @@ pub const MAX_ADMIN_REFUSAL_CATEGORY_BYTES: usize = 64;
 /// Maximum Prometheus text bytes returned by one authenticated scrape.
 pub const MAX_METRICS_EXPOSITION_BYTES: usize = 24 * 1024;
 
+/// Maximum reload identifier bytes carried by the operator status surface.
+pub const MAX_RELOAD_ID_BYTES: usize = 128;
+
+/// Maximum recent generation tenures returned by one bounded snapshot.
+pub const MAX_GENERATION_HISTORY_ENTRIES: usize = 64;
+
+/// Maximum reload transitions returned by one bounded status response.
+pub const MAX_RELOAD_TRANSITIONS: usize = 16;
+
 const METRICS_RESPONSE_OVERHEAD_BYTES: usize = 512;
 const _: () = assert!(
     2 * MAX_METRICS_EXPOSITION_BYTES + METRICS_RESPONSE_OVERHEAD_BYTES <= MAX_ADMIN_CANONICAL_BYTES,
@@ -196,7 +205,8 @@ const _: () = assert!(
 /// - **4** — corrected `execution_state` to report that the execution lane is
 ///   wired; the former `*_no_lane` values remain decode-only aliases.
 /// - **5** — added the ten-method `automonique.platform/v1` local endpoint.
-pub const ADMIN_CAPABILITY: u32 = 5;
+/// - **6** — added generation history and reload-status reads.
+pub const ADMIN_CAPABILITY: u32 = 6;
 
 /// How much of a promise an endpoint is.
 ///
@@ -327,6 +337,8 @@ pub const ENDPOINT_MATURITY: &[(&str, Maturity)] = &[
         Maturity::Experimental,
     ),
     ("automonique.admin/metrics", Maturity::Experimental),
+    ("automonique.admin/generations", Maturity::Experimental),
+    ("automonique.admin/reload_status", Maturity::Experimental),
     ("automonique.platform/capabilities", Maturity::Experimental),
     ("automonique.platform/snapshot", Maturity::Experimental),
     ("automonique.platform/subscribe", Maturity::Experimental),
@@ -589,6 +601,10 @@ pub enum AdminCommand {
     Status,
     /// Read a Prometheus text snapshot over the authenticated local socket.
     Metrics,
+    /// Read the recent append-only generation tenure and handoff history.
+    Generations,
+    /// Read one reload epoch and its append-only transitions.
+    ReloadStatus,
     /// Durably enqueue a no-effect synthetic work item.
     SubmitSynthetic,
     /// Take durable custody of one canonical RunSpec document.
@@ -621,9 +637,11 @@ impl AdminCommand {
     /// Published so [`ENDPOINT_MATURITY`] can be held exhaustive over this lane
     /// by a test rather than by inspection: a command added here without a row
     /// there is a surface the daemon serves and never declared.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
         Self::Status,
         Self::Metrics,
+        Self::Generations,
+        Self::ReloadStatus,
         Self::SubmitSynthetic,
         Self::SubmitRun,
         Self::InspectReconciliation,
@@ -641,6 +659,8 @@ impl AdminCommand {
         match self {
             Self::Status => "status",
             Self::Metrics => "metrics",
+            Self::Generations => "generations",
+            Self::ReloadStatus => "reload_status",
             Self::SubmitSynthetic => "submit_synthetic",
             Self::SubmitRun => "submit_run",
             Self::InspectReconciliation => "inspect_reconciliation",
@@ -1304,6 +1324,7 @@ impl SubmittedRunSpec {
 pub struct AdminRequest {
     request_id: RequestId,
     command: AdminCommand,
+    reload_id: Option<String>,
     submission: Option<SyntheticSubmission>,
     reconciliation_run_id: Option<u64>,
     reconciliation_failure: Option<ReconciliationFailure>,
@@ -1321,6 +1342,7 @@ impl AdminRequest {
         Self {
             request_id,
             command,
+            reload_id: None,
             submission: None,
             reconciliation_run_id: None,
             reconciliation_failure: None,
@@ -1332,12 +1354,37 @@ impl AdminRequest {
         }
     }
 
+    /// Construct a read-only lookup of one durable reload epoch.
+    pub fn reload_status(
+        request_id: RequestId,
+        reload_id: impl Into<String>,
+    ) -> Result<Self, AdminError> {
+        let reload_id = reload_id.into();
+        if !valid_coordinate(&reload_id, MAX_RELOAD_ID_BYTES) {
+            return Err(AdminError::InvalidBody);
+        }
+        Ok(Self {
+            request_id,
+            command: AdminCommand::ReloadStatus,
+            reload_id: Some(reload_id),
+            submission: None,
+            reconciliation_run_id: None,
+            reconciliation_failure: None,
+            outbox_id: None,
+            outbox_reconciliation: None,
+            run_submission: None,
+            intake_pause: None,
+            intake_resume: None,
+        })
+    }
+
     /// Construct a durable synthetic-intake request.
     #[must_use]
     pub const fn submit(request_id: RequestId, submission: SyntheticSubmission) -> Self {
         Self {
             request_id,
             command: AdminCommand::SubmitSynthetic,
+            reload_id: None,
             submission: Some(submission),
             reconciliation_run_id: None,
             reconciliation_failure: None,
@@ -1358,6 +1405,7 @@ impl AdminRequest {
         Self {
             request_id,
             command: AdminCommand::SubmitRun,
+            reload_id: None,
             submission: None,
             reconciliation_run_id: None,
             reconciliation_failure: None,
@@ -1377,6 +1425,7 @@ impl AdminRequest {
         Ok(Self {
             request_id,
             command: AdminCommand::InspectReconciliation,
+            reload_id: None,
             submission: None,
             reconciliation_run_id: Some(run_id),
             reconciliation_failure: None,
@@ -1397,6 +1446,7 @@ impl AdminRequest {
         Self {
             request_id,
             command: AdminCommand::FailReconciliation,
+            reload_id: None,
             submission: None,
             reconciliation_run_id: None,
             reconciliation_failure: Some(failure),
@@ -1415,6 +1465,7 @@ impl AdminRequest {
         Ok(Self {
             request_id,
             command: AdminCommand::InspectOutbox,
+            reload_id: None,
             submission: None,
             reconciliation_run_id: None,
             reconciliation_failure: None,
@@ -1434,6 +1485,7 @@ impl AdminRequest {
         Self {
             request_id,
             command: AdminCommand::ReconcileOutbox,
+            reload_id: None,
             submission: None,
             reconciliation_run_id: None,
             reconciliation_failure: None,
@@ -1451,6 +1503,7 @@ impl AdminRequest {
         Self {
             request_id,
             command: AdminCommand::PauseIntake,
+            reload_id: None,
             submission: None,
             reconciliation_run_id: None,
             reconciliation_failure: None,
@@ -1468,6 +1521,7 @@ impl AdminRequest {
         Self {
             request_id,
             command: AdminCommand::ResumeIntake,
+            reload_id: None,
             submission: None,
             reconciliation_run_id: None,
             reconciliation_failure: None,
@@ -1489,6 +1543,12 @@ impl AdminRequest {
     #[must_use]
     pub const fn command(&self) -> AdminCommand {
         self.command
+    }
+
+    /// Reload identifier, present only for [`AdminCommand::ReloadStatus`].
+    #[must_use]
+    pub fn reload_id(&self) -> Option<&str> {
+        self.reload_id.as_deref()
     }
 
     /// Synthetic work body, present only for [`AdminCommand::SubmitSynthetic`].
@@ -1544,6 +1604,7 @@ impl AdminRequest {
     pub fn to_message(&self) -> Result<Message, AdminError> {
         let body = match (
             self.command,
+            &self.reload_id,
             &self.submission,
             self.reconciliation_run_id,
             &self.reconciliation_failure,
@@ -1555,6 +1616,7 @@ impl AdminRequest {
         ) {
             (
                 AdminCommand::SubmitSynthetic,
+                None,
                 Some(submission),
                 None,
                 None,
@@ -1571,12 +1633,14 @@ impl AdminRequest {
                 None,
                 None,
                 None,
+                None,
                 Some(run_submission),
                 None,
                 None,
             ) => run_submission.to_body(),
             (
                 AdminCommand::InspectReconciliation,
+                None,
                 None,
                 Some(run_id),
                 None,
@@ -1590,6 +1654,7 @@ impl AdminRequest {
                 AdminCommand::FailReconciliation,
                 None,
                 None,
+                None,
                 Some(failure),
                 None,
                 None,
@@ -1599,6 +1664,7 @@ impl AdminRequest {
             ) => failure.to_body()?,
             (
                 AdminCommand::InspectOutbox,
+                None,
                 None,
                 None,
                 None,
@@ -1617,6 +1683,7 @@ impl AdminRequest {
                 None,
                 None,
                 None,
+                None,
                 Some(reconciliation),
                 None,
                 None,
@@ -1624,6 +1691,7 @@ impl AdminRequest {
             ) => reconciliation.to_body()?,
             (
                 AdminCommand::PauseIntake,
+                None,
                 None,
                 None,
                 None,
@@ -1642,10 +1710,30 @@ impl AdminRequest {
                 None,
                 None,
                 None,
+                None,
                 Some(intake_resume),
             ) => intake_resume.to_body(),
             (
-                AdminCommand::Status | AdminCommand::Metrics | AdminCommand::Shutdown,
+                AdminCommand::ReloadStatus,
+                Some(reload_id),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ) => JsonValue::Object(vec![(
+                "reload_id".to_owned(),
+                JsonValue::String(reload_id.clone()),
+            )]),
+            (
+                AdminCommand::Status
+                | AdminCommand::Metrics
+                | AdminCommand::Generations
+                | AdminCommand::Shutdown,
+                None,
                 None,
                 None,
                 None,
@@ -1710,13 +1798,21 @@ impl AdminRequest {
                 message.envelope().request_id().clone(),
                 IntakeResume::from_body(message.body())?,
             )),
-            "status" | "metrics" | "shutdown" => {
+            "reload_status" => {
+                exact_fields(message.body(), &["reload_id"])?;
+                Self::reload_status(
+                    message.envelope().request_id().clone(),
+                    required_body_string(message.body(), "reload_id")?,
+                )
+            }
+            "status" | "metrics" | "generations" | "shutdown" => {
                 if !matches!(message.body(), JsonValue::Object(entries) if entries.is_empty()) {
                     return Err(AdminError::InvalidBody);
                 }
                 let command = match message.envelope().kind().as_str() {
                     "status" => AdminCommand::Status,
                     "metrics" => AdminCommand::Metrics,
+                    "generations" => AdminCommand::Generations,
                     _ => AdminCommand::Shutdown,
                 };
                 Ok(Self::new(message.envelope().request_id().clone(), command))
@@ -3431,6 +3527,487 @@ impl AdminOutboxEvidence {
     }
 }
 
+/// One recent generation tenure on the read-only operator surface.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GenerationTenureView {
+    pub holder_id: String,
+    pub lease_epoch: u64,
+    pub started_at_ms: u64,
+    pub ended_at_ms: Option<u64>,
+    pub end_kind: Option<String>,
+}
+
+impl GenerationTenureView {
+    fn valid(&self) -> bool {
+        valid_coordinate(&self.holder_id, MAX_RECONCILIATION_FIELD_BYTES)
+            && self.lease_epoch > 0
+            && self
+                .ended_at_ms
+                .is_none_or(|ended| ended >= self.started_at_ms)
+            && matches!(
+                self.end_kind.as_deref(),
+                None | Some("released" | "expired" | "superseded")
+            )
+            && self.ended_at_ms.is_some() == self.end_kind.is_some()
+    }
+
+    fn to_body(&self) -> Result<JsonValue, AdminError> {
+        if !self.valid() {
+            return Err(AdminError::InvalidBody);
+        }
+        Ok(JsonValue::Object(vec![
+            ("end_kind".to_owned(), optional_string(&self.end_kind)),
+            (
+                "ended_at_ms".to_owned(),
+                optional_integer("ended_at_ms", self.ended_at_ms)?,
+            ),
+            (
+                "holder_id".to_owned(),
+                JsonValue::String(self.holder_id.clone()),
+            ),
+            (
+                "lease_epoch".to_owned(),
+                integer("lease_epoch", self.lease_epoch)?,
+            ),
+            (
+                "started_at_ms".to_owned(),
+                integer("started_at_ms", self.started_at_ms)?,
+            ),
+        ]))
+    }
+
+    fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
+        exact_fields(
+            body,
+            &[
+                "end_kind",
+                "ended_at_ms",
+                "holder_id",
+                "lease_epoch",
+                "started_at_ms",
+            ],
+        )?;
+        let view = Self {
+            holder_id: required_body_string(body, "holder_id")?,
+            lease_epoch: unsigned(body, "lease_epoch")?,
+            started_at_ms: unsigned(body, "started_at_ms")?,
+            ended_at_ms: optional_unsigned(body, "ended_at_ms")?,
+            end_kind: optional_body_string(body, "end_kind")?,
+        };
+        view.valid().then_some(view).ok_or(AdminError::InvalidBody)
+    }
+}
+
+/// One recorded predecessor-to-successor observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GenerationHandoffView {
+    pub predecessor_epoch: u64,
+    pub successor_epoch: u64,
+    pub predecessor_end_kind: String,
+    pub observed_at_ms: u64,
+}
+
+impl GenerationHandoffView {
+    fn valid(&self) -> bool {
+        self.predecessor_epoch > 0
+            && self.successor_epoch > self.predecessor_epoch
+            && matches!(
+                self.predecessor_end_kind.as_str(),
+                "released" | "expired" | "superseded"
+            )
+    }
+
+    fn to_body(&self) -> Result<JsonValue, AdminError> {
+        if !self.valid() {
+            return Err(AdminError::InvalidBody);
+        }
+        Ok(JsonValue::Object(vec![
+            (
+                "observed_at_ms".to_owned(),
+                integer("observed_at_ms", self.observed_at_ms)?,
+            ),
+            (
+                "predecessor_end_kind".to_owned(),
+                JsonValue::String(self.predecessor_end_kind.clone()),
+            ),
+            (
+                "predecessor_epoch".to_owned(),
+                integer("predecessor_epoch", self.predecessor_epoch)?,
+            ),
+            (
+                "successor_epoch".to_owned(),
+                integer("successor_epoch", self.successor_epoch)?,
+            ),
+        ]))
+    }
+
+    fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
+        exact_fields(
+            body,
+            &[
+                "observed_at_ms",
+                "predecessor_end_kind",
+                "predecessor_epoch",
+                "successor_epoch",
+            ],
+        )?;
+        let view = Self {
+            predecessor_epoch: unsigned(body, "predecessor_epoch")?,
+            successor_epoch: unsigned(body, "successor_epoch")?,
+            predecessor_end_kind: required_body_string(body, "predecessor_end_kind")?,
+            observed_at_ms: unsigned(body, "observed_at_ms")?,
+        };
+        view.valid().then_some(view).ok_or(AdminError::InvalidBody)
+    }
+}
+
+/// Bounded recent history of the logical foreground generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GenerationsView {
+    pub generation_id: String,
+    pub tenures: Vec<GenerationTenureView>,
+    pub handoffs: Vec<GenerationHandoffView>,
+}
+
+impl GenerationsView {
+    fn valid(&self) -> bool {
+        valid_coordinate(&self.generation_id, MAX_RECONCILIATION_FIELD_BYTES)
+            && self.tenures.len() <= MAX_GENERATION_HISTORY_ENTRIES
+            && self.handoffs.len() <= MAX_GENERATION_HISTORY_ENTRIES
+            && self.tenures.iter().all(GenerationTenureView::valid)
+            && self.handoffs.iter().all(GenerationHandoffView::valid)
+            && self
+                .tenures
+                .windows(2)
+                .all(|pair| pair[0].lease_epoch < pair[1].lease_epoch)
+            && self
+                .handoffs
+                .windows(2)
+                .all(|pair| pair[0].successor_epoch < pair[1].successor_epoch)
+            && self.handoffs.iter().all(|handoff| {
+                self.tenures
+                    .iter()
+                    .any(|tenure| tenure.lease_epoch == handoff.successor_epoch)
+            })
+            && self.tenures.iter().enumerate().all(|(index, tenure)| {
+                tenure.ended_at_ms.is_some() || index + 1 == self.tenures.len()
+            })
+    }
+
+    fn to_body(&self) -> Result<JsonValue, AdminError> {
+        if !self.valid() {
+            return Err(AdminError::InvalidBody);
+        }
+        Ok(JsonValue::Object(vec![
+            (
+                "generation_id".to_owned(),
+                JsonValue::String(self.generation_id.clone()),
+            ),
+            (
+                "handoffs".to_owned(),
+                JsonValue::Array(
+                    self.handoffs
+                        .iter()
+                        .map(GenerationHandoffView::to_body)
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+            ),
+            (
+                "tenures".to_owned(),
+                JsonValue::Array(
+                    self.tenures
+                        .iter()
+                        .map(GenerationTenureView::to_body)
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+            ),
+        ]))
+    }
+
+    fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
+        exact_fields(body, &["generation_id", "handoffs", "tenures"])?;
+        let tenures = body
+            .get("tenures")
+            .and_then(JsonValue::as_array)
+            .ok_or(AdminError::InvalidBody)?;
+        let handoffs = body
+            .get("handoffs")
+            .and_then(JsonValue::as_array)
+            .ok_or(AdminError::InvalidBody)?;
+        if tenures.len() > MAX_GENERATION_HISTORY_ENTRIES
+            || handoffs.len() > MAX_GENERATION_HISTORY_ENTRIES
+        {
+            return Err(AdminError::InvalidBody);
+        }
+        let view = Self {
+            generation_id: required_body_string(body, "generation_id")?,
+            tenures: tenures
+                .iter()
+                .map(GenerationTenureView::from_body)
+                .collect::<Result<Vec<_>, _>>()?,
+            handoffs: handoffs
+                .iter()
+                .map(GenerationHandoffView::from_body)
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        view.valid().then_some(view).ok_or(AdminError::InvalidBody)
+    }
+}
+
+/// One append-only reload transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReloadTransitionView {
+    pub revision: u64,
+    pub phase: String,
+    pub observed_at_ms: u64,
+    pub failure_category: Option<String>,
+}
+
+impl ReloadTransitionView {
+    fn valid(&self) -> bool {
+        self.revision > 0
+            && valid_reload_phase(&self.phase)
+            && self
+                .failure_category
+                .as_ref()
+                .is_none_or(|value| valid_coordinate(value, MAX_ADMIN_REFUSAL_CATEGORY_BYTES))
+            && matches!(self.phase.as_str(), "failed" | "rolled_back")
+                == self.failure_category.is_some()
+    }
+
+    fn to_body(&self) -> Result<JsonValue, AdminError> {
+        if !self.valid() {
+            return Err(AdminError::InvalidBody);
+        }
+        Ok(JsonValue::Object(vec![
+            (
+                "failure_category".to_owned(),
+                optional_string(&self.failure_category),
+            ),
+            ("phase".to_owned(), JsonValue::String(self.phase.clone())),
+            (
+                "observed_at_ms".to_owned(),
+                integer("observed_at_ms", self.observed_at_ms)?,
+            ),
+            ("revision".to_owned(), integer("revision", self.revision)?),
+        ]))
+    }
+
+    fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
+        exact_fields(
+            body,
+            &["failure_category", "observed_at_ms", "phase", "revision"],
+        )?;
+        let view = Self {
+            revision: unsigned(body, "revision")?,
+            phase: required_body_string(body, "phase")?,
+            observed_at_ms: unsigned(body, "observed_at_ms")?,
+            failure_category: optional_body_string(body, "failure_category")?,
+        };
+        view.valid().then_some(view).ok_or(AdminError::InvalidBody)
+    }
+}
+
+/// Current state and complete bounded transition history of one reload epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReloadStatusView {
+    pub reload_id: String,
+    pub source_generation_id: String,
+    pub source_lease_epoch: u64,
+    pub target_generation_id: String,
+    pub target_release_digest: String,
+    pub phase: String,
+    pub failure_category: Option<String>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub terminal_at_ms: Option<u64>,
+    pub revision: u64,
+    pub transitions: Vec<ReloadTransitionView>,
+}
+
+impl ReloadStatusView {
+    fn valid(&self) -> bool {
+        let complete_history = self.transitions.first().is_some_and(|first| {
+            first.revision == 1
+                && first.phase == "created"
+                && first.observed_at_ms == self.created_at_ms
+        }) && self.transitions.last().is_some_and(|last| {
+            last.revision == self.revision
+                && last.phase == self.phase
+                && last.observed_at_ms == self.updated_at_ms
+                && last.failure_category == self.failure_category
+        }) && self.transitions.windows(2).all(|pair| {
+            pair[0].revision.checked_add(1) == Some(pair[1].revision)
+                && pair[1].observed_at_ms >= pair[0].observed_at_ms
+                && valid_reload_transition(&pair[0].phase, &pair[1].phase)
+        });
+        valid_coordinate(&self.reload_id, MAX_RELOAD_ID_BYTES)
+            && valid_coordinate(&self.source_generation_id, MAX_RECONCILIATION_FIELD_BYTES)
+            && valid_coordinate(&self.target_generation_id, MAX_RECONCILIATION_FIELD_BYTES)
+            && self.source_generation_id != self.target_generation_id
+            && valid_release_digest(&self.target_release_digest)
+            && self.source_lease_epoch > 0
+            && self.revision > 0
+            && valid_reload_phase(&self.phase)
+            && self.updated_at_ms >= self.created_at_ms
+            && self
+                .terminal_at_ms
+                .is_none_or(|value| value >= self.created_at_ms)
+            && self.transitions.len() <= MAX_RELOAD_TRANSITIONS
+            && self.transitions.iter().all(ReloadTransitionView::valid)
+            && complete_history
+            && self
+                .failure_category
+                .as_ref()
+                .is_none_or(|value| valid_coordinate(value, MAX_ADMIN_REFUSAL_CATEGORY_BYTES))
+            && matches!(self.phase.as_str(), "failed" | "rolled_back")
+                == self.failure_category.is_some()
+            && matches!(self.phase.as_str(), "succeeded" | "failed" | "rolled_back")
+                == self.terminal_at_ms.is_some()
+            && self
+                .terminal_at_ms
+                .is_none_or(|terminal| terminal == self.updated_at_ms)
+    }
+
+    fn to_body(&self) -> Result<JsonValue, AdminError> {
+        if !self.valid() {
+            return Err(AdminError::InvalidBody);
+        }
+        Ok(JsonValue::Object(vec![
+            (
+                "created_at_ms".to_owned(),
+                integer("created_at_ms", self.created_at_ms)?,
+            ),
+            (
+                "failure_category".to_owned(),
+                optional_string(&self.failure_category),
+            ),
+            ("phase".to_owned(), JsonValue::String(self.phase.clone())),
+            (
+                "reload_id".to_owned(),
+                JsonValue::String(self.reload_id.clone()),
+            ),
+            ("revision".to_owned(), integer("revision", self.revision)?),
+            (
+                "source_generation_id".to_owned(),
+                JsonValue::String(self.source_generation_id.clone()),
+            ),
+            (
+                "source_lease_epoch".to_owned(),
+                integer("source_lease_epoch", self.source_lease_epoch)?,
+            ),
+            (
+                "target_generation_id".to_owned(),
+                JsonValue::String(self.target_generation_id.clone()),
+            ),
+            (
+                "target_release_digest".to_owned(),
+                JsonValue::String(self.target_release_digest.clone()),
+            ),
+            (
+                "terminal_at_ms".to_owned(),
+                optional_integer("terminal_at_ms", self.terminal_at_ms)?,
+            ),
+            (
+                "transitions".to_owned(),
+                JsonValue::Array(
+                    self.transitions
+                        .iter()
+                        .map(ReloadTransitionView::to_body)
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+            ),
+            (
+                "updated_at_ms".to_owned(),
+                integer("updated_at_ms", self.updated_at_ms)?,
+            ),
+        ]))
+    }
+
+    fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
+        exact_fields(
+            body,
+            &[
+                "created_at_ms",
+                "failure_category",
+                "phase",
+                "reload_id",
+                "revision",
+                "source_generation_id",
+                "source_lease_epoch",
+                "target_generation_id",
+                "target_release_digest",
+                "terminal_at_ms",
+                "transitions",
+                "updated_at_ms",
+            ],
+        )?;
+        let transitions = body
+            .get("transitions")
+            .and_then(JsonValue::as_array)
+            .ok_or(AdminError::InvalidBody)?;
+        if transitions.len() > MAX_RELOAD_TRANSITIONS {
+            return Err(AdminError::InvalidBody);
+        }
+        let view = Self {
+            reload_id: required_body_string(body, "reload_id")?,
+            source_generation_id: required_body_string(body, "source_generation_id")?,
+            source_lease_epoch: unsigned(body, "source_lease_epoch")?,
+            target_generation_id: required_body_string(body, "target_generation_id")?,
+            target_release_digest: required_body_string(body, "target_release_digest")?,
+            phase: required_body_string(body, "phase")?,
+            failure_category: optional_body_string(body, "failure_category")?,
+            created_at_ms: unsigned(body, "created_at_ms")?,
+            updated_at_ms: unsigned(body, "updated_at_ms")?,
+            terminal_at_ms: optional_unsigned(body, "terminal_at_ms")?,
+            revision: unsigned(body, "revision")?,
+            transitions: transitions
+                .iter()
+                .map(ReloadTransitionView::from_body)
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        view.valid().then_some(view).ok_or(AdminError::InvalidBody)
+    }
+}
+
+fn valid_reload_phase(value: &str) -> bool {
+    matches!(
+        value,
+        "created"
+            | "candidate_started"
+            | "warm"
+            | "quiescing"
+            | "transferred"
+            | "active_proven"
+            | "draining"
+            | "succeeded"
+            | "failed"
+            | "rolled_back"
+    )
+}
+
+fn valid_reload_transition(from: &str, to: &str) -> bool {
+    matches!(
+        (from, to),
+        ("created", "candidate_started" | "failed")
+            | ("candidate_started", "warm" | "failed")
+            | ("warm", "quiescing" | "failed")
+            | ("quiescing", "transferred" | "failed")
+            | ("transferred", "active_proven" | "failed" | "rolled_back")
+            | ("active_proven", "draining" | "failed" | "rolled_back")
+            | ("draining", "succeeded" | "failed" | "rolled_back")
+    )
+}
+
+fn valid_release_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
+}
+
 /// A correlated response from the local daemon.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AdminResponse {
@@ -3447,6 +4024,16 @@ pub enum AdminResponse {
         request_id: RequestId,
         /// Bounded UTF-8 Prometheus text ending in a newline.
         exposition: String,
+    },
+    /// Recent generation tenure and handoff history.
+    Generations {
+        request_id: RequestId,
+        generations: GenerationsView,
+    },
+    /// One reload epoch and its append-only history.
+    ReloadStatus {
+        request_id: RequestId,
+        reload: ReloadStatusView,
     },
     /// A synthetic work item is durable, or the exact retry was replayed.
     SyntheticAccepted {
@@ -3537,6 +4124,8 @@ impl AdminResponse {
         match self {
             Self::Status { request_id, .. }
             | Self::Metrics { request_id, .. }
+            | Self::Generations { request_id, .. }
+            | Self::ReloadStatus { request_id, .. }
             | Self::SyntheticAccepted { request_id, .. }
             | Self::RunAccepted { request_id, .. }
             | Self::ReconciliationInspected { request_id, .. }
@@ -3577,6 +4166,17 @@ impl AdminResponse {
                     )]),
                 ))
             }
+            Self::Generations {
+                request_id,
+                generations,
+            } => Ok(Message::new(
+                envelope(request_id.clone(), "generations_result")?,
+                generations.to_body()?,
+            )),
+            Self::ReloadStatus { request_id, reload } => Ok(Message::new(
+                envelope(request_id.clone(), "reload_status_result")?,
+                reload.to_body()?,
+            )),
             Self::SyntheticAccepted {
                 request_id,
                 inbox_id,
@@ -3747,6 +4347,14 @@ impl AdminResponse {
                     exposition,
                 })
             }
+            "generations_result" => Ok(Self::Generations {
+                request_id,
+                generations: GenerationsView::from_body(message.body())?,
+            }),
+            "reload_status_result" => Ok(Self::ReloadStatus {
+                request_id,
+                reload: ReloadStatusView::from_body(message.body())?,
+            }),
             "synthetic_accepted" => {
                 exact_fields(message.body(), &["duplicate", "inbox_id"])?;
                 let duplicate = match message.body().get("duplicate") {

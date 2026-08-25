@@ -77,6 +77,15 @@ impl JsonValue {
         }
     }
 
+    /// Borrow an array value.
+    #[must_use]
+    pub fn as_array(&self) -> Option<&[Self]> {
+        match self {
+            Self::Array(value) => Some(value),
+            _ => None,
+        }
+    }
+
     /// Serialize to canonical bytes.
     ///
     /// Object keys are sorted by byte order before writing, so a value built in

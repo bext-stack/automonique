@@ -4,12 +4,13 @@ use automonique_protocol::admin::{
     ADMIN_PROTOCOL, AdminCommand, AdminError, AdminInstanceId, AdminOutboxEvidence,
     AdminOutboxEvidenceParts, AdminReconciliationEvidence, AdminRefusalCategory, AdminRequest,
     AdminResponse, DaemonState, DaemonStatus, DurableStateCounts, DurableStateCountsParts,
-    ExecutionState, IntakePause, IntakeResume, MAX_ADMIN_CANONICAL_BYTES, MAX_INSTANCE_ID_BYTES,
-    MAX_INTAKE_ACTOR_BYTES, MAX_INTAKE_REASON_BYTES, MAX_RUN_SUBMISSION_KEY_BYTES,
-    MAX_SUBMITTED_RUN_SPEC_BYTES, MAX_SYNTHETIC_KEY_BYTES, MAX_SYNTHETIC_SCOPE_BYTES,
-    MAX_SYNTHETIC_TASK_BYTES, OperationalMetric, OperationalStatus, OperationalStatusParts,
-    OutboxReconciliation, OutboxReconciliationDecision, OutboxReconciliationParts,
-    ReconciliationFailure, SubmittedRunSpec, SyntheticSubmission,
+    ExecutionState, GenerationHandoffView, GenerationTenureView, GenerationsView, IntakePause,
+    IntakeResume, MAX_ADMIN_CANONICAL_BYTES, MAX_INSTANCE_ID_BYTES, MAX_INTAKE_ACTOR_BYTES,
+    MAX_INTAKE_REASON_BYTES, MAX_RUN_SUBMISSION_KEY_BYTES, MAX_SUBMITTED_RUN_SPEC_BYTES,
+    MAX_SYNTHETIC_KEY_BYTES, MAX_SYNTHETIC_SCOPE_BYTES, MAX_SYNTHETIC_TASK_BYTES,
+    OperationalMetric, OperationalStatus, OperationalStatusParts, OutboxReconciliation,
+    OutboxReconciliationDecision, OutboxReconciliationParts, ReconciliationFailure,
+    ReloadStatusView, ReloadTransitionView, SubmittedRunSpec, SyntheticSubmission,
 };
 use automonique_protocol::codec::{CodecError, FrameDecode, RequestId, decode_frame, encode_frame};
 use automonique_protocol::digest::Sha256;
@@ -1464,6 +1465,123 @@ fn intake_pause_receipts_are_correlated_and_refuse_unwritten_rows() {
 }
 
 #[test]
+fn generation_and_reload_reads_are_exact_bounded_and_round_trip() {
+    let generations_request = AdminRequest::new(request_id(), AdminCommand::Generations);
+    assert_eq!(
+        AdminRequest::from_canonical_bytes(
+            &generations_request
+                .to_message()
+                .expect("encode generations request")
+                .to_canonical_bytes(),
+        )
+        .expect("decode generations request"),
+        generations_request
+    );
+
+    let reload_request =
+        AdminRequest::reload_status(request_id(), "reload-7").expect("bounded reload ID");
+    assert_eq!(reload_request.reload_id(), Some("reload-7"));
+    assert_eq!(
+        AdminRequest::from_canonical_bytes(
+            &reload_request
+                .to_message()
+                .expect("encode reload request")
+                .to_canonical_bytes(),
+        )
+        .expect("decode reload request"),
+        reload_request
+    );
+
+    let generations = AdminResponse::Generations {
+        request_id: request_id(),
+        generations: GenerationsView {
+            generation_id: "foreground".to_owned(),
+            tenures: vec![
+                GenerationTenureView {
+                    holder_id: "daemon-old".to_owned(),
+                    lease_epoch: 6,
+                    started_at_ms: 10,
+                    ended_at_ms: Some(19),
+                    end_kind: Some("superseded".to_owned()),
+                },
+                GenerationTenureView {
+                    holder_id: "daemon-new".to_owned(),
+                    lease_epoch: 7,
+                    started_at_ms: 19,
+                    ended_at_ms: None,
+                    end_kind: None,
+                },
+            ],
+            handoffs: vec![GenerationHandoffView {
+                predecessor_epoch: 6,
+                successor_epoch: 7,
+                predecessor_end_kind: "superseded".to_owned(),
+                observed_at_ms: 19,
+            }],
+        },
+    };
+    let generation_bytes = generations
+        .to_message()
+        .expect("encode generation history")
+        .to_canonical_bytes();
+    assert_eq!(
+        AdminResponse::from_canonical_bytes(&generation_bytes).expect("decode generation history"),
+        generations
+    );
+
+    let reload = AdminResponse::ReloadStatus {
+        request_id: request_id(),
+        reload: ReloadStatusView {
+            reload_id: "reload-7".to_owned(),
+            source_generation_id: "foreground".to_owned(),
+            source_lease_epoch: 6,
+            target_generation_id: "foreground-next".to_owned(),
+            target_release_digest: format!("sha256:{}", "a".repeat(64)),
+            phase: "candidate_started".to_owned(),
+            failure_category: None,
+            created_at_ms: 20,
+            updated_at_ms: 21,
+            terminal_at_ms: None,
+            revision: 2,
+            transitions: vec![
+                ReloadTransitionView {
+                    revision: 1,
+                    phase: "created".to_owned(),
+                    observed_at_ms: 20,
+                    failure_category: None,
+                },
+                ReloadTransitionView {
+                    revision: 2,
+                    phase: "candidate_started".to_owned(),
+                    observed_at_ms: 21,
+                    failure_category: None,
+                },
+            ],
+        },
+    };
+    let reload_bytes = reload
+        .to_message()
+        .expect("encode reload status")
+        .to_canonical_bytes();
+    assert_eq!(
+        AdminResponse::from_canonical_bytes(&reload_bytes).expect("decode reload status"),
+        reload
+    );
+
+    let unknown_phase = String::from_utf8(reload_bytes)
+        .expect("canonical UTF-8")
+        .replace(
+            "\"phase\":\"candidate_started\"",
+            "\"phase\":\"future_phase\"",
+        );
+    assert_eq!(
+        AdminResponse::from_canonical_bytes(unknown_phase.as_bytes())
+            .expect_err("unknown reload phase"),
+        AdminError::InvalidBody
+    );
+}
+
+#[test]
 fn a_reported_pause_cannot_claim_intake_is_still_open() {
     // The coherence rule: paused implies intake is closed.
     let open = DaemonStatus::new(
@@ -2264,6 +2382,7 @@ mod capability {
         (3, "provenance on reconciliation evidence"),
         (4, "execution status reports the wired lane"),
         (5, "the ten-method platform v1 local endpoint"),
+        (6, "generation history and reload-status reads"),
     ];
 
     /// Every endpoint, at the maturity it had when it landed.
@@ -2304,6 +2423,8 @@ mod capability {
         "automonique.batch/batch_detail",
         "automonique.progress.stream/subscribe",
         "automonique.admin/metrics",
+        "automonique.admin/generations",
+        "automonique.admin/reload_status",
         "automonique.platform/capabilities",
         "automonique.platform/snapshot",
         "automonique.platform/subscribe",
@@ -2368,7 +2489,7 @@ mod capability {
     /// closed set rather than by reading the table.
     #[test]
     fn every_admin_command_is_declared() {
-        assert_eq!(AdminCommand::ALL.len(), 11);
+        assert_eq!(AdminCommand::ALL.len(), 13);
         for command in AdminCommand::ALL {
             let endpoint = format!("automonique.admin/{}", command.kind());
             assert!(
