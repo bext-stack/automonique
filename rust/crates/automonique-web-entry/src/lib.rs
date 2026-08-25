@@ -66,7 +66,8 @@ use crate::mobile_auth::{
     MOBILE_AUTH_MEDIA_TYPE, MOBILE_AUTH_SCHEMA_V1, MobileAuthorization, MobileCredentialAuthority,
     MobileCredentialInventory, MobileCredentialInventoryRequest, MobileCredentialRevokeRequest,
     MobileOperatorProvisionRequest, MobilePairingExchangeRequest, MobilePairingOffer,
-    MobileRefreshRequest, MobileRevocation, authorize_platform_request, filter_sessions,
+    MobileRefreshRequest, MobileRevocation, authorize_platform_request, filter_command_state,
+    filter_sessions,
 };
 
 const DASHBOARD_HTML: &str = include_str!("../assets/dashboard.html");
@@ -1742,6 +1743,11 @@ impl WebIntegration {
         if let (Some(authorization), PlatformResponse::Sessions(sessions)) = (mobile, &mut response)
         {
             *sessions = filter_sessions(authorization, sessions.clone());
+        }
+        if let (Some(authorization), PlatformResponse::SessionCommandState(state)) =
+            (mobile, &mut response)
+        {
+            *state = filter_command_state(authorization, state.clone());
         }
         PlatformResponseMessage::new(request_id, response)
             .to_message()
@@ -5781,9 +5787,10 @@ mod tests {
     use automonique_protocol::platform::{
         ActionReceipt, Attachment, ControlLease, ControlLeaseId, CursorTopic, Freshness,
         FreshnessState, PlatformAction, PlatformEvent, PlatformText, ReceiptId, ReceiptOutcome,
-        ResourceId, ResourceKind, SessionHistoryEvent, SessionHistoryEvidence, SessionHistoryPage,
-        SessionHistoryResync, SessionHistoryRole, SessionHistoryRunState, SessionHistoryText,
-        SessionHistoryToolState, SessionHistoryUnknownSource, SessionList, Snapshot, Subscription,
+        ResourceId, ResourceKind, SessionCommandState, SessionCommandTarget, SessionHistoryEvent,
+        SessionHistoryEvidence, SessionHistoryPage, SessionHistoryResync, SessionHistoryRole,
+        SessionHistoryRunState, SessionHistoryText, SessionHistoryToolState,
+        SessionHistoryUnknownSource, SessionList, Snapshot, Subscription,
     };
     use automonique_protocol::primitives::{EpochMillis, Revision};
     use std::collections::VecDeque;
@@ -6473,6 +6480,49 @@ mod tests {
                                 )
                             }
                         }
+                        PlatformRequest::SessionCommandState(value) => {
+                            let session_record = ResourceRecord {
+                                resource: value.session.clone(),
+                                freshness: Freshness {
+                                    state: FreshnessState::Fresh,
+                                    observed_at: EpochMillis::from_millis(20),
+                                    revision: Revision::new(20).unwrap(),
+                                },
+                                summary: PlatformText::new("open").unwrap(),
+                            };
+                            PlatformResponse::SessionCommandState(
+                                SessionCommandState::new(
+                                    session_record,
+                                    Some(SessionCommandTarget {
+                                        target: run.clone(),
+                                        revision: Revision::new(21).unwrap(),
+                                    }),
+                                    Vec::new(),
+                                )
+                                .unwrap(),
+                            )
+                        }
+                        PlatformRequest::SessionFollowUp(value) => {
+                            PlatformResponse::Receipt(ActionReceipt {
+                                action: PlatformAction::FollowUp,
+                                target: value.session.clone(),
+                                ..receipt.clone()
+                            })
+                        }
+                        PlatformRequest::SessionRunStop(value) => {
+                            PlatformResponse::Receipt(ActionReceipt {
+                                action: PlatformAction::StopRun,
+                                target: value.run.clone(),
+                                ..receipt.clone()
+                            })
+                        }
+                        PlatformRequest::SessionApprovalDecision(value) => {
+                            PlatformResponse::Receipt(ActionReceipt {
+                                action: PlatformAction::DecideApproval,
+                                target: value.approval.clone(),
+                                ..receipt.clone()
+                            })
+                        }
                     }
                 };
                 let response = PlatformResponseMessage::new(request.request_id().clone(), response)
@@ -6569,7 +6619,8 @@ mod tests {
 
     #[test]
     fn built_typescript_sdk_passes_the_live_mobile_lifecycle_contract() {
-        const EXCHANGES: usize = 31;
+        const EXCHANGES: usize = 38;
+        const PLATFORM_EXCHANGES: usize = 5;
 
         let state_dir = tempfile::tempdir().expect("temporary state");
         let runtime_dir = tempfile::tempdir().expect("temporary runtime");
@@ -6577,8 +6628,141 @@ mod tests {
             .expect("private state");
         std::fs::set_permissions(runtime_dir.path(), std::fs::Permissions::from_mode(0o700))
             .expect("private runtime");
-        let _platform_listener = UnixListener::bind(runtime_dir.path().join("admin.sock"))
+        let platform_listener = UnixListener::bind(runtime_dir.path().join("admin.sock"))
             .expect("fixture platform socket");
+        let platform_server = thread::spawn(move || {
+            let session = ResourceCoordinate::new(
+                ResourceAuthority::Automonique,
+                ResourceKind::Session,
+                ResourceId::new("session-a").unwrap(),
+            );
+            let run = ResourceCoordinate::new(
+                ResourceAuthority::Automonique,
+                ResourceKind::Run,
+                ResourceId::new("run-a").unwrap(),
+            );
+            let approval = ResourceCoordinate::new(
+                ResourceAuthority::Automonique,
+                ResourceKind::Approval,
+                ResourceId::new("approval-a").unwrap(),
+            );
+            let mut admitted_client = None;
+            for _ in 0..PLATFORM_EXCHANGES {
+                let (mut stream, _) = platform_listener.accept().expect("platform connection");
+                let mut prefix = [0_u8; 4];
+                stream.read_exact(&mut prefix).expect("platform prefix");
+                let length = usize::try_from(u32::from_be_bytes(prefix)).unwrap();
+                let mut payload = vec![0_u8; length];
+                stream.read_exact(&mut payload).expect("platform request");
+                let request = PlatformRequestMessage::from_canonical_bytes(&payload)
+                    .expect("canonical command request");
+                let receipt = |id: &str,
+                               action: PlatformAction,
+                               target: ResourceCoordinate|
+                 -> ActionReceipt {
+                    ActionReceipt {
+                        id: ReceiptId::new(id).unwrap(),
+                        action,
+                        target,
+                        outcome: ReceiptOutcome::Completed,
+                        revision: Revision::new(30).unwrap(),
+                        recorded_at: EpochMillis::from_millis(30),
+                        explanation: None,
+                    }
+                };
+                let response = match request.request() {
+                    PlatformRequest::SessionCommandState(value) => {
+                        assert_eq!(value.session, session);
+                        PlatformResponse::SessionCommandState(
+                            SessionCommandState::new(
+                                ResourceRecord {
+                                    resource: session.clone(),
+                                    freshness: Freshness {
+                                        state: FreshnessState::Fresh,
+                                        observed_at: EpochMillis::from_millis(11),
+                                        revision: Revision::new(11).unwrap(),
+                                    },
+                                    summary: PlatformText::new("open").unwrap(),
+                                },
+                                Some(SessionCommandTarget {
+                                    target: run.clone(),
+                                    revision: Revision::new(12).unwrap(),
+                                }),
+                                vec![SessionCommandTarget {
+                                    target: approval.clone(),
+                                    revision: Revision::new(13).unwrap(),
+                                }],
+                            )
+                            .unwrap(),
+                        )
+                    }
+                    PlatformRequest::SessionFollowUp(value) => {
+                        assert_eq!(value.session, session);
+                        admitted_client = Some(value.client.clone());
+                        assert_eq!(value.expected_session_revision.get(), 11);
+                        assert_eq!(value.idempotency_key.as_str(), "mobile-follow-up");
+                        assert_eq!(value.text.as_str(), "continue");
+                        PlatformResponse::Receipt(receipt(
+                            "receipt-follow",
+                            PlatformAction::FollowUp,
+                            session.clone(),
+                        ))
+                    }
+                    PlatformRequest::SessionRunStop(value) => {
+                        assert_eq!(value.session, session);
+                        assert_eq!(value.run, run);
+                        assert_eq!(admitted_client.as_ref(), Some(&value.client));
+                        assert_eq!(value.expected_session_revision.get(), 11);
+                        assert_eq!(value.expected_run_revision.get(), 12);
+                        assert_eq!(value.idempotency_key.as_str(), "mobile-stop-run");
+                        PlatformResponse::Receipt(receipt(
+                            "receipt-stop",
+                            PlatformAction::StopRun,
+                            run.clone(),
+                        ))
+                    }
+                    PlatformRequest::SessionApprovalDecision(value) => {
+                        assert_eq!(value.session, session);
+                        assert_eq!(value.approval, approval);
+                        assert_eq!(admitted_client.as_ref(), Some(&value.client));
+                        assert_eq!(value.expected_session_revision.get(), 11);
+                        assert_eq!(value.expected_approval_revision.get(), 13);
+                        assert_eq!(value.idempotency_key.as_str(), "mobile-decide-approval");
+                        assert_eq!(
+                            value.decision,
+                            automonique_protocol::platform::SessionApprovalDecision::Grant
+                        );
+                        PlatformResponse::Receipt(receipt(
+                            "receipt-approval",
+                            PlatformAction::DecideApproval,
+                            approval.clone(),
+                        ))
+                    }
+                    PlatformRequest::GetReceipt(value) => {
+                        assert_eq!(value.client.as_ref(), admitted_client.as_ref());
+                        assert!(value.id.is_none());
+                        assert_eq!(
+                            value.idempotency_key.as_ref().map(|key| key.as_str()),
+                            Some("mobile-follow-up")
+                        );
+                        PlatformResponse::Receipt(receipt(
+                            "receipt-follow",
+                            PlatformAction::FollowUp,
+                            session.clone(),
+                        ))
+                    }
+                    other => panic!("unexpected mobile command request: {other:?}"),
+                };
+                let bytes = PlatformResponseMessage::new(request.request_id().clone(), response)
+                    .to_message()
+                    .unwrap()
+                    .to_canonical_bytes();
+                stream
+                    .write_all(&u32::try_from(bytes.len()).unwrap().to_be_bytes())
+                    .unwrap();
+                stream.write_all(&bytes).unwrap();
+            }
+        });
         let integration = Arc::new(
             WebIntegration::open(
                 IntegrationConfig {
@@ -6636,6 +6820,7 @@ mod tests {
         );
 
         web_server.join().expect("web server");
+        platform_server.join().expect("platform server");
     }
 
     #[test]

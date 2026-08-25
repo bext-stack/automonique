@@ -334,6 +334,9 @@ fn referenced_categories(surface: &automonique_protocol::codegen::CommandSurface
             }
             | RequestValidation::ActionAuthority {
                 refusal_category, ..
+            }
+            | RequestValidation::ExactCoordinate {
+                refusal_category, ..
             } => refusal_category.clone(),
         });
     }

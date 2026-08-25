@@ -14,7 +14,7 @@
     "protocol": "automonique.platform",
     "protocolRange": "1",
     "schema": "automonique.platform/v1",
-    "schemaDigest": "sha256:a0fd0ffb675d081adeb6480462b29629b8fd19a9d91f88931cf66a0726387ebe"
+    "schemaDigest": "sha256:3e58e47e26a69e2c897eae4dde19329e1245fdc6070f6762f5eaec140f9b0b41"
   },
   "files": [
     "dist"
@@ -24,6 +24,11 @@
       "types": "./dist/sdk/src/index.d.ts",
       "import": "./dist/sdk/src/index.js",
       "default": "./dist/sdk/src/index.js"
+    },
+    "./testing": {
+      "types": "./dist/sdk/src/testing.d.ts",
+      "import": "./dist/sdk/src/testing.js",
+      "default": "./dist/sdk/src/testing.js"
     }
   },
   "scripts": {

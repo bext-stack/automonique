@@ -29,6 +29,8 @@ pub const MAX_SUBSCRIPTION_EVENTS: usize = 512;
 pub const MAX_SESSION_HISTORY_EVENTS: usize = 512;
 /// Largest display text retained in one mobile-safe history event.
 pub const MAX_SESSION_HISTORY_TEXT_BYTES: usize = 512;
+/// Largest number of pending approvals exposed by one session command-state read.
+pub const MAX_SESSION_COMMAND_APPROVALS: usize = 128;
 /// Largest number of service methods advertised by one endpoint.
 pub const MAX_CAPABILITY_METHODS: usize = 32;
 /// Maximum transport projections advertised by one endpoint.
@@ -318,7 +320,7 @@ pub struct PlatformCursor {
     pub sequence: Revision,
 }
 
-/// Version-one operation names. Only `execute` and control methods mutate.
+/// Version-one operation names, including explicit session-bound mutations.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum PlatformMethod {
     Capabilities,
@@ -333,10 +335,14 @@ pub enum PlatformMethod {
     ReleaseControl,
     SessionHistorySnapshot,
     SessionHistoryPage,
+    SessionCommandState,
+    SessionFollowUp,
+    SessionRunStop,
+    SessionApprovalDecision,
 }
 
 impl PlatformMethod {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 16] = [
         Self::Capabilities,
         Self::Snapshot,
         Self::Subscribe,
@@ -349,6 +355,10 @@ impl PlatformMethod {
         Self::ReleaseControl,
         Self::SessionHistorySnapshot,
         Self::SessionHistoryPage,
+        Self::SessionCommandState,
+        Self::SessionFollowUp,
+        Self::SessionRunStop,
+        Self::SessionApprovalDecision,
     ];
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -365,6 +375,10 @@ impl PlatformMethod {
             Self::ReleaseControl => "release_control",
             Self::SessionHistorySnapshot => "session_history_snapshot",
             Self::SessionHistoryPage => "session_history_page",
+            Self::SessionCommandState => "session_command_state",
+            Self::SessionFollowUp => "session_follow_up",
+            Self::SessionRunStop => "session_run_stop",
+            Self::SessionApprovalDecision => "session_approval_decision",
         }
     }
 
@@ -908,8 +922,8 @@ pub struct SubscribeRequest {
     pub cursor: Option<PlatformCursor>,
 }
 
-/// All mutations pass through this request; no transport-specific mutation
-/// or provider-direct escape hatch exists in the public contract.
+/// General operator mutation request. Session-bound mobile mutations use the
+/// dedicated fenced request types below rather than widening this surface.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecuteRequest {
     /// Authenticated remote principal. Gateways verify this value against the
@@ -1072,6 +1086,117 @@ pub struct ReleaseControlRequest {
     pub idempotency_key: IdempotencyKey,
 }
 
+/// Read the exact revision fences required for session-bound mobile commands.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionCommandStateRequest {
+    pub session: ResourceCoordinate,
+}
+
+/// One session-owned command target and its exact authority revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionCommandTarget {
+    pub target: ResourceCoordinate,
+    pub revision: Revision,
+}
+
+/// Minimal sanitized command state. It deliberately contains no provider payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionCommandState {
+    pub session: ResourceRecord,
+    pub run: Option<SessionCommandTarget>,
+    pub pending_approvals: Vec<SessionCommandTarget>,
+}
+
+impl SessionCommandState {
+    pub fn new(
+        session: ResourceRecord,
+        run: Option<SessionCommandTarget>,
+        pending_approvals: Vec<SessionCommandTarget>,
+    ) -> Result<Self, PlatformError> {
+        validate_command_coordinate(&session.resource, ResourceKind::Session)?;
+        if let Some(run) = &run {
+            validate_command_coordinate(&run.target, ResourceKind::Run)?;
+        }
+        if pending_approvals.len() > MAX_SESSION_COMMAND_APPROVALS {
+            return Err(PlatformError::TooManyCommandApprovals);
+        }
+        for approval in &pending_approvals {
+            validate_command_coordinate(&approval.target, ResourceKind::Approval)?;
+        }
+        Ok(Self {
+            session,
+            run,
+            pending_approvals,
+        })
+    }
+}
+
+/// Closed mobile approval decision vocabulary.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SessionApprovalDecision {
+    Grant,
+    Deny,
+}
+
+impl SessionApprovalDecision {
+    pub const ALL: [Self; 2] = [Self::Grant, Self::Deny];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Grant => "grant",
+            Self::Deny => "deny",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, PlatformError> {
+        parse_closed(&Self::ALL, value, Self::as_str, "session_approval_decision")
+    }
+}
+
+/// Submit bounded follow-up text against one exact session revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionFollowUpRequest {
+    pub client: ClientId,
+    pub session: ResourceCoordinate,
+    pub expected_session_revision: Revision,
+    pub idempotency_key: IdempotencyKey,
+    pub text: PlatformParameter,
+}
+
+/// Stop the exact run currently owned by the exact fenced session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionRunStopRequest {
+    pub client: ClientId,
+    pub session: ResourceCoordinate,
+    pub expected_session_revision: Revision,
+    pub run: ResourceCoordinate,
+    pub expected_run_revision: Revision,
+    pub idempotency_key: IdempotencyKey,
+}
+
+/// Decide the exact pending approval owned by the exact fenced session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionApprovalDecisionRequest {
+    pub client: ClientId,
+    pub session: ResourceCoordinate,
+    pub expected_session_revision: Revision,
+    pub approval: ResourceCoordinate,
+    pub expected_approval_revision: Revision,
+    pub idempotency_key: IdempotencyKey,
+    pub decision: SessionApprovalDecision,
+}
+
+fn validate_command_coordinate(
+    coordinate: &ResourceCoordinate,
+    kind: ResourceKind,
+) -> Result<(), PlatformError> {
+    if coordinate.authority != ResourceAuthority::Automonique || coordinate.kind != kind {
+        return Err(PlatformError::CommandTargetInvalid);
+    }
+    Ok(())
+}
+
 /// Observation attachment. It carries an independent resume cursor and no
 /// provider/control authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1108,6 +1233,10 @@ pub enum PlatformRequest {
     ReleaseControl(ReleaseControlRequest),
     SessionHistorySnapshot(SessionHistorySnapshotRequest),
     SessionHistoryPage(SessionHistoryPageRequest),
+    SessionCommandState(SessionCommandStateRequest),
+    SessionFollowUp(SessionFollowUpRequest),
+    SessionRunStop(SessionRunStopRequest),
+    SessionApprovalDecision(SessionApprovalDecisionRequest),
 }
 
 /// Complete response vocabulary shared by local and remote transports.
@@ -1131,6 +1260,7 @@ pub enum PlatformResponse {
     },
     SessionHistory(SessionHistoryPage),
     SessionHistoryResync(SessionHistoryResync),
+    SessionCommandState(SessionCommandState),
     Refused {
         outcome: ReceiptOutcome,
         explanation: PlatformText,
@@ -1145,6 +1275,8 @@ pub enum PlatformError {
     AuthorityMismatch,
     HistoryLimitOutOfRange,
     HistoryPageInvalid,
+    TooManyCommandApprovals,
+    CommandTargetInvalid,
     UnknownEnum { field: &'static str },
 }
 

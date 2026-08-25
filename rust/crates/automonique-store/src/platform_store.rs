@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{StoreError, validate_database_path};
 
-pub const PLATFORM_STORE_SCHEMA_VERSION: u32 = 2;
+pub const PLATFORM_STORE_SCHEMA_VERSION: u32 = 3;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE platform_meta (
@@ -123,6 +123,13 @@ CREATE INDEX platform_receipts_by_client_key
     ON platform_receipts(client_id,idempotency_key);
 CREATE INDEX platform_receipts_by_client_id
     ON platform_receipts(client_id,receipt_id);
+"#;
+
+const SCHEMA_V3: &str = r#"
+ALTER TABLE platform_receipts ADD COLUMN owner_session_authority TEXT;
+ALTER TABLE platform_receipts ADD COLUMN owner_session_kind TEXT;
+ALTER TABLE platform_receipts ADD COLUMN owner_session_id TEXT;
+ALTER TABLE platform_receipts ADD COLUMN owner_session_revision INTEGER;
 "#;
 
 #[derive(Debug)]
@@ -418,13 +425,43 @@ impl PlatformStore {
         authoritative_revision: Revision,
         now_ms: i64,
     ) -> Stored<ActionAdmission> {
+        self.prepare_execute_inner(request, authoritative_revision, None, now_ms)
+    }
+
+    /// Admit a session-bound action while persisting the exact session fence
+    /// that authorized it. An idempotent replay must match both the translated
+    /// execute request and this ownership binding.
+    pub fn prepare_session_execute(
+        &mut self,
+        request: &ExecuteRequest,
+        authoritative_revision: Revision,
+        owner_session: &ResourceCoordinate,
+        owner_session_revision: Revision,
+        now_ms: i64,
+    ) -> Stored<ActionAdmission> {
+        validate_session(owner_session)?;
+        self.prepare_execute_inner(
+            request,
+            authoritative_revision,
+            Some((owner_session, owner_session_revision)),
+            now_ms,
+        )
+    }
+
+    fn prepare_execute_inner(
+        &mut self,
+        request: &ExecuteRequest,
+        authoritative_revision: Revision,
+        owner_session: Option<(&ResourceCoordinate, Revision)>,
+        now_ms: i64,
+    ) -> Stored<ActionAdmission> {
         validate_time(now_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(existing) = read_receipt_by_key(&transaction, request.idempotency_key.as_str())?
         {
-            if !receipt_matches_request(&existing, request) {
+            if !receipt_matches_request(&existing, request, owner_session) {
                 return Err(PlatformStoreError::Conflict("idempotency_key"));
             }
             transaction.commit()?;
@@ -440,12 +477,17 @@ impl PlatformStore {
         let receipt_id = deterministic_id("receipt", request.idempotency_key.as_str());
         transaction.execute(
             "INSERT INTO platform_receipts(receipt_id,idempotency_key,action,target_authority,target_kind,target_id,
-             expected_revision,parameter,outcome,revision,recorded_at_ms,explanation,client_id)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'accepted',?9,?10,NULL,?11)",
+             expected_revision,parameter,outcome,revision,recorded_at_ms,explanation,client_id,
+             owner_session_authority,owner_session_kind,owner_session_id,owner_session_revision)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'accepted',?9,?10,NULL,?11,?12,?13,?14,?15)",
             params![receipt_id, request.idempotency_key.as_str(), request.action.as_str(), request.target.authority.as_str(),
                 request.target.kind.as_str(), request.target.id.as_str(), request.expected_revision.map(to_db_revision).transpose()?,
                 request.parameter.as_ref().map(|parameter| parameter.as_str()), to_db_revision(revision)?, now_ms,
-                request.client.as_ref().map(|client| client.as_str())],
+                request.client.as_ref().map(|client| client.as_str()),
+                owner_session.map(|(session, _)| session.authority.as_str()),
+                owner_session.map(|(session, _)| session.kind.as_str()),
+                owner_session.map(|(session, _)| session.id.as_str()),
+                owner_session.map(|(_, revision)| to_db_revision(revision)).transpose()?],
         )?;
         let receipt = ActionReceipt {
             id: ReceiptId::new(receipt_id)
@@ -778,6 +820,7 @@ struct StoredReceipt {
     expected_revision: Option<Revision>,
     parameter: Option<String>,
     client: Option<ClientId>,
+    owner_session: Option<(ResourceCoordinate, Revision)>,
 }
 
 type RawReceiptRow = (
@@ -794,6 +837,10 @@ type RawReceiptRow = (
     i64,
     Option<String>,
     Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
 );
 
 type RawControlReceiptRow = (
@@ -819,7 +866,7 @@ fn read_receipt(
     value: &str,
 ) -> Stored<Option<StoredReceipt>> {
     let sql = format!(
-        "SELECT receipt_id,idempotency_key,action,target_authority,target_kind,target_id,expected_revision,parameter,outcome,revision,recorded_at_ms,explanation,client_id FROM platform_receipts WHERE {column}=?1"
+        "SELECT receipt_id,idempotency_key,action,target_authority,target_kind,target_id,expected_revision,parameter,outcome,revision,recorded_at_ms,explanation,client_id,owner_session_authority,owner_session_kind,owner_session_id,owner_session_revision FROM platform_receipts WHERE {column}=?1"
     );
     let raw: Option<RawReceiptRow> = connection
         .query_row(&sql, [value], |row| {
@@ -837,6 +884,10 @@ fn read_receipt(
                 row.get(10)?,
                 row.get(11)?,
                 row.get(12)?,
+                row.get(13)?,
+                row.get(14)?,
+                row.get(15)?,
+                row.get(16)?,
             ))
         })
         .optional()?;
@@ -855,7 +906,29 @@ fn read_receipt(
             recorded,
             explanation,
             client,
+            owner_session_authority,
+            owner_session_kind,
+            owner_session_id,
+            owner_session_revision,
         )| {
+            let owner_session = match (
+                owner_session_authority,
+                owner_session_kind,
+                owner_session_id,
+                owner_session_revision,
+            ) {
+                (None, None, None, None) => None,
+                (Some(authority_name), Some(kind_name), Some(id), Some(rev)) => Some((
+                    ResourceCoordinate::new(
+                        authority(&authority_name)?,
+                        kind(&kind_name)?,
+                        ResourceId::new(id)
+                            .map_err(|_| PlatformStoreError::Corrupt("owner_session_id"))?,
+                    ),
+                    revision(rev)?,
+                )),
+                _ => return Err(PlatformStoreError::Corrupt("owner_session_binding")),
+            };
             Ok(StoredReceipt {
                 receipt: ActionReceipt {
                     id: ReceiptId::new(id)
@@ -882,13 +955,18 @@ fn read_receipt(
                     .map(ClientId::new)
                     .transpose()
                     .map_err(|_| PlatformStoreError::Corrupt("client_id"))?,
+                owner_session,
             })
         },
     )
     .transpose()
 }
 
-fn receipt_matches_request(stored: &StoredReceipt, request: &ExecuteRequest) -> bool {
+fn receipt_matches_request(
+    stored: &StoredReceipt,
+    request: &ExecuteRequest,
+    owner_session: Option<(&ResourceCoordinate, Revision)>,
+) -> bool {
     stored.idempotency_key == request.idempotency_key.as_str()
         && stored.receipt.action == request.action
         && stored.receipt.target == request.target
@@ -899,6 +977,11 @@ fn receipt_matches_request(stored: &StoredReceipt, request: &ExecuteRequest) -> 
                 .as_ref()
                 .map(|parameter| parameter.as_str())
         && stored.client.as_ref() == request.client.as_ref()
+        && stored
+            .owner_session
+            .as_ref()
+            .map(|(session, revision)| (session, *revision))
+            == owner_session
 }
 
 fn append_receipt_event(connection: &Connection, receipt: &ActionReceipt) -> Stored<()> {
@@ -1012,9 +1095,17 @@ fn initialize(connection: &mut Connection) -> Stored<()> {
     if version == PLATFORM_STORE_SCHEMA_VERSION {
         return Ok(());
     }
+    if version == 2 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SCHEMA_V3)?;
+        transaction.pragma_update(None, "user_version", PLATFORM_STORE_SCHEMA_VERSION)?;
+        transaction.commit()?;
+        return Ok(());
+    }
     if version == 1 {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA_V2)?;
+        transaction.execute_batch(SCHEMA_V3)?;
         transaction.pragma_update(None, "user_version", PLATFORM_STORE_SCHEMA_VERSION)?;
         transaction.commit()?;
         return Ok(());
@@ -1039,6 +1130,7 @@ fn initialize(connection: &mut Connection) -> Stored<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(SCHEMA_V1)?;
     transaction.execute_batch(SCHEMA_V2)?;
+    transaction.execute_batch(SCHEMA_V3)?;
     transaction.pragma_update(None, "user_version", PLATFORM_STORE_SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())

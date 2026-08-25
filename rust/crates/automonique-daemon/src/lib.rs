@@ -104,10 +104,11 @@ use automonique_protocol::execute_api::{
 };
 use automonique_protocol::journal::{CursorResume, RetainedRange};
 use automonique_protocol::platform::{
-    Capabilities as PlatformCapabilities, Freshness, FreshnessState, PlatformAction,
-    PlatformMethod, PlatformRequest, PlatformResponse, PlatformText, PlatformTransport,
-    ReceiptOutcome, ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
-    ResourceRecord, SessionHistoryPage, SessionHistoryResync, SessionList, SessionRecord, Snapshot,
+    Capabilities as PlatformCapabilities, Freshness, FreshnessState, MAX_SESSION_COMMAND_APPROVALS,
+    PlatformAction, PlatformMethod, PlatformRequest, PlatformResponse, PlatformText,
+    PlatformTransport, ReceiptOutcome, ResourceAuthority, ResourceCoordinate, ResourceId,
+    ResourceKind, ResourceRecord, SessionCommandState, SessionCommandTarget, SessionHistoryPage,
+    SessionHistoryResync, SessionList, SessionRecord, Snapshot,
 };
 use automonique_protocol::platform_api::{
     MAX_PLATFORM_REQUEST_CANONICAL_BYTES, PlatformRequestMessage, PlatformResponseMessage,
@@ -4519,6 +4520,18 @@ impl Daemon {
             PlatformRequest::SessionHistoryPage(request) => {
                 self.platform_session_history(&request.session, request.after, request.limit)?
             }
+            PlatformRequest::SessionCommandState(request) => {
+                self.platform_session_command_state(&request.session, now_ms)?
+            }
+            PlatformRequest::SessionFollowUp(request) => {
+                self.platform_session_follow_up(request, &snapshot, now_ms)?
+            }
+            PlatformRequest::SessionRunStop(request) => {
+                self.platform_session_run_stop(request, &snapshot, now_ms)?
+            }
+            PlatformRequest::SessionApprovalDecision(request) => {
+                self.platform_session_approval_decision(request, &snapshot, now_ms)?
+            }
             PlatformRequest::Attach(request) => {
                 self.refresh_platform_sessions(now_ms)?;
                 if !self.platform_session_is_open(&request.session)? {
@@ -4633,6 +4646,239 @@ impl Daemon {
                     .map_err(|_| DaemonError::ProtocolRefused("platform_session_history"))?,
             )),
         }
+    }
+
+    fn platform_session_command_state(
+        &mut self,
+        session: &ResourceCoordinate,
+        now_ms: i64,
+    ) -> Result<PlatformResponse, DaemonError> {
+        let Some(binding) = self.platform_owned_session(session)? else {
+            return platform_refusal(ReceiptOutcome::Rejected, "target_not_owned");
+        };
+        self.refresh_platform_sessions(now_ms)?;
+        let session_record = ResourceRecord {
+            resource: session.clone(),
+            freshness: Freshness {
+                state: FreshnessState::Fresh,
+                observed_at: automonique_protocol::primitives::EpochMillis::from_millis(
+                    binding.updated_ms,
+                ),
+                revision: Revision::new(binding.revision)
+                    .map_err(|_| DaemonError::PlatformStoreFailed("revision_invalid"))?,
+            },
+            summary: PlatformText::new("open")
+                .map_err(|_| DaemonError::PlatformStoreFailed("session_state_invalid"))?,
+        };
+        let run = self
+            .run_index
+            .by_run_id(&binding.run_id)
+            .map_err(index_failed)?
+            .last()
+            .map(|record| {
+                Ok::<SessionCommandTarget, DaemonError>(SessionCommandTarget {
+                    target: ResourceCoordinate::new(
+                        ResourceAuthority::Automonique,
+                        ResourceKind::Run,
+                        ResourceId::new(record.run_id.clone())
+                            .map_err(|_| DaemonError::PlatformStoreFailed("run_id_invalid"))?,
+                    ),
+                    revision: Revision::new(record.revision)
+                        .map_err(|_| DaemonError::PlatformStoreFailed("revision_invalid"))?,
+                })
+            })
+            .transpose()?;
+        let pending_approvals = self
+            .approval_requests
+            .pending_for_run(&binding.run_id, now_ms, MAX_SESSION_COMMAND_APPROVALS)
+            .map_err(|error| DaemonError::ApprovalRequestsFailed(error.category()))?
+            .into_iter()
+            .map(|record| {
+                Ok::<SessionCommandTarget, DaemonError>(SessionCommandTarget {
+                    target: ResourceCoordinate::new(
+                        ResourceAuthority::Automonique,
+                        ResourceKind::Approval,
+                        ResourceId::new(record.request_key)
+                            .map_err(|_| DaemonError::PlatformStoreFailed("approval_id_invalid"))?,
+                    ),
+                    revision: Revision::new(record.revision)
+                        .map_err(|_| DaemonError::PlatformStoreFailed("revision_invalid"))?,
+                })
+            })
+            .collect::<Result<Vec<_>, DaemonError>>()?;
+        Ok(PlatformResponse::SessionCommandState(
+            SessionCommandState::new(session_record, run, pending_approvals)
+                .map_err(|_| DaemonError::ProtocolRefused("platform_session_command_state"))?,
+        ))
+    }
+
+    fn platform_owned_session(
+        &self,
+        session: &ResourceCoordinate,
+    ) -> Result<Option<managed_sessions::ManagedSession>, DaemonError> {
+        if session.authority != ResourceAuthority::Automonique
+            || session.kind != ResourceKind::Session
+        {
+            return Ok(None);
+        }
+        self.managed_sessions
+            .by_id(session.id.as_str())
+            .map(|binding| binding.filter(|binding| binding.open))
+            .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))
+    }
+
+    fn platform_has_owned_receipt(
+        &self,
+        key: &automonique_protocol::platform::IdempotencyKey,
+        client: &automonique_protocol::platform::ClientId,
+    ) -> Result<bool, DaemonError> {
+        match self.platform.receipt(None, Some(key), Some(client)) {
+            Ok(_) => Ok(true),
+            Err(PlatformStoreError::NotFound) => Ok(false),
+            Err(error) => Err(DaemonError::PlatformStoreFailed(error.category())),
+        }
+    }
+
+    fn platform_session_follow_up(
+        &mut self,
+        request: &automonique_protocol::platform::SessionFollowUpRequest,
+        status: &StatusSnapshot,
+        now_ms: i64,
+    ) -> Result<PlatformResponse, DaemonError> {
+        let Some(binding) = self.platform_owned_session(&request.session)? else {
+            return platform_refusal(ReceiptOutcome::Rejected, "target_not_owned");
+        };
+        let replay = self.platform_has_owned_receipt(&request.idempotency_key, &request.client)?;
+        if !replay && binding.revision != request.expected_session_revision.get() {
+            return platform_refusal(ReceiptOutcome::Rejected, "stale_revision");
+        }
+        self.refresh_platform_sessions(now_ms)?;
+        let execute = automonique_protocol::platform::ExecuteRequest::new_with_parameter(
+            PlatformAction::FollowUp,
+            request.session.clone(),
+            request.idempotency_key.clone(),
+            Some(request.expected_session_revision),
+            Some(request.text.clone()),
+        )
+        .map_err(|_| DaemonError::ProtocolRefused("platform_session_follow_up"))?
+        .with_client(request.client.clone());
+        self.platform_execute_inner(
+            &execute,
+            status,
+            now_ms,
+            Some((&request.session, request.expected_session_revision)),
+        )
+    }
+
+    fn platform_session_run_stop(
+        &mut self,
+        request: &automonique_protocol::platform::SessionRunStopRequest,
+        status: &StatusSnapshot,
+        now_ms: i64,
+    ) -> Result<PlatformResponse, DaemonError> {
+        let Some(binding) = self.platform_owned_session(&request.session)? else {
+            return platform_refusal(ReceiptOutcome::Rejected, "target_not_owned");
+        };
+        if request.run.authority != ResourceAuthority::Automonique
+            || request.run.kind != ResourceKind::Run
+            || binding.run_id != request.run.id.as_str()
+            || self
+                .managed_sessions
+                .by_run(request.run.id.as_str())
+                .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?
+                .is_none_or(|owner| owner.provider_session_id != binding.provider_session_id)
+        {
+            return platform_refusal(ReceiptOutcome::Rejected, "target_not_owned");
+        }
+        let replay = self.platform_has_owned_receipt(&request.idempotency_key, &request.client)?;
+        if !replay && binding.revision != request.expected_session_revision.get() {
+            return platform_refusal(ReceiptOutcome::Rejected, "stale_revision");
+        }
+        let records = self
+            .run_index
+            .by_run_id(request.run.id.as_str())
+            .map_err(index_failed)?;
+        let Some(record) = records.last() else {
+            return platform_refusal(ReceiptOutcome::Rejected, "target_not_owned");
+        };
+        if !replay && record.revision != request.expected_run_revision.get() {
+            return platform_refusal(ReceiptOutcome::Rejected, "stale_revision");
+        }
+        let execute = automonique_protocol::platform::ExecuteRequest::new_with_parameter(
+            PlatformAction::StopRun,
+            request.run.clone(),
+            request.idempotency_key.clone(),
+            Some(request.expected_run_revision),
+            None,
+        )
+        .map_err(|_| DaemonError::ProtocolRefused("platform_session_run_stop"))?
+        .with_client(request.client.clone());
+        self.platform_execute_inner(
+            &execute,
+            status,
+            now_ms,
+            Some((&request.session, request.expected_session_revision)),
+        )
+    }
+
+    fn platform_session_approval_decision(
+        &mut self,
+        request: &automonique_protocol::platform::SessionApprovalDecisionRequest,
+        status: &StatusSnapshot,
+        now_ms: i64,
+    ) -> Result<PlatformResponse, DaemonError> {
+        let Some(binding) = self.platform_owned_session(&request.session)? else {
+            return platform_refusal(ReceiptOutcome::Rejected, "target_not_owned");
+        };
+        if request.approval.authority != ResourceAuthority::Automonique
+            || request.approval.kind != ResourceKind::Approval
+        {
+            return platform_refusal(ReceiptOutcome::Rejected, "target_not_owned");
+        }
+        let Some(approval) = self
+            .approval_requests
+            .entry(request.approval.id.as_str())
+            .map_err(|error| DaemonError::ApprovalRequestsFailed(error.category()))?
+        else {
+            return platform_refusal(ReceiptOutcome::Rejected, "target_not_owned");
+        };
+        if approval.run_id != binding.run_id
+            || self
+                .managed_sessions
+                .by_run(&approval.run_id)
+                .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?
+                .is_none_or(|owner| owner.provider_session_id != binding.provider_session_id)
+        {
+            return platform_refusal(ReceiptOutcome::Rejected, "target_not_owned");
+        }
+        let replay = self.platform_has_owned_receipt(&request.idempotency_key, &request.client)?;
+        if !replay
+            && (binding.revision != request.expected_session_revision.get()
+                || approval.revision != request.expected_approval_revision.get())
+        {
+            return platform_refusal(ReceiptOutcome::Rejected, "stale_revision");
+        }
+        if !replay && !approval.is_answerable_at(now_ms) {
+            return platform_refusal(ReceiptOutcome::Rejected, "target_not_owned");
+        }
+        let parameter =
+            automonique_protocol::platform::PlatformParameter::new(request.decision.as_str())
+                .map_err(|_| DaemonError::ProtocolRefused("platform_session_approval_decision"))?;
+        let execute = automonique_protocol::platform::ExecuteRequest::new_with_parameter(
+            PlatformAction::DecideApproval,
+            request.approval.clone(),
+            request.idempotency_key.clone(),
+            Some(request.expected_approval_revision),
+            Some(parameter),
+        )
+        .map_err(|_| DaemonError::ProtocolRefused("platform_session_approval_decision"))?
+        .with_client(request.client.clone());
+        self.platform_execute_inner(
+            &execute,
+            status,
+            now_ms,
+            Some((&request.session, request.expected_session_revision)),
+        )
     }
 
     fn platform_session_history_snapshot(
@@ -5131,6 +5377,16 @@ impl Daemon {
         status: &StatusSnapshot,
         now_ms: i64,
     ) -> Result<PlatformResponse, DaemonError> {
+        self.platform_execute_inner(request, status, now_ms, None)
+    }
+
+    fn platform_execute_inner(
+        &mut self,
+        request: &automonique_protocol::platform::ExecuteRequest,
+        status: &StatusSnapshot,
+        now_ms: i64,
+        owner_session: Option<(&ResourceCoordinate, Revision)>,
+    ) -> Result<PlatformResponse, DaemonError> {
         if request.target.authority != ResourceAuthority::Automonique {
             return platform_refusal(ReceiptOutcome::Rejected, "authority_not_local");
         }
@@ -5227,10 +5483,18 @@ impl Daemon {
                 return platform_refusal(ReceiptOutcome::Rejected, "authority_not_local");
             }
         };
-        let admission = match self
-            .platform
-            .prepare_execute(request, authoritative_revision, now_ms)
-        {
+        let admission = match match owner_session {
+            Some((session, revision)) => self.platform.prepare_session_execute(
+                request,
+                authoritative_revision,
+                session,
+                revision,
+                now_ms,
+            ),
+            None => self
+                .platform
+                .prepare_execute(request, authoritative_revision, now_ms),
+        } {
             Ok(admission) => admission,
             Err(error) => return Ok(platform_store_response(&error)),
         };

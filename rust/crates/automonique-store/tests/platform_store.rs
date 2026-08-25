@@ -5,6 +5,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Barrier};
 
 use automonique_protocol::platform::{
     ClientId, ExecuteRequest, Freshness, FreshnessState, IdempotencyKey, PlatformAction,
@@ -161,6 +162,114 @@ fn mobile_receipt_owner_is_bound_atomically_and_lookups_do_not_cross_credentials
             .category(),
         "not_found"
     );
+}
+
+#[test]
+fn session_bound_receipt_replay_requires_the_exact_owner_and_revision_after_restart() {
+    let private = PrivateStore::new();
+    let mut store = PlatformStore::open(private.path()).expect("open store");
+    let owner = ClientId::new("credential-1").expect("owner");
+    let request = execute("session-owned-receipt", Some(11)).with_client(owner);
+    let owning_session = session("session-1");
+
+    let ActionAdmission::New(first) = store
+        .prepare_session_execute(&request, revision(11), &owning_session, revision(3), 1_000)
+        .expect("admit session action")
+    else {
+        panic!("first admission must be new");
+    };
+    drop(store);
+
+    let mut reopened = PlatformStore::open(private.path()).expect("reopen store");
+    let ActionAdmission::Replay(replay) = reopened
+        .prepare_session_execute(&request, revision(11), &owning_session, revision(3), 2_000)
+        .expect("exact replay")
+    else {
+        panic!("exact retry must replay");
+    };
+    assert_eq!(replay, first);
+
+    assert_eq!(
+        reopened
+            .prepare_session_execute(&request, revision(11), &owning_session, revision(4), 2_001,)
+            .expect_err("changed session revision conflicts")
+            .category(),
+        "conflict"
+    );
+    assert_eq!(
+        reopened
+            .prepare_session_execute(
+                &request,
+                revision(11),
+                &session("session-2"),
+                revision(3),
+                2_002,
+            )
+            .expect_err("changed owner conflicts")
+            .category(),
+        "conflict"
+    );
+    assert_eq!(
+        reopened
+            .prepare_execute(&request, revision(11), 2_003)
+            .expect_err("generic replay cannot shed the owner binding")
+            .category(),
+        "conflict"
+    );
+}
+
+#[test]
+fn concurrent_session_command_retries_admit_one_effect_and_replay_one_receipt() {
+    let private = PrivateStore::new();
+    let stores = [
+        PlatformStore::open(private.path()).expect("open first store"),
+        PlatformStore::open(private.path()).expect("open second store"),
+    ];
+    let barrier = Arc::new(Barrier::new(3));
+    let handles = stores.map(|mut store| {
+        let barrier = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            let owner = ClientId::new("credential-1").expect("owner");
+            let request = execute("concurrent-session-command", Some(11)).with_client(owner);
+            let owning_session = session("session-1");
+            barrier.wait();
+            store
+                .prepare_session_execute(
+                    &request,
+                    revision(11),
+                    &owning_session,
+                    revision(3),
+                    1_000,
+                )
+                .expect("concurrent admission")
+        })
+    });
+
+    barrier.wait();
+    let admissions = handles.map(|handle| handle.join().expect("admission thread"));
+    assert_eq!(
+        admissions
+            .iter()
+            .filter(|value| matches!(value, ActionAdmission::New(_)))
+            .count(),
+        1,
+        "exactly one retry may own the effect",
+    );
+    assert_eq!(
+        admissions
+            .iter()
+            .filter(|value| matches!(value, ActionAdmission::Replay(_)))
+            .count(),
+        1,
+        "the losing retry must replay the durable receipt",
+    );
+    let receipt = match &admissions[0] {
+        ActionAdmission::New(value) | ActionAdmission::Replay(value) => value,
+    };
+    let other = match &admissions[1] {
+        ActionAdmission::New(value) | ActionAdmission::Replay(value) => value,
+    };
+    assert_eq!(receipt, other, "both retries must observe the same receipt");
 }
 
 #[test]

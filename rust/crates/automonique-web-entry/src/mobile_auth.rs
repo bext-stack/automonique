@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use automonique_protocol::platform::{
-    PlatformAction, PlatformRequest, ResourceAuthority, ResourceKind, SessionList,
+    PlatformRequest, ResourceAuthority, ResourceKind, SessionCommandState, SessionList,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -1127,34 +1127,10 @@ pub fn authorize_platform_request(
                 && authorization.allows_session(request.session.id.as_str())
                 && request.client.as_str() == authorization.credential_id
         }
-        PlatformRequest::Execute(request) => match request.action {
-            PlatformAction::FollowUp => {
-                authorization.allows(MobileAction::FollowUp)
-                    && request
-                        .client
-                        .as_ref()
-                        .is_some_and(|client| client.as_str() == authorization.credential_id)
-                    && request.target.authority == ResourceAuthority::Automonique
-                    && request.target.kind == ResourceKind::Session
-                    && authorization.allows_session(request.target.id.as_str())
-                    && request.expected_revision.is_some()
-                    && request.parameter.as_ref().is_some_and(|parameter| {
-                        parameter.as_str().len()
-                            <= usize::try_from(authorization.limits.max_follow_up_bytes)
-                                .unwrap_or(usize::MAX)
-                    })
-            }
-            // Platform v1 does not bind runs or approvals back to a session in
-            // the request. A global action bit therefore cannot prove this
-            // target is within the actor's session scope.
-            PlatformAction::StopRun | PlatformAction::DecideApproval => false,
-            PlatformAction::StartRun
-            | PlatformAction::Steer
-            | PlatformAction::SubmitRequest
-            | PlatformAction::SubmitJob
-            | PlatformAction::ApproveRelease
-            | PlatformAction::RegisterNode => false,
-        },
+        // Mobile callers use only the dedicated session-bound commands below.
+        // The generic action grammar remains available to local/operator
+        // clients, but a mobile bearer can never acquire it.
+        PlatformRequest::Execute(_) => false,
         PlatformRequest::GetReceipt(request) => request
             .client
             .as_ref()
@@ -1172,6 +1148,44 @@ pub fn authorize_platform_request(
                 && request.session.kind == ResourceKind::Session
                 && authorization.allows_session(request.session.id.as_str())
                 && request.limit <= authorization.limits.max_page_events
+        }
+        PlatformRequest::SessionCommandState(request) => {
+            request.session.authority == ResourceAuthority::Automonique
+                && request.session.kind == ResourceKind::Session
+                && authorization.allows_session(request.session.id.as_str())
+                && (authorization.allows(MobileAction::FollowUp)
+                    || authorization.allows(MobileAction::StopRun)
+                    || authorization.allows(MobileAction::DecideApproval))
+        }
+        PlatformRequest::SessionFollowUp(request) => {
+            let text = request.text.as_str();
+            authorization.allows(MobileAction::FollowUp)
+                && request.client.as_str() == authorization.credential_id
+                && request.session.authority == ResourceAuthority::Automonique
+                && request.session.kind == ResourceKind::Session
+                && authorization.allows_session(request.session.id.as_str())
+                && !text.trim().is_empty()
+                && text.len()
+                    <= usize::try_from(authorization.limits.max_follow_up_bytes)
+                        .unwrap_or(usize::MAX)
+        }
+        PlatformRequest::SessionRunStop(request) => {
+            authorization.allows(MobileAction::StopRun)
+                && request.client.as_str() == authorization.credential_id
+                && request.session.authority == ResourceAuthority::Automonique
+                && request.session.kind == ResourceKind::Session
+                && authorization.allows_session(request.session.id.as_str())
+                && request.run.authority == ResourceAuthority::Automonique
+                && request.run.kind == ResourceKind::Run
+        }
+        PlatformRequest::SessionApprovalDecision(request) => {
+            authorization.allows(MobileAction::DecideApproval)
+                && request.client.as_str() == authorization.credential_id
+                && request.session.authority == ResourceAuthority::Automonique
+                && request.session.kind == ResourceKind::Session
+                && authorization.allows_session(request.session.id.as_str())
+                && request.approval.authority == ResourceAuthority::Automonique
+                && request.approval.kind == ResourceKind::Approval
         }
         // These reads lack actor/session coordinates in Platform v1. They must
         // remain closed until the caller's receipt/cursor/resource ownership is
@@ -1194,6 +1208,22 @@ pub fn filter_sessions(
             && authorization.allows_session(session.session.resource.id.as_str())
     });
     sessions
+}
+
+/// Strip command targets that the admitted descriptor cannot operate. The
+/// daemon proves ownership; this projection additionally prevents one action
+/// grant from revealing targets belonging to another command capability.
+pub fn filter_command_state(
+    authorization: &MobileAuthorization,
+    mut state: SessionCommandState,
+) -> SessionCommandState {
+    if !authorization.allows(MobileAction::StopRun) {
+        state.run = None;
+    }
+    if !authorization.allows(MobileAction::DecideApproval) {
+        state.pending_approvals.clear();
+    }
+    state
 }
 
 fn validate_time(value: i64) -> Result<(), MobileAuthError> {
@@ -1242,12 +1272,7 @@ fn admit_scope(
         return Err(MobileAuthError::InvalidRequest);
     }
     let actions = actions.into_iter().collect::<BTreeSet<_>>();
-    if actions.is_empty()
-        || actions.len() > MAX_MOBILE_ACTIONS
-        || actions
-            .iter()
-            .any(|action| !matches!(action, MobileAction::Attach | MobileAction::FollowUp))
-    {
+    if actions.is_empty() || actions.len() > MAX_MOBILE_ACTIONS {
         return Err(MobileAuthError::InvalidRequest);
     }
     let sessions = sessions
@@ -1433,8 +1458,11 @@ mod tests {
     use super::*;
     use automonique_protocol::platform::{
         AttachRequest, ClientId, CursorTopic, DetachRequest, ExecuteRequest, Freshness,
-        FreshnessState, IdempotencyKey, PlatformCursor, PlatformParameter, PlatformText,
-        ResourceCoordinate, ResourceId, ResourceRecord, SessionRecord,
+        FreshnessState, GetReceiptRequest, IdempotencyKey, PlatformAction, PlatformCursor,
+        PlatformParameter, PlatformText, ReceiptId, ResourceCoordinate, ResourceId, ResourceRecord,
+        SessionApprovalDecision, SessionApprovalDecisionRequest, SessionCommandState,
+        SessionCommandStateRequest, SessionCommandTarget, SessionFollowUpRequest, SessionRecord,
+        SessionRunStopRequest,
     };
     use automonique_protocol::primitives::{EpochMillis, Revision};
     use tempfile::TempDir;
@@ -1882,18 +1910,24 @@ mod tests {
             auth.operator_provision(oversized, NOW),
             Err(MobileAuthError::InvalidRequest)
         ));
-        let mut unenforceable = request();
-        unenforceable.actions = vec![MobileAction::StopRun];
-        assert!(matches!(
-            auth.operator_provision(unenforceable, NOW),
-            Err(MobileAuthError::InvalidRequest)
-        ));
+        let mut dedicated = request();
+        dedicated.actions = vec![MobileAction::StopRun, MobileAction::DecideApproval];
+        assert!(auth.operator_provision(dedicated, NOW).is_ok());
     }
 
     #[test]
     fn platform_policy_is_per_action_per_session_and_fail_closed() {
         let (_root, mut auth) = authority();
-        let issued = auth.operator_provision(request(), NOW).expect("provision");
+        let mut all_commands = request();
+        all_commands.actions = vec![
+            MobileAction::Attach,
+            MobileAction::FollowUp,
+            MobileAction::StopRun,
+            MobileAction::DecideApproval,
+        ];
+        let issued = auth
+            .operator_provision(all_commands, NOW)
+            .expect("provision");
         let session = |id: &str| {
             ResourceCoordinate::new(
                 ResourceAuthority::Automonique,
@@ -1950,44 +1984,86 @@ mod tests {
             .expect("execute")
             .with_client(ClientId::new(&issued.authorization.credential_id).expect("client")),
         );
+        assert!(authorize_platform_request(&issued.authorization, &follow_up, NOW).is_err());
+
+        let client = ClientId::new(&issued.authorization.credential_id).expect("client");
+        let command_state = PlatformRequest::SessionCommandState(SessionCommandStateRequest {
+            session: session("session-a"),
+        });
+        assert!(authorize_platform_request(&issued.authorization, &command_state, NOW).is_ok());
+        let follow_up = PlatformRequest::SessionFollowUp(SessionFollowUpRequest {
+            client: client.clone(),
+            session: session("session-a"),
+            expected_session_revision: Revision::new(1).expect("revision"),
+            idempotency_key: IdempotencyKey::new("key-follow-up").expect("key"),
+            text: PlatformParameter::new("continue").expect("text"),
+        });
         assert!(authorize_platform_request(&issued.authorization, &follow_up, NOW).is_ok());
-        let blind_follow_up = PlatformRequest::Execute(
-            ExecuteRequest::new_with_parameter(
-                PlatformAction::FollowUp,
-                session("session-a"),
-                IdempotencyKey::new("key-blind").expect("key"),
-                None,
-                Some(PlatformParameter::new("continue").expect("parameter")),
-            )
-            .expect("execute")
-            .with_client(ClientId::new(&issued.authorization.credential_id).expect("client")),
+        let run = ResourceCoordinate::new(
+            ResourceAuthority::Automonique,
+            ResourceKind::Run,
+            ResourceId::new("run-a").expect("run"),
         );
-        assert!(authorize_platform_request(&issued.authorization, &blind_follow_up, NOW).is_err());
-        let stale_shape = PlatformRequest::Execute(
-            ExecuteRequest::new_with_parameter(
-                PlatformAction::FollowUp,
-                session("session-c"),
-                IdempotencyKey::new("key-stale").expect("key"),
-                Some(Revision::new(1).expect("revision")),
-                Some(PlatformParameter::new("continue").expect("parameter")),
-            )
-            .expect("execute")
-            .with_client(ClientId::new(&issued.authorization.credential_id).expect("client")),
+        let stop = PlatformRequest::SessionRunStop(SessionRunStopRequest {
+            client: client.clone(),
+            session: session("session-a"),
+            expected_session_revision: Revision::new(1).expect("revision"),
+            run,
+            expected_run_revision: Revision::new(2).expect("revision"),
+            idempotency_key: IdempotencyKey::new("key-stop").expect("key"),
+        });
+        assert!(authorize_platform_request(&issued.authorization, &stop, NOW).is_ok());
+        let approval = ResourceCoordinate::new(
+            ResourceAuthority::Automonique,
+            ResourceKind::Approval,
+            ResourceId::new("approval-a").expect("approval"),
         );
-        assert!(authorize_platform_request(&issued.authorization, &stale_shape, NOW).is_err());
+        let decide = PlatformRequest::SessionApprovalDecision(SessionApprovalDecisionRequest {
+            client,
+            session: session("session-a"),
+            expected_session_revision: Revision::new(1).expect("revision"),
+            approval,
+            expected_approval_revision: Revision::new(3).expect("revision"),
+            idempotency_key: IdempotencyKey::new("key-decide").expect("key"),
+            decision: SessionApprovalDecision::Grant,
+        });
+        assert!(authorize_platform_request(&issued.authorization, &decide, NOW).is_ok());
+
+        let receipt = |client: ClientId| {
+            PlatformRequest::GetReceipt(GetReceiptRequest {
+                client: Some(client),
+                id: Some(ReceiptId::new("receipt-a").expect("receipt")),
+                idempotency_key: None,
+            })
+        };
+        assert!(
+            authorize_platform_request(
+                &issued.authorization,
+                &receipt(
+                    ClientId::new(&issued.authorization.credential_id).expect("credential client")
+                ),
+                NOW,
+            )
+            .is_ok()
+        );
+        assert!(
+            authorize_platform_request(
+                &issued.authorization,
+                &receipt(ClientId::new("another-client").expect("foreign client")),
+                NOW,
+            )
+            .is_err()
+        );
+
         let mut restrictive = issued.authorization.clone();
         restrictive.limits.max_follow_up_bytes = 8;
-        let oversized_follow_up = PlatformRequest::Execute(
-            ExecuteRequest::new_with_parameter(
-                PlatformAction::FollowUp,
-                session("session-a"),
-                IdempotencyKey::new("key-2").expect("key"),
-                Some(Revision::new(1).expect("revision")),
-                Some(PlatformParameter::new("continued").expect("bounded parameter")),
-            )
-            .expect("execute")
-            .with_client(ClientId::new(&issued.authorization.credential_id).expect("client")),
-        );
+        let oversized_follow_up = PlatformRequest::SessionFollowUp(SessionFollowUpRequest {
+            client: ClientId::new(&issued.authorization.credential_id).expect("client"),
+            session: session("session-a"),
+            expected_session_revision: Revision::new(1).expect("revision"),
+            idempotency_key: IdempotencyKey::new("key-2").expect("key"),
+            text: PlatformParameter::new("continued").expect("bounded parameter"),
+        });
         assert!(authorize_platform_request(&restrictive, &oversized_follow_up, NOW).is_err());
         assert!(
             authorize_platform_request(
@@ -2044,6 +2120,120 @@ mod tests {
             filtered.sessions[0].session.resource.id.as_str(),
             "session-a"
         );
+    }
+
+    #[test]
+    fn dedicated_command_policy_enforces_client_scope_expiry_and_exact_utf8_bytes() {
+        let (_root, mut auth) = authority();
+        let mut provision = request();
+        provision.actions = vec![MobileAction::FollowUp];
+        provision.limits.max_follow_up_bytes = 4;
+        let issued = auth.operator_provision(provision, NOW).expect("provision");
+        let session = |id: &str| {
+            ResourceCoordinate::new(
+                ResourceAuthority::Automonique,
+                ResourceKind::Session,
+                ResourceId::new(id).expect("session"),
+            )
+        };
+        let command = |client: ClientId, session: ResourceCoordinate, text: &str| {
+            PlatformRequest::SessionFollowUp(SessionFollowUpRequest {
+                client,
+                session,
+                expected_session_revision: Revision::new(1).expect("revision"),
+                idempotency_key: IdempotencyKey::new(format!("key-{}", text.len())).expect("key"),
+                text: PlatformParameter::new(text).expect("text"),
+            })
+        };
+        let client = ClientId::new(&issued.authorization.credential_id).expect("client");
+        assert!(
+            authorize_platform_request(
+                &issued.authorization,
+                &command(client.clone(), session("session-a"), "éé"),
+                NOW,
+            )
+            .is_ok()
+        );
+        assert!(
+            authorize_platform_request(
+                &issued.authorization,
+                &command(client.clone(), session("session-a"), "ééa"),
+                NOW,
+            )
+            .is_err()
+        );
+        assert!(
+            authorize_platform_request(
+                &issued.authorization,
+                &command(client.clone(), session("session-a"), "   "),
+                NOW,
+            )
+            .is_err()
+        );
+        assert!(
+            authorize_platform_request(
+                &issued.authorization,
+                &command(
+                    ClientId::new("different-client").expect("client"),
+                    session("session-a"),
+                    "ok",
+                ),
+                NOW,
+            )
+            .is_err()
+        );
+        assert!(
+            authorize_platform_request(
+                &issued.authorization,
+                &command(client.clone(), session("session-c"), "ok"),
+                NOW,
+            )
+            .is_err()
+        );
+        assert!(
+            authorize_platform_request(
+                &issued.authorization,
+                &command(client, session("session-a"), "ok"),
+                NOW + ACCESS_TTL_MILLIS,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn command_state_projection_hides_targets_without_their_independent_grants() {
+        let (_root, mut auth) = authority();
+        let issued = auth.operator_provision(request(), NOW).expect("provision");
+        let coordinate = |kind: ResourceKind, id: &str| {
+            ResourceCoordinate::new(
+                ResourceAuthority::Automonique,
+                kind,
+                ResourceId::new(id).expect("id"),
+            )
+        };
+        let state = SessionCommandState::new(
+            ResourceRecord {
+                resource: coordinate(ResourceKind::Session, "session-a"),
+                freshness: Freshness {
+                    state: FreshnessState::Fresh,
+                    observed_at: EpochMillis::from_millis(NOW),
+                    revision: Revision::new(1).expect("revision"),
+                },
+                summary: PlatformText::new("open").expect("summary"),
+            },
+            Some(SessionCommandTarget {
+                target: coordinate(ResourceKind::Run, "run-a"),
+                revision: Revision::new(2).expect("revision"),
+            }),
+            vec![SessionCommandTarget {
+                target: coordinate(ResourceKind::Approval, "approval-a"),
+                revision: Revision::new(3).expect("revision"),
+            }],
+        )
+        .expect("state");
+        let filtered = filter_command_state(&issued.authorization, state);
+        assert!(filtered.run.is_none());
+        assert!(filtered.pending_approvals.is_empty());
     }
 
     #[test]

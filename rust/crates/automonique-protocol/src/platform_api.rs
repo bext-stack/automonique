@@ -181,6 +181,32 @@ fn optional_revision(
     }
 }
 
+fn required_revision(value: &JsonValue, field: &'static str) -> Result<Revision, PlatformApiError> {
+    Revision::new(unsigned(value, field)?).map_err(|_| PlatformApiError::InvalidBody)
+}
+
+fn command_coordinate(
+    body: &JsonValue,
+    field: &'static str,
+    kind: ResourceKind,
+) -> Result<ResourceCoordinate, PlatformApiError> {
+    let coordinate = coordinate(body.get(field).ok_or(PlatformApiError::InvalidBody)?)?;
+    if coordinate.authority != ResourceAuthority::Automonique || coordinate.kind != kind {
+        return Err(PlatformError::CommandTargetInvalid.into());
+    }
+    Ok(coordinate)
+}
+
+fn validate_command_coordinate_value(
+    coordinate: &ResourceCoordinate,
+    kind: ResourceKind,
+) -> Result<(), PlatformApiError> {
+    if coordinate.authority != ResourceAuthority::Automonique || coordinate.kind != kind {
+        return Err(PlatformError::CommandTargetInvalid.into());
+    }
+    Ok(())
+}
+
 fn optional_text(
     value: &JsonValue,
     field: &'static str,
@@ -341,6 +367,28 @@ fn receipt_json(value: &ActionReceipt) -> Result<JsonValue, PlatformApiError> {
         ("revision", integer(value.revision.get(), "revision")?),
         ("target", coordinate_json(&value.target)),
     ]))
+}
+
+fn command_target_json(value: &SessionCommandTarget) -> Result<JsonValue, PlatformApiError> {
+    Ok(object(vec![
+        ("revision", integer(value.revision.get(), "revision")?),
+        ("target", coordinate_json(&value.target)),
+    ]))
+}
+
+fn command_target(
+    value: &JsonValue,
+    kind: ResourceKind,
+) -> Result<SessionCommandTarget, PlatformApiError> {
+    exact_fields(value, &["revision", "target"])?;
+    let target = coordinate(value.get("target").ok_or(PlatformApiError::InvalidBody)?)?;
+    if target.authority != ResourceAuthority::Automonique || target.kind != kind {
+        return Err(PlatformError::CommandTargetInvalid.into());
+    }
+    Ok(SessionCommandTarget {
+        target,
+        revision: required_revision(value, "revision")?,
+    })
 }
 
 fn receipt(value: &JsonValue) -> Result<ActionReceipt, PlatformApiError> {
@@ -531,6 +579,10 @@ fn request_kind(request: &PlatformRequest) -> &'static str {
         PlatformRequest::ReleaseControl(_) => "release_control",
         PlatformRequest::SessionHistorySnapshot(_) => "session_history_snapshot",
         PlatformRequest::SessionHistoryPage(_) => "session_history_page",
+        PlatformRequest::SessionCommandState(_) => "session_command_state",
+        PlatformRequest::SessionFollowUp(_) => "session_follow_up",
+        PlatformRequest::SessionRunStop(_) => "session_run_stop",
+        PlatformRequest::SessionApprovalDecision(_) => "session_approval_decision",
     }
 }
 
@@ -643,6 +695,93 @@ fn request_body(request: &PlatformRequest) -> Result<JsonValue, PlatformApiError
             ("limit", integer(u64::from(request.limit), "limit")?),
             ("session", coordinate_json(&request.session)),
         ])),
+        PlatformRequest::SessionCommandState(request) => {
+            validate_command_coordinate_value(&request.session, ResourceKind::Session)?;
+            Ok(object(vec![("session", coordinate_json(&request.session))]))
+        }
+        PlatformRequest::SessionFollowUp(request) => {
+            validate_command_coordinate_value(&request.session, ResourceKind::Session)?;
+            Ok(object(vec![
+                (
+                    "client",
+                    JsonValue::String(request.client.as_str().to_owned()),
+                ),
+                (
+                    "expected_session_revision",
+                    integer(
+                        request.expected_session_revision.get(),
+                        "expected_session_revision",
+                    )?,
+                ),
+                (
+                    "idempotency_key",
+                    JsonValue::String(request.idempotency_key.as_str().to_owned()),
+                ),
+                ("session", coordinate_json(&request.session)),
+                ("text", JsonValue::String(request.text.as_str().to_owned())),
+            ]))
+        }
+        PlatformRequest::SessionRunStop(request) => {
+            validate_command_coordinate_value(&request.session, ResourceKind::Session)?;
+            validate_command_coordinate_value(&request.run, ResourceKind::Run)?;
+            Ok(object(vec![
+                (
+                    "client",
+                    JsonValue::String(request.client.as_str().to_owned()),
+                ),
+                (
+                    "expected_run_revision",
+                    integer(request.expected_run_revision.get(), "expected_run_revision")?,
+                ),
+                (
+                    "expected_session_revision",
+                    integer(
+                        request.expected_session_revision.get(),
+                        "expected_session_revision",
+                    )?,
+                ),
+                (
+                    "idempotency_key",
+                    JsonValue::String(request.idempotency_key.as_str().to_owned()),
+                ),
+                ("run", coordinate_json(&request.run)),
+                ("session", coordinate_json(&request.session)),
+            ]))
+        }
+        PlatformRequest::SessionApprovalDecision(request) => {
+            validate_command_coordinate_value(&request.session, ResourceKind::Session)?;
+            validate_command_coordinate_value(&request.approval, ResourceKind::Approval)?;
+            Ok(object(vec![
+                ("approval", coordinate_json(&request.approval)),
+                (
+                    "client",
+                    JsonValue::String(request.client.as_str().to_owned()),
+                ),
+                (
+                    "decision",
+                    JsonValue::String(request.decision.as_str().to_owned()),
+                ),
+                (
+                    "expected_approval_revision",
+                    integer(
+                        request.expected_approval_revision.get(),
+                        "expected_approval_revision",
+                    )?,
+                ),
+                (
+                    "expected_session_revision",
+                    integer(
+                        request.expected_session_revision.get(),
+                        "expected_session_revision",
+                    )?,
+                ),
+                (
+                    "idempotency_key",
+                    JsonValue::String(request.idempotency_key.as_str().to_owned()),
+                ),
+                ("session", coordinate_json(&request.session)),
+            ]))
+        }
     }
 }
 
@@ -777,6 +916,94 @@ fn request_from_message(message: &Message) -> Result<PlatformRequest, PlatformAp
                     .map_err(PlatformError::Field)?,
             }))
         }
+        "session_command_state" => {
+            exact_fields(body, &["session"])?;
+            Ok(PlatformRequest::SessionCommandState(
+                SessionCommandStateRequest {
+                    session: command_coordinate(body, "session", ResourceKind::Session)?,
+                },
+            ))
+        }
+        "session_follow_up" => {
+            exact_fields(
+                body,
+                &[
+                    "client",
+                    "expected_session_revision",
+                    "idempotency_key",
+                    "session",
+                    "text",
+                ],
+            )?;
+            Ok(PlatformRequest::SessionFollowUp(SessionFollowUpRequest {
+                client: ClientId::new(string(body, "client")?.to_owned())
+                    .map_err(PlatformError::Field)?,
+                session: command_coordinate(body, "session", ResourceKind::Session)?,
+                expected_session_revision: required_revision(body, "expected_session_revision")?,
+                idempotency_key: IdempotencyKey::new(string(body, "idempotency_key")?.to_owned())
+                    .map_err(PlatformError::Field)?,
+                text: PlatformParameter::new(string(body, "text")?.to_owned())
+                    .map_err(PlatformError::Field)?,
+            }))
+        }
+        "session_run_stop" => {
+            exact_fields(
+                body,
+                &[
+                    "client",
+                    "expected_run_revision",
+                    "expected_session_revision",
+                    "idempotency_key",
+                    "run",
+                    "session",
+                ],
+            )?;
+            Ok(PlatformRequest::SessionRunStop(SessionRunStopRequest {
+                client: ClientId::new(string(body, "client")?.to_owned())
+                    .map_err(PlatformError::Field)?,
+                session: command_coordinate(body, "session", ResourceKind::Session)?,
+                expected_session_revision: required_revision(body, "expected_session_revision")?,
+                run: command_coordinate(body, "run", ResourceKind::Run)?,
+                expected_run_revision: required_revision(body, "expected_run_revision")?,
+                idempotency_key: IdempotencyKey::new(string(body, "idempotency_key")?.to_owned())
+                    .map_err(PlatformError::Field)?,
+            }))
+        }
+        "session_approval_decision" => {
+            exact_fields(
+                body,
+                &[
+                    "approval",
+                    "client",
+                    "decision",
+                    "expected_approval_revision",
+                    "expected_session_revision",
+                    "idempotency_key",
+                    "session",
+                ],
+            )?;
+            Ok(PlatformRequest::SessionApprovalDecision(
+                SessionApprovalDecisionRequest {
+                    client: ClientId::new(string(body, "client")?.to_owned())
+                        .map_err(PlatformError::Field)?,
+                    session: command_coordinate(body, "session", ResourceKind::Session)?,
+                    expected_session_revision: required_revision(
+                        body,
+                        "expected_session_revision",
+                    )?,
+                    approval: command_coordinate(body, "approval", ResourceKind::Approval)?,
+                    expected_approval_revision: required_revision(
+                        body,
+                        "expected_approval_revision",
+                    )?,
+                    idempotency_key: IdempotencyKey::new(
+                        string(body, "idempotency_key")?.to_owned(),
+                    )
+                    .map_err(PlatformError::Field)?,
+                    decision: SessionApprovalDecision::parse(string(body, "decision")?)?,
+                },
+            ))
+        }
         "session_history_snapshot" => {
             exact_fields(body, &["limit", "session"])?;
             Ok(PlatformRequest::SessionHistorySnapshot(
@@ -859,6 +1086,7 @@ fn response_kind(response: &PlatformResponse) -> &'static str {
         PlatformResponse::ControlReleased { .. } => "control_released",
         PlatformResponse::SessionHistory(_) => "session_history_result",
         PlatformResponse::SessionHistoryResync(_) => "session_history_resync",
+        PlatformResponse::SessionCommandState(_) => "session_command_state_result",
         PlatformResponse::Refused { .. } => "refused",
     }
 }
@@ -1011,6 +1239,23 @@ fn response_body(response: &PlatformResponse) -> Result<JsonValue, PlatformApiEr
                 integer(resync.snapshot_from, "snapshot_from")?,
             ),
             ("snapshot_to", integer(resync.snapshot_to, "snapshot_to")?),
+        ])),
+        PlatformResponse::SessionCommandState(state) => Ok(object(vec![
+            (
+                "pending_approvals",
+                JsonValue::Array(
+                    state
+                        .pending_approvals
+                        .iter()
+                        .map(command_target_json)
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+            ),
+            (
+                "run",
+                optional_json(state.run.as_ref(), command_target_json)?,
+            ),
+            ("session", record_json(&state.session)?),
         ])),
         PlatformResponse::Refused {
             outcome,
@@ -1208,6 +1453,25 @@ fn response_from_message(message: &Message) -> Result<PlatformResponse, Platform
                     coordinate(body.get("session").ok_or(PlatformApiError::InvalidBody)?)?,
                     unsigned(body, "snapshot_from")?,
                     unsigned(body, "snapshot_to")?,
+                )?,
+            ))
+        }
+        "session_command_state_result" => {
+            exact_fields(body, &["pending_approvals", "run", "session"])?;
+            let run = match body.get("run") {
+                Some(JsonValue::Null) => None,
+                Some(value) => Some(command_target(value, ResourceKind::Run)?),
+                None => return Err(PlatformApiError::InvalidBody),
+            };
+            let pending_approvals = array(body, "pending_approvals")?
+                .iter()
+                .map(|value| command_target(value, ResourceKind::Approval))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(PlatformResponse::SessionCommandState(
+                SessionCommandState::new(
+                    record(body.get("session").ok_or(PlatformApiError::InvalidBody)?)?,
+                    run,
+                    pending_approvals,
                 )?,
             ))
         }
