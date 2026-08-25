@@ -71,7 +71,7 @@ export type Sequence = bigint & {readonly __brand: "Sequence"};
 export const Sequence_MIN = 0n;
 export const Sequence_MAX = 9223372036854775807n;
 export function Sequence(value: bigint): Sequence {
-  if (value < 0n || value > 9223372036854775807n) throw new ValidationError("Sequence", "out_of_range");
+  if (typeof value !== "bigint" || value < 0n || value > 9223372036854775807n) throw new ValidationError("Sequence", "out_of_range");
   return value as Sequence;
 }
 

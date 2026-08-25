@@ -11,7 +11,7 @@
 
 import {DurableRowId, DurableRowId_MIN, RequestId} from "./admin-command.js";
 import {EpochMillis} from "./runs.js";
-import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyStringOrNull, bodyUnsigned, byteLength, coupledField, decodeMessageAdmitted, encodeMessage, exactFields, isWellFormedUnicode, mapNullable, orderedEnumSet, rangedInteger, refuse, refuseField, type JsonValue} from "./runtime.js";
+import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyStringOrNull, bodyUnsigned, byteLength, coupledField, decodeMessageAdmitted, encodeMessage, exactFields, exactInputFields, isWellFormedUnicode, mapNullable, orderedEnumSet, rangedInteger, refuse, refuseField, type JsonValue} from "./runtime.js";
 
 /** Stable schema identifier for the version-one control surface. */
 export const AUTOMATION_API_SCHEMA_V1 = "automonique.automation/v1";
@@ -69,7 +69,7 @@ export type AutomationCursor = bigint & {readonly __brand: "AutomationCursor"};
 export const AutomationCursor_MIN = 0n;
 export const AutomationCursor_MAX = 9223372036854775807n;
 export function AutomationCursor(value: bigint): AutomationCursor {
-  if (value < 0n || value > 9223372036854775807n) throw new ValidationError("AutomationCursor", "out_of_range");
+  if (typeof value !== "bigint" || value < 0n || value > 9223372036854775807n) throw new ValidationError("AutomationCursor", "out_of_range");
   return value as AutomationCursor;
 }
 
@@ -78,7 +78,7 @@ export type AutomationPageSize = bigint & {readonly __brand: "AutomationPageSize
 export const AutomationPageSize_MIN = 1n;
 export const AutomationPageSize_MAX = 32n;
 export function AutomationPageSize(value: bigint): AutomationPageSize {
-  if (value < 1n || value > 32n) throw new ValidationError("AutomationPageSize", "out_of_range");
+  if (typeof value !== "bigint" || value < 1n || value > 32n) throw new ValidationError("AutomationPageSize", "out_of_range");
   return value as AutomationPageSize;
 }
 
@@ -252,7 +252,13 @@ export const AutomationDetailBody_FIELDS: readonly string[] = [
   "automation_id",
 ];
 
+/** The exact key set accepted by this generated TypeScript builder. */
+export const AutomationDetailBody_INPUT_FIELDS: readonly string[] = [
+  "automation_id",
+];
+
 export function encodeAutomationDetail(request_id: RequestId, body: AutomationDetailBody): Uint8Array {
+  exactInputFields(body, AutomationDetailBody_INPUT_FIELDS, AUTOMATION_INVALID_BODY);
   return encodeAutomationRequest(request_id, AUTOMATION_AUTOMATION_DETAIL_REQUEST_KIND, [
     ["automation_id", {kind: "string", value: refuse(AUTOMATION_INVALID_FIELD, () => AutomationId(body.automation_id))}],
   ]);
@@ -273,7 +279,15 @@ export const ListAutomationsBody_FIELDS: readonly string[] = [
   "states",
 ];
 
+/** The exact key set accepted by this generated TypeScript builder. */
+export const ListAutomationsBody_INPUT_FIELDS: readonly string[] = [
+  "page_size",
+  "since",
+  "states",
+];
+
 export function encodeListAutomations(request_id: RequestId, body: ListAutomationsBody): Uint8Array {
+  exactInputFields(body, ListAutomationsBody_INPUT_FIELDS, AUTOMATION_INVALID_BODY);
   const states = body.states;
   return encodeAutomationRequest(request_id, AUTOMATION_LIST_AUTOMATIONS_REQUEST_KIND, [
     ["page_size", {kind: "integer", value: refuse(AUTOMATION_PAGE_SIZE_OUT_OF_RANGE, () => AutomationPageSize(body.page_size))}],
@@ -305,7 +319,14 @@ export const RegisterAutomationBody_FIELDS: readonly string[] = [
   "automation_id",
 ];
 
+/** The exact key set accepted by this generated TypeScript builder. */
+export const RegisterAutomationBody_INPUT_FIELDS: readonly string[] = [
+  "actor",
+  "automation_id",
+];
+
 export function encodeRegisterAutomation(request_id: RequestId, body: RegisterAutomationBody): Uint8Array {
+  exactInputFields(body, RegisterAutomationBody_INPUT_FIELDS, AUTOMATION_INVALID_BODY);
   return encodeAutomationRequest(request_id, AUTOMATION_REGISTER_AUTOMATION_REQUEST_KIND, [
     ["actor", {kind: "string", value: refuse(AUTOMATION_INVALID_FIELD, () => AutomationActor(body.actor))}],
     ["automation_id", {kind: "string", value: refuse(AUTOMATION_INVALID_FIELD, () => AutomationId(body.automation_id))}],
@@ -331,7 +352,17 @@ export const SetEnablementBody_FIELDS: readonly string[] = [
   "target",
 ];
 
+/** The exact key set accepted by this generated TypeScript builder. */
+export const SetEnablementBody_INPUT_FIELDS: readonly string[] = [
+  "actor",
+  "automation_id",
+  "cause",
+  "expected_revision",
+  "target",
+];
+
 export function encodeSetEnablement(request_id: RequestId, body: SetEnablementBody): Uint8Array {
+  exactInputFields(body, SetEnablementBody_INPUT_FIELDS, AUTOMATION_INVALID_BODY);
   const cause = coupledField(body.target, body.cause, {
     deciding: "target",
     governed: "cause",

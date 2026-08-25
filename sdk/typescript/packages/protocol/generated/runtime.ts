@@ -260,6 +260,24 @@ export function boundedItems<T>(
   return values;
 }
 
+/** Refuse an untyped request object whose own enumerable keys are not exact. */
+export function exactInputFields(
+  value: object,
+  fields: readonly string[],
+  category: string,
+): void {
+  if (value === null || Array.isArray(value)) {
+    throw new RefusalError(category, "request body is not an object");
+  }
+  const found = Object.keys(value);
+  if (
+    found.length !== fields.length
+    || fields.some((field) => !Object.hasOwn(value, field))
+  ) {
+    throw new RefusalError(category, "request body fields are not exact");
+  }
+}
+
 /**
  * Read a body whose key set must be exactly `fields`.
  *

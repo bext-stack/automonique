@@ -10,7 +10,7 @@
 // ergonomics; it may not redefine anything in this file.
 
 import {DurableRowId, RequestId, RunId, SpecDigest} from "./admin-command.js";
-import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyStringOrNull, bodyUnsigned, bodyValue, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, isWellFormedUnicode, mapNullable, orderedEnumSet, refuse, refuseField, type JsonValue} from "./runtime.js";
+import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyStringOrNull, bodyUnsigned, bodyValue, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, exactInputFields, isWellFormedUnicode, mapNullable, orderedEnumSet, refuse, refuseField, type JsonValue} from "./runtime.js";
 
 /** Maximum lifecycle events one detail view may carry. */
 export const MAX_LIFECYCLE_EVENTS = 128;
@@ -68,7 +68,7 @@ export type EpochMillis = bigint & {readonly __brand: "EpochMillis"};
 export const EpochMillis_MIN = 0n;
 export const EpochMillis_MAX = 9223372036854775807n;
 export function EpochMillis(value: bigint): EpochMillis {
-  if (value < 0n || value > 9223372036854775807n) throw new ValidationError("EpochMillis", "out_of_range");
+  if (typeof value !== "bigint" || value < 0n || value > 9223372036854775807n) throw new ValidationError("EpochMillis", "out_of_range");
   return value as EpochMillis;
 }
 
@@ -77,7 +77,7 @@ export type LastSequence = bigint & {readonly __brand: "LastSequence"};
 export const LastSequence_MIN = 0n;
 export const LastSequence_MAX = 9223372036854775807n;
 export function LastSequence(value: bigint): LastSequence {
-  if (value < 0n || value > 9223372036854775807n) throw new ValidationError("LastSequence", "out_of_range");
+  if (typeof value !== "bigint" || value < 0n || value > 9223372036854775807n) throw new ValidationError("LastSequence", "out_of_range");
   return value as LastSequence;
 }
 
@@ -86,7 +86,7 @@ export type PageSize = bigint & {readonly __brand: "PageSize"};
 export const PageSize_MIN = 1n;
 export const PageSize_MAX = 64n;
 export function PageSize(value: bigint): PageSize {
-  if (value < 1n || value > 64n) throw new ValidationError("PageSize", "out_of_range");
+  if (typeof value !== "bigint" || value < 1n || value > 64n) throw new ValidationError("PageSize", "out_of_range");
   return value as PageSize;
 }
 
@@ -95,7 +95,7 @@ export type RunCursor = bigint & {readonly __brand: "RunCursor"};
 export const RunCursor_MIN = 0n;
 export const RunCursor_MAX = 9223372036854775807n;
 export function RunCursor(value: bigint): RunCursor {
-  if (value < 0n || value > 9223372036854775807n) throw new ValidationError("RunCursor", "out_of_range");
+  if (typeof value !== "bigint" || value < 0n || value > 9223372036854775807n) throw new ValidationError("RunCursor", "out_of_range");
   return value as RunCursor;
 }
 
@@ -104,7 +104,7 @@ export type SpoolSequence = bigint & {readonly __brand: "SpoolSequence"};
 export const SpoolSequence_MIN = 1n;
 export const SpoolSequence_MAX = 9223372036854775807n;
 export function SpoolSequence(value: bigint): SpoolSequence {
-  if (value < 1n || value > 9223372036854775807n) throw new ValidationError("SpoolSequence", "out_of_range");
+  if (typeof value !== "bigint" || value < 1n || value > 9223372036854775807n) throw new ValidationError("SpoolSequence", "out_of_range");
   return value as SpoolSequence;
 }
 
@@ -337,7 +337,15 @@ export const ListRunsBody_FIELDS: readonly string[] = [
   "states",
 ];
 
+/** The exact key set accepted by this generated TypeScript builder. */
+export const ListRunsBody_INPUT_FIELDS: readonly string[] = [
+  "page_size",
+  "since",
+  "states",
+];
+
 export function encodeListRuns(request_id: RequestId, body: ListRunsBody): Uint8Array {
+  exactInputFields(body, ListRunsBody_INPUT_FIELDS, RUNS_INVALID_BODY);
   const since = body.since;
   const states = body.states;
   return encodeRunsRequest(request_id, RUNS_LIST_RUNS_REQUEST_KIND, [
@@ -370,7 +378,13 @@ export const RunDetailBody_FIELDS: readonly string[] = [
   "run_id",
 ];
 
+/** The exact key set accepted by this generated TypeScript builder. */
+export const RunDetailBody_INPUT_FIELDS: readonly string[] = [
+  "run_id",
+];
+
 export function encodeRunDetail(request_id: RequestId, body: RunDetailBody): Uint8Array {
+  exactInputFields(body, RunDetailBody_INPUT_FIELDS, RUNS_INVALID_BODY);
   return encodeRunsRequest(request_id, RUNS_RUN_DETAIL_REQUEST_KIND, [
     ["run_id", {kind: "string", value: refuse(RUNS_INVALID_FIELD, () => RunId(body.run_id))}],
   ]);

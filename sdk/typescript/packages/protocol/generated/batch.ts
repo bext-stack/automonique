@@ -11,7 +11,7 @@
 
 import {DurableRowId, RequestId} from "./admin-command.js";
 import {EpochMillis, LastSequence} from "./runs.js";
-import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyStringOrNull, bodyUnsigned, bodyValue, boundedItems, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, isWellFormedUnicode, mapNullable, rangedInteger, refuse, refuseField, type JsonValue} from "./runtime.js";
+import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyStringOrNull, bodyUnsigned, bodyValue, boundedItems, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, exactInputFields, isWellFormedUnicode, mapNullable, rangedInteger, refuse, refuseField, type JsonValue} from "./runtime.js";
 
 /** Stable schema identifier for the version-one batch control surface. */
 export const BATCH_CONTROL_API_SCHEMA_V1 = "automonique.batch.control/v1";
@@ -69,7 +69,7 @@ export type AdvancedRevision = bigint & {readonly __brand: "AdvancedRevision"};
 export const AdvancedRevision_MIN = 2n;
 export const AdvancedRevision_MAX = 9223372036854775807n;
 export function AdvancedRevision(value: bigint): AdvancedRevision {
-  if (value < 2n || value > 9223372036854775807n) throw new ValidationError("AdvancedRevision", "out_of_range");
+  if (typeof value !== "bigint" || value < 2n || value > 9223372036854775807n) throw new ValidationError("AdvancedRevision", "out_of_range");
   return value as AdvancedRevision;
 }
 
@@ -78,7 +78,7 @@ export type BatchCursor = bigint & {readonly __brand: "BatchCursor"};
 export const BatchCursor_MIN = 0n;
 export const BatchCursor_MAX = 9223372036854775807n;
 export function BatchCursor(value: bigint): BatchCursor {
-  if (value < 0n || value > 9223372036854775807n) throw new ValidationError("BatchCursor", "out_of_range");
+  if (typeof value !== "bigint" || value < 0n || value > 9223372036854775807n) throw new ValidationError("BatchCursor", "out_of_range");
   return value as BatchCursor;
 }
 
@@ -87,7 +87,7 @@ export type BatchPageSize = bigint & {readonly __brand: "BatchPageSize"};
 export const BatchPageSize_MIN = 1n;
 export const BatchPageSize_MAX = 32n;
 export function BatchPageSize(value: bigint): BatchPageSize {
-  if (value < 1n || value > 32n) throw new ValidationError("BatchPageSize", "out_of_range");
+  if (typeof value !== "bigint" || value < 1n || value > 32n) throw new ValidationError("BatchPageSize", "out_of_range");
   return value as BatchPageSize;
 }
 
@@ -96,7 +96,7 @@ export type BatchRevision = bigint & {readonly __brand: "BatchRevision"};
 export const BatchRevision_MIN = 1n;
 export const BatchRevision_MAX = 9223372036854775807n;
 export function BatchRevision(value: bigint): BatchRevision {
-  if (value < 1n || value > 9223372036854775807n) throw new ValidationError("BatchRevision", "out_of_range");
+  if (typeof value !== "bigint" || value < 1n || value > 9223372036854775807n) throw new ValidationError("BatchRevision", "out_of_range");
   return value as BatchRevision;
 }
 
@@ -105,7 +105,7 @@ export type ConcurrencyCeiling = bigint & {readonly __brand: "ConcurrencyCeiling
 export const ConcurrencyCeiling_MIN = 1n;
 export const ConcurrencyCeiling_MAX = 256n;
 export function ConcurrencyCeiling(value: bigint): ConcurrencyCeiling {
-  if (value < 1n || value > 256n) throw new ValidationError("ConcurrencyCeiling", "out_of_range");
+  if (typeof value !== "bigint" || value < 1n || value > 256n) throw new ValidationError("ConcurrencyCeiling", "out_of_range");
   return value as ConcurrencyCeiling;
 }
 
@@ -114,7 +114,7 @@ export type MemberCount = bigint & {readonly __brand: "MemberCount"};
 export const MemberCount_MIN = 1n;
 export const MemberCount_MAX = 128n;
 export function MemberCount(value: bigint): MemberCount {
-  if (value < 1n || value > 128n) throw new ValidationError("MemberCount", "out_of_range");
+  if (typeof value !== "bigint" || value < 1n || value > 128n) throw new ValidationError("MemberCount", "out_of_range");
   return value as MemberCount;
 }
 
@@ -123,7 +123,7 @@ export type MemberOrdinal = bigint & {readonly __brand: "MemberOrdinal"};
 export const MemberOrdinal_MIN = 0n;
 export const MemberOrdinal_MAX = 127n;
 export function MemberOrdinal(value: bigint): MemberOrdinal {
-  if (value < 0n || value > 127n) throw new ValidationError("MemberOrdinal", "out_of_range");
+  if (typeof value !== "bigint" || value < 0n || value > 127n) throw new ValidationError("MemberOrdinal", "out_of_range");
   return value as MemberOrdinal;
 }
 
@@ -442,7 +442,17 @@ export const AdvanceMemberBody_FIELDS: readonly string[] = [
   "state",
 ];
 
+/** The exact key set accepted by this generated TypeScript builder. */
+export const AdvanceMemberBody_INPUT_FIELDS: readonly string[] = [
+  "batch_id",
+  "expected_revision",
+  "last_sequence",
+  "member_key",
+  "state",
+];
+
 export function encodeAdvanceMember(request_id: RequestId, body: AdvanceMemberBody): Uint8Array {
+  exactInputFields(body, AdvanceMemberBody_INPUT_FIELDS, BATCH_INVALID_BODY);
   return encodeBatchRequest(request_id, BATCH_ADVANCE_MEMBER_REQUEST_KIND, [
     ["batch_id", {kind: "string", value: refuse(BATCH_INVALID_FIELD, () => BatchId(body.batch_id))}],
     ["expected_revision", {kind: "integer", value: refuse(BATCH_UNWRITTEN_REVISION, () => BatchRevision(body.expected_revision))}],
@@ -463,7 +473,13 @@ export const BatchDetailBody_FIELDS: readonly string[] = [
   "batch_id",
 ];
 
+/** The exact key set accepted by this generated TypeScript builder. */
+export const BatchDetailBody_INPUT_FIELDS: readonly string[] = [
+  "batch_id",
+];
+
 export function encodeBatchDetail(request_id: RequestId, body: BatchDetailBody): Uint8Array {
+  exactInputFields(body, BatchDetailBody_INPUT_FIELDS, BATCH_INVALID_BODY);
   return encodeBatchRequest(request_id, BATCH_BATCH_DETAIL_REQUEST_KIND, [
     ["batch_id", {kind: "string", value: refuse(BATCH_INVALID_FIELD, () => BatchId(body.batch_id))}],
   ]);
@@ -482,7 +498,14 @@ export const ListBatchesBody_FIELDS: readonly string[] = [
   "since",
 ];
 
+/** The exact key set accepted by this generated TypeScript builder. */
+export const ListBatchesBody_INPUT_FIELDS: readonly string[] = [
+  "page_size",
+  "since",
+];
+
 export function encodeListBatches(request_id: RequestId, body: ListBatchesBody): Uint8Array {
+  exactInputFields(body, ListBatchesBody_INPUT_FIELDS, BATCH_INVALID_BODY);
   return encodeBatchRequest(request_id, BATCH_LIST_BATCHES_REQUEST_KIND, [
     ["page_size", {kind: "integer", value: refuse(BATCH_PAGE_SIZE_OUT_OF_RANGE, () => BatchPageSize(body.page_size))}],
     ["since", {kind: "integer", value: refuse(BATCH_COUNTER_OUT_OF_RANGE, () => BatchCursor(body.since))}],
@@ -506,7 +529,16 @@ export const RegisterBatchBody_FIELDS: readonly string[] = [
   "members",
 ];
 
+/** The exact key set accepted by this generated TypeScript builder. */
+export const RegisterBatchBody_INPUT_FIELDS: readonly string[] = [
+  "batch_id",
+  "concurrency",
+  "label",
+  "members",
+];
+
 export function encodeRegisterBatch(request_id: RequestId, body: RegisterBatchBody): Uint8Array {
+  exactInputFields(body, RegisterBatchBody_INPUT_FIELDS, BATCH_INVALID_BODY);
   const label = body.label;
   return encodeBatchRequest(request_id, BATCH_REGISTER_BATCH_REQUEST_KIND, [
     ["batch_id", {kind: "string", value: refuse(BATCH_INVALID_FIELD, () => BatchId(body.batch_id))}],

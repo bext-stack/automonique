@@ -11,7 +11,7 @@
 
 import {DurableRowId, RequestId} from "./admin-command.js";
 import {EpochMillis} from "./runs.js";
-import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyUnsigned, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, isWellFormedUnicode, mapNullable, refuse, refuseField, type JsonValue} from "./runtime.js";
+import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyIntegerOrNull, bodyString, bodyUnsigned, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, exactInputFields, isWellFormedUnicode, mapNullable, refuse, refuseField, type JsonValue} from "./runtime.js";
 
 /** Stable schema identifier for the version-one decision surface. */
 export const APPROVAL_API_SCHEMA_V1 = "automonique.approval/v1";
@@ -66,7 +66,7 @@ export type ApprovalCursor = bigint & {readonly __brand: "ApprovalCursor"};
 export const ApprovalCursor_MIN = 0n;
 export const ApprovalCursor_MAX = 9223372036854775807n;
 export function ApprovalCursor(value: bigint): ApprovalCursor {
-  if (value < 0n || value > 9223372036854775807n) throw new ValidationError("ApprovalCursor", "out_of_range");
+  if (typeof value !== "bigint" || value < 0n || value > 9223372036854775807n) throw new ValidationError("ApprovalCursor", "out_of_range");
   return value as ApprovalCursor;
 }
 
@@ -75,7 +75,7 @@ export type ApprovalPageSize = bigint & {readonly __brand: "ApprovalPageSize"};
 export const ApprovalPageSize_MIN = 1n;
 export const ApprovalPageSize_MAX = 32n;
 export function ApprovalPageSize(value: bigint): ApprovalPageSize {
-  if (value < 1n || value > 32n) throw new ValidationError("ApprovalPageSize", "out_of_range");
+  if (typeof value !== "bigint" || value < 1n || value > 32n) throw new ValidationError("ApprovalPageSize", "out_of_range");
   return value as ApprovalPageSize;
 }
 
@@ -84,7 +84,7 @@ export type ApprovalRevision = bigint & {readonly __brand: "ApprovalRevision"};
 export const ApprovalRevision_MIN = 1n;
 export const ApprovalRevision_MAX = 1n;
 export function ApprovalRevision(value: bigint): ApprovalRevision {
-  if (value < 1n || value > 1n) throw new ValidationError("ApprovalRevision", "out_of_range");
+  if (typeof value !== "bigint" || value < 1n || value > 1n) throw new ValidationError("ApprovalRevision", "out_of_range");
   return value as ApprovalRevision;
 }
 
@@ -252,7 +252,13 @@ export const ApprovalDetailBody_FIELDS: readonly string[] = [
   "approval_key",
 ];
 
+/** The exact key set accepted by this generated TypeScript builder. */
+export const ApprovalDetailBody_INPUT_FIELDS: readonly string[] = [
+  "approval_key",
+];
+
 export function encodeApprovalDetail(request_id: RequestId, body: ApprovalDetailBody): Uint8Array {
+  exactInputFields(body, ApprovalDetailBody_INPUT_FIELDS, APPROVAL_INVALID_BODY);
   return encodeApprovalRequest(request_id, APPROVAL_APPROVAL_DETAIL_REQUEST_KIND, [
     ["approval_key", {kind: "string", value: refuse(APPROVAL_INVALID_FIELD, () => ApprovalKey(body.approval_key))}],
   ]);
@@ -273,7 +279,15 @@ export const ApprovalsBySubjectBody_FIELDS: readonly string[] = [
   "subject",
 ];
 
+/** The exact key set accepted by this generated TypeScript builder. */
+export const ApprovalsBySubjectBody_INPUT_FIELDS: readonly string[] = [
+  "page_size",
+  "since",
+  "subject",
+];
+
 export function encodeApprovalsBySubject(request_id: RequestId, body: ApprovalsBySubjectBody): Uint8Array {
+  exactInputFields(body, ApprovalsBySubjectBody_INPUT_FIELDS, APPROVAL_INVALID_BODY);
   return encodeApprovalRequest(request_id, APPROVAL_APPROVALS_BY_SUBJECT_REQUEST_KIND, [
     ["page_size", {kind: "integer", value: refuse(APPROVAL_PAGE_SIZE_OUT_OF_RANGE, () => ApprovalPageSize(body.page_size))}],
     ["since", {kind: "integer", value: refuse(APPROVAL_COUNTER_OUT_OF_RANGE, () => ApprovalCursor(body.since))}],
@@ -296,7 +310,15 @@ export const DecideRequestBody_FIELDS: readonly string[] = [
   "request_key",
 ];
 
+/** The exact key set accepted by this generated TypeScript builder. */
+export const DecideRequestBody_INPUT_FIELDS: readonly string[] = [
+  "decider",
+  "decision",
+  "request_key",
+];
+
 export function encodeDecideRequest(request_id: RequestId, body: DecideRequestBody): Uint8Array {
+  exactInputFields(body, DecideRequestBody_INPUT_FIELDS, APPROVAL_INVALID_BODY);
   return encodeApprovalRequest(request_id, APPROVAL_DECIDE_REQUEST_REQUEST_KIND, [
     ["decider", {kind: "string", value: refuse(APPROVAL_INVALID_FIELD, () => Decider(body.decider))}],
     ["decision", {kind: "string", value: refuse(APPROVAL_UNKNOWN_ENUM_VALUE, () => decodeApprovalDecision(body.decision))}],
@@ -317,7 +339,14 @@ export const ListApprovalsBody_FIELDS: readonly string[] = [
   "since",
 ];
 
+/** The exact key set accepted by this generated TypeScript builder. */
+export const ListApprovalsBody_INPUT_FIELDS: readonly string[] = [
+  "page_size",
+  "since",
+];
+
 export function encodeListApprovals(request_id: RequestId, body: ListApprovalsBody): Uint8Array {
+  exactInputFields(body, ListApprovalsBody_INPUT_FIELDS, APPROVAL_INVALID_BODY);
   return encodeApprovalRequest(request_id, APPROVAL_LIST_APPROVALS_REQUEST_KIND, [
     ["page_size", {kind: "integer", value: refuse(APPROVAL_PAGE_SIZE_OUT_OF_RANGE, () => ApprovalPageSize(body.page_size))}],
     ["since", {kind: "integer", value: refuse(APPROVAL_COUNTER_OUT_OF_RANGE, () => ApprovalCursor(body.since))}],
@@ -341,7 +370,16 @@ export const RecordApprovalBody_FIELDS: readonly string[] = [
   "subject",
 ];
 
+/** The exact key set accepted by this generated TypeScript builder. */
+export const RecordApprovalBody_INPUT_FIELDS: readonly string[] = [
+  "approval_key",
+  "decider",
+  "decision",
+  "subject",
+];
+
 export function encodeRecordApproval(request_id: RequestId, body: RecordApprovalBody): Uint8Array {
+  exactInputFields(body, RecordApprovalBody_INPUT_FIELDS, APPROVAL_INVALID_BODY);
   return encodeApprovalRequest(request_id, APPROVAL_RECORD_APPROVAL_REQUEST_KIND, [
     ["approval_key", {kind: "string", value: refuse(APPROVAL_INVALID_FIELD, () => ApprovalKey(body.approval_key))}],
     ["decider", {kind: "string", value: refuse(APPROVAL_INVALID_FIELD, () => Decider(body.decider))}],

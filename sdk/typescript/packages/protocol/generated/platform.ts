@@ -9,7 +9,7 @@
 // Rust is the wire source of truth. Hand-written SDK code may add
 // ergonomics; it may not redefine anything in this file.
 
-import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyString, bodyStringOrNull, bodyStrings, bodyUnsigned, bodyValue, bodyValueOrNull, byteLength, decodeMessageAdmitted, exactFields, exactString, isWellFormedUnicode, mapNullable, refuse, refuseField, type JsonValue} from "./runtime.js";
+import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyString, bodyStringOrNull, bodyStrings, bodyUnsigned, bodyValue, bodyValueOrNull, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, exactInputFields, exactString, isWellFormedUnicode, mapNullable, refuse, refuseField, type JsonValue} from "./runtime.js";
 
 /** Lifetime of one exclusive interactive control lease. */
 export const CONTROL_LEASE_TTL_MILLIS = 30000;
@@ -154,7 +154,7 @@ export type PlatformEpochMillis = bigint & {readonly __brand: "PlatformEpochMill
 export const PlatformEpochMillis_MIN = -9223372036854775808n;
 export const PlatformEpochMillis_MAX = 9223372036854775807n;
 export function PlatformEpochMillis(value: bigint): PlatformEpochMillis {
-  if (value < -9223372036854775808n || value > 9223372036854775807n) throw new ValidationError("PlatformEpochMillis", "out_of_range");
+  if (typeof value !== "bigint" || value < -9223372036854775808n || value > 9223372036854775807n) throw new ValidationError("PlatformEpochMillis", "out_of_range");
   return value as PlatformEpochMillis;
 }
 
@@ -163,7 +163,7 @@ export type PlatformRevision = bigint & {readonly __brand: "PlatformRevision"};
 export const PlatformRevision_MIN = 1n;
 export const PlatformRevision_MAX = 9223372036854775807n;
 export function PlatformRevision(value: bigint): PlatformRevision {
-  if (value < 1n || value > 9223372036854775807n) throw new ValidationError("PlatformRevision", "out_of_range");
+  if (typeof value !== "bigint" || value < 1n || value > 9223372036854775807n) throw new ValidationError("PlatformRevision", "out_of_range");
   return value as PlatformRevision;
 }
 
@@ -420,6 +420,9 @@ export const Subscription_FIELDS: readonly string[] = [
 /** The only major version of this protocol these helpers speak. */
 export const PLATFORM_PROTOCOL_VERSION = 1;
 
+/** A request integer is outside the signed canonical wire range. */
+export const PLATFORM_COUNTER_OUT_OF_RANGE = "platform_counter_out_of_range";
+
 /** An envelope field violates its grammar. */
 export const PLATFORM_FIELD_GRAMMAR = "field_grammar";
 
@@ -475,6 +478,15 @@ export const DecodedPlatformCursor_FIELDS: readonly string[] = [
   "topic",
 ];
 
+export function encodeDecodedPlatformCursor(value: DecodedPlatformCursor): JsonValue {
+  exactInputFields(value, DecodedPlatformCursor_FIELDS, PLATFORM_INVALID_BODY);
+  return {kind: "object", entries: [
+    ["authority", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => decodeResourceAuthority(value.authority))}],
+    ["sequence", {kind: "integer", value: refuse(PLATFORM_INVALID_BODY, () => PlatformRevision(value.sequence))}],
+    ["topic", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => CursorTopic(value.topic))}],
+  ]};
+}
+
 export function decodeDecodedPlatformCursor(body: JsonValue): DecodedPlatformCursor {
   const fields = exactFields(body, DecodedPlatformCursor_FIELDS, PLATFORM_INVALID_BODY);
   return {
@@ -517,6 +529,15 @@ export const DecodedResourceCoordinate_FIELDS: readonly string[] = [
   "id",
   "kind",
 ];
+
+export function encodeDecodedResourceCoordinate(value: DecodedResourceCoordinate): JsonValue {
+  exactInputFields(value, DecodedResourceCoordinate_FIELDS, PLATFORM_INVALID_BODY);
+  return {kind: "object", entries: [
+    ["authority", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => decodeResourceAuthority(value.authority))}],
+    ["id", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => ResourceId(value.id))}],
+    ["kind", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => decodeResourceKind(value.kind))}],
+  ]};
+}
 
 export function decodeDecodedResourceCoordinate(body: JsonValue): DecodedResourceCoordinate {
   const fields = exactFields(body, DecodedResourceCoordinate_FIELDS, PLATFORM_INVALID_BODY);
@@ -574,6 +595,419 @@ export function decodeDecodedSessionRecord(body: JsonValue): DecodedSessionRecor
     run: mapNullable(bodyValueOrNull(fields, "run", PLATFORM_INVALID_BODY), decodeDecodedResourceCoordinate),
     session: decodeDecodedResourceRecord(bodyValue(fields, "session", PLATFORM_INVALID_BODY)),
   };
+}
+
+/**
+ * Build one canonical request payload for `automonique.platform`, version 1.
+ *
+ * The length-delimited framing this protocol travels under is not applied
+ * here: these are payload bytes, and the prefix belongs to the transport
+ * that writes them. This package has no transport.
+ *
+ * The correlation identifier is re-validated rather than trusted, because a
+ * brand exists only in the type checker and an untyped caller reaches this
+ * function with anything at all.
+ */
+export function encodePlatformRequest(
+  request_id: PlatformRequestId,
+  kind: string,
+  entries: readonly (readonly [string, JsonValue])[],
+): Uint8Array {
+  const payload = encodeMessage({
+    envelope: {
+      protocol: PLATFORM_PROTOCOL,
+      version: PLATFORM_PROTOCOL_VERSION,
+      requestId: refuseField(PLATFORM_FIELD_INVALID, PLATFORM_FIELD_GRAMMAR, () =>
+        PlatformRequestId(request_id),
+      ),
+      kind,
+    },
+    body: {kind: "object", entries},
+  });
+  if (payload.length > MAX_PLATFORM_REQUEST_CANONICAL_BYTES) {
+    throw new RefusalError(
+      PLATFORM_FRAME_TOO_LARGE,
+      `canonical payload is ${payload.length} bytes; maximum is ${MAX_PLATFORM_REQUEST_CANONICAL_BYTES}`,
+    );
+  }
+  return payload;
+}
+
+/** Attach one client as an observer of one exact session. */
+export const PLATFORM_ATTACH_REQUEST_KIND = "attach";
+export interface PlatformAttachBody {
+  readonly client: ClientId;
+  readonly session: DecodedResourceCoordinate;
+}
+
+/** The exact key set this command's wire body carries. */
+export const PlatformAttachBody_FIELDS: readonly string[] = [
+  "client",
+  "session",
+];
+
+/** The exact key set accepted by this generated TypeScript builder. */
+export const PlatformAttachBody_INPUT_FIELDS: readonly string[] = [
+  "client",
+  "session",
+];
+
+export function encodePlatformAttach(request_id: PlatformRequestId, body: PlatformAttachBody): Uint8Array {
+  exactInputFields(body, PlatformAttachBody_INPUT_FIELDS, PLATFORM_INVALID_BODY);
+  return encodePlatformRequest(request_id, PLATFORM_ATTACH_REQUEST_KIND, [
+    ["client", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => ClientId(body.client))}],
+    ["session", encodeDecodedResourceCoordinate(body.session)],
+  ]);
+}
+
+/** Read the exact Platform protocol, schema, methods, and transports. */
+export const PLATFORM_CAPABILITIES_REQUEST_KIND = "capabilities";
+
+export function encodePlatformCapabilities(request_id: PlatformRequestId): Uint8Array {
+  return encodePlatformRequest(request_id, PLATFORM_CAPABILITIES_REQUEST_KIND, []);
+}
+
+/** Claim short exclusive control over one exact session. */
+export const PLATFORM_CLAIM_CONTROL_REQUEST_KIND = "claim_control";
+export interface PlatformClaimControlBody {
+  readonly client: ClientId;
+  readonly idempotency_key: IdempotencyKey;
+  readonly session: DecodedResourceCoordinate;
+}
+
+/** The exact key set this command's wire body carries. */
+export const PlatformClaimControlBody_FIELDS: readonly string[] = [
+  "client",
+  "idempotency_key",
+  "session",
+];
+
+/** The exact key set accepted by this generated TypeScript builder. */
+export const PlatformClaimControlBody_INPUT_FIELDS: readonly string[] = [
+  "client",
+  "idempotency_key",
+  "session",
+];
+
+export function encodePlatformClaimControl(request_id: PlatformRequestId, body: PlatformClaimControlBody): Uint8Array {
+  exactInputFields(body, PlatformClaimControlBody_INPUT_FIELDS, PLATFORM_INVALID_BODY);
+  return encodePlatformRequest(request_id, PLATFORM_CLAIM_CONTROL_REQUEST_KIND, [
+    ["client", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => ClientId(body.client))}],
+    ["idempotency_key", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => IdempotencyKey(body.idempotency_key))}],
+    ["session", encodeDecodedResourceCoordinate(body.session)],
+  ]);
+}
+
+/** Detach one client from one exact session. */
+export const PLATFORM_DETACH_REQUEST_KIND = "detach";
+export interface PlatformDetachBody {
+  readonly client: ClientId;
+  readonly session: DecodedResourceCoordinate;
+}
+
+/** The exact key set this command's wire body carries. */
+export const PlatformDetachBody_FIELDS: readonly string[] = [
+  "client",
+  "session",
+];
+
+/** The exact key set accepted by this generated TypeScript builder. */
+export const PlatformDetachBody_INPUT_FIELDS: readonly string[] = [
+  "client",
+  "session",
+];
+
+export function encodePlatformDetach(request_id: PlatformRequestId, body: PlatformDetachBody): Uint8Array {
+  exactInputFields(body, PlatformDetachBody_INPUT_FIELDS, PLATFORM_INVALID_BODY);
+  return encodePlatformRequest(request_id, PLATFORM_DETACH_REQUEST_KIND, [
+    ["client", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => ClientId(body.client))}],
+    ["session", encodeDecodedResourceCoordinate(body.session)],
+  ]);
+}
+
+/** Request one authority-bound idempotent Platform action. */
+export const PLATFORM_EXECUTE_REQUEST_KIND = "execute";
+export interface PlatformExecuteBody {
+  readonly action: PlatformAction;
+  readonly expected_revision: PlatformRevision | null;
+  readonly idempotency_key: IdempotencyKey;
+  readonly parameter: PlatformParameter | null;
+  readonly target: DecodedResourceCoordinate;
+}
+
+/** The exact key set this command's wire body carries. */
+export const PlatformExecuteBody_FIELDS: readonly string[] = [
+  "action",
+  "expected_revision",
+  "idempotency_key",
+  "parameter",
+  "target",
+];
+
+/** The exact key set accepted by this generated TypeScript builder. */
+export const PlatformExecuteBody_INPUT_FIELDS: readonly string[] = [
+  "action",
+  "expected_revision",
+  "idempotency_key",
+  "parameter",
+  "target",
+];
+
+export function encodePlatformExecute(request_id: PlatformRequestId, body: PlatformExecuteBody): Uint8Array {
+  exactInputFields(body, PlatformExecuteBody_INPUT_FIELDS, PLATFORM_INVALID_BODY);
+  const expectedAuthority = (() => {
+    switch (body.action) {
+      case "approve_release": return "ai_operations";
+      case "decide_approval": return "automonique";
+      case "follow_up": return "automonique";
+      case "register_node": return "ai_operations";
+      case "start_run": return "automonique";
+      case "steer": return "automonique";
+      case "stop_run": return "automonique";
+      case "submit_job": return "ai_operations";
+      case "submit_request": return "automonique";
+      default: throw new RefusalError(PLATFORM_VALUE_INVALID, "action is not defined");
+    }
+  })();
+  if (body.target.authority !== expectedAuthority) {
+    throw new RefusalError(PLATFORM_VALUE_INVALID, "action and target authority disagree");
+  }
+  const expected_revision = body.expected_revision;
+  const parameter = body.parameter;
+  return encodePlatformRequest(request_id, PLATFORM_EXECUTE_REQUEST_KIND, [
+    ["action", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => decodePlatformAction(body.action))}],
+    ["expected_revision", expected_revision === null
+        ? {kind: "null"}
+        : {kind: "integer", value: refuse(PLATFORM_COUNTER_OUT_OF_RANGE, () => PlatformRevision(expected_revision))}],
+    ["idempotency_key", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => IdempotencyKey(body.idempotency_key))}],
+    ["parameter", parameter === null
+        ? {kind: "null"}
+        : {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => PlatformParameter(parameter))}],
+    ["target", encodeDecodedResourceCoordinate(body.target)],
+  ]);
+}
+
+/** Read one receipt by exactly one durable coordinate. */
+export const PLATFORM_GET_RECEIPT_REQUEST_KIND = "get_receipt";
+export interface PlatformGetReceiptBody {
+  readonly id: ReceiptId | null;
+  readonly idempotency_key: IdempotencyKey | null;
+}
+
+/** The exact key set this command's wire body carries. */
+export const PlatformGetReceiptBody_FIELDS: readonly string[] = [
+  "id",
+  "idempotency_key",
+];
+
+/** The exact key set accepted by this generated TypeScript builder. */
+export const PlatformGetReceiptBody_INPUT_FIELDS: readonly string[] = [
+  "id",
+  "idempotency_key",
+];
+
+export function encodePlatformGetReceipt(request_id: PlatformRequestId, body: PlatformGetReceiptBody): Uint8Array {
+  exactInputFields(body, PlatformGetReceiptBody_INPUT_FIELDS, PLATFORM_INVALID_BODY);
+  if ((body.id === null) === (body.idempotency_key === null)) {
+    throw new RefusalError(PLATFORM_INVALID_BODY, "exactly one of id and idempotency_key is required");
+  }
+  const id = body.id;
+  const idempotency_key = body.idempotency_key;
+  return encodePlatformRequest(request_id, PLATFORM_GET_RECEIPT_REQUEST_KIND, [
+    ["id", id === null
+        ? {kind: "null"}
+        : {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => ReceiptId(id))}],
+    ["idempotency_key", idempotency_key === null
+        ? {kind: "null"}
+        : {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => IdempotencyKey(idempotency_key))}],
+  ]);
+}
+
+/** Read one bounded page of attachable sessions. */
+export const PLATFORM_LIST_SESSIONS_REQUEST_KIND = "list_sessions";
+export interface PlatformListSessionsBody {
+  readonly authority: ResourceAuthority;
+  readonly cursor: DecodedPlatformCursor | null;
+}
+
+/** The exact key set this command's wire body carries. */
+export const PlatformListSessionsBody_FIELDS: readonly string[] = [
+  "authority",
+  "cursor",
+];
+
+/** The exact key set accepted by this generated TypeScript builder. */
+export const PlatformListSessionsBody_INPUT_FIELDS: readonly string[] = [
+  "authority",
+  "cursor",
+];
+
+export function encodePlatformListSessions(request_id: PlatformRequestId, body: PlatformListSessionsBody): Uint8Array {
+  exactInputFields(body, PlatformListSessionsBody_INPUT_FIELDS, PLATFORM_INVALID_BODY);
+  const cursor = body.cursor;
+  return encodePlatformRequest(request_id, PLATFORM_LIST_SESSIONS_REQUEST_KIND, [
+    ["authority", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => decodeResourceAuthority(body.authority))}],
+    ["cursor", cursor === null
+        ? {kind: "null"}
+        : encodeDecodedPlatformCursor(cursor)],
+  ]);
+}
+
+/** Release one exact control lease under an idempotency key. */
+export const PLATFORM_RELEASE_CONTROL_REQUEST_KIND = "release_control";
+export interface PlatformReleaseControlBody {
+  readonly client: ClientId;
+  readonly idempotency_key: IdempotencyKey;
+  readonly lease: ControlLeaseId;
+  readonly session: DecodedResourceCoordinate;
+}
+
+/** The exact key set this command's wire body carries. */
+export const PlatformReleaseControlBody_FIELDS: readonly string[] = [
+  "client",
+  "idempotency_key",
+  "lease",
+  "session",
+];
+
+/** The exact key set accepted by this generated TypeScript builder. */
+export const PlatformReleaseControlBody_INPUT_FIELDS: readonly string[] = [
+  "client",
+  "idempotency_key",
+  "lease",
+  "session",
+];
+
+export function encodePlatformReleaseControl(request_id: PlatformRequestId, body: PlatformReleaseControlBody): Uint8Array {
+  exactInputFields(body, PlatformReleaseControlBody_INPUT_FIELDS, PLATFORM_INVALID_BODY);
+  return encodePlatformRequest(request_id, PLATFORM_RELEASE_CONTROL_REQUEST_KIND, [
+    ["client", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => ClientId(body.client))}],
+    ["idempotency_key", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => IdempotencyKey(body.idempotency_key))}],
+    ["lease", {kind: "string", value: refuse(PLATFORM_VALUE_INVALID, () => ControlLeaseId(body.lease))}],
+    ["session", encodeDecodedResourceCoordinate(body.session)],
+  ]);
+}
+
+/** Read one bounded point-in-time resource collection. */
+export const PLATFORM_SNAPSHOT_REQUEST_KIND = "snapshot";
+export interface PlatformSnapshotBody {
+  readonly resources: readonly DecodedResourceCoordinate[];
+}
+
+/** The exact key set this command's wire body carries. */
+export const PlatformSnapshotBody_FIELDS: readonly string[] = [
+  "resources",
+];
+
+/** The exact key set accepted by this generated TypeScript builder. */
+export const PlatformSnapshotBody_INPUT_FIELDS: readonly string[] = [
+  "resources",
+];
+
+export function encodePlatformSnapshot(request_id: PlatformRequestId, body: PlatformSnapshotBody): Uint8Array {
+  exactInputFields(body, PlatformSnapshotBody_INPUT_FIELDS, PLATFORM_INVALID_BODY);
+  return encodePlatformRequest(request_id, PLATFORM_SNAPSHOT_REQUEST_KIND, [
+    ["resources", ((): JsonValue => {
+        if (body.resources.length > MAX_SNAPSHOT_RESOURCES) {
+          throw new RefusalError(PLATFORM_VALUE_INVALID, `${body.resources.length} items; maximum is ${MAX_SNAPSHOT_RESOURCES}`);
+        }
+        return {kind: "array", items: body.resources.map(encodeDecodedResourceCoordinate)};
+      })()],
+  ]);
+}
+
+/** Resume the bounded event stream from an optional cursor. */
+export const PLATFORM_SUBSCRIBE_REQUEST_KIND = "subscribe";
+export interface PlatformSubscribeBody {
+  readonly cursor: DecodedPlatformCursor | null;
+}
+
+/** The exact key set this command's wire body carries. */
+export const PlatformSubscribeBody_FIELDS: readonly string[] = [
+  "cursor",
+];
+
+/** The exact key set accepted by this generated TypeScript builder. */
+export const PlatformSubscribeBody_INPUT_FIELDS: readonly string[] = [
+  "cursor",
+];
+
+export function encodePlatformSubscribe(request_id: PlatformRequestId, body: PlatformSubscribeBody): Uint8Array {
+  exactInputFields(body, PlatformSubscribeBody_INPUT_FIELDS, PLATFORM_INVALID_BODY);
+  const cursor = body.cursor;
+  return encodePlatformRequest(request_id, PLATFORM_SUBSCRIBE_REQUEST_KIND, [
+    ["cursor", cursor === null
+        ? {kind: "null"}
+        : encodeDecodedPlatformCursor(cursor)],
+  ]);
+}
+
+/** Command kinds this protocol version defines that no builder above produces. A client needing one of these builds it by hand or waits for the generator to describe it. */
+export const PLATFORM_REQUEST_KINDS_NOT_GENERATED: readonly string[] = [
+];
+
+/** Every generated request this protocol admits. */
+export type PlatformRequest =
+  | {readonly method: "attach"; readonly request: PlatformAttachBody}
+  | {readonly method: "capabilities"}
+  | {readonly method: "claim_control"; readonly request: PlatformClaimControlBody}
+  | {readonly method: "detach"; readonly request: PlatformDetachBody}
+  | {readonly method: "execute"; readonly request: PlatformExecuteBody}
+  | {readonly method: "get_receipt"; readonly request: PlatformGetReceiptBody}
+  | {readonly method: "list_sessions"; readonly request: PlatformListSessionsBody}
+  | {readonly method: "release_control"; readonly request: PlatformReleaseControlBody}
+  | {readonly method: "snapshot"; readonly request: PlatformSnapshotBody}
+  | {readonly method: "subscribe"; readonly request: PlatformSubscribeBody};
+
+export function encodePlatformRequestMessage(request_id: PlatformRequestId, request: PlatformRequest): Uint8Array {
+  switch (request.method) {
+    case PLATFORM_ATTACH_REQUEST_KIND:
+      exactInputFields(request, ["method", "request"], PLATFORM_INVALID_BODY);
+      return encodePlatformAttach(request_id, request.request);
+    case PLATFORM_CAPABILITIES_REQUEST_KIND:
+      exactInputFields(request, ["method"], PLATFORM_INVALID_BODY);
+      return encodePlatformCapabilities(request_id);
+    case PLATFORM_CLAIM_CONTROL_REQUEST_KIND:
+      exactInputFields(request, ["method", "request"], PLATFORM_INVALID_BODY);
+      return encodePlatformClaimControl(request_id, request.request);
+    case PLATFORM_DETACH_REQUEST_KIND:
+      exactInputFields(request, ["method", "request"], PLATFORM_INVALID_BODY);
+      return encodePlatformDetach(request_id, request.request);
+    case PLATFORM_EXECUTE_REQUEST_KIND:
+      exactInputFields(request, ["method", "request"], PLATFORM_INVALID_BODY);
+      return encodePlatformExecute(request_id, request.request);
+    case PLATFORM_GET_RECEIPT_REQUEST_KIND:
+      exactInputFields(request, ["method", "request"], PLATFORM_INVALID_BODY);
+      return encodePlatformGetReceipt(request_id, request.request);
+    case PLATFORM_LIST_SESSIONS_REQUEST_KIND:
+      exactInputFields(request, ["method", "request"], PLATFORM_INVALID_BODY);
+      return encodePlatformListSessions(request_id, request.request);
+    case PLATFORM_RELEASE_CONTROL_REQUEST_KIND:
+      exactInputFields(request, ["method", "request"], PLATFORM_INVALID_BODY);
+      return encodePlatformReleaseControl(request_id, request.request);
+    case PLATFORM_SNAPSHOT_REQUEST_KIND:
+      exactInputFields(request, ["method", "request"], PLATFORM_INVALID_BODY);
+      return encodePlatformSnapshot(request_id, request.request);
+    case PLATFORM_SUBSCRIBE_REQUEST_KIND:
+      exactInputFields(request, ["method", "request"], PLATFORM_INVALID_BODY);
+      return encodePlatformSubscribe(request_id, request.request);
+  }
+}
+
+/** Successful response kind correlated with one request method. */
+export function expectedPlatformResponseKind(method: PlatformRequest["method"]): PlatformResponse["kind"] {
+  switch (method) {
+    case PLATFORM_ATTACH_REQUEST_KIND: return PLATFORM_ATTACHED_RESPONSE_KIND;
+    case PLATFORM_CAPABILITIES_REQUEST_KIND: return PLATFORM_CAPABILITIES_RESULT_RESPONSE_KIND;
+    case PLATFORM_CLAIM_CONTROL_REQUEST_KIND: return PLATFORM_CONTROL_CLAIMED_RESPONSE_KIND;
+    case PLATFORM_DETACH_REQUEST_KIND: return PLATFORM_DETACHED_RESPONSE_KIND;
+    case PLATFORM_EXECUTE_REQUEST_KIND: return PLATFORM_RECEIPT_RESULT_RESPONSE_KIND;
+    case PLATFORM_GET_RECEIPT_REQUEST_KIND: return PLATFORM_RECEIPT_RESULT_RESPONSE_KIND;
+    case PLATFORM_LIST_SESSIONS_REQUEST_KIND: return PLATFORM_SESSIONS_RESULT_RESPONSE_KIND;
+    case PLATFORM_RELEASE_CONTROL_REQUEST_KIND: return PLATFORM_CONTROL_RELEASED_RESPONSE_KIND;
+    case PLATFORM_SNAPSHOT_REQUEST_KIND: return PLATFORM_SNAPSHOT_RESULT_RESPONSE_KIND;
+    case PLATFORM_SUBSCRIBE_REQUEST_KIND: return PLATFORM_SUBSCRIPTION_RESULT_RESPONSE_KIND;
+  }
 }
 
 /** An observation-only session attachment. */

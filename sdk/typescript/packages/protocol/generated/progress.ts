@@ -55,7 +55,7 @@ export type ProgressCursor = bigint & {readonly __brand: "ProgressCursor"};
 export const ProgressCursor_MIN = 0n;
 export const ProgressCursor_MAX = 9223372036854775807n;
 export function ProgressCursor(value: bigint): ProgressCursor {
-  if (value < 0n || value > 9223372036854775807n) throw new ValidationError("ProgressCursor", "out_of_range");
+  if (typeof value !== "bigint" || value < 0n || value > 9223372036854775807n) throw new ValidationError("ProgressCursor", "out_of_range");
   return value as ProgressCursor;
 }
 
@@ -64,7 +64,7 @@ export type RetryAfterMillis = bigint & {readonly __brand: "RetryAfterMillis"};
 export const RetryAfterMillis_MIN = 0n;
 export const RetryAfterMillis_MAX = 300000n;
 export function RetryAfterMillis(value: bigint): RetryAfterMillis {
-  if (value < 0n || value > 300000n) throw new ValidationError("RetryAfterMillis", "out_of_range");
+  if (typeof value !== "bigint" || value < 0n || value > 300000n) throw new ValidationError("RetryAfterMillis", "out_of_range");
   return value as RetryAfterMillis;
 }
 
@@ -73,7 +73,7 @@ export type RetryAttempt = bigint & {readonly __brand: "RetryAttempt"};
 export const RetryAttempt_MIN = 1n;
 export const RetryAttempt_MAX = 4294967295n;
 export function RetryAttempt(value: bigint): RetryAttempt {
-  if (value < 1n || value > 4294967295n) throw new ValidationError("RetryAttempt", "out_of_range");
+  if (typeof value !== "bigint" || value < 1n || value > 4294967295n) throw new ValidationError("RetryAttempt", "out_of_range");
   return value as RetryAttempt;
 }
 

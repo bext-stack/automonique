@@ -10,7 +10,7 @@
 // ergonomics; it may not redefine anything in this file.
 
 import {ADMIN_PROTOCOL, MAX_ADMIN_CANONICAL_BYTES} from "./admin-status.js";
-import {RefusalError, ValidationError, bodyBool, bodyInteger, bodyString, boundedBytes, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, hexEncode, isWellFormedUnicode, refuse, refuseField, type JsonValue} from "./runtime.js";
+import {RefusalError, ValidationError, bodyBool, bodyInteger, bodyString, boundedBytes, byteLength, decodeMessageAdmitted, encodeMessage, exactFields, exactInputFields, hexEncode, isWellFormedUnicode, refuse, refuseField, type JsonValue} from "./runtime.js";
 
 /** Maximum raw RunSpec document bytes this lane carries. The wire spends twice this, because the document travels hex-encoded. */
 export const MAX_SUBMITTED_RUN_SPEC_BYTES = 24576;
@@ -104,7 +104,7 @@ export type DurableRowId = bigint & {readonly __brand: "DurableRowId"};
 export const DurableRowId_MIN = 1n;
 export const DurableRowId_MAX = 9223372036854775807n;
 export function DurableRowId(value: bigint): DurableRowId {
-  if (value < 1n || value > 9223372036854775807n) throw new ValidationError("DurableRowId", "out_of_range");
+  if (typeof value !== "bigint" || value < 1n || value > 9223372036854775807n) throw new ValidationError("DurableRowId", "out_of_range");
   return value as DurableRowId;
 }
 
@@ -185,7 +185,14 @@ export const PauseIntakeBody_FIELDS: readonly string[] = [
   "reason",
 ];
 
+/** The exact key set accepted by this generated TypeScript builder. */
+export const PauseIntakeBody_INPUT_FIELDS: readonly string[] = [
+  "actor",
+  "reason",
+];
+
 export function encodePauseIntake(request_id: RequestId, body: PauseIntakeBody): Uint8Array {
+  exactInputFields(body, PauseIntakeBody_INPUT_FIELDS, ADMIN_INVALID_BODY);
   return encodeAdminRequest(request_id, ADMIN_PAUSE_INTAKE_REQUEST_KIND, [
     ["actor", {kind: "string", value: refuse(ADMIN_INVALID_BODY, () => IntakeActor(body.actor))}],
     ["reason", {kind: "string", value: refuse(ADMIN_INVALID_BODY, () => IntakeReason(body.reason))}],
@@ -203,7 +210,13 @@ export const ResumeIntakeBody_FIELDS: readonly string[] = [
   "actor",
 ];
 
+/** The exact key set accepted by this generated TypeScript builder. */
+export const ResumeIntakeBody_INPUT_FIELDS: readonly string[] = [
+  "actor",
+];
+
 export function encodeResumeIntake(request_id: RequestId, body: ResumeIntakeBody): Uint8Array {
+  exactInputFields(body, ResumeIntakeBody_INPUT_FIELDS, ADMIN_INVALID_BODY);
   return encodeAdminRequest(request_id, ADMIN_RESUME_INTAKE_REQUEST_KIND, [
     ["actor", {kind: "string", value: refuse(ADMIN_INVALID_BODY, () => IntakeActor(body.actor))}],
   ]);
@@ -238,7 +251,15 @@ export const SubmitRunBody_FIELDS: readonly string[] = [
   "spec_digest",
 ];
 
+/** The exact key set accepted by this generated TypeScript builder. */
+export const SubmitRunBody_INPUT_FIELDS: readonly string[] = [
+  "document",
+  "idempotency_key",
+  "spec_digest",
+];
+
 export function encodeSubmitRun(request_id: RequestId, body: SubmitRunBody): Uint8Array {
+  exactInputFields(body, SubmitRunBody_INPUT_FIELDS, ADMIN_INVALID_BODY);
   return encodeAdminRequest(request_id, ADMIN_SUBMIT_RUN_REQUEST_KIND, [
     ["document_hex", {kind: "string", value: refuse(ADMIN_INVALID_BODY, () => hexEncode(boundedBytes(body.document, MAX_SUBMITTED_RUN_SPEC_BYTES, ADMIN_DOCUMENT_TOO_LARGE, ADMIN_INVALID_BODY)))}],
     ["idempotency_key", {kind: "string", value: refuse(ADMIN_INVALID_BODY, () => RunSubmissionKey(body.idempotency_key))}],

@@ -238,7 +238,7 @@ describe("canonical HTTPS Platform v1 transport", () => {
 
     await expect(clientFor("request-number", "snapshot_result", {cursor, resources: []})
       .subscribe({authority: "provider", sequence: 42 as never, topic: "sessions" as never}))
-      .rejects.toMatchObject({category: "request_invalid"});
+      .rejects.toMatchObject({category: "platform_invalid_body"});
   });
 
   test("requires the exact response media type", async () => {

@@ -257,7 +257,7 @@ fn run_runtime_conformance() -> Option<RuntimeRun> {
 /// asking whether its category is declared. Both the Runs and the Automation
 /// suites read it, so one arm covers both.
 fn referenced_categories(surface: &automonique_protocol::codegen::CommandSurface) -> Vec<String> {
-    use automonique_protocol::codegen::{RequestValue, ResponseValue};
+    use automonique_protocol::codegen::{RequestValidation, RequestValue, ResponseValue};
 
     let mut referenced = Vec::new();
     for field in surface.requests.iter().flat_map(|request| &request.fields) {
@@ -299,6 +299,10 @@ fn referenced_categories(surface: &automonique_protocol::codegen::CommandSurface
             // body rather than to the field that carries it, and are collected
             // from the surface's own list below.
             RequestValue::Discriminated { .. } => {}
+            RequestValue::Object { .. } | RequestValue::NullableObject { .. } => {}
+            RequestValue::ObjectArray {
+                oversize_category, ..
+            } => referenced.push(oversize_category.clone()),
             RequestValue::NullableEnumSet {
                 empty_category,
                 repeat_category,
@@ -322,6 +326,16 @@ fn referenced_categories(surface: &automonique_protocol::codegen::CommandSurface
             coupling.required_category.clone(),
             coupling.forbidden_category.clone(),
         ]);
+    }
+    for (_, validation) in &surface.request_validations {
+        referenced.push(match validation {
+            RequestValidation::ExactlyOneNonNull {
+                refusal_category, ..
+            }
+            | RequestValidation::ActionAuthority {
+                refusal_category, ..
+            } => refusal_category.clone(),
+        });
     }
     for field in surface
         .responses
@@ -4817,7 +4831,7 @@ mod runs_surface {
         // Declaring a bound is not applying it.
         for application in [
             format!(
-                "  if (value < 1n || value > {MAX_RUN_PAGE_ITEMS}n) throw new \
+                "  if (typeof value !== \"bigint\" || value < 1n || value > {MAX_RUN_PAGE_ITEMS}n) throw new \
                  ValidationError(\"PageSize\", \"out_of_range\");"
             ),
             "bodyArray(fields, \"runs\", RUNS_INVALID_BODY, MAX_RUN_PAGE_ITEMS, \
@@ -7082,7 +7096,7 @@ mod automation_surface {
                  ValidationError(\"PauseReason\", \"too_long\");"
             ),
             format!(
-                "  if (value < 1n || value > {MAX_AUTOMATION_PAGE_ITEMS}n) throw new \
+                "  if (typeof value !== \"bigint\" || value < 1n || value > {MAX_AUTOMATION_PAGE_ITEMS}n) throw new \
                  ValidationError(\"AutomationPageSize\", \"out_of_range\");"
             ),
             "bodyArray(fields, \"automations\", AUTOMATION_INVALID_BODY, \
@@ -9310,10 +9324,10 @@ mod approval_surface {
                  ValidationError(\"Decider\", \"too_long\");"
             ),
             format!(
-                "  if (value < 1n || value > {MAX_APPROVAL_PAGE_ITEMS}n) throw new \
+                "  if (typeof value !== \"bigint\" || value < 1n || value > {MAX_APPROVAL_PAGE_ITEMS}n) throw new \
                  ValidationError(\"ApprovalPageSize\", \"out_of_range\");"
             ),
-            "  if (value < 1n || value > 1n) throw new ValidationError(\"ApprovalRevision\", \
+            "  if (typeof value !== \"bigint\" || value < 1n || value > 1n) throw new ValidationError(\"ApprovalRevision\", \
              \"out_of_range\");"
                 .to_owned(),
             "bodyArray(fields, \"approvals\", APPROVAL_INVALID_BODY, MAX_APPROVAL_PAGE_ITEMS, \
@@ -12690,19 +12704,19 @@ mod batch_surface {
                  ValidationError(\"BatchLabel\", \"too_long\");"
             ),
             format!(
-                "  if (value < 1n || value > {MAX_BATCH_PAGE_ITEMS}n) throw new \
+                "  if (typeof value !== \"bigint\" || value < 1n || value > {MAX_BATCH_PAGE_ITEMS}n) throw new \
                  ValidationError(\"BatchPageSize\", \"out_of_range\");"
             ),
             format!(
-                "  if (value < 1n || value > {MAX_BATCH_MEMBERS}n) throw new \
+                "  if (typeof value !== \"bigint\" || value < 1n || value > {MAX_BATCH_MEMBERS}n) throw new \
                  ValidationError(\"ConcurrencyCeiling\", \"out_of_range\");"
             ),
             format!(
-                "  if (value < 0n || value > {}n) throw new ValidationError(\"MemberOrdinal\", \
+                "  if (typeof value !== \"bigint\" || value < 0n || value > {}n) throw new ValidationError(\"MemberOrdinal\", \
                  \"out_of_range\");",
                 MAX_BATCH_CONTROL_MEMBERS - 1
             ),
-            "  if (value < 2n || value > 9223372036854775807n) throw new \
+            "  if (typeof value !== \"bigint\" || value < 2n || value > 9223372036854775807n) throw new \
              ValidationError(\"AdvancedRevision\", \"out_of_range\");"
                 .to_owned(),
             // The membership bound is applied on the way out, over the list the

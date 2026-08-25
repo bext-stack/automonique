@@ -46,7 +46,7 @@ export type WireCounter = bigint & {readonly __brand: "WireCounter"};
 export const WireCounter_MIN = 0n;
 export const WireCounter_MAX = 9223372036854775807n;
 export function WireCounter(value: bigint): WireCounter {
-  if (value < 0n || value > 9223372036854775807n) throw new ValidationError("WireCounter", "out_of_range");
+  if (typeof value !== "bigint" || value < 0n || value > 9223372036854775807n) throw new ValidationError("WireCounter", "out_of_range");
   return value as WireCounter;
 }
 

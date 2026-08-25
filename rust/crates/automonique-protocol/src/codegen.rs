@@ -672,7 +672,7 @@ fn emit_bounded_integer(out: &mut String, integer: &BoundedInteger) {
     let _ = writeln!(out, "export function {name}(value: bigint): {name} {{");
     let _ = writeln!(
         out,
-        "  if (value < {min}n || value > {max}n) throw new ValidationError(\"{name}\", \
+        "  if (typeof value !== \"bigint\" || value < {min}n || value > {max}n) throw new ValidationError(\"{name}\", \
          \"out_of_range\");"
     );
     let _ = writeln!(out, "  return value as {name};");
@@ -1013,6 +1013,25 @@ pub enum RequestValue {
         /// Category answered for a value outside the bound.
         refusal_category: String,
     },
+    /// A nested exact object encoded by a [`BodyObject`] in this module.
+    Object {
+        /// Generated object type and encoder stem.
+        type_name: String,
+    },
+    /// A nested exact object that is always present and may be `null`.
+    NullableObject {
+        /// Generated object type and encoder stem.
+        type_name: String,
+    },
+    /// A bounded, possibly empty array of nested exact objects.
+    ObjectArray {
+        /// Generated object type and encoder stem.
+        type_name: String,
+        /// Generated constant naming the largest admissible length.
+        max_items_constant: String,
+        /// Category answered above that length.
+        oversize_category: String,
+    },
     /// A nested body whose discriminant decides whether it carries a payload.
     ///
     /// The generated input is the union [`DiscriminatedBody`] declares, and the
@@ -1078,11 +1097,16 @@ impl RequestField {
             | RequestValue::Integer { type_name, .. }
             | RequestValue::RangedInteger { type_name, .. }
             | RequestValue::Discriminated { type_name }
+            | RequestValue::Object { type_name }
             | RequestValue::Enum { type_name, .. } => type_name.clone(),
-            RequestValue::CheckedArray { type_name, .. } => format!("readonly {type_name}[]"),
+            RequestValue::CheckedArray { type_name, .. }
+            | RequestValue::ObjectArray { type_name, .. } => {
+                format!("readonly {type_name}[]")
+            }
             RequestValue::HexBytes { .. } => "Uint8Array".to_owned(),
             RequestValue::NullableChecked { type_name, .. }
-            | RequestValue::NullableInteger { type_name, .. } => format!("{type_name} | null"),
+            | RequestValue::NullableInteger { type_name, .. }
+            | RequestValue::NullableObject { type_name } => format!("{type_name} | null"),
             RequestValue::NullableEnumSet { type_name, .. } => {
                 format!("readonly {type_name}[] | null")
             }
@@ -1100,6 +1124,7 @@ impl RequestField {
             self.value,
             RequestValue::NullableChecked { .. }
                 | RequestValue::NullableInteger { .. }
+                | RequestValue::NullableObject { .. }
                 | RequestValue::NullableEnumSet { .. }
         )
     }
@@ -1143,6 +1168,24 @@ pub struct RequestCommand {
     pub fields: Vec<RequestField>,
     /// A rule relating two of those fields, applied before any is encoded.
     pub coupling: Option<FieldCoupling>,
+}
+
+/// Cross-field validation generated before one request is encoded.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum RequestValidation {
+    /// Exactly one of two nullable fields must be non-null.
+    ExactlyOneNonNull {
+        left: String,
+        right: String,
+        refusal_category: String,
+    },
+    /// A closed action vocabulary fixes the authority of a nested target.
+    ActionAuthority {
+        action_field: String,
+        target_field: String,
+        action_authorities: Vec<(String, String)>,
+        refusal_category: String,
+    },
 }
 
 /// How one response body field is decoded.
@@ -1374,6 +1417,10 @@ pub struct CommandSurface {
     pub version: u32,
     /// Generated constant carrying the maximum canonical message bytes.
     pub max_message_bytes_constant: String,
+    /// Optional request-specific ceiling when responses may be larger.
+    ///
+    /// When absent, requests use [`Self::max_message_bytes_constant`].
+    pub request_max_message_bytes_constant: Option<String>,
     /// The branded correlation-identifier type.
     pub request_id_type: String,
     /// Refusal categories, pinned to the Rust `category()` spellings.
@@ -1396,6 +1443,12 @@ pub struct CommandSurface {
     pub requests: Vec<RequestCommand>,
     /// Kinds this protocol version defines that no generated builder produces.
     pub request_kinds_not_generated: Vec<String>,
+    /// Cross-field request checks keyed by request kind.
+    pub request_validations: Vec<(String, RequestValidation)>,
+    /// Request kind to successful response kind pairs for a correlated client.
+    ///
+    /// Empty on surfaces that do not publish a request/response client union.
+    pub request_response_kinds: Vec<(String, String)>,
     /// Responses, emitted in kind order.
     pub responses: Vec<ResponseDecoder>,
     /// Kinds this protocol version defines that no generated decoder reads.
@@ -1875,6 +1928,24 @@ export function boundedItems<T>(
   }
   if (values.length === 0) throw new RefusalError(emptyCategory, "empty list");
   return values;
+}
+
+/** Refuse an untyped request object whose own enumerable keys are not exact. */
+export function exactInputFields(
+  value: object,
+  fields: readonly string[],
+  category: string,
+): void {
+  if (value === null || Array.isArray(value)) {
+    throw new RefusalError(category, "request body is not an object");
+  }
+  const found = Object.keys(value);
+  if (
+    found.length !== fields.length
+    || fields.some((field) => !Object.hasOwn(value, field))
+  ) {
+    throw new RefusalError(category, "request body fields are not exact");
+  }
 }
 
 /**
@@ -2506,6 +2577,7 @@ fn admin_command_module() -> GeneratedModule {
             protocol: crate::admin::ADMIN_PROTOCOL.to_owned(),
             version: crate::codec::MajorVersion::FIRST.get(),
             max_message_bytes_constant: "MAX_ADMIN_CANONICAL_BYTES".to_owned(),
+            request_max_message_bytes_constant: None,
             request_id_type: "RequestId".to_owned(),
             categories: vec![
                 category(
@@ -2645,6 +2717,8 @@ fn admin_command_module() -> GeneratedModule {
                 "reconcile_outbox".to_owned(),
                 "submit_synthetic".to_owned(),
             ],
+            request_validations: Vec::new(),
+            request_response_kinds: Vec::new(),
             responses: vec![
                 ResponseDecoder {
                     kind: "intake_paused".to_owned(),
@@ -3004,6 +3078,7 @@ fn runs_module() -> GeneratedModule {
             protocol: crate::runs_api::RUNS_PROTOCOL.to_owned(),
             version: crate::codec::MajorVersion::FIRST.get(),
             max_message_bytes_constant: "MAX_RUNS_CANONICAL_BYTES".to_owned(),
+            request_max_message_bytes_constant: None,
             request_id_type: "RequestId".to_owned(),
             categories: vec![
                 runs_category(
@@ -3247,6 +3322,8 @@ fn runs_module() -> GeneratedModule {
             // `tests/codegen.rs` proves the list against the Rust encoders
             // themselves rather than against this claim.
             request_kinds_not_generated: Vec::new(),
+            request_validations: Vec::new(),
+            request_response_kinds: Vec::new(),
             responses: vec![
                 ResponseDecoder {
                     kind: "run_list_result".to_owned(),
@@ -3669,6 +3746,7 @@ fn automation_module() -> GeneratedModule {
             protocol: crate::automation_api::AUTOMATION_PROTOCOL.to_owned(),
             version: crate::codec::MajorVersion::FIRST.get(),
             max_message_bytes_constant: "MAX_AUTOMATION_CANONICAL_BYTES".to_owned(),
+            request_max_message_bytes_constant: None,
             request_id_type: "RequestId".to_owned(),
             categories: vec![
                 automation_category(
@@ -3928,6 +4006,8 @@ fn automation_module() -> GeneratedModule {
             // `tests/codegen.rs` proves the list against the Rust encoders
             // themselves rather than against this claim.
             request_kinds_not_generated: Vec::new(),
+            request_validations: Vec::new(),
+            request_response_kinds: Vec::new(),
             responses: vec![
                 ResponseDecoder {
                     kind: "automation_accepted".to_owned(),
@@ -4361,6 +4441,7 @@ fn approval_module() -> GeneratedModule {
             protocol: crate::approval_api::APPROVAL_PROTOCOL.to_owned(),
             version: crate::codec::MajorVersion::FIRST.get(),
             max_message_bytes_constant: "MAX_APPROVAL_CANONICAL_BYTES".to_owned(),
+            request_max_message_bytes_constant: None,
             request_id_type: "RequestId".to_owned(),
             categories: vec![
                 approval_category(
@@ -4598,6 +4679,8 @@ fn approval_module() -> GeneratedModule {
             // `tests/codegen.rs` proves the list against the Rust encoders
             // themselves rather than against this claim.
             request_kinds_not_generated: Vec::new(),
+            request_validations: Vec::new(),
+            request_response_kinds: Vec::new(),
             responses: vec![
                 ResponseDecoder {
                     kind: "approval_conflict".to_owned(),
@@ -5135,6 +5218,7 @@ fn batch_module() -> GeneratedModule {
             protocol: crate::batch_api::BATCH_CONTROL_PROTOCOL.to_owned(),
             version: crate::codec::MajorVersion::FIRST.get(),
             max_message_bytes_constant: "MAX_BATCH_CONTROL_CANONICAL_BYTES".to_owned(),
+            request_max_message_bytes_constant: None,
             request_id_type: "RequestId".to_owned(),
             categories: vec![
                 batch_category(
@@ -5453,6 +5537,8 @@ fn batch_module() -> GeneratedModule {
             // `tests/codegen.rs` proves the list against the Rust encoders
             // themselves rather than against this claim.
             request_kinds_not_generated: Vec::new(),
+            request_validations: Vec::new(),
+            request_response_kinds: Vec::new(),
             responses: vec![
                 ResponseDecoder {
                     kind: "batch_detail_result".to_owned(),
@@ -6033,6 +6119,26 @@ fn platform_field(name: &str, value: ResponseValue) -> ResponseField {
     }
 }
 
+fn platform_client_session_fields() -> Vec<RequestField> {
+    vec![
+        RequestField {
+            name: "client".to_owned(),
+            input_name: "client".to_owned(),
+            value: RequestValue::Checked {
+                type_name: "ClientId".to_owned(),
+                refusal_category: PLATFORM_VALUE_INVALID.to_owned(),
+            },
+        },
+        RequestField {
+            name: "session".to_owned(),
+            input_name: "session".to_owned(),
+            value: RequestValue::Object {
+                type_name: "DecodedResourceCoordinate".to_owned(),
+            },
+        },
+    ]
+}
+
 fn platform_body_object(name: &str, doc: &str, fields: Vec<ResponseField>) -> BodyObject {
     BodyObject {
         name: name.to_owned(),
@@ -6347,6 +6453,9 @@ fn platform_module() -> GeneratedModule {
             protocol: crate::platform::PLATFORM_PROTOCOL.to_owned(),
             version: 1,
             max_message_bytes_constant: "MAX_PLATFORM_CANONICAL_BYTES".to_owned(),
+            request_max_message_bytes_constant: Some(
+                "MAX_PLATFORM_REQUEST_CANONICAL_BYTES".to_owned(),
+            ),
             request_id_type: "PlatformRequestId".to_owned(),
             categories: vec![
                 Constant {
@@ -6368,6 +6477,11 @@ fn platform_module() -> GeneratedModule {
                     name: "PLATFORM_FRAME_TOO_LARGE".to_owned(),
                     doc: "The canonical response exceeds its transport ceiling.".to_owned(),
                     value: ConstantValue::Text("frame_too_large".to_owned()),
+                },
+                Constant {
+                    name: "PLATFORM_COUNTER_OUT_OF_RANGE".to_owned(),
+                    doc: "A request integer is outside the signed canonical wire range.".to_owned(),
+                    value: ConstantValue::Text("platform_counter_out_of_range".to_owned()),
                 },
                 Constant {
                     name: "PLATFORM_FIELD_INVALID".to_owned(),
@@ -6447,11 +6561,238 @@ fn platform_module() -> GeneratedModule {
                     ],
                 ),
             ],
-            requests: Vec::new(),
-            request_kinds_not_generated: PlatformMethod::ALL
-                .iter()
-                .map(|method| method.as_str().to_owned())
-                .collect(),
+            requests: vec![
+                RequestCommand {
+                    kind: "capabilities".to_owned(),
+                    name: "PlatformCapabilities".to_owned(),
+                    doc: "Read the exact Platform protocol, schema, methods, and transports."
+                        .to_owned(),
+                    fields: Vec::new(),
+                    coupling: None,
+                },
+                RequestCommand {
+                    kind: "snapshot".to_owned(),
+                    name: "PlatformSnapshot".to_owned(),
+                    doc: "Read one bounded point-in-time resource collection.".to_owned(),
+                    fields: vec![RequestField {
+                        name: "resources".to_owned(),
+                        input_name: "resources".to_owned(),
+                        value: RequestValue::ObjectArray {
+                            type_name: "DecodedResourceCoordinate".to_owned(),
+                            max_items_constant: "MAX_SNAPSHOT_RESOURCES".to_owned(),
+                            oversize_category: PLATFORM_VALUE_INVALID.to_owned(),
+                        },
+                    }],
+                    coupling: None,
+                },
+                RequestCommand {
+                    kind: "subscribe".to_owned(),
+                    name: "PlatformSubscribe".to_owned(),
+                    doc: "Resume the bounded event stream from an optional cursor.".to_owned(),
+                    fields: vec![RequestField {
+                        name: "cursor".to_owned(),
+                        input_name: "cursor".to_owned(),
+                        value: RequestValue::NullableObject {
+                            type_name: "DecodedPlatformCursor".to_owned(),
+                        },
+                    }],
+                    coupling: None,
+                },
+                RequestCommand {
+                    kind: "execute".to_owned(),
+                    name: "PlatformExecute".to_owned(),
+                    doc: "Request one authority-bound idempotent Platform action.".to_owned(),
+                    fields: vec![
+                        RequestField {
+                            name: "action".to_owned(),
+                            input_name: "action".to_owned(),
+                            value: RequestValue::Enum {
+                                type_name: "PlatformAction".to_owned(),
+                                unknown_category: PLATFORM_VALUE_INVALID.to_owned(),
+                            },
+                        },
+                        RequestField {
+                            name: "expected_revision".to_owned(),
+                            input_name: "expected_revision".to_owned(),
+                            value: RequestValue::NullableInteger {
+                                type_name: "PlatformRevision".to_owned(),
+                                refusal_category: "PLATFORM_COUNTER_OUT_OF_RANGE".to_owned(),
+                            },
+                        },
+                        RequestField {
+                            name: "idempotency_key".to_owned(),
+                            input_name: "idempotency_key".to_owned(),
+                            value: RequestValue::Checked {
+                                type_name: "IdempotencyKey".to_owned(),
+                                refusal_category: PLATFORM_VALUE_INVALID.to_owned(),
+                            },
+                        },
+                        RequestField {
+                            name: "parameter".to_owned(),
+                            input_name: "parameter".to_owned(),
+                            value: RequestValue::NullableChecked {
+                                type_name: "PlatformParameter".to_owned(),
+                                refusal_category: PLATFORM_VALUE_INVALID.to_owned(),
+                            },
+                        },
+                        RequestField {
+                            name: "target".to_owned(),
+                            input_name: "target".to_owned(),
+                            value: RequestValue::Object {
+                                type_name: "DecodedResourceCoordinate".to_owned(),
+                            },
+                        },
+                    ],
+                    coupling: None,
+                },
+                RequestCommand {
+                    kind: "get_receipt".to_owned(),
+                    name: "PlatformGetReceipt".to_owned(),
+                    doc: "Read one receipt by exactly one durable coordinate.".to_owned(),
+                    fields: vec![
+                        RequestField {
+                            name: "id".to_owned(),
+                            input_name: "id".to_owned(),
+                            value: RequestValue::NullableChecked {
+                                type_name: "ReceiptId".to_owned(),
+                                refusal_category: PLATFORM_VALUE_INVALID.to_owned(),
+                            },
+                        },
+                        RequestField {
+                            name: "idempotency_key".to_owned(),
+                            input_name: "idempotency_key".to_owned(),
+                            value: RequestValue::NullableChecked {
+                                type_name: "IdempotencyKey".to_owned(),
+                                refusal_category: PLATFORM_VALUE_INVALID.to_owned(),
+                            },
+                        },
+                    ],
+                    coupling: None,
+                },
+                RequestCommand {
+                    kind: "list_sessions".to_owned(),
+                    name: "PlatformListSessions".to_owned(),
+                    doc: "Read one bounded page of attachable sessions.".to_owned(),
+                    fields: vec![
+                        RequestField {
+                            name: "authority".to_owned(),
+                            input_name: "authority".to_owned(),
+                            value: RequestValue::Enum {
+                                type_name: "ResourceAuthority".to_owned(),
+                                unknown_category: PLATFORM_VALUE_INVALID.to_owned(),
+                            },
+                        },
+                        RequestField {
+                            name: "cursor".to_owned(),
+                            input_name: "cursor".to_owned(),
+                            value: RequestValue::NullableObject {
+                                type_name: "DecodedPlatformCursor".to_owned(),
+                            },
+                        },
+                    ],
+                    coupling: None,
+                },
+                RequestCommand {
+                    kind: "attach".to_owned(),
+                    name: "PlatformAttach".to_owned(),
+                    doc: "Attach one client as an observer of one exact session.".to_owned(),
+                    fields: platform_client_session_fields(),
+                    coupling: None,
+                },
+                RequestCommand {
+                    kind: "detach".to_owned(),
+                    name: "PlatformDetach".to_owned(),
+                    doc: "Detach one client from one exact session.".to_owned(),
+                    fields: platform_client_session_fields(),
+                    coupling: None,
+                },
+                RequestCommand {
+                    kind: "claim_control".to_owned(),
+                    name: "PlatformClaimControl".to_owned(),
+                    doc: "Claim short exclusive control over one exact session.".to_owned(),
+                    fields: {
+                        let mut fields = platform_client_session_fields();
+                        fields.push(RequestField {
+                            name: "idempotency_key".to_owned(),
+                            input_name: "idempotency_key".to_owned(),
+                            value: RequestValue::Checked {
+                                type_name: "IdempotencyKey".to_owned(),
+                                refusal_category: PLATFORM_VALUE_INVALID.to_owned(),
+                            },
+                        });
+                        fields
+                    },
+                    coupling: None,
+                },
+                RequestCommand {
+                    kind: "release_control".to_owned(),
+                    name: "PlatformReleaseControl".to_owned(),
+                    doc: "Release one exact control lease under an idempotency key.".to_owned(),
+                    fields: {
+                        let mut fields = platform_client_session_fields();
+                        fields.extend([
+                            RequestField {
+                                name: "idempotency_key".to_owned(),
+                                input_name: "idempotency_key".to_owned(),
+                                value: RequestValue::Checked {
+                                    type_name: "IdempotencyKey".to_owned(),
+                                    refusal_category: PLATFORM_VALUE_INVALID.to_owned(),
+                                },
+                            },
+                            RequestField {
+                                name: "lease".to_owned(),
+                                input_name: "lease".to_owned(),
+                                value: RequestValue::Checked {
+                                    type_name: "ControlLeaseId".to_owned(),
+                                    refusal_category: PLATFORM_VALUE_INVALID.to_owned(),
+                                },
+                            },
+                        ]);
+                        fields
+                    },
+                    coupling: None,
+                },
+            ],
+            request_kinds_not_generated: Vec::new(),
+            request_validations: vec![
+                (
+                    "execute".to_owned(),
+                    RequestValidation::ActionAuthority {
+                        action_field: "action".to_owned(),
+                        target_field: "target".to_owned(),
+                        action_authorities: PlatformAction::ALL
+                            .into_iter()
+                            .map(|action| {
+                                (
+                                    action.as_str().to_owned(),
+                                    action.authority().as_str().to_owned(),
+                                )
+                            })
+                            .collect(),
+                        refusal_category: PLATFORM_VALUE_INVALID.to_owned(),
+                    },
+                ),
+                (
+                    "get_receipt".to_owned(),
+                    RequestValidation::ExactlyOneNonNull {
+                        left: "id".to_owned(),
+                        right: "idempotency_key".to_owned(),
+                        refusal_category: PLATFORM_INVALID_BODY.to_owned(),
+                    },
+                ),
+            ],
+            request_response_kinds: vec![
+                ("capabilities".to_owned(), "capabilities_result".to_owned()),
+                ("snapshot".to_owned(), "snapshot_result".to_owned()),
+                ("subscribe".to_owned(), "subscription_result".to_owned()),
+                ("execute".to_owned(), "receipt_result".to_owned()),
+                ("get_receipt".to_owned(), "receipt_result".to_owned()),
+                ("list_sessions".to_owned(), "sessions_result".to_owned()),
+                ("attach".to_owned(), "attached".to_owned()),
+                ("detach".to_owned(), "detached".to_owned()),
+                ("claim_control".to_owned(), "control_claimed".to_owned()),
+                ("release_control".to_owned(), "control_released".to_owned()),
+            ],
             responses: vec![
                 platform_response(
                     "capabilities_result",
@@ -6683,7 +7024,7 @@ fn runtime_imports(module: &GeneratedModule) -> (Vec<&'static str>, Vec<&'static
         refuses_values = true;
         let request_fields = || surface.requests.iter().flat_map(|request| &request.fields);
         if !surface.requests.is_empty() {
-            names.push("encodeMessage");
+            names.extend(["encodeMessage", "exactInputFields"]);
             types.push("JsonValue");
         }
         for field in request_fields() {
@@ -6702,6 +7043,9 @@ fn runtime_imports(module: &GeneratedModule) -> (Vec<&'static str>, Vec<&'static
                 // helpers it needs are pulled in with the body below.
                 RequestValue::Discriminated { .. } => {}
                 RequestValue::NullableEnumSet { .. } => names.push("orderedEnumSet"),
+                RequestValue::Object { .. }
+                | RequestValue::NullableObject { .. }
+                | RequestValue::ObjectArray { .. } => {}
             }
         }
         if !surface.discriminated_bodies.is_empty() {
@@ -6726,7 +7070,7 @@ fn runtime_imports(module: &GeneratedModule) -> (Vec<&'static str>, Vec<&'static
             types.push("JsonValue");
         }
         if !surface.body_objects.is_empty() {
-            names.push("exactFields");
+            names.extend(["exactFields", "exactInputFields"]);
             types.push("JsonValue");
         }
         for field in surface
@@ -7031,12 +7375,15 @@ fn emit_request_encoder(out: &mut String, surface: &CommandSurface) {
         protocol,
         protocol_constant,
         request_id_type,
-        max_message_bytes_constant,
         oversize_category,
         field_invalid_category,
         field_grammar_category,
         ..
     } = surface;
+    let max_message_bytes_constant = surface
+        .request_max_message_bytes_constant
+        .as_ref()
+        .unwrap_or(&surface.max_message_bytes_constant);
     let version = version_constant(surface);
     let _ = write!(
         out,
@@ -7115,6 +7462,15 @@ fn emit_request(out: &mut String, surface: &CommandSurface, request: &RequestCom
                 .map(|field| field.name.clone())
                 .collect::<Vec<_>>(),
         );
+        emit_name_list(
+            out,
+            &format!("{name}Body_INPUT_FIELDS"),
+            "The exact key set accepted by this generated TypeScript builder.",
+            &fields
+                .iter()
+                .map(|field| field.input_name.clone())
+                .collect::<Vec<_>>(),
+        );
     }
 
     let argument = if fields.is_empty() {
@@ -7137,6 +7493,53 @@ fn emit_request(out: &mut String, surface: &CommandSurface, request: &RequestCom
             surface = surface.name
         );
         return;
+    }
+    let _ = writeln!(
+        out,
+        "  exactInputFields(body, {name}Body_INPUT_FIELDS, {});",
+        surface.invalid_body_category
+    );
+    for (_, validation) in surface
+        .request_validations
+        .iter()
+        .filter(|(request_kind, _)| request_kind == kind)
+    {
+        match validation {
+            RequestValidation::ExactlyOneNonNull {
+                left,
+                right,
+                refusal_category,
+            } => {
+                let _ = writeln!(
+                    out,
+                    "  if ((body.{left} === null) === (body.{right} === null)) {{\n    throw new RefusalError({refusal_category}, \"exactly one of {left} and {right} is required\");\n  }}"
+                );
+            }
+            RequestValidation::ActionAuthority {
+                action_field,
+                target_field,
+                action_authorities,
+                refusal_category,
+            } => {
+                let _ = writeln!(
+                    out,
+                    "  const expectedAuthority = (() => {{\n    switch (body.{action_field}) {{"
+                );
+                let mut mappings = action_authorities.clone();
+                mappings.sort();
+                for (action, authority) in mappings {
+                    let _ = writeln!(out, "      case \"{action}\": return \"{authority}\";");
+                }
+                let _ = writeln!(
+                    out,
+                    "      default: throw new RefusalError({refusal_category}, \"action is not defined\");\n    }}\n  }})();"
+                );
+                let _ = writeln!(
+                    out,
+                    "  if (body.{target_field}.authority !== expectedAuthority) {{\n    throw new RefusalError({refusal_category}, \"action and target authority disagree\");\n  }}"
+                );
+            }
+        }
     }
     // A nullable field is read into a local before it is tested. TypeScript
     // discards the narrowing of a property access inside a closure created
@@ -7242,6 +7645,22 @@ fn emit_request(out: &mut String, surface: &CommandSurface, request: &RequestCom
                 "{input} === null\n        ? {{kind: \"null\"}}\n        : {{kind: \
                  \"integer\", value: refuse({refusal_category}, () => {type_name}({input}))}}"
             ),
+            RequestValue::Object { type_name } => {
+                format!("encode{type_name}({input})")
+            }
+            RequestValue::NullableObject { type_name } => format!(
+                "{input} === null\n        ? {{kind: \"null\"}}\n        : encode{type_name}({input})"
+            ),
+            RequestValue::ObjectArray {
+                type_name,
+                max_items_constant,
+                oversize_category,
+            } => format!(
+                "((): JsonValue => {{\n        if ({input}.length > {max_items_constant}) {{\n          \
+                 throw new RefusalError({oversize_category}, `${{{input}.length}} items; maximum \
+                 is ${{{max_items_constant}}}`);\n        }}\n        return {{kind: \"array\", \
+                 items: {input}.map(encode{type_name})}};\n      }})()"
+            ),
             RequestValue::Discriminated { type_name } => format!("encode{type_name}({input})"),
             RequestValue::CheckedArray {
                 type_name,
@@ -7274,13 +7693,95 @@ fn emit_request(out: &mut String, surface: &CommandSurface, request: &RequestCom
     out.push_str("  ]);\n}\n");
 }
 
+/// Emit the closed request union and request-to-success-response correlation map.
+fn emit_correlated_request_surface(out: &mut String, surface: &CommandSurface) {
+    if surface.request_response_kinds.is_empty() {
+        return;
+    }
+    let request_by_kind: std::collections::BTreeMap<&str, &RequestCommand> = surface
+        .requests
+        .iter()
+        .map(|request| (request.kind.as_str(), request))
+        .collect();
+    let mut mappings = surface.request_response_kinds.clone();
+    mappings.sort();
+    let union = format!("{}Request", surface.name);
+    let mut arms = Vec::with_capacity(mappings.len());
+    for (kind, _) in &mappings {
+        let request = request_by_kind
+            .get(kind.as_str())
+            .unwrap_or_else(|| panic!("response mapping names unknown request kind {kind}"));
+        if request.fields.is_empty() {
+            arms.push(format!("  | {{readonly method: \"{kind}\"}}"));
+        } else {
+            arms.push(format!(
+                "  | {{readonly method: \"{kind}\"; readonly request: {}Body}}",
+                request.name
+            ));
+        }
+    }
+    let _ = writeln!(
+        out,
+        "\n/** Every generated request this protocol admits. */\nexport type {union} =\n{};",
+        arms.join("\n")
+    );
+    let _ = writeln!(
+        out,
+        "\nexport function encode{}RequestMessage(request_id: {}, request: {union}): Uint8Array {{",
+        surface.name, surface.request_id_type
+    );
+    out.push_str("  switch (request.method) {\n");
+    for (kind, _) in &mappings {
+        let request = request_by_kind[kind.as_str()];
+        let constant = kind_constant(surface, kind, "request");
+        let fields = if request.fields.is_empty() {
+            "[\"method\"]"
+        } else {
+            "[\"method\", \"request\"]"
+        };
+        let _ = writeln!(out, "    case {constant}:");
+        let _ = writeln!(
+            out,
+            "      exactInputFields(request, {fields}, {});",
+            surface.invalid_body_category
+        );
+        let _ = writeln!(
+            out,
+            "      return encode{}(request_id{});",
+            request.name,
+            if request.fields.is_empty() {
+                String::new()
+            } else {
+                ", request.request".to_owned()
+            }
+        );
+    }
+    out.push_str("  }\n}\n");
+
+    let _ = writeln!(
+        out,
+        "\n/** Successful response kind correlated with one request method. */\nexport function expected{}ResponseKind(method: {union}[\"method\"]): {}Response[\"kind\"] {{",
+        surface.name, surface.name
+    );
+    out.push_str("  switch (method) {\n");
+    for (request_kind, response_kind) in &mappings {
+        let request_constant = kind_constant(surface, request_kind, "request");
+        let response_constant = kind_constant(surface, response_kind, "response");
+        let _ = writeln!(
+            out,
+            "    case {request_constant}: return {response_constant};"
+        );
+    }
+    out.push_str("  }\n}\n");
+}
+
 /// Emit one nested body type and the decoder that reads it.
 ///
 /// It takes a whole [`JsonValue`] rather than a field map, because a nested
 /// body is a value inside its carrier's body rather than a message of its own.
 /// Its own exact field set is applied here, so a summary carrying one key too
 /// many is refused wherever it is nested.
-fn emit_body_object(out: &mut String, surface: &CommandSurface, object: &BodyObject) {
+fn emit_body_object(out: &mut String, surface: &CommandSurface, object: &BodyObject, encode: bool) {
     let BodyObject { name, doc, fields } = object;
     let mut fields = fields.clone();
     fields.sort_by(|left, right| left.name.cmp(&right.name));
@@ -7307,6 +7808,24 @@ fn emit_body_object(out: &mut String, surface: &CommandSurface, object: &BodyObj
             .collect::<Vec<_>>(),
     );
 
+    if encode {
+        let _ = writeln!(
+            out,
+            "\nexport function encode{name}(value: {name}): JsonValue {{"
+        );
+        let _ = writeln!(out, "  exactInputFields(value, {name}_FIELDS, {invalid});");
+        out.push_str("  return {kind: \"object\", entries: [\n");
+        for field in &fields {
+            let _ = writeln!(
+                out,
+                "    [\"{field_name}\", {value}],",
+                field_name = field.name,
+                value = body_object_field_writer(surface, field)
+            );
+        }
+        out.push_str("  ]};\n}\n");
+    }
+
     let _ = writeln!(
         out,
         "\nexport function decode{name}(body: JsonValue): {name} {{"
@@ -7325,6 +7844,53 @@ fn emit_body_object(out: &mut String, surface: &CommandSurface, object: &BodyObj
         );
     }
     out.push_str("  };\n}\n");
+}
+
+/// Nested object types reachable from generated request fields.
+///
+/// Response-only body objects need decoders, not encoders. Restricting encoder
+/// emission to this transitive closure keeps generated response declarations
+/// unchanged and prevents response-only nullable fields from becoming an
+/// accidental request API.
+fn request_body_object_types(surface: &CommandSurface) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for value in surface
+        .requests
+        .iter()
+        .flat_map(|request| request.fields.iter().map(|field| &field.value))
+    {
+        match value {
+            RequestValue::Object { type_name }
+            | RequestValue::NullableObject { type_name }
+            | RequestValue::ObjectArray { type_name, .. } => {
+                names.insert(type_name.clone());
+            }
+            _ => {}
+        }
+    }
+
+    loop {
+        let mut added = false;
+        for object in &surface.body_objects {
+            if !names.contains(&object.name) {
+                continue;
+            }
+            for field in &object.fields {
+                let dependency = match &field.value {
+                    ResponseValue::Object { type_name }
+                    | ResponseValue::NullableObject { type_name }
+                    | ResponseValue::ObjectArray { type_name, .. } => Some(type_name),
+                    _ => None,
+                };
+                if let Some(dependency) = dependency {
+                    added |= names.insert(dependency.clone());
+                }
+            }
+        }
+        if !added {
+            return names;
+        }
+    }
 }
 
 /// Emit one discriminated nested body: its union, its encoder and its decoder.
@@ -7584,6 +8150,98 @@ fn response_field_reader(surface: &CommandSurface, field: &ResponseField) -> Str
     }
 }
 
+/// The expression that writes one nested exact-object field to canonical JSON.
+fn body_object_field_writer(surface: &CommandSurface, field: &ResponseField) -> String {
+    let invalid = &surface.invalid_body_category;
+    let input = format!("value.{}", field.name);
+    match &field.value {
+        ResponseValue::Bool => format!(
+            "typeof {input} === \"boolean\"\n        ? {{kind: \"bool\", value: {input}}}\n        : \
+             refuse({invalid}, () => {{ throw new ValidationError(\"{}\", \"not_boolean\"); }})",
+            field.name
+        ),
+        ResponseValue::Checked {
+            type_name,
+            refusal_category,
+        } => format!(
+            "{{kind: \"string\", value: refuse({refusal_category}, () => \
+             {type_name}({input}))}}"
+        ),
+        ResponseValue::NullableChecked {
+            type_name,
+            refusal_category,
+        } => format!(
+            "{input} === null\n        ? {{kind: \"null\"}}\n        : {{kind: \"string\", value: \
+             refuse({refusal_category}, () => {type_name}({input}))}}"
+        ),
+        ResponseValue::Integer {
+            type_name,
+            refusal_category,
+            ..
+        } => format!(
+            "{{kind: \"integer\", value: refuse({refusal_category}, () => \
+             {type_name}({input}))}}"
+        ),
+        ResponseValue::RangedInteger {
+            type_name,
+            below_category,
+            above_category,
+            ..
+        } => format!(
+            "{{kind: \"integer\", value: rangedInteger({input}, {type_name}_MIN, \
+             {below_category}, {above_category}, {type_name})}}"
+        ),
+        ResponseValue::NullableInteger {
+            type_name,
+            refusal_category,
+        } => format!(
+            "{input} === null\n        ? {{kind: \"null\"}}\n        : {{kind: \"integer\", value: \
+             refuse({refusal_category}, () => {type_name}({input}))}}"
+        ),
+        ResponseValue::Enum {
+            type_name,
+            unknown_category,
+        } => format!(
+            "{{kind: \"string\", value: refuse({unknown_category}, () => \
+             decode{type_name}({input}))}}"
+        ),
+        ResponseValue::EnumArray {
+            type_name,
+            max_items_constant,
+            oversize_category,
+            unknown_category,
+        } => format!(
+            "((): JsonValue => {{\n        if ({input}.length > {max_items_constant}) \
+             throw new RefusalError({oversize_category}, \"array exceeds its ceiling\");\n        \
+             return {{kind: \"array\", items: {input}.map((item): JsonValue => ({{kind: \
+             \"string\", value: refuse({unknown_category}, () => decode{type_name}(item))}}))}};\n      \
+             }})()"
+        ),
+        ResponseValue::ExactString {
+            expected_constant,
+            mismatch_category,
+            ..
+        } => format!(
+            "{{kind: \"string\", value: exactString({input}, {expected_constant}, \
+             {mismatch_category}, \"{}\")}}",
+            field.name
+        ),
+        ResponseValue::Object { type_name } => format!("encode{type_name}({input})"),
+        ResponseValue::NullableObject { type_name } => {
+            format!("{input} === null ? {{kind: \"null\"}} : encode{type_name}({input})")
+        }
+        ResponseValue::ObjectArray {
+            type_name,
+            max_items_constant,
+            oversize_category,
+        } => format!(
+            "((): JsonValue => {{\n        if ({input}.length > {max_items_constant}) \
+             throw new RefusalError({oversize_category}, \"array exceeds its ceiling\");\n        \
+             return {{kind: \"array\", items: {input}.map(encode{type_name})}};\n      }})()"
+        ),
+    }
+}
+
 /// Emit one response: its kind, its decoded type, and the decoder.
 ///
 /// The decoder takes the correlation identifier separately because it is an
@@ -7812,8 +8470,14 @@ fn emit_command_surface(out: &mut String, surface: &CommandSurface) {
     // where it is defined rather than where it is used.
     let mut objects = surface.body_objects.clone();
     objects.sort_by(|left, right| left.name.cmp(&right.name));
+    let request_object_types = request_body_object_types(surface);
     for object in &objects {
-        emit_body_object(out, surface, object);
+        emit_body_object(
+            out,
+            surface,
+            object,
+            request_object_types.contains(&object.name),
+        );
     }
 
     if !surface.requests.is_empty() {
@@ -7834,6 +8498,7 @@ fn emit_command_surface(out: &mut String, surface: &CommandSurface) {
              for the generator to describe it.",
             &surface.request_kinds_not_generated,
         );
+        emit_correlated_request_surface(out, surface);
     }
 
     if !surface.responses.is_empty() {
