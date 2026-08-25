@@ -33,7 +33,8 @@ use automonique_protocol::approval_api::{
 };
 use automonique_protocol::automation::AutomationActor;
 use automonique_protocol::automation_api::{
-    AutomationId, AutomationRequest, AutomationResponse, RegisterAutomation,
+    AutomationId, AutomationPrompt, AutomationRequest, AutomationResponse, AutomationSchedule,
+    AutomationScope, RegisterAutomation,
 };
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
 use automonique_protocol::context::{ContextManifest, TokenBudget};
@@ -234,10 +235,15 @@ fn submit_run(config: &DaemonConfig, label: &str, run: &str) {
 fn register_automation(config: &DaemonConfig, label: &str, automation: &str) {
     let request = AutomationRequest::RegisterAutomation {
         request_id: request_id(label),
+        // A job that will not fire during the test: one occurrence a minute.
         registration: RegisterAutomation::new(
             AutomationId::new(automation).expect("automation identity"),
             AutomationActor::new("operator:durable-state").expect("actor"),
-        ),
+            AutomationSchedule::every(60_000).expect("interval"),
+            AutomationScope::new("workspace:reports").expect("scope"),
+            AutomationPrompt::new("summarize the night").expect("prompt"),
+        )
+        .expect("a registration within its bounds"),
     };
     let payload = request
         .to_message()

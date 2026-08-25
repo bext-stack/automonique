@@ -36,10 +36,19 @@
 //!   a systemd user unit. Enabled by `improvement-lab.json`, and gated behind
 //!   two separate administrator approvals bound by an HMAC challenge.
 //!
-//! What it still does not do, in the words of the sites that say so: it runs
-//! no scheduler, so the automation store decides nothing; it acts on nobody's
-//! behalf, so the approval ledger permits nothing; it has no executor, so the
-//! batch registry throttles nothing. It establishes no release trust —
+//! * **Automations** (`automation_scheduler`) — a worker that derives one
+//!   occurrence per due instant from the durable automation registry, admits
+//!   it through the durable scheduler core under the generation fence, and
+//!   submits it as a normal item on the synthetic lane under the idempotency
+//!   key `automation:<automation_id>:<instant>`. Enabled by registering an
+//!   automation with a schedule; the occurrence's only effect is the synthetic
+//!   lane's own outbox intent.
+//!
+//! What it still does not do, in the words of the sites that say so: it acts
+//! on nobody's behalf, so the approval ledger permits nothing; it has no
+//! executor beyond the synthetic lane's fixture, so an automation's prompt
+//! reaches no provider and the batch registry throttles nothing. It
+//! establishes no release trust —
 //! nothing in this crate calls `release_trust_root`, so a provider binary is
 //! admitted by pinned digest and workspace identity, never by an attested
 //! signature. Its structured-log surface is limited to bounded, content-free
@@ -83,10 +92,10 @@ use automonique_protocol::approval_api::{
 use automonique_protocol::audit::{AuditCategory, AuditEvent, AuditOutcome, AuditRecord};
 use automonique_protocol::automation::{AutomationActor, EnablementState};
 use automonique_protocol::automation_api::{
-    AutomationContinuation, AutomationCursor, AutomationId, AutomationListPage,
+    AutomationContinuation, AutomationCursor, AutomationId, AutomationListPage, AutomationPrompt,
     AutomationReceiptView, AutomationRecordParts, AutomationRecordView, AutomationRefusal,
-    AutomationRequest, AutomationResponse, ListAutomations, PauseReason, RegisterAutomation,
-    SetEnablement,
+    AutomationRequest, AutomationResponse, AutomationSchedule, AutomationScope, ListAutomations,
+    PauseReason, RegisterAutomation, SetEnablement,
 };
 use automonique_protocol::batch_api::{
     AdvanceMember, BatchApiError, BatchContinuation, BatchCursor, BatchDetailResult, BatchListPage,
@@ -135,7 +144,8 @@ use automonique_store::approval_requests::{
 };
 use automonique_store::audit_chain::{AuditAppend, AuditChain, GENESIS_PREV_HASH};
 use automonique_store::automation_store::{
-    AutomationRecord, AutomationRegistration, AutomationStore, AutomationStoreError,
+    AutomationJobSpec, AutomationRecord, AutomationRegistration,
+    AutomationSchedule as StoreSchedule, AutomationStore, AutomationStoreError,
     EnablementState as StoreEnablementState, EnablementTransition,
 };
 use automonique_store::batch_registry::{
@@ -178,6 +188,7 @@ pub mod approval_policy;
 pub mod ask;
 pub mod attempt_adoption;
 pub mod attempt_host;
+pub mod automation_scheduler;
 pub mod cancel_custody;
 pub mod candidate;
 pub mod codex_usage;
@@ -219,7 +230,7 @@ pub mod site_inventory;
 pub mod skill_runtime;
 pub mod slack;
 mod structured_log;
-mod synthetic;
+pub mod synthetic;
 mod systemd;
 mod telegram;
 pub mod telegram_bridge;
@@ -301,6 +312,16 @@ pub const MANAGED_SESSIONS_NAME: &str = concat!("managed-sessions", ".sqlite3");
 /// today. It is written now so that the scheduler, when it lands, reads its
 /// enablement out of a durable record rather than inventing one.
 pub const AUTOMATION_REGISTRY_NAME: &str = concat!("automations", ".sqlite3");
+
+/// The durable scheduler core's own database, a sibling of
+/// [`AUTOMATION_REGISTRY_NAME`].
+///
+/// Admission order, occupied slots, scope pauses and every identity ever
+/// admitted, under this generation's fence. Separate from the registry for
+/// the reason the registry is separate from the product store: it is a
+/// state machine with its own schema and its own conformance suite, and the
+/// automation worker is its one caller.
+pub const AUTOMATION_SCHEDULER_NAME: &str = concat!("automation-scheduler", ".sqlite3");
 
 /// Durable write-once approval decision ledger, a sibling of [`DATABASE_NAME`].
 ///
@@ -597,6 +618,12 @@ impl DaemonConfig {
     #[must_use]
     pub fn automation_registry_path(&self) -> PathBuf {
         self.state_dir().join(AUTOMATION_REGISTRY_NAME)
+    }
+
+    /// Durable scheduler core path for the automation worker.
+    #[must_use]
+    pub fn automation_scheduler_path(&self) -> PathBuf {
+        self.state_dir().join(AUTOMATION_SCHEDULER_NAME)
     }
 
     /// Durable approval decision ledger path.
@@ -1015,6 +1042,10 @@ pub enum DaemonError {
     /// daemon's own durable state is unsound and must not be presented as an
     /// operator error. [`automation_refusal`] is where the line is drawn.
     AutomationStoreFailed(&'static str),
+    /// The automation scheduler worker could not open its stores under the
+    /// generation fence, or could not be started. The payload is the stable
+    /// category from [`automation_scheduler`].
+    AutomationSchedulerFailed(&'static str),
     /// The durable approval ledger failed in a way no client caused. The
     /// payload is the stable category from that module.
     ///
@@ -1124,6 +1155,7 @@ impl DaemonError {
             Self::AttemptHostFailed(category) => category,
             Self::AttemptAdoptionFailed(category) => category,
             Self::AutomationStoreFailed(category) => category,
+            Self::AutomationSchedulerFailed(category) => category,
             Self::ApprovalLedgerFailed(category) => category,
             Self::BatchRegistryFailed(category) => category,
             Self::GenerationAuditFailed(category) => category,
@@ -1188,6 +1220,9 @@ impl fmt::Display for DaemonError {
             }
             Self::AutomationStoreFailed(category) => {
                 write!(formatter, "automation registry failed: {category}")
+            }
+            Self::AutomationSchedulerFailed(category) => {
+                write!(formatter, "automation scheduler failed: {category}")
             }
             Self::ApprovalLedgerFailed(category) => {
                 write!(formatter, "approval ledger failed: {category}")
@@ -1299,14 +1334,21 @@ pub struct Daemon {
     /// [`Daemon::record_cancellation_audit`], which states what that trade
     /// buys.
     audit_chain: AuditChain,
-    /// The durable record of which automations an operator has in service.
+    /// The durable record of which automation jobs an operator has in service.
     ///
     /// A plain field for the same reason [`Daemon::run_index`] is: it owns no
-    /// dispatcher and needs no ordered disposal. Nothing in this daemon *reads*
-    /// it to decide anything — no scheduler consults it, because there is no
-    /// scheduler — so its whole role in this build is to answer the automation
-    /// control lane truthfully across restarts.
+    /// dispatcher and needs no ordered disposal. This handle answers the
+    /// automation control lane; the scheduler worker below reads the same
+    /// file through its own connection to decide what is due.
     automations: AutomationStore,
+    /// The worker that turns due automations into synthetic-lane runs.
+    ///
+    /// Composed in [`Daemon::open`] under the generation fence and put on a
+    /// thread by [`Daemon::serve`], the split every other worker has. It
+    /// writes to three durable stores this generation owns, so it is drained
+    /// with the other worker groups while the generation is still held, and
+    /// rebuilt with the new epoch when a handoff returns authority.
+    automation_scheduler: automation_scheduler::AutomationSchedulerHost,
     /// The durable record of which approval decisions were made, and by whom.
     ///
     /// A plain field for the reason [`Daemon::run_index`] is: it owns no
@@ -2099,6 +2141,33 @@ impl Daemon {
         let automations = AutomationStore::open(config.automation_registry_path())
             .map_err(|error| DaemonError::AutomationStoreFailed(error.category()))?;
 
+        // THE SCHEDULER WORKER IS COMPOSED HERE AND STARTED IN `serve`, the
+        // split every other worker has: a process that opened a daemon and
+        // never served has derived no occurrence. It opens its own
+        // connections to the registry above, the scheduler core's database
+        // and the product store, and installs this generation's fence on the
+        // core, so a fence it cannot install refuses startup rather than a
+        // worker that ticks under nobody's authority. Recovery mode composes
+        // nothing: it refuses starts, and an occurrence is a start.
+        let automation_scheduler = if disconnected_recovery {
+            automation_scheduler::AutomationSchedulerHost::disabled()
+        } else {
+            automation_scheduler::AutomationSchedulerHost::open(
+                &automation_scheduler::AutomationSchedulerParams {
+                    database_path: &config.database_path(),
+                    registry_path: &config.automation_registry_path(),
+                    scheduler_path: &config.automation_scheduler_path(),
+                    generation_id: GENERATION_ID,
+                    holder_id: instance_id.as_str(),
+                    lease_epoch: lease.epoch,
+                    parallelism_limit: automation_scheduler::AUTOMATION_PARALLELISM_LIMIT,
+                    lease_time_source: Arc::new(lease_time::BootTimeSource),
+                    clock: Arc::new(automation_scheduler::SystemClock),
+                },
+            )
+            .map_err(|error| DaemonError::AutomationSchedulerFailed(error.category()))?
+        };
+
         // The approval ledger opens beside the registry, under the same fence
         // and before the socket guard is disarmed, for the same reason: a
         // daemon that cannot durably record that somebody approved something
@@ -2275,6 +2344,7 @@ impl Daemon {
             platform_models_observed_ms: None,
             audit_chain,
             automations,
+            automation_scheduler,
             approvals,
             approval_requests,
             state_dir,
@@ -2556,6 +2626,10 @@ impl Daemon {
             ));
         }
         workers.extend(named_shutdown_workers(
+            "automation_scheduler",
+            self.automation_scheduler.begin_shutdown(),
+        ));
+        workers.extend(named_shutdown_workers(
             "slack_tickets",
             self.slack_tickets.begin_shutdown(),
         ));
@@ -2767,6 +2841,22 @@ impl Daemon {
             lease_time_source: Arc::new(lease_time::BootTimeSource),
         })
         .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+        // The scheduler worker is rebuilt rather than resumed: its fence
+        // names the epoch, and the epoch moved when authority returned.
+        let mut automation_scheduler = automation_scheduler::AutomationSchedulerHost::open(
+            &automation_scheduler::AutomationSchedulerParams {
+                database_path: &self.config.database_path(),
+                registry_path: &self.config.automation_registry_path(),
+                scheduler_path: &self.config.automation_scheduler_path(),
+                generation_id: GENERATION_ID,
+                holder_id: self.instance_id.as_str(),
+                lease_epoch: self.lease_epoch,
+                parallelism_limit: automation_scheduler::AUTOMATION_PARALLELISM_LIMIT,
+                lease_time_source: Arc::new(lease_time::BootTimeSource),
+                clock: Arc::new(automation_scheduler::SystemClock),
+            },
+        )
+        .map_err(|error| DaemonError::AutomationSchedulerFailed(error.category()))?;
         let mut telegram = telegram::TelegramHost::open_with_ticket_gates(
             &telegram::TelegramHostParams {
                 state_dir: &self.state_dir,
@@ -2810,6 +2900,11 @@ impl Daemon {
                     .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))
             })
             .and_then(|()| {
+                automation_scheduler
+                    .start()
+                    .map_err(|error| DaemonError::AutomationSchedulerFailed(error.category()))
+            })
+            .and_then(|()| {
                 self.progress_endpoint.as_mut().map_or(Ok(()), |endpoint| {
                     endpoint
                         .resume()
@@ -2820,6 +2915,7 @@ impl Daemon {
             slack_tickets.shutdown();
             ticket_intake.shutdown();
             managed_tui.shutdown();
+            automation_scheduler.shutdown();
             let _ = telegram.release();
             return Err(error);
         }
@@ -2827,6 +2923,7 @@ impl Daemon {
         self.telegram = telegram;
         self.ticket_intake = ticket_intake;
         self.managed_tui = managed_tui;
+        self.automation_scheduler = automation_scheduler;
         Ok(())
     }
 
@@ -2966,6 +3063,15 @@ impl Daemon {
                 self.managed_tui
                     .start()
                     .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))
+            })
+            // AUTOMATIONS BEGIN FIRING HERE, AND NOWHERE ELSE. The worker was
+            // composed in `open`; this is what puts its tick on a thread, so a
+            // process that opened a daemon and never served has derived no
+            // occurrence and submitted nothing.
+            .and_then(|()| {
+                self.automation_scheduler
+                    .start()
+                    .map_err(|error| DaemonError::AutomationSchedulerFailed(error.category()))
             })
             // LIVE PROGRESS FAN-OUT BEGINS HERE, AND NOWHERE ELSE. The endpoint
             // was bound in `open`; this is what puts its accept loop on a
@@ -3171,6 +3277,16 @@ impl Daemon {
                 execution.begin_shutdown(),
             ));
         }
+        // The automation worker ends beside the lanes it feeds, and for the
+        // same reason: it writes to three durable stores this generation owns,
+        // so it stops and is joined while the generation is still held. It
+        // holds no lease of its own — the scheduler core's fence is installed
+        // at open and superseded by the next holder's — so this is a join and
+        // not a lifecycle.
+        shutdown_workers.extend(named_shutdown_workers(
+            "automation_scheduler",
+            self.automation_scheduler.begin_shutdown(),
+        ));
         shutdown_workers.extend(named_shutdown_workers(
             "slack_tickets",
             self.slack_tickets.begin_shutdown(),
@@ -7029,18 +7145,14 @@ impl Daemon {
     /// # What an accepted write here does, and what it does not
     ///
     /// It commits one row to the durable registry saying that somebody
-    /// claiming to be `actor` decided this automation is, or is no longer, in
-    /// service. **Nothing else happens.** This daemon has no scheduler, no
-    /// trigger evaluator and no executor, so:
-    ///
-    /// - registering an automation starts nothing;
-    /// - pausing one suppresses nothing, because nothing was running; and
-    /// - resuming one resumes nothing.
-    ///
-    /// That is why an accepted write answers `accepted` rather than
-    /// `completed`: the row is committed, and the decision the row records has
-    /// not taken effect anywhere, because there is nowhere for it to take
-    /// effect yet.
+    /// claiming to be `actor` declared this job, or decided it is, or is no
+    /// longer, in service. Nothing fires *here*: the scheduler worker reads
+    /// the row on its next tick, and what it derives is a run on the synthetic
+    /// lane with its own durable outcome. That is why an accepted write
+    /// answers `accepted` rather than `completed`: the row is committed, and
+    /// what it authorizes happens later and elsewhere. See
+    /// [`automation_scheduler`] for what a pause and an archive do to an
+    /// occurrence already admitted.
     ///
     /// # Fencing
     ///
@@ -7098,17 +7210,39 @@ impl Daemon {
         Ok(())
     }
 
-    /// Record one new automation, enabled, at revision one.
+    /// Record one new automation job, enabled, at revision one, first due
+    /// where its schedule says.
+    ///
+    /// The first instant is derived here, from the registration instant and
+    /// the protocol's own arithmetic, so the registry stores an instant the
+    /// worker will compare rather than a schedule it would have to evaluate.
+    /// A fixed interval so long that its first instant is past the end of
+    /// representable time is a job that would never fire, refused as an
+    /// invalid field rather than registered.
     fn register_automation(
         &mut self,
         request_id: &RequestId,
         registration: &RegisterAutomation,
         now_ms: i64,
     ) -> Result<AutomationResponse, DaemonError> {
+        let Some(first_fire_at) = registration.schedule().first_occurrence(
+            automonique_protocol::primitives::EpochMillis::from_millis(now_ms),
+        ) else {
+            return Ok(AutomationResponse::Refused {
+                request_id: request_id.clone(),
+                refusal: AutomationRefusal::InvalidField,
+            });
+        };
         let receipt = match self.automations.register(AutomationRegistration {
             automation_id: registration.automation_id().as_str(),
             actor: registration.actor().as_str(),
             now_ms,
+            job: AutomationJobSpec {
+                schedule: store_schedule(registration.schedule()),
+                scope: registration.scope().as_str(),
+                prompt: registration.prompt().as_str(),
+                first_fire_at_ms: first_fire_at.as_millis(),
+            },
         }) {
             Ok(receipt) => receipt,
             Err(error) => return refuse_automation(request_id, &error),
@@ -7215,6 +7349,9 @@ impl Daemon {
     }
 
     /// One automation in full, or [`AutomationRefusal::UnknownAutomation`].
+    ///
+    /// The prompt travels here and only here, beside the record; a listing
+    /// omits it.
     fn automation_detail(
         &self,
         request_id: &RequestId,
@@ -7230,10 +7367,14 @@ impl Daemon {
             }
             Err(error) => return refuse_automation(request_id, &error),
         };
-        Ok(AutomationResponse::AutomationDetail {
-            request_id: request_id.clone(),
-            record: automation_record(&record)?,
-        })
+        let prompt = record
+            .job
+            .as_ref()
+            .map(|job| AutomationPrompt::new(&job.prompt))
+            .transpose()
+            .map_err(|_| DaemonError::AutomationStoreFailed("prompt_ungrammatical"))?;
+        AutomationResponse::detail(request_id.clone(), automation_record(&record)?, prompt)
+            .map_err(automation_refused)
     }
 
     /// Answer one operation on the native Approval decision API.
@@ -7946,6 +8087,29 @@ const fn store_enablement_state(state: EnablementState) -> StoreEnablementState 
     }
 }
 
+/// Translate the wire's schedule onto the registry's typed columns.
+const fn store_schedule(schedule: &AutomationSchedule) -> StoreSchedule {
+    match schedule {
+        AutomationSchedule::Once { at } => StoreSchedule::Once {
+            at_ms: at.as_millis(),
+        },
+        AutomationSchedule::Every { interval } => StoreSchedule::Every {
+            interval_ms: interval.as_millis(),
+        },
+    }
+}
+
+/// Translate the registry's typed columns back onto the wire's schedule.
+fn wire_schedule(schedule: StoreSchedule) -> Result<AutomationSchedule, DaemonError> {
+    use automonique_protocol::primitives::EpochMillis;
+
+    match schedule {
+        StoreSchedule::Once { at_ms } => AutomationSchedule::once(EpochMillis::from_millis(at_ms)),
+        StoreSchedule::Every { interval_ms } => AutomationSchedule::every(interval_ms),
+    }
+    .map_err(|_| DaemonError::AutomationStoreFailed("schedule_ungrammatical"))
+}
+
 /// Project one validated registry row onto the wire.
 ///
 /// Every field is re-validated by the protocol's own constructor rather than
@@ -7953,10 +8117,23 @@ const fn store_enablement_state(state: EnablementState) -> StoreEnablementState 
 /// validates it against the wire's, which is the one a client will decode
 /// under. A row the wire cannot carry is a typed daemon failure rather than a
 /// row silently omitted from a page — the same rule the run listing follows for
-/// a dangling index row.
+/// a dangling index row. The prompt is not projected here: it travels on a
+/// detail read alone.
 fn automation_record(record: &AutomationRecord) -> Result<AutomationRecordView, DaemonError> {
     use automonique_protocol::primitives::EpochMillis;
 
+    let (schedule, scope, next_fire_at, last_fired_at) = match &record.job {
+        Some(job) => (
+            Some(wire_schedule(job.schedule)?),
+            Some(
+                AutomationScope::new(&job.scope)
+                    .map_err(|_| DaemonError::AutomationStoreFailed("scope_ungrammatical"))?,
+            ),
+            job.next_fire_at_ms.map(EpochMillis::from_millis),
+            job.last_fired_at_ms.map(EpochMillis::from_millis),
+        ),
+        None => (None, None, None, None),
+    };
     AutomationRecordView::new(AutomationRecordParts {
         entry_id: checked_row_id(record.entry_id)?,
         automation_id: AutomationId::new(&record.automation_id)
@@ -7973,6 +8150,10 @@ fn automation_record(record: &AutomationRecord) -> Result<AutomationRecordView, 
             .map_err(|_| DaemonError::AutomationStoreFailed("cause_ungrammatical"))?,
         created_at: EpochMillis::from_millis(record.created_at_ms),
         updated_at: EpochMillis::from_millis(record.updated_at_ms),
+        schedule,
+        scope,
+        next_fire_at,
+        last_fired_at,
     })
     .map_err(automation_refused)
 }
@@ -8003,6 +8184,8 @@ fn refuse_automation(
         AutomationStoreError::CursorOutOfRange { .. } => AutomationRefusal::CursorOutOfRange,
         AutomationStoreError::RegistryFull { .. } => AutomationRefusal::RegistryFull,
         AutomationStoreError::RevisionMismatch { .. }
+        | AutomationStoreError::Unscheduled
+        | AutomationStoreError::OccurrenceMismatch
         | AutomationStoreError::InsecurePath(_)
         | AutomationStoreError::SchemaVersion { .. }
         | AutomationStoreError::Corrupt(_)

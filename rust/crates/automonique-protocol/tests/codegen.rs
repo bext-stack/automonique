@@ -7643,10 +7643,10 @@ mod automation_surface {
         );
         // And the narrower registration identity is the scheduled bound, not
         // the registry one, so a builder cannot register what cannot fire.
-        assert!(
-            MAX_SCHEDULED_AUTOMATION_ID_BYTES < MAX_AUTOMATION_API_FIELD_BYTES,
-            "this check is only worth making while the two bounds differ"
-        );
+        // This check is only worth making while the two bounds differ.
+        const {
+            assert!(MAX_SCHEDULED_AUTOMATION_ID_BYTES < MAX_AUTOMATION_API_FIELD_BYTES);
+        }
         assert!(
             generated.contains(&format!(
                 "  if (byteLength(value) > {MAX_SCHEDULED_AUTOMATION_ID_BYTES}) throw new \

@@ -1693,7 +1693,9 @@ mod job {
             MAX_SCHEDULED_AUTOMATION_ID_BYTES,
             MAX_OCCURRENCE_KEY_BYTES - OCCURRENCE_KEY_PREFIX.len() - 1 - 19,
         );
-        assert!(MAX_SCHEDULED_AUTOMATION_ID_BYTES < MAX_AUTOMATION_API_FIELD_BYTES);
+        const {
+            assert!(MAX_SCHEDULED_AUTOMATION_ID_BYTES < MAX_AUTOMATION_API_FIELD_BYTES);
+        }
         let widest = "a".repeat(MAX_SCHEDULED_AUTOMATION_ID_BYTES);
         let key = AutomationOccurrenceKey::derive(&id(&widest), EpochMillis::from_millis(i64::MAX))
             .expect("the widest identity at the latest instant still fits");
@@ -1737,9 +1739,12 @@ mod job {
         // The scope is admitted by two lanes and carries the narrower bound:
         // the scheduler core's identifier ceiling, which this crate cannot
         // import and so pins against the core's own source.
-        assert!(
-            MAX_AUTOMATION_SCOPE_BYTES <= automonique_protocol::admin::MAX_SYNTHETIC_SCOPE_BYTES
-        );
+        const {
+            assert!(
+                MAX_AUTOMATION_SCOPE_BYTES
+                    <= automonique_protocol::admin::MAX_SYNTHETIC_SCOPE_BYTES
+            );
+        }
         let core = sibling_source("automonique-core/src/lib.rs");
         assert!(
             core.contains(&format!(
