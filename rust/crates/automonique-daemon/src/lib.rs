@@ -1444,10 +1444,18 @@ enum StartupAuthority {
     },
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
 enum LeaseDisposition {
     Release,
-    Retain,
+    ReleaseWhen(Arc<AtomicBool>),
+}
+
+impl LeaseDisposition {
+    fn releases(&self) -> bool {
+        match self {
+            Self::Release => true,
+            Self::ReleaseWhen(release) => release.load(Ordering::Acquire),
+        }
+    }
 }
 
 impl SocketCleanup {
@@ -2274,17 +2282,18 @@ impl Daemon {
         result
     }
 
-    fn serve_retaining_authority(
+    fn serve_candidate(
         self,
         stop: &AtomicBool,
         ready: std::sync::mpsc::SyncSender<()>,
+        release_on_stop: Arc<AtomicBool>,
     ) -> (Self, Result<(), DaemonError>) {
         let reload = AtomicBool::new(false);
         self.serve_with_control(
             stop,
             &reload,
             None,
-            LeaseDisposition::Retain,
+            LeaseDisposition::ReleaseWhen(release_on_stop),
             Some(ready),
             true,
         )
@@ -2504,6 +2513,7 @@ impl Daemon {
                 .stopping()
                 .map_err(|error| DaemonError::ServiceManagerFailed(error.category()))
         });
+        let release_authority = lease_disposition.releases();
         // LIVE ATTEMPTS END FIRST, AND THEY END BY FINISHING.
         //
         // Every worker holds a registration on the attempt host and writes to
@@ -2534,7 +2544,7 @@ impl Daemon {
             "managed_tui",
             self.managed_tui.begin_shutdown(),
         ));
-        if lease_disposition == LeaseDisposition::Retain {
+        if !release_authority {
             if let Some(progress_endpoint) = self.progress_endpoint.as_mut() {
                 shutdown_workers.extend(named_shutdown_workers(
                     "progress_endpoint",
@@ -2649,7 +2659,7 @@ impl Daemon {
         // longer claims continuous lease authority. A process that dies before
         // this point writes nothing; its successor closes the open row as
         // `superseded` when it observes the abandoned tenure.
-        let tenure_close = if lease_disposition == LeaseDisposition::Release {
+        let tenure_close = if release_authority {
             unix_millis().and_then(|now_ms| {
                 self.generation_audit
                     .end_tenure(TenureEnding {
@@ -2666,7 +2676,7 @@ impl Daemon {
         } else {
             Ok(())
         };
-        let release = if lease_disposition == LeaseDisposition::Release {
+        let release = if release_authority {
             unix_millis().and_then(|now_ms| {
                 self.store
                     .release_generation_lease(

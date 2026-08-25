@@ -5,7 +5,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use automonique_daemon::attempt_adoption::AttemptAdoptionClient;
 use automonique_daemon::candidate::{CandidateSpec, spawn_warm_candidate};
@@ -220,7 +220,85 @@ fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
     candidate.stop().expect("candidate stopped");
     assert!(config.admin_socket().exists());
     assert!(config.progress_socket().exists());
+
+    let committed_source_lease = read_source_lease(&config.database_path());
+    let committed_descriptors = source
+        .candidate_transfer_descriptors()
+        .expect("second transfer descriptors");
+    let mut committed_candidate = spawn_warm_candidate(
+        &config,
+        &release,
+        &CandidateSpec {
+            reload_id: "reload-process-commit".to_owned(),
+            source_holder_id: committed_source_lease.holder_id.clone(),
+            source_lease_epoch: committed_source_lease.epoch,
+            target_generation_id: "foreground-committed".to_owned(),
+            warm_timeout: Duration::from_secs(20),
+        },
+    )
+    .expect("second warm candidate");
+    committed_candidate
+        .prepare_transfer(committed_descriptors)
+        .expect("second candidate validates capabilities");
+    let committed_target = committed_candidate.lease_target();
+    let committed_transfer = store
+        .transfer_generation_lease(LeaseTransferRequest {
+            generation_id: "foreground",
+            source_holder_id: &committed_source_lease.holder_id,
+            source_epoch: committed_source_lease.epoch,
+            target_holder_id: &committed_target.holder_id,
+            target_owner: LeaseOwnerIdentity {
+                boot_id: &committed_target.boot_id,
+                pid: committed_target.pid,
+                starttime: committed_target.starttime,
+            },
+            now_ms: unix_millis(),
+            ttl_ms: 30_000,
+        })
+        .expect("second generation lease transfer");
+    committed_candidate
+        .confirm_authority(&committed_transfer.lease, committed_transfer.adopted_runs)
+        .expect("second candidate proves authority");
+    let committed_cleanup = source
+        .relinquish_endpoint_cleanup()
+        .expect("source transfers cleanup to committed candidate");
+    committed_candidate
+        .activate_serving(committed_cleanup)
+        .expect("committed candidate serves");
+    committed_candidate
+        .commit()
+        .expect("candidate detaches as committed generation");
     drop(source);
+    drop(committed_candidate);
+
+    let committed_status = Command::new(env!("CARGO_BIN_EXE_automonique"))
+        .args(["status", "--json"])
+        .env("XDG_RUNTIME_DIR", &config.runtime_root)
+        .env("XDG_STATE_HOME", &config.state_root)
+        .output()
+        .expect("committed candidate status");
+    assert!(
+        committed_status.status.success(),
+        "committed candidate survives source and handle drop"
+    );
+    assert!(
+        String::from_utf8(committed_status.stdout)
+            .expect("committed status UTF-8")
+            .contains(&committed_target.holder_id)
+    );
+    let shutdown = Command::new(env!("CARGO_BIN_EXE_automonique"))
+        .arg("shutdown")
+        .env("XDG_RUNTIME_DIR", &config.runtime_root)
+        .env("XDG_STATE_HOME", &config.state_root)
+        .output()
+        .expect("committed candidate shutdown");
+    assert!(shutdown.status.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (config.admin_socket().exists() || config.progress_socket().exists())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert!(!config.admin_socket().exists());
     assert!(!config.progress_socket().exists());
 }

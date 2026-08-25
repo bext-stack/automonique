@@ -48,7 +48,7 @@ use crate::control_lock::{ControlLock, ControlLockError};
 use crate::lease_identity::{ProcessIdentity, ProcessIdentityError};
 use crate::release_activation::VerifiedCodeRelease;
 
-const CHANNEL_SCHEMA: &str = "automonique.reload-candidate/v5";
+const CHANNEL_SCHEMA: &str = "automonique.reload-candidate/v6";
 const MAX_CHANNEL_LINE_BYTES: u64 = 4 * 1024;
 const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 const CONTROL_STOP: u8 = b'S';
@@ -57,6 +57,7 @@ const CONTROL_CONFIRM_AUTHORITY: u8 = b'A';
 const CONTROL_CONFIRM_RELINQUISHED: u8 = b'R';
 const CONTROL_ACTIVATE_SERVING: u8 = b'V';
 const CONTROL_QUIESCE: u8 = b'Q';
+const CONTROL_COMMIT: u8 = b'C';
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidateSpec {
@@ -605,6 +606,32 @@ impl WarmCandidate {
         Ok(())
     }
 
+    /// Commit this active candidate as the independent generation.
+    ///
+    /// After the matching acknowledgement the child no longer depends on the
+    /// private handoff channel. Its normal admin shutdown path owns tenure and
+    /// lease release, while dropping this source-side handle no longer kills
+    /// the promoted daemon.
+    pub fn commit(&mut self) -> Result<(), CandidateError> {
+        if !self.serving || self.quiesced || self.relinquished || self.stopped {
+            return Err(CandidateError::Protocol);
+        }
+        send_control(&self.channel, CONTROL_COMMIT, None)?;
+        let mut expected = self.identity.clone();
+        expected.event = "committed".to_owned();
+        let observed: CandidateIdentity = read_message(&self.channel)?;
+        if observed != expected {
+            return Err(CandidateError::Protocol);
+        }
+        self.identity = observed;
+        self.serving = false;
+        // `Child`'s Drop does not terminate a process. This flag suppresses the
+        // explicit candidate-only kill in our Drop implementation now that the
+        // process is the committed generation rather than a disposable child.
+        self.stopped = true;
+        Ok(())
+    }
+
     /// End a non-owning candidate and require a matching acknowledgement.
     /// A candidate that proved authority must first prove a fresh-epoch return.
     pub fn stop(&mut self) -> Result<(), CandidateError> {
@@ -712,9 +739,15 @@ pub fn run_candidate(
                         CandidateControl::ActivateServing => {
                             let stop = Arc::new(AtomicBool::new(false));
                             let thread_stop = Arc::clone(&stop);
+                            let release_on_stop = Arc::new(AtomicBool::new(false));
+                            let thread_release_on_stop = Arc::clone(&release_on_stop);
                             let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
                             let serving = std::thread::spawn(move || {
-                                daemon.serve_retaining_authority(&thread_stop, ready_sender)
+                                daemon.serve_candidate(
+                                    &thread_stop,
+                                    ready_sender,
+                                    thread_release_on_stop,
+                                )
                             });
                             if ready_receiver
                                 .recv_timeout(Duration::from_secs(20))
@@ -731,10 +764,18 @@ pub fn run_candidate(
                             }
                             identity.event = "active".to_owned();
                             write_message(&mut writer, &identity)?;
-                            if !matches!(
-                                receive_control(reader.as_fd())?,
-                                CandidateControl::Quiesce
-                            ) {
+                            let control = receive_control(reader.as_fd())?;
+                            if matches!(control, CandidateControl::Commit) {
+                                release_on_stop.store(true, Ordering::Release);
+                                identity.event = "committed".to_owned();
+                                write_message(&mut writer, &identity)?;
+                                let (_, outcome) = serving.join().map_err(|_| {
+                                    CandidateError::Daemon("candidate_serve_panicked")
+                                })?;
+                                return outcome
+                                    .map_err(|error| CandidateError::Daemon(error.category()));
+                            }
+                            if !matches!(control, CandidateControl::Quiesce) {
                                 stop.store(true, Ordering::Release);
                                 let _ = serving.join();
                                 return Err(CandidateError::Protocol);
@@ -757,7 +798,8 @@ pub fn run_candidate(
                         CandidateControl::Stop
                         | CandidateControl::PrepareTransfer(_)
                         | CandidateControl::ConfirmAuthority
-                        | CandidateControl::Quiesce => {
+                        | CandidateControl::Quiesce
+                        | CandidateControl::Commit => {
                             return Err(CandidateError::Protocol);
                         }
                     };
@@ -782,6 +824,7 @@ pub fn run_candidate(
                 CandidateControl::ConfirmRelinquished
                 | CandidateControl::ActivateServing
                 | CandidateControl::Quiesce
+                | CandidateControl::Commit
                 | CandidateControl::PrepareTransfer(_) => {
                     return Err(CandidateError::Protocol);
                 }
@@ -791,7 +834,8 @@ pub fn run_candidate(
         CandidateControl::ConfirmAuthority
         | CandidateControl::ConfirmRelinquished
         | CandidateControl::ActivateServing
-        | CandidateControl::Quiesce => {
+        | CandidateControl::Quiesce
+        | CandidateControl::Commit => {
             return Err(CandidateError::Protocol);
         }
     };
@@ -814,6 +858,7 @@ enum CandidateControl {
     ConfirmRelinquished,
     ActivateServing,
     Quiesce,
+    Commit,
 }
 
 fn send_control(
@@ -878,6 +923,7 @@ fn receive_control(fd: impl AsFd) -> Result<CandidateControl, CandidateError> {
         }
         CONTROL_ACTIVATE_SERVING if received.is_empty() => Ok(CandidateControl::ActivateServing),
         CONTROL_QUIESCE if received.is_empty() => Ok(CandidateControl::Quiesce),
+        CONTROL_COMMIT if received.is_empty() => Ok(CandidateControl::Commit),
         CONTROL_PREPARE_TRANSFER if received.len() == 3 => {
             let control_lock = received.pop().expect("length checked");
             let progress_listener = received.pop().expect("length checked");
@@ -1247,7 +1293,7 @@ mod tests {
             identity
         );
 
-        let unknown = br#"{"schema":"automonique.reload-candidate/v5","event":"warm","reload_id":"reload-1","target_generation_id":"generation-2","manifest_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binary_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","attempt_count":2,"attempt_inventory_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","target_holder_id":"daemon-42-reload-0123456789abcdef","boot_id":"01234567-89ab-cdef-0123-456789abcdef","starttime":100,"pid":42,"extra":true}\n"#;
+        let unknown = br#"{"schema":"automonique.reload-candidate/v6","event":"warm","reload_id":"reload-1","target_generation_id":"generation-2","manifest_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binary_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","attempt_count":2,"attempt_inventory_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","target_holder_id":"daemon-42-reload-0123456789abcdef","boot_id":"01234567-89ab-cdef-0123-456789abcdef","starttime":100,"pid":42,"extra":true}\n"#;
         assert!(matches!(
             read_message_from::<CandidateIdentity>(&mut unknown.as_slice()),
             Err(CandidateError::Protocol)
