@@ -46,7 +46,16 @@ the Automonique daemon, Manage jobs, Slack, or ShellDeck.
 Install the verified adapter directory under `%S/automonique/ag-ui-adapter`,
 write `%S/automonique/ag-ui-adapter.conf` with mode `0600`, install the checked
 unit, then enable `automonique-ag-ui-adapter.service`. `/healthz` proves only
-the listener; `/readyz` proves the configured Platform authority is reachable.
+the listener; `/readyz` proves the configured Platform authority is reachable
+*and* that a fresh Automonique node is discoverable, which is the lookup every
+`/agent` submission performs.
+
+The adapter is not bound to one daemon generation. On every submission it
+reads the Platform snapshot and targets the daemon's current `fresh` node, so
+a daemon restart (new holder id) needs no adapter change; `AUTOMONIQUE_NODE_ID`
+is optional and only states a preference among fresh nodes. A submission the
+daemon refuses as `unknown_node` or `target_not_active_node` is re-resolved
+and retried once.
 Rollback atomically restores the previous adapter directory and restarts only
 this service. It must not restart the daemon, Manage worker, dashboard, Slack,
 or any active provider run.

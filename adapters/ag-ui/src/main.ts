@@ -6,10 +6,11 @@ import {startSupervisedServer} from "./server.ts";
 
 const port = boundedPort(environment("AUTOMONIQUE_AG_UI_PORT", "18083"));
 const tokenFile = environment("AUTOMONIQUE_AG_UI_TOKEN_FILE");
+const preferredNode = optionalEnvironment("AUTOMONIQUE_NODE_ID");
 const authority = new ProductionPlatformAuthority({
   platformSocket: environment("AUTOMONIQUE_PLATFORM_SOCKET"),
   progressSocket: environment("AUTOMONIQUE_PROGRESS_SOCKET"),
-  nodeId: environment("AUTOMONIQUE_NODE_ID"),
+  ...(preferredNode === undefined ? {} : {nodeId: preferredNode}),
 });
 startSupervisedServer(authority, {
   hostname: "127.0.0.1",
@@ -21,6 +22,11 @@ function environment(name: string, fallback?: string): string {
   const value = (globalThis as typeof globalThis & {process?: {env?: Record<string, string | undefined>}}).process?.env?.[name] ?? fallback;
   if (value === undefined || value.length === 0 || /[\u0000-\u001f\u007f]/u.test(value)) throw new Error(`${name} is required`);
   return value;
+}
+function optionalEnvironment(name: string): string | undefined {
+  const value = (globalThis as typeof globalThis & {process?: {env?: Record<string, string | undefined>}}).process?.env?.[name];
+  if (value === undefined || value.length === 0) return undefined;
+  return environment(name);
 }
 function boundedPort(value: string): number { const port = Number(value); if (!Number.isSafeInteger(port) || port < 1024 || port > 65535) throw new Error("invalid adapter port"); return port; }
 function parseTokenFile(text: string): string {

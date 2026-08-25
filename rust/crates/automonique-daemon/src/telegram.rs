@@ -1001,6 +1001,22 @@ impl TelegramHost {
         matches!(self.status().0, TelegramState::PollingLive)
     }
 
+    /// When the owned bot lease expires, in the store's lease clock domain,
+    /// or `None` when this host owns no lease.
+    ///
+    /// A renewal that failed on a busy store is only a fault once this
+    /// instant has passed; until then the lease is still ours by its TTL.
+    pub(crate) fn lease_expires_ms(&self) -> Option<i64> {
+        let coordinator = match self {
+            Self::Disabled => return None,
+            Self::LeaseOwned { coordinator } | Self::Live { coordinator, .. } => coordinator,
+        };
+        match coordinator.state() {
+            TelegramHostState::LeaseOwnedNoClient(lease) => Some(lease.expires_ms),
+            TelegramHostState::DisabledNoClient => None,
+        }
+    }
+
     /// Renew the owned lease; a no-op when Telegram is not configured.
     ///
     /// Called on the daemon's renewal cadence. A renewal failure is returned

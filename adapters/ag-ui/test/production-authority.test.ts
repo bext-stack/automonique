@@ -30,14 +30,26 @@ describe("production Platform authority", () => {
       unix: path,
       socket: {
         data(socket, data) {
-          const request = JSON.parse(new TextDecoder().decode(data.slice(4))) as {request_id: string};
-          socket.write(wire({
-            protocol: "automonique.platform",
-            version: 1,
-            request_id: request.request_id,
-            kind: "capabilities_result",
-            body: {protocol: "automonique.platform", schema: "automonique.platform/v1", methods: [], transports: ["local_unix"]},
-          }));
+          const request = JSON.parse(new TextDecoder().decode(data.slice(4))) as {request_id: string; kind: string};
+          // Readiness now also resolves the fresh node, so the socket answers
+          // both request kinds the probe sends.
+          socket.write(wire(request.kind === "snapshot"
+            ? {
+              protocol: "automonique.platform",
+              version: 1,
+              request_id: request.request_id,
+              kind: "snapshot_result",
+              body: {cursor: {authority: "automonique", topic: "resources", sequence: 1}, resources: [
+                {resource: {authority: "automonique", kind: "node", id: "node-fixture"}, freshness: {state: "fresh", revision: 1, observed_at: 1}, summary: "daemon ready"},
+              ]},
+            }
+            : {
+              protocol: "automonique.platform",
+              version: 1,
+              request_id: request.request_id,
+              kind: "capabilities_result",
+              body: {protocol: "automonique.platform", schema: "automonique.platform/v1", methods: [], transports: ["local_unix"]},
+            }));
         },
       },
     });
@@ -252,4 +264,140 @@ async function collect(source: AsyncIterable<NativeAdapterEvent>): Promise<Nativ
     output.push(event);
   }
   return output;
+}
+
+// ---------------------------------------------------------------------------
+// #131: the node is discovered, never pinned to one daemon generation.
+// #130: the adapter's exact request set is a checked-in, decoder-tested fixture.
+
+function nodePlatform(nodes: readonly Record<string, unknown>[], refuseFirstSubmit = false): {
+  fetcher: typeof fetch;
+  sent: {kind: string; body: Record<string, unknown>}[];
+} {
+  const sent: {kind: string; body: Record<string, unknown>}[] = [];
+  let submits = 0;
+  const fetcher = (async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const request = JSON.parse(String(init?.body)) as {request_id: string; kind: string; body: Record<string, any>};
+    sent.push({kind: request.kind, body: request.body});
+    let kind = "receipt_result";
+    let body: Record<string, unknown>;
+    if (request.kind === "capabilities") {
+      kind = "capabilities_result";
+      body = {protocol: "automonique.platform", schema: "automonique.platform/v1", methods: [], transports: []};
+    } else if (request.kind === "snapshot") {
+      kind = "snapshot_result";
+      body = {cursor: {authority: "automonique", topic: "resources", sequence: 1}, resources: nodes};
+    } else if (request.kind === "list_sessions") {
+      kind = "sessions_result";
+      body = {sessions: [], cursor: null};
+    } else if (request.kind === "get_receipt") {
+      body = receipt("completed");
+    } else if (request.body.action === "submit_request" && refuseFirstSubmit && submits++ === 0) {
+      kind = "refused";
+      body = {outcome: "rejected", explanation: "unknown_node"};
+    } else {
+      body = receipt(request.body.action === "submit_request" ? "accepted" : "completed");
+    }
+    return new Response(JSON.stringify({protocol: "automonique.platform", version: 1, request_id: request.request_id, kind, body}), {status: 200});
+  }) as typeof fetch;
+  return {fetcher, sent};
+}
+
+function node(id: string, state: "fresh" | "stale", observedAt: number): Record<string, unknown> {
+  return {resource: {authority: "automonique", kind: "node", id}, freshness: {state, revision: 1, observed_at: observedAt}, summary: state === "fresh" ? "daemon ready" : "daemon retired"};
+}
+
+function discovering(fetcher: typeof fetch, nodeId?: string): ProductionPlatformAuthority {
+  return new ProductionPlatformAuthority({
+    platformEndpoint: "http://localhost:18082/api/platform",
+    platformToken: () => "fixture-token-that-is-long-enough-0001",
+    progressSocket: "/nonexistent/progress.sock",
+    fetcher,
+    ...(nodeId === undefined ? {} : {nodeId}),
+  });
+}
+
+describe("node discovery across daemon generations", () => {
+  test("submits to the fresh node even when the configured id is retired", async () => {
+    const platform = nodePlatform([node("daemon-old", "stale", 1), node("daemon-new", "fresh", 2)]);
+    const authority = discovering(platform.fetcher, "daemon-old");
+    const submit = (authority as unknown as {submit(input: AdmittedRunInput, signal?: AbortSignal): Promise<unknown>}).submit;
+    await submit.call(authority, admitted("run-discover"));
+    const execute = platform.sent.find((request) => request.kind === "execute");
+    expect(execute?.body.target).toEqual({authority: "automonique", kind: "node", id: "daemon-new"});
+    expect(execute?.body.client).toBeNull();
+    const snapshot = platform.sent.find((request) => request.kind === "snapshot");
+    expect(snapshot?.body).toEqual({resources: []});
+  });
+
+  test("prefers the configured node while it is still fresh", async () => {
+    const platform = nodePlatform([node("daemon-a", "fresh", 5), node("daemon-b", "fresh", 9)]);
+    const authority = discovering(platform.fetcher, "daemon-a");
+    const submit = (authority as unknown as {submit(input: AdmittedRunInput): Promise<unknown>}).submit;
+    await submit.call(authority, admitted("run-prefer"));
+    const execute = platform.sent.find((request) => request.kind === "execute");
+    expect((execute?.body.target as {id: string}).id).toBe("daemon-a");
+  });
+
+  test("readiness is false when no node is fresh, and true once one is", async () => {
+    expect(await discovering(nodePlatform([node("daemon-old", "stale", 1)]).fetcher).ready()).toBe(false);
+    expect(await discovering(nodePlatform([]).fetcher).ready()).toBe(false);
+    expect(await discovering(nodePlatform([node("daemon-new", "fresh", 2)]).fetcher).ready()).toBe(true);
+  });
+
+  test("an unknown_node refusal is retried once after re-discovering the node", async () => {
+    const platform = nodePlatform([node("daemon-new", "fresh", 2)], true);
+    const authority = discovering(platform.fetcher);
+    const submit = (authority as unknown as {submit(input: AdmittedRunInput): Promise<{outcome: string}>}).submit;
+    const result = await submit.call(authority, admitted("run-retry"));
+    expect(result.outcome).toBe("accepted");
+    expect(platform.sent.filter((request) => request.kind === "execute")).toHaveLength(2);
+    expect(platform.sent.filter((request) => request.kind === "snapshot")).toHaveLength(2);
+  });
+});
+
+describe("Platform request fixture", () => {
+  test("the request set the adapter sends is the checked-in decoder fixture", async () => {
+    const platform = nodePlatform([node("daemon-new", "fresh", 2)]);
+    const authority = discovering(platform.fetcher);
+    const internals = authority as unknown as {
+      submit(input: AdmittedRunInput): Promise<unknown>;
+      sessionTarget(parentRunId: string): Promise<unknown>;
+      terminalReceipt(key: string, initial: {receiptId: string; outcome: string}): Promise<unknown>;
+    };
+    expect(await authority.ready()).toBe(true);
+    await internals.submit.call(authority, admitted("run-fixture"));
+    await internals.sessionTarget.call(authority, "run-parent").catch(() => undefined);
+    await authority.cancel({threadId: "thread-1", runId: "run-fixture", expectedRevision: 3, idempotencyKey: "cancel-run-fixture"});
+    await internals.terminalReceipt.call(authority, "execute-run-fixture", {receiptId: "receipt-accepted", outcome: "accepted"});
+
+    const fixture: Record<string, string> = {};
+    const counts = new Map<string, number>();
+    for (const request of platform.sent) {
+      const action = typeof request.body.action === "string" ? `-${request.body.action}` : "";
+      const label = `${request.kind}${action}`;
+      const seen = counts.get(label) ?? 0;
+      counts.set(label, seen + 1);
+      if (seen > 0) continue;
+      fixture[label] = canonical({body: request.body, kind: request.kind, protocol: "automonique.platform", request_id: "fixture", version: 1});
+    }
+    for (const kind of ["capabilities", "snapshot", "list_sessions", "execute-submit_request", "execute-stop_run", "get_receipt"]) {
+      expect(Object.keys(fixture)).toContain(kind);
+    }
+    const path = new URL("./fixtures/platform-requests.json", import.meta.url);
+    const text = `${canonical(fixture)}\n`;
+    if (process.env.AUTOMONIQUE_UPDATE_FIXTURES === "1") {
+      await Bun.write(path, text);
+    }
+    expect(await Bun.file(path).text()).toBe(text);
+  });
+});
+
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonical(record[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
 }

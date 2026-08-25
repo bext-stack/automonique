@@ -374,6 +374,146 @@ fn session_command_requests_refuse_additional_fields() {
     assert_eq!(error.category(), "platform_invalid_body");
 }
 
+/// `client` was added to `execute` and `get_receipt` after v1 shipped. A
+/// body without the key is the shape every earlier client sends and decodes
+/// as `None`; an explicit `null` is the same; a string is the client; any
+/// other value, and any unknown key, is still refused.
+#[test]
+fn execute_and_receipt_bodies_accept_an_absent_client_key() {
+    let execute = PlatformRequestMessage::new(
+        RequestId::new("pre-client-execute").unwrap(),
+        PlatformRequest::Execute(
+            ExecuteRequest::new(
+                PlatformAction::SubmitRequest,
+                coordinate(ResourceAuthority::Automonique, ResourceKind::Node),
+                IdempotencyKey::new("submit-1").unwrap(),
+                None,
+                None,
+            )
+            .unwrap(),
+        ),
+    );
+    let receipt = PlatformRequestMessage::new(
+        RequestId::new("pre-client-receipt").unwrap(),
+        PlatformRequest::GetReceipt(GetReceiptRequest {
+            client: None,
+            id: None,
+            idempotency_key: Some(IdempotencyKey::new("submit-1").unwrap()),
+        }),
+    );
+    for framed in [execute, receipt] {
+        let message = framed.to_message().unwrap();
+        let JsonValue::Object(entries) = message.body().clone() else {
+            panic!("request body is an object");
+        };
+        assert!(
+            entries
+                .iter()
+                .any(|(key, value)| key == "client" && *value == JsonValue::Null)
+        );
+
+        let without: Vec<_> = entries
+            .iter()
+            .filter(|(key, _)| key != "client")
+            .cloned()
+            .collect();
+        let absent = Message::new(message.envelope().clone(), JsonValue::Object(without));
+        assert_eq!(
+            PlatformRequestMessage::from_canonical_bytes(&absent.to_canonical_bytes()).unwrap(),
+            framed,
+            "an absent client key is the pre-existing wire shape"
+        );
+
+        let mut named = entries.clone();
+        for (key, value) in &mut named {
+            if key == "client" {
+                *value = JsonValue::String("client-9".to_owned());
+            }
+        }
+        let with_client = Message::new(message.envelope().clone(), JsonValue::Object(named));
+        let decoded =
+            PlatformRequestMessage::from_canonical_bytes(&with_client.to_canonical_bytes())
+                .unwrap();
+        let client = match decoded.request() {
+            PlatformRequest::Execute(request) => request.client.clone(),
+            PlatformRequest::GetReceipt(request) => request.client.clone(),
+            other => panic!("unexpected request {other:?}"),
+        };
+        assert_eq!(client, Some(ClientId::new("client-9").unwrap()));
+
+        let mut wrong = entries.clone();
+        for (key, value) in &mut wrong {
+            if key == "client" {
+                *value = JsonValue::Bool(true);
+            }
+        }
+        let wrong = Message::new(message.envelope().clone(), JsonValue::Object(wrong));
+        assert_eq!(
+            PlatformRequestMessage::from_canonical_bytes(&wrong.to_canonical_bytes())
+                .expect_err("a non-string client is refused")
+                .category(),
+            "platform_invalid_body"
+        );
+
+        let mut extra = entries.clone();
+        extra.push(("actor".to_owned(), JsonValue::String("x".to_owned())));
+        let extra = Message::new(message.envelope().clone(), JsonValue::Object(extra));
+        assert_eq!(
+            PlatformRequestMessage::from_canonical_bytes(&extra.to_canonical_bytes())
+                .expect_err("an unknown key is still refused")
+                .category(),
+            "platform_invalid_body"
+        );
+    }
+}
+
+/// The AG-UI adapter's exact request set, as its own test suite emits it,
+/// must decode here. The adapter test writes these canonical payloads from
+/// its real request path; a change on either side breaks the build instead
+/// of production (#130).
+#[test]
+fn the_ag_ui_adapter_request_set_decodes_on_this_wire() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../adapters/ag-ui/test/fixtures/platform-requests.json"
+    );
+    let text = std::fs::read_to_string(path).expect("adapter request fixtures are checked in");
+    let JsonValue::Object(entries) =
+        automonique_protocol::wire::parse_canonical(text.trim().as_bytes())
+            .expect("fixture file is canonical JSON")
+    else {
+        panic!("fixture file is an object of kind -> canonical payload");
+    };
+    let expected = [
+        "capabilities",
+        "snapshot",
+        "list_sessions",
+        "execute",
+        "get_receipt",
+    ];
+    for kind in expected {
+        assert!(
+            entries.iter().any(|(key, _)| key.starts_with(kind)),
+            "the adapter fixture covers {kind}"
+        );
+    }
+    for (label, payload) in &entries {
+        let JsonValue::String(payload) = payload else {
+            panic!("{label}: payload is the canonical request string");
+        };
+        let decoded = PlatformRequestMessage::from_canonical_bytes(payload.as_bytes())
+            .unwrap_or_else(|error| panic!("{label}: {error}"));
+        let kind = decoded
+            .to_message()
+            .expect("decoded request re-encodes")
+            .envelope()
+            .kind()
+            .as_str()
+            .to_owned();
+        assert!(label.starts_with(&kind), "{label} decodes as {kind}");
+    }
+}
+
 #[test]
 fn every_platform_response_has_one_canonical_round_trip() {
     let session_record = record(ResourceKind::Session, "session-1", 2);

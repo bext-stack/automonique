@@ -438,6 +438,89 @@ fn session_commands_are_fenced_to_the_managed_owner_before_receipt_admission() {
     serving.shutdown(&config);
 }
 
+/// #130: the adapter's pre-#118 `execute` body (no `client` key) is accepted,
+/// and a body the lane refuses is answered with the typed `refused` frame
+/// carrying the request id, never a bare EOF.
+#[test]
+fn platform_decode_failures_are_typed_refusals_and_absent_client_is_accepted() {
+    use automonique_protocol::wire::{JsonValue, Message};
+
+    let (_root, config) = fixture();
+    let serving = serve(&config);
+
+    let node = ResourceCoordinate::new(
+        ResourceAuthority::Automonique,
+        ResourceKind::Node,
+        ResourceId::new("node-not-this-daemon").expect("id"),
+    );
+    let execute = PlatformRequestMessage::new(
+        RequestId::new("execute-without-client").expect("request id"),
+        PlatformRequest::Execute(
+            ExecuteRequest::new(
+                PlatformAction::SubmitRequest,
+                node,
+                IdempotencyKey::new("submit-without-client").expect("key"),
+                None,
+                None,
+            )
+            .expect("request"),
+        ),
+    )
+    .to_message()
+    .expect("message");
+    let JsonValue::Object(entries) = execute.body().clone() else {
+        panic!("execute body is an object");
+    };
+    let without_client: Vec<_> = entries
+        .iter()
+        .filter(|(key, _)| key != "client")
+        .cloned()
+        .collect();
+    let absent = Message::new(
+        execute.envelope().clone(),
+        JsonValue::Object(without_client),
+    );
+    let response = PlatformResponseMessage::from_canonical_bytes(&exchange(
+        &config,
+        &absent.to_canonical_bytes(),
+    ))
+    .expect("a body without client is a platform response, not an EOF");
+    assert_eq!(response.request_id().as_str(), "execute-without-client");
+    // The body decoded: the daemon evaluated the target (not its node) and
+    // answered with its typed rejection rather than a decode refusal.
+    match response.response() {
+        PlatformResponse::Refused { explanation, .. } => {
+            assert_eq!(explanation.as_str(), "target_not_active_node");
+        }
+        other => panic!("unexpected response {other:?}"),
+    }
+
+    let mut extra = entries.clone();
+    extra.push(("actor".to_owned(), JsonValue::String("x".to_owned())));
+    let malformed = Message::new(execute.envelope().clone(), JsonValue::Object(extra));
+    let response = PlatformResponseMessage::from_canonical_bytes(&exchange(
+        &config,
+        &malformed.to_canonical_bytes(),
+    ))
+    .expect("a malformed body is answered with a typed refusal frame");
+    assert_eq!(response.request_id().as_str(), "execute-without-client");
+    match response.response() {
+        PlatformResponse::Refused {
+            outcome,
+            explanation,
+        } => {
+            assert_eq!(*outcome, ReceiptOutcome::Rejected);
+            assert_eq!(
+                explanation.as_str(),
+                "invalid_request:platform_invalid_body"
+            );
+        }
+        other => panic!("unexpected response {other:?}"),
+    }
+
+    serving.shutdown(&config);
+}
+
 #[test]
 fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
     let (_root, config) = fixture();
