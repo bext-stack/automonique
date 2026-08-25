@@ -2,9 +2,31 @@
 
 The canonical TypeScript client for Automonique Platform v1. It is an ESM package for browsers, React Native, and server-side JavaScript, with no Node- or Bun-specific runtime imports.
 
+## Installation
+
+`@automonique/sdk` is not currently published to the public npm registry. A
+bare `npm install @automonique/sdk` will fail until an authorized release is
+published.
+
+Until then, use the repository's verified packed-archive workflow from a
+checkout pinned to the required Automonique revision. The same archive path is
+exercised by CI:
+
 ```sh
-npm install @automonique/sdk
+cd sdk/typescript/packages/sdk
+bun install --frozen-lockfile
+npm run typecheck
+npm test
+sdk_archive_dir="$(mktemp -d)"
+npm pack --pack-destination "$sdk_archive_dir"
+
+cd /path/to/consumer
+npm install "$sdk_archive_dir/automonique-sdk-0.1.0.tgz"
 ```
+
+Record the source revision and packed archive checksum in the consuming
+project. The archive is a source-built development artifact, not an official
+registry release.
 
 ```ts
 import {HttpsPlatformTransport, PlatformClient} from "@automonique/sdk";
