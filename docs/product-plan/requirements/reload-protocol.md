@@ -154,6 +154,56 @@ N+1 marks reload E successful. Release retention keeps at least the previous com
 | Database becomes busy | bounded retry; never break lease atomicity; abort reload on deadline |
 | New schema breaks rollback | reject migration/release before spawning target |
 
+### Test coverage of the failure matrix
+
+Two levels of proof exist. The orchestration level drives
+`automonique_daemon::reload::execute_reload` with recording hooks and proves
+the phase order, the pre-/post-transfer partition and the audit record
+(`rust/crates/automonique-daemon/tests/reload_protocol.rs`). The process level
+runs a real source daemon, a real candidate process spawned from an installed
+release, and the product CLI, and injects one real external fault at a named
+point of the handoff through the typed `reload-fault-injection` feature
+(`automonique_daemon::reload_faults`, compiled only for the binary crate's
+tests). The hook is unreachable from a shipping build: the feature is
+activated only through the binary crate's dev-dependency edge, a daemon built
+without it refuses to open while `AUTOMONIQUE_RELOAD_FAULT` is set
+(`rust/crates/automonique-daemon/tests/reload_fault_refusal.rs`, compiled
+only in such a build), and a build with it refuses a script outside the
+closed grammar before anything durable exists
+(`reload_failure_matrix.rs::a_malformed_fault_script_is_refused_before_the_daemon_opens`).
+The positive proof that a live contained
+attempt crosses the handoff — the successor's warm-up inventory counts exactly
+that attempt, the successor refuses a second attempt for the run and forwards
+its cancellation to the source's host, the run finishes exactly once under the
+successor's epoch with one durable receipt, the source retires, and a
+`rollback --wait` with a still-running attempt hands custody back — is
+`rust/crates/automonique/tests/handoff_live_run.rs` (`PROVEN` only inside a
+delegated cgroup scope; it prints `NOT PROVEN` elsewhere).
+
+| Failure point | Orchestration-level test | Process-level test |
+|---|---|---|
+| Target verification | `reload_protocol.rs::target_verification_failure_never_creates_an_epoch` | `reload_failure_matrix.rs::an_unverifiable_target_is_refused_before_any_epoch_exists` — an uninstalled digest is refused `release_verification_failed`; `reload-status` answers `reload_not_found`; the lease row is unchanged |
+| Candidate warm-up | `reload_protocol.rs::every_pre_transfer_failure_resumes_source_and_stops_candidate` (`candidate_warmup_failed`) | `reload_failure_matrix.rs::a_schema_the_candidate_cannot_read_is_refused_at_warm_up` — the candidate reports its own category over the channel and exits; N keeps serving and hands off later. The warm path itself: `candidate_handoff.rs::exact_release_candidate_proves_transfer_and_clean_lease_return` |
+| Candidate crashes before lease transfer | same test (`candidate_spawn_failed`) | `reload_failure_matrix.rs::a_candidate_that_dies_before_transfer_leaves_the_source_active` — `SIGKILL` after warm; the transfer refuses `candidate_exited` before the lease names a dead process; holder, epoch and revision unchanged |
+| N crashes before transfer | none — the orchestrator cannot model its own death | `reload_failure_matrix.rs::a_source_that_dies_before_transfer_is_succeeded_by_ordinary_startup` — `daemon --foreground` aborts after the candidate warmed; the candidate exits owning nothing; ordinary startup expires the dead owner under durable checks, takes the next epoch and closes the orphaned epoch as `source_generation_lost` |
+| Transactional lease transfer fails | same test (`lease_transfer_failed`) | `reload_failure_matrix.rs::a_refused_lease_transfer_leaves_the_source_serving_and_the_candidate_gone` — a live poller lease under the source's authority makes the transfer transaction refuse `handoff_blocked`; nothing partial is written; N resumes and the candidate is gone. Store-level: `automonique-store/tests/store.rs::cooperative_transfer_refuses_live_transport_or_effect_ownership` |
+| N+1 fails after transfer but before active proof | `reload_protocol.rs::every_post_transfer_failure_returns_authority_before_resuming_source`, `failed_lease_return_never_claims_that_the_source_resumed`, `failed_source_resume_never_records_a_clean_rollback` | `reload_failure_matrix.rs::a_candidate_that_dies_after_transfer_returns_authority_to_the_source` — `SIGKILL` after the lease moved; authority returns to the same live process two epochs on and the epoch is `rolled_back` |
+| Slack duplicates during overlap | none at reload level | none at reload level: no Slack transport runs in a process test. The durable event key is proven at the store: `automonique-store/tests/slack_ingress.rs::a_fresh_disposition_is_recorded_exactly_once_and_survives_a_reopen`, `a_full_log_refuses_a_new_disposition_but_still_answers_a_replay` |
+| Telegram long poll hangs | none at reload level | none at reload level: no live poll runs in a process test. The transfer refuses while a poll lease is live (the injection in the transactional-failure row above); the offset and lease fencing are proven at the store: `automonique-store/tests/store.rs::telegram_poller_lease_is_fenced_across_connections_restart_and_authority_epochs`, `telegram_poller_commit_is_atomic_exact_and_deadline_fenced`, `telegram_offset_regression_gap_and_unaccounted_advance_refuse` |
+| Runner unavailable during adoption | none | partial: `reload_failure_matrix.rs::a_successor_forwards_cancellation_to_the_source_hosted_attempt_exactly_once` proves the successor adopts by route, delivers exactly once through the source's custody, and reports `no_live_attempt` only once the source's route is gone. Verification against an execution-backend record and a status file is not implemented: attempts are hosted in-process by the source until they finish, so there is no separate runner whose availability could be checked |
+| Old generation refuses to drain | none | `reload_failure_matrix.rs::a_source_that_refuses_to_drain_does_not_hold_the_active_successor` — the source hangs in its drain after N+1 proved active; N+1 owns the lease and answers every operator surface; the source is terminated; N+1 keeps serving, closes the epoch as `source_generation_lost`, and shuts down cleanly. The release links stay where the source left them |
+| Database becomes busy | none | `reload_failure_matrix.rs::a_busy_database_aborts_the_transfer_within_its_bound_without_moving_the_lease` — another connection holds `BEGIN IMMEDIATE` across the transfer; the transfer fails on the store's busy deadline (`sqlite`) rather than waiting out the lock, the lease row is byte-for-byte unchanged, and N resumes |
+| New schema breaks rollback | none | `reload_failure_matrix.rs::a_schema_the_candidate_cannot_read_is_refused_at_warm_up` — proven at candidate warm-up, not before spawn: the release manifest declares no schema range, so the source has nothing to check before spawning and the candidate's read-only warm-up is the first point that can refuse |
+
+Two properties of the reload identifier follow from these proofs and are
+worth knowing at the operator surface: it is derived from the source epoch
+and the target digest, so an exact retry after a failed attempt from the same
+epoch is answered with the recorded outcome rather than started again (a new
+target, or a source at a new epoch, starts a new one); and the successor keeps
+its copy of the source's live-attempt inventory only while the source's route
+answers, so `runs`/`execute` on the successor refuse a second attempt for a
+source-hosted run exactly as long as the source could still be running it.
+
 ## Crash recovery without a cooperative old generation
 
 On ordinary startup or candidate takeover:
