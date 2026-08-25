@@ -19,8 +19,9 @@ use automonique_runner::{
     LaunchPlan, LaunchPlanError, RunContainment, SandboxedSession, spawn_sandboxed_session,
 };
 use automonique_store::provider_journal::{
-    ApprovalDecision, ApprovalRecord, BindingRecord, CursorAdvance, FinishReason, ProcessExit,
-    ProcessSpawn, ProcessTermination, ProviderJournal, ProviderJournalError, RequestDirection,
+    ApprovalDecision, ApprovalRecord, BindingRecord, CursorAdvance, FinishReason,
+    MAX_REPLAY_PAYLOAD_BYTES, ProcessExit, ProcessSpawn, ProcessTermination, ProviderJournal,
+    ProviderJournalError, ReplayRecordKind, ReplayStepRecord, RequestDirection,
     RequestOutcomeCommit, RequestRecord, RequestSettlement, SessionClosing, SessionClosure,
     SessionOpening, SettledOutcome, TurnCompletion, TurnOpening, TurnOutcome, TurnUsage,
 };
@@ -160,6 +161,8 @@ struct PendingTurn {
     turn_revision: u64,
     request_key: String,
     send_request_id: u64,
+    occurrence_index: u64,
+    replay_response: Option<Vec<u8>>,
     collector: JcodeTurnCollector,
     adapter: JcodeNativeAdapter,
     pending_approval: Option<JcodeApprovalRequest>,
@@ -182,6 +185,7 @@ pub struct JcodeSessionHost {
     incomplete_frame: bool,
     observed_events: VecDeque<JcodeEvent>,
     observed_native: VecDeque<JcodeNativeEnvelope>,
+    last_event_bytes: Vec<u8>,
     negotiation: JcodeNegotiation,
     containment: Option<RunContainment>,
     journal: ProviderJournal,
@@ -329,6 +333,10 @@ impl JcodeSessionHost {
             attempt_id: logical_key,
             provider_kind: "jcode",
             executable_digest: plan.program_sha256(),
+            prompt_version: "provider-turn/v1",
+            tool_schema_version: "jcode-api-stdio/v1",
+            model_id: model.unwrap_or("provider-default"),
+            force_version_change: false,
             spawned_ms: now_ms,
         })?;
         let session = journal.open_session(SessionOpening {
@@ -369,6 +377,7 @@ impl JcodeSessionHost {
             incomplete_frame: host.incomplete_frame,
             observed_events: startup_events,
             observed_native: VecDeque::new(),
+            last_event_bytes: Vec::new(),
             negotiation,
             containment: Some(containment),
             journal,
@@ -475,7 +484,18 @@ impl JcodeSessionHost {
             request_key: &request_key,
             direction: RequestDirection::ToProvider,
             payload_digest: &digest(&encoded),
+            canonical_payload: Some(&encoded),
             created_ms: now_ms,
+        })?;
+        self.journal.record_replay_step(ReplayStepRecord {
+            turn_id: opening.turn_id,
+            step_name: "jcode_turn",
+            occurrence_index: opening.ordinal,
+            kind: ReplayRecordKind::Command,
+            correlation_id: &request_key,
+            canonical_bytes: &encoded,
+            forked_from_step_id: None,
+            recorded_ms: now_ms,
         })?;
         self.process.write_all(&encoded)?;
         let coordinates = RunCoordinates::new(
@@ -501,6 +521,8 @@ impl JcodeSessionHost {
             turn_revision: opening.revision,
             request_key,
             send_request_id: request_id,
+            occurrence_index: opening.ordinal,
+            replay_response: Some(Vec::new()),
             collector: JcodeTurnCollector::new(&self.provider_session_id)?,
             adapter,
             pending_approval: None,
@@ -707,6 +729,7 @@ impl JcodeSessionHost {
             request_key: &request_key,
             direction: RequestDirection::ToProvider,
             payload_digest: &digest(&encoded),
+            canonical_payload: Some(&encoded),
             created_ms: now_ms,
         })?;
         if let Err(error) = self.process.write_all(&encoded) {
@@ -767,6 +790,7 @@ impl JcodeSessionHost {
             request_key: &request_key,
             direction: RequestDirection::ToProvider,
             payload_digest: &digest(&encoded),
+            canonical_payload: Some(&encoded),
             created_ms: now_ms,
         })?;
         self.process.write_all(&encoded)?;
@@ -833,6 +857,17 @@ impl JcodeSessionHost {
             }
             Err(error) => return Err(error),
         };
+        if let Some(pending) = self.pending.as_mut()
+            && let Some(response) = pending.replay_response.as_mut()
+        {
+            if response.len().saturating_add(self.last_event_bytes.len())
+                <= MAX_REPLAY_PAYLOAD_BYTES
+            {
+                response.extend_from_slice(&self.last_event_bytes);
+            } else {
+                pending.replay_response = None;
+            }
+        }
         self.observed_events.push_back(event.clone());
         let native = self
             .pending
@@ -900,19 +935,19 @@ impl JcodeSessionHost {
                 tool_name: tool_name.clone(),
                 description: description.clone(),
             };
-            let approval_digest = digest(
-                format!(
-                    "{}\n{}\n{}",
-                    approval.request_id, approval.tool_name, approval.description
-                )
-                .as_bytes(),
-            );
+            let approval_bytes = format!(
+                "{}\n{}\n{}",
+                approval.request_id, approval.tool_name, approval.description
+            )
+            .into_bytes();
+            let approval_digest = digest(&approval_bytes);
             let approval_request_key = format!("approval:{}", approval.request_id);
             self.journal.record_request(RequestRecord {
                 turn_id: pending.turn_id,
                 request_key: &approval_request_key,
                 direction: RequestDirection::FromProvider,
                 payload_digest: &approval_digest,
+                canonical_payload: Some(&approval_bytes),
                 created_ms: now_ms,
             })?;
             pending.pending_approval = Some(approval.clone());
@@ -934,19 +969,19 @@ impl JcodeSessionHost {
                 is_password,
                 tool_call_id: tool_call_id.clone(),
             };
-            let input_digest = digest(
-                format!(
-                    "{}\n{}\n{}\n{}",
-                    input.request_id, input.prompt, input.is_password, input.tool_call_id
-                )
-                .as_bytes(),
-            );
+            let input_bytes = format!(
+                "{}\n{}\n{}\n{}",
+                input.request_id, input.prompt, input.is_password, input.tool_call_id
+            )
+            .into_bytes();
+            let input_digest = digest(&input_bytes);
             let input_request_key = format!("stdin:{}", input.request_id);
             self.journal.record_request(RequestRecord {
                 turn_id: pending.turn_id,
                 request_key: &input_request_key,
                 direction: RequestDirection::FromProvider,
                 payload_digest: &input_digest,
+                canonical_payload: Some(&input_bytes),
                 created_ms: now_ms,
             })?;
             pending.pending_input = Some(input.clone());
@@ -996,6 +1031,20 @@ impl JcodeSessionHost {
             }
             let result = pending.collector.finish()?;
             let response_digest = digest(result.text().as_bytes());
+            if let Some(response) = pending.replay_response.as_deref()
+                && !response.is_empty()
+            {
+                self.journal.record_replay_step(ReplayStepRecord {
+                    turn_id: pending.turn_id,
+                    step_name: "jcode_turn",
+                    occurrence_index: pending.occurrence_index,
+                    kind: ReplayRecordKind::Notification,
+                    correlation_id: &pending.request_key,
+                    canonical_bytes: response,
+                    forked_from_step_id: None,
+                    recorded_ms: now_ms,
+                })?;
+            }
             let settlement = [RequestSettlement {
                 request_key: &pending.request_key,
                 expected_revision: 1,
@@ -1053,6 +1102,7 @@ impl JcodeSessionHost {
             if events.len() != 1 {
                 return Err(JcodeHostError::Protocol(JcodeProtocolError::InvalidFrame));
             }
+            self.last_event_bytes = line;
             return events
                 .into_iter()
                 .next()

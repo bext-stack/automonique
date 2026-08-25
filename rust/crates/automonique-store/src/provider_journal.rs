@@ -9,16 +9,18 @@
 //! what event sequence was last durably consumed, which capability and schema
 //! versions were negotiated, and which approvals were granted.
 //!
-//! This module stores exactly those bindings and nothing else. There is no
-//! provider IO here: callers supply every identifier, digest and timestamp.
+//! This module stores those bindings plus an optional provider-neutral replay
+//! transcript. Transcript commands and notifications retain bounded canonical
+//! bytes under step/correlation identities, so orchestration can be rerun with
+//! zero provider I/O and compared at the first divergent command.
 //!
 //! # What this journal does not establish
 //!
 //! - It proves what the supervisor *recorded*, not what the provider actually
 //!   did. A journalled turn may have been abandoned before the provider saw it.
-//! - Digests bind content without storing it. The journal never computes a
-//!   digest and cannot reproduce, verify or re-derive the bytes behind one; a
-//!   digest is only a stable name a caller chose to record.
+//! - Request digests still bind content without storing it. Replay bytes exist
+//!   only when a caller explicitly records replay steps; they are never inferred
+//!   from a digest.
 //! - A terminal process state is the supervisor's observation, not proof the
 //!   operating system process is gone.
 //! - A cursor records what was durably consumed, not what the provider emitted;
@@ -44,11 +46,12 @@ use automonique_protocol::provenance::Provenance;
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
+use sha2::{Digest, Sha256};
 
 use crate::{StoreError, StoredProvenance, stored_provenance, validate_database_path};
 
 /// The only provider journal schema this build can read and write.
-pub const PROVIDER_JOURNAL_SCHEMA_VERSION: u32 = 3;
+pub const PROVIDER_JOURNAL_SCHEMA_VERSION: u32 = 4;
 
 /// Exact character count of a lowercase hex SHA-256 digest.
 pub const DIGEST_CHARS: usize = 64;
@@ -58,6 +61,10 @@ const MAX_KIND_BYTES: usize = 64;
 const MAX_VERSION_BYTES: usize = 128;
 const MAX_REASON_BYTES: usize = 512;
 const MAX_SETTLEMENTS: usize = 1_024;
+/// Largest canonical command or notification retained for offline replay.
+pub const MAX_REPLAY_PAYLOAD_BYTES: usize = 1_048_576;
+/// Largest number of transcript records one turn may retain.
+pub const MAX_REPLAY_STEPS: usize = 4_096;
 
 /// Schema v1.
 ///
@@ -204,6 +211,38 @@ ALTER TABLE provider_turns ADD COLUMN causation_id TEXT;
 CREATE INDEX provider_turns_by_trace ON provider_turns(trace_id, turn_id);
 "#;
 
+/// Schema v4 adds version-bound resume and provider-neutral replay records.
+///
+/// Version columns are nullable only so v1-v3 rows migrate without invented
+/// values. Every v4 writer supplies all three; replay and unforced resume refuse
+/// a legacy row that has no complete tuple.
+const SCHEMA_V4: &str = r#"
+ALTER TABLE provider_processes ADD COLUMN prompt_version TEXT;
+ALTER TABLE provider_processes ADD COLUMN tool_schema_version TEXT;
+ALTER TABLE provider_processes ADD COLUMN model_id TEXT;
+ALTER TABLE provider_requests ADD COLUMN canonical_payload BLOB CHECK (
+    canonical_payload IS NULL OR length(canonical_payload) BETWEEN 1 AND 1048576
+);
+
+CREATE TABLE provider_replay_steps (
+    step_id INTEGER PRIMARY KEY,
+    turn_id INTEGER NOT NULL REFERENCES provider_turns(turn_id),
+    step_name TEXT NOT NULL,
+    occurrence_index INTEGER NOT NULL CHECK (occurrence_index >= 1),
+    record_kind TEXT NOT NULL CHECK (record_kind IN ('command', 'notification')),
+    correlation_id TEXT NOT NULL,
+    canonical_bytes BLOB NOT NULL CHECK (
+        length(canonical_bytes) BETWEEN 1 AND 1048576
+    ),
+    forked_from_step_id INTEGER REFERENCES provider_replay_steps(step_id),
+    recorded_ms INTEGER NOT NULL CHECK (recorded_ms >= 0),
+    UNIQUE (turn_id, step_name, occurrence_index, record_kind)
+) STRICT;
+
+CREATE INDEX provider_replay_steps_by_turn
+    ON provider_replay_steps(turn_id, step_id);
+"#;
+
 /// A provider journal error with stable refusal categories.
 #[derive(Debug)]
 pub enum ProviderJournalError {
@@ -231,6 +270,12 @@ pub enum ProviderJournalError {
     CursorRegression { durable: u64, supplied: u64 },
     /// A write-once binding was rebound to a different value.
     BindingConflict(&'static str),
+    /// Resume or replay crossed one pinned provider version without force.
+    ResumeVersionMismatch(&'static str),
+    /// Offline orchestration diverged from the recorded transcript.
+    ReplayDivergence { position: u64 },
+    /// The bounded replay transcript is full.
+    ReplayFull,
     /// A settled row was re-settled with different content.
     AlreadySettled,
     /// The caller's expected revision does not match the durable revision.
@@ -260,6 +305,9 @@ impl ProviderJournalError {
             Self::TurnOrdinal { .. } => "turn_ordinal",
             Self::CursorRegression { .. } => "cursor_regression",
             Self::BindingConflict(_) => "binding_conflict",
+            Self::ResumeVersionMismatch(_) => "resume_version_mismatch",
+            Self::ReplayDivergence { .. } => "replay_divergence",
+            Self::ReplayFull => "replay_full",
             Self::AlreadySettled => "already_settled",
             Self::RevisionMismatch { .. } => "revision_mismatch",
             Self::Corrupt(_) => "corrupt",
@@ -305,6 +353,13 @@ impl fmt::Display for ProviderJournalError {
             Self::BindingConflict(binding) => {
                 write!(formatter, "write-once binding was rebound: {binding}")
             }
+            Self::ResumeVersionMismatch(component) => {
+                write!(formatter, "provider resume version changed: {component}")
+            }
+            Self::ReplayDivergence { position } => {
+                write!(formatter, "offline replay diverged at position {position}")
+            }
+            Self::ReplayFull => formatter.write_str("offline replay transcript is full"),
             Self::AlreadySettled => {
                 formatter.write_str("row is already settled with different content")
             }
@@ -440,6 +495,34 @@ pub enum RequestState {
     Pending,
     Answered,
     Failed,
+}
+
+/// Whether a replay record entered orchestration or came back from it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplayRecordKind {
+    /// Canonical input dispatched by orchestration.
+    Command,
+    /// Canonical output returned to orchestration.
+    Notification,
+}
+
+impl ReplayRecordKind {
+    /// Stable stored spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Command => "command",
+            Self::Notification => "notification",
+        }
+    }
+
+    fn parse(value: &str) -> Journalled<Self> {
+        match value {
+            "command" => Ok(Self::Command),
+            "notification" => Ok(Self::Notification),
+            _ => Err(ProviderJournalError::Corrupt("replay_record_kind")),
+        }
+    }
 }
 
 /// Which negotiated namespace a write-once binding belongs to.
@@ -621,6 +704,7 @@ impl ApprovalDecision {
 }
 
 /// One recorded provider process spawn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessSpawn<'a> {
     /// Stable retry key for this spawn attempt.
     pub spawn_key: &'a str,
@@ -630,7 +714,122 @@ pub struct ProcessSpawn<'a> {
     pub provider_kind: &'a str,
     /// Lowercase hex SHA-256 of the executable the supervisor launched.
     pub executable_digest: &'a str,
+    /// Version of the prompt/template assembly used by this attempt.
+    pub prompt_version: &'a str,
+    /// Version of the tool schema presented to the provider.
+    pub tool_schema_version: &'a str,
+    /// Exact requested/effective model identity, or a declared default label.
+    pub model_id: &'a str,
+    /// Explicitly permit a new process for this attempt to cross a pinned tuple.
+    pub force_version_change: bool,
     pub spawned_ms: i64,
+}
+
+/// Borrowed provider tuple checked before resume or replay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplayVersions<'a> {
+    pub prompt_version: &'a str,
+    pub tool_schema_version: &'a str,
+    pub model_id: &'a str,
+}
+
+/// One command or notification retained as exact canonical bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplayStepRecord<'a> {
+    pub turn_id: i64,
+    pub step_name: &'a str,
+    /// One-based occurrence of this named step within the turn.
+    pub occurrence_index: u64,
+    pub kind: ReplayRecordKind,
+    pub correlation_id: &'a str,
+    pub canonical_bytes: &'a [u8],
+    /// Exact prior record this rerun was forked from, when any.
+    pub forked_from_step_id: Option<i64>,
+    pub recorded_ms: i64,
+}
+
+/// Durable replay record read back from the journal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplayStep {
+    pub step_id: i64,
+    pub turn_id: i64,
+    pub step_name: String,
+    pub occurrence_index: u64,
+    pub kind: ReplayRecordKind,
+    pub correlation_id: String,
+    pub canonical_bytes: Vec<u8>,
+    pub forked_from_step_id: Option<i64>,
+    pub recorded_ms: i64,
+}
+
+/// Receipt for an idempotently recorded replay step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplayStepReceipt {
+    pub step_id: i64,
+    pub duplicate: bool,
+}
+
+/// Effect-free transcript consumed by orchestration during offline replay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfflineReplayTape {
+    steps: Vec<ReplayStep>,
+    position: usize,
+}
+
+impl OfflineReplayTape {
+    /// Match the next recorded command and return its recorded notification.
+    ///
+    /// No provider, transport, clock, environment value, or network operation
+    /// is consulted. A changed order, identity, correlation or byte payload
+    /// fails at the current one-based transcript position.
+    pub fn dispatch(
+        &mut self,
+        step_name: &str,
+        occurrence_index: u64,
+        correlation_id: &str,
+        canonical_command: &[u8],
+    ) -> Journalled<&[u8]> {
+        let command_position = self.position;
+        let Some(command) = self.steps.get(command_position) else {
+            return Err(replay_divergence(command_position));
+        };
+        if command.kind != ReplayRecordKind::Command
+            || command.step_name != step_name
+            || command.occurrence_index != occurrence_index
+            || command.correlation_id != correlation_id
+            || command.canonical_bytes != canonical_command
+        {
+            return Err(replay_divergence(command_position));
+        }
+        let notification_position = command_position + 1;
+        let Some(notification) = self.steps.get(notification_position) else {
+            return Err(replay_divergence(notification_position));
+        };
+        if notification.kind != ReplayRecordKind::Notification
+            || notification.step_name != step_name
+            || notification.occurrence_index != occurrence_index
+            || notification.correlation_id != correlation_id
+        {
+            return Err(replay_divergence(notification_position));
+        }
+        self.position += 2;
+        Ok(&notification.canonical_bytes)
+    }
+
+    /// Prove orchestration consumed the whole recorded transcript exactly once.
+    pub fn finish(self) -> Journalled<()> {
+        if self.position == self.steps.len() {
+            Ok(())
+        } else {
+            Err(replay_divergence(self.position))
+        }
+    }
+
+    /// Number of records not yet consumed.
+    #[must_use]
+    pub fn remaining(&self) -> usize {
+        self.steps.len().saturating_sub(self.position)
+    }
 }
 
 /// A terminal observation for one live process.
@@ -727,8 +926,14 @@ pub struct RequestRecord<'a> {
     /// Unique within the turn; reuse with different content is refused.
     pub request_key: &'a str,
     pub direction: RequestDirection,
-    /// Lowercase hex SHA-256 binding the payload without storing it.
+    /// Lowercase hex SHA-256 binding the payload independently of optional
+    /// canonical-byte retention.
     pub payload_digest: &'a str,
+    /// Exact canonical bytes, retained when the caller has them.
+    ///
+    /// `None` exists only for compatibility with migrated or digest-only
+    /// producers. Production provider hosts supply this for every request.
+    pub canonical_payload: Option<&'a [u8]>,
     pub created_ms: i64,
 }
 
@@ -815,6 +1020,12 @@ pub struct ProcessRow {
     pub attempt_id: String,
     pub provider_kind: String,
     pub executable_digest: String,
+    /// Complete for v4-written rows; absent only on migrated legacy rows.
+    pub prompt_version: Option<String>,
+    /// Complete for v4-written rows; absent only on migrated legacy rows.
+    pub tool_schema_version: Option<String>,
+    /// Complete for v4-written rows; absent only on migrated legacy rows.
+    pub model_id: Option<String>,
     pub state: ProcessState,
     pub spawned_ms: i64,
     pub exited_ms: Option<i64>,
@@ -895,6 +1106,7 @@ pub struct RequestRow {
     pub request_key: String,
     pub direction: RequestDirection,
     pub payload_digest: String,
+    pub canonical_payload: Option<Vec<u8>>,
     pub outcome: RequestState,
     pub response_digest: Option<String>,
     pub failure_reason: Option<String>,
@@ -1012,6 +1224,13 @@ impl ProviderJournal {
         validate_key(spawn.attempt_id, "attempt_id")?;
         validate_bounded(spawn.provider_kind, MAX_KIND_BYTES, "provider_kind")?;
         validate_digest(spawn.executable_digest, "executable_digest")?;
+        validate_bounded(spawn.prompt_version, MAX_VERSION_BYTES, "prompt_version")?;
+        validate_bounded(
+            spawn.tool_schema_version,
+            MAX_VERSION_BYTES,
+            "tool_schema_version",
+        )?;
+        validate_bounded(spawn.model_id, MAX_VERSION_BYTES, "model_id")?;
         validate_time(spawn.spawned_ms, "spawned_ms")?;
 
         let transaction = self
@@ -1021,6 +1240,9 @@ impl ProviderJournal {
             if existing.attempt_id != spawn.attempt_id
                 || existing.provider_kind != spawn.provider_kind
                 || existing.executable_digest != spawn.executable_digest
+                || existing.prompt_version.as_deref() != Some(spawn.prompt_version)
+                || existing.tool_schema_version.as_deref() != Some(spawn.tool_schema_version)
+                || existing.model_id.as_deref() != Some(spawn.model_id)
                 || existing.spawned_ms != spawn.spawned_ms
             {
                 return Err(ProviderJournalError::IdempotencyConflict("spawn_key"));
@@ -1037,17 +1259,33 @@ impl ProviderJournal {
                 process_id: live.process_id,
             });
         }
+        if let Some(previous) = read_latest_process(&transaction, spawn.attempt_id)?
+            && !spawn.force_version_change
+        {
+            require_versions(
+                &previous,
+                ReplayVersions {
+                    prompt_version: spawn.prompt_version,
+                    tool_schema_version: spawn.tool_schema_version,
+                    model_id: spawn.model_id,
+                },
+            )?;
+        }
         transaction.execute(
             "INSERT INTO provider_processes
              (spawn_key, attempt_id, provider_kind, executable_digest, state,
-              spawned_ms, exited_ms, revision)
-             VALUES (?1, ?2, ?3, ?4, 'live', ?5, NULL, 1)",
+              spawned_ms, exited_ms, revision, prompt_version,
+              tool_schema_version, model_id)
+             VALUES (?1, ?2, ?3, ?4, 'live', ?5, NULL, 1, ?6, ?7, ?8)",
             params![
                 spawn.spawn_key,
                 spawn.attempt_id,
                 spawn.provider_kind,
                 spawn.executable_digest,
-                spawn.spawned_ms
+                spawn.spawned_ms,
+                spawn.prompt_version,
+                spawn.tool_schema_version,
+                spawn.model_id
             ],
         )?;
         let process_id = transaction.last_insert_rowid();
@@ -1466,12 +1704,24 @@ impl ProviderJournal {
 
     /// Record one correlated request inside an open turn.
     ///
-    /// The payload digest binds the request content; the content itself never
-    /// enters this journal. Replaying the same key with the same direction and
-    /// digest returns the existing request.
+    /// The payload digest always binds the request content. Producers that have
+    /// canonical wire bytes retain them as well. Replaying the same key requires
+    /// the same direction, digest, canonical-byte presence/content, and time.
     pub fn record_request(&mut self, request: RequestRecord<'_>) -> Journalled<RequestReceipt> {
         validate_key(request.request_key, "request_key")?;
         validate_digest(request.payload_digest, "payload_digest")?;
+        if let Some(payload) = request.canonical_payload
+            && (payload.is_empty() || payload.len() > MAX_REPLAY_PAYLOAD_BYTES)
+        {
+            return Err(ProviderJournalError::InvalidField("canonical_payload"));
+        }
+        if let Some(payload) = request.canonical_payload
+            && format!("{:x}", Sha256::digest(payload)) != request.payload_digest
+        {
+            return Err(ProviderJournalError::InvalidField(
+                "canonical_payload_digest",
+            ));
+        }
         validate_time(request.created_ms, "created_ms")?;
         validate_row_id(request.turn_id, "turn_id")?;
 
@@ -1488,6 +1738,7 @@ impl ProviderJournal {
         {
             if existing.direction != request.direction
                 || existing.payload_digest != request.payload_digest
+                || existing.canonical_payload.as_deref() != request.canonical_payload
                 || existing.created_ms != request.created_ms
             {
                 return Err(ProviderJournalError::IdempotencyConflict("request_key"));
@@ -1502,14 +1753,16 @@ impl ProviderJournal {
         transaction.execute(
             "INSERT INTO provider_requests
              (turn_id, request_key, direction, payload_digest, outcome,
-              response_digest, failure_reason, created_ms, settled_ms, revision)
-             VALUES (?1, ?2, ?3, ?4, 'pending', NULL, NULL, ?5, NULL, 1)",
+              response_digest, failure_reason, created_ms, settled_ms, revision,
+              canonical_payload)
+             VALUES (?1, ?2, ?3, ?4, 'pending', NULL, NULL, ?5, NULL, 1, ?6)",
             params![
                 request.turn_id,
                 request.request_key,
                 request.direction.as_str(),
                 request.payload_digest,
-                request.created_ms
+                request.created_ms,
+                request.canonical_payload
             ],
         )?;
         let request_id = transaction.last_insert_rowid();
@@ -1519,6 +1772,149 @@ impl ProviderJournal {
             revision: 1,
             duplicate: false,
         })
+    }
+
+    /// Append one exact command or notification for offline replay.
+    ///
+    /// Notifications are admitted only after the command with the same step
+    /// identity and correlation. Exact retries replay the existing receipt;
+    /// changed bytes, ancestry, kind, or time conflict.
+    pub fn record_replay_step(
+        &mut self,
+        record: ReplayStepRecord<'_>,
+    ) -> Journalled<ReplayStepReceipt> {
+        validate_row_id(record.turn_id, "turn_id")?;
+        validate_key(record.step_name, "step_name")?;
+        validate_key(record.correlation_id, "correlation_id")?;
+        validate_time(record.recorded_ms, "recorded_ms")?;
+        if record.occurrence_index == 0 {
+            return Err(ProviderJournalError::InvalidField("occurrence_index"));
+        }
+        if record.canonical_bytes.is_empty()
+            || record.canonical_bytes.len() > MAX_REPLAY_PAYLOAD_BYTES
+        {
+            return Err(ProviderJournalError::InvalidField("canonical_bytes"));
+        }
+        if let Some(step_id) = record.forked_from_step_id {
+            validate_row_id(step_id, "forked_from_step_id")?;
+        }
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let turn = read_turn(&transaction, record.turn_id)?
+            .ok_or(ProviderJournalError::NotFound("provider_turn"))?;
+        if turn.state != TurnState::Open {
+            return Err(ProviderJournalError::NotOpen("provider_turn"));
+        }
+        if let Some(existing) = read_replay_step_by_identity(
+            &transaction,
+            record.turn_id,
+            record.step_name,
+            record.occurrence_index,
+            record.kind,
+        )? {
+            if existing.correlation_id != record.correlation_id
+                || existing.canonical_bytes != record.canonical_bytes
+                || existing.forked_from_step_id != record.forked_from_step_id
+                || existing.recorded_ms != record.recorded_ms
+            {
+                return Err(ProviderJournalError::IdempotencyConflict("replay_step"));
+            }
+            transaction.commit()?;
+            return Ok(ReplayStepReceipt {
+                step_id: existing.step_id,
+                duplicate: true,
+            });
+        }
+        let count: i64 = transaction.query_row(
+            "SELECT count(*) FROM provider_replay_steps WHERE turn_id = ?1",
+            [record.turn_id],
+            |row| row.get(0),
+        )?;
+        if usize::try_from(count).map_err(|_| ProviderJournalError::Corrupt("replay_count"))?
+            >= MAX_REPLAY_STEPS
+        {
+            return Err(ProviderJournalError::ReplayFull);
+        }
+        if let Some(forked_from) = record.forked_from_step_id
+            && read_replay_step(&transaction, forked_from)?.is_none()
+        {
+            return Err(ProviderJournalError::NotFound("forked_from_step"));
+        }
+        if record.kind == ReplayRecordKind::Notification {
+            let command = read_replay_step_by_identity(
+                &transaction,
+                record.turn_id,
+                record.step_name,
+                record.occurrence_index,
+                ReplayRecordKind::Command,
+            )?
+            .ok_or(ProviderJournalError::NotFound("replay_command"))?;
+            if command.correlation_id != record.correlation_id {
+                return Err(ProviderJournalError::IdempotencyConflict(
+                    "replay_correlation",
+                ));
+            }
+        }
+        transaction.execute(
+            "INSERT INTO provider_replay_steps
+             (turn_id, step_name, occurrence_index, record_kind, correlation_id,
+              canonical_bytes, forked_from_step_id, recorded_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                record.turn_id,
+                record.step_name,
+                to_db_u64(record.occurrence_index, "occurrence_index")?,
+                record.kind.as_str(),
+                record.correlation_id,
+                record.canonical_bytes,
+                record.forked_from_step_id,
+                record.recorded_ms
+            ],
+        )?;
+        let step_id = transaction.last_insert_rowid();
+        transaction.commit()?;
+        Ok(ReplayStepReceipt {
+            step_id,
+            duplicate: false,
+        })
+    }
+
+    /// Load a completed turn as an effect-free, version-checked replay tape.
+    pub fn offline_replay(
+        &self,
+        turn_id: i64,
+        versions: ReplayVersions<'_>,
+        force_version_change: bool,
+    ) -> Journalled<OfflineReplayTape> {
+        validate_row_id(turn_id, "turn_id")?;
+        validate_versions(versions)?;
+        let turn = read_turn(&self.connection, turn_id)?
+            .ok_or(ProviderJournalError::NotFound("provider_turn"))?;
+        if turn.state != TurnState::Completed {
+            return Err(ProviderJournalError::NotOpen("completed_provider_turn"));
+        }
+        let process = read_process_for_turn(&self.connection, turn_id)?
+            .ok_or(ProviderJournalError::NotFound("provider_process"))?;
+        if !force_version_change {
+            require_versions(&process, versions)?;
+        }
+        let steps = read_replay_steps(&self.connection, turn_id)?;
+        if steps.is_empty() {
+            return Err(ProviderJournalError::NotFound("replay_transcript"));
+        }
+        validate_replay_pairs(&steps)?;
+        Ok(OfflineReplayTape { steps, position: 0 })
+    }
+
+    /// Read one turn's replay records in append order, including fork lineage.
+    pub fn replay_steps(&self, turn_id: i64) -> Journalled<Vec<ReplayStep>> {
+        validate_row_id(turn_id, "turn_id")?;
+        if read_turn(&self.connection, turn_id)?.is_none() {
+            return Err(ProviderJournalError::NotFound("provider_turn"));
+        }
+        read_replay_steps(&self.connection, turn_id)
     }
 
     /// Settle one request outside a turn commit.
@@ -2003,6 +2399,9 @@ struct RawProcess {
     attempt_id: String,
     provider_kind: String,
     executable_digest: String,
+    prompt_version: Option<String>,
+    tool_schema_version: Option<String>,
+    model_id: Option<String>,
     state: String,
     spawned_ms: i64,
     exited_ms: Option<i64>,
@@ -2010,7 +2409,12 @@ struct RawProcess {
 }
 
 const PROCESS_COLUMNS: &str = "process_id, spawn_key, attempt_id, provider_kind,
-     executable_digest, state, spawned_ms, exited_ms, revision";
+     executable_digest, prompt_version, tool_schema_version, model_id,
+     state, spawned_ms, exited_ms, revision";
+const QUALIFIED_PROCESS_COLUMNS: &str = "p.process_id, p.spawn_key, p.attempt_id,
+     p.provider_kind, p.executable_digest, p.prompt_version,
+     p.tool_schema_version, p.model_id, p.state, p.spawned_ms, p.exited_ms,
+     p.revision";
 
 fn raw_process(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawProcess> {
     Ok(RawProcess {
@@ -2019,10 +2423,13 @@ fn raw_process(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawProcess> {
         attempt_id: row.get(2)?,
         provider_kind: row.get(3)?,
         executable_digest: row.get(4)?,
-        state: row.get(5)?,
-        spawned_ms: row.get(6)?,
-        exited_ms: row.get(7)?,
-        revision: row.get(8)?,
+        prompt_version: row.get(5)?,
+        tool_schema_version: row.get(6)?,
+        model_id: row.get(7)?,
+        state: row.get(8)?,
+        spawned_ms: row.get(9)?,
+        exited_ms: row.get(10)?,
+        revision: row.get(11)?,
     })
 }
 
@@ -2038,6 +2445,18 @@ fn validated_process(raw: RawProcess) -> Journalled<ProcessRow> {
         attempt_id: checked_key(raw.attempt_id, "attempt_id")?,
         provider_kind: checked_bounded(raw.provider_kind, MAX_KIND_BYTES, "provider_kind")?,
         executable_digest: checked_digest(raw.executable_digest, "executable_digest")?,
+        prompt_version: raw
+            .prompt_version
+            .map(|value| checked_bounded(value, MAX_VERSION_BYTES, "prompt_version"))
+            .transpose()?,
+        tool_schema_version: raw
+            .tool_schema_version
+            .map(|value| checked_bounded(value, MAX_VERSION_BYTES, "tool_schema_version"))
+            .transpose()?,
+        model_id: raw
+            .model_id
+            .map(|value| checked_bounded(value, MAX_VERSION_BYTES, "model_id"))
+            .transpose()?,
         state,
         spawned_ms: checked_time(raw.spawned_ms, "spawned_ms")?,
         exited_ms: raw
@@ -2081,6 +2500,39 @@ fn read_live_process(connection: &Connection, attempt_id: &str) -> Journalled<Op
                  WHERE attempt_id = ?1 AND state = 'live'"
             ),
             [attempt_id],
+            raw_process,
+        )
+        .optional()?;
+    raw.map(validated_process).transpose()
+}
+
+fn read_latest_process(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Journalled<Option<ProcessRow>> {
+    let raw = connection
+        .query_row(
+            &format!(
+                "SELECT {PROCESS_COLUMNS} FROM provider_processes
+                 WHERE attempt_id = ?1 ORDER BY process_id DESC LIMIT 1"
+            ),
+            [attempt_id],
+            raw_process,
+        )
+        .optional()?;
+    raw.map(validated_process).transpose()
+}
+
+fn read_process_for_turn(connection: &Connection, turn_id: i64) -> Journalled<Option<ProcessRow>> {
+    let raw = connection
+        .query_row(
+            &format!(
+                "SELECT {QUALIFIED_PROCESS_COLUMNS} FROM provider_processes p
+                 JOIN provider_sessions s ON s.process_id = p.process_id
+                 JOIN provider_turns t ON t.session_id = s.session_id
+                 WHERE t.turn_id = ?1"
+            ),
+            [turn_id],
             raw_process,
         )
         .optional()?;
@@ -2435,6 +2887,7 @@ struct RawRequest {
     request_key: String,
     direction: String,
     payload_digest: String,
+    canonical_payload: Option<Vec<u8>>,
     outcome: String,
     response_digest: Option<String>,
     failure_reason: Option<String>,
@@ -2444,7 +2897,7 @@ struct RawRequest {
 }
 
 const REQUEST_COLUMNS: &str = "request_id, turn_id, request_key, direction, payload_digest,
-     outcome, response_digest, failure_reason, created_ms, settled_ms, revision";
+     canonical_payload, outcome, response_digest, failure_reason, created_ms, settled_ms, revision";
 
 fn raw_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRequest> {
     Ok(RawRequest {
@@ -2453,12 +2906,13 @@ fn raw_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRequest> {
         request_key: row.get(2)?,
         direction: row.get(3)?,
         payload_digest: row.get(4)?,
-        outcome: row.get(5)?,
-        response_digest: row.get(6)?,
-        failure_reason: row.get(7)?,
-        created_ms: row.get(8)?,
-        settled_ms: row.get(9)?,
-        revision: row.get(10)?,
+        canonical_payload: row.get(5)?,
+        outcome: row.get(6)?,
+        response_digest: row.get(7)?,
+        failure_reason: row.get(8)?,
+        created_ms: row.get(9)?,
+        settled_ms: row.get(10)?,
+        revision: row.get(11)?,
     })
 }
 
@@ -2479,6 +2933,16 @@ fn validated_request(raw: RawRequest) -> Journalled<RequestRow> {
         request_key: checked_key(raw.request_key, "request_key")?,
         direction: RequestDirection::parse(&raw.direction)?,
         payload_digest: checked_digest(raw.payload_digest, "payload_digest")?,
+        canonical_payload: raw
+            .canonical_payload
+            .map(|payload| {
+                if payload.is_empty() || payload.len() > MAX_REPLAY_PAYLOAD_BYTES {
+                    Err(ProviderJournalError::Corrupt("canonical_payload"))
+                } else {
+                    Ok(payload)
+                }
+            })
+            .transpose()?,
         outcome,
         response_digest: raw
             .response_digest
@@ -2535,6 +2999,121 @@ fn read_turn_requests(
         requests.push(validated_request(raw?)?);
     }
     Ok(requests)
+}
+
+struct RawReplayStep {
+    step_id: i64,
+    turn_id: i64,
+    step_name: String,
+    occurrence_index: i64,
+    record_kind: String,
+    correlation_id: String,
+    canonical_bytes: Vec<u8>,
+    forked_from_step_id: Option<i64>,
+    recorded_ms: i64,
+}
+
+const REPLAY_STEP_COLUMNS: &str = "step_id, turn_id, step_name, occurrence_index,
+     record_kind, correlation_id, canonical_bytes, forked_from_step_id, recorded_ms";
+
+fn raw_replay_step(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawReplayStep> {
+    Ok(RawReplayStep {
+        step_id: row.get(0)?,
+        turn_id: row.get(1)?,
+        step_name: row.get(2)?,
+        occurrence_index: row.get(3)?,
+        record_kind: row.get(4)?,
+        correlation_id: row.get(5)?,
+        canonical_bytes: row.get(6)?,
+        forked_from_step_id: row.get(7)?,
+        recorded_ms: row.get(8)?,
+    })
+}
+
+fn validated_replay_step(raw: RawReplayStep) -> Journalled<ReplayStep> {
+    if raw.canonical_bytes.is_empty() || raw.canonical_bytes.len() > MAX_REPLAY_PAYLOAD_BYTES {
+        return Err(ProviderJournalError::Corrupt("canonical_bytes"));
+    }
+    Ok(ReplayStep {
+        step_id: checked_row_id(raw.step_id, "step_id")?,
+        turn_id: checked_row_id(raw.turn_id, "turn_id")?,
+        step_name: checked_key(raw.step_name, "step_name")?,
+        occurrence_index: checked_revision(raw.occurrence_index)
+            .map_err(|_| ProviderJournalError::Corrupt("occurrence_index"))?,
+        kind: ReplayRecordKind::parse(&raw.record_kind)?,
+        correlation_id: checked_key(raw.correlation_id, "correlation_id")?,
+        canonical_bytes: raw.canonical_bytes,
+        forked_from_step_id: raw
+            .forked_from_step_id
+            .map(|value| checked_row_id(value, "forked_from_step_id"))
+            .transpose()?,
+        recorded_ms: checked_time(raw.recorded_ms, "recorded_ms")?,
+    })
+}
+
+fn read_replay_step(connection: &Connection, step_id: i64) -> Journalled<Option<ReplayStep>> {
+    let raw = connection
+        .query_row(
+            &format!("SELECT {REPLAY_STEP_COLUMNS} FROM provider_replay_steps WHERE step_id = ?1"),
+            [step_id],
+            raw_replay_step,
+        )
+        .optional()?;
+    raw.map(validated_replay_step).transpose()
+}
+
+fn read_replay_step_by_identity(
+    connection: &Connection,
+    turn_id: i64,
+    step_name: &str,
+    occurrence_index: u64,
+    kind: ReplayRecordKind,
+) -> Journalled<Option<ReplayStep>> {
+    let raw = connection
+        .query_row(
+            &format!(
+                "SELECT {REPLAY_STEP_COLUMNS} FROM provider_replay_steps
+                 WHERE turn_id = ?1 AND step_name = ?2 AND occurrence_index = ?3
+                   AND record_kind = ?4"
+            ),
+            params![
+                turn_id,
+                step_name,
+                to_db_u64(occurrence_index, "occurrence_index")?,
+                kind.as_str()
+            ],
+            raw_replay_step,
+        )
+        .optional()?;
+    raw.map(validated_replay_step).transpose()
+}
+
+fn read_replay_steps(connection: &Connection, turn_id: i64) -> Journalled<Vec<ReplayStep>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT {REPLAY_STEP_COLUMNS} FROM provider_replay_steps
+         WHERE turn_id = ?1 ORDER BY step_id"
+    ))?;
+    let rows = statement.query_map([turn_id], raw_replay_step)?;
+    rows.map(|row| validated_replay_step(row?)).collect()
+}
+
+fn validate_replay_pairs(steps: &[ReplayStep]) -> Journalled<()> {
+    if !steps.len().is_multiple_of(2) {
+        return Err(replay_divergence(steps.len()));
+    }
+    for (pair_index, pair) in steps.chunks_exact(2).enumerate() {
+        let command = &pair[0];
+        let notification = &pair[1];
+        if command.kind != ReplayRecordKind::Command
+            || notification.kind != ReplayRecordKind::Notification
+            || command.step_name != notification.step_name
+            || command.occurrence_index != notification.occurrence_index
+            || command.correlation_id != notification.correlation_id
+        {
+            return Err(replay_divergence(pair_index * 2));
+        }
+    }
+    Ok(())
 }
 
 struct RawCursor {
@@ -2732,6 +3311,7 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Journalled<()> 
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA_V2)?;
         transaction.execute_batch(SCHEMA_V3)?;
+        transaction.execute_batch(SCHEMA_V4)?;
         transaction.pragma_update(None, "user_version", PROVIDER_JOURNAL_SCHEMA_VERSION)?;
         transaction.commit()?;
         return Ok(());
@@ -2739,6 +3319,14 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Journalled<()> 
     if version == 2 {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA_V3)?;
+        transaction.execute_batch(SCHEMA_V4)?;
+        transaction.pragma_update(None, "user_version", PROVIDER_JOURNAL_SCHEMA_VERSION)?;
+        transaction.commit()?;
+        return Ok(());
+    }
+    if version == 3 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SCHEMA_V4)?;
         transaction.pragma_update(None, "user_version", PROVIDER_JOURNAL_SCHEMA_VERSION)?;
         transaction.commit()?;
         return Ok(());
@@ -2764,6 +3352,7 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Journalled<()> 
     transaction.execute_batch(SCHEMA_V1)?;
     transaction.execute_batch(SCHEMA_V2)?;
     transaction.execute_batch(SCHEMA_V3)?;
+    transaction.execute_batch(SCHEMA_V4)?;
     transaction.pragma_update(None, "user_version", PROVIDER_JOURNAL_SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -2800,6 +3389,47 @@ fn validate_turn_usage(usage: &TurnUsage<'_>) -> Journalled<()> {
     to_db_u64(usage.cached_input_tokens, "cached_input_tokens")?;
     to_db_u64(usage.output_tokens, "output_tokens")?;
     Ok(())
+}
+
+fn validate_versions(versions: ReplayVersions<'_>) -> Journalled<()> {
+    validate_bounded(versions.prompt_version, MAX_VERSION_BYTES, "prompt_version")?;
+    validate_bounded(
+        versions.tool_schema_version,
+        MAX_VERSION_BYTES,
+        "tool_schema_version",
+    )?;
+    validate_bounded(versions.model_id, MAX_VERSION_BYTES, "model_id")
+}
+
+fn require_versions(process: &ProcessRow, offered: ReplayVersions<'_>) -> Journalled<()> {
+    match process.prompt_version.as_deref() {
+        Some(durable) if durable == offered.prompt_version => {}
+        _ => {
+            return Err(ProviderJournalError::ResumeVersionMismatch(
+                "prompt_version",
+            ));
+        }
+    }
+    match process.tool_schema_version.as_deref() {
+        Some(durable) if durable == offered.tool_schema_version => {}
+        _ => {
+            return Err(ProviderJournalError::ResumeVersionMismatch(
+                "tool_schema_version",
+            ));
+        }
+    }
+    match process.model_id.as_deref() {
+        Some(durable) if durable == offered.model_id => Ok(()),
+        _ => Err(ProviderJournalError::ResumeVersionMismatch("model_id")),
+    }
+}
+
+fn replay_divergence(position: usize) -> ProviderJournalError {
+    ProviderJournalError::ReplayDivergence {
+        position: u64::try_from(position)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1),
+    }
 }
 
 fn validate_key(value: &str, field: &'static str) -> Journalled<()> {

@@ -76,6 +76,10 @@ fn authenticated_scrape_exports_live_and_durable_gen_ai_metrics() {
             attempt_id: "metrics-attempt",
             provider_kind: "openai",
             executable_digest: &"a".repeat(64),
+            prompt_version: "prompt-v1",
+            tool_schema_version: "tools-v1",
+            model_id: "model-a",
+            force_version_change: false,
             spawned_ms: 1,
         })
         .unwrap();

@@ -1166,8 +1166,8 @@ impl Component {
             }
             // Slack ingress v2 adds provenance and migrates v1 files in place.
             Self::SlackIngressSchema => (1, 2),
-            // Provider journal v3 adds provenance after v2 GenAI usage.
-            Self::ProviderJournalSchema => (1, 3),
+            // Provider journal v4 adds deterministic replay after v3 provenance.
+            Self::ProviderJournalSchema => (1, 4),
             // `RunSpec` admission refuses any `protocol_version` but 1.
             Self::RunSpecDocument => (1, 1),
         }

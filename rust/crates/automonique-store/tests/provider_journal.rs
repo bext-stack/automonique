@@ -13,11 +13,13 @@ use std::path::{Path, PathBuf};
 use automonique_store::provider_journal::{
     ApprovalDecision, ApprovalRecord, BindingKind, BindingRecord, CursorAdvance, FinishReason,
     PROVIDER_JOURNAL_SCHEMA_VERSION, ProcessExit, ProcessSpawn, ProcessState, ProcessTermination,
-    ProviderJournal, RequestDirection, RequestOutcomeCommit, RequestRecord, RequestSettlement,
-    RequestState, SessionClosing, SessionClosure, SessionOpening, SessionState, SettledOutcome,
-    TurnCompletion, TurnOpening, TurnOutcome, TurnState, TurnUsage,
+    ProviderJournal, ReplayRecordKind, ReplayStepRecord, ReplayVersions, RequestDirection,
+    RequestOutcomeCommit, RequestRecord, RequestSettlement, RequestState, SessionClosing,
+    SessionClosure, SessionOpening, SessionState, SettledOutcome, TurnCompletion, TurnOpening,
+    TurnOutcome, TurnState, TurnUsage,
 };
 use rusqlite::{Connection, params};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 // Lowercase hex with real letters, so `to_uppercase` genuinely changes them.
@@ -63,6 +65,10 @@ fn spawn(journal: &mut ProviderJournal, spawn_key: &str, attempt_id: &str) -> i6
             attempt_id,
             provider_kind: "codex",
             executable_digest: EXECUTABLE_DIGEST,
+            prompt_version: "prompt-v1",
+            tool_schema_version: "tools-v1",
+            model_id: "model-a",
+            force_version_change: false,
             spawned_ms: 10,
         })
         .expect("record process")
@@ -100,6 +106,7 @@ fn record_request(journal: &mut ProviderJournal, turn_id: i64, key: &str, digest
             request_key: key,
             direction: RequestDirection::ToProvider,
             payload_digest: digest,
+            canonical_payload: None,
             created_ms: 40,
         })
         .expect("record request")
@@ -120,6 +127,303 @@ fn live_turn(journal: &mut ProviderJournal) -> (i64, i64, i64) {
     let session_id = open_session(journal, process_id, "provider-session-a");
     let turn_id = open_turn(journal, session_id, 1, "turn:1");
     (process_id, session_id, turn_id)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReplayCorpusRecord<'a> {
+    kind: ReplayRecordKind,
+    name: &'a str,
+    occurrence: u64,
+    correlation: &'a str,
+    payload: &'a [u8],
+}
+
+fn replay_corpus() -> Vec<ReplayCorpusRecord<'static>> {
+    include_str!("fixtures/provider_replay_v1.txt")
+        .lines()
+        .map(|line| {
+            let mut fields = line.splitn(5, '|');
+            let kind = match fields.next().expect("corpus kind") {
+                "command" => ReplayRecordKind::Command,
+                "notification" => ReplayRecordKind::Notification,
+                _ => panic!("unknown corpus kind"),
+            };
+            let name = fields.next().expect("corpus name");
+            let occurrence = fields
+                .next()
+                .expect("corpus occurrence")
+                .parse()
+                .expect("numeric occurrence");
+            let correlation = fields.next().expect("corpus correlation");
+            let payload = fields.next().expect("corpus payload").as_bytes();
+            ReplayCorpusRecord {
+                kind,
+                name,
+                occurrence,
+                correlation,
+                payload,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn recorded_turn_replays_offline_and_reordering_is_a_ci_failure() {
+    let (_private, mut journal) = journal();
+    let (_, _, turn_id) = live_turn(&mut journal);
+    let corpus = replay_corpus();
+    for (index, record) in corpus.iter().enumerate() {
+        journal
+            .record_replay_step(ReplayStepRecord {
+                turn_id,
+                step_name: record.name,
+                occurrence_index: record.occurrence,
+                kind: record.kind,
+                correlation_id: record.correlation,
+                canonical_bytes: record.payload,
+                forked_from_step_id: None,
+                recorded_ms: 40 + i64::try_from(index).expect("bounded corpus"),
+            })
+            .expect("record replay corpus");
+    }
+    journal
+        .complete_turn(TurnCompletion {
+            turn_id,
+            expected_revision: 1,
+            now_ms: 50,
+            outcome: TurnOutcome::Completed,
+            settlements: &[],
+            cursor: None,
+            usage: None,
+        })
+        .expect("complete replayable turn");
+
+    let versions = ReplayVersions {
+        prompt_version: "prompt-v1",
+        tool_schema_version: "tools-v1",
+        model_id: "model-a",
+    };
+    let mut tape = journal
+        .offline_replay(turn_id, versions, false)
+        .expect("load offline tape");
+    assert_eq!(tape.remaining(), 4);
+    assert_eq!(
+        tape.dispatch(
+            corpus[0].name,
+            corpus[0].occurrence,
+            corpus[0].correlation,
+            corpus[0].payload,
+        )
+        .expect("first deterministic step"),
+        corpus[1].payload
+    );
+    assert_eq!(
+        tape.dispatch(
+            corpus[2].name,
+            corpus[2].occurrence,
+            corpus[2].correlation,
+            corpus[2].payload,
+        )
+        .expect("second deterministic step"),
+        corpus[3].payload
+    );
+    tape.finish().expect("whole transcript consumed");
+
+    let mut reordered = journal
+        .offline_replay(turn_id, versions, false)
+        .expect("load second tape");
+    let error = reordered
+        .dispatch(
+            corpus[2].name,
+            corpus[2].occurrence,
+            corpus[2].correlation,
+            corpus[2].payload,
+        )
+        .expect_err("reordered orchestration must fail");
+    assert_eq!(error.category(), "replay_divergence");
+    assert!(error.to_string().contains("position 1"));
+
+    let error = journal
+        .offline_replay(
+            turn_id,
+            ReplayVersions {
+                model_id: "model-b",
+                ..versions
+            },
+            false,
+        )
+        .expect_err("cross-model replay refusal");
+    assert_eq!(error.category(), "resume_version_mismatch");
+    journal
+        .offline_replay(
+            turn_id,
+            ReplayVersions {
+                model_id: "model-b",
+                ..versions
+            },
+            true,
+        )
+        .expect("explicit forced replay");
+}
+
+#[test]
+fn canonical_request_bytes_are_exact_and_digest_bound() {
+    let (_private, mut journal) = journal();
+    let (_, _, turn_id) = live_turn(&mut journal);
+    let payload = b"{\"fixture\":\"canonical-request\"}";
+    let digest = format!("{:x}", Sha256::digest(payload));
+    journal
+        .record_request(RequestRecord {
+            turn_id,
+            request_key: "canonical-request",
+            direction: RequestDirection::ToProvider,
+            payload_digest: &digest,
+            canonical_payload: Some(payload),
+            created_ms: 40,
+        })
+        .expect("record canonical request");
+    let requests = journal.turn_requests(turn_id).expect("read requests");
+    assert_eq!(
+        requests[0].canonical_payload.as_deref(),
+        Some(payload.as_slice())
+    );
+
+    let error = journal
+        .record_request(RequestRecord {
+            turn_id,
+            request_key: "mismatched-request",
+            direction: RequestDirection::ToProvider,
+            payload_digest: PROMPT_DIGEST,
+            canonical_payload: Some(payload),
+            created_ms: 41,
+        })
+        .expect_err("digest mismatch refusal");
+    assert_eq!(error.category(), "invalid_field");
+}
+
+#[test]
+fn resume_across_the_prompt_tool_model_tuple_requires_explicit_force() {
+    let (_private, mut journal) = journal();
+    let process_id = spawn(&mut journal, "spawn:a", "attempt:a");
+    journal
+        .finish_process(ProcessExit {
+            process_id,
+            expected_revision: 1,
+            now_ms: 20,
+            termination: ProcessTermination::Exited,
+        })
+        .expect("finish first process");
+    let changed = ProcessSpawn {
+        spawn_key: "spawn:b",
+        attempt_id: "attempt:a",
+        provider_kind: "codex",
+        executable_digest: EXECUTABLE_DIGEST,
+        prompt_version: "prompt-v1",
+        tool_schema_version: "tools-v1",
+        model_id: "model-b",
+        force_version_change: false,
+        spawned_ms: 30,
+    };
+    let error = journal
+        .record_process(changed)
+        .expect_err("unforced model drift refusal");
+    assert_eq!(error.category(), "resume_version_mismatch");
+    assert!(error.to_string().contains("model_id"));
+
+    for (spawn_key, prompt_version, tool_schema_version, expected) in [
+        ("spawn:prompt", "prompt-v2", "tools-v1", "prompt_version"),
+        (
+            "spawn:tools",
+            "prompt-v1",
+            "tools-v2",
+            "tool_schema_version",
+        ),
+    ] {
+        let error = journal
+            .record_process(ProcessSpawn {
+                spawn_key,
+                prompt_version,
+                tool_schema_version,
+                model_id: "model-a",
+                ..changed
+            })
+            .expect_err("unforced tuple drift refusal");
+        assert_eq!(error.category(), "resume_version_mismatch");
+        assert!(error.to_string().contains(expected));
+    }
+
+    let forced = journal
+        .record_process(ProcessSpawn {
+            force_version_change: true,
+            ..changed
+        })
+        .expect("explicit version override");
+    let recovery = journal
+        .recover_attempt("attempt:a")
+        .expect("recover forced process");
+    assert_eq!(
+        forced.process_id,
+        recovery.process.expect("latest process").process_id
+    );
+}
+
+#[test]
+fn rerun_steps_preserve_exact_fork_lineage() {
+    let (_private, mut journal) = journal();
+    let (_process_id, session_id, first_turn) = live_turn(&mut journal);
+    let source = journal
+        .record_replay_step(ReplayStepRecord {
+            turn_id: first_turn,
+            step_name: "lookup",
+            occurrence_index: 1,
+            kind: ReplayRecordKind::Command,
+            correlation_id: "correlation-source",
+            canonical_bytes: b"{\"source\":true}",
+            forked_from_step_id: None,
+            recorded_ms: 40,
+        })
+        .expect("source command");
+    journal
+        .record_replay_step(ReplayStepRecord {
+            turn_id: first_turn,
+            step_name: "lookup",
+            occurrence_index: 1,
+            kind: ReplayRecordKind::Notification,
+            correlation_id: "correlation-source",
+            canonical_bytes: b"{\"value\":1}",
+            forked_from_step_id: None,
+            recorded_ms: 41,
+        })
+        .expect("source notification");
+    journal
+        .complete_turn(TurnCompletion {
+            turn_id: first_turn,
+            expected_revision: 1,
+            now_ms: 50,
+            outcome: TurnOutcome::Completed,
+            settlements: &[],
+            cursor: None,
+            usage: None,
+        })
+        .expect("complete source turn");
+
+    let fork = open_turn(&mut journal, session_id, 2, "turn:fork");
+    journal
+        .record_replay_step(ReplayStepRecord {
+            turn_id: fork,
+            step_name: "lookup",
+            occurrence_index: 1,
+            kind: ReplayRecordKind::Command,
+            correlation_id: "correlation-fork",
+            canonical_bytes: b"{\"source\":false}",
+            forked_from_step_id: Some(source.step_id),
+            recorded_ms: 60,
+        })
+        .expect("forked command");
+    let steps = journal.replay_steps(fork).expect("fork transcript");
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].forked_from_step_id, Some(source.step_id));
+    assert_eq!(steps[0].canonical_bytes, b"{\"source\":false}");
 }
 
 #[test]
@@ -224,6 +528,9 @@ fn full_lifecycle_recovers_byte_exact_bindings() {
     assert_eq!(process.state, ProcessState::Live);
     assert_eq!(process.executable_digest, EXECUTABLE_DIGEST);
     assert_eq!(process.provider_kind, "codex");
+    assert_eq!(process.prompt_version.as_deref(), Some("prompt-v1"));
+    assert_eq!(process.tool_schema_version.as_deref(), Some("tools-v1"));
+    assert_eq!(process.model_id.as_deref(), Some("model-a"));
     assert_eq!(process.exited_ms, None);
 
     let session = recovery.session.expect("open session");
@@ -240,6 +547,7 @@ fn full_lifecycle_recovers_byte_exact_bindings() {
     let pending = &recovery.pending_requests[0];
     assert_eq!(pending.request_key, "req:tool-1");
     assert_eq!(pending.payload_digest, TOOL_DIGEST);
+    assert_eq!(pending.canonical_payload, None);
     assert_eq!(pending.outcome, RequestState::Pending);
     assert_eq!(pending.response_digest, None);
     assert_eq!(pending.direction, RequestDirection::ToProvider);
@@ -288,6 +596,10 @@ fn second_live_process_for_one_attempt_refuses() {
             attempt_id: "attempt:a",
             provider_kind: "claude",
             executable_digest: EXECUTABLE_DIGEST,
+            prompt_version: "prompt-v1",
+            tool_schema_version: "tools-v1",
+            model_id: "model-a",
+            force_version_change: false,
             spawned_ms: 11,
         })
         .expect_err("second live process refusal");
@@ -418,6 +730,7 @@ fn duplicate_request_key_in_one_turn_refuses() {
             request_key: "req:prompt",
             direction: RequestDirection::ToProvider,
             payload_digest: TOOL_DIGEST,
+            canonical_payload: None,
             created_ms: 40,
         })
         .expect_err("digest conflict refusal");
@@ -429,6 +742,7 @@ fn duplicate_request_key_in_one_turn_refuses() {
             request_key: "req:prompt",
             direction: RequestDirection::FromProvider,
             payload_digest: PROMPT_DIGEST,
+            canonical_payload: None,
             created_ms: 40,
         })
         .expect_err("direction conflict refusal");
@@ -601,6 +915,10 @@ fn exact_replay_writes_are_idempotent_without_duplication() {
             attempt_id: "attempt:a",
             provider_kind: "codex",
             executable_digest: EXECUTABLE_DIGEST,
+            prompt_version: "prompt-v1",
+            tool_schema_version: "tools-v1",
+            model_id: "model-a",
+            force_version_change: false,
             spawned_ms: 10,
         })
         .expect("first spawn");
@@ -610,6 +928,10 @@ fn exact_replay_writes_are_idempotent_without_duplication() {
             attempt_id: "attempt:a",
             provider_kind: "codex",
             executable_digest: EXECUTABLE_DIGEST,
+            prompt_version: "prompt-v1",
+            tool_schema_version: "tools-v1",
+            model_id: "model-a",
+            force_version_change: false,
             spawned_ms: 10,
         })
         .expect("replayed spawn");
@@ -623,6 +945,10 @@ fn exact_replay_writes_are_idempotent_without_duplication() {
             attempt_id: "attempt:a",
             provider_kind: "codex",
             executable_digest: PROMPT_DIGEST,
+            prompt_version: "prompt-v1",
+            tool_schema_version: "tools-v1",
+            model_id: "model-a",
+            force_version_change: false,
             spawned_ms: 10,
         })
         .expect_err("different executable refusal");
@@ -673,6 +999,7 @@ fn exact_replay_writes_are_idempotent_without_duplication() {
             request_key: "req:prompt",
             direction: RequestDirection::ToProvider,
             payload_digest: PROMPT_DIGEST,
+            canonical_payload: None,
             created_ms: 40,
         })
         .expect("replayed request");
@@ -851,6 +1178,10 @@ fn runtime_stats_group_live_provider_processes_without_exposing_identifiers() {
             attempt_id: "attempt-claude",
             provider_kind: "claude",
             executable_digest: EXECUTABLE_DIGEST,
+            prompt_version: "prompt-v1",
+            tool_schema_version: "tools-v1",
+            model_id: "model-a",
+            force_version_change: false,
             spawned_ms: 60,
         })
         .expect("record claude process");
@@ -883,10 +1214,19 @@ fn runtime_stats_group_live_provider_processes_without_exposing_identifiers() {
 }
 
 #[test]
-fn a_v1_journal_migrates_to_the_usage_schema() {
+fn a_v1_journal_migrates_through_usage_provenance_and_replay_schemas() {
     let (private, journal) = journal();
     drop(journal);
     let raw = Connection::open(private.path()).expect("raw v1 simulation");
+    raw.execute("DROP TABLE provider_replay_steps", [])
+        .expect("remove v4 replay table");
+    raw.execute_batch(
+        "ALTER TABLE provider_processes DROP COLUMN prompt_version;
+         ALTER TABLE provider_processes DROP COLUMN tool_schema_version;
+         ALTER TABLE provider_processes DROP COLUMN model_id;
+         ALTER TABLE provider_requests DROP COLUMN canonical_payload;",
+    )
+    .expect("remove v4 version bindings");
     raw.execute("DROP TABLE provider_turn_usage", [])
         .expect("remove v2 table");
     raw.execute_batch(
@@ -1220,6 +1560,10 @@ fn malformed_caller_fields_refuse_before_touching_the_database() {
             attempt_id: "attempt:b",
             provider_kind: "codex",
             executable_digest: &EXECUTABLE_DIGEST.to_uppercase(),
+            prompt_version: "prompt-v1",
+            tool_schema_version: "tools-v1",
+            model_id: "model-a",
+            force_version_change: false,
             spawned_ms: 10,
         })
         .expect_err("uppercase digest refusal");
@@ -1231,6 +1575,10 @@ fn malformed_caller_fields_refuse_before_touching_the_database() {
             attempt_id: "attempt:b",
             provider_kind: "codex",
             executable_digest: "abcd",
+            prompt_version: "prompt-v1",
+            tool_schema_version: "tools-v1",
+            model_id: "model-a",
+            force_version_change: false,
             spawned_ms: 10,
         })
         .expect_err("short digest refusal");

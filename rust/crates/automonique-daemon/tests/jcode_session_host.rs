@@ -11,7 +11,8 @@ use automonique_runner::{
     ContainmentDomain, ContainmentLimits, LaunchPlan, RunContainment, SocketGrant,
 };
 use automonique_store::provider_journal::{
-    ApprovalDecision, ProcessState, ProviderJournal, RequestState, SessionState, TurnState,
+    ApprovalDecision, ProcessState, ProviderJournal, ReplayVersions, RequestState, SessionState,
+    TurnState,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -261,7 +262,14 @@ fn contained_jcode_session_negotiates_input_resumes_and_journals() {
 
     let mut journal = ProviderJournal::open(&journal_path).unwrap();
     let recovery = journal.recover_attempt("logical-session-1").unwrap();
-    assert_eq!(recovery.process.unwrap().state, ProcessState::Exited);
+    let process = recovery.process.unwrap();
+    assert_eq!(process.state, ProcessState::Exited);
+    assert_eq!(process.prompt_version.as_deref(), Some("provider-turn/v1"));
+    assert_eq!(
+        process.tool_schema_version.as_deref(),
+        Some("jcode-api-stdio/v1")
+    );
+    assert_eq!(process.model_id.as_deref(), Some("fixture-model"));
     assert_eq!(recovery.session.unwrap().state, SessionState::Closed);
     let turns = journal.session_turns(1).unwrap();
     assert_eq!(turns.len(), 3);
@@ -278,6 +286,39 @@ fn contained_jcode_session_negotiates_input_resumes_and_journals() {
             .iter()
             .all(|request| request.outcome == RequestState::Answered)
     );
+    assert!(
+        first_requests
+            .iter()
+            .all(|request| request.canonical_payload.is_some())
+    );
+    for turn in &turns[..2] {
+        let steps = journal.replay_steps(turn.turn_id).unwrap();
+        assert_eq!(steps.len(), 2);
+        let command = &steps[0];
+        let notification = &steps[1];
+        let mut tape = journal
+            .offline_replay(
+                turn.turn_id,
+                ReplayVersions {
+                    prompt_version: "provider-turn/v1",
+                    tool_schema_version: "jcode-api-stdio/v1",
+                    model_id: "fixture-model",
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            tape.dispatch(
+                &command.step_name,
+                command.occurrence_index,
+                &command.correlation_id,
+                &command.canonical_bytes,
+            )
+            .unwrap(),
+            notification.canonical_bytes
+        );
+        tape.finish().unwrap();
+    }
     let approvals = journal.approvals(1).unwrap();
     assert_eq!(approvals.len(), 1);
     assert_eq!(approvals[0].decision, ApprovalDecision::Granted);

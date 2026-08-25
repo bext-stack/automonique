@@ -10,8 +10,8 @@ use automonique_daemon::provider_session_host::{ProviderSessionHost, retire_orph
 use automonique_runner::filesystem::PathIntent;
 use automonique_runner::{ContainmentDomain, ContainmentLimits, LaunchPlan, RunContainment};
 use automonique_store::provider_journal::{
-    ProcessSpawn, ProcessState, ProviderJournal, SessionOpening, SessionState, TurnOpening,
-    TurnState,
+    ProcessSpawn, ProcessState, ProviderJournal, ReplayVersions, SessionOpening, SessionState,
+    TurnOpening, TurnState,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -34,6 +34,10 @@ fn restart_recovery_marks_an_orphaned_process_session_and_turn_lost() {
             attempt_id: "session-recovery",
             provider_kind: "fixture",
             executable_digest: &digest,
+            prompt_version: "prompt-v1",
+            tool_schema_version: "tools-v1",
+            model_id: "model-a",
+            force_version_change: false,
             spawned_ms: 1,
         })
         .unwrap();
@@ -133,6 +137,12 @@ fn turn_two_reuses_the_live_session_process_and_journals_both_turns() {
     let process = recovered.process.unwrap();
     assert_eq!(process.state, ProcessState::Exited);
     assert_eq!(process.executable_digest, plan.program_sha256());
+    assert_eq!(process.prompt_version.as_deref(), Some("provider-turn/v1"));
+    assert_eq!(
+        process.tool_schema_version.as_deref(),
+        Some("codex-jsonl/v1")
+    );
+    assert_eq!(process.model_id.as_deref(), Some("fixture-model"));
     let session = recovered.session.unwrap();
     assert_eq!(session.state, SessionState::Closed);
     let turns = journal.session_turns(session.session_id).unwrap();
@@ -153,10 +163,44 @@ fn turn_two_reuses_the_live_session_process_and_journals_both_turns() {
     assert_eq!(totals.requests, 2);
     assert_eq!(totals.input_tokens, 2);
     assert_eq!(totals.output_tokens, 2);
-    for turn in turns {
+    for (index, turn) in turns.into_iter().enumerate() {
         let usage = journal.turn_usage(turn.turn_id).unwrap().unwrap();
         assert_eq!(usage.gen_ai_system, "fixture");
         assert_eq!(usage.request_model.as_deref(), Some("fixture-model"));
         assert_eq!(usage.finish_reason.as_str(), "stop");
+        let requests = journal.turn_requests(turn.turn_id).unwrap();
+        assert_eq!(requests.len(), 1);
+        let turn_number = index + 1;
+        let prompt = if index == 0 { "first" } else { "second" };
+        let command = format!(
+            "{{\"type\":\"user\",\"turn_id\":\"turn-{turn_number}\",\"message\":\"{prompt}\"}}"
+        );
+        assert_eq!(
+            requests[0].canonical_payload.as_deref(),
+            Some(command.as_bytes())
+        );
+        let steps = journal.replay_steps(turn.turn_id).unwrap();
+        assert_eq!(steps.len(), 2);
+        let mut tape = journal
+            .offline_replay(
+                turn.turn_id,
+                ReplayVersions {
+                    prompt_version: "provider-turn/v1",
+                    tool_schema_version: "codex-jsonl/v1",
+                    model_id: "fixture-model",
+                },
+                false,
+            )
+            .unwrap();
+        let response = tape
+            .dispatch(
+                "provider_turn",
+                u64::try_from(turn_number).unwrap(),
+                &format!("turn-{turn_number}:user"),
+                command.as_bytes(),
+            )
+            .unwrap();
+        assert!(!response.is_empty());
+        tape.finish().unwrap();
     }
 }

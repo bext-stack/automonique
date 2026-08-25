@@ -213,6 +213,10 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
             attempt_id: "platform-live-attempt",
             provider_kind: "fake",
             executable_digest: "abababababababababababababababababababababababababababababababab",
+            prompt_version: "prompt-v1",
+            tool_schema_version: "tools-v1",
+            model_id: "model-a",
+            force_version_change: false,
             spawned_ms: 10,
         })
         .expect("process");

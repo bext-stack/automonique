@@ -505,6 +505,10 @@ impl Fixture {
                 provider_kind: "codex",
                 executable_digest:
                     "abababababababababababababababababababababababababababababababab",
+                prompt_version: "prompt-v1",
+                tool_schema_version: "tools-v1",
+                model_id: "model-a",
+                force_version_change: false,
                 spawned_ms: NOW_MS,
             })
             .expect("provider process");

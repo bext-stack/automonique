@@ -22,10 +22,10 @@ use automonique_agents::{
 use automonique_protocol::provenance::{CausationId, CorrelationId, Provenance, TraceId};
 use automonique_runner::{LaunchPlan, RunContainment, SandboxedSession, spawn_sandboxed_session};
 use automonique_store::provider_journal::{
-    CursorAdvance, FinishReason, ProcessExit, ProcessSpawn, ProcessState, ProcessTermination,
-    ProviderJournal, ProviderJournalError, RequestDirection, RequestRecord, RequestSettlement,
-    SessionClosing, SessionClosure, SessionOpening, SettledOutcome, TurnCompletion, TurnOpening,
-    TurnOutcome, TurnUsage,
+    CursorAdvance, FinishReason, MAX_REPLAY_PAYLOAD_BYTES, ProcessExit, ProcessSpawn, ProcessState,
+    ProcessTermination, ProviderJournal, ProviderJournalError, ReplayRecordKind, ReplayStepRecord,
+    RequestDirection, RequestRecord, RequestSettlement, SessionClosing, SessionClosure,
+    SessionOpening, SettledOutcome, TurnCompletion, TurnOpening, TurnOutcome, TurnUsage,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -212,6 +212,10 @@ impl ProviderSessionHost {
             attempt_id: session_key,
             provider_kind,
             executable_digest: plan.program_sha256(),
+            prompt_version: "provider-turn/v1",
+            tool_schema_version: "codex-jsonl/v1",
+            model_id: request_model.unwrap_or("provider-default"),
+            force_version_change: false,
             spawned_ms: now_ms,
         }) {
             Ok(receipt) => receipt,
@@ -310,7 +314,18 @@ impl ProviderSessionHost {
             request_key: &request_key,
             direction: RequestDirection::ToProvider,
             payload_digest: &digest,
+            canonical_payload: Some(&input),
             created_ms: now_ms,
+        })?;
+        self.journal.record_replay_step(ReplayStepRecord {
+            turn_id: opening.turn_id,
+            step_name: "provider_turn",
+            occurrence_index: opening.ordinal,
+            kind: ReplayRecordKind::Command,
+            correlation_id: &request_key,
+            canonical_bytes: &input,
+            forked_from_step_id: None,
+            recorded_ms: now_ms,
         })?;
 
         if let Err(error) = self
@@ -402,6 +417,18 @@ impl ProviderSessionHost {
             }
         };
         let response_digest = sha256(&response);
+        if !response.is_empty() && response.len() <= MAX_REPLAY_PAYLOAD_BYTES {
+            self.journal.record_replay_step(ReplayStepRecord {
+                turn_id: opening.turn_id,
+                step_name: "provider_turn",
+                occurrence_index: opening.ordinal,
+                kind: ReplayRecordKind::Notification,
+                correlation_id: &request_key,
+                canonical_bytes: &response,
+                forked_from_step_id: None,
+                recorded_ms: now_ms,
+            })?;
+        }
         let settlement = [RequestSettlement {
             request_key: &request_key,
             expected_revision: 1,

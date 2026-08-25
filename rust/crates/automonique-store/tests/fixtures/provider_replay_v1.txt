@@ -1,0 +1,4 @@
+command|lookup|1|correlation-1|{"key":"synthetic"}
+notification|lookup|1|correlation-1|{"value":"fixture"}
+command|render|1|correlation-2|{"value":"fixture"}
+notification|render|1|correlation-2|{"text":"ok"}
