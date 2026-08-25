@@ -1,0 +1,599 @@
+// SPDX-License-Identifier: Elastic-2.0
+
+//! Non-owning candidate process and its one-time warm-up channel.
+//!
+//! The source generation launches the exact binary selected by
+//! [`VerifiedCodeRelease`](crate::release_activation::VerifiedCodeRelease).
+//! The child inherits one private socket as stdin/stdout, proves that its own
+//! executable still has the verified digest, and reads the durable stores in
+//! SQLite read-only mode. It never acquires the control lock, opens a transport,
+//! migrates a database, or claims a lease. A warm child therefore remains a
+//! candidate: later handoff code must explicitly transfer authority before it
+//! can serve.
+
+use std::error::Error;
+use std::ffi::OsString;
+use std::fmt;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+
+use automonique_store::SCHEMA_VERSION;
+use automonique_store::generation_audit::GENERATION_AUDIT_SCHEMA_VERSION;
+use automonique_store::reload_audit::RELOAD_AUDIT_SCHEMA_VERSION;
+use nix::unistd::{geteuid, getppid};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::DaemonConfig;
+use crate::release_activation::VerifiedCodeRelease;
+
+const CHANNEL_SCHEMA: &str = "automonique.reload-candidate/v1";
+const MAX_CHANNEL_LINE_BYTES: u64 = 4 * 1024;
+const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateSpec {
+    pub reload_id: String,
+    pub source_holder_id: String,
+    pub source_lease_epoch: u64,
+    pub target_generation_id: String,
+    pub warm_timeout: Duration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateInput {
+    pub manifest_digest: String,
+    pub binary_sha256: String,
+    pub reload_id: String,
+    pub source_holder_id: String,
+    pub source_lease_epoch: u64,
+    pub target_generation_id: String,
+    pub expected_parent_pid: u32,
+}
+
+#[derive(Debug)]
+pub struct WarmCandidate {
+    child: Child,
+    channel: UnixStream,
+    identity: CandidateIdentity,
+    stopped: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateIdentity {
+    schema: String,
+    event: String,
+    reload_id: String,
+    target_generation_id: String,
+    manifest_digest: String,
+    binary_sha256: String,
+    pid: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateControl {
+    schema: String,
+    command: String,
+    reload_id: String,
+    target_generation_id: String,
+}
+
+#[derive(Debug)]
+pub enum CandidateError {
+    InvalidField(&'static str),
+    UnsafePath(&'static str),
+    DigestMismatch,
+    SchemaMismatch(&'static str),
+    Integrity(&'static str),
+    SourceLeaseChanged,
+    ParentChanged,
+    Protocol,
+    CandidateExited,
+    Io(std::io::Error),
+    Sqlite(rusqlite::Error),
+}
+
+impl CandidateError {
+    #[must_use]
+    pub const fn category(&self) -> &'static str {
+        match self {
+            Self::InvalidField(_) => "candidate_invalid_field",
+            Self::UnsafePath(_) => "candidate_unsafe_path",
+            Self::DigestMismatch => "candidate_digest_mismatch",
+            Self::SchemaMismatch(_) => "candidate_schema_mismatch",
+            Self::Integrity(_) => "candidate_integrity",
+            Self::SourceLeaseChanged => "candidate_source_lease_changed",
+            Self::ParentChanged => "candidate_parent_changed",
+            Self::Protocol => "candidate_protocol",
+            Self::CandidateExited => "candidate_exited",
+            Self::Io(_) => "candidate_io",
+            Self::Sqlite(_) => "candidate_sqlite",
+        }
+    }
+}
+
+impl fmt::Display for CandidateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.category())
+    }
+}
+
+impl Error for CandidateError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Sqlite(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for CandidateError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<rusqlite::Error> for CandidateError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sqlite(error)
+    }
+}
+
+/// Launch the exact verified release and wait for its non-owning warm proof.
+pub fn spawn_warm_candidate(
+    config: &DaemonConfig,
+    release: &VerifiedCodeRelease,
+    spec: &CandidateSpec,
+) -> Result<WarmCandidate, CandidateError> {
+    validate_identifier(&spec.reload_id, "reload_id")?;
+    validate_identifier(&spec.source_holder_id, "source_holder_id")?;
+    validate_identifier(&spec.target_generation_id, "target_generation_id")?;
+    if spec.source_lease_epoch == 0 || spec.warm_timeout.is_zero() {
+        return Err(CandidateError::InvalidField("candidate_spec"));
+    }
+    validate_digest(&release.manifest_digest, true, "manifest_digest")?;
+    validate_digest(&release.binary_sha256, false, "binary_sha256")?;
+
+    let (parent, child_channel) = UnixStream::pair()?;
+    parent.set_read_timeout(Some(spec.warm_timeout))?;
+    parent.set_write_timeout(Some(spec.warm_timeout))?;
+    let child_stdin: OwnedFd = child_channel.try_clone()?.into();
+    let child_stdout: OwnedFd = child_channel.into();
+    let parent_pid = std::process::id();
+    let arguments = candidate_arguments(release, spec, parent_pid);
+    let mut child = Command::new(release.binary_path())
+        .args(arguments)
+        .env("XDG_RUNTIME_DIR", &config.runtime_root)
+        .env("XDG_STATE_HOME", &config.state_root)
+        .stdin(Stdio::from(child_stdin))
+        .stdout(Stdio::from(child_stdout))
+        .stderr(Stdio::null())
+        .spawn()?;
+    let expected = CandidateIdentity {
+        schema: CHANNEL_SCHEMA.to_owned(),
+        event: "warm".to_owned(),
+        reload_id: spec.reload_id.clone(),
+        target_generation_id: spec.target_generation_id.clone(),
+        manifest_digest: release.manifest_digest.clone(),
+        binary_sha256: release.binary_sha256.clone(),
+        pid: child.id(),
+    };
+    let observed: CandidateIdentity = match read_message(&parent) {
+        Ok(observed) => observed,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    if observed != expected {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(CandidateError::Protocol);
+    }
+    Ok(WarmCandidate {
+        child,
+        channel: parent,
+        identity: observed,
+        stopped: false,
+    })
+}
+
+fn candidate_arguments(
+    release: &VerifiedCodeRelease,
+    spec: &CandidateSpec,
+    parent_pid: u32,
+) -> Vec<OsString> {
+    [
+        "__reload-candidate".into(),
+        "--manifest-digest".into(),
+        release.manifest_digest.clone().into(),
+        "--binary-sha256".into(),
+        release.binary_sha256.clone().into(),
+        "--reload-id".into(),
+        spec.reload_id.clone().into(),
+        "--source-holder".into(),
+        spec.source_holder_id.clone().into(),
+        "--source-epoch".into(),
+        spec.source_lease_epoch.to_string().into(),
+        "--generation-id".into(),
+        spec.target_generation_id.clone().into(),
+        "--parent-pid".into(),
+        parent_pid.to_string().into(),
+    ]
+    .into()
+}
+
+impl WarmCandidate {
+    #[must_use]
+    pub const fn pid(&self) -> u32 {
+        self.identity.pid
+    }
+
+    /// End a still-non-owning candidate and require a matching acknowledgement.
+    pub fn stop(mut self) -> Result<(), CandidateError> {
+        let control = CandidateControl {
+            schema: CHANNEL_SCHEMA.to_owned(),
+            command: "stop".to_owned(),
+            reload_id: self.identity.reload_id.clone(),
+            target_generation_id: self.identity.target_generation_id.clone(),
+        };
+        write_message(&mut self.channel, &control)?;
+        let mut expected = self.identity.clone();
+        expected.event = "stopped".to_owned();
+        let observed: CandidateIdentity = read_message(&self.channel)?;
+        if observed != expected {
+            return Err(CandidateError::Protocol);
+        }
+        if !self.child.wait()?.success() {
+            return Err(CandidateError::CandidateExited);
+        }
+        self.stopped = true;
+        Ok(())
+    }
+}
+
+impl Drop for WarmCandidate {
+    fn drop(&mut self) {
+        if !self.stopped {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// Candidate entry point used only by the private inherited channel.
+pub fn run_candidate(
+    config: &DaemonConfig,
+    input: CandidateInput,
+    mut reader: impl Read,
+    mut writer: impl Write,
+) -> Result<(), CandidateError> {
+    validate_input(&input)?;
+    if getppid().as_raw() as u32 != input.expected_parent_pid {
+        return Err(CandidateError::ParentChanged);
+    }
+    verify_own_binary(&input.binary_sha256)?;
+    warm_state(config, &input.source_holder_id, input.source_lease_epoch)?;
+    if getppid().as_raw() as u32 != input.expected_parent_pid {
+        return Err(CandidateError::ParentChanged);
+    }
+    let identity = CandidateIdentity {
+        schema: CHANNEL_SCHEMA.to_owned(),
+        event: "warm".to_owned(),
+        reload_id: input.reload_id,
+        target_generation_id: input.target_generation_id,
+        manifest_digest: input.manifest_digest,
+        binary_sha256: input.binary_sha256,
+        pid: std::process::id(),
+    };
+    write_message(&mut writer, &identity)?;
+    let control: CandidateControl = read_message_from(&mut reader)?;
+    if control.schema != CHANNEL_SCHEMA
+        || control.command != "stop"
+        || control.reload_id != identity.reload_id
+        || control.target_generation_id != identity.target_generation_id
+    {
+        return Err(CandidateError::Protocol);
+    }
+    let mut stopped = identity;
+    stopped.event = "stopped".to_owned();
+    write_message(&mut writer, &stopped)
+}
+
+fn validate_input(input: &CandidateInput) -> Result<(), CandidateError> {
+    validate_digest(&input.manifest_digest, true, "manifest_digest")?;
+    validate_digest(&input.binary_sha256, false, "binary_sha256")?;
+    validate_identifier(&input.reload_id, "reload_id")?;
+    validate_identifier(&input.source_holder_id, "source_holder_id")?;
+    validate_identifier(&input.target_generation_id, "target_generation_id")?;
+    if input.source_lease_epoch == 0 || input.expected_parent_pid == 0 {
+        return Err(CandidateError::InvalidField("candidate_input"));
+    }
+    Ok(())
+}
+
+fn verify_own_binary(expected: &str) -> Result<(), CandidateError> {
+    let path = std::env::current_exe()?;
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() == 0
+        || metadata.len() > MAX_BINARY_BYTES
+        || metadata.uid() != geteuid().as_raw()
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(CandidateError::UnsafePath("candidate_binary"));
+    }
+    let mut file = File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    if encode_hex(&digest.finalize()) == expected {
+        Ok(())
+    } else {
+        Err(CandidateError::DigestMismatch)
+    }
+}
+
+fn warm_state(
+    config: &DaemonConfig,
+    source_holder_id: &str,
+    source_lease_epoch: u64,
+) -> Result<(), CandidateError> {
+    super::validate_root(&config.runtime_root, "runtime root")
+        .map_err(|_| CandidateError::UnsafePath("runtime_root"))?;
+    super::validate_root(&config.state_root, "state root")
+        .map_err(|_| CandidateError::UnsafePath("state_root"))?;
+    super::validate_root(&config.runtime_dir(), "runtime directory")
+        .map_err(|_| CandidateError::UnsafePath("runtime_directory"))?;
+    super::validate_root(&config.state_dir(), "state directory")
+        .map_err(|_| CandidateError::UnsafePath("state_directory"))?;
+
+    let main = read_only_database(&config.database_path(), SCHEMA_VERSION, "main")?;
+    let lease = main
+        .query_row(
+            "SELECT lease_holder, lease_epoch FROM generations
+             WHERE generation_id = 'foreground'",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    if lease
+        != Some((
+            source_holder_id.to_owned(),
+            i64::try_from(source_lease_epoch)
+                .map_err(|_| CandidateError::InvalidField("source_lease_epoch"))?,
+        ))
+    {
+        return Err(CandidateError::SourceLeaseChanged);
+    }
+    drop(main);
+    drop(read_only_database(
+        &config.generation_audit_path(),
+        GENERATION_AUDIT_SCHEMA_VERSION,
+        "generation_audit",
+    )?);
+    drop(read_only_database(
+        &config.reload_audit_path(),
+        RELOAD_AUDIT_SCHEMA_VERSION,
+        "reload_audit",
+    )?);
+    Ok(())
+}
+
+fn read_only_database(
+    path: &Path,
+    expected_version: u32,
+    label: &'static str,
+) -> Result<Connection, CandidateError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != geteuid().as_raw()
+        || metadata.permissions().mode() & 0o7777 != 0o600
+    {
+        return Err(CandidateError::UnsafePath(label));
+    }
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    connection.busy_timeout(Duration::from_secs(2))?;
+    connection.pragma_update(None, "query_only", true)?;
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != expected_version {
+        return Err(CandidateError::SchemaMismatch(label));
+    }
+    let integrity: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(CandidateError::Integrity(label));
+    }
+    Ok(connection)
+}
+
+fn write_message(writer: &mut impl Write, value: &impl Serialize) -> Result<(), CandidateError> {
+    let bytes = serde_json::to_vec(value).map_err(|_| CandidateError::Protocol)?;
+    if bytes.is_empty() || bytes.len() as u64 >= MAX_CHANNEL_LINE_BYTES {
+        return Err(CandidateError::Protocol);
+    }
+    writer.write_all(&bytes)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn read_message<T: for<'de> Deserialize<'de>>(channel: &UnixStream) -> Result<T, CandidateError> {
+    read_message_from(&mut BufReader::new(channel))
+}
+
+fn read_message_from<T: for<'de> Deserialize<'de>>(
+    reader: &mut impl Read,
+) -> Result<T, CandidateError> {
+    let mut line = Vec::new();
+    let read = BufReader::new(reader)
+        .take(MAX_CHANNEL_LINE_BYTES)
+        .read_until(b'\n', &mut line)?;
+    if read == 0 || read as u64 == MAX_CHANNEL_LINE_BYTES || line.last() != Some(&b'\n') {
+        return Err(CandidateError::Protocol);
+    }
+    line.pop();
+    serde_json::from_slice(&line).map_err(|_| CandidateError::Protocol)
+}
+
+fn validate_identifier(value: &str, field: &'static str) -> Result<(), CandidateError> {
+    if value.is_empty()
+        || value.len() > 256
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(CandidateError::InvalidField(field));
+    }
+    Ok(())
+}
+
+fn validate_digest(value: &str, prefixed: bool, field: &'static str) -> Result<(), CandidateError> {
+    let value = if prefixed {
+        value
+            .strip_prefix("sha256:")
+            .ok_or(CandidateError::InvalidField(field))?
+    } else {
+        value
+    };
+    if value.len() != 64
+        || value
+            .bytes()
+            .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+    {
+        return Err(CandidateError::InvalidField(field));
+    }
+    Ok(())
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_is_closed_bounded_and_identity_bound() {
+        let identity = CandidateIdentity {
+            schema: CHANNEL_SCHEMA.to_owned(),
+            event: "warm".to_owned(),
+            reload_id: "reload-1".to_owned(),
+            target_generation_id: "generation-2".to_owned(),
+            manifest_digest: format!("sha256:{}", "a".repeat(64)),
+            binary_sha256: "b".repeat(64),
+            pid: 42,
+        };
+        let mut bytes = Vec::new();
+        write_message(&mut bytes, &identity).expect("encode");
+        assert_eq!(
+            read_message_from::<CandidateIdentity>(&mut bytes.as_slice()).expect("decode"),
+            identity
+        );
+
+        let unknown = br#"{"schema":"automonique.reload-candidate/v1","event":"warm","reload_id":"reload-1","target_generation_id":"generation-2","manifest_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binary_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","pid":42,"extra":true}\n"#;
+        assert!(matches!(
+            read_message_from::<CandidateIdentity>(&mut unknown.as_slice()),
+            Err(CandidateError::Protocol)
+        ));
+        let oversized = vec![b'x'; MAX_CHANNEL_LINE_BYTES as usize];
+        assert!(matches!(
+            read_message_from::<CandidateIdentity>(&mut oversized.as_slice()),
+            Err(CandidateError::Protocol)
+        ));
+    }
+
+    #[test]
+    fn warm_state_is_read_only_and_bound_to_the_source_lease() {
+        let root = tempfile::tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("private");
+        let runtime_root = root.path().join("runtime");
+        let state_root = root.path().join("state");
+        for path in [&runtime_root, &state_root] {
+            fs::create_dir(path).expect("root child");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("private");
+        }
+        let config = DaemonConfig {
+            runtime_root,
+            state_root,
+        };
+        for path in [config.runtime_dir(), config.state_dir()] {
+            fs::create_dir(&path).expect("product dir");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("private");
+        }
+        create_database(&config.database_path(), SCHEMA_VERSION, true);
+        create_database(
+            &config.generation_audit_path(),
+            GENERATION_AUDIT_SCHEMA_VERSION,
+            false,
+        );
+        create_database(
+            &config.reload_audit_path(),
+            RELOAD_AUDIT_SCHEMA_VERSION,
+            false,
+        );
+
+        warm_state(&config, "holder-1", 7).expect("warm");
+        assert!(matches!(
+            warm_state(&config, "holder-1", 8),
+            Err(CandidateError::SourceLeaseChanged)
+        ));
+        let version: u32 = Connection::open(config.database_path())
+            .expect("open")
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, SCHEMA_VERSION, "warm-up migrated no state");
+    }
+
+    fn create_database(path: &Path, version: u32, main: bool) {
+        let connection = Connection::open(path).expect("database");
+        connection
+            .pragma_update(None, "user_version", version)
+            .expect("version");
+        if main {
+            connection
+                .execute_batch(
+                    "CREATE TABLE generations (
+                        generation_id TEXT PRIMARY KEY,
+                        lease_holder TEXT NOT NULL,
+                        lease_epoch INTEGER NOT NULL
+                    ) STRICT;
+                    INSERT INTO generations VALUES ('foreground', 'holder-1', 7);",
+                )
+                .expect("lease");
+        }
+        drop(connection);
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private database");
+    }
+}

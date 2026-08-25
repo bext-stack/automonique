@@ -94,6 +94,19 @@ pub struct VerifiedCodeRelease {
     pub kind: ReleaseKind,
     pub skill_manifest_digest: Option<String>,
     release_target: PathBuf,
+    binary_path: PathBuf,
+}
+
+impl VerifiedCodeRelease {
+    /// Exact absolute binary whose bytes were checked against the manifest.
+    ///
+    /// Candidate handoff launches this path directly. Returning the verified
+    /// path keeps process selection coupled to the checksum decision instead
+    /// of asking the lifecycle code to reconstruct it from release metadata.
+    #[must_use]
+    pub fn binary_path(&self) -> &Path {
+        &self.binary_path
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -419,6 +432,7 @@ impl<S: ReleaseSupervisor> CodeReleaseActivator<S> {
             kind,
             skill_manifest_digest: manifest.skill_manifest_digest,
             release_target: relative,
+            binary_path: binary,
         })
     }
 }

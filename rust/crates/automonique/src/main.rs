@@ -6,6 +6,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 fn main() -> ExitCode {
     let mut arguments = std::env::args_os().skip(1);
     let command = arguments.next();
+    if command.as_deref() == Some(std::ffi::OsStr::new("__reload-candidate")) {
+        return reload_candidate_command(arguments.collect());
+    }
     if command.as_deref() == Some(std::ffi::OsStr::new("__doctor-sandbox-probe")) {
         if arguments.next().is_some() {
             return ExitCode::from(2);
@@ -131,6 +134,88 @@ fn main() -> ExitCode {
         std::io::stdout().lock(),
         std::io::stderr().lock(),
     ))
+}
+
+fn reload_candidate_command(values: Vec<std::ffi::OsString>) -> ExitCode {
+    let [
+        manifest_flag,
+        manifest,
+        binary_flag,
+        binary,
+        reload_flag,
+        reload_id,
+        source_flag,
+        source_holder,
+        epoch_flag,
+        epoch,
+        generation_flag,
+        generation_id,
+        parent_flag,
+        parent_pid,
+    ] = values.as_slice()
+    else {
+        return ExitCode::from(2);
+    };
+    if manifest_flag != "--manifest-digest"
+        || binary_flag != "--binary-sha256"
+        || reload_flag != "--reload-id"
+        || source_flag != "--source-holder"
+        || epoch_flag != "--source-epoch"
+        || generation_flag != "--generation-id"
+        || parent_flag != "--parent-pid"
+    {
+        return ExitCode::from(2);
+    }
+    let Some(input) = manifest
+        .to_str()
+        .zip(binary.to_str())
+        .zip(reload_id.to_str())
+        .zip(source_holder.to_str())
+        .zip(epoch.to_str().and_then(|value| value.parse::<u64>().ok()))
+        .zip(generation_id.to_str())
+        .zip(
+            parent_pid
+                .to_str()
+                .and_then(|value| value.parse::<u32>().ok()),
+        )
+        .map(
+            |(
+                (
+                    (
+                        (((manifest_digest, binary_sha256), reload_id), source_holder_id),
+                        source_lease_epoch,
+                    ),
+                    target_generation_id,
+                ),
+                expected_parent_pid,
+            )| {
+                automonique_daemon::candidate::CandidateInput {
+                    manifest_digest: manifest_digest.to_owned(),
+                    binary_sha256: binary_sha256.to_owned(),
+                    reload_id: reload_id.to_owned(),
+                    source_holder_id: source_holder_id.to_owned(),
+                    source_lease_epoch,
+                    target_generation_id: target_generation_id.to_owned(),
+                    expected_parent_pid,
+                }
+            },
+        )
+    else {
+        return ExitCode::from(2);
+    };
+    let config = match automonique_daemon::DaemonConfig::from_environment() {
+        Ok(config) => config,
+        Err(_) => return ExitCode::FAILURE,
+    };
+    match automonique_daemon::candidate::run_candidate(
+        &config,
+        input,
+        std::io::stdin().lock(),
+        std::io::stdout().lock(),
+    ) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(_) => ExitCode::FAILURE,
+    }
 }
 
 struct PlatformJobArguments {

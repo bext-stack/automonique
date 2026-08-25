@@ -175,6 +175,7 @@ pub mod approval_policy;
 pub mod ask;
 pub mod attempt_host;
 pub mod cancel_custody;
+pub mod candidate;
 pub mod codex_usage;
 pub mod compose;
 mod control_lock;

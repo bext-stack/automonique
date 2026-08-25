@@ -20,6 +20,7 @@ serde_json.workspace = true
 automonique-store = { path = "../automonique-store" }
 nix.workspace = true
 rusqlite.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 
 [lints]
