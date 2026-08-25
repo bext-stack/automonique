@@ -77,6 +77,16 @@ jobs:
           cargo test --workspace --all-targets --offline --locked
           cargo clippy --workspace --all-targets --offline --locked -- -D warnings
 
+      # `automonique-daemon/tests/reload_fault_refusal.rs` compiles only in a
+      # build without the `reload-fault-injection` feature. The workspace run
+      # above unifies that feature in through the binary crate's
+      # dev-dependency and compiles the test to nothing, so the guarantee it
+      # holds — a shipping build refuses to open while a fault is scripted —
+      # is gated here, in the one build that can prove it.
+      - name: The build without fault injection refuses a scripted fault
+        working-directory: rust
+        run: cargo test -p automonique-daemon --test reload_fault_refusal --offline --locked
+
       - name: Locked shared platform client checks
         working-directory: sdk/rust/platform-client
         run: |

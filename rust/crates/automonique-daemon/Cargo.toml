@@ -54,5 +54,12 @@ ureq.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 
+[features]
+# Typed fault injection for the generation handoff, consumed by the process-
+# level failure-matrix tests in the `automonique` binary crate. Off in every
+# shipping build, and a daemon built without it refuses to open while the
+# fault environment variable is set. See `reload_faults`.
+reload-fault-injection = []
+
 [lints]
 workspace = true

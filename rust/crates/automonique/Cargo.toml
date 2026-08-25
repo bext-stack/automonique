@@ -17,6 +17,11 @@ automonique-protocol = { path = "../automonique-protocol" }
 serde_json.workspace = true
 
 [dev-dependencies]
+# The failure-matrix tests script real faults into the handoff; the feature
+# reaches the test-built binary through cargo's feature unification and no
+# release build enables it.
+automonique-daemon = { path = "../automonique-daemon", features = ["reload-fault-injection"] }
+automonique-runner = { path = "../automonique-runner" }
 automonique-store = { path = "../automonique-store" }
 nix.workspace = true
 rusqlite.workspace = true
