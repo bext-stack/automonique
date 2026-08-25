@@ -1975,6 +1975,29 @@ impl Daemon {
             .map(attempt_adoption::AttemptAdoptionEndpoint::route)
     }
 
+    /// Duplicate the exact listener and locked open-file description for a
+    /// warmed child. Possessing these descriptors grants no durable lease;
+    /// candidate activation must still validate and transfer that authority.
+    pub fn candidate_transfer_descriptors(
+        &self,
+    ) -> Result<candidate::CandidateTransferDescriptors, DaemonError> {
+        let listener = self.listener.try_clone()?;
+        let control_lock = self
+            ._control_lock
+            .duplicate()
+            .map_err(|error| match error {
+                control_lock::ControlLockError::Io(error) => DaemonError::Io(error),
+                control_lock::ControlLockError::Held => DaemonError::AlreadyRunning,
+                control_lock::ControlLockError::InsecurePath => {
+                    DaemonError::ControlLockFailed("insecure_path")
+                }
+            })?;
+        Ok(candidate::CandidateTransferDescriptors::new(
+            listener,
+            control_lock,
+        ))
+    }
+
     /// This daemon's live progress replay, when it has an execution lane.
     ///
     /// The seam a renderer holds. Shared rather than lent: a chat bridge polls

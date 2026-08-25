@@ -8,19 +8,20 @@
 //! own file lifecycle and creates stale-inode split-brain hazards.
 
 use std::fs::{self, File, OpenOptions};
+use std::os::fd::AsRawFd as _;
 #[cfg(test)]
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 use nix::errno::Errno;
-use nix::fcntl::{Flock, FlockArg};
+use nix::fcntl::FlockArg;
 use nix::unistd::geteuid;
 
 /// A held exclusive lock. Dropping it releases the kernel lock immediately.
 #[derive(Debug)]
 pub struct ControlLock {
-    _file: Flock<File>,
+    file: File,
 }
 
 /// Why the state-root lock could not be acquired.
@@ -47,20 +48,49 @@ impl ControlLock {
             .open(path)
             .map_err(ControlLockError::Io)?;
         let before = validate(&file, path)?;
-        let locked =
-            Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_file, error)| {
-                if error == Errno::EWOULDBLOCK || error == Errno::EAGAIN {
-                    ControlLockError::Held
-                } else {
-                    ControlLockError::Io(std::io::Error::from_raw_os_error(error as i32))
-                }
-            })?;
-        let after = validate(&locked, path)?;
+        lock(&file)?;
+        let after = validate(&file, path)?;
         if before != after {
             return Err(ControlLockError::InsecurePath);
         }
-        Ok(Self { _file: locked })
+        Ok(Self { file })
     }
+
+    /// Duplicate the locked open-file description for a handoff peer.
+    pub(crate) fn duplicate(&self) -> Result<File, ControlLockError> {
+        self.file.try_clone().map_err(ControlLockError::Io)
+    }
+
+    /// Adopt a duplicated lock descriptor received over the private handoff.
+    ///
+    /// Re-locking a duplicate is idempotent because both descriptors reference
+    /// the same kernel open-file description. The named inode is checked before
+    /// and after so a swapped lock path cannot become the generation fence.
+    pub(crate) fn adopt(file: File, path: impl AsRef<Path>) -> Result<Self, ControlLockError> {
+        let path = path.as_ref();
+        let before = validate(&file, path)?;
+        lock(&file)?;
+        let after = validate(&file, path)?;
+        if before != after {
+            return Err(ControlLockError::InsecurePath);
+        }
+        Ok(Self { file })
+    }
+}
+
+fn lock(file: &File) -> Result<(), ControlLockError> {
+    // `nix::fcntl::Flock` explicitly unlocks on every wrapper drop, which is
+    // wrong for a duplicated open-file description: dropping the source
+    // wrapper would unlock the candidate's duplicate too. The syscall-shaped
+    // API leaves the kernel lock attached until the final duplicate closes.
+    #[allow(deprecated)]
+    nix::fcntl::flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock).map_err(|error| {
+        if error == Errno::EWOULDBLOCK || error == Errno::EAGAIN {
+            ControlLockError::Held
+        } else {
+            ControlLockError::Io(std::io::Error::from_raw_os_error(error as i32))
+        }
+    })
 }
 
 fn validate(file: &File, path: &Path) -> Result<(u64, u64), ControlLockError> {
@@ -121,5 +151,23 @@ mod tests {
             ControlLock::acquire(&link),
             Err(ControlLockError::Io(_))
         ));
+    }
+
+    #[test]
+    fn a_duplicated_lock_transfers_without_an_unlocked_window() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("private root");
+        let path = directory.path().join("daemon.lock");
+        let first = ControlLock::acquire(&path).expect("first holder");
+        let inherited = first.duplicate().expect("duplicate descriptor");
+        let successor = ControlLock::adopt(inherited, &path).expect("adopt duplicate");
+        drop(first);
+        assert!(matches!(
+            ControlLock::acquire(&path),
+            Err(ControlLockError::Held)
+        ));
+        drop(successor);
+        ControlLock::acquire(&path).expect("lock releases with the last duplicate");
     }
 }

@@ -17,8 +17,8 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::net::UnixStream;
+use std::os::unix::fs::{FileTypeExt as _, MetadataExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -34,6 +34,7 @@ use sha2::{Digest, Sha256};
 use crate::DaemonConfig;
 use crate::attempt_adoption::{AttemptAdoptionClient, socket_path as attempt_adoption_socket_path};
 use crate::attempt_host::MAX_ATTEMPT_REGISTRATIONS;
+use crate::control_lock::{ControlLock, ControlLockError};
 use crate::lease_identity::{ProcessIdentity, ProcessIdentityError};
 use crate::release_activation::VerifiedCodeRelease;
 
@@ -83,6 +84,70 @@ pub struct CandidateLeaseTarget {
     pub boot_id: String,
     pub pid: u32,
     pub starttime: u64,
+}
+
+/// Duplicated kernel capabilities the source may send only to its warmed child.
+pub struct CandidateTransferDescriptors {
+    admin_listener: UnixListener,
+    control_lock: File,
+}
+
+impl CandidateTransferDescriptors {
+    pub(crate) const fn new(admin_listener: UnixListener, control_lock: File) -> Self {
+        Self {
+            admin_listener,
+            control_lock,
+        }
+    }
+}
+
+/// Validated listener and continuously-held generation lock for activation.
+pub struct AdoptedCandidateResources {
+    admin_listener: UnixListener,
+    _control_lock: ControlLock,
+}
+
+impl AdoptedCandidateResources {
+    /// Validate descriptors duplicated by the source against the configured
+    /// named inodes. No bind or unlocked interval occurs here.
+    pub fn adopt(
+        config: &DaemonConfig,
+        descriptors: CandidateTransferDescriptors,
+    ) -> Result<Self, CandidateError> {
+        let local = descriptors.admin_listener.local_addr()?;
+        if local.as_pathname() != Some(config.admin_socket().as_path()) {
+            return Err(CandidateError::UnsafePath("admin_listener"));
+        }
+        let metadata = fs::symlink_metadata(config.admin_socket())?;
+        if !metadata.file_type().is_socket()
+            || metadata.uid() != geteuid().as_raw()
+            || metadata.permissions().mode() & 0o7777 != 0o600
+        {
+            return Err(CandidateError::UnsafePath("admin_listener"));
+        }
+        let control_lock = ControlLock::adopt(descriptors.control_lock, config.control_lock_path())
+            .map_err(map_control_lock)?;
+        Ok(Self {
+            admin_listener: descriptors.admin_listener,
+            _control_lock: control_lock,
+        })
+    }
+
+    #[must_use]
+    pub fn admin_socket(&self) -> Option<std::path::PathBuf> {
+        self.admin_listener
+            .local_addr()
+            .ok()
+            .and_then(|address| address.as_pathname().map(Path::to_path_buf))
+    }
+}
+
+fn map_control_lock(error: ControlLockError) -> CandidateError {
+    match error {
+        ControlLockError::Io(error) => CandidateError::Io(error),
+        ControlLockError::Held => CandidateError::Protocol,
+        ControlLockError::InsecurePath => CandidateError::UnsafePath("control_lock"),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -695,6 +760,46 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
         assert_eq!(version, SCHEMA_VERSION, "warm-up migrated no state");
+    }
+
+    #[test]
+    fn listener_and_lock_capabilities_transfer_without_rebinding_or_unlocking() {
+        let root = tempfile::tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("private");
+        let runtime_root = root.path().join("runtime");
+        let state_root = root.path().join("state");
+        for path in [&runtime_root, &state_root] {
+            fs::create_dir(path).expect("root child");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("private");
+        }
+        let config = DaemonConfig {
+            runtime_root,
+            state_root,
+        };
+        let daemon = crate::Daemon::open(&config).expect("source daemon");
+        let adopted = AdoptedCandidateResources::adopt(
+            &config,
+            daemon
+                .candidate_transfer_descriptors()
+                .expect("duplicate capabilities"),
+        )
+        .expect("candidate adopts capabilities");
+        assert_eq!(
+            adopted.admin_socket().as_deref(),
+            Some(config.admin_socket().as_path())
+        );
+        assert!(matches!(
+            ControlLock::acquire(config.control_lock_path()),
+            Err(ControlLockError::Held)
+        ));
+
+        drop(daemon);
+        assert!(matches!(
+            ControlLock::acquire(config.control_lock_path()),
+            Err(ControlLockError::Held)
+        ));
+        drop(adopted);
+        ControlLock::acquire(config.control_lock_path()).expect("final duplicate releases lock");
     }
 
     fn create_database(path: &Path, version: u32, main: bool) {
