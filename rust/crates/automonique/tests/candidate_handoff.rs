@@ -5,11 +5,14 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use automonique_daemon::attempt_adoption::AttemptAdoptionClient;
 use automonique_daemon::candidate::{CandidateSpec, spawn_warm_candidate};
 use automonique_daemon::release_activation::{CodeReleaseActivator, SystemdUserSupervisor};
 use automonique_daemon::{Daemon, DaemonConfig};
+use automonique_store::reload_audit::ReloadPhase;
 use automonique_store::{LeaseOwnerIdentity, LeaseTimeSource, LeaseTransferRequest, Store};
 use nix::sys::time::TimeValLike;
 use nix::time::ClockId;
@@ -103,6 +106,9 @@ fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
         .prepare_transfer(transfer_descriptors)
         .expect("candidate validates transferred listener and lock");
     assert!(candidate.is_transfer_ready());
+    source
+        .quiesce_for_handoff()
+        .expect("source stops intake while retaining attempts");
 
     let target = candidate.lease_target();
     let mut store =
@@ -146,8 +152,11 @@ fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
             .category(),
         "candidate_protocol"
     );
+    let cleanup = source
+        .relinquish_endpoint_cleanup()
+        .expect("source transfers exact socket cleanup");
     candidate
-        .activate_serving()
+        .activate_serving(cleanup)
         .expect("candidate starts inherited endpoints and workers");
     let status = Command::new(env!("CARGO_BIN_EXE_automonique"))
         .args(["status", "--json"])
@@ -158,6 +167,9 @@ fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
     assert!(status.status.success(), "candidate serves admin status");
     let status = String::from_utf8(status.stdout).expect("status UTF-8");
     assert!(status.contains(&target.holder_id));
+    source
+        .retire_after_handoff()
+        .expect("source drains before injected post-drain failure");
     candidate
         .quiesce()
         .expect("candidate drains while retaining authority");
@@ -180,7 +192,225 @@ fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
     candidate
         .confirm_relinquished(&returned.lease)
         .expect("candidate observes returned authority");
+    source
+        .accept_returned_authority(&returned.lease)
+        .expect("source records and projects returned authority");
+    source
+        .resume_endpoint_cleanup()
+        .expect("source resumes exact socket cleanup");
+    source
+        .resume_after_handoff()
+        .expect("source rebuilds stopped workers at returned epoch");
+    let returned_route = source
+        .attempt_adoption_route()
+        .expect("returned source attempt route");
+    assert_eq!(returned_route.holder_id, source_lease.holder_id);
+    assert_eq!(returned_route.lease_epoch, returned.lease.epoch);
+    let returned_inventory = AttemptAdoptionClient::new(
+        returned_route.socket_path,
+        &returned_route.holder_id,
+        returned_route.lease_epoch,
+    )
+    .expect("returned source route client")
+    .inventory()
+    .expect("returned source route inventory");
+    assert!(returned_inventory.attempt_ids.is_empty());
+    let returned_tenure: (String, u64) = Connection::open(config.generation_audit_path())
+        .expect("generation audit")
+        .query_row(
+            "SELECT holder_id, lease_epoch FROM generation_tenures
+             WHERE generation_id = 'foreground' AND end_kind IS NULL",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("returned source tenure");
+    assert_eq!(
+        returned_tenure,
+        (source_lease.holder_id.clone(), returned.lease.epoch)
+    );
     candidate.stop().expect("candidate stopped");
+    assert!(config.admin_socket().exists());
+    assert!(config.progress_socket().exists());
+
+    let committed = source
+        .handoff_to_verified_release("reload-process-commit", release)
+        .expect("ten-phase process handoff succeeds");
+    assert_eq!(committed.phase, ReloadPhase::Succeeded);
+    assert_eq!(
+        fs::read_link(release_root.join("current")).expect("selected release link"),
+        Path::new("releases").join(&manifest_digest)
+    );
+    let committed_holder = read_source_lease(&config.database_path()).holder_id;
+    drop(source);
+
+    let committed_status = Command::new(env!("CARGO_BIN_EXE_automonique"))
+        .args(["status", "--json"])
+        .env("XDG_RUNTIME_DIR", &config.runtime_root)
+        .env("XDG_STATE_HOME", &config.state_root)
+        .output()
+        .expect("committed candidate status");
+    assert!(
+        committed_status.status.success(),
+        "committed candidate survives source and handle drop"
+    );
+    assert!(
+        String::from_utf8(committed_status.stdout)
+            .expect("committed status UTF-8")
+            .contains(&committed_holder)
+    );
+    let shutdown = Command::new(env!("CARGO_BIN_EXE_automonique"))
+        .arg("shutdown")
+        .env("XDG_RUNTIME_DIR", &config.runtime_root)
+        .env("XDG_STATE_HOME", &config.state_root)
+        .output()
+        .expect("committed candidate shutdown");
+    assert!(shutdown.status.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (config.admin_socket().exists() || config.progress_socket().exists())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!config.admin_socket().exists());
+    assert!(!config.progress_socket().exists());
+}
+
+#[test]
+fn authenticated_reload_command_hands_off_and_retires_the_source() {
+    let root = tempfile::tempdir().expect("temporary root");
+    private_directory(root.path());
+    let runtime_root = root.path().join("runtime");
+    let state_root = root.path().join("state");
+    private_directory(&runtime_root);
+    private_directory(&state_root);
+    let config = DaemonConfig {
+        runtime_root,
+        state_root,
+    };
+    let daemon = Daemon::open(&config).expect("source daemon");
+
+    let release_root = config.state_dir().join("improvement-code");
+    private_directory(&release_root);
+    private_directory(&release_root.join("releases"));
+    let executable = fs::read(env!("CARGO_BIN_EXE_automonique")).expect("candidate binary");
+    let previous_digest = install_code_release(&release_root, &executable, 'a');
+    let manifest_digest = install_code_release(&release_root, &executable, 'c');
+    std::os::unix::fs::symlink(
+        Path::new("releases").join(&previous_digest),
+        release_root.join("current"),
+    )
+    .expect("initial current release");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let serve_stop = Arc::clone(&stop);
+    let source = std::thread::spawn(move || daemon.serve(&serve_stop));
+    let digest = format!("sha256:{manifest_digest}");
+    let reload = Command::new(env!("CARGO_BIN_EXE_automonique"))
+        .args(["reload", &digest])
+        .env("XDG_RUNTIME_DIR", &config.runtime_root)
+        .env("XDG_STATE_HOME", &config.state_root)
+        .output()
+        .expect("reload command");
+    assert!(
+        reload.status.success(),
+        "reload command failed: {}",
+        String::from_utf8_lossy(&reload.stderr)
+    );
+    let output = String::from_utf8(reload.stdout).expect("reload output UTF-8");
+    assert!(output.starts_with("reload reload-1-"));
+    assert!(output.ends_with(" accepted\n"));
+    let reload_id = output
+        .strip_prefix("reload ")
+        .and_then(|output| output.strip_suffix(" accepted\n"))
+        .expect("accepted reload ID");
+    source
+        .join()
+        .expect("source serve thread")
+        .expect("source retires without releasing transferred authority");
+
+    let reload_status = Command::new(env!("CARGO_BIN_EXE_automonique"))
+        .args(["reload-status", reload_id])
+        .env("XDG_RUNTIME_DIR", &config.runtime_root)
+        .env("XDG_STATE_HOME", &config.state_root)
+        .output()
+        .expect("reload status command");
+    assert!(
+        reload_status.status.success(),
+        "reload status failed: {}",
+        String::from_utf8_lossy(&reload_status.stderr)
+    );
+    assert!(
+        String::from_utf8(reload_status.stdout)
+            .expect("reload status UTF-8")
+            .contains(" phase=succeeded ")
+    );
+
+    assert_eq!(
+        fs::read_link(release_root.join("current")).expect("selected release link"),
+        Path::new("releases").join(&manifest_digest)
+    );
+    assert_eq!(
+        fs::read_link(release_root.join("previous")).expect("retained release link"),
+        Path::new("releases").join(&previous_digest)
+    );
+    let rollback = Command::new(env!("CARGO_BIN_EXE_automonique"))
+        .args(["rollback", "--wait"])
+        .env("XDG_RUNTIME_DIR", &config.runtime_root)
+        .env("XDG_STATE_HOME", &config.state_root)
+        .output()
+        .expect("rollback command");
+    assert!(
+        rollback.status.success(),
+        "rollback command failed: {}",
+        String::from_utf8_lossy(&rollback.stderr)
+    );
+    assert!(
+        String::from_utf8(rollback.stdout)
+            .expect("rollback output UTF-8")
+            .starts_with("rollback rollback-2-")
+    );
+    assert_eq!(
+        fs::read_link(release_root.join("current")).expect("rolled back release link"),
+        Path::new("releases").join(&previous_digest)
+    );
+    let repeated = Command::new(env!("CARGO_BIN_EXE_automonique"))
+        .arg("rollback")
+        .env("XDG_RUNTIME_DIR", &config.runtime_root)
+        .env("XDG_STATE_HOME", &config.state_root)
+        .output()
+        .expect("repeated rollback command");
+    assert!(!repeated.status.success());
+    assert_eq!(
+        String::from_utf8(repeated.stderr).expect("refusal UTF-8"),
+        "automonique rollback refused: rollback_unavailable\n"
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_automonique"))
+        .args(["status", "--json"])
+        .env("XDG_RUNTIME_DIR", &config.runtime_root)
+        .env("XDG_STATE_HOME", &config.state_root)
+        .output()
+        .expect("candidate status");
+    assert!(
+        status.status.success(),
+        "candidate owns the inherited endpoint"
+    );
+
+    let shutdown = Command::new(env!("CARGO_BIN_EXE_automonique"))
+        .arg("shutdown")
+        .env("XDG_RUNTIME_DIR", &config.runtime_root)
+        .env("XDG_STATE_HOME", &config.state_root)
+        .output()
+        .expect("candidate shutdown");
+    assert!(shutdown.status.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (config.admin_socket().exists() || config.progress_socket().exists())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!config.admin_socket().exists());
+    assert!(!config.progress_socket().exists());
 }
 
 struct SourceLease {
@@ -236,6 +466,36 @@ fn unix_millis() -> i64 {
 fn private_directory(path: &Path) {
     fs::create_dir_all(path).expect("private directory");
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("private mode");
+}
+
+fn install_code_release(root: &Path, executable: &[u8], source: char) -> String {
+    let binary_sha256 = hex(&Sha256::digest(executable));
+    let manifest = serde_json::json!({
+        "schema": "automonique.code-release/v1",
+        "source_sha": source.to_string().repeat(40),
+        "plan_digest": format!("sha256:{}", source.to_string().repeat(64)),
+        "binary_path": "bin/automonique",
+        "binary_sha256": binary_sha256,
+        "changed_paths": ["rust/crates/automonique-cli/src/lib.rs"]
+    });
+    let manifest = serde_json::to_vec(&manifest).expect("manifest");
+    let manifest_digest = hex(&Sha256::digest(&manifest));
+    let release_dir = root.join("releases").join(&manifest_digest);
+    private_directory(&release_dir);
+    private_directory(&release_dir.join("bin"));
+    fs::write(release_dir.join("manifest.json"), manifest).expect("manifest file");
+    fs::write(release_dir.join("bin/automonique"), executable).expect("binary file");
+    fs::set_permissions(
+        release_dir.join("manifest.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("manifest mode");
+    fs::set_permissions(
+        release_dir.join("bin/automonique"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .expect("binary mode");
+    manifest_digest
 }
 
 fn hex(bytes: &[u8]) -> String {

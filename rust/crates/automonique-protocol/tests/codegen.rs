@@ -2632,6 +2632,12 @@ mod command_surface {
             AdminRequest::new(id.clone(), AdminCommand::Status),
             AdminRequest::new(id.clone(), AdminCommand::Metrics),
             AdminRequest::new(id.clone(), AdminCommand::Generations),
+            AdminRequest::reload(
+                id.clone(),
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .expect("a reload request"),
+            AdminRequest::new(id.clone(), AdminCommand::Rollback),
             AdminRequest::reload_status(id.clone(), "reload-1").expect("a reload lookup"),
             AdminRequest::new(id.clone(), AdminCommand::Shutdown),
             AdminRequest::submit(
@@ -2677,6 +2683,8 @@ mod command_surface {
             AdminCommand::Status,
             AdminCommand::Metrics,
             AdminCommand::Generations,
+            AdminCommand::Reload,
+            AdminCommand::Rollback,
             AdminCommand::ReloadStatus,
             AdminCommand::SubmitSynthetic,
             AdminCommand::SubmitRun,
@@ -2692,6 +2700,8 @@ mod command_surface {
                 AdminCommand::Status
                 | AdminCommand::Metrics
                 | AdminCommand::Generations
+                | AdminCommand::Reload
+                | AdminCommand::Rollback
                 | AdminCommand::ReloadStatus
                 | AdminCommand::SubmitSynthetic
                 | AdminCommand::SubmitRun
@@ -2864,6 +2874,22 @@ mod command_surface {
                 pause_id: 1,
                 revision: 2,
             },
+            AdminResponse::ReloadSucceeded {
+                request_id: id.clone(),
+                reload_id: "reload-1".to_owned(),
+            },
+            AdminResponse::ReloadAccepted {
+                request_id: id.clone(),
+                reload_id: "reload-accepted-1".to_owned(),
+            },
+            AdminResponse::RollbackSucceeded {
+                request_id: id.clone(),
+                reload_id: "reload-2".to_owned(),
+            },
+            AdminResponse::RollbackAccepted {
+                request_id: id.clone(),
+                reload_id: "rollback-accepted-1".to_owned(),
+            },
             AdminResponse::Refused {
                 request_id: id.clone(),
                 category: AdminRefusalCategory::new("intake_paused").expect("a category"),
@@ -2878,6 +2904,10 @@ mod command_surface {
                 | AdminResponse::Metrics { .. }
                 | AdminResponse::Generations { .. }
                 | AdminResponse::ReloadStatus { .. }
+                | AdminResponse::ReloadSucceeded { .. }
+                | AdminResponse::ReloadAccepted { .. }
+                | AdminResponse::RollbackSucceeded { .. }
+                | AdminResponse::RollbackAccepted { .. }
                 | AdminResponse::SyntheticAccepted { .. }
                 | AdminResponse::RunAccepted { .. }
                 | AdminResponse::ReconciliationInspected { .. }
