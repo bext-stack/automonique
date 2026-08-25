@@ -28,6 +28,7 @@ use automonique_runner::dispatch::DispatchOutcome;
 use nix::sys::socket::{getsockopt, sockopt};
 use nix::unistd::geteuid;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::attempt_host::DaemonAttemptHost;
 
@@ -116,6 +117,72 @@ pub struct AttemptHostRoute {
     pub socket_path: PathBuf,
     pub holder_id: String,
     pub lease_epoch: u64,
+}
+
+/// Attempts a successor adopted by route rather than by worker.
+///
+/// The worker threads, cancellation tokens and contained process trees stay
+/// in the source generation until they finish; what the successor holds is
+/// the exact identifiers it inventoried at authority confirmation and the
+/// holder- and epoch-pinned route to the host that still owns their sinks. A
+/// successor consults this before starting an attempt for one of these runs
+/// (the run is already executing, just not here) and forwards a cancellation
+/// for one of them through the route, so one live attempt has exactly one
+/// sink and one durable custody row however many generations overlap.
+///
+/// The set is a snapshot, not a subscription. Membership never grows — the
+/// source cannot start an attempt after it quiesced — and it stops mattering
+/// exactly when the route stops answering, because the source retires its
+/// route only after every worker it hosted has joined and advanced the read
+/// model. A successor therefore treats "route unreachable" as "nothing left
+/// to adopt" and drops the snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdoptedSourceAttempts {
+    pub route: AttemptHostRoute,
+    pub attempt_ids: Vec<String>,
+}
+
+impl AdoptedSourceAttempts {
+    /// Whether the snapshot names `attempt_id`.
+    #[must_use]
+    pub fn contains(&self, attempt_id: &str) -> bool {
+        self.attempt_ids.iter().any(|known| known == attempt_id)
+    }
+
+    /// A client pinned to the source host's exact identity.
+    pub fn client(&self) -> Result<AttemptAdoptionClient, AttemptAdoptionError> {
+        AttemptAdoptionClient::new(
+            &self.route.socket_path,
+            &self.route.holder_id,
+            self.route.lease_epoch,
+        )
+    }
+}
+
+/// The bounded digest both generations compute over one attempt inventory.
+///
+/// Length-prefixed and order-preserving, so `["a", "bc"]` and `["ab", "c"]`
+/// differ and a reordered inventory differs; the host lists attempts sorted,
+/// and both sides digest what the host listed.
+#[must_use]
+pub fn inventory_digest(attempt_ids: &[String]) -> String {
+    let mut digest = Sha256::new();
+    for attempt_id in attempt_ids {
+        let length = u32::try_from(attempt_id.len()).unwrap_or(u32::MAX);
+        digest.update(length.to_be_bytes());
+        digest.update(attempt_id.as_bytes());
+    }
+    encode_hex(&digest.finalize())
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 #[derive(Debug, Deserialize, Serialize)]

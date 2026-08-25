@@ -28,7 +28,9 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use automonique_store::generation_audit::GENERATION_AUDIT_SCHEMA_VERSION;
-use automonique_store::reload_audit::RELOAD_AUDIT_SCHEMA_VERSION;
+use automonique_store::reload_audit::{
+    AdvanceReload, RELOAD_AUDIT_SCHEMA_VERSION, ReloadAudit, ReloadPhase,
+};
 use automonique_store::{
     GenerationLease, LeaseRenewal, LeaseTimeSource, SCHEMA_VERSION, Store, StoreError,
 };
@@ -42,13 +44,19 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::DaemonConfig;
-use crate::attempt_adoption::{AttemptAdoptionClient, socket_path as attempt_adoption_socket_path};
+use crate::attempt_adoption::{
+    AdoptedSourceAttempts, AttemptAdoptionClient, AttemptHostRoute, inventory_digest,
+    socket_path as attempt_adoption_socket_path,
+};
 use crate::attempt_host::MAX_ATTEMPT_REGISTRATIONS;
 use crate::control_lock::{ControlLock, ControlLockError};
 use crate::lease_identity::{ProcessIdentity, ProcessIdentityError};
 use crate::release_activation::VerifiedCodeRelease;
 
-const CHANNEL_SCHEMA: &str = "automonique.reload-candidate/v6";
+const CHANNEL_SCHEMA: &str = "automonique.reload-candidate/v7";
+/// Failure category a successor records when the private channel to its
+/// source closes after it proved active but before the source committed it.
+pub const SOURCE_GENERATION_LOST: &str = "source_generation_lost";
 const MAX_CHANNEL_LINE_BYTES: u64 = 4 * 1024;
 const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 const CONTROL_STOP: u8 = b'S';
@@ -92,6 +100,9 @@ pub struct WarmCandidate {
     quiesced: bool,
     relinquished: bool,
     stopped: bool,
+    /// The child was observed to have exited on its own; see
+    /// [`WarmCandidate::has_exited`].
+    exited: bool,
 }
 
 /// Bounded proof of the source attempt inventory observed during warm-up.
@@ -237,6 +248,16 @@ struct CandidateIdentity {
     pid: u32,
 }
 
+/// Authority the source hands its warmed child, or the return of it.
+///
+/// `adopted_runs` is what the durable lease transfer moved: scheduler runs of
+/// the generation now fenced at the child's epoch, which the child re-counts
+/// from the store before it trusts the number. `source_attempts` is the other
+/// population the handoff carries — attempts whose worker threads stay in the
+/// source until they finish — measured from the source's own attempt host at
+/// transfer time, so the child can check the inventory it took during warm-up
+/// against what the source actually still hosts. The two are deliberately not
+/// compared with each other: they count different things.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CandidateAuthority {
@@ -249,6 +270,19 @@ struct CandidateAuthority {
     pid: u32,
     starttime: u64,
     adopted_runs: u64,
+    source_attempts: u32,
+    source_attempts_sha256: String,
+}
+
+/// The one line a candidate writes before exiting on a refusal, so the source
+/// records why its child stopped rather than only that the channel closed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateRefusal {
+    schema: String,
+    event: String,
+    reload_id: String,
+    category: String,
 }
 
 #[derive(Debug)]
@@ -262,6 +296,8 @@ pub enum CandidateError {
     ParentChanged,
     Protocol,
     CandidateExited,
+    /// The child reported its own refusal over the channel before exiting.
+    CandidateRefused(&'static str),
     Io(std::io::Error),
     Sqlite(rusqlite::Error),
     Store(StoreError),
@@ -281,11 +317,36 @@ impl CandidateError {
             Self::ParentChanged => "candidate_parent_changed",
             Self::Protocol => "candidate_protocol",
             Self::CandidateExited => "candidate_exited",
+            Self::CandidateRefused(category) | Self::Daemon(category) => category,
             Self::Io(_) => "candidate_io",
             Self::Sqlite(_) => "candidate_sqlite",
             Self::Store(_) => "candidate_store",
-            Self::Daemon(category) => category,
         }
+    }
+
+    /// The closed set of categories a child may report, as static strings.
+    ///
+    /// A category outside this set is reported as the generic refusal: the
+    /// channel is a private, bounded line and never a free-text conduit.
+    fn reported_category(reported: &str) -> &'static str {
+        const KNOWN: [&str; 12] = [
+            "candidate_invalid_field",
+            "candidate_unsafe_path",
+            "candidate_digest_mismatch",
+            "candidate_schema_mismatch",
+            "candidate_integrity",
+            "candidate_source_lease_changed",
+            "candidate_parent_changed",
+            "candidate_protocol",
+            "candidate_exited",
+            "candidate_io",
+            "candidate_sqlite",
+            "candidate_store",
+        ];
+        KNOWN
+            .into_iter()
+            .find(|known| *known == reported)
+            .unwrap_or("candidate_refused")
     }
 }
 
@@ -354,7 +415,7 @@ pub fn spawn_warm_candidate(
         .stdout(Stdio::from(child_stdout))
         .stderr(Stdio::null())
         .spawn()?;
-    let observed: CandidateIdentity = match read_message(&parent) {
+    let observed = match read_identity(&parent) {
         Ok(observed) => observed,
         Err(error) => {
             let _ = child.kill();
@@ -414,6 +475,7 @@ pub fn spawn_warm_candidate(
         quiesced: false,
         relinquished: false,
         stopped: false,
+        exited: false,
     })
 }
 
@@ -480,7 +542,7 @@ impl WarmCandidate {
         send_control(&self.channel, CONTROL_PREPARE_TRANSFER, Some(descriptors))?;
         let mut expected = self.identity.clone();
         expected.event = "transfer_ready".to_owned();
-        let observed: CandidateIdentity = read_message(&self.channel)?;
+        let observed = read_identity(&self.channel)?;
         if observed != expected {
             return Err(CandidateError::Protocol);
         }
@@ -494,12 +556,44 @@ impl WarmCandidate {
         self.transfer_ready
     }
 
+    /// Whether the child process has already exited, reaping it if so.
+    ///
+    /// A candidate that died is not a candidate that must acknowledge
+    /// anything: the durable lease is what says who holds authority, and a
+    /// dead process holds nothing. Callers use this to decide whether a channel
+    /// exchange can still be expected before they attempt one.
+    pub fn has_exited(&mut self) -> bool {
+        if self.exited {
+            return true;
+        }
+        match self.child.try_wait() {
+            Ok(Some(_)) => {
+                self.exited = true;
+                // Nothing is left for the drop guard to kill.
+                self.stopped = true;
+                true
+            }
+            Ok(None) => false,
+            // A wait that cannot be performed says nothing about liveness; the
+            // next channel exchange will settle it.
+            Err(_) => false,
+        }
+    }
+
     /// Require the transferred candidate lease to match the child's measured
     /// kernel identity, then require the child to renew that exact epoch.
+    ///
+    /// `source_attempts` is the source's own live attempt registry at this
+    /// instant. It must be covered by the inventory the child took during
+    /// warm-up — the same count and digest when nothing finished in between,
+    /// fewer when something did — because an attempt the child never
+    /// inventoried would be one it could neither refuse to duplicate nor route
+    /// a cancellation to.
     pub fn confirm_authority(
         &mut self,
         lease: &GenerationLease,
         adopted_runs: u64,
+        source_attempts: &[String],
     ) -> Result<(), CandidateError> {
         if !self.transfer_ready || self.authority_ready || self.relinquished {
             return Err(CandidateError::Protocol);
@@ -515,16 +609,30 @@ impl WarmCandidate {
             || lease.boot_id != target.boot_id
             || lease.holder_pid != target.pid
             || lease.holder_starttime != target.starttime
-            || adopted_runs != u64::from(self.identity.attempt_count)
         {
             return Err(CandidateError::Protocol);
         }
-        let authority = CandidateAuthority::from_lease("authority", lease, adopted_runs);
+        let source_attempt_count =
+            u32::try_from(source_attempts.len()).map_err(|_| CandidateError::Protocol)?;
+        let source_attempts_sha256 = inventory_digest(source_attempts);
+        if source_attempt_count > self.identity.attempt_count
+            || (source_attempt_count == self.identity.attempt_count
+                && source_attempts_sha256 != self.identity.attempt_inventory_sha256)
+        {
+            return Err(CandidateError::Protocol);
+        }
+        let authority = CandidateAuthority::from_lease(
+            "authority",
+            lease,
+            adopted_runs,
+            source_attempt_count,
+            source_attempts_sha256,
+        );
         send_control(&self.channel, CONTROL_CONFIRM_AUTHORITY, None)?;
         write_message(&mut self.channel, &authority)?;
         let mut expected = self.identity.clone();
         expected.event = "authority_ready".to_owned();
-        let observed: CandidateIdentity = read_message(&self.channel)?;
+        let observed = read_identity(&self.channel)?;
         if observed != expected {
             return Err(CandidateError::Protocol);
         }
@@ -552,12 +660,18 @@ impl WarmCandidate {
         {
             return Err(CandidateError::Protocol);
         }
-        let authority = CandidateAuthority::from_lease("relinquished", returned_lease, 0);
+        let authority = CandidateAuthority::from_lease(
+            "relinquished",
+            returned_lease,
+            0,
+            0,
+            inventory_digest(&[]),
+        );
         send_control(&self.channel, CONTROL_CONFIRM_RELINQUISHED, None)?;
         write_message(&mut self.channel, &authority)?;
         let mut expected = self.identity.clone();
         expected.event = "relinquished".to_owned();
-        let observed: CandidateIdentity = read_message(&self.channel)?;
+        let observed = read_identity(&self.channel)?;
         if observed != expected {
             return Err(CandidateError::Protocol);
         }
@@ -578,7 +692,7 @@ impl WarmCandidate {
         send_control(&self.channel, CONTROL_ACTIVATE_SERVING, None)?;
         let mut expected = self.identity.clone();
         expected.event = "active".to_owned();
-        let observed: CandidateIdentity = read_message(&self.channel)?;
+        let observed = read_identity(&self.channel)?;
         if observed != expected {
             return Err(CandidateError::Protocol);
         }
@@ -596,7 +710,7 @@ impl WarmCandidate {
         send_control(&self.channel, CONTROL_QUIESCE, None)?;
         let mut expected = self.identity.clone();
         expected.event = "quiesced".to_owned();
-        let observed: CandidateIdentity = read_message(&self.channel)?;
+        let observed = read_identity(&self.channel)?;
         if observed != expected {
             return Err(CandidateError::Protocol);
         }
@@ -619,7 +733,7 @@ impl WarmCandidate {
         send_control(&self.channel, CONTROL_COMMIT, None)?;
         let mut expected = self.identity.clone();
         expected.event = "committed".to_owned();
-        let observed: CandidateIdentity = read_message(&self.channel)?;
+        let observed = read_identity(&self.channel)?;
         if observed != expected {
             return Err(CandidateError::Protocol);
         }
@@ -634,14 +748,21 @@ impl WarmCandidate {
 
     /// End a non-owning candidate and require a matching acknowledgement.
     /// A candidate that proved authority must first prove a fresh-epoch return.
+    ///
+    /// A child that has already exited is already stopped: there is no
+    /// process left to acknowledge, and the durable lease — never this
+    /// handle — is what records who holds authority.
     pub fn stop(&mut self) -> Result<(), CandidateError> {
+        if self.has_exited() {
+            return Ok(());
+        }
         if self.stopped || (self.authority_ready && !self.relinquished) {
             return Err(CandidateError::Protocol);
         }
         send_control(&self.channel, CONTROL_STOP, None)?;
         let mut expected = self.identity.clone();
         expected.event = "stopped".to_owned();
-        let observed: CandidateIdentity = read_message(&self.channel)?;
+        let observed = read_identity(&self.channel)?;
         if observed != expected {
             return Err(CandidateError::Protocol);
         }
@@ -654,7 +775,13 @@ impl WarmCandidate {
 }
 
 impl CandidateAuthority {
-    fn from_lease(event: &str, lease: &GenerationLease, adopted_runs: u64) -> Self {
+    fn from_lease(
+        event: &str,
+        lease: &GenerationLease,
+        adopted_runs: u64,
+        source_attempts: u32,
+        source_attempts_sha256: String,
+    ) -> Self {
         Self {
             schema: CHANNEL_SCHEMA.to_owned(),
             event: event.to_owned(),
@@ -665,6 +792,8 @@ impl CandidateAuthority {
             pid: lease.holder_pid,
             starttime: lease.holder_starttime,
             adopted_runs,
+            source_attempts,
+            source_attempts_sha256,
         }
     }
 }
@@ -679,11 +808,37 @@ impl Drop for WarmCandidate {
 }
 
 /// Candidate entry point used only by the private inherited channel.
+///
+/// A refusal is reported on the channel before the process exits, so the
+/// source records the child's own category rather than a closed pipe. The
+/// write is best-effort: a channel that is already gone has nobody to tell.
 pub fn run_candidate(
     config: &DaemonConfig,
     input: CandidateInput,
     mut reader: impl Read + AsFd,
     mut writer: impl Write,
+) -> Result<(), CandidateError> {
+    let reload_id = input.reload_id.clone();
+    let outcome = run_candidate_channel(config, input, &mut reader, &mut writer);
+    if let Err(error) = &outcome {
+        let _ = write_message(
+            &mut writer,
+            &CandidateRefusal {
+                schema: CHANNEL_SCHEMA.to_owned(),
+                event: "refused".to_owned(),
+                reload_id,
+                category: error.category().to_owned(),
+            },
+        );
+    }
+    outcome
+}
+
+fn run_candidate_channel<R: Read + AsFd, W: Write>(
+    config: &DaemonConfig,
+    input: CandidateInput,
+    reader: &mut R,
+    writer: &mut W,
 ) -> Result<(), CandidateError> {
     validate_input(&input)?;
     if getppid().as_raw() as u32 != input.expected_parent_pid {
@@ -691,8 +846,11 @@ pub fn run_candidate(
     }
     verify_own_binary(&input.binary_sha256)?;
     warm_state(config, &input.source_holder_id, input.source_lease_epoch)?;
-    let (attempt_count, attempt_inventory_sha256) =
+    let warm_inventory =
         warm_attempt_host(config, &input.source_holder_id, input.source_lease_epoch)?;
+    let attempt_count = u32::try_from(warm_inventory.len())
+        .map_err(|_| CandidateError::InvalidField("attempt_count"))?;
+    let attempt_inventory_sha256 = inventory_digest(&warm_inventory);
     let process_identity = process_identity(std::process::id())?;
     let target_holder_id = candidate_holder_id(process_identity.pid, &input.reload_id);
     if getppid().as_raw() as u32 != input.expected_parent_pid {
@@ -712,28 +870,31 @@ pub fn run_candidate(
         starttime: process_identity.starttime,
         pid: process_identity.pid,
     };
-    write_message(&mut writer, &identity)?;
+    write_message(writer, &identity)?;
     let mut identity = identity;
     let adopted = match receive_control(reader.as_fd())? {
         CandidateControl::Stop => None,
         CandidateControl::PrepareTransfer(descriptors) => {
             let adopted = AdoptedCandidateResources::adopt(config, descriptors)?;
             identity.event = "transfer_ready".to_owned();
-            write_message(&mut writer, &identity)?;
+            write_message(writer, &identity)?;
             match receive_control(reader.as_fd())? {
                 CandidateControl::Stop => {}
                 CandidateControl::ConfirmAuthority => {
-                    let authority: CandidateAuthority = read_message_from(&mut reader)?;
-                    let renewed = confirm_candidate_authority(
+                    let authority: CandidateAuthority = read_message_from(reader)?;
+                    let (renewed, adopted_attempts) = confirm_candidate_authority(
                         config,
                         &authority,
                         &identity,
+                        &input.source_holder_id,
                         input.source_lease_epoch,
+                        &warm_inventory,
                     )?;
-                    let daemon = crate::Daemon::open_transferred(config, adopted, renewed)
-                        .map_err(|error| CandidateError::Daemon(error.category()))?;
+                    let daemon =
+                        crate::Daemon::open_transferred(config, adopted, renewed, adopted_attempts)
+                            .map_err(|error| CandidateError::Daemon(error.category()))?;
                     identity.event = "authority_ready".to_owned();
-                    write_message(&mut writer, &identity)?;
+                    write_message(writer, &identity)?;
                     let mut daemon = match receive_control(reader.as_fd())? {
                         CandidateControl::ConfirmRelinquished => daemon,
                         CandidateControl::ActivateServing => {
@@ -763,12 +924,35 @@ pub fn run_candidate(
                                 };
                             }
                             identity.event = "active".to_owned();
-                            write_message(&mut writer, &identity)?;
-                            let control = receive_control(reader.as_fd())?;
+                            write_message(writer, &identity)?;
+                            // THE CHANNEL MAY DIE HERE, AND THE GENERATION MUST NOT.
+                            //
+                            // From this point the durable lease names this
+                            // process and its inherited endpoints answer
+                            // operators. A source that crashes, hangs and is
+                            // terminated, or otherwise loses the channel
+                            // before it commits has left exactly one live
+                            // authority, and that authority keeps serving as
+                            // the generation it already is. The reload epoch
+                            // is closed as failed under its own category
+                            // because nobody drained the source; the operator
+                            // sees that and the release links stay wherever
+                            // the source left them.
+                            let control = match receive_control(reader.as_fd()) {
+                                Ok(control) => control,
+                                Err(_) => {
+                                    return serve_orphaned_after_active(
+                                        config,
+                                        &identity.reload_id,
+                                        &release_on_stop,
+                                        serving,
+                                    );
+                                }
+                            };
                             if matches!(control, CandidateControl::Commit) {
                                 release_on_stop.store(true, Ordering::Release);
                                 identity.event = "committed".to_owned();
-                                write_message(&mut writer, &identity)?;
+                                write_message(writer, &identity)?;
                                 let (_, outcome) = serving.join().map_err(|_| {
                                     CandidateError::Daemon("candidate_serve_panicked")
                                 })?;
@@ -786,7 +970,7 @@ pub fn run_candidate(
                                 .map_err(|_| CandidateError::Daemon("candidate_serve_panicked"))?;
                             outcome.map_err(|error| CandidateError::Daemon(error.category()))?;
                             identity.event = "quiesced".to_owned();
-                            write_message(&mut writer, &identity)?;
+                            write_message(writer, &identity)?;
                             if !matches!(
                                 receive_control(reader.as_fd())?,
                                 CandidateControl::ConfirmRelinquished
@@ -803,7 +987,7 @@ pub fn run_candidate(
                             return Err(CandidateError::Protocol);
                         }
                     };
-                    let returned: CandidateAuthority = read_message_from(&mut reader)?;
+                    let returned: CandidateAuthority = read_message_from(reader)?;
                     confirm_candidate_relinquished(
                         config,
                         &returned,
@@ -815,11 +999,11 @@ pub fn run_candidate(
                         .map_err(|error| CandidateError::Daemon(error.category()))?;
                     drop(daemon);
                     identity.event = "relinquished".to_owned();
-                    write_message(&mut writer, &identity)?;
+                    write_message(writer, &identity)?;
                     if !matches!(receive_control(reader.as_fd())?, CandidateControl::Stop) {
                         return Err(CandidateError::Protocol);
                     }
-                    return write_stopped(&mut writer, identity);
+                    return write_stopped(writer, identity);
                 }
                 CandidateControl::ConfirmRelinquished
                 | CandidateControl::ActivateServing
@@ -840,7 +1024,7 @@ pub fn run_candidate(
         }
     };
     drop(adopted);
-    write_stopped(&mut writer, identity)
+    write_stopped(writer, identity)
 }
 
 fn write_stopped(
@@ -849,6 +1033,41 @@ fn write_stopped(
 ) -> Result<(), CandidateError> {
     identity.event = "stopped".to_owned();
     write_message(writer, &identity)
+}
+
+/// Keep serving as the generation this process already is after the source
+/// vanished between active proof and commit.
+///
+/// The reload epoch is closed as failed under [`SOURCE_GENERATION_LOST`]
+/// when it is still the active epoch for this reload: leaving it open would
+/// refuse every later reload as "already in progress" for a handoff nobody
+/// can finish. Closing it as succeeded would claim a drain that never
+/// happened. The lease is released on this generation's own shutdown, exactly
+/// as a committed candidate releases it.
+fn serve_orphaned_after_active(
+    config: &DaemonConfig,
+    reload_id: &str,
+    release_on_stop: &AtomicBool,
+    serving: std::thread::JoinHandle<(crate::Daemon, Result<(), crate::DaemonError>)>,
+) -> Result<(), CandidateError> {
+    release_on_stop.store(true, Ordering::Release);
+    if let Ok(mut audit) = ReloadAudit::open(config.reload_audit_path())
+        && let Ok(Some(active)) = audit.active()
+        && active.reload_id == reload_id
+        && let Ok(observed_at_ms) = super::unix_millis()
+    {
+        let _ = audit.advance(AdvanceReload {
+            reload_id,
+            expected_revision: active.revision,
+            phase: ReloadPhase::Failed,
+            failure_category: Some(SOURCE_GENERATION_LOST),
+            observed_at_ms,
+        });
+    }
+    let (_, outcome) = serving
+        .join()
+        .map_err(|_| CandidateError::Daemon("candidate_serve_panicked"))?;
+    outcome.map_err(|error| CandidateError::Daemon(error.category()))
 }
 
 enum CandidateControl {
@@ -940,12 +1159,29 @@ fn receive_control(fd: impl AsFd) -> Result<CandidateControl, CandidateError> {
     }
 }
 
+/// Accept transferred authority only when every durable population it names
+/// is what this process can see for itself.
+///
+/// Three checks, three populations:
+///
+/// - the lease: renewed at the exact epoch, holder and kernel identity the
+///   source claims, which is what makes this process the fence;
+/// - scheduler runs: the transfer's `adopted_runs` must equal the rows now
+///   fenced at this epoch in the main store, so the number the source reports
+///   is the number the database holds rather than the number it remembers;
+/// - source-hosted attempts: the source's registry at transfer time must be
+///   covered by the warm-up inventory, and the route is read again here so
+///   the set this process adopts is the set still live at the source — never
+///   larger than what the source reported, and identical when nothing
+///   finished in between.
 fn confirm_candidate_authority(
     config: &DaemonConfig,
     authority: &CandidateAuthority,
     identity: &CandidateIdentity,
+    source_holder_id: &str,
     source_lease_epoch: u64,
-) -> Result<GenerationLease, CandidateError> {
+    warm_inventory: &[String],
+) -> Result<(GenerationLease, AdoptedSourceAttempts), CandidateError> {
     let expected_epoch = source_lease_epoch
         .checked_add(1)
         .ok_or(CandidateError::Protocol)?;
@@ -957,10 +1193,17 @@ fn confirm_candidate_authority(
         || authority.boot_id != identity.boot_id
         || authority.pid != identity.pid
         || authority.starttime != identity.starttime
-        || authority.adopted_runs != u64::from(identity.attempt_count)
+        || authority.source_attempts > identity.attempt_count
+        || (authority.source_attempts == identity.attempt_count
+            && authority.source_attempts_sha256 != identity.attempt_inventory_sha256)
     {
         return Err(CandidateError::Protocol);
     }
+    validate_digest(
+        &authority.source_attempts_sha256,
+        false,
+        "source_attempts_sha256",
+    )?;
     let mut store = Store::open_with_lease_time_source(
         config.database_path(),
         Arc::new(crate::lease_time::BootTimeSource),
@@ -980,7 +1223,50 @@ fn confirm_candidate_authority(
     {
         return Err(CandidateError::Protocol);
     }
-    Ok(renewed)
+    drop(store);
+
+    let fenced_runs = read_only_database(&config.database_path(), SCHEMA_VERSION, "main")?
+        .query_row(
+            "SELECT count(*) FROM runs
+             WHERE generation_id = ?1 AND lease_epoch = ?2 AND state = 'running'",
+            rusqlite::params![
+                authority.generation_id,
+                i64::try_from(authority.lease_epoch).map_err(|_| CandidateError::Protocol)?
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
+    if u64::try_from(fenced_runs).map_err(|_| CandidateError::Protocol)? != authority.adopted_runs {
+        return Err(CandidateError::Protocol);
+    }
+
+    let route = AttemptHostRoute {
+        socket_path: attempt_adoption_socket_path(&config.runtime_dir(), source_holder_id)
+            .map_err(|_| CandidateError::UnsafePath("attempt_adoption"))?,
+        holder_id: source_holder_id.to_owned(),
+        lease_epoch: source_lease_epoch,
+    };
+    let live = AttemptAdoptionClient::new(&route.socket_path, &route.holder_id, route.lease_epoch)
+        .map_err(|_| CandidateError::Protocol)?
+        .inventory()
+        .map_err(|_| CandidateError::Protocol)?
+        .attempt_ids;
+    let live_count = u32::try_from(live.len()).map_err(|_| CandidateError::Protocol)?;
+    if live_count > authority.source_attempts
+        || (live_count == authority.source_attempts
+            && inventory_digest(&live) != authority.source_attempts_sha256)
+        || live
+            .iter()
+            .any(|attempt_id| !warm_inventory.contains(attempt_id))
+    {
+        return Err(CandidateError::Protocol);
+    }
+    Ok((
+        renewed,
+        AdoptedSourceAttempts {
+            route,
+            attempt_ids: live,
+        },
+    ))
 }
 
 fn confirm_candidate_relinquished(
@@ -1000,6 +1286,8 @@ fn confirm_candidate_relinquished(
         || returned.pid == 0
         || returned.starttime == 0
         || returned.adopted_runs != 0
+        || returned.source_attempts != 0
+        || returned.source_attempts_sha256 != inventory_digest(&[])
     {
         return Err(CandidateError::Protocol);
     }
@@ -1054,27 +1342,32 @@ fn candidate_holder_id(pid: u32, reload_id: &str) -> String {
     format!("daemon-{pid}-reload-{}", &digest[..16])
 }
 
+/// The exact attempts the source hosts right now, read through its pinned
+/// route.
+///
+/// The identifiers are kept, not only counted: authority confirmation later
+/// checks that nothing the source still hosts is outside this inventory, and
+/// the adopted set handed to the transferred daemon is drawn from it.
 fn warm_attempt_host(
     config: &DaemonConfig,
     source_holder_id: &str,
     source_lease_epoch: u64,
-) -> Result<(u32, String), CandidateError> {
+) -> Result<Vec<String>, CandidateError> {
     let socket_path = attempt_adoption_socket_path(&config.runtime_dir(), source_holder_id)
         .map_err(|_| CandidateError::UnsafePath("attempt_adoption"))?;
     let inventory = AttemptAdoptionClient::new(socket_path, source_holder_id, source_lease_epoch)
         .map_err(|_| CandidateError::Protocol)?
         .inventory()
         .map_err(|_| CandidateError::Protocol)?;
-    let attempt_count = u32::try_from(inventory.attempt_ids.len())
-        .map_err(|_| CandidateError::InvalidField("attempt_count"))?;
-    let mut digest = Sha256::new();
-    for attempt_id in inventory.attempt_ids {
-        let length = u32::try_from(attempt_id.len())
-            .map_err(|_| CandidateError::InvalidField("attempt_id"))?;
-        digest.update(length.to_be_bytes());
-        digest.update(attempt_id.as_bytes());
+    if inventory.attempt_ids.len() > MAX_ATTEMPT_REGISTRATIONS
+        || inventory
+            .attempt_ids
+            .iter()
+            .any(|attempt_id| u32::try_from(attempt_id.len()).is_err())
+    {
+        return Err(CandidateError::InvalidField("attempt_count"));
     }
-    Ok((attempt_count, encode_hex(&digest.finalize())))
+    Ok(inventory.attempt_ids)
 }
 
 fn validate_input(input: &CandidateInput) -> Result<(), CandidateError> {
@@ -1208,13 +1501,25 @@ fn write_message(writer: &mut impl Write, value: &impl Serialize) -> Result<(), 
     Ok(())
 }
 
-fn read_message<T: for<'de> Deserialize<'de>>(channel: &UnixStream) -> Result<T, CandidateError> {
-    read_message_from(&mut BufReader::new(channel))
+/// Read one identity line from the child, surfacing a reported refusal.
+///
+/// A line that is not an identity but is a well-formed refusal for this
+/// channel becomes the child's own category; anything else is a protocol
+/// violation, exactly as before.
+fn read_identity(channel: &UnixStream) -> Result<CandidateIdentity, CandidateError> {
+    let line = read_line(&mut BufReader::new(channel))?;
+    if let Ok(identity) = serde_json::from_slice::<CandidateIdentity>(&line) {
+        return Ok(identity);
+    }
+    match serde_json::from_slice::<CandidateRefusal>(&line) {
+        Ok(refusal) if refusal.schema == CHANNEL_SCHEMA && refusal.event == "refused" => Err(
+            CandidateError::CandidateRefused(CandidateError::reported_category(&refusal.category)),
+        ),
+        _ => Err(CandidateError::Protocol),
+    }
 }
 
-fn read_message_from<T: for<'de> Deserialize<'de>>(
-    reader: &mut impl Read,
-) -> Result<T, CandidateError> {
+fn read_line(reader: &mut impl Read) -> Result<Vec<u8>, CandidateError> {
     let mut line = Vec::new();
     let read = BufReader::new(reader)
         .take(MAX_CHANNEL_LINE_BYTES)
@@ -1223,6 +1528,13 @@ fn read_message_from<T: for<'de> Deserialize<'de>>(
         return Err(CandidateError::Protocol);
     }
     line.pop();
+    Ok(line)
+}
+
+fn read_message_from<T: for<'de> Deserialize<'de>>(
+    reader: &mut impl Read,
+) -> Result<T, CandidateError> {
+    let line = read_line(reader)?;
     serde_json::from_slice(&line).map_err(|_| CandidateError::Protocol)
 }
 
@@ -1293,7 +1605,7 @@ mod tests {
             identity
         );
 
-        let unknown = br#"{"schema":"automonique.reload-candidate/v6","event":"warm","reload_id":"reload-1","target_generation_id":"generation-2","manifest_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binary_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","attempt_count":2,"attempt_inventory_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","target_holder_id":"daemon-42-reload-0123456789abcdef","boot_id":"01234567-89ab-cdef-0123-456789abcdef","starttime":100,"pid":42,"extra":true}\n"#;
+        let unknown = br#"{"schema":"automonique.reload-candidate/v7","event":"warm","reload_id":"reload-1","target_generation_id":"generation-2","manifest_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binary_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","attempt_count":2,"attempt_inventory_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","target_holder_id":"daemon-42-reload-0123456789abcdef","boot_id":"01234567-89ab-cdef-0123-456789abcdef","starttime":100,"pid":42,"extra":true}\n"#;
         assert!(matches!(
             read_message_from::<CandidateIdentity>(&mut unknown.as_slice()),
             Err(CandidateError::Protocol)

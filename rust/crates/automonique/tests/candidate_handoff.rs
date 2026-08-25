@@ -130,7 +130,7 @@ fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
         })
         .expect("transfer generation lease");
     candidate
-        .confirm_authority(&transferred.lease, transferred.adopted_runs)
+        .confirm_authority(&transferred.lease, transferred.adopted_runs, &[])
         .expect("candidate renews transferred authority");
     let candidate_tenure: (String, u64) = Connection::open(config.generation_audit_path())
         .expect("generation audit")

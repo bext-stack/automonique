@@ -211,6 +211,8 @@ pub mod provider_session_host;
 pub mod release_activation;
 pub mod release_builder;
 pub mod reload;
+#[cfg(feature = "reload-fault-injection")]
+pub mod reload_faults;
 pub mod run_lane;
 pub mod shadow;
 pub mod shadow_config;
@@ -1435,6 +1437,18 @@ pub struct Daemon {
     progress_endpoint: Option<progress_hub::ProgressEndpoint>,
     /// Recovery mode never composes an external transport and refuses starts.
     disconnected_recovery: bool,
+    /// Attempts still hosted by the generation this one succeeded.
+    ///
+    /// `Some` only on a daemon that came up through a transfer, and only
+    /// until the source's route stops answering. See
+    /// [`attempt_adoption::AdoptedSourceAttempts`] for what it is consulted
+    /// for; nothing here waits on it, and nothing here can cancel through it
+    /// without the same durable custody a local delivery has.
+    adopted_source_attempts: Option<attempt_adoption::AdoptedSourceAttempts>,
+    /// Test-only fault script for the handoff phases. Absent in every build
+    /// without the feature, which is every build that ships.
+    #[cfg(feature = "reload-fault-injection")]
+    reload_fault_hook: Option<reload_faults::ReloadFaultHook>,
     /// Held until every database and worker field above it has been dropped.
     _control_lock: control_lock::ControlLock,
 }
@@ -1450,8 +1464,18 @@ enum StartupAuthority {
     Transferred {
         resources: candidate::AdoptedCandidateResources,
         lease: GenerationLease,
+        adopted_attempts: attempt_adoption::AdoptedSourceAttempts,
     },
 }
+
+/// Environment variable naming a reload fault to inject.
+///
+/// Honoured only by a build with the `reload-fault-injection` feature, which
+/// exists for the process-level failure-matrix tests. Every other build
+/// refuses to open a daemon while it is set: a fault configuration that is
+/// silently ignored would be one an operator could not tell apart from a
+/// fault that fired.
+pub const RELOAD_FAULT_ENV: &str = "AUTOMONIQUE_RELOAD_FAULT";
 
 enum LeaseDisposition {
     Release,
@@ -1480,6 +1504,77 @@ impl ProcessReloadHooks<'_> {
     fn refuse(category: &'static str) -> reload::ReloadRefusal {
         reload::ReloadRefusal::new(category)
     }
+
+    /// Consult the test-only fault script at one named point.
+    ///
+    /// Without the feature this is a no-op that the compiler removes; with it
+    /// the script's action is applied as a real external fault. The point
+    /// itself never changes the protocol's control flow: whatever the action
+    /// broke is discovered by the next real phase, exactly as it would be in
+    /// production.
+    #[cfg(feature = "reload-fault-injection")]
+    fn fault(
+        &mut self,
+        point: reload_faults::ReloadFaultPoint,
+    ) -> Result<(), reload::ReloadRefusal> {
+        let Some(hook) = self.daemon.reload_fault_hook.as_mut() else {
+            return Ok(());
+        };
+        match hook(point) {
+            reload_faults::ReloadFaultAction::Continue => Ok(()),
+            reload_faults::ReloadFaultAction::KillCandidate => {
+                let pid = self
+                    .candidate
+                    .as_ref()
+                    .ok_or_else(|| Self::refuse("candidate_unavailable"))?
+                    .pid();
+                reload_faults::kill_process(pid);
+                Ok(())
+            }
+            reload_faults::ReloadFaultAction::AbortSource => std::process::abort(),
+            reload_faults::ReloadFaultAction::HangSource => loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            },
+            reload_faults::ReloadFaultAction::HoldMainDatabaseWriteLock(duration) => {
+                reload_faults::hold_write_lock(&self.daemon.config.database_path(), duration)
+                    .map_err(Self::refuse)
+            }
+        }
+    }
+}
+
+/// Close a reload epoch whose source generation is provably gone.
+///
+/// Called only by a generation that acquired — never inherited — its lease.
+/// An open epoch whose `source_lease_epoch` is below this generation's own is
+/// one the previous holder started and never finished; the acquiring daemon
+/// is the proof that holder is no longer live, so the epoch is closed as
+/// failed under [`candidate::SOURCE_GENERATION_LOST`]. An open epoch at or
+/// above this epoch is not touched: it is not this daemon's to judge.
+fn abandon_orphaned_reload(
+    audit: &mut ReloadAudit,
+    lease_epoch: u64,
+    now_ms: i64,
+) -> Result<(), DaemonError> {
+    let Some(active) = audit
+        .active()
+        .map_err(|error| DaemonError::ReloadAuditFailed(error.category()))?
+    else {
+        return Ok(());
+    };
+    if active.source_lease_epoch >= lease_epoch {
+        return Ok(());
+    }
+    audit
+        .advance(automonique_store::reload_audit::AdvanceReload {
+            reload_id: &active.reload_id,
+            expected_revision: active.revision,
+            phase: automonique_store::reload_audit::ReloadPhase::Failed,
+            failure_category: Some(candidate::SOURCE_GENERATION_LOST),
+            observed_at_ms: now_ms,
+        })
+        .map(|_| ())
+        .map_err(|error| DaemonError::ReloadAuditFailed(error.category()))
 }
 
 impl reload::ReloadHooks for ProcessReloadHooks<'_> {
@@ -1513,7 +1608,10 @@ impl reload::ReloadHooks for ProcessReloadHooks<'_> {
             .as_mut()
             .ok_or_else(|| Self::refuse("candidate_unavailable"))?
             .prepare_transfer(descriptors)
-            .map_err(|error| Self::refuse(error.category()))
+            .map_err(|error| Self::refuse(error.category()))?;
+        #[cfg(feature = "reload-fault-injection")]
+        self.fault(reload_faults::ReloadFaultPoint::CandidateWarm)?;
+        Ok(())
     }
 
     fn quiesce_source(&mut self) -> Result<(), reload::ReloadRefusal> {
@@ -1523,11 +1621,20 @@ impl reload::ReloadHooks for ProcessReloadHooks<'_> {
     }
 
     fn transfer_leases(&mut self) -> Result<(), reload::ReloadRefusal> {
-        let target = self
+        #[cfg(feature = "reload-fault-injection")]
+        self.fault(reload_faults::ReloadFaultPoint::BeforeLeaseTransfer)?;
+        let candidate = self
             .candidate
-            .as_ref()
-            .ok_or_else(|| Self::refuse("candidate_unavailable"))?
-            .lease_target();
+            .as_mut()
+            .ok_or_else(|| Self::refuse("candidate_unavailable"))?;
+        // The durable lease names a process. A candidate that died since it
+        // warmed must not be named: the transfer would commit authority to a
+        // pid nobody holds, and every step after it would be a rollback of a
+        // handoff that should never have been recorded as transferred.
+        if candidate.has_exited() {
+            return Err(Self::refuse("candidate_exited"));
+        }
+        let target = candidate.lease_target();
         let transferred = self
             .daemon
             .store
@@ -1551,6 +1658,18 @@ impl reload::ReloadHooks for ProcessReloadHooks<'_> {
     }
 
     fn activate_candidate(&mut self) -> Result<(), reload::ReloadRefusal> {
+        #[cfg(feature = "reload-fault-injection")]
+        self.fault(reload_faults::ReloadFaultPoint::AfterLeaseTransfer)?;
+        // The attempts this generation still hosts, measured now rather than
+        // remembered from warm-up: the candidate checks this against the
+        // inventory it took, and adopts by route exactly what is still live.
+        let source_attempts = self
+            .daemon
+            .attempt_host
+            .as_ref()
+            .ok_or_else(|| Self::refuse("attempt_host_unavailable"))?
+            .registered_attempts()
+            .map_err(|error| Self::refuse(error.category()))?;
         let lease = self
             .candidate_lease
             .as_ref()
@@ -1560,7 +1679,7 @@ impl reload::ReloadHooks for ProcessReloadHooks<'_> {
             .as_mut()
             .ok_or_else(|| Self::refuse("candidate_unavailable"))?;
         candidate
-            .confirm_authority(lease, self.adopted_runs)
+            .confirm_authority(lease, self.adopted_runs, &source_attempts)
             .map_err(|error| Self::refuse(error.category()))?;
         self.authority_confirmed = true;
         let cleanup = self
@@ -1603,6 +1722,8 @@ impl reload::ReloadHooks for ProcessReloadHooks<'_> {
     }
 
     fn drain_source(&mut self) -> Result<(), reload::ReloadRefusal> {
+        #[cfg(feature = "reload-fault-injection")]
+        self.fault(reload_faults::ReloadFaultPoint::BeforeSourceDrain)?;
         self.daemon
             .retire_after_handoff()
             .map_err(|error| Self::refuse(error.category()))?;
@@ -1643,14 +1764,25 @@ impl reload::ReloadHooks for ProcessReloadHooks<'_> {
     }
 
     fn return_leases(&mut self) -> Result<(), reload::ReloadRefusal> {
-        if self.candidate_active {
+        // A candidate that died after the transfer cannot quiesce or
+        // acknowledge a return, and does not need to: the durable transfer
+        // back is what returns authority, and a dead process holds none. The
+        // exchanges below are skipped for it rather than attempted against a
+        // closed channel, so "N+1 failed after transfer" ends with the source
+        // resumed and the epoch recorded as rolled back — not as recovery
+        // required for a rollback that in fact completed.
+        let candidate_exited = self
+            .candidate
+            .as_mut()
+            .is_some_and(candidate::WarmCandidate::has_exited);
+        if self.candidate_active && !candidate_exited {
             self.candidate
                 .as_mut()
                 .ok_or_else(|| Self::refuse("candidate_unavailable"))?
                 .quiesce()
                 .map_err(|error| Self::refuse(error.category()))?;
-            self.candidate_active = false;
         }
+        self.candidate_active = false;
         let candidate_lease = self
             .candidate_lease
             .as_ref()
@@ -1674,7 +1806,7 @@ impl reload::ReloadHooks for ProcessReloadHooks<'_> {
                 ttl_ms: LEASE_TTL_MS,
             })
             .map_err(|error| Self::refuse(error.category()))?;
-        if self.authority_confirmed {
+        if self.authority_confirmed && !candidate_exited {
             self.candidate
                 .as_mut()
                 .ok_or_else(|| Self::refuse("candidate_unavailable"))?
@@ -1745,12 +1877,29 @@ impl Daemon {
         config: &DaemonConfig,
         resources: candidate::AdoptedCandidateResources,
         lease: GenerationLease,
+        adopted_attempts: attempt_adoption::AdoptedSourceAttempts,
     ) -> Result<Self, DaemonError> {
         Self::open_with_authority(
             config,
             false,
-            StartupAuthority::Transferred { resources, lease },
+            StartupAuthority::Transferred {
+                resources,
+                lease,
+                adopted_attempts,
+            },
         )
+    }
+
+    /// Install a typed fault script for the next handoff this daemon runs.
+    ///
+    /// Test builds only. The script is consulted at the points named by
+    /// [`reload_faults::ReloadFaultPoint`] and can crash this process, kill
+    /// the candidate, hang the drain, or hold the main database's write lock
+    /// — every one of them a real fault applied from outside the protocol,
+    /// never a phase that pretends to fail.
+    #[cfg(feature = "reload-fault-injection")]
+    pub fn install_reload_fault_hook(&mut self, hook: reload_faults::ReloadFaultHook) {
+        self.reload_fault_hook = Some(hook);
     }
 
     fn open_with_authority(
@@ -1758,6 +1907,18 @@ impl Daemon {
         disconnected_recovery: bool,
         authority: StartupAuthority,
     ) -> Result<Self, DaemonError> {
+        // A fault configuration is refused before anything durable is
+        // touched, so a production binary given a test-only variable stops
+        // here rather than running a handoff nobody can tell was scripted.
+        #[cfg(not(feature = "reload-fault-injection"))]
+        if std::env::var_os(RELOAD_FAULT_ENV).is_some() {
+            return Err(DaemonError::ProtocolRefused(
+                "reload_fault_injection_unavailable",
+            ));
+        }
+        #[cfg(feature = "reload-fault-injection")]
+        let reload_fault_hook =
+            reload_faults::hook_from_environment().map_err(DaemonError::ProtocolRefused)?;
         validate_root(&config.runtime_root, "runtime root")?;
         ensure_private_dir(&config.state_root, "state root")?;
         let runtime_dir = config.runtime_dir();
@@ -1783,6 +1944,7 @@ impl Daemon {
 
         let now_ms = unix_millis()?;
         let socket_path = config.admin_socket();
+        let mut adopted_source_attempts = None;
         let (
             listener,
             transferred_progress_listener,
@@ -1872,7 +2034,12 @@ impl Daemon {
                     remove_socket_on_drop,
                 )
             }
-            StartupAuthority::Transferred { resources, lease } => {
+            StartupAuthority::Transferred {
+                resources,
+                lease,
+                adopted_attempts,
+            } => {
+                adopted_source_attempts = Some(adopted_attempts);
                 let (listener, progress_listener, control_lock) = resources.into_parts();
                 let socket_identity = validate_admin_listener(&listener, &socket_path)?;
                 if lease.generation_id != GENERATION_ID
@@ -1952,8 +2119,17 @@ impl Daemon {
             lease.epoch,
             now_ms,
         )?;
-        let reload_audit = ReloadAudit::open(config.reload_audit_path())
+        let mut reload_audit = ReloadAudit::open(config.reload_audit_path())
             .map_err(|error| DaemonError::ReloadAuditFailed(error.category()))?;
+        // A generation that *acquired* its lease — rather than being handed
+        // it — found no live predecessor. A reload epoch still open under an
+        // older source epoch is therefore one whose source died mid-protocol,
+        // and it is closed here as failed so the ledger stops calling it in
+        // progress. A transferred daemon never does this: its reload is the
+        // open one, and its source is alive and driving it.
+        if adopted_source_attempts.is_none() {
+            abandon_orphaned_reload(&mut reload_audit, lease.epoch, now_ms)?;
+        }
         let generation_queues_clean =
             startup_queues_clean(&store.status_snapshot_at(GENERATION_ID, now_ms)?);
 
@@ -2294,6 +2470,9 @@ impl Daemon {
             managed_tui,
             progress_endpoint: Some(progress_endpoint),
             disconnected_recovery,
+            adopted_source_attempts,
+            #[cfg(feature = "reload-fault-injection")]
+            reload_fault_hook,
             _control_lock: control_lock,
         })
     }
@@ -6175,12 +6354,55 @@ impl Daemon {
             .ok_or(ExecuteRefusal::ExecutionUnavailable)?;
         let submission_id =
             u64::try_from(entry.submission_id).map_err(|_| ExecuteRefusal::ExecutionUnavailable)?;
+        // A run whose attempt is still hosted by the generation this one
+        // succeeded is already executing — just not here. Refusing it is what
+        // "one attempt per submission" means across a handoff: the row is
+        // still `ready` because the source's worker advances it only when the
+        // attempt ends, and this lane's own live set knows nothing of a worker
+        // it never spawned.
+        let attempt_id = RunSpec::from_canonical_bytes(&entry.document)
+            .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?
+            .attempt_id()
+            .as_str()
+            .to_owned();
+        if self.source_hosts_attempt(&attempt_id).is_some() {
+            return Err(ExecuteRefusal::AlreadyExecuting);
+        }
         self.admit_approval(&record.run_id, &entry.spec_digest, &entry.document, now_ms)?;
         self.execution
             .as_mut()
             .ok_or(ExecuteRefusal::ExecutionUnavailable)?
             .start(&entry.document, record.submission_id, record.revision)?;
         Ok(submission_id)
+    }
+
+    /// The route to the source generation still hosting `attempt_id`, if any.
+    ///
+    /// `Some` only while the attempt is in the adopted snapshot *and* the
+    /// source's route still answers at its pinned identity. The route is the
+    /// liveness signal on purpose: the source retires it only after every
+    /// worker it hosted has finished and advanced the read model, so an
+    /// unreachable route means there is nothing left to adopt, and the
+    /// snapshot is dropped. A snapshot member the route no longer lists is
+    /// still reported as hosted — its worker may be between releasing its
+    /// registration and advancing the row, and a second attempt in that gap is
+    /// exactly what this exists to refuse.
+    fn source_hosts_attempt(
+        &mut self,
+        attempt_id: &str,
+    ) -> Option<attempt_adoption::AttemptAdoptionClient> {
+        let adopted = self.adopted_source_attempts.as_ref()?;
+        if !adopted.contains(attempt_id) {
+            return None;
+        }
+        let client = adopted.client().ok()?;
+        match client.inventory() {
+            Ok(_) => Some(client),
+            Err(_) => {
+                self.adopted_source_attempts = None;
+                None
+            }
+        }
     }
 
     /// Expire what timed out, and remind about what has not.
@@ -6887,12 +7109,36 @@ impl Daemon {
             .attempt_host
             .as_ref()
             .ok_or(ExecuteRefusal::ExecutionUnavailable)?;
-        let outcome = match host.cancel(&attempt_id, request_ref, observed_sequence) {
+        let dispatched = match host.cancel(&attempt_id, request_ref, observed_sequence) {
+            // No registration holds this attempt here. Custody was not
+            // consulted and nothing was written — which is what makes it safe
+            // to ask the generation this one succeeded, whose host may still
+            // own the sink. That delivery runs under the source's dispatcher
+            // over the same durable ledger, so it is still exactly one
+            // reservation and at most one delivery for this reference.
+            DispatchOutcome::UnknownAttempt => match self.source_hosts_attempt(&attempt_id) {
+                Some(route) => route
+                    .cancel(&attempt_id, request_ref, observed_sequence)
+                    .map_err(|error| match error {
+                        // The source answered, and refused: its host could
+                        // not state an outcome.
+                        attempt_adoption::AttemptAdoptionError::HostUnavailable => {
+                            ExecuteRefusal::ExecutionUnavailable
+                        }
+                        // The request did not provably reach a sink. Saying
+                        // "no live attempt" would be a guess; this is not.
+                        _ => ExecuteRefusal::CancelNotDelivered,
+                    })?,
+                None => return Err(ExecuteRefusal::NoLiveAttempt),
+            },
+            outcome => outcome,
+        };
+        let outcome = match dispatched {
             DispatchOutcome::Delivered => CancelRunOutcome::Delivered,
             DispatchOutcome::AlreadyDelivered => CancelRunOutcome::AlreadyDelivered,
             DispatchOutcome::Conflict => CancelRunOutcome::Conflict,
-            // No registration holds this attempt: it finished, or never
-            // started. Custody was not consulted and nothing was written.
+            // No registration holds this attempt anywhere: it finished, or
+            // never started.
             DispatchOutcome::UnknownAttempt => return Err(ExecuteRefusal::NoLiveAttempt),
             DispatchOutcome::SinkUnavailable => return Err(ExecuteRefusal::CancelNotDelivered),
             DispatchOutcome::CustodyFull => return Err(ExecuteRefusal::LaneSaturated),
