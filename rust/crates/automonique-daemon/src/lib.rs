@@ -498,7 +498,9 @@ const STARTUP_TIMEOUT_EXTENSION: Duration = Duration::from_secs(5 * 60);
 /// Distinct from `reconciliation_required` on purpose: a submitter that retries
 /// on a degraded generation is waiting for a repair, while one that retries
 /// through a pause is waiting for a person.
-const INTAKE_PAUSED_CATEGORY: &str = "intake_paused";
+/// One spelling, shared with the automation scheduler worker: the worker
+/// refuses to derive under a pause with the same word the socket arms answer.
+const INTAKE_PAUSED_CATEGORY: &str = automation_scheduler::INTAKE_PAUSED_CATEGORY;
 
 /// Configuration for one foreground daemon instance.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1300,6 +1302,11 @@ pub struct Daemon {
     remove_socket_on_drop: bool,
     controller: automonique_core::Controller,
     reconciliation_run_id: Option<i64>,
+    /// The in-memory half of the intake decision, published to the
+    /// automation scheduler worker. Written wherever `reconciliation_run_id`
+    /// is, and only there, so the worker's gate and the socket arms' gate are
+    /// the same gate.
+    intake_signal: Arc<automation_scheduler::IntakeSignal>,
     telegram: telegram::TelegramHost,
     /// Configured-channel Slack ticket intake and confirmation lifecycle.
     slack_tickets: slack::SlackTicketHost,
@@ -2149,6 +2156,7 @@ impl Daemon {
         // core, so a fence it cannot install refuses startup rather than a
         // worker that ticks under nobody's authority. Recovery mode composes
         // nothing: it refuses starts, and an occurrence is a start.
+        let intake_signal = Arc::new(automation_scheduler::IntakeSignal::new());
         let automation_scheduler = if disconnected_recovery {
             automation_scheduler::AutomationSchedulerHost::disabled()
         } else {
@@ -2163,6 +2171,7 @@ impl Daemon {
                     parallelism_limit: automation_scheduler::AUTOMATION_PARALLELISM_LIMIT,
                     lease_time_source: Arc::new(lease_time::BootTimeSource),
                     clock: Arc::new(automation_scheduler::SystemClock),
+                    intake_signal: Arc::clone(&intake_signal),
                 },
             )
             .map_err(|error| DaemonError::AutomationSchedulerFailed(error.category()))?
@@ -2334,6 +2343,7 @@ impl Daemon {
             remove_socket_on_drop,
             controller: automonique_core::Controller::new(),
             reconciliation_run_id: None,
+            intake_signal,
             telegram,
             slack_tickets,
             ticket_gates,
@@ -2854,6 +2864,7 @@ impl Daemon {
                 parallelism_limit: automation_scheduler::AUTOMATION_PARALLELISM_LIMIT,
                 lease_time_source: Arc::new(lease_time::BootTimeSource),
                 clock: Arc::new(automation_scheduler::SystemClock),
+                intake_signal: Arc::clone(&self.intake_signal),
             },
         )
         .map_err(|error| DaemonError::AutomationSchedulerFailed(error.category()))?;
@@ -3590,6 +3601,7 @@ impl Daemon {
                     .parse::<i64>()
                     .map_err(|_| DaemonError::ProtocolRefused("reconciliation_run_id"))?;
                 self.reconciliation_run_id = Some(run_id);
+                self.intake_signal.set_reconciliation_pending(true);
                 Ok(())
             }
         }
@@ -3671,6 +3683,12 @@ impl Daemon {
         };
         DurableStateCounts::new(DurableStateCountsParts {
             approvals_recorded: durable_count(self.approvals.decision_count()),
+            // Not a store read: the worker with custody of the registry and
+            // the scheduler core, observed on its thread. A worker that
+            // stopped on a fault is a measured zero an operator acts on; a
+            // generation that composed none (disconnected recovery) has
+            // nothing to measure.
+            automation_scheduler_workers: self.automation_scheduler.workers_metric(),
             automations_registered: durable_count(self.automations.automation_count()),
             open_tenure_epoch,
             open_tenures,
@@ -4050,6 +4068,20 @@ impl Daemon {
                 let submission = request
                     .submission()
                     .ok_or(DaemonError::ProtocolRefused("admin_invalid_body"))?;
+                // The `automation:` namespace is the scheduler worker's to
+                // derive occurrence keys in, on this very lane, and the lane
+                // dedupes on the key: a caller-chosen key under it would be
+                // absorbed as a replay of an occurrence, or absorb one. Refused
+                // by name, here, so the caller learns which rule it met.
+                if automonique_protocol::admin::synthetic_key_is_reserved(
+                    submission.idempotency_key(),
+                ) {
+                    return self.write_refusal(
+                        stream,
+                        request.request_id(),
+                        automonique_protocol::admin::RESERVED_SYNTHETIC_KEY_CATEGORY,
+                    );
+                }
                 let receipt = self.store.submit_inbox(InboxSubmission {
                     transport: "local.synthetic",
                     transport_key: submission.idempotency_key(),
@@ -4319,6 +4351,7 @@ impl Daemon {
                 };
                 if self.reconciliation_run_id == Some(run_id) {
                     self.reconciliation_run_id = None;
+                    self.intake_signal.set_reconciliation_pending(false);
                 }
                 AdminResponse::ReconciliationFailed {
                     request_id: request.request_id().clone(),
@@ -8736,7 +8769,14 @@ fn record_tenure(
         .map_err(generation_audit_failed)
 }
 
-fn snapshot_requires_reconciliation(snapshot: &StatusSnapshot) -> bool {
+/// The durable half of "this generation is degraded": a running run whose
+/// work lock has lapsed, or an outbox delivery whose outcome is unknown.
+///
+/// The other half is [`Daemon::reconciliation_run_id`], which the serve loop
+/// holds in memory; every intake arm and the automation scheduler worker
+/// judge both, so `accepting_intake == false` stays a statement about what
+/// the whole daemon does.
+pub(crate) fn snapshot_requires_reconciliation(snapshot: &StatusSnapshot) -> bool {
     snapshot.runs_reconciliation_pending() > 0 || snapshot.outbox_in_flight_ambiguous() > 0
 }
 

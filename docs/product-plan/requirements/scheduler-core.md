@@ -164,10 +164,15 @@ the core's own `cancel` verbs — queued work never starts, running work keeps
 its slot until the lane's terminal commit. A committed `running` row is still
 never silently requeued after a crash: the worker reads the lane back by key
 and either waits on the delivery it finds or hands over the one it never made,
-which is how the no-duplicate-start property survives a restart.
+which is how the no-duplicate-start property survives a restart. The worker
+is also bound by the daemon's three intake gates — disconnected recovery, a
+degraded generation, an operator pause — exactly as the socket's intake arms
+are: under a closed intake it derives nothing and starts nothing, and what
+was due fires once when intake reopens.
 `requirements/automation-goals-and-triggers.md` § *The occurrence key and the
-fence, as built* states the derivation, the catch-up policy and what still
-does not ship (cron, triggers, a provider executor behind the prompt).
+fence, as built* states the derivation, the catch-up policy, the intake
+gates, the interval floor, retention and what still does not ship (cron,
+triggers, a provider executor behind the prompt).
 
 The remaining obligations this document does not restate — fencing writes as
 well as work (#50), boot- and suspend-aware lease time (#51), and the durable

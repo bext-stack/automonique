@@ -25,7 +25,31 @@
 //! `every@<ms>`) or one of the recognized phrases (`hourly`, `every hour`).
 //! A phrase that resolves to the five-field cron form (`daily`) is refused as
 //! `unsupported_schedule`: the daemon has no cron evaluator, and a schedule it
-//! could not fire is not registered.
+//! could not fire is not registered. A fixed interval shorter than one second
+//! (`every@999`) is refused as `interval_too_short`: every firing is a durable
+//! row in the scheduler core and a durable delivery on the run lane, neither
+//! of which is pruned, and the worker looks for due instants four times a
+//! second, so a sub-second interval would grow two tables while mostly
+//! skipping its own instants.
+//!
+//! # What a pause costs, stated plainly
+//!
+//! `pause` stops new occurrences from being derived and cancels one that is
+//! queued but not yet started; that instant is **skipped for good**, not held
+//! for the resume. For a fixed interval that is one grid instant. For a
+//! `once@` job there is only one instant, so a one-shot paused after its
+//! instant was admitted and before it started is consumed: it shows
+//! `next_fire_at_ms=-` afterwards and does not fire on resume. Register it
+//! again under a new identity to fire it later. An occurrence the lane is
+//! already running is not stopped by a pause — `archive` requests a stop —
+//! and a paused interval automation resumes from its next grid instant, never
+//! with a burst of the instants it spent paused.
+//!
+//! An operator intake pause (the admin lane's `pause_intake`, reported by
+//! `automonique status` as `intake paused: true`) is a different switch: it
+//! closes the run lane to everything, automations included, and a due
+//! occurrence simply waits — unskipped — until intake is resumed, then fires
+//! once.
 //!
 //! # The discipline, mirroring the other verbs
 //!
@@ -198,9 +222,15 @@ fn build(operation: &Operation) -> Result<AutomationRequest, AutomationCliError>
                     job.scope,
                     job.prompt,
                 )
-                // The one refusal the constructor adds over its parts: an
-                // identity too long to derive an occurrence key from.
-                .map_err(|_| AutomationCliError::Field("invalid_automation_id"))?,
+                // The two refusals the constructor adds over its parts: an
+                // identity too long to derive an occurrence key from, and a
+                // fixed interval below the registration floor.
+                .map_err(|error| match error {
+                    AutomationApiError::IntervalTooShort { .. } => {
+                        AutomationCliError::Field("interval_too_short")
+                    }
+                    _ => AutomationCliError::Field("invalid_automation_id"),
+                })?,
             })
         }
         Operation::Pause {
@@ -1199,6 +1229,16 @@ mod tests {
                     &["--schedule", "every@0", "--scope", "ws", "--prompt", "p"],
                 ),
                 "invalid_schedule",
+            ),
+            // Below the registration floor: a well-formed schedule the lane
+            // refuses to register, by its own name.
+            (
+                register(
+                    "nightly-report",
+                    "ben",
+                    &["--schedule", "every@999", "--scope", "ws", "--prompt", "p"],
+                ),
+                "interval_too_short",
             ),
             // Cron is canonical and is refused by name: the daemon has no
             // evaluator for it, and `daily` resolves to it.

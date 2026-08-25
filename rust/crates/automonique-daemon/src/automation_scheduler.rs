@@ -70,6 +70,15 @@
 //! resume, a fixed interval continues from the first instant after `now`,
 //! never with a burst of catch-up firings.
 //!
+//! The skip is permanent, and it is the one way an instant is consumed
+//! without firing: a pause that lands while the occurrence is queued — after
+//! the tick that admitted it, before the core started it — settles that
+//! instant as not fired. For a fixed interval that costs one grid instant;
+//! for a one-shot it is the only instant there was, so a `once@` job paused
+//! in that window is exhausted (`next_fire_at_ms` null) and never fires,
+//! even after a resume. An operator who wants a one-shot to fire later
+//! registers it again under a new identity.
+//!
 //! # Restart
 //!
 //! Nothing here is in memory. A due-but-unfired occurrence is due again on the
@@ -77,6 +86,54 @@
 //! active in the registry, running in the core and present on the lane, and
 //! is waited on rather than resubmitted; a paused automation is still paused,
 //! because the registry is what says so.
+//!
+//! # Intake
+//!
+//! Submitting an occurrence to the lane is intake, and this worker is bound
+//! by the same three gates every socket intake arm is: a generation in
+//! **disconnected recovery** composes no worker at all; a **degraded
+//! generation** — the serve loop holding a reconciliation open, or the status
+//! snapshot counting a lapsed work lock or an ambiguous outbox delivery —
+//! closes it with [`RECONCILIATION_REQUIRED_CATEGORY`]; and an **operator
+//! pause** closes it with [`INTAKE_PAUSED_CATEGORY`]. The judgement is made
+//! once per tick, under the same snapshot the fence is checked on, and
+//! reported on [`TickReport::intake_closed`]. The in-memory half of the second
+//! gate reaches the worker through [`IntakeSignal`], which the serve loop
+//! sets and clears beside its own marker, so the worker and the arms never
+//! disagree about which state they are in.
+//!
+//! While intake is closed the worker **derives nothing and hands nothing to
+//! the lane**: a due automation stays due at its instant (`next_fire_at_ms`
+//! is not touched), an occurrence already queued in the core stays queued,
+//! and one the core started but the lane never received keeps waiting under
+//! its key. Settling what the lane has already finished, and cancelling what
+//! an operator withdrew, continue — neither is intake. When intake reopens,
+//! the first open tick admits and starts what was held, once, under the same
+//! keys, and the catch-up rule applies unchanged: an interval that fell
+//! behind during the closure fires its oldest due instant and continues from
+//! the first grid instant after that tick's `now`. Nothing is lost, and
+//! nothing fires twice, because nothing was written while the door was shut.
+//!
+//! # What an operator sees
+//!
+//! A worker that stops on a non-transient failure — a stale fence, a corrupt
+//! pairing of the three stores — records the category on
+//! [`AutomationSchedulerHost::fault`], emits one `worker_fault` observation to
+//! the journal (`structured_log`, no user content), and is reported by the
+//! status projection's `automation_scheduler_workers` as a measured zero, where
+//! a live worker is one and a recovery-mode daemon that composed none reports
+//! no reading.
+//!
+//! # Retention
+//!
+//! Every occurrence leaves one row in the scheduler core (`scheduler_work`,
+//! which remembers terminal identities so nothing starts twice) and one
+//! delivery on the synthetic lane's inbox and outbox. Nothing in this slice
+//! prunes either: the rows are the replay-safety evidence, and a short
+//! interval grows both tables at that interval's rate. The registration floor
+//! (`MIN_AUTOMATION_INTERVAL_MS`, one second) bounds that rate; a retention
+//! policy for settled occurrences is a later slice's, and until it lands an
+//! operator should expect the two databases to grow by one row per firing.
 //!
 //! # The clock
 //!
@@ -93,6 +150,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use automonique_core::SchedulerFence;
 use automonique_core::scheduler_conformance::{QueuedWork, ScopeId, WorkId, WorkState};
+use automonique_protocol::admin::OperationalMetric;
 use automonique_protocol::automation_api::{
     AutomationId, AutomationOccurrenceKey, AutomationSchedule,
 };
@@ -101,12 +159,63 @@ use automonique_store::automation_store::{
     AutomationRecord, AutomationSchedule as StoredSchedule, AutomationStore, AutomationStoreError,
 };
 use automonique_store::durable_scheduler::{DurableSchedulerError, DurableSchedulerStore};
-use automonique_store::{InboxSubmission, LeaseTimeSource, Store, StoreError};
+use automonique_store::{InboxSubmission, LeaseTimeSource, StatusSnapshot, Store, StoreError};
+
+use crate::{DaemonError, snapshot_requires_reconciliation, structured_log};
 
 /// The transport an occurrence is submitted on: the daemon's durable synthetic
 /// lane, the one `automonique submit` uses and the serve loop's controller
 /// tick claims from.
 pub const OCCURRENCE_TRANSPORT: &str = "local.synthetic";
+
+/// The worker group this worker drains and faults under, in the journal and
+/// in the daemon's labelled shutdown.
+pub const WORKER_GROUP: &str = "automation_scheduler";
+
+/// Why a tick derived nothing: an operator closed intake.
+///
+/// The same word the socket's intake arms refuse with, so a tick report and a
+/// refused `automonique submit` say the same thing about the same state.
+pub const INTAKE_PAUSED_CATEGORY: &str = "intake_paused";
+
+/// Why a tick derived nothing: the generation is degraded and must reconcile
+/// before it accepts anything. The socket arms' word, again.
+pub const RECONCILIATION_REQUIRED_CATEGORY: &str = DaemonError::ReconciliationRequired.category();
+
+/// What the serve loop knows about intake that the product store does not.
+///
+/// The socket's intake arms refuse on three grounds: disconnected recovery,
+/// a degraded generation, and an operator pause. The first composes no
+/// worker at all and the third is a durable row the worker reads for itself.
+/// The second is half durable — the status snapshot's own reconciliation
+/// counts — and half the serve loop's memory of a controller tick that asked
+/// for reconciliation ([`crate::Daemon`]'s `reconciliation_run_id`). This is
+/// that half, published so the worker judges intake by exactly the three
+/// grounds the arms do rather than by the two it could read alone.
+#[derive(Debug, Default)]
+pub struct IntakeSignal {
+    reconciliation_pending: AtomicBool,
+}
+
+impl IntakeSignal {
+    /// A signal with nothing pending: the state a fresh generation starts in.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record whether the serve loop is holding a reconciliation open.
+    pub fn set_reconciliation_pending(&self, pending: bool) {
+        self.reconciliation_pending
+            .store(pending, Ordering::Release);
+    }
+
+    /// Whether the serve loop is holding a reconciliation open.
+    #[must_use]
+    pub fn reconciliation_pending(&self) -> bool {
+        self.reconciliation_pending.load(Ordering::Acquire)
+    }
+}
 
 /// Occurrences the scheduler core lets run at once, across every automation.
 ///
@@ -165,6 +274,8 @@ pub struct AutomationSchedulerParams<'a> {
     pub lease_time_source: Arc<dyn LeaseTimeSource>,
     /// Where `now` comes from.
     pub clock: Arc<dyn AutomationClock>,
+    /// The serve loop's in-memory half of the intake decision.
+    pub intake_signal: Arc<IntakeSignal>,
 }
 
 /// Why the worker could not open, or why one tick did not complete.
@@ -295,14 +406,28 @@ pub struct TickReport {
     /// Occurrences cancelled before they started, because their automation was
     /// withdrawn while they were queued.
     pub cancelled: usize,
+    /// Why the tick admitted and started nothing, when intake was closed:
+    /// [`INTAKE_PAUSED_CATEGORY`] or [`RECONCILIATION_REQUIRED_CATEGORY`].
+    /// `None` on a tick that judged intake open.
+    pub intake_closed: Option<&'static str>,
 }
 
 impl TickReport {
     /// Whether the tick changed nothing, so the worker may sleep.
+    ///
+    /// A closed intake is not a change: a tick that only found the door shut
+    /// sleeps like one that found nothing due.
     #[must_use]
     pub const fn is_idle(&self) -> bool {
         self.admitted == 0 && self.started == 0 && self.settled == 0 && self.cancelled == 0
     }
+}
+
+/// What the intake arms would say to a submission right now.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Intake {
+    Open,
+    Closed(&'static str),
 }
 
 #[derive(Clone)]
@@ -316,6 +441,7 @@ struct OwnedParams {
     parallelism_limit: u32,
     lease_time_source: Arc<dyn LeaseTimeSource>,
     clock: Arc<dyn AutomationClock>,
+    intake_signal: Arc<IntakeSignal>,
 }
 
 /// The worker, drivable one tick at a time.
@@ -359,6 +485,7 @@ impl AutomationSchedulerWorker {
             parallelism_limit: params.parallelism_limit,
             lease_time_source: Arc::clone(&params.lease_time_source),
             clock: Arc::clone(&params.clock),
+            intake_signal: Arc::clone(&params.intake_signal),
         };
         Self::open_owned(owned)
     }
@@ -426,17 +553,35 @@ impl AutomationSchedulerWorker {
         if now_ms < 0 {
             return Err(AutomationSchedulerError::Clock("clock_before_epoch"));
         }
-        self.require_generation(now_ms)?;
+        let snapshot = self.require_generation(now_ms)?;
+        let intake = self.judge_intake(&snapshot, now_ms)?;
         let mut report = TickReport::default();
-        self.reconcile_active(now_ms, &mut report)?;
-        self.admit_due(now_ms, &mut report)?;
-        self.start_admitted(now_ms, &mut report)?;
+        self.reconcile_active(now_ms, intake, &mut report)?;
+        match intake {
+            Intake::Open => {
+                self.admit_due(now_ms, &mut report)?;
+                self.start_admitted(now_ms, &mut report)?;
+            }
+            // Nothing is derived and nothing is started: a due automation
+            // stays due at its instant, a queued occurrence stays queued in
+            // the core, and both are picked up — once — by the first tick
+            // that finds intake open. See "Intake" above.
+            Intake::Closed(category) => report.intake_closed = Some(category),
+        }
         Ok(report)
     }
 
     /// The product store's generation row must name this holder and epoch
     /// with a live lease.
-    fn require_generation(&mut self, now_ms: i64) -> Result<(), AutomationSchedulerError> {
+    ///
+    /// One status snapshot per tick, and the whole of it is used: the
+    /// generation row for the fence, and the reconciliation counts for the
+    /// intake judgement below. The store has no cheaper read of the row
+    /// alone, and the counts would have to be read in any case.
+    fn require_generation(
+        &mut self,
+        now_ms: i64,
+    ) -> Result<StatusSnapshot, AutomationSchedulerError> {
         let snapshot = self
             .store
             .status_snapshot_at(&self.params.generation_id, now_ms)?;
@@ -449,14 +594,42 @@ impl AutomationSchedulerWorker {
         {
             return Err(AutomationSchedulerError::StaleFence);
         }
-        Ok(())
+        Ok(snapshot)
+    }
+
+    /// Judge intake exactly as the socket's intake arms do, in their order:
+    /// a degraded generation first, an operator pause second. Disconnected
+    /// recovery is the third ground, and it composes no worker to ask.
+    fn judge_intake(
+        &mut self,
+        snapshot: &StatusSnapshot,
+        now_ms: i64,
+    ) -> Result<Intake, AutomationSchedulerError> {
+        if self.params.intake_signal.reconciliation_pending()
+            || snapshot_requires_reconciliation(snapshot)
+        {
+            return Ok(Intake::Closed(RECONCILIATION_REQUIRED_CATEGORY));
+        }
+        if self
+            .store
+            .intake_paused(&self.params.generation_id, now_ms)?
+            .is_some()
+        {
+            return Ok(Intake::Closed(INTAKE_PAUSED_CATEGORY));
+        }
+        Ok(Intake::Open)
     }
 
     /// Step 1: every occurrence the registry records as active, read back
     /// against the core and the lane.
+    ///
+    /// Runs under a closed intake too, because none of it is intake except
+    /// one arm — handing an occurrence the core already started to the lane
+    /// — and that arm waits.
     fn reconcile_active(
         &mut self,
         now_ms: i64,
+        intake: Intake,
         report: &mut TickReport,
     ) -> Result<(), AutomationSchedulerError> {
         for record in self.registry.active_occurrences(OCCURRENCE_BATCH)? {
@@ -497,17 +670,22 @@ impl AutomationSchedulerWorker {
                         .inbox_disposition(OCCURRENCE_TRANSPORT, occurrence.key.as_str())?
                     {
                         // Started by the core, never handed to the lane: a
-                        // crash between the two, or a withdrawal that landed
-                        // between a tick's start and this one.
-                        None => {
-                            if enabled {
+                        // crash between the two, a withdrawal that landed
+                        // between a tick's start and this one, or an intake
+                        // that closed in the same window. Handing it over is
+                        // intake, so under a closed intake it keeps waiting,
+                        // in the core, under its key.
+                        None => match (enabled, intake) {
+                            (true, Intake::Open) => {
                                 self.submit_to_lane(&occurrence, now_ms)?;
                                 report.started += 1;
-                            } else {
+                            }
+                            (true, Intake::Closed(_)) => {}
+                            (false, _) => {
                                 self.cancel_unstarted(&occurrence, now_ms)?;
                                 report.cancelled += 1;
                             }
-                        }
+                        },
                         Some(disposition) if disposition.state.is_terminal() => {
                             self.settle_fired(&occurrence, now_ms)?;
                             report.settled += 1;
@@ -811,6 +989,25 @@ impl AutomationSchedulerHost {
             .is_some_and(|worker| !worker.is_finished())
     }
 
+    /// The worker as the status projection reports it.
+    ///
+    /// One when the worker is on its thread — or composed and not yet
+    /// started, which no status is answered during — zero when the thread
+    /// ended on its own (the journal's `worker_fault` observation names the
+    /// category; [`Self::fault`] holds it here), and unavailable when the
+    /// host was [`Self::disabled`]: nothing was composed, so there is nothing
+    /// to measure, which is a different fact from a worker that stopped.
+    #[must_use]
+    pub fn workers_metric(&self) -> OperationalMetric {
+        if self.is_running() || self.composed.is_some() {
+            OperationalMetric::Measured(1)
+        } else if self.worker.is_some() || self.fault().is_some() {
+            OperationalMetric::Measured(0)
+        } else {
+            OperationalMetric::Unavailable
+        }
+    }
+
     /// Signal and join the worker.
     pub fn shutdown(&mut self) {
         if let Some(worker) = self.begin_shutdown() {
@@ -842,9 +1039,16 @@ impl AutomationSchedulerWorker {
                 Ok(_) => std::thread::sleep(IDLE_POLL),
                 Err(error) if error.is_transient() => std::thread::sleep(IDLE_POLL),
                 Err(error) => {
+                    // The fault is recorded where the status projection reads
+                    // it and where the journal keeps it; the thread then ends
+                    // rather than looping over a failure no later tick could
+                    // repair. Emitting cannot fail the worker: a journal that
+                    // is absent or refuses the datagram changes nothing about
+                    // why the worker stopped.
                     if let Ok(mut slot) = fault.lock() {
                         *slot = Some(error.category());
                     }
+                    let _ = structured_log::emit_worker_fault(WORKER_GROUP, error.category());
                     return;
                 }
             }

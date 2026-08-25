@@ -74,6 +74,63 @@ does not:
   requests a stop; custody stays with the core until the lane's terminal
   commit lands. On resume, the automation continues from its next due
   instant.
+
+  The skip is permanent, and it is stated here because it is the one way an
+  instant is consumed without firing: a pause that lands while the
+  occurrence is queued — after the tick that admitted it and before the core
+  started it — settles that instant as not fired. For a fixed interval that
+  costs one grid instant. For a `once@` job it is the only instant there
+  was, so a one-shot paused in that window is exhausted (`next_fire_at_ms`
+  null) and does not fire on resume; an operator who still wants it fired
+  registers it again under a new identity. The CLI's usage text says the
+  same.
+- **Intake gates.** Handing an occurrence to the lane is intake, and the
+  worker is bound by the same three gates every socket intake arm applies:
+  a generation in disconnected recovery composes no worker; a degraded
+  generation (the serve loop holding a reconciliation open, or the status
+  snapshot counting a lapsed work lock or an ambiguous outbox delivery)
+  closes it with `reconciliation_required`; an operator pause closes it with
+  `intake_paused`. Under a closed intake the worker derives nothing and
+  hands nothing over: a due automation stays due at its instant, a queued
+  occurrence stays queued in the core, and one the core started but the lane
+  never received keeps waiting under its key, while settling finished runs
+  and cancelling withdrawn ones continue. When intake reopens the first open
+  tick admits and starts what was held, once, under the same keys, and the
+  catch-up rule applies unchanged — the oldest due instant fires and the
+  interval continues from the first grid instant after that tick. An
+  automation pause and an intake pause are therefore different switches: the
+  first skips a queued instant for good, the second holds it.
+- **Minimum interval.** A fixed interval below one second
+  (`MIN_AUTOMATION_INTERVAL_MS`) is refused at registration with the typed
+  `automation_interval_too_short` (the CLI reports `interval_too_short`).
+  The schedule grammar itself is unchanged on both sides of the wire — any
+  positive `every@<ms>` still decodes on a record — so the floor is a
+  registration rule the daemon and the CLI both apply, and the generated
+  TypeScript builder does not: a registration it emits below the floor is
+  refused by the daemon under the same category.
+- **Retention.** Every firing leaves one row in the scheduler core's
+  `scheduler_work` (terminal identities are what stop a replay from starting
+  twice) and one delivery on the synthetic lane's inbox and outbox. Nothing
+  in this slice prunes any of them: a short interval grows the two databases
+  at that interval's rate, which the floor above bounds, and a retention
+  policy for settled occurrences is a later slice's. Until it lands, expect
+  one row per firing in each table.
+- **Health.** A worker that stops on a non-transient failure (a stale fence,
+  a corrupt pairing of the three stores) records the category, emits one
+  `worker_fault` observation to the journal (structured-log schema v1,
+  `AUTOMONIQUE_WORKER_GROUP=automation_scheduler`,
+  `AUTOMONIQUE_FAULT_CATEGORY=<category>`, no user content), and is reported
+  by `automonique status` under the durable-state counts as
+  `automation scheduler workers: 0`; a live worker is `1`, and a
+  recovery-mode daemon that composed none reports `unavailable`. The admin
+  capability moved to 10 for the added field.
+- **Version one moved in place.** The job fields, the prompt on a detail
+  read and the page bound (32 → 24) were added to `automonique.automation`
+  v1 without a major version, because the daemon, the CLI and the
+  never-published TypeScript SDK ship from one tree in one release and there
+  is no deployed peer to keep compatible with. `automonique_protocol::automation_api`
+  records the decision beside the types; the first published SDK is the
+  point after which a change of this shape becomes a v2.
 - **What fires.** The occurrence is a normal item on the daemon's durable
   synthetic lane — the same lane `automonique submit` uses — claimed and
   completed by the serve loop's controller with that lane's own outbox

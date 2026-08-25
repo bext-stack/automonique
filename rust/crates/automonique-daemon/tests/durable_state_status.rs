@@ -150,6 +150,11 @@ fn counts(status: &DaemonStatus) -> DurableStateCounts {
         OperationalMetric::Measured(status.generation()),
         "the audited tenure and the generation lease must name the same epoch"
     );
+    assert_eq!(
+        counts.automation_scheduler_workers(),
+        OperationalMetric::Measured(1),
+        "a serving daemon has its automation scheduler worker on its thread"
+    );
     counts
 }
 

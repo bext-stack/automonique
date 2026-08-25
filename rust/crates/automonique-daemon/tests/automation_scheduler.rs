@@ -26,7 +26,8 @@ use automonique_core::scheduler_conformance::{WorkId, WorkState};
 use automonique_core::{Controller, SchedulerFence, TickOutcome};
 use automonique_daemon::automation_scheduler::{
     AUTOMATION_PARALLELISM_LIMIT, AutomationClock, AutomationSchedulerError,
-    AutomationSchedulerParams, AutomationSchedulerWorker, OCCURRENCE_TRANSPORT, TickReport,
+    AutomationSchedulerParams, AutomationSchedulerWorker, INTAKE_PAUSED_CATEGORY, IntakeSignal,
+    OCCURRENCE_TRANSPORT, RECONCILIATION_REQUIRED_CATEGORY, TickReport,
 };
 use automonique_daemon::synthetic::StoreScheduler;
 use automonique_protocol::automation_api::{AutomationId, AutomationOccurrenceKey};
@@ -36,7 +37,10 @@ use automonique_store::automation_store::{
     EnablementState, EnablementTransition,
 };
 use automonique_store::durable_scheduler::DurableSchedulerStore;
-use automonique_store::{InboxState, LeaseRequest, LeaseTimeSource, Store};
+use automonique_store::{
+    InboxState, InboxSubmission, IntakePauseRequest, IntakeResumeRequest, LeaseRequest,
+    LeaseTimeSource, OutboxClaimRequest, SchedulerClaim, Store, TerminalRun, TerminalState,
+};
 
 const GENERATION: &str = "generation";
 const T0: i64 = 1_700_000_000_000;
@@ -79,6 +83,9 @@ struct Fixture {
     holder: String,
     epoch: u64,
     lease_expires_ms: i64,
+    /// What the serve loop would publish: nothing pending, unless a test
+    /// says otherwise.
+    intake_signal: Arc<IntakeSignal>,
 }
 
 impl Fixture {
@@ -112,6 +119,7 @@ impl Fixture {
             holder: "holder-1".to_owned(),
             epoch: lease.epoch,
             lease_expires_ms: lease.expires_ms,
+            intake_signal: Arc::new(IntakeSignal::new()),
         }
     }
 
@@ -144,8 +152,40 @@ impl Fixture {
             parallelism_limit: limit,
             lease_time_source: Arc::clone(&self.clock) as Arc<dyn LeaseTimeSource>,
             clock: Arc::clone(&self.clock) as Arc<dyn AutomationClock>,
+            intake_signal: Arc::clone(&self.intake_signal),
         })
         .expect("open the worker")
+    }
+
+    /// Close intake the way an operator does: a durable pause row under this
+    /// generation's authority, which the socket arms and the worker both read.
+    fn pause_intake(&mut self, reason: &str) -> u64 {
+        let now_ms = self.clock.get();
+        self.store
+            .pause_intake(IntakePauseRequest {
+                generation_id: GENERATION,
+                holder_id: self.holder.as_str(),
+                authority_lease_epoch: self.epoch,
+                actor: "dana",
+                reason,
+                now_ms,
+            })
+            .expect("pause intake")
+            .revision
+    }
+
+    fn resume_intake(&mut self, expected_revision: u64) {
+        let now_ms = self.clock.get();
+        self.store
+            .resume_intake(IntakeResumeRequest {
+                generation_id: GENERATION,
+                holder_id: self.holder.as_str(),
+                authority_lease_epoch: self.epoch,
+                actor: "dana",
+                expected_revision,
+                now_ms,
+            })
+            .expect("resume intake");
     }
 
     fn worker(&self) -> AutomationSchedulerWorker {
@@ -292,6 +332,19 @@ fn report(admitted: usize, started: usize, settled: usize, cancelled: usize) -> 
         started,
         settled,
         cancelled,
+        intake_closed: None,
+    }
+}
+
+/// A tick that found intake closed: nothing admitted, nothing started, and
+/// the category the socket arms would have refused with.
+fn closed(category: &'static str, settled: usize, cancelled: usize) -> TickReport {
+    TickReport {
+        admitted: 0,
+        started: 0,
+        settled,
+        cancelled,
+        intake_closed: Some(category),
     }
 }
 
@@ -850,4 +903,384 @@ fn a_registration_from_before_jobs_existed_is_never_due() {
         TickReport::default()
     );
     assert_eq!(fixture.outbox_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Intake: the worker is bound by the socket arms' three gates
+// ---------------------------------------------------------------------------
+
+/// An operator pause closes the lane to automations exactly as it closes it
+/// to `automonique submit`. A due instant is not lost and not duplicated: it
+/// stays due, unadvanced, and fires once — at its own instant — on the first
+/// tick after intake reopens, with the catch-up rule deciding the successor.
+#[test]
+fn a_due_occurrence_waits_out_an_intake_pause_and_fires_once_on_resume() {
+    let mut fixture = Fixture::new();
+    fixture.register_every("nightly", "workspace:reports", T0);
+    let mut worker = fixture.worker();
+    let at = T0 + MINUTE;
+
+    fixture.clock.set(at - 1);
+    let revision = fixture.pause_intake("maintenance");
+
+    // Due, and refused by name. Nothing reached the core, the lane or the
+    // registry's occurrence columns.
+    assert_eq!(
+        worker.tick_at(at).expect("tick"),
+        closed(INTAKE_PAUSED_CATEGORY, 0, 0)
+    );
+    assert_eq!(fixture.core_state("nightly", at), None);
+    assert_eq!(fixture.lane_state("nightly", at), None);
+    let held = fixture.job("nightly");
+    assert_eq!(held.next_fire_at_ms, Some(at), "still due at its instant");
+    assert_eq!(held.active_occurrence_ms, None);
+    assert_eq!(held.last_fired_at_ms, None);
+
+    // The pause outlasts the next grid instant: still closed, still due at
+    // the oldest instant, and the report says the same thing every tick.
+    assert_eq!(
+        worker.tick_at(at + MINUTE + 1).expect("tick"),
+        closed(INTAKE_PAUSED_CATEGORY, 0, 0)
+    );
+    assert_eq!(fixture.job("nightly").next_fire_at_ms, Some(at));
+    assert_eq!(fixture.outbox_count(), 0);
+
+    // Reopened at at+2m+30s: the oldest due instant fires once under its own
+    // key, the instant in between is skipped (never a burst), and the
+    // successor is the first grid instant after this tick's now.
+    let reopened = at + 2 * MINUTE + 30_000;
+    fixture.clock.set(reopened);
+    fixture.resume_intake(revision);
+    assert_eq!(worker.tick_at(reopened).expect("tick"), report(1, 1, 0, 0));
+    assert_eq!(fixture.lane_state("nightly", at), Some(InboxState::Pending));
+    assert_eq!(fixture.lane_state("nightly", at + MINUTE), None);
+    assert_eq!(fixture.lane_state("nightly", at + 2 * MINUTE), None);
+    let fired = fixture.job("nightly");
+    assert_eq!(fired.active_occurrence_ms, Some(at));
+    assert_eq!(fired.next_fire_at_ms, Some(at + 3 * MINUTE));
+
+    assert_eq!(fixture.drain_lane(), 1);
+    assert_eq!(
+        worker.tick_at(reopened + 1).expect("tick"),
+        report(0, 0, 1, 0)
+    );
+    assert_eq!(fixture.job("nightly").last_fired_at_ms, Some(at));
+    assert_eq!(
+        fixture.outbox_count(),
+        1,
+        "exactly one firing for the whole window"
+    );
+    // And a replayed tick after the window derives nothing more.
+    assert_eq!(
+        worker.tick_at(reopened + 2).expect("tick"),
+        TickReport::default()
+    );
+    assert_eq!(fixture.outbox_count(), 1);
+}
+
+/// A one-shot due inside a closed window is neither consumed nor fired by
+/// the closure — unlike a pause of the automation itself, which skips a
+/// queued instant. It fires once when intake reopens and is then exhausted.
+#[test]
+fn a_one_shot_due_under_a_closed_intake_fires_once_when_it_reopens() {
+    let mut fixture = Fixture::new();
+    let at = T0 + MINUTE;
+    fixture.register_once("report", "workspace:reports", at);
+    let mut worker = fixture.worker();
+
+    let revision = fixture.pause_intake("maintenance");
+    assert_eq!(
+        worker.tick_at(at).expect("tick"),
+        closed(INTAKE_PAUSED_CATEGORY, 0, 0)
+    );
+    assert_eq!(fixture.job("report").next_fire_at_ms, Some(at));
+
+    fixture.clock.set(at + MINUTE);
+    fixture.resume_intake(revision);
+    assert_eq!(
+        worker.tick_at(at + MINUTE).expect("tick"),
+        report(1, 1, 0, 0)
+    );
+    assert_eq!(fixture.lane_state("report", at), Some(InboxState::Pending));
+    assert_eq!(fixture.drain_lane(), 1);
+    assert_eq!(
+        worker.tick_at(at + MINUTE + 1).expect("tick"),
+        report(0, 0, 1, 0)
+    );
+    let job = fixture.job("report");
+    assert_eq!(job.last_fired_at_ms, Some(at));
+    assert_eq!(
+        job.next_fire_at_ms, None,
+        "a one-shot is exhausted by its firing"
+    );
+    assert_eq!(fixture.outbox_count(), 1);
+}
+
+/// The serve loop's in-memory reconciliation marker closes the worker the
+/// way it closes the socket arms, and reopening it lets the held instant
+/// fire once.
+#[test]
+fn a_pending_reconciliation_closes_the_scheduler_like_the_socket_arms() {
+    let mut fixture = Fixture::new();
+    fixture.register_every("nightly", "workspace:reports", T0);
+    let mut worker = fixture.worker();
+    let at = T0 + MINUTE;
+
+    fixture.intake_signal.set_reconciliation_pending(true);
+    assert_eq!(
+        worker.tick_at(at).expect("tick"),
+        closed(RECONCILIATION_REQUIRED_CATEGORY, 0, 0)
+    );
+    assert_eq!(fixture.core_state("nightly", at), None);
+    assert_eq!(fixture.lane_state("nightly", at), None);
+    assert_eq!(fixture.job("nightly").next_fire_at_ms, Some(at));
+
+    fixture.intake_signal.set_reconciliation_pending(false);
+    assert_eq!(
+        worker.tick_at(at + 10_000).expect("tick"),
+        report(1, 1, 0, 0)
+    );
+    assert_eq!(fixture.lane_state("nightly", at), Some(InboxState::Pending));
+    assert_eq!(fixture.job("nightly").next_fire_at_ms, Some(at + MINUTE));
+    assert_eq!(fixture.drain_lane(), 1);
+    assert_eq!(
+        worker.tick_at(at + 10_001).expect("tick"),
+        report(0, 0, 1, 0)
+    );
+    assert_eq!(fixture.outbox_count(), 1);
+}
+
+/// The durable half of a degraded generation — here an outbox delivery whose
+/// lease lapsed with its outcome unknown, the same seed `daemon.rs` uses to
+/// put a daemon into `failed` — closes the worker from the status snapshot
+/// the socket arms read, with no help from memory.
+#[test]
+fn an_ambiguous_outbox_delivery_in_the_snapshot_closes_the_scheduler() {
+    let mut fixture = Fixture::new();
+    fixture.register_every("nightly", "workspace:reports", T0);
+    let mut worker = fixture.worker();
+
+    // A manual synthetic task runs to completion with an outbox intent, and
+    // the intent's delivery is claimed for ten milliseconds and never
+    // acknowledged.
+    fixture
+        .store
+        .submit_inbox(InboxSubmission {
+            transport: OCCURRENCE_TRANSPORT,
+            transport_key: "operator:manual-1",
+            scope: "workspace:manual",
+            payload: b"manual task",
+            received_ms: T0,
+        })
+        .expect("submit");
+    let claimed = fixture
+        .store
+        .claim_next(SchedulerClaim {
+            transport: OCCURRENCE_TRANSPORT,
+            generation_id: GENERATION,
+            holder_id: fixture.holder.as_str(),
+            lease_epoch: fixture.epoch,
+            now_ms: T0,
+        })
+        .expect("claim")
+        .expect("one item to claim");
+    assert!(!claimed.duplicate);
+    fixture
+        .store
+        .finish_run(TerminalRun {
+            run_id: claimed.run_id,
+            generation_id: GENERATION,
+            holder_id: fixture.holder.as_str(),
+            lease_epoch: fixture.epoch,
+            expected_revision: 1,
+            now_ms: T0 + 1,
+            state: TerminalState::Succeeded,
+            event_kind: "run.succeeded",
+            event_payload: b"synthetic",
+            outbox_intent_key: "fake:ambiguous",
+            outbox_kind: "fake.receipt",
+            outbox_payload: b"effect",
+        })
+        .expect("terminal outbox");
+    fixture
+        .store
+        .claim_outbox(OutboxClaimRequest {
+            transport: "fake",
+            kind: "fake.receipt",
+            generation_id: GENERATION,
+            holder_id: fixture.holder.as_str(),
+            lease_epoch: fixture.epoch,
+            now_ms: T0 + 2,
+            ttl_ms: 10,
+        })
+        .expect("claim outbox")
+        .expect("the effect to deliver");
+
+    // Past the delivery lease, inside the generation lease: the fence holds,
+    // the snapshot counts one ambiguous delivery, and the worker derives
+    // nothing for the automation that is due. The lease clock has to move
+    // for the delivery lease to lapse; the fixture's one clock is both.
+    let at = T0 + MINUTE;
+    fixture.clock.set(at);
+    assert_eq!(
+        worker.tick_at(at).expect("tick"),
+        closed(RECONCILIATION_REQUIRED_CATEGORY, 0, 0)
+    );
+    assert_eq!(fixture.core_state("nightly", at), None);
+    assert_eq!(fixture.lane_state("nightly", at), None);
+    assert_eq!(fixture.job("nightly").next_fire_at_ms, Some(at));
+    // And a later tick under the same condition says the same thing.
+    fixture.clock.set(at + MINUTE);
+    assert_eq!(
+        worker.tick_at(at + MINUTE).expect("tick"),
+        closed(RECONCILIATION_REQUIRED_CATEGORY, 0, 0)
+    );
+    assert_eq!(
+        fixture.outbox_count(),
+        1,
+        "only the manual task's intent exists"
+    );
+}
+
+/// What was already in flight when intake closed is not intake: an
+/// occurrence the lane is running settles, a queued one stays queued, and one
+/// the core started but the lane never received waits — then all of it
+/// proceeds, once, when intake reopens.
+#[test]
+fn a_closed_intake_settles_what_ran_and_holds_what_was_started_but_not_submitted() {
+    let mut fixture = Fixture::new();
+    fixture.register_every("running", "scope:a", T0);
+    fixture.register_every("queued", "scope:a", T0);
+    fixture.register_every("started", "scope:b", T0);
+    let at = T0 + MINUTE;
+    let mut worker = fixture.worker();
+
+    // Open: `running` and `started` start (different scopes); `queued` waits
+    // behind `running`.
+    assert_eq!(worker.tick_at(at).expect("tick"), report(3, 2, 0, 0));
+    assert_eq!(fixture.core_state("queued", at), Some(WorkState::Queued));
+    assert_eq!(fixture.lane_state("started", at), Some(InboxState::Pending));
+
+    // The lane finishes both before intake closes.
+    assert_eq!(fixture.drain_lane(), 2);
+    fixture.clock.set(at + 1);
+    let revision = fixture.pause_intake("maintenance");
+
+    // Closed: the two finished runs settle (not intake), `queued` is still
+    // queued in the core because the core is not ticked while the door is
+    // shut, and nothing new is derived.
+    assert_eq!(
+        worker.tick_at(at + 1).expect("tick"),
+        closed(INTAKE_PAUSED_CATEGORY, 2, 0)
+    );
+    assert_eq!(fixture.job("running").last_fired_at_ms, Some(at));
+    assert_eq!(fixture.job("started").last_fired_at_ms, Some(at));
+    assert_eq!(fixture.core_state("queued", at), Some(WorkState::Queued));
+    assert_eq!(fixture.lane_state("queued", at), None);
+    assert_eq!(fixture.job("queued").active_occurrence_ms, Some(at));
+    assert!(fixture.core_running().is_empty());
+
+    // Reopened: the queued occurrence starts, once, under the key it was
+    // admitted with, and the next grid instant is derived for the others.
+    let reopened = at + MINUTE;
+    fixture.clock.set(reopened);
+    fixture.resume_intake(revision);
+    let reopened_report = worker.tick_at(reopened).expect("tick");
+    assert_eq!(reopened_report.intake_closed, None);
+    assert_eq!(
+        reopened_report.admitted, 2,
+        "running and started are due again"
+    );
+    assert!(reopened_report.started >= 1, "the held occurrence starts");
+    assert_eq!(fixture.lane_state("queued", at), Some(InboxState::Pending));
+    assert_eq!(
+        fixture.job("queued").next_fire_at_ms,
+        Some(at + 2 * MINUTE),
+        "advanced past its instant the moment it reached the lane"
+    );
+}
+
+/// The core-started-but-never-submitted window, met under a closed intake:
+/// the worker does not hand the occurrence to the lane until intake reopens,
+/// and then hands it over exactly once.
+#[test]
+fn an_occurrence_started_in_the_core_waits_for_intake_before_reaching_the_lane() {
+    let mut fixture = Fixture::new();
+    fixture.register_every("nightly", "workspace:reports", T0);
+    let at = T0 + MINUTE;
+    let key = Fixture::key("nightly", at);
+    {
+        let fence =
+            SchedulerFence::new(GENERATION, fixture.holder.as_str(), fixture.epoch).expect("fence");
+        let mut core = DurableSchedulerStore::open(
+            fixture.scheduler_path(),
+            AUTOMATION_PARALLELISM_LIMIT,
+            fence.clone(),
+        )
+        .expect("open the core");
+        core.submit(&automonique_core::scheduler_conformance::QueuedWork::new(
+            WorkId::new(key.as_str()).expect("work id"),
+            automonique_core::scheduler_conformance::ScopeId::new("workspace:reports")
+                .expect("scope"),
+        ))
+        .expect("admit");
+        assert_eq!(core.tick(&fence).expect("start").len(), 1);
+        fixture
+            .registry()
+            .admit_occurrence("nightly", at)
+            .expect("mark active");
+    }
+    let mut worker = fixture.worker();
+    fixture.clock.set(at);
+    let revision = fixture.pause_intake("maintenance");
+    assert_eq!(
+        worker.tick_at(at).expect("tick"),
+        closed(INTAKE_PAUSED_CATEGORY, 0, 0)
+    );
+    assert_eq!(
+        fixture.lane_state("nightly", at),
+        None,
+        "held, not handed over"
+    );
+    assert_eq!(fixture.core_state("nightly", at), Some(WorkState::Running));
+    assert_eq!(fixture.job("nightly").active_occurrence_ms, Some(at));
+
+    fixture.clock.set(at + 5_000);
+    fixture.resume_intake(revision);
+    assert_eq!(
+        worker.tick_at(at + 5_000).expect("tick"),
+        report(0, 1, 0, 0)
+    );
+    assert_eq!(fixture.lane_state("nightly", at), Some(InboxState::Pending));
+    assert_eq!(fixture.drain_lane(), 1);
+    assert_eq!(
+        worker.tick_at(at + 5_001).expect("tick"),
+        report(0, 0, 1, 0)
+    );
+    assert_eq!(fixture.outbox_count(), 1);
+}
+
+/// A withdrawal is not intake either: a paused automation's queued
+/// occurrence is cancelled under a closed intake exactly as under an open one.
+#[test]
+fn a_closed_intake_still_cancels_what_an_operator_withdrew() {
+    let mut fixture = Fixture::new();
+    fixture.register_every("s1", "scope:shared", T0);
+    fixture.register_every("s2", "scope:shared", T0);
+    let mut worker = fixture.worker();
+    let at = T0 + MINUTE;
+    assert_eq!(worker.tick_at(at).expect("tick"), report(2, 1, 0, 0));
+    assert_eq!(fixture.core_state("s2", at), Some(WorkState::Queued));
+
+    fixture.clock.set(at + 1);
+    fixture.transition("s2", 1, EnablementState::Paused);
+    let _revision = fixture.pause_intake("maintenance");
+    assert_eq!(
+        worker.tick_at(at + 1).expect("tick"),
+        closed(INTAKE_PAUSED_CATEGORY, 0, 1)
+    );
+    assert_eq!(fixture.core_state("s2", at), Some(WorkState::Cancelled));
+    let skipped = fixture.job("s2");
+    assert_eq!(skipped.active_occurrence_ms, None);
+    assert_eq!(skipped.next_fire_at_ms, Some(at + MINUTE));
 }

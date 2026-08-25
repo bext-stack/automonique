@@ -86,6 +86,32 @@ pub const MAX_SYNTHETIC_KEY_BYTES: usize = 128;
 /// Maximum task bytes accepted by the local synthetic intake.
 pub const MAX_SYNTHETIC_TASK_BYTES: usize = 8 * 1024;
 
+/// The idempotency-key namespace a caller may not choose from.
+///
+/// The daemon's automation scheduler derives every occurrence key it submits
+/// on the synthetic lane as `automation:<automation_id>:<instant>`
+/// ([`crate::automation_api::OCCURRENCE_KEY_PREFIX`]), and the lane dedupes
+/// on that key. An operator's `automonique submit` under a key in that
+/// namespace would either be absorbed as a replay of an occurrence or absorb
+/// the occurrence as a replay of itself, so the daemon refuses it with
+/// [`RESERVED_SYNTHETIC_KEY_CATEGORY`] before the lane sees it. The
+/// namespace is reserved by the intake arm rather than by
+/// [`SyntheticSubmission::new`], because a constructor refusal would be
+/// answered on the wire with silence — the daemon places no frame it cannot
+/// decode — where an arm refusal is a typed answer the caller can read.
+pub const RESERVED_SYNTHETIC_KEY_PREFIX: &str = crate::automation_api::OCCURRENCE_KEY_PREFIX;
+
+/// The refusal category a submission under [`RESERVED_SYNTHETIC_KEY_PREFIX`]
+/// receives, from the daemon's intake arm and from the CLI before it dials.
+pub const RESERVED_SYNTHETIC_KEY_CATEGORY: &str = "idempotency_key_reserved";
+
+/// Whether a caller-supplied idempotency key lies in the namespace the
+/// automation scheduler derives its occurrence keys from.
+#[must_use]
+pub fn synthetic_key_is_reserved(idempotency_key: &str) -> bool {
+    idempotency_key.starts_with(RESERVED_SYNTHETIC_KEY_PREFIX)
+}
+
 /// Maximum byte length of reconciliation coordinates and reasons.
 pub const MAX_RECONCILIATION_FIELD_BYTES: usize = 256;
 
@@ -209,7 +235,10 @@ const _: () = assert!(
 /// - **7** — added authenticated generation reload execution.
 /// - **8** — added authenticated rollback to the retained compatible release.
 /// - **9** — added durable reload acceptance before asynchronous handoff.
-pub const ADMIN_CAPABILITY: u32 = 9;
+/// - **10** — added `automation_scheduler_workers` to the status's
+///   durable-state counts, so an operator can see whether the automation
+///   scheduler worker is on its thread.
+pub const ADMIN_CAPABILITY: u32 = 10;
 
 /// How much of a promise an endpoint is.
 ///
@@ -2498,9 +2527,22 @@ impl OperationalStatus {
 /// "the count could not be read" is the absence of any fact at all. Substituting
 /// one for the other is how a status starts lying about the state it exists to
 /// describe.
+///
+/// # The one field that is not a count of rows
+///
+/// `automation_scheduler_workers` is a reading of the worker that has custody
+/// of two of the stores counted here — the automation registry and the
+/// scheduler core — rather than of a store itself: one when the worker is on
+/// its thread, zero when it stopped on a fault (the journal names the
+/// category), and unavailable when no worker was composed, which is what a
+/// generation in disconnected recovery does. It lives beside the counts
+/// because it answers the question those counts raise — "and is anything
+/// acting on these rows?" — and carries the same distinction between a
+/// measured zero and no reading at all.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DurableStateCounts {
     approvals_recorded: OperationalMetric,
+    automation_scheduler_workers: OperationalMetric,
     automations_registered: OperationalMetric,
     open_tenure_epoch: OperationalMetric,
     open_tenures: OperationalMetric,
@@ -2512,6 +2554,9 @@ pub struct DurableStateCounts {
 pub struct DurableStateCountsParts {
     /// Decisions in the approval ledger.
     pub approvals_recorded: OperationalMetric,
+    /// Automation scheduler workers on their thread: one or zero, and
+    /// unavailable when none was composed.
+    pub automation_scheduler_workers: OperationalMetric,
     /// Automations in the registry, in every enablement state.
     pub automations_registered: OperationalMetric,
     /// Lease epoch of the open tenure, when there is one to read.
@@ -2540,7 +2585,8 @@ impl DurableStateCounts {
     ///
     /// Returns [`AdminError::InvalidBody`] for any other pairing, including
     /// more than one open tenure and an open tenure at epoch zero, which no
-    /// lease ever holds.
+    /// lease ever holds — and for more than one automation scheduler worker,
+    /// of which a daemon composes at most one.
     pub fn new(parts: DurableStateCountsParts) -> Result<Self, AdminError> {
         if !matches!(
             (parts.open_tenures, parts.open_tenure_epoch),
@@ -2554,8 +2600,15 @@ impl DurableStateCounts {
         ) {
             return Err(AdminError::InvalidBody);
         }
+        if matches!(
+            parts.automation_scheduler_workers,
+            OperationalMetric::Measured(2..)
+        ) {
+            return Err(AdminError::InvalidBody);
+        }
         Ok(Self {
             approvals_recorded: parts.approvals_recorded,
+            automation_scheduler_workers: parts.automation_scheduler_workers,
             automations_registered: parts.automations_registered,
             open_tenure_epoch: parts.open_tenure_epoch,
             open_tenures: parts.open_tenures,
@@ -2568,6 +2621,16 @@ impl DurableStateCounts {
     #[must_use]
     pub const fn approvals_recorded(&self) -> OperationalMetric {
         self.approvals_recorded
+    }
+
+    /// Automation scheduler workers on their thread.
+    ///
+    /// One when the worker is running, zero when it stopped on a fault, and
+    /// [`OperationalMetric::Unavailable`] when the daemon composed none
+    /// (disconnected recovery).
+    #[must_use]
+    pub const fn automation_scheduler_workers(&self) -> OperationalMetric {
+        self.automation_scheduler_workers
     }
 
     /// Automations the registry holds, in every enablement state.
@@ -2608,6 +2671,10 @@ impl DurableStateCounts {
                 self.approvals_recorded.to_body()?,
             ),
             (
+                "automation_scheduler_workers".to_owned(),
+                self.automation_scheduler_workers.to_body()?,
+            ),
+            (
                 "automations_registered".to_owned(),
                 self.automations_registered.to_body()?,
             ),
@@ -2628,8 +2695,9 @@ impl DurableStateCounts {
     }
 
     fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
-        const FIELDS: [&str; 6] = [
+        const FIELDS: [&str; 7] = [
             "approvals_recorded",
+            "automation_scheduler_workers",
             "automations_registered",
             "open_tenure_epoch",
             "open_tenures",
@@ -2642,6 +2710,7 @@ impl DurableStateCounts {
         };
         Self::new(DurableStateCountsParts {
             approvals_recorded: metric("approvals_recorded")?,
+            automation_scheduler_workers: metric("automation_scheduler_workers")?,
             automations_registered: metric("automations_registered")?,
             open_tenure_epoch: metric("open_tenure_epoch")?,
             open_tenures: metric("open_tenures")?,

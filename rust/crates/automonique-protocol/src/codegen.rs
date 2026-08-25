@@ -2464,10 +2464,14 @@ fn admin_status_module() -> GeneratedModule {
                 doc: "What the daemon's durable stores hold, counted while the status was \
                       answered. Each field is one read of one store and they are not one \
                       transaction; a store that could not be counted is `unavailable`, never \
-                      zero."
+                      zero. `automation_scheduler_workers` reads the worker with custody of \
+                      the automation registry and the scheduler core rather than a store: one \
+                      on its thread, zero when it stopped on a fault, `unavailable` when none \
+                      was composed."
                     .to_owned(),
                 fields: vec![
                     required("approvals_recorded", "OperationalMetric"),
+                    required("automation_scheduler_workers", "OperationalMetric"),
                     required("automations_registered", "OperationalMetric"),
                     required("open_tenure_epoch", "OperationalMetric"),
                     required("open_tenures", "OperationalMetric"),

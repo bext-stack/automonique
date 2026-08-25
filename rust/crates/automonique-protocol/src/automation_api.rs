@@ -50,6 +50,41 @@
 //! [`AutomationId`] itself keeps the registry's wider grammar so a row written
 //! before schedules existed is still readable.
 //!
+//! # Version one moved, and did so deliberately
+//!
+//! The job — a required `schedule`, `scope` and `prompt` on
+//! [`RegisterAutomation`], the job columns on every record, the prompt on a
+//! detail read, and the page bound falling from thirty-two to twenty-four —
+//! was added to `automonique.automation` **v1 in place**, without a major
+//! version. The wire is therefore incompatible with a client written against
+//! the jobless v1: a register frame without the three fields is refused, and
+//! a record without the job columns does not decode. This is accepted
+//! because the three things that speak this protocol — the daemon, the CLI
+//! and the TypeScript SDK — ship from one tree in one release, and the SDK
+//! has never been published; there is no deployed peer to keep compatible
+//! with, and a major version whose only client is the same commit would
+//! document a transition nobody makes. The first published SDK is the point
+//! after which this stops being true and a change of this shape becomes a
+//! v2.
+//!
+//! # What a registration is refused for, beyond its fields
+//!
+//! Two rules relate a registration to the lane it will fire on, and both are
+//! decided here so an operator meets them before a frame is spent:
+//!
+//! - **The interval floor.** A fixed interval below
+//!   [`MIN_AUTOMATION_INTERVAL_MS`] is [`AutomationApiError::IntervalTooShort`].
+//! - **The key namespace.** An occurrence key opens with
+//!   [`OCCURRENCE_KEY_PREFIX`], and that namespace is closed to
+//!   `automonique submit`: the admin lane refuses a caller-chosen idempotency
+//!   key under it with [`crate::admin::RESERVED_SYNTHETIC_KEY_CATEGORY`], so
+//!   an operator's synthetic task can never be absorbed as a replay of an
+//!   occurrence, nor an occurrence as a replay of it.
+//!
+//! What the daemon's worker does with a registered job under a pause, an
+//! archive, or a closed intake is stated on `automonique_daemon::automation_scheduler`
+//! and in `docs/product-plan/requirements/automation-goals-and-triggers.md`.
+//!
 //! # The vocabulary is borrowed, not re-spelled
 //!
 //! [`crate::automation::EnablementState`], [`crate::automation::AutomationActor`]
@@ -202,6 +237,23 @@ pub const MAX_SCHEDULED_AUTOMATION_ID_BYTES: usize =
 /// `every@` followed by at most [`MAX_INSTANT_DIGITS`] digits. A cron
 /// rendering is longer and is refused before its length matters.
 pub const MAX_AUTOMATION_SCHEDULE_BYTES: usize = "every@".len() + MAX_INSTANT_DIGITS;
+
+/// Shortest fixed interval a registration may declare, in milliseconds.
+///
+/// A floor rather than a tuning: every occurrence is a durable row in the
+/// scheduler core and a durable delivery on the synthetic lane, neither of
+/// which this slice prunes, and the worker notices a due instant on a
+/// quarter-second poll. An interval below one second would therefore
+/// register a job whose every instant is either skipped by the catch-up rule
+/// or fired late, while growing two tables as fast as the lane can commit.
+/// [`RegisterAutomation::new`] refuses it with the typed
+/// [`AutomationApiError::IntervalTooShort`]; [`AutomationSchedule::every`]
+/// itself still admits any positive interval, so a record carrying one stays
+/// readable and the wire grammar (`every@<ms>`, positive) is unchanged on
+/// both sides. The generated TypeScript builder does not apply this floor:
+/// a registration it emits below it is refused by the daemon under the same
+/// category, which is the one place the rule has to hold.
+pub const MIN_AUTOMATION_INTERVAL_MS: i64 = 1_000;
 
 /// Maximum automations one listing page may carry.
 ///
@@ -488,6 +540,12 @@ pub enum AutomationApiError {
     },
     /// An occurrence key did not have the shape this lane derives.
     OccurrenceKeyMalformed,
+    /// A registration declared a fixed interval below
+    /// [`MIN_AUTOMATION_INTERVAL_MS`].
+    IntervalTooShort {
+        /// Shortest interval a registration may declare.
+        min_ms: i64,
+    },
 }
 
 impl AutomationApiError {
@@ -521,6 +579,7 @@ impl AutomationApiError {
             Self::JobIncoherent => "automation_job_incoherent",
             Self::OccurrenceKeyTooLong { .. } => "automation_occurrence_key_too_long",
             Self::OccurrenceKeyMalformed => "automation_occurrence_key_malformed",
+            Self::IntervalTooShort { .. } => "automation_interval_too_short",
         }
     }
 }
@@ -614,6 +673,9 @@ impl fmt::Display for AutomationApiError {
             }
             Self::OccurrenceKeyMalformed => {
                 formatter.write_str("the occurrence key is not automation:<id>:<instant>")
+            }
+            Self::IntervalTooShort { min_ms } => {
+                write!(formatter, "a fixed interval is at least {min_ms} ms")
             }
         }
     }
@@ -1234,7 +1296,9 @@ impl RegisterAutomation {
     /// identity is longer than [`MAX_SCHEDULED_AUTOMATION_ID_BYTES`]: the
     /// occurrence key derived from it must fit the durable submit lane's key
     /// bound, and an identity that cannot fire is refused before a frame is
-    /// spent rather than registered and never fired.
+    /// spent rather than registered and never fired. Returns
+    /// [`AutomationApiError::IntervalTooShort`] for a fixed interval below
+    /// [`MIN_AUTOMATION_INTERVAL_MS`], for the reason stated there.
     pub fn new(
         automation_id: AutomationId,
         actor: AutomationActor,
@@ -1249,6 +1313,13 @@ impl RegisterAutomation {
                     max_bytes: MAX_SCHEDULED_AUTOMATION_ID_BYTES,
                     actual_bytes: automation_id.as_str().len(),
                 },
+            });
+        }
+        if let AutomationSchedule::Every { interval } = &schedule
+            && interval.as_millis() < MIN_AUTOMATION_INTERVAL_MS
+        {
+            return Err(AutomationApiError::IntervalTooShort {
+                min_ms: MIN_AUTOMATION_INTERVAL_MS,
             });
         }
         Ok(Self {

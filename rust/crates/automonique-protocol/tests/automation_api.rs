@@ -22,7 +22,7 @@ use automonique_protocol::automation_api::{
     AutomationSchedule, AutomationScope, AutomationStateFilter, ENABLEMENT_STATES, ListAutomations,
     MAX_AUTOMATION_API_FIELD_BYTES, MAX_AUTOMATION_CANONICAL_BYTES, MAX_AUTOMATION_PAGE_ITEMS,
     MAX_AUTOMATION_PROMPT_BYTES, MAX_AUTOMATION_SCOPE_BYTES, MAX_OCCURRENCE_KEY_BYTES,
-    MAX_SCHEDULED_AUTOMATION_ID_BYTES, OCCURRENCE_KEY_PREFIX,
+    MAX_SCHEDULED_AUTOMATION_ID_BYTES, MIN_AUTOMATION_INTERVAL_MS, OCCURRENCE_KEY_PREFIX,
     OUTCOMES_THIS_PROTOCOL_NEVER_PRODUCES, PauseReason, RegisterAutomation, SetEnablement,
     decode_enablement, permits_transition, requires_cause,
 };
@@ -1429,6 +1429,7 @@ mod bounds {
             AutomationApiError::JobIncoherent.category(),
             AutomationApiError::OccurrenceKeyTooLong { max_bytes: 0 }.category(),
             AutomationApiError::OccurrenceKeyMalformed.category(),
+            AutomationApiError::IntervalTooShort { min_ms: 0 }.category(),
         ];
         let mut unique = categories.to_vec();
         unique.sort_unstable();
@@ -1446,6 +1447,90 @@ mod bounds {
 /// The job: schedule, scope, prompt, and the occurrence key they derive.
 mod job {
     use super::*;
+
+    /// The floor is a registration rule, not a schedule rule: the schedule
+    /// type and the wire still carry any positive interval, so a record
+    /// written with one stays readable, while a new registration below the
+    /// floor is refused by name before a frame is spent — and again by the
+    /// decoder, so a client that skipped the constructor meets the same
+    /// answer.
+    #[test]
+    fn a_registration_refuses_an_interval_below_the_floor_and_the_wire_re_decides_it() {
+        assert_eq!(MIN_AUTOMATION_INTERVAL_MS, 1_000);
+        let below = every(MIN_AUTOMATION_INTERVAL_MS - 1);
+        assert_eq!(
+            below.render(),
+            "every@999",
+            "the schedule itself admits the interval"
+        );
+        let refused = RegisterAutomation::new(
+            id("nightly"),
+            who("ben"),
+            below.clone(),
+            scope("s"),
+            prompt("p"),
+        )
+        .expect_err("a sub-second interval is refused at registration");
+        assert_eq!(
+            refused,
+            AutomationApiError::IntervalTooShort {
+                min_ms: MIN_AUTOMATION_INTERVAL_MS
+            }
+        );
+        assert_eq!(refused.category(), "automation_interval_too_short");
+        assert_eq!(refused.to_string(), "a fixed interval is at least 1000 ms");
+
+        assert!(
+            RegisterAutomation::new(
+                id("nightly"),
+                who("ben"),
+                every(MIN_AUTOMATION_INTERVAL_MS),
+                scope("s"),
+                prompt("p"),
+            )
+            .is_ok(),
+            "the floor itself is admitted"
+        );
+        // A one-shot has no interval to be short.
+        assert!(
+            RegisterAutomation::new(
+                id("nightly"),
+                who("ben"),
+                AutomationSchedule::once(EpochMillis::from_millis(1)).expect("instant"),
+                scope("s"),
+                prompt("p"),
+            )
+            .is_ok()
+        );
+
+        let payload = br#"{"body":{"actor":"ben","automation_id":"nightly","prompt":"p","schedule":"every@999","scope":"s"},"kind":"register_automation","protocol":"automonique.automation","request_id":"r","version":1}"#;
+        assert_eq!(
+            AutomationRequest::from_canonical_bytes(payload)
+                .expect_err("the decoder applies the floor too")
+                .category(),
+            "automation_interval_too_short"
+        );
+        // The same interval on a record is a row this lane still serves.
+        let record = AutomationRecordView::new(AutomationRecordParts {
+            entry_id: 1,
+            automation_id: id("nightly"),
+            revision: 1,
+            enablement: EnablementState::Enabled,
+            actor: who("ben"),
+            cause: None,
+            created_at: EpochMillis::from_millis(1_700_000_000_000),
+            updated_at: EpochMillis::from_millis(1_700_000_000_000),
+            schedule: Some(below),
+            scope: Some(scope("s")),
+            next_fire_at: Some(EpochMillis::from_millis(1_700_000_000_999)),
+            last_fired_at: None,
+        })
+        .expect("a record carries any positive interval");
+        assert_eq!(
+            record.schedule().map(AutomationSchedule::render).as_deref(),
+            Some("every@999")
+        );
+    }
 
     #[test]
     fn a_schedule_round_trips_through_its_canonical_rendering() {
@@ -1711,11 +1796,23 @@ mod job {
         // the registry could hold but the lane could never fire is refused
         // before a frame is spent.
         assert!(
-            RegisterAutomation::new(id(&widest), who("ben"), every(1), scope("s"), prompt("p"))
-                .is_ok()
+            RegisterAutomation::new(
+                id(&widest),
+                who("ben"),
+                every(MIN_AUTOMATION_INTERVAL_MS),
+                scope("s"),
+                prompt("p")
+            )
+            .is_ok()
         );
         assert!(matches!(
-            RegisterAutomation::new(id(&over), who("ben"), every(1), scope("s"), prompt("p")),
+            RegisterAutomation::new(
+                id(&over),
+                who("ben"),
+                every(MIN_AUTOMATION_INTERVAL_MS),
+                scope("s"),
+                prompt("p")
+            ),
             Err(AutomationApiError::Field {
                 field: "automation_id",
                 error: automonique_protocol::primitives::ValueError::TooLong { .. },

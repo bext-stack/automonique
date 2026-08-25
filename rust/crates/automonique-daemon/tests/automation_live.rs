@@ -40,7 +40,10 @@ use std::time::{Duration, Instant};
 
 use automonique_daemon::automation_scheduler::OCCURRENCE_TRANSPORT;
 use automonique_daemon::{Daemon, DaemonConfig};
-use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse, DaemonState};
+use automonique_protocol::admin::{
+    AdminCommand, AdminRequest, AdminResponse, DaemonState, IntakePause, IntakeResume,
+    OperationalMetric, RESERVED_SYNTHETIC_KEY_CATEGORY, SyntheticSubmission,
+};
 use automonique_protocol::automation::{AutomationActor, EnablementState};
 use automonique_protocol::automation_api::{
     AutomationContinuation, AutomationCursor, AutomationId, AutomationListPage,
@@ -1419,5 +1422,208 @@ fn a_cron_registration_is_refused_before_the_daemon() {
         "a cron registration was answered instead of refused before the daemon",
     );
     assert!(listed(&config, "list-after-cron").entries().is_empty());
+    serving.shutdown(&config);
+}
+
+/// Send one fully formed admin request and decode its answer.
+fn admin(config: &DaemonConfig, request: AdminRequest) -> AdminResponse {
+    let payload = request
+        .to_message()
+        .expect("encode request")
+        .to_canonical_bytes();
+    let response = exchange(config, &payload).expect("the admin lane answered");
+    AdminResponse::from_canonical_bytes(&response).expect("admitted response")
+}
+
+/// An operator intake pause closes the run lane to automations exactly as it
+/// closes it to `automonique submit`: the worker on its real thread derives
+/// nothing while the pause stands, the due instant is neither consumed nor
+/// duplicated, and it fires once — keyed by that oldest instant — after the
+/// resume. The status meanwhile reports the worker alive on its thread.
+#[test]
+fn an_intake_pause_holds_a_due_occurrence_until_intake_resumes() {
+    let (_root, config) = fixture();
+    let serving = serve(&config);
+
+    let AdminResponse::IntakePaused { .. } = admin(
+        &config,
+        AdminRequest::pause_intake(
+            request_id("pause-intake-1"),
+            IntakePause::new("dana", "maintenance").expect("pause body"),
+        ),
+    ) else {
+        panic!("the pause was not accepted")
+    };
+    let receipt = register_job(
+        &config,
+        "register-held",
+        "held-by-intake",
+        "ben",
+        AutomationSchedule::every(1_000).expect("interval"),
+        AutomationScope::new("workspace:held").expect("scope"),
+        AutomationPrompt::new("wait for intake").expect("prompt"),
+    );
+    let first = EpochMillis::from_millis(receipt.updated_at().as_millis() + 1_000);
+
+    // Well past the first instant, and past the second: nothing derived,
+    // the instant still the first one, the worker still on its thread.
+    std::thread::sleep(Duration::from_millis(2_500));
+    let held = detail(&config, "detail-held", "held-by-intake");
+    assert_eq!(
+        held.last_fired_at(),
+        None,
+        "an occurrence fired under a pause"
+    );
+    assert_eq!(
+        held.next_fire_at(),
+        Some(first),
+        "the due instant was consumed or advanced under a pause"
+    );
+    let AdminResponse::Status { status, .. } = call(&config, AdminCommand::Status) else {
+        panic!("status response")
+    };
+    assert!(status.intake_paused());
+    assert!(!status.accepting_intake());
+    assert_eq!(
+        status.outbox_pending(),
+        0,
+        "an intent was committed under a pause"
+    );
+    assert_eq!(
+        status
+            .durable_state()
+            .expect("durable counts")
+            .automation_scheduler_workers(),
+        OperationalMetric::Measured(1),
+        "the worker is on its thread while it waits"
+    );
+
+    // Resumed: the oldest due instant fires once, and the successor is on
+    // the grid after the firing tick.
+    let AdminResponse::IntakeResumed { .. } = admin(
+        &config,
+        AdminRequest::resume_intake(
+            request_id("resume-intake-1"),
+            IntakeResume::new("dana").expect("resume body"),
+        ),
+    ) else {
+        panic!("the resume was not accepted")
+    };
+    let fired = wait_for_firing(&config, "held-by-intake");
+    assert_eq!(
+        fired.last_fired_at(),
+        Some(first),
+        "the firing is keyed by the instant that was held, not by when intake reopened"
+    );
+    let next = fired.next_fire_at().expect("an interval has a successor");
+    assert!(next.as_millis() > first.as_millis());
+    assert_eq!((next.as_millis() - first.as_millis()) % 1_000, 0);
+    serving.shutdown(&config);
+
+    assert_eq!(
+        lane_state(&config, "held-by-intake", first),
+        Some(InboxState::Completed)
+    );
+    assert_eq!(
+        lane_state(
+            &config,
+            "held-by-intake",
+            EpochMillis::from_millis(first.as_millis() + 1_000)
+        ),
+        None,
+        "the instant that passed under the pause was skipped, not fired late"
+    );
+}
+
+/// The `automation:` idempotency-key namespace is the scheduler's: a manual
+/// submission under it is refused by name and lands nowhere, so an operator's
+/// task can never be absorbed as an occurrence's replay, nor an occurrence as
+/// the task's. The CLI refuses the same key before it dials; this is the
+/// daemon's own answer to a client that did not.
+#[test]
+fn a_manual_submission_under_the_occurrence_namespace_is_refused_by_name() {
+    let (_root, config) = fixture();
+    let serving = serve(&config);
+    let answer = admin(
+        &config,
+        AdminRequest::submit(
+            request_id("reserved-1"),
+            SyntheticSubmission::new(
+                "workspace:manual",
+                "automation:nightly:1700000000000",
+                "a task under the scheduler's namespace",
+            )
+            .expect("structurally valid"),
+        ),
+    );
+    let AdminResponse::Refused { category, .. } = answer else {
+        panic!("a reserved key was accepted: {answer:?}")
+    };
+    assert_eq!(category.as_str(), RESERVED_SYNTHETIC_KEY_CATEGORY);
+    assert_eq!(category.as_str(), "idempotency_key_reserved");
+
+    // The same key one byte outside the namespace is ordinary work.
+    let answer = admin(
+        &config,
+        AdminRequest::submit(
+            request_id("unreserved-1"),
+            SyntheticSubmission::new(
+                "workspace:manual",
+                "automations:nightly:1700000000000",
+                "a task under a name of the operator's own",
+            )
+            .expect("structurally valid"),
+        ),
+    );
+    assert!(
+        matches!(
+            answer,
+            AdminResponse::SyntheticAccepted {
+                duplicate: false,
+                ..
+            }
+        ),
+        "an unreserved key was refused: {answer:?}"
+    );
+    let AdminResponse::Status { status, .. } = call(&config, AdminCommand::Status) else {
+        panic!("status response")
+    };
+    serving.shutdown(&config);
+    let store = Store::open(config.database_path()).expect("open the product store");
+    assert!(
+        store
+            .inbox_disposition(OCCURRENCE_TRANSPORT, "automation:nightly:1700000000000")
+            .expect("read the lane")
+            .is_none(),
+        "the refused key reached the lane"
+    );
+    assert!(
+        store
+            .inbox_disposition(OCCURRENCE_TRANSPORT, "automations:nightly:1700000000000")
+            .expect("read the lane")
+            .is_some(),
+        "the accepted key never reached the lane"
+    );
+    let _ = status;
+}
+
+/// A fixed interval below the registration floor is refused by the
+/// protocol's own decoder before the daemon sees it, the way a cron
+/// schedule is: the socket closes without an answer and nothing is
+/// registered.
+#[test]
+fn a_sub_second_interval_is_refused_before_the_daemon() {
+    let (_root, config) = fixture();
+    let serving = serve(&config);
+    let payload = br#"{"body":{"actor":"ben","automation_id":"too-fast","prompt":"p","schedule":"every@999","scope":"ws"},"kind":"register_automation","protocol":"automonique.automation","request_id":"floor-1","version":1}"#;
+    assert!(
+        exchange(&config, payload).is_none(),
+        "a sub-second registration was answered instead of refused before the daemon",
+    );
+    let page = listed(&config, "list-after-floor");
+    assert!(
+        page.entries().is_empty(),
+        "a sub-second registration landed: {page:?}"
+    );
     serving.shutdown(&config);
 }
