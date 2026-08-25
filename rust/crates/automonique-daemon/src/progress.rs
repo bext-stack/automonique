@@ -12,7 +12,7 @@
 //! # The mapping is a projection, not a translation
 //!
 //! [`RecordedKind`] has ten members and the shared
-//! [`EventKind`](automonique_protocol::event::EventKind) has twenty-four, so
+//! [`EventKind`](automonique_protocol::event::EventKind) has twenty-five, so
 //! [`frame_kind`] is total in one direction and deliberately partial in the
 //! other: Codex command-execution items become tool-call frames, while shared
 //! kinds with no admitted provider schema remain impossible here. The mapping
@@ -470,13 +470,6 @@ impl JcodeProgressMapper {
                 None,
                 None,
             ),
-            JcodeEvent::PermissionRequest { .. } => (
-                EventKind::ApprovalRequested,
-                Authority::Authoritative,
-                None,
-                None,
-                None,
-            ),
             JcodeEvent::SessionStatus { status, .. } => (
                 if status == "generating" {
                     EventKind::TurnStarted
@@ -509,9 +502,15 @@ impl JcodeProgressMapper {
                 None,
                 RetryContext::new(RetryCategory::Rejected, false, None, 1).ok(),
             ),
-            JcodeEvent::ReasoningDelta { .. }
-            | JcodeEvent::ReasoningDone { .. }
+            // The two provider waits are not projected here. The execution lane
+            // emits their pause frames itself — `ApprovalRequested` once the
+            // durable approval exists, so the label can name its key, and
+            // `InputRequested` once the request is the one blocking the turn —
+            // and a bare frame from this projection would precede both facts.
+            JcodeEvent::PermissionRequest { .. }
             | JcodeEvent::StdinRequest { .. }
+            | JcodeEvent::ReasoningDelta { .. }
+            | JcodeEvent::ReasoningDone { .. }
             | JcodeEvent::Ok { .. }
             | JcodeEvent::Pong { .. }
             | JcodeEvent::Unknown { .. } => return None,

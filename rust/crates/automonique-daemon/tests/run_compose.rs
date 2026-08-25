@@ -91,8 +91,8 @@ use automonique_daemon::compose::{
     compose_with_profile,
 };
 use automonique_daemon::execute::{
-    DAEMON_BACKEND_ID, DAEMON_WORKSPACE_REGISTRY, JCODE_INTEGRATION_MODE, JCODE_RESUME_ENV,
-    locate_launch_helper, offered_host_features, run_workspace,
+    DAEMON_BACKEND_ID, DAEMON_DRAINING_REASON, DAEMON_WORKSPACE_REGISTRY, JCODE_INTEGRATION_MODE,
+    JCODE_RESUME_ENV, locate_launch_helper, offered_host_features, run_workspace,
 };
 use automonique_daemon::run_lane::{
     CONVERSATION_PROVIDER_CONFIG_NAME, PROVIDER_DEPLOYMENTS_NAME, SocketRunLane,
@@ -1019,10 +1019,25 @@ fn first_failing_gate() -> Option<&'static str> {
     None
 }
 
+/// Record that a contained proof did not run here, or refuse to let it be
+/// skipped.
+///
+/// A skip is silent only where nothing could have been proven: no delegated
+/// cgroup domain wraps this binary, so no enforced run was ever reachable. Once
+/// a domain *is* present — the delegated scope the module recipe wraps the
+/// binary in — every other gate is something the caller built the environment
+/// to satisfy, and a missing busybox, helper or sandbox mechanism is then a
+/// broken proof rather than an absent one. Passing vacuously inside the very
+/// scope that exists to make the proof reachable is the one outcome this
+/// function must never produce, with or without [`REQUIRE_ENFORCED_ENV`].
 fn not_proven(test: &str, reason: &str) {
     assert!(
         std::env::var_os(REQUIRE_ENFORCED_ENV).is_none(),
         "{test}: {REQUIRE_ENFORCED_ENV} is set but this host cannot prove it: {reason}"
+    );
+    assert!(
+        ContainmentDomain::discover().is_err(),
+        "{test}: a delegated cgroup domain is present but the proof is unreachable: {reason}"
     );
     eprintln!("[run_compose] NOT PROVEN: {test}: {reason}");
 }
@@ -1145,6 +1160,60 @@ fn open_lane(fixture: &Fixture) -> SocketRunLane {
         &fixture.config.run_index_path(),
     )
     .expect("the run lane opens")
+}
+
+/// The first `ready` run the index reports, or a loud failure at `deadline`.
+fn wait_for_ready_run(
+    index: &automonique_store::run_index::RunIndex,
+    deadline: Instant,
+    failure: &str,
+) -> String {
+    loop {
+        let page = index.page(0, 8).expect("run page");
+        if let Some(record) = page
+            .entries
+            .into_iter()
+            .find(|record| record.spool_state == automonique_store::run_index::RunSpoolState::Ready)
+        {
+            break record.run_id;
+        }
+        assert!(Instant::now() < deadline, "{failure}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Wait until `run_id`'s durable spool holds one authoritative pause frame of
+/// `kind` whose label is exactly `text`, or fail loudly with `failure` at
+/// `deadline`.
+///
+/// Exact rather than `contains`: the label is the whole of what a renderer
+/// shows, so a frame that carried a prefix, an identifier or a placeholder
+/// beside the prompt would be a different frame from the one asserted here.
+fn wait_for_pause_frame(
+    events: &Path,
+    run_id: &str,
+    deadline: Instant,
+    kind: automonique_protocol::event::EventKind,
+    text: Option<&str>,
+    failure: &str,
+) {
+    let spool = events.parent().expect("spool directory");
+    while !automonique_runner::read_events(spool, run_id).is_ok_and(|projected| {
+        projected.iter().any(|event| {
+            ProgressFrame::from_canonical_bytes(event.payload()).is_ok_and(|frame| {
+                frame.kind() == kind
+                    && frame.authority() == automonique_protocol::event::Authority::Authoritative
+                    && frame
+                        .body()
+                        .text()
+                        .map(automonique_protocol::progress_api::ProgressText::as_str)
+                        == text
+            })
+        })
+    }) {
+        assert!(Instant::now() < deadline, "{failure}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// THE WHOLE FEATURE, MINUS THE PROVIDER.
@@ -1303,14 +1372,14 @@ fn a_jcode_provider_permission_waits_for_the_durable_operator_decision() {
         .state_dir()
         .join(automonique_daemon::APPROVAL_REQUESTS_NAME);
     let deadline = Instant::now() + Duration::from_secs(15);
-    let request_key = loop {
+    let (request_key, run_id) = loop {
         let approvals = ApprovalRequests::open(&approvals_path).expect("approval requests open");
         let pending = approvals.pending(8).expect("pending approvals");
         if let Some(record) = pending
             .into_iter()
             .find(|record| record.state == ApprovalState::Pending)
         {
-            break record.request_key;
+            break (record.request_key, record.run_id);
         }
         assert!(
             Instant::now() < deadline,
@@ -1318,6 +1387,25 @@ fn a_jcode_provider_permission_waits_for_the_durable_operator_decision() {
         );
         std::thread::sleep(Duration::from_millis(20));
     };
+    // The wait reaches the progress stream as one approval frame whose label
+    // leads with the durable key a consumer decides by, then names the tool
+    // and what it asked. This is the frame the ACP bridge and the AG-UI
+    // adapter read the key from.
+    wait_for_pause_frame(
+        &fixture
+            .state_dir()
+            .join("runs")
+            .join(&run_id)
+            .join("spool")
+            .join("events.ndjson"),
+        &run_id,
+        deadline,
+        automonique_protocol::event::EventKind::ApprovalRequested,
+        Some(&format!(
+            "approval {request_key}: write — write the approved fixture"
+        )),
+        "provider approval did not reach the progress stream with its key",
+    );
     let decision = ApprovalRequest::DecideRequest {
         request_id: RequestId::new("provider-approval-decision").expect("request ID"),
         decision: DecideRequest::new(
@@ -1522,25 +1610,28 @@ fn a_control_lease_steers_the_live_jcode_turn_and_nothing_after_it() {
         .join(&run_id)
         .join("spool")
         .join("events.ndjson");
-    while !automonique_runner::read_events(events.parent().expect("spool directory"), &run_id)
-        .is_ok_and(|projected| {
-            projected.iter().any(|event| {
+    // The wait is surfaced as the protocol's own input-request kind, labelled
+    // with the provider's prompt and nothing else: no request identifier, no
+    // placeholder, and never as an approval — that is a different affordance.
+    wait_for_pause_frame(
+        &events,
+        &run_id,
+        deadline,
+        automonique_protocol::event::EventKind::InputRequested,
+        Some("fixture input"),
+        "JCode turn did not expose its bounded stdin request",
+    );
+    assert!(
+        !automonique_runner::read_events(events.parent().expect("spool directory"), &run_id)
+            .expect("spool events")
+            .iter()
+            .any(|event| {
                 ProgressFrame::from_canonical_bytes(event.payload()).is_ok_and(|frame| {
                     frame.kind() == automonique_protocol::event::EventKind::ApprovalRequested
-                        && frame
-                            .body()
-                            .text()
-                            .is_some_and(|text| text.as_str().contains("provider input stdin-1"))
                 })
-            })
-        })
-    {
-        assert!(
-            Instant::now() < deadline,
-            "JCode turn did not expose its bounded stdin request"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+            }),
+        "a provider input request must not be drawn as an approval"
+    );
 
     let session = ResourceCoordinate::new(
         ResourceAuthority::Automonique,
@@ -1714,6 +1805,261 @@ fn a_control_lease_steers_the_live_jcode_turn_and_nothing_after_it() {
     assert_eq!(outcome, ReceiptOutcome::Rejected);
     assert_eq!(explanation.as_str(), "control_lease_not_active");
     serving.shutdown(&fixture.config);
+}
+
+/// A JCode fixture that raises one provider wait and then never speaks again:
+/// `pause` is the exact event line the turn blocks on after `message_accepted`.
+///
+/// Every request after that is read and dropped, so the provider is still
+/// alive — and still waiting — when the daemon is told to stop.
+fn silent_after_pause_fixture(server: &str, session: &str, pause: &str) -> Fixture {
+    let fixture = Fixture::new(
+        None,
+        Some(&format!("127.0.0.1 {} loopback\n", unused_loopback_port())),
+    );
+    let home = fixture.provider_home();
+    let script = format!(
+        concat!(
+            "IFS= read -r request; printf '%s\\n' '",
+            "{{\"v\":1,\"reply_to\":1,\"ev\":\"hello_ok\",\"version\":1,\"server\":\"{server}\",",
+            "\"capabilities\":[\"sessions\",\"streaming\",\"cancellation\",\"soft_interrupt\",",
+            "\"stdin_requests\",\"permission_requests\",\"history\",\"model_catalog\",",
+            "\"reasoning_effort\",\"usage\",\"runtime_info\"]}}'; ",
+            "IFS= read -r request; printf '%s\\n' '",
+            "{{\"v\":1,\"reply_to\":2,\"ev\":\"attached\",\"session\":{{\"session_id\":\"{session}\",\"status\":\"idle\"}}}}'; ",
+            "IFS= read -r request; printf '%s\\n' ",
+            "'{{\"v\":1,\"ev\":\"message_accepted\",\"session_id\":\"{session}\"}}' ",
+            "'{pause}'; ",
+            "while IFS= read -r request; do :; done"
+        ),
+        server = server,
+        session = session,
+        pause = pause,
+    );
+    write_private(
+        &fixture.state_dir().join(PROVIDER_CONFIG_NAME),
+        &format!(
+            "engine=jcode\nbinary={BUSYBOX}\nhome={}\nversion={server}\narg=sh\narg=-c\narg={script}\narg=api-stdio\n",
+            home.display()
+        ),
+    );
+    fixture
+}
+
+/// Stop a serving daemon whose one live JCode turn is paused on `pause`, and
+/// prove the stop was bounded and the wait was left durably unanswered.
+///
+/// `pause_label` is asked for only once the turn is live, because the approval
+/// label names a key the daemon has not proposed until then.
+///
+/// Returns the run identity and the aborted turn's request rows, so each
+/// caller asserts the durable fate of the request it raised.
+fn drain_paused_turn(
+    fixture: &Fixture,
+    task: &str,
+    pause_kind: automonique_protocol::event::EventKind,
+    pause_label: impl FnOnce() -> String,
+    pause_failure: &str,
+) -> (String, Vec<automonique_store::provider_journal::RequestRow>) {
+    let serving = serve(&fixture.config);
+    let mut run_lane = open_lane(fixture);
+    let task = task.to_owned();
+    let run = std::thread::spawn(move || run_lane.run(&task));
+    let index =
+        automonique_store::run_index::RunIndex::open(fixture.state_dir().join(RUN_INDEX_NAME))
+            .expect("run index");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let run_id = wait_for_ready_run(&index, deadline, "JCode turn did not become live");
+    let events = fixture
+        .state_dir()
+        .join("runs")
+        .join(&run_id)
+        .join("spool")
+        .join("events.ndjson");
+    let pause_label = pause_label();
+    wait_for_pause_frame(
+        &events,
+        &run_id,
+        deadline,
+        pause_kind,
+        Some(&pause_label),
+        pause_failure,
+    );
+
+    // THE STOP. The document allows this turn five minutes, and before the
+    // drain flag the worker would have used all of them waiting for a person.
+    let stopping = Instant::now();
+    serving.shutdown(&fixture.config);
+    let drained = stopping.elapsed();
+    assert!(
+        drained < Duration::from_secs(30),
+        "a draining daemon waited {drained:?} on a pending provider request"
+    );
+    assert_eq!(
+        run.join().expect("run thread"),
+        Err(RunFailure::Cancelled),
+        "the abandoned wait must end the run as cancelled, not as an answer"
+    );
+    let record = index
+        .by_run_id(&run_id)
+        .expect("run record")
+        .into_iter()
+        .last()
+        .expect("the run is indexed");
+    assert_eq!(
+        record.spool_state,
+        automonique_store::run_index::RunSpoolState::Cancelled
+    );
+
+    let mut journal = automonique_store::provider_journal::ProviderJournal::open(
+        fixture
+            .state_dir()
+            .join(automonique_daemon::PROVIDER_JOURNAL_NAME),
+    )
+    .expect("provider journal");
+    let recovery = journal
+        .recover_attempt(&format!("{run_id}-attempt"))
+        .expect("JCode recovery");
+    assert!(
+        recovery.process.is_some_and(|process| {
+            process.state != automonique_store::provider_journal::ProcessState::Live
+        }),
+        "the provider process must not be recorded live after the host closed"
+    );
+    let session = recovery.session.expect("provider session");
+    let turn = journal
+        .session_turns(session.session_id)
+        .expect("turns")
+        .pop()
+        .expect("turn");
+    assert_eq!(
+        turn.state,
+        automonique_store::provider_journal::TurnState::Aborted,
+        "the paused turn is aborted, not completed"
+    );
+    let requests = journal.turn_requests(turn.turn_id).expect("requests");
+    (run_id, requests)
+}
+
+/// A DRAINING DAEMON DOES NOT WAIT FOR A PERSON.
+///
+/// The provider asks for input and nobody answers. The daemon is told to stop.
+/// The wait is abandoned within a bounded time, the request is neither
+/// answered on the operator's behalf nor stranded pending: it is settled as
+/// failed with [`DAEMON_DRAINING_REASON`], so a successor reading the journal
+/// can tell a wait this daemon walked away from apart from one the provider
+/// ended.
+#[test]
+fn a_draining_daemon_abandons_a_pending_provider_input_wait_durably() {
+    let test = "a_draining_daemon_abandons_a_pending_provider_input_wait_durably";
+    if let Some(reason) = first_failing_gate() {
+        not_proven(test, reason);
+        return;
+    }
+    let fixture = silent_after_pause_fixture(
+        "jcode/drain-input-fixture",
+        "jcode-drain-input-session",
+        "{\"v\":1,\"ev\":\"stdin_request\",\"session_id\":\"jcode-drain-input-session\",\"request_id\":\"stdin-drain\",\"prompt\":\"answer before the daemon stops\",\"is_password\":false,\"tool_call_id\":\"tool-input-1\"}",
+    );
+    let (_, requests) = drain_paused_turn(
+        &fixture,
+        "wait for input nobody gives",
+        automonique_protocol::event::EventKind::InputRequested,
+        || "answer before the daemon stops".to_owned(),
+        "JCode turn did not expose its stdin request",
+    );
+    let stdin = requests
+        .iter()
+        .find(|request| request.request_key == "stdin:stdin-drain")
+        .expect("the stdin request is journalled");
+    assert_eq!(
+        stdin.outcome,
+        automonique_store::provider_journal::RequestState::Failed
+    );
+    assert_eq!(
+        stdin.failure_reason.as_deref(),
+        Some(DAEMON_DRAINING_REASON)
+    );
+    assert!(
+        stdin.response_digest.is_none(),
+        "no answer may be fabricated for the operator"
+    );
+}
+
+/// The same rule for a permission wait: the daemon decides nothing. The
+/// durable approval it proposed is still pending in the approval store for
+/// the operator to find, and the journal names the drain as the reason the
+/// host stopped waiting on it.
+#[test]
+fn a_draining_daemon_abandons_a_pending_provider_approval_wait_durably() {
+    let test = "a_draining_daemon_abandons_a_pending_provider_approval_wait_durably";
+    if let Some(reason) = first_failing_gate() {
+        not_proven(test, reason);
+        return;
+    }
+    let fixture = silent_after_pause_fixture(
+        "jcode/drain-approval-fixture",
+        "jcode-drain-approval-session",
+        "{\"v\":1,\"ev\":\"permission_request\",\"session_id\":\"jcode-drain-approval-session\",\"request_id\":\"permission-drain\",\"tool_name\":\"write\",\"description\":\"write before the daemon stops\"}",
+    );
+    let approvals_path = fixture
+        .state_dir()
+        .join(automonique_daemon::APPROVAL_REQUESTS_NAME);
+    let (run_id, requests) = drain_paused_turn(
+        &fixture,
+        "wait for an approval nobody gives",
+        automonique_protocol::event::EventKind::ApprovalRequested,
+        || {
+            // The label is asserted through the key the store actually holds:
+            // the frame must name the durable approval, not a guess at one.
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let approvals =
+                    ApprovalRequests::open(&approvals_path).expect("approval requests open");
+                if let Some(record) = approvals
+                    .pending(8)
+                    .expect("pending approvals")
+                    .into_iter()
+                    .find(|record| record.state == ApprovalState::Pending)
+                {
+                    break format!(
+                        "approval {}: write — write before the daemon stops",
+                        record.request_key
+                    );
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "provider approval was not proposed"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        },
+        "JCode turn did not expose its permission request",
+    );
+    let permission = requests
+        .iter()
+        .find(|request| request.request_key == "approval:permission-drain")
+        .expect("the permission request is journalled");
+    assert_eq!(
+        permission.outcome,
+        automonique_store::provider_journal::RequestState::Failed
+    );
+    assert_eq!(
+        permission.failure_reason.as_deref(),
+        Some(DAEMON_DRAINING_REASON)
+    );
+    let approvals = ApprovalRequests::open(&approvals_path).expect("approval requests open");
+    let still_pending = approvals
+        .pending(8)
+        .expect("pending approvals")
+        .into_iter()
+        .find(|record| record.run_id == run_id)
+        .expect("the proposed approval survives the drain");
+    assert_eq!(
+        still_pending.state,
+        ApprovalState::Pending,
+        "a draining daemon must not decide the operator's approval"
+    );
 }
 
 #[test]
