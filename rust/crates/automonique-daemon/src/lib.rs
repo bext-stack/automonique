@@ -156,7 +156,7 @@ use automonique_store::run_submissions::{
     RunSubmission, RunSubmissionError, RunSubmissionLog, RunSubmissionState,
 };
 use automonique_store::{
-    InboxSubmission, IntakePauseRequest, IntakeResumeRequest, LeaseExpiryRequest,
+    GenerationLease, InboxSubmission, IntakePauseRequest, IntakeResumeRequest, LeaseExpiryRequest,
     LeaseOwnerIdentity, LeaseRenewal, LeaseRequest,
     OutboxReconciliationDecision as StoreOutboxDecision, OutboxReconciliationRequest,
     ReconciliationDecision, ReconciliationRequest, StatusSnapshot, Store, StoreError,
@@ -1436,6 +1436,14 @@ struct SocketCleanup {
     armed: bool,
 }
 
+enum StartupAuthority {
+    Acquire,
+    Transferred {
+        resources: candidate::AdoptedCandidateResources,
+        lease: GenerationLease,
+    },
+}
+
 impl SocketCleanup {
     fn disarm(&mut self) {
         self.armed = false;
@@ -1465,22 +1473,32 @@ impl Daemon {
         config: &DaemonConfig,
         disconnected_recovery: bool,
     ) -> Result<Self, DaemonError> {
+        Self::open_with_authority(config, disconnected_recovery, StartupAuthority::Acquire)
+    }
+
+    fn open_transferred(
+        config: &DaemonConfig,
+        resources: candidate::AdoptedCandidateResources,
+        lease: GenerationLease,
+    ) -> Result<Self, DaemonError> {
+        Self::open_with_authority(
+            config,
+            false,
+            StartupAuthority::Transferred { resources, lease },
+        )
+    }
+
+    fn open_with_authority(
+        config: &DaemonConfig,
+        disconnected_recovery: bool,
+        authority: StartupAuthority,
+    ) -> Result<Self, DaemonError> {
         validate_root(&config.runtime_root, "runtime root")?;
         ensure_private_dir(&config.state_root, "state root")?;
         let runtime_dir = config.runtime_dir();
         let state_dir = config.state_dir();
         ensure_private_dir(&runtime_dir, "runtime directory")?;
         ensure_private_dir(&state_dir, "state directory")?;
-        let control_lock =
-            control_lock::ControlLock::acquire(config.control_lock_path()).map_err(|error| {
-                match error {
-                    control_lock::ControlLockError::Held => DaemonError::AlreadyRunning,
-                    control_lock::ControlLockError::InsecurePath => {
-                        DaemonError::ControlLockFailed("insecure_path")
-                    }
-                    control_lock::ControlLockError::Io(error) => DaemonError::Io(error),
-                }
-            })?;
         let process_identity =
             lease_identity::ProcessIdentity::current().map_err(|error| match error {
                 lease_identity::ProcessIdentityError::Io(error) => DaemonError::Io(error),
@@ -1498,75 +1516,138 @@ impl Daemon {
             Arc::new(lease_time::BootTimeSource),
         )?;
 
+        let now_ms = unix_millis()?;
         let socket_path = config.admin_socket();
-        let (listener, remove_socket_on_drop) = open_admin_listener(&socket_path)?;
-        let socket_metadata = fs::symlink_metadata(&socket_path)?;
-        if !socket_metadata.file_type().is_socket()
-            || socket_metadata.uid() != geteuid().as_raw()
-            || socket_metadata.mode() & 0o7777 != 0o600
-        {
-            return Err(DaemonError::InsecurePath("admin socket"));
-        }
-        listener.set_nonblocking(true)?;
-        let socket_identity = (socket_metadata.dev(), socket_metadata.ino());
+        let (
+            listener,
+            transferred_progress_listener,
+            control_lock,
+            instance_id,
+            lease,
+            socket_identity,
+            remove_socket_on_drop,
+        ) = match authority {
+            StartupAuthority::Acquire => {
+                let control_lock = control_lock::ControlLock::acquire(config.control_lock_path())
+                    .map_err(|error| match error {
+                    control_lock::ControlLockError::Held => DaemonError::AlreadyRunning,
+                    control_lock::ControlLockError::InsecurePath => {
+                        DaemonError::ControlLockFailed("insecure_path")
+                    }
+                    control_lock::ControlLockError::Io(error) => DaemonError::Io(error),
+                })?;
+                let (listener, remove_socket_on_drop) = open_admin_listener(&socket_path)?;
+                let socket_identity = validate_admin_listener(&listener, &socket_path)?;
+                let mut socket_cleanup = SocketCleanup {
+                    path: socket_path.clone(),
+                    identity: socket_identity,
+                    armed: remove_socket_on_drop,
+                };
+
+                // Establish endpoint exclusion before changing durable ownership. A
+                // failed competing bind cannot leave a phantom generation lease.
+                if let Some(previous) = store
+                    .status_snapshot_at(GENERATION_ID, now_ms)?
+                    .generation()
+                    && previous.lease_expires_ms() > lease_now_ms
+                {
+                    let previous_identity = lease_identity::ProcessIdentity {
+                        boot_id: previous.boot_id().to_owned(),
+                        pid: previous.holder_pid(),
+                        starttime: previous.holder_starttime(),
+                    };
+                    let previous_live =
+                        previous_identity.is_live().map_err(|error| match error {
+                            lease_identity::ProcessIdentityError::Io(error) => {
+                                DaemonError::Io(error)
+                            }
+                            lease_identity::ProcessIdentityError::Malformed(category) => {
+                                DaemonError::ControlLockFailed(category)
+                            }
+                        })?;
+                    if previous_live {
+                        return Err(DaemonError::AlreadyRunning);
+                    }
+                    store.expire_generation_lease_owner(LeaseExpiryRequest {
+                        generation_id: previous.generation_id(),
+                        holder_id: previous.holder_id(),
+                        epoch: previous.lease_epoch(),
+                        owner: LeaseOwnerIdentity {
+                            boot_id: previous.boot_id(),
+                            pid: previous.holder_pid(),
+                            starttime: previous.holder_starttime(),
+                        },
+                        now_ms,
+                    })?;
+                }
+                let instance = format!("daemon-{}-{now_ms}", std::process::id());
+                let instance_id = AdminInstanceId::new(instance)
+                    .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
+                let lease = store.acquire_generation_lease_owned(
+                    LeaseRequest {
+                        generation_id: GENERATION_ID,
+                        holder_id: instance_id.as_str(),
+                        now_ms,
+                        ttl_ms: LEASE_TTL_MS,
+                    },
+                    LeaseOwnerIdentity {
+                        boot_id: &process_identity.boot_id,
+                        pid: process_identity.pid,
+                        starttime: process_identity.starttime,
+                    },
+                )?;
+                socket_cleanup.disarm();
+                (
+                    listener,
+                    None,
+                    control_lock,
+                    instance_id,
+                    lease,
+                    socket_identity,
+                    remove_socket_on_drop,
+                )
+            }
+            StartupAuthority::Transferred { resources, lease } => {
+                let (listener, progress_listener, control_lock) = resources.into_parts();
+                let socket_identity = validate_admin_listener(&listener, &socket_path)?;
+                if lease.generation_id != GENERATION_ID
+                    || lease.expires_ms <= lease_now_ms
+                    || lease.boot_id != process_identity.boot_id
+                    || lease.holder_pid != process_identity.pid
+                    || lease.holder_starttime != process_identity.starttime
+                {
+                    return Err(DaemonError::Store(StoreError::StaleEpoch));
+                }
+                let durable = store.status_snapshot_at(GENERATION_ID, now_ms)?;
+                let Some(current) = durable.generation() else {
+                    return Err(DaemonError::Store(StoreError::StaleEpoch));
+                };
+                if current.holder_id() != lease.holder_id
+                    || current.lease_epoch() != lease.epoch
+                    || current.lease_expires_ms() != lease.expires_ms
+                    || current.boot_id() != lease.boot_id
+                    || current.holder_pid() != lease.holder_pid
+                    || current.holder_starttime() != lease.holder_starttime
+                {
+                    return Err(DaemonError::Store(StoreError::StaleEpoch));
+                }
+                let instance_id = AdminInstanceId::new(lease.holder_id.clone())
+                    .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
+                (
+                    listener,
+                    Some(progress_listener),
+                    control_lock,
+                    instance_id,
+                    lease,
+                    socket_identity,
+                    false,
+                )
+            }
+        };
         let mut socket_cleanup = SocketCleanup {
             path: socket_path.clone(),
             identity: socket_identity,
             armed: remove_socket_on_drop,
-        };
-
-        // Establish endpoint exclusion before changing durable ownership. A
-        // failed competing bind cannot leave a phantom generation lease.
-        let now_ms = unix_millis()?;
-        if let Some(previous) = store
-            .status_snapshot_at(GENERATION_ID, now_ms)?
-            .generation()
-            && previous.lease_expires_ms() > lease_now_ms
-        {
-            let previous_identity = lease_identity::ProcessIdentity {
-                boot_id: previous.boot_id().to_owned(),
-                pid: previous.holder_pid(),
-                starttime: previous.holder_starttime(),
-            };
-            let previous_live = previous_identity.is_live().map_err(|error| match error {
-                lease_identity::ProcessIdentityError::Io(error) => DaemonError::Io(error),
-                lease_identity::ProcessIdentityError::Malformed(category) => {
-                    DaemonError::ControlLockFailed(category)
-                }
-            })?;
-            if previous_live {
-                return Err(DaemonError::AlreadyRunning);
-            }
-            store.expire_generation_lease_owner(LeaseExpiryRequest {
-                generation_id: previous.generation_id(),
-                holder_id: previous.holder_id(),
-                epoch: previous.lease_epoch(),
-                owner: LeaseOwnerIdentity {
-                    boot_id: previous.boot_id(),
-                    pid: previous.holder_pid(),
-                    starttime: previous.holder_starttime(),
-                },
-                now_ms,
-            })?;
-        }
-        let instance = format!("daemon-{}-{now_ms}", std::process::id());
-        let instance_id = AdminInstanceId::new(instance)
-            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
-        let lease = match store.acquire_generation_lease_owned(
-            LeaseRequest {
-                generation_id: GENERATION_ID,
-                holder_id: instance_id.as_str(),
-                now_ms,
-                ttl_ms: LEASE_TTL_MS,
-            },
-            LeaseOwnerIdentity {
-                boot_id: &process_identity.boot_id,
-                pid: process_identity.pid,
-                starttime: process_identity.starttime,
-            },
-        ) {
-            Ok(lease) => lease,
-            Err(error) => return Err(DaemonError::Store(error)),
         };
 
         // THE TENURE IS RECORDED SECOND, AND IMMEDIATELY.
@@ -1887,9 +1968,23 @@ impl Daemon {
         // endpoint from a client's point of view, and a daemon that answered
         // status but could not be watched would be a daemon whose capability
         // integer is a lie.
-        let progress_endpoint =
-            progress_hub::ProgressEndpoint::bind(config.progress_socket(), execution.progress())
-                .map_err(|error| DaemonError::ProgressEndpointFailed(error.category()))?;
+        let progress_endpoint = transferred_progress_listener
+            .map_or_else(
+                || {
+                    progress_hub::ProgressEndpoint::bind(
+                        config.progress_socket(),
+                        execution.progress(),
+                    )
+                },
+                |listener| {
+                    progress_hub::ProgressEndpoint::adopt(
+                        config.progress_socket(),
+                        listener,
+                        execution.progress(),
+                    )
+                },
+            )
+            .map_err(|error| DaemonError::ProgressEndpointFailed(error.category()))?;
         socket_cleanup.disarm();
 
         Ok(Self {
@@ -1997,6 +2092,14 @@ impl Daemon {
         &self,
     ) -> Result<candidate::CandidateTransferDescriptors, DaemonError> {
         let listener = self.listener.try_clone()?;
+        let progress_listener = self
+            .progress_endpoint
+            .as_ref()
+            .ok_or(DaemonError::ProgressEndpointFailed(
+                "progress_endpoint_unavailable",
+            ))?
+            .duplicate_listener()
+            .map_err(|error| DaemonError::ProgressEndpointFailed(error.category()))?;
         let control_lock = self
             ._control_lock
             .duplicate()
@@ -2009,6 +2112,7 @@ impl Daemon {
             })?;
         Ok(candidate::CandidateTransferDescriptors::new(
             listener,
+            progress_listener,
             control_lock,
         ))
     }
@@ -7479,6 +7583,25 @@ fn open_admin_listener(path: &Path) -> Result<(UnixListener, bool), DaemonError>
     }
     listener.set_nonblocking(true)?;
     Ok((listener, false))
+}
+
+fn validate_admin_listener(
+    listener: &UnixListener,
+    path: &Path,
+) -> Result<(u64, u64), DaemonError> {
+    let local = listener.local_addr()?;
+    if local.as_pathname() != Some(path) {
+        return Err(DaemonError::InsecurePath("admin socket"));
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != geteuid().as_raw()
+        || metadata.mode() & 0o7777 != 0o600
+    {
+        return Err(DaemonError::InsecurePath("admin socket"));
+    }
+    listener.set_nonblocking(true)?;
+    Ok((metadata.dev(), metadata.ino()))
 }
 
 fn activated_listener_fd(

@@ -125,6 +125,19 @@ fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
     candidate
         .confirm_authority(&transferred.lease, transferred.adopted_runs)
         .expect("candidate renews transferred authority");
+    let candidate_tenure: (String, u64) = Connection::open(config.generation_audit_path())
+        .expect("generation audit")
+        .query_row(
+            "SELECT holder_id, lease_epoch FROM generation_tenures
+             WHERE generation_id = 'foreground' AND end_kind IS NULL",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("candidate tenure");
+    assert_eq!(
+        candidate_tenure,
+        (target.holder_id.clone(), transferred.lease.epoch)
+    );
     assert_eq!(
         candidate
             .stop()

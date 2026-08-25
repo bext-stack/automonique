@@ -46,7 +46,7 @@ use crate::control_lock::{ControlLock, ControlLockError};
 use crate::lease_identity::{ProcessIdentity, ProcessIdentityError};
 use crate::release_activation::VerifiedCodeRelease;
 
-const CHANNEL_SCHEMA: &str = "automonique.reload-candidate/v4";
+const CHANNEL_SCHEMA: &str = "automonique.reload-candidate/v5";
 const MAX_CHANNEL_LINE_BYTES: u64 = 4 * 1024;
 const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 const CONTROL_STOP: u8 = b'S';
@@ -106,13 +106,19 @@ pub struct CandidateLeaseTarget {
 /// Duplicated kernel capabilities the source may send only to its warmed child.
 pub struct CandidateTransferDescriptors {
     admin_listener: UnixListener,
+    progress_listener: UnixListener,
     control_lock: File,
 }
 
 impl CandidateTransferDescriptors {
-    pub(crate) const fn new(admin_listener: UnixListener, control_lock: File) -> Self {
+    pub(crate) const fn new(
+        admin_listener: UnixListener,
+        progress_listener: UnixListener,
+        control_lock: File,
+    ) -> Self {
         Self {
             admin_listener,
+            progress_listener,
             control_lock,
         }
     }
@@ -121,6 +127,7 @@ impl CandidateTransferDescriptors {
 /// Validated listener and continuously-held generation lock for activation.
 pub struct AdoptedCandidateResources {
     admin_listener: UnixListener,
+    progress_listener: UnixListener,
     _control_lock: ControlLock,
 }
 
@@ -142,10 +149,22 @@ impl AdoptedCandidateResources {
         {
             return Err(CandidateError::UnsafePath("admin_listener"));
         }
+        let progress_local = descriptors.progress_listener.local_addr()?;
+        if progress_local.as_pathname() != Some(config.progress_socket().as_path()) {
+            return Err(CandidateError::UnsafePath("progress_listener"));
+        }
+        let progress_metadata = fs::symlink_metadata(config.progress_socket())?;
+        if !progress_metadata.file_type().is_socket()
+            || progress_metadata.uid() != geteuid().as_raw()
+            || progress_metadata.permissions().mode() & 0o7777 != 0o600
+        {
+            return Err(CandidateError::UnsafePath("progress_listener"));
+        }
         let control_lock = ControlLock::adopt(descriptors.control_lock, config.control_lock_path())
             .map_err(map_control_lock)?;
         Ok(Self {
             admin_listener: descriptors.admin_listener,
+            progress_listener: descriptors.progress_listener,
             _control_lock: control_lock,
         })
     }
@@ -156,6 +175,22 @@ impl AdoptedCandidateResources {
             .local_addr()
             .ok()
             .and_then(|address| address.as_pathname().map(Path::to_path_buf))
+    }
+
+    #[must_use]
+    pub fn progress_socket(&self) -> Option<std::path::PathBuf> {
+        self.progress_listener
+            .local_addr()
+            .ok()
+            .and_then(|address| address.as_pathname().map(Path::to_path_buf))
+    }
+
+    pub(crate) fn into_parts(self) -> (UnixListener, UnixListener, ControlLock) {
+        (
+            self.admin_listener,
+            self.progress_listener,
+            self._control_lock,
+        )
     }
 }
 
@@ -212,6 +247,7 @@ pub enum CandidateError {
     Io(std::io::Error),
     Sqlite(rusqlite::Error),
     Store(StoreError),
+    Daemon(&'static str),
 }
 
 impl CandidateError {
@@ -230,6 +266,7 @@ impl CandidateError {
             Self::Io(_) => "candidate_io",
             Self::Sqlite(_) => "candidate_sqlite",
             Self::Store(_) => "candidate_store",
+            Self::Daemon(category) => category,
         }
     }
 }
@@ -600,12 +637,14 @@ pub fn run_candidate(
                 CandidateControl::Stop => {}
                 CandidateControl::ConfirmAuthority => {
                     let authority: CandidateAuthority = read_message_from(&mut reader)?;
-                    confirm_candidate_authority(
+                    let renewed = confirm_candidate_authority(
                         config,
                         &authority,
                         &identity,
                         input.source_lease_epoch,
                     )?;
+                    let daemon = crate::Daemon::open_transferred(config, adopted, renewed)
+                        .map_err(|error| CandidateError::Daemon(error.category()))?;
                     identity.event = "authority_ready".to_owned();
                     write_message(&mut writer, &identity)?;
                     if !matches!(
@@ -621,11 +660,13 @@ pub fn run_candidate(
                         &input.source_holder_id,
                         input.source_lease_epoch,
                     )?;
+                    drop(daemon);
                     identity.event = "relinquished".to_owned();
                     write_message(&mut writer, &identity)?;
                     if !matches!(receive_control(reader.as_fd())?, CandidateControl::Stop) {
                         return Err(CandidateError::Protocol);
                     }
+                    return write_stopped(&mut writer, identity);
                 }
                 CandidateControl::ConfirmRelinquished | CandidateControl::PrepareTransfer(_) => {
                     return Err(CandidateError::Protocol);
@@ -638,9 +679,15 @@ pub fn run_candidate(
         }
     };
     drop(adopted);
-    let mut stopped = identity;
-    stopped.event = "stopped".to_owned();
-    write_message(&mut writer, &stopped)
+    write_stopped(&mut writer, identity)
+}
+
+fn write_stopped(
+    writer: &mut impl Write,
+    mut identity: CandidateIdentity,
+) -> Result<(), CandidateError> {
+    identity.event = "stopped".to_owned();
+    write_message(writer, &identity)
 }
 
 enum CandidateControl {
@@ -660,9 +707,10 @@ fn send_control(
     let sent = if let Some(descriptors) = descriptors {
         let rights = [
             descriptors.admin_listener.as_fd(),
+            descriptors.progress_listener.as_fd(),
             descriptors.control_lock.as_fd(),
         ];
-        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(3))];
         let mut control = SendAncillaryBuffer::new(&mut space);
         if !control.push(SendAncillaryMessage::ScmRights(&rights)) {
             return Err(CandidateError::Protocol);
@@ -688,7 +736,7 @@ fn receive_control(fd: impl AsFd) -> Result<CandidateControl, CandidateError> {
     let mut received = Vec::new();
     let (bytes, flags) = {
         let mut vectors = [IoSliceMut::new(&mut marker)];
-        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(3))];
         let mut control = RecvAncillaryBuffer::new(&mut space);
         let message = recvmsg(fd, &mut vectors, &mut control, RecvFlags::CMSG_CLOEXEC)
             .map_err(|error| CandidateError::Io(error.into()))?;
@@ -709,12 +757,14 @@ fn receive_control(fd: impl AsFd) -> Result<CandidateControl, CandidateError> {
         CONTROL_CONFIRM_RELINQUISHED if received.is_empty() => {
             Ok(CandidateControl::ConfirmRelinquished)
         }
-        CONTROL_PREPARE_TRANSFER if received.len() == 2 => {
+        CONTROL_PREPARE_TRANSFER if received.len() == 3 => {
             let control_lock = received.pop().expect("length checked");
+            let progress_listener = received.pop().expect("length checked");
             let admin_listener = received.pop().expect("length checked");
             Ok(CandidateControl::PrepareTransfer(
                 CandidateTransferDescriptors::new(
                     UnixListener::from(admin_listener),
+                    UnixListener::from(progress_listener),
                     File::from(control_lock),
                 ),
             ))
@@ -728,7 +778,7 @@ fn confirm_candidate_authority(
     authority: &CandidateAuthority,
     identity: &CandidateIdentity,
     source_lease_epoch: u64,
-) -> Result<(), CandidateError> {
+) -> Result<GenerationLease, CandidateError> {
     let expected_epoch = source_lease_epoch
         .checked_add(1)
         .ok_or(CandidateError::Protocol)?;
@@ -763,7 +813,7 @@ fn confirm_candidate_authority(
     {
         return Err(CandidateError::Protocol);
     }
-    Ok(())
+    Ok(renewed)
 }
 
 fn confirm_candidate_relinquished(
@@ -1076,7 +1126,7 @@ mod tests {
             identity
         );
 
-        let unknown = br#"{"schema":"automonique.reload-candidate/v4","event":"warm","reload_id":"reload-1","target_generation_id":"generation-2","manifest_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binary_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","attempt_count":2,"attempt_inventory_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","target_holder_id":"daemon-42-reload-0123456789abcdef","boot_id":"01234567-89ab-cdef-0123-456789abcdef","starttime":100,"pid":42,"extra":true}\n"#;
+        let unknown = br#"{"schema":"automonique.reload-candidate/v5","event":"warm","reload_id":"reload-1","target_generation_id":"generation-2","manifest_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binary_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","attempt_count":2,"attempt_inventory_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","target_holder_id":"daemon-42-reload-0123456789abcdef","boot_id":"01234567-89ab-cdef-0123-456789abcdef","starttime":100,"pid":42,"extra":true}\n"#;
         assert!(matches!(
             read_message_from::<CandidateIdentity>(&mut unknown.as_slice()),
             Err(CandidateError::Protocol)
@@ -1155,6 +1205,10 @@ mod tests {
         assert_eq!(
             adopted.admin_socket().as_deref(),
             Some(config.admin_socket().as_path())
+        );
+        assert_eq!(
+            adopted.progress_socket().as_deref(),
+            Some(config.progress_socket().as_path())
         );
         assert!(matches!(
             ControlLock::acquire(config.control_lock_path()),

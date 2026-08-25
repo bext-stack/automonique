@@ -829,9 +829,10 @@ impl From<std::io::Error> for ProgressEndpointError {
 /// [`ProgressEndpoint::start`] is what puts the accept loop on a thread, and
 /// [`ProgressEndpoint::shutdown`] is what takes it and every writer off again.
 pub struct ProgressEndpoint {
-    listener: Option<UnixListener>,
+    listener: UnixListener,
     socket_path: PathBuf,
     socket_identity: (u64, u64),
+    remove_socket_on_drop: bool,
     hub: Arc<ProgressHub>,
     stop: Arc<AtomicBool>,
     accept: Option<JoinHandle<()>>,
@@ -882,9 +883,10 @@ impl ProgressEndpoint {
         }
         listener.set_nonblocking(true)?;
         Ok(Self {
-            listener: Some(listener),
+            listener,
             socket_path,
             socket_identity: (metadata.dev(), metadata.ino()),
+            remove_socket_on_drop: true,
             hub,
             stop: Arc::new(AtomicBool::new(false)),
             accept: None,
@@ -897,6 +899,41 @@ impl ProgressEndpoint {
         &self.socket_path
     }
 
+    /// Duplicate the already-bound listener for a generation candidate.
+    pub(crate) fn duplicate_listener(&self) -> Result<UnixListener, ProgressEndpointError> {
+        self.listener.try_clone().map_err(ProgressEndpointError::Io)
+    }
+
+    /// Adopt the exact listener supplied by the source generation.
+    pub(crate) fn adopt(
+        socket_path: impl Into<PathBuf>,
+        listener: UnixListener,
+        hub: Arc<ProgressHub>,
+    ) -> Result<Self, ProgressEndpointError> {
+        let socket_path = socket_path.into();
+        let local = listener.local_addr()?;
+        if local.as_pathname() != Some(socket_path.as_path()) {
+            return Err(ProgressEndpointError::UnsafeSocket);
+        }
+        let metadata = fs::symlink_metadata(&socket_path)?;
+        if !metadata.file_type().is_socket()
+            || metadata.uid() != geteuid().as_raw()
+            || metadata.mode() & 0o7777 != 0o600
+        {
+            return Err(ProgressEndpointError::UnsafeSocket);
+        }
+        listener.set_nonblocking(true)?;
+        Ok(Self {
+            listener,
+            socket_path,
+            socket_identity: (metadata.dev(), metadata.ino()),
+            remove_socket_on_drop: false,
+            hub,
+            stop: Arc::new(AtomicBool::new(false)),
+            accept: None,
+        })
+    }
+
     /// Put the accept loop on a thread.
     ///
     /// # Errors
@@ -907,10 +944,7 @@ impl ProgressEndpoint {
         if self.accept.is_some() {
             return Err(ProgressEndpointError::AlreadyStarted);
         }
-        let listener = self
-            .listener
-            .take()
-            .ok_or(ProgressEndpointError::AlreadyStarted)?;
+        let listener = self.listener.try_clone()?;
         let hub = Arc::clone(&self.hub);
         let stop = Arc::clone(&self.stop);
         self.accept = Some(std::thread::spawn(move || {
@@ -956,6 +990,9 @@ impl Drop for ProgressEndpoint {
         self.stop.store(true, Ordering::Release);
         if let Some(accept) = self.accept.take() {
             let _ = accept.join();
+        }
+        if !self.remove_socket_on_drop {
+            return;
         }
         let Ok(metadata) = fs::symlink_metadata(&self.socket_path) else {
             return;
