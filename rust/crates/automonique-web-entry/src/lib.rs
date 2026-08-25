@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod agent_auth;
+mod mobile_auth;
 
 pub use agent_auth::AgentAuthConfig;
 
@@ -61,6 +62,12 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
 use crate::agent_auth::{AgentAuthAction, AgentAuthManager};
+use crate::mobile_auth::{
+    MOBILE_AUTH_MEDIA_TYPE, MOBILE_AUTH_SCHEMA_V1, MobileAuthorization, MobileCredentialAuthority,
+    MobileCredentialInventory, MobileCredentialInventoryRequest, MobileCredentialRevokeRequest,
+    MobileOperatorProvisionRequest, MobilePairingExchangeRequest, MobilePairingOffer,
+    MobileRefreshRequest, MobileRevocation, authorize_platform_request, filter_sessions,
+};
 
 const DASHBOARD_HTML: &str = include_str!("../assets/dashboard.html");
 const DASHBOARD_CSS: &str = include_str!("../assets/dashboard.css");
@@ -112,6 +119,17 @@ pub enum Route {
     ApiOperations,
     ApiPlatform,
     ApiPlatformRemote,
+    MobileDiscovery,
+    MobileOperatorProvision,
+    MobilePairingCreate,
+    MobilePairingExchange,
+    MobileCredentialInventory,
+    MobileCredentialRevoke,
+    MobileRefresh,
+    MobileRevoke,
+    MobileAuthorization,
+    MobileUnauthorized,
+    MobileAccessUnauthorized,
     ApiProcesses,
     ApiChat,
     ApiChatAction,
@@ -464,6 +482,45 @@ fn valid_bearer_token(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
+fn bearer_token(value: Option<&str>) -> Option<&str> {
+    let (scheme, token) = value?.split_once(' ')?;
+    (scheme.eq_ignore_ascii_case("bearer") && valid_bearer_token(token)).then_some(token)
+}
+
+fn presents_mobile_access_token(value: Option<&str>) -> bool {
+    value
+        .and_then(|value| value.split_once(' '))
+        .is_some_and(|(scheme, token)| {
+            scheme.eq_ignore_ascii_case("bearer") && token.starts_with("ma_")
+        })
+}
+
+fn authorize_remote_bearer(
+    authorization: Option<&str>,
+    mobile_authorized: bool,
+    manage_authorize: impl FnOnce() -> bool,
+) -> bool {
+    if presents_mobile_access_token(authorization) {
+        mobile_authorized
+    } else {
+        mobile_authorized || manage_authorize()
+    }
+}
+
+fn request_credentials_authorized(
+    mobile_access_presented: bool,
+    mobile_authorized: bool,
+    basic_authorized: bool,
+    session_authorized: bool,
+    other_bearer_authorized: bool,
+) -> bool {
+    if mobile_access_presented {
+        mobile_authorized
+    } else {
+        basic_authorized || session_authorized || other_bearer_authorized
+    }
+}
+
 fn read_private_config(path: &Path, limit: u64) -> Result<Vec<u8>, AuthConfigError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| AuthConfigError::Unreadable)?;
     if !metadata.file_type().is_file()
@@ -617,6 +674,7 @@ pub struct WebIntegration {
     memory_path: PathBuf,
     lane: Mutex<SocketRunLane>,
     platform: Mutex<PlatformClient<UnixTransport>>,
+    mobile_auth: Mutex<MobileCredentialAuthority>,
     slack: Mutex<Option<Box<dyn SlackSurface + Send>>>,
     github: Mutex<Option<Box<dyn GitHubSurface + Send>>>,
     manage: ManageIntegration,
@@ -1592,12 +1650,19 @@ impl WebIntegration {
             mcp_server,
         };
         let shared_assistant = AskHost::open_paths(state_dir, runtime_dir).ok();
+        let mobile_auth = MobileCredentialAuthority::open(
+            state_dir.join("mobile-credentials.sqlite3"),
+            config.hosts.canonical(),
+            &config.actor,
+        )
+        .map_err(|_| "dashboard mobile credential authority unavailable")?;
         Ok(Self {
             config,
             state_dir: state_dir.to_path_buf(),
             memory_path: state_dir.join("agent-memory.sqlite3"),
             lane: Mutex::new(lane),
             platform: Mutex::new(PlatformClient::new(UnixTransport::new(admin_socket))),
+            mobile_auth: Mutex::new(mobile_auth),
             slack: Mutex::new(slack),
             github: Mutex::new(github),
             manage,
@@ -1648,9 +1713,17 @@ impl WebIntegration {
         })
     }
 
-    fn platform_remote(&self, body: &[u8]) -> Result<Vec<u8>, &'static str> {
+    fn platform_remote(
+        &self,
+        body: &[u8],
+        mobile: Option<&MobileAuthorization>,
+    ) -> Result<Vec<u8>, &'static str> {
         let request = PlatformRequestMessage::from_canonical_bytes(body)
             .map_err(|_| "platform_request_invalid")?;
+        if let Some(authorization) = mobile {
+            authorize_platform_request(authorization, request.request(), now_ms_i64())
+                .map_err(|_| "platform_mobile_unauthorized")?;
+        }
         let request_id = request.request_id().clone();
         let mut client = self
             .platform
@@ -1666,10 +1739,125 @@ impl WebIntegration {
         {
             capabilities.transports.push(PlatformTransport::RemoteHttps);
         }
+        if let (Some(authorization), PlatformResponse::Sessions(sessions)) = (mobile, &mut response)
+        {
+            *sessions = filter_sessions(authorization, sessions.clone());
+        }
         PlatformResponseMessage::new(request_id, response)
             .to_message()
             .map(|message| message.to_canonical_bytes())
             .map_err(|_| "platform_response_invalid")
+    }
+
+    fn mobile_discovery(&self) -> Result<mobile_auth::MobileDiscovery, &'static str> {
+        self.mobile_auth
+            .lock()
+            .map(|authority| authority.discovery().clone())
+            .map_err(|_| "mobile_credential_authority_busy")
+    }
+
+    fn mobile_operator_provision(
+        &self,
+        request: MobileOperatorProvisionRequest,
+    ) -> Result<mobile_auth::IssuedMobileCredentials, &'static str> {
+        self.mobile_auth
+            .lock()
+            .map_err(|_| "mobile_credential_authority_busy")?
+            .operator_provision(request, now_ms_i64())
+            .map_err(|error| error.category())
+    }
+
+    fn mobile_pairing_create(
+        &self,
+        request: MobileOperatorProvisionRequest,
+    ) -> Result<MobilePairingOffer, &'static str> {
+        self.mobile_auth
+            .lock()
+            .map_err(|_| "mobile_credential_authority_busy")?
+            .create_pairing(request, now_ms_i64())
+            .map_err(|error| error.category())
+    }
+
+    fn mobile_pairing_exchange(
+        &self,
+        mut request: MobilePairingExchangeRequest,
+    ) -> Result<mobile_auth::IssuedMobileCredentials, &'static str> {
+        self.mobile_auth
+            .lock()
+            .map_err(|_| "mobile_credential_authority_busy")?
+            .exchange_pairing(&mut request, now_ms_i64())
+            .map_err(|error| error.category())
+    }
+
+    fn mobile_credential_inventory(
+        &self,
+        request: MobileCredentialInventoryRequest,
+    ) -> Result<MobileCredentialInventory, &'static str> {
+        self.mobile_auth
+            .lock()
+            .map_err(|_| "mobile_credential_authority_busy")?
+            .credential_inventory(request, now_ms_i64())
+            .map_err(|error| error.category())
+    }
+
+    fn mobile_credential_revoke(
+        &self,
+        request: MobileCredentialRevokeRequest,
+    ) -> Result<MobileRevocation, &'static str> {
+        self.mobile_auth
+            .lock()
+            .map_err(|_| "mobile_credential_authority_busy")?
+            .revoke_credential_id(request, now_ms_i64())
+            .map_err(|error| error.category())
+    }
+
+    fn mobile_refresh(
+        &self,
+        mut request: MobileRefreshRequest,
+    ) -> Result<mobile_auth::IssuedMobileCredentials, &'static str> {
+        self.mobile_auth
+            .lock()
+            .map_err(|_| "mobile_credential_authority_busy")?
+            .refresh(
+                &mut request.refresh_token,
+                &request.server_identity,
+                now_ms_i64(),
+            )
+            .map_err(|error| error.category())
+    }
+
+    fn mobile_revoke(
+        &self,
+        mut request: MobileRefreshRequest,
+    ) -> Result<MobileRevocation, &'static str> {
+        self.mobile_auth
+            .lock()
+            .map_err(|_| "mobile_credential_authority_busy")?
+            .revoke(
+                &mut request.refresh_token,
+                &request.server_identity,
+                now_ms_i64(),
+            )
+            .map_err(|error| error.category())?;
+        Ok(MobileRevocation {
+            schema: MOBILE_AUTH_SCHEMA_V1,
+            revoked: true,
+        })
+    }
+
+    fn mobile_authorization(
+        &self,
+        authorization: Option<&str>,
+    ) -> Result<MobileAuthorization, &'static str> {
+        let token = bearer_token(authorization).ok_or("mobile_credential_invalid")?;
+        let authority = self
+            .mobile_auth
+            .lock()
+            .map_err(|_| "mobile_credential_authority_busy")?;
+        let server_identity = authority.discovery().server_identity.clone();
+        authority
+            .authorize_access(token, &server_identity, now_ms_i64())
+            .map_err(|error| error.category())
     }
 
     fn memory(&self, query: Option<&str>) -> Result<MemoryView, &'static str> {
@@ -4419,6 +4607,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 "/assets/dashboard.js" => Route::Script,
                 "/favicon.svg" => Route::Favicon,
                 "/robots.txt" => Route::Robots,
+                "/.well-known/automonique-mobile" => Route::MobileDiscovery,
                 "/api/status" => Route::ApiStatus,
                 "/api/memory" => Route::ApiMemory,
                 "/api/memory/search" => Route::ApiMemorySearch,
@@ -4433,6 +4622,14 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                         Route::ApiPlatform
                     }
                 }
+                "/api/mobile/operator-provision" => Route::MobileOperatorProvision,
+                "/api/mobile/pairings" => Route::MobilePairingCreate,
+                "/api/mobile/pairings/exchange" => Route::MobilePairingExchange,
+                "/api/mobile/credentials/list" => Route::MobileCredentialInventory,
+                "/api/mobile/credentials/revoke" => Route::MobileCredentialRevoke,
+                "/api/mobile/refresh" => Route::MobileRefresh,
+                "/api/mobile/revoke" => Route::MobileRevoke,
+                "/api/mobile/authorization" => Route::MobileAuthorization,
                 "/api/processes" => Route::ApiProcesses,
                 "/api/chat" => Route::ApiChat,
                 "/api/chat/action" => Route::ApiChatAction,
@@ -4450,6 +4647,13 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 Route::ApiMemorySearch
                     | Route::ApiAgentAccountsAction
                     | Route::ApiPlatformRemote
+                    | Route::MobileOperatorProvision
+                    | Route::MobilePairingCreate
+                    | Route::MobilePairingExchange
+                    | Route::MobileCredentialInventory
+                    | Route::MobileCredentialRevoke
+                    | Route::MobileRefresh
+                    | Route::MobileRevoke
                     | Route::ApiChat
                     | Route::ApiChatAction
                     | Route::ApiChatNew
@@ -4889,7 +5093,20 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         | Route::ApiManageChatHistory
         | Route::ApiManageChatTurn
         | Route::ApiManageChatNew
-        | Route::ApiManageChatAction => empty_response("500 Internal Server Error"),
+        | Route::ApiManageChatAction
+        | Route::MobileDiscovery
+        | Route::MobileOperatorProvision
+        | Route::MobilePairingCreate
+        | Route::MobilePairingExchange
+        | Route::MobileCredentialInventory
+        | Route::MobileCredentialRevoke
+        | Route::MobileRefresh
+        | Route::MobileRevoke
+        | Route::MobileAuthorization => empty_response("500 Internal Server Error"),
+        Route::MobileUnauthorized => {
+            mobile_error("401 Unauthorized", "mobile_operator_authorization_required")
+        }
+        Route::MobileAccessUnauthorized => empty_response("401 Unauthorized"),
         Route::Health => Response {
             status: "200 OK",
             content_type: Some("text/plain; charset=utf-8"),
@@ -4943,6 +5160,7 @@ fn api_response(
     body: &[u8],
     integration: &WebIntegration,
     state: &AppState,
+    mobile_authorization: Option<&MobileAuthorization>,
 ) -> Response {
     match route {
         Route::ApiMemory => match integration.memory(None) {
@@ -4976,7 +5194,7 @@ fn api_response(
             Ok(view) => json_response("200 OK", &view),
             Err(category) => json_error("503 Service Unavailable", category),
         },
-        Route::ApiPlatformRemote => match integration.platform_remote(body) {
+        Route::ApiPlatformRemote => match integration.platform_remote(body, mobile_authorization) {
             Ok(body) => Response {
                 status: "200 OK",
                 content_type: Some(PLATFORM_CONTENT_TYPE),
@@ -4988,8 +5206,81 @@ fn api_response(
             Err("platform_request_invalid") => {
                 json_error("400 Bad Request", "platform_request_invalid")
             }
+            Err("platform_mobile_unauthorized") => {
+                json_error("403 Forbidden", "platform_mobile_unauthorized")
+            }
             Err(category) => json_error("503 Service Unavailable", category),
         },
+        Route::MobileDiscovery => match integration.mobile_discovery() {
+            Ok(discovery) => mobile_response("200 OK", &discovery),
+            Err(category) => mobile_error("503 Service Unavailable", category),
+        },
+        Route::MobileOperatorProvision => {
+            match serde_json::from_slice::<MobileOperatorProvisionRequest>(body) {
+                Ok(request) => match integration.mobile_operator_provision(request) {
+                    Ok(credentials) => mobile_response("201 Created", &credentials),
+                    Err(category) => mobile_error("400 Bad Request", category),
+                },
+                Err(_) => mobile_error("400 Bad Request", "mobile_request_invalid"),
+            }
+        }
+        Route::MobilePairingCreate => {
+            match serde_json::from_slice::<MobileOperatorProvisionRequest>(body) {
+                Ok(request) => match integration.mobile_pairing_create(request) {
+                    Ok(offer) => mobile_response("201 Created", &offer),
+                    Err(category) => mobile_error("400 Bad Request", category),
+                },
+                Err(_) => mobile_error("400 Bad Request", "mobile_request_invalid"),
+            }
+        }
+        Route::MobilePairingExchange => {
+            match serde_json::from_slice::<MobilePairingExchangeRequest>(body) {
+                Ok(request) => match integration.mobile_pairing_exchange(request) {
+                    Ok(credentials) => mobile_response("201 Created", &credentials),
+                    Err("mobile_pairing_invalid") => {
+                        mobile_error("401 Unauthorized", "mobile_pairing_invalid")
+                    }
+                    Err(category) => mobile_error("503 Service Unavailable", category),
+                },
+                Err(_) => mobile_error("400 Bad Request", "mobile_request_invalid"),
+            }
+        }
+        Route::MobileCredentialInventory => {
+            match serde_json::from_slice::<MobileCredentialInventoryRequest>(body) {
+                Ok(request) => match integration.mobile_credential_inventory(request) {
+                    Ok(inventory) => mobile_response("200 OK", &inventory),
+                    Err(category) => mobile_error("400 Bad Request", category),
+                },
+                Err(_) => mobile_error("400 Bad Request", "mobile_request_invalid"),
+            }
+        }
+        Route::MobileCredentialRevoke => {
+            match serde_json::from_slice::<MobileCredentialRevokeRequest>(body) {
+                Ok(request) => match integration.mobile_credential_revoke(request) {
+                    Ok(revocation) => mobile_response("200 OK", &revocation),
+                    Err(category) => mobile_error("400 Bad Request", category),
+                },
+                Err(_) => mobile_error("400 Bad Request", "mobile_request_invalid"),
+            }
+        }
+        Route::MobileRefresh => match serde_json::from_slice::<MobileRefreshRequest>(body) {
+            Ok(request) => match integration.mobile_refresh(request) {
+                Ok(credentials) => mobile_response("200 OK", &credentials),
+                Err(category) => mobile_error("401 Unauthorized", category),
+            },
+            Err(_) => mobile_error("400 Bad Request", "mobile_request_invalid"),
+        },
+        Route::MobileRevoke => match serde_json::from_slice::<MobileRefreshRequest>(body) {
+            Ok(request) => match integration.mobile_revoke(request) {
+                Ok(revocation) => mobile_response("200 OK", &revocation),
+                Err(category) => mobile_error("401 Unauthorized", category),
+            },
+            Err(_) => mobile_error("400 Bad Request", "mobile_request_invalid"),
+        },
+        Route::MobileAuthorization => mobile_authorization.map_or_else(
+            || mobile_error("401 Unauthorized", "mobile_credential_invalid"),
+            |authorization| mobile_response("200 OK", authorization),
+        ),
         Route::ApiProcesses => json_response("200 OK", &integration.processes()),
         Route::ApiChat => match serde_json::from_slice::<ChatRequest>(body) {
             Ok(request) => match integration.chat(request, &state.snapshot()) {
@@ -5060,6 +5351,25 @@ fn json_response<T: Serialize>(status: &'static str, value: &T) -> Response {
     }
 }
 
+fn mobile_response<T: Serialize>(status: &'static str, value: &T) -> Response {
+    Response {
+        status,
+        content_type: Some(MOBILE_AUTH_MEDIA_TYPE),
+        cache_control: "no-store",
+        location: None,
+        retry_after: None,
+        body: serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec()),
+    }
+}
+
+fn mobile_error(status: &'static str, category: &'static str) -> Response {
+    #[derive(Serialize)]
+    struct ErrorBody {
+        error: &'static str,
+    }
+    mobile_response(status, &ErrorBody { error: category })
+}
+
 fn json_error(status: &'static str, category: &'static str) -> Response {
     #[derive(Serialize)]
     struct ErrorBody {
@@ -5094,7 +5404,12 @@ fn empty_response(status: &'static str) -> Response {
     }
 }
 
-fn response_bytes(response: Response, head_only: bool, session_cookie: Option<&str>) -> Vec<u8> {
+fn response_bytes(
+    mut response: Response,
+    head_only: bool,
+    session_cookie: Option<&str>,
+    route: Route,
+) -> Vec<u8> {
     let content_security_policy = if response.content_type == Some("text/html; charset=utf-8") {
         "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
     } else {
@@ -5128,9 +5443,14 @@ fn response_bytes(response: Response, head_only: bool, session_cookie: Option<&s
         headers.push_str("Allow: GET, HEAD\r\n");
     }
     if response.status == "401 Unauthorized" {
-        if response.content_type == Some("application/json; charset=utf-8") {
+        if route == Route::ManageUnauthorized {
             headers.push_str("WWW-Authenticate: Bearer realm=\"Monique Manage Chat\"\r\n");
-        } else {
+        } else if matches!(
+            route,
+            Route::MobileAccessUnauthorized | Route::MobileAuthorization
+        ) {
+            headers.push_str("WWW-Authenticate: Bearer realm=\"Automonique Mobile\"\r\n");
+        } else if matches!(route, Route::MobileUnauthorized | Route::Unauthorized) {
             headers.push_str(
                 "WWW-Authenticate: Basic realm=\"Monique Operations\", charset=\"UTF-8\"\r\n",
             );
@@ -5146,6 +5466,7 @@ fn response_bytes(response: Response, head_only: bool, session_cookie: Option<&s
     if !head_only {
         bytes.extend_from_slice(&response.body);
     }
+    response.body.zeroize();
     bytes
 }
 
@@ -5199,6 +5520,25 @@ fn handle(
                 let local_health = normalize_host(request.host) == Some("localhost")
                     && requested_route == Route::Health;
                 let remote_platform = requested_route == Route::ApiPlatformRemote;
+                let operator_mobile = matches!(
+                    requested_route,
+                    Route::MobileOperatorProvision
+                        | Route::MobilePairingCreate
+                        | Route::MobileCredentialInventory
+                        | Route::MobileCredentialRevoke
+                );
+                let mobile_lifecycle = matches!(
+                    requested_route,
+                    Route::MobileDiscovery
+                        | Route::MobileOperatorProvision
+                        | Route::MobilePairingCreate
+                        | Route::MobilePairingExchange
+                        | Route::MobileCredentialInventory
+                        | Route::MobileCredentialRevoke
+                        | Route::MobileRefresh
+                        | Route::MobileRevoke
+                        | Route::MobileAuthorization
+                );
                 let needs_auth = !local_health
                     && !matches!(
                         requested_route,
@@ -5206,15 +5546,43 @@ fn handle(
                             | Route::HttpsRedirect
                             | Route::UnknownHost
                             | Route::BadRequest
+                            | Route::MobileDiscovery
+                            | Route::MobilePairingExchange
+                            | Route::MobileRefresh
+                            | Route::MobileRevoke
+                            | Route::MobileAuthorization
                     );
                 let basic_authorized = auth.authorize(request.authorization);
                 let session_authorized = auth.authorize_session(request.cookie);
+                let mobile_authorization = (remote_platform
+                    || requested_route == Route::MobileAuthorization)
+                    .then(|| {
+                        integration.and_then(|integration| {
+                            integration.mobile_authorization(request.authorization).ok()
+                        })
+                    })
+                    .flatten();
+                let mobile_access_presented =
+                    remote_platform && presents_mobile_access_token(request.authorization);
                 let bearer_authorized = remote_platform
-                    && integration.is_some_and(|integration| {
-                        integration
-                            .manage
-                            .authorize_platform_bearer(request.authorization)
-                    });
+                    && authorize_remote_bearer(
+                        request.authorization,
+                        mobile_authorization.is_some(),
+                        || {
+                            integration.is_some_and(|integration| {
+                                integration
+                                    .manage
+                                    .authorize_platform_bearer(request.authorization)
+                            })
+                        },
+                    );
+                let credentials_authorized = request_credentials_authorized(
+                    mobile_access_presented,
+                    mobile_authorization.is_some(),
+                    basic_authorized,
+                    session_authorized,
+                    bearer_authorized,
+                );
                 let manage_chat_route = matches!(
                     requested_route,
                     Route::ApiManageChatHistory
@@ -5226,16 +5594,22 @@ fn handle(
                     Route::RateLimited
                 } else if manage_chat_route && !manage_chat_auth.authorize(request.authorization) {
                     Route::ManageUnauthorized
-                } else if needs_auth
-                    && !manage_chat_route
-                    && !(basic_authorized || session_authorized || bearer_authorized)
-                {
-                    Route::Unauthorized
-                } else if request.method == Method::Post
+                } else if operator_mobile && !basic_authorized {
+                    Route::MobileUnauthorized
+                } else if needs_auth && !manage_chat_route && !credentials_authorized {
+                    if mobile_access_presented {
+                        Route::MobileAccessUnauthorized
+                    } else {
+                        Route::Unauthorized
+                    }
+                } else if requested_route != Route::HttpsRedirect
+                    && request.method == Method::Post
                     && (request.content_length == 0
                         || !request.content_type.is_some_and(|value| {
                             value.eq_ignore_ascii_case(if remote_platform {
                                 PLATFORM_CONTENT_TYPE
+                            } else if mobile_lifecycle {
+                                MOBILE_AUTH_MEDIA_TYPE
                             } else {
                                 "application/json"
                             })
@@ -5250,9 +5624,18 @@ fn handle(
                 } else {
                     Vec::new()
                 };
-                let issue_session =
-                    needs_auth && !remote_platform && basic_authorized && !session_authorized;
-                break Ok((route, request.method == Method::Head, body, issue_session));
+                let issue_session = needs_auth
+                    && !remote_platform
+                    && !mobile_lifecycle
+                    && basic_authorized
+                    && !session_authorized;
+                break Ok((
+                    route,
+                    request.method == Method::Head,
+                    body,
+                    issue_session,
+                    mobile_authorization,
+                ));
             }
             Err(Route::BadRequest) if !bytes.windows(4).any(|part| part == b"\r\n\r\n") => {
                 continue;
@@ -5260,9 +5643,10 @@ fn handle(
             Err(error) => break Err(error),
         }
     };
-    let (route, head_only, body, issue_session) = match parsed {
+    bytes.zeroize();
+    let (route, head_only, mut body, issue_session, mobile_authorization) = match parsed {
         Ok(value) => value,
-        Err(route) => (route, false, Vec::new(), false),
+        Err(route) => (route, false, Vec::new(), false, None),
     };
     let response = if matches!(
         route,
@@ -5283,21 +5667,39 @@ fn handle(
             | Route::ApiManageChatTurn
             | Route::ApiManageChatNew
             | Route::ApiManageChatAction
+            | Route::MobileDiscovery
+            | Route::MobileOperatorProvision
+            | Route::MobilePairingCreate
+            | Route::MobilePairingExchange
+            | Route::MobileCredentialInventory
+            | Route::MobileCredentialRevoke
+            | Route::MobileRefresh
+            | Route::MobileRevoke
+            | Route::MobileAuthorization
     ) {
         integration.map_or_else(
             || json_error("503 Service Unavailable", "integration_unavailable"),
-            |integration| api_response(route, &body, integration, state),
+            |integration| {
+                api_response(
+                    route,
+                    &body,
+                    integration,
+                    state,
+                    mobile_authorization.as_ref(),
+                )
+            },
         )
     } else {
         response_for(route, state, hosts)
     };
+    body.zeroize();
     let session_cookie = issue_session.then(|| auth.session_cookie());
-    stream.write_all(&response_bytes(
-        response,
-        head_only,
-        session_cookie.as_deref(),
-    ))?;
-    stream.flush()
+    let mut wire_response = response_bytes(response, head_only, session_cookie.as_deref(), route);
+    let written = stream
+        .write_all(&wire_response)
+        .and_then(|()| stream.flush());
+    wire_response.zeroize();
+    written
 }
 
 pub fn serve(
@@ -5593,6 +5995,8 @@ mod tests {
             ("/api/status?fresh=1", Route::ApiStatus),
             ("/api/operations", Route::ApiOperations),
             ("/api/platform", Route::ApiPlatform),
+            ("/.well-known/automonique-mobile", Route::MobileDiscovery),
+            ("/api/mobile/authorization", Route::MobileAuthorization),
             ("/api/processes", Route::ApiProcesses),
             ("/api/agent-accounts", Route::ApiAgentAccounts),
             ("/missing", Route::NotFound),
@@ -5608,6 +6012,144 @@ mod tests {
         assert_eq!(
             Route::ApiPlatformRemote,
             route(&parse_request(&bytes).unwrap(), &fixture_hosts())
+        );
+        for (path, expected) in [
+            (
+                "/api/mobile/operator-provision",
+                Route::MobileOperatorProvision,
+            ),
+            ("/api/mobile/refresh", Route::MobileRefresh),
+            ("/api/mobile/revoke", Route::MobileRevoke),
+        ] {
+            let bytes = format!(
+                "POST {path} HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nContent-Length: 2\r\nContent-Type: {MOBILE_AUTH_MEDIA_TYPE}\r\n\r\n{{}}"
+            );
+            assert_eq!(
+                expected,
+                route(&parse_request(bytes.as_bytes()).unwrap(), &fixture_hosts())
+            );
+        }
+    }
+
+    #[test]
+    fn mobile_access_tokens_are_exclusively_identified_before_manage_authorization() {
+        assert!(presents_mobile_access_token(Some(
+            "Bearer ma_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        )));
+        assert!(presents_mobile_access_token(Some("bearer ma_malformed")));
+        assert!(!presents_mobile_access_token(Some(
+            "Bearer manage-service-token"
+        )));
+        assert!(!presents_mobile_access_token(Some(
+            "Basic ma_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        )));
+        let manage_called = std::cell::Cell::new(false);
+        assert!(!authorize_remote_bearer(
+            Some("Bearer ma_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            false,
+            || {
+                manage_called.set(true);
+                true
+            }
+        ));
+        assert!(
+            !manage_called.get(),
+            "mobile token reached Manage authority"
+        );
+        for state in ["invalid", "expired", "revoked"] {
+            assert!(
+                !request_credentials_authorized(true, false, true, false, false),
+                "{state} mobile token fell back to Basic authority"
+            );
+            assert!(
+                !request_credentials_authorized(true, false, false, true, false),
+                "{state} mobile token fell back to session authority"
+            );
+        }
+        assert!(request_credentials_authorized(
+            true, true, false, false, false
+        ));
+    }
+
+    #[test]
+    fn mobile_credential_lock_contention_waits_and_processes_replay() {
+        let state_dir = tempfile::tempdir().expect("temporary state");
+        let runtime_dir = tempfile::tempdir().expect("temporary runtime");
+        std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private state");
+        std::fs::set_permissions(runtime_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private runtime");
+        let _platform_listener = UnixListener::bind(runtime_dir.path().join("admin.sock"))
+            .expect("fixture platform socket");
+        let integration = Arc::new(
+            WebIntegration::open(
+                IntegrationConfig {
+                    tenant: String::from("operator"),
+                    actor: String::from("operator:mutex-contract"),
+                    hosts: fixture_hosts(),
+                },
+                state_dir.path(),
+                runtime_dir.path(),
+            )
+            .expect("web integration"),
+        );
+
+        let mut authority = integration
+            .mobile_auth
+            .lock()
+            .expect("credential authority");
+        let now = now_ms_i64();
+        let issued = authority
+            .operator_provision(
+                MobileOperatorProvisionRequest {
+                    actions: vec![mobile_auth::MobileAction::Attach],
+                    session_scope: vec![String::from("session-a")],
+                    limits: mobile_auth::MobileLimits {
+                        max_page_events: 16,
+                        max_follow_up_bytes: 32,
+                    },
+                },
+                now,
+            )
+            .expect("provision");
+        let server_identity = issued.authorization.server_identity.clone();
+        let replay = issued.refresh_token.clone();
+        let mut refresh = issued.refresh_token.clone();
+        let successor = authority
+            .refresh(&mut refresh, &server_identity, now + 1)
+            .expect("rotate while holding authority lock");
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker_integration = Arc::clone(&integration);
+        let worker = thread::spawn(move || {
+            started_tx.send(()).expect("signal worker start");
+            let result = worker_integration
+                .mobile_refresh(MobileRefreshRequest {
+                    refresh_token: replay,
+                    server_identity,
+                })
+                .map(|_| ());
+            result_tx.send(result).expect("send refresh result");
+        });
+        started_rx.recv().expect("worker started");
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        drop(authority);
+        assert_eq!(
+            result_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("contended refresh completed"),
+            Err("mobile_credential_invalid")
+        );
+        worker.join().expect("refresh worker");
+        let bearer = format!("Bearer {}", successor.access_token);
+        assert_eq!(
+            integration.mobile_authorization(Some(&bearer)),
+            Err("mobile_credential_revoked")
         );
     }
 
@@ -5950,6 +6492,77 @@ mod tests {
     }
 
     #[test]
+    fn built_typescript_sdk_passes_the_live_mobile_lifecycle_contract() {
+        const EXCHANGES: usize = 31;
+
+        let state_dir = tempfile::tempdir().expect("temporary state");
+        let runtime_dir = tempfile::tempdir().expect("temporary runtime");
+        std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private state");
+        std::fs::set_permissions(runtime_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private runtime");
+        let _platform_listener = UnixListener::bind(runtime_dir.path().join("admin.sock"))
+            .expect("fixture platform socket");
+        let integration = Arc::new(
+            WebIntegration::open(
+                IntegrationConfig {
+                    tenant: String::from("operator"),
+                    actor: String::from("operator:mobile-contract"),
+                    hosts: fixture_hosts(),
+                },
+                state_dir.path(),
+                runtime_dir.path(),
+            )
+            .expect("web integration"),
+        );
+
+        let web_listener = TcpListener::bind("127.0.0.1:0").expect("web listener");
+        let web_address = web_listener.local_addr().unwrap();
+        let web_state = Arc::new(AppState::new(fixture_status()));
+        let web_server = {
+            let integration = Arc::clone(&integration);
+            let state = Arc::clone(&web_state);
+            thread::spawn(move || {
+                for _ in 0..EXCHANGES {
+                    let (stream, _) = web_listener.accept().expect("HTTP connection");
+                    handle(
+                        stream,
+                        &state,
+                        &fixture_auth(),
+                        &fixture_manage_chat_auth(),
+                        Some(&integration),
+                        &fixture_hosts(),
+                    )
+                    .expect("mobile lifecycle HTTP route");
+                }
+            })
+        };
+
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let sdk = repository.join("sdk/typescript/packages/sdk");
+        let build = Command::new("bun")
+            .args(["run", "build"])
+            .current_dir(&sdk)
+            .status()
+            .expect("build TypeScript SDK");
+        assert!(build.success(), "TypeScript SDK build failed");
+        let script = sdk.join("conformance/mobile-rust-http-contract.ts");
+        let status = Command::new("bun")
+            .arg("run")
+            .arg(script)
+            .arg(format!("http://localhost:{}", web_address.port()))
+            .current_dir(repository)
+            .status()
+            .expect("run TypeScript mobile lifecycle client");
+        assert!(
+            status.success(),
+            "TypeScript mobile lifecycle client failed"
+        );
+
+        web_server.join().expect("web server");
+    }
+
+    #[test]
     fn status_projection_is_bounded_and_operational() {
         let status = fixture_status();
         assert_eq!("automonique.dashboard.status/v1", status.schema);
@@ -6283,6 +6896,7 @@ mod tests {
             response_for(Route::Dashboard, &state, &fixture_hosts()),
             false,
             None,
+            Route::Dashboard,
         ))
         .unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -6290,6 +6904,45 @@ mod tests {
         assert!(response.contains("connect-src 'self'"));
         assert!(response.contains("X-Frame-Options: DENY\r\n"));
         assert!(!response.contains("unsafe-inline"));
+    }
+
+    #[test]
+    fn authentication_challenges_do_not_downgrade_mobile_credentials_to_basic() {
+        let operator = String::from_utf8(response_bytes(
+            mobile_error("401 Unauthorized", "mobile_operator_authorization_required"),
+            false,
+            None,
+            Route::MobileUnauthorized,
+        ))
+        .expect("operator response");
+        assert!(operator.contains("WWW-Authenticate: Basic realm=\"Monique Operations\""));
+
+        for route in [Route::MobileAuthorization, Route::MobileAccessUnauthorized] {
+            let response = String::from_utf8(response_bytes(
+                mobile_error("401 Unauthorized", "mobile_credential_invalid"),
+                false,
+                None,
+                route,
+            ))
+            .expect("mobile bearer response");
+            assert!(response.contains("WWW-Authenticate: Bearer realm=\"Automonique Mobile\""));
+            assert!(!response.contains("WWW-Authenticate: Basic"));
+        }
+
+        for route in [
+            Route::MobileRefresh,
+            Route::MobileRevoke,
+            Route::MobilePairingExchange,
+        ] {
+            let response = String::from_utf8(response_bytes(
+                mobile_error("401 Unauthorized", "mobile_credential_invalid"),
+                false,
+                None,
+                route,
+            ))
+            .expect("body-secret response");
+            assert!(!response.contains("WWW-Authenticate:"));
+        }
     }
 
     #[test]
@@ -6375,6 +7028,7 @@ mod tests {
             response_for(Route::Dashboard, &state, &fixture_hosts()),
             false,
             None,
+            Route::Dashboard,
         ))
         .unwrap();
         assert!(response.contains("Permissions-Policy: camera=(), microphone=(self)"));
@@ -6469,6 +7123,7 @@ mod tests {
             response_for(Route::Legacy, &state, &fixture_hosts()),
             true,
             None,
+            Route::Legacy,
         );
         assert!(
             response
@@ -6497,6 +7152,7 @@ mod tests {
             response_for(Route::MethodNotAllowed, &state, &fixture_hosts()),
             false,
             None,
+            Route::MethodNotAllowed,
         );
         assert!(!response.windows(9).any(|part| part == b"Location:"));
     }
@@ -6789,7 +7445,30 @@ mod tests {
         client.read_to_end(&mut received).unwrap();
         server.join().unwrap();
         let response = String::from_utf8(received).unwrap();
-        assert!(response.starts_with("HTTP/1.1 308 Permanent Redirect\r\n"));
+        assert!(
+            response.starts_with("HTTP/1.1 308 Permanent Redirect\r\n"),
+            "unexpected response: {response:?}"
+        );
+        assert!(!response.contains("WWW-Authenticate"));
+    }
+
+    #[test]
+    fn pairing_exchange_redirects_to_canonical_https_before_parsing_secrets() {
+        let body =
+            r#"{"pairing_id":"invalid","pairing_token":"invalid","server_identity":"invalid"}"#;
+        let response = exchange_without_integration(
+            format!(
+                "POST /api/mobile/pairings/exchange HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nContent-Type: {MOBILE_AUTH_MEDIA_TYPE}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let response = String::from_utf8(response).expect("HTTP response");
+        assert!(
+            response.starts_with("HTTP/1.1 308 Permanent Redirect\r\n"),
+            "unexpected pairing response: {response:?}"
+        );
+        assert!(!response.contains("mobile_pairing_invalid"));
         assert!(!response.contains("WWW-Authenticate"));
     }
 

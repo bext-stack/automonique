@@ -372,6 +372,16 @@ fn referenced_categories(surface: &automonique_protocol::codegen::CommandSurface
                 unknown_category,
                 ..
             } => referenced.extend([oversize_category.clone(), unknown_category.clone()]),
+            ResponseValue::CheckedArray {
+                oversize_category,
+                refusal_category,
+                ..
+            }
+            | ResponseValue::IntegerArray {
+                oversize_category,
+                refusal_category,
+                ..
+            } => referenced.extend([oversize_category.clone(), refusal_category.clone()]),
             ResponseValue::ExactString {
                 mismatch_category, ..
             } => referenced.push(mismatch_category.clone()),
