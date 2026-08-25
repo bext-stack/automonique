@@ -24,4 +24,4 @@ export * from "./runtime.js";
 // The digest of the surface re-exported above. It identifies the schema
 // these files were generated from; it is not a checksum of this file.
 export const SCHEMA_DIGEST_ALGORITHM = "sha256";
-export const SCHEMA_DIGEST = "3e58e47e26a69e2c897eae4dde19329e1245fdc6070f6762f5eaec140f9b0b41";
+export const SCHEMA_DIGEST = "3a185d3cab1b238172d3cb23d54690553b8eeeffb4d7832e8316283ad3d3db50";

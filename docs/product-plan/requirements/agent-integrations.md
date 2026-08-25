@@ -89,6 +89,9 @@ Raw provider events are recorded with provider, binary version, protocol mode an
 - `AssistantMessageCompleted` — authoritative text;
 - `ToolCallStarted` / `ToolCallUpdated` / `ToolCallCompleted`;
 - `ApprovalRequested` / `ApprovalResolved`;
+- `InputRequested` — a provider input request pausing the turn until the
+  controller lease holder answers it; distinct from an approval because the two
+  are answered through different authorities;
 - `SubagentStarted` / `SubagentEvent` / `SubagentCompleted`;
 - `UsageUpdated`;
 - `ProviderWarning` / `ProviderFault`;

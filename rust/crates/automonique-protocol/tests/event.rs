@@ -232,7 +232,7 @@ mod kind_coverage {
 
     #[test]
     fn every_declared_kind_is_representable_with_a_distinct_spelling() {
-        assert_eq!(EventKind::ALL.len(), 24);
+        assert_eq!(EventKind::ALL.len(), 25);
         let mut spellings: Vec<&str> = EventKind::ALL.iter().map(|kind| kind.as_str()).collect();
         let total = spellings.len();
         spellings.sort_unstable();
@@ -327,6 +327,35 @@ mod body_members {
         assert_eq!(
             required,
             vec![EventKind::ProviderWarning, EventKind::ProviderFault]
+        );
+    }
+
+    /// The two pause kinds carry a label and nothing else: an operator is
+    /// being asked to act, so there is something to name, and neither a step
+    /// nor a retry context describes a wait.
+    #[test]
+    fn the_pause_kinds_admit_a_label_and_no_other_member() {
+        for kind in [EventKind::ApprovalRequested, EventKind::InputRequested] {
+            assert_eq!(kind.text_rule(), MemberRule::Optional, "{}", kind.as_str());
+            assert_eq!(kind.step_rule(), MemberRule::Forbidden, "{}", kind.as_str());
+            assert_eq!(
+                kind.retry_rule(),
+                MemberRule::Forbidden,
+                "{}",
+                kind.as_str()
+            );
+            assert!(!kind.is_terminal());
+            assert!(!kind.is_preview_only());
+        }
+        // A decision is not a request: nothing is being asked, so there is
+        // nothing to label.
+        assert_eq!(
+            EventKind::ApprovalResolved.text_rule(),
+            MemberRule::Forbidden
+        );
+        assert_eq!(
+            EventKind::from_spelling("input_requested"),
+            Some(EventKind::InputRequested)
         );
     }
 

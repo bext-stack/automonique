@@ -116,9 +116,23 @@ pub enum EventKind {
     /// A tool call finished.
     ToolCallCompleted,
     /// The provider asked for permission.
+    ///
+    /// The one wait an operator answers through the approval lane. Its label,
+    /// when it carries one, names the durable approval and the tool that asked;
+    /// see [`EventKind::text_rule`].
     ApprovalRequested,
     /// A permission request reached a decision.
     ApprovalResolved,
+    /// The provider asked for input.
+    ///
+    /// A distinct kind rather than a second face of [`EventKind::ApprovalRequested`],
+    /// because the two are answered through different authorities: an approval
+    /// is decided by key through the approval lane, while provider input is
+    /// delivered by whoever holds the session's controller lease. A renderer
+    /// that drew both as one card would offer the wrong affordance for one of
+    /// them. The turn is paused until the input arrives, exactly as it is for
+    /// a permission request.
+    InputRequested,
     /// A subagent began.
     SubagentStarted,
     /// A subagent reported an event.
@@ -137,7 +151,7 @@ pub enum EventKind {
 
 impl EventKind {
     /// Every kind, for coverage checks.
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::ProviderConnected,
         Self::ProviderDisconnected,
         Self::SessionCreated,
@@ -155,6 +169,7 @@ impl EventKind {
         Self::ToolCallCompleted,
         Self::ApprovalRequested,
         Self::ApprovalResolved,
+        Self::InputRequested,
         Self::SubagentStarted,
         Self::SubagentEvent,
         Self::SubagentCompleted,
@@ -185,6 +200,7 @@ impl EventKind {
             Self::ToolCallCompleted => "tool_call_completed",
             Self::ApprovalRequested => "approval_requested",
             Self::ApprovalResolved => "approval_resolved",
+            Self::InputRequested => "input_requested",
             Self::SubagentStarted => "subagent_started",
             Self::SubagentEvent => "subagent_event",
             Self::SubagentCompleted => "subagent_completed",
@@ -246,6 +262,7 @@ impl EventKind {
             | Self::AssistantMessageCompleted
             | Self::ApprovalRequested
             | Self::ApprovalResolved
+            | Self::InputRequested
             | Self::UsageUpdated
             | Self::ProviderWarning
             | Self::ProviderFault
@@ -279,6 +296,7 @@ impl EventKind {
             | Self::ToolCallCompleted
             | Self::ApprovalRequested
             | Self::ApprovalResolved
+            | Self::InputRequested
             | Self::SubagentStarted
             | Self::SubagentEvent
             | Self::SubagentCompleted
@@ -291,9 +309,20 @@ impl EventKind {
     ///
     /// Required for the two assistant-message kinds, whose whole content is the
     /// text; allowed as a label where a renderer has something to name — a tool,
-    /// a subagent, the sentence a fault came with — and forbidden elsewhere, so
-    /// a kind that means nothing to display cannot become a channel for
-    /// provider bytes.
+    /// a subagent, the sentence a fault came with, the request a paused turn is
+    /// waiting on — and forbidden elsewhere, so a kind that means nothing to
+    /// display cannot become a channel for provider bytes.
+    ///
+    /// The two pause kinds carry a label because an operator is being asked to
+    /// act, and a card that says only "waiting" gives them nothing to act on.
+    /// On [`EventKind::ApprovalRequested`] the label names the durable approval
+    /// key first, then the tool and what it asked, so a consumer can decide the
+    /// approval it was shown rather than the one it guessed. On
+    /// [`EventKind::InputRequested`] the label is the provider's prompt, bounded
+    /// and sanitized like every other label, and it is *absent* when the
+    /// provider asked for the input to be masked: a masked request is drawn
+    /// without its prompt rather than with a placeholder that could be mistaken
+    /// for one.
     #[must_use]
     pub const fn text_rule(self) -> MemberRule {
         match self {
@@ -301,6 +330,8 @@ impl EventKind {
             Self::ToolCallStarted
             | Self::ToolCallUpdated
             | Self::ToolCallCompleted
+            | Self::ApprovalRequested
+            | Self::InputRequested
             | Self::SubagentStarted
             | Self::SubagentEvent
             | Self::SubagentCompleted
@@ -316,7 +347,6 @@ impl EventKind {
             | Self::TurnSteered
             | Self::TurnInterrupted
             | Self::TurnCompleted
-            | Self::ApprovalRequested
             | Self::ApprovalResolved
             | Self::UsageUpdated
             | Self::RunTerminal => MemberRule::Forbidden,
