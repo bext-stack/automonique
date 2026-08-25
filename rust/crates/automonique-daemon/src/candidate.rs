@@ -296,6 +296,17 @@ pub enum CandidateError {
     ParentChanged,
     Protocol,
     CandidateExited,
+    /// The other side of the private channel speaks a different
+    /// `automonique.reload-candidate` schema.
+    ///
+    /// Its own category, distinct from [`CandidateError::SchemaMismatch`]
+    /// (the *durable* schema the candidate's read-only warm-up could not
+    /// read) and from [`CandidateError::Protocol`] (a line that is malformed
+    /// or names the wrong identity), because the repair is different: this
+    /// release cannot hand off to, or back to, a release whose channel is
+    /// older or newer than [`CHANNEL_SCHEMA`], and the crossing has to be a
+    /// restart rather than a reload.
+    ChannelSchemaMismatch,
     /// The child reported its own refusal over the channel before exiting.
     CandidateRefused(&'static str),
     Io(std::io::Error),
@@ -317,6 +328,7 @@ impl CandidateError {
             Self::ParentChanged => "candidate_parent_changed",
             Self::Protocol => "candidate_protocol",
             Self::CandidateExited => "candidate_exited",
+            Self::ChannelSchemaMismatch => "candidate_channel_schema_mismatch",
             Self::CandidateRefused(category) | Self::Daemon(category) => category,
             Self::Io(_) => "candidate_io",
             Self::Sqlite(_) => "candidate_sqlite",
@@ -327,9 +339,14 @@ impl CandidateError {
     /// The closed set of categories a child may report, as static strings.
     ///
     /// A category outside this set is reported as the generic refusal: the
-    /// channel is a private, bounded line and never a free-text conduit.
+    /// channel is a private, bounded line and never a free-text conduit. The
+    /// set is this module's own categories plus those a candidate legitimately
+    /// carries out of the daemon it opened or served
+    /// ([`CandidateError::Daemon`]), so a transferred daemon that could not
+    /// open its store, bind its route, or record its tenure is reported under
+    /// that word rather than collapsed to `candidate_refused`.
     fn reported_category(reported: &str) -> &'static str {
-        const KNOWN: [&str; 12] = [
+        const KNOWN: [&str; 13] = [
             "candidate_invalid_field",
             "candidate_unsafe_path",
             "candidate_digest_mismatch",
@@ -339,12 +356,16 @@ impl CandidateError {
             "candidate_parent_changed",
             "candidate_protocol",
             "candidate_exited",
+            "candidate_channel_schema_mismatch",
             "candidate_io",
             "candidate_sqlite",
             "candidate_store",
         ];
         KNOWN
             .into_iter()
+            .chain(super::DAEMON_ERROR_CATEGORIES)
+            .chain(crate::attempt_adoption::AttemptAdoptionError::CATEGORIES)
+            .chain(["candidate_serve_panicked"])
             .find(|known| *known == reported)
             .unwrap_or("candidate_refused")
     }
@@ -423,6 +444,15 @@ pub fn spawn_warm_candidate(
             return Err(error);
         }
     };
+    // A child that speaks another channel schema is a release this one
+    // cannot hand off to; that is judged before anything else about its
+    // identity, so the operator sees the schema and not a protocol mismatch
+    // that the schema difference merely caused.
+    if observed.schema != CHANNEL_SCHEMA {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(CandidateError::ChannelSchemaMismatch);
+    }
     if validate_digest(
         &observed.attempt_inventory_sha256,
         false,
@@ -1185,8 +1215,10 @@ fn confirm_candidate_authority(
     let expected_epoch = source_lease_epoch
         .checked_add(1)
         .ok_or(CandidateError::Protocol)?;
-    if authority.schema != CHANNEL_SCHEMA
-        || authority.event != "authority"
+    if authority.schema != CHANNEL_SCHEMA {
+        return Err(CandidateError::ChannelSchemaMismatch);
+    }
+    if authority.event != "authority"
         || authority.generation_id != super::GENERATION_ID
         || authority.holder_id != identity.target_holder_id
         || authority.lease_epoch != expected_epoch
@@ -1278,8 +1310,10 @@ fn confirm_candidate_relinquished(
     let expected_epoch = source_lease_epoch
         .checked_add(2)
         .ok_or(CandidateError::Protocol)?;
-    if returned.schema != CHANNEL_SCHEMA
-        || returned.event != "relinquished"
+    if returned.schema != CHANNEL_SCHEMA {
+        return Err(CandidateError::ChannelSchemaMismatch);
+    }
+    if returned.event != "relinquished"
         || returned.generation_id != super::GENERATION_ID
         || returned.holder_id != source_holder_id
         || returned.lease_epoch != expected_epoch
@@ -1504,17 +1538,19 @@ fn write_message(writer: &mut impl Write, value: &impl Serialize) -> Result<(), 
 /// Read one identity line from the child, surfacing a reported refusal.
 ///
 /// A line that is not an identity but is a well-formed refusal for this
-/// channel becomes the child's own category; anything else is a protocol
-/// violation, exactly as before.
+/// channel becomes the child's own category; a refusal shaped like this
+/// channel's but stamped with another schema is the schema mismatch it is;
+/// anything else is a protocol violation, exactly as before.
 fn read_identity(channel: &UnixStream) -> Result<CandidateIdentity, CandidateError> {
     let line = read_line(&mut BufReader::new(channel))?;
     if let Ok(identity) = serde_json::from_slice::<CandidateIdentity>(&line) {
         return Ok(identity);
     }
     match serde_json::from_slice::<CandidateRefusal>(&line) {
-        Ok(refusal) if refusal.schema == CHANNEL_SCHEMA && refusal.event == "refused" => Err(
+        Ok(refusal) if refusal.event == "refused" && refusal.schema == CHANNEL_SCHEMA => Err(
             CandidateError::CandidateRefused(CandidateError::reported_category(&refusal.category)),
         ),
+        Ok(refusal) if refusal.event == "refused" => Err(CandidateError::ChannelSchemaMismatch),
         _ => Err(CandidateError::Protocol),
     }
 }
@@ -1581,6 +1617,73 @@ fn encode_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal line stamped with another channel schema is the schema
+    /// mismatch it is, and a well-formed refusal in this schema carries the
+    /// child's own category — from the closed set, which now includes what a
+    /// transferred daemon can legitimately fail with.
+    #[test]
+    fn a_refusal_in_another_channel_schema_is_a_schema_mismatch_not_a_protocol_error() {
+        fn read(line: &str) -> Result<CandidateIdentity, CandidateError> {
+            let (parent, mut child) = UnixStream::pair().expect("channel pair");
+            parent
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            child.write_all(line.as_bytes()).expect("child line");
+            drop(child);
+            read_identity(&parent)
+        }
+
+        let foreign = read(
+            "{\"schema\":\"automonique.reload-candidate/v6\",\"event\":\"refused\",\
+             \"reload_id\":\"reload-1\",\"category\":\"candidate_protocol\"}\n",
+        );
+        assert!(
+            matches!(foreign, Err(CandidateError::ChannelSchemaMismatch)),
+            "{foreign:?}"
+        );
+        assert_eq!(
+            CandidateError::ChannelSchemaMismatch.category(),
+            "candidate_channel_schema_mismatch"
+        );
+
+        let own = read(&format!(
+            "{{\"schema\":\"{CHANNEL_SCHEMA}\",\"event\":\"refused\",\
+             \"reload_id\":\"reload-1\",\"category\":\"candidate_channel_schema_mismatch\"}}\n"
+        ));
+        assert!(
+            matches!(
+                own,
+                Err(CandidateError::CandidateRefused(
+                    "candidate_channel_schema_mismatch"
+                ))
+            ),
+            "{own:?}"
+        );
+
+        // Not a refusal at all: a protocol violation, exactly as before.
+        let garbage = read("{\"schema\":\"automonique.reload-candidate/v6\",\"event\":\"warm\"}\n");
+        assert!(
+            matches!(garbage, Err(CandidateError::Protocol)),
+            "{garbage:?}"
+        );
+
+        // The daemon's own categories are reported as themselves; free text
+        // is not.
+        assert_eq!(CandidateError::reported_category("io"), "io");
+        assert_eq!(
+            CandidateError::reported_category("attempt_adoption_socket_in_use"),
+            "attempt_adoption_socket_in_use"
+        );
+        assert_eq!(
+            CandidateError::reported_category("candidate_serve_panicked"),
+            "candidate_serve_panicked"
+        );
+        assert_eq!(
+            CandidateError::reported_category("anything else"),
+            "candidate_refused"
+        );
+    }
 
     #[test]
     fn channel_is_closed_bounded_and_identity_bound() {

@@ -31,9 +31,9 @@ use automonique_runner::control::{CancelDelivery, CancelSink, CancelSinkError};
 use automonique_store::{Store, TelegramPollerLeaseRequest};
 use handoff_support::{
     ProcBootTime, Serving, attempt_id_of, cancel, candidate_processes, cli, cli_command, fixture,
-    install_releases, process_exited, read_source_lease, reload_id_for, reload_phase,
-    reload_status, run_spec, stderr_text, stdout_text, submit, unix_millis, wait_for_generation,
-    wait_for_reload_phase, wait_for_sockets_removed, wait_until,
+    install_code_release, install_releases, process_exited, read_source_lease, reload_id_for,
+    reload_phase, reload_status, run_spec, stderr_text, stdout_text, submit, unix_millis,
+    wait_for_generation, wait_for_reload_phase, wait_for_sockets_removed, wait_until,
 };
 use rusqlite::Connection;
 
@@ -340,6 +340,13 @@ fn a_source_that_refuses_to_drain_does_not_hold_the_active_successor() {
         .expect("source daemon process");
     let before = wait_for_generation(&config);
 
+    let current_link = releases.root.join("current");
+    let current_before = std::fs::read_link(&current_link).expect("current release link");
+    assert_eq!(
+        current_before,
+        std::path::Path::new("releases").join(&releases.previous)
+    );
+
     let reload = cli(&config, &["reload", &format!("sha256:{next}")]);
     assert!(reload.status.success(), "{}", stderr_text(&reload));
     let reload_id = reload_id_for("reload", before.epoch, &next);
@@ -377,6 +384,14 @@ fn a_source_that_refuses_to_drain_does_not_hold_the_active_successor() {
     let held = read_source_lease(&config.database_path());
     assert_eq!(held.holder_id, successor.holder_id);
     assert_eq!(held.epoch, successor.epoch);
+    // The release links stay where the source left them: activation is the
+    // source's step, after its drain, and it never got there. The successor
+    // does not move them on the source's behalf.
+    assert_eq!(
+        std::fs::read_link(&current_link).expect("current release link"),
+        current_before,
+        "the successor left the current link as the source left it"
+    );
 
     let shutdown = cli(&config, &["shutdown"]);
     assert!(shutdown.status.success());
@@ -420,6 +435,9 @@ fn a_busy_database_aborts_the_transfer_within_its_bound_without_moving_the_lease
         "the transfer gave up on its busy deadline rather than waiting out the lock: {elapsed:?}"
     );
     assert_failure(&config, &reload_id, "failed", "sqlite");
+    // Holder, epoch and revision: the fields a transfer would have moved.
+    // The row's renewal timestamps keep advancing under the live source, so
+    // the whole row is not what is compared.
     let after = read_source_lease(&config.database_path());
     assert_eq!(after.holder_id, before.holder_id);
     assert_eq!(after.epoch, before.epoch);
@@ -480,6 +498,79 @@ fn a_schema_the_candidate_cannot_read_is_refused_at_warm_up() {
         .expect("restore the schema");
     drop(connection);
     reload_succeeds_then_shutdown(&config, source, &releases.retry);
+}
+
+/// A release whose candidate speaks the previous channel schema is refused
+/// under its own category at warm-up, and the source resumes.
+///
+/// The channel schema moved from `v6` to `v7` with the attempt inventory the
+/// handoff now carries. A `v7` source that spawns a `v6` candidate sees the
+/// candidate's warm-up identity stamped with the older schema; this is the
+/// rollback-to-the-previous-release case, and it is what makes the first
+/// deployment of a `v7` release, and any rollback across it, restart-based.
+/// The candidate here is a script that answers the inherited channel exactly
+/// as a `v6` binary's warm-up would, so the source's judgement is exercised
+/// against a real child process rather than a crafted line.
+#[test]
+fn a_candidate_speaking_another_channel_schema_is_refused_at_warm_up() {
+    let (_root, config) = fixture();
+    let releases = install_releases(&config);
+    let previous_schema_candidate = install_code_release(
+        &releases.root,
+        concat!(
+            "#!/bin/sh\n",
+            "# A candidate of the previous release: it answers the warm-up on the\n",
+            "# inherited channel in the previous channel schema and waits.\n",
+            "printf '%s\\n' '{\"schema\":\"automonique.reload-candidate/v6\",",
+            "\"event\":\"warm\",\"reload_id\":\"reload\",",
+            "\"target_generation_id\":\"foreground\",",
+            "\"manifest_digest\":\"sha256:",
+            "0000000000000000000000000000000000000000000000000000000000000000\",",
+            "\"binary_sha256\":",
+            "\"0000000000000000000000000000000000000000000000000000000000000000\",",
+            "\"attempt_count\":0,\"attempt_inventory_sha256\":",
+            "\"0000000000000000000000000000000000000000000000000000000000000000\",",
+            "\"target_holder_id\":\"daemon-1-reload-0000000000000000\",",
+            "\"boot_id\":\"00000000-0000-0000-0000-000000000000\",",
+            "\"starttime\":1,\"pid\":1}'\n",
+            "exec sleep 60\n",
+        )
+        .as_bytes(),
+        '1',
+    );
+    let source = Serving::start(Daemon::open(&config).expect("source daemon"), &config);
+    let before = read_source_lease(&config.database_path());
+
+    let reload = cli(
+        &config,
+        &[
+            "reload",
+            &format!("sha256:{previous_schema_candidate}"),
+            "--wait",
+        ],
+    );
+    assert!(!reload.status.success());
+    let reload_id = reload_id_for("reload", before.epoch, &previous_schema_candidate);
+    assert_eq!(
+        stderr_text(&reload),
+        format!("reload {reload_id} failed: candidate_channel_schema_mismatch\n")
+    );
+    assert_failure(
+        &config,
+        &reload_id,
+        "failed",
+        "candidate_channel_schema_mismatch",
+    );
+    let after = read_source_lease(&config.database_path());
+    assert_eq!(after.holder_id, before.holder_id);
+    assert_eq!(after.epoch, before.epoch);
+    assert_eq!(after.revision, before.revision);
+    assert!(candidate_processes(&reload_id).is_empty());
+    let status = cli(&config, &["status", "--json"]);
+    assert!(status.status.success());
+    assert!(stdout_text(&status).contains(&before.holder_id));
+
+    reload_succeeds_then_shutdown(&config, source, &releases.next);
 }
 
 struct CountingSink {
