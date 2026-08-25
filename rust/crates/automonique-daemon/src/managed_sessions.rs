@@ -378,19 +378,15 @@ impl ManagedSessionStore {
             [provider_session_id],
             |row| row.get(0),
         )?;
-        for (suffix, role, text, truncated) in
-            [("user", "user", user_text.as_str(), user_truncated)]
-        {
-            sequence = sequence
-                .checked_add(1)
-                .ok_or(ManagedSessionError::InvalidField("sequence"))?;
-            let key = format!("{source_key}:{suffix}");
-            transaction.execute(
-                "INSERT INTO managed_session_history(provider_session_id,sequence,source_key,at_ms,role,text,truncated,evidence,tool_state,unknown_source,run_state)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,'authoritative',NULL,NULL,NULL) ON CONFLICT(source_key) DO NOTHING",
-                params![provider_session_id, sequence, key, at_ms, role, text, truncated],
-            )?;
-        }
+        sequence = sequence
+            .checked_add(1)
+            .ok_or(ManagedSessionError::InvalidField("sequence"))?;
+        let user_key = format!("{source_key}:user");
+        transaction.execute(
+            "INSERT INTO managed_session_history(provider_session_id,sequence,source_key,at_ms,role,text,truncated,evidence,tool_state,unknown_source,run_state)
+             VALUES(?1,?2,?3,?4,'user',?5,?6,'authoritative',NULL,NULL,NULL) ON CONFLICT(source_key) DO NOTHING",
+            params![provider_session_id, sequence, user_key, at_ms, user_text.as_str(), user_truncated],
+        )?;
         for (index, event) in projected.iter().enumerate() {
             sequence = sequence
                 .checked_add(1)
