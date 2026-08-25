@@ -64,8 +64,9 @@ use zeroize::Zeroize;
 use crate::agent_auth::{AgentAuthAction, AgentAuthManager};
 use crate::mobile_auth::{
     MOBILE_AUTH_MEDIA_TYPE, MOBILE_AUTH_SCHEMA_V1, MobileAuthorization, MobileCredentialAuthority,
-    MobileOperatorProvisionRequest, MobileRefreshRequest, MobileRevocation,
-    authorize_platform_request, filter_sessions,
+    MobileCredentialInventory, MobileCredentialInventoryRequest, MobileCredentialRevokeRequest,
+    MobileOperatorProvisionRequest, MobilePairingExchangeRequest, MobilePairingOffer,
+    MobileRefreshRequest, MobileRevocation, authorize_platform_request, filter_sessions,
 };
 
 const DASHBOARD_HTML: &str = include_str!("../assets/dashboard.html");
@@ -120,6 +121,10 @@ pub enum Route {
     ApiPlatformRemote,
     MobileDiscovery,
     MobileOperatorProvision,
+    MobilePairingCreate,
+    MobilePairingExchange,
+    MobileCredentialInventory,
+    MobileCredentialRevoke,
     MobileRefresh,
     MobileRevoke,
     MobileAuthorization,
@@ -1759,6 +1764,50 @@ impl WebIntegration {
             .lock()
             .map_err(|_| "mobile_credential_authority_busy")?
             .operator_provision(request, now_ms_i64())
+            .map_err(|error| error.category())
+    }
+
+    fn mobile_pairing_create(
+        &self,
+        request: MobileOperatorProvisionRequest,
+    ) -> Result<MobilePairingOffer, &'static str> {
+        self.mobile_auth
+            .lock()
+            .map_err(|_| "mobile_credential_authority_busy")?
+            .create_pairing(request, now_ms_i64())
+            .map_err(|error| error.category())
+    }
+
+    fn mobile_pairing_exchange(
+        &self,
+        mut request: MobilePairingExchangeRequest,
+    ) -> Result<mobile_auth::IssuedMobileCredentials, &'static str> {
+        self.mobile_auth
+            .lock()
+            .map_err(|_| "mobile_credential_authority_busy")?
+            .exchange_pairing(&mut request, now_ms_i64())
+            .map_err(|error| error.category())
+    }
+
+    fn mobile_credential_inventory(
+        &self,
+        request: MobileCredentialInventoryRequest,
+    ) -> Result<MobileCredentialInventory, &'static str> {
+        self.mobile_auth
+            .lock()
+            .map_err(|_| "mobile_credential_authority_busy")?
+            .credential_inventory(request, now_ms_i64())
+            .map_err(|error| error.category())
+    }
+
+    fn mobile_credential_revoke(
+        &self,
+        request: MobileCredentialRevokeRequest,
+    ) -> Result<MobileRevocation, &'static str> {
+        self.mobile_auth
+            .lock()
+            .map_err(|_| "mobile_credential_authority_busy")?
+            .revoke_credential_id(request, now_ms_i64())
             .map_err(|error| error.category())
     }
 
@@ -4574,6 +4623,10 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                     }
                 }
                 "/api/mobile/operator-provision" => Route::MobileOperatorProvision,
+                "/api/mobile/pairings" => Route::MobilePairingCreate,
+                "/api/mobile/pairings/exchange" => Route::MobilePairingExchange,
+                "/api/mobile/credentials/list" => Route::MobileCredentialInventory,
+                "/api/mobile/credentials/revoke" => Route::MobileCredentialRevoke,
                 "/api/mobile/refresh" => Route::MobileRefresh,
                 "/api/mobile/revoke" => Route::MobileRevoke,
                 "/api/mobile/authorization" => Route::MobileAuthorization,
@@ -4595,6 +4648,10 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                     | Route::ApiAgentAccountsAction
                     | Route::ApiPlatformRemote
                     | Route::MobileOperatorProvision
+                    | Route::MobilePairingCreate
+                    | Route::MobilePairingExchange
+                    | Route::MobileCredentialInventory
+                    | Route::MobileCredentialRevoke
                     | Route::MobileRefresh
                     | Route::MobileRevoke
                     | Route::ApiChat
@@ -5039,6 +5096,10 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         | Route::ApiManageChatAction
         | Route::MobileDiscovery
         | Route::MobileOperatorProvision
+        | Route::MobilePairingCreate
+        | Route::MobilePairingExchange
+        | Route::MobileCredentialInventory
+        | Route::MobileCredentialRevoke
         | Route::MobileRefresh
         | Route::MobileRevoke
         | Route::MobileAuthorization => empty_response("500 Internal Server Error"),
@@ -5158,6 +5219,45 @@ fn api_response(
             match serde_json::from_slice::<MobileOperatorProvisionRequest>(body) {
                 Ok(request) => match integration.mobile_operator_provision(request) {
                     Ok(credentials) => mobile_response("201 Created", &credentials),
+                    Err(category) => mobile_error("400 Bad Request", category),
+                },
+                Err(_) => mobile_error("400 Bad Request", "mobile_request_invalid"),
+            }
+        }
+        Route::MobilePairingCreate => {
+            match serde_json::from_slice::<MobileOperatorProvisionRequest>(body) {
+                Ok(request) => match integration.mobile_pairing_create(request) {
+                    Ok(offer) => mobile_response("201 Created", &offer),
+                    Err(category) => mobile_error("400 Bad Request", category),
+                },
+                Err(_) => mobile_error("400 Bad Request", "mobile_request_invalid"),
+            }
+        }
+        Route::MobilePairingExchange => {
+            match serde_json::from_slice::<MobilePairingExchangeRequest>(body) {
+                Ok(request) => match integration.mobile_pairing_exchange(request) {
+                    Ok(credentials) => mobile_response("201 Created", &credentials),
+                    Err("mobile_pairing_invalid") => {
+                        mobile_error("401 Unauthorized", "mobile_pairing_invalid")
+                    }
+                    Err(category) => mobile_error("503 Service Unavailable", category),
+                },
+                Err(_) => mobile_error("400 Bad Request", "mobile_request_invalid"),
+            }
+        }
+        Route::MobileCredentialInventory => {
+            match serde_json::from_slice::<MobileCredentialInventoryRequest>(body) {
+                Ok(request) => match integration.mobile_credential_inventory(request) {
+                    Ok(inventory) => mobile_response("200 OK", &inventory),
+                    Err(category) => mobile_error("400 Bad Request", category),
+                },
+                Err(_) => mobile_error("400 Bad Request", "mobile_request_invalid"),
+            }
+        }
+        Route::MobileCredentialRevoke => {
+            match serde_json::from_slice::<MobileCredentialRevokeRequest>(body) {
+                Ok(request) => match integration.mobile_credential_revoke(request) {
+                    Ok(revocation) => mobile_response("200 OK", &revocation),
                     Err(category) => mobile_error("400 Bad Request", category),
                 },
                 Err(_) => mobile_error("400 Bad Request", "mobile_request_invalid"),
@@ -5420,11 +5520,21 @@ fn handle(
                 let local_health = normalize_host(request.host) == Some("localhost")
                     && requested_route == Route::Health;
                 let remote_platform = requested_route == Route::ApiPlatformRemote;
-                let operator_provision = requested_route == Route::MobileOperatorProvision;
+                let operator_mobile = matches!(
+                    requested_route,
+                    Route::MobileOperatorProvision
+                        | Route::MobilePairingCreate
+                        | Route::MobileCredentialInventory
+                        | Route::MobileCredentialRevoke
+                );
                 let mobile_lifecycle = matches!(
                     requested_route,
                     Route::MobileDiscovery
                         | Route::MobileOperatorProvision
+                        | Route::MobilePairingCreate
+                        | Route::MobilePairingExchange
+                        | Route::MobileCredentialInventory
+                        | Route::MobileCredentialRevoke
                         | Route::MobileRefresh
                         | Route::MobileRevoke
                         | Route::MobileAuthorization
@@ -5437,6 +5547,7 @@ fn handle(
                             | Route::UnknownHost
                             | Route::BadRequest
                             | Route::MobileDiscovery
+                            | Route::MobilePairingExchange
                             | Route::MobileRefresh
                             | Route::MobileRevoke
                             | Route::MobileAuthorization
@@ -5483,7 +5594,7 @@ fn handle(
                     Route::RateLimited
                 } else if manage_chat_route && !manage_chat_auth.authorize(request.authorization) {
                     Route::ManageUnauthorized
-                } else if operator_provision && !basic_authorized {
+                } else if operator_mobile && !basic_authorized {
                     Route::MobileUnauthorized
                 } else if needs_auth && !manage_chat_route && !credentials_authorized {
                     if mobile_access_presented {
@@ -5491,7 +5602,8 @@ fn handle(
                     } else {
                         Route::Unauthorized
                     }
-                } else if request.method == Method::Post
+                } else if requested_route != Route::HttpsRedirect
+                    && request.method == Method::Post
                     && (request.content_length == 0
                         || !request.content_type.is_some_and(|value| {
                             value.eq_ignore_ascii_case(if remote_platform {
@@ -5557,6 +5669,10 @@ fn handle(
             | Route::ApiManageChatAction
             | Route::MobileDiscovery
             | Route::MobileOperatorProvision
+            | Route::MobilePairingCreate
+            | Route::MobilePairingExchange
+            | Route::MobileCredentialInventory
+            | Route::MobileCredentialRevoke
             | Route::MobileRefresh
             | Route::MobileRevoke
             | Route::MobileAuthorization
@@ -6377,7 +6493,7 @@ mod tests {
 
     #[test]
     fn built_typescript_sdk_passes_the_live_mobile_lifecycle_contract() {
-        const EXCHANGES: usize = 20;
+        const EXCHANGES: usize = 31;
 
         let state_dir = tempfile::tempdir().expect("temporary state");
         let runtime_dir = tempfile::tempdir().expect("temporary runtime");
@@ -6813,7 +6929,11 @@ mod tests {
             assert!(!response.contains("WWW-Authenticate: Basic"));
         }
 
-        for route in [Route::MobileRefresh, Route::MobileRevoke] {
+        for route in [
+            Route::MobileRefresh,
+            Route::MobileRevoke,
+            Route::MobilePairingExchange,
+        ] {
             let response = String::from_utf8(response_bytes(
                 mobile_error("401 Unauthorized", "mobile_credential_invalid"),
                 false,
@@ -7325,7 +7445,30 @@ mod tests {
         client.read_to_end(&mut received).unwrap();
         server.join().unwrap();
         let response = String::from_utf8(received).unwrap();
-        assert!(response.starts_with("HTTP/1.1 308 Permanent Redirect\r\n"));
+        assert!(
+            response.starts_with("HTTP/1.1 308 Permanent Redirect\r\n"),
+            "unexpected response: {response:?}"
+        );
+        assert!(!response.contains("WWW-Authenticate"));
+    }
+
+    #[test]
+    fn pairing_exchange_redirects_to_canonical_https_before_parsing_secrets() {
+        let body =
+            r#"{"pairing_id":"invalid","pairing_token":"invalid","server_identity":"invalid"}"#;
+        let response = exchange_without_integration(
+            format!(
+                "POST /api/mobile/pairings/exchange HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nContent-Type: {MOBILE_AUTH_MEDIA_TYPE}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let response = String::from_utf8(response).expect("HTTP response");
+        assert!(
+            response.starts_with("HTTP/1.1 308 Permanent Redirect\r\n"),
+            "unexpected pairing response: {response:?}"
+        );
+        assert!(!response.contains("mobile_pairing_invalid"));
         assert!(!response.contains("WWW-Authenticate"));
     }
 

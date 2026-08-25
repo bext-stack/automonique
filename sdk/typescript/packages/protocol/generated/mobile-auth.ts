@@ -9,10 +9,13 @@
 // Rust is the wire source of truth. Hand-written SDK code may add
 // ergonomics; it may not redefine anything in this file.
 
-import {RefusalError, ValidationError, bodyArray, bodyBool, bodyString, bodyStrings, bodyUnsigned, bodyValue, byteLength, exactFields, exactInputFields, exactString, isWellFormedUnicode, jsonUnsigned, refuse, type JsonValue} from "./runtime.js";
+import {RefusalError, ValidationError, bodyArray, bodyBool, bodyIntegerOrNull, bodyString, bodyStringOrNull, bodyStrings, bodyUnsigned, bodyValue, byteLength, exactFields, exactInputFields, exactString, isWellFormedUnicode, jsonUnsigned, mapNullable, refuse, type JsonValue} from "./runtime.js";
 
 /** Maximum independently granted mobile actions. */
 export const MAX_MOBILE_ACTIONS = 4;
+
+/** Maximum secret-free credential summaries in one operator page. */
+export const MAX_MOBILE_CREDENTIAL_PAGE_SIZE = 100;
 
 /** Maximum negotiated UTF-8 follow-up bytes. */
 export const MAX_MOBILE_FOLLOW_UP_BYTES = 65536;
@@ -50,6 +53,9 @@ export const MOBILE_AUTH_SCHEMA_V1 = "automonique.mobile-auth/v1";
 /** A mobile lifecycle field fell outside its value domain. */
 export const MOBILE_AUTH_VALUE_INVALID = "mobile_auth_value_invalid";
 
+/** Absolute maximum lifetime of a one-time pairing offer. */
+export const MOBILE_PAIRING_TTL_MILLIS = 300000;
+
 /** Branded identifier, at most 46 UTF-8 bytes. */
 export type MobileCredentialId = string & {readonly __brand: "MobileCredentialId"};
 export const MobileCredentialId_MAX_BYTES = 46;
@@ -60,6 +66,18 @@ export function MobileCredentialId(value: string): MobileCredentialId {
   if (byteLength(value) > 46) throw new ValidationError("MobileCredentialId", "too_long");
   if (!MobileCredentialId_PATTERN.test(value)) throw new ValidationError("MobileCredentialId", "invalid_character");
   return value as MobileCredentialId;
+}
+
+/** Branded identifier, at most 46 UTF-8 bytes. */
+export type MobilePairingId = string & {readonly __brand: "MobilePairingId"};
+export const MobilePairingId_MAX_BYTES = 46;
+export const MobilePairingId_PATTERN = /^pi_[A-Za-z0-9_-]{43}$/u;
+export function MobilePairingId(value: string): MobilePairingId {
+  if (value.length === 0) throw new ValidationError("MobilePairingId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("MobilePairingId", "invalid_character");
+  if (byteLength(value) > 46) throw new ValidationError("MobilePairingId", "too_long");
+  if (!MobilePairingId_PATTERN.test(value)) throw new ValidationError("MobilePairingId", "invalid_character");
+  return value as MobilePairingId;
 }
 
 /** Branded identifier, at most 256 UTF-8 bytes. */
@@ -96,6 +114,30 @@ export function MobileActor(value: string): MobileActor {
   if (byteLength(value) > 256) throw new ValidationError("MobileActor", "too_long");
   if (!MobileActor_PATTERN.test(value)) throw new ValidationError("MobileActor", "invalid_character");
   return value as MobileActor;
+}
+
+/** Bounded string, at most 2048 UTF-8 bytes. */
+export type MobileCredentialInventoryEndpoint = string & {readonly __brand: "MobileCredentialInventoryEndpoint"};
+export const MobileCredentialInventoryEndpoint_MAX_BYTES = 2048;
+export const MobileCredentialInventoryEndpoint_PATTERN = /^https:\/\/[^?#@]+\/api\/mobile\/credentials\/list$/u;
+export function MobileCredentialInventoryEndpoint(value: string): MobileCredentialInventoryEndpoint {
+  if (value.length === 0) throw new ValidationError("MobileCredentialInventoryEndpoint", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("MobileCredentialInventoryEndpoint", "invalid_character");
+  if (byteLength(value) > 2048) throw new ValidationError("MobileCredentialInventoryEndpoint", "too_long");
+  if (!MobileCredentialInventoryEndpoint_PATTERN.test(value)) throw new ValidationError("MobileCredentialInventoryEndpoint", "invalid_character");
+  return value as MobileCredentialInventoryEndpoint;
+}
+
+/** Bounded string, at most 2048 UTF-8 bytes. */
+export type MobileCredentialRevokeEndpoint = string & {readonly __brand: "MobileCredentialRevokeEndpoint"};
+export const MobileCredentialRevokeEndpoint_MAX_BYTES = 2048;
+export const MobileCredentialRevokeEndpoint_PATTERN = /^https:\/\/[^?#@]+\/api\/mobile\/credentials\/revoke$/u;
+export function MobileCredentialRevokeEndpoint(value: string): MobileCredentialRevokeEndpoint {
+  if (value.length === 0) throw new ValidationError("MobileCredentialRevokeEndpoint", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("MobileCredentialRevokeEndpoint", "invalid_character");
+  if (byteLength(value) > 2048) throw new ValidationError("MobileCredentialRevokeEndpoint", "too_long");
+  if (!MobileCredentialRevokeEndpoint_PATTERN.test(value)) throw new ValidationError("MobileCredentialRevokeEndpoint", "invalid_character");
+  return value as MobileCredentialRevokeEndpoint;
 }
 
 /** Bounded string, at most 64 UTF-8 bytes. */
@@ -135,6 +177,42 @@ export function MobileOperatorProvisionEndpoint(value: string): MobileOperatorPr
 }
 
 /** Bounded string, at most 2048 UTF-8 bytes. */
+export type MobilePairingCreateEndpoint = string & {readonly __brand: "MobilePairingCreateEndpoint"};
+export const MobilePairingCreateEndpoint_MAX_BYTES = 2048;
+export const MobilePairingCreateEndpoint_PATTERN = /^https:\/\/[^?#@]+\/api\/mobile\/pairings$/u;
+export function MobilePairingCreateEndpoint(value: string): MobilePairingCreateEndpoint {
+  if (value.length === 0) throw new ValidationError("MobilePairingCreateEndpoint", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("MobilePairingCreateEndpoint", "invalid_character");
+  if (byteLength(value) > 2048) throw new ValidationError("MobilePairingCreateEndpoint", "too_long");
+  if (!MobilePairingCreateEndpoint_PATTERN.test(value)) throw new ValidationError("MobilePairingCreateEndpoint", "invalid_character");
+  return value as MobilePairingCreateEndpoint;
+}
+
+/** Bounded string, at most 2048 UTF-8 bytes. */
+export type MobilePairingExchangeEndpoint = string & {readonly __brand: "MobilePairingExchangeEndpoint"};
+export const MobilePairingExchangeEndpoint_MAX_BYTES = 2048;
+export const MobilePairingExchangeEndpoint_PATTERN = /^https:\/\/[^?#@]+\/api\/mobile\/pairings\/exchange$/u;
+export function MobilePairingExchangeEndpoint(value: string): MobilePairingExchangeEndpoint {
+  if (value.length === 0) throw new ValidationError("MobilePairingExchangeEndpoint", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("MobilePairingExchangeEndpoint", "invalid_character");
+  if (byteLength(value) > 2048) throw new ValidationError("MobilePairingExchangeEndpoint", "too_long");
+  if (!MobilePairingExchangeEndpoint_PATTERN.test(value)) throw new ValidationError("MobilePairingExchangeEndpoint", "invalid_character");
+  return value as MobilePairingExchangeEndpoint;
+}
+
+/** Bounded string, at most 46 UTF-8 bytes. */
+export type MobilePairingToken = string & {readonly __brand: "MobilePairingToken"};
+export const MobilePairingToken_MAX_BYTES = 46;
+export const MobilePairingToken_PATTERN = /^mp_[A-Za-z0-9_-]{43}$/u;
+export function MobilePairingToken(value: string): MobilePairingToken {
+  if (value.length === 0) throw new ValidationError("MobilePairingToken", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("MobilePairingToken", "invalid_character");
+  if (byteLength(value) > 46) throw new ValidationError("MobilePairingToken", "too_long");
+  if (!MobilePairingToken_PATTERN.test(value)) throw new ValidationError("MobilePairingToken", "invalid_character");
+  return value as MobilePairingToken;
+}
+
+/** Bounded string, at most 2048 UTF-8 bytes. */
 export type MobilePlatformEndpoint = string & {readonly __brand: "MobilePlatformEndpoint"};
 export const MobilePlatformEndpoint_MAX_BYTES = 2048;
 export const MobilePlatformEndpoint_PATTERN = /^https:\/\/[^?#@]+\/api\/platform$/u;
@@ -168,6 +246,15 @@ export function MobileServerIdentity(value: string): MobileServerIdentity {
   if (byteLength(value) > 71) throw new ValidationError("MobileServerIdentity", "too_long");
   if (!MobileServerIdentity_PATTERN.test(value)) throw new ValidationError("MobileServerIdentity", "invalid_character");
   return value as MobileServerIdentity;
+}
+
+/** Bounded integer in [1, 100]. */
+export type MobileCredentialPageSize = bigint & {readonly __brand: "MobileCredentialPageSize"};
+export const MobileCredentialPageSize_MIN = 1n;
+export const MobileCredentialPageSize_MAX = 100n;
+export function MobileCredentialPageSize(value: bigint): MobileCredentialPageSize {
+  if (typeof value !== "bigint" || value < 1n || value > 100n) throw new ValidationError("MobileCredentialPageSize", "out_of_range");
+  return value as MobileCredentialPageSize;
 }
 
 /** Bounded integer in [0, 9007199254740991]. */
@@ -299,10 +386,122 @@ export function decodeMobileAuthorization(body: JsonValue): MobileAuthorization 
   };
 }
 
+/** Bounded secret-free operator credential inventory page. */
+export interface MobileCredentialInventory {
+  readonly credentials: readonly MobileCredentialSummary[];
+  readonly next_cursor: MobileCredentialId | null;
+  readonly schema: typeof MOBILE_AUTH_SCHEMA_V1;
+}
+
+/** The exact key set this nested body carries. */
+export const MobileCredentialInventory_FIELDS: readonly string[] = [
+  "credentials",
+  "next_cursor",
+  "schema",
+];
+
+export function decodeMobileCredentialInventory(body: JsonValue): MobileCredentialInventory {
+  const fields = exactFields(body, MobileCredentialInventory_FIELDS, MOBILE_AUTH_INVALID_BODY);
+  return {
+    credentials: bodyArray(fields, "credentials", MOBILE_AUTH_INVALID_BODY, MAX_MOBILE_CREDENTIAL_PAGE_SIZE, MOBILE_AUTH_VALUE_INVALID).map(
+      decodeMobileCredentialSummary,
+    ),
+    next_cursor: mapNullable(bodyStringOrNull(fields, "next_cursor", MOBILE_AUTH_INVALID_BODY), (value) =>
+      refuse(MOBILE_AUTH_VALUE_INVALID, () => MobileCredentialId(value)),
+    ),
+    schema: exactString(bodyString(fields, "schema", MOBILE_AUTH_INVALID_BODY), MOBILE_AUTH_SCHEMA_V1, MOBILE_AUTH_SCHEMA_MISMATCH, "schema"),
+  };
+}
+
+/** Bounded operator credential inventory page request. */
+export interface MobileCredentialInventoryRequest {
+  readonly cursor: MobileCredentialId | null;
+  readonly page_size: MobileCredentialPageSize;
+}
+
+/** The exact key set this nested body carries. */
+export const MobileCredentialInventoryRequest_FIELDS: readonly string[] = [
+  "cursor",
+  "page_size",
+];
+
+export function encodeMobileCredentialInventoryRequest(value: MobileCredentialInventoryRequest): JsonValue {
+  exactInputFields(value, MobileCredentialInventoryRequest_FIELDS, MOBILE_AUTH_INVALID_BODY);
+  return {kind: "object", entries: [
+    ["cursor", ((entry) => entry === null
+        ? {kind: "null"}
+        : {kind: "string", value: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobileCredentialId(entry))})(value.cursor)],
+    ["page_size", {kind: "integer", value: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobileCredentialPageSize(value.page_size))}],
+  ]};
+}
+
+export function decodeMobileCredentialInventoryRequest(body: JsonValue): MobileCredentialInventoryRequest {
+  const fields = exactFields(body, MobileCredentialInventoryRequest_FIELDS, MOBILE_AUTH_INVALID_BODY);
+  return {
+    cursor: mapNullable(bodyStringOrNull(fields, "cursor", MOBILE_AUTH_INVALID_BODY), (value) =>
+      refuse(MOBILE_AUTH_VALUE_INVALID, () => MobileCredentialId(value)),
+    ),
+    page_size: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobileCredentialPageSize(bodyUnsigned(fields, "page_size", MOBILE_AUTH_INVALID_BODY))),
+  };
+}
+
+/** Operator revocation of one exact credential family. */
+export interface MobileCredentialRevokeRequest {
+  readonly credential_id: MobileCredentialId;
+}
+
+/** The exact key set this nested body carries. */
+export const MobileCredentialRevokeRequest_FIELDS: readonly string[] = [
+  "credential_id",
+];
+
+export function encodeMobileCredentialRevokeRequest(value: MobileCredentialRevokeRequest): JsonValue {
+  exactInputFields(value, MobileCredentialRevokeRequest_FIELDS, MOBILE_AUTH_INVALID_BODY);
+  return {kind: "object", entries: [
+    ["credential_id", {kind: "string", value: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobileCredentialId(value.credential_id))}],
+  ]};
+}
+
+export function decodeMobileCredentialRevokeRequest(body: JsonValue): MobileCredentialRevokeRequest {
+  const fields = exactFields(body, MobileCredentialRevokeRequest_FIELDS, MOBILE_AUTH_INVALID_BODY);
+  return {
+    credential_id: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobileCredentialId(bodyString(fields, "credential_id", MOBILE_AUTH_INVALID_BODY))),
+  };
+}
+
+/** Secret-free operator inventory projection for one credential family. */
+export interface MobileCredentialSummary {
+  readonly authorization: MobileAuthorization;
+  readonly refresh_expires_at_ms: MobileEpochMillis;
+  readonly revoked_at_ms: MobileEpochMillis | null;
+}
+
+/** The exact key set this nested body carries. */
+export const MobileCredentialSummary_FIELDS: readonly string[] = [
+  "authorization",
+  "refresh_expires_at_ms",
+  "revoked_at_ms",
+];
+
+export function decodeMobileCredentialSummary(body: JsonValue): MobileCredentialSummary {
+  const fields = exactFields(body, MobileCredentialSummary_FIELDS, MOBILE_AUTH_INVALID_BODY);
+  return {
+    authorization: decodeMobileAuthorization(bodyValue(fields, "authorization", MOBILE_AUTH_INVALID_BODY)),
+    refresh_expires_at_ms: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobileEpochMillis(bodyUnsigned(fields, "refresh_expires_at_ms", MOBILE_AUTH_INVALID_BODY))),
+    revoked_at_ms: mapNullable(bodyIntegerOrNull(fields, "revoked_at_ms", MOBILE_AUTH_INVALID_BODY), (value) =>
+      refuse(MOBILE_AUTH_VALUE_INVALID, () => MobileEpochMillis(value)),
+    ),
+  };
+}
+
 /** HTTPS-origin-bound discovery document. */
 export interface MobileDiscovery {
+  readonly credential_inventory_endpoint: MobileCredentialInventoryEndpoint;
+  readonly credential_revoke_endpoint: MobileCredentialRevokeEndpoint;
   readonly operator_provision_endpoint: MobileOperatorProvisionEndpoint;
   readonly origin: MobileHttpsOrigin;
+  readonly pairing_create_endpoint: MobilePairingCreateEndpoint;
+  readonly pairing_exchange_endpoint: MobilePairingExchangeEndpoint;
   readonly platform_endpoint: MobilePlatformEndpoint;
   readonly protocol: typeof MOBILE_AUTH_PROTOCOL;
   readonly schema: typeof MOBILE_AUTH_SCHEMA_V1;
@@ -312,8 +511,12 @@ export interface MobileDiscovery {
 
 /** The exact key set this nested body carries. */
 export const MobileDiscovery_FIELDS: readonly string[] = [
+  "credential_inventory_endpoint",
+  "credential_revoke_endpoint",
   "operator_provision_endpoint",
   "origin",
+  "pairing_create_endpoint",
+  "pairing_exchange_endpoint",
   "platform_endpoint",
   "protocol",
   "schema",
@@ -324,8 +527,12 @@ export const MobileDiscovery_FIELDS: readonly string[] = [
 export function decodeMobileDiscovery(body: JsonValue): MobileDiscovery {
   const fields = exactFields(body, MobileDiscovery_FIELDS, MOBILE_AUTH_INVALID_BODY);
   return {
+    credential_inventory_endpoint: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobileCredentialInventoryEndpoint(bodyString(fields, "credential_inventory_endpoint", MOBILE_AUTH_INVALID_BODY))),
+    credential_revoke_endpoint: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobileCredentialRevokeEndpoint(bodyString(fields, "credential_revoke_endpoint", MOBILE_AUTH_INVALID_BODY))),
     operator_provision_endpoint: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobileOperatorProvisionEndpoint(bodyString(fields, "operator_provision_endpoint", MOBILE_AUTH_INVALID_BODY))),
     origin: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobileHttpsOrigin(bodyString(fields, "origin", MOBILE_AUTH_INVALID_BODY))),
+    pairing_create_endpoint: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobilePairingCreateEndpoint(bodyString(fields, "pairing_create_endpoint", MOBILE_AUTH_INVALID_BODY))),
+    pairing_exchange_endpoint: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobilePairingExchangeEndpoint(bodyString(fields, "pairing_exchange_endpoint", MOBILE_AUTH_INVALID_BODY))),
     platform_endpoint: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobilePlatformEndpoint(bodyString(fields, "platform_endpoint", MOBILE_AUTH_INVALID_BODY))),
     protocol: exactString(bodyString(fields, "protocol", MOBILE_AUTH_INVALID_BODY), MOBILE_AUTH_PROTOCOL, MOBILE_AUTH_PROTOCOL_MISMATCH, "protocol"),
     schema: exactString(bodyString(fields, "schema", MOBILE_AUTH_INVALID_BODY), MOBILE_AUTH_SCHEMA_V1, MOBILE_AUTH_SCHEMA_MISMATCH, "schema"),
@@ -420,6 +627,73 @@ export function decodeMobileOperatorProvisionRequest(body: JsonValue): MobileOpe
     session_scope: bodyStrings(fields, "session_scope", MOBILE_AUTH_INVALID_BODY, MAX_MOBILE_SESSIONS, MOBILE_AUTH_VALUE_INVALID).map((value) =>
       refuse(MOBILE_AUTH_VALUE_INVALID, () => MobileSessionId(value)),
     ),
+  };
+}
+
+/** Strict one-time pairing exchange proof. */
+export interface MobilePairingExchangeRequest {
+  readonly pairing_id: MobilePairingId;
+  readonly pairing_token: MobilePairingToken;
+  readonly server_identity: MobileServerIdentity;
+}
+
+/** The exact key set this nested body carries. */
+export const MobilePairingExchangeRequest_FIELDS: readonly string[] = [
+  "pairing_id",
+  "pairing_token",
+  "server_identity",
+];
+
+export function encodeMobilePairingExchangeRequest(value: MobilePairingExchangeRequest): JsonValue {
+  exactInputFields(value, MobilePairingExchangeRequest_FIELDS, MOBILE_AUTH_INVALID_BODY);
+  return {kind: "object", entries: [
+    ["pairing_id", {kind: "string", value: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobilePairingId(value.pairing_id))}],
+    ["pairing_token", {kind: "string", value: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobilePairingToken(value.pairing_token))}],
+    ["server_identity", {kind: "string", value: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobileServerIdentity(value.server_identity))}],
+  ]};
+}
+
+export function decodeMobilePairingExchangeRequest(body: JsonValue): MobilePairingExchangeRequest {
+  const fields = exactFields(body, MobilePairingExchangeRequest_FIELDS, MOBILE_AUTH_INVALID_BODY);
+  return {
+    pairing_id: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobilePairingId(bodyString(fields, "pairing_id", MOBILE_AUTH_INVALID_BODY))),
+    pairing_token: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobilePairingToken(bodyString(fields, "pairing_token", MOBILE_AUTH_INVALID_BODY))),
+    server_identity: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobileServerIdentity(bodyString(fields, "server_identity", MOBILE_AUTH_INVALID_BODY))),
+  };
+}
+
+/** Copy-safe origin and identity-bound one-time pairing offer. */
+export interface MobilePairingOffer {
+  readonly exchange_endpoint: MobilePairingExchangeEndpoint;
+  readonly expires_at_ms: MobileEpochMillis;
+  readonly origin: MobileHttpsOrigin;
+  readonly pairing_id: MobilePairingId;
+  readonly pairing_token: MobilePairingToken;
+  readonly schema: typeof MOBILE_AUTH_SCHEMA_V1;
+  readonly server_identity: MobileServerIdentity;
+}
+
+/** The exact key set this nested body carries. */
+export const MobilePairingOffer_FIELDS: readonly string[] = [
+  "exchange_endpoint",
+  "expires_at_ms",
+  "origin",
+  "pairing_id",
+  "pairing_token",
+  "schema",
+  "server_identity",
+];
+
+export function decodeMobilePairingOffer(body: JsonValue): MobilePairingOffer {
+  const fields = exactFields(body, MobilePairingOffer_FIELDS, MOBILE_AUTH_INVALID_BODY);
+  return {
+    exchange_endpoint: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobilePairingExchangeEndpoint(bodyString(fields, "exchange_endpoint", MOBILE_AUTH_INVALID_BODY))),
+    expires_at_ms: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobileEpochMillis(bodyUnsigned(fields, "expires_at_ms", MOBILE_AUTH_INVALID_BODY))),
+    origin: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobileHttpsOrigin(bodyString(fields, "origin", MOBILE_AUTH_INVALID_BODY))),
+    pairing_id: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobilePairingId(bodyString(fields, "pairing_id", MOBILE_AUTH_INVALID_BODY))),
+    pairing_token: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobilePairingToken(bodyString(fields, "pairing_token", MOBILE_AUTH_INVALID_BODY))),
+    schema: exactString(bodyString(fields, "schema", MOBILE_AUTH_INVALID_BODY), MOBILE_AUTH_SCHEMA_V1, MOBILE_AUTH_SCHEMA_MISMATCH, "schema"),
+    server_identity: refuse(MOBILE_AUTH_VALUE_INVALID, () => MobileServerIdentity(bodyString(fields, "server_identity", MOBILE_AUTH_INVALID_BODY))),
   };
 }
 

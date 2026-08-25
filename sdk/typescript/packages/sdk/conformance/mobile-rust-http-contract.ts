@@ -12,6 +12,7 @@ const {
   ClientId,
   IdempotencyKey,
   MobileFollowUpBytes,
+  MobileCredentialPageSize,
   MobileLifecycleClient,
   MobileLifecycleError,
   MobilePageEvents,
@@ -73,6 +74,15 @@ if (dashboard.status !== 200 || dashboardSession === undefined) {
   throw new Error("failed to establish dashboard session fixture");
 }
 const sessionCookie = dashboardSession;
+
+const pairingScope = {
+  actions: ["attach"] as const,
+  limits: {
+    max_follow_up_bytes: MobileFollowUpBytes(32n),
+    max_page_events: MobilePageEvents(16n),
+  },
+  session_scope: [MobileSessionId("session-a")],
+};
 
 async function expectMobilePlatformDenial(token: string): Promise<void> {
   const body = encodePlatformRequestMessage(PlatformRequestId("mobile-exclusive"), {
@@ -142,6 +152,102 @@ let cookieProvisionStatus = 0;
   cookieProvisionStatus = response.status;
 }
 if (cookieProvisionStatus !== 401) throw new Error("operator provisioning accepted a session cookie");
+
+{
+  const body = new TextDecoder().decode(toCanonicalBytes({
+    kind: "object",
+    entries: [
+      ["actions", {kind: "array", items: [{kind: "string", value: "attach"}]}],
+      ["limits", {kind: "object", entries: [
+        ["max_follow_up_bytes", {kind: "integer", value: 32n}],
+        ["max_page_events", {kind: "integer", value: 16n}],
+      ]}],
+      ["session_scope", {kind: "array", items: [{kind: "string", value: "session-a"}]}],
+    ],
+  }));
+  const sessionDenied = await routedFetch(`${canonicalOrigin}/api/mobile/pairings`, {
+    method: "POST",
+    headers: {cookie: sessionCookie, "content-type": MOBILE_AUTH_MEDIA_TYPE},
+    body,
+  });
+  if (sessionDenied.status !== 401) throw new Error("pairing creation accepted dashboard session");
+  const manageDenied = await routedFetch(`${canonicalOrigin}/api/mobile/pairings`, {
+    method: "POST",
+    headers: {authorization: "Bearer manage-token", "content-type": MOBILE_AUTH_MEDIA_TYPE},
+    body,
+  });
+  if (manageDenied.status !== 401) throw new Error("pairing creation accepted Manage bearer");
+}
+
+const offer = await client.createPairing(pairingScope, "Basic b3BzOmZpeHR1cmUtcGFzc3dvcmQ=");
+{
+  const malformed = toCanonicalBytes({
+    kind: "object",
+    entries: [
+      ["pairing_id", {kind: "string", value: offer.pairing_id}],
+      ["pairing_token", {kind: "string", value: offer.pairing_token}],
+      ["server_identity", {kind: "string", value: offer.server_identity}],
+      ["unexpected", {kind: "bool", value: true}],
+    ],
+  });
+  const response = await routedFetch(client.discovery.pairing_exchange_endpoint, {
+    method: "POST",
+    headers: {"content-type": MOBILE_AUTH_MEDIA_TYPE},
+    body: new TextDecoder().decode(malformed),
+  });
+  if (response.status !== 400) throw new Error("pairing exchange accepted an unknown field");
+}
+const paired = await client.exchangePairing({
+  pairing_id: offer.pairing_id,
+  pairing_token: offer.pairing_token,
+  server_identity: offer.server_identity,
+});
+try {
+  await client.exchangePairing({
+    pairing_id: offer.pairing_id,
+    pairing_token: offer.pairing_token,
+    server_identity: offer.server_identity,
+  });
+  throw new Error("consumed pairing replay succeeded");
+} catch (error) {
+  if (!(error instanceof MobileLifecycleError) || error.status !== 401) throw error;
+}
+if ((await client.authorization(paired.access_token)).credential_id !== paired.authorization.credential_id) {
+  throw new Error("paired credential admission mismatch");
+}
+{
+  const body = new TextDecoder().decode(toCanonicalBytes({
+    kind: "object",
+    entries: [
+      ["actions", {kind: "array", items: [{kind: "string", value: "attach"}]}],
+      ["limits", {kind: "object", entries: [
+        ["max_follow_up_bytes", {kind: "integer", value: 32n}],
+        ["max_page_events", {kind: "integer", value: 16n}],
+      ]}],
+      ["session_scope", {kind: "array", items: [{kind: "string", value: "session-a"}]}],
+    ],
+  }));
+  const mobileDenied = await routedFetch(`${canonicalOrigin}/api/mobile/pairings`, {
+    method: "POST",
+    headers: {authorization: `Bearer ${paired.access_token}`, "content-type": MOBILE_AUTH_MEDIA_TYPE},
+    body,
+  });
+  if (mobileDenied.status !== 401) throw new Error("pairing creation accepted mobile bearer");
+}
+const inventory = await client.credentialInventory({
+  cursor: null,
+  page_size: MobileCredentialPageSize(100n),
+}, "Basic b3BzOmZpeHR1cmUtcGFzc3dvcmQ=");
+if (!inventory.credentials.some((entry) => entry.authorization.credential_id === paired.authorization.credential_id)) {
+  throw new Error("paired credential absent from operator inventory");
+}
+await client.revokeCredential({credential_id: paired.authorization.credential_id}, "Basic b3BzOmZpeHR1cmUtcGFzc3dvcmQ=");
+try {
+  await client.authorization(paired.access_token);
+  throw new Error("operator-revoked paired access succeeded");
+} catch (error) {
+  if (!(error instanceof MobileLifecycleError) || error.status !== 401) throw error;
+}
 
 const first = await client.provision({
   actions: ["attach", "follow_up"],
@@ -259,5 +365,5 @@ try {
   if (!(error instanceof MobileLifecycleError) || error.status !== 401) throw error;
 }
 
-if (sawNoStore !== 13) throw new Error(`unexpected lifecycle exchange count: ${sawNoStore}`);
+if (sawNoStore !== 24) throw new Error(`unexpected lifecycle exchange count: ${sawNoStore}`);
 console.log("TypeScript SDK passed the live Rust mobile credential lifecycle contract");

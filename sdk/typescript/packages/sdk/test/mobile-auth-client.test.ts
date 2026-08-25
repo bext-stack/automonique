@@ -5,6 +5,7 @@ import {describe, expect, test} from "bun:test";
 import {
   MOBILE_AUTH_MEDIA_TYPE,
   MobileFollowUpBytes,
+  MobileCredentialPageSize,
   MobilePageEvents,
   MobileSessionId,
   parseCanonical,
@@ -56,8 +57,12 @@ function response(value: unknown, status = 200): Response {
 
 function discovery(extra: Readonly<Record<string, unknown>> = {}): unknown {
   return {
+    credential_inventory_endpoint: `${origin}/api/mobile/credentials/list`,
+    credential_revoke_endpoint: `${origin}/api/mobile/credentials/revoke`,
     operator_provision_endpoint: `${origin}/api/mobile/operator-provision`,
     origin,
+    pairing_create_endpoint: `${origin}/api/mobile/pairings`,
+    pairing_exchange_endpoint: `${origin}/api/mobile/pairings/exchange`,
     platform_endpoint: `${origin}/api/platform`,
     protocol: "automonique.mobile-auth",
     schema: "automonique.mobile-auth/v1",
@@ -249,5 +254,70 @@ describe("mobile credential lifecycle client", () => {
       limits: {max_follow_up_bytes: MobileFollowUpBytes(1n), max_page_events: MobilePageEvents(1n)},
       session_scope: [],
     }, "Basic fixture")).rejects.toMatchObject({category: "unexpected_success_status"});
+  });
+
+  test("creates and exchanges pairings, inventories, and revokes without ambient authority", async () => {
+    const offer = {
+      exchange_endpoint: `${origin}/api/mobile/pairings/exchange`,
+      expires_at_ms: BigInt(Date.now() + 60_000),
+      origin,
+      pairing_id: `pi_${"P".repeat(43)}`,
+      pairing_token: `mp_${"Q".repeat(43)}`,
+      schema: "automonique.mobile-auth/v1",
+      server_identity: identity,
+    };
+    const authorization = (issued() as {authorization: unknown}).authorization;
+    const requests: {url: string; init: RequestInit | undefined}[] = [];
+    const responses = [
+      response(discovery()),
+      response(offer, 201),
+      response(issued(), 201),
+      response({
+        credentials: [{authorization, refresh_expires_at_ms: 9_007_199_254_740_991n, revoked_at_ms: null}],
+        next_cursor: null,
+        schema: "automonique.mobile-auth/v1",
+      }),
+      response({revoked: true, schema: "automonique.mobile-auth/v1"}),
+    ];
+    const fetcher = (async (input: string | URL | Request, init?: RequestInit) => {
+      requests.push({url: input.toString(), init});
+      const next = responses.shift();
+      if (next === undefined) throw new Error("unexpected request");
+      return next;
+    }) as typeof fetch;
+    const client = await MobileLifecycleClient.discover(origin, fetcher, undefined, identity);
+    const created = await client.createPairing({
+      actions: ["attach"],
+      limits: {max_follow_up_bytes: MobileFollowUpBytes(32n), max_page_events: MobilePageEvents(16n)},
+      session_scope: [MobileSessionId("session-a")],
+    }, "Basic fixture-operator");
+    const paired = await client.exchangePairing({
+      pairing_id: created.pairing_id,
+      pairing_token: created.pairing_token,
+      server_identity: created.server_identity,
+    });
+    const inventory = await client.credentialInventory({
+      cursor: null,
+      page_size: MobileCredentialPageSize(10n),
+    }, "Basic fixture-operator");
+    expect(inventory.credentials[0]?.authorization.credential_id)
+      .toBe(paired.authorization.credential_id);
+    expect(await client.revokeCredential({
+      credential_id: paired.authorization.credential_id,
+    }, "Basic fixture-operator")).toEqual({revoked: true, schema: "automonique.mobile-auth/v1"});
+    expect(requests.map((entry) => entry.url)).toEqual([
+      `${origin}/.well-known/automonique-mobile`,
+      `${origin}/api/mobile/pairings`,
+      `${origin}/api/mobile/pairings/exchange`,
+      `${origin}/api/mobile/credentials/list`,
+      `${origin}/api/mobile/credentials/revoke`,
+    ]);
+    for (const request of requests) {
+      expect(request.init?.credentials).toBe("omit");
+      expect(request.init?.redirect).toBe("error");
+    }
+    expect(new Headers(requests[2]?.init?.headers).has("authorization")).toBe(false);
+    expect(new Headers(requests[1]?.init?.headers).get("authorization"))
+      .toBe("Basic fixture-operator");
   });
 });

@@ -2,6 +2,7 @@
 
 import {
   MAX_MOBILE_HTTP_BODY_BYTES,
+  MOBILE_PAIRING_TTL_MILLIS,
   MOBILE_AUTH_MEDIA_TYPE,
   ClientId,
   MobileAccessToken,
@@ -12,27 +13,42 @@ import {
   ValidationError,
   WireError,
   decodeIssuedMobileCredentials,
+  decodeMobileCredentialInventory,
   decodeMobileAuthorization,
   decodeMobileDiscovery,
   decodeMobileError,
+  decodeMobilePairingOffer,
   decodeMobileRevocation,
+  encodeMobileCredentialInventoryRequest,
+  encodeMobileCredentialRevokeRequest,
   encodeMobileOperatorProvisionRequest,
+  encodeMobilePairingExchangeRequest,
   encodeMobileRefreshRequest,
   parseCanonical,
   toCanonicalBytes,
   type IssuedMobileCredentials,
   type JsonValue,
   type MobileAuthorization,
+  type MobileCredentialInventory,
+  type MobileCredentialInventoryRequest,
+  type MobileCredentialRevokeRequest,
   type MobileDiscovery,
   type MobileOperatorProvisionRequest,
+  type MobilePairingExchangeRequest,
+  type MobilePairingOffer,
   type MobileRevocation,
 } from "../../protocol/src/index.js";
 
 export type {
   IssuedMobileCredentials,
   MobileAuthorization,
+  MobileCredentialInventory,
+  MobileCredentialInventoryRequest,
+  MobileCredentialRevokeRequest,
   MobileDiscovery,
   MobileOperatorProvisionRequest,
+  MobilePairingExchangeRequest,
+  MobilePairingOffer,
   MobileRevocation,
 };
 
@@ -252,7 +268,11 @@ export class MobileLifecycleClient {
     }
     if (
       discovery.origin !== expectedOrigin
+      || discovery.credential_inventory_endpoint !== `${expectedOrigin}/api/mobile/credentials/list`
+      || discovery.credential_revoke_endpoint !== `${expectedOrigin}/api/mobile/credentials/revoke`
       || discovery.operator_provision_endpoint !== `${expectedOrigin}/api/mobile/operator-provision`
+      || discovery.pairing_create_endpoint !== `${expectedOrigin}/api/mobile/pairings`
+      || discovery.pairing_exchange_endpoint !== `${expectedOrigin}/api/mobile/pairings/exchange`
       || discovery.platform_endpoint !== `${expectedOrigin}/api/platform`
       || discovery.supported_versions.length !== 1
       || discovery.supported_versions[0] !== 1n
@@ -277,6 +297,102 @@ export class MobileLifecycleClient {
       201,
       signal,
     ).then((issued) => verifyIssued(issued, this.discovery.server_identity));
+  }
+
+  async createPairing(
+    request: MobileOperatorProvisionRequest,
+    authorization: string | (() => string | Promise<string>),
+    signal?: AbortSignal,
+  ): Promise<MobilePairingOffer> {
+    const supplied = typeof authorization === "string" ? authorization : await authorization();
+    const offer = await this.request(
+      this.discovery.pairing_create_endpoint,
+      encodeMobileOperatorProvisionRequest(request),
+      decodeMobilePairingOffer,
+      {authorization: operatorAuthorization(supplied)},
+      201,
+      signal,
+    );
+    const now = BigInt(Date.now());
+    if (
+      offer.origin !== this.discovery.origin
+      || offer.server_identity !== this.discovery.server_identity
+      || offer.exchange_endpoint !== this.discovery.pairing_exchange_endpoint
+      || offer.expires_at_ms <= now
+      || offer.expires_at_ms > now + BigInt(MOBILE_PAIRING_TTL_MILLIS)
+    ) {
+      throw new MobileLifecycleError(0, "mobile_pairing_invalid");
+    }
+    return offer;
+  }
+
+  async exchangePairing(
+    request: MobilePairingExchangeRequest,
+    signal?: AbortSignal,
+  ): Promise<IssuedMobileCredentials> {
+    if (request.server_identity !== this.discovery.server_identity) {
+      throw new MobileLifecycleError(0, "mobile_server_identity_mismatch");
+    }
+    const issued = await this.request(
+      this.discovery.pairing_exchange_endpoint,
+      encodeMobilePairingExchangeRequest(request),
+      decodeIssuedMobileCredentials,
+      {},
+      201,
+      signal,
+    );
+    return verifyIssued(issued, this.discovery.server_identity);
+  }
+
+  async credentialInventory(
+    request: MobileCredentialInventoryRequest,
+    authorization: string | (() => string | Promise<string>),
+    signal?: AbortSignal,
+  ): Promise<MobileCredentialInventory> {
+    const supplied = typeof authorization === "string" ? authorization : await authorization();
+    const inventory = await this.request(
+      this.discovery.credential_inventory_endpoint,
+      encodeMobileCredentialInventoryRequest(request),
+      decodeMobileCredentialInventory,
+      {authorization: operatorAuthorization(supplied)},
+      200,
+      signal,
+    );
+    const now = BigInt(Date.now());
+    for (const summary of inventory.credentials) {
+      const authorization = summary.authorization;
+      if (
+        authorization.server_identity !== this.discovery.server_identity
+        || authorization.issued_at_ms > now
+        || authorization.issued_at_ms >= authorization.expires_at_ms
+        || summary.refresh_expires_at_ms < authorization.expires_at_ms
+        || new Set(authorization.actions).size !== authorization.actions.length
+        || new Set(authorization.session_scope).size !== authorization.session_scope.length
+        || (summary.revoked_at_ms !== null
+          && (summary.revoked_at_ms < authorization.issued_at_ms || summary.revoked_at_ms > now))
+      ) {
+        throw new MobileLifecycleError(0, "mobile_auth_invalid_body");
+      }
+    }
+    return inventory;
+  }
+
+  async revokeCredential(
+    request: MobileCredentialRevokeRequest,
+    authorization: string | (() => string | Promise<string>),
+    signal?: AbortSignal,
+  ): Promise<MobileRevocation> {
+    const supplied = typeof authorization === "string" ? authorization : await authorization();
+    const revoked = await this.request(
+      this.discovery.credential_revoke_endpoint,
+      encodeMobileCredentialRevokeRequest(request),
+      decodeMobileRevocation,
+      {authorization: operatorAuthorization(supplied)},
+      200,
+      signal,
+    );
+    if (!revoked.revoked) throw new MobileLifecycleError(0, "mobile_revocation_incomplete");
+    return revoked;
   }
 
   async refresh(
