@@ -184,6 +184,7 @@ dependencies = [
  "automonique-daemon",
  "automonique-platform-client",
  "automonique-protocol",
+ "automonique-runner",
  "automonique-store",
  "nix",
  "rusqlite",
