@@ -377,17 +377,16 @@ fn history_text(value: &str) -> Result<SessionHistoryText, PlatformApiError> {
     SessionHistoryText::new(value.to_owned()).map_err(|error| PlatformError::Field(error).into())
 }
 
+type HistoryEventArrays = (
+    Vec<JsonValue>,
+    Vec<JsonValue>,
+    Vec<JsonValue>,
+    Vec<JsonValue>,
+);
+
 fn history_event_arrays(
     events: &[SessionHistoryEvent],
-) -> Result<
-    (
-        Vec<JsonValue>,
-        Vec<JsonValue>,
-        Vec<JsonValue>,
-        Vec<JsonValue>,
-    ),
-    PlatformApiError,
-> {
+) -> Result<HistoryEventArrays, PlatformApiError> {
     let mut messages = Vec::new();
     let mut tools = Vec::new();
     let mut runs = Vec::new();
