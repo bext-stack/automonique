@@ -61,6 +61,7 @@ pub enum AttemptAdoptionError {
     Protocol,
     HostUnavailable,
     AlreadyStarted,
+    WorkerPanicked,
     Io(std::io::Error),
 }
 
@@ -75,6 +76,7 @@ impl AttemptAdoptionError {
             Self::Protocol => "attempt_adoption_protocol",
             Self::HostUnavailable => "attempt_adoption_host_unavailable",
             Self::AlreadyStarted => "attempt_adoption_already_started",
+            Self::WorkerPanicked => "attempt_adoption_worker_panicked",
             Self::Io(_) => "attempt_adoption_io",
         }
     }
@@ -237,6 +239,43 @@ impl AttemptAdoptionEndpoint {
         self.accept = Some(std::thread::spawn(move || {
             accept_loop(&listener, &holder_id, lease_epoch, &host, &stop);
         }));
+        Ok(())
+    }
+
+    /// Rebind this source-owned route at a newly returned lease epoch.
+    ///
+    /// The old accept loop is joined before its exact inode is removed. The
+    /// replacement retains the same holder and attempt host, but answers only
+    /// at the new fence, so no cancellation client can mistake an E route for
+    /// the source's returned E+2 authority.
+    pub(crate) fn retarget(&mut self, lease_epoch: u64) -> Result<(), AttemptAdoptionError> {
+        if lease_epoch == 0 || lease_epoch == self.lease_epoch {
+            return Err(AttemptAdoptionError::InvalidField("lease_epoch"));
+        }
+        let was_started = self.accept.is_some();
+        self.stop.store(true, Ordering::Release);
+        if let Some(accept) = self.accept.take() {
+            accept
+                .join()
+                .map_err(|_| AttemptAdoptionError::WorkerPanicked)?;
+        }
+        drop(self.listener.take());
+        remove_socket_if_identity(&self.socket_path, self.socket_identity);
+        // The filesystem may immediately reuse the removed inode for the
+        // replacement below. Disarm the old Drop guard before rebinding so it
+        // cannot mistake that reuse for the endpoint it used to own.
+        self.socket_identity = (0, 0);
+
+        let mut replacement = Self::bind(
+            self.socket_path.clone(),
+            &self.holder_id,
+            lease_epoch,
+            Arc::clone(&self.host),
+        )?;
+        if was_started {
+            replacement.start()?;
+        }
+        *self = replacement;
         Ok(())
     }
 

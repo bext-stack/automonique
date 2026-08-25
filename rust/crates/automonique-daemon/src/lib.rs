@@ -2149,6 +2149,75 @@ impl Daemon {
         self.arm_endpoint_cleanup()
     }
 
+    /// Accept an E+2 lease returned by a failed candidate and make every
+    /// source-owned authority projection agree with it before resumption.
+    pub fn accept_returned_authority(
+        &mut self,
+        returned: &GenerationLease,
+    ) -> Result<(), DaemonError> {
+        let expected_epoch = self
+            .lease_epoch
+            .checked_add(2)
+            .ok_or(DaemonError::Store(StoreError::StaleEpoch))?;
+        let process_identity =
+            lease_identity::ProcessIdentity::current().map_err(|error| match error {
+                lease_identity::ProcessIdentityError::Io(error) => DaemonError::Io(error),
+                lease_identity::ProcessIdentityError::Malformed(category) => {
+                    DaemonError::ControlLockFailed(category)
+                }
+            })?;
+        let lease_now_ms = self
+            .lease_time
+            .require_authority()
+            .map_err(map_lease_authority_error)?;
+        if returned.generation_id != GENERATION_ID
+            || returned.holder_id != self.instance_id.as_str()
+            || returned.epoch != expected_epoch
+            || returned.expires_ms <= lease_now_ms
+            || returned.boot_id != process_identity.boot_id
+            || returned.holder_pid != process_identity.pid
+            || returned.holder_starttime != process_identity.starttime
+        {
+            return Err(DaemonError::Store(StoreError::StaleEpoch));
+        }
+
+        let now_ms = unix_millis()?;
+        let renewed = self.store.renew_generation_lease(LeaseRenewal {
+            generation_id: GENERATION_ID,
+            holder_id: self.instance_id.as_str(),
+            epoch: returned.epoch,
+            now_ms,
+            ttl_ms: LEASE_TTL_MS,
+        })?;
+        if renewed.generation_id != returned.generation_id
+            || renewed.holder_id != returned.holder_id
+            || renewed.epoch != returned.epoch
+            || renewed.boot_id != returned.boot_id
+            || renewed.holder_pid != returned.holder_pid
+            || renewed.holder_starttime != returned.holder_starttime
+        {
+            return Err(DaemonError::Store(StoreError::StaleEpoch));
+        }
+
+        let tenure = record_tenure(
+            &mut self.generation_audit,
+            self.instance_id.as_str(),
+            renewed.epoch,
+            now_ms,
+        )?;
+        self.lease_epoch = renewed.epoch;
+        self.lease_expires_ms = renewed.expires_ms;
+        self.tenure_revision = tenure.revision;
+        self.attempt_adoption
+            .as_mut()
+            .ok_or(DaemonError::AttemptAdoptionFailed(
+                "attempt_adoption_unavailable",
+            ))?
+            .retarget(renewed.epoch)
+            .map_err(|error| DaemonError::AttemptAdoptionFailed(error.category()))?;
+        Ok(())
+    }
+
     fn arm_endpoint_cleanup(&mut self) -> Result<(), DaemonError> {
         let identity = validate_admin_listener(&self.listener, &self.socket_path)?;
         if identity != self.socket_identity {

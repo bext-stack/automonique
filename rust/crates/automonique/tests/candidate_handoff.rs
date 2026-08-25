@@ -7,6 +7,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use automonique_daemon::attempt_adoption::AttemptAdoptionClient;
 use automonique_daemon::candidate::{CandidateSpec, spawn_warm_candidate};
 use automonique_daemon::release_activation::{CodeReleaseActivator, SystemdUserSupervisor};
 use automonique_daemon::{Daemon, DaemonConfig};
@@ -183,6 +184,36 @@ fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
     candidate
         .confirm_relinquished(&returned.lease)
         .expect("candidate observes returned authority");
+    source
+        .accept_returned_authority(&returned.lease)
+        .expect("source records and projects returned authority");
+    let returned_route = source
+        .attempt_adoption_route()
+        .expect("returned source attempt route");
+    assert_eq!(returned_route.holder_id, source_lease.holder_id);
+    assert_eq!(returned_route.lease_epoch, returned.lease.epoch);
+    let returned_inventory = AttemptAdoptionClient::new(
+        returned_route.socket_path,
+        &returned_route.holder_id,
+        returned_route.lease_epoch,
+    )
+    .expect("returned source route client")
+    .inventory()
+    .expect("returned source route inventory");
+    assert!(returned_inventory.attempt_ids.is_empty());
+    let returned_tenure: (String, u64) = Connection::open(config.generation_audit_path())
+        .expect("generation audit")
+        .query_row(
+            "SELECT holder_id, lease_epoch FROM generation_tenures
+             WHERE generation_id = 'foreground' AND end_kind IS NULL",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("returned source tenure");
+    assert_eq!(
+        returned_tenure,
+        (source_lease.holder_id.clone(), returned.lease.epoch)
+    );
     source
         .resume_endpoint_cleanup()
         .expect("source resumes exact socket cleanup");
