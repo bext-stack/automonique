@@ -1047,6 +1047,11 @@ fn argv(
 /// [`automonique_runner::admission::AdmittedLaunch::with_broker`] to this run's
 /// own broker, and a document that bound either itself would be refused a
 /// broker outright — a plan refuses one name bound twice.
+///
+/// A JCode workload also gets `JCODE_NO_TELEMETRY=1`. The sandbox has no
+/// telemetry egress, so the opt-out changes nothing the engine can reach; it
+/// only stops the engine's opt-out notice from being written into every
+/// contained run's journal.
 fn environment(
     home: &str,
     workspace: &str,
@@ -1066,6 +1071,7 @@ fn environment(
         // already-authorized private home instead of letting it fall back to
         // an ungranted host /tmp path.
         (OsString::from("JCODE_RUNTIME_DIR"), OsString::from(home)),
+        (OsString::from("JCODE_NO_TELEMETRY"), OsString::from("1")),
         // Provider-neutral coordinate used by small contained adapters. The
         // credential remains a file below this already-granted home; no secret
         // is copied into the environment or the run document.
@@ -1082,7 +1088,7 @@ fn environment(
         (OsString::from("SSL_CERT_DIR"), OsString::from(CA_DIRECTORY)),
     ];
     if engine == ProviderEngine::Codex {
-        environment.retain(|(name, _)| name != "JCODE_RUNTIME_DIR");
+        environment.retain(|(name, _)| name != "JCODE_RUNTIME_DIR" && name != "JCODE_NO_TELEMETRY");
     }
     if engine == ProviderEngine::Jcode
         && let Some(ManagedSessionMode::Resume(session_id)) = managed_session
