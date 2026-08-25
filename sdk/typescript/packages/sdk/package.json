@@ -24,6 +24,11 @@
       "types": "./dist/sdk/src/index.d.ts",
       "import": "./dist/sdk/src/index.js",
       "default": "./dist/sdk/src/index.js"
+    },
+    "./testing": {
+      "types": "./dist/sdk/src/testing.d.ts",
+      "import": "./dist/sdk/src/testing.js",
+      "default": "./dist/sdk/src/testing.js"
     }
   },
   "scripts": {

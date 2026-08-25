@@ -55,4 +55,34 @@ receipt bindings locally, and exposes no generic `execute` method. Its
 optional fourth constructor argument is an injectable millisecond clock for
 deterministic runtime integration and testing.
 
+## Deterministic fixtures
+
+The optional `@automonique/sdk/testing` subpath provides runtime-neutral test
+fixtures without importing Bun, Node, or a test runner:
+
+```ts
+import {MobileSessionClient} from "@automonique/sdk";
+import {
+  DeterministicPlatformAdapter,
+  createDeterministicSdkFixture,
+} from "@automonique/sdk/testing";
+
+const fixture = createDeterministicSdkFixture();
+const adapter = new DeterministicPlatformAdapter(
+  fixture.mutation.ambiguousThenReconciled,
+);
+const client = new MobileSessionClient(
+  adapter,
+  fixture.authorization,
+  fixture.serverIdentity,
+  () => fixture.now,
+);
+```
+
+The fixed matrix covers exact and conflicting duplicates, cursor gaps and
+expiry, stale revisions, sanitized unknown history events, unknown mutation
+outcomes, and idempotency-key receipt reconciliation. The scripted adapter
+records exact requests and fails closed on an unexpected order or exhausted
+script.
+
 This package is licensed under Apache-2.0. Automonique product code outside `sdk/` has a separate licensing boundary.
