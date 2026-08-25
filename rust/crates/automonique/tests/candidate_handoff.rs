@@ -293,32 +293,13 @@ fn authenticated_reload_command_hands_off_and_retires_the_source() {
     private_directory(&release_root);
     private_directory(&release_root.join("releases"));
     let executable = fs::read(env!("CARGO_BIN_EXE_automonique")).expect("candidate binary");
-    let binary_sha256 = hex(&Sha256::digest(&executable));
-    let manifest = serde_json::json!({
-        "schema": "automonique.code-release/v1",
-        "source_sha": "c".repeat(40),
-        "plan_digest": format!("sha256:{}", "d".repeat(64)),
-        "binary_path": "bin/automonique",
-        "binary_sha256": binary_sha256,
-        "changed_paths": ["rust/crates/automonique-cli/src/lib.rs"]
-    });
-    let manifest = serde_json::to_vec(&manifest).expect("manifest");
-    let manifest_digest = hex(&Sha256::digest(&manifest));
-    let release_dir = release_root.join("releases").join(&manifest_digest);
-    private_directory(&release_dir);
-    private_directory(&release_dir.join("bin"));
-    fs::write(release_dir.join("manifest.json"), manifest).expect("manifest file");
-    fs::write(release_dir.join("bin/automonique"), executable).expect("binary file");
-    fs::set_permissions(
-        release_dir.join("manifest.json"),
-        fs::Permissions::from_mode(0o600),
+    let previous_digest = install_code_release(&release_root, &executable, 'a');
+    let manifest_digest = install_code_release(&release_root, &executable, 'c');
+    std::os::unix::fs::symlink(
+        Path::new("releases").join(&previous_digest),
+        release_root.join("current"),
     )
-    .expect("manifest mode");
-    fs::set_permissions(
-        release_dir.join("bin/automonique"),
-        fs::Permissions::from_mode(0o700),
-    )
-    .expect("binary mode");
+    .expect("initial current release");
 
     let stop = Arc::new(AtomicBool::new(false));
     let serve_stop = Arc::clone(&stop);
@@ -347,6 +328,42 @@ fn authenticated_reload_command_hands_off_and_retires_the_source() {
         fs::read_link(release_root.join("current")).expect("selected release link"),
         Path::new("releases").join(&manifest_digest)
     );
+    assert_eq!(
+        fs::read_link(release_root.join("previous")).expect("retained release link"),
+        Path::new("releases").join(&previous_digest)
+    );
+    let rollback = Command::new(env!("CARGO_BIN_EXE_automonique"))
+        .arg("rollback")
+        .env("XDG_RUNTIME_DIR", &config.runtime_root)
+        .env("XDG_STATE_HOME", &config.state_root)
+        .output()
+        .expect("rollback command");
+    assert!(
+        rollback.status.success(),
+        "rollback command failed: {}",
+        String::from_utf8_lossy(&rollback.stderr)
+    );
+    assert!(
+        String::from_utf8(rollback.stdout)
+            .expect("rollback output UTF-8")
+            .starts_with("rollback rollback-2-")
+    );
+    assert_eq!(
+        fs::read_link(release_root.join("current")).expect("rolled back release link"),
+        Path::new("releases").join(&previous_digest)
+    );
+    let repeated = Command::new(env!("CARGO_BIN_EXE_automonique"))
+        .arg("rollback")
+        .env("XDG_RUNTIME_DIR", &config.runtime_root)
+        .env("XDG_STATE_HOME", &config.state_root)
+        .output()
+        .expect("repeated rollback command");
+    assert!(!repeated.status.success());
+    assert_eq!(
+        String::from_utf8(repeated.stderr).expect("refusal UTF-8"),
+        "automonique rollback refused: rollback_unavailable\n"
+    );
+
     let status = Command::new(env!("CARGO_BIN_EXE_automonique"))
         .args(["status", "--json"])
         .env("XDG_RUNTIME_DIR", &config.runtime_root)
@@ -428,6 +445,36 @@ fn unix_millis() -> i64 {
 fn private_directory(path: &Path) {
     fs::create_dir_all(path).expect("private directory");
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("private mode");
+}
+
+fn install_code_release(root: &Path, executable: &[u8], source: char) -> String {
+    let binary_sha256 = hex(&Sha256::digest(executable));
+    let manifest = serde_json::json!({
+        "schema": "automonique.code-release/v1",
+        "source_sha": source.to_string().repeat(40),
+        "plan_digest": format!("sha256:{}", source.to_string().repeat(64)),
+        "binary_path": "bin/automonique",
+        "binary_sha256": binary_sha256,
+        "changed_paths": ["rust/crates/automonique-cli/src/lib.rs"]
+    });
+    let manifest = serde_json::to_vec(&manifest).expect("manifest");
+    let manifest_digest = hex(&Sha256::digest(&manifest));
+    let release_dir = root.join("releases").join(&manifest_digest);
+    private_directory(&release_dir);
+    private_directory(&release_dir.join("bin"));
+    fs::write(release_dir.join("manifest.json"), manifest).expect("manifest file");
+    fs::write(release_dir.join("bin/automonique"), executable).expect("binary file");
+    fs::set_permissions(
+        release_dir.join("manifest.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("manifest mode");
+    fs::set_permissions(
+        release_dir.join("bin/automonique"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .expect("binary mode");
+    manifest_digest
 }
 
 fn hex(bytes: &[u8]) -> String {

@@ -2627,6 +2627,7 @@ mod command_surface {
                 "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             )
             .expect("a reload request"),
+            AdminRequest::new(id.clone(), AdminCommand::Rollback),
             AdminRequest::reload_status(id.clone(), "reload-1").expect("a reload lookup"),
             AdminRequest::new(id.clone(), AdminCommand::Shutdown),
             AdminRequest::submit(
@@ -2673,6 +2674,7 @@ mod command_surface {
             AdminCommand::Metrics,
             AdminCommand::Generations,
             AdminCommand::Reload,
+            AdminCommand::Rollback,
             AdminCommand::ReloadStatus,
             AdminCommand::SubmitSynthetic,
             AdminCommand::SubmitRun,
@@ -2689,6 +2691,7 @@ mod command_surface {
                 | AdminCommand::Metrics
                 | AdminCommand::Generations
                 | AdminCommand::Reload
+                | AdminCommand::Rollback
                 | AdminCommand::ReloadStatus
                 | AdminCommand::SubmitSynthetic
                 | AdminCommand::SubmitRun
@@ -2865,6 +2868,10 @@ mod command_surface {
                 request_id: id.clone(),
                 reload_id: "reload-1".to_owned(),
             },
+            AdminResponse::RollbackSucceeded {
+                request_id: id.clone(),
+                reload_id: "reload-2".to_owned(),
+            },
             AdminResponse::Refused {
                 request_id: id.clone(),
                 category: AdminRefusalCategory::new("intake_paused").expect("a category"),
@@ -2880,6 +2887,7 @@ mod command_surface {
                 | AdminResponse::Generations { .. }
                 | AdminResponse::ReloadStatus { .. }
                 | AdminResponse::ReloadSucceeded { .. }
+                | AdminResponse::RollbackSucceeded { .. }
                 | AdminResponse::SyntheticAccepted { .. }
                 | AdminResponse::RunAccepted { .. }
                 | AdminResponse::ReconciliationInspected { .. }

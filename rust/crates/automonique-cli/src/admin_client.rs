@@ -44,6 +44,7 @@ pub(crate) enum Operation {
     Metrics,
     Generations,
     Reload(String),
+    Rollback,
     ReloadStatus(String),
     Submit(SyntheticSubmission),
     SubmitRun(SubmittedRunSpec),
@@ -84,6 +85,7 @@ pub(crate) fn request(
         Operation::Metrics => "metrics",
         Operation::Generations => "generations",
         Operation::Reload(_) => "reload",
+        Operation::Rollback => "rollback",
         Operation::ReloadStatus(_) => "reload-status",
         Operation::Submit(_) => "submit",
         Operation::SubmitRun(_) => "run-submit",
@@ -118,6 +120,7 @@ pub(crate) fn request(
             AdminRequest::reload(request_id, target_release_digest)
                 .map_err(|error| ClientError::Protocol(error.category()))?
         }
+        Operation::Rollback => AdminRequest::new(request_id, AdminCommand::Rollback),
         Operation::ReloadStatus(reload_id) => AdminRequest::reload_status(request_id, reload_id)
             .map_err(|error| ClientError::Protocol(error.category()))?,
         Operation::Shutdown => AdminRequest::new(request_id, AdminCommand::Shutdown),
@@ -127,7 +130,10 @@ pub(crate) fn request(
         .to_message()
         .map_err(|error| ClientError::Protocol(error.category()))?
         .to_canonical_bytes();
-    let timeout = if request.command() == AdminCommand::Reload {
+    let timeout = if matches!(
+        request.command(),
+        AdminCommand::Reload | AdminCommand::Rollback
+    ) {
         RELOAD_TIMEOUT
     } else {
         IO_TIMEOUT

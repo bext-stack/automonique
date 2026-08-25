@@ -53,7 +53,7 @@
 //!
 //! # Where the seeded registry comes from
 //!
-//! [`admin_command_registry`] describes the fourteen commands
+//! [`admin_command_registry`] describes the fifteen commands
 //! [`crate::admin::AdminCommand`] actually admits, with the field names those
 //! bodies actually encode and the byte bounds `crate::admin` actually enforces
 //! — imported from that module rather than restated here, so a widened bound
@@ -1325,7 +1325,7 @@ impl CommandRegistry {
 
 /// The registry describing the local administration commands this build ships.
 ///
-/// Fourteen commands, matching [`crate::admin::AdminCommand`]'s variants, with
+/// Fifteen commands, matching [`crate::admin::AdminCommand`]'s variants, with
 /// the field names and byte bounds `crate::admin` actually encodes and
 /// enforces.
 ///
@@ -1344,6 +1344,7 @@ pub fn admin_command_registry() -> Result<CommandRegistry, CommandRegistryError>
         metrics_spec()?,
         generations_spec()?,
         reload_spec()?,
+        rollback_spec()?,
         reload_status_spec()?,
         submit_synthetic_spec()?,
         submit_run_spec()?,
@@ -1467,6 +1468,21 @@ fn reload_spec() -> Result<CommandSpec, CommandRegistryError> {
         approval: ApprovalPolicy::OperatorConfirmation,
         dry_run: DryRun::Unsupported,
         mutation: keyed(Some("target_release_digest"), None)?,
+    })
+}
+
+fn rollback_spec() -> Result<CommandSpec, CommandRegistryError> {
+    CommandSpec::new(CommandSpecParts {
+        id: CommandId::new("rollback")?,
+        aliases: Vec::new(),
+        summary: help("Hand authority back to the retained compatible release.")?,
+        fields: Vec::new(),
+        authorization: AuthorizationRequirement::LocalPeer,
+        approval: ApprovalPolicy::OperatorConfirmation,
+        dry_run: DryRun::Unsupported,
+        mutation: unkeyed(
+            "The protected previous selector fixes the target, and an exact repeat at that target refuses.",
+        )?,
     })
 }
 

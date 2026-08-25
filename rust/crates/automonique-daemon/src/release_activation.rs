@@ -24,6 +24,7 @@ const MANIFEST_SCHEMA: &str = "automonique.code-release/v1";
 const MANIFEST_NAME: &str = "manifest.json";
 const RELEASES_NAME: &str = "releases";
 const CURRENT_NAME: &str = "current";
+const PREVIOUS_NAME: &str = "previous";
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const MAX_MANIFEST_BYTES: u64 = 128 * 1024;
 const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
@@ -101,6 +102,7 @@ pub struct VerifiedCodeRelease {
 pub struct HandoffActivationReceipt {
     root: PathBuf,
     previous_target: Option<PathBuf>,
+    previous_rollback_target: Option<PathBuf>,
     state_dir: PathBuf,
     skill_receipt: Option<crate::skill_runtime::SkillActivationReceipt>,
 }
@@ -109,6 +111,11 @@ impl HandoffActivationReceipt {
     /// Restore both code and skill selectors after a failed generation handoff.
     pub fn rollback(&self) -> Result<(), ReleaseActivationError> {
         restore_link(&self.root, self.previous_target.as_deref())?;
+        restore_named_link(
+            &self.root,
+            PREVIOUS_NAME,
+            self.previous_rollback_target.as_deref(),
+        )?;
         if let Some(receipt) = self.skill_receipt.as_ref() {
             crate::skill_runtime::rollback(&self.state_dir, receipt)
                 .map_err(|_| ReleaseActivationError::RollbackFailed)?;
@@ -132,11 +139,28 @@ impl VerifiedCodeRelease {
     /// The caller owns the live generation handoff and must retain the receipt
     /// until N+1 commits so it can reverse both selectors on rollback.
     pub fn activate_for_handoff(&self) -> Result<HandoffActivationReceipt, ReleaseActivationError> {
+        self.activate_for_generation(true)
+    }
+
+    /// Select this release as a rollback target without rotating the retained
+    /// previous selector back to the release being left.
+    pub fn activate_for_rollback(
+        &self,
+    ) -> Result<HandoffActivationReceipt, ReleaseActivationError> {
+        self.activate_for_generation(false)
+    }
+
+    fn activate_for_generation(
+        &self,
+        retain_current_as_previous: bool,
+    ) -> Result<HandoffActivationReceipt, ReleaseActivationError> {
         if self.kind == ReleaseKind::SkillOnly {
             return Err(ReleaseActivationError::WrongActivator);
         }
         let current = self.activation_root.join(CURRENT_NAME);
         let previous_target = read_current_target(&current)?;
+        let previous_rollback_target =
+            read_current_target(&self.activation_root.join(PREVIOUS_NAME))?;
         let state_dir = self
             .activation_root
             .parent()
@@ -155,7 +179,26 @@ impl VerifiedCodeRelease {
             ReleaseKind::Code => None,
             ReleaseKind::SkillOnly => return Err(ReleaseActivationError::WrongActivator),
         };
+        if retain_current_as_previous
+            && let Err(error) = restore_named_link(
+                &self.activation_root,
+                PREVIOUS_NAME,
+                previous_target.as_deref(),
+            )
+        {
+            if let Some(receipt) = skill_receipt.as_ref() {
+                let _ = crate::skill_runtime::rollback(&state_dir, receipt);
+            }
+            return Err(error);
+        }
         if let Err(error) = install_link(&self.activation_root, &self.release_target, "handoff") {
+            if retain_current_as_previous {
+                let _ = restore_named_link(
+                    &self.activation_root,
+                    PREVIOUS_NAME,
+                    previous_rollback_target.as_deref(),
+                );
+            }
             if let Some(receipt) = skill_receipt.as_ref()
                 && crate::skill_runtime::rollback(&state_dir, receipt).is_err()
             {
@@ -166,6 +209,7 @@ impl VerifiedCodeRelease {
         Ok(HandoffActivationReceipt {
             root: self.activation_root.clone(),
             previous_target,
+            previous_rollback_target,
             state_dir,
             skill_receipt,
         })
@@ -499,25 +543,56 @@ impl<S: ReleaseSupervisor> CodeReleaseActivator<S> {
             binary_path: binary,
         })
     }
+
+    /// Verify and return the retained release eligible for an online rollback.
+    pub fn verify_previous(&self) -> Result<VerifiedCodeRelease, ReleaseActivationError> {
+        let target = read_current_target(&self.root.join(PREVIOUS_NAME))?
+            .ok_or(ReleaseActivationError::StateConflict)?;
+        if read_current_target(&self.root.join(CURRENT_NAME))?.as_ref() == Some(&target) {
+            return Err(ReleaseActivationError::StateConflict);
+        }
+        let digest = target
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or(ReleaseActivationError::UnsafePath("previous target"))?;
+        self.verify(&format!("sha256:{digest}"))
+    }
 }
 
 fn install_link(root: &Path, target: &Path, purpose: &str) -> Result<(), ReleaseActivationError> {
-    let temporary = root.join(format!(".current-{purpose}"));
+    install_named_link(root, CURRENT_NAME, target, purpose)
+}
+
+fn install_named_link(
+    root: &Path,
+    name: &str,
+    target: &Path,
+    purpose: &str,
+) -> Result<(), ReleaseActivationError> {
+    let temporary = root.join(format!(".{name}-{purpose}"));
     match fs::symlink_metadata(&temporary) {
         Ok(_) => return Err(ReleaseActivationError::StateConflict),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(ReleaseActivationError::Io(error)),
     }
     symlink(target, &temporary).map_err(ReleaseActivationError::Io)?;
-    fs::rename(&temporary, root.join(CURRENT_NAME)).map_err(ReleaseActivationError::Io)?;
+    fs::rename(&temporary, root.join(name)).map_err(ReleaseActivationError::Io)?;
     sync_directory(root)
 }
 
 fn restore_link(root: &Path, previous: Option<&Path>) -> Result<(), ReleaseActivationError> {
+    restore_named_link(root, CURRENT_NAME, previous)
+}
+
+fn restore_named_link(
+    root: &Path,
+    name: &str,
+    previous: Option<&Path>,
+) -> Result<(), ReleaseActivationError> {
     match previous {
-        Some(target) => install_link(root, target, "rollback"),
+        Some(target) => install_named_link(root, name, target, "rollback"),
         None => {
-            let current = root.join(CURRENT_NAME);
+            let current = root.join(name);
             if current.exists() || fs::symlink_metadata(&current).is_ok() {
                 fs::remove_file(current).map_err(ReleaseActivationError::Io)?;
                 sync_directory(root)?;
@@ -971,6 +1046,10 @@ mod tests {
             fs::read_link(root.path().join(CURRENT_NAME)).expect("current"),
             candidate_target
         );
+        assert_eq!(
+            fs::read_link(root.path().join(PREVIOUS_NAME)).expect("retained previous"),
+            previous_target
+        );
         assert!(activator.supervisor.calls.is_empty());
 
         receipt.rollback().expect("handoff rollback");
@@ -978,6 +1057,60 @@ mod tests {
             fs::read_link(root.path().join(CURRENT_NAME)).expect("current"),
             previous_target
         );
+        assert!(fs::symlink_metadata(root.path().join(PREVIOUS_NAME)).is_err());
+    }
+
+    #[test]
+    fn online_rollback_uses_retained_release_without_turning_into_a_toggle() {
+        let root = tempfile::tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("private");
+        fs::create_dir(root.path().join(RELEASES_NAME)).expect("releases");
+        fs::set_permissions(
+            root.path().join(RELEASES_NAME),
+            fs::Permissions::from_mode(0o700),
+        )
+        .expect("private");
+        let old = add_release(root.path(), 'a');
+        let new = add_release(root.path(), 'c');
+        let old_target = Path::new(RELEASES_NAME).join(old.trim_start_matches("sha256:"));
+        let new_target = Path::new(RELEASES_NAME).join(new.trim_start_matches("sha256:"));
+        symlink(&old_target, root.path().join(CURRENT_NAME)).expect("current");
+        let activator = CodeReleaseActivator::new(
+            root.path(),
+            "automonique.service",
+            RecordingSupervisor {
+                calls: Vec::new(),
+                readiness: VecDeque::new(),
+            },
+        )
+        .expect("activator");
+
+        activator
+            .verify(&new)
+            .expect("new release")
+            .activate_for_handoff()
+            .expect("new release selected");
+        assert_eq!(
+            fs::read_link(root.path().join(CURRENT_NAME)).expect("current"),
+            new_target
+        );
+        let rollback = activator.verify_previous().expect("retained old release");
+        assert_eq!(rollback.manifest_digest, old);
+        rollback
+            .activate_for_rollback()
+            .expect("old release reselected");
+        assert_eq!(
+            fs::read_link(root.path().join(CURRENT_NAME)).expect("current"),
+            old_target
+        );
+        assert_eq!(
+            fs::read_link(root.path().join(PREVIOUS_NAME)).expect("retained selector"),
+            old_target
+        );
+        assert!(matches!(
+            activator.verify_previous(),
+            Err(ReleaseActivationError::StateConflict)
+        ));
     }
 
     #[test]

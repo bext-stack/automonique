@@ -1472,6 +1472,7 @@ struct ProcessReloadHooks<'a> {
     candidate_active: bool,
     cleanup_transferred: bool,
     activation: Option<release_activation::HandoffActivationReceipt>,
+    rollback_selection: bool,
 }
 
 impl ProcessReloadHooks<'_> {
@@ -1605,9 +1606,12 @@ impl reload::ReloadHooks for ProcessReloadHooks<'_> {
             .retire_after_handoff()
             .map_err(|error| Self::refuse(error.category()))?;
         self.activation = Some(
-            self.release
-                .activate_for_handoff()
-                .map_err(|_| Self::refuse("release_activation_failed"))?,
+            if self.rollback_selection {
+                self.release.activate_for_rollback()
+            } else {
+                self.release.activate_for_handoff()
+            }
+            .map_err(|_| Self::refuse("release_activation_failed"))?,
         );
         self.candidate
             .as_mut()
@@ -2356,6 +2360,15 @@ impl Daemon {
         reload_id: &str,
         release: release_activation::VerifiedCodeRelease,
     ) -> Result<automonique_store::reload_audit::ReloadRecord, reload::ReloadExecutionError> {
+        self.handoff_to_verified_release_with_selection(reload_id, release, false)
+    }
+
+    fn handoff_to_verified_release_with_selection(
+        &mut self,
+        reload_id: &str,
+        release: release_activation::VerifiedCodeRelease,
+        rollback_selection: bool,
+    ) -> Result<automonique_store::reload_audit::ReloadRecord, reload::ReloadExecutionError> {
         let target_generation_id = format!("foreground-{}", &release.source_sha[..12]);
         let target_release_digest = release.manifest_digest.clone();
         let source_holder_id = self.instance_id.as_str().to_owned();
@@ -2376,6 +2389,7 @@ impl Daemon {
             candidate_active: false,
             cleanup_transferred: false,
             activation: None,
+            rollback_selection,
         };
         reload::execute_reload(
             &mut audit,
@@ -3755,6 +3769,52 @@ impl Daemon {
                     Ok(_) => {
                         self.handoff_committed = true;
                         AdminResponse::ReloadSucceeded {
+                            request_id: request.request_id().clone(),
+                            reload_id,
+                        }
+                    }
+                    Err(error) => {
+                        return self.write_refusal(stream, request.request_id(), error.category());
+                    }
+                }
+            }
+            automonique_protocol::admin::AdminCommand::Rollback => {
+                if self.disconnected_recovery || self.handoff_quiesced {
+                    return self.write_refusal(stream, request.request_id(), "handoff_state");
+                }
+                let activator = match release_activation::CodeReleaseActivator::new(
+                    self.state_dir.join("improvement-code"),
+                    "automonique.service",
+                    release_activation::SystemdUserSupervisor,
+                ) {
+                    Ok(activator) => activator,
+                    Err(_) => {
+                        return self.write_refusal(
+                            stream,
+                            request.request_id(),
+                            "rollback_unavailable",
+                        );
+                    }
+                };
+                let release = match activator.verify_previous() {
+                    Ok(release) => release,
+                    Err(_) => {
+                        return self.write_refusal(
+                            stream,
+                            request.request_id(),
+                            "rollback_unavailable",
+                        );
+                    }
+                };
+                let digest_hex = release
+                    .manifest_digest
+                    .strip_prefix("sha256:")
+                    .ok_or(DaemonError::ProtocolRefused("admin_invalid_body"))?;
+                let reload_id = format!("rollback-{}-{}", self.lease_epoch, &digest_hex[..16]);
+                match self.handoff_to_verified_release_with_selection(&reload_id, release, true) {
+                    Ok(_) => {
+                        self.handoff_committed = true;
+                        AdminResponse::RollbackSucceeded {
                             request_id: request.request_id().clone(),
                             reload_id,
                         }

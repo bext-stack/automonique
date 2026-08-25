@@ -101,7 +101,7 @@ fn spec_with(
 // ---------------------------------------------------------------------------
 
 /// How many commands the closed [`AdminCommand`] enum carries.
-const ADMIN_COMMAND_COUNT: usize = 14;
+const ADMIN_COMMAND_COUNT: usize = 15;
 
 /// Every admin command, in the order the enum declares them.
 const EVERY_ADMIN_COMMAND: [AdminCommand; ADMIN_COMMAND_COUNT] = [
@@ -109,6 +109,7 @@ const EVERY_ADMIN_COMMAND: [AdminCommand; ADMIN_COMMAND_COUNT] = [
     AdminCommand::Metrics,
     AdminCommand::Generations,
     AdminCommand::Reload,
+    AdminCommand::Rollback,
     AdminCommand::ReloadStatus,
     AdminCommand::SubmitSynthetic,
     AdminCommand::SubmitRun,
@@ -134,16 +135,17 @@ fn position(command: AdminCommand) -> usize {
         AdminCommand::Metrics => 1,
         AdminCommand::Generations => 2,
         AdminCommand::Reload => 3,
-        AdminCommand::ReloadStatus => 4,
-        AdminCommand::SubmitSynthetic => 5,
-        AdminCommand::SubmitRun => 6,
-        AdminCommand::InspectReconciliation => 7,
-        AdminCommand::FailReconciliation => 8,
-        AdminCommand::InspectOutbox => 9,
-        AdminCommand::ReconcileOutbox => 10,
-        AdminCommand::PauseIntake => 11,
-        AdminCommand::ResumeIntake => 12,
-        AdminCommand::Shutdown => 13,
+        AdminCommand::Rollback => 4,
+        AdminCommand::ReloadStatus => 5,
+        AdminCommand::SubmitSynthetic => 6,
+        AdminCommand::SubmitRun => 7,
+        AdminCommand::InspectReconciliation => 8,
+        AdminCommand::FailReconciliation => 9,
+        AdminCommand::InspectOutbox => 10,
+        AdminCommand::ReconcileOutbox => 11,
+        AdminCommand::PauseIntake => 12,
+        AdminCommand::ResumeIntake => 13,
+        AdminCommand::Shutdown => 14,
     }
 }
 
@@ -167,6 +169,9 @@ fn representative_requests(command: AdminCommand) -> Vec<AdminRequest> {
             )
             .expect("a valid release digest"),
         ],
+        AdminCommand::Rollback => {
+            vec![AdminRequest::new(request_id(), AdminCommand::Rollback)]
+        }
         AdminCommand::ReloadStatus => vec![
             AdminRequest::reload_status(request_id(), "reload-1").expect("a valid reload lookup"),
         ],
@@ -373,7 +378,7 @@ mod anti_drift {
         );
     }
 
-    /// The three disciplines partition the fourteen commands, and the partition is
+    /// The three disciplines partition the fifteen commands, and the partition is
     /// stated rather than derived, so reclassifying a command — describing a
     /// write as a read, or dropping a retry key — fails here.
     #[test]
@@ -413,7 +418,7 @@ mod anti_drift {
         );
         assert_eq!(
             named(|mutation| matches!(mutation, MutationDiscipline::Unkeyed { .. })),
-            ["pause_intake", "resume_intake", "shutdown"],
+            ["pause_intake", "resume_intake", "rollback", "shutdown"],
             "the set of commands exempt from the retry discipline changed"
         );
         assert_eq!(
@@ -457,6 +462,7 @@ mod seeded_registry {
                 "pause_intake",
                 "reconcile_outbox",
                 "reload",
+                "rollback",
                 "reload_status",
                 "resume_intake",
                 "shutdown",
@@ -535,6 +541,7 @@ mod seeded_registry {
                 "pause_intake",
                 "reconcile_outbox",
                 "reload",
+                "rollback",
                 "shutdown"
             ]
         );
