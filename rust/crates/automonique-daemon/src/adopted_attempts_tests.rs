@@ -354,13 +354,13 @@ impl ScriptedSource {
             SourceAnswer::Silent => None,
             SourceAnswer::ForeignIdentity => Some(format!(
                 "{{\"schema\":\"automonique.attempt-adoption/v1\",\"holder_id\":\"someone-else\",\
-                 \"lease_epoch\":{},\"answer\":\"inventory\",\"attempt_ids\":[]}}\n",
+                 \"lease_epoch\":{},\"answer\":{{\"answer\":\"inventory\",\"attempt_ids\":[]}}}}\n",
                 route.lease_epoch
             )),
             SourceAnswer::Refused => Some(format!(
                 "{{\"schema\":\"automonique.attempt-adoption/v1\",\"holder_id\":\"{}\",\
-                 \"lease_epoch\":{},\"answer\":\"refused\",\
-                 \"category\":\"attempt_adoption_host_unavailable\"}}\n",
+                 \"lease_epoch\":{},\"answer\":{{\"answer\":\"refused\",\
+                 \"category\":\"attempt_adoption_host_unavailable\"}}}}\n",
                 route.holder_id, route.lease_epoch
             )),
         };

@@ -311,7 +311,7 @@ fn only_an_absent_or_refused_socket_proves_the_route_gone() {
         stream
             .write_all(
                 b"{\"schema\":\"automonique.attempt-adoption/v1\",\"holder_id\":\"someone-else\",\
-                  \"lease_epoch\":7,\"answer\":\"inventory\",\"attempt_ids\":[]}\n",
+                  \"lease_epoch\":7,\"answer\":{\"answer\":\"inventory\",\"attempt_ids\":[]}}\n",
             )
             .expect("foreign answer");
     });
@@ -336,8 +336,8 @@ fn only_an_absent_or_refused_socket_proves_the_route_gone() {
         stream
             .write_all(
                 b"{\"schema\":\"automonique.attempt-adoption/v1\",\"holder_id\":\"daemon-source\",\
-                  \"lease_epoch\":7,\"answer\":\"refused\",\
-                  \"category\":\"attempt_adoption_host_unavailable\"}\n",
+                  \"lease_epoch\":7,\"answer\":{\"answer\":\"refused\",\
+                  \"category\":\"attempt_adoption_host_unavailable\"}}\n",
             )
             .expect("refusal");
     });
