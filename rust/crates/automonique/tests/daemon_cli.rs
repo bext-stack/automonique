@@ -351,9 +351,14 @@ fn the_product_binary_serves_status_and_shutdown_end_to_end() {
         "{human}"
     );
     // The durable-state block follows the operational metrics: a fresh daemon
-    // under its first generation has one open tenure at epoch 1 and no runs.
+    // under its first generation has one open tenure at epoch 1, no runs, and
+    // its automation scheduler worker on its thread.
     assert!(human.contains("runs registered: 0\n"), "{human}");
-    assert!(human.ends_with("open tenure epoch: 1\n"), "{human}");
+    assert!(human.contains("open tenure epoch: 1\n"), "{human}");
+    assert!(
+        human.ends_with("automation scheduler workers: 1\n"),
+        "{human}"
+    );
 
     let json = run(&runtime, &state, &["status", "--json"]);
     assert!(json.status.success());
@@ -381,6 +386,24 @@ fn the_product_binary_serves_status_and_shutdown_end_to_end() {
         value["event_cursor"]
             .as_u64()
             .is_some_and(|cursor| cursor >= 1)
+    );
+    assert_eq!(
+        value["durable_state"]["automation_scheduler_workers"],
+        serde_json::json!({"state": "measured", "value": 1})
+    );
+
+    // The `automation:` key namespace is the scheduler's; the product binary
+    // refuses it by name before it dials, and nothing reaches the lane.
+    let reserved = run_with_stdin(
+        &runtime,
+        &state,
+        &["submit", "workspace:test", "automation:cli:1"],
+        b"synthetic local task",
+    );
+    assert_eq!(reserved.status.code(), Some(2));
+    assert_eq!(
+        reserved.stderr,
+        b"automonique submit refused: idempotency_key_reserved\n"
     );
 
     let accepted = run_with_stdin(

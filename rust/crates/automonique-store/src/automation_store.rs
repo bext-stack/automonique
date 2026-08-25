@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Durable registry of which automations are in service, and who withdrew the
-//! ones that are not.
+//! Durable registry of automation jobs: which are in service, who withdrew the
+//! ones that are not, and where each one's occurrences have got to.
 //!
 //! `automonique_protocol::automation` models an automation as an immutable
 //! `AutomationRevision`: a schedule, a set of pre-approved effects, an overlap
@@ -11,47 +11,78 @@
 //! because a withdrawal with no stated cause is the one an operator cannot
 //! safely resume from.
 //!
-//! Those are values in memory. Nothing in this product wrote them down. Restart
-//! the daemon and every pause an operator entered is gone, which makes a pause
-//! a suggestion rather than a decision. This module is the durable half. One row
-//! per automation:
+//! Those are values in memory. This module is the durable half. One row per
+//! automation:
 //!
 //! ```text
-//! automation_id -> (revision, enablement, actor, cause, created_at_ms, updated_at_ms)
+//! automation_id -> (revision, enablement, actor, cause, created_at_ms, updated_at_ms,
+//!                   schedule, scope, prompt,
+//!                   next_fire_at_ms, last_fired_at_ms, active_occurrence_ms)
 //! ```
 //!
-//! There is no scheduling here, no clock, and no protocol dependency. Callers
-//! supply every identifier and timestamp, so restarts stay deterministic and
-//! tests do not depend on an ambient clock.
+//! There is no clock here and no protocol dependency. Callers supply every
+//! identifier, timestamp and occurrence instant, so restarts stay
+//! deterministic and tests do not depend on an ambient clock. The daemon's
+//! scheduler worker is the one caller that supplies instants it derived from a
+//! schedule; this module records where that worker has got to and never
+//! decides what is due on its own.
 //!
 //! # What a row is, and what it is not
 //!
-//! **A row records an operator's decision about whether an automation is in
-//! service.** That is the whole of it.
+//! **A row records an operator's decision about whether an automation job is
+//! in service, the job itself, and the occurrence bookkeeping the scheduler
+//! worker keeps on it.** Three things it is not:
 //!
-//! - **It does not schedule.** Nothing here evaluates a `CanonicalSchedule`,
-//!   computes a next occurrence, or holds a timer. An `enabled` row means
-//!   somebody said this automation may fire, not that anything will fire it.
-//! - **It does not evaluate a trigger or fire an action.** `TriggerSpec`,
-//!   `FilterExpression` and `AutomationAction` live in the protocol crate and
-//!   are not stored here at all; the executor that would consume them does not
-//!   exist in this release. A `paused` row therefore suppresses nothing today,
-//!   because there is nothing running to suppress. It is written now so that the
-//!   scheduler, when it lands, reads its enablement out of a durable record
-//!   rather than inventing one.
+//! - **It does not evaluate a schedule.** The schedule is typed columns —
+//!   a one-shot instant or a fixed interval — and `next_fire_at_ms` is the
+//!   instant the worker last wrote, not one this module computed. [`AutomationStore::due`]
+//!   compares that column with the `now` a caller hands in; the arithmetic that
+//!   produced the column lives in the protocol crate, so the store and the
+//!   daemon cannot disagree about it.
+//! - **It does not fire anything.** The occurrence verbs below record that the
+//!   worker admitted, started or settled an occurrence; the run itself is a
+//!   normal item on the daemon's durable synthetic lane, keyed by the same
+//!   instant, and its outcome is that lane's.
 //! - **It does not verify the actor.** [`AutomationRegistration::actor`] and
 //!   [`EnablementTransition::actor`] are recorded exactly as supplied. This
 //!   module cannot tell an operator from a runbook from a typo; authenticating
 //!   the peer is the daemon's `SO_PEERCRED` check, and the protocol's
 //!   `AutomationActor` says the same of itself — it names who asked, and is not
 //!   a capability.
-//! - **It does not store the automation.** The schedule, the approved-effect
-//!   scope, the trigger, the action and the overlap policy are not columns here.
-//!   Persisting the protocol's whole type graph would mean persisting a
-//!   canonical rendering this module cannot re-validate without depending on the
-//!   crate that defines it. What is durable is the spine an operator acts on:
-//!   identity, revision, enablement, and attribution. An approved-effect scope
-//!   recorded here would be an authority claim nothing checks, so there is none.
+//!
+//! The trigger, the action, the overlap policy and the approved-effect scope
+//! of the protocol's rich model are still not columns here. An approved-effect
+//! scope recorded here would be an authority claim nothing checks, so there is
+//! none; the overlap policy is fixed rather than stored — one occurrence per
+//! automation is active at a time, which `active_occurrence_ms` is.
+//!
+//! # The occurrence bookkeeping
+//!
+//! Three instants per scheduled row, all caller-supplied:
+//!
+//! - `next_fire_at_ms` — the instant the next occurrence is due, written at
+//!   registration (the schedule's first occurrence) and advanced by
+//!   [`AutomationStore::advance_after_start`]. `NULL` once a one-shot has
+//!   started: nothing further is due.
+//! - `active_occurrence_ms` — the instant of the occurrence the worker has
+//!   admitted to the scheduler core and not yet settled. At most one, which is
+//!   the overlap policy. Set by [`AutomationStore::admit_occurrence`] and
+//!   cleared by [`AutomationStore::settle_occurrence`].
+//! - `last_fired_at_ms` — the scheduled instant of the last occurrence that
+//!   was submitted as a run, written when it is settled as fired.
+//!
+//! Every occurrence verb is a compare-and-set on the instant the caller names,
+//! refused as [`AutomationStoreError::OccurrenceMismatch`] when the row is not
+//! where the caller believed. That is what makes the worker's recovery after a
+//! crash safe to replay: a verb that already took effect is a no-op or a
+//! mismatch, never a second effect. An occurrence settled as fired must have
+//! had its `next_fire_at_ms` advanced first, and the store refuses to settle
+//! one that was not: an instant that stayed due after firing would fire again.
+//!
+//! A row registered before jobs existed — schema version one — carries no job
+//! at all. It is read, listed and transitioned exactly as before, and it is
+//! never due. The job columns are `NULL` together for exactly those rows; a row
+//! with half a job is corruption, checked on every read.
 //!
 //! # The enablement lattice
 //!
@@ -162,8 +193,15 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 
 use crate::{StoreError, validate_database_path};
 
-/// The only automation registry schema this build can read and write.
-pub const AUTOMATION_STORE_SCHEMA_VERSION: u32 = 1;
+/// The automation registry schema this build writes.
+///
+/// Version one — identity, revision, enablement and attribution — is read and
+/// migrated forward in place on open: the job columns are added, nullable, and
+/// every existing row keeps reading exactly as it did with no job.
+pub const AUTOMATION_STORE_SCHEMA_VERSION: u32 = 2;
+
+/// The schema this build migrates forward from.
+const AUTOMATION_STORE_SCHEMA_V1: u32 = 1;
 
 /// Largest number of automations any registry will hold.
 ///
@@ -182,21 +220,31 @@ pub const MAX_AUTOMATIONS: usize = 65_536;
 pub const MAX_IDENTIFIER_BYTES: usize = 256;
 
 /// Largest page [`AutomationStore::page`] and
-/// [`AutomationStore::page_in_states`] will return.
+/// [`AutomationStore::page_in_states`] will return, and the largest batch
+/// [`AutomationStore::due`] and [`AutomationStore::active_occurrences`] serve.
 pub const MAX_AUTOMATION_PAGE: usize = 512;
 
-/// Schema v1.
+/// Longest accepted prompt, in bytes.
+///
+/// The daemon's durable synthetic lane admits a task of at most this many
+/// bytes, non-empty and free of NUL, and an occurrence submits the prompt as
+/// exactly that task. A prompt this module stores is one that lane accepts.
+pub const MAX_PROMPT_BYTES: usize = 8 * 1024;
+
+/// Schema v2, as a fresh registry is created.
 ///
 /// The invariants a second writer must not be able to break are database
 /// constraints: one row per `automation_id`, a positive revision, the closed
-/// three-word enablement vocabulary, non-negative timestamps, and the coupling
-/// between `enabled` and an absent cause.
+/// three-word enablement vocabulary, non-negative timestamps, the coupling
+/// between `enabled` and an absent cause, the closed two-word schedule
+/// vocabulary, and the coupling between a schedule and the columns that belong
+/// to it.
 ///
-/// The identifier grammar, the length bound, the transition lattice and the
+/// The identifier grammar, the length bounds, the transition lattice and the
 /// agreement between a withdrawn state and a revision above one are deliberately
 /// *not* database constraints: they are enforced on write and re-checked on
 /// every read, so a row written around this API is refused rather than believed.
-const SCHEMA_V1: &str = r#"
+const SCHEMA_V2: &str = r#"
 CREATE TABLE automations (
     entry_id INTEGER PRIMARY KEY,
     automation_id TEXT NOT NULL UNIQUE,
@@ -208,10 +256,69 @@ CREATE TABLE automations (
     cause TEXT,
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
     updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0),
-    CHECK ((enablement = 'enabled') = (cause IS NULL))
+    schedule_kind TEXT CHECK (schedule_kind IN ('once', 'every')),
+    schedule_at_ms INTEGER CHECK (schedule_at_ms >= 0),
+    schedule_interval_ms INTEGER CHECK (schedule_interval_ms >= 1),
+    scope TEXT,
+    prompt TEXT,
+    next_fire_at_ms INTEGER CHECK (next_fire_at_ms >= 0),
+    last_fired_at_ms INTEGER CHECK (last_fired_at_ms >= 0),
+    active_occurrence_ms INTEGER CHECK (active_occurrence_ms >= 0),
+    CHECK ((enablement = 'enabled') = (cause IS NULL)),
+    CHECK ((schedule_kind IS NULL) = (scope IS NULL)),
+    CHECK ((schedule_kind IS NULL) = (prompt IS NULL)),
+    CHECK ((schedule_kind = 'once') = (schedule_at_ms IS NOT NULL)),
+    CHECK ((schedule_kind = 'every') = (schedule_interval_ms IS NOT NULL)),
+    CHECK (
+        schedule_kind IS NOT NULL
+        OR (
+            schedule_at_ms IS NULL
+            AND schedule_interval_ms IS NULL
+            AND next_fire_at_ms IS NULL
+            AND last_fired_at_ms IS NULL
+            AND active_occurrence_ms IS NULL
+        )
+    )
 ) STRICT;
 
 CREATE INDEX automations_by_enablement ON automations(enablement, entry_id);
+CREATE INDEX automations_due
+    ON automations(next_fire_at_ms, entry_id)
+    WHERE next_fire_at_ms IS NOT NULL;
+CREATE INDEX automations_active
+    ON automations(active_occurrence_ms, entry_id)
+    WHERE active_occurrence_ms IS NOT NULL;
+"#;
+
+/// The expand-only step from schema v1 to v2.
+///
+/// Every added column is nullable and every existing row keeps `NULL` in all
+/// of them, which is exactly the shape of a row with no job. The per-column
+/// checks travel with the columns; the cross-column couplings a fresh v2
+/// registry declares as table constraints cannot be added by `ALTER TABLE`,
+/// so on a migrated registry they are held by this module's write path and
+/// re-checked on every read, as the lattice already is on both.
+const MIGRATE_V1_TO_V2: &str = r#"
+ALTER TABLE automations ADD COLUMN schedule_kind TEXT
+    CHECK (schedule_kind IN ('once', 'every'));
+ALTER TABLE automations ADD COLUMN schedule_at_ms INTEGER
+    CHECK (schedule_at_ms >= 0);
+ALTER TABLE automations ADD COLUMN schedule_interval_ms INTEGER
+    CHECK (schedule_interval_ms >= 1);
+ALTER TABLE automations ADD COLUMN scope TEXT;
+ALTER TABLE automations ADD COLUMN prompt TEXT;
+ALTER TABLE automations ADD COLUMN next_fire_at_ms INTEGER
+    CHECK (next_fire_at_ms >= 0);
+ALTER TABLE automations ADD COLUMN last_fired_at_ms INTEGER
+    CHECK (last_fired_at_ms >= 0);
+ALTER TABLE automations ADD COLUMN active_occurrence_ms INTEGER
+    CHECK (active_occurrence_ms >= 0);
+CREATE INDEX automations_due
+    ON automations(next_fire_at_ms, entry_id)
+    WHERE next_fire_at_ms IS NOT NULL;
+CREATE INDEX automations_active
+    ON automations(active_occurrence_ms, entry_id)
+    WHERE active_occurrence_ms IS NOT NULL;
 "#;
 
 /// An automation registry error with stable refusal categories.
@@ -294,6 +401,18 @@ pub enum AutomationStoreError {
         /// Capacity of the handle that refused.
         capacity: usize,
     },
+    /// An occurrence verb was asked of a row that carries no job.
+    ///
+    /// A row registered before jobs existed is never due and admits nothing;
+    /// asking it to is a caller that read the wrong row.
+    Unscheduled,
+    /// The row's occurrence bookkeeping is not where the caller believed.
+    ///
+    /// Every occurrence verb names the instant it is about and is a
+    /// compare-and-set on it. A mismatch says the row moved — another admission
+    /// landed, a settle already cleared it, or the instant was never due — and
+    /// nothing was written.
+    OccurrenceMismatch,
     /// A stored row violates an invariant this API can only have written once.
     Corrupt(&'static str),
     /// Filesystem failure while establishing the private registry.
@@ -318,6 +437,8 @@ impl AutomationStoreError {
             Self::RevisionMismatch { .. } => "revision_mismatch",
             Self::CursorOutOfRange { .. } => "cursor_out_of_range",
             Self::RegistryFull { .. } => "registry_full",
+            Self::Unscheduled => "unscheduled",
+            Self::OccurrenceMismatch => "occurrence_mismatch",
             Self::Corrupt(_) => "corrupt",
             Self::Io(_) => "io",
             Self::Sqlite(_) => "sqlite",
@@ -377,6 +498,10 @@ impl fmt::Display for AutomationStoreError {
                 formatter,
                 "automation registry holds its capacity of {capacity}"
             ),
+            Self::Unscheduled => formatter.write_str("automation carries no job"),
+            Self::OccurrenceMismatch => {
+                formatter.write_str("automation occurrence bookkeeping is not at that instant")
+            }
             Self::Corrupt(invariant) => {
                 write!(formatter, "stored row violates invariant: {invariant}")
             }
@@ -492,7 +617,60 @@ impl fmt::Display for EnablementState {
     }
 }
 
-/// One automation presented for registration.
+/// The two schedule forms this registry stores.
+///
+/// Typed columns rather than the protocol's canonical rendering, because this
+/// module does not depend on the crate that defines the rendering and a string
+/// it could not re-validate would be a row it had to believe. The daemon
+/// projects the protocol's schedule onto this and back.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum AutomationSchedule {
+    /// Once, at an exact instant.
+    Once {
+        /// When, in Unix milliseconds.
+        at_ms: i64,
+    },
+    /// Every fixed interval.
+    Every {
+        /// The interval, in milliseconds. Strictly positive.
+        interval_ms: i64,
+    },
+}
+
+impl AutomationSchedule {
+    /// The stored `schedule_kind` text.
+    #[must_use]
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::Once { .. } => "once",
+            Self::Every { .. } => "every",
+        }
+    }
+
+    fn columns(self) -> (&'static str, Option<i64>, Option<i64>) {
+        match self {
+            Self::Once { at_ms } => (self.kind(), Some(at_ms), None),
+            Self::Every { interval_ms } => (self.kind(), None, Some(interval_ms)),
+        }
+    }
+}
+
+/// The job one registration declares.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AutomationJobSpec<'a> {
+    /// When occurrences fire.
+    pub schedule: AutomationSchedule,
+    /// The scope every occurrence is serialized under. The identifier grammar.
+    pub scope: &'a str,
+    /// The task every occurrence submits. Non-empty, at most
+    /// [`MAX_PROMPT_BYTES`], free of NUL; otherwise free text.
+    pub prompt: &'a str,
+    /// The instant the first occurrence is due, as the caller derived it from
+    /// the schedule. Written as the row's initial `next_fire_at_ms`.
+    pub first_fire_at_ms: i64,
+}
+
+/// One automation job presented for registration.
 ///
 /// The initial enablement is not a field: registration always writes `enabled`
 /// at revision one with no cause, because that is the protocol's
@@ -507,6 +685,8 @@ pub struct AutomationRegistration<'a> {
     pub actor: &'a str,
     /// When it was declared, in caller-supplied milliseconds.
     pub now_ms: i64,
+    /// What fires, when, and under which scope.
+    pub job: AutomationJobSpec<'a>,
 }
 
 /// One requested move along the enablement lattice.
@@ -543,6 +723,24 @@ pub struct AutomationReceipt {
     pub updated_at_ms: i64,
 }
 
+/// The job half of a validated row, and where its occurrences have got to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AutomationJob {
+    /// When occurrences fire.
+    pub schedule: AutomationSchedule,
+    /// The scope every occurrence is serialized under.
+    pub scope: String,
+    /// The task every occurrence submits.
+    pub prompt: String,
+    /// The instant the next occurrence is due, or `None` when nothing further
+    /// is: a one-shot that has started.
+    pub next_fire_at_ms: Option<i64>,
+    /// The scheduled instant of the last occurrence settled as fired.
+    pub last_fired_at_ms: Option<i64>,
+    /// The instant of the occurrence admitted and not yet settled, if any.
+    pub active_occurrence_ms: Option<i64>,
+}
+
 /// Validated `automations` row.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AutomationRecord {
@@ -564,10 +762,16 @@ pub struct AutomationRecord {
     /// When its enablement last changed. Equal to `created_at_ms` at revision
     /// one.
     pub updated_at_ms: i64,
+    /// The job, or `None` for a row registered before jobs existed.
+    pub job: Option<AutomationJob>,
 }
 
 impl AutomationRecord {
     /// Whether the automation is in service.
+    ///
+    /// The enablement half of the question only: a row with no job admits an
+    /// occurrence it will never have, and whether one is *due* is
+    /// [`AutomationStore::due`]'s to answer.
     #[must_use]
     pub const fn admits_occurrence(&self) -> bool {
         self.enablement.admits_occurrence()
@@ -717,6 +921,12 @@ impl AutomationStore {
         validate_identifier(registration.automation_id, "automation_id")?;
         validate_identifier(registration.actor, "actor")?;
         validate_time(registration.now_ms, "now_ms")?;
+        let job = registration.job;
+        validate_schedule(job.schedule)?;
+        validate_identifier(job.scope, "scope")?;
+        validate_prompt(job.prompt)?;
+        validate_time(job.first_fire_at_ms, "first_fire_at_ms")?;
+        let (schedule_kind, schedule_at_ms, schedule_interval_ms) = job.schedule.columns();
 
         let transaction = self
             .connection
@@ -735,13 +945,21 @@ impl AutomationStore {
         }
         transaction.execute(
             "INSERT INTO automations
-             (automation_id, revision, enablement, actor, cause, created_at_ms, updated_at_ms)
-             VALUES (?1, 1, ?2, ?3, NULL, ?4, ?4)",
+             (automation_id, revision, enablement, actor, cause, created_at_ms, updated_at_ms,
+              schedule_kind, schedule_at_ms, schedule_interval_ms, scope, prompt,
+              next_fire_at_ms, last_fired_at_ms, active_occurrence_ms)
+             VALUES (?1, 1, ?2, ?3, NULL, ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL)",
             params![
                 registration.automation_id,
                 EnablementState::Enabled.as_str(),
                 registration.actor,
                 registration.now_ms,
+                schedule_kind,
+                schedule_at_ms,
+                schedule_interval_ms,
+                job.scope,
+                job.prompt,
+                job.first_fire_at_ms,
             ],
         )?;
         let entry_id = transaction.last_insert_rowid();
@@ -972,6 +1190,217 @@ impl AutomationStore {
         count_automations(&self.connection)
     }
 
+    /// The enabled, scheduled rows whose next occurrence is due at `now_ms` and
+    /// which have no occurrence active, oldest instant first.
+    ///
+    /// This is the one question the scheduler worker asks on every tick, and
+    /// it is answered from the caller's clock: the store holds instants and
+    /// compares them, and never reads a clock of its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationStoreError::InvalidField`] for a negative `now_ms`
+    /// or a limit outside `1..=MAX_AUTOMATION_PAGE`, and
+    /// [`AutomationStoreError::Corrupt`] for a row this API could not have
+    /// written.
+    pub fn due(&self, now_ms: i64, limit: usize) -> Registered<Vec<AutomationRecord>> {
+        validate_time(now_ms, "now_ms")?;
+        let limit = batch_limit(limit)?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {RECORD_COLUMNS} FROM automations
+             WHERE enablement = 'enabled'
+               AND schedule_kind IS NOT NULL
+               AND active_occurrence_ms IS NULL
+               AND next_fire_at_ms IS NOT NULL
+               AND next_fire_at_ms <= ?1
+             ORDER BY next_fire_at_ms, entry_id LIMIT ?2"
+        ))?;
+        let rows = statement.query_map(params![now_ms, limit], raw_record)?;
+        let mut records = Vec::new();
+        for raw in rows {
+            records.push(validated_record(raw?)?);
+        }
+        Ok(records)
+    }
+
+    /// Every row with an occurrence admitted and not yet settled, whatever its
+    /// enablement, oldest instant first.
+    ///
+    /// The worker reconciles these before it admits anything new: after a
+    /// restart they are the occurrences whose scheduler-core and run-lane state
+    /// has to be read back rather than assumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationStoreError::InvalidField`] for a limit outside
+    /// `1..=MAX_AUTOMATION_PAGE`, and [`AutomationStoreError::Corrupt`] for a
+    /// row this API could not have written.
+    pub fn active_occurrences(&self, limit: usize) -> Registered<Vec<AutomationRecord>> {
+        let limit = batch_limit(limit)?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {RECORD_COLUMNS} FROM automations
+             WHERE active_occurrence_ms IS NOT NULL
+             ORDER BY active_occurrence_ms, entry_id LIMIT ?1"
+        ))?;
+        let rows = statement.query_map(params![limit], raw_record)?;
+        let mut records = Vec::new();
+        for raw in rows {
+            records.push(validated_record(raw?)?);
+        }
+        Ok(records)
+    }
+
+    /// Record that the occurrence due at `occurrence_ms` was admitted to the
+    /// scheduler core.
+    ///
+    /// A compare-and-set: the row must be enabled, carry no active occurrence,
+    /// and have exactly this instant as its next. Anything else is
+    /// [`AutomationStoreError::OccurrenceMismatch`] and writes nothing, which
+    /// is what lets a worker replaying a crashed tick call this again without
+    /// admitting a second occurrence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationStoreError::InvalidField`] for a malformed field,
+    /// [`AutomationStoreError::NotFound`] for an unregistered automation,
+    /// [`AutomationStoreError::Unscheduled`] for a row with no job, and
+    /// [`AutomationStoreError::OccurrenceMismatch`] when the row is not at that
+    /// instant.
+    pub fn admit_occurrence(&mut self, automation_id: &str, occurrence_ms: i64) -> Registered<()> {
+        validate_identifier(automation_id, "automation_id")?;
+        validate_time(occurrence_ms, "occurrence_ms")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record = read_by_id(&transaction, automation_id)?
+            .ok_or(AutomationStoreError::NotFound("automation"))?;
+        let job = record.job.ok_or(AutomationStoreError::Unscheduled)?;
+        if !record.enablement.admits_occurrence()
+            || job.active_occurrence_ms.is_some()
+            || job.next_fire_at_ms != Some(occurrence_ms)
+        {
+            return Err(AutomationStoreError::OccurrenceMismatch);
+        }
+        let changed = transaction.execute(
+            "UPDATE automations SET active_occurrence_ms = ?2
+             WHERE entry_id = ?1 AND enablement = 'enabled'
+               AND active_occurrence_ms IS NULL AND next_fire_at_ms = ?2",
+            params![record.entry_id, occurrence_ms],
+        )?;
+        if changed != 1 {
+            return Err(corrupt("occurrence_admission"));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Advance `next_fire_at_ms` past the active occurrence once it has been
+    /// started, to the successor the caller derived — or to nothing, for a
+    /// one-shot.
+    ///
+    /// Idempotent by shape rather than by value: the advance applies only while
+    /// `next_fire_at_ms` still equals the active instant, so a replay after a
+    /// crash answers `false` and leaves the successor the first call wrote.
+    /// The active occurrence itself is untouched; settling it is
+    /// [`AutomationStore::settle_occurrence`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationStoreError::InvalidField`] for a malformed field,
+    /// [`AutomationStoreError::NotFound`] for an unregistered automation,
+    /// [`AutomationStoreError::Unscheduled`] for a row with no job, and
+    /// [`AutomationStoreError::OccurrenceMismatch`] when that instant is not
+    /// the active occurrence.
+    pub fn advance_after_start(
+        &mut self,
+        automation_id: &str,
+        occurrence_ms: i64,
+        next_fire_at_ms: Option<i64>,
+    ) -> Registered<bool> {
+        validate_identifier(automation_id, "automation_id")?;
+        validate_time(occurrence_ms, "occurrence_ms")?;
+        if let Some(next) = next_fire_at_ms {
+            validate_time(next, "next_fire_at_ms")?;
+            if next <= occurrence_ms {
+                return Err(AutomationStoreError::InvalidField("next_fire_at_ms"));
+            }
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record = read_by_id(&transaction, automation_id)?
+            .ok_or(AutomationStoreError::NotFound("automation"))?;
+        let job = record.job.ok_or(AutomationStoreError::Unscheduled)?;
+        if job.active_occurrence_ms != Some(occurrence_ms) {
+            return Err(AutomationStoreError::OccurrenceMismatch);
+        }
+        if job.next_fire_at_ms != Some(occurrence_ms) {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let changed = transaction.execute(
+            "UPDATE automations SET next_fire_at_ms = ?3
+             WHERE entry_id = ?1 AND active_occurrence_ms = ?2 AND next_fire_at_ms = ?2",
+            params![record.entry_id, occurrence_ms, next_fire_at_ms],
+        )?;
+        if changed != 1 {
+            return Err(corrupt("occurrence_advance"));
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Clear the active occurrence, recording it as the last fired one when it
+    /// was submitted as a run.
+    ///
+    /// A compare-and-set on the active instant. An occurrence settled as fired
+    /// must already have had its `next_fire_at_ms` advanced past it — see
+    /// [`AutomationStore::advance_after_start`] — and the store refuses to
+    /// settle one that was not, because an instant left due after firing would
+    /// be admitted again. One settled as not fired keeps its `next_fire_at_ms`
+    /// as it is: whether that instant is retried or skipped was the caller's
+    /// decision when it advanced or did not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationStoreError::InvalidField`] for a malformed field,
+    /// [`AutomationStoreError::NotFound`] for an unregistered automation,
+    /// [`AutomationStoreError::Unscheduled`] for a row with no job, and
+    /// [`AutomationStoreError::OccurrenceMismatch`] when that instant is not
+    /// the active occurrence or is still the next one due.
+    pub fn settle_occurrence(
+        &mut self,
+        automation_id: &str,
+        occurrence_ms: i64,
+        fired: bool,
+    ) -> Registered<()> {
+        validate_identifier(automation_id, "automation_id")?;
+        validate_time(occurrence_ms, "occurrence_ms")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record = read_by_id(&transaction, automation_id)?
+            .ok_or(AutomationStoreError::NotFound("automation"))?;
+        let job = record.job.ok_or(AutomationStoreError::Unscheduled)?;
+        if job.active_occurrence_ms != Some(occurrence_ms)
+            || (fired && job.next_fire_at_ms == Some(occurrence_ms))
+        {
+            return Err(AutomationStoreError::OccurrenceMismatch);
+        }
+        let changed = transaction.execute(
+            "UPDATE automations
+             SET active_occurrence_ms = NULL,
+                 last_fired_at_ms = CASE WHEN ?3 THEN ?2 ELSE last_fired_at_ms END
+             WHERE entry_id = ?1 AND active_occurrence_ms = ?2",
+            params![record.entry_id, occurrence_ms, fired],
+        )?;
+        if changed != 1 {
+            return Err(corrupt("occurrence_settlement"));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Read one page, optionally restricted to a set of states.
     ///
     /// The page is read inside one transaction together with the bound the
@@ -1073,10 +1502,21 @@ struct RawRecord {
     cause: Option<String>,
     created_at_ms: i64,
     updated_at_ms: i64,
+    schedule_kind: Option<String>,
+    schedule_at_ms: Option<i64>,
+    schedule_interval_ms: Option<i64>,
+    scope: Option<String>,
+    prompt: Option<String>,
+    next_fire_at_ms: Option<i64>,
+    last_fired_at_ms: Option<i64>,
+    active_occurrence_ms: Option<i64>,
 }
 
 const RECORD_COLUMNS: &str = "entry_id, automation_id, revision, enablement, \
-                              actor, cause, created_at_ms, updated_at_ms";
+                              actor, cause, created_at_ms, updated_at_ms, \
+                              schedule_kind, schedule_at_ms, schedule_interval_ms, \
+                              scope, prompt, next_fire_at_ms, last_fired_at_ms, \
+                              active_occurrence_ms";
 
 fn raw_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRecord> {
     Ok(RawRecord {
@@ -1088,6 +1528,14 @@ fn raw_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRecord> {
         cause: row.get(5)?,
         created_at_ms: row.get(6)?,
         updated_at_ms: row.get(7)?,
+        schedule_kind: row.get(8)?,
+        schedule_at_ms: row.get(9)?,
+        schedule_interval_ms: row.get(10)?,
+        scope: row.get(11)?,
+        prompt: row.get(12)?,
+        next_fire_at_ms: row.get(13)?,
+        last_fired_at_ms: row.get(14)?,
+        active_occurrence_ms: row.get(15)?,
     })
 }
 
@@ -1108,6 +1556,7 @@ fn raw_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRecord> {
 fn validated_record(raw: RawRecord) -> Registered<AutomationRecord> {
     let enablement =
         EnablementState::from_spelling(&raw.enablement).ok_or(corrupt("enablement"))?;
+    let job = validated_job(&raw)?;
     let cause = match raw.cause {
         Some(cause) => Some(checked_identifier(cause, "cause")?),
         None => None,
@@ -1131,7 +1580,50 @@ fn validated_record(raw: RawRecord) -> Registered<AutomationRecord> {
         cause,
         created_at_ms: checked_time(raw.created_at_ms, "created_at_ms")?,
         updated_at_ms: checked_time(raw.updated_at_ms, "updated_at_ms")?,
+        job,
     })
+}
+
+/// Re-derive the job half of a row, refusing half a job.
+///
+/// The couplings a fresh registry holds as table constraints are re-checked
+/// here for the migrated registry that cannot: the job columns are `NULL`
+/// together or present together, the instant columns belong to a schedule,
+/// and the schedule's own column matches its kind.
+fn validated_job(raw: &RawRecord) -> Registered<Option<AutomationJob>> {
+    let Some(kind) = raw.schedule_kind.as_deref() else {
+        if raw.schedule_at_ms.is_some()
+            || raw.schedule_interval_ms.is_some()
+            || raw.scope.is_some()
+            || raw.prompt.is_some()
+            || raw.next_fire_at_ms.is_some()
+            || raw.last_fired_at_ms.is_some()
+            || raw.active_occurrence_ms.is_some()
+        {
+            return Err(corrupt("job"));
+        }
+        return Ok(None);
+    };
+    let schedule = match (kind, raw.schedule_at_ms, raw.schedule_interval_ms) {
+        ("once", Some(at_ms), None) => AutomationSchedule::Once { at_ms },
+        ("every", None, Some(interval_ms)) => AutomationSchedule::Every { interval_ms },
+        _ => return Err(corrupt("schedule")),
+    };
+    validate_schedule(schedule).map_err(|_| corrupt("schedule"))?;
+    let scope = checked_identifier(raw.scope.clone().ok_or(corrupt("scope"))?, "scope")?;
+    let prompt = raw.prompt.clone().ok_or(corrupt("prompt"))?;
+    validate_prompt(&prompt).map_err(|_| corrupt("prompt"))?;
+    let instant = |value: Option<i64>, field: &'static str| -> Registered<Option<i64>> {
+        value.map(|value| checked_time(value, field)).transpose()
+    };
+    Ok(Some(AutomationJob {
+        schedule,
+        scope,
+        prompt,
+        next_fire_at_ms: instant(raw.next_fire_at_ms, "next_fire_at_ms")?,
+        last_fired_at_ms: instant(raw.last_fired_at_ms, "last_fired_at_ms")?,
+        active_occurrence_ms: instant(raw.active_occurrence_ms, "active_occurrence_ms")?,
+    }))
 }
 
 fn read_by_id(
@@ -1166,6 +1658,16 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Registered<()> 
     if version == AUTOMATION_STORE_SCHEMA_VERSION {
         return Ok(());
     }
+    if version == AUTOMATION_STORE_SCHEMA_V1 {
+        // Expand-only, in one transaction with the version stamp, so a crash
+        // mid-migration leaves a v1 registry that migrates again rather than a
+        // half-widened table nothing can read.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(MIGRATE_V1_TO_V2)?;
+        transaction.pragma_update(None, "user_version", AUTOMATION_STORE_SCHEMA_VERSION)?;
+        transaction.commit()?;
+        return Ok(());
+    }
     if version != 0 {
         return Err(AutomationStoreError::SchemaVersion {
             found: version,
@@ -1184,7 +1686,7 @@ fn initialize_or_validate_schema(connection: &mut Connection) -> Registered<()> 
         });
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(SCHEMA_V1)?;
+    transaction.execute_batch(SCHEMA_V2)?;
     transaction.pragma_update(None, "user_version", AUTOMATION_STORE_SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -1205,6 +1707,32 @@ fn validate_time(value: i64, field: &'static str) -> Registered<()> {
         return Err(AutomationStoreError::InvalidField(field));
     }
     Ok(())
+}
+
+/// The durable synthetic lane's task rule: non-empty, bounded, free of NUL.
+fn validate_prompt(value: &str) -> Registered<()> {
+    if value.is_empty() || value.len() > MAX_PROMPT_BYTES || value.contains('\0') {
+        return Err(AutomationStoreError::InvalidField("prompt"));
+    }
+    Ok(())
+}
+
+fn validate_schedule(schedule: AutomationSchedule) -> Registered<()> {
+    match schedule {
+        AutomationSchedule::Once { at_ms } if at_ms >= 0 => Ok(()),
+        AutomationSchedule::Every { interval_ms } if interval_ms >= 1 => Ok(()),
+        AutomationSchedule::Once { .. } | AutomationSchedule::Every { .. } => {
+            Err(AutomationStoreError::InvalidField("schedule"))
+        }
+    }
+}
+
+/// A due or active batch size, bounded like a page.
+fn batch_limit(limit: usize) -> Registered<i64> {
+    if limit == 0 || limit > MAX_AUTOMATION_PAGE {
+        return Err(AutomationStoreError::InvalidField("limit"));
+    }
+    i64::try_from(limit).map_err(|_| AutomationStoreError::InvalidField("limit"))
 }
 
 fn checked_identifier(value: String, field: &'static str) -> Registered<String> {

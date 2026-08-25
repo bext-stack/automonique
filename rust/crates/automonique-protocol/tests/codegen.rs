@@ -958,6 +958,7 @@ fn encoded_status() -> Message {
     .with_durable_state(
         DurableStateCounts::new(DurableStateCountsParts {
             approvals_recorded: OperationalMetric::Measured(2),
+            automation_scheduler_workers: OperationalMetric::Measured(1),
             automations_registered: OperationalMetric::Measured(1),
             // The epoch is this snapshot's own generation, which is what the
             // status carries above; any other number is refused.
@@ -5213,10 +5214,12 @@ mod automation_surface {
     use automonique_protocol::automation::{AutomationActor, EnablementState};
     use automonique_protocol::automation_api::{
         AUTOMATION_PROTOCOL, AutomationApiError, AutomationContinuation, AutomationCursor,
-        AutomationId, AutomationListPage, AutomationPageSize, AutomationReceiptView,
-        AutomationRecordParts, AutomationRecordView, AutomationRefusal, AutomationRequest,
-        AutomationResponse, AutomationStateFilter, ListAutomations, MAX_AUTOMATION_API_FIELD_BYTES,
-        MAX_AUTOMATION_PAGE_ITEMS, PauseReason, RegisterAutomation, SetEnablement,
+        AutomationId, AutomationListPage, AutomationPageSize, AutomationPrompt,
+        AutomationReceiptView, AutomationRecordParts, AutomationRecordView, AutomationRefusal,
+        AutomationRequest, AutomationResponse, AutomationSchedule, AutomationScope,
+        AutomationStateFilter, ListAutomations, MAX_AUTOMATION_API_FIELD_BYTES,
+        MAX_AUTOMATION_PAGE_ITEMS, MAX_AUTOMATION_PROMPT_BYTES, MAX_AUTOMATION_SCOPE_BYTES,
+        MAX_SCHEDULED_AUTOMATION_ID_BYTES, PauseReason, RegisterAutomation, SetEnablement,
     };
     use automonique_protocol::codec::{MAX_REQUEST_ID_BYTES, MajorVersion};
     use automonique_protocol::codegen::{
@@ -5275,6 +5278,18 @@ mod automation_surface {
         AutomationPageSize::new(items).expect("a page size within the bound")
     }
 
+    fn schedule(rendered: &str) -> AutomationSchedule {
+        AutomationSchedule::from_rendering(rendered).expect("a canonical schedule")
+    }
+
+    fn scope(value: &str) -> AutomationScope {
+        AutomationScope::new(value).expect("a valid scope")
+    }
+
+    fn prompt(value: &str) -> AutomationPrompt {
+        AutomationPrompt::new(value).expect("a valid prompt")
+    }
+
     /// A decimal string, because the wire carries 64-bit values and a JSON
     /// reader that used a double would round the largest of them without saying
     /// so. Every counter in this corpus travels as text for that reason.
@@ -5308,6 +5323,16 @@ mod automation_surface {
         "held: \"maintenance\" \\ withdrawn by ops/oncall — naïve 日本語 🚀".to_owned()
     }
 
+    fn escaping_scope() -> String {
+        "workspace/\"reports\" \\ naïve 日本語 🚀".to_owned()
+    }
+
+    /// A prompt is prose: it carries a newline and a tab, which no identifier
+    /// on this lane may, beside every escape the identifiers reach.
+    fn escaping_prompt() -> String {
+        "Summarize \"last night\":\n\t- naïve 日本語 🚀 \\ done".to_owned()
+    }
+
     /// One row's eight columns, in the shape the fixtures name them.
     ///
     /// A parameter object for the same reason [`AutomationRecordParts`] is one:
@@ -5323,6 +5348,10 @@ mod automation_surface {
         cause: Option<&'a str>,
         created_at_ms: i64,
         updated_at_ms: i64,
+        schedule: Option<&'a str>,
+        scope: Option<&'a str>,
+        next_fire_at_ms: Option<i64>,
+        last_fired_at_ms: Option<i64>,
     }
 
     fn record(row: Row<'_>) -> AutomationRecordView {
@@ -5335,6 +5364,10 @@ mod automation_surface {
             cause: row.cause.map(reason),
             created_at: EpochMillis::from_millis(row.created_at_ms),
             updated_at: EpochMillis::from_millis(row.updated_at_ms),
+            schedule: row.schedule.map(schedule),
+            scope: row.scope.map(scope),
+            next_fire_at: row.next_fire_at_ms.map(EpochMillis::from_millis),
+            last_fired_at: row.last_fired_at_ms.map(EpochMillis::from_millis),
         })
         .expect("a well-formed automation row")
     }
@@ -5354,8 +5387,12 @@ mod automation_surface {
     fn request_cases() -> Vec<RequestCase> {
         let maximal_request_id = format!("req-{}", "a".repeat(MAX_REQUEST_ID_BYTES - 4));
         // Every character escapes to two bytes, which is the worst case the
-        // protocol's own frame arithmetic budgets for.
-        let maximal_automation_id = "\"".repeat(MAX_AUTOMATION_API_FIELD_BYTES);
+        // protocol's own frame arithmetic budgets for. A registration's
+        // identity is bounded by the occurrence key it derives, so its maximum
+        // is the narrower one.
+        let maximal_automation_id = "\"".repeat(MAX_SCHEDULED_AUTOMATION_ID_BYTES);
+        let maximal_scope = "\"".repeat(MAX_AUTOMATION_SCOPE_BYTES);
+        let maximal_prompt = "\"".repeat(MAX_AUTOMATION_PROMPT_BYTES);
 
         vec![
             RequestCase {
@@ -5506,19 +5543,51 @@ mod automation_surface {
             },
             RequestCase {
                 id: "register-automation-maximal",
-                note: "an identity at MAX_AUTOMATION_API_FIELD_BYTES whose every character \
-                       escapes to two bytes, which is the worst case this protocol's frame \
-                       arithmetic budgets for",
+                note: "every job bound at once: an identity at \
+                       MAX_SCHEDULED_AUTOMATION_ID_BYTES, a scope at MAX_AUTOMATION_SCOPE_BYTES \
+                       and a prompt at MAX_AUTOMATION_PROMPT_BYTES, each character of each \
+                       escaping to two bytes, under an interval at the wire's integer ceiling",
                 request: AutomationRequest::RegisterAutomation {
                     request_id: request_id("req-register-1"),
                     registration: RegisterAutomation::new(
                         automation_id(&maximal_automation_id),
                         actor(&escaping_actor()),
-                    ),
+                        schedule(&format!("every@{}", i64::MAX)),
+                        scope(&maximal_scope),
+                        prompt(&maximal_prompt),
+                    )
+                    .expect("a maximal registration"),
                 },
                 params: JsonValue::Object(vec![
                     ("actor".to_owned(), text(&escaping_actor())),
                     ("automation_id".to_owned(), text(&maximal_automation_id)),
+                    ("prompt".to_owned(), text(&maximal_prompt)),
+                    ("schedule".to_owned(), text(&format!("every@{}", i64::MAX))),
+                    ("scope".to_owned(), text(&maximal_scope)),
+                ]),
+            },
+            RequestCase {
+                id: "register-automation-once-escaping",
+                note: "a one-shot at the epoch itself — `once@0`, the one rendering whose \
+                       instant is a single zero — with a prompt carrying a newline and a tab, \
+                       which a prompt may and no identifier on this lane may",
+                request: AutomationRequest::RegisterAutomation {
+                    request_id: request_id("req-register-2"),
+                    registration: RegisterAutomation::new(
+                        automation_id(&escaping_automation_id()),
+                        actor("ops/oncall"),
+                        schedule("once@0"),
+                        scope(&escaping_scope()),
+                        prompt(&escaping_prompt()),
+                    )
+                    .expect("a one-shot registration"),
+                },
+                params: JsonValue::Object(vec![
+                    ("actor".to_owned(), text("ops/oncall")),
+                    ("automation_id".to_owned(), text(&escaping_automation_id())),
+                    ("prompt".to_owned(), text(&escaping_prompt())),
+                    ("schedule".to_owned(), text("once@0")),
+                    ("scope".to_owned(), text(&escaping_scope())),
                 ]),
             },
             RequestCase {
@@ -5634,7 +5703,9 @@ mod automation_surface {
                 id: "automation-list-page-more",
                 note: "a page whose last row and whose continuation cursor are both at the \
                        wire's ceiling, carrying a resumed automation beside a withdrawn one so \
-                       that a null cause and a stated one travel in the same array",
+                       that a null cause and a stated one travel in the same array — and a \
+                       fixed interval with both executions beside a fired one-shot whose next \
+                       instant is null and whose last is at the ceiling",
                 response: listing(
                     "automation-list-page-more",
                     &unfiltered,
@@ -5649,6 +5720,10 @@ mod automation_surface {
                                 cause: None,
                                 created_at_ms: 1_700_000_000_000,
                                 updated_at_ms: 1_700_000_000_500,
+                                schedule: Some("every@60000"),
+                                scope: Some("workspace/reports"),
+                                next_fire_at_ms: Some(1_700_000_120_000),
+                                last_fired_at_ms: Some(1_700_000_060_000),
                             }),
                             record(Row {
                                 entry_id: wire_ceiling() - 1,
@@ -5659,6 +5734,10 @@ mod automation_surface {
                                 cause: Some(&escaping_cause()),
                                 created_at_ms: 0,
                                 updated_at_ms: i64::MAX,
+                                schedule: Some("once@0"),
+                                scope: Some(&escaping_scope()),
+                                next_fire_at_ms: None,
+                                last_fired_at_ms: Some(i64::MAX),
                             }),
                         ],
                         AutomationContinuation::More(AutomationCursor::new(wire_ceiling())),
@@ -5683,7 +5762,9 @@ mod automation_surface {
             },
             ResponseCase {
                 id: "automation-list-page-complete",
-                note: "the end of the registry: `more` false and an explicit null cursor",
+                note: "the end of the registry: `more` false and an explicit null cursor, \
+                       carrying a row registered before jobs existed — every job column null \
+                       together, which is the one shape the nulls may take",
                 response: listing(
                     "automation-list-page-complete",
                     &unfiltered,
@@ -5697,6 +5778,10 @@ mod automation_surface {
                             cause: Some("held for the migration"),
                             created_at_ms: 1_700_000_000_000,
                             updated_at_ms: 1_700_000_009_000,
+                            schedule: None,
+                            scope: None,
+                            next_fire_at_ms: None,
+                            last_fired_at_ms: None,
                         })],
                         AutomationContinuation::Complete,
                     )
@@ -5706,10 +5791,12 @@ mod automation_surface {
             ResponseCase {
                 id: "automation-detail-paused",
                 note: "one automation in full, withdrawn: the actor is whoever withdrew it and \
-                       the cause is why, which is the whole of the history this registry keeps",
-                response: AutomationResponse::AutomationDetail {
-                    request_id: request_id("req-detail-1"),
-                    record: record(Row {
+                       the cause is why, which is the whole of the history this registry keeps. \
+                       The prompt travels here and only here, with every escape a prompt can \
+                       carry",
+                response: AutomationResponse::detail(
+                    request_id("req-detail-1"),
+                    record(Row {
                         entry_id: 4,
                         automation_id: &escaping_automation_id(),
                         revision: 2,
@@ -5718,16 +5805,23 @@ mod automation_surface {
                         cause: Some(&escaping_cause()),
                         created_at_ms: 1_700_000_000_000,
                         updated_at_ms: 1_700_000_001_000,
+                        schedule: Some("every@3600000"),
+                        scope: Some(&escaping_scope()),
+                        next_fire_at_ms: Some(1_700_000_000_000),
+                        last_fired_at_ms: None,
                     }),
-                },
+                    Some(prompt(&escaping_prompt())),
+                )
+                .expect("a coherent detail"),
             },
             ResponseCase {
                 id: "automation-detail-never-paused",
                 note: "a never-paused automation at revision one: the actor is the registrant \
-                       rather than a resumer, and the cause is null",
-                response: AutomationResponse::AutomationDetail {
-                    request_id: request_id("req-detail-2"),
-                    record: record(Row {
+                       rather than a resumer, and the cause is null. Registered before jobs \
+                       existed, so the job columns and the prompt are null together",
+                response: AutomationResponse::detail(
+                    request_id("req-detail-2"),
+                    record(Row {
                         entry_id: 5,
                         automation_id: "auto-fresh",
                         revision: 1,
@@ -5736,8 +5830,14 @@ mod automation_surface {
                         cause: None,
                         created_at_ms: 1_700_000_000_000,
                         updated_at_ms: 1_700_000_000_000,
+                        schedule: None,
+                        scope: None,
+                        next_fire_at_ms: None,
+                        last_fired_at_ms: None,
                     }),
-                },
+                    None,
+                )
+                .expect("a coherent detail"),
             },
             ResponseCase {
                 id: "revision-conflict",
@@ -5784,7 +5884,33 @@ mod automation_surface {
                     ),
                     ("enablement", text(value.enablement().as_str())),
                     ("entry_id", number(value.entry_id())),
+                    (
+                        "last_fired_at_ms",
+                        value.last_fired_at().map_or_else(
+                            || text("null"),
+                            |instant| JsonValue::String(instant.as_millis().to_string()),
+                        ),
+                    ),
+                    (
+                        "next_fire_at_ms",
+                        value.next_fire_at().map_or_else(
+                            || text("null"),
+                            |instant| JsonValue::String(instant.as_millis().to_string()),
+                        ),
+                    ),
                     ("revision", number(value.revision())),
+                    (
+                        "schedule",
+                        value
+                            .schedule()
+                            .map_or_else(|| text("null"), |schedule| text(&schedule.render())),
+                    ),
+                    (
+                        "scope",
+                        value
+                            .scope()
+                            .map_or_else(|| text("null"), |scope| text(scope.as_str())),
+                    ),
                     (
                         "updated_at_ms",
                         JsonValue::String(value.updated_at().as_millis().to_string()),
@@ -5828,8 +5954,14 @@ mod automation_surface {
                     fields.extend(record_fields(&format!("automations.{index}."), carried));
                 }
             }
-            AutomationResponse::AutomationDetail { record, .. } => {
+            AutomationResponse::AutomationDetail { record, prompt, .. } => {
                 fields.extend(record_fields("", record));
+                fields.push((
+                    "prompt".to_owned(),
+                    prompt
+                        .as_ref()
+                        .map_or_else(|| text("null"), |prompt| text(prompt.as_str())),
+                ));
             }
             AutomationResponse::Conflict {
                 expected_revision,
@@ -5871,6 +6003,9 @@ mod automation_surface {
     // -----------------------------------------------------------------------
 
     /// A well-formed record body, as a starting point for one that is not.
+    ///
+    /// Scheduled, so that a job column can be overridden on its own to make a
+    /// body incoherent, and so that the instants have a schedule to belong to.
     fn record_body(overrides: &[(&str, JsonValue)]) -> JsonValue {
         let mut entries: Vec<(String, JsonValue)> = vec![
             ("actor".to_owned(), text("ops/oncall")),
@@ -5882,7 +6017,14 @@ mod automation_surface {
             ),
             ("enablement".to_owned(), text("enabled")),
             ("entry_id".to_owned(), JsonValue::Integer(1)),
+            ("last_fired_at_ms".to_owned(), JsonValue::Null),
+            (
+                "next_fire_at_ms".to_owned(),
+                JsonValue::Integer(1_700_000_060_000),
+            ),
             ("revision".to_owned(), JsonValue::Integer(1)),
+            ("schedule".to_owned(), text("every@60000")),
+            ("scope".to_owned(), text("workspace/reports")),
             (
                 "updated_at_ms".to_owned(),
                 JsonValue::Integer(1_700_000_000_000),
@@ -5895,6 +6037,19 @@ mod automation_surface {
                 .unwrap_or_else(|| panic!("{name} is not a record field"));
             slot.1 = value.clone();
         }
+        JsonValue::Object(entries)
+    }
+
+    /// A detail body: a record body with its prompt member spliced in.
+    fn detail_body(overrides: &[(&str, JsonValue)], prompt: JsonValue) -> JsonValue {
+        let JsonValue::Object(mut entries) = record_body(overrides) else {
+            panic!("a record body is an object")
+        };
+        let position = entries
+            .iter()
+            .position(|(name, _)| name.as_str() > "prompt")
+            .unwrap_or(entries.len());
+        entries.insert(position, ("prompt".to_owned(), prompt));
         JsonValue::Object(entries)
     }
 
@@ -6057,6 +6212,66 @@ mod automation_surface {
                 payload: one_record_page(record_body(&[("actor", text(""))])),
             },
             DecodeRefusal {
+                id: "schedule-not-canonical",
+                note: "a schedule that is prose rather than a canonical rendering: the wire \
+                       carries `once@<ms>` and `every@<ms>` and nothing an operator typed",
+                payload: one_record_page(record_body(&[("schedule", text("daily"))])),
+            },
+            DecodeRefusal {
+                id: "schedule-interval-zero",
+                note: "`every@0` would fire without advancing; the interval is strictly positive \
+                       on both sides of the wire",
+                payload: one_record_page(record_body(&[("schedule", text("every@0"))])),
+            },
+            DecodeRefusal {
+                id: "scope-empty",
+                note: "an empty scope serializes under nothing; the absence of a scope is null, \
+                       and only beside a null schedule",
+                payload: one_record_page(record_body(&[("scope", text(""))])),
+            },
+            DecodeRefusal {
+                id: "next-fire-at-before-epoch",
+                note: "an instant the registry's `next_fire_at_ms >= 0` constraint cannot hold",
+                payload: one_record_page(record_body(&[(
+                    "next_fire_at_ms",
+                    JsonValue::Integer(-1),
+                )])),
+            },
+            DecodeRefusal {
+                id: "last-fired-at-not-an-integer",
+                note: "an execution instant is an integer or a null and nothing else",
+                payload: one_record_page(record_body(&[("last_fired_at_ms", text("never"))])),
+            },
+            DecodeRefusal {
+                id: "detail-prompt-empty",
+                note: "an empty prompt is a job that submits nothing; the absence of a prompt is \
+                       null, and only beside a null schedule",
+                payload: automation_message(
+                    "automation_detail_result",
+                    "req-detail-1",
+                    detail_body(&[], text("")),
+                ),
+            },
+            DecodeRefusal {
+                id: "detail-prompt-not-a-string",
+                note: "the prompt member is a string or a null and nothing else",
+                payload: automation_message(
+                    "automation_detail_result",
+                    "req-detail-1",
+                    detail_body(&[], JsonValue::Integer(5)),
+                ),
+            },
+            DecodeRefusal {
+                id: "detail-without-prompt-member",
+                note: "a detail body is a record plus its prompt; a record on its own is a body \
+                       of the wrong shape, however well-formed the record",
+                payload: automation_message(
+                    "automation_detail_result",
+                    "req-detail-1",
+                    record_body(&[]),
+                ),
+            },
+            DecodeRefusal {
                 id: "page-over-bound",
                 note: "one row past MAX_AUTOMATION_PAGE_ITEMS. The length is judged before any \
                        item is read, so what these items are does not matter and the refusal \
@@ -6119,12 +6334,22 @@ mod automation_surface {
                     ("cause".to_owned(), JsonValue::Null),
                     ("enablement".to_owned(), text("enabled")),
                     ("entry_id".to_owned(), JsonValue::Integer(1)),
+                    ("last_fired_at_ms".to_owned(), JsonValue::Null),
+                    ("next_fire_at_ms".to_owned(), JsonValue::Null),
                     ("revision".to_owned(), JsonValue::Integer(1)),
+                    ("schedule".to_owned(), JsonValue::Null),
+                    ("scope".to_owned(), JsonValue::Null),
                     (
                         "updated_at_ms".to_owned(),
                         JsonValue::Integer(1_700_000_000_000),
                     ),
                 ])),
+            },
+            DecodeRefusal {
+                id: "page-item-carries-a-prompt",
+                note: "the prompt travels on a detail read and never in a listing; a page item \
+                       carrying one is a record of the wrong shape",
+                payload: one_record_page(detail_body(&[], text("summarize"))),
             },
             DecodeRefusal {
                 id: "unknown-kind",
@@ -6286,6 +6511,50 @@ mod automation_surface {
                        and would tell a caller to retry with the revision it already used",
                 payload: automation_message("revision_conflict", "req-set-1", conflict_body(4, 4)),
             },
+            RustOnlyRefusal {
+                id: "record-scope-without-schedule",
+                note: "a scope with no schedule to serialize under: the job columns are null \
+                       together or present together, which relates two fields",
+                payload: one_record_page(record_body(&[
+                    ("schedule", JsonValue::Null),
+                    ("next_fire_at_ms", JsonValue::Null),
+                ])),
+            },
+            RustOnlyRefusal {
+                id: "record-next-fire-without-schedule",
+                note: "an instant something is due at, on a row with nothing scheduled",
+                payload: one_record_page(record_body(&[
+                    ("schedule", JsonValue::Null),
+                    ("scope", JsonValue::Null),
+                ])),
+            },
+            RustOnlyRefusal {
+                id: "detail-prompt-without-job",
+                note: "a prompt on a row registered before jobs existed, which is a task \
+                       nothing will ever fire — the prompt and the job imply each other",
+                payload: automation_message(
+                    "automation_detail_result",
+                    "req-detail-1",
+                    detail_body(
+                        &[
+                            ("schedule", JsonValue::Null),
+                            ("scope", JsonValue::Null),
+                            ("next_fire_at_ms", JsonValue::Null),
+                        ],
+                        text("summarize"),
+                    ),
+                ),
+            },
+            RustOnlyRefusal {
+                id: "detail-job-without-prompt",
+                note: "a scheduled row whose detail carries no prompt: a job that would submit \
+                       nothing, refused by the same coupling the other way round",
+                payload: automation_message(
+                    "automation_detail_result",
+                    "req-detail-1",
+                    detail_body(&[], JsonValue::Null),
+                ),
+            },
         ]
     }
 
@@ -6363,8 +6632,26 @@ mod automation_surface {
         ])
     }
 
+    fn register_params(
+        actor: &str,
+        id: &str,
+        prompt: &str,
+        schedule: &str,
+        scope: &str,
+    ) -> JsonValue {
+        JsonValue::Object(vec![
+            ("actor".to_owned(), text(actor)),
+            ("automation_id".to_owned(), text(id)),
+            ("prompt".to_owned(), text(prompt)),
+            ("schedule".to_owned(), text(schedule)),
+            ("scope".to_owned(), text(scope)),
+        ])
+    }
+
     fn encode_refusals() -> Vec<EncodeRefusal> {
         let long_identifier = "a".repeat(MAX_AUTOMATION_API_FIELD_BYTES + 1);
+        let scheduled_identifier_over_bound = "a".repeat(MAX_SCHEDULED_AUTOMATION_ID_BYTES + 1);
+        let long_prompt = "p".repeat(MAX_AUTOMATION_PROMPT_BYTES + 1);
         let long_request_id = "r".repeat(MAX_REQUEST_ID_BYTES + 1);
 
         let withdrawal_without_cause = |target: EnablementState| {
@@ -6576,36 +6863,155 @@ mod automation_surface {
             },
             EncodeRefusal {
                 id: "register-automation-id-over-bound",
-                note: "one byte over the identity bound",
+                note: "one byte over the identity bound, which the registry grammar itself \
+                       refuses before the narrower scheduled bound is reached",
                 kind: "register_automation",
                 request_id: "req-register-1".to_owned(),
-                params: JsonValue::Object(vec![
-                    ("actor".to_owned(), text("ops/oncall")),
-                    ("automation_id".to_owned(), text(&long_identifier)),
-                ]),
+                params: register_params(
+                    "ops/oncall",
+                    &long_identifier,
+                    "summarize",
+                    "every@60000",
+                    "workspace/reports",
+                ),
                 category: AutomationId::new(&long_identifier)
                     .expect_err("an overlong identity is refused")
                     .category()
                     .to_owned(),
-                constructor: Some(("AutomationId", "automation_id", "too_long")),
+                constructor: Some(("ScheduledAutomationId", "automation_id", "too_long")),
+            },
+            EncodeRefusal {
+                id: "register-automation-id-over-scheduled-bound",
+                note: "one byte over the scheduled identity bound: an identity the registry \
+                       could hold but whose occurrence key could never fit the durable submit \
+                       lane, refused before a frame is spent rather than registered and never \
+                       fired",
+                kind: "register_automation",
+                request_id: "req-register-1".to_owned(),
+                params: register_params(
+                    "ops/oncall",
+                    &scheduled_identifier_over_bound,
+                    "summarize",
+                    "every@60000",
+                    "workspace/reports",
+                ),
+                category: RegisterAutomation::new(
+                    automation_id(&scheduled_identifier_over_bound),
+                    actor("ops/oncall"),
+                    schedule("every@60000"),
+                    scope("workspace/reports"),
+                    prompt("summarize"),
+                )
+                .expect_err("an identity too long to derive a key from is refused")
+                .category()
+                .to_owned(),
+                constructor: Some(("ScheduledAutomationId", "automation_id", "too_long")),
             },
             EncodeRefusal {
                 id: "register-actor-control-character",
                 note: "a control character in an actor, which the wire never carries raw",
                 kind: "register_automation",
                 request_id: "req-register-1".to_owned(),
-                params: JsonValue::Object(vec![
-                    ("actor".to_owned(), text("ops\u{7}oncall")),
-                    ("automation_id".to_owned(), text("auto-nightly")),
-                ]),
+                params: register_params(
+                    "ops\u{7}oncall",
+                    "auto-nightly",
+                    "summarize",
+                    "every@60000",
+                    "workspace/reports",
+                ),
                 category: wire_category(
                     "register_automation",
-                    JsonValue::Object(vec![
-                        ("actor".to_owned(), text("ops\u{7}oncall")),
-                        ("automation_id".to_owned(), text("auto-nightly")),
-                    ]),
+                    register_params(
+                        "ops\u{7}oncall",
+                        "auto-nightly",
+                        "summarize",
+                        "every@60000",
+                        "workspace/reports",
+                    ),
                 ),
                 constructor: Some(("AutomationActor", "actor", "invalid_character")),
+            },
+            EncodeRefusal {
+                id: "register-prompt-empty",
+                note: "an empty prompt is a job that submits nothing",
+                kind: "register_automation",
+                request_id: "req-register-1".to_owned(),
+                params: register_params(
+                    "ops/oncall",
+                    "auto-nightly",
+                    "",
+                    "every@60000",
+                    "workspace/reports",
+                ),
+                category: AutomationPrompt::new("")
+                    .expect_err("an empty prompt is refused")
+                    .category()
+                    .to_owned(),
+                constructor: Some(("AutomationPrompt", "prompt", "empty")),
+            },
+            EncodeRefusal {
+                id: "register-prompt-over-bound",
+                note: "one byte over the prompt bound, which is the durable submit lane's task \
+                       bound",
+                kind: "register_automation",
+                request_id: "req-register-1".to_owned(),
+                params: register_params(
+                    "ops/oncall",
+                    "auto-nightly",
+                    &long_prompt,
+                    "every@60000",
+                    "workspace/reports",
+                ),
+                category: AutomationPrompt::new(&long_prompt)
+                    .expect_err("an overlong prompt is refused")
+                    .category()
+                    .to_owned(),
+                constructor: Some(("AutomationPrompt", "prompt", "too_long")),
+            },
+            EncodeRefusal {
+                id: "register-scope-control-character",
+                note: "a scope is an identifier, not prose: the newline a prompt may carry is \
+                       outside a scope's grammar",
+                kind: "register_automation",
+                request_id: "req-register-1".to_owned(),
+                params: register_params(
+                    "ops/oncall",
+                    "auto-nightly",
+                    "summarize",
+                    "every@60000",
+                    "workspace\nreports",
+                ),
+                category: AutomationScope::new("workspace\nreports")
+                    .expect_err("a control-bearing scope is refused")
+                    .category()
+                    .to_owned(),
+                constructor: Some(("AutomationScope", "scope", "invalid_character")),
+            },
+            EncodeRefusal {
+                id: "register-schedule-prose",
+                note: "a schedule that is prose rather than a canonical rendering, stopped where \
+                       an untyped caller reaches the builder: what an operator typed is parsed \
+                       into a rendering before it reaches the wire, never carried as typed",
+                kind: "register_automation",
+                request_id: "req-register-1".to_owned(),
+                params: register_params(
+                    "ops/oncall",
+                    "auto-nightly",
+                    "summarize",
+                    "every day at nine",
+                    "workspace/reports",
+                ),
+                category: wire_category(
+                    "register_automation",
+                    register_params(
+                        "ops/oncall",
+                        "auto-nightly",
+                        "summarize",
+                        "every day at nine",
+                        "workspace/reports",
+                    ),
+                ),
+                constructor: Some(("AutomationSchedule", "schedule", "invalid_character")),
             },
             EncodeRefusal {
                 id: "automation-detail-id-empty",
@@ -6631,7 +7037,7 @@ mod automation_surface {
             },
             EncodeRefusal {
                 id: "list-automations-page-size-above-bound",
-                note: "one past MAX_AUTOMATION_PAGE_ITEMS, which is thirty-two here and \
+                note: "one past MAX_AUTOMATION_PAGE_ITEMS, which is twenty-four here and \
                        sixty-four on the Runs lane: a page bound follows the frame arithmetic of \
                        the rows it carries",
                 kind: "list_automations",
@@ -6860,7 +7266,14 @@ mod automation_surface {
         let requests = vec![
             AutomationRequest::RegisterAutomation {
                 request_id: id.clone(),
-                registration: RegisterAutomation::new(automation_id("auto-1"), actor("ops/oncall")),
+                registration: RegisterAutomation::new(
+                    automation_id("auto-1"),
+                    actor("ops/oncall"),
+                    schedule("every@60000"),
+                    scope("workspace/reports"),
+                    prompt("summarize"),
+                )
+                .expect("a registration"),
             },
             AutomationRequest::SetEnablement {
                 request_id: id.clone(),
@@ -6966,7 +7379,12 @@ mod automation_surface {
                     cause: None,
                     created_at_ms: 0,
                     updated_at_ms: 0,
+                    schedule: None,
+                    scope: None,
+                    next_fire_at_ms: None,
+                    last_fired_at_ms: None,
                 }),
+                prompt: None,
             },
             AutomationResponse::conflict(id.clone(), 1, 2).expect("a conflict"),
             AutomationResponse::Refused {
@@ -7156,8 +7574,17 @@ mod automation_surface {
                 automonique_protocol::automation_api::MAX_AUTOMATION_CANONICAL_BYTES
             ),
             format!("export const AutomationId_MAX_BYTES = {MAX_AUTOMATION_API_FIELD_BYTES};"),
+            format!(
+                "export const ScheduledAutomationId_MAX_BYTES = {MAX_SCHEDULED_AUTOMATION_ID_BYTES};"
+            ),
             format!("export const AutomationActor_MAX_BYTES = {MAX_AUTOMATION_API_FIELD_BYTES};"),
             format!("export const PauseReason_MAX_BYTES = {MAX_AUTOMATION_API_FIELD_BYTES};"),
+            format!("export const AutomationScope_MAX_BYTES = {MAX_AUTOMATION_SCOPE_BYTES};"),
+            format!("export const AutomationPrompt_MAX_BYTES = {MAX_AUTOMATION_PROMPT_BYTES};"),
+            format!(
+                "export const AutomationSchedule_MAX_BYTES = {};",
+                automonique_protocol::automation_api::MAX_AUTOMATION_SCHEDULE_BYTES
+            ),
             format!("export const AutomationPageSize_MAX = {MAX_AUTOMATION_PAGE_ITEMS}n;"),
             "export const AutomationPageSize_MIN = 1n;".to_owned(),
             "export const AutomationCursor_MIN = 0n;".to_owned(),
@@ -7201,6 +7628,32 @@ mod automation_surface {
             generated.contains("export const AutomationId_PATTERN = /^[^\\p{Cc}]+$/u;"),
             "the automation identity does not carry the control-free grammar the durable \
              registry stores under"
+        );
+        // A prompt is prose: only NUL is outside its grammar.
+        assert!(
+            generated.contains("export const AutomationPrompt_PATTERN = /^[^\\u0000]+$/u;"),
+            "the prompt does not carry the durable submit lane's task grammar"
+        );
+        // The schedule grammar is the two canonical renderings and nothing else.
+        assert!(
+            generated.contains(
+                "export const AutomationSchedule_PATTERN = \
+                 /^(once@(0|[1-9][0-9]{0,18})|every@[1-9][0-9]{0,18})$/u;"
+            ),
+            "the schedule does not carry the canonical once@/every@ grammar"
+        );
+        // And the narrower registration identity is the scheduled bound, not
+        // the registry one, so a builder cannot register what cannot fire.
+        // This check is only worth making while the two bounds differ.
+        const {
+            assert!(MAX_SCHEDULED_AUTOMATION_ID_BYTES < MAX_AUTOMATION_API_FIELD_BYTES);
+        }
+        assert!(
+            generated.contains(&format!(
+                "  if (byteLength(value) > {MAX_SCHEDULED_AUTOMATION_ID_BYTES}) throw new \
+                 ValidationError(\"ScheduledAutomationId\", \"too_long\");"
+            )),
+            "the scheduled identity bound is declared but not applied"
         );
     }
 
@@ -7298,6 +7751,10 @@ mod automation_surface {
                     error: ValueError::Empty,
                 }
                 .category(),
+            ),
+            (
+                "AUTOMATION_INVALID_SCHEDULE",
+                AutomationApiError::InvalidSchedule.category(),
             ),
         ] {
             assert_eq!(

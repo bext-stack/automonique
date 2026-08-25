@@ -37,7 +37,8 @@ use automonique_protocol::approval_api::{
 };
 use automonique_protocol::automation::AutomationActor;
 use automonique_protocol::automation_api::{
-    AutomationId, AutomationRequest, AutomationResponse, RegisterAutomation,
+    AutomationId, AutomationPrompt, AutomationRequest, AutomationResponse, AutomationSchedule,
+    AutomationScope, RegisterAutomation,
 };
 use automonique_protocol::batch_api::{
     AdvanceMember, BatchContinuation, BatchCursor, BatchDetailResult, BatchListPage, BatchPageSize,
@@ -1265,10 +1266,15 @@ fn one_socket_places_each_frame_by_the_protocol_it_declares() {
     assert_eq!(runs(&config, "runs-mixed"), 0);
     let automation = AutomationRequest::RegisterAutomation {
         request_id: RequestId::new("automation-mixed").expect("request ID"),
+        // A job that will not fire during the test: one occurrence a minute.
         registration: RegisterAutomation::new(
             AutomationId::new("nightly-report").expect("automation identity"),
             AutomationActor::new("ben").expect("actor"),
-        ),
+            AutomationSchedule::every(60_000).expect("interval"),
+            AutomationScope::new("workspace:reports").expect("scope"),
+            AutomationPrompt::new("summarize the night").expect("prompt"),
+        )
+        .expect("a registration within its bounds"),
     };
     let payload = automation
         .to_message()

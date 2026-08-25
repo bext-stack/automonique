@@ -395,6 +395,7 @@ mod tests {
         .expect("operational status");
         let durable = DurableStateCounts::new(DurableStateCountsParts {
             approvals_recorded: OperationalMetric::Measured(2),
+            automation_scheduler_workers: OperationalMetric::Measured(1),
             automations_registered: OperationalMetric::Measured(3),
             open_tenure_epoch: OperationalMetric::Measured(7),
             open_tenures: OperationalMetric::Measured(1),

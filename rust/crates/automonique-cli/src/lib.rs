@@ -51,7 +51,7 @@ use std::os::unix::fs::MetadataExt;
 
 const MAX_RUNTIME_PATH_BYTES: usize = 4_096;
 const MAX_RUNTIME_COMPONENTS: usize = 256;
-const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique metrics\n       automonique generations\n       automonique reload <sha256:manifest-digest> [--wait]\n       automonique rollback [--wait]\n       automonique reload-status <reload-id>\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique run submit <idempotency-key> < run-spec.bin\n       automonique runs list [--state <state>]... [--cursor <submission-id>] [--page <size>]\n       automonique runs detail <run-id>\n       automonique runs tail <spool-root> <run-id> [cursor]\n       automonique automation register <automation-id> <actor>\n       automonique automation pause <automation-id> <revision> <actor> <cause>\n       automonique automation resume <automation-id> <revision> <actor>\n       automonique automation archive <automation-id> <revision> <actor> <cause>\n       automonique automation list [--state <state>]... [--cursor <entry-id>] [--page <size>]\n       automonique automation detail <automation-id>\n       automonique approval record <approval-key> <subject> <granted|denied> <decider>\n       automonique approval list [--cursor <entry-id>] [--page <size>]\n       automonique approval detail <approval-key>\n       automonique approval by-subject <subject> [--cursor <entry-id>] [--page <size>]\n       automonique batch register <batch-id> [--label <label>] [--sequential | --parallel <ceiling>] <member-key>...\n       automonique batch advance <batch-id> <member-key> <revision> <state> <last-sequence>\n       automonique batch list [--cursor <entry-id>] [--page <size>]\n       automonique batch detail <batch-id>\n       automonique parity compare <database> <scope> [--registry <path>] [--category <category>]\n       automonique parity score <database> <scope>\n       automonique parity gate <database> <scope> <decision-key> <decider> [--registry <path>]\n       automonique audit verify <database>\n       automonique cancel <run-id> <request-ref> [observed-sequence]\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique progress subscribe <socket-path> <run-id> [cursor]\n       automonique shutdown\n";
+const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique metrics\n       automonique generations\n       automonique reload <sha256:manifest-digest> [--wait]\n       automonique rollback [--wait]\n       automonique reload-status <reload-id>\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique run submit <idempotency-key> < run-spec.bin\n       automonique runs list [--state <state>]... [--cursor <submission-id>] [--page <size>]\n       automonique runs detail <run-id>\n       automonique runs tail <spool-root> <run-id> [cursor]\n       automonique automation register <automation-id> <actor> --schedule <once@ms|every@ms|hourly> --scope <scope> --prompt <text>\n           (every@ms is at least 1000; pausing an automation skips a queued instant for good, so a once@ job paused before it starts is consumed)\n       automonique automation pause <automation-id> <revision> <actor> <cause>\n       automonique automation resume <automation-id> <revision> <actor>\n       automonique automation archive <automation-id> <revision> <actor> <cause>\n       automonique automation list [--state <state>]... [--cursor <entry-id>] [--page <size>]\n       automonique automation detail <automation-id>\n       automonique approval record <approval-key> <subject> <granted|denied> <decider>\n       automonique approval list [--cursor <entry-id>] [--page <size>]\n       automonique approval detail <approval-key>\n       automonique approval by-subject <subject> [--cursor <entry-id>] [--page <size>]\n       automonique batch register <batch-id> [--label <label>] [--sequential | --parallel <ceiling>] <member-key>...\n       automonique batch advance <batch-id> <member-key> <revision> <state> <last-sequence>\n       automonique batch list [--cursor <entry-id>] [--page <size>]\n       automonique batch detail <batch-id>\n       automonique parity compare <database> <scope> [--registry <path>] [--category <category>]\n       automonique parity score <database> <scope>\n       automonique parity gate <database> <scope> <decision-key> <decider> [--registry <path>]\n       automonique audit verify <database>\n       automonique cancel <run-id> <request-ref> [observed-sequence]\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique progress subscribe <socket-path> <run-id> [cursor]\n       automonique shutdown\n";
 const RELOAD_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 const RELOAD_WAIT_POLL: Duration = Duration::from_millis(100);
 
@@ -305,10 +305,21 @@ where
                         automation_id: automation_id.clone(),
                     })
                 }
-                (Some("register"), [automation_id, actor]) => {
+                // `register` is two positional words and then `--flag value`
+                // pairs. A word in a flag position that is not a flag, or a
+                // flag with no value after it, is a shape this CLI does not
+                // have — usage — while a flag it does not know, or a value
+                // outside its grammar, is the verb's own refusal.
+                (Some("register"), [automation_id, actor, flags @ ..])
+                    if flags.len() % 2 == 0
+                        && flags.iter().step_by(2).all(|flag| {
+                            flag.to_str().is_some_and(|flag| flag.starts_with("--"))
+                        }) =>
+                {
                     Command::Automation(automation::Operation::Register {
                         automation_id: automation_id.clone(),
                         actor: actor.clone(),
+                        flags: flags.to_vec(),
                     })
                 }
                 (Some("pause"), [automation_id, revision, actor, cause]) => {
@@ -966,6 +977,17 @@ fn admin_submit<R: Read, W: Write, E: Write>(
         let _ = stderr.write_all(b"automonique submit refused: invalid_idempotency_key\n");
         return 2;
     };
+    // The `automation:` namespace belongs to the daemon's scheduler worker,
+    // which derives occurrence keys in it on this same lane. The daemon
+    // refuses it by the same name; judging it here spends no frame.
+    if automonique_protocol::admin::synthetic_key_is_reserved(&idempotency_key) {
+        let _ = writeln!(
+            stderr,
+            "automonique submit refused: {}",
+            automonique_protocol::admin::RESERVED_SYNTHETIC_KEY_CATEGORY
+        );
+        return 2;
+    }
     let mut task = Vec::new();
     let limit = u64::try_from(automonique_protocol::admin::MAX_SYNTHETIC_TASK_BYTES)
         .expect("protocol task bound fits u64")
@@ -1065,6 +1087,7 @@ fn admin_status<W: Write, E: Write>(
             "accepting_intake": status.accepting_intake(),
             "durable_state": {
                 "approvals_recorded": metric_json(durable.approvals_recorded()),
+                "automation_scheduler_workers": metric_json(durable.automation_scheduler_workers()),
                 "automations_registered": metric_json(durable.automations_registered()),
                 "open_tenure_epoch": metric_json(durable.open_tenure_epoch()),
                 "open_tenures": metric_json(durable.open_tenures()),
@@ -1103,7 +1126,7 @@ fn admin_status<W: Write, E: Write>(
             + "\n"
     } else {
         format!(
-            "Automonique daemon: {}\ninstance: {}\ngeneration: {}\nevent cursor: {}\ninbox pending: {}\noutbox pending: {}\nrunning: {}\naccepting intake: {}\nintake paused: {}\nexecution: {}\ntelegram: {}\ntelegram poller epoch: {}\nobserved ms: {}\nreconciliation pending: {}\noutbox ready: {}\noutbox delayed: {}\noutbox live: {}\noutbox ambiguous: {}\noutbox delivered: {}\noutbox dead-lettered: {}\noutbox oldest ready age ms: {}\ntelegram pollers live: {}\ntelegram pollers expired: {}\ntelegram offset lag: {}\nprovider available: {}\nsandbox launch refusals: {}\nruns registered: {}\nautomations registered: {}\napprovals recorded: {}\ntenures recorded: {}\nopen tenures: {}\nopen tenure epoch: {}\n",
+            "Automonique daemon: {}\ninstance: {}\ngeneration: {}\nevent cursor: {}\ninbox pending: {}\noutbox pending: {}\nrunning: {}\naccepting intake: {}\nintake paused: {}\nexecution: {}\ntelegram: {}\ntelegram poller epoch: {}\nobserved ms: {}\nreconciliation pending: {}\noutbox ready: {}\noutbox delayed: {}\noutbox live: {}\noutbox ambiguous: {}\noutbox delivered: {}\noutbox dead-lettered: {}\noutbox oldest ready age ms: {}\ntelegram pollers live: {}\ntelegram pollers expired: {}\ntelegram offset lag: {}\nprovider available: {}\nsandbox launch refusals: {}\nruns registered: {}\nautomations registered: {}\napprovals recorded: {}\ntenures recorded: {}\nopen tenures: {}\nopen tenure epoch: {}\nautomation scheduler workers: {}\n",
             status.state().as_str(),
             status.instance_id().as_str(),
             status.generation(),
@@ -1138,6 +1161,7 @@ fn admin_status<W: Write, E: Write>(
             metric_text(durable.tenures_recorded()),
             metric_text(durable.open_tenures()),
             metric_text(durable.open_tenure_epoch()),
+            metric_text(durable.automation_scheduler_workers()),
         )
     };
     if stdout.write_all(rendered.as_bytes()).is_err() {
@@ -1927,6 +1951,7 @@ mod tests {
     fn counts(runs: OperationalMetric) -> DurableStateCounts {
         DurableStateCounts::new(DurableStateCountsParts {
             approvals_recorded: OperationalMetric::Measured(5),
+            automation_scheduler_workers: OperationalMetric::Measured(1),
             automations_registered: OperationalMetric::Measured(0),
             open_tenure_epoch: OperationalMetric::Measured(3),
             open_tenures: OperationalMetric::Measured(1),
@@ -1994,6 +2019,7 @@ mod tests {
             .expect("durable counts are reported");
         for (field, value) in [
             ("approvals_recorded", 5),
+            ("automation_scheduler_workers", 1),
             ("automations_registered", 0),
             ("open_tenure_epoch", 3),
             ("open_tenures", 1),

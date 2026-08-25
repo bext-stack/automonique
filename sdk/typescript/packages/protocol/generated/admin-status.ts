@@ -12,7 +12,7 @@
 import {ValidationError, byteLength, isWellFormedUnicode} from "./runtime.js";
 
 /** What this build's local endpoints can do, as one monotonic integer. A client compares it against the number it was written for; it never assumes the two must be equal. */
-export const ADMIN_CAPABILITY = 9;
+export const ADMIN_CAPABILITY = 10;
 
 /** Stable protocol name for local daemon administration. */
 export const ADMIN_PROTOCOL = "automonique.admin";
@@ -134,9 +134,10 @@ export const DaemonStatus_FIELDS: readonly string[] = [
   "telegram_state",
 ];
 
-/** What the daemon's durable stores hold, counted while the status was answered. Each field is one read of one store and they are not one transaction; a store that could not be counted is `unavailable`, never zero. */
+/** What the daemon's durable stores hold, counted while the status was answered. Each field is one read of one store and they are not one transaction; a store that could not be counted is `unavailable`, never zero. `automation_scheduler_workers` reads the worker with custody of the automation registry and the scheduler core rather than a store: one on its thread, zero when it stopped on a fault, `unavailable` when none was composed. */
 export interface DurableStateCounts {
   readonly approvals_recorded: OperationalMetric;
+  readonly automation_scheduler_workers: OperationalMetric;
   readonly automations_registered: OperationalMetric;
   readonly open_tenure_epoch: OperationalMetric;
   readonly open_tenures: OperationalMetric;
@@ -145,6 +146,7 @@ export interface DurableStateCounts {
 }
 export const DurableStateCounts_FIELDS: readonly string[] = [
   "approvals_recorded",
+  "automation_scheduler_workers",
   "automations_registered",
   "open_tenure_epoch",
   "open_tenures",

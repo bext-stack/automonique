@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 //! Durable adapter for the daemon's deliberately no-effect synthetic lane.
+//!
+//! Public so an integration test can drive the same controller tick the serve
+//! loop drives, against the same store the automation scheduler worker submits
+//! to; nothing outside this crate composes one in production.
 
 use automonique_core::{
     ClaimOutcome, CommitOutcome, CommitReceipt, DurableError, DurableScheduler, DurableWorkItem,
@@ -11,7 +15,7 @@ use automonique_store::{
     LeaseRenewal, SchedulerClaim, Store, StoreError, TerminalRun, TerminalState,
 };
 
-pub(crate) struct StoreScheduler<'a> {
+pub struct StoreScheduler<'a> {
     store: &'a mut Store,
     now_ms: i64,
     lease_now_ms: i64,
@@ -21,7 +25,7 @@ pub(crate) struct StoreScheduler<'a> {
 }
 
 impl<'a> StoreScheduler<'a> {
-    pub(crate) fn new(
+    pub fn new(
         store: &'a mut Store,
         now_ms: i64,
         lease_now_ms: i64,
