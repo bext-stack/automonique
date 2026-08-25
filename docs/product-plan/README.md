@@ -55,8 +55,8 @@ What deliberately remains, and why:
 Historical GPL reference documents are marked superseded.
 The remaining `reference/` documents are sanitized technical context.
 
-Any new private identifier entering this tree is a defect. The public scanner
-helps detect regressions but cannot stand in for private-data review.
+Any new private identifier entering this tree is a defect and must be caught
+through review of the proposed change.
 
 Documents tied to the former implementation were not copied as source. The
 migration and parity documents now live under
