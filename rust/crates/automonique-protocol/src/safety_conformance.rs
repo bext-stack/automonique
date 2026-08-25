@@ -165,7 +165,7 @@ pub const PENDING_BINDINGS: [PendingBinding; 4] = [
     },
     PendingBinding {
         property: SafetyProperty::SchedulerCore,
-        surface: "the durable scheduler in automonique-core",
+        surface: "the live automation scheduler in automonique-daemon",
         tracked_at: "docs/product-plan/requirements/scheduler-core.md",
     },
 ];

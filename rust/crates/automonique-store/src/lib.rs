@@ -16,6 +16,7 @@ pub mod automation_store;
 pub mod batch_registry;
 pub mod cancel_ledger;
 pub mod context_memory;
+pub mod durable_scheduler;
 pub mod generation_audit;
 pub mod improvements;
 pub mod operator_members;

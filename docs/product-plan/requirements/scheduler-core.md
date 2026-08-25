@@ -138,19 +138,31 @@ request, one that reports a cancellation it did not perform, and one that ticks
 under its own fence rather than the presented one. Each must fail, at the case
 that names what was broken.
 
-## What this does not prove
+## What this does and does not prove
 
-The reference model holds rows in vectors. It has no lease timer, no store, no
-executor, and it runs nothing. Passing the suite proves the specification is
-satisfiable and that the named failures are caught; it proves nothing about a
-durable scheduler, because there is not one yet.
+The reference model still holds rows in vectors and runs nothing. The production
+state-machine implementation is
+`automonique_store::durable_scheduler::DurableSchedulerStore`: its SQLite
+transactions durably preserve admission order, pauses, occupied slots, stop
+requests and terminal state; every operation checks the installed generation
+fence; and the generic suite runs against that implementation. Generated
+operation sequences additionally compare it with the reference model across
+reopens.
 
-The durable implementation is M8 #45, and it inherits obligations this document
-does not restate: fencing writes as well as work (#50), boot- and suspend-aware
-lease time (#51), and the durable cancellation ledger (#49). This suite is a
-floor those must clear, not a substitute for them.
-`automonique_protocol::safety_conformance::PENDING_BINDINGS` carries the gap as
-checkable data.
+That binding proves the scheduler core and restart persistence, not an
+automation executor. The live Automation request currently carries only an ID
+and actor, while its registry deliberately stores no schedule, scope, trigger,
+action or approved-effect set. Until that wire and storage decision is made, the
+daemon cannot truthfully derive work to submit or an effect to emit. A committed
+`running` row is also never silently requeued after a crash: it remains an
+ambiguous start for the caller to reconcile, which is how the store preserves
+the no-duplicate-start property.
+
+M8 #45 therefore remains the daemon integration tracker. It inherits
+obligations this document does not restate: fencing writes as well as work
+(#50), boot- and suspend-aware lease time (#51), and the durable cancellation
+ledger (#49). `automonique_protocol::safety_conformance::PENDING_BINDINGS`
+carries that remaining live-surface gap as checkable data.
 
 ## Provenance
 
