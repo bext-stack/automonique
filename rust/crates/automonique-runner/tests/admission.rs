@@ -1245,14 +1245,12 @@ fn a_document_requiring_uid_separation_is_admitted_to_a_separated_plan() {
     // composition step that grants the mountpoint and binds TMPDIR.
     let mountpoint = workspace.path().join("scratch");
     fs::create_dir(&mountpoint).unwrap();
-    let pending = automonique_runner::WorkloadTempfs::prepare(
+    let pending = automonique_runner::RunTempfs::for_workload(
         &mountpoint,
         admitted.temporary_storage_budget(),
     )
     .unwrap();
-    let attached = admitted
-        .with_temporary_storage(&automonique_runner::RunTempfs::Workload(Box::new(pending)))
-        .unwrap();
+    let attached = admitted.with_temporary_storage(&pending).unwrap();
     let mount = attached
         .plan()
         .temporary_storage_mount()

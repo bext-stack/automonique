@@ -1058,11 +1058,16 @@ impl TempfsRendezvous {
 
 /// A run's temporary filesystem, mounted where the plan's identity requires.
 ///
-/// The mount site is derived from the plan rather than chosen beside it, so a
-/// plan whose workload runs in a child user namespace cannot be given a mount
-/// it would read `EACCES` from, and there is no rule to enforce that
-/// separately.
-pub enum RunTempfs {
+/// The site is chosen once, from the plan, by [`Self::provide`], and there is
+/// no other way to obtain a supervisor-mounted one. That is what makes the
+/// pairing this type replaced — a workload in a child user namespace holding a
+/// grant on a filesystem the supervisor mounted, which it would read `EACCES`
+/// from — unrepresentable rather than merely refused.
+pub struct RunTempfs {
+    site: RunTempfsSite,
+}
+
+enum RunTempfsSite {
     /// The plan keeps the supervisor's identity, so the supervisor mounts.
     Supervisor(Box<MountedTempfs>),
     /// The plan separates the workload's identity, so the launch mounts inside
@@ -1072,11 +1077,13 @@ pub enum RunTempfs {
 
 impl fmt::Debug for RunTempfs {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Supervisor(mounted) => {
+        match &self.site {
+            RunTempfsSite::Supervisor(mounted) => {
                 formatter.debug_tuple("Supervisor").field(mounted).finish()
             }
-            Self::Workload(pending) => formatter.debug_tuple("Workload").field(pending).finish(),
+            RunTempfsSite::Workload(pending) => {
+                formatter.debug_tuple("Workload").field(pending).finish()
+            }
         }
     }
 }
@@ -1094,12 +1101,32 @@ impl RunTempfs {
         budget: TemporaryStorageBudget,
     ) -> Result<Self, MountError> {
         if plan.separates_workload_identity() {
-            WorkloadTempfs::prepare(mountpoint, budget)
-                .map(|pending| Self::Workload(Box::new(pending)))
+            Self::for_workload(mountpoint, budget)
         } else {
-            MountedTempfs::mount(verified, mountpoint, budget)
-                .map(|mounted| Self::Supervisor(Box::new(mounted)))
+            MountedTempfs::mount(verified, mountpoint, budget).map(|mounted| Self {
+                site: RunTempfsSite::Supervisor(Box::new(mounted)),
+            })
         }
+    }
+
+    /// Prepare a filesystem for the launch to mount, without a plan to derive
+    /// it from.
+    ///
+    /// Safe to reach directly, unlike the supervisor-mounted site: attaching
+    /// this to a plan that does not separate its workload's identity adds a
+    /// `tempfs=` line that plan cannot carry, and the plan refuses to encode.
+    ///
+    /// # Errors
+    ///
+    /// [`MountError::MountpointRejected`] for a mountpoint that is not an
+    /// empty directory this uid owns.
+    pub fn for_workload(
+        mountpoint: &Path,
+        budget: TemporaryStorageBudget,
+    ) -> Result<Self, MountError> {
+        WorkloadTempfs::prepare(mountpoint, budget).map(|pending| Self {
+            site: RunTempfsSite::Workload(Box::new(pending)),
+        })
     }
 
     /// Bind a checkpoint file to whichever site holds the filesystem.
@@ -1109,38 +1136,41 @@ impl RunTempfs {
     /// The supervisor-mounted site writes its first checkpoint here and
     /// reports a write that fails.
     pub fn with_checkpoint(self, path: impl Into<PathBuf>) -> io::Result<Self> {
-        match self {
-            Self::Supervisor(mounted) => mounted
-                .with_checkpoint(path)
-                .map(|mounted| Self::Supervisor(Box::new(mounted))),
-            Self::Workload(pending) => Ok(Self::Workload(Box::new(pending.with_checkpoint(path)))),
-        }
+        let site = match self.site {
+            RunTempfsSite::Supervisor(mounted) => {
+                RunTempfsSite::Supervisor(Box::new(mounted.with_checkpoint(path)?))
+            }
+            RunTempfsSite::Workload(pending) => {
+                RunTempfsSite::Workload(Box::new(pending.with_checkpoint(path)))
+            }
+        };
+        Ok(Self { site })
     }
 
     /// Exact mountpoint, canonical.
     #[must_use]
     pub fn mountpoint(&self) -> &Path {
-        match self {
-            Self::Supervisor(mounted) => mounted.mountpoint(),
-            Self::Workload(pending) => pending.mountpoint(),
+        match &self.site {
+            RunTempfsSite::Supervisor(mounted) => mounted.mountpoint(),
+            RunTempfsSite::Workload(pending) => pending.mountpoint(),
         }
     }
 
     /// The budget in force.
     #[must_use]
     pub const fn budget(&self) -> TemporaryStorageBudget {
-        match self {
-            Self::Supervisor(mounted) => mounted.budget(),
-            Self::Workload(pending) => pending.budget(),
+        match &self.site {
+            RunTempfsSite::Supervisor(mounted) => mounted.budget(),
+            RunTempfsSite::Workload(pending) => pending.budget(),
         }
     }
 
     /// What the supervision loop polls, and reads back from.
     #[must_use]
     pub fn watch(&self) -> TemporaryStorageWatch {
-        match self {
-            Self::Supervisor(mounted) => mounted.watch(),
-            Self::Workload(pending) => pending.watch(),
+        match &self.site {
+            RunTempfsSite::Supervisor(mounted) => mounted.watch(),
+            RunTempfsSite::Workload(pending) => pending.watch(),
         }
     }
 
@@ -1148,18 +1178,18 @@ impl RunTempfs {
     /// mounts it.
     #[must_use]
     pub fn request(&self) -> Option<TemporaryStorageMount> {
-        match self {
-            Self::Supervisor(_) => None,
-            Self::Workload(pending) => Some(pending.request()),
+        match &self.site {
+            RunTempfsSite::Supervisor(_) => None,
+            RunTempfsSite::Workload(pending) => Some(pending.request()),
         }
     }
 
     /// Take the half of this that a launch consumes, once.
     #[must_use]
     pub fn rendezvous(&mut self) -> Option<TempfsRendezvous> {
-        match self {
-            Self::Supervisor(_) => None,
-            Self::Workload(pending) => pending.rendezvous(),
+        match &mut self.site {
+            RunTempfsSite::Supervisor(_) => None,
+            RunTempfsSite::Workload(pending) => pending.rendezvous(),
         }
     }
 
@@ -1169,9 +1199,9 @@ impl RunTempfs {
     ///
     /// Whatever the site's own reconcile says.
     pub fn reconcile(self, deadline: Duration) -> Result<Outcome, UnmountError> {
-        match self {
-            Self::Supervisor(mounted) => mounted.reconcile(deadline),
-            Self::Workload(pending) => pending.reconcile(deadline),
+        match self.site {
+            RunTempfsSite::Supervisor(mounted) => mounted.reconcile(deadline),
+            RunTempfsSite::Workload(pending) => pending.reconcile(deadline),
         }
     }
 }
