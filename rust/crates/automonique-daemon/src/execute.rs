@@ -2279,12 +2279,16 @@ struct Attempt {
     /// worker drops it, including a panic, and its drop stops the listener and
     /// tears down every tunnel still open.
     broker: Option<EgressBroker>,
-    /// This run's temporary-storage mount. Owning it here bounds its lifetime
-    /// to the run exactly as the broker is bounded: after the run tree is
-    /// disposed, the worker reconciles it — a bounded `statfs` readback (or a
-    /// connection abort if the server is stuck), a non-lazy unmount, and a
-    /// final ledger checkpoint — and its drop detaches it on any other path,
-    /// including a panic, so no writable scratch mount outlives the run.
+    /// This run's temporary filesystem. Owning it here bounds its lifetime to
+    /// the run exactly as the broker is bounded: after the run tree is
+    /// disposed, the worker reconciles it and writes the final ledger
+    /// checkpoint, and its drop takes it down on any other path, including a
+    /// panic, so no writable scratch space outlives the run. What the
+    /// reconcile does depends on where the mount is: a supervisor-mounted one
+    /// takes a bounded `statfs` readback (or aborts a stuck connection) and
+    /// unmounts; a launch-mounted one reads the filesystem's own ledger and
+    /// waits for the kernel to close the connection, which is what the mount
+    /// namespace dying with the run tree does.
     temporary_storage: RunTempfs,
     /// Exact provider session observed by the normalized stream.
     session_capture: Arc<Mutex<Option<String>>>,
@@ -2327,14 +2331,18 @@ impl Attempt {
         // THE SCRATCH MOUNT OUTLIVES NO RUN.
         //
         // `execute` has disposed the run cgroup by here, so the workload tree
-        // is dead and holds no descriptor into the mount. The reconcile is
-        // therefore a non-lazy unmount that cannot refuse `EBUSY`: it takes a
-        // bounded `statfs` readback (aborting the FUSE connection if the server
-        // is stuck rather than hanging the worker), unmounts, and writes the
-        // final ledger checkpoint that preserves the consumed-budget record
-        // across a crash. Its own `Drop` detaches the mount on every other
-        // path, including a panic before this line. The outcome is the
-        // operator's to see: it lands in the native journal beside the run
+        // is dead and holds no descriptor into the mount. For a mount this
+        // supervisor performed the reconcile is therefore a non-lazy unmount
+        // that cannot refuse `EBUSY`: a bounded `statfs` readback (aborting
+        // the FUSE connection if the server is stuck rather than hanging the
+        // worker), then the unmount. For one the launch performed there is
+        // nothing here to unmount — the mount died with the workload's own
+        // mount namespace — so the readback is the filesystem's own ledger and
+        // the kernel closing the connection is the confirmation. Both write
+        // the final ledger checkpoint that preserves the consumed-budget
+        // record across a crash, and both take themselves down in `Drop` on
+        // every other path, including a panic before this line. The outcome is
+        // the operator's to see: it lands in the native journal beside the run
         // id, at warning priority when a ceiling refused anything, the
         // readback had to be aborted, or the unmount was not confirmed.
         match temporary_storage.reconcile(DEFAULT_READBACK_DEADLINE) {
