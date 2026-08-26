@@ -122,6 +122,9 @@ use automonique_runner::{
 };
 use automonique_store::cancel_ledger::CancelLedger;
 
+#[path = "support/isolation.rs"]
+mod test_isolation;
+
 const BUSYBOX: &str = "/usr/bin/busybox";
 const REQUIRE_ENFORCED_ENV: &str = "AUTOMONIQUE_REQUIRE_ENFORCED_CONTAINMENT";
 const PROMPT_SLOT: &str = "execute-prompt-slot";
@@ -189,6 +192,7 @@ fn fixture() -> (tempfile::TempDir, DaemonConfig) {
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
         .expect("private root");
     let runtime = root.path().join("runtime");
+    test_isolation::assert_isolated_runtime_root(&runtime);
     let state = root.path().join("state");
     for directory in [&runtime, &state] {
         std::fs::create_dir(directory).expect("root");

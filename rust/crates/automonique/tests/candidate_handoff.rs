@@ -23,11 +23,15 @@ use nix::unistd::Pid;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
+#[path = "support/isolation.rs"]
+mod test_isolation;
+
 #[test]
 fn exact_release_candidate_proves_transfer_and_clean_lease_return() {
     let root = tempfile::tempdir().expect("temporary root");
     private_directory(root.path());
     let runtime_root = root.path().join("runtime");
+    test_isolation::assert_isolated_runtime_root(&runtime_root);
     let state_root = root.path().join("state");
     private_directory(&runtime_root);
     private_directory(&state_root);
@@ -284,6 +288,7 @@ fn authenticated_reload_command_hands_off_and_retires_the_source() {
     let root = tempfile::tempdir().expect("temporary root");
     private_directory(root.path());
     let runtime_root = root.path().join("runtime");
+    test_isolation::assert_isolated_runtime_root(&runtime_root);
     let state_root = root.path().join("state");
     private_directory(&runtime_root);
     private_directory(&state_root);
@@ -437,6 +442,7 @@ fn an_adopted_candidate_leaves_the_socket_units_admin_path_in_place() {
     let root = tempfile::tempdir().expect("temporary root");
     private_directory(root.path());
     let runtime_root = root.path().join("runtime");
+    test_isolation::assert_isolated_runtime_root(&runtime_root);
     let state_root = root.path().join("state");
     private_directory(&runtime_root);
     private_directory(&state_root);

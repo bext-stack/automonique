@@ -5,6 +5,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "support/isolation.rs"]
+mod test_isolation;
+
 use automonique_store::{
     InboxSubmission, LeaseRequest, OutboxClaimRequest, SchedulerClaim, Store, TerminalRun,
     TerminalState,
@@ -16,6 +19,7 @@ fn roots() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
         .expect("private root");
     let runtime = root.path().join("runtime");
+    test_isolation::assert_isolated_runtime_root(&runtime);
     let state = root.path().join("state");
     std::fs::create_dir(&runtime).expect("runtime root");
     std::fs::create_dir(&state).expect("state root");

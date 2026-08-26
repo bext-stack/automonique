@@ -129,6 +129,9 @@ use automonique_runner::{
 use automonique_store::approval_requests::{ApprovalRequests, ApprovalState};
 use automonique_store::provider_deployments::{DeploymentRegistration, ProviderDeployments};
 
+#[path = "support/isolation.rs"]
+mod test_isolation;
+
 const BUSYBOX: &str = "/usr/bin/busybox";
 const REQUIRE_ENFORCED_ENV: &str = "AUTOMONIQUE_REQUIRE_ENFORCED_CONTAINMENT";
 /// What a contained run's answer file is prefixed with, so a reply that carries
@@ -156,6 +159,7 @@ impl Fixture {
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
             .expect("private root");
         let runtime = root.path().join("runtime");
+        test_isolation::assert_isolated_runtime_root(&runtime);
         let state = root.path().join("state");
         for directory in [&runtime, &state] {
             std::fs::create_dir(directory).expect("root");

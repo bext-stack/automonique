@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 use automonique_daemon::{Daemon, DaemonConfig};
 use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse};
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
+
+#[path = "support/isolation.rs"]
+mod test_isolation;
 use automonique_store::provider_journal::{
     FinishReason, ProcessSpawn, ProviderJournal, SessionOpening, TurnCompletion, TurnOpening,
     TurnOutcome, TurnUsage,
@@ -20,6 +23,7 @@ fn fixture() -> (tempfile::TempDir, DaemonConfig) {
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
         .expect("private root");
     let runtime = root.path().join("runtime");
+    test_isolation::assert_isolated_runtime_root(&runtime);
     let state = root.path().join("state");
     std::fs::create_dir(&runtime).expect("runtime root");
     std::fs::create_dir(&state).expect("state root");

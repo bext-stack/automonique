@@ -52,6 +52,9 @@ use automonique_protocol::sandbox::{
 };
 use automonique_protocol::tools::RunId;
 use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
+
+#[path = "support/isolation.rs"]
+mod test_isolation;
 use automonique_runner::{
     AdmissionFields, AdmissionFieldsParts, ArtifactGrantBindings, CwdToken, ExecutionPlanDigest,
     ExtensionSetDigest, FallbackEligibility, IntegrationMode, IoReservation, ModelRoutingDigest,
@@ -66,6 +69,7 @@ fn fixture() -> (tempfile::TempDir, DaemonConfig) {
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
         .expect("private root");
     let runtime = root.path().join("runtime");
+    test_isolation::assert_isolated_runtime_root(&runtime);
     let state = root.path().join("state");
     std::fs::create_dir(&runtime).expect("runtime root");
     std::fs::create_dir(&state).expect("state root");

@@ -9,6 +9,9 @@ use std::os::unix::net::UnixListener;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+#[path = "support/isolation.rs"]
+mod test_isolation;
+
 fn runtime(with_product_directory: bool) -> tempfile::TempDir {
     let runtime = tempfile::tempdir().expect("temporary runtime directory");
     #[cfg(unix)]
@@ -32,6 +35,7 @@ fn runtime(with_product_directory: bool) -> tempfile::TempDir {
 }
 
 fn run(binary: &str, runtime: &Path, args: &[&str]) -> Output {
+    test_isolation::assert_isolated_runtime_root(runtime);
     Command::new(binary)
         .args(args)
         .env("XDG_RUNTIME_DIR", runtime)

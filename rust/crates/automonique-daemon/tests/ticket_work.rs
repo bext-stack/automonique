@@ -80,6 +80,9 @@ use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse, Exe
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
 use automonique_runner::ContainmentDomain;
 use automonique_runner::capability::HostCapabilities;
+
+#[path = "support/isolation.rs"]
+mod test_isolation;
 use automonique_store::support_tickets::{
     FleetTicket, SupportTicketStore, TicketLifecycle, TicketTransition,
 };
@@ -120,6 +123,7 @@ impl Fixture {
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
             .expect("private root");
         let runtime = root.path().join("runtime");
+        test_isolation::assert_isolated_runtime_root(&runtime);
         let state = root.path().join("state");
         for directory in [&runtime, &state] {
             std::fs::create_dir(directory).expect("root");

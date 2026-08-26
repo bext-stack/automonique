@@ -9,6 +9,9 @@ use std::os::unix::net::UnixListener;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+#[path = "support/isolation.rs"]
+mod test_isolation;
+
 fn private_runtime() -> tempfile::TempDir {
     let runtime = tempfile::tempdir().expect("temporary runtime directory");
     #[cfg(unix)]
@@ -30,6 +33,7 @@ fn private_runtime() -> tempfile::TempDir {
 }
 
 fn run(runtime: &Path, args: &[&str]) -> Output {
+    test_isolation::assert_isolated_runtime_root(runtime);
     let mut command = Command::new(env!("CARGO_BIN_EXE_automonique"));
     command
         .args(args)

@@ -109,6 +109,9 @@ use automonique_runner::admission::{
     TemporaryStorageEnforcement, UnenforcedBudget, admit,
 };
 use automonique_runner::capability::HostCapabilities;
+
+#[path = "support/isolation.rs"]
+mod test_isolation;
 use automonique_runner::{
     AdmissionFields, AdmissionFieldsParts, ArtifactGrantBindings, ContainmentDomain, CwdToken,
     ExecutionPlanDigest, ExtensionSetDigest, FallbackEligibility, IntegrationMode, IoReservation,
@@ -855,6 +858,7 @@ fn fixture(policy: &str, slots: &[(&str, Vec<u8>)]) -> (tempfile::TempDir, Daemo
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
         .expect("private root");
     let runtime = root.path().join("runtime");
+    test_isolation::assert_isolated_runtime_root(&runtime);
     let state = root.path().join("state");
     for directory in [&runtime, &state] {
         std::fs::create_dir(directory).expect("root");

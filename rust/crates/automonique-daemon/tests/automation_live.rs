@@ -64,11 +64,15 @@ use automonique_protocol::wire::{JsonValue, Message};
 use automonique_store::automation_store::AutomationStore;
 use automonique_store::{InboxState, Store};
 
+#[path = "support/isolation.rs"]
+mod test_isolation;
+
 fn fixture() -> (tempfile::TempDir, DaemonConfig) {
     let root = tempfile::tempdir().expect("temporary root");
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
         .expect("private root");
     let runtime = root.path().join("runtime");
+    test_isolation::assert_isolated_runtime_root(&runtime);
     let state = root.path().join("state");
     std::fs::create_dir(&runtime).expect("runtime root");
     std::fs::create_dir(&state).expect("state root");
