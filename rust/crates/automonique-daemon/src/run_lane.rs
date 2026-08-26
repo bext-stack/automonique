@@ -461,9 +461,13 @@ impl SocketRunLane {
     ) -> Result<Self, RunIndexUnavailable> {
         let run_index = RunIndex::open(run_index_path).map_err(|_| RunIndexUnavailable)?;
         // Both policies fail closed: an unreadable file is the same answer as
-        // an absent one, which is that `/run` is not configured here.
-        let provider = ProviderConfig::load(&state_dir.join(crate::compose::PROVIDER_CONFIG_NAME))
-            .unwrap_or_default();
+        // an absent one, which is that `/run` is not configured here. The
+        // execution provider additionally refuses the retired direct Codex
+        // engine, so a Codex-configured run provider is loaded as absent rather
+        // than selected — production run execution is JCode or nothing.
+        let provider =
+            ProviderConfig::load_execution(&state_dir.join(crate::compose::PROVIDER_CONFIG_NAME))
+                .unwrap_or_default();
         let conversation_provider =
             ProviderConfig::load(&state_dir.join(CONVERSATION_PROVIDER_CONFIG_NAME));
         let mut conversation_provider_refused = conversation_provider.is_err();
@@ -1265,7 +1269,12 @@ impl RunFailure {
     #[must_use]
     pub const fn from_compose(refusal: ComposeRefusal) -> Self {
         match refusal {
-            ComposeRefusal::NotConfigured => Self::NotConfigured,
+            // A run provider that selects the retired direct Codex engine is,
+            // for a run attempt, the same fact as no provider at all: this
+            // deployment has no usable run-execution engine configured.
+            ComposeRefusal::NotConfigured | ComposeRefusal::CodexEngineRetired => {
+                Self::NotConfigured
+            }
             ComposeRefusal::TaskRejected => Self::TaskRejected,
             ComposeRefusal::ProviderUnreadable
             | ComposeRefusal::HostUnenforceable
