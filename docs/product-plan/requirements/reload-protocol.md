@@ -221,21 +221,30 @@ must speak the same version, and neither side negotiates:
 
 - A daemon speaking the previous version cannot `reload` into a release that
   speaks this one. The older source judges the newer candidate's warm-up
-  identity under its own vocabulary and refuses `candidate_protocol` at
-  warm-up; the source resumes and nothing durable moves.
+  identity under its own vocabulary and refuses there; the source resumes and
+  nothing durable moves. Which category it reports is the older release's to
+  decide rather than this one's, because it is the older code that does the
+  judging: a `v7` daemon offered a `v8` release reports
+  `candidate_channel_schema_mismatch`, observed live on 2026-08-26 during the
+  `v8` deployment.
 - A daemon speaking this version cannot `rollback` (or `reload`) to a release
   that speaks an older one. The older candidate's warm-up identity is refused
   `candidate_channel_schema_mismatch` at warm-up — its own category, distinct
-  from the durable-schema refusal — and the source resumes. The candidate
-  side refuses an authority or return message in another schema under the
-  same category.
+  from the durable-schema refusal — and the source resumes. This side
+  compares the schema before it judges anything else about the identity, so
+  the operator sees the schema rather than a protocol mismatch the schema
+  difference merely caused. The candidate side refuses an authority or return
+  message in another schema under the same category.
 
 The first deployment of a release that moves the channel version, and any
 rollback across that boundary, must therefore be restart-based: stop the
 unit, move the `current` release link, start it. The zero-downtime
 `reload`/`rollback` verbs apply within a channel version, and a version
 change is a restart-based deployment by design rather than a negotiated
-one.
+one. Attempting the `reload` first is safe and is the cheapest way to
+confirm a crossing: the refusal arrives at warm-up, before any lease
+transfer, so the running generation keeps serving and the release links stay
+where they are.
 
 ## Service-manager adoption
 
