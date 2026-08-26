@@ -153,7 +153,8 @@ use automonique_protocol::sandbox::{
 use automonique_protocol::tools::RunId as FrameRunId;
 use automonique_runner::admission::{
     AdmissionContext, AdmissionContextParts, AdmissionRefusal, AdmittedLaunch, BrokeredDestination,
-    PromptSource, ResolvedPrompt, TemporaryStorageEnforcement, UnenforcedBudget, admit,
+    PromptSource, ProviderIdentityPolicy, ResolvedPrompt, TemporaryStorageEnforcement,
+    UnenforcedBudget, admit,
 };
 use automonique_runner::backend::{
     CapturedFrame, DirectProcessBackend, ObservedSequence, PROGRESS_BUDGET_WARNING,
@@ -904,6 +905,16 @@ impl ExecutionLane {
             // one that asks for it is refused if this is empty, so the policy
             // can neither widen a denied document nor be defaulted into one.
             brokered_destinations: self.egress_destinations.clone(),
+            // Off, and no deployment surface turns it on yet. Identity-bound
+            // egress needs two things this lane does not have: a supervisor-held
+            // provider credential — every credential here is a file below the
+            // provider's own home, never a value the daemon holds — and a
+            // provider engine that honours a base-URL variable, which the
+            // pinned JCode engine does not on its OAuth route. Until both
+            // exist, the mechanism is built, tested and disabled, and
+            // production composes exactly the plan it composed before.
+            // See `docs/operations/identity-bound-egress.md`.
+            provider_identity: ProviderIdentityPolicy::Disabled,
             temporary_storage,
         })
         .map_err(|_| ExecuteRefusal::AdmissionRefused)?;
