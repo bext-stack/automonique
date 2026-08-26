@@ -7,6 +7,22 @@
 //! latest Automonique run for that resumable provider session.  A follow-up
 //! therefore has an exact provider binding and an exact run to observe after a
 //! daemon restart.
+//!
+//! # The binding names the run of the current turn, not of the last one
+//!
+//! A row is advanced twice per turn: once when the provider session is known
+//! and the turn is about to start, with [`ManagedRunState::InFlight`], and once
+//! when the run reaches a terminal spool state, with
+//! [`ManagedRunState::Completed`].  The two phases are what make the binding
+//! usable by a session-scoped control surface: a provider permission request is
+//! raised *during* the run that raised it, so a binding that only advanced at
+//! completion always named the previous, already-terminal run and could never
+//! own a live approval or a stoppable run.
+//!
+//! The phase is persisted rather than inferred because the revision has to move
+//! at both ends of the turn.  A settlement that could not be distinguished from
+//! the turn-start observation of the same run would be a silent no-op, and an
+//! attached client watching `revision` would never learn that the turn ended.
 
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
@@ -27,7 +43,7 @@ use automonique_runner::{Authority as SpoolAuthority, Event as SpoolEvent, Event
 use nix::unistd::geteuid;
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, TransactionBehavior, params};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const MAX_SESSIONS: usize = automonique_protocol::platform::MAX_SNAPSHOT_RESOURCES;
 
 const SCHEMA: &str = r#"
@@ -72,6 +88,15 @@ CREATE INDEX managed_session_history_page
     ON managed_session_history(provider_session_id, sequence);
 "#;
 
+/// The turn phase of the bound run.
+///
+/// Existing rows were only ever written at completion, so `completed` is the
+/// exact history-preserving backfill for them.
+const SCHEMA_V3: &str = r#"
+ALTER TABLE managed_sessions ADD COLUMN run_state TEXT NOT NULL DEFAULT 'completed'
+    CHECK (run_state IN ('in_flight', 'completed'));
+"#;
+
 #[derive(Debug)]
 pub enum ManagedSessionError {
     InvalidField(&'static str),
@@ -108,11 +133,47 @@ impl From<std::io::Error> for ManagedSessionError {
 
 pub type Managed<T> = Result<T, ManagedSessionError>;
 
+/// Which end of a turn the bound run is at.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedRunState {
+    /// The turn has started and the run has not reported a terminal state.
+    InFlight,
+    /// The run reached a terminal spool state.
+    Completed,
+}
+
+impl ManagedRunState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InFlight => "in_flight",
+            Self::Completed => "completed",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_in_flight(self) -> bool {
+        matches!(self, Self::InFlight)
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "in_flight" => Some(Self::InFlight),
+            "completed" => Some(Self::Completed),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedSession {
     pub provider_session_id: String,
     pub run_id: String,
     pub open: bool,
+    /// The turn phase [`run_id`](Self::run_id) is at.  A session whose binding
+    /// is [`ManagedRunState::InFlight`] names the run that is executing right
+    /// now, which is the run a live approval and a live stop belong to.
+    pub run_state: ManagedRunState,
     pub revision: u64,
     pub created_ms: i64,
     pub updated_ms: i64,
@@ -195,10 +256,58 @@ impl ManagedSessionStore {
         &self.path
     }
 
-    pub fn observe(
+    /// Bind this session to the run that is about to take its turn.
+    ///
+    /// Called once the provider session identifier is known and before the turn
+    /// is started, so everything the turn goes on to raise — a provider
+    /// permission request above all — is raised against the run this session
+    /// already names.  Without it the binding lags exactly one turn and a
+    /// session-scoped surface can only ever address a terminal run.
+    pub fn observe_active(
         &mut self,
         provider_session_id: &str,
         run_id: &str,
+        now_ms: i64,
+    ) -> Managed<ManagedSession> {
+        self.bind(
+            provider_session_id,
+            run_id,
+            ManagedRunState::InFlight,
+            now_ms,
+        )
+    }
+
+    /// Settle this session's binding on the run that has just become terminal.
+    ///
+    /// This is the observation that existed before turn-start binding, and it
+    /// keeps its exact effect on `run_id` and `state`: it advances the binding
+    /// to `run_id` and reopens a session recorded as lost.  It additionally
+    /// records that the turn is over, which is what moves the revision at the
+    /// end of a turn that turn-start binding already advanced.
+    pub fn observe_terminal(
+        &mut self,
+        provider_session_id: &str,
+        run_id: &str,
+        now_ms: i64,
+    ) -> Managed<ManagedSession> {
+        self.bind(
+            provider_session_id,
+            run_id,
+            ManagedRunState::Completed,
+            now_ms,
+        )
+    }
+
+    /// One durable binding write.
+    ///
+    /// Idempotent on the whole observation rather than on `run_id` alone: the
+    /// same run observed twice in the same phase writes nothing and holds the
+    /// revision still, and a phase change on the same run is a real advance.
+    fn bind(
+        &mut self,
+        provider_session_id: &str,
+        run_id: &str,
+        run_state: ManagedRunState,
         now_ms: i64,
     ) -> Managed<ManagedSession> {
         validate(provider_session_id, run_id, now_ms)?;
@@ -207,7 +316,11 @@ impl ManagedSessionStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = read(&transaction, provider_session_id)?;
         match existing {
-            Some(existing) if existing.run_id == run_id && existing.open => {
+            Some(existing)
+                if existing.run_id == run_id
+                    && existing.open
+                    && existing.run_state == run_state =>
+            {
                 transaction.commit()?;
                 return Ok(existing);
             }
@@ -217,11 +330,12 @@ impl ManagedSessionStore {
                     .checked_add(1)
                     .ok_or(ManagedSessionError::InvalidField("revision"))?;
                 transaction.execute(
-                    "UPDATE managed_sessions SET run_id=?2,state='open',revision=?3,updated_ms=?4
-                     WHERE provider_session_id=?1 AND revision=?5",
+                    "UPDATE managed_sessions SET run_id=?2,state='open',run_state=?3,revision=?4,updated_ms=?5
+                     WHERE provider_session_id=?1 AND revision=?6",
                     params![
                         provider_session_id,
                         run_id,
+                        run_state.as_str(),
                         to_i64(revision)?,
                         now_ms,
                         to_i64(existing.revision)?
@@ -230,9 +344,9 @@ impl ManagedSessionStore {
             }
             None => {
                 transaction.execute(
-                    "INSERT INTO managed_sessions(provider_session_id,run_id,state,revision,created_ms,updated_ms)
-                     VALUES(?1,?2,'open',1,?3,?3)",
-                    params![provider_session_id, run_id, now_ms],
+                    "INSERT INTO managed_sessions(provider_session_id,run_id,state,run_state,revision,created_ms,updated_ms)
+                     VALUES(?1,?2,'open',?3,1,?4,?4)",
+                    params![provider_session_id, run_id, run_state.as_str(), now_ms],
                 )?;
             }
         }
@@ -252,7 +366,7 @@ impl ManagedSessionStore {
         RunId::new(run_id).map_err(|_| ManagedSessionError::InvalidField("run_id"))?;
         self.connection
             .query_row(
-                "SELECT provider_session_id,run_id,state,revision,created_ms,updated_ms
+                "SELECT provider_session_id,run_id,state,run_state,revision,created_ms,updated_ms
                  FROM managed_sessions WHERE run_id=?1",
                 [run_id],
                 decode,
@@ -263,7 +377,7 @@ impl ManagedSessionStore {
 
     pub fn list(&self) -> Managed<Vec<ManagedSession>> {
         let mut statement = self.connection.prepare(
-            "SELECT provider_session_id,run_id,state,revision,created_ms,updated_ms
+            "SELECT provider_session_id,run_id,state,run_state,revision,created_ms,updated_ms
              FROM managed_sessions ORDER BY updated_ms DESC,provider_session_id LIMIT ?1",
         )?;
         let limit =
@@ -658,7 +772,7 @@ fn validate(provider_session_id: &str, run_id: &str, now_ms: i64) -> Managed<()>
 fn read(connection: &Connection, id: &str) -> Managed<Option<ManagedSession>> {
     connection
         .query_row(
-            "SELECT provider_session_id,run_id,state,revision,created_ms,updated_ms
+            "SELECT provider_session_id,run_id,state,run_state,revision,created_ms,updated_ms
              FROM managed_sessions WHERE provider_session_id=?1",
             [id],
             decode,
@@ -728,20 +842,28 @@ fn read_receipt_intent(
 }
 
 fn decode(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedSession> {
-    let revision = row.get::<_, i64>(3)?;
+    let revision = row.get::<_, i64>(4)?;
+    let run_state = row.get::<_, String>(3)?;
     Ok(ManagedSession {
         provider_session_id: row.get(0)?,
         run_id: row.get(1)?,
         open: row.get::<_, String>(2)? == "open",
+        run_state: ManagedRunState::parse(&run_state).ok_or_else(|| {
+            rusqlite::Error::InvalidColumnType(
+                3,
+                "run_state".to_owned(),
+                rusqlite::types::Type::Text,
+            )
+        })?,
         revision: u64::try_from(revision).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
-                3,
+                4,
                 rusqlite::types::Type::Integer,
                 Box::new(error),
             )
         })?,
-        created_ms: row.get(4)?,
-        updated_ms: row.get(5)?,
+        created_ms: row.get(5)?,
+        updated_ms: row.get(6)?,
     })
 }
 
@@ -755,11 +877,18 @@ fn initialize(connection: &mut Connection) -> Managed<()> {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA)?;
         transaction.execute_batch(SCHEMA_V2)?;
+        transaction.execute_batch(SCHEMA_V3)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
     } else if version == 1 {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA_V2)?;
+        transaction.execute_batch(SCHEMA_V3)?;
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        transaction.commit()?;
+    } else if version == 2 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SCHEMA_V3)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
     } else if version != SCHEMA_VERSION {
@@ -808,14 +937,84 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let mut store = ManagedSessionStore::open(root.path().join("managed.sqlite3")).unwrap();
-        let first = store.observe("session-1", "run-1", 10).unwrap();
+        let first = store.observe_terminal("session-1", "run-1", 10).unwrap();
         assert_eq!(first.revision, 1);
-        assert_eq!(store.observe("session-1", "run-1", 11).unwrap(), first);
-        let second = store.observe("session-1", "run-2", 12).unwrap();
+        assert_eq!(
+            store.observe_terminal("session-1", "run-1", 11).unwrap(),
+            first
+        );
+        let second = store.observe_terminal("session-1", "run-2", 12).unwrap();
         assert_eq!(second.revision, 2);
         assert_eq!(second.run_id, "run-2");
         assert_eq!(store.by_run("run-2").unwrap(), Some(second.clone()));
         assert_eq!(store.list().unwrap(), vec![second]);
+    }
+
+    /// The binding names the in-flight run from turn start, and settles on the
+    /// same run when it ends.  Both ends move the revision: an attached client
+    /// that only ever saw the turn-start observation would never learn that the
+    /// turn was over.
+    #[test]
+    fn a_turn_binds_its_run_in_flight_and_settles_on_the_same_run() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let mut store = ManagedSessionStore::open(root.path().join("managed.sqlite3")).unwrap();
+
+        let first = store.observe_terminal("session-1", "run-1", 10).unwrap();
+        assert_eq!(first.run_state, ManagedRunState::Completed);
+        assert_eq!(first.revision, 1);
+
+        let started = store.observe_active("session-1", "run-2", 11).unwrap();
+        assert_eq!(started.run_id, "run-2");
+        assert!(started.run_state.is_in_flight());
+        assert_eq!(started.revision, 2);
+        assert_eq!(
+            store.observe_active("session-1", "run-2", 12).unwrap(),
+            started,
+            "the same turn observed twice holds the revision still"
+        );
+        assert_eq!(store.by_run("run-2").unwrap(), Some(started));
+        assert_eq!(
+            store.by_run("run-1").unwrap(),
+            None,
+            "the previous run is no longer the session's binding"
+        );
+
+        let settled = store.observe_terminal("session-1", "run-2", 13).unwrap();
+        assert_eq!(settled.run_id, "run-2");
+        assert_eq!(settled.run_state, ManagedRunState::Completed);
+        assert_eq!(settled.revision, 3);
+        assert_eq!(
+            store.observe_terminal("session-1", "run-2", 14).unwrap(),
+            settled
+        );
+    }
+
+    /// A row written by a generation that predates turn-start binding named a
+    /// run at its completion, so it opens as `completed` and nothing about the
+    /// existing projection changes under it.
+    #[test]
+    fn a_pre_turn_start_row_migrates_to_a_completed_binding() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.path().join("managed.sqlite3");
+        {
+            let mut store = ManagedSessionStore::open(&path).unwrap();
+            store.observe_terminal("session-1", "run-1", 10).unwrap();
+            store
+                .connection
+                .execute_batch("ALTER TABLE managed_sessions DROP COLUMN run_state;")
+                .unwrap();
+            store
+                .connection
+                .pragma_update(None, "user_version", 2_u32)
+                .unwrap();
+        }
+        let store = ManagedSessionStore::open(&path).unwrap();
+        let migrated = store.by_id("session-1").unwrap().expect("migrated row");
+        assert_eq!(migrated.run_id, "run-1");
+        assert_eq!(migrated.run_state, ManagedRunState::Completed);
+        assert_eq!(migrated.revision, 1);
     }
 
     #[test]
