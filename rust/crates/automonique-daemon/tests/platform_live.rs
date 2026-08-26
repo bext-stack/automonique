@@ -22,9 +22,11 @@ use automonique_protocol::platform::{
 };
 use automonique_protocol::platform_api::{PlatformRequestMessage, PlatformResponseMessage};
 use automonique_protocol::primitives::Revision;
-use automonique_store::approval_requests::{ApprovalContext, ApprovalProposal, ApprovalRequests};
+use automonique_store::approval_requests::{
+    ApprovalContext, ApprovalProposal, ApprovalRequests, ApprovalState,
+};
 use automonique_store::provider_journal::{ProcessSpawn, ProviderJournal, SessionOpening};
-use automonique_store::run_index::{RunIndex, RunIndexEntry};
+use automonique_store::run_index::{RunIndex, RunIndexEntry, RunSpoolState, StateAdvance};
 
 fn fixture() -> (tempfile::TempDir, DaemonConfig) {
     let root = tempfile::tempdir().expect("temporary root");
@@ -227,16 +229,16 @@ fn session_commands_are_fenced_to_the_managed_owner_before_receipt_admission() {
     )
     .expect("managed sessions");
     sessions
-        .observe("owned-session", "owned-run", 100)
+        .observe_terminal("owned-session", "owned-run", 100)
         .expect("owned binding");
     sessions
-        .observe("foreign-session", "foreign-run", 101)
+        .observe_terminal("foreign-session", "foreign-run", 101)
         .expect("foreign binding");
     sessions
-        .observe("rebound-session", "old-run", 102)
+        .observe_terminal("rebound-session", "old-run", 102)
         .expect("old binding");
     let rebound = sessions
-        .observe("rebound-session", "new-run", 103)
+        .observe_terminal("rebound-session", "new-run", 103)
         .expect("rebound binding");
     assert_eq!(rebound.revision, 2);
     drop(sessions);
@@ -436,6 +438,406 @@ fn session_commands_are_fenced_to_the_managed_owner_before_receipt_admission() {
     };
     assert_eq!(explanation.as_str(), "target_not_owned");
     serving.shutdown(&config);
+}
+
+/// Register one run and, when asked, drive its read-model row to a terminal
+/// state the way a finished worker does.
+fn register_run(config: &DaemonConfig, submission_id: i64, run_id: &str, terminal: bool) {
+    let mut index = RunIndex::open(config.run_index_path()).expect("run index");
+    index
+        .register(RunIndexEntry {
+            submission_id,
+            run_id,
+            registered_at_ms: submission_id + 10,
+        })
+        .expect("register run");
+    if !terminal {
+        return;
+    }
+    let running = index
+        .advance_state(StateAdvance {
+            submission_id,
+            expected_revision: 1,
+            new_state: RunSpoolState::Running,
+            last_sequence: 1,
+            now_ms: submission_id + 20,
+        })
+        .expect("run starts");
+    index
+        .advance_state(StateAdvance {
+            submission_id,
+            expected_revision: running.revision,
+            new_state: RunSpoolState::Completed,
+            last_sequence: 2,
+            now_ms: submission_id + 30,
+        })
+        .expect("run completes");
+}
+
+fn command_state(
+    config: &DaemonConfig,
+    label: &str,
+    session: &ResourceCoordinate,
+) -> automonique_protocol::platform::SessionCommandState {
+    let PlatformResponse::SessionCommandState(state) = platform(
+        config,
+        label,
+        PlatformRequest::SessionCommandState(SessionCommandStateRequest {
+            session: session.clone(),
+        }),
+    ) else {
+        panic!("{label}: expected a command state")
+    };
+    state
+}
+
+/// The turn in flight is the turn the session can act on.
+///
+/// This is the whole of #145 stated as a proof. The session has taken one
+/// completed turn on `settled-run` and is now taking another on `live-run`,
+/// which is where a provider permission request is raised — during the run that
+/// raised it, exactly as `execute.rs` proposes one. What is asserted is that the
+/// live run is the one the session names, that its approval is the one the
+/// session projects, and that a decision on it is admitted and lands in the
+/// durable row.
+///
+/// The last assertion is the anti-vacuity one: `granted` in
+/// `ApprovalRequests::entry` is the precise condition the execute lane's
+/// approval-wait loop breaks on, so a decision that reaches this row is a
+/// decision that releases the turn. That the loop then hands the permission
+/// back to the provider is `automonique-daemon`'s JCode host proof and the live
+/// non-production exercise; it needs a delegated cgroup domain and a workload,
+/// and neither is what this file proves.
+#[test]
+fn a_live_turns_approval_is_projected_and_decidable_by_its_own_session() {
+    let (_root, config) = fixture();
+    std::fs::create_dir(config.state_dir()).expect("product state");
+    std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
+        .expect("private product state");
+    register_run(&config, 1, "settled-run", true);
+    register_run(&config, 2, "live-run", false);
+
+    let mut sessions = automonique_daemon::managed_sessions::ManagedSessionStore::open(
+        config.managed_sessions_path(),
+    )
+    .expect("managed sessions");
+    let settled = sessions
+        .observe_terminal("live-session", "settled-run", 100)
+        .expect("first turn settles");
+    assert_eq!(settled.revision, 1);
+    let live = sessions
+        .observe_active("live-session", "live-run", 101)
+        .expect("second turn starts");
+    assert_eq!(live.revision, 2, "turn start advances the binding");
+    drop(sessions);
+
+    let settled_approval = "apr-44444444444444444444444444444444";
+    let live_approval = "apr-55555555555555555555555555555555";
+    let mut approvals =
+        ApprovalRequests::open(config.approval_requests_path()).expect("approval requests");
+    for (key, run_id) in [
+        (settled_approval, "settled-run"),
+        (live_approval, "live-run"),
+    ] {
+        approvals
+            .propose(approval_proposal(key, run_id))
+            .expect("approval proposal");
+    }
+    drop(approvals);
+
+    let serving = serve(&config);
+    let client = ClientId::new("mobile-credential-live").expect("client");
+    let session = automonique_coordinate(ResourceKind::Session, "live-session");
+
+    let state = command_state(&config, "live-command-state", &session);
+    assert_eq!(state.session.freshness.revision.get(), 2);
+    assert_eq!(
+        state.run.as_ref().expect("live run").target.id.as_str(),
+        "live-run",
+        "the in-flight run is the one the session names"
+    );
+    assert_eq!(state.pending_approvals.len(), 1);
+    assert_eq!(state.pending_approvals[0].target.id.as_str(), live_approval);
+
+    // The previous turn's approval is still pending in the store, and is still
+    // refused: settling a turn does not hand its approvals to the next one.
+    let PlatformResponse::Refused { explanation, .. } = platform(
+        &config,
+        "stale-run-approval",
+        PlatformRequest::SessionApprovalDecision(SessionApprovalDecisionRequest {
+            client: client.clone(),
+            session: session.clone(),
+            expected_session_revision: Revision::new(2).expect("revision"),
+            approval: automonique_coordinate(ResourceKind::Approval, settled_approval),
+            expected_approval_revision: Revision::FIRST,
+            idempotency_key: IdempotencyKey::new("stale-run-approval").expect("key"),
+            decision: SessionApprovalDecision::Grant,
+        }),
+    ) else {
+        panic!("a decision on the session's previous run must be refused")
+    };
+    assert_eq!(explanation.as_str(), "target_not_owned");
+
+    let decision = SessionApprovalDecisionRequest {
+        client: client.clone(),
+        session: session.clone(),
+        expected_session_revision: Revision::new(2).expect("revision"),
+        approval: automonique_coordinate(ResourceKind::Approval, live_approval),
+        expected_approval_revision: Revision::FIRST,
+        idempotency_key: IdempotencyKey::new("live-run-approval").expect("key"),
+        decision: SessionApprovalDecision::Grant,
+    };
+    let PlatformResponse::Receipt(receipt) = platform(
+        &config,
+        "live-run-approval",
+        PlatformRequest::SessionApprovalDecision(decision.clone()),
+    ) else {
+        panic!("a decision on the live run must be admitted")
+    };
+    assert_eq!(receipt.outcome, ReceiptOutcome::Completed);
+    let PlatformResponse::Receipt(replay) = platform(
+        &config,
+        "live-run-approval-replay",
+        PlatformRequest::SessionApprovalDecision(decision),
+    ) else {
+        panic!("replay receipt")
+    };
+    assert_eq!(replay, receipt, "the decision is idempotent by key");
+
+    // The turn no longer has a pending approval to wait on, and the stale one
+    // is untouched.
+    let after = command_state(&config, "live-command-state-decided", &session);
+    assert!(after.pending_approvals.is_empty());
+    serving.shutdown(&config);
+
+    let approvals =
+        ApprovalRequests::open(config.approval_requests_path()).expect("approval requests");
+    let decided = approvals
+        .entry(live_approval)
+        .expect("read")
+        .expect("live approval row");
+    assert_eq!(decided.state, ApprovalState::Granted);
+    assert!(!decided.is_answerable_at(200), "the wait is over");
+    assert_eq!(
+        approvals
+            .entry(settled_approval)
+            .expect("read")
+            .expect("stale approval row")
+            .state,
+        ApprovalState::Pending,
+        "a refused decision wrote nothing"
+    );
+}
+
+/// A binding is a session's own, in flight exactly as much as at rest.
+///
+/// Turn-start binding widens what a session can address, so the fence is
+/// re-proved on the wider surface: another session's live run is refused, and
+/// so is an approval owned by it, with no receipt written for either.
+#[test]
+fn a_foreign_sessions_live_run_and_approval_are_refused() {
+    let (_root, config) = fixture();
+    std::fs::create_dir(config.state_dir()).expect("product state");
+    std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
+        .expect("private product state");
+    register_run(&config, 1, "mine-run", false);
+    register_run(&config, 2, "theirs-run", false);
+
+    let mut sessions = automonique_daemon::managed_sessions::ManagedSessionStore::open(
+        config.managed_sessions_path(),
+    )
+    .expect("managed sessions");
+    sessions
+        .observe_active("mine-session", "mine-run", 100)
+        .expect("my turn");
+    sessions
+        .observe_active("theirs-session", "theirs-run", 101)
+        .expect("their turn");
+    drop(sessions);
+
+    let theirs_approval = "apr-66666666666666666666666666666666";
+    let mut approvals =
+        ApprovalRequests::open(config.approval_requests_path()).expect("approval requests");
+    approvals
+        .propose(approval_proposal(theirs_approval, "theirs-run"))
+        .expect("approval proposal");
+    drop(approvals);
+
+    let serving = serve(&config);
+    let client = ClientId::new("mobile-credential-mine").expect("client");
+    let mine = automonique_coordinate(ResourceKind::Session, "mine-session");
+
+    let state = command_state(&config, "mine-command-state", &mine);
+    assert_eq!(
+        state.run.as_ref().expect("my run").target.id.as_str(),
+        "mine-run"
+    );
+    assert!(
+        state.pending_approvals.is_empty(),
+        "another session's approval is not mine to see"
+    );
+
+    let stop_key = IdempotencyKey::new("foreign-live-run-stop").expect("key");
+    let PlatformResponse::Refused { explanation, .. } = platform(
+        &config,
+        "foreign-live-run-stop",
+        PlatformRequest::SessionRunStop(SessionRunStopRequest {
+            client: client.clone(),
+            session: mine.clone(),
+            expected_session_revision: Revision::FIRST,
+            run: automonique_coordinate(ResourceKind::Run, "theirs-run"),
+            expected_run_revision: Revision::FIRST,
+            idempotency_key: stop_key.clone(),
+        }),
+    ) else {
+        panic!("a stop on another session's run must be refused")
+    };
+    assert_eq!(explanation.as_str(), "target_not_owned");
+
+    let approval_key = IdempotencyKey::new("foreign-live-approval").expect("key");
+    let PlatformResponse::Refused { explanation, .. } = platform(
+        &config,
+        "foreign-live-approval",
+        PlatformRequest::SessionApprovalDecision(SessionApprovalDecisionRequest {
+            client: client.clone(),
+            session: mine,
+            expected_session_revision: Revision::FIRST,
+            approval: automonique_coordinate(ResourceKind::Approval, theirs_approval),
+            expected_approval_revision: Revision::FIRST,
+            idempotency_key: approval_key.clone(),
+            decision: SessionApprovalDecision::Grant,
+        }),
+    ) else {
+        panic!("a decision on another session's approval must be refused")
+    };
+    assert_eq!(explanation.as_str(), "target_not_owned");
+
+    for key in [stop_key, approval_key] {
+        let PlatformResponse::Refused { explanation, .. } = platform(
+            &config,
+            "foreign-receipt",
+            PlatformRequest::GetReceipt(
+                GetReceiptRequest::by_idempotency_key(key).with_client(client.clone()),
+            ),
+        ) else {
+            panic!("a refused command writes no receipt")
+        };
+        assert_eq!(explanation.as_str(), "not_found");
+    }
+    serving.shutdown(&config);
+
+    let approvals =
+        ApprovalRequests::open(config.approval_requests_path()).expect("approval requests");
+    assert_eq!(
+        approvals
+            .entry(theirs_approval)
+            .expect("read")
+            .expect("their approval row")
+            .state,
+        ApprovalState::Pending
+    );
+}
+
+/// A settled turn projects exactly what it projected before turn-start binding,
+/// and a binding whose worker died mid-turn settles the first time anyone looks.
+///
+/// The two halves are one test because they are the same guarantee from either
+/// side: the projection names a terminal run, whether the worker said so or the
+/// read model did.
+#[test]
+fn a_settled_turn_projects_as_before_and_an_abandoned_binding_heals_on_read() {
+    let (_root, config) = fixture();
+    std::fs::create_dir(config.state_dir()).expect("product state");
+    std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
+        .expect("private product state");
+    register_run(&config, 1, "done-run", true);
+    register_run(&config, 2, "abandoned-run", true);
+    register_run(&config, 3, "unretired-run", false);
+
+    let mut sessions = automonique_daemon::managed_sessions::ManagedSessionStore::open(
+        config.managed_sessions_path(),
+    )
+    .expect("managed sessions");
+    sessions
+        .observe_active("done-session", "done-run", 100)
+        .expect("turn starts");
+    let settled = sessions
+        .observe_terminal("done-session", "done-run", 101)
+        .expect("turn settles");
+    assert_eq!(settled.revision, 2, "settling a turn moves the revision");
+    // A generation that died mid-turn leaves these two behind: one whose run
+    // the read model calls terminal, and one whose run is still going.
+    sessions
+        .observe_active("abandoned-session", "abandoned-run", 102)
+        .expect("abandoned turn");
+    sessions
+        .observe_active("unretired-session", "unretired-run", 103)
+        .expect("live turn");
+    drop(sessions);
+
+    let serving = serve(&config);
+    let done = automonique_coordinate(ResourceKind::Session, "done-session");
+    let state = command_state(&config, "done-command-state", &done);
+    assert_eq!(state.session.freshness.revision.get(), 2);
+    assert_eq!(
+        state.run.as_ref().expect("run").target.id.as_str(),
+        "done-run"
+    );
+    assert!(state.pending_approvals.is_empty());
+    assert_eq!(
+        command_state(&config, "done-command-state-again", &done)
+            .session
+            .freshness
+            .revision
+            .get(),
+        2,
+        "reading a settled binding writes nothing"
+    );
+
+    let abandoned = automonique_coordinate(ResourceKind::Session, "abandoned-session");
+    assert_eq!(
+        command_state(&config, "abandoned-command-state", &abandoned)
+            .session
+            .freshness
+            .revision
+            .get(),
+        2,
+        "the abandoned binding is settled by the read"
+    );
+
+    let unretired = automonique_coordinate(ResourceKind::Session, "unretired-session");
+    assert_eq!(
+        command_state(&config, "unretired-command-state", &unretired)
+            .session
+            .freshness
+            .revision
+            .get(),
+        1,
+        "a run the read model has not called terminal is left alone"
+    );
+    serving.shutdown(&config);
+
+    let sessions = automonique_daemon::managed_sessions::ManagedSessionStore::open(
+        config.managed_sessions_path(),
+    )
+    .expect("managed sessions");
+    let healed = sessions
+        .by_id("abandoned-session")
+        .expect("read")
+        .expect("row");
+    assert_eq!(
+        healed.run_id, "abandoned-run",
+        "the run named does not change"
+    );
+    assert!(!healed.run_state.is_in_flight());
+    assert!(
+        sessions
+            .by_id("unretired-session")
+            .expect("read")
+            .expect("row")
+            .run_state
+            .is_in_flight()
+    );
 }
 
 /// #130: the adapter's pre-#118 `execute` body (no `client` key) is accepted,

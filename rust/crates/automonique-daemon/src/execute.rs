@@ -1017,6 +1017,7 @@ impl ExecutionLane {
                     answer_path: workspace.join(crate::compose::ANSWER_LEAF),
                     publisher: self.progress.publisher(run_id),
                     session_capture: Arc::clone(&session_capture),
+                    managed_sessions_path: self.managed_sessions_path.clone(),
                     controls: Arc::clone(&self.jcode_controls),
                     temporary_storage: Some(temporary_storage_watch.clone()),
                     approval: ProviderApprovalContext {
@@ -1407,6 +1408,9 @@ struct JcodePreparedParts<'a> {
     answer_path: PathBuf,
     publisher: Box<dyn ProgressPublisher>,
     session_capture: Arc<Mutex<Option<String>>>,
+    /// Where the managed-session binding lives, so this run can name itself as
+    /// its session's active run before the turn starts.
+    managed_sessions_path: PathBuf,
     controls: Arc<JcodeControlRegistry>,
     /// The run's temporary-storage watch, when it has a mount. `None` only
     /// for callers that run without one, such as tests of the protocol alone.
@@ -1475,6 +1479,7 @@ struct JcodePreparedRun {
     answer_path: PathBuf,
     publisher: Box<dyn ProgressPublisher>,
     session_capture: Arc<Mutex<Option<String>>>,
+    managed_sessions_path: PathBuf,
     controls: Arc<JcodeControlRegistry>,
     temporary_storage: Option<TemporaryStorageWatch>,
     approval: ProviderApprovalContext,
@@ -1507,6 +1512,7 @@ impl JcodePreparedRun {
             answer_path: parts.answer_path,
             publisher: parts.publisher,
             session_capture: parts.session_capture,
+            managed_sessions_path: parts.managed_sessions_path,
             controls: parts.controls,
             temporary_storage: parts.temporary_storage,
             approval: parts.approval,
@@ -1534,6 +1540,7 @@ impl JcodePreparedRun {
             answer_path,
             publisher,
             session_capture,
+            managed_sessions_path,
             controls,
             temporary_storage,
             approval,
@@ -1577,6 +1584,27 @@ impl JcodePreparedRun {
         }
         if let Ok(mut captured) = session_capture.lock() {
             *captured = Some(host.provider_session_id().to_owned());
+        }
+        // THE SESSION NAMES THE RUN IT IS RUNNING.
+        //
+        // Written here, before the turn is started, because everything this
+        // turn raises is raised against this run: a provider permission request
+        // arrives mid-turn and belongs to the run that asked for it. A binding
+        // advanced only at completion names the previous, already-terminal run,
+        // so a session-scoped surface cannot own the live approval it is being
+        // asked to decide, nor name the run it is being asked to stop.
+        //
+        // Best-effort, exactly like the settlement at the other end of the
+        // turn: the binding is a projection of what the run is doing, and a
+        // projection that could not be written is not a reason to refuse to
+        // run. The independent connection is opened and dropped here rather
+        // than held across the turn so nothing this worker owns keeps a write
+        // lock while the provider thinks.
+        if let Ok(bound_at) = crate::unix_millis()
+            && let Ok(mut sessions) =
+                crate::managed_sessions::ManagedSessionStore::open(&managed_sessions_path)
+        {
+            let _ = sessions.observe_active(host.provider_session_id(), &run_id, bound_at);
         }
         let control = match controls.register(host.provider_session_id(), &run_id) {
             Ok(control) => control,
@@ -2222,7 +2250,9 @@ struct Attempt {
     temporary_storage: MountedTempfs,
     /// Exact provider session observed by the normalized stream.
     session_capture: Arc<Mutex<Option<String>>>,
-    /// Independent durable connection opened after the run becomes terminal.
+    /// Where the session binding lives.  An independent durable connection is
+    /// opened against it once the run becomes terminal, to settle the binding
+    /// this run's own worker advanced at turn start.
     managed_sessions_path: PathBuf,
     /// The lane's drain flag; see [`ExecutionLane::begin_shutdown`].
     draining: Arc<AtomicBool>,
@@ -2311,14 +2341,21 @@ impl Attempt {
         } else {
             report.last_sequence
         };
-        if state == RunSpoolState::Completed
-            && let Ok(captured) = session_capture.lock()
+        // The turn is over, whichever way it ended. Settling every terminal
+        // state, not only a completion, is what keeps the binding honest after
+        // turn-start binding: a run bound in flight that then failed, timed out
+        // or was cancelled would otherwise leave its session permanently
+        // claiming a live run. The run named does not change here — this worker
+        // bound it at turn start — so a failure settles exactly where a
+        // completion does, and a run whose provider session was never observed
+        // still writes nothing at all.
+        if let Ok(captured) = session_capture.lock()
             && let Some(provider_session_id) = captured.as_deref()
             && let Ok(now_ms) = crate::unix_millis()
             && let Ok(mut sessions) =
                 crate::managed_sessions::ManagedSessionStore::open(&managed_sessions_path)
         {
-            let _ = sessions.observe(provider_session_id, &run_id, now_ms);
+            let _ = sessions.observe_terminal(provider_session_id, &run_id, now_ms);
         }
         advance(index_path, submission_id, revision, state, last_sequence);
         // The process and spool are terminal and the registration is already

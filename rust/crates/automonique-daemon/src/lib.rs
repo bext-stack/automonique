@@ -5160,6 +5160,13 @@ impl Daemon {
         }
     }
 
+    /// The session's own view of its current turn: the run it is on, and the
+    /// approvals that run is waiting for.
+    ///
+    /// The binding names the run of the *current* turn — advanced at turn start
+    /// — so an approval raised mid-turn is projected here while it is still
+    /// answerable, which is what makes a session-scoped decision and an
+    /// exact-run stop reachable at all.
     fn platform_session_command_state(
         &mut self,
         session: &ResourceCoordinate,
@@ -5168,6 +5175,7 @@ impl Daemon {
         let Some(binding) = self.platform_owned_session(session)? else {
             return platform_refusal(ReceiptOutcome::Rejected, "target_not_owned");
         };
+        let binding = self.settle_abandoned_binding(binding, now_ms)?;
         self.refresh_platform_sessions(now_ms)?;
         let session_record = ResourceRecord {
             resource: session.clone(),
@@ -5222,6 +5230,40 @@ impl Daemon {
             SessionCommandState::new(session_record, run, pending_approvals)
                 .map_err(|_| DaemonError::ProtocolRefused("platform_session_command_state"))?,
         ))
+    }
+
+    /// Settle a binding whose run ended without the worker recording it.
+    ///
+    /// A run's own worker settles the binding on every terminal state it
+    /// reaches, so the only way an in-flight binding outlives its run is a
+    /// generation that died mid-turn. The run index is the authority on that,
+    /// and it is already read here — so the repair is a read-repair rather than
+    /// a sweeper: the projection converges the first time anyone looks, exactly
+    /// as the approval ledger heals its proposal on the next open.
+    ///
+    /// A run the index no longer retains is left alone. Retention dropping a
+    /// row is not evidence that the run ended, and inventing a settlement from
+    /// an absence would be the read model deciding what the run did.
+    fn settle_abandoned_binding(
+        &mut self,
+        binding: managed_sessions::ManagedSession,
+        now_ms: i64,
+    ) -> Result<managed_sessions::ManagedSession, DaemonError> {
+        if !binding.run_state.is_in_flight() {
+            return Ok(binding);
+        }
+        let terminal = self
+            .run_index
+            .by_run_id(&binding.run_id)
+            .map_err(index_failed)?
+            .last()
+            .is_some_and(|record| record.spool_state.is_terminal());
+        if !terminal {
+            return Ok(binding);
+        }
+        self.managed_sessions
+            .observe_terminal(&binding.provider_session_id, &binding.run_id, now_ms)
+            .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))
     }
 
     fn platform_owned_session(

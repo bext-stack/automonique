@@ -88,6 +88,12 @@ use automonique_protocol::execute_api::{ExecuteRefusal, ExecuteRequest, ExecuteR
 use automonique_protocol::host::{AttemptId, HostId, HostLifetime, WorkId};
 use automonique_protocol::identity::Actor;
 use automonique_protocol::models::{ExecutorClass, ProviderAccountId};
+use automonique_protocol::platform::{
+    ClientId, IdempotencyKey, PlatformAction, PlatformRequest, PlatformResponse, ReceiptOutcome,
+    ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind, SessionCommandStateRequest,
+    SessionRunStopRequest,
+};
+use automonique_protocol::platform_api::{PlatformRequestMessage, PlatformResponseMessage};
 use automonique_protocol::primitives::Revision;
 use automonique_protocol::provider::BinaryProvenance;
 use automonique_protocol::runs_api::{
@@ -1109,6 +1115,145 @@ fn a_cancellation_is_delivered_once_and_its_replays_deliver_nothing() {
         vec![("ref-a".to_owned(), 3)],
         "one reference, recorded once, at the sequence the first delivery claimed"
     );
+}
+
+/// A mobile stop names the run of the turn that is running, and it is delivered.
+///
+/// #145: before turn-start binding, a managed session's binding advanced only
+/// when a run *finished*, so the only run a session could ever name was one that
+/// had already ended and every exact-run stop was answered `rejected`. Here the
+/// binding names the run while it is in flight, and the stop travels the whole
+/// admitted path — session ownership, exact run, both revisions, idempotency
+/// key — into the same dispatcher a `CancelRun` reaches.
+///
+/// It is proved in this file rather than beside the other session-surface
+/// proofs because delivery is what is at stake: the assertion is that the sink
+/// registered for this run's attempt was called, and that the durable cancel
+/// ledger holds the reference. As with every proof in this section, that a
+/// delivered cancellation ends a real process tree is `automonique-runner`'s
+/// containment proof, not this one.
+#[test]
+fn a_session_stop_reaches_the_in_flight_runs_attempt_and_is_idempotent() {
+    let (_root, config) = fixture();
+    let run = "run-session-stop";
+    let attempt = format!("{run}-attempt-1");
+    let spec = run_spec(run, "true");
+    let session_id = "session-stop-1";
+
+    let (serving, deliveries, registration) = serve_with_attempt(&config, &attempt);
+    submit(&config, &spec, "session-stop");
+
+    let mut sessions = automonique_daemon::managed_sessions::ManagedSessionStore::open(
+        config.managed_sessions_path(),
+    )
+    .expect("managed sessions");
+    sessions
+        .observe_active(session_id, run, 100)
+        .expect("the turn binds its run at start");
+    drop(sessions);
+
+    let session = platform_coordinate(ResourceKind::Session, session_id);
+    let state = command_state(&config, "stop-command-state", &session);
+    assert_eq!(
+        state
+            .run
+            .as_ref()
+            .expect("in-flight run")
+            .target
+            .id
+            .as_str(),
+        run,
+        "the session names the run it is running"
+    );
+
+    let request = SessionRunStopRequest {
+        client: ClientId::new("mobile-credential-stop").expect("client"),
+        session: session.clone(),
+        expected_session_revision: Revision::FIRST,
+        run: platform_coordinate(ResourceKind::Run, run),
+        expected_run_revision: Revision::FIRST,
+        idempotency_key: IdempotencyKey::new("session-run-stop").expect("key"),
+    };
+    let PlatformResponse::Receipt(receipt) = platform(
+        &config,
+        "session-run-stop",
+        PlatformRequest::SessionRunStop(request.clone()),
+    ) else {
+        panic!("a stop on the in-flight run must be admitted")
+    };
+    assert_eq!(receipt.action, PlatformAction::StopRun);
+    assert_eq!(receipt.target.id.as_str(), run);
+    assert_eq!(
+        receipt.outcome,
+        ReceiptOutcome::Completed,
+        "the stop was delivered, not rejected as a terminal run"
+    );
+    assert_eq!(
+        deliveries.load(Ordering::Acquire),
+        1,
+        "the cancellation reached the running attempt's sink"
+    );
+
+    let PlatformResponse::Receipt(replay) = platform(
+        &config,
+        "session-run-stop-replay",
+        PlatformRequest::SessionRunStop(request),
+    ) else {
+        panic!("replay receipt")
+    };
+    assert_eq!(replay, receipt);
+    assert_eq!(
+        deliveries.load(Ordering::Acquire),
+        1,
+        "a replay must not reach the sink a second time"
+    );
+
+    drop(registration);
+    serving.shutdown(&config);
+    assert_eq!(
+        recorded(&config, &attempt).len(),
+        1,
+        "one reference, recorded once"
+    );
+}
+
+fn platform_coordinate(kind: ResourceKind, id: &str) -> ResourceCoordinate {
+    ResourceCoordinate::new(
+        ResourceAuthority::Automonique,
+        kind,
+        ResourceId::new(id).expect("resource id"),
+    )
+}
+
+fn platform(config: &DaemonConfig, label: &str, request: PlatformRequest) -> PlatformResponse {
+    let request_id = RequestId::new(label).expect("request id");
+    let payload = PlatformRequestMessage::new(request_id.clone(), request)
+        .to_message()
+        .expect("request")
+        .to_canonical_bytes();
+    let response = PlatformResponseMessage::from_canonical_bytes(
+        &exchange(config, &payload).expect("the platform lane answered"),
+    )
+    .expect("platform response");
+    assert_eq!(response.request_id(), &request_id);
+    response.response().clone()
+}
+
+fn command_state(
+    config: &DaemonConfig,
+    label: &str,
+    session: &ResourceCoordinate,
+) -> automonique_protocol::platform::SessionCommandState {
+    let PlatformResponse::SessionCommandState(state) = platform(
+        config,
+        label,
+        PlatformRequest::SessionCommandState(SessionCommandStateRequest {
+            session: session.clone(),
+        }),
+    ) else {
+        panic!("{label}: expected a command state")
+    };
+    state
 }
 
 /// A replay presented to a daemon that restarted in between is still a replay.
