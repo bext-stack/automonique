@@ -324,6 +324,18 @@ pub enum ComposeRefusal {
     /// this module's own bug rather than the operator's, and it is a refusal
     /// rather than a panic because a control plane does not crash on a sentence.
     DocumentRejected,
+    /// The run-execution provider selects the retired direct Codex engine.
+    ///
+    /// The direct Codex JSONL execution path was the temporary production
+    /// fallback while the pinned JCode `api-stdio` engine was proven and
+    /// live-verified (epic bext-stack/automonique#66; plan
+    /// `docs/product-plan/unified-client-platform.md`). It is retired as a
+    /// run-execution engine: [`ProviderConfig::load_execution`] refuses a
+    /// provider that resolves to [`ProviderEngine::Codex`] so production selects
+    /// the JCode engine or nothing. This says nothing about the conversational
+    /// chat adapter, a separate provider role that still rides the Codex-style
+    /// answer-file mechanism through the generic [`ProviderConfig::load`].
+    CodexEngineRetired,
 }
 
 impl ComposeRefusal {
@@ -337,6 +349,7 @@ impl ComposeRefusal {
             Self::TaskRejected => "task_rejected",
             Self::IdentityRejected => "identity_rejected",
             Self::DocumentRejected => "document_rejected",
+            Self::CodexEngineRetired => "codex_engine_retired",
         }
     }
 }
@@ -350,6 +363,9 @@ impl core::fmt::Display for ComposeRefusal {
             Self::TaskRejected => "the task text is empty or too large",
             Self::IdentityRejected => "the run identity is unusable",
             Self::DocumentRejected => "the composed document was refused",
+            Self::CodexEngineRetired => {
+                "the direct Codex execution provider is retired; the run engine is JCode (set engine=jcode)"
+            }
         })
     }
 }
@@ -550,6 +566,54 @@ impl ProviderConfig {
             version: version.unwrap_or_else(|| String::from("provider")),
             argv,
         }))
+    }
+
+    /// Load the run-execution provider, refusing the retired direct `codex exec`
+    /// engine.
+    ///
+    /// Run execution has one production engine: the pinned JCode `api-stdio`
+    /// host. The direct Codex CLI JSONL path — `codex exec`, selected by a
+    /// provider that resolves to [`ProviderEngine::Codex`] whose invocation is
+    /// the Codex `exec` subcommand ([`DEFAULT_ARGV`], or any override that begins
+    /// with `exec`) — was the temporary production fallback during the JCode
+    /// canary and is retired (epic bext-stack/automonique#66; plan
+    /// `docs/product-plan/unified-client-platform.md`, whose acceptance is
+    /// "production provider configuration launches the pinned JCode engine
+    /// rather than direct `codex exec`"). It is refused with
+    /// [`ComposeRefusal::CodexEngineRetired`], so the run lane selects the JCode
+    /// engine or reports no runnable provider rather than silently falling back
+    /// to direct `codex exec`.
+    ///
+    /// The refusal is deliberately scoped to the direct Codex CLI, not to the
+    /// shared answer-file mechanism [`ProviderEngine::Codex`] also expresses. The
+    /// conversational chat adapter is a separate provider role that rides that
+    /// mechanism with its own non-`exec` invocation and continues to load
+    /// through the generic [`load`](Self::load) unchanged. An absent file remains
+    /// `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// Every error [`load`](Self::load) returns, plus
+    /// [`ComposeRefusal::CodexEngineRetired`] for a provider that selects the
+    /// retired direct `codex exec` engine.
+    pub fn load_execution(path: &Path) -> Result<Option<Self>, ComposeRefusal> {
+        match Self::load(path)? {
+            Some(config) if config.is_direct_codex_cli() => Err(ComposeRefusal::CodexEngineRetired),
+            other => Ok(other),
+        }
+    }
+
+    /// Whether this provider is the retired direct Codex CLI: the Codex engine
+    /// invoked through its `exec` subcommand.
+    ///
+    /// `codex exec` is the whole of the direct fallback the plan retires. A
+    /// Codex-engine provider with a different invocation — the answer-file
+    /// mechanism the conversational adapter and hermetic test providers ride —
+    /// is not the Codex CLI and is not what this gate removes.
+    #[must_use]
+    fn is_direct_codex_cli(&self) -> bool {
+        self.engine == ProviderEngine::Codex
+            && self.argv.first().is_some_and(|argument| argument == "exec")
     }
 
     /// The provider binary this deployment runs.
@@ -1377,4 +1441,122 @@ fn is_safe_segment(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+#[cfg(test)]
+mod codex_retirement_tests {
+    use super::{ComposeRefusal, ProviderConfig, ProviderEngine};
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+
+    /// Write a private (0o600) provider configuration in a fresh temporary
+    /// directory and return its path. The directory is leaked deliberately: a
+    /// unit test process is short-lived and the file lives under the system
+    /// temporary root, never the daemon state directory.
+    fn private_provider(body: &str) -> PathBuf {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("provider");
+        let mut file = std::fs::File::create(&path).expect("provider file");
+        file.write_all(body.as_bytes()).expect("provider body");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("private provider file");
+        // Keep the directory alive for the lifetime of the test binary.
+        std::mem::forget(dir);
+        path
+    }
+
+    const JCODE: &str = "engine=jcode\nbinary=/bin/true\nhome=/tmp\narg=--quiet\narg=api-stdio\n";
+    // The direct Codex CLI, explicit engine, with a `codex exec` invocation.
+    const CODEX_EXEC_EXPLICIT: &str =
+        "engine=codex\nbinary=/bin/true\nhome=/tmp\narg=exec\narg=--json\narg={answer}\n";
+    // The historical production fallback: an omitted engine (Codex default) and
+    // an omitted argv, which `load` fills with the `codex exec` DEFAULT_ARGV.
+    const CODEX_EXEC_DEFAULT: &str = "binary=/bin/true\nhome=/tmp\n";
+    // A Codex-engine provider that is NOT the Codex CLI: the answer-file
+    // mechanism the conversational chat adapter rides (a non-`exec` invocation).
+    const CODEX_ANSWER_FILE: &str = "binary=/bin/true\nhome=/tmp\narg=--output\narg={answer}\n";
+
+    #[test]
+    fn load_execution_refuses_an_explicit_direct_codex_exec_provider() {
+        let path = private_provider(CODEX_EXEC_EXPLICIT);
+        assert_eq!(
+            ProviderConfig::load_execution(&path),
+            Err(ComposeRefusal::CodexEngineRetired),
+        );
+    }
+
+    #[test]
+    fn load_execution_refuses_the_omitted_config_that_defaults_to_codex_exec() {
+        let path = private_provider(CODEX_EXEC_DEFAULT);
+        // load fills DEFAULT_ARGV, whose first argument is the `exec` subcommand.
+        assert_eq!(
+            ProviderConfig::load(&path)
+                .expect("loads")
+                .expect("present")
+                .argv()
+                .first()
+                .map(String::as_str),
+            Some("exec"),
+        );
+        assert_eq!(
+            ProviderConfig::load_execution(&path),
+            Err(ComposeRefusal::CodexEngineRetired),
+        );
+    }
+
+    #[test]
+    fn load_execution_accepts_the_pinned_jcode_run_engine() {
+        let path = private_provider(JCODE);
+        let provider = ProviderConfig::load_execution(&path)
+            .expect("jcode run engine loads")
+            .expect("provider present");
+        assert_eq!(provider.engine(), ProviderEngine::Jcode);
+    }
+
+    #[test]
+    fn load_execution_leaves_an_unconfigured_deployment_unconfigured() {
+        let missing = Path::new("/nonexistent/automonique/provider");
+        assert_eq!(ProviderConfig::load_execution(missing), Ok(None));
+    }
+
+    #[test]
+    fn load_execution_accepts_the_non_cli_answer_file_mechanism() {
+        // Retiring the direct `codex exec` engine must not remove the shared
+        // answer-file mechanism a non-CLI Codex-engine provider (the
+        // conversational adapter, hermetic test providers) rides. A Codex-engine
+        // provider whose invocation is not `codex exec` still loads for
+        // execution.
+        let path = private_provider(CODEX_ANSWER_FILE);
+        let provider = ProviderConfig::load_execution(&path)
+            .expect("non-CLI codex-mechanism provider still loads for execution")
+            .expect("provider present");
+        assert_eq!(provider.engine(), ProviderEngine::Codex);
+    }
+
+    #[test]
+    fn the_generic_loader_still_accepts_every_codex_style_provider() {
+        // The conversational chat adapter loads through the generic loader, a
+        // separate provider role from run execution. Retiring the direct Codex
+        // *run* engine must not disturb it, so the generic loader still accepts
+        // even a `codex exec` configuration.
+        for body in [CODEX_EXEC_EXPLICIT, CODEX_EXEC_DEFAULT, CODEX_ANSWER_FILE] {
+            let path = private_provider(body);
+            let provider = ProviderConfig::load(&path)
+                .expect("codex-style provider still loads")
+                .expect("provider present");
+            assert_eq!(provider.engine(), ProviderEngine::Codex);
+        }
+    }
+
+    #[test]
+    fn the_retirement_refusal_names_the_jcode_engine() {
+        assert_eq!(
+            ComposeRefusal::CodexEngineRetired.category(),
+            "codex_engine_retired",
+        );
+        let message = ComposeRefusal::CodexEngineRetired.to_string();
+        assert!(message.contains("JCode"), "{message}");
+        assert!(message.contains("retired"), "{message}");
+    }
 }

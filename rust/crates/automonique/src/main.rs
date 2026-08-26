@@ -319,11 +319,22 @@ fn run_platform_job(
     use automonique_platform_client::{ActionResult, PlatformClient, UnixTransport};
     use automonique_protocol::platform::{
         ExecuteRequest, FreshnessState, GetReceiptRequest, IdempotencyKey, PlatformAction,
-        PlatformText, ReceiptOutcome, ResourceAuthority, ResourceKind,
+        PlatformText, ReceiptOutcome, ResourceAuthority, ResourceCoordinate, ResourceId,
+        ResourceKind,
     };
 
     let mut client = PlatformClient::new(UnixTransport::new(&arguments.socket));
-    let snapshot = client.snapshot(Vec::new()).map_err(|_| "snapshot")?;
+    // This command only ever needs the serving node, and a daemon whose
+    // inventory no longer fits one response refuses a snapshot of everything
+    // with `snapshot_too_large`. `node/current` resolves to whichever
+    // generation is serving and comes back under that generation's concrete
+    // identity, which is what the execute request must name.
+    let current = ResourceCoordinate::new(
+        ResourceAuthority::Automonique,
+        ResourceKind::Node,
+        ResourceId::new(automonique_daemon::CURRENT_NODE_ALIAS).map_err(|_| "request")?,
+    );
+    let snapshot = client.snapshot(vec![current]).map_err(|_| "snapshot")?;
     let mut nodes = snapshot.resources.into_iter().filter(|record| {
         record.resource.authority == ResourceAuthority::Automonique
             && record.resource.kind == ResourceKind::Node
