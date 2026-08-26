@@ -42,7 +42,7 @@ use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, Work
 use automonique_runner::admission::{
     AdmissionContext, AdmissionContextParts, AdmissionRefusal, AdmittedLaunch,
     INFORMATIONAL_FIELDS, PromptSource, ResolvedPrompt, TemporaryStorageEnforcement,
-    UnenforcedBudget, WorkloadIdentityEnforcement, admit,
+    UnenforcedBudget, admit, refuse_identity_temporary_storage_conflict,
 };
 use automonique_runner::filesystem::PathIntent;
 use automonique_runner::{
@@ -282,9 +282,6 @@ fn context_parts(root: &Path) -> AdmissionContextParts {
         // storage budget; tests that need the fail-closed direction override
         // this field.
         temporary_storage: TemporaryStorageEnforcement::Available,
-        // Likewise for the workload identity: the mappable host can separate
-        // it, and the fail-closed test below says otherwise.
-        workload_identity: WorkloadIdentityEnforcement::Available,
     }
 }
 
@@ -1195,24 +1192,26 @@ fn a_host_that_cannot_mount_refuses_the_temporary_storage_budget() {
 }
 
 #[test]
-fn a_host_that_cannot_separate_the_workload_identity_refuses_every_document() {
-    let workspace = TempDir::new("identity-unenforceable");
-    let error = admit_with_context(workspace.path(), |context| {
-        context.workload_identity = WorkloadIdentityEnforcement::Unavailable(
-            "credential_switch_refused: the uid switch inside the namespace was refused".to_owned(),
-        );
-    })
-    .unwrap_err();
-    assert!(error.to_string().contains("workload identity"));
-    match error {
-        AdmissionRefusal::WorkloadIdentityUnenforceable(reason) => {
-            assert!(
-                reason.contains("credential_switch_refused"),
-                "the refusal must carry the helper's typed denial: {reason}"
-            );
-        }
-        other => panic!("got {other:?}"),
-    }
+fn identity_separation_and_the_temporary_storage_mount_cannot_combine() {
+    // The rule is a pure function of the plan, pinned here exactly as
+    // `AdmittedLaunch::with_temporary_storage` consults it: no document field
+    // can request identity separation yet, so this seam is where the
+    // combination is kept apart.
+    let digest = "a".repeat(64);
+    let plain = automonique_runner::LaunchPlan::new("/usr/bin/true", &digest).unwrap();
+    assert!(refuse_identity_temporary_storage_conflict(&plain).is_ok());
+
+    let separated = plain.separate_workload_identity().unwrap();
+    let error = refuse_identity_temporary_storage_conflict(&separated).unwrap_err();
+    assert!(matches!(
+        error,
+        AdmissionRefusal::WorkloadIdentityTemporaryStorageConflict
+    ));
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("child user namespace") && rendered.contains("FUSE"),
+        "the refusal must name the kernel limitation: {rendered}"
+    );
 }
 
 #[test]

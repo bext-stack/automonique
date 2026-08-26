@@ -374,7 +374,7 @@ fn exchange(config: &DaemonConfig, payload: &[u8]) -> Vec<u8> {
 }
 
 fn sandbox_enforceable() -> bool {
-    HostCapabilities::probe_with_launch_helper(locate_launch_helper().as_deref())
+    HostCapabilities::probe()
         .select_mode(&automonique_daemon::execute::ENFORCED_PROPERTIES)
         .is_ok()
 }

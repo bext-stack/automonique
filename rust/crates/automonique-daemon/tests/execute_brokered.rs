@@ -104,7 +104,7 @@ use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, Work
 use automonique_runner::admission::{
     AdmissionContext, AdmissionContextParts, AdmissionRefusal, AdmittedLaunch, BrokeredDestination,
     BrokeredScope, PromptSource, ResolvedPrompt, TemporaryStorageEnforcement, UnenforcedBudget,
-    WorkloadIdentityEnforcement, admit,
+    admit,
 };
 use automonique_runner::capability::HostCapabilities;
 use automonique_runner::{
@@ -374,7 +374,6 @@ fn context(
         unenforced_budgets: UnenforcedBudget::ALL.to_vec(),
         brokered_destinations: destinations.to_vec(),
         temporary_storage: TemporaryStorageEnforcement::Available,
-        workload_identity: WorkloadIdentityEnforcement::Available,
     })
     .expect("a valid context")
 }
@@ -816,7 +815,7 @@ fn connect_head(port: u16) -> String {
 // --- the enforced proof ---------------------------------------------------
 
 fn sandbox_enforceable() -> bool {
-    HostCapabilities::probe_with_launch_helper(locate_launch_helper().as_deref())
+    HostCapabilities::probe()
         .select_mode(&automonique_daemon::execute::ENFORCED_PROPERTIES)
         .is_ok()
 }

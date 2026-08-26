@@ -118,8 +118,7 @@ use automonique_protocol::sandbox::{
 };
 use automonique_runner::admission::{
     AdmissionContext, AdmissionContextParts, AdmittedLaunch, BrokeredDestination, BrokeredScope,
-    PromptSource, ResolvedPrompt, TemporaryStorageEnforcement, UnenforcedBudget,
-    WorkloadIdentityEnforcement, admit,
+    PromptSource, ResolvedPrompt, TemporaryStorageEnforcement, UnenforcedBudget, admit,
 };
 use automonique_runner::capability::HostCapabilities;
 use automonique_runner::{
@@ -347,7 +346,6 @@ fn admit_composed(
         unenforced_budgets: UnenforcedBudget::ALL.to_vec(),
         brokered_destinations: destinations.to_vec(),
         temporary_storage: TemporaryStorageEnforcement::Available,
-        workload_identity: WorkloadIdentityEnforcement::Available,
     })
     .expect("a valid context");
     admit(&spec, &context).expect("a composed document must be admissible")
@@ -996,7 +994,7 @@ fn a_task_that_cannot_be_a_prompt_is_refused() {
 // --- the contained proof --------------------------------------------------
 
 fn sandbox_enforceable() -> bool {
-    HostCapabilities::probe_with_launch_helper(locate_launch_helper().as_deref())
+    HostCapabilities::probe()
         .select_mode(&automonique_daemon::execute::ENFORCED_PROPERTIES)
         .is_ok()
 }

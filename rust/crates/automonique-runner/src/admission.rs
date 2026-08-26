@@ -282,24 +282,6 @@ pub enum TemporaryStorageEnforcement {
     Unavailable(String),
 }
 
-/// Whether this host can give the workload a host uid of its own.
-///
-/// A standing host answer, like [`TemporaryStorageEnforcement`] beside it:
-/// the caller decides it once by asking the launch helper
-/// ([`crate::capability::WorkloadIdentityFinding`]), and every document is
-/// admitted against the same answer. Every launch through the entry helper
-/// performs the switch and refuses when it cannot, so a host that cannot
-/// separate the identity runs nothing; carrying the answer here turns that
-/// late refusal into an admission answer with the host-wide word.
-#[derive(Clone, Debug)]
-pub enum WorkloadIdentityEnforcement {
-    /// The launch helper proved the switch on a throwaway child.
-    Available,
-    /// The switch is refused on this host. The string is the typed denial,
-    /// rendered, so a refusal names why.
-    Unavailable(String),
-}
-
 /// Where an allowlisted destination is expected to live.
 ///
 /// A mirror of the egress broker's own `AddressScope`, kept in this crate so
@@ -498,12 +480,13 @@ pub enum AdmissionRefusal {
     /// away from the budgeted mount. The budget attaches `TMPDIR`, so the two
     /// cannot both be present.
     TemporaryStorageTmpdirConflict,
-    /// The host cannot give the workload a host uid of its own: no subordinate
-    /// range, no setuid mapper, or a namespace policy that refuses the switch.
-    /// The string is the launch helper's typed denial. This is the fail-closed
-    /// answer the boundary requires — never admitted with the workload sharing
-    /// the supervisor's uid.
-    WorkloadIdentityUnenforceable(String),
+    /// The plan asks for a separated workload identity *and* the enforced
+    /// temporary-storage mount, which this kernel cannot deliver together:
+    /// FUSE refuses `allow_other` access to a process in a child user
+    /// namespace, so the supervisor-mounted scratch tree would be unreachable
+    /// by the very workload it budgets. Each feature works alone; the
+    /// combination is refused fail-closed rather than admitted and broken.
+    WorkloadIdentityTemporaryStorageConflict,
     /// The spec's canonical digest could not be computed.
     Digest(RunSpecEncodeError),
 }
@@ -572,9 +555,10 @@ impl fmt::Display for AdmissionRefusal {
             Self::TemporaryStorageBudgetMismatch => formatter.write_str(
                 "the offered mount does not read back the admitted temporary-storage budget",
             ),
-            Self::WorkloadIdentityUnenforceable(reason) => write!(
-                formatter,
-                "the host cannot separate the workload identity from the supervisor's: {reason}"
+            Self::WorkloadIdentityTemporaryStorageConflict => formatter.write_str(
+                "a separated workload identity cannot attach the temporary-storage mount: this \
+                 kernel's FUSE refuses allow_other access from a child user namespace, so the \
+                 supervisor-mounted scratch tree would be unreachable by the workload",
             ),
             Self::TemporaryStorageTmpdirConflict => formatter.write_str(
                 "the document binds TMPDIR, which the temporary-storage budget must own",
@@ -727,13 +711,6 @@ pub struct AdmissionContextParts {
     /// nothing: [`admit`] refuses with
     /// [`AdmissionRefusal::TemporaryStorageUnenforceable`].
     pub temporary_storage: TemporaryStorageEnforcement,
-    /// Whether this host can give the workload a host uid of its own.
-    ///
-    /// A standing host answer decided once by the caller through the
-    /// capability probe's helper-backed identity finding. Every launch
-    /// switches identity, so a host that cannot runs nothing: [`admit`]
-    /// refuses with [`AdmissionRefusal::WorkloadIdentityUnenforceable`].
-    pub workload_identity: WorkloadIdentityEnforcement,
 }
 
 /// The validated runtime half of one admission.
@@ -877,12 +854,6 @@ impl AdmissionContext {
     #[must_use]
     pub const fn temporary_storage(&self) -> &TemporaryStorageEnforcement {
         &self.parts.temporary_storage
-    }
-
-    /// Whether this host can give the workload a host uid of its own.
-    #[must_use]
-    pub const fn workload_identity(&self) -> &WorkloadIdentityEnforcement {
-        &self.parts.workload_identity
     }
 }
 
@@ -1029,6 +1000,7 @@ impl AdmittedLaunch {
         if self.temporary_storage_attached {
             return Err(AdmissionRefusal::TemporaryStorageAlreadyAttached);
         }
+        refuse_identity_temporary_storage_conflict(&self.plan)?;
         if mounted.budget() != self.temporary_storage_budget {
             return Err(AdmissionRefusal::TemporaryStorageBudgetMismatch);
         }
@@ -1183,7 +1155,6 @@ pub fn admit(
     let broker = check_egress(spec, context)?;
     let limits = map_quotas(spec, context)?;
     let temporary_storage_budget = map_temporary_storage(spec, context)?;
-    require_workload_identity(context)?;
     let prompt = resolve_prompt(spec, context)?;
     let plan = build_plan(spec, context, prompt)?;
     let spec_digest = spec.canonical_digest().map_err(AdmissionRefusal::Digest)?;
@@ -1234,18 +1205,23 @@ fn map_temporary_storage(
         .map_err(|_| AdmissionRefusal::QuotaRejected("sandbox.budgets.temporary_storage"))
 }
 
-/// Refuse fail-closed when the host cannot separate the workload's identity.
+/// The one rule that keeps the two features apart while the kernel forces a
+/// choice, shared by every place a temporary-storage mount could reach an
+/// identity-separated plan.
 ///
-/// There is no document field to map: every launch switches identity, and
-/// the only question is whether this host lets it. The answer is the caller's
-/// standing one, taken from the launch helper's own probe.
-fn require_workload_identity(context: &AdmissionContext) -> Result<(), AdmissionRefusal> {
-    match context.workload_identity() {
-        WorkloadIdentityEnforcement::Available => Ok(()),
-        WorkloadIdentityEnforcement::Unavailable(reason) => Err(
-            AdmissionRefusal::WorkloadIdentityUnenforceable(reason.clone()),
-        ),
+/// Nothing in the RunSpec vocabulary can request identity separation yet, so
+/// through [`admit`] this can never fire; it guards the composition seam so
+/// that when a document field arrives — or a caller composes a plan directly —
+/// the combination is a typed refusal, not a workload that discovers `EACCES`
+/// on its own scratch directory. See `docs/operations/workload-identity.md`
+/// for the kernel measurement behind it.
+pub fn refuse_identity_temporary_storage_conflict(
+    plan: &LaunchPlan,
+) -> Result<(), AdmissionRefusal> {
+    if plan.separates_workload_identity() {
+        return Err(AdmissionRefusal::WorkloadIdentityTemporaryStorageConflict);
     }
+    Ok(())
 }
 
 /// Refuse every runner-owned admission field that names an unbuilt subsystem.

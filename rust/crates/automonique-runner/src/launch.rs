@@ -15,12 +15,14 @@
 //!    the workload cannot read the plan channel either way;
 //! 4. opens the workload once and copies the verified bytes into an immutable
 //!    sealed descriptor;
-//! 5. gives itself the workload identity ([`crate::identity`]): an
-//!    unprivileged user namespace whose subordinate mapping is written by
-//!    the host's setuid `newuidmap`/`newgidmap`, a uid switch inside it to
-//!    a host uid that is not the supervisor's, and a capability set reduced
-//!    to the three discretionary-access capabilities the workload keeps over
-//!    the supervisor's files — every step read back from the kernel;
+//! 5. when the plan carries `identity=subordinate`, gives itself the workload
+//!    identity ([`crate::identity`]): an unprivileged user namespace whose
+//!    subordinate mapping is written by the host's setuid
+//!    `newuidmap`/`newgidmap`, a uid switch inside it to a host uid that is
+//!    not the supervisor's, and a capability set reduced to the three
+//!    discretionary-access capabilities the workload keeps over the
+//!    supervisor's files — every step read back from the kernel. A plan that
+//!    does not ask keeps the supervisor's identity, exactly as before;
 //! 6. closes every descriptor except the sealed program descriptor and the
 //!    standard streams and verifies the closure ([`crate::descriptors`]);
 //! 7. installs the plan's Landlock filesystem allowlist
@@ -38,10 +40,10 @@
 //!
 //! Any failure at any step exits with [`crate::HELPER_REFUSED_EXIT`] before
 //! the workload runs. The workload's very first instruction therefore executes
-//! inside the cgroup, under its own host uid, behind both Landlock domains and
-//! the syscall filter, with exactly three inherited descriptors and exactly
-//! the environment the plan spells out — empty unless it spells one, and never
-//! anything inherited.
+//! inside the cgroup — under its own host uid when the plan asked for one —
+//! behind both Landlock domains and the syscall filter, with exactly three
+//! inherited descriptors and exactly the environment the plan spells out —
+//! empty unless it spells one, and never anything inherited.
 //!
 //! The identity switch sits where it does for two reasons. It follows the
 //! cgroup join and the program staging because both are done as the
@@ -89,13 +91,16 @@
 //! - **It does not protect the supervisor from a same-uid attacker.** The
 //!   plan travels over a private pipe and the cgroup is delegation-checked,
 //!   but a process of the supervisor's uid outside the sandbox can already
-//!   trace the supervisor itself. What the identity switch closes is the
-//!   other direction: from `execve` on, the workload runs as a host uid no
-//!   supervisor-uid process shares, so `/proc/<pid>/environ` and
-//!   `/proc/<pid>/fd/0` — the environment and the prompt — answer `EACCES`
-//!   to such a reader, and the workload can neither signal nor trace a
-//!   supervisor-uid process. The environment is still not hidden from the
-//!   host: root, and the workload's own descendants, can read it.
+//!   trace the supervisor itself. What the identity switch closes — for a
+//!   plan that requests it — is the other direction: from `execve` on, the
+//!   workload runs as a host uid no supervisor-uid process shares, so
+//!   `/proc/<pid>/environ` and `/proc/<pid>/fd/0` — the environment and the
+//!   prompt — answer `EACCES` to such a reader, and the workload can neither
+//!   signal nor trace a supervisor-uid process. A plan that does not request
+//!   it keeps the supervisor's uid and the same-uid exposure that has always
+//!   come with it; see [`crate::identity`] for why the request is not yet the
+//!   default. The environment is never hidden from the host either way:
+//!   root, and the workload's own descendants, can read it.
 //! - **Identity separation is not discretionary-access separation.** The
 //!   workload keeps `CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH` and `CAP_FOWNER`
 //!   inside its namespace over inodes the supervisor owns, because the
@@ -309,6 +314,7 @@ pub struct LaunchPlan {
     environment: Vec<(String, Vec<u8>)>,
     prompt: Option<Vec<u8>>,
     rlimit_nofile: Option<u64>,
+    separate_identity: bool,
 }
 
 /// Redacting: a derived `Debug` would print environment values and prompt
@@ -331,6 +337,7 @@ impl fmt::Debug for LaunchPlan {
             )
             .field("prompt_bytes", &self.prompt_len())
             .field("rlimit_nofile", &self.rlimit_nofile)
+            .field("separate_identity", &self.separate_identity)
             .finish()
     }
 }
@@ -412,6 +419,7 @@ impl LaunchPlan {
             environment: Vec::new(),
             prompt: None,
             rlimit_nofile: None,
+            separate_identity: false,
         })
     }
 
@@ -580,6 +588,37 @@ impl LaunchPlan {
         Ok(self)
     }
 
+    /// Run the workload as a host uid that is not the supervisor's.
+    ///
+    /// The entry helper performs the whole switch ([`crate::identity`]) and
+    /// refuses the launch when the host cannot: subordinate ranges, the
+    /// setuid mappers and — where the host restricts unprivileged user
+    /// namespaces — an AppArmor grant are all prerequisites, and every step
+    /// is read back from the kernel. Off by default: a plan that does not ask
+    /// launches exactly as before, and asking twice is refused like every
+    /// other repeated line.
+    ///
+    /// A plan carrying this cannot attach the enforced temporary-storage
+    /// mount: on current kernels FUSE refuses `allow_other` access to a
+    /// process in a child user namespace, so the combination is refused
+    /// (fail-closed) rather than admitted and broken; see
+    /// [`crate::admission`].
+    pub fn separate_workload_identity(mut self) -> Result<Self, LaunchPlanError> {
+        if self.separate_identity {
+            return Err(LaunchPlanError::PolicyRejected(
+                "identity separation is requested twice".to_owned(),
+            ));
+        }
+        self.separate_identity = true;
+        Ok(self)
+    }
+
+    /// Whether this plan runs its workload under a separated host uid.
+    #[must_use]
+    pub const fn separates_workload_identity(&self) -> bool {
+        self.separate_identity
+    }
+
     /// Exact workload program path.
     #[must_use]
     pub fn program(&self) -> &Path {
@@ -707,6 +746,9 @@ impl LaunchPlan {
         if let Some(limit) = self.rlimit_nofile {
             frame.push_str(&format!("rlimit_nofile={limit}\n"));
         }
+        if self.separate_identity {
+            frame.push_str("identity=subordinate\n");
+        }
         for argument in &self.arguments {
             frame.push_str(&format!("arg={}\n", hex(argument)));
         }
@@ -785,6 +827,14 @@ impl LaunchPlan {
                         .parse::<u64>()
                         .map_err(|_| LaunchPlanError::FrameRejected)?;
                     *current = current.clone().rlimit_descriptors(value)?;
+                }
+                ("identity", Some(current)) => {
+                    if value != "subordinate" {
+                        return Err(LaunchPlanError::FrameRejected);
+                    }
+                    // A second line refuses in the builder: one request has
+                    // one spelling, and a repeat is a broken frame.
+                    *current = current.clone().separate_workload_identity()?;
                 }
                 ("grant", Some(current)) => {
                     let (intent, path_hex) = value
@@ -1151,13 +1201,17 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
     //    path is never resolved again.
     let program_descriptor = staged_verified_program_descriptor(&plan)?;
 
-    // 5. Become the workload identity: a host uid that is not the
-    //    supervisor's, in a user namespace of this process's own, with the
-    //    capability set the workload keeps. Every step is read back from the
-    //    kernel and any failure refuses the launch. The mapper this spawns is
-    //    reaped, and its pipe closed, before the descriptor closure below.
-    crate::identity::separate_workload_identity()
-        .map_err(|error| format!("workload identity refused: {error}"))?;
+    // 5. When the plan asks, become the workload identity: a host uid that is
+    //    not the supervisor's, in a user namespace of this process's own,
+    //    with the capability set the workload keeps. Every step is read back
+    //    from the kernel and any failure refuses the launch. The mapper this
+    //    spawns is reaped, and its pipe closed, before the descriptor closure
+    //    below. A plan that does not ask launches with the supervisor's
+    //    identity, exactly as every plan did before the line existed.
+    if plan.separate_identity {
+        crate::identity::separate_workload_identity()
+            .map_err(|error| format!("workload identity refused: {error}"))?;
+    }
 
     // 6. Close everything but the standard streams and the staged program.
     let allowlist = DescriptorAllowlist::new(&[
@@ -1607,6 +1661,48 @@ mod tests {
             output.stdout.ends_with(b"verified-bytes-ran\n"),
             "{output:?}"
         );
+    }
+
+    #[test]
+    fn the_identity_line_round_trips_and_a_repeat_is_refused() {
+        let digest = "a".repeat(64);
+        let plain = LaunchPlan::new("/usr/bin/true", &digest).unwrap();
+        let encoded = String::from_utf8(plain.encode().unwrap()).unwrap();
+        assert!(
+            !encoded.contains("identity="),
+            "a plan that does not ask must not carry the line: {encoded}"
+        );
+        assert!(
+            !LaunchPlan::decode(encoded.as_bytes())
+                .unwrap()
+                .separates_workload_identity()
+        );
+
+        let asking = LaunchPlan::new("/usr/bin/true", &digest)
+            .unwrap()
+            .separate_workload_identity()
+            .unwrap();
+        assert!(asking.separates_workload_identity());
+        let encoded = String::from_utf8(asking.encode().unwrap()).unwrap();
+        assert!(encoded.contains("\nidentity=subordinate\n"), "{encoded}");
+        let decoded = LaunchPlan::decode(encoded.as_bytes()).unwrap();
+        assert!(decoded.separates_workload_identity());
+        assert_eq!(decoded, asking);
+
+        assert!(matches!(
+            asking.clone().separate_workload_identity(),
+            Err(LaunchPlanError::PolicyRejected(_))
+        ));
+        let repeated = encoded.replace(
+            "identity=subordinate\n",
+            "identity=subordinate\nidentity=subordinate\n",
+        );
+        assert!(LaunchPlan::decode(repeated.as_bytes()).is_err());
+        let unknown = encoded.replace("identity=subordinate", "identity=root");
+        assert!(matches!(
+            LaunchPlan::decode(unknown.as_bytes()),
+            Err(LaunchPlanError::FrameRejected)
+        ));
     }
 
     #[test]

@@ -6,16 +6,19 @@ The workload used to run as the supervisor's own uid. Any process of that uid
 on the host could read the workload's `/proc/<pid>/environ` (its environment,
 including any secret placed there) and open `/proc/<pid>/fd/0` (its prompt),
 and could trace it. Audit finding F-10 named this the largest real sandbox
-gap. This page records how the workload gets a host uid of its own, what that
-does and does not close, and the one host prerequisite that is not yet
-satisfied on the runner host.
+gap. This page records how a workload gets a host uid of its own, what that
+does and does not close, why the request is per-plan and off by default, and
+the kernel limitation that keeps it apart from the temporary-storage mount.
 
 ## The mechanism
 
 Per the owner decision on issue #47, the workload's identity is separated
 through an **unprivileged user namespace**, with **no setuid binary of ours**.
-The launch entry helper, which becomes the workload, does this between the
-cgroup join and the Landlock/seccomp installation, single-threaded:
+The request is one launch-plan line — `LaunchPlan::separate_workload_identity`
+puts `identity=subordinate` in the frame — and a plan that does not ask
+launches exactly as before. When the plan asks, the launch entry helper, which
+becomes the workload, does this between the cgroup join and the
+Landlock/seccomp installation, single-threaded:
 
 1. It resolves an identity plan from the host's own files: the account's first
    subordinate uid range in `/etc/subuid` and gid range in `/etc/subgid`. The
@@ -52,9 +55,11 @@ namespace sees as its root group. Mapping the account's own gid is what
 supplementary groups and can neither add nor drop them. That inheritance is
 the same as before this feature existed.
 
-The seccomp filter installed after the switch denies `unshare`, `setns`,
-`clone` with any namespace flag, and answers `clone3` with `ENOSYS`, so the
-workload cannot open a nested namespace in which it would be root again.
+The seccomp filter — installed for every workload, separated or not — denies
+`unshare`, `setns`, `clone` with any namespace flag, and answers `clone3` with
+`ENOSYS` rather than `EPERM` (the one answer that makes a C library fall back
+to `clone`, where the flags are visible). A separated workload therefore
+cannot open a nested namespace in which it would be root again.
 
 ## What is closed, and where
 
@@ -63,7 +68,7 @@ workload cannot open a nested namespace in which it would be root again.
 | The workload runs as a host uid that is not the supervisor's. From `execve` on, a process of the supervisor's uid gets `EACCES` reading `/proc/<pid>/environ` and opening `/proc/<pid>/fd/0`: the credential change marks the workload non-dumpable, so its `/proc` files become root-owned. The delegated-scope proof `a_same_uid_observer_cannot_read_the_workload_environ_or_stdin` reads both from the supervisor uid and from a same-uid sibling and asserts the refusals; `the_workload_runs_as_a_host_uid_outside_the_supervisor_uid` reads `/proc/<pid>/status` from outside the namespace. | `automonique_runner::identity`, `automonique_runner::launch` |
 | Identity separation is **not** discretionary-access separation. The workload keeps `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH`/`CAP_FOWNER` over inodes the supervisor owns — the workspace and the provider home — because a workload that could not open them would not be a workload. The Landlock allowlist stays the filesystem boundary. | `automonique_runner::identity` |
 | The capability probe exercises the switch, rather than reading a config file: it runs the launch helper in a throwaway probe mode that performs the whole switch on itself and reports its own kernel view. So a host whose subordinate files, mapping helpers or AppArmor policy would refuse the launch refuses the probe the same way, and readiness (`SandboxEnforceableLaneWired` / `SandboxUnavailableLaneWired`) reflects it. | `automonique_runner::capability::WorkloadIdentityFinding`, `automonique_daemon::execute::offered_host_features` |
-| Fail-closed. `uid_separation` is one of the daemon's `ENFORCED_PROPERTIES`, so a host that cannot separate the identity offers nothing and refuses every run. Admission additionally carries a `WorkloadIdentityEnforcement` standing answer and refuses fail-closed with the host-wide `sandbox_unenforceable` when it is unavailable, exactly as the temporary-storage budget does. | `automonique_runner::admission`, `automonique_daemon::execute` |
+| Fail-closed, per plan. A plan that asks is refused by the entry helper — before the workload exists — when any prerequisite is missing, with a typed reason. A plan that asks **and** would attach the enforced temporary-storage mount is refused at admission with `WorkloadIdentityTemporaryStorageConflict`, naming the kernel limitation below; each feature works alone. No RunSpec field can request the separation yet, so the daemon lane composes every run without it and `uid_separation` is not in the daemon's `ENFORCED_PROPERTIES`; it joins them when the limitation below is resolved and a document vocabulary exists. | `automonique_runner::admission::refuse_identity_temporary_storage_conflict`, `automonique_runner::launch` |
 
 Signalling is deliberately **not** blocked: the supervisor's uid owns the
 workload's user namespace, so it keeps `CAP_KILL` over that namespace, which
@@ -90,47 +95,50 @@ not the ability to end the run.
   `<account>:200000:65536`. The distro seeds these when the account is
   created; the runner host already has them.
 
-## Known blocker: the temporary-storage FUSE mount (issue #140/#111)
+These are prerequisites for a plan that asks; a host without them runs every
+ordinary plan untouched and refuses only the asking ones, typed.
 
-The identity switch and the per-run FUSE temporary-storage mount are, on this
-kernel, **mutually exclusive under the real containment lane**, and this is
-the reason issue #47 is not yet merged or deployed.
+## The kernel limitation: no separated identity with the FUSE tempfs
+
+The identity switch and the per-run FUSE temporary-storage mount (#140) are,
+on this kernel, **mutually exclusive**, which is why the combination is a
+typed admission refusal (`WorkloadIdentityTemporaryStorageConflict`) and the
+separation is not yet the default.
 
 The tempfs is mounted by the supervisor through the setuid `fusermount3`, so
 the FUSE connection's owning user namespace (`fc->user_ns`) is the init user
-namespace. The workload, after the switch, runs in a **child** user namespace.
-On this host's kernel (Ubuntu 6.8.0-124-generic) `fuse_permission` calls
-`fuse_allow_current_process`, and with `allow_other` that returns
-`current_in_userns(fc->user_ns)` — which, measured directly, refuses a process
-in a child user namespace with `EACCES` **regardless of uid or file mode**. It
-was verified that:
+namespace. A switched workload runs in a **child** user namespace. On this
+kernel (Ubuntu 6.8.0-124-generic) `fuse_permission` calls
+`fuse_allow_current_process`, and — measured directly — a process in a child
+user namespace is refused with `EACCES` **regardless of uid or file mode**,
+even with `allow_other` on the mount and `user_allow_other` in
+`/etc/fuse.conf`. The measurements, taken with throwaway builds on the runner
+host:
 
-- `user_allow_other` in `/etc/fuse.conf` is enabled and the live mount carries
-  `allow_other` (`super_options` shows it);
-- `stat`/`getattr` on the mount from the switched workload **succeeds** (so the
+- `stat`/`getattr` on the mount from the switched workload **succeeds** (the
   server and the mount are reachable), but every `open`/`opendir`/`create`/
-  `write` — which pass through `fuse_permission` — is refused;
-- the refusal persists when the workload keeps the supervisor's own host uid
-  (skipping the `setresuid`), so it is the **child user namespace itself**, not
-  the uid change, that the kernel rejects;
-- the refusal persists with the FUSE root node owned by the workload's host uid
-  at mode `0700` (owner match) and with `default_permissions` removed, confirming
-  it is `fuse_allow_current_process`, not the mode-bit check.
+  `write` — the operations that pass through `fuse_permission` — is refused;
+- the refusal persists when the switched process keeps the supervisor's own
+  host uid (skipping the `setresuid`), so it is the **child user namespace
+  itself**, not the uid change, that the kernel rejects;
+- the refusal persists with the FUSE root node owned by the workload's host
+  uid at mode `0700` (owner match) and with `default_permissions` removed,
+  confirming it is `fuse_allow_current_process`, not the mode-bit check.
 
-`allow_other` is therefore necessary but **not sufficient** on this kernel. The
-owner-named alternative — "the mount performed inside the namespace" — is the
-required fix: the launch helper (which owns the workload's user namespace, and
-would additionally unshare a mount namespace) performs the FUSE mount itself,
-so `fc->user_ns` is the workload's namespace and access is allowed. That makes
+So `allow_other` is necessary but **not sufficient**, and no mount-option or
+ownership change on the supervisor's mount can lift the refusal. `#140` is
+deliberately untouched: its mount options, prerequisites and every test are
+exactly what they were.
+
+**Intended end state.** The mount is performed *inside* the workload's
+namespace: the launch helper, which owns the workload's user namespace and can
+unshare a mount namespace beside it, performs the FUSE mount itself, so
+`fc->user_ns` is the workload's namespace and access is ordinary. That makes
 the mount private to the workload's mount namespace, so the supervisor's
 `statvfs` reconcile (`temporary_storage_readback`) must move to the ledger the
-QuotaFs server already maintains, or read the mount through
-`/proc/<workload>/root`. That is a change to the live #140 surface and its
-tests, and is tracked as the remaining work for #47.
-
-Until it lands, the delegated-scope proofs `tempfs_contained`, `run_compose`
-and `execute_brokered` fail under the real lane (every composed run launches
-through the helper, which now switches identity), while the identity proofs
-(`workload_identity`), the capability model (`capability`) and admission
-(`admission`) pass. The undelegated workspace suite is green, because the
-switch is only exercised where a delegated cgroup domain exists.
+QuotaFs server already maintains, or read through `/proc/<workload>/root`.
+When that lands, the combination refusal is removed, a document vocabulary can
+request the separation, and `uid_separation` joins the daemon's enforced
+properties. Until then: every #140 delegated proof passes unchanged, the
+identity proofs in `tests/workload_identity.rs` pass for plans that ask, and
+`a_plan_that_does_not_ask_keeps_the_supervisor_identity` pins the default.

@@ -53,19 +53,9 @@ pub const CHECKPOINT_LEAF: &str = "tempfs-ledger";
 /// socket's number from.
 const COMM_FD_ENV: &str = "_FUSE_COMMFD";
 /// Mount options beyond the name and subtype. `default_permissions` makes the
-/// kernel check mode bits; `allow_other` lets a process of another uid reach
-/// the mount at all — the workload runs as one ([`crate::identity`]) — and
-/// is why [`DEFAULT_FUSE_CONF`] must enable `user_allow_other`; the three
-/// flags keep the scratch tree from ever executing anything or carrying a
-/// device node.
-const MOUNT_OPTIONS: &str = "default_permissions,allow_other,nosuid,nodev,noexec";
-/// libfuse's host configuration, which must enable `user_allow_other` for an
-/// unprivileged mount to carry `allow_other`.
-pub const DEFAULT_FUSE_CONF: &str = "/etc/fuse.conf";
-/// The line `fuse.conf` must carry.
-const USER_ALLOW_OTHER: &str = "user_allow_other";
-/// Bound on the `fuse.conf` read.
-const MAX_FUSE_CONF_BYTES: usize = 64 * 1024;
+/// kernel check mode bits; the three flags keep the scratch tree from ever
+/// executing anything or carrying a device node.
+const MOUNT_OPTIONS: &str = "default_permissions,nosuid,nodev,noexec";
 /// The setuid bit, as `st_mode` carries it.
 const S_ISUID: u32 = 0o4000;
 /// Bound on the helper's diagnostic kept in an error.
@@ -87,9 +77,6 @@ pub enum PrerequisiteError {
     /// Without setuid root the helper cannot mount for an unprivileged uid.
     FusermountNotSetuidRoot(PathBuf),
     FusermountNotExecutable(PathBuf),
-    /// `fuse.conf` does not enable `user_allow_other`, so `fusermount3`
-    /// would refuse the `allow_other` the workload's identity needs.
-    UserAllowOtherDisabled(PathBuf),
     Io(PathBuf, io::Error),
 }
 
@@ -117,11 +104,6 @@ impl fmt::Display for PrerequisiteError {
                     path.display()
                 )
             }
-            Self::UserAllowOtherDisabled(path) => write!(
-                formatter,
-                "{} does not enable {USER_ALLOW_OTHER}, which allow_other needs",
-                path.display()
-            ),
             Self::Io(path, error) => write!(formatter, "{}: {error}", path.display()),
         }
     }
@@ -129,12 +111,11 @@ impl fmt::Display for PrerequisiteError {
 
 impl std::error::Error for PrerequisiteError {}
 
-/// The three host facts a FUSE mount depends on.
+/// The two host facts a FUSE mount depends on.
 #[derive(Clone, Debug)]
 pub struct FusePrerequisites {
     dev_fuse: PathBuf,
     fusermount: PathBuf,
-    fuse_conf: PathBuf,
 }
 
 impl FusePrerequisites {
@@ -144,21 +125,12 @@ impl FusePrerequisites {
         Self::at(DEFAULT_DEV_FUSE, DEFAULT_FUSERMOUNT3)
     }
 
-    /// Explicit device and helper locations, with the host's `fuse.conf`, for
-    /// tests and for hosts that differ.
+    /// Explicit locations, for tests and for hosts that differ.
     pub fn at(dev_fuse: impl Into<PathBuf>, fusermount: impl Into<PathBuf>) -> Self {
         Self {
             dev_fuse: dev_fuse.into(),
             fusermount: fusermount.into(),
-            fuse_conf: PathBuf::from(DEFAULT_FUSE_CONF),
         }
-    }
-
-    /// The same prerequisites with an explicit `fuse.conf`.
-    #[must_use]
-    pub fn with_fuse_conf(mut self, fuse_conf: impl Into<PathBuf>) -> Self {
-        self.fuse_conf = fuse_conf.into();
-        self
     }
 
     /// Refuse unless both prerequisites are present and usable by this uid.
@@ -210,42 +182,11 @@ impl FusePrerequisites {
                 self.fusermount.clone(),
             ));
         }
-        // `fusermount3` reads this file itself and refuses `allow_other`
-        // without the line; checking it here turns that refusal into an
-        // admission answer instead of a failed mount.
-        let conf = match fs::read(&self.fuse_conf) {
-            Ok(bytes) if bytes.len() <= MAX_FUSE_CONF_BYTES => bytes,
-            Ok(_) => {
-                return Err(PrerequisiteError::UserAllowOtherDisabled(
-                    self.fuse_conf.clone(),
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(PrerequisiteError::UserAllowOtherDisabled(
-                    self.fuse_conf.clone(),
-                ));
-            }
-            Err(error) => return Err(PrerequisiteError::Io(self.fuse_conf.clone(), error)),
-        };
-        if !fuse_conf_allows_other(&String::from_utf8_lossy(&conf)) {
-            return Err(PrerequisiteError::UserAllowOtherDisabled(
-                self.fuse_conf.clone(),
-            ));
-        }
         Ok(VerifiedFuse {
             dev_fuse: self.dev_fuse.clone(),
             fusermount: self.fusermount.clone(),
         })
     }
-}
-
-/// Whether a `fuse.conf` enables `user_allow_other`: the option on a line of
-/// its own, as libfuse requires, with comments and blank lines ignored.
-fn fuse_conf_allows_other(contents: &str) -> bool {
-    contents.lines().any(|line| {
-        let line = line.trim();
-        !line.starts_with('#') && line == USER_ALLOW_OTHER
-    })
 }
 
 /// Proof that [`FusePrerequisites::verify`] passed; the only way to mount.
@@ -1043,43 +984,6 @@ mod tests {
             error,
             PrerequisiteError::DevFuseNotCharacterDevice(_)
         ));
-    }
-
-    #[test]
-    fn user_allow_other_must_be_a_line_of_its_own_outside_a_comment() {
-        assert!(fuse_conf_allows_other("user_allow_other\n"));
-        assert!(fuse_conf_allows_other(
-            "# header\n\n  user_allow_other  \nmount_max = 1000\n"
-        ));
-        assert!(!fuse_conf_allows_other("#user_allow_other\n"));
-        assert!(!fuse_conf_allows_other("user_allow_other = yes\n"));
-        assert!(!fuse_conf_allows_other(""));
-    }
-
-    #[test]
-    fn a_fuse_conf_without_user_allow_other_is_refused() {
-        let directory = tempfile::tempdir().unwrap();
-        let conf = directory.path().join("fuse.conf");
-        std::fs::write(&conf, b"#user_allow_other\n").unwrap();
-        // The device and helper checks come first; on a host without them
-        // the earlier refusal is the one observed, and that is still closed.
-        match FusePrerequisites::host_default()
-            .with_fuse_conf(&conf)
-            .verify()
-        {
-            Err(PrerequisiteError::UserAllowOtherDisabled(path)) => assert_eq!(path, conf),
-            Err(other) => eprintln!("[tempfs] NOT PROVEN (earlier prerequisite failed): {other}"),
-            Ok(_) => panic!("a fuse.conf without user_allow_other must be refused"),
-        }
-        let missing = directory.path().join("absent-fuse.conf");
-        match FusePrerequisites::host_default()
-            .with_fuse_conf(&missing)
-            .verify()
-        {
-            Err(PrerequisiteError::UserAllowOtherDisabled(path)) => assert_eq!(path, missing),
-            Err(other) => eprintln!("[tempfs] NOT PROVEN (earlier prerequisite failed): {other}"),
-            Ok(_) => panic!("a missing fuse.conf must be refused"),
-        }
     }
 
     #[test]

@@ -3810,11 +3810,7 @@ impl Daemon {
         // list written here, so the measurement this status reports and the
         // host features the execution lane offers cannot disagree about which
         // properties this build enforces.
-        // The identity property in the set is proven by running the launch
-        // helper, so the measurement asks the same helper the lane will use.
-        let helper = execute::locate_launch_helper();
-        let selection = HostCapabilities::probe_with_launch_helper(helper.as_deref())
-            .select_mode(&execute::ENFORCED_PROPERTIES);
+        let selection = HostCapabilities::probe().select_mode(&execute::ENFORCED_PROPERTIES);
         match selection {
             Ok(_) => ExecutionState::SandboxEnforceableLaneWired,
             Err(_) => ExecutionState::SandboxUnavailableLaneWired,

@@ -42,14 +42,8 @@ const TTL: Duration = Duration::from_secs(1);
 const S_IFMT: u32 = 0o170000;
 const S_IFREG: u32 = 0o100000;
 const PERM_MASK: u32 = 0o7777;
-/// Mode bits of the root directory: the mount owner and its group, no other.
-///
-/// The workload runs as a subordinate host uid that is not the supervisor's
-/// ([`crate::identity`]), but it keeps the supervisor's gid, so group access
-/// is what lets it reach the scratch tree the supervisor mounted. `other` is
-/// still denied, and the mount carries `allow_other` and `default_permissions`
-/// so the kernel enforces exactly these bits against the workload's identity.
-const ROOT_PERM: u16 = 0o770;
+/// Mode bits of the root directory: private to the mount owner.
+const ROOT_PERM: u16 = 0o700;
 
 /// The first exceedance the ledger recorded, published for a supervisor.
 ///

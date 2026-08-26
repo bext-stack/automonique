@@ -203,6 +203,8 @@ fn observed_plan(script: &str, workspace: &Path) -> LaunchPlan {
         .unwrap()
         .prompt(PROMPT)
         .unwrap()
+        .separate_workload_identity()
+        .unwrap()
 }
 
 /// Launch a long-lived, observable workload and wait until it has started.
@@ -477,4 +479,56 @@ fn the_workload_cannot_open_a_nested_namespace_to_become_root() {
         "inside the namespace the supervisor's group is the root group"
     );
     containment.dispose(Duration::from_secs(10)).unwrap();
+}
+
+#[test]
+fn a_plan_that_does_not_ask_keeps_the_supervisor_identity() {
+    // The control for every proof above: identity separation is opt-in, and a
+    // plan without the line launches exactly as before — the workload is the
+    // supervisor's uid, in the supervisor's user namespace.
+    let Some(proof) = proof_or_not_proven("a_plan_that_does_not_ask_keeps_the_supervisor_identity")
+    else {
+        return;
+    };
+    let workspace = TempDir::new("plain");
+    let marker = workspace.path().join("started");
+    let script = format!(
+        "{bb} touch \"$WORKSPACE/started\"; exec {bb} sleep 30",
+        bb = BUSYBOX
+    );
+    let plan = LaunchPlan::new(BUSYBOX, busybox_sha256())
+        .unwrap()
+        .argument("sh")
+        .unwrap()
+        .argument("-c")
+        .unwrap()
+        .argument(&script)
+        .unwrap()
+        .filesystem_grant(PathIntent::ReadExecute, BUSYBOX)
+        .unwrap()
+        .filesystem_grant(PathIntent::ReadWrite, workspace.path())
+        .unwrap()
+        .filesystem_grant(PathIntent::Read, "/dev/null")
+        .unwrap()
+        .environment("WORKSPACE", workspace.path().as_os_str().as_encoded_bytes())
+        .unwrap();
+    assert!(!plan.separates_workload_identity());
+    let containment =
+        RunContainment::create(&proof.domain, &run_id("plain"), ContainmentLimits::none()).unwrap();
+    let mut child = spawn_sandboxed(Path::new(HELPER), &plan, &containment).unwrap();
+    wait_for_marker(&mut child, &marker);
+    let pid = child.id();
+
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let uid = four_ids(&status_field(&status, "Uid:").unwrap());
+    assert_eq!(
+        uid,
+        vec![supervisor_uid(); 4],
+        "without the request the workload keeps the supervisor's uid"
+    );
+    let ours = fs::read_link("/proc/self/ns/user").unwrap();
+    let theirs = fs::read_link(format!("/proc/{pid}/ns/user")).unwrap();
+    assert_eq!(theirs, ours, "and the supervisor's user namespace");
+
+    end(containment, child);
 }
