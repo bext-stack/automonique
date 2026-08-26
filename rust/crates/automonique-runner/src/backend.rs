@@ -94,6 +94,8 @@ use crate::containment::{ContainmentDomain, ContainmentError, ContainmentLimits,
 use crate::launch::{LaunchError, LaunchPlan, StdoutCapture, spawn_sandboxed_with_stdout};
 use crate::runner::CancellationToken;
 use crate::spool::{Authority, EventKind, Spool, SpoolError, Status};
+use crate::tempfs_fs::ExceedanceChannel;
+use crate::tempfs_ledger::Exceedance;
 use automonique_protocol::event::{
     Authority as FrameAuthority, EventKind as FrameKind, RetryCategory, RetryContext,
 };
@@ -333,6 +335,17 @@ pub enum ExecutionOutcome {
     Cancelled,
     /// The deadline elapsed, so the tree was killed.
     TimedOut,
+    /// The workload crossed its temporary-storage budget. The FUSE filesystem
+    /// refused the write or the object at the syscall that asked (`ENOSPC` /
+    /// `EDQUOT`), the supervisor read the first refusal from the mount's
+    /// exceedance channel, and the tree was killed. The exceedance names the
+    /// ceiling that tripped, exactly as the filesystem observed it; the
+    /// `statfs` readback that corroborates it is on the reconcile's own
+    /// [`crate::Outcome`], which the caller holds beside this report.
+    TemporaryStorageExceeded {
+        /// The first refusal the filesystem's ledger recorded.
+        exceedance: Exceedance,
+    },
 }
 
 impl ExecutionOutcome {
@@ -345,9 +358,10 @@ impl ExecutionOutcome {
     pub const fn terminal_payload(self) -> &'static [u8] {
         match self {
             Self::Completed => TERMINAL_COMPLETED,
-            Self::Failed { .. } | Self::FailedBySignal { .. } | Self::LaunchRefused => {
-                TERMINAL_FAILED
-            }
+            Self::Failed { .. }
+            | Self::FailedBySignal { .. }
+            | Self::LaunchRefused
+            | Self::TemporaryStorageExceeded { .. } => TERMINAL_FAILED,
             Self::Cancelled => TERMINAL_CANCELLED,
             Self::TimedOut => TERMINAL_TIMED_OUT,
         }
@@ -375,6 +389,10 @@ impl fmt::Display for ExecutionOutcome {
             }
             Self::Cancelled => formatter.write_str("the run was cancelled and the tree killed"),
             Self::TimedOut => formatter.write_str("the run exceeded its deadline and was killed"),
+            Self::TemporaryStorageExceeded { exceedance } => write!(
+                formatter,
+                "the run crossed its temporary-storage budget and was killed: {exceedance}"
+            ),
         }
     }
 }
@@ -565,6 +583,7 @@ impl DirectProcessBackend {
             spool,
             capture: None,
             observed: ObservedSequence::default(),
+            temporary_storage: None,
         })
     }
 }
@@ -585,6 +604,10 @@ pub struct PreparedRun {
     spool: Spool,
     capture: Option<ProgressCapture>,
     observed: ObservedSequence,
+    /// The mount's exceedance channel, when this run has a temporary-storage
+    /// mount. Polled in the supervision loop so a workload that crosses its
+    /// scratch budget is contained the first time the ledger refuses it.
+    temporary_storage: Option<Arc<ExceedanceChannel>>,
 }
 
 impl fmt::Debug for PreparedRun {
@@ -630,6 +653,19 @@ impl PreparedRun {
         self
     }
 
+    /// Poll `channel` in the supervision loop and contain the run the first
+    /// time its temporary-storage ledger refuses a write or an object.
+    ///
+    /// Without this call the ceiling still holds — the FUSE filesystem refuses
+    /// the syscall regardless — but the run continues past its first `ENOSPC`
+    /// until it exits or its deadline elapses. With it, the first refusal ends
+    /// the run with [`ExecutionOutcome::TemporaryStorageExceeded`].
+    #[must_use]
+    pub fn with_temporary_storage_channel(mut self, channel: Arc<ExceedanceChannel>) -> Self {
+        self.temporary_storage = Some(channel);
+        self
+    }
+
     /// A handle on the sequence this attempt's spool has reached.
     ///
     /// Cloned before [`Self::execute`] consumes the attempt, because the point
@@ -665,6 +701,7 @@ impl PreparedRun {
             spool,
             capture,
             observed,
+            temporary_storage,
             ..
         } = self;
         let mut supervised = SupervisedRun {
@@ -677,6 +714,7 @@ impl PreparedRun {
             capture,
             frame_run_id,
             observed,
+            temporary_storage,
         };
 
         // No `?` between here and `finish`: a supervision failure must not be
@@ -727,6 +765,10 @@ struct SupervisedRun {
     capture: Option<ProgressCapture>,
     frame_run_id: RunId,
     observed: ObservedSequence,
+    /// The temporary-storage mount's exceedance channel, when the run has a
+    /// mount. Polled every supervision interval so the first refusal contains
+    /// the run.
+    temporary_storage: Option<Arc<ExceedanceChannel>>,
 }
 
 /// The reader thread and the queue it fills.
@@ -1039,6 +1081,21 @@ impl SupervisedRun {
             // The loop the supervisor already runs is where progress is
             // absorbed, because it is the one place that holds the spool.
             self.poll_progress();
+            // A temporary-storage refusal contains the run the first time the
+            // ledger records one. The ceiling has already held — the workload
+            // saw its own `ENOSPC`/`EDQUOT` — and this is the policy the ticket
+            // names on top of it: the run does not continue past its first
+            // budget refusal.
+            if let Some(exceedance) = self
+                .temporary_storage
+                .as_ref()
+                .and_then(|channel| channel.first())
+            {
+                return Ok((
+                    Some(pid),
+                    ExecutionOutcome::TemporaryStorageExceeded { exceedance },
+                ));
+            }
             if cancellation.is_cancelled() {
                 return Ok((Some(pid), ExecutionOutcome::Cancelled));
             }

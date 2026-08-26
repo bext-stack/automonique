@@ -41,7 +41,8 @@ use automonique_protocol::tools::{CredentialAudiences, RunId};
 use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
 use automonique_runner::admission::{
     AdmissionContext, AdmissionContextParts, AdmissionRefusal, AdmittedLaunch,
-    INFORMATIONAL_FIELDS, PromptSource, ResolvedPrompt, UnenforcedBudget, admit,
+    INFORMATIONAL_FIELDS, PromptSource, ResolvedPrompt, TemporaryStorageEnforcement,
+    UnenforcedBudget, admit,
 };
 use automonique_runner::filesystem::PathIntent;
 use automonique_runner::{
@@ -277,6 +278,10 @@ fn context_parts(root: &Path) -> AdmissionContextParts {
         // The mappable spec denies egress on both axes, and a context that
         // resolved a destination for it would be refused as a contradiction.
         brokered_destinations: Vec::new(),
+        // The mappable context is one whose host can enforce the temporary
+        // storage budget; tests that need the fail-closed direction override
+        // this field.
+        temporary_storage: TemporaryStorageEnforcement::Available,
     }
 }
 
@@ -1109,8 +1114,9 @@ fn every_budget_without_an_enforcement_surface_must_be_acknowledged() {
     let workspace = TempDir::new("unenforced");
     let root = workspace.path();
 
-    // Only the two declarations with no enforcement surface remain in this
-    // vocabulary. CPU and descriptor limits are absent by construction.
+    // Only artifact accounting has no enforcement surface now: temporary
+    // storage is enforced through a per-run FUSE mount, and CPU and descriptor
+    // limits were enforced before that.
     for missing in UnenforcedBudget::ALL {
         let error = admit_with_context(root, |context| {
             context.unenforced_budgets = UnenforcedBudget::ALL
@@ -1134,7 +1140,118 @@ fn every_budget_without_an_enforcement_surface_must_be_acknowledged() {
         admitted.unenforced_budgets(),
         UnenforcedBudget::ALL.as_slice()
     );
-    assert_eq!(UnenforcedBudget::ALL.len(), 2);
+    assert_eq!(UnenforcedBudget::ALL.len(), 1);
+}
+
+#[test]
+fn the_temporary_storage_budget_maps_to_a_derived_object_ceiling() {
+    let workspace = TempDir::new("tempfs-budget");
+    let admitted = admit_with_sandbox(workspace.path(), |sandbox| {
+        sandbox.budgets = Budgets::declare(BudgetQuantities {
+            cgroup_memory_bytes: MEMORY_BYTES,
+            cgroup_cpu_millicores: CPU_MILLICORES,
+            rlimit_processes: PROCESSES,
+            rlimit_descriptors: DESCRIPTORS,
+            timeout_millis: TIMEOUT_MILLIS,
+            // Exactly 256 blocks of 4096 bytes: one object per block.
+            temporary_storage_bytes: 1024 * 1024,
+            spool_bytes: SPOOL_BYTES,
+            artifact_bytes: 1024 * 1024,
+        })
+        .unwrap();
+    })
+    .unwrap();
+    let budget = admitted.temporary_storage_budget();
+    assert_eq!(budget.bytes(), 1024 * 1024);
+    assert_eq!(budget.objects(), 256);
+    // The plan carries no scratch grant and no TMPDIR until a mount is attached.
+    assert!(!admitted.has_temporary_storage());
+    assert!(
+        admitted
+            .plan()
+            .environment_names()
+            .all(|name| name != "TMPDIR"),
+        "TMPDIR must not be in the plan before a mount is attached"
+    );
+}
+
+#[test]
+fn a_host_that_cannot_mount_refuses_the_temporary_storage_budget() {
+    let workspace = TempDir::new("tempfs-unenforceable");
+    let error = admit_with_context(workspace.path(), |context| {
+        context.temporary_storage =
+            TemporaryStorageEnforcement::Unavailable("/dev/fuse is missing".to_owned());
+    })
+    .unwrap_err();
+    match error {
+        AdmissionRefusal::TemporaryStorageUnenforceable(reason) => {
+            assert!(reason.contains("/dev/fuse"), "the refusal must carry why");
+        }
+        other => panic!("got {other:?}"),
+    }
+}
+
+#[test]
+fn a_byte_ceiling_that_statfs_cannot_report_exactly_is_refused() {
+    let workspace = TempDir::new("tempfs-misaligned");
+    // Not a multiple of the 4096-byte readback block.
+    let error = admit_with_sandbox(workspace.path(), |sandbox| {
+        sandbox.budgets = Budgets::declare(BudgetQuantities {
+            cgroup_memory_bytes: MEMORY_BYTES,
+            cgroup_cpu_millicores: CPU_MILLICORES,
+            rlimit_processes: PROCESSES,
+            rlimit_descriptors: DESCRIPTORS,
+            timeout_millis: TIMEOUT_MILLIS,
+            temporary_storage_bytes: 4097,
+            spool_bytes: SPOOL_BYTES,
+            artifact_bytes: 1024 * 1024,
+        })
+        .unwrap();
+    })
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AdmissionRefusal::QuotaRejected("sandbox.budgets.temporary_storage")
+        ),
+        "got {error:?}"
+    );
+
+    // A ceiling above the charging cap is refused the same way.
+    let error = admit_with_sandbox(workspace.path(), |sandbox| {
+        sandbox.budgets = Budgets::declare(BudgetQuantities {
+            cgroup_memory_bytes: MEMORY_BYTES,
+            cgroup_cpu_millicores: CPU_MILLICORES,
+            rlimit_processes: PROCESSES,
+            rlimit_descriptors: DESCRIPTORS,
+            timeout_millis: TIMEOUT_MILLIS,
+            temporary_storage_bytes: 256 * 1024 * 1024,
+            spool_bytes: SPOOL_BYTES,
+            artifact_bytes: 1024 * 1024,
+        })
+        .unwrap();
+    })
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AdmissionRefusal::QuotaRejected("sandbox.budgets.temporary_storage")
+        ),
+        "got {error:?}"
+    );
+}
+
+#[test]
+fn a_document_that_binds_tmpdir_is_refused_because_the_budget_owns_it() {
+    let workspace = TempDir::new("tempfs-tmpdir");
+    let mut parts = spec_parts();
+    parts.environment = vec![(OsString::from("TMPDIR"), OsString::from("/somewhere"))];
+    let spec = RunSpec::new(parts).unwrap();
+    let error = admit(&spec, &mappable_context(workspace.path())).unwrap_err();
+    assert!(
+        matches!(error, AdmissionRefusal::TemporaryStorageTmpdirConflict),
+        "got {error:?}"
+    );
 }
 
 #[test]
@@ -1297,10 +1414,7 @@ fn a_context_resolution_must_be_absolute_canonical_and_inside_the_workspace() {
 
     // One budget acknowledged twice is a malformed context, not a stronger one.
     let mut parts = context_parts(root);
-    parts.unenforced_budgets = vec![
-        UnenforcedBudget::TemporaryStorage,
-        UnenforcedBudget::TemporaryStorage,
-    ];
+    parts.unenforced_budgets = vec![UnenforcedBudget::Artifact, UnenforcedBudget::Artifact];
     let error = AdmissionContext::new(parts).unwrap_err();
     assert!(
         matches!(

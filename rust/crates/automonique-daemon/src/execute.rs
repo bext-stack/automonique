@@ -153,7 +153,7 @@ use automonique_protocol::sandbox::{
 use automonique_protocol::tools::RunId as FrameRunId;
 use automonique_runner::admission::{
     AdmissionContext, AdmissionContextParts, AdmittedLaunch, BrokeredDestination, PromptSource,
-    ResolvedPrompt, UnenforcedBudget, admit,
+    ResolvedPrompt, TemporaryStorageEnforcement, UnenforcedBudget, admit,
 };
 use automonique_runner::backend::{
     CapturedFrame, DirectProcessBackend, ObservedSequence, PROGRESS_BUDGET_WARNING,
@@ -164,6 +164,10 @@ use automonique_runner::backend::{
 use automonique_runner::capability::{BoundaryProperty, HostCapabilities};
 use automonique_runner::control::{CancelDelivery, CancelSink, CancelSinkError};
 use automonique_runner::dispatch::RegistrationHandle;
+use automonique_runner::tempfs::{
+    CHECKPOINT_LEAF, DEFAULT_READBACK_DEADLINE, FusePrerequisites, MOUNT_LEAF, MountedTempfs,
+    reap_stale_mounts,
+};
 use automonique_runner::{
     Authority as SpoolAuthority, CancellationToken, ContainmentDomain, Controller,
     EventKind as SpoolEventKind, LaunchPlan, PromptDeliveryPlan, RunContainment, RunSpec, Spool,
@@ -664,6 +668,19 @@ impl ExecutionLane {
         let egress_destinations =
             crate::egress::load_destinations(&state_dir.join(crate::EGRESS_DESTINATIONS_NAME))
                 .unwrap_or_default();
+        // Detach any temporary-storage mount a crashed predecessor left stale
+        // under this daemon's runs directory. Only disconnected mounts this uid
+        // owns are detached; a live one belongs to a still-running supervisor
+        // during generation handoff and is left alone. Each stale one's last
+        // ledger checkpoint stays on disk for reconciliation. Best effort: a
+        // host without FUSE has nothing to reap and refuses every run anyway.
+        if let Ok(verified) = FusePrerequisites::host_default().verify() {
+            let _ = reap_stale_mounts(
+                &verified,
+                &state_dir.join(RUNS_DIRECTORY),
+                DEFAULT_READBACK_DEADLINE,
+            );
+        }
         Self {
             attempt_host,
             managed_sessions_path: state_dir.join(crate::MANAGED_SESSIONS_NAME),
@@ -839,6 +856,17 @@ impl ExecutionLane {
             .ok_or(ExecuteRefusal::ProviderBinaryUnverified)?
             .to_owned();
 
+        // Verify the FUSE stack now, once, so the answer the context carries
+        // and the proof used to mount are the same fresh check. A host that
+        // cannot open `/dev/fuse` or lacks a setuid `fusermount3` makes the
+        // temporary-storage budget unenforceable, and admission refuses the
+        // document rather than admitting it with the budget acknowledged.
+        let verified_fuse = FusePrerequisites::host_default().verify();
+        let temporary_storage = match &verified_fuse {
+            Ok(_) => TemporaryStorageEnforcement::Available,
+            Err(error) => TemporaryStorageEnforcement::Unavailable(error.to_string()),
+        };
+
         let context = AdmissionContext::new(AdmissionContextParts {
             backend: ExecutionBackendId::new(DAEMON_BACKEND_ID)
                 .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?,
@@ -856,15 +884,16 @@ impl ExecutionLane {
             // Naming a budget is not waiving it: `admission` requires each
             // unenforced budget to be acknowledged in advance, and republishes
             // the acknowledgement on the admitted launch. This daemon
-            // acknowledges the two remaining gaps: no temporary filesystem
-            // quota and no artifact accounting. CPU and descriptor limits are
-            // now applied by the cgroup and launch helper respectively.
+            // acknowledges the one remaining gap: no artifact accounting.
+            // CPU, descriptor and temporary-storage limits are now applied — by
+            // the cgroup, the launch helper, and a per-run FUSE mount.
             unenforced_budgets: UnenforcedBudget::ALL.to_vec(),
             // The destinations this deployment resolves brokered egress to.
             // A document that denies egress is refused if this is non-empty and
             // one that asks for it is refused if this is empty, so the policy
             // can neither widen a denied document nor be defaulted into one.
             brokered_destinations: self.egress_destinations.clone(),
+            temporary_storage,
         })
         .map_err(|_| ExecuteRefusal::AdmissionRefused)?;
 
@@ -886,6 +915,30 @@ impl ExecutionLane {
             .and_then(|()| private_directory(&workspace))
             .and_then(|()| private_directory(&spool_root))
             .map_err(|()| ExecuteRefusal::ExecutionUnavailable)?;
+
+        // The per-run temporary-storage mount. Admission proved the host can
+        // enforce it (so `verified_fuse` is `Ok`) and produced the exact
+        // budget; the supervisor mounts a FUSE filesystem with those ceilings
+        // under the run's private directory, confirms it from the kernel, and
+        // attaches it to the plan as a read-write Landlock grant plus `TMPDIR`.
+        // It is created before the workload is prepared, so the grant binds to
+        // the FUSE root inode the launch enforces, and it lives exactly as long
+        // as the run: the `Attempt` owns it and reconciles it after execution.
+        let verified_fuse = verified_fuse.map_err(|_| ExecuteRefusal::ContainmentUnavailable)?;
+        let mountpoint = run_root.join(MOUNT_LEAF);
+        private_directory(&mountpoint).map_err(|()| ExecuteRefusal::ExecutionUnavailable)?;
+        let temporary_storage = MountedTempfs::mount(
+            &verified_fuse,
+            &mountpoint,
+            admitted.temporary_storage_budget(),
+        )
+        .map_err(|_| ExecuteRefusal::ContainmentUnavailable)?
+        .with_checkpoint(run_root.join(CHECKPOINT_LEAF))
+        .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?;
+        let temporary_storage_channel = temporary_storage.exceedance_channel();
+        let admitted = admitted
+            .with_temporary_storage(&temporary_storage)
+            .map_err(|_| ExecuteRefusal::AdmissionRefused)?;
 
         // EVERYTHING THAT CAN STILL REFUSE HAPPENS BEFORE THE ANSWER.
         //
@@ -978,7 +1031,11 @@ impl ExecutionLane {
                     admitted.plan().clone(),
                     spool,
                 )
-                .map_err(|_| ExecuteRefusal::ContainmentUnavailable)?;
+                .map_err(|_| ExecuteRefusal::ContainmentUnavailable)?
+                // The first temporary-storage refusal contains the run: the
+                // supervision loop polls this channel and ends the workload on
+                // its first `ENOSPC`/`EDQUOT` with a typed budget outcome.
+                .with_temporary_storage_channel(temporary_storage_channel.clone());
             // Capture only a stdout grammar the document explicitly selected.
             let prepared = if emits_normalized_stream(spec) {
                 match progress_capture(spec, run_id, &self.progress, Arc::clone(&session_capture)) {
@@ -1005,6 +1062,7 @@ impl ExecutionLane {
             progress: Arc::clone(&self.progress),
             attempt_host: Arc::clone(&self.attempt_host),
             broker,
+            temporary_storage,
             session_capture,
             managed_sessions_path: self.managed_sessions_path.clone(),
             draining: Arc::clone(&self.draining),
@@ -2083,6 +2141,13 @@ struct Attempt {
     /// worker drops it, including a panic, and its drop stops the listener and
     /// tears down every tunnel still open.
     broker: Option<EgressBroker>,
+    /// This run's temporary-storage mount. Owning it here bounds its lifetime
+    /// to the run exactly as the broker is bounded: after the run tree is
+    /// disposed, the worker reconciles it — a bounded `statfs` readback (or a
+    /// connection abort if the server is stuck), a non-lazy unmount, and a
+    /// final ledger checkpoint — and its drop detaches it on any other path,
+    /// including a panic, so no writable scratch mount outlives the run.
+    temporary_storage: MountedTempfs,
     /// Exact provider session observed by the normalized stream.
     session_capture: Arc<Mutex<Option<String>>>,
     /// Independent durable connection opened after the run becomes terminal.
@@ -2112,12 +2177,24 @@ impl Attempt {
             progress,
             attempt_host,
             broker,
+            temporary_storage,
             session_capture,
             managed_sessions_path,
             draining,
         } = self;
 
         let report = prepared.execute(&cancellation, timeout, &draining);
+        // THE SCRATCH MOUNT OUTLIVES NO RUN.
+        //
+        // `execute` has disposed the run cgroup by here, so the workload tree
+        // is dead and holds no descriptor into the mount. The reconcile is
+        // therefore a non-lazy unmount that cannot refuse `EBUSY`: it takes a
+        // bounded `statfs` readback (aborting the FUSE connection if the server
+        // is stuck rather than hanging the worker), unmounts, and writes the
+        // final ledger checkpoint that preserves the consumed-budget record
+        // across a crash. Its own `Drop` detaches the mount on every other
+        // path, including a panic before this line.
+        let _ = temporary_storage.reconcile(DEFAULT_READBACK_DEADLINE);
         // The spool's lock is free from here, so the durable record is readable
         // and strictly better than the window this hub was holding: complete,
         // hash-chain verified, and not subject to eviction.

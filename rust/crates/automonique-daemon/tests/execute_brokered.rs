@@ -103,7 +103,8 @@ use automonique_protocol::tools::RunId;
 use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
 use automonique_runner::admission::{
     AdmissionContext, AdmissionContextParts, AdmissionRefusal, AdmittedLaunch, BrokeredDestination,
-    BrokeredScope, PromptSource, ResolvedPrompt, UnenforcedBudget, admit,
+    BrokeredScope, PromptSource, ResolvedPrompt, TemporaryStorageEnforcement, UnenforcedBudget,
+    admit,
 };
 use automonique_runner::capability::{BoundaryProperty, HostCapabilities};
 use automonique_runner::{
@@ -372,6 +373,7 @@ fn context(
         ),
         unenforced_budgets: UnenforcedBudget::ALL.to_vec(),
         brokered_destinations: destinations.to_vec(),
+        temporary_storage: TemporaryStorageEnforcement::Available,
     })
     .expect("a valid context")
 }
