@@ -198,7 +198,7 @@ use crate::seccomp::SocketFamilyPolicy;
 use crate::tempfs::{MountError, TempfsRendezvous};
 use crate::tempfs_ledger::TemporaryStorageBudget;
 use crate::tempfs_namespace::{
-    TemporaryStorageMount, bound_reads, confirm_for_workload, mount_for_workload,
+    TemporaryStorageMount, bound_reads, confirm_for_workload, mount_for_workload, unbound_reads,
 };
 use crate::{HELPER_REFUSED_EXIT, RunContainment};
 use nix::fcntl::{AtFlags, FcntlArg, OFlag, SealFlag};
@@ -1355,12 +1355,6 @@ pub fn spawn_sandboxed_session_with_tempfs(
     })
 }
 
-/// Restore a stream to blocking reads and writes after a rendezvous.
-fn unbound_reads(socket: &UnixStream) -> std::io::Result<()> {
-    socket.set_read_timeout(None)?;
-    socket.set_write_timeout(None)
-}
-
 /// Entry-helper process body for a composed sandboxed launch.
 ///
 /// See the module documentation for the exact sequence. Every failure exits
@@ -1520,6 +1514,13 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
             confirm_for_workload(mounted, socket)
                 .map_err(|error| format!("temporary storage refused: {error}"))?;
         }
+    }
+    // The rendezvous deadline belongs to the rendezvous. A session plan keeps
+    // this very socket as the workload's stdin, and a deadline left on it
+    // would make the next provider turn answer `EAGAIN` after twenty idle
+    // seconds, so it is cleared before the descriptor is let go.
+    if let Some(socket) = rendezvous.as_ref() {
+        unbound_reads(socket).map_err(|_| "the plan channel could not be restored".to_owned())?;
     }
     drop(rendezvous);
 

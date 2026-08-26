@@ -492,6 +492,18 @@ pub fn bound_reads(socket: &UnixStream, deadline: Duration) -> io::Result<()> {
     socket.set_write_timeout(Some(deadline))
 }
 
+/// Undo [`bound_reads`], restoring blocking reads and writes.
+///
+/// A deadline is an option of the *socket*, not of the descriptor that set it,
+/// so a launch that left one on its plan channel would leave it on the socket
+/// the workload keeps as its stdin — where a session's next turn would answer
+/// `EAGAIN` after twenty idle seconds. The rendezvous therefore clears its own
+/// deadline on both ends the moment it is done with them.
+pub fn unbound_reads(socket: &UnixStream) -> io::Result<()> {
+    socket.set_read_timeout(None)?;
+    socket.set_write_timeout(None)
+}
+
 /// Canonical, existing, empty, owned by this namespace's root, and not
 /// already a mountpoint.
 fn validate_mountpoint(mountpoint: &Path) -> Result<PathBuf, WorkloadMountError> {
