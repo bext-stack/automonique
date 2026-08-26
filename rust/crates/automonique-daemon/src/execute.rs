@@ -176,8 +176,8 @@ use automonique_runner::{
     RunSpec, Spool, UnmountError, WorkspaceRegistryId,
 };
 use automonique_store::approval_requests::{
-    ApprovalContext, ApprovalProposal, ApprovalRequests, ApprovalState, REQUEST_KEY_HEX_BYTES,
-    REQUEST_KEY_PREFIX,
+    ApprovalContext, ApprovalProposal, ApprovalRequests, ApprovalState, MAX_APPROVAL_REQUEST_PAGE,
+    REQUEST_KEY_HEX_BYTES, REQUEST_KEY_PREFIX,
 };
 use automonique_store::run_index::{RunIndex, RunSpoolState, StateAdvance};
 use nix::libc;
@@ -1093,6 +1093,7 @@ impl ExecutionLane {
             temporary_storage,
             session_capture,
             managed_sessions_path: self.managed_sessions_path.clone(),
+            approval_requests_path: self.state_dir.join(crate::APPROVAL_REQUESTS_NAME),
             draining: Arc::clone(&self.draining),
         })
     }
@@ -2254,6 +2255,9 @@ struct Attempt {
     /// opened against it once the run becomes terminal, to settle the binding
     /// this run's own worker advanced at turn start.
     managed_sessions_path: PathBuf,
+    /// Where this run's provider-permission proposals live, so the ones it
+    /// leaves unanswered can be closed when it becomes terminal.
+    approval_requests_path: PathBuf,
     /// The lane's drain flag; see [`ExecutionLane::begin_shutdown`].
     draining: Arc<AtomicBool>,
 }
@@ -2282,6 +2286,7 @@ impl Attempt {
             temporary_storage,
             session_capture,
             managed_sessions_path,
+            approval_requests_path,
             draining,
         } = self;
 
@@ -2341,6 +2346,30 @@ impl Attempt {
         } else {
             report.last_sequence
         };
+        // THE RUN'S PERMISSIONS DO NOT OUTLIVE THE RUN.
+        //
+        // A provider permission is proposed by this worker so that *this* run's
+        // paused turn can continue, and it is answerable only while the run is
+        // there to act on the answer. Once the run is terminal — stopped by an
+        // operator, timed out, or failed — a row still `pending` is a live
+        // question about a dead run: the session's command state goes on
+        // projecting it, and an operator can still be asked to answer something
+        // that can no longer have an effect.
+        //
+        // It is closed as an EXPIRY rather than a decision, and that is the
+        // store's own distinction rather than a shortcut:
+        // `ApprovalRequests::decide` demands the ledger key of whoever decided,
+        // and nobody did — the run ended. An expiry is the absence of an
+        // answer, which is exactly what happened, and it is the state
+        // `pending_for_run` and `is_answerable_at` already exclude.
+        //
+        // A DRAINING daemon is the one exception, and it is the same rule the
+        // approval wait itself keeps a few frames up: a stopping daemon decides
+        // nothing for the operator, so the proposal stays pending where it was
+        // written, for the next generation to answer.
+        if !draining.load(Ordering::Acquire) {
+            expire_unanswered_approvals(&approval_requests_path, &run_id);
+        }
         // The turn is over, whichever way it ended. Settling every terminal
         // state, not only a completion, is what keeps the binding honest after
         // turn-start binding: a run bound in flight that then failed, timed out
@@ -2578,6 +2607,41 @@ fn advance(
     });
 }
 
+/// Close every provider permission this terminated run left unanswered.
+///
+/// Scoped to the proposals this run's own worker wrote
+/// ([`PROVIDER_APPROVAL_PROPOSER`]). An approval raised by another stage of the
+/// run's life — the launch gate, which asks whether the run may start at all —
+/// is answerable without an executing attempt and is none of this worker's
+/// business to close.
+///
+/// Each row is fenced on the revision it was read at, so an approval an
+/// operator decided in the same instant keeps exactly the decision they made,
+/// and a second pass over an already-closed row changes nothing. One page is
+/// the whole set: a turn pauses on one permission at a time and does not
+/// propose the next until that one is answered.
+///
+/// Best-effort, like every other durable write on this path. The run is over
+/// either way, and an expiry that could not be written is still bounded by the
+/// deadline the proposal already carries.
+fn expire_unanswered_approvals(store_path: &Path, run_id: &str) {
+    let Ok(now_ms) = crate::unix_millis() else {
+        return;
+    };
+    let Ok(mut approvals) = ApprovalRequests::open(store_path) else {
+        return;
+    };
+    let Ok(pending) = approvals.pending_for_run(run_id, now_ms, MAX_APPROVAL_REQUEST_PAGE) else {
+        return;
+    };
+    for record in pending {
+        if record.requested_by != PROVIDER_APPROVAL_PROPOSER {
+            continue;
+        }
+        let _ = approvals.expire(&record.request_key, record.revision, now_ms);
+    }
+}
+
 /// The cancellation destination: the very token the backend polls.
 ///
 /// Setting the token is the whole delivery, exactly as the runner's own
@@ -2721,18 +2785,182 @@ fn is_containment_run_id(run_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_PROVIDER_BINARY_BYTES, TokenCancelSink, admission_refusal, is_containment_run_id,
-        is_safe_segment, is_within_byte_limit, provider_binary_digest,
+        MAX_PROVIDER_BINARY_BYTES, PROVIDER_APPROVAL_PROPOSER, TokenCancelSink, admission_refusal,
+        expire_unanswered_approvals, is_containment_run_id, is_safe_segment, is_within_byte_limit,
+        provider_binary_digest,
     };
     use crate::attempt_host::DaemonAttemptHost;
     use automonique_protocol::execute_api::ExecuteRefusal;
     use automonique_runner::CancellationToken;
     use automonique_runner::admission::AdmissionRefusal;
     use automonique_runner::dispatch::DispatchOutcome;
+    use automonique_store::approval_requests::{
+        ApprovalContext, ApprovalOutcome, ApprovalProposal, ApprovalRequests, ApprovalState,
+    };
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const FAR_FUTURE_MS: i64 = 9_000_000_000_000;
+
+    fn approval_store(root: &Path) -> ApprovalRequests {
+        ApprovalRequests::open(root.join("approval-requests.sqlite3")).expect("approval requests")
+    }
+
+    fn propose(store: &mut ApprovalRequests, key: &str, run_id: &str, requested_by: &str) {
+        store
+            .propose(ApprovalProposal {
+                request_key: key,
+                subject: &format!("provider-permission:{key}"),
+                run_id,
+                context: ApprovalContext {
+                    spec_digest: &"1".repeat(64),
+                    program_path: "/usr/bin/expiry-test",
+                    program_sha256: &"2".repeat(64),
+                    prompt_sha256: &"3".repeat(64),
+                    cwd_token: "expiry-test-cwd",
+                },
+                requested_by,
+                requested_at_ms: 1,
+                expires_at_ms: FAR_FUTURE_MS,
+            })
+            .expect("proposal");
+    }
+
+    fn state_of(store: &ApprovalRequests, key: &str) -> ApprovalState {
+        store.entry(key).expect("read").expect("row").state
+    }
+
+    /// A run that ends leaves no live question behind it.
+    ///
+    /// The permission this run's worker proposed is answerable only while the
+    /// run is there to act on the answer, so a terminal run closes it. The
+    /// assertion that matters to the session surface is the last one:
+    /// `pending_for_run` is the exact query
+    /// `Daemon::platform_session_command_state` projects its pending approvals
+    /// from, so an empty answer here is an empty projection there.
+    #[test]
+    fn a_terminated_runs_unanswered_permission_is_expired_and_leaves_the_projection_empty() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.path().join("approval-requests.sqlite3");
+        let mine = "apr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let theirs = "apr-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        {
+            let mut store = approval_store(root.path());
+            propose(&mut store, mine, "run-stopped", PROVIDER_APPROVAL_PROPOSER);
+            propose(
+                &mut store,
+                theirs,
+                "run-elsewhere",
+                PROVIDER_APPROVAL_PROPOSER,
+            );
+        }
+
+        expire_unanswered_approvals(&path, "run-stopped");
+
+        let store = approval_store(root.path());
+        assert_eq!(state_of(&store, mine), ApprovalState::Expired);
+        assert!(
+            !store
+                .entry(mine)
+                .expect("read")
+                .expect("row")
+                .is_answerable_at(2),
+            "a closed permission is no longer answerable"
+        );
+        assert_eq!(
+            store.entry(mine).expect("read").expect("row").approval_key,
+            None,
+            "nobody decided it, so no decider is named"
+        );
+        assert!(
+            store
+                .pending_for_run("run-stopped", 2, 16)
+                .expect("projection")
+                .is_empty(),
+            "the session command state projects nothing for a terminated run"
+        );
+        assert_eq!(
+            state_of(&store, theirs),
+            ApprovalState::Pending,
+            "another run's permission is not this run's to close"
+        );
+    }
+
+    /// An answer already given is never overwritten, and a second pass is a
+    /// no-op — the sweep is fenced on the revision it read.
+    #[test]
+    fn expiry_leaves_a_decided_permission_alone_and_is_idempotent_under_replay() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.path().join("approval-requests.sqlite3");
+        let granted = "apr-cccccccccccccccccccccccccccccccc";
+        let unanswered = "apr-dddddddddddddddddddddddddddddddd";
+        {
+            let mut store = approval_store(root.path());
+            propose(&mut store, granted, "run-mixed", PROVIDER_APPROVAL_PROPOSER);
+            propose(
+                &mut store,
+                unanswered,
+                "run-mixed",
+                PROVIDER_APPROVAL_PROPOSER,
+            );
+            store
+                .decide(granted, 1, ApprovalOutcome::Granted, "apv-operator-1", 5)
+                .expect("operator decision");
+        }
+
+        expire_unanswered_approvals(&path, "run-mixed");
+        let after_first = {
+            let store = approval_store(root.path());
+            (
+                store.entry(granted).expect("read").expect("row"),
+                store.entry(unanswered).expect("read").expect("row"),
+            )
+        };
+        assert_eq!(after_first.0.state, ApprovalState::Granted);
+        assert_eq!(
+            after_first.0.approval_key.as_deref(),
+            Some("apv-operator-1")
+        );
+        assert_eq!(after_first.1.state, ApprovalState::Expired);
+
+        expire_unanswered_approvals(&path, "run-mixed");
+        let store = approval_store(root.path());
+        assert_eq!(
+            store.entry(granted).expect("read").expect("row"),
+            after_first.0,
+            "a decided permission is byte-identical after a replayed sweep"
+        );
+        assert_eq!(
+            store.entry(unanswered).expect("read").expect("row"),
+            after_first.1,
+            "an already-closed permission is not closed twice"
+        );
+    }
+
+    /// The sweep speaks only for the proposals this run's own worker wrote. A
+    /// launch-gate approval asks whether the run may start at all and is
+    /// answerable without an executing attempt.
+    #[test]
+    fn expiry_does_not_close_an_approval_this_worker_did_not_propose() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.path().join("approval-requests.sqlite3");
+        let gate = "apr-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        {
+            let mut store = approval_store(root.path());
+            propose(&mut store, gate, "run-gated", "automonique.launch-gate");
+        }
+
+        expire_unanswered_approvals(&path, "run-gated");
+
+        let store = approval_store(root.path());
+        assert_eq!(state_of(&store, gate), ApprovalState::Pending);
+    }
 
     #[test]
     fn provider_binary_limit_accepts_the_boundary_and_refuses_the_next_byte() {
