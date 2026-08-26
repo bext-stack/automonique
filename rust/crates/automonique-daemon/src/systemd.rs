@@ -50,6 +50,21 @@ impl Notifier {
         Self::new(&address, watchdog_usec.as_deref(), watchdog_pid.as_deref()).map(Some)
     }
 
+    /// The notifier of a process the manager already counts as the unit's
+    /// main process, such as a reload candidate the source has announced.
+    ///
+    /// Its first watchdog ping is due at once: the manager's deadline runs
+    /// from the previous main process's last accepted ping, not from this
+    /// process's start, so waiting the usual half interval could overrun it.
+    pub(crate) fn from_environment_adopted() -> Result<Option<Self>, NotifyError> {
+        Ok(Self::from_environment()?.map(Self::adopted))
+    }
+
+    fn adopted(mut self) -> Self {
+        self.next_watchdog = self.watchdog_interval.map(|_| Instant::now());
+        self
+    }
+
     fn new(
         address: &OsStr,
         watchdog_usec: Option<&OsStr>,
@@ -210,6 +225,31 @@ mod tests {
         assert_eq!(receive(&receiver), b"MAINPID=424242");
         notifier.stopping().expect("stopping");
         assert_eq!(receive(&receiver), b"STOPPING=1\nSTATUS=Stopping");
+    }
+
+    #[test]
+    fn an_adopted_main_process_feeds_the_watchdog_at_once() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("notify.sock");
+        let receiver = UnixDatagram::bind(&path).expect("notification receiver");
+        // Thirty seconds, as the service unit declares: a fresh notifier would
+        // not ping for fifteen, an adopted one pings on its first turn.
+        let usec = OsStr::new("30000000");
+        let mut fresh = Notifier::new(path.as_os_str(), Some(usec), None).expect("notifier");
+        fresh.watchdog_if_due().expect("watchdog");
+        let mut adopted = Notifier::new(path.as_os_str(), Some(usec), None)
+            .expect("notifier")
+            .adopted();
+        adopted.watchdog_if_due().expect("watchdog");
+        assert_eq!(receive(&receiver), b"WATCHDOG=1");
+        receiver
+            .set_nonblocking(true)
+            .expect("nonblocking receiver");
+        let mut buffer = [0_u8; 64];
+        assert!(
+            receiver.recv(&mut buffer).is_err(),
+            "the fresh notifier pinged before its interval elapsed"
+        );
     }
 
     #[test]

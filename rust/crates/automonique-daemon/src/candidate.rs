@@ -877,7 +877,8 @@ fn run_candidate_channel<R: Read + AsFd, W: Write>(
     writer: &mut W,
 ) -> Result<(), CandidateError> {
     validate_input(&input)?;
-    if getppid().as_raw() as u32 != input.expected_parent_pid {
+    let source_pid = input.expected_parent_pid;
+    if getppid().as_raw() as u32 != source_pid {
         return Err(CandidateError::ParentChanged);
     }
     verify_own_binary(&input.binary_sha256)?;
@@ -944,6 +945,7 @@ fn run_candidate_channel<R: Read + AsFd, W: Write>(
                                     &thread_stop,
                                     ready_sender,
                                     thread_release_on_stop,
+                                    source_pid,
                                 )
                             });
                             if ready_receiver
