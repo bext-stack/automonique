@@ -432,6 +432,12 @@ pub fn spawn_warm_candidate(
         .args(arguments)
         .env("XDG_RUNTIME_DIR", &config.runtime_root)
         .env("XDG_STATE_HOME", &config.state_root)
+        // The service manager set WATCHDOG_PID to the source's pid; the
+        // candidate exists to become the main process, so it must keep the
+        // watchdog cadence from WATCHDOG_USEC rather than disable itself on
+        // a pid that is not its own. Its pings are ignored until the source
+        // announces it as main, then they are the ones that count.
+        .env_remove("WATCHDOG_PID")
         .stdin(Stdio::from(child_stdin))
         .stdout(Stdio::from(child_stdout))
         .stderr(Stdio::null())
@@ -871,7 +877,8 @@ fn run_candidate_channel<R: Read + AsFd, W: Write>(
     writer: &mut W,
 ) -> Result<(), CandidateError> {
     validate_input(&input)?;
-    if getppid().as_raw() as u32 != input.expected_parent_pid {
+    let source_pid = input.expected_parent_pid;
+    if getppid().as_raw() as u32 != source_pid {
         return Err(CandidateError::ParentChanged);
     }
     verify_own_binary(&input.binary_sha256)?;
@@ -938,6 +945,7 @@ fn run_candidate_channel<R: Read + AsFd, W: Write>(
                                     &thread_stop,
                                     ready_sender,
                                     thread_release_on_stop,
+                                    source_pid,
                                 )
                             });
                             if ready_receiver

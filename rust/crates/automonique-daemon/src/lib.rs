@@ -1556,6 +1556,14 @@ enum LeaseDisposition {
     ReleaseWhen(Arc<AtomicBool>),
 }
 
+/// What a reload candidate's serving loop owes the source that spawned it:
+/// one readiness signal once every worker and inherited accept loop has
+/// started, and the unit's main-process role back if it ends uncommitted.
+struct CandidateServing {
+    ready: std::sync::mpsc::SyncSender<()>,
+    source_pid: u32,
+}
+
 struct ProcessReloadHooks<'a> {
     daemon: &'a mut Daemon,
     release: release_activation::VerifiedCodeRelease,
@@ -1761,6 +1769,19 @@ impl reload::ReloadHooks for ProcessReloadHooks<'_> {
             .relinquish_endpoint_cleanup()
             .map_err(|error| Self::refuse(error.category()))?;
         self.cleanup_transferred = true;
+        // Under a notifying service manager this process is the unit's main
+        // process; hand that role to the candidate now, so the manager reads
+        // the candidate's readiness and watchdog pings as the unit's and does
+        // not treat this process's later exit as the unit stopping. Refused
+        // (and rolled back) rather than skipped when the manager cannot be
+        // told: a handoff the manager will kill in ninety seconds is not one.
+        match systemd::Notifier::from_environment() {
+            Ok(Some(notifier)) => notifier
+                .main_pid(candidate.pid())
+                .map_err(|_| Self::refuse("service_manager_main_pid"))?,
+            Ok(None) => {}
+            Err(_) => return Err(Self::refuse("service_manager_unavailable")),
+        }
         candidate
             .activate_serving(cleanup)
             .map_err(|error| Self::refuse(error.category()))?;
@@ -3203,14 +3224,29 @@ impl Daemon {
         stop: &AtomicBool,
         ready: std::sync::mpsc::SyncSender<()>,
         release_on_stop: Arc<AtomicBool>,
+        source_pid: u32,
     ) -> (Self, Result<(), DaemonError>) {
+        // The source announced this process as the unit's main process before
+        // it asked it to serve, so from here the manager counts this process's
+        // readiness and watchdog pings and nobody else's: a candidate that
+        // served without feeding the watchdog would be aborted at the
+        // watchdog limit, which is an outage dressed as a reload.
+        let service_manager = match systemd::Notifier::from_environment_adopted() {
+            Ok(service_manager) => service_manager,
+            Err(error) => {
+                return (
+                    self,
+                    Err(DaemonError::ServiceManagerFailed(error.category())),
+                );
+            }
+        };
         let reload = AtomicBool::new(false);
         self.serve_with_control(
             stop,
             &reload,
-            None,
+            service_manager,
             LeaseDisposition::ReleaseWhen(release_on_stop),
-            Some(ready),
+            Some(CandidateServing { ready, source_pid }),
             true,
         )
     }
@@ -3221,7 +3257,7 @@ impl Daemon {
         reload: &AtomicBool,
         mut service_manager: Option<systemd::Notifier>,
         lease_disposition: LeaseDisposition,
-        mut ready: Option<std::sync::mpsc::SyncSender<()>>,
+        candidate: Option<CandidateServing>,
         claim_endpoint_cleanup: bool,
     ) -> (Self, Result<(), DaemonError>) {
         let initial_lease = self
@@ -3318,8 +3354,8 @@ impl Daemon {
                 if claim_endpoint_cleanup && let Err(error) = self.arm_endpoint_cleanup() {
                     break 'serving Err(error);
                 }
-                if let Some(sender) = ready.take() {
-                    let _ = sender.send(());
+                if let Some(serving) = candidate.as_ref() {
+                    let _ = serving.ready.send(());
                 }
                 loop {
                     let lease_now_ms = match self.lease_time.require_authority() {
@@ -3471,9 +3507,18 @@ impl Daemon {
             }
         };
         let service_stopping = service_manager.as_ref().map_or(Ok(()), |notifier| {
-            notifier
-                .stopping()
-                .map_err(|error| DaemonError::ServiceManagerFailed(error.category()))
+            match candidate.as_ref() {
+                // A candidate that ends uncommitted is being rolled back. The
+                // manager has counted it as the unit's main process since the
+                // source announced it, so it hands that role back to the
+                // source before it goes, rather than announce a stop the unit
+                // is not making; its own exit is then an ordinary child's.
+                Some(serving) if !lease_disposition.releases() => {
+                    notifier.main_pid(serving.source_pid)
+                }
+                _ => notifier.stopping(),
+            }
+            .map_err(|error| DaemonError::ServiceManagerFailed(error.category()))
         });
         let release_authority = lease_disposition.releases() && !self.handoff_committed;
         // LIVE ATTEMPTS END FIRST, AND THEY END BY FINISHING.
