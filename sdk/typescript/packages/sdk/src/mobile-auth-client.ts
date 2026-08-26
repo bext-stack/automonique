@@ -2,11 +2,15 @@
 
 import {
   MAX_MOBILE_HTTP_BODY_BYTES,
+  MAX_SUPPORTED_MOBILE_PROTOCOL_VERSION,
+  MIN_SUPPORTED_MOBILE_PROTOCOL_VERSION,
   MOBILE_PAIRING_TTL_MILLIS,
   MOBILE_AUTH_MEDIA_TYPE,
+  MOBILE_PROTOCOL_UNSUPPORTED,
   ClientId,
   MobileAccessToken,
   MobileHttpsOrigin,
+  MobileProtocolVersion,
   MobileRefreshToken,
   MobileServerIdentity,
   RefusalError,
@@ -49,6 +53,7 @@ export type {
   MobileOperatorProvisionRequest,
   MobilePairingExchangeRequest,
   MobilePairingOffer,
+  MobileProtocolVersion,
   MobileRevocation,
 };
 
@@ -62,6 +67,75 @@ export class MobileLifecycleError extends Error {
     this.status = status;
     this.category = category;
   }
+}
+
+/**
+ * Every mobile protocol version this build speaks, ascending.
+ *
+ * Read from the generated surface rather than written here, so a server that
+ * widens the protocol and a client rebuilt against it cannot disagree about
+ * what "supported" means. This is a *support* set and is deliberately narrower
+ * than the `MobileProtocolVersion` value domain, which says only what the wire
+ * can carry.
+ */
+export const SUPPORTED_MOBILE_PROTOCOL_VERSIONS: readonly MobileProtocolVersion[] = Array.from(
+  {length: MAX_SUPPORTED_MOBILE_PROTOCOL_VERSION - MIN_SUPPORTED_MOBILE_PROTOCOL_VERSION + 1},
+  (_unused, offset) =>
+    MobileProtocolVersion(BigInt(MIN_SUPPORTED_MOBILE_PROTOCOL_VERSION + offset)),
+);
+
+function renderVersions(versions: readonly MobileProtocolVersion[]): string {
+  return versions.length === 0 ? "none" : versions.join(", ");
+}
+
+/**
+ * The server and this build share no mobile protocol version.
+ *
+ * Held apart from `mobile_discovery_mismatch` because the two are different
+ * operator problems that used to collapse into one refusal: a mismatch says
+ * the document is not the one this origin should be serving, while this says
+ * both sides are healthy and have nothing in common to speak. It names both
+ * sets so the operator can see which side has to move.
+ */
+export class MobileProtocolUnsupportedError extends MobileLifecycleError {
+  /** Exactly what the server advertised, in the order it advertised it. */
+  readonly advertised: readonly MobileProtocolVersion[];
+  /** Every version this build speaks. */
+  readonly supported: readonly MobileProtocolVersion[];
+
+  constructor(
+    status: number,
+    advertised: readonly MobileProtocolVersion[],
+    options?: ErrorOptions,
+  ) {
+    super(status, MOBILE_PROTOCOL_UNSUPPORTED, options);
+    this.name = "MobileProtocolUnsupportedError";
+    this.advertised = advertised;
+    this.supported = SUPPORTED_MOBILE_PROTOCOL_VERSIONS;
+    this.message = `${this.message}: server advertised ${renderVersions(advertised)}, `
+      + `this client speaks ${renderVersions(this.supported)}`;
+  }
+}
+
+/**
+ * The highest protocol version the server advertised that this build speaks.
+ *
+ * Position in the advertised list is not read as preference. The highest
+ * shared version is the newest contract both sides implement, whichever order
+ * the server listed it in, and a version above this build's ceiling is passed
+ * over rather than refused — that is the whole point of advertising a list.
+ */
+function negotiateProtocolVersion(
+  advertised: readonly MobileProtocolVersion[],
+  status: number,
+): MobileProtocolVersion {
+  let selected: MobileProtocolVersion | undefined;
+  for (const version of advertised) {
+    if (!SUPPORTED_MOBILE_PROTOCOL_VERSIONS.includes(version)) continue;
+    if (selected === undefined || version > selected) selected = version;
+  }
+  if (selected === undefined) throw new MobileProtocolUnsupportedError(status, advertised);
+  return selected;
 }
 
 /**
@@ -227,10 +301,17 @@ function verifyIssued(
 export class MobileLifecycleClient {
   readonly discovery: MobileDiscovery;
   readonly fetcher: typeof fetch;
+  /** The version admission settled on: the highest both sides speak. */
+  readonly protocolVersion: MobileProtocolVersion;
 
-  private constructor(discovery: MobileDiscovery, fetcher: typeof fetch) {
+  private constructor(
+    discovery: MobileDiscovery,
+    fetcher: typeof fetch,
+    protocolVersion: MobileProtocolVersion,
+  ) {
     this.discovery = discovery;
     this.fetcher = fetcher;
+    this.protocolVersion = protocolVersion;
   }
 
   static async discover(
@@ -274,13 +355,21 @@ export class MobileLifecycleClient {
       || discovery.pairing_create_endpoint !== `${expectedOrigin}/api/mobile/pairings`
       || discovery.pairing_exchange_endpoint !== `${expectedOrigin}/api/mobile/pairings/exchange`
       || discovery.platform_endpoint !== `${expectedOrigin}/api/platform`
-      || discovery.supported_versions.length !== 1
-      || discovery.supported_versions[0] !== 1n
+      // A repeated version is a defect in the document rather than a
+      // disagreement about which version to speak, so it stays a mismatch.
+      || new Set(discovery.supported_versions).size !== discovery.supported_versions.length
       || (pinnedIdentity !== undefined && discovery.server_identity !== pinnedIdentity)
     ) {
       throw new MobileLifecycleError(response.status, "mobile_discovery_mismatch");
     }
-    return new MobileLifecycleClient(discovery, fetcher);
+    // Negotiated after the layout is admitted: an unrecognised version is a
+    // reason to refuse this server, not evidence that the document is
+    // malformed, and an empty advertisement offers nothing to agree on.
+    const protocolVersion = negotiateProtocolVersion(
+      discovery.supported_versions,
+      response.status,
+    );
+    return new MobileLifecycleClient(discovery, fetcher, protocolVersion);
   }
 
   async provision(

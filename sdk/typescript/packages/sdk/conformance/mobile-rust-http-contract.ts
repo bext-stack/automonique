@@ -15,6 +15,7 @@ const {
   MobileCredentialPageSize,
   MobileLifecycleClient,
   MobileLifecycleError,
+  MobileProtocolUnsupportedError,
   MobileSessionClient,
   MobilePageEvents,
   HttpsPlatformTransport,
@@ -22,6 +23,7 @@ const {
   MobileServerIdentity,
   MobileSessionId,
   PlatformParameter,
+  SUPPORTED_MOBILE_PROTOCOL_VERSIONS,
   decodeMobileError,
   encodeMobileRefreshRequest,
   encodePlatformRequestMessage,
@@ -64,8 +66,91 @@ const routedFetch = (async (input: string | URL | Request, init?: RequestInit) =
   return response;
 }) as typeof fetch;
 
-const client = await MobileLifecycleClient.discover(canonicalOrigin, routedFetch);
+// The discovery document the Rust server actually served, kept so the
+// negotiation cases below run against a real advertisement rather than a
+// hand-written fixture. Captured from the one exchange `discover` already
+// makes, so the fixture server's connection budget is unchanged.
+let servedDiscovery: Uint8Array | undefined;
+const capturingFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+  const response = await routedFetch(input, init);
+  servedDiscovery = new Uint8Array(await response.clone().arrayBuffer());
+  return response;
+}) as typeof fetch;
+
+const client = await MobileLifecycleClient.discover(canonicalOrigin, capturingFetch);
 if (client.discovery.server_identity.length !== 71) throw new Error("server identity shape mismatch");
+if (servedDiscovery === undefined) throw new Error("discovery document was not captured");
+const servedDiscoveryBody: Uint8Array = servedDiscovery;
+const servedVersions = client.discovery.supported_versions;
+const highestSupported =
+  SUPPORTED_MOBILE_PROTOCOL_VERSIONS[SUPPORTED_MOBILE_PROTOCOL_VERSIONS.length - 1];
+if (highestSupported === undefined) throw new Error("this build speaks no mobile protocol version");
+if (client.protocolVersion !== highestSupported) {
+  throw new Error(`live discovery negotiated ${client.protocolVersion}, not ${highestSupported}`);
+}
+if (servedVersions.length !== SUPPORTED_MOBILE_PROTOCOL_VERSIONS.length
+  || servedVersions.some((version, index) => version !== SUPPORTED_MOBILE_PROTOCOL_VERSIONS[index])) {
+  throw new Error("the Rust server advertised a different support range than the SDK speaks");
+}
+
+/**
+ * Replay the served document with a different advertised version list.
+ *
+ * Everything but `supported_versions` stays exactly what Rust produced —
+ * origin, endpoints, identity, media type and cache directive — so these
+ * exercise the negotiation rule and nothing else.
+ */
+async function discoverAdvertising(versions: readonly bigint[]) {
+  const served = parseCanonical(servedDiscoveryBody);
+  if (served.kind !== "object") throw new Error("served discovery is not an object");
+  const rewritten = {
+    kind: "object" as const,
+    entries: served.entries.map(([key, value]) =>
+      key === "supported_versions"
+        ? [key, {
+          kind: "array" as const,
+          items: versions.map((version) => ({kind: "integer" as const, value: version})),
+        }] as const
+        : [key, value] as const),
+  };
+  const body = new TextDecoder().decode(toCanonicalBytes(rewritten));
+  const replay = (async () => new Response(body, {
+    headers: {"cache-control": "no-store", "content-type": MOBILE_AUTH_MEDIA_TYPE},
+  })) as typeof fetch;
+  return MobileLifecycleClient.discover(canonicalOrigin, replay);
+}
+
+const unsupportedVersion = highestSupported + 1n;
+const forwardCompatible = await discoverAdvertising([unsupportedVersion, highestSupported]);
+if (forwardCompatible.protocolVersion !== highestSupported) {
+  throw new Error("a newer advertised version displaced the highest shared one");
+}
+try {
+  await discoverAdvertising([unsupportedVersion]);
+  throw new Error("a server sharing no protocol version was admitted");
+} catch (error) {
+  if (!(error instanceof MobileProtocolUnsupportedError)) throw error;
+  if (error.category !== "mobile_protocol_unsupported") {
+    throw new Error(`no-overlap refusal changed category: ${error.category}`);
+  }
+  if (error.supported.length !== SUPPORTED_MOBILE_PROTOCOL_VERSIONS.length) {
+    throw new Error("the refusal did not name this build's supported set");
+  }
+}
+try {
+  await discoverAdvertising([]);
+  throw new Error("an empty advertisement was admitted");
+} catch (error) {
+  if (!(error instanceof MobileProtocolUnsupportedError)) throw error;
+}
+try {
+  await discoverAdvertising([0n]);
+  throw new Error("a malformed version value was admitted");
+} catch (error) {
+  if (!(error instanceof MobileLifecycleError) || error.category !== "mobile_auth_value_invalid") {
+    throw new Error("a malformed version value stopped being told apart from an unsupported one");
+  }
+}
 
 const dashboard = await routeFetch(`${canonicalOrigin}/`, {
   method: "GET",

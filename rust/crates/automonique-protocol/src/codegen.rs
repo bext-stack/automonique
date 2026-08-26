@@ -831,6 +831,48 @@ pub const PLATFORM_MODULE: &str = "platform";
 /// Generated mobile authentication and authorization module stem.
 pub const MOBILE_AUTH_MODULE: &str = "mobile-auth";
 
+/// Lowest mobile protocol version this build speaks.
+pub const MIN_SUPPORTED_MOBILE_PROTOCOL_VERSION: u16 = 1;
+
+/// Highest mobile protocol version this build speaks.
+///
+/// Held apart from the `MobileProtocolVersion` value domain on purpose. The
+/// domain says which numbers the wire can carry, so an unknown-but-well-formed
+/// version decodes and is then *negotiated away*; this pair says which of them
+/// this build actually implements. Collapsing the two — the `1..1` domain this
+/// surface shipped with — made every version but the current one a malformed
+/// value, so a server that advertised `[1, 2]` was refused by a client that
+/// would have been perfectly happy to keep speaking `1`.
+///
+/// Widening the protocol is this constant plus the code that speaks the new
+/// version. Nothing else has to learn a second spelling.
+pub const MAX_SUPPORTED_MOBILE_PROTOCOL_VERSION: u16 = 1;
+
+/// Maximum protocol versions one discovery document may advertise.
+pub const MAX_MOBILE_PROTOCOL_VERSIONS: usize = 8;
+
+/// Smallest mobile protocol version the discovery wire can carry.
+///
+/// Zero names no version, so the domain starts at one whatever this build
+/// happens to speak.
+pub const MIN_MOBILE_PROTOCOL_VERSION_VALUE: u16 = 1;
+
+/// Largest mobile protocol version the discovery wire can carry.
+///
+/// The advertised list is a `u16` sequence, so this is the domain rather than a
+/// policy: a value outside it is malformed, not merely unsupported.
+pub const MAX_MOBILE_PROTOCOL_VERSION_VALUE: u16 = u16::MAX;
+
+/// Every mobile protocol version this build speaks, ascending.
+///
+/// This is exactly what a server advertises in `supported_versions` and exactly
+/// what a client intersects an advertisement against, so neither side can hold
+/// a different idea of the same fact.
+#[must_use]
+pub fn supported_mobile_protocol_versions() -> Vec<u16> {
+    (MIN_SUPPORTED_MOBILE_PROTOCOL_VERSION..=MAX_SUPPORTED_MOBILE_PROTOCOL_VERSION).collect()
+}
+
 /// The file one module is written to.
 #[must_use]
 pub fn module_file_name(module: &str) -> String {
@@ -6812,6 +6854,21 @@ fn mobile_auth_module() -> GeneratedModule {
                 value: ConstantValue::Text("mobile_auth_protocol_mismatch".to_owned()),
             },
             Constant {
+                name: "MOBILE_PROTOCOL_UNSUPPORTED".to_owned(),
+                doc: "No advertised protocol version is one this build speaks.".to_owned(),
+                value: ConstantValue::Text("mobile_protocol_unsupported".to_owned()),
+            },
+            Constant {
+                name: "MIN_SUPPORTED_MOBILE_PROTOCOL_VERSION".to_owned(),
+                doc: "Lowest mobile protocol version this build speaks.".to_owned(),
+                value: ConstantValue::Count(usize::from(MIN_SUPPORTED_MOBILE_PROTOCOL_VERSION)),
+            },
+            Constant {
+                name: "MAX_SUPPORTED_MOBILE_PROTOCOL_VERSION".to_owned(),
+                doc: "Highest mobile protocol version this build speaks.".to_owned(),
+                value: ConstantValue::Count(usize::from(MAX_SUPPORTED_MOBILE_PROTOCOL_VERSION)),
+            },
+            Constant {
                 name: "MAX_MOBILE_HTTP_BODY_BYTES".to_owned(),
                 doc: "Maximum accepted mobile lifecycle response body.".to_owned(),
                 value: ConstantValue::Count(65_536),
@@ -6819,7 +6876,7 @@ fn mobile_auth_module() -> GeneratedModule {
             Constant {
                 name: "MAX_MOBILE_PROTOCOL_VERSIONS".to_owned(),
                 doc: "Maximum protocol versions in discovery.".to_owned(),
-                value: ConstantValue::Count(8),
+                value: ConstantValue::Count(MAX_MOBILE_PROTOCOL_VERSIONS),
             },
             Constant {
                 name: "MAX_MOBILE_ACTIONS".to_owned(),
@@ -6967,8 +7024,8 @@ fn mobile_auth_module() -> GeneratedModule {
             },
             BoundedInteger {
                 name: "MobileProtocolVersion".to_owned(),
-                min: 1,
-                max: 1,
+                min: i64::from(MIN_MOBILE_PROTOCOL_VERSION_VALUE),
+                max: i64::from(MAX_MOBILE_PROTOCOL_VERSION_VALUE),
             },
             BoundedInteger {
                 name: "MobileCredentialPageSize".to_owned(),

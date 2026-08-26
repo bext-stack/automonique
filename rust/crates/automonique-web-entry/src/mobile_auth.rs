@@ -16,6 +16,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use automonique_protocol::codegen::supported_mobile_protocol_versions;
 use automonique_protocol::platform::{
     PlatformRequest, ResourceAuthority, ResourceKind, SessionCommandState, SessionList,
 };
@@ -438,7 +439,7 @@ impl MobileCredentialAuthority {
             credential_revoke_endpoint: format!("{origin}/api/mobile/credentials/revoke"),
             origin,
             server_identity,
-            supported_versions: vec![1],
+            supported_versions: supported_mobile_protocol_versions(),
         };
         Ok(Self {
             #[cfg(test)]
@@ -1546,6 +1547,35 @@ mod tests {
             ),
             Err(MobileAuthError::ServerIdentityMismatch)
         ));
+    }
+
+    /// What the server advertises is the shared support range, not a literal.
+    ///
+    /// A client admits this server on the highest version the two sets share,
+    /// so the advertisement and the range a client intersects against have to
+    /// be one fact. Written against the constants rather than against `[1]` so
+    /// it keeps checking the rule once the protocol widens.
+    #[test]
+    fn discovery_advertises_every_version_this_build_speaks() {
+        let (_root, auth) = authority();
+        let advertised = &auth.discovery().supported_versions;
+        assert_eq!(advertised, &supported_mobile_protocol_versions());
+        assert!(!advertised.is_empty());
+        assert_eq!(
+            advertised.first().copied(),
+            Some(automonique_protocol::codegen::MIN_SUPPORTED_MOBILE_PROTOCOL_VERSION)
+        );
+        assert_eq!(
+            advertised.last().copied(),
+            Some(automonique_protocol::codegen::MAX_SUPPORTED_MOBILE_PROTOCOL_VERSION)
+        );
+        assert!(advertised.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(advertised.len() <= automonique_protocol::codegen::MAX_MOBILE_PROTOCOL_VERSIONS);
+        let encoded = serde_json::to_value(auth.discovery()).expect("discovery serializes");
+        assert_eq!(
+            encoded["supported_versions"],
+            serde_json::json!(supported_mobile_protocol_versions())
+        );
     }
 
     #[test]
