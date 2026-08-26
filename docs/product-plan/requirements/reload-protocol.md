@@ -214,25 +214,28 @@ probes again. `cancel` answers `no_live_attempt` only once the route is gone.
 ### Channel schema compatibility across this release
 
 The private source-to-candidate channel is versioned
-(`automonique.reload-candidate/v7` in this release; `v6` before the handoff
-carried the source's attempt inventory). The two sides of a handoff must
-speak the same version, and neither side negotiates:
+(`automonique.reload-candidate/v8` in this release; `v7` before the
+activation control carried the admin pathname's owner, `v6` before the
+handoff carried the source's attempt inventory). The two sides of a handoff
+must speak the same version, and neither side negotiates:
 
-- A running `v6` daemon cannot `reload` into a `v7` release. The `v6` source
-  judges the `v7` candidate's warm-up identity under its own vocabulary and
-  refuses `candidate_protocol` at warm-up; the source resumes and nothing
-  durable moves.
-- A `v7` daemon cannot `rollback` (or `reload`) to a `v6` release. The `v6`
-  candidate's warm-up identity is refused `candidate_channel_schema_mismatch`
-  at warm-up — its own category, distinct from the durable-schema refusal —
-  and the source resumes. The candidate side refuses an authority or return
-  message in another schema under the same category.
+- A daemon speaking the previous version cannot `reload` into a release that
+  speaks this one. The older source judges the newer candidate's warm-up
+  identity under its own vocabulary and refuses `candidate_protocol` at
+  warm-up; the source resumes and nothing durable moves.
+- A daemon speaking this version cannot `rollback` (or `reload`) to a release
+  that speaks an older one. The older candidate's warm-up identity is refused
+  `candidate_channel_schema_mismatch` at warm-up — its own category, distinct
+  from the durable-schema refusal — and the source resumes. The candidate
+  side refuses an authority or return message in another schema under the
+  same category.
 
-The first deployment of a `v7` release, and any rollback across the `v6`/`v7`
-boundary, must therefore be restart-based: stop the unit, move the `current`
-release link, start it. The zero-downtime `reload`/`rollback` verbs apply
-within a channel version, and a version change is a restart-based deployment
-by design rather than a negotiated one.
+The first deployment of a release that moves the channel version, and any
+rollback across that boundary, must therefore be restart-based: stop the
+unit, move the `current` release link, start it. The zero-downtime
+`reload`/`rollback` verbs apply within a channel version, and a version
+change is a restart-based deployment by design rather than a negotiated
+one.
 
 ## Service-manager adoption
 
@@ -255,6 +258,31 @@ A source that predates this step never announces its candidate, so the first
 release that carries the adoption step is deployed by restart: reloading from
 such a source is exactly the delayed restart described above, and loading an
 adopting release does not turn that handoff into one.
+
+### The admin pathname belongs to the socket unit
+
+Under socket activation the admin pathname is created by
+`automonique.socket`, and it outlives every generation that answers on it:
+the service adopts the unit's one named descriptor and never unlinks the
+path, because the unit goes on listening on that inode across restarts. A hot
+reload does not change that. The cleanup transfer that moves the exact
+admin/progress inodes to the candidate carries whether the source owned the
+admin pathname at all, so a candidate adopted from an activated source arms
+no unlink of it, and a rollback re-arms on the source only the duty the
+source actually had. The progress endpoint is bound by the daemon itself in
+either case, so its cleanup always moves.
+
+Adoption is what makes this load-bearing: once the candidate is the unit's
+main process, its own orderly stop is the unit's stop, and its drop path is
+the last one to touch the pathname. A generation that unlinked it would leave
+the socket unit listening on an inode no client can reach and every later
+activated start refusing `admin_socket_missing` on a path that is gone —
+distinct from a bare I/O failure precisely because it names one condition
+with one repair, and the repair is restarting the socket unit, never the
+daemon recreating a path it does not own. A daemon started from a release
+that predates this rule still transfers the unlink duty unconditionally, so
+stopping such a generation requires the socket unit to be restarted alongside
+the service.
 
 ## Crash recovery without a cooperative old generation
 

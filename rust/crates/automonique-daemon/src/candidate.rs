@@ -53,7 +53,7 @@ use crate::control_lock::{ControlLock, ControlLockError};
 use crate::lease_identity::{ProcessIdentity, ProcessIdentityError};
 use crate::release_activation::VerifiedCodeRelease;
 
-const CHANNEL_SCHEMA: &str = "automonique.reload-candidate/v7";
+const CHANNEL_SCHEMA: &str = "automonique.reload-candidate/v8";
 /// Failure category a successor records when the private channel to its
 /// source closes after it proved active but before the source committed it.
 pub const SOURCE_GENERATION_LOST: &str = "source_generation_lost";
@@ -63,7 +63,12 @@ const CONTROL_STOP: u8 = b'S';
 const CONTROL_PREPARE_TRANSFER: u8 = b'T';
 const CONTROL_CONFIRM_AUTHORITY: u8 = b'A';
 const CONTROL_CONFIRM_RELINQUISHED: u8 = b'R';
-const CONTROL_ACTIVATE_SERVING: u8 = b'V';
+/// Activate, with the admin pathname owned by the daemon process tree: the
+/// candidate inherits the duty to unlink it when it stops.
+const CONTROL_ACTIVATE_SERVING_OWNED: u8 = b'V';
+/// Activate, with the admin pathname owned by the service manager's socket
+/// unit: the candidate holds that unit's inode and must never unlink it.
+const CONTROL_ACTIVATE_SERVING_ACTIVATED: u8 = b'W';
 const CONTROL_QUIESCE: u8 = b'Q';
 const CONTROL_COMMIT: u8 = b'C';
 
@@ -128,14 +133,27 @@ pub struct CandidateTransferDescriptors {
     control_lock: File,
 }
 
-/// One-use proof that the source disarmed cleanup of the transferred sockets.
+/// One-use proof that the source disarmed cleanup of the transferred sockets,
+/// carrying whether the admin pathname was the source's to unlink at all.
 pub struct EndpointCleanupTransfer {
-    _private: (),
+    admin_socket_path_owned: bool,
 }
 
 impl EndpointCleanupTransfer {
-    pub(crate) const fn new() -> Self {
-        Self { _private: () }
+    pub(crate) const fn new(admin_socket_path_owned: bool) -> Self {
+        Self {
+            admin_socket_path_owned,
+        }
+    }
+
+    /// Whether the source owned the admin pathname, and so whether the
+    /// candidate may arm an unlink of it.
+    ///
+    /// False for a socket-activated source: the pathname belongs to the
+    /// socket unit, outlives every generation that answers on it, and is
+    /// recreated by nobody in this process tree once it is gone.
+    pub(crate) const fn admin_socket_path_owned(&self) -> bool {
+        self.admin_socket_path_owned
     }
 }
 
@@ -720,12 +738,17 @@ impl WarmCandidate {
     /// worker and inherited accept loop has started.
     pub fn activate_serving(
         &mut self,
-        _cleanup: EndpointCleanupTransfer,
+        cleanup: EndpointCleanupTransfer,
     ) -> Result<(), CandidateError> {
         if !self.authority_ready || self.serving || self.quiesced || self.relinquished {
             return Err(CandidateError::Protocol);
         }
-        send_control(&self.channel, CONTROL_ACTIVATE_SERVING, None)?;
+        let marker = if cleanup.admin_socket_path_owned() {
+            CONTROL_ACTIVATE_SERVING_OWNED
+        } else {
+            CONTROL_ACTIVATE_SERVING_ACTIVATED
+        };
+        send_control(&self.channel, marker, None)?;
         let mut expected = self.identity.clone();
         expected.event = "active".to_owned();
         let observed = read_identity(&self.channel)?;
@@ -934,7 +957,9 @@ fn run_candidate_channel<R: Read + AsFd, W: Write>(
                     write_message(writer, &identity)?;
                     let mut daemon = match receive_control(reader.as_fd())? {
                         CandidateControl::ConfirmRelinquished => daemon,
-                        CandidateControl::ActivateServing => {
+                        CandidateControl::ActivateServing {
+                            admin_socket_path_owned,
+                        } => {
                             let stop = Arc::new(AtomicBool::new(false));
                             let thread_stop = Arc::clone(&stop);
                             let release_on_stop = Arc::new(AtomicBool::new(false));
@@ -946,6 +971,7 @@ fn run_candidate_channel<R: Read + AsFd, W: Write>(
                                     ready_sender,
                                     thread_release_on_stop,
                                     source_pid,
+                                    admin_socket_path_owned,
                                 )
                             });
                             if ready_receiver
@@ -1044,7 +1070,7 @@ fn run_candidate_channel<R: Read + AsFd, W: Write>(
                     return write_stopped(writer, identity);
                 }
                 CandidateControl::ConfirmRelinquished
-                | CandidateControl::ActivateServing
+                | CandidateControl::ActivateServing { .. }
                 | CandidateControl::Quiesce
                 | CandidateControl::Commit
                 | CandidateControl::PrepareTransfer(_) => {
@@ -1055,7 +1081,7 @@ fn run_candidate_channel<R: Read + AsFd, W: Write>(
         }
         CandidateControl::ConfirmAuthority
         | CandidateControl::ConfirmRelinquished
-        | CandidateControl::ActivateServing
+        | CandidateControl::ActivateServing { .. }
         | CandidateControl::Quiesce
         | CandidateControl::Commit => {
             return Err(CandidateError::Protocol);
@@ -1113,7 +1139,12 @@ enum CandidateControl {
     PrepareTransfer(CandidateTransferDescriptors),
     ConfirmAuthority,
     ConfirmRelinquished,
-    ActivateServing,
+    /// Serve as the adopted generation. `admin_socket_path_owned` is the
+    /// source's ownership of the admin pathname, which the candidate inherits
+    /// along with the descriptor.
+    ActivateServing {
+        admin_socket_path_owned: bool,
+    },
     Quiesce,
     Commit,
 }
@@ -1178,7 +1209,16 @@ fn receive_control(fd: impl AsFd) -> Result<CandidateControl, CandidateError> {
         CONTROL_CONFIRM_RELINQUISHED if received.is_empty() => {
             Ok(CandidateControl::ConfirmRelinquished)
         }
-        CONTROL_ACTIVATE_SERVING if received.is_empty() => Ok(CandidateControl::ActivateServing),
+        CONTROL_ACTIVATE_SERVING_OWNED if received.is_empty() => {
+            Ok(CandidateControl::ActivateServing {
+                admin_socket_path_owned: true,
+            })
+        }
+        CONTROL_ACTIVATE_SERVING_ACTIVATED if received.is_empty() => {
+            Ok(CandidateControl::ActivateServing {
+                admin_socket_path_owned: false,
+            })
+        }
         CONTROL_QUIESCE if received.is_empty() => Ok(CandidateControl::Quiesce),
         CONTROL_COMMIT if received.is_empty() => Ok(CandidateControl::Commit),
         CONTROL_PREPARE_TRANSFER if received.len() == 3 => {
@@ -1716,7 +1756,7 @@ mod tests {
             identity
         );
 
-        let unknown = br#"{"schema":"automonique.reload-candidate/v7","event":"warm","reload_id":"reload-1","target_generation_id":"generation-2","manifest_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binary_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","attempt_count":2,"attempt_inventory_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","target_holder_id":"daemon-42-reload-0123456789abcdef","boot_id":"01234567-89ab-cdef-0123-456789abcdef","starttime":100,"pid":42,"extra":true}\n"#;
+        let unknown = br#"{"schema":"automonique.reload-candidate/v8","event":"warm","reload_id":"reload-1","target_generation_id":"generation-2","manifest_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binary_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","attempt_count":2,"attempt_inventory_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","target_holder_id":"daemon-42-reload-0123456789abcdef","boot_id":"01234567-89ab-cdef-0123-456789abcdef","starttime":100,"pid":42,"extra":true}\n"#;
         assert!(matches!(
             read_message_from::<CandidateIdentity>(&mut unknown.as_slice()),
             Err(CandidateError::Protocol)

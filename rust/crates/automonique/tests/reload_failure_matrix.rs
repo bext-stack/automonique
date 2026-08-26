@@ -503,11 +503,13 @@ fn a_schema_the_candidate_cannot_read_is_refused_at_warm_up() {
 /// A release whose candidate speaks the previous channel schema is refused
 /// under its own category at warm-up, and the source resumes.
 ///
-/// The channel schema moved from `v6` to `v7` with the attempt inventory the
-/// handoff now carries. A `v7` source that spawns a `v6` candidate sees the
-/// candidate's warm-up identity stamped with the older schema; this is the
-/// rollback-to-the-previous-release case, and it is what makes the first
-/// deployment of a `v7` release, and any rollback across it, restart-based.
+/// The channel schema has moved twice: to `v7` with the attempt inventory the
+/// handoff carries, and to `v8` with the admin pathname's owner the
+/// activation control carries. A source of this release that spawns a
+/// candidate stamped with an older schema sees that in its warm-up identity;
+/// this is the rollback-to-the-previous-release case, and it is what makes
+/// the first deployment of a release that moves the version, and any rollback
+/// across it, restart-based.
 /// The candidate here is a script that answers the inherited channel exactly
 /// as a `v6` binary's warm-up would, so the source's judgement is exercised
 /// against a real child process rather than a crafted line.
