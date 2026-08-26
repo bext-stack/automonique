@@ -16,6 +16,7 @@ pub mod control;
 pub mod descriptors;
 pub mod dispatch;
 pub mod filesystem;
+pub mod identity;
 mod landlock_abi;
 mod launch;
 pub mod network;
@@ -43,6 +44,9 @@ pub use containment::{
     CGROUP_DIR_ENV, CPU_MAX_PERIOD_MICROS, ContainmentDomain, ContainmentError, ContainmentLimits,
     Controller, HELPER_REFUSED_EXIT, MAX_RUN_ID_BYTES, RunContainment,
     containment_entry_helper_main, domain_is_owned, process_is_live,
+};
+pub use identity::{
+    IdentityError, WorkloadIdentity, WorkloadIdentityDenial, probe_with_launch_helper,
 };
 pub use launch::{
     FRAME_HEADER, FRAME_TERMINATOR, LaunchError, LaunchPlan, LaunchPlanError, MAX_FRAME_BYTES,

@@ -17,9 +17,13 @@
 //! 2. *A probe must not become the thing it measures.* The probe never creates a
 //!    cgroup, never allocates a Landlock ruleset descriptor, never calls
 //!    `restrict_self`, never sets `PR_SET_NO_NEW_PRIVS`, never installs a
-//!    seccomp filter, and never calls `unshare`. Any of those would restrict the
-//!    supervisor itself, permanently and irreversibly, as a side effect of
-//!    asking a question.
+//!    seccomp filter, and never calls `unshare` in this process. Any of those
+//!    would restrict the supervisor itself, permanently and irreversibly, as a
+//!    side effect of asking a question. The one mechanism that can only be
+//!    known by exercising it — the workload identity switch, whose
+//!    prerequisites include an AppArmor grant no file describes — is
+//!    exercised by a throwaway child, the launch helper in probe mode, which
+//!    restricts nothing but itself and reports its own kernel view.
 //! 3. *Degradation is never silent.* [`HostCapabilities::select_mode`] returns
 //!    either a mode that enforces every requested property, or a typed refusal
 //!    naming each requested property no available mode can enforce and which
@@ -37,6 +41,7 @@
 //! crate's compatibility engine, and ignores securityfs entirely.
 
 use crate::containment::{ContainmentDomain, ContainmentError};
+use crate::identity::{WorkloadIdentity, WorkloadIdentityDenial};
 use crate::landlock_abi::KNOWN as KNOWN_LANDLOCK_ABI;
 use landlock::{
     ABI, Access as _, AccessFs, AccessNet, CompatLevel, Compatible as _, Ruleset, RulesetAttr as _,
@@ -438,6 +443,57 @@ impl UserNamespaceFinding {
     }
 }
 
+/// Whether a launcher can give the workload a host uid of its own here.
+///
+/// Unlike the other findings this one is exercised, not observed: the launch
+/// helper is run in [`crate::identity::PROBE_MODE_FLAG`] mode as a throwaway
+/// child, performs the whole switch on itself — user namespace, subordinate
+/// mapping, uid change, capability shaping — and reports its own `/proc`
+/// view. A host whose subordinate files, mapping helpers or AppArmor policy
+/// would refuse the launch therefore refuses the probe the same way, with the
+/// same typed reason.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum WorkloadIdentityFinding {
+    /// The helper switched to this identity and confirmed it from the kernel.
+    Separable(WorkloadIdentity),
+    /// The switch was not attempted or was refused, with the typed reason.
+    Unavailable(WorkloadIdentityDenial),
+}
+
+impl WorkloadIdentityFinding {
+    /// Ask `helper` in a throwaway child, or report that there is none to ask.
+    ///
+    /// The supervisor's own process is not touched; see [`HostCapabilities`].
+    #[must_use]
+    pub fn probe_with_launch_helper(helper: Option<&Path>) -> Self {
+        let Some(helper) = helper else {
+            return Self::Unavailable(WorkloadIdentityDenial::NoLaunchHelper);
+        };
+        match crate::identity::probe_with_launch_helper(helper) {
+            Ok(identity) => Self::Separable(identity),
+            Err(denial) => Self::Unavailable(denial),
+        }
+    }
+
+    /// The identity a workload would get, or `None` when it cannot have one.
+    #[must_use]
+    pub const fn identity(self) -> Option<WorkloadIdentity> {
+        match self {
+            Self::Separable(identity) => Some(identity),
+            Self::Unavailable(_) => None,
+        }
+    }
+
+    /// The reason no separate identity is available, or `None` when one is.
+    #[must_use]
+    pub const fn denial(self) -> Option<WorkloadIdentityDenial> {
+        match self {
+            Self::Separable(_) => None,
+            Self::Unavailable(denial) => Some(denial),
+        }
+    }
+}
+
 /// Why `seccomp(2)` filter mode cannot narrow a workload's syscall surface.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum SeccompUnavailable {
@@ -538,8 +594,9 @@ pub enum Mechanism {
     CgroupDomain,
     /// A Landlock ruleset applied to the workload before `exec`.
     Landlock,
-    /// An unprivileged user namespace, and the mount and network namespaces it
-    /// makes creatable.
+    /// An unprivileged user namespace: the subordinate-uid identity the
+    /// launch helper switches the workload to inside one, and the mount and
+    /// network namespaces a full namespaced mode would create beyond it.
     UserNamespace,
     /// A `seccomp(2)` filter installed on the workload before `exec`.
     SeccompFilter,
@@ -586,8 +643,13 @@ pub enum BoundaryProperty {
     /// UDP, raw sockets, and ICMP. Only a network namespace provides this; no
     /// Landlock ABI does.
     CompleteNetworkDenial,
-    /// The workload runs under a uid distinct from the supervisor's, so it
-    /// cannot signal supervisor processes or write supervisor-owned files.
+    /// The workload runs under a host uid distinct from the supervisor's, so
+    /// a supervisor-uid process cannot read its environment, its descriptors
+    /// or its memory, and it cannot signal or trace supervisor-uid processes.
+    /// It says nothing about file ownership: the workload keeps discretionary
+    /// access to the supervisor's files through its namespace's capabilities,
+    /// and the Landlock allowlist remains the filesystem boundary; see
+    /// [`crate::identity`].
     UidSeparation,
     /// The workload's syscall surface is narrowed to an explicit allowlist.
     SyscallRestriction,
@@ -632,16 +694,16 @@ impl fmt::Display for BoundaryProperty {
 /// | mode | launcher work before `exec` |
 /// |---|---|
 /// | [`Self::ContainmentOnly`] | place the child in a run cgroup, then `exec` |
-/// | [`Self::KernelRestricted`] | additionally set `PR_SET_NO_NEW_PRIVS`, apply a Landlock ruleset, install a seccomp filter |
-/// | [`Self::NamespacedIsolation`] | additionally unshare user, mount, and network namespaces |
+/// | [`Self::KernelRestricted`] | additionally switch the workload to a subordinate host uid inside a user namespace of its own, set `PR_SET_NO_NEW_PRIVS`, apply a Landlock ruleset, install a seccomp filter |
+/// | [`Self::NamespacedIsolation`] | additionally unshare mount and network namespaces |
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum EnforcementMode {
     /// Namespaced isolation: the native mode. Everything below, plus a private
     /// uid, a private mount view, and a private empty network stack.
     NamespacedIsolation,
-    /// In-kernel restriction without namespaces: containment plus Landlock plus
-    /// a syscall filter, all applied to a workload that keeps the supervisor's
-    /// uid and the host network stack.
+    /// In-kernel restriction: containment plus a subordinate host uid in a
+    /// user namespace plus Landlock plus a syscall filter, all applied to a
+    /// workload that keeps the host mount view and network stack.
     KernelRestricted,
     /// Containment alone: the workload is bounded and killable, and nothing
     /// else about it is restricted.
@@ -687,12 +749,14 @@ impl EnforcementMode {
                 Self::KernelRestricted,
                 BoundaryProperty::FilesystemRestriction | BoundaryProperty::TcpDenial,
             ) => Some(Mechanism::Landlock),
-            // Landlock's network rights cover TCP only, and a Landlock ruleset
-            // never changes a uid, so this mode cannot reach either property.
-            (
-                Self::KernelRestricted,
-                BoundaryProperty::CompleteNetworkDenial | BoundaryProperty::UidSeparation,
-            ) => None,
+            // The uid switch is a user namespace with a subordinate mapping;
+            // Landlock never changes a uid.
+            (Self::KernelRestricted, BoundaryProperty::UidSeparation) => {
+                Some(Mechanism::UserNamespace)
+            }
+            // Landlock's network rights cover TCP only, and this mode keeps
+            // the host network stack, so it cannot reach this property.
+            (Self::KernelRestricted, BoundaryProperty::CompleteNetworkDenial) => None,
             (Self::NamespacedIsolation, _) => Some(Mechanism::UserNamespace),
         }
     }
@@ -760,6 +824,8 @@ pub enum UnsatisfiedCause {
     },
     /// A kernel policy forbids unprivileged user-namespace creation.
     UserNamespaceDenied(UserNamespaceDenial),
+    /// The launch helper cannot give the workload a host uid of its own.
+    WorkloadIdentityUnavailable(WorkloadIdentityDenial),
     /// `seccomp(2)` filter mode cannot narrow a syscall surface here.
     SeccompFilterUnavailable(SeccompUnavailable),
 }
@@ -776,6 +842,7 @@ impl fmt::Display for UnsatisfiedCause {
                 "Landlock {observed} is below the ABI {needed} that defines this access right"
             ),
             Self::UserNamespaceDenied(denial) => write!(formatter, "{denial}"),
+            Self::WorkloadIdentityUnavailable(denial) => write!(formatter, "{denial}"),
             Self::SeccompFilterUnavailable(reason) => write!(formatter, "{reason}"),
         }
     }
@@ -970,30 +1037,51 @@ impl std::error::Error for ModeRefusal {}
 
 /// What enforcement this host can actually provide.
 ///
-/// Produced by [`Self::probe`], which reads fixed kernel paths and asks the
-/// Landlock version query, and changes nothing. [`Self::from_findings`] exists
-/// for callers that already established the findings some other way.
+/// Produced by [`Self::probe_with_launch_helper`], which reads fixed kernel
+/// paths, asks the Landlock version query, and asks the launch helper — in a
+/// throwaway child — what identity a workload would get; or by
+/// [`Self::probe`], which does the same without a helper and therefore
+/// reports the identity as unavailable. [`Self::from_findings`] exists for
+/// callers that already established the findings some other way.
 #[derive(Debug)]
 pub struct HostCapabilities {
     containment: ContainmentFinding,
     landlock: LandlockFinding,
     user_namespace: UserNamespaceFinding,
+    workload_identity: WorkloadIdentityFinding,
     seccomp: SeccompFinding,
 }
 
 impl HostCapabilities {
-    /// Observe this host. Read-only and side-effect free.
+    /// Observe this host without a launch helper to ask.
     ///
-    /// Nothing here creates a cgroup, allocates a Landlock ruleset descriptor,
-    /// calls `restrict_self`, sets `PR_SET_NO_NEW_PRIVS`, installs a seccomp
-    /// filter, or calls `unshare`. Probing twice returns the same findings, and
-    /// a process that probes is no more restricted afterwards than before.
+    /// Read-only and side-effect free: nothing here creates a cgroup,
+    /// allocates a Landlock ruleset descriptor, calls `restrict_self`, sets
+    /// `PR_SET_NO_NEW_PRIVS`, installs a seccomp filter, or calls `unshare`.
+    /// Probing twice returns the same findings, and a process that probes is
+    /// no more restricted afterwards than before. The workload identity is
+    /// reported [`WorkloadIdentityFinding::Unavailable`] with
+    /// [`WorkloadIdentityDenial::NoLaunchHelper`]: without the helper there
+    /// is nothing to exercise it with, and a guess would be the overclaim
+    /// this module exists to prevent.
     #[must_use]
     pub fn probe() -> Self {
+        Self::probe_with_launch_helper(None)
+    }
+
+    /// Observe this host, asking `helper` what identity a workload would get.
+    ///
+    /// Everything [`Self::probe`] says holds for this process. The helper runs
+    /// as a throwaway child in [`crate::identity::PROBE_MODE_FLAG`] mode and
+    /// is the only process the switch is tried on; see
+    /// [`WorkloadIdentityFinding`].
+    #[must_use]
+    pub fn probe_with_launch_helper(helper: Option<&Path>) -> Self {
         Self {
             containment: ContainmentFinding::probe(),
             landlock: LandlockFinding::probe(),
             user_namespace: UserNamespaceFinding::probe(),
+            workload_identity: WorkloadIdentityFinding::probe_with_launch_helper(helper),
             seccomp: SeccompFinding::probe(),
         }
     }
@@ -1011,12 +1099,14 @@ impl HostCapabilities {
         containment: ContainmentFinding,
         landlock: LandlockFinding,
         user_namespace: UserNamespaceFinding,
+        workload_identity: WorkloadIdentityFinding,
         seccomp: SeccompFinding,
     ) -> Self {
         Self {
             containment,
             landlock,
             user_namespace,
+            workload_identity,
             seccomp,
         }
     }
@@ -1037,6 +1127,12 @@ impl HostCapabilities {
     #[must_use]
     pub const fn user_namespace(&self) -> UserNamespaceFinding {
         self.user_namespace
+    }
+
+    /// Workload identity finding.
+    #[must_use]
+    pub const fn workload_identity(&self) -> WorkloadIdentityFinding {
+        self.workload_identity
     }
 
     /// Seccomp finding.
@@ -1142,6 +1238,29 @@ impl HostCapabilities {
                 blocked.push(BlockedMechanism { mechanism, cause });
             }
         }
+        if blocked.is_empty() {
+            // The property's mechanism is not itself blocked, yet no
+            // installable mode delivers it: the identity switch is available
+            // but the only modes that would run it are uninstallable, and the
+            // full namespaced mode is denied. This happens exactly for
+            // `UidSeparation` on a host whose helper can switch identity but
+            // whose restricted modes are unavailable while unprivileged user
+            // namespaces are denied — so the honest, non-empty reason is that
+            // namespace denial. See the reasoning in [`Self::blocker`].
+            if let Some(denial) = self.user_namespace.denial() {
+                for mode in EnforcementMode::LADDER {
+                    if mode.mechanism_for(property) == Some(Mechanism::UserNamespace)
+                        && !mode.is_available_on(self)
+                    {
+                        blocked.push(BlockedMechanism {
+                            mechanism: Mechanism::UserNamespace,
+                            cause: UnsatisfiedCause::UserNamespaceDenied(denial),
+                        });
+                        break;
+                    }
+                }
+            }
+        }
         debug_assert!(
             !blocked.is_empty(),
             "{property} was reported unenforceable with no blocked mechanism"
@@ -1177,10 +1296,23 @@ impl HostCapabilities {
                     needed,
                 })
             }
-            Mechanism::UserNamespace => self
-                .user_namespace
-                .denial()
-                .map(UnsatisfiedCause::UserNamespaceDenied),
+            // `UidSeparation` is authoritative from the launch helper, which
+            // actually performs the switch; the generic user-namespace policy
+            // is deliberately not consulted for it, because the helper's own
+            // AppArmor grant can let the switch succeed on a host whose sysctl
+            // restricts unprivileged user namespaces in general. Every other
+            // namespace-backed property is gated on that policy reading,
+            // because nothing exercises those namespaces yet.
+            Mechanism::UserNamespace => match property {
+                BoundaryProperty::UidSeparation => self
+                    .workload_identity
+                    .denial()
+                    .map(UnsatisfiedCause::WorkloadIdentityUnavailable),
+                _ => self
+                    .user_namespace
+                    .denial()
+                    .map(UnsatisfiedCause::UserNamespaceDenied),
+            },
             Mechanism::SeccompFilter => self
                 .seccomp
                 .denial()

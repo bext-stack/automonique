@@ -18,8 +18,9 @@
 //! than what is taken away.
 
 use automonique_runner::seccomp::{
-    IO_URING_SYSCALLS, MAX_ALLOWED_SHAPES, PROCESS_INSPECTION_SYSCALLS, REQUIRED_TARGET_ARCH,
-    SOCKET_TYPE_MASK, SocketDomain, SocketFamilyPolicy, SocketFilterError, SocketKind,
+    CLONE_NAMESPACE_FLAGS, IO_URING_SYSCALLS, MAX_ALLOWED_SHAPES, NAMESPACE_SYSCALLS,
+    PROCESS_INSPECTION_SYSCALLS, REQUIRED_TARGET_ARCH, SOCKET_TYPE_MASK, SYS_CLONE, SYS_CLONE3,
+    SocketDomain, SocketFamilyPolicy, SocketFilterError, SocketKind,
 };
 use nix::libc;
 use std::path::Path;
@@ -560,17 +561,26 @@ fn every_policy_filters_unconditional_syscalls_and_both_syscall_abis() {
         for syscall in IO_URING_SYSCALLS
             .into_iter()
             .chain(PROCESS_INSPECTION_SYSCALLS)
+            .chain(NAMESPACE_SYSCALLS)
         {
             assert!(
                 filtered.contains(&syscall),
-                "io_uring syscall {syscall} is not filtered: {filtered:?}"
+                "unconditionally denied syscall {syscall} is not filtered: {filtered:?}"
             );
             assert!(
                 filtered.contains(&(syscall | 0x4000_0000)),
                 "the x32 spelling of {syscall} is not filtered: {filtered:?}"
             );
         }
-        for syscall in [libc::SYS_socket, libc::SYS_socketpair] {
+        // socket and socketpair carry rule chains; clone and clone3 are
+        // filtered too — clone conditionally on its namespace flags, clone3
+        // by the second program that answers ENOSYS.
+        for syscall in [
+            libc::SYS_socket,
+            libc::SYS_socketpair,
+            SYS_CLONE,
+            SYS_CLONE3,
+        ] {
             assert!(filtered.contains(&syscall), "{syscall} is not filtered");
             assert!(
                 filtered.contains(&(syscall | 0x4000_0000)),
@@ -582,8 +592,12 @@ fn every_policy_filters_unconditional_syscalls_and_both_syscall_abis() {
         // syscall" means for every other module in this crate.
         assert_eq!(
             filtered.len(),
-            2 * (IO_URING_SYSCALLS.len() + PROCESS_INSPECTION_SYSCALLS.len() + 2)
+            2 * (IO_URING_SYSCALLS.len()
+                + PROCESS_INSPECTION_SYSCALLS.len()
+                + NAMESPACE_SYSCALLS.len()
+                + 4)
         );
+        assert!(!CLONE_NAMESPACE_FLAGS.is_empty());
     }
 }
 

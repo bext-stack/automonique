@@ -108,7 +108,7 @@ use automonique_runner::admission::{
     BrokeredScope, PromptSource, ProviderIdentityPolicy, ResolvedPrompt,
     TemporaryStorageEnforcement, UnenforcedBudget, admit,
 };
-use automonique_runner::capability::{BoundaryProperty, HostCapabilities};
+use automonique_runner::capability::HostCapabilities;
 use automonique_runner::{
     AdmissionFields, AdmissionFieldsParts, ArtifactGrantBindings, ContainmentDomain, CwdToken,
     ExecutionPlanDigest, ExtensionSetDigest, FallbackEligibility, IntegrationMode, IoReservation,
@@ -819,12 +819,7 @@ fn connect_head(port: u16) -> String {
 
 fn sandbox_enforceable() -> bool {
     HostCapabilities::probe()
-        .select_mode(&[
-            BoundaryProperty::DescendantContainment,
-            BoundaryProperty::FilesystemRestriction,
-            BoundaryProperty::TcpDenial,
-            BoundaryProperty::SyscallRestriction,
-        ])
+        .select_mode(&automonique_daemon::execute::ENFORCED_PROPERTIES)
         .is_ok()
 }
 

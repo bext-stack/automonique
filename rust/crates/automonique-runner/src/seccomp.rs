@@ -79,6 +79,19 @@
 //!   calls, and `pidfd_getfd` under every policy. Those interfaces can read or
 //!   alter a sibling process, or copy one of its already-open descriptors,
 //!   bypassing the workload's own filesystem and socket-creation boundaries.
+//! - **Namespace creation is refused outright.** The workload runs inside a
+//!   user namespace of its own ([`crate::identity`]) and, on hosts that grant
+//!   the launch helper `userns`, it inherits that grant. A nested user
+//!   namespace would make the workload root again inside it — with the mount,
+//!   network and other namespaces that root can create. So every policy
+//!   denies [`NAMESPACE_SYSCALLS`] (`unshare`, `setns`) unconditionally,
+//!   denies `clone(2)` whenever its flags name any namespace
+//!   ([`CLONE_NAMESPACE_FLAGS`]), and answers `clone3(2)` with `ENOSYS`
+//!   rather than `EPERM`: `clone3` takes its flags through a struct the
+//!   filter cannot inspect, and `ENOSYS` is the one answer that makes a C
+//!   library fall back to `clone`, where the flags are visible. That
+//!   answer is a second, tiny program installed after the first, because
+//!   one program has one denial errno.
 //!
 //! # Denial is `EPERM`, not death
 //!
@@ -226,6 +239,33 @@ pub const PROCESS_INSPECTION_SYSCALLS: [i64; 4] = [
     nix::libc::SYS_process_vm_writev & !X32_SYSCALL_BIT,
     nix::libc::SYS_pidfd_getfd & !X32_SYSCALL_BIT,
 ];
+
+/// Namespace-creation entry points every policy denies unconditionally.
+pub const NAMESPACE_SYSCALLS: [i64; 2] = [
+    nix::libc::SYS_unshare & !X32_SYSCALL_BIT,
+    nix::libc::SYS_setns & !X32_SYSCALL_BIT,
+];
+/// `clone(2)`, denied when its flags name a namespace.
+pub const SYS_CLONE: i64 = nix::libc::SYS_clone & !X32_SYSCALL_BIT;
+/// `clone3(2)`, answered `ENOSYS` by the second program.
+pub const SYS_CLONE3: i64 = nix::libc::SYS_clone3 & !X32_SYSCALL_BIT;
+/// The `clone(2)` flag bits that create a namespace. Any one of them set
+/// denies the call; a `clone` without them — threads, `fork` through
+/// `clone`, `vfork` — is untouched.
+pub const CLONE_NAMESPACE_FLAGS: [u64; 8] = [
+    nix::libc::CLONE_NEWNS as u64,
+    nix::libc::CLONE_NEWCGROUP as u64,
+    nix::libc::CLONE_NEWUTS as u64,
+    nix::libc::CLONE_NEWIPC as u64,
+    nix::libc::CLONE_NEWUSER as u64,
+    nix::libc::CLONE_NEWPID as u64,
+    nix::libc::CLONE_NEWNET as u64,
+    nix::libc::CLONE_NEWTIME as u64,
+];
+/// The errno the `clone3` program answers with.
+pub const CLONE3_ERRNO: i32 = nix::libc::ENOSYS;
+/// Index of the `flags` argument of `clone(2)` on `x86_64`.
+const ARG_CLONE_FLAGS: u8 = 0;
 
 /// Index of the `domain` argument of `socket(2)` and `socketpair(2)`.
 const ARG_DOMAIN: u8 = 0;
@@ -770,6 +810,7 @@ impl SocketFamilyPolicy {
         for syscall in IO_URING_SYSCALLS
             .into_iter()
             .chain(PROCESS_INSPECTION_SYSCALLS)
+            .chain(NAMESPACE_SYSCALLS)
         {
             for number in both_abis(syscall) {
                 // An empty rule chain matches the syscall whatever its
@@ -778,8 +819,12 @@ impl SocketFamilyPolicy {
                 rules.insert(number, Vec::new());
             }
         }
+        let clone_rules = clone_namespace_rules()?;
+        for number in both_abis(SYS_CLONE) {
+            rules.insert(number, clone_rules.clone());
+        }
 
-        let filtered_syscalls: Vec<i64> = rules.keys().copied().collect();
+        let mut filtered_syscalls: Vec<i64> = rules.keys().copied().collect();
         let filter = SeccompFilter::new(
             rules,
             // Every syscall this filter does not name runs untouched. It has to
@@ -796,8 +841,31 @@ impl SocketFamilyPolicy {
                     SocketFilterError::FilterRefused(error.to_string())
                 })?;
 
+        // The second program: `clone3` answers `ENOSYS`, so a C library
+        // falls back to `clone`, which the first program inspects.
+        let mut clone3_rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+        for number in both_abis(SYS_CLONE3) {
+            clone3_rules.insert(number, Vec::new());
+            filtered_syscalls.push(number);
+        }
+        filtered_syscalls.sort_unstable();
+        let clone3_filter = SeccompFilter::new(
+            clone3_rules,
+            SeccompAction::Allow,
+            SeccompAction::Errno(CLONE3_ERRNO as u32),
+            TargetArch::x86_64,
+        )
+        .map_err(|error| SocketFilterError::FilterRefused(error.to_string()))?;
+        let clone3_program: BpfProgram =
+            clone3_filter
+                .try_into()
+                .map_err(|error: seccompiler::BackendError| {
+                    SocketFilterError::FilterRefused(error.to_string())
+                })?;
+
         Ok(CompiledSocketFilter {
             program,
+            clone3_program,
             filtered_syscalls,
         })
     }
@@ -810,6 +878,29 @@ impl SocketFamilyPolicy {
     pub fn apply_to_current_thread(&self) -> Result<EnforcedSocketFilter, SocketFilterError> {
         self.compile()?.apply_to_current_thread()
     }
+}
+
+/// One denial rule per namespace flag: `clone(2)` is refused when any of
+/// [`CLONE_NAMESPACE_FLAGS`] is set in its flags argument.
+///
+/// `seccompiler` has no masked inequality, so "any of these bits" is spelled
+/// as one masked-equality rule per bit; rules for one syscall are a
+/// disjunction, which is exactly the meaning wanted.
+fn clone_namespace_rules() -> Result<Vec<SeccompRule>, SocketFilterError> {
+    CLONE_NAMESPACE_FLAGS
+        .into_iter()
+        .map(|flag| {
+            let condition = SeccompCondition::new(
+                ARG_CLONE_FLAGS,
+                SeccompCmpArgLen::Qword,
+                SeccompCmpOp::MaskedEq(flag),
+                flag,
+            )
+            .map_err(|error| SocketFilterError::FilterRefused(error.to_string()))?;
+            SeccompRule::new(vec![condition])
+                .map_err(|error| SocketFilterError::FilterRefused(error.to_string()))
+        })
+        .collect()
 }
 
 /// Both spellings of one syscall number on `x86_64`: native and `x32`.
@@ -1019,20 +1110,22 @@ fn unallowed_protocol_tests(allowed: &[u32]) -> Vec<ArgTest> {
 #[derive(Clone, Debug)]
 pub struct CompiledSocketFilter {
     program: BpfProgram,
+    clone3_program: BpfProgram,
     filtered_syscalls: Vec<i64>,
 }
 
 impl CompiledSocketFilter {
-    /// Number of BPF instructions in the assembled program.
+    /// Number of BPF instructions in the assembled programs, both of them.
     #[must_use]
     pub fn instruction_count(&self) -> usize {
-        self.program.len()
+        self.program.len() + self.clone3_program.len()
     }
 
-    /// Syscall numbers this program has a rule chain for, ascending.
+    /// Syscall numbers the programs have a rule chain for, ascending.
     ///
     /// Every other syscall is passed through untouched. The list includes each
-    /// filtered syscall's `x32` spelling as well as its native one.
+    /// filtered syscall's `x32` spelling as well as its native one, and the
+    /// `clone3` numbers the second program answers.
     #[must_use]
     pub fn filtered_syscalls(&self) -> &[i64] {
         &self.filtered_syscalls
@@ -1046,8 +1139,13 @@ impl CompiledSocketFilter {
     pub fn apply_to_current_thread(&self) -> Result<EnforcedSocketFilter, SocketFilterError> {
         seccompiler::apply_filter(&self.program)
             .map_err(|error| SocketFilterError::ApplyRefused(error.to_string()))?;
+        // Filters stack: the kernel runs every installed program and takes
+        // the most restrictive answer, so the `clone3` program adds its
+        // `ENOSYS` without touching what the first program decided.
+        seccompiler::apply_filter(&self.clone3_program)
+            .map_err(|error| SocketFilterError::ApplyRefused(error.to_string()))?;
         Ok(EnforcedSocketFilter {
-            instruction_count: self.program.len(),
+            instruction_count: self.instruction_count(),
         })
     }
 }
@@ -1359,10 +1457,11 @@ mod tests {
         for (name, policy) in policies() {
             let compiled = policy.compile().expect("compiles on this build");
             let filtered = compiled.filtered_syscalls();
-            for syscall in [SYS_SOCKET, SYS_SOCKETPAIR]
+            for syscall in [SYS_SOCKET, SYS_SOCKETPAIR, SYS_CLONE, SYS_CLONE3]
                 .into_iter()
                 .chain(IO_URING_SYSCALLS)
                 .chain(PROCESS_INSPECTION_SYSCALLS)
+                .chain(NAMESPACE_SYSCALLS)
             {
                 for number in both_abis(syscall) {
                     assert!(

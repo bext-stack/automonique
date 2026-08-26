@@ -108,7 +108,7 @@ use automonique_protocol::sandbox::{
 };
 use automonique_protocol::tools::RunId;
 use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
-use automonique_runner::capability::{BoundaryProperty, HostCapabilities};
+use automonique_runner::capability::HostCapabilities;
 use automonique_runner::control::{CancelDelivery, CancelSink, CancelSinkError};
 use automonique_runner::dispatch::RegistrationHandle;
 use automonique_runner::{
@@ -146,12 +146,7 @@ const TERMINAL_DEADLINE: Duration = Duration::from_secs(90);
 /// assuming the answer.
 fn sandbox_enforceable() -> bool {
     HostCapabilities::probe()
-        .select_mode(&[
-            BoundaryProperty::DescendantContainment,
-            BoundaryProperty::FilesystemRestriction,
-            BoundaryProperty::TcpDenial,
-            BoundaryProperty::SyscallRestriction,
-        ])
+        .select_mode(&automonique_daemon::execute::ENFORCED_PROPERTIES)
         .is_ok()
 }
 
