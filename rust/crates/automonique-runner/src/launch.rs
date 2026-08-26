@@ -1341,6 +1341,10 @@ pub fn spawn_sandboxed_session_with_tempfs(
                     .complete(&supervisor)
                     .map_err(LaunchError::TemporaryStorage)
             })
+            // And give the deadline back. This end becomes the session's own
+            // stream, whose turns are as long as a provider takes; a deadline
+            // left here would end one of them with `EAGAIN` for no reason the
+            // reader could connect to a mount that completed minutes ago.
             .and_then(|()| unbound_reads(&supervisor).map_err(LaunchError::Io));
         if let Err(error) = handover {
             let _ = child.kill();
