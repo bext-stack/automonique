@@ -8,6 +8,9 @@ use std::time::{Duration, Instant};
 
 use automonique_daemon::{Daemon, DaemonConfig};
 
+#[path = "support/isolation.rs"]
+mod test_isolation;
+
 const CHILD_MARKER: &str = "AUTOMONIQUE_SOCKET_ACTIVATION_CHILD";
 const RUNTIME_ROOT: &str = "AUTOMONIQUE_SOCKET_ACTIVATION_RUNTIME_ROOT";
 const STATE_ROOT: &str = "AUTOMONIQUE_SOCKET_ACTIVATION_STATE_ROOT";
@@ -22,6 +25,7 @@ fn daemon_adopts_the_one_named_systemd_listener_without_unlinking_it() {
     let root = tempfile::tempdir().expect("temporary root");
     private_directory(root.path());
     let runtime_root = root.path().join("runtime");
+    test_isolation::assert_isolated_runtime_root(&runtime_root);
     let state_root = root.path().join("state");
     let runtime_dir = runtime_root.join("automonique");
     private_directory(&runtime_root);

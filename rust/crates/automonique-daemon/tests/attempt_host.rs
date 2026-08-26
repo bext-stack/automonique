@@ -41,6 +41,9 @@ use automonique_runner::control::{
 use automonique_runner::dispatch::DispatchOutcome;
 use automonique_store::cancel_ledger::CancelLedger;
 
+#[path = "support/isolation.rs"]
+mod test_isolation;
+
 const SPOOL_MAX_BYTES: u64 = 1024 * 1024;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Iterations for the racing tests. High enough that an interleaving the
@@ -286,6 +289,7 @@ fn fixture() -> (tempfile::TempDir, DaemonConfig) {
     let root = tempfile::tempdir().expect("temporary root");
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("private root");
     let runtime = root.path().join("runtime");
+    test_isolation::assert_isolated_runtime_root(&runtime);
     let state = root.path().join("state");
     fs::create_dir(&runtime).expect("runtime root");
     fs::create_dir(&state).expect("state root");

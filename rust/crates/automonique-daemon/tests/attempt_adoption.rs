@@ -19,6 +19,9 @@ use automonique_daemon::{Daemon, DaemonConfig};
 use automonique_runner::control::{CancelDelivery, CancelSink, CancelSinkError};
 use automonique_runner::dispatch::DispatchOutcome;
 
+#[path = "support/isolation.rs"]
+mod test_isolation;
+
 struct CountingSink {
     deliveries: Arc<AtomicUsize>,
 }
@@ -39,6 +42,7 @@ fn a_serving_daemon_publishes_its_exact_adoption_route() {
     let root = tempfile::tempdir().expect("temporary root");
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("private root");
     let runtime_root = root.path().join("runtime");
+    test_isolation::assert_isolated_runtime_root(&runtime_root);
     let state_root = root.path().join("state");
     fs::create_dir(&runtime_root).expect("runtime root");
     fs::create_dir(&state_root).expect("state root");

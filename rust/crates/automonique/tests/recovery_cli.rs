@@ -6,6 +6,9 @@ use std::path::Path;
 use std::process::{Child, Command, Output};
 use std::time::{Duration, Instant};
 
+#[path = "support/isolation.rs"]
+mod test_isolation;
+
 #[test]
 fn backup_restore_and_disconnected_start_drill() {
     let root = tempfile::tempdir().expect("root");
@@ -178,6 +181,7 @@ fn run(runtime: &Path, state: &Path, arguments: &[&str]) -> Output {
 }
 
 fn command(runtime: &Path, state: &Path) -> Command {
+    test_isolation::assert_isolated_runtime_root(runtime);
     let mut command = Command::new(env!("CARGO_BIN_EXE_automonique"));
     command
         .env("XDG_RUNTIME_DIR", runtime)

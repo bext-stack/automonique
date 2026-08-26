@@ -29,6 +29,9 @@ use automonique_store::generation_audit::{
 };
 use automonique_store::{LeaseRequest, Store};
 
+#[path = "support/isolation.rs"]
+mod test_isolation;
+
 /// The generation identifier the daemon takes, mirroring its private constant.
 ///
 /// Spelled here because the daemon does not export it. It is not taken on
@@ -44,6 +47,7 @@ fn fixture() -> (tempfile::TempDir, DaemonConfig) {
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
         .expect("private root");
     let runtime = root.path().join("runtime");
+    test_isolation::assert_isolated_runtime_root(&runtime);
     let state = root.path().join("state");
     std::fs::create_dir(&runtime).expect("runtime root");
     std::fs::create_dir(&state).expect("state root");

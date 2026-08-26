@@ -9,11 +9,15 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
+#[path = "support/isolation.rs"]
+mod test_isolation;
+
 #[test]
 fn sighup_completes_the_notify_reload_protocol_without_changing_pid() {
     let root = tempfile::tempdir().expect("temporary root");
     private_directory(root.path());
     let runtime_root = root.path().join("runtime");
+    test_isolation::assert_isolated_runtime_root(&runtime_root);
     let state_root = root.path().join("state");
     private_directory(&runtime_root);
     private_directory(&state_root);

@@ -18,6 +18,9 @@ use automonique_store::provider_journal::{
 };
 use sha2::{Digest as _, Sha256};
 
+#[path = "support/isolation.rs"]
+mod test_isolation;
+
 const BUSYBOX: &str = "/usr/bin/busybox";
 
 /// The exact `hello_ok` capability list of the maintained fork build.
@@ -111,6 +114,7 @@ fn installed_jcode_negotiates_inside_the_production_sandbox_when_configured() {
     let root = tempfile::tempdir().unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let runtime = root.path().join("runtime");
+    test_isolation::assert_isolated_runtime_root(&runtime);
     fs::create_dir(&runtime).unwrap();
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
     let containment = RunContainment::create(

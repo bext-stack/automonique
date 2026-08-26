@@ -86,11 +86,15 @@ pub fn hex(bytes: &[u8]) -> String {
     encoded
 }
 
+#[path = "../support/isolation.rs"]
+mod isolation;
+
 /// A private root with the daemon's state directory and prompt slot in place.
 pub fn fixture() -> (tempfile::TempDir, DaemonConfig) {
     let root = tempfile::tempdir().expect("temporary root");
     private_directory(root.path());
     let runtime_root = root.path().join("runtime");
+    isolation::assert_isolated_runtime_root(&runtime_root);
     let state_root = root.path().join("state");
     private_directory(&runtime_root);
     private_directory(&state_root);
@@ -202,6 +206,7 @@ pub fn reload_id_for(kind: &str, source_epoch: u64, manifest_digest: &str) -> St
 // --- the product binary ---------------------------------------------------
 
 pub fn cli_command(config: &DaemonConfig) -> Command {
+    isolation::assert_isolated_runtime_root(&config.runtime_root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_automonique"));
     command
         .env("XDG_RUNTIME_DIR", &config.runtime_root)
