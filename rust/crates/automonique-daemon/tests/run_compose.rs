@@ -118,7 +118,7 @@ use automonique_protocol::sandbox::{
 };
 use automonique_runner::admission::{
     AdmissionContext, AdmissionContextParts, AdmittedLaunch, BrokeredDestination, BrokeredScope,
-    PromptSource, ResolvedPrompt, UnenforcedBudget, admit,
+    PromptSource, ResolvedPrompt, TemporaryStorageEnforcement, UnenforcedBudget, admit,
 };
 use automonique_runner::capability::{BoundaryProperty, HostCapabilities};
 use automonique_runner::{
@@ -345,6 +345,7 @@ fn admit_composed(
         ),
         unenforced_budgets: UnenforcedBudget::ALL.to_vec(),
         brokered_destinations: destinations.to_vec(),
+        temporary_storage: TemporaryStorageEnforcement::Available,
     })
     .expect("a valid context");
     admit(&spec, &context).expect("a composed document must be admissible")
@@ -1269,6 +1270,40 @@ fn a_contained_run_answers_through_the_real_lane() {
     assert_eq!(
         remaining, 0,
         "operator content must not outlive the run that consumed it"
+    );
+
+    // THE SCRATCH MOUNT OUTLIVES NO RUN, AND ITS RECORD DOES.
+    //
+    // Each run got its own temporary-storage mount under its private
+    // directory; after the run the lane reconciled it, unmounted it, confirmed
+    // that from the mount table, and left the ledger's final checkpoint beside
+    // where the mount was. Read back from disk, not from the lane.
+    let runs = fixture.state_dir().join("runs");
+    let mut checkpoints = 0;
+    for entry in std::fs::read_dir(&runs).expect("the runs directory exists") {
+        let run_dir = entry.expect("a run directory entry").path();
+        let checkpoint = automonique_runner::Checkpoint::read(
+            &run_dir.join(automonique_runner::CHECKPOINT_LEAF),
+        )
+        .expect("every run leaves its final temporary-storage checkpoint");
+        assert_eq!(checkpoint.phase, automonique_runner::CheckpointPhase::Final);
+        let final_record = checkpoint
+            .final_record
+            .expect("a final checkpoint carries the readback taken at unmount");
+        assert!(final_record.unmount_confirmed, "the mount table is clear");
+        assert!(!final_record.aborted, "the server answered the readback");
+        assert_eq!(checkpoint.snapshot.refused_bytes, 0, "nothing was refused");
+        assert_eq!(checkpoint.snapshot.refused_objects, 0);
+        checkpoints += 1;
+    }
+    assert_eq!(checkpoints, 2, "one checkpoint per run");
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").expect("mountinfo");
+    let runs_text = runs.to_string_lossy();
+    assert!(
+        !mountinfo
+            .lines()
+            .any(|line| line.contains("fuse.automonique-tempfs") && line.contains(&*runs_text)),
+        "no temporary-storage mount outlives its run"
     );
 
     serving.shutdown(&fixture.config);

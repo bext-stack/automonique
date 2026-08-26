@@ -73,9 +73,10 @@
 
 use crate::filesystem::PathIntent;
 use crate::{
-    ContainmentLimits, LaunchPlan, LaunchPlanError, MAX_RUN_ID_BYTES, PortabilityPolicy,
-    PromptDeliveryPlan, ProtectedPromptReference, RemoteAttestationPolicy, RunSpec, RunSpecDigest,
-    RunSpecEncodeError, SocketGrant, WorkspaceRegistryId,
+    ContainmentLimits, LaunchPlan, LaunchPlanError, MAX_RUN_ID_BYTES, MountedTempfs,
+    PortabilityPolicy, PromptDeliveryPlan, ProtectedPromptReference, RemoteAttestationPolicy,
+    RunSpec, RunSpecDigest, RunSpecEncodeError, SocketGrant, TemporaryStorageBudget,
+    WorkspaceRegistryId,
 };
 use automonique_protocol::models::ExecutorClass;
 use automonique_protocol::provider::BinaryProvenance;
@@ -240,25 +241,45 @@ pub const INFORMATIONAL_FIELDS: [&str; 29] = [
 /// or re-check it.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum UnenforcedBudget {
-    /// `temporary_storage_bytes`. No temporary filesystem is created or
-    /// quota-bounded here.
-    TemporaryStorage,
-    /// `artifact_bytes`. Artifact collection is a separate, unbuilt subsystem.
+    /// `artifact_bytes`. Artifact collection is a separate, unbuilt subsystem;
+    /// there is no publication surface to attach a byte or count ceiling to.
     Artifact,
 }
 
 impl UnenforcedBudget {
     /// Every unenforced budget, in the order admission checks them.
-    pub const ALL: [Self; 2] = [Self::TemporaryStorage, Self::Artifact];
+    ///
+    /// `temporary_storage` used to be here; it is enforced now, through a
+    /// per-run FUSE filesystem with exact byte and object ceilings (see
+    /// [`crate::tempfs`]), so a run declaring it is refused on a host that
+    /// cannot mount it rather than admitted acknowledging it.
+    pub const ALL: [Self; 1] = [Self::Artifact];
 
     /// The exact spec field this budget names.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::TemporaryStorage => "sandbox.budgets.temporary_storage",
             Self::Artifact => "sandbox.budgets.artifact",
         }
     }
+}
+
+/// Whether this host can enforce the temporary-storage budget for one run.
+///
+/// A standing host answer, like [`AdmissionContextParts::host_features`]: the
+/// caller decides it once by verifying [`crate::FusePrerequisites`], and every
+/// document is admitted against the same answer. It is here rather than probed
+/// inside [`admit`] because admission is pure — it opens, stats and reads
+/// nothing — and verifying `/dev/fuse` is an I/O check the caller performs.
+#[derive(Clone, Debug)]
+pub enum TemporaryStorageEnforcement {
+    /// The host verified `/dev/fuse` and `fusermount3`, so a per-run mount can
+    /// be created. The [`crate::VerifiedFuse`] that proves it is held by the
+    /// caller and handed to [`crate::MountedTempfs::mount`] separately.
+    Available,
+    /// The host cannot mount a FUSE filesystem. The string is the prerequisite
+    /// failure, rendered, so a refusal names why.
+    Unavailable(String),
 }
 
 /// Where an allowlisted destination is expected to live.
@@ -443,6 +464,22 @@ pub enum AdmissionRefusal {
         /// The launch surface's own refusal, unaltered.
         error: LaunchPlanError,
     },
+    /// The spec declares a temporary-storage budget the host cannot enforce:
+    /// `/dev/fuse` or `fusermount3` is missing or unusable by this uid. The
+    /// string is the prerequisite failure. This is the fail-closed answer the
+    /// budget requires — never admitted with the budget acknowledged.
+    TemporaryStorageUnenforceable(String),
+    /// A temporary-storage mount was offered to a launch that already carries
+    /// one. Two grants of the scratch mountpoint have no single meaning.
+    TemporaryStorageAlreadyAttached,
+    /// The offered mount's kernel-read-back budget is not the one this launch
+    /// was admitted for. A mount that does not match its budget is refused
+    /// rather than attached.
+    TemporaryStorageBudgetMismatch,
+    /// The document binds `TMPDIR` itself, which would redirect scratch writes
+    /// away from the budgeted mount. The budget attaches `TMPDIR`, so the two
+    /// cannot both be present.
+    TemporaryStorageTmpdirConflict,
     /// The spec's canonical digest could not be computed.
     Digest(RunSpecEncodeError),
 }
@@ -501,6 +538,19 @@ impl fmt::Display for AdmissionRefusal {
             Self::Plan { field, error } => {
                 write!(formatter, "mapping spec field {field} was refused: {error}")
             }
+            Self::TemporaryStorageUnenforceable(reason) => write!(
+                formatter,
+                "sandbox.budgets.temporary_storage cannot be enforced on this host: {reason}"
+            ),
+            Self::TemporaryStorageAlreadyAttached => {
+                formatter.write_str("this launch already carries a temporary-storage mount")
+            }
+            Self::TemporaryStorageBudgetMismatch => formatter.write_str(
+                "the offered mount does not read back the admitted temporary-storage budget",
+            ),
+            Self::TemporaryStorageTmpdirConflict => formatter.write_str(
+                "the document binds TMPDIR, which the temporary-storage budget must own",
+            ),
             Self::Digest(error) => write!(formatter, "canonical spec digest unavailable: {error}"),
         }
     }
@@ -641,6 +691,14 @@ pub struct AdmissionContextParts {
     /// brokered egress consults it. See [`AdmissionContext`]'s own note for why
     /// this field exists at all.
     pub brokered_destinations: Vec<BrokeredDestination>,
+    /// Whether this host can enforce the temporary-storage budget.
+    ///
+    /// A standing host answer decided once by the caller through
+    /// [`crate::FusePrerequisites::verify`]. Every RunSpec carries a
+    /// temporary-storage budget, so a host that cannot enforce it runs
+    /// nothing: [`admit`] refuses with
+    /// [`AdmissionRefusal::TemporaryStorageUnenforceable`].
+    pub temporary_storage: TemporaryStorageEnforcement,
 }
 
 /// The validated runtime half of one admission.
@@ -779,6 +837,12 @@ impl AdmissionContext {
     pub fn brokered_destinations(&self) -> &[BrokeredDestination] {
         &self.parts.brokered_destinations
     }
+
+    /// Whether this host can enforce the temporary-storage budget.
+    #[must_use]
+    pub const fn temporary_storage(&self) -> &TemporaryStorageEnforcement {
+        &self.parts.temporary_storage
+    }
 }
 
 /// One spec, admitted: everything a supervisor needs for exactly one attempt.
@@ -798,6 +862,8 @@ pub struct AdmittedLaunch {
     unenforced_budgets: Vec<UnenforcedBudget>,
     broker: Option<BrokerRequirement>,
     broker_attached: bool,
+    temporary_storage_budget: TemporaryStorageBudget,
+    temporary_storage_attached: bool,
 }
 
 impl AdmittedLaunch {
@@ -867,6 +933,80 @@ impl AdmittedLaunch {
     #[must_use]
     pub const fn has_broker(&self) -> bool {
         self.broker_attached
+    }
+
+    /// The exact temporary-storage budget the supervisor must mount for this
+    /// run.
+    ///
+    /// Always present — every RunSpec carries the budget, and admission
+    /// refused the run outright if the host could not enforce it — so a
+    /// supervisor reads this, mounts a filesystem with exactly these ceilings,
+    /// and attaches it with [`Self::with_temporary_storage`] before the plan
+    /// runs. The plan carries no scratch grant until then, exactly as it
+    /// carries no network grant until a broker is attached.
+    #[must_use]
+    pub const fn temporary_storage_budget(&self) -> TemporaryStorageBudget {
+        self.temporary_storage_budget
+    }
+
+    /// Whether the temporary-storage mount has been attached to this launch.
+    #[must_use]
+    pub const fn has_temporary_storage(&self) -> bool {
+        self.temporary_storage_attached
+    }
+
+    /// Point this launch at a mounted temporary-storage filesystem, and grant
+    /// it nothing else.
+    ///
+    /// This is the only way the workload's scratch space enters the plan, and
+    /// it is written here rather than at the supervisor so the composition is
+    /// one reviewed step. What it adds, in full:
+    ///
+    /// - one read-write Landlock grant on the mount's canonical mountpoint,
+    ///   the exact directory the FUSE server owns;
+    /// - `TMPDIR` bound to that mountpoint, so a workload that writes to
+    ///   `$TMPDIR` writes into the budgeted tree.
+    ///
+    /// The mount is refused unless its kernel-read-back budget is exactly the
+    /// one this launch was admitted for: a mount that does not match its
+    /// budget is a mount for a different run, or a host that lied about the
+    /// ceilings, and either is a refusal rather than an attachment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdmissionRefusal::TemporaryStorageAlreadyAttached`] on a
+    /// second attachment, [`AdmissionRefusal::TemporaryStorageBudgetMismatch`]
+    /// when the mount's budget is not the admitted one, and
+    /// [`AdmissionRefusal::Plan`] when the launch surface refuses the
+    /// composition — which is what happens when the document bound `TMPDIR` or
+    /// granted the mountpoint itself, both of which admission also refuses up
+    /// front.
+    pub fn with_temporary_storage(
+        mut self,
+        mounted: &MountedTempfs,
+    ) -> Result<Self, AdmissionRefusal> {
+        if self.temporary_storage_attached {
+            return Err(AdmissionRefusal::TemporaryStorageAlreadyAttached);
+        }
+        if mounted.budget() != self.temporary_storage_budget {
+            return Err(AdmissionRefusal::TemporaryStorageBudgetMismatch);
+        }
+        let mountpoint = mounted.mountpoint();
+        let refused = |error: LaunchPlanError| AdmissionRefusal::Plan {
+            field: "sandbox.budgets.temporary_storage",
+            error,
+        };
+        let mut plan = self
+            .plan
+            .clone()
+            .filesystem_grant(PathIntent::ReadWrite, mountpoint)
+            .map_err(refused)?;
+        plan = plan
+            .environment("TMPDIR", mountpoint.as_os_str().as_encoded_bytes())
+            .map_err(refused)?;
+        self.plan = plan;
+        self.temporary_storage_attached = true;
+        Ok(self)
     }
 
     /// The closed list of spec fields admission did not consult.
@@ -1001,6 +1141,7 @@ pub fn admit(
     check_sandbox_fields(spec)?;
     let broker = check_egress(spec, context)?;
     let limits = map_quotas(spec, context)?;
+    let temporary_storage_budget = map_temporary_storage(spec, context)?;
     let prompt = resolve_prompt(spec, context)?;
     let plan = build_plan(spec, context, prompt)?;
     let spec_digest = spec.canonical_digest().map_err(AdmissionRefusal::Digest)?;
@@ -1016,7 +1157,39 @@ pub fn admit(
         unenforced_budgets: context.unenforced_budgets().to_vec(),
         broker,
         broker_attached: false,
+        temporary_storage_budget,
+        temporary_storage_attached: false,
     })
+}
+
+/// Map the temporary-storage budget, refusing fail-closed where the host
+/// cannot enforce it and where the document would fight the mount.
+///
+/// The byte ceiling must be a positive multiple of the readback block size —
+/// so `statfs` reports the ceiling exactly rather than rounding it — and no
+/// larger than the charging cap; the object ceiling is derived from it. A host
+/// that cannot mount a FUSE filesystem refuses the run rather than admitting
+/// it with the budget acknowledged, and a document that binds `TMPDIR` or
+/// grants the scratch mountpoint itself is refused before the mount, because
+/// the attachment owns both.
+fn map_temporary_storage(
+    spec: &RunSpec,
+    context: &AdmissionContext,
+) -> Result<TemporaryStorageBudget, AdmissionRefusal> {
+    match context.temporary_storage() {
+        TemporaryStorageEnforcement::Available => {}
+        TemporaryStorageEnforcement::Unavailable(reason) => {
+            return Err(AdmissionRefusal::TemporaryStorageUnenforceable(
+                reason.clone(),
+            ));
+        }
+    }
+    if spec.environment().iter().any(|(name, _)| name == "TMPDIR") {
+        return Err(AdmissionRefusal::TemporaryStorageTmpdirConflict);
+    }
+    let bytes = spec.sandbox().budgets().temporary_storage().quantity();
+    TemporaryStorageBudget::from_bytes(bytes)
+        .map_err(|_| AdmissionRefusal::QuotaRejected("sandbox.budgets.temporary_storage"))
 }
 
 /// Refuse every runner-owned admission field that names an unbuilt subsystem.

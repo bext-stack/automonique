@@ -9,9 +9,13 @@ publish = false
 
 [dependencies]
 automonique-protocol = { path = "../automonique-protocol" }
+fuser = { workspace = true }
 landlock = { workspace = true }
 seccompiler = { workspace = true }
 nix = { version = "=0.29.0", default-features = false, features = ["fs", "poll", "process", "ptrace", "resource", "signal", "socket", "uio", "user"] }
+# Receives the `/dev/fuse` descriptor from `fusermount3` over `SCM_RIGHTS` as
+# an `OwnedFd` without any `unsafe`.
+rustix = { workspace = true }
 sha2.workspace = true
 
 [dev-dependencies]

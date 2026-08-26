@@ -28,6 +28,11 @@ mod spec_encode;
 mod spec_fields;
 mod spool;
 pub mod supervise;
+pub mod tempfs;
+pub mod tempfs_checkpoint;
+pub mod tempfs_fs;
+pub mod tempfs_ledger;
+pub mod tempfs_readback;
 
 pub use boundary::{
     BoundaryProbeError, BoundaryRequirement, BoundaryStatus, BoundarySubject,
@@ -74,4 +79,18 @@ pub use spec_fields::{
 pub use spool::{
     Authority, Event, EventKind, MAX_EVENT_PAYLOAD_BYTES, RunState, Spool, SpoolError, Status,
     read_events,
+};
+pub use tempfs::{
+    CHECKPOINT_LEAF, DEFAULT_DEV_FUSE, DEFAULT_FUSERMOUNT3, DEFAULT_READBACK_DEADLINE, FS_NAME,
+    FS_SUBTYPE, FusePrerequisites, MOUNT_LEAF, MountError, MountedTempfs, Outcome,
+    PrerequisiteError, ReapedMount, UnmountError, VerifiedFuse, detach_stale, reap_stale_mounts,
+};
+pub use tempfs_checkpoint::{Checkpoint, CheckpointError, FinalRecord, Phase as CheckpointPhase};
+pub use tempfs_fs::ExceedanceChannel;
+pub use tempfs_ledger::{
+    BudgetError, Exceedance, Ledger, LedgerSnapshot, MAX_TEMPORARY_STORAGE_BYTES,
+    Resource as TemporaryStorageResource, STATFS_BLOCK_BYTES, TemporaryStorageBudget,
+};
+pub use tempfs_readback::{
+    MountEvidence, MountStatus, ReadbackError, StatfsReadback, abort_connection,
 };
