@@ -3821,10 +3821,12 @@ impl Daemon {
         matches!(
             self.execution_state,
             automonique_protocol::admin::ExecutionState::SandboxEnforceableLaneWired
-        ) && compose::ProviderConfig::load(&self.state_dir.join(compose::PROVIDER_CONFIG_NAME))
-            .ok()
-            .flatten()
-            .is_some()
+        ) && compose::ProviderConfig::load_execution(
+            &self.state_dir.join(compose::PROVIDER_CONFIG_NAME),
+        )
+        .ok()
+        .flatten()
+        .is_some()
     }
 
     fn gen_ai_usage(&self) -> Option<GenAiUsageObservation> {
