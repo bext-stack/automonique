@@ -251,6 +251,11 @@ a delayed restart, not a reload. A candidate that is quiesced for rollback
 after it was announced sends `MAINPID=<source>` back before it stops, so the
 source's pings count again and the candidate's exit is an ordinary child's.
 
+A source that predates this step never announces its candidate, so the first
+release that carries the adoption step is deployed by restart: reloading from
+such a source is exactly the delayed restart described above, and loading an
+adopting release does not turn that handoff into one.
+
 ## Crash recovery without a cooperative old generation
 
 On ordinary startup or candidate takeover:
