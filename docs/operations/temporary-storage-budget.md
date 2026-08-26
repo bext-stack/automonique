@@ -73,6 +73,36 @@ The daemon's run index and the status projection still read `failed` for a
 budget kill. A distinct wire state would be a protocol change and is not made
 here.
 
+### Verifying a live run: `findmnt` is the wrong first reflex
+
+For a run whose workload identity is separated — which, where the host offers
+`uid_separation`, is every run — **`findmnt -t fuse.automonique-tempfs` on the
+host shows nothing while the run is live, and that is the feature working.**
+The mount is private to the workload's mount namespace; a supervisor that could
+see it in its own table would be the arrangement this replaced, the one the
+workload reads `EACCES` from. An empty `findmnt` is not a missing mount, and a
+`findmnt` that *does* show one means the run kept the supervisor's identity.
+
+Read it where it lives instead, in this order:
+
+1. **The workload's own mount table**, during the run:
+   `grep automonique-tempfs /proc/<workload pid>/mountinfo`. This is the
+   primary evidence, and its tell is `user_id=0` together with `allow_other`:
+   `0` is namespace-root, so no supervisor-performed mount can ever show it —
+   those carry the supervisor's own host uid.
+2. **The reconcile event**, after the run:
+   `journalctl --user -u <unit> AUTOMONIQUE_EVENT=temporary_storage_reconciled -o json`,
+   which carries the same mount line, the ceilings, the peaks, the refused
+   counts and `unmount_confirmed`.
+3. **The run's checkpoint**, `<state>/runs/<run_id>/tempfs-ledger`, plain
+   `key=value`, which holds `mount.evidence` and the final ledger and outlives
+   the supervisor that wrote it.
+
+Between runs the host's `findmnt` must be empty either way, and no run's `tmp`
+directory should remain. For a supervisor-mounted run — one whose plan keeps
+the supervisor's identity — `findmnt` *is* the right first reflex, and one
+`fuse.automonique-tempfs` entry per live run is what it should show.
+
 ## Oversized single writes: all-or-nothing per request
 
 A write that would cross the byte ceiling is refused whole at the granularity
