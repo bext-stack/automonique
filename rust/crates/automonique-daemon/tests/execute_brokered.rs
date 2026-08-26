@@ -78,6 +78,8 @@ use automonique_daemon::execute::{
     DAEMON_WORKSPACE_REGISTRY, locate_launch_helper, offered_host_features,
 };
 use automonique_daemon::{Daemon, DaemonConfig};
+use automonique_egress_broker::allowlist::MAX_ALLOWLIST_ENTRIES;
+use automonique_egress_broker::identity::{SENTINEL_ENTROPY_BYTES, SENTINEL_PREFIX};
 use automonique_egress_broker::{BrokerConfig, EgressBroker};
 use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse, SubmittedRunSpec};
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
@@ -103,8 +105,8 @@ use automonique_protocol::tools::RunId;
 use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
 use automonique_runner::admission::{
     AdmissionContext, AdmissionContextParts, AdmissionRefusal, AdmittedLaunch, BrokeredDestination,
-    BrokeredScope, PromptSource, ResolvedPrompt, TemporaryStorageEnforcement, UnenforcedBudget,
-    admit,
+    BrokeredScope, PromptSource, ProviderIdentityPolicy, ResolvedPrompt,
+    TemporaryStorageEnforcement, UnenforcedBudget, admit,
 };
 use automonique_runner::capability::{BoundaryProperty, HostCapabilities};
 use automonique_runner::{
@@ -373,6 +375,7 @@ fn context(
         ),
         unenforced_budgets: UnenforcedBudget::ALL.to_vec(),
         brokered_destinations: destinations.to_vec(),
+        provider_identity: ProviderIdentityPolicy::Disabled,
         temporary_storage: TemporaryStorageEnforcement::Available,
     })
     .expect("a valid context")
@@ -1238,4 +1241,42 @@ fn a_brokered_document_without_a_destination_policy_is_refused() {
     assert_eq!(listed_state(&config, run), RunState::Ready);
 
     serving.shutdown(&config);
+}
+
+/// The two crates the runner and the broker each state a constant in, pinned
+/// from the one crate that depends on both.
+///
+/// `automonique-runner` deliberately does not depend on
+/// `automonique-egress-broker` — the runner admits launches, the broker moves
+/// bytes, and neither should have to build the other. The cost of that is two
+/// pairs of numbers written twice, each with a doc comment saying it mirrors
+/// the other. This is the test those comments name: if either crate changes its
+/// side alone, this fails here rather than at runtime, where the symptom would
+/// be a launch admitted against a policy no broker could be started with, or a
+/// sentinel the runner refuses to attach and the broker would have accepted.
+#[test]
+fn the_runner_and_the_broker_agree_on_the_constants_they_each_state() {
+    assert_eq!(
+        automonique_runner::admission::MAX_BROKERED_DESTINATIONS,
+        MAX_ALLOWLIST_ENTRIES,
+        "a launch may name no more destinations than a broker will hold"
+    );
+    assert_eq!(
+        automonique_runner::admission::SESSION_SENTINEL_PREFIX,
+        SENTINEL_PREFIX,
+        "the runner must recognise the prefix the broker mints"
+    );
+    assert_eq!(
+        automonique_runner::admission::SESSION_SENTINEL_DIGITS,
+        SENTINEL_ENTROPY_BYTES * 2,
+        "the runner must expect the width the broker mints"
+    );
+
+    // Not merely equal constants: a sentinel the broker actually mints is one
+    // the runner actually accepts.
+    let minted = automonique_egress_broker::SessionSentinel::generate().expect("mint a sentinel");
+    assert!(
+        automonique_runner::admission::is_session_sentinel(minted.token()),
+        "the runner must accept a sentinel the broker minted"
+    );
 }

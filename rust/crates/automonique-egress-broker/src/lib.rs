@@ -100,8 +100,10 @@
 //! asked for.
 
 pub mod allowlist;
+pub mod identity;
 pub mod relay;
 pub mod request;
+pub mod substitute;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -115,8 +117,15 @@ use std::time::Duration;
 pub use allowlist::{
     AddressScope, Destination, DestinationAllowlist, DestinationError, DestinationHost,
 };
+pub use identity::{
+    CredentialScheme, IdentityError, IdentityRefusal, ProviderCredential, ProviderIdentity,
+    RefusalRecord, SessionSentinel,
+};
 pub use relay::RelayOutcome;
 pub use request::{ConnectRequest, RequestError};
+pub use substitute::{ProviderRequest, Upstream};
+
+use identity::RefusalLedger;
 
 /// The environment variables that point a workload at the broker.
 ///
@@ -150,6 +159,10 @@ pub enum BrokerError {
     TimeoutRejected(Duration),
     /// The loopback listener could not be bound.
     ListenerRefused(std::io::Error),
+    /// The `CONNECT` allowlist named the same host as the bound provider
+    /// identity. One of the two is a mistake, and guessing which is not this
+    /// crate's job.
+    IdentityHostAlsoTunnelled,
 }
 
 impl fmt::Display for BrokerError {
@@ -166,6 +179,10 @@ impl fmt::Display for BrokerError {
             Self::ListenerRefused(error) => {
                 write!(formatter, "the loopback listener was refused: {error}")
             }
+            Self::IdentityHostAlsoTunnelled => formatter.write_str(
+                "the allowlist names the provider identity's host; a tunnel to it would bypass \
+                 the credential substitution",
+            ),
         }
     }
 }
@@ -186,6 +203,8 @@ impl std::error::Error for BrokerError {
 pub struct BrokerConfig {
     allowlist: DestinationAllowlist,
     port: u16,
+    identity: Option<Arc<ProviderIdentity>>,
+    provider_port: u16,
     max_connections: usize,
     head_timeout: Duration,
     connect_timeout: Duration,
@@ -197,6 +216,8 @@ impl Default for BrokerConfig {
         Self {
             allowlist: DestinationAllowlist::deny_all(),
             port: 0,
+            identity: None,
+            provider_port: 0,
             max_connections: 8,
             head_timeout: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(10),
@@ -225,6 +246,29 @@ impl BrokerConfig {
     #[must_use]
     pub const fn with_port(mut self, port: u16) -> Self {
         self.port = port;
+        self
+    }
+
+    /// Bind an identity-bound provider endpoint alongside the tunnel.
+    ///
+    /// This is the flag. Without it the broker is exactly what it has always
+    /// been — a `CONNECT` proxy over an allowlist — and every behaviour
+    /// described elsewhere in this crate is unchanged. With it, a second
+    /// loopback listener appears, the workload is given a sentinel instead of a
+    /// credential, and a `CONNECT` naming the identity's host is refused so the
+    /// substituting route is the only way to reach it.
+    #[must_use]
+    pub fn with_provider_identity(mut self, identity: ProviderIdentity) -> Self {
+        self.identity = Some(Arc::new(identity));
+        self
+    }
+
+    /// Bind a fixed loopback port for the provider endpoint instead of a
+    /// kernel-assigned one. The default (`0`) is the better choice, for the
+    /// same reason it is on [`Self::with_port`].
+    #[must_use]
+    pub const fn with_provider_port(mut self, port: u16) -> Self {
+        self.provider_port = port;
         self
     }
 
@@ -262,6 +306,12 @@ impl BrokerConfig {
         &self.allowlist
     }
 
+    /// The bound provider identity, if this configuration has one.
+    #[must_use]
+    pub fn provider_identity(&self) -> Option<&ProviderIdentity> {
+        self.identity.as_deref()
+    }
+
     fn validate(&self) -> Result<(), BrokerError> {
         if self.max_connections == 0 || self.max_connections > MAX_CONNECTION_LIMIT {
             return Err(BrokerError::ConnectionLimitRejected(self.max_connections));
@@ -269,6 +319,23 @@ impl BrokerConfig {
         for timeout in [self.head_timeout, self.connect_timeout, self.idle_timeout] {
             if timeout < Duration::from_millis(1) || timeout > MAX_TIMEOUT {
                 return Err(BrokerError::TimeoutRejected(timeout));
+            }
+        }
+        // An allowlist that names the identity's host would contradict the
+        // refusal below: the tunnel would be permitted to the very host the
+        // substitution exists to be the only route to. Refused at configuration
+        // time rather than resolved at request time, because "which of the two
+        // policies wins" is not a question this crate should be answering per
+        // connection.
+        if let Some(identity) = &self.identity {
+            let upstream = identity.upstream();
+            if self
+                .allowlist
+                .entries()
+                .iter()
+                .any(|entry| entry.host() == upstream.host())
+            {
+                return Err(BrokerError::IdentityHostAlsoTunnelled);
             }
         }
         Ok(())
@@ -299,6 +366,21 @@ pub struct BrokerStats {
     pub bytes_to_destination: u64,
     /// Bytes relayed towards clients.
     pub bytes_to_client: u64,
+    /// Requests forwarded to the provider with the real credential
+    /// substituted for this session's sentinel.
+    pub provider_forwarded: u64,
+    /// Requests refused at the provider endpoint because the credential
+    /// presented was not this session's sentinel, was absent, or was one of
+    /// two. None of these reached a dial.
+    pub provider_refused_identity: u64,
+    /// Requests refused at the provider endpoint for any other reason.
+    pub provider_refused_other: u64,
+    /// `CONNECT` requests refused because they named the identity's host.
+    pub refused_provider_tunnel: u64,
+    /// Bytes written towards the provider, request heads included.
+    pub bytes_to_provider: u64,
+    /// Bytes streamed back from the provider to the workload.
+    pub bytes_from_provider: u64,
 }
 
 #[derive(Default)]
@@ -312,6 +394,12 @@ struct Counters {
     destination_unreachable: AtomicU64,
     bytes_to_destination: AtomicU64,
     bytes_to_client: AtomicU64,
+    provider_forwarded: AtomicU64,
+    provider_refused_identity: AtomicU64,
+    provider_refused_other: AtomicU64,
+    refused_provider_tunnel: AtomicU64,
+    bytes_to_provider: AtomicU64,
+    bytes_from_provider: AtomicU64,
 }
 
 impl Counters {
@@ -326,6 +414,12 @@ impl Counters {
             destination_unreachable: self.destination_unreachable.load(Ordering::Relaxed),
             bytes_to_destination: self.bytes_to_destination.load(Ordering::Relaxed),
             bytes_to_client: self.bytes_to_client.load(Ordering::Relaxed),
+            provider_forwarded: self.provider_forwarded.load(Ordering::Relaxed),
+            provider_refused_identity: self.provider_refused_identity.load(Ordering::Relaxed),
+            provider_refused_other: self.provider_refused_other.load(Ordering::Relaxed),
+            refused_provider_tunnel: self.refused_provider_tunnel.load(Ordering::Relaxed),
+            bytes_to_provider: self.bytes_to_provider.load(Ordering::Relaxed),
+            bytes_from_provider: self.bytes_from_provider.load(Ordering::Relaxed),
         }
     }
 }
@@ -345,6 +439,7 @@ struct LiveConnections {
 struct Shared {
     config: BrokerConfig,
     counters: Counters,
+    ledger: RefusalLedger,
     live: Mutex<LiveConnections>,
     stopping: AtomicBool,
 }
@@ -420,8 +515,9 @@ impl Drop for ConnectionSlot {
 /// Dropping one stops it.
 pub struct EgressBroker {
     local_addr: SocketAddr,
+    provider_addr: Option<SocketAddr>,
     shared: Arc<Shared>,
-    accept_thread: Mutex<Option<JoinHandle<()>>>,
+    accept_threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl fmt::Debug for EgressBroker {
@@ -429,7 +525,9 @@ impl fmt::Debug for EgressBroker {
         formatter
             .debug_struct("EgressBroker")
             .field("local_addr", &self.local_addr)
+            .field("provider_addr", &self.provider_addr)
             .field("allowlist", &self.shared.config.allowlist)
+            .field("identity", &self.shared.config.identity)
             .field("stats", &self.shared.counters.snapshot())
             .finish()
     }
@@ -443,31 +541,70 @@ impl EgressBroker {
     /// there is no deployment of this crate that wants one.
     pub fn start(config: BrokerConfig) -> Result<Self, BrokerError> {
         config.validate()?;
-        let listener = TcpListener::bind(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            config.port,
-        ))
-        .map_err(BrokerError::ListenerRefused)?;
-        let local_addr = listener
-            .local_addr()
-            .map_err(BrokerError::ListenerRefused)?;
-        listener
-            .set_nonblocking(true)
-            .map_err(BrokerError::ListenerRefused)?;
+        let (listener, local_addr) = bind_loopback(config.port)?;
+        let provider = match config.identity {
+            Some(_) => Some(bind_loopback(config.provider_port)?),
+            None => None,
+        };
+        let provider_addr = provider.as_ref().map(|(_, address)| *address);
 
         let shared = Arc::new(Shared {
             config,
             counters: Counters::default(),
+            ledger: RefusalLedger::default(),
             live: Mutex::new(LiveConnections::default()),
             stopping: AtomicBool::new(false),
         });
-        let accept_shared = Arc::clone(&shared);
-        let accept_thread = thread::spawn(move || accept_loop(&listener, &accept_shared));
+        let mut accept_threads = Vec::with_capacity(2);
+        let tunnel_shared = Arc::clone(&shared);
+        accept_threads.push(thread::spawn(move || {
+            accept_loop(&listener, &tunnel_shared, Role::Tunnel);
+        }));
+        if let Some((listener, _)) = provider {
+            let provider_shared = Arc::clone(&shared);
+            accept_threads.push(thread::spawn(move || {
+                accept_loop(&listener, &provider_shared, Role::Provider);
+            }));
+        }
         Ok(Self {
             local_addr,
+            provider_addr,
             shared,
-            accept_thread: Mutex::new(Some(accept_thread)),
+            accept_threads: Mutex::new(accept_threads),
         })
+    }
+
+    /// The identity-bound provider endpoint's address, if one is bound. Its
+    /// port is the second port a launch plan grants.
+    #[must_use]
+    pub const fn provider_addr(&self) -> Option<SocketAddr> {
+        self.provider_addr
+    }
+
+    /// The base URL a workload is pointed at in place of the provider's own.
+    ///
+    /// Plain `http` on loopback: the hop is a socket on this host, and the TLS
+    /// that matters is the one the broker terminates on the far side.
+    #[must_use]
+    pub fn provider_base_url(&self) -> Option<String> {
+        self.provider_addr
+            .map(|address| format!("http://127.0.0.1:{}", address.port()))
+    }
+
+    /// The sentinel this session's workload is given in place of a credential.
+    #[must_use]
+    pub fn sentinel_token(&self) -> Option<&str> {
+        self.shared
+            .config
+            .identity
+            .as_ref()
+            .map(|identity| identity.sentinel_token())
+    }
+
+    /// The identity-bound refusals recorded so far, oldest first.
+    #[must_use]
+    pub fn refusals(&self) -> Vec<RefusalRecord> {
+        self.shared.ledger.entries()
     }
 
     /// The bound loopback address. Its port is what a launch plan grants.
@@ -498,8 +635,12 @@ impl EgressBroker {
     /// threads to finish. Idempotent; [`Drop`] calls it.
     pub fn shutdown(&self) {
         self.shared.stop_all();
-        let handle = self.accept_thread.lock().ok().and_then(|mut it| it.take());
-        if let Some(handle) = handle {
+        let handles = self
+            .accept_threads
+            .lock()
+            .map(|mut held| std::mem::take(&mut *held))
+            .unwrap_or_default();
+        for handle in handles {
             let _ = handle.join();
         }
     }
@@ -511,15 +652,45 @@ impl Drop for EgressBroker {
     }
 }
 
+/// Bind one loopback listener and report the address the kernel gave it.
+///
+/// The bind address is `127.0.0.1`, always, for both listeners and for the same
+/// reason: a broker reachable from off-host is an open relay to the allowlist,
+/// and a provider endpoint reachable from off-host is worse — it is the real
+/// credential, offered to the network.
+fn bind_loopback(port: u16) -> Result<(TcpListener, SocketAddr), BrokerError> {
+    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+        .map_err(BrokerError::ListenerRefused)?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(BrokerError::ListenerRefused)?;
+    listener
+        .set_nonblocking(true)
+        .map_err(BrokerError::ListenerRefused)?;
+    Ok((listener, local_addr))
+}
+
+/// Which of a broker's two listeners a connection arrived on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Role {
+    /// The `CONNECT` proxy.
+    Tunnel,
+    /// The identity-bound provider endpoint.
+    Provider,
+}
+
 /// Accept until told to stop, then wait for every handler.
-fn accept_loop(listener: &TcpListener, shared: &Arc<Shared>) {
+fn accept_loop(listener: &TcpListener, shared: &Arc<Shared>, role: Role) {
     let mut handlers: Vec<JoinHandle<()>> = Vec::new();
     while !shared.stopping.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((client, peer)) => {
                 handlers.retain(|handle| !handle.is_finished());
                 let shared = Arc::clone(shared);
-                handlers.push(thread::spawn(move || serve(&shared, client, peer)));
+                handlers.push(thread::spawn(move || match role {
+                    Role::Tunnel => serve(&shared, client, peer),
+                    Role::Provider => serve_provider(&shared, client, peer),
+                }));
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(ACCEPT_POLL_INTERVAL);
@@ -540,6 +711,7 @@ fn accept_loop(listener: &TcpListener, shared: &Arc<Shared>) {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Refusal {
     BadRequest,
+    Unauthorized,
     Forbidden,
     RequestTimeout,
     BadGateway,
@@ -550,6 +722,7 @@ impl Refusal {
     const fn status_line(self) -> &'static str {
         match self {
             Self::BadRequest => "HTTP/1.1 400 Bad Request\r\n",
+            Self::Unauthorized => "HTTP/1.1 401 Unauthorized\r\n",
             Self::Forbidden => "HTTP/1.1 403 Forbidden\r\n",
             Self::RequestTimeout => "HTTP/1.1 408 Request Timeout\r\n",
             Self::BadGateway => "HTTP/1.1 502 Bad Gateway\r\n",
@@ -561,12 +734,82 @@ impl Refusal {
 /// Answer a refusal and close. Bounded by a write deadline so a client that
 /// never reads cannot hold the handler open.
 fn refuse(client: &TcpStream, refusal: Refusal, deadline: Duration) {
+    answer(client, refusal, None, deadline);
+}
+
+/// The header naming which typed refusal a request met.
+///
+/// Its value is always one of [`IdentityRefusal::as_str`]'s fixed spellings, so
+/// it echoes a decision this crate made and never a byte the client sent. A
+/// workload that is refused should be able to tell "you sent the wrong
+/// credential" from "the provider is unreachable" without an operator reading
+/// a log for it.
+pub const REFUSAL_HEADER: &str = "x-automonique-egress-refusal";
+
+/// Answer a refusal and close, optionally naming which one it was.
+fn answer(
+    client: &TcpStream,
+    refusal: Refusal,
+    reason: Option<IdentityRefusal>,
+    deadline: Duration,
+) {
     let _ = client.set_write_timeout(Some(deadline));
     let mut sink = client;
     let _ = sink.write_all(refusal.status_line().as_bytes());
+    if let Some(reason) = reason {
+        let _ = sink.write_all(format!("{REFUSAL_HEADER}: {}\r\n", reason.as_str()).as_bytes());
+    }
     let _ = sink.write_all(b"Content-Length: 0\r\nConnection: close\r\n\r\n");
     let _ = sink.flush();
     let _ = client.shutdown(Shutdown::Both);
+}
+
+impl IdentityRefusal {
+    /// The status this refusal is answered with.
+    const fn status(self) -> Refusal {
+        match self {
+            Self::MissingCredential => Refusal::Unauthorized,
+            Self::ForeignCredential | Self::AmbiguousCredential | Self::TunnelToProviderRefused => {
+                Refusal::Forbidden
+            }
+            Self::HeadTimedOut => Refusal::RequestTimeout,
+            Self::UpstreamUnreachable | Self::UpstreamOutOfScope | Self::UpstreamTlsRefused => {
+                Refusal::BadGateway
+            }
+            _ => Refusal::BadRequest,
+        }
+    }
+
+    /// Whether this refusal is one the identity binding itself produced, as
+    /// opposed to a malformed request or an unreachable provider.
+    const fn is_identity_decision(self) -> bool {
+        matches!(
+            self,
+            Self::ForeignCredential
+                | Self::MissingCredential
+                | Self::AmbiguousCredential
+                | Self::TunnelToProviderRefused
+        )
+    }
+}
+
+impl Shared {
+    /// Record a typed refusal, count it, and tell the client which it was.
+    fn refuse_identity(&self, client: &TcpStream, refusal: IdentityRefusal) {
+        self.ledger.record(refusal);
+        let counter = if refusal.is_identity_decision() {
+            &self.counters.provider_refused_identity
+        } else {
+            &self.counters.provider_refused_other
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        answer(
+            client,
+            refusal.status(),
+            Some(refusal),
+            self.config.head_timeout,
+        );
+    }
 }
 
 /// Serve one client connection from accept to tunnel teardown.
@@ -612,6 +855,31 @@ fn serve(shared: &Arc<Shared>, client: TcpStream, peer: SocketAddr) {
             return;
         }
     };
+
+    // A bound identity makes the provider host unreachable by tunnel. This is
+    // the check that keeps the substitution from being optional: without it a
+    // workload holding a foreign key would simply `CONNECT` to the provider and
+    // negotiate its own TLS inside an opaque tunnel, and every byte of the
+    // substitution would be decoration. It runs before the allowlist so the
+    // answer does not depend on how the allowlist happens to be spelled.
+    if let Some(identity) = &config.identity
+        && identity.upstream().host() == read.request.host()
+    {
+        shared
+            .counters
+            .refused_provider_tunnel
+            .fetch_add(1, Ordering::Relaxed);
+        shared
+            .ledger
+            .record(IdentityRefusal::TunnelToProviderRefused);
+        answer(
+            &client,
+            Refusal::Forbidden,
+            Some(IdentityRefusal::TunnelToProviderRefused),
+            config.head_timeout,
+        );
+        return;
+    }
 
     // The allowlist decision happens here, before any resolution and any dial:
     // a destination that is not permitted produces no packet of any kind.
@@ -696,6 +964,137 @@ fn serve(shared: &Arc<Shared>, client: TcpStream, peer: SocketAddr) {
             .bytes_to_client
             .fetch_add(outcome.to_client, Ordering::Relaxed);
     }
+}
+
+/// Serve one request on the identity-bound provider endpoint.
+///
+/// The order of the steps is the security property. Everything a workload
+/// controls is decided *before* anything is resolved and before anything is
+/// dialled: a request carrying a credential the supervisor did not issue is
+/// refused while the provider socket is still untouched, so the exfiltration
+/// attempt produces a refusal and not a packet.
+fn serve_provider(shared: &Arc<Shared>, client: TcpStream, peer: SocketAddr) {
+    let config = &shared.config;
+    shared.counters.accepted.fetch_add(1, Ordering::Relaxed);
+
+    // This listener exists only when an identity is bound, so the `else` is a
+    // standing assertion rather than a reachable path.
+    let Some(identity) = config.identity.as_ref() else {
+        refuse(&client, Refusal::Forbidden, config.head_timeout);
+        return;
+    };
+
+    if !peer.ip().is_loopback() {
+        shared.refuse_identity(&client, IdentityRefusal::ClientUnreadable);
+        return;
+    }
+
+    let Some(slot) = shared.register(&client) else {
+        shared
+            .counters
+            .refused_saturated
+            .fetch_add(1, Ordering::Relaxed);
+        refuse(&client, Refusal::ServiceUnavailable, config.head_timeout);
+        return;
+    };
+
+    let read = match substitute::read_head(&client, config.head_timeout) {
+        Ok(read) => read,
+        Err(refusal) => {
+            shared.refuse_identity(&client, refusal);
+            return;
+        }
+    };
+
+    // The identity decision. Nothing below this line runs for a request that
+    // does not carry this session's own sentinel.
+    if let Err(refusal) = read.request.authenticate(identity.sentinel()) {
+        shared.refuse_identity(&client, refusal);
+        return;
+    }
+
+    let length = match read.request.body_length() {
+        Ok(length) => length,
+        Err(refusal) => {
+            shared.refuse_identity(&client, refusal);
+            return;
+        }
+    };
+    let body = match substitute::read_body(&client, read.early_body, length, config.head_timeout) {
+        Ok(body) => body,
+        Err(refusal) => {
+            shared.refuse_identity(&client, refusal);
+            return;
+        }
+    };
+
+    // Resolve once, check the scope of what came back, and dial one of those
+    // materialized addresses — the same sequence the tunnel follows, for the
+    // same reason: a name that answers differently on a second lookup must not
+    // be able to move the connection after the check has passed.
+    let destination = identity.upstream();
+    let addresses = match resolve(destination) {
+        Ok(addresses) if !addresses.is_empty() => addresses,
+        _ => {
+            shared.refuse_identity(&client, IdentityRefusal::UpstreamUnreachable);
+            return;
+        }
+    };
+    let in_scope: Vec<SocketAddr> = addresses
+        .into_iter()
+        .filter(|address| destination.scope().permits(address.ip()))
+        .collect();
+    if in_scope.is_empty() {
+        shared.refuse_identity(&client, IdentityRefusal::UpstreamOutOfScope);
+        return;
+    }
+    let socket = match substitute::dial_in_scope(&in_scope, config.connect_timeout) {
+        Ok(socket) => socket,
+        Err(refusal) => {
+            shared.refuse_identity(&client, refusal);
+            return;
+        }
+    };
+    slot.attach_destination(&socket);
+
+    let mut upstream =
+        match substitute::Upstream::establish(socket, destination, config.idle_timeout) {
+            Ok(upstream) => upstream,
+            Err(refusal) => {
+                shared.refuse_identity(&client, refusal);
+                return;
+            }
+        };
+
+    // The substitution. The head that goes out is rebuilt from parsed parts and
+    // carries the supervisor's credential; the sentinel is dropped here and
+    // never leaves the host.
+    let head = read.request.upstream_head(identity);
+    if upstream.write_all(&head).is_err()
+        || upstream.write_all(&body).is_err()
+        || upstream.flush().is_err()
+    {
+        shared.refuse_identity(&client, IdentityRefusal::UpstreamUnreachable);
+        return;
+    }
+    shared
+        .counters
+        .provider_forwarded
+        .fetch_add(1, Ordering::Relaxed);
+    shared
+        .counters
+        .bytes_to_provider
+        .fetch_add((head.len() + body.len()) as u64, Ordering::Relaxed);
+
+    let _ = client.set_write_timeout(Some(config.idle_timeout));
+    if let Ok(moved) = substitute::stream_response(&mut upstream, &client) {
+        shared
+            .counters
+            .bytes_from_provider
+            .fetch_add(moved, Ordering::Relaxed);
+    }
+    let _ = upstream.socket().shutdown(Shutdown::Both);
+    let _ = client.shutdown(Shutdown::Both);
 }
 
 /// Resolve a destination to at most [`MAX_RESOLVED_ADDRESSES`] addresses.

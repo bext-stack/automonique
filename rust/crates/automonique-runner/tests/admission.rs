@@ -40,9 +40,10 @@ use automonique_protocol::sandbox::{
 use automonique_protocol::tools::{CredentialAudiences, RunId};
 use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
 use automonique_runner::admission::{
-    AdmissionContext, AdmissionContextParts, AdmissionRefusal, AdmittedLaunch,
-    INFORMATIONAL_FIELDS, PromptSource, ResolvedPrompt, TemporaryStorageEnforcement,
-    UnenforcedBudget, admit,
+    AdmissionContext, AdmissionContextParts, AdmissionRefusal, AdmittedLaunch, BrokeredDestination,
+    BrokeredScope, INFORMATIONAL_FIELDS, PromptSource, ProviderIdentityBinding,
+    ProviderIdentityPolicy, ResolvedPrompt, SESSION_SENTINEL_DIGITS, SESSION_SENTINEL_PREFIX,
+    TemporaryStorageEnforcement, UnenforcedBudget, admit,
 };
 use automonique_runner::filesystem::PathIntent;
 use automonique_runner::{
@@ -61,6 +62,7 @@ use sha2::{Digest as _, Sha256};
 use std::ffi::OsString;
 use std::fs;
 use std::io::Read as _;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU64;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -278,6 +280,9 @@ fn context_parts(root: &Path) -> AdmissionContextParts {
         // The mappable spec denies egress on both axes, and a context that
         // resolved a destination for it would be refused as a contradiction.
         brokered_destinations: Vec::new(),
+        // Off, which is the default and what production runs. Tests that prove
+        // the attachment override this field.
+        provider_identity: ProviderIdentityPolicy::Disabled,
         // The mappable context is one whose host can enforce the temporary
         // storage budget; tests that need the fail-closed direction override
         // this field.
@@ -1506,6 +1511,223 @@ fn hex(bytes: &[u8]) -> String {
         result.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
     }
     result
+}
+
+/// A well-formed sentinel, of the shape the broker mints.
+fn sentinel() -> String {
+    format!(
+        "{SESSION_SENTINEL_PREFIX}{}",
+        "a1".repeat(SESSION_SENTINEL_DIGITS / 2)
+    )
+}
+
+fn provider_destination() -> BrokeredDestination {
+    BrokeredDestination::new("api.example.com", 443, BrokeredScope::Public).unwrap()
+}
+
+fn identity_binding() -> ProviderIdentityBinding {
+    ProviderIdentityBinding::new(
+        "PROVIDER_BASE_URL",
+        "PROVIDER_API_KEY",
+        provider_destination(),
+    )
+    .unwrap()
+}
+
+/// Admit a brokered spec against a context that resolves one destination and
+/// carries `policy`.
+fn admit_brokered(
+    root: &Path,
+    policy: ProviderIdentityPolicy,
+) -> Result<AdmittedLaunch, AdmissionRefusal> {
+    let mut sandbox = sandbox_parts();
+    sandbox.profile = SandboxProfile::new(
+        "admission-profile",
+        1,
+        FilesystemAccess::IsolatedWritable,
+        ToolWorkloadEgress::brokered(NetworkAccess::BrokeredNamed),
+    )
+    .unwrap();
+    sandbox.provider_control_egress = ProviderControlEgress::brokered(NetworkAccess::BrokeredNamed);
+    sandbox.tool_workload_egress = ToolWorkloadEgress::brokered(NetworkAccess::BrokeredNamed);
+    let mut parts = spec_parts();
+    parts.sandbox = SandboxSpec::compile(sandbox).unwrap();
+    let spec = RunSpec::new(parts).unwrap();
+
+    let mut context = context_parts(root);
+    context.brokered_destinations =
+        vec![BrokeredDestination::new("chatgpt.com", 443, BrokeredScope::Public).unwrap()];
+    context.provider_identity = policy;
+    admit(&spec, &AdmissionContext::new(context)?)
+}
+
+#[test]
+fn a_launch_binds_no_provider_identity_unless_a_deployment_asks_for_one() {
+    let workspace = TempDir::new("identity-default");
+    let root = workspace.path();
+
+    // The default on the parts struct is the disabled one, so a caller that
+    // never heard of this feature cannot switch it on by omission.
+    assert_eq!(
+        ProviderIdentityPolicy::default(),
+        ProviderIdentityPolicy::Disabled
+    );
+
+    let admitted = admit_brokered(root, ProviderIdentityPolicy::Disabled).unwrap();
+    assert!(admitted.provider_identity_requirement().is_none());
+    assert!(!admitted.has_provider_identity());
+    assert_eq!(
+        admitted
+            .plan()
+            .environment_names()
+            .filter(|name| *name == "PROVIDER_BASE_URL" || *name == "PROVIDER_API_KEY")
+            .count(),
+        0
+    );
+
+    // And a launch with a policy but no broker gets nothing either: a workload
+    // whose spec denies egress has nothing to be identity-bound to.
+    let admitted = admit_with_context(root, |context| {
+        context.provider_identity = ProviderIdentityPolicy::Enabled(identity_binding());
+    })
+    .unwrap();
+    assert!(admitted.broker_requirement().is_none());
+    assert!(admitted.provider_identity_requirement().is_none());
+    assert!(matches!(
+        admitted.with_provider_identity(loopback(4242), &sentinel()),
+        Err(AdmissionRefusal::ProviderIdentityNotRequired)
+    ));
+}
+
+#[test]
+fn an_attached_provider_identity_adds_one_port_and_two_variables_and_nothing_else() {
+    let workspace = TempDir::new("identity-attach");
+    let admitted = admit_brokered(
+        workspace.path(),
+        ProviderIdentityPolicy::Enabled(identity_binding()),
+    )
+    .unwrap();
+
+    let requirement = admitted
+        .provider_identity_requirement()
+        .expect("a bound identity survives admission");
+    assert_eq!(requirement.base_url_variable(), "PROVIDER_BASE_URL");
+    assert_eq!(requirement.credential_variable(), "PROVIDER_API_KEY");
+    assert_eq!(requirement.destination(), &provider_destination());
+
+    let before = admitted.plan().clone();
+    let token = sentinel();
+    let attached = admitted
+        .with_provider_identity(loopback(4242), &token)
+        .unwrap();
+    assert!(attached.has_provider_identity());
+
+    let expected = before
+        .clone()
+        .allow_connect_port(4242)
+        .unwrap()
+        .environment("PROVIDER_BASE_URL", b"http://127.0.0.1:4242")
+        .unwrap()
+        .environment("PROVIDER_API_KEY", token.as_bytes())
+        .unwrap();
+    assert_eq!(attached.plan(), &expected);
+
+    // A second attachment is refused rather than layered.
+    assert!(matches!(
+        attached.with_provider_identity(loopback(4243), &token),
+        Err(AdmissionRefusal::ProviderIdentityAlreadyAttached)
+    ));
+}
+
+#[test]
+fn an_endpoint_or_sentinel_that_is_not_one_is_refused_before_it_enters_a_plan() {
+    let workspace = TempDir::new("identity-refusals");
+    let root = workspace.path();
+    let policy = ProviderIdentityPolicy::Enabled(identity_binding());
+
+    for endpoint in [
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 4242),
+    ] {
+        let admitted = admit_brokered(root, policy.clone()).unwrap();
+        assert!(
+            matches!(
+                admitted.with_provider_identity(endpoint, &sentinel()),
+                Err(AdmissionRefusal::ProviderEndpointRejected(_))
+            ),
+            "{endpoint} must not be a provider endpoint"
+        );
+    }
+
+    // The mistake that matters: a caller handing the workload something that is
+    // not a sentinel — an empty string, a placeholder, or the real credential.
+    for token in [
+        String::new(),
+        "sk-ant-the-real-credential".to_owned(),
+        SESSION_SENTINEL_PREFIX.to_owned(),
+        format!(
+            "{SESSION_SENTINEL_PREFIX}{}",
+            "z".repeat(SESSION_SENTINEL_DIGITS)
+        ),
+        format!(
+            "{SESSION_SENTINEL_PREFIX}{}",
+            "a".repeat(SESSION_SENTINEL_DIGITS - 1)
+        ),
+    ] {
+        let admitted = admit_brokered(root, policy.clone()).unwrap();
+        assert!(
+            matches!(
+                admitted.with_provider_identity(loopback(4242), &token),
+                Err(AdmissionRefusal::SentinelRejected)
+            ),
+            "{token:?} must not be accepted as a sentinel"
+        );
+    }
+}
+
+#[test]
+fn a_binding_that_would_fight_another_attachment_is_refused_when_it_is_built() {
+    for (base_url, credential) in [
+        ("HTTPS_PROXY", "PROVIDER_API_KEY"),
+        ("PROVIDER_BASE_URL", "HTTP_PROXY"),
+        ("PROVIDER_BASE_URL", "TMPDIR"),
+        ("PROVIDER_BASE_URL", "PROVIDER_BASE_URL"),
+        ("provider_base_url", "PROVIDER_API_KEY"),
+        ("9PROVIDER", "PROVIDER_API_KEY"),
+        ("PROVIDER-BASE-URL", "PROVIDER_API_KEY"),
+        ("", "PROVIDER_API_KEY"),
+    ] {
+        let error = ProviderIdentityBinding::new(base_url, credential, provider_destination())
+            .expect_err("{base_url}/{credential} must not bind");
+        assert!(
+            matches!(
+                error,
+                AdmissionRefusal::ContextRejected("provider_identity")
+            ),
+            "{base_url}/{credential} produced {error:?}"
+        );
+    }
+}
+
+#[test]
+fn a_context_cannot_both_tunnel_to_the_provider_host_and_bind_its_identity() {
+    let workspace = TempDir::new("identity-contradiction");
+    let mut parts = context_parts(workspace.path());
+    parts.brokered_destinations = vec![provider_destination()];
+    parts.provider_identity = ProviderIdentityPolicy::Enabled(identity_binding());
+
+    let error = AdmissionContext::new(parts).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AdmissionRefusal::ContextRejected("provider_identity")
+        ),
+        "{error:?}"
+    );
+}
+
+fn loopback(port: u16) -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
 }
 
 fn assert_unmappable(error: &AdmissionRefusal, expected: &str) {

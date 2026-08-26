@@ -118,7 +118,8 @@ use automonique_protocol::sandbox::{
 };
 use automonique_runner::admission::{
     AdmissionContext, AdmissionContextParts, AdmittedLaunch, BrokeredDestination, BrokeredScope,
-    PromptSource, ResolvedPrompt, TemporaryStorageEnforcement, UnenforcedBudget, admit,
+    PromptSource, ProviderIdentityPolicy, ResolvedPrompt, TemporaryStorageEnforcement,
+    UnenforcedBudget, admit,
 };
 use automonique_runner::capability::{BoundaryProperty, HostCapabilities};
 use automonique_runner::{
@@ -345,6 +346,7 @@ fn admit_composed(
         ),
         unenforced_budgets: UnenforcedBudget::ALL.to_vec(),
         brokered_destinations: destinations.to_vec(),
+        provider_identity: ProviderIdentityPolicy::Disabled,
         temporary_storage: TemporaryStorageEnforcement::Available,
     })
     .expect("a valid context");
