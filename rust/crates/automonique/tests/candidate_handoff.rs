@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::os::unix::io::OwnedFd;
+use std::os::unix::net::UnixListener;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,8 +16,10 @@ use automonique_daemon::release_activation::{CodeReleaseActivator, SystemdUserSu
 use automonique_daemon::{Daemon, DaemonConfig};
 use automonique_store::reload_audit::ReloadPhase;
 use automonique_store::{LeaseOwnerIdentity, LeaseTimeSource, LeaseTransferRequest, Store};
+use nix::sys::signal::kill;
 use nix::sys::time::TimeValLike;
 use nix::time::ClockId;
+use nix::unistd::Pid;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
@@ -411,6 +415,198 @@ fn authenticated_reload_command_hands_off_and_retires_the_source() {
     }
     assert!(!config.admin_socket().exists());
     assert!(!config.progress_socket().exists());
+}
+
+/// A socket-activated generation, and the generation adopted from it by a hot
+/// reload, both answer on a pathname neither of them created — and neither
+/// removes it.
+///
+/// The pathname belongs to the socket unit. It is bound before any daemon
+/// starts, it stays bound while the unit is loaded, and it is what every
+/// socket-activated start validates. A generation that unlinked it would
+/// leave the unit listening on an inode no client can reach and every later
+/// start refusing on a path that is gone; the reload's cleanup transfer is
+/// where that duty could wrongly be handed to a successor, so the successor
+/// is what this drives to a full stop.
+///
+/// The activation is real rather than simulated: the test binds the pathname
+/// itself and hands the daemon that descriptor as `LISTEN_FDS=1`, the way the
+/// socket unit does. Everything lives under this test's own private roots.
+#[test]
+fn an_adopted_candidate_leaves_the_socket_units_admin_path_in_place() {
+    let root = tempfile::tempdir().expect("temporary root");
+    private_directory(root.path());
+    let runtime_root = root.path().join("runtime");
+    let state_root = root.path().join("state");
+    private_directory(&runtime_root);
+    private_directory(&state_root);
+    let config = DaemonConfig {
+        runtime_root,
+        state_root,
+    };
+
+    // What `RuntimeDirectory=` and `ListenStream=` leave behind before the
+    // service is ever started: a private runtime directory and a bound
+    // pathname nothing in the daemon's process tree created.
+    private_directory(&config.runtime_dir());
+    let admin = config.admin_socket();
+    let unit_listener = UnixListener::bind(&admin).expect("the socket unit binds the admin path");
+    fs::set_permissions(&admin, fs::Permissions::from_mode(0o600)).expect("private admin path");
+    let unit_inode = inode_of(&admin);
+
+    // The state directory is the daemon's to create, and it refuses one that
+    // is not private. Here the release tree is installed before any daemon has
+    // run, so the test creates the parent the way the daemon would.
+    private_directory(&config.state_dir());
+    let release_root = config.state_dir().join("improvement-code");
+    private_directory(&release_root);
+    private_directory(&release_root.join("releases"));
+    let executable = fs::read(env!("CARGO_BIN_EXE_automonique")).expect("candidate binary");
+    let previous_digest = install_code_release(&release_root, &executable, 'a');
+    let next_digest = install_code_release(&release_root, &executable, 'c');
+    std::os::unix::fs::symlink(
+        Path::new("releases").join(&previous_digest),
+        release_root.join("current"),
+    )
+    .expect("initial current release");
+
+    let mut source = spawn_activated_daemon(&config, &unit_listener);
+    let source_pid = source.id();
+    wait_until(
+        "the activated daemon to answer",
+        Duration::from_secs(30),
+        || cli(&config, &["status", "--json"]).status.success(),
+    );
+    let before = read_source_lease(&config.database_path());
+    assert_eq!(
+        before.pid, source_pid,
+        "the generation is the process the test handed the listener to"
+    );
+    assert_eq!(
+        inode_of(&admin),
+        unit_inode,
+        "the activated daemon adopted the pathname rather than rebinding it"
+    );
+
+    let reload = cli(
+        &config,
+        &["reload", &format!("sha256:{next_digest}"), "--wait"],
+    );
+    assert!(
+        reload.status.success(),
+        "the activated source hands off: {}",
+        String::from_utf8_lossy(&reload.stderr)
+    );
+    let retired = source.wait().expect("source status");
+    assert!(retired.success(), "the source retires cleanly: {retired}");
+    let adopted = read_source_lease(&config.database_path());
+    assert_ne!(adopted.holder_id, before.holder_id);
+    assert_ne!(adopted.pid, source_pid);
+    let status = cli(&config, &["status", "--json"]);
+    assert!(
+        status.status.success(),
+        "the adopted candidate answers on the inherited endpoint"
+    );
+
+    // The stop that took the unit down in the field: the adopted candidate is
+    // the last generation, and its drop path is the one that reaches the
+    // admin pathname.
+    let shutdown = cli(&config, &["shutdown"]);
+    assert!(
+        shutdown.status.success(),
+        "the adopted candidate stops: {}",
+        String::from_utf8_lossy(&shutdown.stderr)
+    );
+    wait_until(
+        "the adopted candidate to exit",
+        Duration::from_secs(20),
+        || !process_is_live(adopted.pid),
+    );
+    wait_until(
+        "the progress endpoint to be removed",
+        Duration::from_secs(10),
+        || !config.progress_socket().exists(),
+    );
+    assert!(
+        admin.exists(),
+        "the socket unit's pathname survives the generation adopted from it"
+    );
+    assert_eq!(
+        inode_of(&admin),
+        unit_inode,
+        "the pathname is still the socket unit's own inode"
+    );
+
+    // What the crash loop could never reach: the socket unit's next
+    // activation, on the descriptor it has been holding all along.
+    let mut restarted = spawn_activated_daemon(&config, &unit_listener);
+    wait_until(
+        "the next socket-activated start to answer",
+        Duration::from_secs(30),
+        || cli(&config, &["status", "--json"]).status.success(),
+    );
+    let restarted_lease = read_source_lease(&config.database_path());
+    assert_eq!(restarted_lease.pid, restarted.id());
+    let shutdown = cli(&config, &["shutdown"]);
+    assert!(shutdown.status.success());
+    let stopped = restarted.wait().expect("restarted daemon status");
+    assert!(stopped.success(), "the restarted daemon stops cleanly");
+    assert!(admin.exists());
+    assert_eq!(inode_of(&admin), unit_inode);
+    drop(unit_listener);
+}
+
+/// Start the product binary the way the socket unit starts it: with the
+/// unit's already-bound listener as the one activated descriptor.
+///
+/// A shell stands between the test and the binary because `LISTEN_PID` must
+/// name the daemon's own process, and that value is only knowable after the
+/// fork — `exec` then keeps the pid the shell reported. The script is a fixed
+/// literal; the binary and its arguments arrive as positional parameters
+/// rather than as interpolated text.
+fn spawn_activated_daemon(config: &DaemonConfig, listener: &UnixListener) -> Child {
+    let inherited = listener.try_clone().expect("duplicate the unit listener");
+    Command::new("/bin/sh")
+        .arg("-c")
+        .arg("exec 3<&0 0</dev/null; export LISTEN_PID=$$; exec \"$0\" \"$@\"")
+        .arg(env!("CARGO_BIN_EXE_automonique"))
+        .arg("daemon")
+        .arg("--foreground")
+        .env("XDG_RUNTIME_DIR", &config.runtime_root)
+        .env("XDG_STATE_HOME", &config.state_root)
+        .env("LISTEN_FDS", "1")
+        .env("LISTEN_FDNAMES", "admin")
+        .stdin(Stdio::from(OwnedFd::from(inherited)))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("activated daemon process")
+}
+
+fn cli(config: &DaemonConfig, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_automonique"))
+        .args(args)
+        .env("XDG_RUNTIME_DIR", &config.runtime_root)
+        .env("XDG_STATE_HOME", &config.state_root)
+        .output()
+        .expect("product binary runs")
+}
+
+fn inode_of(path: &Path) -> (u64, u64) {
+    let metadata = fs::symlink_metadata(path).expect("admin path metadata");
+    (metadata.dev(), metadata.ino())
+}
+
+fn process_is_live(pid: u32) -> bool {
+    i32::try_from(pid).is_ok_and(|raw| kill(Pid::from_raw(raw), None).is_ok())
+}
+
+fn wait_until(what: &str, timeout: Duration, mut predicate: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !predicate() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 struct SourceLease {

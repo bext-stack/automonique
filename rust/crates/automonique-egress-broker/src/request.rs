@@ -48,7 +48,7 @@ pub const MAX_HEADER_LINES: usize = 64;
 const READ_CHUNK_BYTES: usize = 1024;
 
 /// The head's terminator: one empty line.
-const HEAD_TERMINATOR: &[u8] = b"\r\n\r\n";
+pub(crate) const HEAD_TERMINATOR: &[u8] = b"\r\n\r\n";
 
 /// One parsed `CONNECT` target. Carries no headers, because none are used.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -315,14 +315,14 @@ fn reject_malformed_header(line: &[u8]) -> Result<(), RequestError> {
     Ok(())
 }
 
-fn strip_cr(line: &[u8]) -> &[u8] {
+pub(crate) fn strip_cr(line: &[u8]) -> &[u8] {
     match line.split_last() {
         Some((b'\r', rest)) => rest,
         _ => line,
     }
 }
 
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub(crate) fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)

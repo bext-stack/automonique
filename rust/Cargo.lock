@@ -305,6 +305,13 @@ dependencies = [
 [[package]]
 name = "automonique-egress-broker"
 version = "0.1.0"
+dependencies = [
+ "hex",
+ "rustls",
+ "subtle",
+ "webpki-roots 1.0.9",
+ "zeroize",
+]
 
 [[package]]
 name = "automonique-github-connector"

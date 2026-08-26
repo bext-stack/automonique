@@ -414,6 +414,172 @@ impl BrokerRequirement {
     }
 }
 
+/// Whether a deployment binds this workload's provider identity, and how.
+///
+/// # What identity-bound egress changes
+///
+/// A destination allowlist answers "may this workload reach the provider?" and
+/// cannot answer "as whom?". A workload that holds the real provider credential
+/// can be persuaded to send the workspace to the allowlisted provider host
+/// under a credential an attacker supplied, and no destination policy can tell
+/// that apart from legitimate traffic. Binding the identity removes the
+/// credential from the sandbox: the workload is given a per-session sentinel
+/// and a base URL pointing at a loopback endpoint the broker owns, and the
+/// broker substitutes the real credential only for a request carrying that
+/// session's own sentinel.
+///
+/// # The default is off, and off is what production runs
+///
+/// [`Self::Disabled`] leaves a workload with exactly the credential arrangement
+/// it has always had, reaching its provider through the `CONNECT` tunnel;
+/// nothing in an admitted plan differs. Turning it on is a per-workload
+/// decision a deployment makes, not a property of the document, which is why it
+/// lives on the context beside
+/// [`AdmissionContextParts::brokered_destinations`] and carries the same honest
+/// residual: a reviewer of the document cannot see it there.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ProviderIdentityPolicy {
+    /// The workload holds whatever authorization its provider home gives it.
+    #[default]
+    Disabled,
+    /// The workload is given a sentinel and a loopback base URL in place of a
+    /// credential.
+    Enabled(ProviderIdentityBinding),
+}
+
+impl ProviderIdentityPolicy {
+    /// The binding, when one is enabled.
+    #[must_use]
+    pub const fn binding(&self) -> Option<&ProviderIdentityBinding> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled(binding) => Some(binding),
+        }
+    }
+}
+
+/// Which two variables carry the identity-bound provider endpoint into a
+/// workload, and which destination sits behind it.
+///
+/// The names are a deployment's answer rather than a constant, because the
+/// variable a provider engine honours for its base URL is the engine's business
+/// and differs between them. What is not negotiable is that both names are
+/// bound by the attachment and neither may be bound by the document: a plan
+/// refuses one name bound twice, so a document that tried to point its own base
+/// URL somewhere else is refused rather than obeyed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderIdentityBinding {
+    base_url_variable: String,
+    credential_variable: String,
+    destination: BrokeredDestination,
+}
+
+impl ProviderIdentityBinding {
+    /// Bind two variable names to one provider destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdmissionRefusal::ContextRejected`] naming `provider_identity`
+    /// when either name is not a launch-plan variable name, when the two are
+    /// the same name, or when either collides with a name some other attachment
+    /// owns — the proxy pair or `TMPDIR`. A collision is refused here rather
+    /// than discovered as a plan refusal at attachment time, because "which
+    /// attachment owns this variable" has one answer and it should be given
+    /// before a run starts.
+    pub fn new(
+        base_url_variable: &str,
+        credential_variable: &str,
+        destination: BrokeredDestination,
+    ) -> Result<Self, AdmissionRefusal> {
+        let rejected = || AdmissionRefusal::ContextRejected("provider_identity");
+        for name in [base_url_variable, credential_variable] {
+            if !is_launch_variable_name(name)
+                || BROKER_PROXY_VARIABLES.contains(&name)
+                || name == "TMPDIR"
+            {
+                return Err(rejected());
+            }
+        }
+        if base_url_variable == credential_variable {
+            return Err(rejected());
+        }
+        Ok(Self {
+            base_url_variable: base_url_variable.to_owned(),
+            credential_variable: credential_variable.to_owned(),
+            destination,
+        })
+    }
+
+    /// The variable carrying the loopback base URL.
+    #[must_use]
+    pub fn base_url_variable(&self) -> &str {
+        &self.base_url_variable
+    }
+
+    /// The variable carrying the session sentinel.
+    #[must_use]
+    pub fn credential_variable(&self) -> &str {
+        &self.credential_variable
+    }
+
+    /// The provider destination the broker substitutes towards.
+    ///
+    /// Deliberately not one of the [`BrokerRequirement`]'s destinations: while
+    /// an identity is bound the broker refuses a tunnel to this host, so naming
+    /// it in both places would be naming two contradictory policies.
+    #[must_use]
+    pub const fn destination(&self) -> &BrokeredDestination {
+        &self.destination
+    }
+}
+
+/// The prefix the egress broker gives every session sentinel.
+///
+/// Deliberately the broker's own `SENTINEL_PREFIX`, and the width below is its
+/// own `SENTINEL_ENTROPY_BYTES` rendered as hex. This crate does not depend on
+/// that one — the ceilings at the top of this file are pinned across the same
+/// gap for the same reason — so the two spellings are one shape written twice,
+/// and `sentinel_shape_matches_the_brokers` in the daemon crate, which depends
+/// on both, is what holds them together.
+pub const SESSION_SENTINEL_PREFIX: &str = "amq-egress-session-";
+
+/// Hex digits a sentinel carries after its prefix.
+pub const SESSION_SENTINEL_DIGITS: usize = 64;
+
+/// Whether `token` has the shape of a broker session sentinel.
+///
+/// A shape check and nothing more: it cannot tell a real sentinel from a
+/// well-formed guess, and it is not asked to. What it catches is the mistake
+/// that matters — a caller attaching an empty string, a placeholder, or the
+/// real provider credential — each of which would build exactly the arrangement
+/// this feature exists to prevent, invisibly, until an exfiltration succeeded.
+#[must_use]
+pub fn is_session_sentinel(token: &str) -> bool {
+    let Some(digits) = token.strip_prefix(SESSION_SENTINEL_PREFIX) else {
+        return false;
+    };
+    digits.len() == SESSION_SENTINEL_DIGITS
+        && digits
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Whether `name` is a name [`LaunchPlan::environment`] will accept.
+///
+/// Mirrored rather than shared because the launch surface keeps its grammar
+/// private; a name this accepts and the plan then refuses would turn a context
+/// mistake into a refusal at attachment time, which is later and less clear.
+fn is_launch_variable_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if !(first.is_ascii_uppercase() || first == b'_') {
+        return false;
+    }
+    bytes.all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
 /// Why one spec was not admitted, before any plan, cgroup or process exists.
 ///
 /// Every variant is a refusal. None of them means "admitted with less than the
@@ -422,6 +588,14 @@ impl BrokerRequirement {
 pub enum AdmissionRefusal {
     /// The document is not RunSpec v1.
     UnsupportedProtocol(u32),
+    /// This launch binds no provider identity, so there is nothing to attach.
+    ProviderIdentityNotRequired,
+    /// A provider identity has already been attached to this launch.
+    ProviderIdentityAlreadyAttached,
+    /// A provider endpoint that is not loopback, or names port zero.
+    ProviderEndpointRejected(SocketAddr),
+    /// The sentinel offered at attachment was not a well-formed sentinel.
+    SentinelRejected,
     /// A context input is malformed; names the input.
     ContextRejected(&'static str),
     /// The resolved working directory is not the workspace root or beneath it.
@@ -531,6 +705,19 @@ impl fmt::Display for AdmissionRefusal {
             Self::UnsupportedPromptDigest => formatter.write_str("a prompt digest must be sha256"),
             Self::HostFeatureRejected(error) => {
                 write!(formatter, "host enforcement negotiation failed: {error}")
+            }
+            Self::ProviderIdentityNotRequired => {
+                formatter.write_str("this launch binds no provider identity")
+            }
+            Self::ProviderIdentityAlreadyAttached => {
+                formatter.write_str("a provider identity is already attached to this launch")
+            }
+            Self::ProviderEndpointRejected(endpoint) => write!(
+                formatter,
+                "a provider endpoint must be loopback with a non-zero port, not {endpoint}"
+            ),
+            Self::SentinelRejected => {
+                formatter.write_str("the offered sentinel is not a well-formed session sentinel")
             }
             Self::BrokerNotRequired => {
                 formatter.write_str("this launch requires no broker, so none may be attached")
@@ -703,6 +890,11 @@ pub struct AdmissionContextParts {
     /// brokered egress consults it. See [`AdmissionContext`]'s own note for why
     /// this field exists at all.
     pub brokered_destinations: Vec<BrokeredDestination>,
+    /// Whether this deployment binds this workload's provider identity.
+    ///
+    /// Defaults to [`ProviderIdentityPolicy::Disabled`], which is what every
+    /// caller that does not opt in gets and what production runs today.
+    pub provider_identity: ProviderIdentityPolicy,
     /// Whether this host can enforce the temporary-storage budget.
     ///
     /// A standing host answer decided once by the caller through
@@ -793,6 +985,18 @@ impl AdmissionContext {
                 return Err(AdmissionRefusal::ContextRejected("brokered_destinations"));
             }
         }
+        // The identity's host is the one host a brokered launch may *not*
+        // tunnel to, so naming it in both places is a contradiction the broker
+        // itself refuses to start with. Refused here too, so a run never
+        // reaches the broker to be refused there.
+        if let Some(binding) = parts.provider_identity.binding()
+            && parts
+                .brokered_destinations
+                .iter()
+                .any(|destination| destination.host == binding.destination().host)
+        {
+            return Err(AdmissionRefusal::ContextRejected("provider_identity"));
+        }
         Ok(Self { parts })
     }
 
@@ -855,6 +1059,12 @@ impl AdmissionContext {
     pub const fn temporary_storage(&self) -> &TemporaryStorageEnforcement {
         &self.parts.temporary_storage
     }
+
+    /// Whether this deployment binds the workload's provider identity.
+    #[must_use]
+    pub const fn provider_identity(&self) -> &ProviderIdentityPolicy {
+        &self.parts.provider_identity
+    }
 }
 
 /// One spec, admitted: everything a supervisor needs for exactly one attempt.
@@ -874,6 +1084,8 @@ pub struct AdmittedLaunch {
     unenforced_budgets: Vec<UnenforcedBudget>,
     broker: Option<BrokerRequirement>,
     broker_attached: bool,
+    provider_identity: Option<ProviderIdentityBinding>,
+    provider_identity_attached: bool,
     temporary_storage_budget: TemporaryStorageBudget,
     temporary_storage_attached: bool,
 }
@@ -945,6 +1157,24 @@ impl AdmittedLaunch {
     #[must_use]
     pub const fn has_broker(&self) -> bool {
         self.broker_attached
+    }
+
+    /// The provider identity this launch binds, when it binds one.
+    ///
+    /// `None` is the whole statement that no sentinel and no base URL may enter
+    /// the plan, and [`Self::with_provider_identity`] refuses to give it any. It
+    /// is `None` for every launch whose spec denies egress, whatever the
+    /// context asked for: a workload with no broker has nothing to be
+    /// identity-bound *to*.
+    #[must_use]
+    pub const fn provider_identity_requirement(&self) -> Option<&ProviderIdentityBinding> {
+        self.provider_identity.as_ref()
+    }
+
+    /// Whether a provider identity has already been attached to this launch.
+    #[must_use]
+    pub const fn has_provider_identity(&self) -> bool {
+        self.provider_identity_attached
     }
 
     /// The exact temporary-storage budget the supervisor must mount for this
@@ -1102,6 +1332,83 @@ impl AdmittedLaunch {
         self.broker_attached = true;
         Ok(self)
     }
+
+    /// Point this launch at the broker's identity-bound provider endpoint, and
+    /// grant it nothing else.
+    ///
+    /// A second attachment beside [`Self::with_broker`], and deliberately
+    /// separate from it: the tunnel is what every brokered launch gets, and
+    /// this is what a launch gets only where a deployment enabled it. What it
+    /// adds, in full:
+    ///
+    /// - [`LaunchPlan::allow_connect_port`] for the provider endpoint's own
+    ///   port, which is a second loopback port on the same broker;
+    /// - the binding's base-URL variable, bound to `http://<endpoint>`;
+    /// - the binding's credential variable, bound to this session's sentinel.
+    ///
+    /// And what it deliberately does not add: no socket grant — the tunnel
+    /// attachment already decided which sockets a workload may create, and this
+    /// one has no business widening that; no bind port; no filesystem grant;
+    /// and, most of the point, no provider credential. The value the workload
+    /// receives is a sentinel that authorizes nothing anywhere but this one
+    /// broker for the life of this one run.
+    ///
+    /// The residual is the same one the tunnel attachment states and one line
+    /// longer: a Landlock network rule names a port and not an address, so this
+    /// grant is "port `Q`, anywhere" rather than "the provider endpoint", and a
+    /// workload now has two such ports rather than one. What narrows both is
+    /// unchanged — each is a kernel-assigned ephemeral port on `127.0.0.1`, the
+    /// workload cannot resolve a name, and it may not bind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdmissionRefusal::ProviderIdentityNotRequired`] when this
+    /// launch binds no identity, [`AdmissionRefusal::ProviderIdentityAlreadyAttached`]
+    /// on a second attachment, [`AdmissionRefusal::ProviderEndpointRejected`]
+    /// for an endpoint that is not loopback or names port zero,
+    /// [`AdmissionRefusal::SentinelRejected`] for a sentinel that is not one,
+    /// and [`AdmissionRefusal::Plan`] when the launch surface refuses the
+    /// composition — which is what happens when the document bound either
+    /// variable itself, since a plan refuses one name bound twice.
+    pub fn with_provider_identity(
+        mut self,
+        endpoint: SocketAddr,
+        sentinel: &str,
+    ) -> Result<Self, AdmissionRefusal> {
+        let Some(binding) = self.provider_identity.clone() else {
+            return Err(AdmissionRefusal::ProviderIdentityNotRequired);
+        };
+        if self.provider_identity_attached {
+            return Err(AdmissionRefusal::ProviderIdentityAlreadyAttached);
+        }
+        if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
+            return Err(AdmissionRefusal::ProviderEndpointRejected(endpoint));
+        }
+        // Checked rather than trusted: a caller that handed a workload an empty
+        // string, or the real credential by mistake, would have built exactly
+        // the arrangement this feature exists to prevent, and the mistake would
+        // be invisible until an exfiltration succeeded.
+        if !is_session_sentinel(sentinel) {
+            return Err(AdmissionRefusal::SentinelRejected);
+        }
+        let refused = |error: LaunchPlanError| AdmissionRefusal::Plan {
+            field: "sandbox.provider_control_egress",
+            error,
+        };
+        let base_url = format!("http://{endpoint}");
+        let plan = self
+            .plan
+            .clone()
+            .allow_connect_port(endpoint.port())
+            .map_err(refused)?
+            .environment(binding.base_url_variable(), base_url.as_bytes())
+            .map_err(refused)?
+            .environment(binding.credential_variable(), sentinel.as_bytes())
+            .map_err(refused)?;
+        self.plan = plan;
+        self.provider_identity_attached = true;
+        Ok(self)
+    }
 }
 
 /// Map one validated spec plus its runtime context onto one launch.
@@ -1168,8 +1475,13 @@ pub fn admit(
         timeout: spec.timeout(),
         spool_budget_bytes: spec.spool_budget_bytes(),
         unenforced_budgets: context.unenforced_budgets().to_vec(),
+        provider_identity: broker
+            .is_some()
+            .then(|| context.provider_identity().binding().cloned())
+            .flatten(),
         broker,
         broker_attached: false,
+        provider_identity_attached: false,
         temporary_storage_budget,
         temporary_storage_attached: false,
     })

@@ -12,8 +12,12 @@ systemctl --user enable --now automonique-backup.timer
 systemctl --user status automonique.service
 ```
 
-The socket unit owns the private admin listener across daemon restarts. The
-service adopts that one named descriptor, starts the directly installed daemon
+The socket unit owns the private admin listener across daemon restarts, and
+owns its pathname: no daemon that adopted the descriptor ever unlinks it,
+including a candidate adopted as the unit's main process by a hot reload. If
+the path is removed anyway, the service refuses to start with
+`admin_socket_missing` until `systemctl --user restart automonique.socket`
+recreates it. The service adopts that one named descriptor, starts the directly installed daemon
 binary from the product state directory, creates private XDG runtime/state
 directories, delegates its cgroup subtree, and waits for the daemon's real
 readiness notification. A supervised reload sends SIGHUP and waits while the

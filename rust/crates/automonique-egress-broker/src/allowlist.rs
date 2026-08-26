@@ -84,6 +84,25 @@ impl AddressScope {
             Self::Loopback => address.is_loopback(),
         }
     }
+
+    /// Whether a session to a destination in this scope must be wrapped in TLS.
+    ///
+    /// A public destination always must: the identity-bound path substitutes a
+    /// real credential into the request, and sending one in the clear across
+    /// the internet would be worse than the exfiltration the substitution
+    /// exists to prevent. A loopback destination never leaves the host, so
+    /// requiring a certificate for one would only mean minting certificates.
+    ///
+    /// This says nothing about the `CONNECT` tunnel, which carries whatever
+    /// transport security the workload negotiated end to end and is never
+    /// terminated here.
+    #[must_use]
+    pub const fn requires_transport_security(self) -> bool {
+        match self {
+            Self::Public => true,
+            Self::Loopback => false,
+        }
+    }
 }
 
 impl fmt::Display for AddressScope {

@@ -7,7 +7,16 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# The `CONNECT` half of this crate stays dependency-free on purpose: a tunnel
+# that moves opaque bytes needs no parser and no key. The dependencies below
+# belong exclusively to the identity-bound provider path, and their presence is
+# the visible signal that one route through this crate does terminate TLS.
 [dependencies]
+hex = { workspace = true }
+rustls = { workspace = true }
+subtle = { workspace = true }
+webpki-roots = { workspace = true }
+zeroize = { workspace = true }
 
 [lints]
 workspace = true

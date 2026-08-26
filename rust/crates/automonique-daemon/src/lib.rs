@@ -996,6 +996,13 @@ pub enum DaemonError {
     /// systemd advertised an inherited listener that did not match the one
     /// exact admin-socket contract this daemon accepts.
     SocketActivationRefused,
+    /// The admin socket pathname is absent where a bound listener claims it.
+    ///
+    /// Its own category rather than a bare I/O failure, because it names one
+    /// operator condition with one repair: a socket unit's pathname was
+    /// unlinked out from under it, and the socket unit — never this daemon —
+    /// is what recreates it.
+    AdminSocketMissing,
     /// The connecting Unix peer is not the daemon's effective user.
     PeerDenied,
     /// The admin frame was incomplete, too large, or not admitted.
@@ -1147,11 +1154,12 @@ pub enum DaemonError {
 /// siblings) contribute the categories those modules define, of which the
 /// attempt route's are chained in beside this list because a transferred
 /// daemon binds one on startup.
-pub(crate) const DAEMON_ERROR_CATEGORIES: [&str; 11] = [
+pub(crate) const DAEMON_ERROR_CATEGORIES: [&str; 12] = [
     "environment_missing",
     "insecure_path",
     "already_running",
     "socket_activation_refused",
+    "admin_socket_missing",
     "peer_denied",
     "protocol_refused",
     "io",
@@ -1170,6 +1178,7 @@ impl DaemonError {
             Self::InsecurePath(_) => "insecure_path",
             Self::AlreadyRunning => "already_running",
             Self::SocketActivationRefused => "socket_activation_refused",
+            Self::AdminSocketMissing => "admin_socket_missing",
             Self::PeerDenied => "peer_denied",
             Self::ProtocolRefused(_) => "protocol_refused",
             Self::Io(_) => "io",
@@ -1212,6 +1221,9 @@ impl fmt::Display for DaemonError {
             Self::AlreadyRunning => formatter.write_str("another Automonique daemon is running"),
             Self::SocketActivationRefused => {
                 formatter.write_str("the inherited admin listener was refused")
+            }
+            Self::AdminSocketMissing => {
+                formatter.write_str("the admin socket path is absent; its socket unit owns it")
             }
             Self::PeerDenied => formatter.write_str("local administration peer was denied"),
             Self::ProtocolRefused(category) => {
@@ -1327,6 +1339,19 @@ pub struct Daemon {
     lease_time: lease_time::SuspendFence,
     socket_identity: (u64, u64),
     remove_socket_on_drop: bool,
+    /// Whether unlinking `socket_path` is this process tree's duty at all.
+    ///
+    /// False when the admin endpoint arrived through socket activation: the
+    /// pathname then belongs to the service manager's socket unit, which
+    /// outlives every daemon that answers on it. Unlinking it strands that
+    /// unit on an inode no client can reach and makes every later activated
+    /// start fail on a path that is gone.
+    ///
+    /// Distinct from `remove_socket_on_drop`, which is the *armed* state of
+    /// the duty and moves back and forth across a handoff. This one is a
+    /// property of the endpoint rather than of the moment, and changes only
+    /// where a candidate is told what its source owned.
+    owns_admin_socket_path: bool,
     controller: automonique_core::Controller,
     reconciliation_run_id: Option<i64>,
     /// The in-memory half of the intake decision, published to the
@@ -2563,6 +2588,12 @@ impl Daemon {
             lease_time,
             socket_identity,
             remove_socket_on_drop,
+            // The two agree at `open` in both startup branches: a self-bound
+            // listener owns its pathname and arms the guard, while an
+            // activated or an inherited one owns neither. They diverge only
+            // afterwards, when a handoff disarms the source and arms the
+            // candidate.
+            owns_admin_socket_path: remove_socket_on_drop,
             controller: automonique_core::Controller::new(),
             reconciliation_run_id: None,
             intake_signal,
@@ -2745,6 +2776,13 @@ impl Daemon {
 
     /// Transfer responsibility for unlinking the exact admin/progress socket
     /// inodes to a candidate at its serving-readiness boundary.
+    ///
+    /// What is transferred is this process's *ownership* of the admin
+    /// pathname, not merely its armed guard. A socket-activated source never
+    /// owned that pathname, and a candidate that armed cleanup on it would
+    /// unlink the socket unit's own inode on its first orderly stop. The
+    /// progress endpoint is this daemon's own creation either way, so its
+    /// cleanup always moves.
     pub fn relinquish_endpoint_cleanup(
         &mut self,
     ) -> Result<candidate::EndpointCleanupTransfer, DaemonError> {
@@ -2760,11 +2798,16 @@ impl Daemon {
                 ))?;
         progress.disarm_cleanup();
         self.remove_socket_on_drop = false;
-        Ok(candidate::EndpointCleanupTransfer::new())
+        Ok(candidate::EndpointCleanupTransfer::new(
+            self.owns_admin_socket_path,
+        ))
     }
 
     /// Reclaim cleanup responsibility after the candidate proved an E+2
     /// authority return and disarmed its own exact inode guards.
+    ///
+    /// A source that never owned the admin pathname resumes without arming a
+    /// guard on it: rollback restores what this process had, and it had none.
     pub fn resume_endpoint_cleanup(&mut self) -> Result<(), DaemonError> {
         self.arm_endpoint_cleanup()
     }
@@ -3175,7 +3218,11 @@ impl Daemon {
             ))?
             .arm_cleanup()
             .map_err(|error| DaemonError::ProgressEndpointFailed(error.category()))?;
-        self.remove_socket_on_drop = true;
+        // The progress endpoint is bound by whichever daemon opened it, so its
+        // guard arms unconditionally. The admin pathname is only sometimes
+        // ours, and arming a guard on a socket unit's path would make an
+        // orderly stop delete the endpoint every later start needs.
+        self.remove_socket_on_drop = self.owns_admin_socket_path;
         Ok(())
     }
 
@@ -3219,13 +3266,23 @@ impl Daemon {
         result
     }
 
+    /// Serve as the adopted candidate of a live source.
+    ///
+    /// `owns_admin_socket_path` is the source's own ownership of the admin
+    /// pathname, carried across the private channel with the cleanup
+    /// transfer. It is what decides whether arming cleanup here arms an
+    /// unlink at all: a candidate adopted from a socket-activated source
+    /// holds the socket unit's inode, and unlinking it on this process's stop
+    /// would leave the unit listening on a path that no longer exists.
     fn serve_candidate(
-        self,
+        mut self,
         stop: &AtomicBool,
         ready: std::sync::mpsc::SyncSender<()>,
         release_on_stop: Arc<AtomicBool>,
         source_pid: u32,
+        owns_admin_socket_path: bool,
     ) -> (Self, Result<(), DaemonError>) {
+        self.owns_admin_socket_path = owns_admin_socket_path;
         // The source announced this process as the unit's main process before
         // it asked it to serve, so from here the manager counts this process's
         // readiness and watchdog pings and nobody else's: a candidate that
@@ -9601,7 +9658,13 @@ fn validate_admin_listener(
     if local.as_pathname() != Some(path) {
         return Err(DaemonError::InsecurePath("admin socket"));
     }
-    let metadata = fs::symlink_metadata(path)?;
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            DaemonError::AdminSocketMissing
+        } else {
+            DaemonError::Io(error)
+        }
+    })?;
     if !metadata.file_type().is_socket()
         || metadata.uid() != geteuid().as_raw()
         || metadata.mode() & 0o7777 != 0o600
@@ -10057,7 +10120,7 @@ mod tests {
 
     use super::{
         Daemon, DaemonConfig, DrainPhase, OperationalMetric, activated_listener_fd,
-        drain_shutdown_workers, durable_count, named_shutdown_workers,
+        drain_shutdown_workers, durable_count, named_shutdown_workers, validate_admin_listener,
     };
 
     #[test]
@@ -10113,8 +10176,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn configuration_reload_replaces_both_policy_fields_or_neither() {
+    /// A private runtime and state root of this test's own, never the
+    /// operator's: every daemon a unit test opens binds real sockets and
+    /// takes a real control lock under these paths.
+    fn private_roots() -> (tempfile::TempDir, DaemonConfig) {
         let root = tempfile::tempdir().expect("temporary root");
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
             .expect("private root");
@@ -10125,10 +10190,129 @@ mod tests {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
                 .expect("private configuration root");
         }
-        let config = DaemonConfig {
-            runtime_root,
-            state_root,
-        };
+        (
+            root,
+            DaemonConfig {
+                runtime_root,
+                state_root,
+            },
+        )
+    }
+
+    /// A self-bound daemon created its admin pathname, so the candidate it
+    /// hands off to inherits the duty to unlink it, and a rollback puts that
+    /// duty back where it was.
+    #[test]
+    fn cleanup_transfer_from_a_self_bound_source_carries_the_unlink_duty() {
+        let (_root, config) = private_roots();
+        let mut daemon = Daemon::open(&config).expect("daemon opens");
+        assert!(
+            daemon.owns_admin_socket_path,
+            "a self-bound listener owns the pathname it created"
+        );
+        assert!(daemon.remove_socket_on_drop);
+
+        let transfer = daemon
+            .relinquish_endpoint_cleanup()
+            .expect("the source relinquishes cleanup");
+        assert!(
+            transfer.admin_socket_path_owned(),
+            "the candidate is told the pathname is the process tree's to remove"
+        );
+        assert!(
+            !daemon.remove_socket_on_drop,
+            "the source disarms while the candidate holds the duty"
+        );
+
+        daemon
+            .resume_endpoint_cleanup()
+            .expect("rollback returns cleanup to the source");
+        assert!(
+            daemon.remove_socket_on_drop,
+            "a source that owned the pathname arms again on rollback"
+        );
+
+        let admin = config.admin_socket();
+        assert!(admin.exists());
+        drop(daemon);
+        assert!(
+            !admin.exists(),
+            "the daemon that created the pathname removes it"
+        );
+    }
+
+    /// A socket-activated daemon holds a pathname its socket unit created and
+    /// keeps. Neither the handoff nor a rollback may arm an unlink of it: the
+    /// unit goes on listening on that inode across every generation, and a
+    /// daemon that removed it would leave every later activated start with
+    /// nothing to validate.
+    ///
+    /// Activation itself is simulated — the descriptor systemd would pass is
+    /// not available to a unit test — but from the assignment below this is
+    /// the same code an activated `open` reaches.
+    #[test]
+    fn cleanup_transfer_from_an_activated_source_carries_no_unlink_duty() {
+        let (_root, config) = private_roots();
+        let mut daemon = Daemon::open(&config).expect("daemon opens");
+        // What `open_admin_listener` returns when systemd handed over the
+        // listener: the pathname belongs to the socket unit, and no guard on
+        // it is ever armed.
+        daemon.owns_admin_socket_path = false;
+        daemon.remove_socket_on_drop = false;
+
+        let transfer = daemon
+            .relinquish_endpoint_cleanup()
+            .expect("the source relinquishes cleanup");
+        assert!(
+            !transfer.admin_socket_path_owned(),
+            "the candidate is told the socket unit owns the pathname"
+        );
+        assert!(!daemon.remove_socket_on_drop);
+
+        daemon
+            .resume_endpoint_cleanup()
+            .expect("rollback returns cleanup to the source");
+        assert!(
+            !daemon.remove_socket_on_drop,
+            "rollback restores what this source had, and it had no duty"
+        );
+
+        let admin = config.admin_socket();
+        let progress = config.progress_socket();
+        assert!(admin.exists());
+        assert!(progress.exists());
+        drop(daemon);
+        assert!(
+            admin.exists(),
+            "the socket unit's pathname survives the daemon that answered on it"
+        );
+        assert!(
+            !progress.exists(),
+            "the progress endpoint is the daemon's own creation and is still removed"
+        );
+    }
+
+    #[test]
+    fn an_absent_admin_socket_path_is_its_own_refusal() {
+        let (_root, config) = private_roots();
+        let daemon = Daemon::open(&config).expect("daemon opens");
+        let admin = config.admin_socket();
+        // Exactly what the outage left behind: a live listener, and no
+        // pathname for the next start to find.
+        std::fs::remove_file(&admin).expect("unlink the admin pathname");
+        let error = validate_admin_listener(&daemon.listener, &admin)
+            .expect_err("a missing pathname is refused");
+        assert_eq!(
+            error.category(),
+            "admin_socket_missing",
+            "the journal names the condition rather than reporting a bare I/O failure"
+        );
+        assert!(super::DAEMON_ERROR_CATEGORIES.contains(&error.category()));
+    }
+
+    #[test]
+    fn configuration_reload_replaces_both_policy_fields_or_neither() {
+        let (_root, config) = private_roots();
         let mut daemon = Daemon::open(&config).expect("daemon opens");
         assert_eq!(
             daemon.configured_approval_requirement,
