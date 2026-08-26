@@ -153,7 +153,8 @@ use automonique_protocol::sandbox::{
 use automonique_protocol::tools::RunId as FrameRunId;
 use automonique_runner::admission::{
     AdmissionContext, AdmissionContextParts, AdmissionRefusal, AdmittedLaunch, BrokeredDestination,
-    PromptSource, ResolvedPrompt, TemporaryStorageEnforcement, UnenforcedBudget, admit,
+    PromptSource, ResolvedPrompt, TemporaryStorageEnforcement, UnenforcedBudget,
+    WorkloadIdentityEnforcement, admit,
 };
 use automonique_runner::backend::{
     CapturedFrame, DirectProcessBackend, ObservedSequence, PROGRESS_BUDGET_WARNING,
@@ -162,7 +163,7 @@ use automonique_runner::backend::{
     TERMINAL_CANCELLED, TERMINAL_COMPLETED, TERMINAL_FAILED, TERMINAL_TIMED_OUT,
     TemporaryStorageWatch, temporary_storage_exceeded_frame,
 };
-use automonique_runner::capability::{BoundaryProperty, HostCapabilities};
+use automonique_runner::capability::{BoundaryProperty, HostCapabilities, WorkloadIdentityFinding};
 use automonique_runner::control::{CancelDelivery, CancelSink, CancelSinkError};
 use automonique_runner::dispatch::RegistrationHandle;
 use automonique_runner::tempfs::{
@@ -245,10 +246,11 @@ pub const DAEMON_BACKEND_ID: &str = "local-direct";
 /// One array, read by the daemon's startup measurement *and* by
 /// [`offered_host_features`], so what the status reports and what a document
 /// negotiates against cannot drift apart.
-pub const ENFORCED_PROPERTIES: [BoundaryProperty; 4] = [
+pub const ENFORCED_PROPERTIES: [BoundaryProperty; 5] = [
     BoundaryProperty::DescendantContainment,
     BoundaryProperty::FilesystemRestriction,
     BoundaryProperty::TcpDenial,
+    BoundaryProperty::UidSeparation,
     BoundaryProperty::SyscallRestriction,
 ];
 
@@ -291,7 +293,14 @@ pub const HOST_FEATURE_DOMAIN: &str = "automonique.host-feature.v1";
 /// business and this lane does not pretend to it.
 #[must_use]
 pub fn offered_host_features() -> Vec<HostFeature> {
-    let Ok(selection) = HostCapabilities::probe().select_mode(&ENFORCED_PROPERTIES) else {
+    // `UidSeparation` is proven by running the launch helper, so the probe
+    // must be given it; without a helper the identity is unavailable and this
+    // host offers nothing, which is the honest answer for a host that cannot
+    // launch a workload anyway.
+    let helper = locate_launch_helper();
+    let Ok(selection) = HostCapabilities::probe_with_launch_helper(helper.as_deref())
+        .select_mode(&ENFORCED_PROPERTIES)
+    else {
         // A host with no enforceable mode offers nothing, which is the same
         // answer `sandbox_enforceable` gives and refuses on first.
         return Vec::new();
@@ -482,6 +491,12 @@ pub struct ExecutionLane {
     /// What this host offers a document's enforcement negotiation, measured
     /// once at open beside the sandbox measurement it is derived from.
     offered: Vec<HostFeature>,
+    /// Whether this host can give the workload a host uid of its own, measured
+    /// once at open by asking the launch helper. Carried into every admission
+    /// context so a host that cannot separate the identity refuses fail-closed
+    /// with the host-wide `sandbox_unenforceable`, exactly as the temporary
+    /// storage budget does.
+    workload_identity: WorkloadIdentityEnforcement,
     /// The destinations this deployment resolves `brokered_named` egress to,
     /// read once at open. Empty is the ordinary case and refuses every document
     /// that asks for egress; see [`crate::egress`].
@@ -697,6 +712,7 @@ impl ExecutionLane {
             managed_sessions_path: state_dir.join(crate::MANAGED_SESSIONS_NAME),
             state_dir,
             run_index_path,
+            workload_identity: measure_workload_identity(helper.as_deref()),
             helper,
             sandbox_enforceable,
             offered: offered_host_features(),
@@ -905,6 +921,7 @@ impl ExecutionLane {
             // can neither widen a denied document nor be defaulted into one.
             brokered_destinations: self.egress_destinations.clone(),
             temporary_storage,
+            workload_identity: self.workload_identity.clone(),
         })
         .map_err(|_| ExecuteRefusal::AdmissionRefused)?;
 
@@ -2458,7 +2475,10 @@ const fn registration_refusal(error: crate::attempt_host::AttemptHostError) -> E
 /// failure the runner quotes stops here: the wire refusal carries no reason.
 const fn admission_refusal(refusal: &AdmissionRefusal) -> ExecuteRefusal {
     match refusal {
-        AdmissionRefusal::TemporaryStorageUnenforceable(_) => ExecuteRefusal::SandboxUnenforceable,
+        AdmissionRefusal::TemporaryStorageUnenforceable(_)
+        | AdmissionRefusal::WorkloadIdentityUnenforceable(_) => {
+            ExecuteRefusal::SandboxUnenforceable
+        }
         _ => ExecuteRefusal::AdmissionRefused,
     }
 }
@@ -2619,6 +2639,23 @@ fn read_bounded(path: &Path, limit: u64) -> Option<Vec<u8>> {
         return None;
     }
     Some(bytes)
+}
+
+/// Whether this host can separate the workload identity, as a standing answer.
+///
+/// Asks the launch helper — in a throwaway child that restricts only itself —
+/// what identity a workload would get, and folds the finding into the same
+/// [`WorkloadIdentityEnforcement`] admission consumes. A host without a helper,
+/// or one the switch is refused on, is `Unavailable` with the typed reason, so
+/// admission refuses fail-closed rather than running a workload as the
+/// supervisor's uid.
+fn measure_workload_identity(helper: Option<&Path>) -> WorkloadIdentityEnforcement {
+    match WorkloadIdentityFinding::probe_with_launch_helper(helper) {
+        WorkloadIdentityFinding::Separable(_) => WorkloadIdentityEnforcement::Available,
+        WorkloadIdentityFinding::Unavailable(denial) => {
+            WorkloadIdentityEnforcement::Unavailable(format!("{}: {denial}", denial.as_str()))
+        }
+    }
 }
 
 /// Find the entry helper by the two routes [`LAUNCH_HELPER_NAME`] documents.

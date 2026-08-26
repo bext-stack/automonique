@@ -282,6 +282,24 @@ pub enum TemporaryStorageEnforcement {
     Unavailable(String),
 }
 
+/// Whether this host can give the workload a host uid of its own.
+///
+/// A standing host answer, like [`TemporaryStorageEnforcement`] beside it:
+/// the caller decides it once by asking the launch helper
+/// ([`crate::capability::WorkloadIdentityFinding`]), and every document is
+/// admitted against the same answer. Every launch through the entry helper
+/// performs the switch and refuses when it cannot, so a host that cannot
+/// separate the identity runs nothing; carrying the answer here turns that
+/// late refusal into an admission answer with the host-wide word.
+#[derive(Clone, Debug)]
+pub enum WorkloadIdentityEnforcement {
+    /// The launch helper proved the switch on a throwaway child.
+    Available,
+    /// The switch is refused on this host. The string is the typed denial,
+    /// rendered, so a refusal names why.
+    Unavailable(String),
+}
+
 /// Where an allowlisted destination is expected to live.
 ///
 /// A mirror of the egress broker's own `AddressScope`, kept in this crate so
@@ -480,6 +498,12 @@ pub enum AdmissionRefusal {
     /// away from the budgeted mount. The budget attaches `TMPDIR`, so the two
     /// cannot both be present.
     TemporaryStorageTmpdirConflict,
+    /// The host cannot give the workload a host uid of its own: no subordinate
+    /// range, no setuid mapper, or a namespace policy that refuses the switch.
+    /// The string is the launch helper's typed denial. This is the fail-closed
+    /// answer the boundary requires — never admitted with the workload sharing
+    /// the supervisor's uid.
+    WorkloadIdentityUnenforceable(String),
     /// The spec's canonical digest could not be computed.
     Digest(RunSpecEncodeError),
 }
@@ -547,6 +571,10 @@ impl fmt::Display for AdmissionRefusal {
             }
             Self::TemporaryStorageBudgetMismatch => formatter.write_str(
                 "the offered mount does not read back the admitted temporary-storage budget",
+            ),
+            Self::WorkloadIdentityUnenforceable(reason) => write!(
+                formatter,
+                "the host cannot separate the workload identity from the supervisor's: {reason}"
             ),
             Self::TemporaryStorageTmpdirConflict => formatter.write_str(
                 "the document binds TMPDIR, which the temporary-storage budget must own",
@@ -699,6 +727,13 @@ pub struct AdmissionContextParts {
     /// nothing: [`admit`] refuses with
     /// [`AdmissionRefusal::TemporaryStorageUnenforceable`].
     pub temporary_storage: TemporaryStorageEnforcement,
+    /// Whether this host can give the workload a host uid of its own.
+    ///
+    /// A standing host answer decided once by the caller through the
+    /// capability probe's helper-backed identity finding. Every launch
+    /// switches identity, so a host that cannot runs nothing: [`admit`]
+    /// refuses with [`AdmissionRefusal::WorkloadIdentityUnenforceable`].
+    pub workload_identity: WorkloadIdentityEnforcement,
 }
 
 /// The validated runtime half of one admission.
@@ -842,6 +877,12 @@ impl AdmissionContext {
     #[must_use]
     pub const fn temporary_storage(&self) -> &TemporaryStorageEnforcement {
         &self.parts.temporary_storage
+    }
+
+    /// Whether this host can give the workload a host uid of its own.
+    #[must_use]
+    pub const fn workload_identity(&self) -> &WorkloadIdentityEnforcement {
+        &self.parts.workload_identity
     }
 }
 
@@ -1142,6 +1183,7 @@ pub fn admit(
     let broker = check_egress(spec, context)?;
     let limits = map_quotas(spec, context)?;
     let temporary_storage_budget = map_temporary_storage(spec, context)?;
+    require_workload_identity(context)?;
     let prompt = resolve_prompt(spec, context)?;
     let plan = build_plan(spec, context, prompt)?;
     let spec_digest = spec.canonical_digest().map_err(AdmissionRefusal::Digest)?;
@@ -1190,6 +1232,20 @@ fn map_temporary_storage(
     let bytes = spec.sandbox().budgets().temporary_storage().quantity();
     TemporaryStorageBudget::from_bytes(bytes)
         .map_err(|_| AdmissionRefusal::QuotaRejected("sandbox.budgets.temporary_storage"))
+}
+
+/// Refuse fail-closed when the host cannot separate the workload's identity.
+///
+/// There is no document field to map: every launch switches identity, and
+/// the only question is whether this host lets it. The answer is the caller's
+/// standing one, taken from the launch helper's own probe.
+fn require_workload_identity(context: &AdmissionContext) -> Result<(), AdmissionRefusal> {
+    match context.workload_identity() {
+        WorkloadIdentityEnforcement::Available => Ok(()),
+        WorkloadIdentityEnforcement::Unavailable(reason) => Err(
+            AdmissionRefusal::WorkloadIdentityUnenforceable(reason.clone()),
+        ),
+    }
 }
 
 /// Refuse every runner-owned admission field that names an unbuilt subsystem.

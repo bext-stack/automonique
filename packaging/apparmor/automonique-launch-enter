@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Elastic-2.0
+#
+# AppArmor profile for the Automonique launch entry helper.
+#
+# The helper separates the workload's identity from the supervisor's by
+# creating an unprivileged user namespace and switching to a subordinate uid
+# inside it. On hosts that set `kernel.apparmor_restrict_unprivileged_userns`
+# (Ubuntu 24.04 and later), an unconfined process that creates a user
+# namespace is moved to the `unprivileged_userns` profile, which denies every
+# capability inside the namespace, including the `CAP_SETUID` the switch needs.
+# This profile grants the helper `userns` so it keeps its capabilities inside
+# the namespace it creates. It confines nothing else: the workload's own
+# boundary is the cgroup, Landlock, seccomp and the identity switch itself.
+#
+# Attachment: every path the helper is launched from. The release layout keeps
+# it under the state directory (`bin/` and each release's `bin/`); the two
+# `rust/target` entries cover a development checkout's test builds. Adjust the
+# attachment if the state directory lives elsewhere, then reload:
+#
+#   install -m 0644 packaging/apparmor/automonique-launch-enter \
+#     /etc/apparmor.d/automonique-launch-enter
+#   apparmor_parser -r /etc/apparmor.d/automonique-launch-enter
+#
+# Verify with `automonique-launch-enter --probe-workload-identity`, which
+# prints the host uid a workload would run under, or the typed reason it
+# cannot.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile automonique-launch-enter @{HOME}{.automonique-live/automonique/{bin,improvement-code/releases/*/bin},automonique/{,.claude/worktrees/*/}rust/target/{debug,release}}/automonique-launch-enter flags=(unconfined) {
+  userns,
+
+  # Site-specific additions and overrides. See local/README for details.
+  include if exists <local/automonique-launch-enter>
+}

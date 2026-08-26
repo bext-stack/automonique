@@ -42,7 +42,7 @@ use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, Work
 use automonique_runner::admission::{
     AdmissionContext, AdmissionContextParts, AdmissionRefusal, AdmittedLaunch,
     INFORMATIONAL_FIELDS, PromptSource, ResolvedPrompt, TemporaryStorageEnforcement,
-    UnenforcedBudget, admit,
+    UnenforcedBudget, WorkloadIdentityEnforcement, admit,
 };
 use automonique_runner::filesystem::PathIntent;
 use automonique_runner::{
@@ -282,6 +282,9 @@ fn context_parts(root: &Path) -> AdmissionContextParts {
         // storage budget; tests that need the fail-closed direction override
         // this field.
         temporary_storage: TemporaryStorageEnforcement::Available,
+        // Likewise for the workload identity: the mappable host can separate
+        // it, and the fail-closed test below says otherwise.
+        workload_identity: WorkloadIdentityEnforcement::Available,
     }
 }
 
@@ -1186,6 +1189,27 @@ fn a_host_that_cannot_mount_refuses_the_temporary_storage_budget() {
     match error {
         AdmissionRefusal::TemporaryStorageUnenforceable(reason) => {
             assert!(reason.contains("/dev/fuse"), "the refusal must carry why");
+        }
+        other => panic!("got {other:?}"),
+    }
+}
+
+#[test]
+fn a_host_that_cannot_separate_the_workload_identity_refuses_every_document() {
+    let workspace = TempDir::new("identity-unenforceable");
+    let error = admit_with_context(workspace.path(), |context| {
+        context.workload_identity = WorkloadIdentityEnforcement::Unavailable(
+            "credential_switch_refused: the uid switch inside the namespace was refused".to_owned(),
+        );
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("workload identity"));
+    match error {
+        AdmissionRefusal::WorkloadIdentityUnenforceable(reason) => {
+            assert!(
+                reason.contains("credential_switch_refused"),
+                "the refusal must carry the helper's typed denial: {reason}"
+            );
         }
         other => panic!("got {other:?}"),
     }
