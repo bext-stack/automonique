@@ -44,7 +44,6 @@ use automonique_runner::admission::{
     BrokeredScope, INFORMATIONAL_FIELDS, PromptSource, ProviderIdentityBinding,
     ProviderIdentityPolicy, ResolvedPrompt, SESSION_SENTINEL_DIGITS, SESSION_SENTINEL_PREFIX,
     TemporaryStorageEnforcement, UnenforcedBudget, admit,
-    refuse_identity_temporary_storage_conflict,
 };
 use automonique_runner::filesystem::PathIntent;
 use automonique_runner::{
@@ -55,9 +54,9 @@ use automonique_runner::{
     LaunchPlan, LaunchPlanError, ModelRoutingDigest, PersonaDigest, PortabilityPolicy,
     ProfileDigest, PromptDeliveryPlan, ProtectedPromptReference, RemoteAttestationPolicy,
     RequiredCapabilities, RunContainment, RunCoordinates, RunOrigin, RunSpec, RunSpecParts,
-    RunnerEventDialect, SchedulerDecisionDigest, SchedulerReservationBinding,
-    SchedulerReservationId, SkillsetDigest, ToolsetDigest, WorkspaceRegistryId,
-    WorkspaceReservation,
+    RunnerEventDialect, STATFS_BLOCK_BYTES, SchedulerDecisionDigest, SchedulerReservationBinding,
+    SchedulerReservationId, SkillsetDigest, TemporaryStorageBudget, TemporaryStorageMount,
+    ToolsetDigest, WorkspaceRegistryId, WorkspaceReservation,
 };
 use sha2::{Digest as _, Sha256};
 use std::ffi::OsString;
@@ -1198,26 +1197,104 @@ fn a_host_that_cannot_mount_refuses_the_temporary_storage_budget() {
 }
 
 #[test]
-fn identity_separation_and_the_temporary_storage_mount_cannot_combine() {
-    // The rule is a pure function of the plan, pinned here exactly as
-    // `AdmittedLaunch::with_temporary_storage` consults it: no document field
-    // can request identity separation yet, so this seam is where the
-    // combination is kept apart.
-    let digest = "a".repeat(64);
-    let plain = automonique_runner::LaunchPlan::new("/usr/bin/true", &digest).unwrap();
-    assert!(refuse_identity_temporary_storage_conflict(&plain).is_ok());
+fn a_document_requiring_uid_separation_is_admitted_to_a_separated_plan() {
+    // THE DOCUMENT'S REQUEST IS A REQUIRED FEATURE, NOT A NEW FIELD.
+    //
+    // `sandbox.required_features` already names the kernel boundary properties
+    // a launch must enforce, and `uid_separation` is one of them. A document
+    // that names it, on a host that offers it, is admitted to a plan that
+    // separates; one that does not name it is admitted to a plan that does not.
+    let workspace = TempDir::new("uid-separation");
+    let uid_separation =
+        RequiredFeature::new("uid_separation", std::slice::from_ref(&implementation())).unwrap();
+    let process_boundary =
+        RequiredFeature::new("process_boundary", std::slice::from_ref(&implementation())).unwrap();
 
-    let separated = plain.separate_workload_identity().unwrap();
-    let error = refuse_identity_temporary_storage_conflict(&separated).unwrap_err();
-    assert!(matches!(
-        error,
-        AdmissionRefusal::WorkloadIdentityTemporaryStorageConflict
-    ));
-    let rendered = error.to_string();
+    let plain = admit(&mappable_spec(), &mappable_context(workspace.path())).unwrap();
     assert!(
-        rendered.contains("child user namespace") && rendered.contains("FUSE"),
-        "the refusal must name the kernel limitation: {rendered}"
+        !plain.plan().separates_workload_identity(),
+        "a document that does not ask keeps the supervisor's identity"
     );
+
+    let mut sandbox = sandbox_parts();
+    sandbox.required_features =
+        RequiredFeatures::declare(&[process_boundary, uid_separation]).unwrap();
+    let mut parts = spec_parts();
+    parts.sandbox = SandboxSpec::compile(sandbox).unwrap();
+    let spec = RunSpec::new(parts).unwrap();
+
+    // Fail-closed first: a host that does not offer the feature refuses the
+    // document at the negotiation, before any plan is built.
+    let error = admit(&spec, &mappable_context(workspace.path())).unwrap_err();
+    assert!(
+        matches!(error, AdmissionRefusal::HostFeatureRejected(_)),
+        "an unoffered feature is refused at the negotiation, got {error:?}"
+    );
+
+    let mut context = context_parts(workspace.path());
+    context.host_features = vec![
+        HostFeature::new("process_boundary", implementation()).unwrap(),
+        HostFeature::new("uid_separation", implementation()).unwrap(),
+    ];
+    let admitted = admit(&spec, &AdmissionContext::new(context).unwrap()).unwrap();
+    assert!(
+        admitted.plan().separates_workload_identity(),
+        "a document requiring uid_separation is admitted to a separated plan"
+    );
+    // And the mount the launch will perform is attached by the same one
+    // composition step that grants the mountpoint and binds TMPDIR.
+    let mountpoint = workspace.path().join("scratch");
+    fs::create_dir(&mountpoint).unwrap();
+    let pending = automonique_runner::WorkloadTempfs::prepare(
+        &mountpoint,
+        admitted.temporary_storage_budget(),
+    )
+    .unwrap();
+    let attached = admitted
+        .with_temporary_storage(&automonique_runner::RunTempfs::Workload(Box::new(pending)))
+        .unwrap();
+    let mount = attached
+        .plan()
+        .temporary_storage_mount()
+        .expect("a separated plan carries the mount its launch performs");
+    assert_eq!(mount.mountpoint(), fs::canonicalize(&mountpoint).unwrap());
+    assert_eq!(mount.budget(), attached.temporary_storage_budget());
+}
+
+#[test]
+fn identity_separation_carries_the_mount_the_launch_performs() {
+    // The mount site follows the plan, so the pair that used to be a typed
+    // refusal is now one composition. A separated plan carries the mount
+    // request the launch performs; a plan that keeps the supervisor's identity
+    // refuses that line outright, because it has no namespace to mount in.
+    let digest = "a".repeat(64);
+    let budget = TemporaryStorageBudget::from_bytes(STATFS_BLOCK_BYTES).unwrap();
+    let mount = TemporaryStorageMount::new("/run/scratch", budget);
+    let plain = automonique_runner::LaunchPlan::new("/usr/bin/true", &digest).unwrap();
+    let error = plain
+        .clone()
+        .mount_temporary_storage(mount.clone())
+        .unwrap()
+        .encode()
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("identity separation"),
+        "a plan without a namespace cannot mount: {error}"
+    );
+
+    let separated = plain
+        .separate_workload_identity()
+        .unwrap()
+        .mount_temporary_storage(mount)
+        .unwrap();
+    let frame = separated.encode().unwrap();
+    let decoded = automonique_runner::LaunchPlan::decode(&frame).unwrap();
+    assert_eq!(decoded, separated);
+    let carried = decoded
+        .temporary_storage_mount()
+        .expect("the frame carries the mount");
+    assert_eq!(carried.mountpoint(), std::path::Path::new("/run/scratch"));
+    assert_eq!(carried.budget(), budget);
 }
 
 #[test]

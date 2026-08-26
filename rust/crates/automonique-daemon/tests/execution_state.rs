@@ -18,7 +18,6 @@ use std::time::{Duration, Instant};
 use automonique_daemon::{Daemon, DaemonConfig};
 use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse, ExecutionState};
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
-use automonique_runner::capability::HostCapabilities;
 
 #[path = "support/isolation.rs"]
 mod test_isolation;
@@ -96,8 +95,8 @@ fn reported_execution_state_matches_an_independent_measurement() {
 
     // The independent measurement asks for exactly the properties the
     // composed launch path enforces — the same question the daemon asks.
-    let independent =
-        HostCapabilities::probe().select_mode(&automonique_daemon::execute::ENFORCED_PROPERTIES);
+    let independent = automonique_daemon::execute::probe_host()
+        .select_mode(&automonique_daemon::execute::ENFORCED_PROPERTIES);
     let expected = match independent {
         Ok(_) => ExecutionState::SandboxEnforceableLaneWired,
         Err(_) => ExecutionState::SandboxUnavailableLaneWired,

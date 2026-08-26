@@ -30,7 +30,8 @@ use automonique_agents::{
 };
 use automonique_protocol::provenance::{CausationId, CorrelationId, Provenance, TraceId};
 use automonique_runner::{
-    LaunchPlan, LaunchPlanError, RunContainment, SandboxedSession, spawn_sandboxed_session,
+    LaunchPlan, LaunchPlanError, RunContainment, SandboxedSession, TempfsRendezvous,
+    spawn_sandboxed_session_with_tempfs,
 };
 use automonique_store::provider_journal::{
     ApprovalDecision, ApprovalRecord, BindingRecord, CursorAdvance, FinishReason,
@@ -236,6 +237,7 @@ impl JcodeSessionHost {
         expected_server: &str,
         now_ms: i64,
         startup_timeout: Duration,
+        temporary_storage: Option<TempfsRendezvous>,
     ) -> Result<Self, JcodeHostError> {
         validate_key(logical_key, "logical_key")?;
         if now_ms < 0 || !working_dir.is_absolute() {
@@ -267,8 +269,13 @@ impl JcodeSessionHost {
             &configuration_sha256,
             expected_server,
         )?;
-        let mut process = spawn_sandboxed_session(helper, &launch_plan, &containment)
-            .map_err(JcodeHostError::Launch)?;
+        let mut process = spawn_sandboxed_session_with_tempfs(
+            helper,
+            &launch_plan,
+            &containment,
+            temporary_storage,
+        )
+        .map_err(JcodeHostError::Launch)?;
         let stream = match process.try_clone_stream() {
             Ok(stream) => stream,
             Err(error) => {

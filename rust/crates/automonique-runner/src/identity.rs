@@ -628,17 +628,39 @@ fn verify_mapper(path: &Path) -> Result<(), IdentityError> {
 
 /// Give the calling process the workload identity, irreversibly.
 ///
-/// Runs in the entry helper between program staging and descriptor closure,
-/// and in the probe child. The sequence is: resolve the plan; spawn the
-/// mapper; `unshare(CLONE_NEWUSER)`; release the mapper and wait for it; read
-/// the kernel's maps back; switch to the workload uid; shape the capability
-/// sets; read the process status back; set the umask. Any failure is a typed
-/// refusal, and a process that returns `Ok` *is* the workload identity by the
-/// kernel's own account.
+/// Runs in the probe child, and in the entry helper for a launch that mounts
+/// nothing between the two halves. The sequence is: resolve the plan; spawn
+/// the mapper; `unshare(CLONE_NEWUSER)`; release the mapper and wait for it;
+/// read the kernel's maps back ([`enter_workload_namespace`]); switch to the
+/// workload uid; shape the capability sets; read the process status back; set
+/// the umask ([`assume_workload_identity`]). Any failure is a typed refusal,
+/// and a process that returns `Ok` *is* the workload identity by the kernel's
+/// own account.
 ///
 /// The caller must be single-threaded: `unshare(CLONE_NEWUSER)` refuses a
 /// threaded process, and the credential calls are per-thread on Linux.
 pub fn separate_workload_identity() -> Result<WorkloadIdentity, IdentityError> {
+    let plan = enter_workload_namespace()?;
+    assume_workload_identity(&plan)
+}
+
+/// Enter the workload's user namespace and confirm its maps, without yet
+/// giving up in-namespace root.
+///
+/// This is the first half of [`separate_workload_identity`], split out because
+/// there is exactly one thing that must happen between the two halves: the
+/// per-run temporary filesystem is mounted here, by the only process that can
+/// mount it where the workload can reach it. A caller that returns from this
+/// function is namespace-root — uid 0 in a user namespace it owns, holding a
+/// full capability set *inside* that namespace and none outside it — which is
+/// what `unshare(CLONE_NEWNS)` and an unprivileged FUSE mount both require.
+///
+/// A caller that enters must go on to [`assume_workload_identity`]. Nothing
+/// enforces that in the type system, because the launch helper is the only
+/// caller and it refuses the launch on every path where it cannot; what would
+/// be worse than a compile error is a workload that runs as namespace-root,
+/// and no path here returns one.
+pub fn enter_workload_namespace() -> Result<IdentityPlan, IdentityError> {
     let plan = resolve_identity_plan()?;
 
     // The mapper is this very binary, spawned through `/proc/self/exe` so a
@@ -697,8 +719,19 @@ pub fn separate_workload_identity() -> Result<WorkloadIdentity, IdentityError> {
     }
 
     confirm_maps(&plan)?;
-    switch_credentials(&plan)?;
-    confirm_identity(&plan)?;
+    Ok(plan)
+}
+
+/// Become the workload identity inside the namespace
+/// [`enter_workload_namespace`] created: switch to the workload uid, shape the
+/// capability sets down to the three the workload keeps, read the whole
+/// credential state back from the kernel, and set the umask.
+///
+/// A process that returns `Ok` *is* the workload identity by the kernel's own
+/// account.
+pub fn assume_workload_identity(plan: &IdentityPlan) -> Result<WorkloadIdentity, IdentityError> {
+    switch_credentials(plan)?;
+    confirm_identity(plan)?;
 
     let _previous = nix::sys::stat::umask(
         nix::sys::stat::Mode::from_bits(WORKLOAD_UMASK).expect("the umask is a mode"),

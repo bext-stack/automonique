@@ -433,6 +433,22 @@ impl QuotaFs {
     }
 }
 
+/// The `statfs` answer this filesystem would give the kernel right now.
+///
+/// The same call the FUSE `statfs` handler makes, reachable without the
+/// kernel round trip. A mount performed inside a workload's own mount
+/// namespace has no path the supervisor can `statvfs`, so this is where its
+/// reconcile takes the filesystem's account of itself: the ledger, which
+/// nothing but kernel-delivered FUSE requests ever moves.
+#[must_use]
+pub fn statfs_view(state: &SharedState) -> crate::tempfs_ledger::StatfsView {
+    state
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .ledger
+        .statfs()
+}
+
 /// Read the ledger out of a shared state.
 #[must_use]
 pub fn snapshot(state: &SharedState) -> LedgerSnapshot {

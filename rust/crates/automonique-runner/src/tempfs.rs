@@ -12,11 +12,27 @@
 //! refuses to report success until `/proc/self/mountinfo` shows a FUSE mount
 //! of this crate's subtype owned by this uid at the mountpoint, and
 //! `statvfs(2)` on it returns the budget that was asked for.
+//!
+//! That is one of two mount sites. A plan whose workload identity is separated
+//! cannot use it at all — FUSE refuses a process in a child user namespace —
+//! so its filesystem is mounted by the launch, inside the namespaces the
+//! launch creates, and handed back here over a socket
+//! ([`crate::tempfs_namespace`]). The site follows from the plan
+//! ([`RunTempfs::provide`]), not from a caller's choice, so the wrong one
+//! cannot be attached to a run. Everything after the `mount(2)` is shared: the
+//! same [`crate::tempfs_fs::QuotaFs`] served in this process, the same ledger,
+//! the same checkpoint, the same exceedance channel, the same reconcile. What
+//! differs is what a reconcile can read — a mount in the workload's own mount
+//! namespace is in no table this process can see, so its readback is the
+//! filesystem's own `statfs` rather than a `statvfs` round trip, and its
+//! unmount is the namespace's death rather than a `fusermount3 -u`.
 
 use crate::backend::TemporaryStorageWatch;
+use crate::launch::LaunchPlan;
 use crate::tempfs_checkpoint::{Checkpoint, FinalRecord, Phase, now_millis};
-use crate::tempfs_fs::{ExceedanceChannel, QuotaFs, SharedState, snapshot};
+use crate::tempfs_fs::{ExceedanceChannel, QuotaFs, SharedState, snapshot, statfs_view};
 use crate::tempfs_ledger::{LedgerSnapshot, TemporaryStorageBudget};
+use crate::tempfs_namespace::{TemporaryStorageMount, receive_mount, release};
 use crate::tempfs_readback::{
     MountEvidence, MountStatus, ReadbackError, StatfsReadback, abort_connection, classify, inspect,
     mount_evidence, mount_table, statfs_bounded,
@@ -33,7 +49,7 @@ use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _}
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The kernel's FUSE control device.
@@ -236,6 +252,11 @@ pub enum MountError {
         budget: TemporaryStorageBudget,
         observed: Box<Result<StatfsReadback, ReadbackError>>,
     },
+    /// The launch was to mount the filesystem inside the workload's own
+    /// namespaces and the handover did not complete. The string is what the
+    /// rendezvous refused with; nothing was left mounted, because the mount
+    /// only ever existed in a namespace that dies with the refused launch.
+    Rendezvous(String),
 }
 
 impl fmt::Display for MountError {
@@ -269,6 +290,9 @@ impl fmt::Display for MountError {
                 formatter,
                 "statvfs did not read back the budget {budget}: {observed:?}"
             ),
+            Self::Rendezvous(reason) => {
+                write!(formatter, "the launch did not hand back a mount: {reason}")
+            }
         }
     }
 }
@@ -289,6 +313,10 @@ pub enum UnmountError {
     /// The mount table still shows the mount after the helper reported
     /// success.
     StillMounted(Box<MountEvidence>),
+    /// The launch was to mount the filesystem and never did, so there is no
+    /// mount to reconcile and no ledger the kernel ever touched. The run was
+    /// refused before the workload existed.
+    NeverMounted,
 }
 
 impl fmt::Display for UnmountError {
@@ -303,6 +331,9 @@ impl fmt::Display for UnmountError {
             Self::MountTable(error) => write!(formatter, "mount table unreadable: {error}"),
             Self::StillMounted(evidence) => {
                 write!(formatter, "still mounted after unmount: {evidence}")
+            }
+            Self::NeverMounted => {
+                formatter.write_str("the launch never mounted the temporary filesystem")
             }
         }
     }
@@ -361,11 +392,33 @@ impl fmt::Display for Outcome {
     }
 }
 
+/// Which side of the launch performed the mount, and therefore what a
+/// reconcile can read and who takes it down.
+///
+/// One filesystem, one ledger, one checkpoint and one supervisor-side server
+/// either way; the difference is entirely the `mount(2)`.
+#[derive(Clone, Debug)]
+enum MountSite {
+    /// The supervisor mounted it through the setuid `fusermount3`, in its own
+    /// mount namespace. It can see the mount in its own table, `statvfs` the
+    /// mountpoint, and unmount it by name.
+    Supervisor { fusermount: PathBuf },
+    /// The launch helper mounted it inside the workload's user and mount
+    /// namespaces and handed the connection back
+    /// ([`crate::tempfs_namespace`]). The mount is private to that namespace:
+    /// it is in no table the supervisor can read, there is no path here to
+    /// `statvfs`, and there is nothing to unmount — the namespace dies with
+    /// the run tree and takes the mount with it, and the kernel closing this
+    /// connection is the evidence that it did. The ledger, which only
+    /// kernel-delivered FUSE requests move, is the readback.
+    Workload,
+}
+
 /// A mounted, serving temporary-storage filesystem. Dropping it detaches the
 /// mount.
 pub struct MountedTempfs {
     mountpoint: PathBuf,
-    fusermount: PathBuf,
+    site: MountSite,
     budget: TemporaryStorageBudget,
     state: SharedState,
     channel: Arc<ExceedanceChannel>,
@@ -422,7 +475,9 @@ impl MountedTempfs {
             };
         let mut mounted = Self {
             mountpoint,
-            fusermount: verified.fusermount.clone(),
+            site: MountSite::Supervisor {
+                fusermount: verified.fusermount.clone(),
+            },
             budget,
             state,
             channel,
@@ -550,9 +605,24 @@ impl MountedTempfs {
     /// What a supervisor polls to contain a run on its first refusal and reads
     /// back from once the run is dead: the channel and the mountpoint, without
     /// the mount itself, which stays here to be reconciled after the run.
+    ///
+    /// A mount the supervisor performed is read back through `statvfs` on its
+    /// own mountpoint. A mount the launch performed is private to the
+    /// workload's mount namespace, so its readback is the filesystem's own
+    /// `statfs` answer, computed from the ledger by the same call the kernel
+    /// would have reached.
     #[must_use]
     pub fn watch(&self) -> TemporaryStorageWatch {
-        TemporaryStorageWatch::new(Arc::clone(&self.channel), &self.mountpoint)
+        match self.site {
+            MountSite::Supervisor { .. } => {
+                TemporaryStorageWatch::new(Arc::clone(&self.channel), &self.mountpoint)
+            }
+            MountSite::Workload => TemporaryStorageWatch::served(
+                Arc::clone(&self.channel),
+                &self.mountpoint,
+                Arc::clone(&self.state),
+            ),
+        }
     }
 
     /// The ledger as it stands right now.
@@ -581,6 +651,37 @@ impl MountedTempfs {
     /// supervisor's in-memory copy either way, so the consumed-budget record
     /// survives an unresponsive server.
     pub fn reconcile(mut self, deadline: Duration) -> Result<Outcome, UnmountError> {
+        let (statfs_before_unmount, aborted, unmount_confirmed) = match self.site.clone() {
+            MountSite::Supervisor { fusermount } => self.detach_own_mount(&fusermount, deadline)?,
+            MountSite::Workload => self.release_workload_mount(deadline),
+        };
+        self.detached = true;
+        finish_session(self.session.take(), SESSION_JOIN_DEADLINE);
+        let outcome = Outcome {
+            budget: self.budget,
+            ledger: self.snapshot(),
+            evidence: self.evidence.clone(),
+            statfs_at_mount: self.statfs_at_mount,
+            statfs_before_unmount,
+            aborted,
+            unmount_confirmed,
+        };
+        // Best effort: the outcome is the supervisor's to report regardless,
+        // and a checkpoint that cannot be written is not a reason to fail a
+        // reconcile that already produced the record.
+        let _ = self.checkpoint_final(&outcome);
+        Ok(outcome)
+    }
+}
+
+impl MountedTempfs {
+    /// Read back and detach a mount this supervisor performed: the behaviour
+    /// the enforced budget has always had.
+    fn detach_own_mount(
+        &mut self,
+        fusermount: &Path,
+        deadline: Duration,
+    ) -> Result<(Option<StatfsReadback>, bool, bool), UnmountError> {
         let already_gone = mount_evidence(&self.mountpoint)
             .map_err(UnmountError::MountTable)?
             .is_none();
@@ -599,38 +700,51 @@ impl MountedTempfs {
             }
         };
         if !already_gone {
-            run_unmount(&self.fusermount, &self.mountpoint, false).or_else(|error| {
+            run_unmount(fusermount, &self.mountpoint, false).or_else(|error| {
                 // A non-lazy unmount can refuse EBUSY if a descriptor is still
                 // open; on the abort path the connection is already dead, so a
                 // lazy detach is correct and cannot leave a writable mount.
                 if aborted {
-                    run_unmount(&self.fusermount, &self.mountpoint, true)
+                    run_unmount(fusermount, &self.mountpoint, true)
                 } else {
                     Err(error)
                 }
             })?;
         }
-        self.detached = true;
-        finish_session(self.session.take(), SESSION_JOIN_DEADLINE);
-        let unmount_confirmed =
-            match mount_evidence(&self.mountpoint).map_err(UnmountError::MountTable)? {
-                None => true,
-                Some(evidence) => return Err(UnmountError::StillMounted(Box::new(evidence))),
-            };
-        let outcome = Outcome {
-            budget: self.budget,
-            ledger: self.snapshot(),
-            evidence: self.evidence.clone(),
-            statfs_at_mount: self.statfs_at_mount,
-            statfs_before_unmount,
-            aborted,
-            unmount_confirmed,
-        };
-        // Best effort: the outcome is the supervisor's to report regardless,
-        // and a checkpoint that cannot be written is not a reason to fail a
-        // reconcile that already produced the record.
-        let _ = self.checkpoint_final(&outcome);
-        Ok(outcome)
+        match mount_evidence(&self.mountpoint).map_err(UnmountError::MountTable)? {
+            None => Ok((statfs_before_unmount, aborted, true)),
+            Some(evidence) => Err(UnmountError::StillMounted(Box::new(evidence))),
+        }
+    }
+
+    /// Let go of a mount the launch performed inside the workload's own
+    /// namespaces.
+    ///
+    /// There is nothing here to unmount: the mount lives in a mount namespace
+    /// this process is not in, and that namespace dies with the run tree the
+    /// caller has already disposed. What the supervisor owns is the
+    /// connection, and the kernel closing it — which is what the last mount
+    /// going away does — is the evidence the mount is gone. A connection still
+    /// alive after `deadline` means something in that namespace outlived the
+    /// disposal, so it is aborted through `fusectl`: after that write every
+    /// request on it fails with `ENOTCONN` and no writable scratch space
+    /// remains, whoever is still holding it.
+    ///
+    /// The readback is the filesystem's own `statfs`, taken from the ledger by
+    /// the same call the kernel's `statvfs` would have reached. It is always
+    /// available, which is why this path records one where the supervisor's
+    /// own mount can record `statfs unavailable`.
+    fn release_workload_mount(
+        &mut self,
+        deadline: Duration,
+    ) -> (Option<StatfsReadback>, bool, bool) {
+        let statfs = Some(ledger_statfs(&self.state));
+        if wait_for_session(self.session.as_ref(), deadline) {
+            return (statfs, false, true);
+        }
+        let _ = abort_connection(&self.evidence);
+        let confirmed = wait_for_session(self.session.as_ref(), SESSION_JOIN_DEADLINE);
+        (statfs, true, confirmed)
     }
 }
 
@@ -639,11 +753,426 @@ impl Drop for MountedTempfs {
         if self.detached {
             return;
         }
-        // Best effort, and lazy: on this path the owner is going away, so the
-        // mount must not outlive it even if a descriptor is still open. The
-        // server thread ends once the kernel closes the connection.
-        let _ = run_unmount(&self.fusermount, &self.mountpoint, true);
+        match &self.site {
+            MountSite::Supervisor { fusermount } => {
+                // Best effort, and lazy: on this path the owner is going away,
+                // so the mount must not outlive it even if a descriptor is
+                // still open. The server thread ends once the kernel closes
+                // the connection.
+                let _ = run_unmount(fusermount, &self.mountpoint, true);
+            }
+            MountSite::Workload => {
+                // Nothing to detach and nothing that could outlive this: the
+                // mount is in the workload's own mount namespace, and aborting
+                // the connection makes it answer `ENOTCONN` to whatever is
+                // left there. The abort is also what unblocks the server
+                // thread below.
+                let _ = abort_connection(&self.evidence);
+            }
+        }
         finish_session(self.session.take(), SESSION_JOIN_DEADLINE);
+    }
+}
+
+/// Whether the FUSE session ended within `deadline`.
+fn wait_for_session(session: Option<&BackgroundSession>, deadline: Duration) -> bool {
+    let Some(session) = session else {
+        return true;
+    };
+    let until = Instant::now() + deadline;
+    loop {
+        if session.guard.is_finished() {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The `statfs` this filesystem would answer the kernel with, right now.
+///
+/// Crate-visible because a watch on a mount the supervisor cannot see reads
+/// back through the same call.
+pub(crate) fn ledger_statfs(state: &SharedState) -> StatfsReadback {
+    let view = statfs_view(state);
+    StatfsReadback {
+        block_size: u64::from(view.block_bytes),
+        fragment_size: u64::from(view.block_bytes),
+        blocks: view.blocks,
+        blocks_free: view.blocks_free,
+        blocks_available: view.blocks_free,
+        files: view.files,
+        files_free: view.files_free,
+        name_max: u64::from(view.name_max),
+    }
+}
+
+/// A run's temporary filesystem when the *launch* is what mounts it.
+///
+/// Created before the launch, so the supervisor can watch and reconcile the
+/// run whatever the launch does, and completed by the launch's own rendezvous
+/// ([`crate::tempfs_namespace`]). Everything a supervisor needs before the
+/// mount exists — the exceedance channel it polls, the ledger it reads back,
+/// the mountpoint the plan grants — exists from construction; only the
+/// `mount(2)` and the kernel evidence wait.
+pub struct WorkloadTempfs {
+    mountpoint: PathBuf,
+    budget: TemporaryStorageBudget,
+    checkpoint_path: Option<PathBuf>,
+    state: SharedState,
+    channel: Arc<ExceedanceChannel>,
+    /// The uid the filesystem's nodes are owned by, which must be the uid the
+    /// workload sees itself as inside its namespace.
+    node_uid: u32,
+    /// Taken by [`Self::rendezvous`], once.
+    filesystem: Option<QuotaFs>,
+    mounted: Arc<Mutex<Option<MountedTempfs>>>,
+}
+
+impl fmt::Debug for WorkloadTempfs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkloadTempfs")
+            .field("mountpoint", &self.mountpoint)
+            .field("budget", &self.budget)
+            .field("mounted", &self.is_mounted())
+            .finish_non_exhaustive()
+    }
+}
+
+impl WorkloadTempfs {
+    /// Prepare `budget` at `mountpoint` for a launch to mount.
+    ///
+    /// The mountpoint is checked here, by the supervisor that owns it, for
+    /// exactly what [`MountedTempfs::mount`] checks: an empty directory this
+    /// uid owns that is not already a mountpoint. The launch checks it again
+    /// inside its own namespace, because between the two checks the only
+    /// process that could change it is the supervisor itself.
+    ///
+    /// # Errors
+    ///
+    /// [`MountError::MountpointRejected`] for anything else, and
+    /// [`MountError::MountTable`] when the mount table cannot be read.
+    pub fn prepare(mountpoint: &Path, budget: TemporaryStorageBudget) -> Result<Self, MountError> {
+        let mountpoint = validate_mountpoint(mountpoint)?;
+        // Finding 3 of the in-namespace mount: the nodes must be owned by the
+        // uid the workload sees itself as. The identity map re-uses the
+        // supervisor's uid number as the workload's namespace uid, so this is
+        // that number — and the launch reports what it actually got, which the
+        // rendezvous refuses unless it is this.
+        let node_uid = nix::unistd::getuid().as_raw();
+        let channel = Arc::new(ExceedanceChannel::default());
+        let filesystem = QuotaFs::new(
+            budget,
+            node_uid,
+            crate::identity::SUPERVISOR_NAMESPACE_ID,
+            Arc::clone(&channel),
+        );
+        Ok(Self {
+            mountpoint,
+            budget,
+            checkpoint_path: None,
+            state: filesystem.state(),
+            channel,
+            node_uid,
+            filesystem: Some(filesystem),
+            mounted: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// Bind a checkpoint file to this filesystem.
+    ///
+    /// The first checkpoint is written when the launch's mount arrives, not
+    /// here: before that there is no mount, no evidence and no ledger the
+    /// kernel has touched, and a checkpoint of those would be a claim rather
+    /// than a record.
+    #[must_use]
+    pub fn with_checkpoint(mut self, path: impl Into<PathBuf>) -> Self {
+        self.checkpoint_path = Some(path.into());
+        self
+    }
+
+    /// Exact mountpoint, canonical.
+    #[must_use]
+    pub fn mountpoint(&self) -> &Path {
+        &self.mountpoint
+    }
+
+    /// The budget in force.
+    #[must_use]
+    pub const fn budget(&self) -> TemporaryStorageBudget {
+        self.budget
+    }
+
+    /// The mount request the plan carries to the launch helper.
+    #[must_use]
+    pub fn request(&self) -> TemporaryStorageMount {
+        TemporaryStorageMount::new(self.mountpoint.clone(), self.budget)
+    }
+
+    /// What the supervision loop polls, and reads back from.
+    #[must_use]
+    pub fn watch(&self) -> TemporaryStorageWatch {
+        TemporaryStorageWatch::served(
+            Arc::clone(&self.channel),
+            &self.mountpoint,
+            Arc::clone(&self.state),
+        )
+    }
+
+    /// Whether the launch's mount has arrived.
+    #[must_use]
+    pub fn is_mounted(&self) -> bool {
+        self.mounted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Take the half of this that a launch consumes, once.
+    ///
+    /// The launch owns the rendezvous for exactly as long as the spawn takes:
+    /// it serves the descriptor the helper hands back and leaves the mount
+    /// here, where the supervisor reconciles it.
+    #[must_use]
+    pub fn rendezvous(&mut self) -> Option<TempfsRendezvous> {
+        let filesystem = self.filesystem.take()?;
+        Some(TempfsRendezvous {
+            mountpoint: self.mountpoint.clone(),
+            budget: self.budget,
+            checkpoint_path: self.checkpoint_path.clone(),
+            node_uid: self.node_uid,
+            filesystem,
+            channel: Arc::clone(&self.channel),
+            mounted: Arc::clone(&self.mounted),
+        })
+    }
+
+    /// Reconcile the launch's mount, exactly as a supervisor-mounted one is
+    /// reconciled.
+    ///
+    /// # Errors
+    ///
+    /// [`UnmountError::NeverMounted`] when the launch was refused before it
+    /// mounted anything; otherwise whatever the mount's own reconcile says.
+    pub fn reconcile(self, deadline: Duration) -> Result<Outcome, UnmountError> {
+        let mounted = self
+            .mounted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        mounted
+            .ok_or(UnmountError::NeverMounted)?
+            .reconcile(deadline)
+    }
+}
+
+/// The half of a [`WorkloadTempfs`] one launch consumes.
+///
+/// Moved into the spawn, which is the only place that holds the launch's own
+/// end of the rendezvous socket.
+pub struct TempfsRendezvous {
+    mountpoint: PathBuf,
+    budget: TemporaryStorageBudget,
+    checkpoint_path: Option<PathBuf>,
+    node_uid: u32,
+    filesystem: QuotaFs,
+    channel: Arc<ExceedanceChannel>,
+    mounted: Arc<Mutex<Option<MountedTempfs>>>,
+}
+
+impl fmt::Debug for TempfsRendezvous {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TempfsRendezvous")
+            .field("mountpoint", &self.mountpoint)
+            .field("budget", &self.budget)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TempfsRendezvous {
+    /// Take the launch's mount over `socket`, serve it, and keep it.
+    ///
+    /// Receives the `/dev/fuse` descriptor the launch mounted with, refuses
+    /// anything but a `fuse.<subtype>` mount at this mountpoint owned by
+    /// namespace-root and serving the identity the filesystem's nodes were
+    /// built for, starts the FUSE session, and only then releases the launch —
+    /// which answers with the `statvfs` it read in its own namespace, checked
+    /// here against the admitted budget before the launch is allowed to go on.
+    ///
+    /// # Errors
+    ///
+    /// [`MountError::Rendezvous`] for a socket that fails, a launch that
+    /// refuses, or a report that does not match; [`MountError::Session`] when
+    /// the FUSE session cannot be started. Every one of them refuses the
+    /// launch, and nothing is left mounted: the mount exists only in the
+    /// launch's own mount namespace, which dies with it.
+    pub fn complete(self, socket: &UnixStream) -> Result<(), MountError> {
+        let Self {
+            mountpoint,
+            budget,
+            checkpoint_path,
+            node_uid,
+            filesystem,
+            channel,
+            mounted,
+        } = self;
+        let state = filesystem.state();
+        let (descriptor, evidence) = receive_mount(socket, &mountpoint, FS_SUBTYPE, node_uid)
+            .map_err(MountError::Rendezvous)?;
+        let session =
+            Session::from_fd(filesystem, descriptor, SessionACL::Owner, Config::default())
+                .and_then(Session::spawn)
+                .map_err(MountError::Session)?;
+        let mut attached = MountedTempfs {
+            mountpoint,
+            site: MountSite::Workload,
+            budget,
+            state,
+            channel,
+            session: Some(session),
+            evidence,
+            statfs_at_mount: zero_statfs(),
+            checkpoint_path: None,
+            checkpoint_sequence: 0,
+            detached: false,
+        };
+        // From here a failure drops `attached`, which aborts the connection:
+        // the launch's mount answers `ENOTCONN` and the launch, still waiting
+        // on a socket that just closed, refuses itself.
+        attached.statfs_at_mount = release(socket, budget).map_err(MountError::Rendezvous)?;
+        if let Some(path) = checkpoint_path {
+            attached = attached
+                .with_checkpoint(path)
+                .map_err(|error| MountError::Rendezvous(error.to_string()))?;
+        }
+        *mounted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(attached);
+        Ok(())
+    }
+}
+
+/// A run's temporary filesystem, mounted where the plan's identity requires.
+///
+/// The mount site is derived from the plan rather than chosen beside it, so a
+/// plan whose workload runs in a child user namespace cannot be given a mount
+/// it would read `EACCES` from, and there is no rule to enforce that
+/// separately.
+pub enum RunTempfs {
+    /// The plan keeps the supervisor's identity, so the supervisor mounts.
+    Supervisor(Box<MountedTempfs>),
+    /// The plan separates the workload's identity, so the launch mounts inside
+    /// the namespaces it creates.
+    Workload(Box<WorkloadTempfs>),
+}
+
+impl fmt::Debug for RunTempfs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Supervisor(mounted) => {
+                formatter.debug_tuple("Supervisor").field(mounted).finish()
+            }
+            Self::Workload(pending) => formatter.debug_tuple("Workload").field(pending).finish(),
+        }
+    }
+}
+
+impl RunTempfs {
+    /// Provide `budget` at `mountpoint` for `plan`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the chosen site refuses with, before any workload exists.
+    pub fn provide(
+        plan: &LaunchPlan,
+        verified: &VerifiedFuse,
+        mountpoint: &Path,
+        budget: TemporaryStorageBudget,
+    ) -> Result<Self, MountError> {
+        if plan.separates_workload_identity() {
+            WorkloadTempfs::prepare(mountpoint, budget)
+                .map(|pending| Self::Workload(Box::new(pending)))
+        } else {
+            MountedTempfs::mount(verified, mountpoint, budget)
+                .map(|mounted| Self::Supervisor(Box::new(mounted)))
+        }
+    }
+
+    /// Bind a checkpoint file to whichever site holds the filesystem.
+    ///
+    /// # Errors
+    ///
+    /// The supervisor-mounted site writes its first checkpoint here and
+    /// reports a write that fails.
+    pub fn with_checkpoint(self, path: impl Into<PathBuf>) -> io::Result<Self> {
+        match self {
+            Self::Supervisor(mounted) => mounted
+                .with_checkpoint(path)
+                .map(|mounted| Self::Supervisor(Box::new(mounted))),
+            Self::Workload(pending) => Ok(Self::Workload(Box::new(pending.with_checkpoint(path)))),
+        }
+    }
+
+    /// Exact mountpoint, canonical.
+    #[must_use]
+    pub fn mountpoint(&self) -> &Path {
+        match self {
+            Self::Supervisor(mounted) => mounted.mountpoint(),
+            Self::Workload(pending) => pending.mountpoint(),
+        }
+    }
+
+    /// The budget in force.
+    #[must_use]
+    pub const fn budget(&self) -> TemporaryStorageBudget {
+        match self {
+            Self::Supervisor(mounted) => mounted.budget(),
+            Self::Workload(pending) => pending.budget(),
+        }
+    }
+
+    /// What the supervision loop polls, and reads back from.
+    #[must_use]
+    pub fn watch(&self) -> TemporaryStorageWatch {
+        match self {
+            Self::Supervisor(mounted) => mounted.watch(),
+            Self::Workload(pending) => pending.watch(),
+        }
+    }
+
+    /// The mount request this run's plan must carry, when the launch is what
+    /// mounts it.
+    #[must_use]
+    pub fn request(&self) -> Option<TemporaryStorageMount> {
+        match self {
+            Self::Supervisor(_) => None,
+            Self::Workload(pending) => Some(pending.request()),
+        }
+    }
+
+    /// Take the half of this that a launch consumes, once.
+    #[must_use]
+    pub fn rendezvous(&mut self) -> Option<TempfsRendezvous> {
+        match self {
+            Self::Supervisor(_) => None,
+            Self::Workload(pending) => pending.rendezvous(),
+        }
+    }
+
+    /// Reconcile the run's mount and assemble its outcome.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the site's own reconcile says.
+    pub fn reconcile(self, deadline: Duration) -> Result<Outcome, UnmountError> {
+        match self {
+            Self::Supervisor(mounted) => mounted.reconcile(deadline),
+            Self::Workload(pending) => pending.reconcile(deadline),
+        }
     }
 }
 

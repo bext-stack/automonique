@@ -91,10 +91,11 @@
 //! by its own pipe rather than by growing a buffer in this process.
 
 use crate::containment::{ContainmentDomain, ContainmentError, ContainmentLimits, RunContainment};
-use crate::launch::{LaunchError, LaunchPlan, StdoutCapture, spawn_sandboxed_with_stdout};
+use crate::launch::{LaunchError, LaunchPlan, StdoutCapture, spawn_sandboxed_with_tempfs};
 use crate::runner::CancellationToken;
 use crate::spool::{Authority, EventKind, Spool, SpoolError, Status};
-use crate::tempfs_fs::ExceedanceChannel;
+use crate::tempfs::{TempfsRendezvous, ledger_statfs};
+use crate::tempfs_fs::{ExceedanceChannel, SharedState};
 use crate::tempfs_ledger::Exceedance;
 use crate::tempfs_readback::{ReadbackError, StatfsReadback, statfs_bounded};
 use automonique_protocol::event::{
@@ -617,6 +618,7 @@ impl DirectProcessBackend {
             capture: None,
             observed: ObservedSequence::default(),
             temporary_storage: None,
+            temporary_storage_mount: None,
         })
     }
 }
@@ -642,6 +644,9 @@ pub struct PreparedRun {
     /// is contained the first time the ledger refuses it, and read back once
     /// the tree is dead so the spool carries the kernel's account of it.
     temporary_storage: Option<TemporaryStorageWatch>,
+    /// The launch's half of the temporary-storage rendezvous, when the plan's
+    /// own launch is what mounts the filesystem. Consumed by the spawn.
+    temporary_storage_mount: Option<TempfsRendezvous>,
 }
 
 /// What a supervisor watches to contain one run's temporary storage.
@@ -655,6 +660,35 @@ pub struct PreparedRun {
 pub struct TemporaryStorageWatch {
     channel: Arc<ExceedanceChannel>,
     mountpoint: PathBuf,
+    readback: ReadbackSource,
+}
+
+/// Where a watch's `statfs` answer comes from.
+///
+/// Both are the filesystem's own account of itself; they differ only in
+/// whether the kernel is asked for it, and the difference is not a choice but
+/// a consequence of where the mount lives.
+#[derive(Clone)]
+enum ReadbackSource {
+    /// `statvfs(2)` on the supervisor's own mountpoint, bounded, answered by
+    /// the FUSE session over a kernel round trip.
+    Mount,
+    /// The FUSE server's own `statfs`, computed from the ledger by the same
+    /// call the kernel would have reached. This is what a mount performed
+    /// inside the workload's mount namespace reads back with: the supervisor
+    /// has no path to `statvfs`, because the mount is in no mount table it can
+    /// see. Nothing but kernel-delivered FUSE requests ever moves the ledger,
+    /// so the number is the filesystem's, not the configuration's.
+    Ledger(SharedState),
+}
+
+impl fmt::Debug for ReadbackSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mount => formatter.write_str("Mount"),
+            Self::Ledger(_) => formatter.write_str("Ledger"),
+        }
+    }
 }
 
 impl TemporaryStorageWatch {
@@ -664,6 +698,24 @@ impl TemporaryStorageWatch {
         Self {
             channel,
             mountpoint: mountpoint.into(),
+            readback: ReadbackSource::Mount,
+        }
+    }
+
+    /// Watch `channel`, reading back from the server's own ledger.
+    ///
+    /// For a filesystem mounted inside the workload's own mount namespace,
+    /// where `mountpoint` names a path only the workload can resolve.
+    #[must_use]
+    pub fn served(
+        channel: Arc<ExceedanceChannel>,
+        mountpoint: impl Into<PathBuf>,
+        state: SharedState,
+    ) -> Self {
+        Self {
+            channel,
+            mountpoint: mountpoint.into(),
+            readback: ReadbackSource::Ledger(state),
         }
     }
 
@@ -686,7 +738,10 @@ impl TemporaryStorageWatch {
     /// The kernel's errno, a deadline that passed without an answer, or no
     /// thread for the bounded call.
     pub fn readback(&self, deadline: Duration) -> Result<StatfsReadback, ReadbackError> {
-        statfs_bounded(&self.mountpoint, deadline)
+        match &self.readback {
+            ReadbackSource::Mount => statfs_bounded(&self.mountpoint, deadline),
+            ReadbackSource::Ledger(state) => Ok(ledger_statfs(state)),
+        }
     }
 }
 
@@ -786,6 +841,19 @@ impl PreparedRun {
         self
     }
 
+    /// Serve the temporary filesystem this run's own launch mounts.
+    ///
+    /// Required exactly when the plan carries a mount request — a plan whose
+    /// workload identity is separated, whose scratch filesystem the supervisor
+    /// cannot mount where the workload could reach it. The spawn completes the
+    /// handover before the workload begins and refuses the launch if it cannot;
+    /// see [`crate::spawn_sandboxed_with_tempfs`].
+    #[must_use]
+    pub fn with_temporary_storage_mount(mut self, rendezvous: TempfsRendezvous) -> Self {
+        self.temporary_storage_mount = Some(rendezvous);
+        self
+    }
+
     /// A handle on the sequence this attempt's spool has reached.
     ///
     /// Cloned before [`Self::execute`] consumes the attempt, because the point
@@ -822,6 +890,7 @@ impl PreparedRun {
             capture,
             observed,
             temporary_storage,
+            temporary_storage_mount,
             ..
         } = self;
         let mut supervised = SupervisedRun {
@@ -835,6 +904,7 @@ impl PreparedRun {
             frame_run_id,
             observed,
             temporary_storage,
+            temporary_storage_mount,
         };
 
         // No `?` between here and `finish`: a supervision failure must not be
@@ -894,6 +964,8 @@ struct SupervisedRun {
     /// every supervision interval so the first refusal contains the run, and
     /// read back at `finish` so the spool carries the kernel's account of it.
     temporary_storage: Option<TemporaryStorageWatch>,
+    /// The launch's half of the rendezvous, consumed by the spawn below.
+    temporary_storage_mount: Option<TempfsRendezvous>,
 }
 
 /// The reader thread and the queue it fills.
@@ -1167,8 +1239,14 @@ impl SupervisedRun {
         } else {
             StdoutCapture::Inherit
         };
-        let child = spawn_sandboxed_with_stdout(helper, plan, containment, stdout)
-            .map_err(|error| (None, BackendError::Launch(error)))?;
+        let child = spawn_sandboxed_with_tempfs(
+            helper,
+            plan,
+            containment,
+            stdout,
+            self.temporary_storage_mount.take(),
+        )
+        .map_err(|error| (None, BackendError::Launch(error)))?;
         let raw = i32::try_from(child.id()).map_err(|_| (None, BackendError::PidUnrepresentable));
         self.child = Some(child);
         let pid = Pid::from_raw(raw?);

@@ -3,12 +3,25 @@
 # Temporary-storage budget
 
 `sandbox.budgets.temporary_storage` is enforced. It stopped being an
-acknowledged `UnenforcedBudget` when the runner gained a per-run,
-supervisor-owned FUSE filesystem with exact byte and object ceilings, mounted
-by the unprivileged supervisor uid through the host's setuid `fusermount3` and
+acknowledged `UnenforcedBudget` when the runner gained a per-run FUSE
+filesystem with exact byte and object ceilings, served by the supervisor and
 granted read-write to the workload's Landlock ruleset. The feasibility of the
 mechanism on the runner host is recorded in `spikes/tempfs-quota/README.md`;
 this page records the product decisions the integration makes.
+
+**Two mount sites, one filesystem.** A plan that keeps the supervisor's
+identity gets a filesystem the supervisor mounts through the host's setuid
+`fusermount3`, in the supervisor's own mount namespace — the original
+mechanism, unchanged. A plan that separates the workload's identity gets one
+the *launch* mounts, inside the user and mount namespaces it creates, and hands
+back to the supervisor over the plan channel; a supervisor-mounted filesystem
+is unreachable to a process in a child user namespace, so this is not a
+preference but the only mount that works for such a workload. The site follows
+from the plan (`RunTempfs::provide`), so the wrong one cannot be attached. The
+ledger, the exceedance channel, the checkpoint, the containment policy and the
+reconcile are the same code in both cases; `docs/operations/workload-identity.md`
+records the kernel facts behind the second site and why the supervisor still
+serves it.
 
 ## What is enforced, and where
 
@@ -17,12 +30,12 @@ this page records the product decisions the integration makes.
 | A run's budget is `TemporaryStorageBudget { bytes, objects }`. `bytes` is the document's `temporary_storage_bytes`, exact. `objects` is derived: one object per 4 KiB block of the byte ceiling (`bytes / 4096`), so the same number bounds files, directories and symlinks. A wire field for the object count would be a protocol change and is deliberately not made here. | `automonique_runner::tempfs::TemporaryStorageBudget::from_bytes` |
 | Admission refuses a byte ceiling that is zero, not a multiple of 4096 (`statfs` reports blocks and the readback must equal the ceiling exactly, not round it), or above `MAX_TEMPORARY_STORAGE_BYTES` (128 MiB, see charging). The refusal is `QuotaRejected("sandbox.budgets.temporary_storage")`. | `automonique_runner::admission::map_temporary_storage` |
 | Admission refuses when the host cannot enforce. The context carries `TemporaryStorageEnforcement`: either a `VerifiedFuse` (the supervisor opened `/dev/fuse` read-write and found a setuid-root, executable `fusermount3`) or the typed `PrerequisiteError`, which admission republishes as `TemporaryStorageUnenforceable`. Nothing is admitted with a temporary-storage budget it cannot apply. | `automonique_runner::admission` |
-| The mount is created by the supervisor after admission and after the attempt is registered (so a duplicate attempt is refused before any `fusermount3` is spawned), under the run's private directory (`<state>/runs/<run_id>/tmp`), before any workload exists. `fusermount3` is invoked by absolute path and explicit argument vector, and the mount is confirmed from the kernel before use: the mount table must show `fuse.automonique-tempfs` at the mountpoint, owned by this uid, and `statvfs` must read back exactly the requested ceilings with zero usage. Any mismatch detaches the mount and refuses the run. | `automonique_runner::tempfs::MountedTempfs::mount` |
-| The plan is pointed at the mount only through `AdmittedLaunch::with_temporary_storage(&mounted)`, which refuses a mount whose kernel-read-back ceilings differ from the admitted budget, and which adds exactly one read-write Landlock grant on the mountpoint and binds `TMPDIR` to it. A document that binds `TMPDIR` itself is refused at admission: it would redirect scratch writes away from the budgeted tree. | `automonique_runner::admission::AdmittedLaunch` |
+| The mount is created after admission and after the attempt is registered (so a duplicate attempt is refused before any mount is attempted), under the run's private directory (`<state>/runs/<run_id>/tmp`), before any workload exists. Supervisor-mounted: `fusermount3` is invoked by absolute path and explicit argument vector, and the mount is confirmed from the kernel before use — the mount table must show `fuse.automonique-tempfs` at the mountpoint, owned by this uid, and `statvfs` must read back exactly the requested ceilings with zero usage; any mismatch detaches the mount and refuses the run. Launch-mounted: the launch reports the mount table entry it created and the `statvfs` it read *after* becoming the workload, and the supervisor refuses anything but a `fuse.automonique-tempfs` mount at the admitted mountpoint, owned by namespace-root, serving the identity the filesystem's nodes were built for, reading back exactly the requested ceilings with zero usage; any mismatch refuses the launch before the workload runs. | `automonique_runner::tempfs::MountedTempfs::mount`, `automonique_runner::tempfs_namespace` |
+| The plan is pointed at the filesystem only through `AdmittedLaunch::with_temporary_storage(&temporary_storage)`, which refuses a budget that is not the admitted one, and which adds exactly one read-write Landlock grant on the mountpoint, binds `TMPDIR` to it, and — for a plan whose launch is what mounts — adds the one `tempfs=` frame line naming the mountpoint and the ceilings. A document that binds `TMPDIR` itself is refused at admission: it would redirect scratch writes away from the budgeted tree. | `automonique_runner::admission::AdmittedLaunch` |
 | A workload that exceeds either ceiling is refused by the filesystem at the syscall that asked (`ENOSPC` for bytes, `EDQUOT` for objects), and the supervisor's poll loop reads the first refusal and kills the run cgroup. The outcome is `ExecutionOutcome::TemporaryStorageExceeded { exceedance }`, carrying the refusal exactly as the ledger recorded it. Once the tree is dead the supervisor reads `statvfs` from the mount (bounded by `TEMPORARY_STORAGE_READBACK_DEADLINE`); the `ExecutionReport` carries that readback (`temporary_storage_readback`), and the spool records one synthetic `provider_warning` frame, `TEMPORARY_STORAGE_EXCEEDED_WARNING: <exceedance>; statfs <readback>`, as the last event before the `failed` terminal. The terminal payload itself stays `failed`: a new wire state would be a protocol change and is deliberately not made, so a reader distinguishes a budget kill by that frame. A JCode session run applies the same policy from the daemon's turn loop: the turn is cancelled, the same frame is recorded, and the run ends `failed`. | `automonique_runner::backend`, `automonique_daemon::execute` |
 | The ledger is checkpointed to `<state>/runs/<run_id>/tempfs-ledger` while the run lives (on every change, at most every 250 ms, and immediately on an exceedance) and finally at unmount with the outcome. A supervisor that dies keeps the last checkpoint; the reaper reads it back. | `automonique_runner::tempfs_checkpoint` |
-| Readback is bounded. Every `statvfs` the supervisor issues against its own mount runs under a deadline; on expiry the supervisor writes `/sys/fs/fuse/connections/<minor>/abort`, which the kernel lets the mount owner do, and the reconciliation continues from the last checkpoint. A stuck server cannot hang the run's end. The daemon records every reconcile's outcome in the native journal (see below). | `automonique_runner::tempfs::MountedTempfs::reconcile`, `automonique_daemon::execute::Attempt` |
-| A dead owner leaves a stale mount (`ENOTCONN`; `auto_unmount` does not clean up a same-uid mount on this host). When the daemon opens its execution lane at start, the reaper walks `/proc/self/mountinfo` for this uid's `fuse.automonique-tempfs` entries under the runs directory, detaches every disconnected one lazily, reads the dead owner's last checkpoint beside it, and reports each one to the native journal. A live entry is left alone: it belongs to a still-running supervisor (a previous generation during handoff). | `automonique_runner::tempfs::reap_stale_mounts`, `automonique_daemon::execute::ExecutionLane::open` |
+| Readback is bounded. Every `statvfs` the supervisor issues against its own mount runs under a deadline; on expiry the supervisor writes `/sys/fs/fuse/connections/<minor>/abort`, which the kernel lets the mount owner do, and the reconciliation continues from the last checkpoint. A stuck server cannot hang the run's end. For a launch-mounted filesystem there is no path to `statvfs` and no round trip to bound: the readback is the server's own `statfs` answer, computed from the ledger by the same call the kernel's `statvfs` would have reached, so it is always available and always the filesystem's own account. The daemon records every reconcile's outcome in the native journal (see below). | `automonique_runner::tempfs::MountedTempfs::reconcile`, `automonique_daemon::execute::Attempt` |
+| A dead owner leaves a stale mount (`ENOTCONN`; `auto_unmount` does not clean up a same-uid mount on this host). When the daemon opens its execution lane at start, the reaper walks `/proc/self/mountinfo` for this uid's `fuse.automonique-tempfs` entries under the runs directory, detaches every disconnected one lazily, reads the dead owner's last checkpoint beside it, and reports each one to the native journal. A live entry is left alone: it belongs to a still-running supervisor (a previous generation during handoff). This is the supervisor-mounted site only, and it stays because that site stays: a launch-mounted filesystem leaves nothing to reap, because its mount lives in a mount namespace that dies with the run tree, and its checkpoint is read back the same way either way. | `automonique_runner::tempfs::reap_stale_mounts`, `automonique_daemon::execute::ExecutionLane::open` |
 
 ## Where the outcome is recorded
 
@@ -94,8 +107,18 @@ The runner host must expose `/dev/fuse` as a character device this uid can
 open read-write and `/usr/bin/fusermount3` as a setuid-root executable. Both
 are verified before every admission. On a host without them every document is
 refused (`sandbox_unenforceable` on the wire) rather than run without the
-budget. Nothing else is required: no user namespace, no filesystem quota, no
-capability.
+budget. Nothing else is required for the supervisor-mounted site: no user
+namespace, no filesystem quota, no capability.
+
+The launch-mounted site needs no `fusermount3` at all — it calls `mount(2)`
+directly as namespace-root — but it does need everything the identity switch
+needs, listed in `docs/operations/workload-identity.md`: subordinate ranges,
+the setuid mapping helpers, and an AppArmor grant where the host restricts
+unprivileged user namespaces. Those are prerequisites of the identity request
+itself, refused by the feature negotiation before a plan exists, so a document
+never reaches a mount it cannot have. The `/dev/fuse` and `fusermount3` gate is
+still applied uniformly: one verified prerequisite, checked before every
+admission, is what the fail-closed answer is built on.
 
 ## What is not enforced here
 

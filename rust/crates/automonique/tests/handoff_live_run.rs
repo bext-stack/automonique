@@ -69,7 +69,6 @@ use automonique_daemon::execute::{ENFORCED_PROPERTIES, locate_launch_helper};
 use automonique_daemon::release_activation::{CodeReleaseActivator, SystemdUserSupervisor};
 use automonique_protocol::execute_api::{ExecuteRefusal, ExecuteResponse};
 use automonique_protocol::runs_api::RunState;
-use automonique_runner::capability::HostCapabilities;
 use automonique_runner::{Authority, ContainmentDomain, EventKind, Spool};
 use automonique_store::cancel_ledger::CancelLedger;
 use automonique_store::reload_audit::{ReloadAudit, ReloadPhase};
@@ -104,7 +103,7 @@ fn first_failing_gate() -> Option<&'static str> {
     if !std::path::Path::new(BUSYBOX).exists() {
         return Some("no static busybox at /usr/bin/busybox");
     }
-    if HostCapabilities::probe()
+    if automonique_daemon::execute::probe_host()
         .select_mode(&ENFORCED_PROPERTIES)
         .is_err()
     {

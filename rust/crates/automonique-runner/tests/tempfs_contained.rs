@@ -29,11 +29,13 @@ use automonique_runner::backend::{
     DirectProcessBackend, ExecutionOutcome, TEMPORARY_STORAGE_EXCEEDED_WARNING,
 };
 use automonique_runner::filesystem::PathIntent;
-use automonique_runner::tempfs::{FusePrerequisites, MountedTempfs};
+use automonique_runner::identity::{self, WorkloadIdentity};
+use automonique_runner::tempfs::{FusePrerequisites, MountedTempfs, WorkloadTempfs};
+use automonique_runner::tempfs_readback::mount_evidence;
 use automonique_runner::{
-    CancellationToken, ContainmentDomain, ContainmentError, ContainmentLimits, Event, EventKind,
-    LaunchPlan, STATFS_BLOCK_BYTES, Spool, TemporaryStorageBudget, TemporaryStorageResource,
-    VerifiedFuse,
+    CancellationToken, Checkpoint, CheckpointPhase, ContainmentDomain, ContainmentError,
+    ContainmentLimits, Event, EventKind, LaunchPlan, STATFS_BLOCK_BYTES, Spool,
+    TemporaryStorageBudget, TemporaryStorageResource, VerifiedFuse,
 };
 use sha2::{Digest as _, Sha256};
 use std::fs;
@@ -133,6 +135,31 @@ fn proof_or_not_proven(proof: &str) -> Option<Proof> {
         domain.root().display()
     );
     Some(Proof { domain, fuse })
+}
+
+/// The same gate, plus a host that can actually separate a workload identity.
+///
+/// Both features have to be real for the composed proof to mean anything: a
+/// host that cannot mount proves nothing about the budget, and a host that
+/// cannot separate proves nothing about the composition.
+fn separated_proof_or_not_proven(proof: &str) -> Option<(Proof, WorkloadIdentity)> {
+    let required = std::env::var_os(REQUIRE_ENFORCED_ENV).is_some();
+    let base = proof_or_not_proven(proof)?;
+    match identity::probe_with_launch_helper(Path::new(HELPER)) {
+        Ok(identity) => {
+            eprintln!("[tempfs-contained] ENFORCED {proof}: identity {identity}");
+            Some((base, identity))
+        }
+        Err(denial) => {
+            eprintln!("[tempfs-contained] NOT PROVEN {proof}: identity unavailable: {denial}");
+            assert!(
+                !required,
+                "{REQUIRE_ENFORCED_ENV} is set, so {proof} must run, but the workload identity \
+                 is unavailable: {denial}"
+            );
+            None
+        }
+    }
 }
 
 #[test]
@@ -284,6 +311,284 @@ fn a_contained_workload_that_overflows_its_budget_is_killed_with_a_typed_outcome
     assert_eq!(statfs.used_bytes(), 8 * STATFS_BLOCK_BYTES);
     assert_eq!(outcome.ledger.peak_bytes, 8 * STATFS_BLOCK_BYTES);
     assert!(outcome.ledger.refused_bytes >= 1);
+}
+
+/// One separated, contained run: the plan asks for both, the launch mounts
+/// inside its own namespaces, and the supervisor serves and reconciles it.
+struct SeparatedRun {
+    report: automonique_runner::backend::ExecutionReport,
+    outcome: automonique_runner::tempfs::Outcome,
+    run_root: PathBuf,
+    spool_root: PathBuf,
+    run_id: String,
+    spool_budget: u64,
+}
+
+/// Run `script` under a plan that separates the workload's identity *and*
+/// mounts `budget` at its own `$TMPDIR`, then reconcile.
+fn run_separated(
+    proof: &Proof,
+    temp: &TempDir,
+    label: &str,
+    budget: TemporaryStorageBudget,
+    script: &str,
+) -> SeparatedRun {
+    let run_root = temp.subdir("run");
+    let mountpoint = run_root.join("tmp");
+    fs::create_dir(&mountpoint).unwrap();
+    let spool_root = temp.subdir("spool");
+
+    // The filesystem exists before the launch does; the mount does not. The
+    // supervisor holds the ledger, the exceedance channel and the checkpoint
+    // from here, and the launch hands back the connection it mounted with.
+    let mut pending = WorkloadTempfs::prepare(&mountpoint, budget)
+        .unwrap()
+        .with_checkpoint(run_root.join("tempfs-ledger"));
+    let watch = pending.watch();
+    let rendezvous = pending.rendezvous().expect("the launch takes it once");
+    let mnt = pending.mountpoint().to_path_buf();
+
+    let plan = LaunchPlan::new(BUSYBOX, busybox_sha256())
+        .unwrap()
+        .argument("sh")
+        .unwrap()
+        .argument("-c")
+        .unwrap()
+        .argument(script)
+        .unwrap()
+        .separate_workload_identity()
+        .unwrap()
+        .mount_temporary_storage(pending.request())
+        .unwrap()
+        .filesystem_grant(PathIntent::ReadExecute, BUSYBOX)
+        .unwrap()
+        .filesystem_grant(PathIntent::ReadWrite, &mnt)
+        .unwrap()
+        .filesystem_grant(PathIntent::Read, "/dev/zero")
+        .unwrap()
+        .environment("TMPDIR", mnt.as_os_str().as_encoded_bytes())
+        .unwrap();
+
+    let backend = DirectProcessBackend::new(HELPER).unwrap();
+    let id = run_id(label);
+    let spool_budget = 64 * 1024;
+    let spool = Spool::open(&spool_root, &id, spool_budget).unwrap();
+    let prepared = backend
+        .prepare(
+            &proof.domain,
+            &run_id_for(&spool),
+            ContainmentLimits::none(),
+            plan,
+            spool,
+        )
+        .unwrap()
+        .with_temporary_storage(watch)
+        .with_temporary_storage_mount(rendezvous);
+    let report = prepared
+        .execute(&CancellationToken::new(), RUN_DEADLINE)
+        .unwrap();
+
+    // THE MOUNT WAS NEVER IN THIS MOUNT NAMESPACE.
+    //
+    // The supervisor served the filesystem for the whole run and still has no
+    // entry for it in its own table: the `mount(2)` happened inside the
+    // workload's namespaces, which is the whole point of the change.
+    assert!(
+        mount_evidence(&mnt).unwrap().is_none(),
+        "a launch-performed mount must never appear in the supervisor's mount table"
+    );
+
+    let outcome = pending.reconcile(READBACK_DEADLINE).unwrap();
+    SeparatedRun {
+        report,
+        outcome,
+        run_root,
+        spool_root,
+        run_id: id,
+        spool_budget,
+    }
+}
+
+#[test]
+fn a_separated_workload_is_contained_at_its_byte_ceiling() {
+    let Some((proof, identity)) =
+        separated_proof_or_not_proven("a_separated_workload_is_contained_at_its_byte_ceiling")
+    else {
+        return;
+    };
+    let temp = TempDir::new("separated-bytes");
+    // Eight blocks of scratch, eight objects.
+    let budget = TemporaryStorageBudget::new(8 * STATFS_BLOCK_BYTES, 8).unwrap();
+    let script = format!(
+        "{bb} dd if=/dev/zero of=\"$TMPDIR/fill\" bs=4096 count=64; {bb} sleep 30",
+        bb = BUSYBOX
+    );
+    let run = run_separated(&proof, &temp, "sepbytes", budget, &script);
+
+    // The typed budget outcome, from a workload that was not the supervisor.
+    match run.report.outcome() {
+        ExecutionOutcome::TemporaryStorageExceeded { exceedance } => {
+            assert_eq!(exceedance.resource, TemporaryStorageResource::Bytes);
+            assert_eq!(exceedance.ceiling, 8 * STATFS_BLOCK_BYTES);
+        }
+        other => panic!("expected a temporary-storage budget outcome, got {other}"),
+    }
+    assert_eq!(run.report.outcome().terminal_payload(), b"failed");
+
+    // THE KERNEL'S OWN ACCOUNT OF WHERE THE MOUNT LIVED.
+    //
+    // `user_id=0` is namespace-root, which no supervisor-performed mount can
+    // ever show — the supervisor's own mounts carry its host uid — and
+    // `allow_other` is what admits the workload once it drops namespace-root.
+    let evidence = &run.outcome.evidence;
+    assert!(
+        evidence.is_fuse_subtype("automonique-tempfs"),
+        "the launch mounted this crate's filesystem: {evidence}"
+    );
+    assert_eq!(
+        evidence.user_id(),
+        Some(0),
+        "an in-namespace mount is namespace-root's: {evidence}"
+    );
+    assert!(
+        evidence.super_options.contains("allow_other"),
+        "the workload is not the mounter, so allow_other is necessary: {evidence}"
+    );
+    assert_ne!(
+        identity.host_uid(),
+        nix::unistd::getuid().as_raw(),
+        "the workload ran as a host uid that is not the supervisor's"
+    );
+
+    // The ceiling held, and the filesystem says so.
+    let readback = run
+        .report
+        .temporary_storage_readback()
+        .expect("the server answered the supervisor's readback after the kill");
+    assert_eq!(readback.ceiling_bytes(), 8 * STATFS_BLOCK_BYTES);
+    assert_eq!(readback.blocks_free, 0, "the ceiling held: no free blocks");
+    assert!(run.outcome.exceeded());
+    assert!(run.outcome.unmount_confirmed);
+    assert!(!run.outcome.aborted);
+    let statfs = run
+        .outcome
+        .statfs_before_unmount
+        .expect("the reconcile records the filesystem's own statfs");
+    assert_eq!(statfs.used_bytes(), 8 * STATFS_BLOCK_BYTES);
+    assert_eq!(run.outcome.ledger.peak_bytes, 8 * STATFS_BLOCK_BYTES);
+    assert!(run.outcome.ledger.refused_bytes >= 1);
+    // The mount's own readback, taken in the namespace by the process that
+    // became the workload: the budget, empty.
+    assert_eq!(
+        run.outcome.statfs_at_mount.ceiling_bytes(),
+        8 * STATFS_BLOCK_BYTES
+    );
+    assert_eq!(run.outcome.statfs_at_mount.used_bytes(), 0);
+
+    // The durable record names the budget, not just `failed`.
+    let spool = Spool::open(&run.spool_root, &run.run_id, run.spool_budget).unwrap();
+    let events = spool.events_after(0).unwrap();
+    assert_eq!(events.last().map(Event::kind), Some(EventKind::Terminal));
+    let warnings: Vec<ProgressFrame> = events
+        .iter()
+        .filter(|event| event.kind() == EventKind::AdapterEvent)
+        .filter_map(|event| ProgressFrame::from_canonical_bytes(event.payload()).ok())
+        .filter(|frame| frame.kind() == FrameKind::ProviderWarning)
+        .collect();
+    assert_eq!(warnings.len(), 1, "the exceedance is recorded exactly once");
+    let text = warnings[0]
+        .body()
+        .text()
+        .map(ProgressText::as_str)
+        .expect("the warning has a text");
+    assert!(
+        text.starts_with(TEMPORARY_STORAGE_EXCEEDED_WARNING),
+        "the frame names the refusal: {text}"
+    );
+}
+
+#[test]
+fn a_separated_workload_is_contained_at_its_object_ceiling() {
+    let Some((proof, _identity)) =
+        separated_proof_or_not_proven("a_separated_workload_is_contained_at_its_object_ceiling")
+    else {
+        return;
+    };
+    let temp = TempDir::new("separated-objects");
+    // Room for plenty of bytes and four objects, so the object ceiling is what
+    // refuses first and `EDQUOT` is what the workload sees.
+    let budget = TemporaryStorageBudget::new(64 * STATFS_BLOCK_BYTES, 4).unwrap();
+    let script = format!(
+        "for n in 1 2 3 4 5 6 7 8 9 10; do {bb} touch \"$TMPDIR/f$n\"; done; {bb} sleep 30",
+        bb = BUSYBOX
+    );
+    let run = run_separated(&proof, &temp, "sepobjects", budget, &script);
+
+    match run.report.outcome() {
+        ExecutionOutcome::TemporaryStorageExceeded { exceedance } => {
+            assert_eq!(exceedance.resource, TemporaryStorageResource::Objects);
+            assert_eq!(exceedance.ceiling, 4);
+        }
+        other => panic!("expected an object-ceiling outcome, got {other}"),
+    }
+    assert!(run.outcome.exceeded());
+    assert!(run.outcome.ledger.refused_objects >= 1);
+    assert_eq!(run.outcome.ledger.peak_objects, 4);
+    let statfs = run
+        .outcome
+        .statfs_before_unmount
+        .expect("the reconcile records the filesystem's own statfs");
+    assert_eq!(statfs.files, 4);
+    assert_eq!(statfs.files_free, 0, "the ceiling held: no free objects");
+}
+
+#[test]
+fn the_consumed_budget_of_a_separated_run_survives_a_supervisor_restart() {
+    let Some((proof, _identity)) = separated_proof_or_not_proven(
+        "the_consumed_budget_of_a_separated_run_survives_a_supervisor_restart",
+    ) else {
+        return;
+    };
+    let temp = TempDir::new("separated-checkpoint");
+    let budget = TemporaryStorageBudget::new(8 * STATFS_BLOCK_BYTES, 8).unwrap();
+    let script = format!(
+        "{bb} dd if=/dev/zero of=\"$TMPDIR/fill\" bs=4096 count=64; {bb} sleep 30",
+        bb = BUSYBOX
+    );
+    let run = run_separated(&proof, &temp, "sepckpt", budget, &script);
+
+    // THE RECORD IS ON DISK, NOT IN THE SUPERVISOR'S MEMORY.
+    //
+    // Read back through the ordinary checkpoint reader, which is exactly what
+    // a restarted supervisor's reaper uses: nothing of this process is
+    // consulted, so a supervisor that died instead of reconciling would find
+    // the same consumed budget here.
+    let checkpoint = Checkpoint::read(&run.run_root.join("tempfs-ledger"))
+        .expect("the final checkpoint is readable after the run");
+    assert_eq!(checkpoint.phase, CheckpointPhase::Final);
+    assert_eq!(checkpoint.snapshot.budget, budget);
+    assert_eq!(checkpoint.snapshot.peak_bytes, 8 * STATFS_BLOCK_BYTES);
+    assert!(checkpoint.snapshot.refused_bytes >= 1);
+    assert!(
+        checkpoint.snapshot.exceeded(),
+        "the checkpoint carries the exceedance the run ended on"
+    );
+    assert!(
+        checkpoint.mount_evidence.contains("user_id=0"),
+        "the checkpoint carries the in-namespace mount evidence: {}",
+        checkpoint.mount_evidence
+    );
+    let final_record = checkpoint
+        .final_record
+        .expect("the final phase carries the reconcile's own readbacks");
+    assert!(final_record.unmount_confirmed);
+    assert_eq!(
+        final_record
+            .statfs_before_unmount
+            .expect("the readback is recorded")
+            .used_bytes(),
+        8 * STATFS_BLOCK_BYTES
+    );
 }
 
 /// The spool names the run it belongs to; the backend requires the two to

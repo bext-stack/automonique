@@ -108,7 +108,6 @@ use automonique_runner::admission::{
     BrokeredScope, PromptSource, ProviderIdentityPolicy, ResolvedPrompt,
     TemporaryStorageEnforcement, UnenforcedBudget, admit,
 };
-use automonique_runner::capability::HostCapabilities;
 
 #[path = "support/isolation.rs"]
 mod test_isolation;
@@ -821,7 +820,7 @@ fn connect_head(port: u16) -> String {
 // --- the enforced proof ---------------------------------------------------
 
 fn sandbox_enforceable() -> bool {
-    HostCapabilities::probe()
+    automonique_daemon::execute::probe_host()
         .select_mode(&automonique_daemon::execute::ENFORCED_PROPERTIES)
         .is_ok()
 }

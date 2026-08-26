@@ -167,13 +167,13 @@ use automonique_runner::capability::{BoundaryProperty, HostCapabilities};
 use automonique_runner::control::{CancelDelivery, CancelSink, CancelSinkError};
 use automonique_runner::dispatch::RegistrationHandle;
 use automonique_runner::tempfs::{
-    CHECKPOINT_LEAF, DEFAULT_READBACK_DEADLINE, FusePrerequisites, MOUNT_LEAF, MountedTempfs,
+    CHECKPOINT_LEAF, DEFAULT_READBACK_DEADLINE, FusePrerequisites, MOUNT_LEAF, RunTempfs,
     reap_stale_mounts,
 };
 use automonique_runner::{
     Authority as SpoolAuthority, CancellationToken, ContainmentDomain, Controller,
     EventKind as SpoolEventKind, Exceedance, LaunchPlan, PromptDeliveryPlan, RunContainment,
-    RunSpec, Spool, UnmountError, WorkspaceRegistryId,
+    RunSpec, Spool, TempfsRendezvous, UnmountError, WorkspaceRegistryId,
 };
 use automonique_store::approval_requests::{
     ApprovalContext, ApprovalProposal, ApprovalRequests, ApprovalState, REQUEST_KEY_HEX_BYTES,
@@ -246,15 +246,34 @@ pub const DAEMON_BACKEND_ID: &str = "local-direct";
 /// One array, read by the daemon's startup measurement *and* by
 /// [`offered_host_features`], so what the status reports and what a document
 /// negotiates against cannot drift apart.
-pub const ENFORCED_PROPERTIES: [BoundaryProperty; 4] = [
+pub const ENFORCED_PROPERTIES: [BoundaryProperty; 5] = [
     BoundaryProperty::DescendantContainment,
     BoundaryProperty::FilesystemRestriction,
     BoundaryProperty::TcpDenial,
     BoundaryProperty::SyscallRestriction,
+    // Restored once the per-run temporary filesystem could be mounted inside
+    // the workload's own namespaces, which is what let identity separation and
+    // the enforced scratch budget compose. It is a property this build
+    // enforces, so a host that cannot provide it is measured as unenforceable
+    // rather than quietly running workloads under the supervisor's uid; a
+    // document asks for it by requiring the `uid_separation` feature.
+    BoundaryProperty::UidSeparation,
 ];
 
 /// Domain separator for the implementation digest this daemon publishes.
 pub const HOST_FEATURE_DOMAIN: &str = "automonique.host-feature.v1";
+
+/// Observe this host the way this daemon's launches will use it.
+///
+/// The launch helper is part of the observation rather than beside it:
+/// `uid_separation` is a property only the helper can demonstrate — the
+/// capability model refuses to guess it — so a probe without the helper reports
+/// it unavailable and the whole mode selection fails closed. This daemon knows
+/// where its helper is ([`locate_launch_helper`]), so it asks.
+#[must_use]
+pub fn probe_host() -> HostCapabilities {
+    HostCapabilities::probe_with_launch_helper(locate_launch_helper().as_deref())
+}
 
 /// Host enforcement features this daemon offers to a document's negotiation.
 ///
@@ -292,7 +311,7 @@ pub const HOST_FEATURE_DOMAIN: &str = "automonique.host-feature.v1";
 /// business and this lane does not pretend to it.
 #[must_use]
 pub fn offered_host_features() -> Vec<HostFeature> {
-    let Ok(selection) = HostCapabilities::probe().select_mode(&ENFORCED_PROPERTIES) else {
+    let Ok(selection) = probe_host().select_mode(&ENFORCED_PROPERTIES) else {
         // A host with no enforceable mode offers nothing, which is the same
         // answer `sandbox_enforceable` gives and refuses on first.
         return Vec::new();
@@ -981,7 +1000,8 @@ impl ExecutionLane {
         let verified_fuse = verified_fuse.map_err(|_| ExecuteRefusal::ContainmentUnavailable)?;
         let mountpoint = run_root.join(MOUNT_LEAF);
         private_directory(&mountpoint).map_err(|()| ExecuteRefusal::ExecutionUnavailable)?;
-        let temporary_storage = MountedTempfs::mount(
+        let mut temporary_storage = RunTempfs::provide(
+            admitted.plan(),
             &verified_fuse,
             &mountpoint,
             admitted.temporary_storage_budget(),
@@ -990,6 +1010,9 @@ impl ExecutionLane {
         .with_checkpoint(run_root.join(CHECKPOINT_LEAF))
         .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?;
         let temporary_storage_watch = temporary_storage.watch();
+        // Present exactly when the plan separates the workload's identity, in
+        // which case the launch is what mounts and this is what serves it.
+        let temporary_storage_mount = temporary_storage.rendezvous();
         let admitted = admitted
             .with_temporary_storage(&temporary_storage)
             .map_err(|_| ExecuteRefusal::AdmissionRefused)?;
@@ -1020,6 +1043,7 @@ impl ExecutionLane {
                     managed_sessions_path: self.managed_sessions_path.clone(),
                     controls: Arc::clone(&self.jcode_controls),
                     temporary_storage: Some(temporary_storage_watch.clone()),
+                    temporary_storage_mount,
                     approval: ProviderApprovalContext {
                         store_path: self.state_dir.join(crate::APPROVAL_REQUESTS_NAME),
                         spec_digest: admitted
@@ -1064,6 +1088,13 @@ impl ExecutionLane {
                 // its first `ENOSPC`/`EDQUOT` with a typed budget outcome, and
                 // the spool records the refusal and the mount's readback.
                 .with_temporary_storage(temporary_storage_watch.clone());
+            // The launch mounts its own scratch filesystem when its identity
+            // is separated; the spawn serves it and refuses the run if the
+            // handover does not complete.
+            let prepared = match temporary_storage_mount {
+                Some(rendezvous) => prepared.with_temporary_storage_mount(rendezvous),
+                None => prepared,
+            };
             // Capture only a stdout grammar the document explicitly selected.
             let prepared = if emits_normalized_stream(spec) {
                 match progress_capture(spec, run_id, &self.progress, Arc::clone(&session_capture)) {
@@ -1415,6 +1446,9 @@ struct JcodePreparedParts<'a> {
     /// The run's temporary-storage watch, when it has a mount. `None` only
     /// for callers that run without one, such as tests of the protocol alone.
     temporary_storage: Option<TemporaryStorageWatch>,
+    /// The launch's half of the temporary-storage rendezvous, when the plan's
+    /// own launch is what mounts the filesystem.
+    temporary_storage_mount: Option<TempfsRendezvous>,
     approval: ProviderApprovalContext,
 }
 
@@ -1482,6 +1516,7 @@ struct JcodePreparedRun {
     managed_sessions_path: PathBuf,
     controls: Arc<JcodeControlRegistry>,
     temporary_storage: Option<TemporaryStorageWatch>,
+    temporary_storage_mount: Option<TempfsRendezvous>,
     approval: ProviderApprovalContext,
     observed: ObservedSequence,
 }
@@ -1515,6 +1550,7 @@ impl JcodePreparedRun {
             managed_sessions_path: parts.managed_sessions_path,
             controls: parts.controls,
             temporary_storage: parts.temporary_storage,
+            temporary_storage_mount: parts.temporary_storage_mount,
             approval: parts.approval,
             observed: ObservedSequence::default(),
         })
@@ -1543,6 +1579,7 @@ impl JcodePreparedRun {
             managed_sessions_path,
             controls,
             temporary_storage,
+            temporary_storage_mount,
             approval,
             observed,
         } = self;
@@ -1574,6 +1611,7 @@ impl JcodePreparedRun {
             &expected_server,
             now_ms,
             Duration::from_secs(30),
+            temporary_storage_mount,
         ) {
             Ok(host) => host,
             Err(_) => return writer.finish(RunSpoolState::Failed),
@@ -2247,7 +2285,7 @@ struct Attempt {
     /// connection abort if the server is stuck), a non-lazy unmount, and a
     /// final ledger checkpoint — and its drop detaches it on any other path,
     /// including a panic, so no writable scratch mount outlives the run.
-    temporary_storage: MountedTempfs,
+    temporary_storage: RunTempfs,
     /// Exact provider session observed by the normalized stream.
     session_capture: Arc<Mutex<Option<String>>>,
     /// Where the session binding lives.  An independent durable connection is
@@ -2472,6 +2510,7 @@ const fn unmount_error_category(error: &UnmountError) -> &'static str {
         UnmountError::Refused { .. } => "unmount_refused",
         UnmountError::MountTable(_) => "mount_table_unreadable",
         UnmountError::StillMounted(_) => "still_mounted",
+        UnmountError::NeverMounted => "never_mounted",
     }
 }
 

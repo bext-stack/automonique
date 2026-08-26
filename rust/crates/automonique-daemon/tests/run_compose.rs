@@ -121,7 +121,6 @@ use automonique_runner::admission::{
     PromptSource, ProviderIdentityPolicy, ResolvedPrompt, TemporaryStorageEnforcement,
     UnenforcedBudget, admit,
 };
-use automonique_runner::capability::HostCapabilities;
 use automonique_runner::{
     ContainmentDomain, LaunchPlan, PromptDeliveryPlan, ProtectedPromptReference, RunSpec,
     WorkspaceRegistryId,
@@ -1000,7 +999,7 @@ fn a_task_that_cannot_be_a_prompt_is_refused() {
 // --- the contained proof --------------------------------------------------
 
 fn sandbox_enforceable() -> bool {
-    HostCapabilities::probe()
+    automonique_daemon::execute::probe_host()
         .select_mode(&automonique_daemon::execute::ENFORCED_PROPERTIES)
         .is_ok()
 }

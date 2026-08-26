@@ -92,10 +92,17 @@ impl fmt::Display for MountEvidence {
 /// Parse the mount table, tolerating lines this crate does not understand.
 #[must_use]
 pub fn parse_mountinfo(text: &str) -> Vec<MountEvidence> {
-    text.lines().filter_map(parse_line).collect()
+    text.lines().filter_map(parse_mountinfo_line).collect()
 }
 
-fn parse_line(line: &str) -> Option<MountEvidence> {
+/// Parse one `mountinfo` line, or refuse it.
+///
+/// Public because a mount performed inside a workload's own mount namespace
+/// never appears in the supervisor's table: the launch reads the line there
+/// and reports it, and the supervisor parses it here rather than trusting a
+/// summary of it.
+#[must_use]
+pub fn parse_mountinfo_line(line: &str) -> Option<MountEvidence> {
     // `ID PARENT MAJ:MIN ROOT MOUNTPOINT OPTIONS [optional...] - FSTYPE SOURCE SUPEROPTS`
     let (before, after) = line.split_once(" - ")?;
     let mut before = before.split(' ');

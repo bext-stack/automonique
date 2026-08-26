@@ -15,8 +15,10 @@ seccompiler = { workspace = true }
 nix = { version = "=0.29.0", default-features = false, features = ["fs", "poll", "process", "ptrace", "resource", "sched", "signal", "socket", "uio", "user"] }
 # Receives the `/dev/fuse` descriptor from `fusermount3` over `SCM_RIGHTS` as
 # an `OwnedFd` without any `unsafe`; `thread` is the user-namespace and
-# capability surface the workload identity switch uses.
-rustix = { workspace = true, features = ["thread"] }
+# capability surface the workload identity switch uses, and `mount` is the
+# `mount(2)` the launch helper performs inside the workload's own namespaces —
+# both without `unsafe`, which this workspace forbids.
+rustix = { workspace = true, features = ["mount", "thread"] }
 sha2.workspace = true
 
 [dev-dependencies]

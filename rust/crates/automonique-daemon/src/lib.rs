@@ -3861,13 +3861,12 @@ impl Daemon {
     /// refuses every start, so the measurement and the lane agree.
     fn measure_execution_state() -> automonique_protocol::admin::ExecutionState {
         use automonique_protocol::admin::ExecutionState;
-        use automonique_runner::capability::HostCapabilities;
 
         // The property set is [`execute::ENFORCED_PROPERTIES`] rather than a
         // list written here, so the measurement this status reports and the
         // host features the execution lane offers cannot disagree about which
         // properties this build enforces.
-        let selection = HostCapabilities::probe().select_mode(&execute::ENFORCED_PROPERTIES);
+        let selection = execute::probe_host().select_mode(&execute::ENFORCED_PROPERTIES);
         match selection {
             Ok(_) => ExecutionState::SandboxEnforceableLaneWired,
             Err(_) => ExecutionState::SandboxUnavailableLaneWired,

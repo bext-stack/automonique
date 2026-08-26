@@ -22,7 +22,12 @@
 //!    not the supervisor's, and a capability set reduced to the three
 //!    discretionary-access capabilities the workload keeps over the
 //!    supervisor's files — every step read back from the kernel. A plan that
-//!    does not ask keeps the supervisor's identity, exactly as before;
+//!    does not ask keeps the supervisor's identity, exactly as before. When
+//!    that plan also carries `tempfs=`, the run's temporary filesystem is
+//!    mounted **between the two halves of the switch**, while this process is
+//!    still namespace-root, and handed back to the supervisor that serves it
+//!    ([`crate::tempfs_namespace`]) — a filesystem the supervisor mounted
+//!    would answer `EACCES` to a workload in a child user namespace;
 //! 6. closes every descriptor except the sealed program descriptor and the
 //!    standard streams and verifies the closure ([`crate::descriptors`]);
 //! 7. installs the plan's Landlock filesystem allowlist
@@ -89,7 +94,8 @@
 //!   [`crate::seccomp`]'s io_uring denial make them; see those modules for
 //!   the exact residual surface.
 //! - **It does not protect the supervisor from a same-uid attacker.** The
-//!   plan travels over a private pipe and the cgroup is delegation-checked,
+//!   plan travels over a private pipe — a private socket when the launch has a
+//!   mount to hand back — and the cgroup is delegation-checked,
 //!   but a process of the supervisor's uid outside the sandbox can already
 //!   trace the supervisor itself. What the identity switch closes — for a
 //!   plan that requests it — is the other direction: from `execve` on, the
@@ -157,6 +163,14 @@
 //! [`MAX_LAUNCH_ENV_ENTRIES`] of them, and a repeated name is refused rather
 //! than resolved in either direction.
 //!
+//! A `tempfs=` line appears at most once and asks the launch to mount the run's
+//! temporary filesystem itself, as `tempfs=<mountpoint-hex>:<bytes>:<objects>`.
+//! It is refused without `identity=subordinate`: without a user namespace of
+//! its own the launch has no `CAP_SYS_ADMIN` to mount with, and an unseparated
+//! workload gets the supervisor's own mount instead. The line names the
+//! mountpoint and the ceilings only — the read-write grant and `TMPDIR` are
+//! ordinary `grant=`/`env=` lines the same composition step adds.
+//!
 //! A `prompt_hex=` line appears at most once and carries the bytes the
 //! workload reads from its own stdin. Its ceiling is chosen so that one
 //! prompt can never crowd the rest of a plan out of the frame: at
@@ -181,6 +195,11 @@ use crate::descriptors::{DescriptorAllowlist, close_all_except, verify_only_allo
 use crate::filesystem::{FilesystemPolicy, PathIntent};
 use crate::network::TcpBindConnectPolicy;
 use crate::seccomp::SocketFamilyPolicy;
+use crate::tempfs::{MountError, TempfsRendezvous};
+use crate::tempfs_ledger::TemporaryStorageBudget;
+use crate::tempfs_namespace::{
+    TemporaryStorageMount, bound_reads, confirm_for_workload, mount_for_workload,
+};
 use crate::{HELPER_REFUSED_EXIT, RunContainment};
 use nix::fcntl::{AtFlags, FcntlArg, OFlag, SealFlag};
 use nix::sys::memfd::MemFdCreateFlag;
@@ -191,11 +210,12 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::ops::Deref;
-use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::Duration;
 
 /// Exact first line of every launch plan frame.
 pub const FRAME_HEADER: &str = "schema=automonique.launch/v3";
@@ -235,6 +255,21 @@ const SHA256_HEX_BYTES: usize = 64;
 /// helper. It is consumed before `execve`; the workload receives only the
 /// environment declared by [`LaunchPlan`].
 const SESSION_STREAM_ENV: &str = "AUTOMONIQUE_SESSION_STREAM";
+
+/// Private marker telling the entry helper that its plan channel is a socket
+/// carrying the temporary-storage rendezvous after the frame. Like
+/// [`SESSION_STREAM_ENV`] it is consumed before `execve` and never reaches the
+/// workload, and like it, it must agree with the plan: a helper told to expect
+/// a rendezvous by a plan that asks for no mount, or the reverse, refuses.
+const TEMPFS_MOUNT_ENV: &str = "AUTOMONIQUE_TEMPFS_MOUNT";
+
+/// How long either side of the mount rendezvous waits on the other.
+///
+/// A launch that has mounted but cannot hand the mount over must not hold the
+/// supervisor's worker, and a supervisor that stops answering must not hold a
+/// launch already inside its own namespaces. The deadline turns either into a
+/// refusal before the workload exists.
+pub const TEMPFS_RENDEZVOUS_DEADLINE: Duration = Duration::from_secs(20);
 
 /// Why a launch plan is refused, before any child exists.
 ///
@@ -315,6 +350,7 @@ pub struct LaunchPlan {
     prompt: Option<Vec<u8>>,
     rlimit_nofile: Option<u64>,
     separate_identity: bool,
+    temporary_storage: Option<TemporaryStorageMount>,
 }
 
 /// Redacting: a derived `Debug` would print environment values and prompt
@@ -338,6 +374,7 @@ impl fmt::Debug for LaunchPlan {
             .field("prompt_bytes", &self.prompt_len())
             .field("rlimit_nofile", &self.rlimit_nofile)
             .field("separate_identity", &self.separate_identity)
+            .field("temporary_storage", &self.temporary_storage)
             .finish()
     }
 }
@@ -420,6 +457,7 @@ impl LaunchPlan {
             prompt: None,
             rlimit_nofile: None,
             separate_identity: false,
+            temporary_storage: None,
         })
     }
 
@@ -598,11 +636,10 @@ impl LaunchPlan {
     /// launches exactly as before, and asking twice is refused like every
     /// other repeated line.
     ///
-    /// A plan carrying this cannot attach the enforced temporary-storage
-    /// mount: on current kernels FUSE refuses `allow_other` access to a
-    /// process in a child user namespace, so the combination is refused
-    /// (fail-closed) rather than admitted and broken; see
-    /// [`crate::admission`].
+    /// A plan carrying this is also the only plan that may carry
+    /// [`Self::mount_temporary_storage`]: a workload in a child user namespace
+    /// cannot reach a filesystem the supervisor mounted, so the launch mounts
+    /// that one itself, inside the namespaces this line creates.
     pub fn separate_workload_identity(mut self) -> Result<Self, LaunchPlanError> {
         if self.separate_identity {
             return Err(LaunchPlanError::PolicyRejected(
@@ -617,6 +654,48 @@ impl LaunchPlan {
     #[must_use]
     pub const fn separates_workload_identity(&self) -> bool {
         self.separate_identity
+    }
+
+    /// Mount the run's temporary filesystem inside the workload's own
+    /// namespaces, at `mount`'s mountpoint and with `mount`'s ceilings.
+    ///
+    /// Only a plan that separates the workload's identity may carry this, and
+    /// it is refused otherwise: without a user namespace of its own the launch
+    /// has no `CAP_SYS_ADMIN` to mount with, and the supervisor's own mount is
+    /// what an unseparated workload gets. The line names the mountpoint and
+    /// the budget only; the descriptor travels back to the supervisor over the
+    /// plan channel, and the launch refuses unless the kernel reads the exact
+    /// budget back ([`crate::tempfs_namespace`]).
+    ///
+    /// This does **not** grant the mountpoint. The read-write grant and
+    /// `TMPDIR` are one composition step in
+    /// [`crate::admission::AdmittedLaunch::with_temporary_storage`], which is
+    /// where the supervisor-mounted path attaches them too.
+    pub fn mount_temporary_storage(
+        mut self,
+        mount: TemporaryStorageMount,
+    ) -> Result<Self, LaunchPlanError> {
+        if self.temporary_storage.is_some() {
+            return Err(LaunchPlanError::PolicyRejected(
+                "a temporary-storage mount is requested twice".to_owned(),
+            ));
+        }
+        if !mount.mountpoint().is_absolute()
+            || mount.mountpoint().as_os_str().is_empty()
+            || mount.mountpoint().as_os_str().len() > MAX_LAUNCH_ARG_BYTES
+        {
+            return Err(LaunchPlanError::PolicyRejected(
+                "the temporary-storage mountpoint must be a bounded absolute path".to_owned(),
+            ));
+        }
+        self.temporary_storage = Some(mount);
+        Ok(self)
+    }
+
+    /// The temporary-storage mount this launch performs, when it performs one.
+    #[must_use]
+    pub const fn temporary_storage_mount(&self) -> Option<&TemporaryStorageMount> {
+        self.temporary_storage.as_ref()
     }
 
     /// Exact workload program path.
@@ -700,6 +779,15 @@ impl LaunchPlan {
                 "TCP port exceptions require the tcp socket grant".to_owned(),
             ));
         }
+        if self.temporary_storage.is_some() && !self.separate_identity {
+            // The launch mounts only inside a user namespace of its own; a
+            // plan that keeps the supervisor's identity has no such namespace,
+            // and its scratch filesystem is the supervisor's own mount.
+            return Err(LaunchPlanError::PolicyRejected(
+                "a launch-performed temporary-storage mount requires identity separation"
+                    .to_owned(),
+            ));
+        }
         if self.environment.len() > MAX_LAUNCH_ENV_ENTRIES {
             return Err(LaunchPlanError::EnvironmentRejected(
                 "too many environment entries",
@@ -748,6 +836,14 @@ impl LaunchPlan {
         }
         if self.separate_identity {
             frame.push_str("identity=subordinate\n");
+        }
+        if let Some(mount) = &self.temporary_storage {
+            frame.push_str(&format!(
+                "tempfs={}:{}:{}\n",
+                hex(mount.mountpoint().as_os_str().as_encoded_bytes()),
+                mount.budget().bytes(),
+                mount.budget().objects()
+            ));
         }
         for argument in &self.arguments {
             frame.push_str(&format!("arg={}\n", hex(argument)));
@@ -836,6 +932,36 @@ impl LaunchPlan {
                     // one spelling, and a repeat is a broken frame.
                     *current = current.clone().separate_workload_identity()?;
                 }
+                ("tempfs", Some(current)) => {
+                    let mut fields = value.split(':');
+                    let path = fields
+                        .next()
+                        .and_then(unhex)
+                        .ok_or(LaunchPlanError::FrameRejected)?;
+                    let bytes: u64 = fields
+                        .next()
+                        .and_then(|value| value.parse().ok())
+                        .ok_or(LaunchPlanError::FrameRejected)?;
+                    let objects: u64 = fields
+                        .next()
+                        .and_then(|value| value.parse().ok())
+                        .ok_or(LaunchPlanError::FrameRejected)?;
+                    if fields.next().is_some() {
+                        return Err(LaunchPlanError::FrameRejected);
+                    }
+                    let budget = TemporaryStorageBudget::new(bytes, objects)
+                        .map_err(|error| LaunchPlanError::PolicyRejected(error.to_string()))?;
+                    let path = os_string_from_bytes(path)?;
+                    // A second line refuses in the builder: one mount has one
+                    // spelling, and a repeat is a broken frame.
+                    *current =
+                        current
+                            .clone()
+                            .mount_temporary_storage(TemporaryStorageMount::new(
+                                PathBuf::from(path),
+                                budget,
+                            ))?;
+                }
                 ("grant", Some(current)) => {
                     let (intent, path_hex) = value
                         .split_once(':')
@@ -901,6 +1027,10 @@ impl LaunchPlan {
 pub enum LaunchError {
     Plan(LaunchPlanError),
     Io(std::io::Error),
+    /// The launch was to mount the run's temporary filesystem inside the
+    /// workload's namespaces and the handover did not complete. The child was
+    /// killed and reaped before this was returned.
+    TemporaryStorage(MountError),
 }
 
 impl fmt::Display for LaunchError {
@@ -908,6 +1038,9 @@ impl fmt::Display for LaunchError {
         match self {
             Self::Plan(error) => write!(formatter, "launch plan refused: {error}"),
             Self::Io(error) => write!(formatter, "launch I/O failed: {error}"),
+            Self::TemporaryStorage(error) => {
+                write!(formatter, "launch temporary storage refused: {error}")
+            }
         }
     }
 }
@@ -989,17 +1122,84 @@ pub fn spawn_sandboxed_with_stdout(
     containment: &RunContainment,
     stdout: StdoutCapture,
 ) -> Result<Child, LaunchError> {
+    spawn_sandboxed_with_tempfs(helper, plan, containment, stdout, None)
+}
+
+/// Spawn the entry helper, serving the temporary filesystem it mounts.
+///
+/// The plan channel is a socket rather than a pipe when `rendezvous` is
+/// present, because the launch has something to hand back: it mounts the run's
+/// scratch filesystem inside the workload's own namespaces and passes the
+/// `/dev/fuse` connection here, where it is served for the life of the run.
+/// This call returns only once that handover is complete and the kernel has
+/// read the admitted budget back, or refuses — the child is killed and reaped
+/// on every failing path, so no workload begins without the filesystem its
+/// budget accounts for.
+///
+/// A plan that asks for a mount and a spawn that offers no rendezvous refuse
+/// each other; so do the reverse. See [`crate::tempfs_namespace`] for why the
+/// mount happens there and the server here.
+///
+/// # Errors
+///
+/// [`LaunchError::Plan`] for a plan that will not encode, [`LaunchError::Io`]
+/// for a spawn or a frame write that fails, and
+/// [`LaunchError::TemporaryStorage`] for a handover that does not complete.
+pub fn spawn_sandboxed_with_tempfs(
+    helper: &Path,
+    plan: &LaunchPlan,
+    containment: &RunContainment,
+    stdout: StdoutCapture,
+    rendezvous: Option<TempfsRendezvous>,
+) -> Result<Child, LaunchError> {
+    if plan.temporary_storage.is_some() != rendezvous.is_some() {
+        return Err(LaunchError::Plan(LaunchPlanError::PolicyRejected(
+            "the plan and the spawn disagree about the scratch mount".to_owned(),
+        )));
+    }
     let frame = plan.encode()?;
+    let Some(rendezvous) = rendezvous else {
+        let mut child = Command::new(helper)
+            .env_clear()
+            .env(crate::CGROUP_DIR_ENV, containment.path())
+            .stdin(Stdio::piped())
+            .stdout(stdout.stdio())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        let mut stdin = child.stdin.take().expect("stdin was requested piped");
+        stdin.write_all(&frame)?;
+        drop(stdin);
+        return Ok(child);
+    };
+
+    let (supervisor, launch) = UnixStream::pair()?;
+    bound_reads(&supervisor, TEMPFS_RENDEZVOUS_DEADLINE)?;
+    let launch: OwnedFd = launch.into();
     let mut child = Command::new(helper)
         .env_clear()
         .env(crate::CGROUP_DIR_ENV, containment.path())
-        .stdin(Stdio::piped())
+        .env(TEMPFS_MOUNT_ENV, "1")
+        .stdin(Stdio::from(launch))
         .stdout(stdout.stdio())
         .stderr(Stdio::inherit())
         .spawn()?;
-    let mut stdin = child.stdin.take().expect("stdin was requested piped");
-    stdin.write_all(&frame)?;
-    drop(stdin);
+    let handover = (&supervisor)
+        .write_all(&frame)
+        .map_err(LaunchError::Io)
+        .and_then(|()| {
+            rendezvous
+                .complete(&supervisor)
+                .map_err(LaunchError::TemporaryStorage)
+        });
+    if let Err(error) = handover {
+        // The launch is still inside its own namespaces, waiting on a socket
+        // that is about to close. Killing it here is what makes the refusal a
+        // refusal rather than a workload running without an accounted mount.
+        drop(supervisor);
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
     Ok(child)
 }
 
@@ -1082,32 +1282,83 @@ pub fn spawn_sandboxed_session(
     plan: &LaunchPlan,
     containment: &RunContainment,
 ) -> Result<SandboxedSession, LaunchError> {
+    spawn_sandboxed_session_with_tempfs(helper, plan, containment, None)
+}
+
+/// Spawn a session-scoped workload, serving the temporary filesystem it
+/// mounts.
+///
+/// The session's own stream is the plan channel, so it is also the rendezvous:
+/// the mount is handed over and confirmed before the first provider turn is
+/// written, and the stream's deadlines are cleared again afterwards so the
+/// session reads and writes exactly as it did before.
+///
+/// # Errors
+///
+/// As [`spawn_sandboxed_session`], plus [`LaunchError::TemporaryStorage`] for
+/// a handover that does not complete.
+pub fn spawn_sandboxed_session_with_tempfs(
+    helper: &Path,
+    plan: &LaunchPlan,
+    containment: &RunContainment,
+    rendezvous: Option<TempfsRendezvous>,
+) -> Result<SandboxedSession, LaunchError> {
     if plan.prompt_len().is_some() {
         return Err(LaunchPlanError::PromptRejected.into());
+    }
+    if plan.temporary_storage.is_some() != rendezvous.is_some() {
+        return Err(LaunchError::Plan(LaunchPlanError::PolicyRejected(
+            "the plan and the spawn disagree about the scratch mount".to_owned(),
+        )));
     }
     let frame = plan.encode()?;
     let (mut supervisor, workload) = UnixStream::pair()?;
     let workload_stdin = workload.try_clone()?;
     let workload_stdin: OwnedFd = workload_stdin.into();
     let workload_stdout: OwnedFd = workload.into();
-    let mut child = Command::new(helper)
+    let mut command = Command::new(helper);
+    command
         .env_clear()
         .env(crate::CGROUP_DIR_ENV, containment.path())
         .env(SESSION_STREAM_ENV, "1")
         .stdin(Stdio::from(workload_stdin))
         .stdout(Stdio::from(workload_stdout))
-        .stderr(Stdio::inherit())
-        .spawn()?;
+        .stderr(Stdio::inherit());
+    if rendezvous.is_some() {
+        command.env(TEMPFS_MOUNT_ENV, "1");
+    }
+    let mut child = command.spawn()?;
     if let Err(error) = supervisor.write_all(&frame) {
         let _ = child.kill();
         let _ = child.wait();
         return Err(LaunchError::Io(error));
+    }
+    if let Some(rendezvous) = rendezvous {
+        let handover = bound_reads(&supervisor, TEMPFS_RENDEZVOUS_DEADLINE)
+            .map_err(LaunchError::Io)
+            .and_then(|()| {
+                rendezvous
+                    .complete(&supervisor)
+                    .map_err(LaunchError::TemporaryStorage)
+            })
+            .and_then(|()| unbound_reads(&supervisor).map_err(LaunchError::Io));
+        if let Err(error) = handover {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
     }
     Ok(SandboxedSession {
         child,
         stream: supervisor,
         kill_interface: containment.path().join("cgroup.kill"),
     })
+}
+
+/// Restore a stream to blocking reads and writes after a rendezvous.
+fn unbound_reads(socket: &UnixStream) -> std::io::Result<()> {
+    socket.set_read_timeout(None)?;
+    socket.set_write_timeout(None)
 }
 
 /// Entry-helper process body for a composed sandboxed launch.
@@ -1159,7 +1410,18 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
             return Err("session stream marker malformed".to_owned());
         }
     };
-    let frame = if session_stream {
+    let mount_rendezvous = match std::env::var(TEMPFS_MOUNT_ENV) {
+        Ok(value) if value == "1" => true,
+        Ok(_) => return Err("temporary-storage marker malformed".to_owned()),
+        Err(std::env::VarError::NotPresent) => false,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("temporary-storage marker malformed".to_owned());
+        }
+    };
+    // A socket carries the plan whenever anything must travel back over it,
+    // so the frame is read through its own terminator rather than to EOF:
+    // there is no EOF to wait for while the supervisor still holds its end.
+    let frame = if session_stream || mount_rendezvous {
         read_session_launch_frame()?
     } else {
         let mut frame = Vec::new();
@@ -1174,6 +1436,23 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
     if session_stream && plan.prompt.is_some() {
         return Err("session stream cannot carry a one-shot prompt".to_owned());
     }
+    if mount_rendezvous != plan.temporary_storage.is_some() {
+        return Err("the plan and the launch disagree about the scratch mount".to_owned());
+    }
+    // The rendezvous rides on the plan channel, so it is taken before step 3
+    // replaces fd 0 and closed before step 6 verifies the descriptor table.
+    let rendezvous = if mount_rendezvous {
+        let socket = std::io::stdin()
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|_| "the plan channel could not be retained".to_owned())?;
+        let socket = UnixStream::from(socket);
+        bound_reads(&socket, TEMPFS_RENDEZVOUS_DEADLINE)
+            .map_err(|_| "the plan channel is not a socket".to_owned())?;
+        Some(socket)
+    } else {
+        None
+    };
 
     // 2. Enter the cgroup before the workload exists; confirm from the kernel.
     let target = std::env::var_os(crate::CGROUP_DIR_ENV)
@@ -1209,9 +1488,40 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
     //    below. A plan that does not ask launches with the supervisor's
     //    identity, exactly as every plan did before the line existed.
     if plan.separate_identity {
-        crate::identity::separate_workload_identity()
+        let identity = crate::identity::enter_workload_namespace()
             .map_err(|error| format!("workload identity refused: {error}"))?;
+        // 5a. Still namespace-root, and only here: mount the run's temporary
+        //     filesystem inside the namespaces just created, hand the
+        //     connection to the supervisor that serves it, and let go of it.
+        //     A supervisor-mounted filesystem would answer this workload
+        //     `EACCES` on every open; one mounted here is ordinary. The socket
+        //     is closed before the descriptor closure below, whatever happens.
+        let mounted = match plan.temporary_storage.as_ref() {
+            Some(mount) => {
+                let socket = rendezvous
+                    .as_ref()
+                    .ok_or_else(|| "no rendezvous for the scratch mount".to_owned())?;
+                Some(
+                    mount_for_workload(mount, identity.workload().namespace_uid(), socket)
+                        .map_err(|error| format!("temporary storage refused: {error}"))?,
+                )
+            }
+            None => None,
+        };
+        crate::identity::assume_workload_identity(&identity)
+            .map_err(|error| format!("workload identity refused: {error}"))?;
+        // 5b. Read the mount back as the workload, which is the operation a
+        //     supervisor-mounted filesystem refuses. Only a readback equal to
+        //     the admitted budget releases the launch.
+        if let Some(mounted) = mounted.as_ref() {
+            let socket = rendezvous
+                .as_ref()
+                .ok_or_else(|| "no rendezvous for the scratch mount".to_owned())?;
+            confirm_for_workload(mounted, socket)
+                .map_err(|error| format!("temporary storage refused: {error}"))?;
+        }
     }
+    drop(rendezvous);
 
     // 6. Close everything but the standard streams and the staged program.
     let allowlist = DescriptorAllowlist::new(&[
@@ -1701,6 +2011,61 @@ mod tests {
         let unknown = encoded.replace("identity=subordinate", "identity=root");
         assert!(matches!(
             LaunchPlan::decode(unknown.as_bytes()),
+            Err(LaunchPlanError::FrameRejected)
+        ));
+    }
+
+    #[test]
+    fn the_tempfs_line_round_trips_and_needs_a_namespace_to_mount_in() {
+        let digest = "a".repeat(64);
+        let budget = TemporaryStorageBudget::new(8192, 2).unwrap();
+        let mount = TemporaryStorageMount::new("/state/runs/r1/tmp", budget);
+
+        // A plan that keeps the supervisor's identity has no namespace to
+        // mount in, and the supervisor's own mount is what it gets instead.
+        let plain = LaunchPlan::new("/usr/bin/true", &digest)
+            .unwrap()
+            .mount_temporary_storage(mount.clone())
+            .unwrap();
+        assert!(matches!(
+            plain.encode(),
+            Err(LaunchPlanError::PolicyRejected(_))
+        ));
+
+        let asking = LaunchPlan::new("/usr/bin/true", &digest)
+            .unwrap()
+            .separate_workload_identity()
+            .unwrap()
+            .mount_temporary_storage(mount.clone())
+            .unwrap();
+        let encoded = String::from_utf8(asking.encode().unwrap()).unwrap();
+        assert!(
+            encoded.contains(&format!(
+                "\ntempfs={}:8192:2\n",
+                hex("/state/runs/r1/tmp".as_bytes())
+            )),
+            "{encoded}"
+        );
+        let decoded = LaunchPlan::decode(encoded.as_bytes()).unwrap();
+        assert_eq!(decoded, asking);
+        assert_eq!(decoded.temporary_storage_mount(), Some(&mount));
+
+        // One mount has one spelling, in both directions.
+        assert!(matches!(
+            asking.clone().mount_temporary_storage(mount),
+            Err(LaunchPlanError::PolicyRejected(_))
+        ));
+        let line = format!("tempfs={}:8192:2\n", hex("/state/runs/r1/tmp".as_bytes()));
+        let repeated = encoded.replace(&line, &format!("{line}{line}"));
+        assert!(LaunchPlan::decode(repeated.as_bytes()).is_err());
+
+        // A ceiling the readback could not report exactly is refused at the
+        // frame, exactly as admission refuses it at the document.
+        let misaligned = encoded.replace(":8192:2\n", ":8193:2\n");
+        assert!(LaunchPlan::decode(misaligned.as_bytes()).is_err());
+        let truncated = encoded.replace(":8192:2\n", ":8192\n");
+        assert!(matches!(
+            LaunchPlan::decode(truncated.as_bytes()),
             Err(LaunchPlanError::FrameRejected)
         ));
     }

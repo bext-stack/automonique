@@ -108,7 +108,6 @@ use automonique_protocol::sandbox::{
 };
 use automonique_protocol::tools::RunId;
 use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
-use automonique_runner::capability::HostCapabilities;
 use automonique_runner::control::{CancelDelivery, CancelSink, CancelSinkError};
 use automonique_runner::dispatch::RegistrationHandle;
 use automonique_runner::{
@@ -144,11 +143,13 @@ const TERMINAL_DEADLINE: Duration = Duration::from_secs(90);
 /// Whether the capability probe says this host can enforce the composed
 /// sandbox.
 ///
-/// Exactly the four properties `Daemon::measure_execution_state` asks for, so
-/// this test agrees with the daemon by asking the same question rather than by
-/// assuming the answer.
+/// Exactly the properties `Daemon::measure_execution_state` asks for, of the
+/// host observed exactly as it observes it — launch helper included, because
+/// `uid_separation` is a property only the helper can demonstrate. This test
+/// agrees with the daemon by asking the same question rather than by assuming
+/// the answer.
 fn sandbox_enforceable() -> bool {
-    HostCapabilities::probe()
+    automonique_daemon::execute::probe_host()
         .select_mode(&automonique_daemon::execute::ENFORCED_PROPERTIES)
         .is_ok()
 }

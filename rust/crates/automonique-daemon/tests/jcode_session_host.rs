@@ -165,6 +165,7 @@ fn installed_jcode_negotiates_inside_the_production_sandbox_when_configured() {
         &server,
         100,
         Duration::from_secs(30),
+        None,
     )
     .expect("installed JCode negotiates inside enforced containment");
     assert!(!host.provider_session_id().is_empty());
@@ -253,6 +254,7 @@ fn contained_jcode_session_negotiates_input_resumes_and_journals() {
         "jcode/fixture",
         100,
         Duration::from_secs(5),
+        None,
     )
     .expect("host starts");
     let pid = host.operating_system_process_id();
@@ -452,6 +454,7 @@ fn eof_is_unknown_once_and_restart_retires_the_orphan_before_resume() {
         "jcode/eof-fixture",
         100,
         Duration::from_secs(5),
+        None,
     )
     .expect("first host starts");
     assert_eq!(
@@ -519,6 +522,7 @@ fn eof_is_unknown_once_and_restart_retires_the_orphan_before_resume() {
         "jcode/eof-fixture",
         400,
         Duration::from_secs(5),
+        None,
     )
     .expect("restart resumes exact provider session");
     resumed.close(500).expect("resumed host closes");
@@ -581,6 +585,7 @@ fn an_exact_resume_across_the_input_request_capability_change_is_compatible() {
         "jcode/cutover",
         100,
         Duration::from_secs(5),
+        None,
     )
     .expect("the legacy advertisement negotiates");
     assert_eq!(
@@ -623,6 +628,7 @@ fn an_exact_resume_across_the_input_request_capability_change_is_compatible() {
         "jcode/cutover",
         400,
         Duration::from_secs(5),
+        None,
     )
     .expect("the exact resume is compatible across the capability change");
     assert_eq!(
@@ -663,6 +669,7 @@ fn an_exact_resume_across_the_input_request_capability_change_is_compatible() {
         "jcode/cutover",
         700,
         Duration::from_secs(5),
+        None,
     );
     assert!(
         matches!(

@@ -33,6 +33,7 @@ pub mod tempfs;
 pub mod tempfs_checkpoint;
 pub mod tempfs_fs;
 pub mod tempfs_ledger;
+pub mod tempfs_namespace;
 pub mod tempfs_readback;
 
 pub use boundary::{
@@ -46,14 +47,15 @@ pub use containment::{
     containment_entry_helper_main, domain_is_owned, process_is_live,
 };
 pub use identity::{
-    IdentityError, WorkloadIdentity, WorkloadIdentityDenial, probe_with_launch_helper,
+    IdentityError, IdentityPlan, WorkloadIdentity, WorkloadIdentityDenial, probe_with_launch_helper,
 };
 pub use launch::{
     FRAME_HEADER, FRAME_TERMINATOR, LaunchError, LaunchPlan, LaunchPlanError, MAX_FRAME_BYTES,
     MAX_LAUNCH_ARG_BYTES, MAX_LAUNCH_ARGS, MAX_LAUNCH_ENV_ENTRIES, MAX_LAUNCH_ENV_NAME_BYTES,
     MAX_LAUNCH_ENV_VALUE_BYTES, MAX_LAUNCH_NOFILE, MAX_LAUNCH_PROMPT_BYTES, MAX_PROGRAM_BYTES,
-    MIN_LAUNCH_NOFILE, SandboxedSession, SocketGrant, StdoutCapture, launch_entry_helper_main,
-    spawn_sandboxed, spawn_sandboxed_session, spawn_sandboxed_with_stdout,
+    MIN_LAUNCH_NOFILE, SandboxedSession, SocketGrant, StdoutCapture, TEMPFS_RENDEZVOUS_DEADLINE,
+    launch_entry_helper_main, spawn_sandboxed, spawn_sandboxed_session,
+    spawn_sandboxed_session_with_tempfs, spawn_sandboxed_with_stdout, spawn_sandboxed_with_tempfs,
 };
 pub use runner::{CancellationToken, ContainmentEvidence, Runner, RunnerError};
 pub use simulation::{
@@ -87,7 +89,8 @@ pub use spool::{
 pub use tempfs::{
     CHECKPOINT_LEAF, DEFAULT_DEV_FUSE, DEFAULT_FUSERMOUNT3, DEFAULT_READBACK_DEADLINE, FS_NAME,
     FS_SUBTYPE, FusePrerequisites, MOUNT_LEAF, MountError, MountedTempfs, Outcome,
-    PrerequisiteError, ReapedMount, UnmountError, VerifiedFuse, detach_stale, reap_stale_mounts,
+    PrerequisiteError, ReapedMount, RunTempfs, TempfsRendezvous, UnmountError, VerifiedFuse,
+    WorkloadTempfs, detach_stale, reap_stale_mounts,
 };
 pub use tempfs_checkpoint::{Checkpoint, CheckpointError, FinalRecord, Phase as CheckpointPhase};
 pub use tempfs_fs::ExceedanceChannel;
@@ -95,6 +98,7 @@ pub use tempfs_ledger::{
     BudgetError, Exceedance, Ledger, LedgerSnapshot, MAX_TEMPORARY_STORAGE_BYTES,
     Resource as TemporaryStorageResource, STATFS_BLOCK_BYTES, TemporaryStorageBudget,
 };
+pub use tempfs_namespace::{MountedByLaunch, TemporaryStorageMount, WorkloadMountError};
 pub use tempfs_readback::{
     MountEvidence, MountStatus, ReadbackError, StatfsReadback, abort_connection,
 };
