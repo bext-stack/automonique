@@ -13,6 +13,7 @@
 //! of this crate's subtype owned by this uid at the mountpoint, and
 //! `statvfs(2)` on it returns the budget that was asked for.
 
+use crate::backend::TemporaryStorageWatch;
 use crate::tempfs_checkpoint::{Checkpoint, FinalRecord, Phase, now_millis};
 use crate::tempfs_fs::{ExceedanceChannel, QuotaFs, SharedState, snapshot};
 use crate::tempfs_ledger::{LedgerSnapshot, TemporaryStorageBudget};
@@ -546,6 +547,14 @@ impl MountedTempfs {
         Arc::clone(&self.channel)
     }
 
+    /// What a supervisor polls to contain a run on its first refusal and reads
+    /// back from once the run is dead: the channel and the mountpoint, without
+    /// the mount itself, which stays here to be reconciled after the run.
+    #[must_use]
+    pub fn watch(&self) -> TemporaryStorageWatch {
+        TemporaryStorageWatch::new(Arc::clone(&self.channel), &self.mountpoint)
+    }
+
     /// The ledger as it stands right now.
     #[must_use]
     pub fn snapshot(&self) -> LedgerSnapshot {
@@ -653,8 +662,9 @@ pub struct ReapedMount {
 /// Detach every stale (`Disconnected`) mount this uid owns under `runs_root`,
 /// and attach each one's last checkpoint.
 ///
-/// Called at daemon start and at run reconciliation. A `Live` entry is left
-/// alone: it belongs to a still-running supervisor (a previous generation
+/// Called once, when the daemon opens its execution lane at start; a run's own
+/// mount is reconciled by its owner and never reaches this. A `Live` entry is
+/// left alone: it belongs to a still-running supervisor (a previous generation
 /// during handoff), and detaching it would pull a writable scratch space out
 /// from under an accounted run. Only this uid's `fuse.<FS_SUBTYPE>` mounts
 /// whose mountpoint is `<runs_root>/<run_id>/<MOUNT_LEAF>` are considered, so

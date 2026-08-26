@@ -96,6 +96,7 @@ use crate::runner::CancellationToken;
 use crate::spool::{Authority, EventKind, Spool, SpoolError, Status};
 use crate::tempfs_fs::ExceedanceChannel;
 use crate::tempfs_ledger::Exceedance;
+use crate::tempfs_readback::{ReadbackError, StatfsReadback, statfs_bounded};
 use automonique_protocol::event::{
     Authority as FrameAuthority, EventKind as FrameKind, RetryCategory, RetryContext,
 };
@@ -189,6 +190,26 @@ const _: () = assert!(
 /// The text of the one warning an exhausted progress budget records.
 pub const PROGRESS_BUDGET_WARNING: &str =
     "progress capture stopped: the run's spool budget is spent";
+
+/// The prefix of the one warning a temporary-storage exceedance records.
+///
+/// The frame's text is this prefix, the refusal exactly as the filesystem's
+/// ledger spelled it, and the `statvfs` the supervisor read from the mount
+/// after the tree was killed (or why it could not), so the durable record
+/// carries the kernel readback beside the refusal rather than a configuration
+/// claim. It is appended as a synthetic `provider_warning` immediately before
+/// the `failed` terminal event, which is what lets a reader tell a run that
+/// crossed its scratch budget from one that failed for any other reason.
+pub const TEMPORARY_STORAGE_EXCEEDED_WARNING: &str = "temporary-storage budget exceeded";
+
+/// How long the supervisor waits for the mount's `statvfs` when it records an
+/// exceedance.
+///
+/// Bounded because the server it asks is the one the workload just overflowed;
+/// a server that does not answer costs the frame its readback, never the
+/// attempt its terminal event. The daemon's reconcile, which follows, aborts a
+/// server that stays silent.
+pub const TEMPORARY_STORAGE_READBACK_DEADLINE: Duration = Duration::from_secs(2);
 
 /// One frame a [`ProgressMapper`] produced, before the spool places it.
 ///
@@ -486,6 +507,7 @@ pub struct ExecutionReport {
     outcome: ExecutionOutcome,
     supervised_pid: Option<Pid>,
     status: Status,
+    temporary_storage_readback: Option<StatfsReadback>,
 }
 
 impl ExecutionReport {
@@ -493,6 +515,17 @@ impl ExecutionReport {
     #[must_use]
     pub const fn outcome(&self) -> ExecutionOutcome {
         self.outcome
+    }
+
+    /// The mount's `statvfs` the supervisor read after killing a run that
+    /// crossed its temporary-storage budget: the kernel's own account of the
+    /// usage the ceiling held at, taken once the tree was dead and recorded in
+    /// the spool's exceedance warning. `None` for every other outcome, and for
+    /// an exceedance whose server did not answer within
+    /// [`TEMPORARY_STORAGE_READBACK_DEADLINE`].
+    #[must_use]
+    pub const fn temporary_storage_readback(&self) -> Option<StatfsReadback> {
+        self.temporary_storage_readback
     }
 
     /// The pid of the process this supervisor spawned, if one was ever created.
@@ -604,10 +637,95 @@ pub struct PreparedRun {
     spool: Spool,
     capture: Option<ProgressCapture>,
     observed: ObservedSequence,
-    /// The mount's exceedance channel, when this run has a temporary-storage
-    /// mount. Polled in the supervision loop so a workload that crosses its
-    /// scratch budget is contained the first time the ledger refuses it.
-    temporary_storage: Option<Arc<ExceedanceChannel>>,
+    /// The mount's watch, when this run has a temporary-storage mount. Polled
+    /// in the supervision loop so a workload that crosses its scratch budget
+    /// is contained the first time the ledger refuses it, and read back once
+    /// the tree is dead so the spool carries the kernel's account of it.
+    temporary_storage: Option<TemporaryStorageWatch>,
+}
+
+/// What a supervisor watches to contain one run's temporary storage.
+///
+/// The mount's first-refusal channel, polled on the supervision interval, and
+/// the mountpoint the supervisor reads `statvfs` from when it records the
+/// exceedance. Taken from a mounted filesystem by
+/// [`crate::tempfs::MountedTempfs::watch`]; the mount itself stays with its
+/// owner, which reconciles and detaches it after the run.
+#[derive(Clone, Debug)]
+pub struct TemporaryStorageWatch {
+    channel: Arc<ExceedanceChannel>,
+    mountpoint: PathBuf,
+}
+
+impl TemporaryStorageWatch {
+    /// Watch `channel`, reading `statvfs` back from `mountpoint`.
+    #[must_use]
+    pub fn new(channel: Arc<ExceedanceChannel>, mountpoint: impl Into<PathBuf>) -> Self {
+        Self {
+            channel,
+            mountpoint: mountpoint.into(),
+        }
+    }
+
+    /// The first refusal the ledger recorded, once there is one.
+    #[must_use]
+    pub fn first(&self) -> Option<Exceedance> {
+        self.channel.first()
+    }
+
+    /// The mountpoint this watch reads back.
+    #[must_use]
+    pub fn mountpoint(&self) -> &Path {
+        &self.mountpoint
+    }
+
+    /// `statvfs` at the mountpoint, bounded by `deadline`.
+    ///
+    /// # Errors
+    ///
+    /// The kernel's errno, a deadline that passed without an answer, or no
+    /// thread for the bounded call.
+    pub fn readback(&self, deadline: Duration) -> Result<StatfsReadback, ReadbackError> {
+        statfs_bounded(&self.mountpoint, deadline)
+    }
+}
+
+/// The one synthetic warning a temporary-storage exceedance records.
+///
+/// `None` only when the protocol refuses the text, which a bounded exceedance
+/// and readback cannot make it do; the fallible shape is kept so no caller
+/// can panic on the way to its terminal event.
+#[must_use]
+pub fn temporary_storage_exceeded_frame(
+    exceedance: Exceedance,
+    readback: &Result<StatfsReadback, ReadbackError>,
+) -> Option<CapturedFrame> {
+    let text = match readback {
+        Ok(statfs) => {
+            format!("{TEMPORARY_STORAGE_EXCEEDED_WARNING}: {exceedance}; statfs {statfs}")
+        }
+        Err(error) => {
+            format!(
+                "{TEMPORARY_STORAGE_EXCEEDED_WARNING}: {exceedance}; statfs unavailable: {error}"
+            )
+        }
+    };
+    let body = ProgressBody::new(
+        FrameKind::ProviderWarning,
+        ProgressBodyParts {
+            text: ProgressText::new(text).ok(),
+            step: None,
+            // Not retryable, and no wait: the budget is the document's, and
+            // running the same document again would fill the same ceiling.
+            retry: RetryContext::new(RetryCategory::Internal, false, None, 1).ok(),
+        },
+    )
+    .ok()?;
+    Some(CapturedFrame {
+        authority: FrameAuthority::Synthetic,
+        kind: FrameKind::ProviderWarning,
+        body,
+    })
 }
 
 impl fmt::Debug for PreparedRun {
@@ -653,16 +771,18 @@ impl PreparedRun {
         self
     }
 
-    /// Poll `channel` in the supervision loop and contain the run the first
-    /// time its temporary-storage ledger refuses a write or an object.
+    /// Poll `watch` in the supervision loop and contain the run the first time
+    /// its temporary-storage ledger refuses a write or an object.
     ///
     /// Without this call the ceiling still holds — the FUSE filesystem refuses
     /// the syscall regardless — but the run continues past its first `ENOSPC`
     /// until it exits or its deadline elapses. With it, the first refusal ends
-    /// the run with [`ExecutionOutcome::TemporaryStorageExceeded`].
+    /// the run with [`ExecutionOutcome::TemporaryStorageExceeded`], the mount
+    /// is read back once the tree is dead, and the spool records both in a
+    /// [`TEMPORARY_STORAGE_EXCEEDED_WARNING`] frame before the terminal event.
     #[must_use]
-    pub fn with_temporary_storage_channel(mut self, channel: Arc<ExceedanceChannel>) -> Self {
-        self.temporary_storage = Some(channel);
+    pub fn with_temporary_storage(mut self, watch: TemporaryStorageWatch) -> Self {
+        self.temporary_storage = Some(watch);
         self
     }
 
@@ -725,18 +845,23 @@ impl PreparedRun {
                 Err((pid, error)) => (pid, None, Some(error)),
             };
         let payload = outcome.map_or(TERMINAL_FAILED, ExecutionOutcome::terminal_payload);
-        let finished = supervised.finish(payload, DRAIN_DEADLINE);
+        let exceeded = match outcome {
+            Some(ExecutionOutcome::TemporaryStorageExceeded { exceedance }) => Some(exceedance),
+            _ => None,
+        };
+        let finished = supervised.finish(payload, DRAIN_DEADLINE, exceeded);
 
         // A supervisor failure is the more truthful thing to report, so it wins
         // over any disposal error that followed it.
         if let Some(error) = failure {
             return Err(error);
         }
-        let status = finished?;
+        let (status, temporary_storage_readback) = finished?;
         Ok(ExecutionReport {
             outcome: outcome.expect("a run without a failure produced an outcome"),
             supervised_pid,
             status,
+            temporary_storage_readback,
         })
     }
 }
@@ -765,10 +890,10 @@ struct SupervisedRun {
     capture: Option<ProgressCapture>,
     frame_run_id: RunId,
     observed: ObservedSequence,
-    /// The temporary-storage mount's exceedance channel, when the run has a
-    /// mount. Polled every supervision interval so the first refusal contains
-    /// the run.
-    temporary_storage: Option<Arc<ExceedanceChannel>>,
+    /// The temporary-storage mount's watch, when the run has a mount. Polled
+    /// every supervision interval so the first refusal contains the run, and
+    /// read back at `finish` so the spool carries the kernel's account of it.
+    temporary_storage: Option<TemporaryStorageWatch>,
 }
 
 /// The reader thread and the queue it fills.
@@ -1089,7 +1214,7 @@ impl SupervisedRun {
             if let Some(exceedance) = self
                 .temporary_storage
                 .as_ref()
-                .and_then(|channel| channel.first())
+                .and_then(TemporaryStorageWatch::first)
             {
                 return Ok((
                     Some(pid),
@@ -1157,7 +1282,12 @@ impl SupervisedRun {
     /// separate obligation: the tree must die, the log must close, and the
     /// kernel must be left with no residue. The errors are reported in that
     /// order of seriousness once all three have been attempted.
-    fn finish(mut self, payload: &[u8], drain: Duration) -> Result<Status, BackendError> {
+    fn finish(
+        mut self,
+        payload: &[u8],
+        drain: Duration,
+        exceeded: Option<Exceedance>,
+    ) -> Result<(Status, Option<StatfsReadback>), BackendError> {
         let drained = self.terminate_tree(drain);
         // Only now: the tree is dead, so the pipe's last writer is gone and the
         // reader reaches end of file instead of waiting on a live process. What
@@ -1166,6 +1296,12 @@ impl SupervisedRun {
         // the same deadline the cgroup drain gets, so a tree that would not die
         // costs this attempt its progress rather than its terminal record.
         self.drain_progress(drain);
+        // A budget exceedance is the last word before the terminal event: the
+        // tree is dead, so the mount's `statvfs` is its final usage, and the
+        // transcript is drained, so the frame follows everything the workload
+        // said.
+        let temporary_storage_readback =
+            exceeded.and_then(|exceedance| self.record_temporary_storage_exceedance(exceedance));
 
         let mut spool = self.spool.take().expect("a supervised run holds its spool");
         let recorded = spool.append(EventKind::Terminal, Authority::Authoritative, payload);
@@ -1184,7 +1320,37 @@ impl SupervisedRun {
         recorded?;
         drained?;
         disposed?;
-        Ok(status)
+        Ok((status, temporary_storage_readback))
+    }
+
+    /// Record the one warning a temporary-storage exceedance leaves in the
+    /// spool, and return the readback it carried.
+    ///
+    /// Called after the tree is killed and the transcript drained, so the
+    /// `statvfs` it reads is the mount's final usage and the frame is the last
+    /// word before the terminal event. Appended under the terminal reserve
+    /// only, like the progress-budget warning: the attempt's own last word is
+    /// never crowded out by the explanation. The readback is returned even
+    /// when the spool had no room for the frame, because the supervisor's
+    /// report is a separate record from the spool's.
+    fn record_temporary_storage_exceedance(
+        &mut self,
+        exceedance: Exceedance,
+    ) -> Option<StatfsReadback> {
+        let watch = self.temporary_storage.as_ref()?;
+        let readback = watch.readback(TEMPORARY_STORAGE_READBACK_DEADLINE);
+        if let Some(frame) = temporary_storage_exceeded_frame(exceedance, &readback)
+            && self
+                .spool
+                .as_ref()
+                .is_some_and(|spool| spool.remaining_bytes() > PROGRESS_TERMINAL_RESERVE_BYTES)
+        {
+            // Appended directly rather than through `persist_progress`: the
+            // progress latch may already be set, and this frame is not
+            // progress but the reason there is no more of it.
+            let _ = self.append_frame(&frame);
+        }
+        readback.ok()
     }
 }
 

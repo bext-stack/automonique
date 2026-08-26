@@ -158,8 +158,9 @@ use automonique_runner::admission::{
 use automonique_runner::backend::{
     CapturedFrame, DirectProcessBackend, ObservedSequence, PROGRESS_BUDGET_WARNING,
     PROGRESS_PREVIEW_RESERVE_BYTES, PROGRESS_TERMINAL_RESERVE_BYTES, PreparedRun, ProgressCapture,
-    ProgressPublisher, STARTED_PAYLOAD_PREFIX, TERMINAL_CANCELLED, TERMINAL_COMPLETED,
-    TERMINAL_FAILED, TERMINAL_TIMED_OUT,
+    ProgressPublisher, STARTED_PAYLOAD_PREFIX, TEMPORARY_STORAGE_READBACK_DEADLINE,
+    TERMINAL_CANCELLED, TERMINAL_COMPLETED, TERMINAL_FAILED, TERMINAL_TIMED_OUT,
+    TemporaryStorageWatch, temporary_storage_exceeded_frame,
 };
 use automonique_runner::capability::{BoundaryProperty, HostCapabilities};
 use automonique_runner::control::{CancelDelivery, CancelSink, CancelSinkError};
@@ -170,8 +171,8 @@ use automonique_runner::tempfs::{
 };
 use automonique_runner::{
     Authority as SpoolAuthority, CancellationToken, ContainmentDomain, Controller,
-    EventKind as SpoolEventKind, LaunchPlan, PromptDeliveryPlan, RunContainment, RunSpec, Spool,
-    WorkspaceRegistryId,
+    EventKind as SpoolEventKind, Exceedance, LaunchPlan, PromptDeliveryPlan, RunContainment,
+    RunSpec, Spool, UnmountError, WorkspaceRegistryId,
 };
 use automonique_store::approval_requests::{
     ApprovalContext, ApprovalProposal, ApprovalRequests, ApprovalState, REQUEST_KEY_HEX_BYTES,
@@ -672,14 +673,24 @@ impl ExecutionLane {
         // under this daemon's runs directory. Only disconnected mounts this uid
         // owns are detached; a live one belongs to a still-running supervisor
         // during generation handoff and is left alone. Each stale one's last
-        // ledger checkpoint stays on disk for reconciliation. Best effort: a
-        // host without FUSE has nothing to reap and refuses every run anyway.
-        if let Ok(verified) = FusePrerequisites::host_default().verify() {
-            let _ = reap_stale_mounts(
+        // ledger checkpoint stays on disk for reconciliation, and each one is
+        // reported to the native journal with whether the detach cleared the
+        // mount table and whether a checkpoint was found. Best effort: a host
+        // without FUSE has nothing to reap and refuses every run anyway.
+        if let Ok(verified) = FusePrerequisites::host_default().verify()
+            && let Ok(reaped) = reap_stale_mounts(
                 &verified,
                 &state_dir.join(RUNS_DIRECTORY),
                 DEFAULT_READBACK_DEADLINE,
-            );
+            )
+        {
+            for mount in &reaped {
+                let _ = crate::structured_log::emit_temporary_storage_reaped(
+                    &mount.run_id,
+                    mount.detached,
+                    mount.checkpoint.is_some(),
+                );
+            }
         }
         Self {
             attempt_host,
@@ -916,30 +927,6 @@ impl ExecutionLane {
             .and_then(|()| private_directory(&spool_root))
             .map_err(|()| ExecuteRefusal::ExecutionUnavailable)?;
 
-        // The per-run temporary-storage mount. Admission proved the host can
-        // enforce it (so `verified_fuse` is `Ok`) and produced the exact
-        // budget; the supervisor mounts a FUSE filesystem with those ceilings
-        // under the run's private directory, confirms it from the kernel, and
-        // attaches it to the plan as a read-write Landlock grant plus `TMPDIR`.
-        // It is created before the workload is prepared, so the grant binds to
-        // the FUSE root inode the launch enforces, and it lives exactly as long
-        // as the run: the `Attempt` owns it and reconciles it after execution.
-        let verified_fuse = verified_fuse.map_err(|_| ExecuteRefusal::ContainmentUnavailable)?;
-        let mountpoint = run_root.join(MOUNT_LEAF);
-        private_directory(&mountpoint).map_err(|()| ExecuteRefusal::ExecutionUnavailable)?;
-        let temporary_storage = MountedTempfs::mount(
-            &verified_fuse,
-            &mountpoint,
-            admitted.temporary_storage_budget(),
-        )
-        .map_err(|_| ExecuteRefusal::ContainmentUnavailable)?
-        .with_checkpoint(run_root.join(CHECKPOINT_LEAF))
-        .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?;
-        let temporary_storage_channel = temporary_storage.exceedance_channel();
-        let admitted = admitted
-            .with_temporary_storage(&temporary_storage)
-            .map_err(|_| ExecuteRefusal::AdmissionRefused)?;
-
         // EVERYTHING THAT CAN STILL REFUSE HAPPENS BEFORE THE ANSWER.
         //
         // Registration, the spool and the run cgroup are all created here, on
@@ -969,6 +956,33 @@ impl ExecutionLane {
             )
             .map_err(registration_refusal)?;
 
+        // The per-run temporary-storage mount. Admission proved the host can
+        // enforce it (so `verified_fuse` is `Ok`) and produced the exact
+        // budget; the supervisor mounts a FUSE filesystem with those ceilings
+        // under the run's private directory, confirms it from the kernel, and
+        // attaches it to the plan as a read-write Landlock grant plus `TMPDIR`.
+        // It follows the registration so a duplicate attempt is refused before
+        // any `fusermount3` is spawned for it, and precedes the spool and the
+        // cgroup so the grant binds to the FUSE root inode the launch enforces.
+        // It lives exactly as long as the run: the `Attempt` owns it and
+        // reconciles it after execution, and a refusal below this line drops
+        // it, which detaches the mount.
+        let verified_fuse = verified_fuse.map_err(|_| ExecuteRefusal::ContainmentUnavailable)?;
+        let mountpoint = run_root.join(MOUNT_LEAF);
+        private_directory(&mountpoint).map_err(|()| ExecuteRefusal::ExecutionUnavailable)?;
+        let temporary_storage = MountedTempfs::mount(
+            &verified_fuse,
+            &mountpoint,
+            admitted.temporary_storage_budget(),
+        )
+        .map_err(|_| ExecuteRefusal::ContainmentUnavailable)?
+        .with_checkpoint(run_root.join(CHECKPOINT_LEAF))
+        .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?;
+        let temporary_storage_watch = temporary_storage.watch();
+        let admitted = admitted
+            .with_temporary_storage(&temporary_storage)
+            .map_err(|_| ExecuteRefusal::AdmissionRefused)?;
+
         let spool = Spool::open(&spool_root, run_id, admitted.spool_budget_bytes())
             .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?;
         let session_capture = Arc::new(Mutex::new(None));
@@ -993,6 +1007,7 @@ impl ExecutionLane {
                     publisher: self.progress.publisher(run_id),
                     session_capture: Arc::clone(&session_capture),
                     controls: Arc::clone(&self.jcode_controls),
+                    temporary_storage: Some(temporary_storage_watch.clone()),
                     approval: ProviderApprovalContext {
                         store_path: self.state_dir.join(crate::APPROVAL_REQUESTS_NAME),
                         spec_digest: admitted
@@ -1033,9 +1048,10 @@ impl ExecutionLane {
                 )
                 .map_err(|_| ExecuteRefusal::ContainmentUnavailable)?
                 // The first temporary-storage refusal contains the run: the
-                // supervision loop polls this channel and ends the workload on
-                // its first `ENOSPC`/`EDQUOT` with a typed budget outcome.
-                .with_temporary_storage_channel(temporary_storage_channel.clone());
+                // supervision loop polls this watch and ends the workload on
+                // its first `ENOSPC`/`EDQUOT` with a typed budget outcome, and
+                // the spool records the refusal and the mount's readback.
+                .with_temporary_storage(temporary_storage_watch.clone());
             // Capture only a stdout grammar the document explicitly selected.
             let prepared = if emits_normalized_stream(spec) {
                 match progress_capture(spec, run_id, &self.progress, Arc::clone(&session_capture)) {
@@ -1381,6 +1397,9 @@ struct JcodePreparedParts<'a> {
     publisher: Box<dyn ProgressPublisher>,
     session_capture: Arc<Mutex<Option<String>>>,
     controls: Arc<JcodeControlRegistry>,
+    /// The run's temporary-storage watch, when it has a mount. `None` only
+    /// for callers that run without one, such as tests of the protocol alone.
+    temporary_storage: Option<TemporaryStorageWatch>,
     approval: ProviderApprovalContext,
 }
 
@@ -1446,6 +1465,7 @@ struct JcodePreparedRun {
     publisher: Box<dyn ProgressPublisher>,
     session_capture: Arc<Mutex<Option<String>>>,
     controls: Arc<JcodeControlRegistry>,
+    temporary_storage: Option<TemporaryStorageWatch>,
     approval: ProviderApprovalContext,
     observed: ObservedSequence,
 }
@@ -1477,6 +1497,7 @@ impl JcodePreparedRun {
             publisher: parts.publisher,
             session_capture: parts.session_capture,
             controls: parts.controls,
+            temporary_storage: parts.temporary_storage,
             approval: parts.approval,
             observed: ObservedSequence::default(),
         })
@@ -1503,6 +1524,7 @@ impl JcodePreparedRun {
             publisher,
             session_capture,
             controls,
+            temporary_storage,
             approval,
             observed,
         } = self;
@@ -1610,6 +1632,24 @@ impl JcodePreparedRun {
             }
             if elapsed >= timeout {
                 break RunSpoolState::TimedOut;
+            }
+            // A temporary-storage refusal ends the run the first time the
+            // ledger records one, exactly as the direct backend does: the
+            // ceiling has already held (the provider saw its own `ENOSPC` or
+            // `EDQUOT`), and the run does not continue past it. The provider
+            // is asked to cancel so it can leave cleanly, the refusal and the
+            // mount's readback are recorded as the last word before the
+            // terminal event, and closing the host below ends the tree.
+            if let Some(watch) = temporary_storage.as_ref()
+                && let Some(exceedance) = watch.first()
+            {
+                let _ = host.cancel(
+                    crate::unix_millis().unwrap_or(now_ms),
+                    Duration::from_millis(100),
+                );
+                writer.project(&mut mapper, host.take_events());
+                writer.temporary_storage_exceeded(exceedance, watch);
+                break RunSpoolState::Failed;
             }
             let outcome = host.poll_turn(
                 crate::unix_millis().unwrap_or(now_ms),
@@ -2007,10 +2047,31 @@ impl JcodeSpoolWriter {
         self.progress_stopped = true;
     }
 
+    /// Record the one warning a temporary-storage exceedance leaves: the
+    /// refusal as the ledger spelled it and the mount's bounded `statvfs`, as
+    /// the last word before the `failed` terminal event. Recorded past the
+    /// progress latch, because this frame is not progress but the reason the
+    /// run has no more of it; still under the spool's reserves, so the
+    /// terminal event is never crowded out.
+    fn temporary_storage_exceeded(
+        &mut self,
+        exceedance: Exceedance,
+        watch: &TemporaryStorageWatch,
+    ) {
+        let readback = watch.readback(TEMPORARY_STORAGE_READBACK_DEADLINE);
+        if let Some(frame) = temporary_storage_exceeded_frame(exceedance, &readback) {
+            let _ = self.append_frame_past_latch(&frame);
+        }
+    }
+
     fn append_frame(&mut self, frame: &CapturedFrame) -> Result<(), ()> {
         if self.progress_stopped {
             return Err(());
         }
+        self.append_frame_past_latch(frame)
+    }
+
+    fn append_frame_past_latch(&mut self, frame: &CapturedFrame) -> Result<(), ()> {
         let remaining = self.spool.remaining_bytes();
         if remaining <= PROGRESS_TERMINAL_RESERVE_BYTES
             || (frame.authority == FrameAuthority::Synthetic
@@ -2193,8 +2254,24 @@ impl Attempt {
         // is stuck rather than hanging the worker), unmounts, and writes the
         // final ledger checkpoint that preserves the consumed-budget record
         // across a crash. Its own `Drop` detaches the mount on every other
-        // path, including a panic before this line.
-        let _ = temporary_storage.reconcile(DEFAULT_READBACK_DEADLINE);
+        // path, including a panic before this line. The outcome is the
+        // operator's to see: it lands in the native journal beside the run
+        // id, at warning priority when a ceiling refused anything, the
+        // readback had to be aborted, or the unmount was not confirmed.
+        match temporary_storage.reconcile(DEFAULT_READBACK_DEADLINE) {
+            Ok(outcome) => {
+                let _ = crate::structured_log::emit_temporary_storage_reconciled(
+                    &run_id,
+                    &crate::structured_log::TemporaryStorageReconciliation::from_outcome(&outcome),
+                );
+            }
+            Err(error) => {
+                let _ = crate::structured_log::emit_temporary_storage_unreconciled(
+                    &run_id,
+                    unmount_error_category(&error),
+                );
+            }
+        }
         // The spool's lock is free from here, so the durable record is readable
         // and strictly better than the window this hub was holding: complete,
         // hash-chain verified, and not subject to eviction.
@@ -2338,6 +2415,17 @@ fn progress_capture(
 const PROGRESS_SCOPE_TENANT: &str = "automonique";
 const PROGRESS_SCOPE_ACCOUNT: &str = "daemon";
 const PROGRESS_SCOPE_NAMESPACE: &str = "run-lane";
+
+/// The stable category the journal records for a temporary-storage reconcile
+/// that could not unmount, or could not confirm that it had.
+const fn unmount_error_category(error: &UnmountError) -> &'static str {
+    match error {
+        UnmountError::Spawn(_) => "fusermount_unavailable",
+        UnmountError::Refused { .. } => "unmount_refused",
+        UnmountError::MountTable(_) => "mount_table_unreadable",
+        UnmountError::StillMounted(_) => "still_mounted",
+    }
+}
 
 /// Translate one registration failure into the refusal that names it.
 ///

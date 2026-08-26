@@ -15,14 +15,50 @@ this page records the product decisions the integration makes.
 | Decision | Where it lives |
 | --- | --- |
 | A run's budget is `TemporaryStorageBudget { bytes, objects }`. `bytes` is the document's `temporary_storage_bytes`, exact. `objects` is derived: one object per 4 KiB block of the byte ceiling (`bytes / 4096`), so the same number bounds files, directories and symlinks. A wire field for the object count would be a protocol change and is deliberately not made here. | `automonique_runner::tempfs::TemporaryStorageBudget::from_bytes` |
-| Admission refuses a byte ceiling that is zero, not a multiple of 4096 (`statfs` reports blocks and the readback must equal the ceiling exactly, not round it), or above `MAX_TEMPORARY_STORAGE_BYTES` (128 MiB, see charging). The refusal is `QuotaRejected("sandbox.budgets.temporary_storage")`. | `automonique_runner::admission::map_quotas` |
+| Admission refuses a byte ceiling that is zero, not a multiple of 4096 (`statfs` reports blocks and the readback must equal the ceiling exactly, not round it), or above `MAX_TEMPORARY_STORAGE_BYTES` (128 MiB, see charging). The refusal is `QuotaRejected("sandbox.budgets.temporary_storage")`. | `automonique_runner::admission::map_temporary_storage` |
 | Admission refuses when the host cannot enforce. The context carries `TemporaryStorageEnforcement`: either a `VerifiedFuse` (the supervisor opened `/dev/fuse` read-write and found a setuid-root, executable `fusermount3`) or the typed `PrerequisiteError`, which admission republishes as `TemporaryStorageUnenforceable`. Nothing is admitted with a temporary-storage budget it cannot apply. | `automonique_runner::admission` |
-| The mount is created by the supervisor after admission, under the run's private directory (`<state>/runs/<run_id>/tmp`), before any workload exists. `fusermount3` is invoked by absolute path and explicit argument vector, and the mount is confirmed from the kernel before use: the mount table must show `fuse.automonique-tempfs` at the mountpoint, owned by this uid, and `statvfs` must read back exactly the requested ceilings with zero usage. Any mismatch detaches the mount and refuses the run. | `automonique_runner::tempfs::MountedTempfs::mount` |
+| The mount is created by the supervisor after admission and after the attempt is registered (so a duplicate attempt is refused before any `fusermount3` is spawned), under the run's private directory (`<state>/runs/<run_id>/tmp`), before any workload exists. `fusermount3` is invoked by absolute path and explicit argument vector, and the mount is confirmed from the kernel before use: the mount table must show `fuse.automonique-tempfs` at the mountpoint, owned by this uid, and `statvfs` must read back exactly the requested ceilings with zero usage. Any mismatch detaches the mount and refuses the run. | `automonique_runner::tempfs::MountedTempfs::mount` |
 | The plan is pointed at the mount only through `AdmittedLaunch::with_temporary_storage(&mounted)`, which refuses a mount whose kernel-read-back ceilings differ from the admitted budget, and which adds exactly one read-write Landlock grant on the mountpoint and binds `TMPDIR` to it. A document that binds `TMPDIR` itself is refused at admission: it would redirect scratch writes away from the budgeted tree. | `automonique_runner::admission::AdmittedLaunch` |
-| A workload that exceeds either ceiling is refused by the filesystem at the syscall that asked (`ENOSPC` for bytes, `EDQUOT` for objects), and the supervisor's poll loop reads the first refusal and kills the run cgroup. The outcome is `ExecutionOutcome::TemporaryStorageExceeded { exceedance }`; the report carries the ledger snapshot and the `statvfs` readback taken before unmount; the spool records a synthetic `provider_warning` frame naming the exceedance and the readback before the `failed` terminal event. | `automonique_runner::backend` |
+| A workload that exceeds either ceiling is refused by the filesystem at the syscall that asked (`ENOSPC` for bytes, `EDQUOT` for objects), and the supervisor's poll loop reads the first refusal and kills the run cgroup. The outcome is `ExecutionOutcome::TemporaryStorageExceeded { exceedance }`, carrying the refusal exactly as the ledger recorded it. Once the tree is dead the supervisor reads `statvfs` from the mount (bounded by `TEMPORARY_STORAGE_READBACK_DEADLINE`); the `ExecutionReport` carries that readback (`temporary_storage_readback`), and the spool records one synthetic `provider_warning` frame, `TEMPORARY_STORAGE_EXCEEDED_WARNING: <exceedance>; statfs <readback>`, as the last event before the `failed` terminal. The terminal payload itself stays `failed`: a new wire state would be a protocol change and is deliberately not made, so a reader distinguishes a budget kill by that frame. A JCode session run applies the same policy from the daemon's turn loop: the turn is cancelled, the same frame is recorded, and the run ends `failed`. | `automonique_runner::backend`, `automonique_daemon::execute` |
 | The ledger is checkpointed to `<state>/runs/<run_id>/tempfs-ledger` while the run lives (on every change, at most every 250 ms, and immediately on an exceedance) and finally at unmount with the outcome. A supervisor that dies keeps the last checkpoint; the reaper reads it back. | `automonique_runner::tempfs_checkpoint` |
-| Readback is bounded. Every `statvfs` the supervisor issues against its own mount runs under a deadline; on expiry the supervisor writes `/sys/fs/fuse/connections/<minor>/abort`, which the kernel lets the mount owner do, and the reconciliation continues from the last checkpoint. A stuck server cannot hang the run's end. | `automonique_runner::tempfs::MountedTempfs::reconcile` |
-| A dead owner leaves a stale mount (`ENOTCONN`; `auto_unmount` does not clean up a same-uid mount on this host). At daemon start the reaper walks `/proc/self/mountinfo` for this uid's `fuse.automonique-tempfs` entries under the runs directory, detaches every disconnected one lazily, and attaches its last checkpoint to the report. A live entry is left alone: it belongs to a still-running supervisor (a previous generation during handoff). | `automonique_runner::tempfs::reap_stale_mounts` |
+| Readback is bounded. Every `statvfs` the supervisor issues against its own mount runs under a deadline; on expiry the supervisor writes `/sys/fs/fuse/connections/<minor>/abort`, which the kernel lets the mount owner do, and the reconciliation continues from the last checkpoint. A stuck server cannot hang the run's end. The daemon records every reconcile's outcome in the native journal (see below). | `automonique_runner::tempfs::MountedTempfs::reconcile`, `automonique_daemon::execute::Attempt` |
+| A dead owner leaves a stale mount (`ENOTCONN`; `auto_unmount` does not clean up a same-uid mount on this host). When the daemon opens its execution lane at start, the reaper walks `/proc/self/mountinfo` for this uid's `fuse.automonique-tempfs` entries under the runs directory, detaches every disconnected one lazily, reads the dead owner's last checkpoint beside it, and reports each one to the native journal. A live entry is left alone: it belongs to a still-running supervisor (a previous generation during handoff). | `automonique_runner::tempfs::reap_stale_mounts`, `automonique_daemon::execute::ExecutionLane::open` |
+
+## Where the outcome is recorded
+
+Three records, none of them a configuration claim:
+
+1. **The run's spool.** A run killed for its scratch budget carries one
+   synthetic `provider_warning` frame immediately before its `failed`
+   terminal event. Its text is `TEMPORARY_STORAGE_EXCEEDED_WARNING`, the
+   exceedance as the ledger spelled it (`bytes requested=… used=… ceiling=…
+   errno=ENOSPC(28)` or the `objects`/`EDQUOT` form), and the `statvfs` the
+   supervisor read after the kill (`statfs bsize=… blocks=… bfree=0 …`), or
+   `statfs unavailable: <reason>` when the server did not answer within the
+   readback deadline. The frame is appended under the terminal reserve only;
+   the run's own last word is never crowded out. The test
+   `a_contained_workload_that_overflows_its_budget_is_killed_with_a_typed_outcome`
+   pins its position and content.
+2. **The ledger checkpoint** at `<state>/runs/<run_id>/tempfs-ledger`: the
+   final phase carries the ledger (peaks, refused counts, the first refusals
+   verbatim), the mount evidence, `statfs` at mount and before unmount, and
+   whether the readback was aborted and the unmount confirmed. The daemon
+   test `a_contained_run_answers_through_the_real_lane` reads it back for
+   every run.
+3. **The native journal** (`journalctl --user -u <unit>`), one structured
+   event per reconcile: `temporary_storage_reconciled` with the run id,
+   ceilings, peaks, refused counts, the kernel's used bytes before unmount,
+   and the abort/unmount-confirmed flags, at priority 6 normally and 4 when a
+   ceiling refused anything, the readback was aborted, or the unmount was not
+   confirmed; `temporary_storage_unreconciled` with a stable category when
+   the unmount itself failed (the mount's own drop still detaches it lazily);
+   and `temporary_storage_mount_reaped` for every stale mount the reaper
+   detached at lane open. Run identifiers and categories are validated
+   before they become fields; no workload content reaches the journal.
+
+The daemon's run index and the status projection still read `failed` for a
+budget kill. A distinct wire state would be a protocol change and is not made
+here.
 
 ## Oversized single writes: all-or-nothing per request
 
