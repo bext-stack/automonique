@@ -3,6 +3,7 @@
 import {describe, expect, test} from "bun:test";
 
 import {
+  MAX_MOBILE_PROTOCOL_VERSIONS,
   MOBILE_AUTH_MEDIA_TYPE,
   MobileFollowUpBytes,
   MobileCredentialPageSize,
@@ -15,6 +16,8 @@ import {
 import {
   MobileLifecycleClient,
   MobileLifecycleError,
+  MobileProtocolUnsupportedError,
+  SUPPORTED_MOBILE_PROTOCOL_VERSIONS,
   mobilePlatformClientId,
 } from "../src/mobile-auth-client.ts";
 
@@ -155,6 +158,76 @@ describe("mobile credential lifecycle client", () => {
       refresh_token: refresh,
       server_identity: identity,
     }));
+  });
+
+  // The versions this build speaks, and the first one above its ceiling.
+  // Written from the generated support range rather than from the literal `1`
+  // so these stay tests of the rule after a build widens the protocol.
+  const highestSupported =
+    SUPPORTED_MOBILE_PROTOCOL_VERSIONS[SUPPORTED_MOBILE_PROTOCOL_VERSIONS.length - 1]!;
+  const unsupported = highestSupported + 1n;
+
+  function discoveringFetch(versions: readonly bigint[]): typeof fetch {
+    return (async () => response(discovery({supported_versions: versions}))) as typeof fetch;
+  }
+
+  test("admits a server advertising exactly the versions this build speaks", async () => {
+    const client = await MobileLifecycleClient.discover(
+      origin,
+      discoveringFetch(SUPPORTED_MOBILE_PROTOCOL_VERSIONS),
+    );
+    expect(client.protocolVersion).toBe(highestSupported);
+    expect(client.discovery.supported_versions).toEqual(SUPPORTED_MOBILE_PROTOCOL_VERSIONS);
+  });
+
+  test("admits a server advertising a newer version alongside one this build speaks", async () => {
+    const client = await MobileLifecycleClient.discover(
+      origin,
+      discoveringFetch([unsupported, highestSupported]),
+    );
+    expect(client.protocolVersion).toBe(highestSupported);
+
+    const ascending = await MobileLifecycleClient.discover(
+      origin,
+      discoveringFetch([highestSupported, unsupported]),
+    );
+    expect(ascending.protocolVersion).toBe(highestSupported);
+  });
+
+  test("refuses a server sharing no version, naming both sets", async () => {
+    const refusal = await MobileLifecycleClient.discover(origin, discoveringFetch([unsupported]))
+      .then(() => undefined, (error: unknown) => error);
+    expect(refusal).toBeInstanceOf(MobileProtocolUnsupportedError);
+    const typed = refusal as MobileProtocolUnsupportedError;
+    expect(typed.category).toBe("mobile_protocol_unsupported");
+    expect(typed.advertised).toEqual([unsupported]);
+    expect(typed.supported).toEqual(SUPPORTED_MOBILE_PROTOCOL_VERSIONS);
+    expect(typed.message).toContain(String(unsupported));
+    expect(typed.message).toContain(String(highestSupported));
+  });
+
+  test("refuses an empty advertisement as no shared version", async () => {
+    await expect(MobileLifecycleClient.discover(origin, discoveringFetch([])))
+      .rejects.toMatchObject({category: "mobile_protocol_unsupported"});
+  });
+
+  test("refuses a malformed version value apart from an unsupported one", async () => {
+    await expect(MobileLifecycleClient.discover(origin, discoveringFetch([0n])))
+      .rejects.toMatchObject({category: "mobile_auth_value_invalid"});
+    await expect(MobileLifecycleClient.discover(origin, discoveringFetch([65_536n])))
+      .rejects.toMatchObject({category: "mobile_auth_value_invalid"});
+  });
+
+  test("refuses a repeated version and an advertisement past the wire ceiling", async () => {
+    await expect(MobileLifecycleClient.discover(
+      origin,
+      discoveringFetch([highestSupported, highestSupported]),
+    )).rejects.toMatchObject({category: "mobile_discovery_mismatch"});
+
+    const overCeiling = Array.from({length: MAX_MOBILE_PROTOCOL_VERSIONS + 1}, (_unused, index) =>
+      BigInt(index + 1));
+    await expect(MobileLifecycleClient.discover(origin, discoveringFetch(overCeiling)))
+      .rejects.toMatchObject({category: "mobile_auth_value_invalid"});
   });
 
   test("fails closed on strict-schema, identity, media, caching, and bearer errors", async () => {

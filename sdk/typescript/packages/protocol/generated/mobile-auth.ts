@@ -32,6 +32,12 @@ export const MAX_MOBILE_PROTOCOL_VERSIONS = 8;
 /** Maximum exact session identifiers in one credential scope. */
 export const MAX_MOBILE_SESSIONS = 100;
 
+/** Highest mobile protocol version this build speaks. */
+export const MAX_SUPPORTED_MOBILE_PROTOCOL_VERSION = 1;
+
+/** Lowest mobile protocol version this build speaks. */
+export const MIN_SUPPORTED_MOBILE_PROTOCOL_VERSION = 1;
+
 /** A mobile lifecycle document was not its exact bounded schema. */
 export const MOBILE_AUTH_INVALID_BODY = "mobile_auth_invalid_body";
 
@@ -55,6 +61,9 @@ export const MOBILE_AUTH_VALUE_INVALID = "mobile_auth_value_invalid";
 
 /** Absolute maximum lifetime of a one-time pairing offer. */
 export const MOBILE_PAIRING_TTL_MILLIS = 300000;
+
+/** No advertised protocol version is one this build speaks. */
+export const MOBILE_PROTOCOL_UNSUPPORTED = "mobile_protocol_unsupported";
 
 /** Branded identifier, at most 46 UTF-8 bytes. */
 export type MobileCredentialId = string & {readonly __brand: "MobileCredentialId"};
@@ -284,12 +293,12 @@ export function MobilePageEvents(value: bigint): MobilePageEvents {
   return value as MobilePageEvents;
 }
 
-/** Bounded integer in [1, 1]. */
+/** Bounded integer in [1, 65535]. */
 export type MobileProtocolVersion = bigint & {readonly __brand: "MobileProtocolVersion"};
 export const MobileProtocolVersion_MIN = 1n;
-export const MobileProtocolVersion_MAX = 1n;
+export const MobileProtocolVersion_MAX = 65535n;
 export function MobileProtocolVersion(value: bigint): MobileProtocolVersion {
-  if (typeof value !== "bigint" || value < 1n || value > 1n) throw new ValidationError("MobileProtocolVersion", "out_of_range");
+  if (typeof value !== "bigint" || value < 1n || value > 65535n) throw new ValidationError("MobileProtocolVersion", "out_of_range");
   return value as MobileProtocolVersion;
 }
 
