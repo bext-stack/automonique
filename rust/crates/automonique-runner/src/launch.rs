@@ -13,27 +13,47 @@
 //! 3. replaces stdin with the prompt descriptor the plan names — an anonymous,
 //!    sealed, memory-backed file — or with `/dev/null` when it names none, so
 //!    the workload cannot read the plan channel either way;
-//! 4. opens the workload once, copies the verified bytes into an immutable
-//!    sealed descriptor, then closes every descriptor except that descriptor
-//!    and the standard streams and verifies the closure
-//!    ([`crate::descriptors`]);
-//! 5. installs the plan's Landlock filesystem allowlist
+//! 4. opens the workload once and copies the verified bytes into an immutable
+//!    sealed descriptor;
+//! 5. when the plan carries `identity=subordinate`, gives itself the workload
+//!    identity ([`crate::identity`]): an unprivileged user namespace whose
+//!    subordinate mapping is written by the host's setuid
+//!    `newuidmap`/`newgidmap`, a uid switch inside it to a host uid that is
+//!    not the supervisor's, and a capability set reduced to the three
+//!    discretionary-access capabilities the workload keeps over the
+//!    supervisor's files — every step read back from the kernel. A plan that
+//!    does not ask keeps the supervisor's identity, exactly as before;
+//! 6. closes every descriptor except the sealed program descriptor and the
+//!    standard streams and verifies the closure ([`crate::descriptors`]);
+//! 7. installs the plan's Landlock filesystem allowlist
 //!    ([`crate::filesystem`]);
-//! 6. installs the plan's Landlock TCP policy ([`crate::network`]);
-//! 7. installs the plan's seccomp socket-family filter ([`crate::seccomp`]),
-//!    which denies creating every socket shape the plan does not grant —
-//!    including UDP, raw and packet sockets, and non-TCP stream protocols
-//!    that Landlock's TCP rules cannot see;
-//! 8. applies the plan's per-process resource limits and verifies their kernel
-//!    readback;
-//! 9. `execveat`s the sealed descriptor with exactly the environment the plan
-//!    names. The path is not resolved again.
+//! 8. installs the plan's Landlock TCP policy ([`crate::network`]);
+//! 9. installs the plan's seccomp filter ([`crate::seccomp`]), which denies
+//!    creating every socket shape the plan does not grant — including UDP,
+//!    raw and packet sockets, and non-TCP stream protocols that Landlock's
+//!    TCP rules cannot see — and denies every namespace-creating syscall, so
+//!    the identity of step 5 cannot be nested away;
+//! 10. applies the plan's per-process resource limits and verifies their
+//!     kernel readback;
+//! 11. `execveat`s the sealed descriptor with exactly the environment the plan
+//!     names. The path is not resolved again.
 //!
 //! Any failure at any step exits with [`crate::HELPER_REFUSED_EXIT`] before
 //! the workload runs. The workload's very first instruction therefore executes
-//! inside the cgroup, behind both Landlock domains and the socket filter, with
-//! exactly three inherited descriptors and exactly the environment the plan
-//! spells out — empty unless it spells one, and never anything inherited.
+//! inside the cgroup — under its own host uid when the plan asked for one —
+//! behind both Landlock domains and the syscall filter, with exactly three
+//! inherited descriptors and exactly the environment the plan spells out —
+//! empty unless it spells one, and never anything inherited.
+//!
+//! The identity switch sits where it does for two reasons. It follows the
+//! cgroup join and the program staging because both are done as the
+//! supervisor's uid — the run cgroup's interfaces are the supervisor's files,
+//! and the program is opened by the same rules as before — and it precedes
+//! descriptor closure because the switch spawns and reaps a short-lived
+//! mapper process whose pipe must be gone before the descriptor table is
+//! verified. The helper itself is still the process that becomes the
+//! workload, so the pid the supervisor holds is the pid the switch applies
+//! to, and the supervisor's launch protocol is unchanged.
 //!
 //! # Why this order
 //!
@@ -68,21 +88,30 @@
 //!   closed as [`crate::descriptors`], the plan's grants, and
 //!   [`crate::seccomp`]'s io_uring denial make them; see those modules for
 //!   the exact residual surface.
-//! - **It does not protect against a same-uid attacker.** The plan travels
-//!   over a private pipe and the cgroup is delegation-checked, but a process
-//!   of the same uid outside the sandbox can already trace the supervisor.
-//! - **Environment values are not hidden from the host.** Frame delivery keeps
-//!   them out of argv, so no process listing shows them, but from `execve`
-//!   until exit any same-uid reader can read `/proc/<pid>/environ`. That is
-//!   the same-uid limit named above rather than a new one, and it is the
-//!   reason a secret placed in the environment is a secret shared with the
-//!   whole host account.
+//! - **It does not protect the supervisor from a same-uid attacker.** The
+//!   plan travels over a private pipe and the cgroup is delegation-checked,
+//!   but a process of the supervisor's uid outside the sandbox can already
+//!   trace the supervisor itself. What the identity switch closes — for a
+//!   plan that requests it — is the other direction: from `execve` on, the
+//!   workload runs as a host uid no supervisor-uid process shares, so
+//!   `/proc/<pid>/environ` and `/proc/<pid>/fd/0` — the environment and the
+//!   prompt — answer `EACCES` to such a reader, and the workload can neither
+//!   signal nor trace a supervisor-uid process. A plan that does not request
+//!   it keeps the supervisor's uid and the same-uid exposure that has always
+//!   come with it; see [`crate::identity`] for why the request is not yet the
+//!   default. The environment is never hidden from the host either way:
+//!   root, and the workload's own descendants, can read it.
+//! - **Identity separation is not discretionary-access separation.** The
+//!   workload keeps `CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH` and `CAP_FOWNER`
+//!   inside its namespace over inodes the supervisor owns, because the
+//!   workspace, the provider home and the scratch mount are all such inodes.
+//!   The filesystem allowlist is the filesystem boundary, exactly as before;
+//!   see [`crate::identity`] for what the capabilities do and do not reach.
 //! - **The prompt is closed to the path namespace, not to the host.** Prompt
 //!   bytes live in an anonymous memory-backed file that no directory entry
 //!   names, so there is no path to open and no grant that could reach it, and
 //!   its seals make the bytes immutable — the workload cannot rewrite its own
-//!   prompt and hand a different one to a child. A same-uid reader can still
-//!   reach the same bytes through `/proc/<pid>/fd/0`.
+//!   prompt and hand a different one to a child.
 //! - **Naming a variable can name a mechanism.** `LD_PRELOAD`,
 //!   `LD_LIBRARY_PATH` and their kin change what a dynamically linked program
 //!   loads. There is deliberately no denylist here: a denylist would be
@@ -285,6 +314,7 @@ pub struct LaunchPlan {
     environment: Vec<(String, Vec<u8>)>,
     prompt: Option<Vec<u8>>,
     rlimit_nofile: Option<u64>,
+    separate_identity: bool,
 }
 
 /// Redacting: a derived `Debug` would print environment values and prompt
@@ -307,6 +337,7 @@ impl fmt::Debug for LaunchPlan {
             )
             .field("prompt_bytes", &self.prompt_len())
             .field("rlimit_nofile", &self.rlimit_nofile)
+            .field("separate_identity", &self.separate_identity)
             .finish()
     }
 }
@@ -388,6 +419,7 @@ impl LaunchPlan {
             environment: Vec::new(),
             prompt: None,
             rlimit_nofile: None,
+            separate_identity: false,
         })
     }
 
@@ -556,6 +588,37 @@ impl LaunchPlan {
         Ok(self)
     }
 
+    /// Run the workload as a host uid that is not the supervisor's.
+    ///
+    /// The entry helper performs the whole switch ([`crate::identity`]) and
+    /// refuses the launch when the host cannot: subordinate ranges, the
+    /// setuid mappers and — where the host restricts unprivileged user
+    /// namespaces — an AppArmor grant are all prerequisites, and every step
+    /// is read back from the kernel. Off by default: a plan that does not ask
+    /// launches exactly as before, and asking twice is refused like every
+    /// other repeated line.
+    ///
+    /// A plan carrying this cannot attach the enforced temporary-storage
+    /// mount: on current kernels FUSE refuses `allow_other` access to a
+    /// process in a child user namespace, so the combination is refused
+    /// (fail-closed) rather than admitted and broken; see
+    /// [`crate::admission`].
+    pub fn separate_workload_identity(mut self) -> Result<Self, LaunchPlanError> {
+        if self.separate_identity {
+            return Err(LaunchPlanError::PolicyRejected(
+                "identity separation is requested twice".to_owned(),
+            ));
+        }
+        self.separate_identity = true;
+        Ok(self)
+    }
+
+    /// Whether this plan runs its workload under a separated host uid.
+    #[must_use]
+    pub const fn separates_workload_identity(&self) -> bool {
+        self.separate_identity
+    }
+
     /// Exact workload program path.
     #[must_use]
     pub fn program(&self) -> &Path {
@@ -683,6 +746,9 @@ impl LaunchPlan {
         if let Some(limit) = self.rlimit_nofile {
             frame.push_str(&format!("rlimit_nofile={limit}\n"));
         }
+        if self.separate_identity {
+            frame.push_str("identity=subordinate\n");
+        }
         for argument in &self.arguments {
             frame.push_str(&format!("arg={}\n", hex(argument)));
         }
@@ -761,6 +827,14 @@ impl LaunchPlan {
                         .parse::<u64>()
                         .map_err(|_| LaunchPlanError::FrameRejected)?;
                     *current = current.clone().rlimit_descriptors(value)?;
+                }
+                ("identity", Some(current)) => {
+                    if value != "subordinate" {
+                        return Err(LaunchPlanError::FrameRejected);
+                    }
+                    // A second line refuses in the builder: one request has
+                    // one spelling, and a repeat is a broken frame.
+                    *current = current.clone().separate_workload_identity()?;
                 }
                 ("grant", Some(current)) => {
                     let (intent, path_hex) = value
@@ -935,6 +1009,12 @@ pub fn spawn_sandboxed_with_stdout(
 pub struct SandboxedSession {
     child: Child,
     stream: UnixStream,
+    /// The run containment's `cgroup.kill`, captured at spawn.
+    ///
+    /// The workload runs as a host uid the supervisor does not share, so a
+    /// signal to its pid is refused with `EPERM`; the cgroup's kill interface
+    /// is a supervisor-owned file and reaches the whole tree.
+    kill_interface: PathBuf,
 }
 
 impl SandboxedSession {
@@ -958,10 +1038,19 @@ impl SandboxedSession {
         self.child.wait()
     }
 
-    /// Request process termination. The owning containment remains responsible
-    /// for descendant-complete cleanup.
+    /// Terminate the workload tree through its run cgroup.
+    ///
+    /// The owning containment remains responsible for draining and removing
+    /// the cgroup; a cgroup already removed holds nothing left to kill and is
+    /// not an error. The direct signal is still sent as a fallback for a
+    /// process that was never given the workload identity.
     pub fn kill(&mut self) -> Result<(), std::io::Error> {
-        self.child.kill()
+        let direct = self.child.kill();
+        match std::fs::write(&self.kill_interface, b"1") {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => direct.or(Ok(())),
+            Err(error) => Err(error),
+        }
     }
 
     /// Operating-system process identifier, for supervision evidence only.
@@ -976,7 +1065,7 @@ impl Drop for SandboxedSession {
         // A session owns a process, not merely its control socket. This is the
         // startup-failure path as well as the caller-forgot-to-close path; in
         // both cases leaving the child behind would outlive its journal owner.
-        let _ = self.child.kill();
+        let _ = self.kill();
         let _ = self.child.wait();
     }
 }
@@ -1017,6 +1106,7 @@ pub fn spawn_sandboxed_session(
     Ok(SandboxedSession {
         child,
         stream: supervisor,
+        kill_interface: containment.path().join("cgroup.kill"),
     })
 }
 
@@ -1027,6 +1117,25 @@ pub fn spawn_sandboxed_session(
 /// written to stderr as a single bounded line containing no plan content.
 #[must_use]
 pub fn launch_entry_helper_main() -> i32 {
+    // Two auxiliary modes share the binary so the AppArmor profile that
+    // grants it `userns` covers every process that needs the grant: the
+    // mapper the launch spawns for itself, and the capability probe's
+    // throwaway child. Either is selected by exactly one argument; a launch
+    // takes none, and anything else is refused.
+    let mut arguments = std::env::args_os().skip(1);
+    match (arguments.next(), arguments.next()) {
+        (None, None) => {}
+        (Some(mode), None) if mode == crate::identity::MAP_MODE_FLAG => {
+            return crate::identity::map_workload_identity_main();
+        }
+        (Some(mode), None) if mode == crate::identity::PROBE_MODE_FLAG => {
+            return crate::identity::probe_workload_identity_main();
+        }
+        _ => {
+            eprintln!("automonique-launch-enter: refused: unknown argument");
+            return HELPER_REFUSED_EXIT;
+        }
+    }
     match enter_enforce_and_exec() {
         Ok(never) => match never {},
         Err(reason) => {
@@ -1091,6 +1200,20 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
     //    the retained descriptor is the object execveat consumes; the source
     //    path is never resolved again.
     let program_descriptor = staged_verified_program_descriptor(&plan)?;
+
+    // 5. When the plan asks, become the workload identity: a host uid that is
+    //    not the supervisor's, in a user namespace of this process's own,
+    //    with the capability set the workload keeps. Every step is read back
+    //    from the kernel and any failure refuses the launch. The mapper this
+    //    spawns is reaped, and its pipe closed, before the descriptor closure
+    //    below. A plan that does not ask launches with the supervisor's
+    //    identity, exactly as every plan did before the line existed.
+    if plan.separate_identity {
+        crate::identity::separate_workload_identity()
+            .map_err(|error| format!("workload identity refused: {error}"))?;
+    }
+
+    // 6. Close everything but the standard streams and the staged program.
     let allowlist = DescriptorAllowlist::new(&[
         0,
         1,
@@ -1114,7 +1237,7 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
         }
     })?;
 
-    // 5–6. Landlock domains. The TCP policy confirms single-threadedness from
+    // 7–8. Landlock domains. The TCP policy confirms single-threadedness from
     //      /proc while it is being installed, so it must precede the
     //      filesystem domain that deliberately makes /proc unreadable.
     //      Anything either policy opens is close-on-exec and dropped before
@@ -1131,24 +1254,24 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
         )
         .map_err(|error| error.to_string())?;
 
-    // 7. The seccomp socket-family filter closes what Landlock cannot reach:
-    //    UDP, raw and packet sockets, and non-TCP stream protocols. It is
-    //    installed last so its own installation needs no carve-outs in the
-    //    layers above, and like them it survives execve.
+    // 9. The seccomp filter closes what Landlock cannot reach: UDP, raw and
+    //    packet sockets, non-TCP stream protocols, and every namespace
+    //    creation. It is installed last so its own installation needs no
+    //    carve-outs in the layers above, and like them it survives execve.
     plan.socket_policy()
         .map_err(|error| error.to_string())?
         .apply_to_current_thread()
         .map_err(|error| error.to_string())?;
 
-    // 8. Apply the workload's process-local descriptor ceiling only after the
+    // 10. Apply the workload's process-local descriptor ceiling only after the
     //    helper has finished opening policy and executable descriptors. The
     //    hard limit is lowered with the soft limit so the workload cannot raise
     //    it again; readback makes a silent kernel no-op a refusal.
     apply_resource_limits(&plan)?;
 
-    // 9. Exact program, exact argv, exactly the named environment — which is
-    //    empty when the plan named none, as every plan did before `env=`
-    //    existed.
+    // 11. Exact program, exact argv, exactly the named environment — which is
+    //     empty when the plan named none, as every plan did before `env=`
+    //     existed.
     let program = CString::new(plan.program.as_os_str().as_encoded_bytes().to_vec())
         .map_err(|_| "program path contains NUL".to_owned())?;
     let mut argv = Vec::with_capacity(plan.arguments.len() + 1);
@@ -1538,6 +1661,48 @@ mod tests {
             output.stdout.ends_with(b"verified-bytes-ran\n"),
             "{output:?}"
         );
+    }
+
+    #[test]
+    fn the_identity_line_round_trips_and_a_repeat_is_refused() {
+        let digest = "a".repeat(64);
+        let plain = LaunchPlan::new("/usr/bin/true", &digest).unwrap();
+        let encoded = String::from_utf8(plain.encode().unwrap()).unwrap();
+        assert!(
+            !encoded.contains("identity="),
+            "a plan that does not ask must not carry the line: {encoded}"
+        );
+        assert!(
+            !LaunchPlan::decode(encoded.as_bytes())
+                .unwrap()
+                .separates_workload_identity()
+        );
+
+        let asking = LaunchPlan::new("/usr/bin/true", &digest)
+            .unwrap()
+            .separate_workload_identity()
+            .unwrap();
+        assert!(asking.separates_workload_identity());
+        let encoded = String::from_utf8(asking.encode().unwrap()).unwrap();
+        assert!(encoded.contains("\nidentity=subordinate\n"), "{encoded}");
+        let decoded = LaunchPlan::decode(encoded.as_bytes()).unwrap();
+        assert!(decoded.separates_workload_identity());
+        assert_eq!(decoded, asking);
+
+        assert!(matches!(
+            asking.clone().separate_workload_identity(),
+            Err(LaunchPlanError::PolicyRejected(_))
+        ));
+        let repeated = encoded.replace(
+            "identity=subordinate\n",
+            "identity=subordinate\nidentity=subordinate\n",
+        );
+        assert!(LaunchPlan::decode(repeated.as_bytes()).is_err());
+        let unknown = encoded.replace("identity=subordinate", "identity=root");
+        assert!(matches!(
+            LaunchPlan::decode(unknown.as_bytes()),
+            Err(LaunchPlanError::FrameRejected)
+        ));
     }
 
     #[test]

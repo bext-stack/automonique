@@ -79,7 +79,7 @@ use automonique_daemon::{Daemon, DaemonConfig};
 use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse, ExecutionState};
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
 use automonique_runner::ContainmentDomain;
-use automonique_runner::capability::{BoundaryProperty, HostCapabilities};
+use automonique_runner::capability::HostCapabilities;
 
 #[path = "support/isolation.rs"]
 mod test_isolation;
@@ -379,12 +379,7 @@ fn exchange(config: &DaemonConfig, payload: &[u8]) -> Vec<u8> {
 
 fn sandbox_enforceable() -> bool {
     HostCapabilities::probe()
-        .select_mode(&[
-            BoundaryProperty::DescendantContainment,
-            BoundaryProperty::FilesystemRestriction,
-            BoundaryProperty::TcpDenial,
-            BoundaryProperty::SyscallRestriction,
-        ])
+        .select_mode(&automonique_daemon::execute::ENFORCED_PROPERTIES)
         .is_ok()
 }
 

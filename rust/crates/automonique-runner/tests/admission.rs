@@ -44,6 +44,7 @@ use automonique_runner::admission::{
     BrokeredScope, INFORMATIONAL_FIELDS, PromptSource, ProviderIdentityBinding,
     ProviderIdentityPolicy, ResolvedPrompt, SESSION_SENTINEL_DIGITS, SESSION_SENTINEL_PREFIX,
     TemporaryStorageEnforcement, UnenforcedBudget, admit,
+    refuse_identity_temporary_storage_conflict,
 };
 use automonique_runner::filesystem::PathIntent;
 use automonique_runner::{
@@ -1194,6 +1195,29 @@ fn a_host_that_cannot_mount_refuses_the_temporary_storage_budget() {
         }
         other => panic!("got {other:?}"),
     }
+}
+
+#[test]
+fn identity_separation_and_the_temporary_storage_mount_cannot_combine() {
+    // The rule is a pure function of the plan, pinned here exactly as
+    // `AdmittedLaunch::with_temporary_storage` consults it: no document field
+    // can request identity separation yet, so this seam is where the
+    // combination is kept apart.
+    let digest = "a".repeat(64);
+    let plain = automonique_runner::LaunchPlan::new("/usr/bin/true", &digest).unwrap();
+    assert!(refuse_identity_temporary_storage_conflict(&plain).is_ok());
+
+    let separated = plain.separate_workload_identity().unwrap();
+    let error = refuse_identity_temporary_storage_conflict(&separated).unwrap_err();
+    assert!(matches!(
+        error,
+        AdmissionRefusal::WorkloadIdentityTemporaryStorageConflict
+    ));
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("child user namespace") && rendered.contains("FUSE"),
+        "the refusal must name the kernel limitation: {rendered}"
+    );
 }
 
 #[test]

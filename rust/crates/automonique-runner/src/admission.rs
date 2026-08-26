@@ -654,6 +654,13 @@ pub enum AdmissionRefusal {
     /// away from the budgeted mount. The budget attaches `TMPDIR`, so the two
     /// cannot both be present.
     TemporaryStorageTmpdirConflict,
+    /// The plan asks for a separated workload identity *and* the enforced
+    /// temporary-storage mount, which this kernel cannot deliver together:
+    /// FUSE refuses `allow_other` access to a process in a child user
+    /// namespace, so the supervisor-mounted scratch tree would be unreachable
+    /// by the very workload it budgets. Each feature works alone; the
+    /// combination is refused fail-closed rather than admitted and broken.
+    WorkloadIdentityTemporaryStorageConflict,
     /// The spec's canonical digest could not be computed.
     Digest(RunSpecEncodeError),
 }
@@ -734,6 +741,11 @@ impl fmt::Display for AdmissionRefusal {
             }
             Self::TemporaryStorageBudgetMismatch => formatter.write_str(
                 "the offered mount does not read back the admitted temporary-storage budget",
+            ),
+            Self::WorkloadIdentityTemporaryStorageConflict => formatter.write_str(
+                "a separated workload identity cannot attach the temporary-storage mount: this \
+                 kernel's FUSE refuses allow_other access from a child user namespace, so the \
+                 supervisor-mounted scratch tree would be unreachable by the workload",
             ),
             Self::TemporaryStorageTmpdirConflict => formatter.write_str(
                 "the document binds TMPDIR, which the temporary-storage budget must own",
@@ -1218,6 +1230,7 @@ impl AdmittedLaunch {
         if self.temporary_storage_attached {
             return Err(AdmissionRefusal::TemporaryStorageAlreadyAttached);
         }
+        refuse_identity_temporary_storage_conflict(&self.plan)?;
         if mounted.budget() != self.temporary_storage_budget {
             return Err(AdmissionRefusal::TemporaryStorageBudgetMismatch);
         }
@@ -1502,6 +1515,25 @@ fn map_temporary_storage(
     let bytes = spec.sandbox().budgets().temporary_storage().quantity();
     TemporaryStorageBudget::from_bytes(bytes)
         .map_err(|_| AdmissionRefusal::QuotaRejected("sandbox.budgets.temporary_storage"))
+}
+
+/// The one rule that keeps the two features apart while the kernel forces a
+/// choice, shared by every place a temporary-storage mount could reach an
+/// identity-separated plan.
+///
+/// Nothing in the RunSpec vocabulary can request identity separation yet, so
+/// through [`admit`] this can never fire; it guards the composition seam so
+/// that when a document field arrives — or a caller composes a plan directly —
+/// the combination is a typed refusal, not a workload that discovers `EACCES`
+/// on its own scratch directory. See `docs/operations/workload-identity.md`
+/// for the kernel measurement behind it.
+pub fn refuse_identity_temporary_storage_conflict(
+    plan: &LaunchPlan,
+) -> Result<(), AdmissionRefusal> {
+    if plan.separates_workload_identity() {
+        return Err(AdmissionRefusal::WorkloadIdentityTemporaryStorageConflict);
+    }
+    Ok(())
 }
 
 /// Refuse every runner-owned admission field that names an unbuilt subsystem.

@@ -15,9 +15,13 @@ use automonique_runner::capability::{
     BoundaryProperty, ContainmentFinding, ContainmentUnavailable, EnforcementMode,
     HostCapabilities, LANDLOCK_ABI_FILESYSTEM, LANDLOCK_ABI_HIGHEST_KNOWN, LANDLOCK_ABI_TCP,
     LandlockAbi, LandlockFinding, Mechanism, ModeRefusal, SeccompFinding, SeccompUnavailable,
-    UnsatisfiedCause, UserNamespaceDenial, UserNamespaceFinding,
+    UnsatisfiedCause, UserNamespaceDenial, UserNamespaceFinding, WorkloadIdentityFinding,
 };
+use automonique_runner::identity::{self, WorkloadIdentityDenial};
 use automonique_runner::{ContainmentDomain, ContainmentError};
+use std::path::Path;
+
+const HELPER: &str = env!("CARGO_BIN_EXE_automonique-launch-enter");
 use landlock::{
     ABI, Access as _, AccessFs, AccessNet, CompatLevel, Compatible as _, Ruleset, RulesetAttr as _,
     Scope,
@@ -51,6 +55,25 @@ const USER_NAMESPACE_CASES: [UserNamespaceFinding; 3] = [
     UserNamespaceFinding::Denied(UserNamespaceDenial::NoKernelSupport),
 ];
 
+/// A synthetic identity: any identity the probe could report is shaped like
+/// this, and the selector reads only whether one exists.
+fn separable() -> WorkloadIdentityFinding {
+    match identity::parse_probe_report(
+        "workload-identity: separable ns_uid=1000 host_uid=265535 host_gid=1000",
+    ) {
+        Some(Ok(identity)) => WorkloadIdentityFinding::Separable(identity),
+        _ => panic!("the synthetic identity report must parse"),
+    }
+}
+
+fn workload_identity_cases() -> [WorkloadIdentityFinding; 3] {
+    [
+        separable(),
+        WorkloadIdentityFinding::Unavailable(WorkloadIdentityDenial::NoLaunchHelper),
+        WorkloadIdentityFinding::Unavailable(WorkloadIdentityDenial::CredentialSwitchRefused),
+    ]
+}
+
 const SECCOMP_CASES: [SeccompFinding; 3] = [
     SeccompFinding::FilterAvailable,
     SeccompFinding::Unavailable(SeccompUnavailable::NoInterface),
@@ -70,13 +93,16 @@ fn synthetic_hosts() -> Vec<HostCapabilities> {
     for containment in 0..CONTAINMENT_CASES {
         for landlock in LANDLOCK_CASES {
             for user_namespace in USER_NAMESPACE_CASES {
-                for seccomp in SECCOMP_CASES {
-                    hosts.push(HostCapabilities::from_findings(
-                        containment_finding(containment),
-                        landlock,
-                        user_namespace,
-                        seccomp,
-                    ));
+                for workload_identity in workload_identity_cases() {
+                    for seccomp in SECCOMP_CASES {
+                        hosts.push(HostCapabilities::from_findings(
+                            containment_finding(containment),
+                            landlock,
+                            user_namespace,
+                            workload_identity,
+                            seccomp,
+                        ));
+                    }
                 }
             }
         }
@@ -103,6 +129,7 @@ fn full_host() -> HostCapabilities {
         ContainmentFinding::Delegated,
         LandlockFinding::Enforceable(abi(LANDLOCK_ABI_HIGHEST_KNOWN)),
         UserNamespaceFinding::NoObservedDenial,
+        separable(),
         SeccompFinding::FilterAvailable,
     )
 }
@@ -142,7 +169,7 @@ fn probing_does_not_restrict_the_calling_process() {
         std::fs::read_to_string("/proc/thread-self/cgroup").ok(),
     );
 
-    let host = HostCapabilities::probe();
+    let host = HostCapabilities::probe_with_launch_helper(Some(Path::new(HELPER)));
 
     let after = (
         status_field("NoNewPrivs:"),
@@ -166,9 +193,10 @@ fn probing_does_not_restrict_the_calling_process() {
     );
 
     // A probe with side effects would not answer the same way twice.
-    let again = HostCapabilities::probe();
+    let again = HostCapabilities::probe_with_launch_helper(Some(Path::new(HELPER)));
     assert_eq!(host.landlock(), again.landlock());
     assert_eq!(host.user_namespace(), again.user_namespace());
+    assert_eq!(host.workload_identity(), again.workload_identity());
     assert_eq!(host.seccomp(), again.seccomp());
     assert_eq!(
         host.containment().is_delegated(),
@@ -234,6 +262,91 @@ fn probe_findings_are_internally_consistent() {
         host.seccomp().denial().is_none(),
         host.seccomp() == SeccompFinding::FilterAvailable
     );
+
+    // Without a helper the identity is unavailable for exactly that reason.
+    assert_eq!(
+        host.workload_identity(),
+        WorkloadIdentityFinding::Unavailable(WorkloadIdentityDenial::NoLaunchHelper)
+    );
+    assert_eq!(host.workload_identity().identity(), None);
+}
+
+/// The identity finding is the helper's own report: a separable identity is
+/// a host uid that is not this process's, inside the account's subordinate
+/// range, and a denial carries a reason that explains itself. Either outcome
+/// is legitimate on a given host; what is not is a claim the helper did not
+/// make, and this test cross-checks the helper directly.
+#[test]
+fn workload_identity_finding_is_the_helpers_own_report() {
+    let finding = WorkloadIdentityFinding::probe_with_launch_helper(Some(Path::new(HELPER)));
+    let direct = identity::probe_with_launch_helper(Path::new(HELPER));
+    match finding {
+        WorkloadIdentityFinding::Separable(identity) => {
+            assert_eq!(direct, Ok(identity));
+            assert_eq!(finding.identity(), Some(identity));
+            assert_eq!(finding.denial(), None);
+            let supervisor = nix::unistd::getuid().as_raw();
+            assert_ne!(identity.host_uid(), supervisor, "{identity}");
+            assert_eq!(identity.namespace_uid(), supervisor, "{identity}");
+            assert_eq!(identity.host_gid(), nix::unistd::getgid().as_raw());
+            eprintln!("[capability] ENFORCED workload identity: {identity}");
+        }
+        WorkloadIdentityFinding::Unavailable(denial) => {
+            assert_eq!(direct, Err(denial));
+            assert_eq!(finding.identity(), None);
+            assert_eq!(finding.denial(), Some(denial));
+            assert_ne!(
+                denial,
+                WorkloadIdentityDenial::NoLaunchHelper,
+                "a helper was named"
+            );
+            assert!(!denial.to_string().is_empty());
+            eprintln!("[capability] NOT PROVEN workload identity: {denial}");
+        }
+    }
+    assert_eq!(
+        WorkloadIdentityFinding::probe_with_launch_helper(None),
+        WorkloadIdentityFinding::Unavailable(WorkloadIdentityDenial::NoLaunchHelper)
+    );
+    let absent = Path::new("/nonexistent/automonique-launch-enter");
+    assert_eq!(
+        WorkloadIdentityFinding::probe_with_launch_helper(Some(absent)),
+        WorkloadIdentityFinding::Unavailable(WorkloadIdentityDenial::HelperUnavailable)
+    );
+}
+
+/// Whatever the identity finding says, the `uid_separation` property follows
+/// it exactly: enforced by the kernel-restricted mode when the helper proved
+/// the switch, blocked with the helper's own reason otherwise.
+#[test]
+fn uid_separation_follows_the_identity_finding_and_nothing_else() {
+    let host = HostCapabilities::probe_with_launch_helper(Some(Path::new(HELPER)));
+    let Ok(selection) = host.select_mode(&[]) else {
+        eprintln!("[capability] NOT PROVEN: no enforceable mode on this host");
+        return;
+    };
+    match host.workload_identity() {
+        WorkloadIdentityFinding::Separable(_) => assert!(
+            selection
+                .enforced()
+                .contains(&BoundaryProperty::UidSeparation),
+            "a separable identity must make uid_separation enforced: {selection}"
+        ),
+        WorkloadIdentityFinding::Unavailable(denial) => {
+            let dropped = selection
+                .dropped()
+                .iter()
+                .find(|entry| entry.property() == BoundaryProperty::UidSeparation)
+                .expect("an unavailable identity must drop uid_separation");
+            assert!(
+                dropped
+                    .blocked_mechanisms()
+                    .iter()
+                    .any(|blocked| blocked.cause()
+                        == UnsatisfiedCause::WorkloadIdentityUnavailable(denial))
+            );
+        }
+    }
 }
 
 /// The Landlock finding is re-derived here straight from the `landlock` crate,
@@ -416,6 +529,7 @@ fn a_host_without_a_containment_domain_has_no_mode_at_all() {
         ContainmentFinding::Unusable(ContainmentError::DomainNotDelegated),
         LandlockFinding::Enforceable(abi(LANDLOCK_ABI_HIGHEST_KNOWN)),
         UserNamespaceFinding::NoObservedDenial,
+        separable(),
         SeccompFinding::FilterAvailable,
     );
     assert!(host.available_modes().is_empty());
@@ -442,6 +556,7 @@ fn refusal_names_the_unsatisfiable_property_and_every_blocked_mechanism() {
         ContainmentFinding::Delegated,
         LandlockFinding::Unsupported,
         UserNamespaceFinding::Denied(UserNamespaceDenial::ApparmorRestricted),
+        WorkloadIdentityFinding::Unavailable(WorkloadIdentityDenial::NoLaunchHelper),
         SeccompFinding::FilterAvailable,
     );
     let refusal = host
@@ -495,6 +610,7 @@ fn landlock_below_abi_four_drops_tcp_denial_naming_the_needed_level() {
         ContainmentFinding::Delegated,
         LandlockFinding::Enforceable(observed),
         UserNamespaceFinding::Denied(UserNamespaceDenial::ApparmorRestricted),
+        WorkloadIdentityFinding::Unavailable(WorkloadIdentityDenial::NoLaunchHelper),
         SeccompFinding::FilterAvailable,
     );
 
@@ -524,13 +640,18 @@ fn landlock_below_abi_four_drops_tcp_denial_naming_the_needed_level() {
 
 /// A weaker mode is only acceptable if the caller is told precisely what it
 /// cost. This host can restrict a filesystem and deny TCP, and cannot separate
-/// uids or deny UDP; both shortfalls must be in the returned value.
+/// uids or deny UDP; both shortfalls must be in the returned value, each with
+/// the mechanism's own reason. The uid switch is blamed on what the launch
+/// helper reported — its authority for that property — while the complete
+/// network denial is blamed on the generic user-namespace policy that gates
+/// the full namespaced mode.
 #[test]
 fn a_degraded_mode_records_every_guarantee_it_dropped() {
     let host = HostCapabilities::from_findings(
         ContainmentFinding::Delegated,
         LandlockFinding::Enforceable(abi(LANDLOCK_ABI_TCP)),
         UserNamespaceFinding::Denied(UserNamespaceDenial::ApparmorRestricted),
+        WorkloadIdentityFinding::Unavailable(WorkloadIdentityDenial::NamespaceCreationRefused),
         SeccompFinding::FilterAvailable,
     );
     let selection = host
@@ -561,15 +682,21 @@ fn a_degraded_mode_records_every_guarantee_it_dropped() {
         "Landlock denies TCP only and changes no uid; both gaps must be reported"
     );
     for entry in selection.dropped() {
+        let expected = match entry.property() {
+            // The identity finding is authoritative for uid separation.
+            BoundaryProperty::UidSeparation => UnsatisfiedCause::WorkloadIdentityUnavailable(
+                WorkloadIdentityDenial::NamespaceCreationRefused,
+            ),
+            // The full namespaced mode is gated on the user-namespace policy.
+            _ => UnsatisfiedCause::UserNamespaceDenied(UserNamespaceDenial::ApparmorRestricted),
+        };
         assert_eq!(
             entry
                 .blocked_mechanisms()
                 .iter()
                 .map(|blocked| blocked.cause())
                 .collect::<Vec<_>>(),
-            [UnsatisfiedCause::UserNamespaceDenied(
-                UserNamespaceDenial::ApparmorRestricted
-            )]
+            [expected]
         );
     }
     assert!(
@@ -602,6 +729,7 @@ fn losing_seccomp_costs_exactly_the_syscall_restriction() {
         ContainmentFinding::Delegated,
         LandlockFinding::Enforceable(abi(LANDLOCK_ABI_HIGHEST_KNOWN)),
         UserNamespaceFinding::NoObservedDenial,
+        separable(),
         SeccompFinding::Unavailable(SeccompUnavailable::StrictModeOnly),
     );
     let selection = host.select_mode(&[]).expect("every other mechanism works");
@@ -824,6 +952,7 @@ fn landlock_is_never_credited_with_namespace_only_properties() {
         ContainmentFinding::Delegated,
         LandlockFinding::Enforceable(abi(LANDLOCK_ABI_HIGHEST_KNOWN)),
         UserNamespaceFinding::Denied(UserNamespaceDenial::ApparmorRestricted),
+        WorkloadIdentityFinding::Unavailable(WorkloadIdentityDenial::NoLaunchHelper),
         SeccompFinding::FilterAvailable,
     );
     for property in [
