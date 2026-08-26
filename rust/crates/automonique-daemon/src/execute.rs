@@ -152,8 +152,8 @@ use automonique_protocol::sandbox::{
 };
 use automonique_protocol::tools::RunId as FrameRunId;
 use automonique_runner::admission::{
-    AdmissionContext, AdmissionContextParts, AdmittedLaunch, BrokeredDestination, PromptSource,
-    ResolvedPrompt, TemporaryStorageEnforcement, UnenforcedBudget, admit,
+    AdmissionContext, AdmissionContextParts, AdmissionRefusal, AdmittedLaunch, BrokeredDestination,
+    PromptSource, ResolvedPrompt, TemporaryStorageEnforcement, UnenforcedBudget, admit,
 };
 use automonique_runner::backend::{
     CapturedFrame, DirectProcessBackend, ObservedSequence, PROGRESS_BUDGET_WARNING,
@@ -908,7 +908,7 @@ impl ExecutionLane {
         })
         .map_err(|_| ExecuteRefusal::AdmissionRefused)?;
 
-        let admitted = admit(spec, &context).map_err(|_| ExecuteRefusal::AdmissionRefused)?;
+        let admitted = admit(spec, &context).map_err(|refusal| admission_refusal(&refusal))?;
         // One broker, this run's, bound before the plan is finished — because
         // the port the plan grants is the port this broker just bound, and it
         // does not exist until it is. A run whose document denies egress takes
@@ -2446,6 +2446,23 @@ const fn registration_refusal(error: crate::attempt_host::AttemptHostError) -> E
     }
 }
 
+/// Translate one admission refusal into the refusal that names it.
+///
+/// Admission judges the document against this host, and nearly everything it
+/// refuses is the document's to fix, so the lane reports it as
+/// `admission_refused`. One arm is the host's instead: a temporary-storage
+/// budget the host cannot enforce — no `/dev/fuse`, no setuid `fusermount3` —
+/// refuses every document this daemon is asked to run, and an operator staring
+/// at that host needs the host-wide word, `sandbox_unenforceable`, not one that
+/// sends them back to re-read a document that was fine. The prerequisite
+/// failure the runner quotes stops here: the wire refusal carries no reason.
+const fn admission_refusal(refusal: &AdmissionRefusal) -> ExecuteRefusal {
+    match refusal {
+        AdmissionRefusal::TemporaryStorageUnenforceable(_) => ExecuteRefusal::SandboxUnenforceable,
+        _ => ExecuteRefusal::AdmissionRefused,
+    }
+}
+
 /// Move one read-model row from `ready` to its terminal state.
 ///
 /// # Why two advances
@@ -2656,11 +2673,13 @@ fn is_containment_run_id(run_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_PROVIDER_BINARY_BYTES, TokenCancelSink, is_containment_run_id, is_safe_segment,
-        is_within_byte_limit, provider_binary_digest,
+        MAX_PROVIDER_BINARY_BYTES, TokenCancelSink, admission_refusal, is_containment_run_id,
+        is_safe_segment, is_within_byte_limit, provider_binary_digest,
     };
     use crate::attempt_host::DaemonAttemptHost;
+    use automonique_protocol::execute_api::ExecuteRefusal;
     use automonique_runner::CancellationToken;
+    use automonique_runner::admission::AdmissionRefusal;
     use automonique_runner::dispatch::DispatchOutcome;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -2686,6 +2705,34 @@ mod tests {
             provider_binary_digest(b"abc"),
             "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    /// The one admission refusal that is about the host rather than the
+    /// document crosses to the wire as the host-wide word, and every other one
+    /// keeps the document's.
+    #[test]
+    fn a_host_without_a_fuse_stack_is_refused_as_sandbox_unenforceable() {
+        let host_wide = admission_refusal(&AdmissionRefusal::TemporaryStorageUnenforceable(
+            "/dev/fuse is not a character device".to_owned(),
+        ));
+        assert_eq!(host_wide, ExecuteRefusal::SandboxUnenforceable);
+        assert!(
+            host_wide.is_host_wide(),
+            "a host that cannot mount the budget refuses every document"
+        );
+
+        for about_the_document in [
+            AdmissionRefusal::RunIdUnusable,
+            AdmissionRefusal::TemporaryStorageTmpdirConflict,
+            AdmissionRefusal::TemporaryStorageAlreadyAttached,
+            AdmissionRefusal::QuotaRejected("sandbox.budgets.temporary_storage"),
+        ] {
+            assert_eq!(
+                admission_refusal(&about_the_document),
+                ExecuteRefusal::AdmissionRefused,
+                "{about_the_document}"
+            );
+        }
     }
 
     /// The seam between the daemon's host-wide dispatcher and a live attempt.
