@@ -31,6 +31,7 @@ pub mod slack_ingress;
 pub mod slack_interactions;
 pub mod sqlite_policy;
 pub mod support_tickets;
+pub mod work_context_store;
 
 use std::error::Error;
 use std::fmt;
