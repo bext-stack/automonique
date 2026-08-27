@@ -13,6 +13,13 @@ daemon's effective uid, so the policy must contain exactly one matching
 principal. A malformed, insecure, unmapped, or unusable policy disables v2 and
 causes v2-only negotiation and requests to receive a correlated typed refusal.
 
+The daemon retains the startup policy descriptor identity, metadata, length,
+and SHA-256 digest. It securely reopens and compares that complete generation
+before every negotiation and every v2 request. Deletion, replacement, mode or
+owner changes, and even an in-place same-principal grant change therefore
+refuse with `platform_v2_policy_changed` (or the applicable insecure-policy
+category) until the daemon restarts and loads the new generation.
+
 The file has this bounded shape:
 
 ```json

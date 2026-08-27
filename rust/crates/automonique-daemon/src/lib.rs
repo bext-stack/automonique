@@ -5185,7 +5185,8 @@ impl Daemon {
         message: &PlatformNegotiationRequestMessage,
         peer_uid: u32,
     ) -> Result<(), DaemonError> {
-        let supported = PlatformVersionOffer::new(if self.platform_v2.available_for(peer_uid) {
+        let availability = self.platform_v2.availability(peer_uid);
+        let supported = PlatformVersionOffer::new(if availability.is_ok() {
             vec![1, 2]
         } else {
             vec![1]
@@ -5195,7 +5196,9 @@ impl Daemon {
             Ok(selected) => PlatformNegotiationResponse::Negotiated(selected),
             Err(_) => PlatformNegotiationResponse::Refused(
                 PlatformV2Refusal::new(
-                    self.platform_v2.refusal_category(),
+                    availability
+                        .err()
+                        .unwrap_or("platform_v2_negotiation_refused"),
                     "Platform major 2 is unavailable for this authenticated peer",
                 )
                 .map_err(|_| DaemonError::ProtocolRefused("platform_negotiation"))?,

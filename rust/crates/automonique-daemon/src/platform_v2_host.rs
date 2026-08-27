@@ -11,7 +11,9 @@ use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
+use std::path::PathBuf;
 
+use automonique_protocol::digest::{Sha256, Sha256Digest};
 use automonique_protocol::identity::Actor;
 use automonique_protocol::platform::ResourceAuthority;
 use automonique_protocol::platform_v2::{
@@ -58,11 +60,48 @@ pub enum PlatformV2Host {
 
 #[derive(Debug)]
 pub struct PlatformV2Runtime {
+    policy_fence: PolicyFence,
     principals: BTreeMap<u32, PrincipalPolicy>,
     work_contexts: WorkContextStore,
     lineage: LineageIndex,
     reviews: ReviewStore,
     nonces: HostNonces,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PolicyGeneration {
+    device: u64,
+    inode: u64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    length: u64,
+    digest: Sha256Digest,
+}
+
+#[derive(Debug)]
+struct PolicySnapshot {
+    bytes: Vec<u8>,
+    generation: PolicyGeneration,
+}
+
+#[derive(Debug)]
+struct PolicyFence {
+    path: PathBuf,
+    expected_uid: u32,
+    generation: PolicyGeneration,
+}
+
+impl PolicyFence {
+    fn verify(&self) -> Result<(), &'static str> {
+        let current = read_policy_snapshot(&self.path, self.expected_uid)?
+            .ok_or("platform_v2_policy_changed")?;
+        if current.generation != self.generation {
+            return Err("platform_v2_policy_changed");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -142,14 +181,17 @@ impl PlatformV2Host {
         }
     }
 
-    pub fn available_for(&self, uid: u32) -> bool {
-        matches!(self, Self::Enabled(runtime) if runtime.principals.contains_key(&uid))
-    }
-
-    pub const fn refusal_category(&self) -> &'static str {
+    pub fn availability(&self, uid: u32) -> Result<(), &'static str> {
         match self {
-            Self::Disabled(category) => category,
-            Self::Enabled(_) => "platform_v2_principal_unmapped",
+            Self::Disabled(category) => Err(category),
+            Self::Enabled(runtime) => {
+                runtime.policy_fence.verify()?;
+                if runtime.principals.contains_key(&uid) {
+                    Ok(())
+                } else {
+                    Err("platform_v2_principal_unmapped")
+                }
+            }
         }
     }
 
@@ -174,11 +216,11 @@ impl PlatformV2Runtime {
         review_path: &Path,
         expected_uid: u32,
     ) -> Result<Option<Self>, &'static str> {
-        let Some(bytes) = read_policy_file(policy_path, expected_uid)? else {
+        let Some(snapshot) = read_policy_snapshot(policy_path, expected_uid)? else {
             return Ok(None);
         };
         let document: PolicyDocument =
-            serde_json::from_slice(&bytes).map_err(|_| "platform_v2_policy_invalid")?;
+            serde_json::from_slice(&snapshot.bytes).map_err(|_| "platform_v2_policy_invalid")?;
         let principals = parse_policy(document)?;
         if principals.len() != 1 || !principals.contains_key(&expected_uid) {
             // The admin socket currently admits only this daemon's effective
@@ -228,6 +270,11 @@ impl PlatformV2Runtime {
             }
         }
         Ok(Some(Self {
+            policy_fence: PolicyFence {
+                path: policy_path.to_path_buf(),
+                expected_uid,
+                generation: snapshot.generation,
+            },
             principals,
             work_contexts,
             lineage,
@@ -242,6 +289,7 @@ impl PlatformV2Runtime {
         request: &PlatformV2Request,
         now_ms: i64,
     ) -> Result<PlatformV2Response, &'static str> {
+        self.policy_fence.verify()?;
         let principal = self
             .principals
             .get(&uid)
@@ -623,14 +671,32 @@ fn read_policy_file(
     policy_path: &Path,
     expected_uid: u32,
 ) -> Result<Option<Vec<u8>>, &'static str> {
-    read_policy_file_after_open(policy_path, expected_uid, || {})
+    read_policy_snapshot(policy_path, expected_uid)
+        .map(|snapshot| snapshot.map(|value| value.bytes))
 }
 
+#[cfg(test)]
 fn read_policy_file_after_open(
     policy_path: &Path,
     expected_uid: u32,
     after_open: impl FnOnce(),
 ) -> Result<Option<Vec<u8>>, &'static str> {
+    read_policy_snapshot_after_open(policy_path, expected_uid, after_open)
+        .map(|snapshot| snapshot.map(|value| value.bytes))
+}
+
+fn read_policy_snapshot(
+    policy_path: &Path,
+    expected_uid: u32,
+) -> Result<Option<PolicySnapshot>, &'static str> {
+    read_policy_snapshot_after_open(policy_path, expected_uid, || {})
+}
+
+fn read_policy_snapshot_after_open(
+    policy_path: &Path,
+    expected_uid: u32,
+    after_open: impl FnOnce(),
+) -> Result<Option<PolicySnapshot>, &'static str> {
     let mut policy_file = match OpenOptions::new()
         .read(true)
         .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
@@ -663,7 +729,19 @@ fn read_policy_file_after_open(
     if bytes.len() as u64 > MAX_POLICY_BYTES {
         return Err("platform_v2_policy_insecure");
     }
-    Ok(Some(bytes))
+    Ok(Some(PolicySnapshot {
+        generation: PolicyGeneration {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            length: metadata.len(),
+            digest: Sha256::digest(&bytes),
+        },
+        bytes,
+    }))
 }
 
 fn validate_principal_mappings(
@@ -1058,6 +1136,49 @@ mod tests {
         .unwrap()
     }
 
+    fn generation_policy(uid: u32, grant: bool) -> serde_json::Value {
+        let grants = if grant {
+            serde_json::json!(["tool.actor"])
+        } else {
+            serde_json::json!([])
+        };
+        serde_json::json!({
+            "version": 1,
+            "principals": [{
+                "uid": uid,
+                "tenant": "tenant-test",
+                "actor": "actor-test",
+                "serving_authority": "automonique",
+                "projects": ["project-test"],
+                "workspaces": [{
+                    "project": "project-test", "kind": "project", "id": "project-test",
+                    "inherited_authority": {
+                        "filesystem": [], "credentials": [], "network": [],
+                        "tools": grants, "providers": [], "models": []
+                    }
+                }],
+                "authority": {
+                    "filesystem": [], "credentials": [], "network": [],
+                    "tools": grants, "providers": [], "models": []
+                },
+                "review_authorities": {}
+            }]
+        })
+    }
+
+    fn write_generation_policy(path: &Path, document: &serde_json::Value) {
+        fs::write(path, serde_json::to_vec(document).unwrap()).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn policy_fence(path: &Path, uid: u32) -> PolicyFence {
+        PolicyFence {
+            path: path.to_path_buf(),
+            expected_uid: uid,
+            generation: read_policy_snapshot(path, uid).unwrap().unwrap().generation,
+        }
+    }
+
     #[test]
     fn inherited_scope_ceiling_is_independent_and_narrower() {
         let parsed = parse_policy(policy(serde_json::json!([]))).unwrap();
@@ -1120,5 +1241,41 @@ mod tests {
         .unwrap();
         assert_eq!(bytes, b"opened document");
         assert_eq!(fs::read(path).unwrap(), b"replacement document");
+    }
+    #[test]
+    fn loaded_policy_fence_refuses_in_place_grant_narrowing_until_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("policy.json");
+        let uid = nix::unistd::geteuid().as_raw();
+        write_generation_policy(&path, &generation_policy(uid, true));
+        let loaded = policy_fence(&path, uid);
+        assert_eq!(loaded.verify(), Ok(()));
+
+        write_generation_policy(&path, &generation_policy(uid, false));
+        assert_eq!(loaded.verify(), Err("platform_v2_policy_changed"));
+
+        let restarted = policy_fence(&path, uid);
+        assert_eq!(restarted.verify(), Ok(()));
+        assert_eq!(loaded.verify(), Err("platform_v2_policy_changed"));
+    }
+
+    #[test]
+    fn loaded_policy_fence_refuses_same_content_replacement_and_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("policy.json");
+        let replacement = directory.path().join("replacement.json");
+        let uid = nix::unistd::geteuid().as_raw();
+        let document = generation_policy(uid, true);
+        write_generation_policy(&path, &document);
+        let loaded = policy_fence(&path, uid);
+
+        write_generation_policy(&replacement, &document);
+        fs::rename(&replacement, &path).unwrap();
+        assert_eq!(loaded.verify(), Err("platform_v2_policy_changed"));
+
+        let restarted = policy_fence(&path, uid);
+        assert_eq!(restarted.verify(), Ok(()));
+        fs::remove_file(&path).unwrap();
+        assert_eq!(restarted.verify(), Err("platform_v2_policy_changed"));
     }
 }
