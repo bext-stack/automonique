@@ -8482,7 +8482,7 @@ mod tests {
         assert!(
             DASHBOARD_HTML.contains("data-panel=\"sessions\" aria-labelledby=\"sessions-title\"")
         );
-        assert!(DASHBOARD_HTML.contains("PRIMARY CONVERSATION SURFACE"));
+        assert!(DASHBOARD_HTML.contains("PRIMARY WORK SURFACE"));
         assert!(DASHBOARD_HTML.contains("SECONDARY / RECOVERY"));
         assert!(DASHBOARD_HTML.contains(
             "This assistant is not attached to an authority-qualified Platform session."
@@ -8522,11 +8522,53 @@ mod tests {
         assert_eq!(show_view.matches("loadChatHistory()").count(), 1);
         assert_eq!(show_view.matches("loadPlatform()").count(), 1);
         assert!(!DASHBOARD_JS.contains("byId(\"sidebar-new-chat\").addEventListener"));
-        assert!(DASHBOARD_JS.contains(
-            "refreshStatus();\nloadConfiguration();\nshowView(window.location.hash.slice(1)"
-        ));
+        assert!(
+            DASHBOARD_JS.contains(
+                "refreshStatus();\nloadConfiguration();\nshowView(window.location.hash ||"
+            )
+        );
         assert!(!DASHBOARD_JS.contains("refreshStatus();\nloadPlatform();"));
         assert!(!DASHBOARD_JS.contains("loadPlatform();\nloadProcesses();\nloadConfiguration();"));
+    }
+
+    #[test]
+    fn dashboard_hosts_a_capability_gated_workspace_first_presentation_shell() {
+        for marker in [
+            "id=\"cockpit-workspace-navigation\"",
+            "id=\"cockpit-workspace-summary\"",
+            "id=\"cockpit-workspace-inspector\"",
+            "id=\"cockpit-external-signal\"",
+            "id=\"cockpit-agent-signal\"",
+            "data-cockpit-attention=\"needs_you\"",
+            "data-cockpit-attention=\"working\"",
+            "data-cockpit-attention=\"blocked\"",
+            "data-cockpit-attention=\"done\"",
+            "id=\"cockpit-action-receipt\" data-state=\"idle\" role=\"status\" aria-live=\"polite\"",
+            "role=\"tablist\" aria-label=\"Selected workspace surfaces\"",
+            "role=\"listbox\" aria-label=\"Hosted workspaces\"",
+            "OPERATIONAL INVENTORY",
+        ] {
+            assert!(
+                DASHBOARD_HTML.contains(marker),
+                "missing cockpit marker {marker}"
+            );
+        }
+        assert!(DASHBOARD_JS.contains("Platform v1 retained-session mode"));
+        assert!(DASHBOARD_HTML.contains("no inference from conversation summaries"));
+        assert!(DASHBOARD_JS.contains("derivePresentation(cockpitDocument(view), selection)"));
+        assert!(DASHBOARD_JS.contains("buildDeepLink"));
+        assert!(DASHBOARD_JS.contains("exact revision ${capability.exact_revision}"));
+        assert!(DASHBOARD_JS.contains("no mutation sent"));
+        assert!(
+            DASHBOARD_JS
+                .contains("Outcome is ambiguous. Lookup by receipt identity without replay.")
+        );
+        assert!(!PLATFORM_COCKPIT_JS.contains(".summary"));
+        assert!(PLATFORM_COCKPIT_JS.contains("document.stale === true"));
+        assert!(PLATFORM_COCKPIT_JS.contains("capability.workspace_id !== workspace.id"));
+        assert!(DASHBOARD_CSS.contains(".hosted-workspace-grid"));
+        assert!(DASHBOARD_CSS.contains("@media (max-width: 760px)"));
+        assert!(DASHBOARD_CSS.contains("@media (max-width: 460px)"));
     }
 
     #[test]
