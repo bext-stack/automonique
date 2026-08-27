@@ -136,16 +136,33 @@ store must also prove the coordinate and revision are a repository relation of
 the selected project; an unrelated repository is refused even when its
 external snapshot exists.
 
-The lifecycle filesystem adapter, workspace-create/resume adapter, and
-git/CI/pull-request workers are intentionally not wired in this slice.
-Lifecycle submit and workspace create return typed pending/unavailable
-refusals. Resume first checks that the authoritative user workspace exists, is
-active, belongs to the requested project, and has the exact expected lifecycle
-revision, then refuses before lineage admission. Review actions validate the
-server-selected role and current review revision, then likewise refuse before
-creating any preview or receipt. This prevents permanent unclaimable custody.
+Lifecycle submission is wired through the exact retained preview, current
+policy, preview digest, durable approval and server-issued receipt identity.
+Purely logical changes, including a `UserWorkspace` over a registry-authorized
+`authorized_folder` checkout, commit atomically and return `completed`.
+Attempt creation and attempt/session resume return an honest `accepted`
+receipt after reserving their durable outbox effect; no process or filesystem
+result is fabricated.
+
+The host exposes a typed lifecycle-effect adapter. An enabled adapter receives
+only the closed mutation intent, server-issued resulting identity and bound
+idempotency key. The host claims work under a bounded durable lease and records
+completion only after the adapter reports success. A lost or uncertain claim
+becomes ambiguous after expiry. It is never replayed until the same adapter
+reconciles the original idempotency key as verified not-started; exact completed
+evidence closes it without replay, and unknown evidence remains unavailable.
+The default adapter supports no effects, so accepted attempt/session work stays
+ready for a configured worker rather than being claimed or falsely completed.
+
+Workspace resume intents now prove the task's server-stored workspace against
+the requested project's bounded policy set, recheck the active workspace and
+exact revision, and then retain an idempotent `accepted` polling receipt across
+restart. Workspace create remains unavailable: its base and branch selectors
+are deliberately separate domains and this release has no typed private
+selector-to-canonical-root/repository/base registry. Treating the existing
+opaque selector bytes as paths, refs, or commands would be an unsafe authority
+guess. Git-worktree execution is blocked for the same reason. Review actions
+still validate the server-selected role and current review revision, then
+refuse before custody because git/CI/pull-request workers are not configured.
 Cancellations of already-existing durable lineage intents remain immediate,
-final store operations. A future worker must
-use the stores' typed reservation, write-admission, ambiguity, and
-reconciliation APIs. It must not replay a write after an ambiguous result and
-must never substitute a shell command for an adapter.
+final store operations.

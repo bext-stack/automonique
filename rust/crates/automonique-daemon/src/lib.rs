@@ -223,7 +223,7 @@ pub mod mcp_client;
 pub mod memory_config;
 pub mod model_inventory;
 pub mod parity_trace;
-mod platform_v2_host;
+pub mod platform_v2_host;
 pub mod pm2_inventory;
 pub mod progress;
 pub mod progress_hub;

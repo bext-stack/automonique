@@ -26,10 +26,10 @@ use automonique_protocol::platform_v2::{
 use automonique_protocol::platform_v2_api::{decode_work_context_page, encode_work_context_page};
 use automonique_protocol::platform_v2_lifecycle::{
     ExpectedWorkContext, ExternalParentResolution, MutationApproval, MutationApprovalDecision,
-    MutationApprovalId, MutationApprovalRequirement, MutationPreview, MutationPreviewId,
-    MutationPreviewRef, MutationReceipt, MutationSubmission, ResolvedParentSnapshot,
-    WorkContextAuthority, WorkContextMutationIntent, WorkContextMutationProposal,
-    WorkContextRegistrySelector, WorkContextRequestDigest,
+    MutationApprovalId, MutationApprovalRequirement, MutationPreview, MutationPreviewDigest,
+    MutationPreviewId, MutationPreviewRef, MutationReceipt, MutationSubmission,
+    ResolvedParentSnapshot, WorkContextAuthority, WorkContextMutationIntent,
+    WorkContextMutationProposal, WorkContextRegistrySelector, WorkContextRequestDigest,
 };
 use automonique_protocol::platform_v2_lifecycle_api::{
     decode_work_context_mutation_approval, decode_work_context_mutation_preview,
@@ -1131,6 +1131,75 @@ impl WorkContextStore {
         }
         tx.commit()?;
         Ok(ReceiptAdmission::New(receipt))
+    }
+
+    /// Build and submit the canonical mutation document from the narrow
+    /// transport coordinates. The approval body is loaded from durable
+    /// custody; callers cannot replace any actor, authority, digest, expiry,
+    /// or idempotency binding carried by it.
+    pub fn submit_approved_mutation(
+        &mut self,
+        preview_ref: &MutationPreviewRef,
+        preview_digest: MutationPreviewDigest,
+        approval_id: Option<&MutationApprovalId>,
+        policy: &MutationPolicyDecision,
+        receipt_id: ReceiptId,
+        trusted_now_ms: i64,
+    ) -> Stored<ReceiptAdmission> {
+        let preview = self.authorize_existing_preview(preview_ref, policy)?;
+        let current_digest = work_context_mutation_preview_digest(&preview).map_err(protocol)?;
+        if current_digest != preview_digest {
+            return Err(WorkContextStoreError::ApprovalMismatch);
+        }
+        if let Some(receipt) = load_approved_submission_replay(
+            &self.connection,
+            &preview,
+            preview_digest,
+            approval_id,
+            policy,
+        )? {
+            return Ok(ReceiptAdmission::Replay(receipt));
+        }
+        let approval = approval_id
+            .map(|id| {
+                let document: Vec<u8> = self
+                    .connection
+                    .query_row(
+                        "SELECT approval_document FROM work_context_approvals WHERE approval_id=?1 AND preview_id=?2",
+                        params![id.as_str(), preview_ref.id().as_str()],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .ok_or(WorkContextStoreError::ApprovalMismatch)?;
+                let approval =
+                    decode_work_context_mutation_approval(&document, &preview).map_err(protocol)?;
+                if approval.id() != id
+                    || encode_work_context_mutation_approval(&approval).map_err(protocol)?
+                        != document
+                {
+                    return Err(WorkContextStoreError::Corrupt("approval_projection"));
+                }
+                Ok(approval)
+            })
+            .transpose()?;
+        let document = encode_work_context_mutation_submission(
+            &preview,
+            approval.as_ref(),
+            EpochMillis::from_millis(trusted_now_ms),
+        )
+        .map_err(protocol)?;
+        match self.submit_mutation(preview_ref, &document, policy, receipt_id, trusted_now_ms) {
+            Err(WorkContextStoreError::BodyConflict) => load_approved_submission_replay(
+                &self.connection,
+                &preview,
+                preview_digest,
+                approval_id,
+                policy,
+            )?
+            .map(ReceiptAdmission::Replay)
+            .ok_or(WorkContextStoreError::BodyConflict),
+            result => result,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3362,6 +3431,37 @@ fn load_receipt_lookup(
     }
     Ok(ReceiptLookup::Found(receipt))
 }
+
+fn load_approved_submission_replay(
+    connection: &Connection,
+    preview: &MutationPreview,
+    preview_digest: MutationPreviewDigest,
+    approval_id: Option<&MutationApprovalId>,
+    policy: &MutationPolicyDecision,
+) -> Stored<Option<MutationReceipt>> {
+    let existing: Option<(String, Vec<u8>)> = connection
+        .query_row(
+            "SELECT receipt_id,submission_document FROM work_context_receipts WHERE preview_id=?1",
+            [preview.preview().id().as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((stored_receipt_id, submission_document)) = existing else {
+        return Ok(None);
+    };
+    let submission =
+        decode_work_context_mutation_submission(&submission_document, preview).map_err(protocol)?;
+    if submission.preview_digest() != preview_digest || submission.approval_id() != approval_id {
+        return Err(WorkContextStoreError::BodyConflict);
+    }
+    let ReceiptLookup::Found(receipt) =
+        load_receipt_lookup(connection, policy, "r.receipt_id=?4", &stored_receipt_id)?
+    else {
+        return Err(WorkContextStoreError::Corrupt("receipt_lookup"));
+    };
+    Ok(Some(receipt))
+}
+
 struct ValidatedAcceptedEffect {
     receipt_id: String,
     recorded_at_ms: i64,

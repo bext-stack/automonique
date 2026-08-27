@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use automonique_protocol::digest::{Sha256, Sha256Digest};
 use automonique_protocol::identity::Actor;
-use automonique_protocol::platform::ResourceAuthority;
+use automonique_protocol::platform::{ReceiptId, ResourceAuthority};
 use automonique_protocol::platform_v2::{
     NegotiatedPlatform, PlatformVersionOffer, ProjectId, UserWorkspaceId, WorkContextIdentity,
     WorkContextQueryResult, WorkContextTargetKind, negotiate_platform_version,
@@ -32,14 +32,17 @@ use automonique_protocol::platform_v2_review::{
 };
 use automonique_protocol::platform_v2_transport::{
     PlatformV2Refusal, PlatformV2Request, PlatformV2Response, RawMutationApprovalDocument,
-    ReceiptLookupKey,
+    RawMutationReceiptDocument, ReceiptLookupKey,
 };
 use automonique_protocol::primitives::EpochMillis;
 use automonique_store::lineage_index::{IntentAuthorizationScope, LineageIndex};
 use automonique_store::review_store::{ReviewStore, ReviewStoreError};
 use automonique_store::work_context_store::{
-    ApprovalPolicyDecision, MutationPolicyDecision, PreviewAdmission, ReceiptLookup,
-    WorkContextApprovalAuthority, WorkContextNonceSource, WorkContextStore,
+    ApprovalPolicyDecision, ExternalEffectCompletionPolicy, ExternalEffectExecutorPolicy,
+    ExternalEffectReconciliation, ExternalEffectReconciliationOutcome,
+    ExternalEffectRecoveryPolicy, MutationPolicyDecision, PreviewAdmission, ProviderEffectEvidence,
+    ReceiptAdmission, ReceiptLookup, WorkContextApprovalAuthority, WorkContextNonceSource,
+    WorkContextStore, WorkContextStoreError,
 };
 use serde::Deserialize;
 
@@ -50,6 +53,7 @@ pub const REVIEW_STORE_NAME: &str = "platform-v2-review.sqlite3";
 
 const PREVIEW_LIFETIME_MS: i64 = 5 * 60 * 1_000;
 const APPROVAL_LIFETIME_MS: i64 = 60 * 1_000;
+const EFFECT_LEASE_LIFETIME_MS: i64 = 30 * 1_000;
 const MAX_POLICY_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug)]
@@ -58,7 +62,6 @@ pub enum PlatformV2Host {
     Enabled(Box<PlatformV2Runtime>),
 }
 
-#[derive(Debug)]
 pub struct PlatformV2Runtime {
     policy_fence: PolicyFence,
     principals: BTreeMap<u32, PrincipalPolicy>,
@@ -66,6 +69,82 @@ pub struct PlatformV2Runtime {
     lineage: LineageIndex,
     reviews: ReviewStore,
     nonces: HostNonces,
+    lifecycle_effects: Box<dyn PlatformV2LifecycleEffectAdapter>,
+}
+
+impl std::fmt::Debug for PlatformV2Runtime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PlatformV2Runtime")
+            .field("policy_fence", &self.policy_fence)
+            .field("principals", &self.principals)
+            .field("work_contexts", &self.work_contexts)
+            .field("lineage", &self.lineage)
+            .field("reviews", &self.reviews)
+            .field("nonces", &self.nonces)
+            .field("lifecycle_effects", &"typed adapter")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlatformV2EffectExecution {
+    Completed,
+    NotStarted,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlatformV2EffectReconciliation {
+    VerifiedNotStarted(Vec<u8>),
+    Completed(Vec<u8>),
+    Unknown(Vec<u8>),
+}
+
+/// Typed external-effect boundary. It receives only the closed lifecycle
+/// intent and server-issued identities; paths and commands are never accepted.
+pub trait PlatformV2LifecycleEffectAdapter: Send {
+    fn supported_effect_kinds(&self) -> BTreeSet<String>;
+
+    fn execute(
+        &mut self,
+        intent: &WorkContextMutationIntent,
+        resulting_identity: &WorkContextIdentity,
+        idempotency_key: &automonique_protocol::platform::IdempotencyKey,
+    ) -> PlatformV2EffectExecution;
+
+    fn reconcile(
+        &mut self,
+        intent: &WorkContextMutationIntent,
+        resulting_identity: &WorkContextIdentity,
+        idempotency_key: &automonique_protocol::platform::IdempotencyKey,
+    ) -> PlatformV2EffectReconciliation;
+}
+
+struct UnavailableLifecycleEffectAdapter;
+
+impl PlatformV2LifecycleEffectAdapter for UnavailableLifecycleEffectAdapter {
+    fn supported_effect_kinds(&self) -> BTreeSet<String> {
+        BTreeSet::new()
+    }
+
+    fn execute(
+        &mut self,
+        _intent: &WorkContextMutationIntent,
+        _resulting_identity: &WorkContextIdentity,
+        _idempotency_key: &automonique_protocol::platform::IdempotencyKey,
+    ) -> PlatformV2EffectExecution {
+        PlatformV2EffectExecution::NotStarted
+    }
+
+    fn reconcile(
+        &mut self,
+        _intent: &WorkContextMutationIntent,
+        _resulting_identity: &WorkContextIdentity,
+        _idempotency_key: &automonique_protocol::platform::IdempotencyKey,
+    ) -> PlatformV2EffectReconciliation {
+        PlatformV2EffectReconciliation::Unknown(b"adapter unavailable".to_vec())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -168,12 +247,31 @@ impl PlatformV2Host {
         review_path: &Path,
         expected_uid: u32,
     ) -> Self {
+        Self::open_with_lifecycle_adapter(
+            policy_path,
+            work_context_path,
+            lineage_path,
+            review_path,
+            expected_uid,
+            Box::new(UnavailableLifecycleEffectAdapter),
+        )
+    }
+
+    pub fn open_with_lifecycle_adapter(
+        policy_path: &Path,
+        work_context_path: &Path,
+        lineage_path: &Path,
+        review_path: &Path,
+        expected_uid: u32,
+        lifecycle_effects: Box<dyn PlatformV2LifecycleEffectAdapter>,
+    ) -> Self {
         match PlatformV2Runtime::open(
             policy_path,
             work_context_path,
             lineage_path,
             review_path,
             expected_uid,
+            lifecycle_effects,
         ) {
             Ok(Some(runtime)) => Self::Enabled(Box::new(runtime)),
             Ok(None) => Self::Disabled("platform_v2_unavailable"),
@@ -215,6 +313,7 @@ impl PlatformV2Runtime {
         lineage_path: &Path,
         review_path: &Path,
         expected_uid: u32,
+        lifecycle_effects: Box<dyn PlatformV2LifecycleEffectAdapter>,
     ) -> Result<Option<Self>, &'static str> {
         let Some(snapshot) = read_policy_snapshot(policy_path, expected_uid)? else {
             return Ok(None);
@@ -280,6 +379,7 @@ impl PlatformV2Runtime {
             lineage,
             reviews,
             nonces: HostNonces::new()?,
+            lifecycle_effects,
         }))
     }
 
@@ -298,6 +398,7 @@ impl PlatformV2Runtime {
         // Policy is a live server-owned authorization registry, not a cached
         // substitute for durable identity and ownership truth.
         self.validate_all_policy_mappings(&principal)?;
+        self.drive_lifecycle_effects(&principal, now_ms)?;
         match request {
             PlatformV2Request::QueryWorkContexts(query) => {
                 if query
@@ -425,18 +526,48 @@ impl PlatformV2Runtime {
                         .map_err(|_| "platform_v2_response_invalid")?,
                 ))
             }
-            PlatformV2Request::SubmitMutation(_) => {
-                // The durable store has typed outbox reservation APIs, but no
-                // host adapter is wired in this slice. Refuse before admission
-                // instead of claiming an external filesystem effect occurred.
-                Ok(PlatformV2Response::MutationRefused(MutationRefusal::new(
-                    MutationRefusalCategory::Unavailable,
-                    None,
-                    MutationExplanation::new(
-                        "no Platform v2 lifecycle effect adapter is configured",
+            PlatformV2Request::SubmitMutation(value) => {
+                let candidate = self
+                    .work_contexts
+                    .preview_for_actor(
+                        value.preview(),
+                        &principal.actor,
+                        principal.serving_authority,
                     )
-                    .map_err(|_| "platform_v2_response_invalid")?,
-                )))
+                    .map_err(|_| "platform_v2_submission_refused")?;
+                let request_digest = candidate.proposal().request_digest();
+                let (project, inherited_authority) =
+                    scope_for_intent(candidate.proposal().intent(), &principal)
+                        .map_err(|_| "platform_v2_submission_refused")?;
+                self.validate_intent_scope(&principal, candidate.proposal().intent())?;
+                let policy = principal.mutation_policy(
+                    Some(project),
+                    inherited_authority,
+                    candidate.proposal().intent(),
+                    request_digest,
+                    candidate.approval(),
+                );
+                let receipt_id = ReceiptId::new(format!("receipt_{}", self.nonces.token()))
+                    .map_err(|_| "platform_v2_nonce_invalid")?;
+                match self.work_contexts.submit_approved_mutation(
+                    value.preview(),
+                    value.preview_digest(),
+                    value.approval(),
+                    &policy,
+                    receipt_id,
+                    now_ms,
+                ) {
+                    Ok(ReceiptAdmission::New(receipt) | ReceiptAdmission::Replay(receipt)) => {
+                        Ok(PlatformV2Response::MutationReceipt(
+                            RawMutationReceiptDocument::from_receipt(&receipt)
+                                .map_err(|_| "platform_v2_response_invalid")?,
+                        ))
+                    }
+                    Err(error) => Ok(PlatformV2Response::MutationRefused(mutation_store_refusal(
+                        &error,
+                        request_digest,
+                    )?)),
+                }
             }
             PlatformV2Request::GetMutationReceipt(value) => {
                 if !principal.projects.contains(value.project()) {
@@ -515,10 +646,40 @@ impl PlatformV2Runtime {
                 if !principal.projects.contains(value.project()) {
                     return Err("platform_v2_scope_denied");
                 }
+                let allowed = user_workspaces_for_project(&principal, value.project());
                 let outcome = match value.intent() {
-                    WorkspaceIntent::Create(_) => return Err("platform_v2_create_adapter_pending"),
+                    WorkspaceIntent::Create(intent) => {
+                        // Create selectors are intentionally distinct from the
+                        // lifecycle registry selector. Until a typed private
+                        // base/branch registry is installed, custody would
+                        // admit client-selected coordinates that no worker can
+                        // safely resolve.
+                        let workspace = self
+                            .lineage
+                            .task_workspace_authorized(
+                                principal.actor.tenant(),
+                                intent.task(),
+                                &allowed,
+                            )
+                            .map_err(|_| "platform_v2_create_scope_denied")?
+                            .ok_or("platform_v2_create_scope_denied")?;
+                        authorize_workspace(&principal, value.project(), &workspace)?;
+                        return Err("platform_v2_create_selector_registry_unavailable");
+                    }
                     WorkspaceIntent::Resume(intent) => {
                         authorize_workspace(&principal, value.project(), intent.workspace())?;
+                        let task_workspace = self
+                            .lineage
+                            .task_workspace_authorized(
+                                principal.actor.tenant(),
+                                intent.task(),
+                                &allowed,
+                            )
+                            .map_err(|_| "platform_v2_resume_scope_denied")?
+                            .ok_or("platform_v2_resume_scope_denied")?;
+                        if &task_workspace != intent.workspace() {
+                            return Err("platform_v2_resume_scope_denied");
+                        }
                         self.work_contexts
                             .validate_resumable_user_workspace(
                                 principal.actor.tenant(),
@@ -532,7 +693,7 @@ impl PlatformV2Runtime {
                                 "unavailable" => "platform_v2_resume_not_resumable",
                                 _ => "platform_v2_resume_refused",
                             })?;
-                        return Err("platform_v2_resume_adapter_pending");
+                        WorkspaceIntentOutcome::Accepted
                     }
                     WorkspaceIntent::Cancel(intent) => {
                         authorize_workspace(&principal, value.project(), intent.workspace())?;
@@ -542,21 +703,23 @@ impl PlatformV2Runtime {
                 self.lineage
                     .record_intent(principal.actor.tenant(), value.intent(), &outcome)
                     .map_err(|_| "platform_v2_intent_refused")?;
-                Ok(PlatformV2Response::WorkspaceIntentResult(outcome))
+                let stored = self
+                    .lineage
+                    .intent_authorized_in_workspaces(
+                        &negotiated_v2()?,
+                        principal.actor.tenant(),
+                        value.intent().intent_id(),
+                        &allowed,
+                    )
+                    .map_err(|_| "platform_v2_intent_refused")?
+                    .ok_or("platform_v2_intent_refused")?;
+                Ok(PlatformV2Response::WorkspaceIntentResult(stored.outcome))
             }
             PlatformV2Request::GetWorkspaceIntent(value) => {
                 if !principal.projects.contains(value.project()) {
                     return Err("platform_v2_scope_denied");
                 }
-                let allowed: BTreeSet<UserWorkspaceId> = principal
-                    .workspaces
-                    .iter()
-                    .filter(|(_, scope)| &scope.project == value.project())
-                    .filter_map(|(identity, _)| match identity {
-                        WorkContextIdentity::UserWorkspace(workspace) => Some(workspace.clone()),
-                        _ => None,
-                    })
-                    .collect();
+                let allowed = user_workspaces_for_project(&principal, value.project());
                 self.lineage
                     .intent_authorized_in_workspaces(
                         &negotiated_v2()?,
@@ -664,6 +827,133 @@ impl PlatformV2Runtime {
         let identity = primary_identity_for_intent(intent)
             .ok_or("platform_v2_create_project_adapter_pending")?;
         self.validate_policy_mapping(principal, identity)
+    }
+
+    fn drive_lifecycle_effects(
+        &mut self,
+        principal: &PrincipalPolicy,
+        now_ms: i64,
+    ) -> Result<(), &'static str> {
+        let allowed = self.lifecycle_effects.supported_effect_kinds();
+        if allowed.is_empty() {
+            return Ok(());
+        }
+        let executor = Actor::new(
+            principal.actor.tenant(),
+            "platform-v2-lifecycle-effect-worker",
+        )
+        .map_err(|_| "platform_v2_effect_policy_invalid")?;
+        let recovery_policy = ExternalEffectRecoveryPolicy::for_lease_executor(
+            executor.clone(),
+            principal.serving_authority,
+            allowed.clone(),
+        );
+        if let Some(effect) = self
+            .work_contexts
+            .recover_next_ambiguous_external_effect(&recovery_policy, now_ms, &mut self.nonces)
+            .map_err(|_| "platform_v2_effect_recovery_refused")?
+        {
+            self.authorize_lifecycle_effect(principal, &effect)?;
+            self.policy_fence.verify()?;
+            let reconciliation = self.lifecycle_effects.reconcile(
+                effect.intent(),
+                effect.resulting_identity(),
+                effect.idempotency_key(),
+            );
+            let reconciliation = match reconciliation {
+                PlatformV2EffectReconciliation::VerifiedNotStarted(document) => {
+                    ExternalEffectReconciliation::VerifiedNotStarted {
+                        evidence: ProviderEffectEvidence::new(
+                            effect.idempotency_key().clone(),
+                            document,
+                        )
+                        .map_err(|_| "platform_v2_effect_evidence_invalid")?,
+                    }
+                }
+                PlatformV2EffectReconciliation::Completed(document) => {
+                    ExternalEffectReconciliation::Completed {
+                        evidence: ProviderEffectEvidence::new(
+                            effect.idempotency_key().clone(),
+                            document,
+                        )
+                        .map_err(|_| "platform_v2_effect_evidence_invalid")?,
+                    }
+                }
+                PlatformV2EffectReconciliation::Unknown(document) => {
+                    ExternalEffectReconciliation::Unknown {
+                        evidence: ProviderEffectEvidence::new(
+                            effect.idempotency_key().clone(),
+                            document,
+                        )
+                        .map_err(|_| "platform_v2_effect_evidence_invalid")?,
+                    }
+                }
+            };
+            match self
+                .work_contexts
+                .reconcile_external_effect(&effect, &reconciliation, now_ms)
+                .map_err(|_| "platform_v2_effect_recovery_refused")?
+            {
+                ExternalEffectReconciliationOutcome::Ready
+                | ExternalEffectReconciliationOutcome::Completed(_)
+                | ExternalEffectReconciliationOutcome::ReconcileRequired => {}
+            }
+        }
+        let executor_policy =
+            ExternalEffectExecutorPolicy::new(executor, principal.serving_authority, allowed);
+        if let Some(effect) = self
+            .work_contexts
+            .claim_next_external_effect(
+                &executor_policy,
+                now_ms,
+                EFFECT_LEASE_LIFETIME_MS,
+                &mut self.nonces,
+            )
+            .map_err(|_| "platform_v2_effect_claim_refused")?
+        {
+            self.authorize_lifecycle_effect(principal, &effect)?;
+            self.policy_fence.verify()?;
+            if self.lifecycle_effects.execute(
+                effect.intent(),
+                effect.resulting_identity(),
+                effect.idempotency_key(),
+            ) == PlatformV2EffectExecution::Completed
+            {
+                self.work_contexts
+                    .complete_external_effect(&effect, now_ms)
+                    .map_err(|_| "platform_v2_effect_completion_refused")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn authorize_lifecycle_effect(
+        &self,
+        principal: &PrincipalPolicy,
+        effect: &ExternalEffectCompletionPolicy,
+    ) -> Result<(), &'static str> {
+        let preview = self
+            .work_contexts
+            .preview_for_actor(
+                effect.preview(),
+                &principal.actor,
+                principal.serving_authority,
+            )
+            .map_err(|_| "platform_v2_effect_policy_refused")?;
+        let (project, inherited_authority) =
+            scope_for_intent(preview.proposal().intent(), principal)
+                .map_err(|_| "platform_v2_effect_policy_refused")?;
+        let policy = principal.mutation_policy(
+            Some(project),
+            inherited_authority,
+            preview.proposal().intent(),
+            preview.proposal().request_digest(),
+            preview.approval(),
+        );
+        self.work_contexts
+            .authorize_existing_preview(effect.preview(), &policy)
+            .map(|_| ())
+            .map_err(|_| "platform_v2_effect_policy_refused")
     }
 }
 
@@ -1003,6 +1293,21 @@ fn authorize_workspace(
     )
 }
 
+fn user_workspaces_for_project(
+    principal: &PrincipalPolicy,
+    project: &ProjectId,
+) -> BTreeSet<UserWorkspaceId> {
+    principal
+        .workspaces
+        .iter()
+        .filter(|(_, scope)| &scope.project == project)
+        .filter_map(|(identity, _)| match identity {
+            WorkContextIdentity::UserWorkspace(workspace) => Some(workspace.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn primary_identity_for_intent(
     intent: &automonique_protocol::platform_v2_lifecycle::WorkContextMutationIntent,
 ) -> Option<&WorkContextIdentity> {
@@ -1047,6 +1352,46 @@ fn approval_expiry(requested_expiry: i64, preview_expiry: i64) -> i64 {
 fn negotiated_v2() -> Result<NegotiatedPlatform, &'static str> {
     let offer = PlatformVersionOffer::new(vec![2]).map_err(|_| "platform_v2_negotiation")?;
     negotiate_platform_version(&offer, &offer).map_err(|_| "platform_v2_negotiation")
+}
+
+fn mutation_store_refusal(
+    error: &WorkContextStoreError,
+    request_digest: automonique_protocol::platform_v2_lifecycle::WorkContextRequestDigest,
+) -> Result<MutationRefusal, &'static str> {
+    let category = match error {
+        WorkContextStoreError::InvalidField(_)
+        | WorkContextStoreError::Protocol(_)
+        | WorkContextStoreError::Corrupt(_)
+        | WorkContextStoreError::InsecurePath(_)
+        | WorkContextStoreError::SchemaVersion { .. }
+        | WorkContextStoreError::Io(_)
+        | WorkContextStoreError::Sqlite(_) => MutationRefusalCategory::InvalidRequest,
+        WorkContextStoreError::Unauthorized | WorkContextStoreError::NotFound => {
+            MutationRefusalCategory::Unauthorized
+        }
+        WorkContextStoreError::AuthorityWidening => MutationRefusalCategory::AuthorityWidening,
+        WorkContextStoreError::StaleRevision => MutationRefusalCategory::StaleRevision,
+        WorkContextStoreError::GraphConflict | WorkContextStoreError::BodyConflict => {
+            MutationRefusalCategory::Conflict
+        }
+        WorkContextStoreError::ApprovalRequired => MutationRefusalCategory::ApprovalRequired,
+        WorkContextStoreError::ApprovalMismatch | WorkContextStoreError::ApprovalConsumed => {
+            MutationRefusalCategory::ApprovalMismatch
+        }
+        WorkContextStoreError::ApprovalDenied => MutationRefusalCategory::ApprovalDenied,
+        WorkContextStoreError::ApprovalExpired => MutationRefusalCategory::ApprovalExpired,
+        WorkContextStoreError::PreviewExpired => MutationRefusalCategory::PreviewExpired,
+        WorkContextStoreError::Unavailable => MutationRefusalCategory::Unavailable,
+        WorkContextStoreError::ReconcileRequired => MutationRefusalCategory::Unknown,
+    };
+    Ok(MutationRefusal::new(
+        category,
+        Some(request_digest),
+        MutationExplanation::new(
+            "the current server policy or durable mutation state refused submission",
+        )
+        .map_err(|_| "platform_v2_response_invalid")?,
+    ))
 }
 
 fn refused(category: &str) -> PlatformV2Response {

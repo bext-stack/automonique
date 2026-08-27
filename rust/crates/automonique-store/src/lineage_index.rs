@@ -698,6 +698,25 @@ impl LineageIndex {
         value.into_stored().map(Some)
     }
 
+    /// Resolve a task only through a server-owned bounded workspace set.
+    /// Possession of an orchestration task ID is not workspace authority.
+    pub fn task_workspace_authorized(
+        &self,
+        tenant: &str,
+        task: &automonique_protocol::platform_v2_lineage::OrchestrationTaskId,
+        allowed: &BTreeSet<UserWorkspaceId>,
+    ) -> Indexed<Option<UserWorkspaceId>> {
+        validate_tenant(tenant)?;
+        let identity = OrchestrationIdentity::Task(task.clone());
+        let Some((record, _)) = read_orchestration(&self.connection, tenant, &identity)? else {
+            return Ok(None);
+        };
+        if !allowed.contains(record.workspace()) {
+            return Ok(None);
+        }
+        Ok(Some(record.workspace().clone()))
+    }
+
     /// Rebuild the bounded projection for one exact authorized tenant/workspace.
     fn projection_unchecked(
         &self,
