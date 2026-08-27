@@ -423,6 +423,112 @@ describe("canonical HTTPS Platform v2 client", () => {
     expect(client.negotiated).toBeNull();
   });
 
+  test("checks stale negotiation and v2 generations before decoding malformed bytes", async () => {
+    const staleNegotiation = deferred<Response>();
+    const staleNegotiationStarted = deferred<void>();
+    let negotiationFetch = 0;
+    const negotiationTransport = new HttpsPlatformV2Transport(
+      "https://manage.example/api/platform/v2",
+      () => "token",
+      (async (_input, init) => {
+        const body = typeof init?.body === "string" ? init.body : "";
+        const requestId = decodeMessage(new TextEncoder().encode(body)).envelope.requestId;
+        if (negotiationFetch++ === 0) {
+          staleNegotiationStarted.resolve(undefined);
+          return staleNegotiation.promise;
+        }
+        return canonicalResponse(requestId, "automonique.platform.negotiation", 1, "platform_v2_refused", {
+          category: "unsupported", explanation: "v2 disabled", schema: PLATFORM_SCHEMA_V2,
+        }, PLATFORM_NEGOTIATION_MEDIA_TYPE);
+      }) as typeof fetch,
+    );
+    const negotiationClient = new PlatformV2Client(negotiationTransport);
+    const staleAttempt = negotiationClient.negotiate(offer);
+    await staleNegotiationStarted.promise;
+    expect((await negotiationClient.negotiate(offer)).kind).toBe("platform_v2_refused");
+    staleNegotiation.resolve(new Response("not-json", {
+      headers: {"cache-control": "no-store", "content-type": PLATFORM_NEGOTIATION_MEDIA_TYPE},
+    }));
+    await expect(staleAttempt).rejects.toMatchObject({category: "negotiation_superseded"});
+
+    const staleV2 = deferred<Response>();
+    const staleV2Started = deferred<void>();
+    let v2Fetch = 0;
+    const v2Transport = new HttpsPlatformV2Transport(
+      "https://manage.example/api/platform/v2",
+      () => "token",
+      (async (_input, init) => {
+        const body = typeof init?.body === "string" ? init.body : "";
+        const message = decodeMessage(new TextEncoder().encode(body));
+        if (v2Fetch++ === 0) {
+          return canonicalResponse(message.envelope.requestId, "automonique.platform.negotiation", 1, "negotiated", negotiatedBody(2n), PLATFORM_NEGOTIATION_MEDIA_TYPE);
+        }
+        if (message.envelope.kind === "get_work_context") {
+          staleV2Started.resolve(undefined);
+          return staleV2.promise;
+        }
+        return canonicalResponse(message.envelope.requestId, "automonique.platform.negotiation", 1, "platform_v2_refused", {
+          category: "unsupported", explanation: "v2 disabled", schema: PLATFORM_SCHEMA_V2,
+        }, PLATFORM_NEGOTIATION_MEDIA_TYPE);
+      }) as typeof fetch,
+    );
+    const v2Client = new PlatformV2Client(v2Transport);
+    await v2Client.negotiate(offer);
+    const staleRead = v2Client.getWorkContext(projectA);
+    await staleV2Started.promise;
+    expect((await v2Client.negotiate(offer)).kind).toBe("platform_v2_refused");
+    staleV2.resolve(new Response("not-json", {
+      headers: {"cache-control": "no-store", "content-type": PLATFORM_V2_MEDIA_TYPE},
+    }));
+    await expect(staleRead).rejects.toMatchObject({category: "negotiation_invalidated"});
+  });
+
+  test("renegotiation cancels delayed credentials before an old read or mutation can fetch", async () => {
+    const operations = [
+      (client: PlatformV2Client) => client.getWorkContext(projectA),
+      (client: PlatformV2Client) => client.prepareMutation(
+        IdempotencyKey("delayed-mutation"),
+        {kind: "create_project", label: WorkContextLabel("Delayed"), repositories: []},
+      ),
+    ];
+    for (const operation of operations) {
+      const delayedCredential = deferred<string>();
+      let credentialCalls = 0;
+      const fetchedKinds: string[] = [];
+      const fetchedAuthorizations: string[] = [];
+      const transport = new HttpsPlatformV2Transport(
+        "https://manage.example/api/platform/v2",
+        () => {
+          credentialCalls += 1;
+          if (credentialCalls === 2) return delayedCredential.promise;
+          return `token-${credentialCalls}`;
+        },
+        (async (_input, init) => {
+          const body = typeof init?.body === "string" ? init.body : "";
+          const message = decodeMessage(new TextEncoder().encode(body));
+          fetchedKinds.push(message.envelope.kind);
+          fetchedAuthorizations.push(new Headers(init?.headers).get("authorization") ?? "");
+          if (fetchedKinds.length === 1) {
+            return canonicalResponse(message.envelope.requestId, "automonique.platform.negotiation", 1, "negotiated", negotiatedBody(2n), PLATFORM_NEGOTIATION_MEDIA_TYPE);
+          }
+          return canonicalResponse(message.envelope.requestId, "automonique.platform.negotiation", 1, "platform_v2_refused", {
+            category: "unsupported", explanation: "v2 disabled", schema: PLATFORM_SCHEMA_V2,
+          }, PLATFORM_NEGOTIATION_MEDIA_TYPE);
+        }) as typeof fetch,
+      );
+      const client = new PlatformV2Client(transport);
+      await client.negotiate(offer);
+      const oldOperation = operation(client);
+      expect(credentialCalls).toBe(2);
+      expect((await client.negotiate(offer)).kind).toBe("platform_v2_refused");
+      await expect(oldOperation).rejects.toMatchObject({category: "negotiation_invalidated"});
+      delayedCredential.resolve("stale-token");
+      await Promise.resolve();
+      expect(fetchedKinds).toEqual(["negotiate", "negotiate"]);
+      expect(fetchedAuthorizations).toEqual(["Bearer token-1", "Bearer token-3"]);
+    }
+  });
+
   test("fences an in-flight v2 response when renegotiation invalidates its generation", async () => {
     const response = deferred<PlatformV2Response>();
     const adapter = new DeterministicPlatformV2Adapter([

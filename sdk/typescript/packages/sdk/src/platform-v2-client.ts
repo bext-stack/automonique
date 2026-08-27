@@ -166,6 +166,37 @@ function protocolError(error: unknown, status = 0): PlatformTransportError {
   return new PlatformTransportError(status, category, {cause: error});
 }
 
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted === true) {
+    throw new PlatformTransportError(0, "aborted", {cause: signal.reason});
+  }
+}
+
+interface CombinedAbortSignal {
+  readonly signal: AbortSignal;
+  dispose(): void;
+}
+
+function combineAbortSignals(primary: AbortSignal, secondary?: AbortSignal): CombinedAbortSignal {
+  if (secondary === undefined) return {signal: primary, dispose() {}};
+  const controller = new AbortController();
+  const abortPrimary = () => controller.abort(primary.reason);
+  const abortSecondary = () => controller.abort(secondary.reason);
+  if (primary.aborted) abortPrimary();
+  else if (secondary.aborted) abortSecondary();
+  else {
+    primary.addEventListener("abort", abortPrimary, {once: true});
+    secondary.addEventListener("abort", abortSecondary, {once: true});
+  }
+  return {
+    signal: controller.signal,
+    dispose() {
+      primary.removeEventListener("abort", abortPrimary);
+      secondary.removeEventListener("abort", abortSecondary);
+    },
+  };
+}
+
 async function exchangeHttps(
   endpointValue: string,
   credentialProvider: () => string | Promise<string>,
@@ -178,10 +209,9 @@ async function exchangeHttps(
   const maximumResponseBytes = lane === "negotiation"
     ? MAX_PLATFORM_NEGOTIATION_RESPONSE_CANONICAL_BYTES
     : MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES;
-  if (signal?.aborted === true) {
-    throw new PlatformTransportError(0, "aborted", {cause: signal.reason});
-  }
+  throwIfAborted(signal);
   const token = await abortableCredential(credentialProvider, signal);
+  throwIfAborted(signal);
   const response = await fetcher(endpointValue, {
     method: "POST",
     credentials: "omit",
@@ -316,6 +346,7 @@ export class PlatformV2Client {
   readonly #exchange: PlatformV2Exchange | null;
   readonly #testingTransport: PlatformV2CanonicalTestingHandlers | null;
   #negotiationGeneration = 0n;
+  #generationAbort = new AbortController();
   #negotiated: {readonly generation: bigint; readonly value: NegotiatedPlatform} | null = null;
 
   constructor(transport: HttpsPlatformV2Transport | PlatformV2CanonicalTestingTransport) {
@@ -340,6 +371,8 @@ export class PlatformV2Client {
   }
 
   async negotiate(offer: PlatformVersionOffer, signal?: AbortSignal): Promise<PlatformNegotiationResponse> {
+    this.#generationAbort.abort("platform_v2_generation_invalidated");
+    this.#generationAbort = new AbortController();
     const generation = ++this.#negotiationGeneration;
     this.#negotiated = null;
     let requestId: ReturnType<typeof PlatformRequestId>;
@@ -350,35 +383,48 @@ export class PlatformV2Client {
     } catch (error) {
       throw protocolError(error);
     }
-    let response: PlatformNegotiationResponse;
-    if (this.#exchange !== null) {
-      const exchanged = await this.#exchange("negotiation", payload, signal);
-      try {
-        response = decodePlatformNegotiationResponse(exchanged.payload, requestId, offer);
-      } catch (error) {
-        throw protocolError(error, exchanged.status);
+    const combined = combineAbortSignals(this.#generationAbort.signal, signal);
+    try {
+      let response: PlatformNegotiationResponse;
+      if (this.#exchange !== null) {
+        const exchanged = await this.#exchange("negotiation", payload, combined.signal);
+        if (generation !== this.#negotiationGeneration) {
+          throw new PlatformTransportError(0, "negotiation_superseded");
+        }
+        try {
+          response = decodePlatformNegotiationResponse(exchanged.payload, requestId, offer);
+        } catch (error) {
+          throw protocolError(error, exchanged.status);
+        }
+      } else {
+        response = await this.#testingTransport!.negotiate(requestId, offer, combined.signal);
       }
-    } else {
-      response = await this.#testingTransport!.negotiate(requestId, offer, signal);
+      if (generation !== this.#negotiationGeneration) {
+        throw new PlatformTransportError(0, "negotiation_superseded");
+      }
+      if (
+        response.kind === "negotiated"
+        && response.negotiated.version === 2n
+        && response.negotiated.schema === PLATFORM_SCHEMA_V2
+        && response.negotiated.work_context === "v2_structured"
+      ) {
+        this.#negotiated = {generation, value: response.negotiated};
+      }
+      return response;
+    } catch (error) {
+      if (generation !== this.#negotiationGeneration) {
+        throw new PlatformTransportError(0, "negotiation_superseded", {cause: error});
+      }
+      throw error;
+    } finally {
+      combined.dispose();
     }
-    if (generation !== this.#negotiationGeneration) {
-      throw new PlatformTransportError(0, "negotiation_superseded");
-    }
-    if (
-      response.kind === "negotiated"
-      && response.negotiated.version === 2n
-      && response.negotiated.schema === PLATFORM_SCHEMA_V2
-      && response.negotiated.work_context === "v2_structured"
-    ) {
-      this.#negotiated = {generation, value: response.negotiated};
-    }
-    return response;
   }
 
-  #request(request: PlatformV2Request, signal?: AbortSignal): Promise<PlatformV2Response> {
+  async #request(request: PlatformV2Request, signal?: AbortSignal): Promise<PlatformV2Response> {
     const negotiated = this.#negotiated;
     if (negotiated === null) {
-      return Promise.reject(new PlatformTransportError(0, "platform_v2_not_negotiated"));
+      throw new PlatformTransportError(0, "platform_v2_not_negotiated");
     }
     let requestId: ReturnType<typeof PlatformRequestId>;
     let payload: Uint8Array;
@@ -386,26 +432,38 @@ export class PlatformV2Client {
       requestId = PlatformRequestId(defaultRequestId());
       payload = encodePlatformV2Request(requestId, request);
     } catch (error) {
-      return Promise.reject(protocolError(error));
+      throw protocolError(error);
     }
-    const response = this.#exchange !== null
-      ? this.#exchange("v2", payload, signal).then((exchanged) => {
+    const combined = combineAbortSignals(this.#generationAbort.signal, signal);
+    const invalidated = () => negotiated.generation !== this.#negotiationGeneration
+      || this.#negotiated?.generation !== negotiated.generation;
+    try {
+      let response: PlatformV2Response;
+      if (this.#exchange !== null) {
+        const exchanged = await this.#exchange("v2", payload, combined.signal);
+        if (invalidated()) {
+          throw new PlatformTransportError(0, "negotiation_invalidated");
+        }
         try {
-          return decodePlatformV2Response(exchanged.payload, requestId, request.kind);
+          response = decodePlatformV2Response(exchanged.payload, requestId, request.kind);
         } catch (error) {
           throw protocolError(error, exchanged.status);
         }
-      })
-      : this.#testingTransport!.request(requestId, request, signal);
-    return response.then((decoded) => {
-      if (
-        negotiated.generation !== this.#negotiationGeneration
-        || this.#negotiated?.generation !== negotiated.generation
-      ) {
+      } else {
+        response = await this.#testingTransport!.request(requestId, request, combined.signal);
+      }
+      if (invalidated()) {
         throw new PlatformTransportError(0, "negotiation_invalidated");
       }
-      return decoded;
-    });
+      return response;
+    } catch (error) {
+      if (invalidated()) {
+        throw new PlatformTransportError(0, "negotiation_invalidated", {cause: error});
+      }
+      throw error;
+    } finally {
+      combined.dispose();
+    }
   }
 
   async queryWorkContexts(query: WorkContextQuery & {readonly project: ProjectId}, signal?: AbortSignal) {

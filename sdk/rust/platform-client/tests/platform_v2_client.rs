@@ -4,10 +4,8 @@ use automonique_platform_client::platform_v2_client::testing::{
     DeterministicPlatformV2Step, DeterministicPlatformV2Transport,
 };
 use automonique_platform_client::platform_v2_client::{
-    NegotiationResult, PlatformV2Client, PlatformV2ClientError as ClientError, PlatformV2Lane,
-    PlatformV2Transport, WorkContextGetResult,
+    NegotiationResult, PlatformV2Client, PlatformV2ClientError as ClientError, WorkContextGetResult,
 };
-use automonique_protocol::codec::RequestId;
 use automonique_protocol::identity::Actor;
 use automonique_protocol::platform::{IdempotencyKey, ResourceAuthority};
 use automonique_protocol::platform_v2::{
@@ -22,9 +20,7 @@ use automonique_protocol::platform_v2_lifecycle::{
     WorkContextMutationProposal,
 };
 use automonique_protocol::platform_v2_transport::{
-    MAX_PLATFORM_NEGOTIATION_RESPONSE_CANONICAL_BYTES, PlatformNegotiationRequest,
-    PlatformNegotiationRequestMessage, PlatformNegotiationResponse,
-    PlatformNegotiationResponseMessage, PlatformV2Refusal, PlatformV2Response,
+    PlatformNegotiationResponse, PlatformV2Refusal, PlatformV2Response,
 };
 use automonique_protocol::primitives::{EpochMillis, Revision};
 
@@ -72,7 +68,7 @@ fn negotiates_v2_then_preserves_exact_request_coordinates() {
             project_record("project-a"),
         ))),
     ]);
-    let mut client = PlatformV2Client::new(transport);
+    let mut client = PlatformV2Client::new_testing(transport);
     assert!(matches!(
         client
             .negotiate(PlatformVersionOffer::new(vec![1, 2]).unwrap())
@@ -105,7 +101,7 @@ fn downgrade_and_refusal_never_enable_v2_requests() {
             DeterministicPlatformV2Transport::new([DeterministicPlatformV2Step::Negotiation(
                 response,
             )]);
-        let mut client = PlatformV2Client::new(transport);
+        let mut client = PlatformV2Client::new_testing(transport);
         let result = client
             .negotiate(PlatformVersionOffer::new(vec![1, 2]).unwrap())
             .unwrap();
@@ -120,53 +116,35 @@ fn downgrade_and_refusal_never_enable_v2_requests() {
     }
 }
 
-struct ResponseBytes(Vec<u8>);
-impl PlatformV2Transport for ResponseBytes {
-    fn exchange(
-        &mut self,
-        _lane: PlatformV2Lane,
-        _canonical_request: &[u8],
-    ) -> Result<Vec<u8>, ClientError> {
-        Ok(self.0.clone())
-    }
-}
-
 #[test]
 fn refuses_malformed_oversized_and_mismatched_negotiation_responses() {
-    let mut malformed = PlatformV2Client::new(ResponseBytes(b"not-json".to_vec()));
+    let mut malformed = PlatformV2Client::new_testing(DeterministicPlatformV2Transport::new([
+        DeterministicPlatformV2Step::MalformedResponse,
+    ]));
     assert_eq!(
         malformed.negotiate(PlatformVersionOffer::new(vec![2]).unwrap()),
         Err(ClientError::Protocol)
     );
-    let mut oversized = PlatformV2Client::new(ResponseBytes(vec![
-        b'x';
-        MAX_PLATFORM_NEGOTIATION_RESPONSE_CANONICAL_BYTES
-            + 1
+    let mut oversized = PlatformV2Client::new_testing(DeterministicPlatformV2Transport::new([
+        DeterministicPlatformV2Step::OversizedResponse,
     ]));
     assert_eq!(
         oversized.negotiate(PlatformVersionOffer::new(vec![2]).unwrap()),
         Err(ClientError::ResponseTooLarge)
     );
 
-    let other = PlatformNegotiationRequestMessage::new(
-        RequestId::new("other-request").unwrap(),
-        PlatformNegotiationRequest::Negotiate(PlatformVersionOffer::new(vec![2]).unwrap()),
-    );
-    let bytes = PlatformNegotiationResponseMessage::for_request(
-        &other,
-        PlatformNegotiationResponse::Negotiated(
-            NegotiatedPlatform::new(
-                PlatformVersion::V2,
-                PLATFORM_SCHEMA_V2,
-                WorkContextAvailability::V2Structured,
-            )
-            .unwrap(),
+    let mut client = PlatformV2Client::new_testing(DeterministicPlatformV2Transport::new([
+        DeterministicPlatformV2Step::UncorrelatedNegotiation(
+            PlatformNegotiationResponse::Negotiated(
+                NegotiatedPlatform::new(
+                    PlatformVersion::V2,
+                    PLATFORM_SCHEMA_V2,
+                    WorkContextAvailability::V2Structured,
+                )
+                .unwrap(),
+            ),
         ),
-    )
-    .unwrap()
-    .to_canonical_bytes()
-    .unwrap();
-    let mut client = PlatformV2Client::new(ResponseBytes(bytes));
+    ]));
     assert_eq!(
         client.negotiate(PlatformVersionOffer::new(vec![2]).unwrap()),
         Err(ClientError::Correlation)
@@ -183,7 +161,7 @@ fn rejects_a_valid_record_for_the_wrong_coordinate() {
             project_record("project-b"),
         ))),
     ]);
-    let mut client = PlatformV2Client::new(transport);
+    let mut client = PlatformV2Client::new_testing(transport);
     client
         .negotiate(PlatformVersionOffer::new(vec![2]).unwrap())
         .unwrap();
@@ -210,7 +188,7 @@ fn rejects_pages_and_resyncs_for_other_request_coordinates() {
         v2_negotiation(),
         DeterministicPlatformV2Step::V2(Box::new(PlatformV2Response::WorkContextPage(wrong_page))),
     ]);
-    let mut client = PlatformV2Client::new(transport);
+    let mut client = PlatformV2Client::new_testing(transport);
     client
         .negotiate(PlatformVersionOffer::new(vec![2]).unwrap())
         .unwrap();
@@ -225,7 +203,7 @@ fn rejects_pages_and_resyncs_for_other_request_coordinates() {
             WorkContextResync::new(WorkContextCursor::new("cursor-2").unwrap()),
         ))),
     ]);
-    let mut client = PlatformV2Client::new(transport);
+    let mut client = PlatformV2Client::new_testing(transport);
     client
         .negotiate(PlatformVersionOffer::new(vec![2]).unwrap())
         .unwrap();
@@ -272,7 +250,7 @@ fn rejects_mutation_preview_for_a_substituted_intent() {
         v2_negotiation(),
         DeterministicPlatformV2Step::V2(Box::new(PlatformV2Response::MutationPreview(preview))),
     ]);
-    let mut client = PlatformV2Client::new(transport);
+    let mut client = PlatformV2Client::new_testing(transport);
     client
         .negotiate(PlatformVersionOffer::new(vec![2]).unwrap())
         .unwrap();

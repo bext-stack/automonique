@@ -5,6 +5,19 @@
 //! The wire codec remains owned by `automonique-protocol`. This module adds
 //! transport policy, negotiation state, and operation-specific result types;
 //! it never accepts actor, tenant, or authority assertions from a caller.
+//!
+//! The authenticated canonical-byte exchange is deliberately not public:
+//!
+//! ```compile_fail
+//! use automonique_platform_client::platform_v2_client::{PlatformV2Lane, PlatformV2Transport};
+//! ```
+//!
+//! ```compile_fail
+//! use automonique_platform_client::{BearerToken, HttpsTransport};
+//! let token = BearerToken::new("secret").unwrap();
+//! let mut transport = HttpsTransport::new("https://manage.example/v2", token).unwrap();
+//! let _ = transport.exchange((), b"arbitrary authenticated bytes");
+//! ```
 
 use std::io::Read;
 #[cfg(unix)]
@@ -94,14 +107,14 @@ pub const PLATFORM_V2_CONTENT_TYPE: &str = "application/vnd.automonique.platform
 
 /// A canonical request/response lane with its independent response bound.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PlatformV2Lane {
+enum PlatformV2Lane {
     Negotiation,
     V2,
 }
 
 impl PlatformV2Lane {
     #[must_use]
-    pub const fn content_type(self) -> &'static str {
+    const fn content_type(self) -> &'static str {
         match self {
             Self::Negotiation => PLATFORM_NEGOTIATION_CONTENT_TYPE,
             Self::V2 => PLATFORM_V2_CONTENT_TYPE,
@@ -109,7 +122,7 @@ impl PlatformV2Lane {
     }
 
     #[must_use]
-    pub const fn maximum_response_bytes(self) -> usize {
+    const fn maximum_response_bytes(self) -> usize {
         match self {
             Self::Negotiation => MAX_PLATFORM_NEGOTIATION_RESPONSE_CANONICAL_BYTES,
             Self::V2 => MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES,
@@ -119,7 +132,7 @@ impl PlatformV2Lane {
 
 /// Canonical-byte transport used by production and deterministic test fakes.
 /// Correlation and response-kind checks remain in [`PlatformV2Client`].
-pub trait PlatformV2Transport {
+trait PlatformV2Transport {
     fn exchange(
         &mut self,
         lane: PlatformV2Lane,
@@ -295,17 +308,35 @@ pub enum ReviewReceiptResult {
 
 /// Client whose v2 methods remain unavailable until this exact connection has
 /// negotiated structured Platform major two.
+type RawExchange<T> = fn(&mut T, PlatformV2Lane, &[u8]) -> Result<Vec<u8>, ClientError>;
+
 pub struct PlatformV2Client<T> {
     transport: T,
+    exchange: RawExchange<T>,
     next_request: u64,
     negotiated: Option<NegotiatedPlatform>,
 }
 
-impl<T: PlatformV2Transport> PlatformV2Client<T> {
+impl PlatformV2Client<HttpsTransport> {
     #[must_use]
-    pub const fn new(transport: T) -> Self {
+    pub const fn new_https(transport: HttpsTransport) -> Self {
+        Self::with_exchange(transport, HttpsTransport::exchange)
+    }
+}
+
+#[cfg(unix)]
+impl PlatformV2Client<UnixTransport> {
+    #[must_use]
+    pub const fn new_unix(transport: UnixTransport) -> Self {
+        Self::with_exchange(transport, UnixTransport::exchange)
+    }
+}
+
+impl<T> PlatformV2Client<T> {
+    const fn with_exchange(transport: T, exchange: RawExchange<T>) -> Self {
         Self {
             transport,
+            exchange,
             next_request: 1,
             negotiated: None,
         }
@@ -333,9 +364,7 @@ impl<T: PlatformV2Transport> PlatformV2Client<T> {
         let payload = request
             .to_canonical_bytes()
             .map_err(|_| ClientError::Protocol)?;
-        let response = self
-            .transport
-            .exchange(PlatformV2Lane::Negotiation, &payload)?;
+        let response = (self.exchange)(&mut self.transport, PlatformV2Lane::Negotiation, &payload)?;
         let response = PlatformNegotiationResponseMessage::from_canonical_bytes(
             &response, &request,
         )
@@ -366,7 +395,7 @@ impl<T: PlatformV2Transport> PlatformV2Client<T> {
         let payload = message
             .to_canonical_bytes()
             .map_err(|_| ClientError::Protocol)?;
-        let response = self.transport.exchange(PlatformV2Lane::V2, &payload)?;
+        let response = (self.exchange)(&mut self.transport, PlatformV2Lane::V2, &payload)?;
         PlatformV2ResponseMessage::from_canonical_bytes(&response, &message)
             .map(|message| message.response().clone())
             .map_err(|error| match error {
@@ -632,6 +661,9 @@ pub mod testing {
     pub enum DeterministicPlatformV2Step {
         Negotiation(PlatformNegotiationResponse),
         V2(Box<PlatformV2Response>),
+        MalformedResponse,
+        OversizedResponse,
+        UncorrelatedNegotiation(PlatformNegotiationResponse),
         Error(ClientError),
     }
 
@@ -671,6 +703,13 @@ pub mod testing {
         }
     }
 
+    impl PlatformV2Client<DeterministicPlatformV2Transport> {
+        #[must_use]
+        pub const fn new_testing(transport: DeterministicPlatformV2Transport) -> Self {
+            Self::with_exchange(transport, DeterministicPlatformV2Transport::exchange)
+        }
+    }
+
     impl PlatformV2Transport for DeterministicPlatformV2Transport {
         fn exchange(
             &mut self,
@@ -678,9 +717,30 @@ pub mod testing {
             canonical_request: &[u8],
         ) -> Result<Vec<u8>, ClientError> {
             let step = self.steps.pop_front().ok_or(ClientError::Protocol)?;
-            if let DeterministicPlatformV2Step::Error(error) = step {
-                return Err(error);
-            }
+            let step = match step {
+                DeterministicPlatformV2Step::Error(error) => return Err(error),
+                DeterministicPlatformV2Step::MalformedResponse => return Ok(b"not-json".to_vec()),
+                DeterministicPlatformV2Step::OversizedResponse => {
+                    return Ok(vec![b'x'; lane.maximum_response_bytes() + 1]);
+                }
+                DeterministicPlatformV2Step::UncorrelatedNegotiation(response) => {
+                    if lane != PlatformV2Lane::Negotiation {
+                        return Err(ClientError::Protocol);
+                    }
+                    let request =
+                        PlatformNegotiationRequestMessage::from_canonical_bytes(canonical_request)
+                            .map_err(|_| ClientError::Protocol)?;
+                    let other = PlatformNegotiationRequestMessage::new(
+                        RequestId::new("fixture-other-request")
+                            .map_err(|_| ClientError::Protocol)?,
+                        request.request().clone(),
+                    );
+                    return PlatformNegotiationResponseMessage::for_request(&other, response)
+                        .and_then(|message| message.to_canonical_bytes())
+                        .map_err(|_| ClientError::Protocol);
+                }
+                step => step,
+            };
             match (lane, step) {
                 (
                     PlatformV2Lane::Negotiation,
