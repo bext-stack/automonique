@@ -77,6 +77,31 @@ mod work_context_surface {
             "{\"identities\":9,\"items\":640,\"page_limit\":128,\"schema\":\"automonique.platform/v2\",\"refusals\":9,\"version\":2}\n"
         );
     }
+
+    #[test]
+    fn generated_typescript_consumes_the_shared_lineage_boundary_corpus() {
+        let runtime = javascript_runtime().unwrap_or_else(|| {
+            record_js_gap("the Platform v2 lineage fixture did not run");
+            "bun"
+        });
+        if javascript_runtime().is_none() {
+            return;
+        }
+        let output = Command::new(runtime)
+            .arg(package_root().join("conformance/platform-v2-lineage-runtime.ts"))
+            .current_dir(package_root())
+            .output()
+            .expect("the TypeScript lineage runtime starts");
+        assert!(
+            output.status.success(),
+            "lineage fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "{\"cases\":9,\"codec_bytes\":578,\"providers\":4,\"question_links\":2,\"stale_heartbeats\":1}\n"
+        );
+    }
 }
 
 fn crate_root() -> PathBuf {

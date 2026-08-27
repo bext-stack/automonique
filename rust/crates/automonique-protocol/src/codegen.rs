@@ -314,6 +314,10 @@ use crate::platform_v2::{
     CheckoutKind, HostSetupKind, WorkContextAvailability, WorkContextKind, WorkContextLifecycle,
     WorkContextRelationKind, WorkContextTargetKind,
 };
+use crate::platform_v2_lineage::{
+    ExternalWorkProvider, ExternalWorkState, LineageFreshnessState, OrchestrationKind,
+    WorkspaceIntentConflict,
+};
 use crate::primitives::ValueError;
 use crate::progress_api::{StreamMessageKind, StreamRefusal};
 use crate::provenance::MAX_PROVENANCE_ID_BYTES;
@@ -8338,6 +8342,13 @@ fn work_context_module() -> GeneratedModule {
                 value: ConstantValue::Count(crate::platform_v2::MAX_WORK_CONTEXT_RELATIONS),
             },
             Constant {
+                name: "MAX_LINEAGE_RECORDS".to_owned(),
+                doc: "Maximum lineage records carried by one bounded projection.".to_owned(),
+                value: ConstantValue::Count(
+                    crate::platform_v2_lineage::MAX_LINEAGE_RECORDS,
+                ),
+            },
+            Constant {
                 name: "MIN_PLATFORM_VERSION".to_owned(),
                 doc: "Lowest Platform major version this contract negotiates.".to_owned(),
                 value: ConstantValue::Count(usize::from(crate::platform_v2::MIN_PLATFORM_VERSION)),
@@ -8438,27 +8449,71 @@ fn work_context_module() -> GeneratedModule {
         ],
         branded_ids: [
             "AttemptWorkspaceId",
+            "BaseSelectorId",
+            "BranchSelectorId",
             "CheckoutId",
+            "ExternalWorkKey",
+            "ExternalWorkAuthorityId",
+            "ExternalWorkScope",
             "HostSetupId",
+            "OrchestrationDecisionGateId",
+            "OrchestrationDispatchId",
+            "OrchestrationHeartbeatId",
+            "OrchestrationQuestionId",
+            "OrchestrationRunId",
+            "OrchestrationTaskId",
+            "OrchestrationWorkerId",
             "PaneId",
             "ProjectId",
             "UserWorkspaceId",
             "WorkContextCursor",
             "WorkSessionId",
+            "WorkspaceIntentId",
         ]
         .into_iter()
         .map(|name| BrandedId {
             name: name.to_owned(),
-            max_bytes: crate::platform_v2::MAX_WORK_CONTEXT_FIELD_BYTES,
+            max_bytes: if matches!(
+                name,
+                "AttemptWorkspaceId"
+                    | "CheckoutId"
+                    | "HostSetupId"
+                    | "PaneId"
+                    | "ProjectId"
+                    | "UserWorkspaceId"
+                    | "WorkContextCursor"
+                    | "WorkSessionId"
+            ) {
+                crate::platform_v2::MAX_WORK_CONTEXT_FIELD_BYTES
+            } else {
+                crate::platform_v2_lineage::MAX_LINEAGE_FIELD_BYTES
+            },
             pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),
         })
         .collect(),
-        bounded_strings: vec![BoundedString {
-            name: "WorkContextLabel".to_owned(),
-            max_bytes: crate::platform_v2::MAX_WORK_CONTEXT_LABEL_BYTES,
-            pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),
-        }],
+        bounded_strings: vec![
+            BoundedString {
+                name: "LineageMessage".to_owned(),
+                max_bytes: crate::platform_v2_lineage::MAX_LINEAGE_MESSAGE_BYTES,
+                pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),
+            },
+            BoundedString {
+                name: "WorkContextLabel".to_owned(),
+                max_bytes: crate::platform_v2::MAX_WORK_CONTEXT_LABEL_BYTES,
+                pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),
+            },
+        ],
         bounded_integers: vec![
+            BoundedInteger {
+                name: "LineageStaleAfterMs".to_owned(),
+                min: 1,
+                max: i64::MAX,
+            },
+            BoundedInteger {
+                name: "LineageObservedAtMs".to_owned(),
+                min: 1,
+                max: i64::MAX,
+            },
             BoundedInteger {
                 name: "PlatformVersionNumber".to_owned(),
                 min: i64::from(crate::platform_v2::MIN_PLATFORM_VERSION),
@@ -8487,8 +8542,27 @@ fn work_context_module() -> GeneratedModule {
                 platform_values(&CheckoutKind::ALL, CheckoutKind::as_str),
             ),
             security_enum(
+                "ExternalWorkProvider",
+                platform_values(&ExternalWorkProvider::ALL, ExternalWorkProvider::as_str),
+            ),
+            security_enum(
+                "ExternalWorkState",
+                platform_values(&ExternalWorkState::ALL, ExternalWorkState::as_str),
+            ),
+            security_enum(
                 "HostSetupKind",
                 platform_values(&HostSetupKind::ALL, HostSetupKind::as_str),
+            ),
+            security_enum(
+                "LineageFreshnessState",
+                platform_values(
+                    &LineageFreshnessState::ALL,
+                    LineageFreshnessState::as_str,
+                ),
+            ),
+            security_enum(
+                "OrchestrationKind",
+                platform_values(&OrchestrationKind::ALL, OrchestrationKind::as_str),
             ),
             security_enum(
                 "WorkContextKind",
@@ -8516,11 +8590,61 @@ fn work_context_module() -> GeneratedModule {
                 "WorkContextTargetKind",
                 platform_values(&WorkContextTargetKind::ALL, WorkContextTargetKind::as_str),
             ),
+            security_enum(
+                "WorkspaceIntentConflict",
+                platform_values(
+                    &WorkspaceIntentConflict::ALL,
+                    WorkspaceIntentConflict::as_str,
+                ),
+            ),
         ],
-        unions: vec![Union {
-            name: "WorkContextIdentity".to_owned(),
-            discriminant: "kind".to_owned(),
-            variants: vec![
+        unions: vec![
+            Union {
+                name: "LineageStatus".to_owned(),
+                discriminant: "kind".to_owned(),
+                variants: vec![
+                    UnionVariant { tag: "blocked".to_owned(), payload: Some(("reason".to_owned(), "LineageMessage".to_owned())) },
+                    UnionVariant { tag: "done".to_owned(), payload: Some(("outcome".to_owned(), "LineageMessage".to_owned())) },
+                    UnionVariant { tag: "waiting".to_owned(), payload: Some(("reason".to_owned(), "LineageMessage".to_owned())) },
+                    UnionVariant { tag: "working".to_owned(), payload: None },
+                ],
+            },
+            Union {
+                name: "OrchestrationIdentity".to_owned(),
+                discriminant: "kind".to_owned(),
+                variants: vec![
+                    UnionVariant { tag: "decision_gate".to_owned(), payload: Some(("id".to_owned(), "OrchestrationDecisionGateId".to_owned())) },
+                    UnionVariant { tag: "dispatch".to_owned(), payload: Some(("id".to_owned(), "OrchestrationDispatchId".to_owned())) },
+                    UnionVariant { tag: "heartbeat".to_owned(), payload: Some(("id".to_owned(), "OrchestrationHeartbeatId".to_owned())) },
+                    UnionVariant { tag: "question".to_owned(), payload: Some(("id".to_owned(), "OrchestrationQuestionId".to_owned())) },
+                    UnionVariant { tag: "run".to_owned(), payload: Some(("id".to_owned(), "OrchestrationRunId".to_owned())) },
+                    UnionVariant { tag: "task".to_owned(), payload: Some(("id".to_owned(), "OrchestrationTaskId".to_owned())) },
+                    UnionVariant { tag: "worker".to_owned(), payload: Some(("id".to_owned(), "OrchestrationWorkerId".to_owned())) },
+                ],
+            },
+            Union {
+                name: "WorkspaceIntent".to_owned(),
+                discriminant: "kind".to_owned(),
+                variants: vec![
+                    UnionVariant { tag: "create".to_owned(), payload: Some(("request".to_owned(), "WorkspaceCreateIntent".to_owned())) },
+                    UnionVariant { tag: "resume".to_owned(), payload: Some(("request".to_owned(), "WorkspaceResumeIntent".to_owned())) },
+                ],
+            },
+            Union {
+                name: "WorkspaceIntentOutcome".to_owned(),
+                discriminant: "kind".to_owned(),
+                variants: vec![
+                    UnionVariant { tag: "accepted".to_owned(), payload: None },
+                    UnionVariant { tag: "conflict".to_owned(), payload: Some(("conflict".to_owned(), "WorkspaceIntentConflict".to_owned())) },
+                    UnionVariant { tag: "created".to_owned(), payload: Some(("workspace".to_owned(), "UserWorkspaceId".to_owned())) },
+                    UnionVariant { tag: "resumed".to_owned(), payload: Some(("workspace".to_owned(), "UserWorkspaceId".to_owned())) },
+                    UnionVariant { tag: "unknown".to_owned(), payload: None },
+                ],
+            },
+            Union {
+                name: "WorkContextIdentity".to_owned(),
+                discriminant: "kind".to_owned(),
+                variants: vec![
                 UnionVariant {
                     tag: "attempt_workspace".to_owned(),
                     payload: Some(("id".to_owned(), "AttemptWorkspaceId".to_owned())),
@@ -8557,9 +8681,68 @@ fn work_context_module() -> GeneratedModule {
                     tag: "user_workspace".to_owned(),
                     payload: Some(("id".to_owned(), "UserWorkspaceId".to_owned())),
                 },
-            ],
-        }],
+                ],
+            },
+        ],
         interfaces: vec![
+            Interface {
+                name: "ExternalWorkIdentity".to_owned(),
+                doc: "Provider-qualified external identity; provider, scope, and key are one indivisible identity.".to_owned(),
+                fields: vec![
+                    required("authority", "ExternalWorkAuthorityId"),
+                    required("key", "ExternalWorkKey"),
+                    required("provider", "ExternalWorkProvider"),
+                    required("scope", "ExternalWorkScope"),
+                ],
+            },
+            Interface {
+                name: "ExternalWorkItem".to_owned(),
+                doc: "External work projection bound to, but never identified as, a user workspace.".to_owned(),
+                fields: vec![
+                    required("freshness", "LineageFreshness"),
+                    required("identity", "ExternalWorkIdentity"),
+                    nullable("latest_useful_message", "LatestUsefulMessage"),
+                    nullable("moved_to", "ExternalWorkIdentity"),
+                    required("origin", "LineageOrigin"),
+                    required("revision", "WorkContextRevision"),
+                    required("state", "ExternalWorkState"),
+                    required("workspace", "UserWorkspaceId"),
+                ],
+            },
+            Interface {
+                name: "LatestUsefulMessage".to_owned(),
+                doc: "Latest bounded operator-useful text, separate from identity and authority.".to_owned(),
+                fields: vec![required("observed_at_ms", "LineageObservedAtMs"), required("text", "LineageMessage")],
+            },
+            Interface {
+                name: "LineageFreshness".to_owned(),
+                doc: "Explicit source observation and staleness declaration; clients do not infer freshness from status.".to_owned(),
+                fields: vec![
+                    required("observed_at_ms", "LineageObservedAtMs"),
+                    required("stale_after_ms", "LineageStaleAfterMs"),
+                    required("state", "LineageFreshnessState"),
+                ],
+            },
+            Interface {
+                name: "LineageOrigin".to_owned(),
+                doc: "Exact path-free origin coordinate for attention jumps.".to_owned(),
+                fields: vec![
+                    nullable("attempt", "AttemptWorkspaceId"),
+                    nullable("pane", "PaneId"),
+                    nullable("session", "WorkSessionId"),
+                    required("workspace", "UserWorkspaceId"),
+                ],
+            },
+            Interface {
+                name: "LineageProjection".to_owned(),
+                doc: "Bounded records for one exact user workspace; identities remain in separate domains.".to_owned(),
+                fields: vec![
+                    required("external_work_items", "readonly ExternalWorkItem[]"),
+                    required("orchestration", "readonly OrchestrationRecord[]"),
+                    required("schema", "typeof PLATFORM_SCHEMA_V2"),
+                    required("workspace", "UserWorkspaceId"),
+                ],
+            },
             Interface {
                 name: "NegotiatedPlatform".to_owned(),
                 doc: "Highest shared Platform version and truthful work-context availability."
@@ -8579,6 +8762,21 @@ fn work_context_module() -> GeneratedModule {
                 fields: vec![
                     required("schema", "typeof PLATFORM_NEGOTIATION_SCHEMA_V1"),
                     required("versions", "readonly PlatformVersionNumber[]"),
+                ],
+            },
+            Interface {
+                name: "OrchestrationRecord".to_owned(),
+                doc: "Internal lineage node with a typed parent and explicit workspace binding.".to_owned(),
+                fields: vec![
+                    nullable("external_work", "ExternalWorkIdentity"),
+                    required("freshness", "LineageFreshness"),
+                    required("identity", "OrchestrationIdentity"),
+                    nullable("latest_useful_message", "LatestUsefulMessage"),
+                    required("origin", "LineageOrigin"),
+                    nullable("parent", "OrchestrationIdentity"),
+                    required("revision", "WorkContextRevision"),
+                    required("status", "LineageStatus"),
+                    required("workspace", "UserWorkspaceId"),
                 ],
             },
             Interface {
@@ -8645,6 +8843,27 @@ fn work_context_module() -> GeneratedModule {
                     required("expired_after", "WorkContextCursor"),
                     required("outcome", "\"resync_required\""),
                     required("schema", "typeof PLATFORM_SCHEMA_V2"),
+                ],
+            },
+            Interface {
+                name: "WorkspaceCreateIntent".to_owned(),
+                doc: "Create intent using opaque registry selectors rather than host paths or branch names.".to_owned(),
+                fields: vec![
+                    required("base_selector", "BaseSelectorId"),
+                    required("branch_selector", "BranchSelectorId"),
+                    required("external_work", "ExternalWorkIdentity"),
+                    required("intent_id", "WorkspaceIntentId"),
+                    required("task", "OrchestrationTaskId"),
+                ],
+            },
+            Interface {
+                name: "WorkspaceResumeIntent".to_owned(),
+                doc: "Resume intent fenced by exact workspace revision.".to_owned(),
+                fields: vec![
+                    required("expected_revision", "WorkContextRevision"),
+                    required("intent_id", "WorkspaceIntentId"),
+                    required("task", "OrchestrationTaskId"),
+                    required("workspace", "UserWorkspaceId"),
                 ],
             },
         ],
@@ -10893,6 +11112,272 @@ export function decodeWorkContextResync(payload: Uint8Array): WorkContextResync 
   });
 }
 
+function sameExternalWorkIdentity(left: ExternalWorkIdentity, right: ExternalWorkIdentity): boolean {
+  return left.provider === right.provider && left.authority === right.authority && left.scope === right.scope && left.key === right.key;
+}
+
+function sameOrchestrationIdentity(left: OrchestrationIdentity, right: OrchestrationIdentity): boolean {
+  return left.kind === right.kind && left.id === right.id;
+}
+
+function compareText(left: string, right: string): number {
+  return compareUtf8(left, right);
+}
+
+function compareExternalWorkIdentity(left: ExternalWorkIdentity, right: ExternalWorkIdentity): number {
+  return compareText(left.provider, right.provider)
+    || compareText(left.authority, right.authority)
+    || compareText(left.scope, right.scope)
+    || compareText(left.key, right.key);
+}
+
+function compareOrchestrationIdentity(left: OrchestrationIdentity, right: OrchestrationIdentity): number {
+  return compareText(left.kind, right.kind) || compareText(left.id, right.id);
+}
+
+export function validateExternalWorkIdentity(value: ExternalWorkIdentity): ExternalWorkIdentity {
+  exactInput(value, ExternalWorkIdentity_FIELDS);
+  return {
+    authority: ExternalWorkAuthorityId(value.authority),
+    key: ExternalWorkKey(value.key),
+    provider: decodeExternalWorkProvider(value.provider),
+    scope: ExternalWorkScope(value.scope),
+  };
+}
+
+export function validateLineageOrigin(value: LineageOrigin): LineageOrigin {
+  exactInput(value, LineageOrigin_FIELDS);
+  const attempt = value.attempt === null ? null : AttemptWorkspaceId(value.attempt);
+  const session = value.session === null ? null : WorkSessionId(value.session);
+  const pane = value.pane === null ? null : PaneId(value.pane);
+  if ((session !== null && attempt === null) || (pane !== null && session === null)) workContextRefusal("lineage origin is invalid");
+  return {attempt, pane, session, workspace: UserWorkspaceId(value.workspace)};
+}
+
+function originRefines(value: LineageOrigin, parent: LineageOrigin): boolean {
+  return value.workspace === parent.workspace
+    && (parent.attempt === null || value.attempt === parent.attempt)
+    && (parent.session === null || value.session === parent.session)
+    && (parent.pane === null || value.pane === parent.pane);
+}
+
+export function validateLatestUsefulMessage(value: LatestUsefulMessage): LatestUsefulMessage {
+  exactInput(value, LatestUsefulMessage_FIELDS);
+  return {observed_at_ms: LineageObservedAtMs(workContextWireUnsigned(value.observed_at_ms, LineageObservedAtMs_MAX, "observed_at_ms")), text: LineageMessage(value.text)};
+}
+
+export function validateLineageFreshness(value: LineageFreshness): LineageFreshness {
+  exactInput(value, LineageFreshness_FIELDS);
+  return {
+    observed_at_ms: LineageObservedAtMs(workContextWireUnsigned(value.observed_at_ms, LineageObservedAtMs_MAX, "observed_at_ms")),
+    stale_after_ms: LineageStaleAfterMs(workContextWireUnsigned(value.stale_after_ms, LineageStaleAfterMs_MAX, "stale_after_ms")),
+    state: decodeLineageFreshnessState(value.state),
+  };
+}
+
+export function validateLineageStatus(value: LineageStatus): LineageStatus {
+  switch (value.kind) {
+    case "blocked": exactInput(value, ["kind", "reason"]); return {kind: value.kind, reason: LineageMessage(value.reason)};
+    case "done": exactInput(value, ["kind", "outcome"]); return {kind: value.kind, outcome: LineageMessage(value.outcome)};
+    case "waiting": exactInput(value, ["kind", "reason"]); return {kind: value.kind, reason: LineageMessage(value.reason)};
+    case "working": exactInput(value, ["kind"]); return {kind: value.kind};
+    default: return assertNeverLineageStatus(value);
+  }
+}
+
+export function validateOrchestrationIdentity(value: OrchestrationIdentity): OrchestrationIdentity {
+  switch (value.kind) {
+    case "decision_gate": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: OrchestrationDecisionGateId(value.id)};
+    case "dispatch": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: OrchestrationDispatchId(value.id)};
+    case "heartbeat": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: OrchestrationHeartbeatId(value.id)};
+    case "question": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: OrchestrationQuestionId(value.id)};
+    case "run": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: OrchestrationRunId(value.id)};
+    case "task": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: OrchestrationTaskId(value.id)};
+    case "worker": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: OrchestrationWorkerId(value.id)};
+    default: return assertNeverOrchestrationIdentity(value);
+  }
+}
+
+function orchestrationParentAllowed(identity: OrchestrationIdentity, parent: OrchestrationIdentity | null): boolean {
+  switch (identity.kind) {
+    case "run": return parent === null;
+    case "task": return parent?.kind === "run" || parent?.kind === "task";
+    case "dispatch": return parent?.kind === "task";
+    case "worker": return parent?.kind === "dispatch";
+    case "heartbeat": return parent?.kind === "worker";
+    case "question": return parent?.kind === "task";
+    case "decision_gate": return parent?.kind === "question" || parent?.kind === "task";
+    default: return assertNeverOrchestrationIdentity(identity);
+  }
+}
+
+export function validateExternalWorkItem(value: ExternalWorkItem): ExternalWorkItem {
+  exactInput(value, ExternalWorkItem_FIELDS);
+  const identity = validateExternalWorkIdentity(value.identity);
+  const moved_to = value.moved_to === null ? null : validateExternalWorkIdentity(value.moved_to);
+  const state = decodeExternalWorkState(value.state);
+  const freshness = validateLineageFreshness(value.freshness);
+  const latest = value.latest_useful_message === null ? null : validateLatestUsefulMessage(value.latest_useful_message);
+  if ((state === "moved") !== (moved_to !== null) || (moved_to !== null && sameExternalWorkIdentity(identity, moved_to))
+      || (latest !== null && latest.observed_at_ms > freshness.observed_at_ms)) {
+    workContextRefusal("external work transition is invalid");
+  }
+  return {
+    freshness,
+    identity,
+    latest_useful_message: latest,
+    moved_to,
+    origin: validateLineageOrigin(value.origin),
+    revision: WorkContextRevision(workContextWireUnsigned(value.revision, WorkContextRevision_MAX, "revision")),
+    state,
+    workspace: UserWorkspaceId(value.workspace),
+  };
+}
+
+export function validateOrchestrationRecord(value: OrchestrationRecord): OrchestrationRecord {
+  exactInput(value, OrchestrationRecord_FIELDS);
+  const identity = validateOrchestrationIdentity(value.identity);
+  const parent = value.parent === null ? null : validateOrchestrationIdentity(value.parent);
+  const freshness = validateLineageFreshness(value.freshness);
+  const latest = value.latest_useful_message === null ? null : validateLatestUsefulMessage(value.latest_useful_message);
+  if (!orchestrationParentAllowed(identity, parent)
+      || (parent !== null && sameOrchestrationIdentity(identity, parent))
+      || (latest !== null && latest.observed_at_ms > freshness.observed_at_ms)) {
+    workContextRefusal("orchestration parent is invalid");
+  }
+  return {
+    external_work: value.external_work === null ? null : validateExternalWorkIdentity(value.external_work),
+    freshness,
+    identity,
+    latest_useful_message: latest,
+    origin: validateLineageOrigin(value.origin),
+    parent,
+    revision: WorkContextRevision(workContextWireUnsigned(value.revision, WorkContextRevision_MAX, "revision")),
+    status: validateLineageStatus(value.status),
+    workspace: UserWorkspaceId(value.workspace),
+  };
+}
+
+export function validateLineageProjection(value: LineageProjection): LineageProjection {
+  exactInput(value, LineageProjection_FIELDS);
+  if (value.schema !== PLATFORM_SCHEMA_V2) workContextRefusal("lineage projection schema is incompatible");
+  if (!Array.isArray(value.external_work_items) || !Array.isArray(value.orchestration)
+      || value.external_work_items.length + value.orchestration.length > MAX_LINEAGE_RECORDS) {
+    workContextRefusal("lineage projection exceeds its record limit");
+  }
+  const workspace = UserWorkspaceId(value.workspace);
+  const external_work_items = value.external_work_items.map(validateExternalWorkItem)
+    .sort((left, right) => compareExternalWorkIdentity(left.identity, right.identity));
+  const orchestration = value.orchestration.map(validateOrchestrationRecord)
+    .sort((left, right) => compareOrchestrationIdentity(left.identity, right.identity));
+  if (external_work_items.some((item) => item.workspace !== workspace)
+      || orchestration.some((item) => item.workspace !== workspace)
+      || external_work_items.some((item, index) => index > 0 && sameExternalWorkIdentity(external_work_items[index - 1]!.identity, item.identity))
+      || orchestration.some((item, index) => index > 0 && sameOrchestrationIdentity(orchestration[index - 1]!.identity, item.identity))) {
+    workContextRefusal("lineage projection is duplicated or crosses workspaces");
+  }
+  for (const item of external_work_items) {
+    if (item.origin.workspace !== workspace) workContextRefusal("lineage origin crosses workspaces");
+    if (item.moved_to !== null) { const target = external_work_items.find((candidate) => sameExternalWorkIdentity(candidate.identity, item.moved_to!)); if (target === undefined || !originRefines(target.origin, item.origin)) workContextRefusal("lineage external link is unresolved"); }
+    const seen = new Set<string>(); let cursor: ExternalWorkItem | undefined = item;
+    while (cursor !== undefined && cursor.moved_to !== null) { const target: ExternalWorkIdentity = cursor.moved_to; const key = `${target.provider}\u0000${target.authority}\u0000${target.scope}\u0000${target.key}`; if (seen.has(key) || sameExternalWorkIdentity(target, item.identity)) workContextRefusal("lineage external cycle"); seen.add(key); cursor = external_work_items.find((candidate) => sameExternalWorkIdentity(candidate.identity, target)); }
+  }
+  for (const record of orchestration) {
+    if (record.origin.workspace !== workspace) workContextRefusal("lineage origin crosses workspaces");
+    if (record.external_work !== null) { const target = external_work_items.find((item) => sameExternalWorkIdentity(item.identity, record.external_work!)); if (target === undefined || !originRefines(record.origin, target.origin)) workContextRefusal("lineage external link is unresolved"); }
+    if (record.parent !== null) { const target = orchestration.find((item) => sameOrchestrationIdentity(item.identity, record.parent!)); if (target === undefined || !originRefines(record.origin, target.origin)) workContextRefusal("lineage parent is unresolved"); }
+    const seen = new Set<string>(); let cursor: OrchestrationRecord | undefined = record;
+    while (cursor !== undefined && cursor.parent !== null) { const parent: OrchestrationIdentity = cursor.parent; const key = `${parent.kind}\u0000${parent.id}`; if (seen.has(key) || sameOrchestrationIdentity(parent, record.identity)) workContextRefusal("lineage cycle"); seen.add(key); cursor = orchestration.find((item) => sameOrchestrationIdentity(item.identity, parent)); }
+  }
+  return {external_work_items, orchestration, schema: PLATFORM_SCHEMA_V2, workspace};
+}
+
+export function validateWorkspaceCreateIntent(value: WorkspaceCreateIntent): WorkspaceCreateIntent {
+  exactInput(value, WorkspaceCreateIntent_FIELDS);
+  return {
+    base_selector: BaseSelectorId(value.base_selector),
+    branch_selector: BranchSelectorId(value.branch_selector),
+    external_work: validateExternalWorkIdentity(value.external_work),
+    intent_id: WorkspaceIntentId(value.intent_id),
+    task: OrchestrationTaskId(value.task),
+  };
+}
+
+export function validateWorkspaceResumeIntent(value: WorkspaceResumeIntent): WorkspaceResumeIntent {
+  exactInput(value, WorkspaceResumeIntent_FIELDS);
+  return {
+    expected_revision: WorkContextRevision(workContextWireUnsigned(value.expected_revision, WorkContextRevision_MAX, "expected_revision")),
+    intent_id: WorkspaceIntentId(value.intent_id),
+    task: OrchestrationTaskId(value.task),
+    workspace: UserWorkspaceId(value.workspace),
+  };
+}
+
+export function validateWorkspaceIntent(value: WorkspaceIntent): WorkspaceIntent {
+  switch (value.kind) {
+    case "create": exactInput(value, ["kind", "request"]); return {kind: value.kind, request: validateWorkspaceCreateIntent(value.request)};
+    case "resume": exactInput(value, ["kind", "request"]); return {kind: value.kind, request: validateWorkspaceResumeIntent(value.request)};
+    default: return assertNeverWorkspaceIntent(value);
+  }
+}
+
+export function validateWorkspaceIntentOutcome(value: WorkspaceIntentOutcome): WorkspaceIntentOutcome {
+  switch (value.kind) {
+    case "accepted": exactInput(value, ["kind"]); return {kind: value.kind};
+    case "conflict": exactInput(value, ["conflict", "kind"]); return {kind: value.kind, conflict: decodeWorkspaceIntentConflict(value.conflict)};
+    case "created": exactInput(value, ["kind", "workspace"]); return {kind: value.kind, workspace: UserWorkspaceId(value.workspace)};
+    case "resumed": exactInput(value, ["kind", "workspace"]); return {kind: value.kind, workspace: UserWorkspaceId(value.workspace)};
+    case "unknown": exactInput(value, ["kind"]); return {kind: value.kind};
+    default: return assertNeverWorkspaceIntentOutcome(value);
+  }
+}
+
+function lineageJson(value: unknown): JsonValue {
+  if (value === null) return {kind: "null"};
+  if (typeof value === "boolean") return {kind: "bool", value};
+  if (typeof value === "bigint") return {kind: "integer", value};
+  if (typeof value === "string") return {kind: "string", value};
+  if (Array.isArray(value)) return {kind: "array", items: value.map(lineageJson)};
+  if (typeof value === "object") return object(Object.entries(value as Readonly<Record<string, unknown>>).sort(([a],[b]) => compareUtf8(a,b)).map(([key,entry]) => [key,lineageJson(entry)] as const));
+  throw new ValidationError("lineage", "unsupported_json_value");
+}
+function lineagePlain(value: JsonValue): unknown {
+  switch (value.kind) {
+    case "null": return null; case "bool": case "integer": case "string": return value.value;
+    case "array": return value.items.map(lineagePlain);
+    case "object": return Object.fromEntries(value.entries.map(([key,entry]) => [key,lineagePlain(entry)]));
+  }
+}
+function lineageDocument(value: unknown): Uint8Array {
+  const bytes = toCanonicalBytes(lineageJson({platform_version: 2n, schema: PLATFORM_SCHEMA_V2, value}));
+  if (bytes.length > MAX_WORK_CONTEXT_PAGE_CANONICAL_BYTES) throw new RefusalError("frame_too_large", "lineage document exceeds ceiling");
+  return bytes;
+}
+function decodeLineageDocument(payload: Uint8Array): unknown {
+  const value = lineagePlain(parseDocument(payload, MAX_WORK_CONTEXT_PAGE_CANONICAL_BYTES)) as Readonly<Record<string, unknown>>;
+  exactInput(value as object, ["platform_version", "schema", "value"]);
+  if (value.platform_version !== 2n || value.schema !== PLATFORM_SCHEMA_V2) workContextRefusal("lineage requires negotiated Platform v2");
+  return value.value;
+}
+export function requireLineageV2(value: NegotiatedPlatform): NegotiatedPlatform {
+  const negotiated = validateNegotiatedPlatform(value);
+  if (negotiated.version !== 2n || negotiated.schema !== PLATFORM_SCHEMA_V2 || negotiated.work_context !== "v2_structured") {
+    workContextRefusal("lineage is unavailable before Platform v2 negotiation");
+  }
+  return negotiated;
+}
+function lineageChecked<T>(operation: () => T): T {
+  try { return operation(); } catch (error) {
+    if (error instanceof RefusalError) throw error;
+    throw new RefusalError(WORK_CONTEXT_VALUE_INVALID, "lineage value is invalid");
+  }
+}
+export function encodeLineageProjection(negotiated: NegotiatedPlatform, value: LineageProjection): Uint8Array { return lineageChecked(() => { requireLineageV2(negotiated); return lineageDocument(validateLineageProjection(value)); }); }
+export function decodeLineageProjection(negotiated: NegotiatedPlatform, payload: Uint8Array): LineageProjection { return lineageChecked(() => { requireLineageV2(negotiated); return validateLineageProjection(decodeLineageDocument(payload) as LineageProjection); }); }
+export function encodeWorkspaceIntent(negotiated: NegotiatedPlatform, value: WorkspaceIntent): Uint8Array { return lineageChecked(() => { requireLineageV2(negotiated); return lineageDocument(validateWorkspaceIntent(value)); }); }
+export function decodeWorkspaceIntent(negotiated: NegotiatedPlatform, payload: Uint8Array): WorkspaceIntent { return lineageChecked(() => { requireLineageV2(negotiated); return validateWorkspaceIntent(decodeLineageDocument(payload) as WorkspaceIntent); }); }
+export function encodeWorkspaceIntentOutcome(negotiated: NegotiatedPlatform, value: WorkspaceIntentOutcome): Uint8Array { return lineageChecked(() => { requireLineageV2(negotiated); return lineageDocument(validateWorkspaceIntentOutcome(value)); }); }
+export function decodeWorkspaceIntentOutcome(negotiated: NegotiatedPlatform, payload: Uint8Array): WorkspaceIntentOutcome { return lineageChecked(() => { requireLineageV2(negotiated); return validateWorkspaceIntentOutcome(decodeLineageDocument(payload) as WorkspaceIntentOutcome); }); }
 // Platform v2 lifecycle is additive to the read contract above. All fields are
 // exact and all authority arrays are already in canonical UTF-8 order.
 export const MAX_AUTHORITY_GRANTS_PER_AXIS = 64;

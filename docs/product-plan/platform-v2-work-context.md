@@ -133,6 +133,89 @@ snapshot ceiling: for example, 640 records remain five ordinary 128-item pages.
 The helper is deterministic protocol behavior, not a persistence, indexing, or
 authorization implementation.
 
+## External work and orchestration lineage
+
+Platform v2 keeps three identities separate even when one operator experience
+shows them together:
+
+- `ExternalWorkIdentity` is the indivisible tuple `provider + opaque source
+  authority/installation + opaque scope + opaque key`. Providers are the
+  closed set `github`, `gitlab`, `linear`, and `jira_compatible`. The authority
+  component prevents two self-hosted GitLab or Jira-compatible instances from
+  colliding even when their scope/key bytes match. A moved item carries its
+  complete replacement identity, which may name another supported provider or
+  installation when both exact identities are authorized. Durable intake and
+  update require that replacement to exist first; dangling targets and moved
+  cycles are refused. A closed item has no replacement.
+- `UserWorkspaceId` is the durable human workspace to which work is bound. It
+  is neither an issue key nor an execution identity, and observing the binding
+  grants no provider, repository, filesystem, or execution authority.
+- `OrchestrationIdentity` has distinct branded domains for `run`, `task`,
+  `dispatch`, `worker`, `heartbeat`, `question`, and `decision_gate`. No generic
+  orchestration ID or generic authority string exists.
+
+Internal parentage is closed and typed:
+
+```text
+Run ─► Task ─► Dispatch ─► Worker ─► Heartbeat
+       ├─► Task (bounded child-task lineage)
+       └─► Question ─► DecisionGate
+       └────────────────► DecisionGate
+```
+
+A run has no parent. Dispatch without a task, worker without a dispatch,
+heartbeat without a worker, or question without a task is an orphan and is
+refused. A decision gate binds to the exact question or task whose decision it
+guards. External work and every internal record independently name the same
+`UserWorkspaceId`; their identities are never synthesized from one another.
+
+Every projected record carries explicit freshness (`observed_at_ms`, a positive
+staleness interval, and `fresh|stale`) and may carry one latest useful message
+bounded to 1,024 UTF-8 bytes. Status is a discriminated value: `working` has no
+invented explanation, `blocked` and `waiting` carry a bounded reason, and
+`done` carries a bounded outcome. A stale heartbeat cannot prove a worker is
+running. Messages are presentation evidence, never IDs, authority, or implicit
+state transitions. A `done` outcome cannot change, while later monotonic
+freshness observations and useful evidence may advance its revision.
+
+Each external and orchestration record also carries a path-free origin
+coordinate: workspace plus optional attempt, session, and pane. Session
+requires attempt and pane requires session. A child relation may refine its
+parent coordinate but cannot change or discard a parent component. Projections
+resolve every moved/external/parent link and reject missing targets and cycles.
+
+## Task-to-workspace create and resume intent
+
+A create intent binds an exact orchestration task and external work identity to
+an idempotent intent ID plus distinct opaque base and branch selector IDs. The
+selectors are issued by an authorized registry; they do not contain and cannot
+be replaced by a host path, repository slug, ref name, provider URL, or command
+fragment. A resume intent names the exact task, `UserWorkspaceId`, and non-zero
+expected revision. Neither request accepts a generic string selector.
+
+Outcomes are `accepted` or `unknown` polling receipts, `created` or `resumed`
+final receipts, or a closed typed conflict. The immutable request digest is
+looked up by intent ID before reconciliation. An exact authoritative execution
+receipt advances `accepted|unknown` from that admitted snapshot, so a creation
+that succeeded remains `created` even if the separately observed source later
+moves or closes. Lookup requires negotiated v2 and an authorized
+tenant/project/workspace scope; possession of an opaque intent ID grants no
+read authority. Stable conflicts
+cover duplicate intake, task already bound, workspace absent, revision
+mismatch, moved/closed external work, orphan dispatch, stale heartbeat,
+pending question, and cancelled creation. Duplicate intake returns the prior
+binding or a conflict; it never creates a second workspace. Moved and closed
+sources do not silently retarget. Cancellation is terminal for that exact
+create intent, while a new authorized intent requires a new identity.
+
+The shared synthetic corpus
+`rust/crates/automonique-protocol/fixtures/platform-v2-lineage-v1.json` covers
+those boundaries and mixed-version behavior. Offers such as `[1,2,3]` still
+downgrade truthfully to a v1-only peer with lineage unavailable; when a peer
+later offers v2, negotiation recovers v2 and the structured lineage surface.
+The corpus contains opaque test values only and no host paths or live provider
+identifiers.
+
 ## Mutation contract
 
 Create project, host setup, checkout, user workspace, and attempt workspace;
@@ -148,6 +231,32 @@ Reopening human work under an active `UserWorkspace` means creating a new
 after archive requires a new `UserWorkspace` and then a new attempt. Resume is
 reserved for a hibernated `AttemptWorkspace` or `Session`. Archive remains
 non-destructive and does not cancel an active attempt implicitly.
+
+This contract slice supplies the identities, graph, strict negotiation,
+exact query/page/resynchronization codecs, a deterministic pager over already
+authorized input, external-work/orchestration lineage values, generated
+TypeScript declarations and fail-closed composite validators, and shared
+bidirectional Rust/TypeScript conformance fixtures.
+`SCHEMA_DIGEST` identifies the complete
+additive generated surface and therefore moves when the v2 module changes. The
+SDK still advertises `protocolRange: 1` and `automonique.platform/v1`, so its
+manifest pins the separately generated `PLATFORM_V1_SCHEMA_DIGEST`; the
+checked-in Platform v1 module remains byte-identical.
+
+`automonique-store::lineage_index` is the authoritative normalized SQLite
+index for this slice. It validates current-version tables, indexes, required
+columns, foreign keys, and SQLite integrity on open. It keeps external work, internal orchestration, and
+workspace intents in separate constrained tables; uses exact idempotent replay
+and revision fencing; enforces monotonic observations, immutable terminal
+status, and non-zero orchestration revisions; and rebuilds only a bounded
+projection for one exact `UserWorkspaceId` after restart. The embedding daemon
+must pass its authorization decision through the authority-scoped projection
+seam. It stores neither provider payloads nor host paths.
+
+External-provider ingestion, workspace create/resume execution, authorization
+and selector registries, daemon routes, SDK client ergonomics, and UI
+projection remain separate runtime work. The contract and index do not claim
+that a provider item was fetched, a worker is live, or a workspace was created.
 
 Before submission, the server produces a bounded preview of the exact current
 record, resulting record, inherited authority, effective authority, and every

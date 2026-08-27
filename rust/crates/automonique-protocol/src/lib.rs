@@ -36,6 +36,8 @@ pub mod platform_v2;
 pub mod platform_v2_api;
 pub mod platform_v2_lifecycle;
 pub mod platform_v2_lifecycle_api;
+pub mod platform_v2_lineage;
+pub mod platform_v2_lineage_api;
 pub mod primitives;
 pub mod progress_api;
 pub mod protocols;
