@@ -21,11 +21,19 @@ describe("distribution manifest", () => {
     expect(sdkPackage.automonique.schemaDigest).toBe(
       `${SCHEMA_DIGEST_ALGORITHM}:${PLATFORM_V1_SCHEMA_DIGEST}`,
     );
+    expect(sdkPackage.automonique.aggregateSchemaDigest).toBe(
+      `${SCHEMA_DIGEST_ALGORITHM}:${SCHEMA_DIGEST}`,
+    );
     expect(PLATFORM_V1_SCHEMA_DIGEST).not.toBe(SCHEMA_DIGEST);
   });
 
   test("the manifest's protocol coordinates are the generated surface's", () => {
     expect(sdkPackage.automonique.protocol).toBe("automonique.platform");
+    expect(sdkPackage.automonique.protocolRange).toBe("1-2");
     expect(sdkPackage.automonique.schema).toBe("automonique.platform/v1");
+    expect(sdkPackage.automonique.schemas).toEqual([
+      "automonique.platform/v1",
+      "automonique.platform/v2",
+    ]);
   });
 });
