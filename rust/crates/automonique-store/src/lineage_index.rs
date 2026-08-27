@@ -19,33 +19,39 @@ use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use automonique_protocol::platform_v2::UserWorkspaceId;
+use automonique_protocol::platform_v2::{
+    AttemptWorkspaceId, PaneId, UserWorkspaceId, WorkSessionId,
+};
 use automonique_protocol::platform_v2_lineage::{
-    BaseSelectorId, BranchSelectorId, ExternalWorkIdentity, ExternalWorkItem, ExternalWorkKey,
-    ExternalWorkProvider, ExternalWorkScope, ExternalWorkState, LatestUsefulMessage,
-    LineageFreshness, LineageFreshnessState, LineageMessage, LineageProjection, LineageStatus,
-    MAX_LINEAGE_RECORDS, OrchestrationDecisionGateId, OrchestrationDispatchId,
-    OrchestrationHeartbeatId, OrchestrationIdentity, OrchestrationKind, OrchestrationQuestionId,
-    OrchestrationRecord, OrchestrationRunId, OrchestrationTaskId, OrchestrationWorkerId,
-    WorkspaceIntent, WorkspaceIntentConflict, WorkspaceIntentId, WorkspaceIntentOutcome,
+    BaseSelectorId, BranchSelectorId, ExternalWorkAuthorityId, ExternalWorkIdentity,
+    ExternalWorkItem, ExternalWorkKey, ExternalWorkProvider, ExternalWorkScope, ExternalWorkState,
+    LatestUsefulMessage, LineageFreshness, LineageFreshnessState, LineageMessage, LineageOrigin,
+    LineageProjection, LineageStatus, MAX_LINEAGE_RECORDS, OrchestrationDecisionGateId,
+    OrchestrationDispatchId, OrchestrationHeartbeatId, OrchestrationIdentity, OrchestrationKind,
+    OrchestrationQuestionId, OrchestrationRecord, OrchestrationRunId, OrchestrationTaskId,
+    OrchestrationWorkerId, WorkspaceIntent, WorkspaceIntentConflict, WorkspaceIntentId,
+    WorkspaceIntentOutcome,
 };
 use automonique_protocol::primitives::Revision;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
 
 use crate::{StoreError, validate_database_path};
 
 /// The only lineage-index schema this build reads or writes.
-pub const LINEAGE_INDEX_SCHEMA_VERSION: u32 = 1;
+pub const LINEAGE_INDEX_SCHEMA_VERSION: u32 = 2;
 
-const SCHEMA_V1: &str = r#"
+const SCHEMA_V2: &str = r#"
 CREATE TABLE lineage_external_work (
     provider TEXT NOT NULL CHECK (provider IN ('github','gitlab','linear','jira_compatible')),
+    authority_id TEXT NOT NULL,
     scope TEXT NOT NULL,
     work_key TEXT NOT NULL,
     workspace_id TEXT NOT NULL,
     revision INTEGER NOT NULL CHECK (revision >= 1),
     external_state TEXT NOT NULL CHECK (external_state IN ('open','moved','closed')),
     moved_provider TEXT,
+    moved_authority_id TEXT,
     moved_scope TEXT,
     moved_key TEXT,
     observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= 1),
@@ -53,16 +59,22 @@ CREATE TABLE lineage_external_work (
     freshness_state TEXT NOT NULL CHECK (freshness_state IN ('fresh','stale')),
     latest_message TEXT,
     latest_observed_at_ms INTEGER CHECK (latest_observed_at_ms >= 1),
-    PRIMARY KEY (provider, scope, work_key),
-    UNIQUE (provider, scope, work_key, workspace_id),
+    origin_attempt_id TEXT,
+    origin_session_id TEXT,
+    origin_pane_id TEXT,
+    PRIMARY KEY (provider, authority_id, scope, work_key),
+    UNIQUE (provider, authority_id, scope, work_key, workspace_id),
     CHECK ((external_state = 'moved') = (moved_provider IS NOT NULL)),
     CHECK ((moved_provider IS NULL) = (moved_scope IS NULL)),
+    CHECK ((moved_provider IS NULL) = (moved_authority_id IS NULL)),
     CHECK ((moved_provider IS NULL) = (moved_key IS NULL)),
-    CHECK ((latest_message IS NULL) = (latest_observed_at_ms IS NULL))
+    CHECK ((latest_message IS NULL) = (latest_observed_at_ms IS NULL)),
+    CHECK (origin_session_id IS NULL OR origin_attempt_id IS NOT NULL),
+    CHECK (origin_pane_id IS NULL OR origin_session_id IS NOT NULL)
 ) STRICT;
 
 CREATE INDEX lineage_external_by_workspace
-    ON lineage_external_work(workspace_id, provider, scope, work_key);
+    ON lineage_external_work(workspace_id, provider, authority_id, scope, work_key);
 
 CREATE TABLE lineage_orchestration (
     orchestration_kind TEXT NOT NULL CHECK (orchestration_kind IN
@@ -70,6 +82,7 @@ CREATE TABLE lineage_orchestration (
     orchestration_id TEXT NOT NULL,
     workspace_id TEXT NOT NULL,
     external_provider TEXT,
+    external_authority_id TEXT,
     external_scope TEXT,
     external_key TEXT,
     parent_kind TEXT,
@@ -82,18 +95,24 @@ CREATE TABLE lineage_orchestration (
     latest_message TEXT,
     latest_observed_at_ms INTEGER CHECK (latest_observed_at_ms >= 1),
     revision INTEGER NOT NULL CHECK (revision >= 1),
+    origin_attempt_id TEXT,
+    origin_session_id TEXT,
+    origin_pane_id TEXT,
     PRIMARY KEY (orchestration_kind, orchestration_id),
     UNIQUE (orchestration_kind, orchestration_id, workspace_id),
-    FOREIGN KEY (external_provider, external_scope, external_key, workspace_id)
-        REFERENCES lineage_external_work(provider, scope, work_key, workspace_id),
+    FOREIGN KEY (external_provider, external_authority_id, external_scope, external_key, workspace_id)
+        REFERENCES lineage_external_work(provider, authority_id, scope, work_key, workspace_id),
     FOREIGN KEY (parent_kind, parent_id, workspace_id)
         REFERENCES lineage_orchestration(orchestration_kind, orchestration_id, workspace_id),
     CHECK ((external_provider IS NULL) = (external_scope IS NULL)),
+    CHECK ((external_provider IS NULL) = (external_authority_id IS NULL)),
     CHECK ((external_provider IS NULL) = (external_key IS NULL)),
     CHECK ((parent_kind IS NULL) = (parent_id IS NULL)),
     CHECK (parent_kind IS NULL OR orchestration_kind != parent_kind OR orchestration_id != parent_id),
     CHECK ((status_kind = 'working') = (status_message IS NULL)),
     CHECK ((latest_message IS NULL) = (latest_observed_at_ms IS NULL)),
+    CHECK (origin_session_id IS NULL OR origin_attempt_id IS NOT NULL),
+    CHECK (origin_pane_id IS NULL OR origin_session_id IS NOT NULL),
     CHECK (
         (orchestration_kind = 'run' AND parent_kind IS NULL) OR
         (orchestration_kind = 'task' AND parent_kind IN ('run','task')) OR
@@ -110,43 +129,48 @@ CREATE INDEX lineage_orchestration_by_workspace
 
 CREATE TABLE lineage_workspace_intents (
     intent_id TEXT PRIMARY KEY,
+    request_digest BLOB NOT NULL CHECK (length(request_digest) = 32),
     intent_kind TEXT NOT NULL CHECK (intent_kind IN ('create','resume')),
     task_kind TEXT NOT NULL CHECK (task_kind = 'task'),
     task_id TEXT NOT NULL,
     workspace_id TEXT NOT NULL,
     external_provider TEXT,
+    external_authority_id TEXT,
     external_scope TEXT,
     external_key TEXT,
     base_selector TEXT,
     branch_selector TEXT,
     expected_revision INTEGER CHECK (expected_revision >= 1),
-    outcome_kind TEXT NOT NULL CHECK (outcome_kind IN ('created','resumed','conflict')),
+    outcome_kind TEXT NOT NULL CHECK (outcome_kind IN ('accepted','unknown','created','resumed','conflict')),
     outcome_conflict TEXT CHECK (outcome_conflict IN
         ('duplicate_intake','task_already_bound','workspace_not_found','revision_mismatch',
          'external_work_moved','external_work_closed','orphan_dispatch','stale_heartbeat',
          'question_pending','creation_cancelled')),
     outcome_workspace_id TEXT,
+    reconciliation TEXT NOT NULL CHECK (reconciliation IN ('final','poll_receipt')),
     FOREIGN KEY (task_kind, task_id, workspace_id)
         REFERENCES lineage_orchestration(orchestration_kind, orchestration_id, workspace_id),
-    FOREIGN KEY (external_provider, external_scope, external_key, workspace_id)
-        REFERENCES lineage_external_work(provider, scope, work_key, workspace_id),
+    FOREIGN KEY (external_provider, external_authority_id, external_scope, external_key, workspace_id)
+        REFERENCES lineage_external_work(provider, authority_id, scope, work_key, workspace_id),
     CHECK (
-        (intent_kind = 'create' AND external_provider IS NOT NULL AND external_scope IS NOT NULL
+        (intent_kind = 'create' AND external_provider IS NOT NULL AND external_authority_id IS NOT NULL AND external_scope IS NOT NULL
             AND external_key IS NOT NULL AND base_selector IS NOT NULL
             AND branch_selector IS NOT NULL AND expected_revision IS NULL) OR
-        (intent_kind = 'resume' AND external_provider IS NULL AND external_scope IS NULL
+        (intent_kind = 'resume' AND external_provider IS NULL AND external_authority_id IS NULL AND external_scope IS NULL
             AND external_key IS NULL AND base_selector IS NULL
             AND branch_selector IS NULL AND expected_revision IS NOT NULL)
     ),
     CHECK (
+        (outcome_kind IN ('accepted','unknown') AND outcome_conflict IS NULL
+            AND outcome_workspace_id IS NULL AND reconciliation = 'poll_receipt') OR
         (outcome_kind = 'conflict' AND outcome_conflict IS NOT NULL
-            AND outcome_workspace_id IS NULL) OR
+            AND outcome_workspace_id IS NULL AND reconciliation = 'final') OR
         (outcome_kind IN ('created','resumed') AND outcome_conflict IS NULL
-            AND outcome_workspace_id = workspace_id)
+            AND outcome_workspace_id = workspace_id AND reconciliation = 'final')
     ),
     CHECK (
-        (intent_kind = 'create' AND outcome_kind IN ('created','conflict')) OR
-        (intent_kind = 'resume' AND outcome_kind IN ('resumed','conflict'))
+        (intent_kind = 'create' AND outcome_kind IN ('accepted','unknown','created','conflict')) OR
+        (intent_kind = 'resume' AND outcome_kind IN ('accepted','unknown','resumed','conflict'))
     )
 ) STRICT;
 "#;
@@ -162,6 +186,7 @@ pub enum LineageIndexError {
     RevisionMismatch { expected: u64, durable: u64 },
     NotFound(&'static str),
     OrphanDispatch,
+    Unauthorized,
     ProjectionTooLarge,
     Corrupt(&'static str),
     Io(std::io::Error),
@@ -180,6 +205,7 @@ impl LineageIndexError {
             Self::RevisionMismatch { .. } => "revision_mismatch",
             Self::NotFound(_) => "not_found",
             Self::OrphanDispatch => "orphan_dispatch",
+            Self::Unauthorized => "unauthorized",
             Self::ProjectionTooLarge => "projection_too_large",
             Self::Corrupt(_) => "corrupt",
             Self::Io(_) => "io",
@@ -253,6 +279,13 @@ pub enum WriteAdmission {
     Inserted { revision: u64 },
     Updated { revision: u64 },
     Replayed { revision: u64 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredWorkspaceIntent {
+    pub request_digest: [u8; 32],
+    pub intent: WorkspaceIntent,
+    pub outcome: WorkspaceIntentOutcome,
 }
 
 impl WriteAdmission {
@@ -360,6 +393,7 @@ impl LineageIndex {
             .ok_or(LineageIndexError::InvalidField("revision"))?;
         if item.revision().get() != next
             || item.workspace() != existing.workspace()
+            || item.origin() != existing.origin()
             || !external_transition_allowed(&existing, item)
         {
             return Err(LineageIndexError::IdentityConflict);
@@ -382,6 +416,9 @@ impl LineageIndex {
         let existing = read_orchestration(&transaction, record.identity())?;
         match (existing, expected_revision) {
             (None, None) => {
+                if record.revision() != Revision::FIRST {
+                    return Err(LineageIndexError::InvalidField("revision"));
+                }
                 insert_orchestration(&transaction, record)?;
                 transaction.commit()?;
                 Ok(WriteAdmission::Inserted { revision: 1 })
@@ -409,8 +446,17 @@ impl LineageIndex {
                     });
                 }
                 if stored.workspace() != record.workspace()
+                    || stored.origin() != record.origin()
                     || stored.parent() != record.parent()
                     || stored.external_work() != record.external_work()
+                    || record.revision().get() != durable.saturating_add(1)
+                    || !observation_monotonic(
+                        stored.freshness().observed_at_ms(),
+                        stored.latest_useful_message(),
+                        record.freshness().observed_at_ms(),
+                        record.latest_useful_message(),
+                    )
+                    || matches!(stored.status(), LineageStatus::Done(_))
                 {
                     return Err(LineageIndexError::IdentityConflict);
                 }
@@ -433,17 +479,25 @@ impl LineageIndex {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let fingerprint = intent_fingerprint(&transaction, intent, outcome)?;
-        if let Some(existing) = read_intent(&transaction, &fingerprint.intent_id)? {
-            return if existing == fingerprint {
+        let request_digest = intent_digest(intent);
+        if let Some(existing) = read_intent(&transaction, intent.intent_id().as_str())? {
+            return if existing.request_digest == request_digest {
                 Ok(WriteAdmission::Replayed { revision: 1 })
             } else {
                 Err(LineageIndexError::IdentityConflict)
             };
         }
+        let fingerprint = intent_fingerprint(&transaction, intent, outcome, request_digest)?;
         insert_intent(&transaction, &fingerprint)?;
         transaction.commit()?;
         Ok(WriteAdmission::Inserted { revision: 1 })
+    }
+
+    /// Look up the immutable request and its accepted/unknown/final decision.
+    pub fn intent(&self, id: &WorkspaceIntentId) -> Indexed<Option<StoredWorkspaceIntent>> {
+        read_intent(&self.connection, id.as_str())?
+            .map(IntentFingerprint::into_stored)
+            .transpose()
     }
 
     /// Rebuild the bounded projection for one exact authorized workspace.
@@ -456,15 +510,56 @@ impl LineageIndex {
         LineageProjection::new(workspace.clone(), external, orchestration)
             .map_err(|_| LineageIndexError::Corrupt("projection"))
     }
+
+    /// Rebuild a projection only after the embedding authority accepts the
+    /// exact workspace scope. This is the daemon-facing seam; the index does
+    /// not infer authorization from possession of a workspace identifier.
+    pub fn projection_authorized(
+        &self,
+        workspace: &UserWorkspaceId,
+        authorize: impl FnOnce(&UserWorkspaceId) -> bool,
+    ) -> Indexed<LineageProjection> {
+        if !authorize(workspace) {
+            return Err(LineageIndexError::Unauthorized);
+        }
+        self.projection(workspace)
+    }
 }
 
 fn external_transition_allowed(previous: &ExternalWorkItem, next: &ExternalWorkItem) -> bool {
-    match previous.state() {
-        ExternalWorkState::Open => true,
+    observation_monotonic(
+        previous.freshness().observed_at_ms(),
+        previous.latest_useful_message(),
+        next.freshness().observed_at_ms(),
+        next.latest_useful_message(),
+    ) && match previous.state() {
+        ExternalWorkState::Open => matches!(
+            next.state(),
+            ExternalWorkState::Open | ExternalWorkState::Moved | ExternalWorkState::Closed
+        ),
         ExternalWorkState::Moved => {
             next.state() == ExternalWorkState::Moved && previous.moved_to() == next.moved_to()
         }
         ExternalWorkState::Closed => next.state() == ExternalWorkState::Closed,
+    }
+}
+
+fn observation_monotonic(
+    previous_observed: u64,
+    previous_message: Option<&LatestUsefulMessage>,
+    next_observed: u64,
+    next_message: Option<&LatestUsefulMessage>,
+) -> bool {
+    if next_observed < previous_observed {
+        return false;
+    }
+    match (previous_message, next_message) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(previous), Some(next)) => {
+            next.observed_at_ms() > previous.observed_at_ms()
+                || (next.observed_at_ms() == previous.observed_at_ms() && next == previous)
+        }
     }
 }
 
@@ -475,11 +570,17 @@ fn validate_record_links(connection: &Connection, record: &OrchestrationRecord) 
         if item.workspace() != record.workspace() {
             return Err(LineageIndexError::IdentityConflict);
         }
+        if !record.origin().refines(item.origin()) {
+            return Err(LineageIndexError::IdentityConflict);
+        }
     }
     if let Some(parent) = record.parent() {
         let parent =
             read_orchestration(connection, parent)?.ok_or(LineageIndexError::OrphanDispatch)?;
         if parent.0.workspace() != record.workspace() {
+            return Err(LineageIndexError::IdentityConflict);
+        }
+        if !record.origin().refines(parent.0.origin()) {
             return Err(LineageIndexError::IdentityConflict);
         }
     }
@@ -491,15 +592,17 @@ fn insert_external(connection: &Connection, item: &ExternalWorkItem) -> Indexed<
     let latest = item.latest_useful_message();
     connection.execute(
         "INSERT INTO lineage_external_work VALUES
-         (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+         (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
         params![
             item.identity().provider().as_str(),
+            item.identity().authority().as_str(),
             item.identity().scope().as_str(),
             item.identity().key().as_str(),
             item.workspace().as_str(),
             to_db(item.revision().get(), "revision")?,
             item.state().as_str(),
             moved.map(|value| value.provider().as_str()),
+            moved.map(|value| value.authority().as_str()),
             moved.map(|value| value.scope().as_str()),
             moved.map(|value| value.key().as_str()),
             to_db(item.freshness().observed_at_ms(), "observed_at_ms")?,
@@ -509,6 +612,9 @@ fn insert_external(connection: &Connection, item: &ExternalWorkItem) -> Indexed<
             latest
                 .map(|value| to_db(value.observed_at_ms(), "latest_observed_at_ms"))
                 .transpose()?,
+            item.origin().attempt().map(|value| value.as_str()),
+            item.origin().session().map(|value| value.as_str()),
+            item.origin().pane().map(|value| value.as_str()),
         ],
     )?;
     Ok(())
@@ -522,18 +628,20 @@ fn update_external_row(
     let moved = item.moved_to();
     let latest = item.latest_useful_message();
     let changed = connection.execute(
-        "UPDATE lineage_external_work SET revision=?5,external_state=?6,moved_provider=?7,
-         moved_scope=?8,moved_key=?9,observed_at_ms=?10,stale_after_ms=?11,freshness_state=?12,
-         latest_message=?13,latest_observed_at_ms=?14
-         WHERE provider=?1 AND scope=?2 AND work_key=?3 AND revision=?4",
+        "UPDATE lineage_external_work SET revision=?6,external_state=?7,moved_provider=?8,
+         moved_authority_id=?9,moved_scope=?10,moved_key=?11,observed_at_ms=?12,stale_after_ms=?13,freshness_state=?14,
+         latest_message=?15,latest_observed_at_ms=?16
+         WHERE provider=?1 AND authority_id=?2 AND scope=?3 AND work_key=?4 AND revision=?5",
         params![
             item.identity().provider().as_str(),
+            item.identity().authority().as_str(),
             item.identity().scope().as_str(),
             item.identity().key().as_str(),
             to_db(expected.get(), "revision")?,
             to_db(item.revision().get(), "revision")?,
             item.state().as_str(),
             moved.map(|value| value.provider().as_str()),
+            moved.map(|value| value.authority().as_str()),
             moved.map(|value| value.scope().as_str()),
             moved.map(|value| value.key().as_str()),
             to_db(item.freshness().observed_at_ms(), "observed_at_ms")?,
@@ -589,6 +697,7 @@ fn write_orchestration(
         record.identity().id(),
         record.workspace().as_str(),
         external.map(|value| value.provider().as_str()),
+        external.map(|value| value.authority().as_str()),
         external.map(|value| value.scope().as_str()),
         external.map(|value| value.key().as_str()),
         parent.map(|value| value.kind().as_str()),
@@ -603,6 +712,9 @@ fn write_orchestration(
             .map(|value| to_db(value.observed_at_ms(), "latest_observed_at_ms"))
             .transpose()?,
         to_db(revision, "revision")?,
+        record.origin().attempt().map(|value| value.as_str()),
+        record.origin().session().map(|value| value.as_str()),
+        record.origin().pane().map(|value| value.as_str()),
         expected
             .map(|value| to_db(value.get(), "revision"))
             .transpose()?,
@@ -610,15 +722,15 @@ fn write_orchestration(
     let changed = if insert {
         connection.execute(
             "INSERT INTO lineage_orchestration
-             SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16
-             WHERE ?17 IS NULL",
+             SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20
+             WHERE ?21 IS NULL",
             values,
         )?
     } else {
         connection.execute(
-            "UPDATE lineage_orchestration SET status_kind=?9,status_message=?10,observed_at_ms=?11,
-             stale_after_ms=?12,freshness_state=?13,latest_message=?14,latest_observed_at_ms=?15,revision=?16
-             WHERE orchestration_kind=?1 AND orchestration_id=?2 AND revision=?17", values)?
+            "UPDATE lineage_orchestration SET status_kind=?10,status_message=?11,observed_at_ms=?12,
+             stale_after_ms=?13,freshness_state=?14,latest_message=?15,latest_observed_at_ms=?16,revision=?17
+             WHERE orchestration_kind=?1 AND orchestration_id=?2 AND revision=?21", values)?
     };
     if changed != 1 {
         return Err(LineageIndexError::Corrupt("orchestration_write"));
@@ -629,12 +741,14 @@ fn write_orchestration(
 #[derive(Debug)]
 struct RawExternal {
     provider: String,
+    authority: String,
     scope: String,
     key: String,
     workspace: String,
     revision: i64,
     state: String,
     moved_provider: Option<String>,
+    moved_authority: Option<String>,
     moved_scope: Option<String>,
     moved_key: Option<String>,
     observed_at_ms: i64,
@@ -642,28 +756,36 @@ struct RawExternal {
     freshness_state: String,
     latest_message: Option<String>,
     latest_observed_at_ms: Option<i64>,
+    origin_attempt: Option<String>,
+    origin_session: Option<String>,
+    origin_pane: Option<String>,
 }
 
-const EXTERNAL_COLUMNS: &str = "provider,scope,work_key,workspace_id,revision,external_state,
-    moved_provider,moved_scope,moved_key,observed_at_ms,stale_after_ms,freshness_state,
-    latest_message,latest_observed_at_ms";
+const EXTERNAL_COLUMNS: &str = "provider,authority_id,scope,work_key,workspace_id,revision,external_state,
+    moved_provider,moved_authority_id,moved_scope,moved_key,observed_at_ms,stale_after_ms,freshness_state,
+    latest_message,latest_observed_at_ms,origin_attempt_id,origin_session_id,origin_pane_id";
 
 fn raw_external(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawExternal> {
     Ok(RawExternal {
         provider: row.get(0)?,
-        scope: row.get(1)?,
-        key: row.get(2)?,
-        workspace: row.get(3)?,
-        revision: row.get(4)?,
-        state: row.get(5)?,
-        moved_provider: row.get(6)?,
-        moved_scope: row.get(7)?,
-        moved_key: row.get(8)?,
-        observed_at_ms: row.get(9)?,
-        stale_after_ms: row.get(10)?,
-        freshness_state: row.get(11)?,
-        latest_message: row.get(12)?,
-        latest_observed_at_ms: row.get(13)?,
+        authority: row.get(1)?,
+        scope: row.get(2)?,
+        key: row.get(3)?,
+        workspace: row.get(4)?,
+        revision: row.get(5)?,
+        state: row.get(6)?,
+        moved_provider: row.get(7)?,
+        moved_authority: row.get(8)?,
+        moved_scope: row.get(9)?,
+        moved_key: row.get(10)?,
+        observed_at_ms: row.get(11)?,
+        stale_after_ms: row.get(12)?,
+        freshness_state: row.get(13)?,
+        latest_message: row.get(14)?,
+        latest_observed_at_ms: row.get(15)?,
+        origin_attempt: row.get(16)?,
+        origin_session: row.get(17)?,
+        origin_pane: row.get(18)?,
     })
 }
 
@@ -675,10 +797,11 @@ fn read_external(
         .query_row(
             &format!(
                 "SELECT {EXTERNAL_COLUMNS} FROM lineage_external_work
-                  WHERE provider=?1 AND scope=?2 AND work_key=?3"
+                  WHERE provider=?1 AND authority_id=?2 AND scope=?3 AND work_key=?4"
             ),
             params![
                 identity.provider().as_str(),
+                identity.authority().as_str(),
                 identity.scope().as_str(),
                 identity.key().as_str()
             ],
@@ -694,7 +817,7 @@ fn read_external_workspace(
 ) -> Indexed<Vec<ExternalWorkItem>> {
     let mut statement = connection.prepare(&format!(
         "SELECT {EXTERNAL_COLUMNS} FROM lineage_external_work WHERE workspace_id=?1
-         ORDER BY provider,scope,work_key LIMIT ?2"
+         ORDER BY provider,authority_id,scope,work_key LIMIT ?2"
     ))?;
     let limit = i64::try_from(MAX_LINEAGE_RECORDS + 1)
         .map_err(|_| LineageIndexError::InvalidField("limit"))?;
@@ -707,12 +830,17 @@ fn read_external_workspace(
 }
 
 fn decode_external(raw: RawExternal) -> Indexed<ExternalWorkItem> {
-    let identity = decode_external_identity(&raw.provider, &raw.scope, &raw.key)?;
-    let moved_to = match (raw.moved_provider, raw.moved_scope, raw.moved_key) {
-        (None, None, None) => None,
-        (Some(provider), Some(scope), Some(key)) => {
-            Some(decode_external_identity(&provider, &scope, &key)?)
-        }
+    let identity = decode_external_identity(&raw.provider, &raw.authority, &raw.scope, &raw.key)?;
+    let moved_to = match (
+        raw.moved_provider,
+        raw.moved_authority,
+        raw.moved_scope,
+        raw.moved_key,
+    ) {
+        (None, None, None, None) => None,
+        (Some(provider), Some(authority), Some(scope), Some(key)) => Some(
+            decode_external_identity(&provider, &authority, &scope, &key)?,
+        ),
         _ => return Err(LineageIndexError::Corrupt("moved_identity")),
     };
     let freshness = LineageFreshness::new(
@@ -733,10 +861,14 @@ fn decode_external(raw: RawExternal) -> Indexed<ExternalWorkItem> {
         ),
         _ => return Err(LineageIndexError::Corrupt("latest_message")),
     };
-    ExternalWorkItem::new(
+    ExternalWorkItem::new_with_origin(
         identity,
-        UserWorkspaceId::new(raw.workspace)
-            .map_err(|_| LineageIndexError::Corrupt("workspace_id"))?,
+        decode_origin(
+            raw.workspace,
+            raw.origin_attempt,
+            raw.origin_session,
+            raw.origin_pane,
+        )?,
         Revision::new(from_db(raw.revision, "revision")?)
             .map_err(|_| LineageIndexError::Corrupt("revision"))?,
         parse_external_state(&raw.state)?,
@@ -747,14 +879,40 @@ fn decode_external(raw: RawExternal) -> Indexed<ExternalWorkItem> {
     .map_err(|_| LineageIndexError::Corrupt("external_work_item"))
 }
 
+fn decode_origin(
+    workspace: String,
+    attempt: Option<String>,
+    session: Option<String>,
+    pane: Option<String>,
+) -> Indexed<LineageOrigin> {
+    LineageOrigin::new(
+        UserWorkspaceId::new(workspace).map_err(|_| LineageIndexError::Corrupt("workspace_id"))?,
+        attempt
+            .map(AttemptWorkspaceId::new)
+            .transpose()
+            .map_err(|_| LineageIndexError::Corrupt("origin_attempt_id"))?,
+        session
+            .map(WorkSessionId::new)
+            .transpose()
+            .map_err(|_| LineageIndexError::Corrupt("origin_session_id"))?,
+        pane.map(PaneId::new)
+            .transpose()
+            .map_err(|_| LineageIndexError::Corrupt("origin_pane_id"))?,
+    )
+    .map_err(|_| LineageIndexError::Corrupt("origin"))
+}
+
 fn decode_external_identity(
     provider: &str,
+    authority: &str,
     scope: &str,
     key: &str,
 ) -> Indexed<ExternalWorkIdentity> {
     Ok(ExternalWorkIdentity::new(
         ExternalWorkProvider::parse(provider)
             .map_err(|_| LineageIndexError::Corrupt("provider"))?,
+        ExternalWorkAuthorityId::new(authority)
+            .map_err(|_| LineageIndexError::Corrupt("external_authority"))?,
         ExternalWorkScope::new(scope).map_err(|_| LineageIndexError::Corrupt("scope"))?,
         ExternalWorkKey::new(key).map_err(|_| LineageIndexError::Corrupt("work_key"))?,
     ))
@@ -780,6 +938,7 @@ struct RawOrchestration {
     id: String,
     workspace: String,
     external_provider: Option<String>,
+    external_authority: Option<String>,
     external_scope: Option<String>,
     external_key: Option<String>,
     parent_kind: Option<String>,
@@ -792,11 +951,15 @@ struct RawOrchestration {
     latest_message: Option<String>,
     latest_observed_at_ms: Option<i64>,
     revision: i64,
+    origin_attempt: Option<String>,
+    origin_session: Option<String>,
+    origin_pane: Option<String>,
 }
 
 const ORCHESTRATION_COLUMNS: &str = "orchestration_kind,orchestration_id,workspace_id,
-    external_provider,external_scope,external_key,parent_kind,parent_id,status_kind,status_message,
-    observed_at_ms,stale_after_ms,freshness_state,latest_message,latest_observed_at_ms,revision";
+    external_provider,external_authority_id,external_scope,external_key,parent_kind,parent_id,status_kind,status_message,
+    observed_at_ms,stale_after_ms,freshness_state,latest_message,latest_observed_at_ms,revision,
+    origin_attempt_id,origin_session_id,origin_pane_id";
 
 fn raw_orchestration(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawOrchestration> {
     Ok(RawOrchestration {
@@ -804,18 +967,22 @@ fn raw_orchestration(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawOrchestrati
         id: row.get(1)?,
         workspace: row.get(2)?,
         external_provider: row.get(3)?,
-        external_scope: row.get(4)?,
-        external_key: row.get(5)?,
-        parent_kind: row.get(6)?,
-        parent_id: row.get(7)?,
-        status_kind: row.get(8)?,
-        status_message: row.get(9)?,
-        observed_at_ms: row.get(10)?,
-        stale_after_ms: row.get(11)?,
-        freshness_state: row.get(12)?,
-        latest_message: row.get(13)?,
-        latest_observed_at_ms: row.get(14)?,
-        revision: row.get(15)?,
+        external_authority: row.get(4)?,
+        external_scope: row.get(5)?,
+        external_key: row.get(6)?,
+        parent_kind: row.get(7)?,
+        parent_id: row.get(8)?,
+        status_kind: row.get(9)?,
+        status_message: row.get(10)?,
+        observed_at_ms: row.get(11)?,
+        stale_after_ms: row.get(12)?,
+        freshness_state: row.get(13)?,
+        latest_message: row.get(14)?,
+        latest_observed_at_ms: row.get(15)?,
+        revision: row.get(16)?,
+        origin_attempt: row.get(17)?,
+        origin_session: row.get(18)?,
+        origin_pane: row.get(19)?,
     })
 }
 
@@ -857,11 +1024,16 @@ fn read_orchestration_workspace(
 
 fn decode_orchestration(raw: RawOrchestration) -> Indexed<(OrchestrationRecord, u64)> {
     let identity = decode_orchestration_identity(&raw.kind, &raw.id)?;
-    let external = match (raw.external_provider, raw.external_scope, raw.external_key) {
-        (None, None, None) => None,
-        (Some(provider), Some(scope), Some(key)) => {
-            Some(decode_external_identity(&provider, &scope, &key)?)
-        }
+    let external = match (
+        raw.external_provider,
+        raw.external_authority,
+        raw.external_scope,
+        raw.external_key,
+    ) {
+        (None, None, None, None) => None,
+        (Some(provider), Some(authority), Some(scope), Some(key)) => Some(
+            decode_external_identity(&provider, &authority, &scope, &key)?,
+        ),
         _ => return Err(LineageIndexError::Corrupt("external_identity")),
     };
     let parent = match (raw.parent_kind, raw.parent_id) {
@@ -888,18 +1060,25 @@ fn decode_orchestration(raw: RawOrchestration) -> Indexed<(OrchestrationRecord, 
         ),
         _ => return Err(LineageIndexError::Corrupt("latest_message")),
     };
-    let record = OrchestrationRecord::new(
+    let durable_revision = from_db(raw.revision, "revision")?;
+    let origin = decode_origin(
+        raw.workspace,
+        raw.origin_attempt,
+        raw.origin_session,
+        raw.origin_pane,
+    )?;
+    let record = OrchestrationRecord::new_with_origin(
         identity,
-        UserWorkspaceId::new(raw.workspace)
-            .map_err(|_| LineageIndexError::Corrupt("workspace_id"))?,
+        origin,
         external,
         parent,
         status,
         freshness,
         latest,
+        Revision::new(durable_revision).map_err(|_| LineageIndexError::Corrupt("revision"))?,
     )
     .map_err(|_| LineageIndexError::Corrupt("orchestration_record"))?;
-    Ok((record, from_db(raw.revision, "revision")?))
+    Ok((record, durable_revision))
 }
 
 fn parse_orchestration_kind(value: &str) -> Indexed<OrchestrationKind> {
@@ -952,10 +1131,12 @@ fn decode_status(kind: &str, message: Option<String>) -> Indexed<LineageStatus> 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct IntentFingerprint {
     intent_id: String,
+    request_digest: [u8; 32],
     intent_kind: &'static str,
     task_id: String,
     workspace: String,
     external_provider: Option<String>,
+    external_authority: Option<String>,
     external_scope: Option<String>,
     external_key: Option<String>,
     base_selector: Option<String>,
@@ -964,12 +1145,128 @@ struct IntentFingerprint {
     outcome_kind: &'static str,
     outcome_conflict: Option<&'static str>,
     outcome_workspace: Option<String>,
+    reconciliation: &'static str,
+}
+
+impl IntentFingerprint {
+    fn into_stored(self) -> Indexed<StoredWorkspaceIntent> {
+        let intent_id = WorkspaceIntentId::new(self.intent_id)
+            .map_err(|_| LineageIndexError::Corrupt("intent_id"))?;
+        let task = OrchestrationTaskId::new(self.task_id)
+            .map_err(|_| LineageIndexError::Corrupt("task_id"))?;
+        let intent = match self.intent_kind {
+            "create" => WorkspaceIntent::Create(
+                automonique_protocol::platform_v2_lineage::WorkspaceCreateIntent::new(
+                    intent_id,
+                    task,
+                    decode_external_identity(
+                        self.external_provider
+                            .as_deref()
+                            .ok_or(LineageIndexError::Corrupt("create_intent"))?,
+                        self.external_authority
+                            .as_deref()
+                            .ok_or(LineageIndexError::Corrupt("create_intent"))?,
+                        self.external_scope
+                            .as_deref()
+                            .ok_or(LineageIndexError::Corrupt("create_intent"))?,
+                        self.external_key
+                            .as_deref()
+                            .ok_or(LineageIndexError::Corrupt("create_intent"))?,
+                    )?,
+                    BaseSelectorId::new(
+                        self.base_selector
+                            .ok_or(LineageIndexError::Corrupt("create_intent"))?,
+                    )
+                    .map_err(|_| LineageIndexError::Corrupt("base_selector"))?,
+                    BranchSelectorId::new(
+                        self.branch_selector
+                            .ok_or(LineageIndexError::Corrupt("create_intent"))?,
+                    )
+                    .map_err(|_| LineageIndexError::Corrupt("branch_selector"))?,
+                ),
+            ),
+            "resume" => WorkspaceIntent::Resume(
+                automonique_protocol::platform_v2_lineage::WorkspaceResumeIntent::new(
+                    intent_id,
+                    task,
+                    UserWorkspaceId::new(self.workspace.clone())
+                        .map_err(|_| LineageIndexError::Corrupt("workspace_id"))?,
+                    Revision::new(from_db(
+                        self.expected_revision
+                            .ok_or(LineageIndexError::Corrupt("resume_intent"))?,
+                        "expected_revision",
+                    )?)
+                    .map_err(|_| LineageIndexError::Corrupt("expected_revision"))?,
+                ),
+            ),
+            _ => return Err(LineageIndexError::Corrupt("intent_kind")),
+        };
+        let outcome = match self.outcome_kind {
+            "accepted" => WorkspaceIntentOutcome::Accepted,
+            "unknown" => WorkspaceIntentOutcome::Unknown,
+            "created" => WorkspaceIntentOutcome::Created(
+                UserWorkspaceId::new(
+                    self.outcome_workspace
+                        .ok_or(LineageIndexError::Corrupt("intent_outcome"))?,
+                )
+                .map_err(|_| LineageIndexError::Corrupt("intent_outcome"))?,
+            ),
+            "resumed" => WorkspaceIntentOutcome::Resumed(
+                UserWorkspaceId::new(
+                    self.outcome_workspace
+                        .ok_or(LineageIndexError::Corrupt("intent_outcome"))?,
+                )
+                .map_err(|_| LineageIndexError::Corrupt("intent_outcome"))?,
+            ),
+            "conflict" => WorkspaceIntentOutcome::Conflict(parse_conflict(
+                self.outcome_conflict
+                    .ok_or(LineageIndexError::Corrupt("intent_outcome"))?,
+            )?),
+            _ => return Err(LineageIndexError::Corrupt("intent_outcome")),
+        };
+        Ok(StoredWorkspaceIntent {
+            request_digest: self.request_digest,
+            intent,
+            outcome,
+        })
+    }
+}
+
+fn intent_digest(intent: &WorkspaceIntent) -> [u8; 32] {
+    fn field(hasher: &mut Sha256, value: &str) {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    let mut hasher = Sha256::new();
+    field(&mut hasher, "automonique.platform/v2/workspace-intent/v1");
+    match intent {
+        WorkspaceIntent::Create(value) => {
+            field(&mut hasher, "create");
+            field(&mut hasher, value.intent_id().as_str());
+            field(&mut hasher, value.task().as_str());
+            field(&mut hasher, value.external_work().provider().as_str());
+            field(&mut hasher, value.external_work().authority().as_str());
+            field(&mut hasher, value.external_work().scope().as_str());
+            field(&mut hasher, value.external_work().key().as_str());
+            field(&mut hasher, value.base_selector().as_str());
+            field(&mut hasher, value.branch_selector().as_str());
+        }
+        WorkspaceIntent::Resume(value) => {
+            field(&mut hasher, "resume");
+            field(&mut hasher, value.intent_id().as_str());
+            field(&mut hasher, value.task().as_str());
+            field(&mut hasher, value.workspace().as_str());
+            hasher.update(value.expected_revision().get().to_be_bytes());
+        }
+    }
+    hasher.finalize().into()
 }
 
 fn intent_fingerprint(
     connection: &Connection,
     intent: &WorkspaceIntent,
     outcome: &WorkspaceIntentOutcome,
+    request_digest: [u8; 32],
 ) -> Indexed<IntentFingerprint> {
     let (intent_id, intent_kind, task_id, requested_workspace, external, base, branch, expected) =
         match intent {
@@ -1015,6 +1312,8 @@ fn intent_fingerprint(
         external_state = Some(item.state());
     }
     let (outcome_kind, outcome_conflict, outcome_workspace) = match outcome {
+        WorkspaceIntentOutcome::Accepted => ("accepted", None, None),
+        WorkspaceIntentOutcome::Unknown => ("unknown", None, None),
         WorkspaceIntentOutcome::Created(workspace) if intent_kind == "create" => {
             ("created", None, Some(workspace.as_str().to_owned()))
         }
@@ -1045,10 +1344,12 @@ fn intent_fingerprint(
     }
     Ok(IntentFingerprint {
         intent_id,
+        request_digest,
         intent_kind,
         task_id: task_id.to_owned(),
         workspace: task.workspace().as_str().to_owned(),
         external_provider: external.map(|value| value.provider().as_str().to_owned()),
+        external_authority: external.map(|value| value.authority().as_str().to_owned()),
         external_scope: external.map(|value| value.scope().as_str().to_owned()),
         external_key: external.map(|value| value.key().as_str().to_owned()),
         base_selector: base.map(str::to_owned),
@@ -1057,19 +1358,22 @@ fn intent_fingerprint(
         outcome_kind,
         outcome_conflict,
         outcome_workspace,
+        reconciliation: outcome.reconciliation().as_str(),
     })
 }
 
 fn insert_intent(connection: &Connection, value: &IntentFingerprint) -> Indexed<()> {
     connection.execute(
         "INSERT INTO lineage_workspace_intents VALUES
-         (?1,?2,'task',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+         (?1,?2,?3,'task',?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
         params![
             value.intent_id,
+            value.request_digest.as_slice(),
             value.intent_kind,
             value.task_id,
             value.workspace,
             value.external_provider,
+            value.external_authority,
             value.external_scope,
             value.external_key,
             value.base_selector,
@@ -1078,92 +1382,86 @@ fn insert_intent(connection: &Connection, value: &IntentFingerprint) -> Indexed<
             value.outcome_kind,
             value.outcome_conflict,
             value.outcome_workspace,
+            value.reconciliation,
         ],
     )?;
     Ok(())
 }
 
 fn read_intent(connection: &Connection, intent_id: &str) -> Indexed<Option<IntentFingerprint>> {
-    connection
-        .query_row(
-            "SELECT intent_id,intent_kind,task_id,workspace_id,external_provider,external_scope,
-         external_key,base_selector,branch_selector,expected_revision,outcome_kind,
-         outcome_conflict,outcome_workspace_id FROM lineage_workspace_intents WHERE intent_id=?1",
-            [intent_id],
-            |row| {
-                let intent_kind: String = row.get(1)?;
-                let outcome_kind: String = row.get(10)?;
-                let conflict: Option<String> = row.get(11)?;
-                Ok((
-                    row.get::<_, String>(0)?,
-                    intent_kind,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                    row.get::<_, Option<i64>>(9)?,
-                    outcome_kind,
-                    conflict,
-                    row.get::<_, Option<String>>(12)?,
-                ))
-            },
-        )
-        .optional()?
-        .map(|raw| {
+    type Raw = (
+        String,
+        Vec<u8>,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+    );
+    connection.query_row(
+        "SELECT intent_id,request_digest,intent_kind,task_id,workspace_id,external_provider,external_authority_id,external_scope,external_key,base_selector,branch_selector,expected_revision,outcome_kind,outcome_conflict,outcome_workspace_id,reconciliation FROM lineage_workspace_intents WHERE intent_id=?1",
+        [intent_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?,row.get(15)?)))
+    .optional()?.map(|raw: Raw| {
             WorkspaceIntentId::new(&raw.0).map_err(|_| LineageIndexError::Corrupt("intent_id"))?;
-            OrchestrationTaskId::new(&raw.2).map_err(|_| LineageIndexError::Corrupt("task_id"))?;
-            UserWorkspaceId::new(&raw.3).map_err(|_| LineageIndexError::Corrupt("workspace_id"))?;
-            let intent_kind = match raw.1.as_str() {
+            let request_digest: [u8;32] = raw.1.clone().try_into().map_err(|_| LineageIndexError::Corrupt("request_digest"))?;
+            OrchestrationTaskId::new(&raw.3).map_err(|_| LineageIndexError::Corrupt("task_id"))?;
+            UserWorkspaceId::new(&raw.4).map_err(|_| LineageIndexError::Corrupt("workspace_id"))?;
+            let intent_kind = match raw.2.as_str() {
                 "create" => "create",
                 "resume" => "resume",
                 _ => return Err(LineageIndexError::Corrupt("intent_kind")),
             };
-            let outcome_kind = match raw.10.as_str() {
+            let outcome_kind = match raw.12.as_str() {
+                "accepted" => "accepted",
+                "unknown" => "unknown",
                 "created" => "created",
                 "resumed" => "resumed",
                 "conflict" => "conflict",
                 _ => return Err(LineageIndexError::Corrupt("outcome_kind")),
             };
-            let outcome_conflict = raw.11.as_deref().map(parse_conflict).transpose()?;
+            let outcome_conflict = raw.13.as_deref().map(parse_conflict).transpose()?;
             if !matches!(
                 (intent_kind, outcome_kind),
-                ("create", "created" | "conflict") | ("resume", "resumed" | "conflict")
+                ("create", "accepted" | "unknown" | "created" | "conflict") | ("resume", "accepted" | "unknown" | "resumed" | "conflict")
             ) {
                 return Err(LineageIndexError::Corrupt("intent_outcome"));
             }
             match intent_kind {
                 "create" => {
-                    let (Some(provider), Some(scope), Some(key), Some(base), Some(branch), None) =
-                        (&raw.4, &raw.5, &raw.6, &raw.7, &raw.8, raw.9)
+                    let (Some(provider), Some(authority), Some(scope), Some(key), Some(base), Some(branch), None) =
+                        (&raw.5, &raw.6, &raw.7, &raw.8, &raw.9, &raw.10, raw.11)
                     else {
                         return Err(LineageIndexError::Corrupt("create_intent"));
                     };
-                    decode_external_identity(provider, scope, key)?;
+                    decode_external_identity(provider, authority, scope, key)?;
                     BaseSelectorId::new(base)
                         .map_err(|_| LineageIndexError::Corrupt("base_selector"))?;
                     BranchSelectorId::new(branch)
                         .map_err(|_| LineageIndexError::Corrupt("branch_selector"))?;
                 }
                 "resume" => {
-                    if raw.4.is_some()
-                        || raw.5.is_some()
-                        || raw.6.is_some()
-                        || raw.7.is_some()
-                        || raw.8.is_some()
-                        || raw.9.is_none_or(|value| value < 1)
+                    if raw.5.is_some() || raw.6.is_some() || raw.7.is_some() || raw.8.is_some()
+                        || raw.9.is_some() || raw.10.is_some() || raw.11.is_none_or(|value| value < 1)
                     {
                         return Err(LineageIndexError::Corrupt("resume_intent"));
                     }
                 }
                 _ => unreachable!(),
             }
-            match (outcome_kind, outcome_conflict, raw.12.as_deref()) {
-                ("conflict", Some(_), None) => {}
-                ("created", None, Some(workspace)) | ("resumed", None, Some(workspace))
-                    if workspace == raw.3 =>
+            match (outcome_kind, outcome_conflict, raw.14.as_deref(), raw.15.as_str()) {
+                ("accepted" | "unknown", None, None, "poll_receipt") => {}
+                ("conflict", Some(_), None, "final") => {}
+                ("created", None, Some(workspace), "final") | ("resumed", None, Some(workspace), "final")
+                    if workspace == raw.4 =>
                 {
                     UserWorkspaceId::new(workspace)
                         .map_err(|_| LineageIndexError::Corrupt("outcome_workspace_id"))?;
@@ -1172,18 +1470,15 @@ fn read_intent(connection: &Connection, intent_id: &str) -> Indexed<Option<Inten
             }
             Ok(IntentFingerprint {
                 intent_id: raw.0,
+                request_digest,
                 intent_kind,
-                task_id: raw.2,
-                workspace: raw.3,
-                external_provider: raw.4,
-                external_scope: raw.5,
-                external_key: raw.6,
-                base_selector: raw.7,
-                branch_selector: raw.8,
-                expected_revision: raw.9,
+                task_id: raw.3, workspace: raw.4, external_provider: raw.5, external_authority: raw.6,
+                external_scope: raw.7, external_key: raw.8, base_selector: raw.9, branch_selector: raw.10,
+                expected_revision: raw.11,
                 outcome_kind,
                 outcome_conflict: outcome_conflict.map(WorkspaceIntentConflict::as_str),
-                outcome_workspace: raw.12,
+                outcome_workspace: raw.14,
+                reconciliation: if raw.15 == "final" { "final" } else { "poll_receipt" },
             })
         })
         .transpose()
@@ -1226,7 +1521,7 @@ fn initialize(connection: &mut Connection) -> Indexed<()> {
         });
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(SCHEMA_V1)?;
+    transaction.execute_batch(SCHEMA_V2)?;
     transaction.pragma_update(None, "user_version", LINEAGE_INDEX_SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())

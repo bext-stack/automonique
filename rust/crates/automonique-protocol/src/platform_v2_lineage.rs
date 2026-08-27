@@ -8,7 +8,7 @@
 
 use core::fmt;
 
-use crate::platform_v2::UserWorkspaceId;
+use crate::platform_v2::{AttemptWorkspaceId, PaneId, UserWorkspaceId, WorkSessionId};
 use crate::primitives::{BoundedString, IdDomain, OpaqueId, Revision, ValueError};
 
 pub const MAX_LINEAGE_FIELD_BYTES: usize = 256;
@@ -27,6 +27,7 @@ macro_rules! lineage_id_domain {
 
 lineage_id_domain!(ExternalWorkScopeDomain, ExternalWorkScope);
 lineage_id_domain!(ExternalWorkKeyDomain, ExternalWorkKey);
+lineage_id_domain!(ExternalWorkAuthorityIdDomain, ExternalWorkAuthorityId);
 lineage_id_domain!(OrchestrationRunIdDomain, OrchestrationRunId);
 lineage_id_domain!(OrchestrationTaskIdDomain, OrchestrationTaskId);
 lineage_id_domain!(OrchestrationDispatchIdDomain, OrchestrationDispatchId);
@@ -42,6 +43,79 @@ lineage_id_domain!(BaseSelectorIdDomain, BaseSelectorId);
 lineage_id_domain!(BranchSelectorIdDomain, BranchSelectorId);
 
 pub type LineageMessage = BoundedString<MAX_LINEAGE_MESSAGE_BYTES>;
+
+/// Exact, path-free origin used by clients when jumping back into retained work.
+/// Optional descendants form a strict prefix: pane requires session, and session
+/// requires attempt.  Every lineage relation must preserve this coordinate.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct LineageOrigin {
+    workspace: UserWorkspaceId,
+    attempt: Option<AttemptWorkspaceId>,
+    session: Option<WorkSessionId>,
+    pane: Option<PaneId>,
+}
+
+impl LineageOrigin {
+    pub fn new(
+        workspace: UserWorkspaceId,
+        attempt: Option<AttemptWorkspaceId>,
+        session: Option<WorkSessionId>,
+        pane: Option<PaneId>,
+    ) -> Result<Self, LineageError> {
+        if session.is_some() && attempt.is_none() || pane.is_some() && session.is_none() {
+            return Err(LineageError::OriginInvalid);
+        }
+        Ok(Self {
+            workspace,
+            attempt,
+            session,
+            pane,
+        })
+    }
+    #[must_use]
+    pub fn workspace_only(workspace: UserWorkspaceId) -> Self {
+        Self {
+            workspace,
+            attempt: None,
+            session: None,
+            pane: None,
+        }
+    }
+    #[must_use]
+    pub const fn workspace(&self) -> &UserWorkspaceId {
+        &self.workspace
+    }
+    #[must_use]
+    pub const fn attempt(&self) -> Option<&AttemptWorkspaceId> {
+        self.attempt.as_ref()
+    }
+    #[must_use]
+    pub const fn session(&self) -> Option<&WorkSessionId> {
+        self.session.as_ref()
+    }
+    #[must_use]
+    pub const fn pane(&self) -> Option<&PaneId> {
+        self.pane.as_ref()
+    }
+
+    /// A child may refine its parent's coordinate, but may not change or drop it.
+    #[must_use]
+    pub fn refines(&self, parent: &Self) -> bool {
+        self.workspace == parent.workspace
+            && parent
+                .attempt
+                .as_ref()
+                .is_none_or(|v| self.attempt.as_ref() == Some(v))
+            && parent
+                .session
+                .as_ref()
+                .is_none_or(|v| self.session.as_ref() == Some(v))
+            && parent
+                .pane
+                .as_ref()
+                .is_none_or(|v| self.pane.as_ref() == Some(v))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ExternalWorkProvider {
@@ -80,6 +154,7 @@ impl ExternalWorkProvider {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ExternalWorkIdentity {
     provider: ExternalWorkProvider,
+    authority: ExternalWorkAuthorityId,
     scope: ExternalWorkScope,
     key: ExternalWorkKey,
 }
@@ -88,11 +163,13 @@ impl ExternalWorkIdentity {
     #[must_use]
     pub const fn new(
         provider: ExternalWorkProvider,
+        authority: ExternalWorkAuthorityId,
         scope: ExternalWorkScope,
         key: ExternalWorkKey,
     ) -> Self {
         Self {
             provider,
+            authority,
             scope,
             key,
         }
@@ -101,6 +178,10 @@ impl ExternalWorkIdentity {
     #[must_use]
     pub const fn provider(&self) -> ExternalWorkProvider {
         self.provider
+    }
+    #[must_use]
+    pub const fn authority(&self) -> &ExternalWorkAuthorityId {
+        &self.authority
     }
     #[must_use]
     pub const fn scope(&self) -> &ExternalWorkScope {
@@ -223,6 +304,7 @@ pub struct ExternalWorkItem {
     moved_to: Option<ExternalWorkIdentity>,
     freshness: LineageFreshness,
     latest_useful_message: Option<LatestUsefulMessage>,
+    origin: LineageOrigin,
 }
 
 impl ExternalWorkItem {
@@ -235,19 +317,43 @@ impl ExternalWorkItem {
         freshness: LineageFreshness,
         latest_useful_message: Option<LatestUsefulMessage>,
     ) -> Result<Self, LineageError> {
-        if (state == ExternalWorkState::Moved) != moved_to.is_some()
-            || moved_to.as_ref().is_some_and(|target| target == &identity)
-        {
-            return Err(LineageError::ExternalWorkTransitionInvalid);
-        }
-        Ok(Self {
+        Self::new_with_origin(
             identity,
-            workspace,
+            LineageOrigin::workspace_only(workspace),
             revision,
             state,
             moved_to,
             freshness,
             latest_useful_message,
+        )
+    }
+
+    pub fn new_with_origin(
+        identity: ExternalWorkIdentity,
+        origin: LineageOrigin,
+        revision: Revision,
+        state: ExternalWorkState,
+        moved_to: Option<ExternalWorkIdentity>,
+        freshness: LineageFreshness,
+        latest_useful_message: Option<LatestUsefulMessage>,
+    ) -> Result<Self, LineageError> {
+        if (state == ExternalWorkState::Moved) != moved_to.is_some()
+            || moved_to.as_ref().is_some_and(|target| target == &identity)
+            || latest_useful_message
+                .as_ref()
+                .is_some_and(|message| message.observed_at_ms() > freshness.observed_at_ms())
+        {
+            return Err(LineageError::ExternalWorkTransitionInvalid);
+        }
+        Ok(Self {
+            identity,
+            workspace: origin.workspace().clone(),
+            revision,
+            state,
+            moved_to,
+            freshness,
+            latest_useful_message,
+            origin,
         })
     }
     #[must_use]
@@ -277,6 +383,10 @@ impl ExternalWorkItem {
     #[must_use]
     pub const fn latest_useful_message(&self) -> Option<&LatestUsefulMessage> {
         self.latest_useful_message.as_ref()
+    }
+    #[must_use]
+    pub const fn origin(&self) -> &LineageOrigin {
+        &self.origin
     }
 }
 
@@ -383,6 +493,8 @@ pub struct OrchestrationRecord {
     status: LineageStatus,
     freshness: LineageFreshness,
     latest_useful_message: Option<LatestUsefulMessage>,
+    origin: LineageOrigin,
+    revision: Revision,
 }
 
 impl OrchestrationRecord {
@@ -395,21 +507,49 @@ impl OrchestrationRecord {
         freshness: LineageFreshness,
         latest_useful_message: Option<LatestUsefulMessage>,
     ) -> Result<Self, LineageError> {
-        if !parent_allowed(
-            identity.kind(),
-            parent.as_ref().map(OrchestrationIdentity::kind),
-        ) || parent.as_ref() == Some(&identity)
-        {
-            return Err(LineageError::OrchestrationParentInvalid);
-        }
-        Ok(Self {
+        Self::new_with_origin(
             identity,
-            workspace,
+            LineageOrigin::workspace_only(workspace),
             external_work,
             parent,
             status,
             freshness,
             latest_useful_message,
+            Revision::FIRST,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_origin(
+        identity: OrchestrationIdentity,
+        origin: LineageOrigin,
+        external_work: Option<ExternalWorkIdentity>,
+        parent: Option<OrchestrationIdentity>,
+        status: LineageStatus,
+        freshness: LineageFreshness,
+        latest_useful_message: Option<LatestUsefulMessage>,
+        revision: Revision,
+    ) -> Result<Self, LineageError> {
+        if !parent_allowed(
+            identity.kind(),
+            parent.as_ref().map(OrchestrationIdentity::kind),
+        ) || parent.as_ref() == Some(&identity)
+            || latest_useful_message
+                .as_ref()
+                .is_some_and(|message| message.observed_at_ms() > freshness.observed_at_ms())
+        {
+            return Err(LineageError::OrchestrationParentInvalid);
+        }
+        Ok(Self {
+            identity,
+            workspace: origin.workspace().clone(),
+            external_work,
+            parent,
+            status,
+            freshness,
+            latest_useful_message,
+            origin,
+            revision,
         })
     }
     #[must_use]
@@ -439,6 +579,14 @@ impl OrchestrationRecord {
     #[must_use]
     pub const fn latest_useful_message(&self) -> Option<&LatestUsefulMessage> {
         self.latest_useful_message.as_ref()
+    }
+    #[must_use]
+    pub const fn origin(&self) -> &LineageOrigin {
+        &self.origin
+    }
+    #[must_use]
+    pub const fn revision(&self) -> Revision {
+        self.revision
     }
 }
 
@@ -484,6 +632,62 @@ impl LineageProjection {
         {
             return Err(LineageError::InventoryInvalid);
         }
+        for item in &external_work_items {
+            if item.origin().workspace() != &workspace {
+                return Err(LineageError::OriginInvalid);
+            }
+            if let Some(moved) = item.moved_to() {
+                let Some(target) = external_work_items
+                    .iter()
+                    .find(|candidate| candidate.identity() == moved)
+                else {
+                    return Err(LineageError::ExternalLinkInvalid);
+                };
+                if !target.origin().refines(item.origin()) {
+                    return Err(LineageError::OriginInvalid);
+                }
+            }
+        }
+        for record in &orchestration {
+            if record.origin().workspace() != &workspace {
+                return Err(LineageError::OriginInvalid);
+            }
+            if let Some(external) = record.external_work() {
+                let Some(target) = external_work_items
+                    .iter()
+                    .find(|item| item.identity() == external)
+                else {
+                    return Err(LineageError::ExternalLinkInvalid);
+                };
+                if !record.origin().refines(target.origin()) {
+                    return Err(LineageError::OriginInvalid);
+                }
+            }
+            if let Some(parent) = record.parent() {
+                let Some(target) = orchestration.iter().find(|item| item.identity() == parent)
+                else {
+                    return Err(LineageError::OrchestrationParentInvalid);
+                };
+                if !record.origin().refines(target.origin()) {
+                    return Err(LineageError::OriginInvalid);
+                }
+            }
+        }
+        // A parent-kind matrix is insufficient for task-to-task cycles.
+        for record in &orchestration {
+            let mut cursor = record.parent();
+            let mut traversed = 0usize;
+            while let Some(parent) = cursor {
+                if parent == record.identity() || traversed >= orchestration.len() {
+                    return Err(LineageError::OrchestrationCycle);
+                }
+                cursor = orchestration
+                    .iter()
+                    .find(|item| item.identity() == parent)
+                    .and_then(OrchestrationRecord::parent);
+                traversed += 1;
+            }
+        }
         Ok(Self {
             workspace,
             external_work_items,
@@ -505,9 +709,10 @@ impl LineageProjection {
     }
 }
 
-fn external_identity_key(identity: &ExternalWorkIdentity) -> (&str, &str, &str) {
+fn external_identity_key(identity: &ExternalWorkIdentity) -> (&str, &str, &str, &str) {
     (
         identity.provider().as_str(),
+        identity.authority().as_str(),
         identity.scope().as_str(),
         identity.key().as_str(),
     )
@@ -633,6 +838,15 @@ pub enum WorkspaceIntent {
     Create(WorkspaceCreateIntent),
     Resume(WorkspaceResumeIntent),
 }
+impl WorkspaceIntent {
+    #[must_use]
+    pub const fn intent_id(&self) -> &WorkspaceIntentId {
+        match self {
+            Self::Create(v) => v.intent_id(),
+            Self::Resume(v) => v.intent_id(),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum WorkspaceIntentConflict {
@@ -680,9 +894,38 @@ impl WorkspaceIntentConflict {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkspaceIntentOutcome {
+    Accepted,
+    Unknown,
     Created(UserWorkspaceId),
     Resumed(UserWorkspaceId),
     Conflict(WorkspaceIntentConflict),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkspaceIntentReconciliation {
+    Final,
+    PollReceipt,
+}
+impl WorkspaceIntentReconciliation {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Final => "final",
+            Self::PollReceipt => "poll_receipt",
+        }
+    }
+}
+
+impl WorkspaceIntentOutcome {
+    #[must_use]
+    pub const fn reconciliation(&self) -> WorkspaceIntentReconciliation {
+        match self {
+            Self::Accepted | Self::Unknown => WorkspaceIntentReconciliation::PollReceipt,
+            Self::Created(_) | Self::Resumed(_) | Self::Conflict(_) => {
+                WorkspaceIntentReconciliation::Final
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -692,6 +935,9 @@ pub enum LineageError {
     FreshnessInvalid,
     ExternalWorkTransitionInvalid,
     OrchestrationParentInvalid,
+    OrchestrationCycle,
+    ExternalLinkInvalid,
+    OriginInvalid,
     InventoryInvalid,
 }
 
@@ -703,6 +949,9 @@ impl fmt::Display for LineageError {
             Self::FreshnessInvalid => "lineage freshness is invalid",
             Self::ExternalWorkTransitionInvalid => "external work transition is invalid",
             Self::OrchestrationParentInvalid => "orchestration parent is invalid",
+            Self::OrchestrationCycle => "orchestration lineage contains a cycle",
+            Self::ExternalLinkInvalid => "external lineage target is absent",
+            Self::OriginInvalid => "lineage origin coordinate is invalid",
             Self::InventoryInvalid => {
                 "lineage projection is duplicated, oversized, or crosses workspaces"
             }

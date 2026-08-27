@@ -138,11 +138,12 @@ authorization implementation.
 Platform v2 keeps three identities separate even when one operator experience
 shows them together:
 
-- `ExternalWorkIdentity` is the indivisible tuple `provider + opaque scope +
-  opaque key`. Providers are the closed set `github`, `gitlab`, `linear`, and
-  `jira_compatible`. The same scope/key bytes at two providers are different
-  identities. A moved item carries its complete replacement identity; a closed
-  item has no replacement.
+- `ExternalWorkIdentity` is the indivisible tuple `provider + opaque source
+  authority/installation + opaque scope + opaque key`. Providers are the
+  closed set `github`, `gitlab`, `linear`, and `jira_compatible`. The authority
+  component prevents two self-hosted GitLab or Jira-compatible instances from
+  colliding even when their scope/key bytes match. A moved item carries its
+  complete replacement identity; a closed item has no replacement.
 - `UserWorkspaceId` is the durable human workspace to which work is bound. It
   is neither an issue key nor an execution identity, and observing the binding
   grants no provider, repository, filesystem, or execution authority.
@@ -173,6 +174,12 @@ invented explanation, `blocked` and `waiting` carry a bounded reason, and
 running. Messages are presentation evidence, never IDs, authority, or implicit
 state transitions.
 
+Each external and orchestration record also carries a path-free origin
+coordinate: workspace plus optional attempt, session, and pane. Session
+requires attempt and pane requires session. A child relation may refine its
+parent coordinate but cannot change or discard a parent component. Projections
+resolve every moved/external/parent link and reject missing targets and cycles.
+
 ## Task-to-workspace create and resume intent
 
 A create intent binds an exact orchestration task and external work identity to
@@ -182,7 +189,11 @@ be replaced by a host path, repository slug, ref name, provider URL, or command
 fragment. A resume intent names the exact task, `UserWorkspaceId`, and non-zero
 expected revision. Neither request accepts a generic string selector.
 
-Outcomes are `created`, `resumed`, or a closed typed conflict. Stable conflicts
+Outcomes are `accepted` or `unknown` polling receipts, `created` or `resumed`
+final receipts, or a closed typed conflict. The immutable request digest is
+looked up by intent ID before mutable task/source validation, so retry after an
+ambiguous response returns the prior receipt instead of being reinterpreted
+against newer state. Stable conflicts
 cover duplicate intake, task already bound, workspace absent, revision
 mismatch, moved/closed external work, orphan dispatch, stale heartbeat,
 pending question, and cancelled creation. Duplicate intake returns the prior
@@ -227,9 +238,11 @@ checked-in Platform v1 module remains byte-identical.
 `automonique-store::lineage_index` is the authoritative normalized SQLite
 index for this slice. It keeps external work, internal orchestration, and
 workspace intents in separate constrained tables; uses exact idempotent replay
-and revision fencing; and rebuilds only a bounded projection for one exact
-`UserWorkspaceId` after restart. It stores neither provider payloads nor host
-paths.
+and revision fencing; enforces monotonic observations, immutable terminal
+status, and non-zero orchestration revisions; and rebuilds only a bounded
+projection for one exact `UserWorkspaceId` after restart. The embedding daemon
+must pass its authorization decision through the authority-scoped projection
+seam. It stores neither provider payloads nor host paths.
 
 External-provider ingestion, workspace create/resume execution, authorization
 and selector registries, daemon routes, SDK client ergonomics, and UI

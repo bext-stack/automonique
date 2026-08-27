@@ -6,6 +6,11 @@ use automonique_protocol::platform_v2::{
     PlatformVersionOffer, UserWorkspaceId, negotiate_platform_version,
 };
 use automonique_protocol::platform_v2_lineage::*;
+use automonique_protocol::platform_v2_lineage_api::{
+    decode_lineage_projection, decode_workspace_intent, decode_workspace_intent_outcome,
+    encode_lineage_projection, encode_workspace_intent, encode_workspace_intent_outcome,
+    require_lineage_v2,
+};
 use automonique_protocol::primitives::Revision;
 
 fn opaque<T>(
@@ -18,6 +23,10 @@ fn opaque<T>(
 fn external(provider: ExternalWorkProvider, scope: &str, key: &str) -> ExternalWorkIdentity {
     ExternalWorkIdentity::new(
         provider,
+        opaque(
+            ExternalWorkAuthorityId::new,
+            &format!("installation-{scope}"),
+        ),
         opaque(ExternalWorkScope::new, scope),
         opaque(ExternalWorkKey::new, key),
     )
@@ -55,6 +64,13 @@ fn provider_qualified_work_identity_never_collapses_into_workspace_or_other_prov
     let github = external(ExternalWorkProvider::GitHub, "scope-01", "item-42");
     let gitlab = external(ExternalWorkProvider::GitLab, "scope-01", "item-42");
     assert_ne!(github, gitlab);
+    let other_installation = ExternalWorkIdentity::new(
+        ExternalWorkProvider::GitHub,
+        opaque(ExternalWorkAuthorityId::new, "installation-other"),
+        opaque(ExternalWorkScope::new, "scope-01"),
+        opaque(ExternalWorkKey::new, "item-42"),
+    );
+    assert_ne!(github, other_installation);
 
     let workspace = opaque(UserWorkspaceId::new, "workspace-01");
     let item = ExternalWorkItem::new(
@@ -250,6 +266,50 @@ fn orchestration_parentage_is_typed_and_orphans_are_refused() {
 }
 
 #[test]
+fn complete_projection_resolves_relations_and_rejects_cycles() {
+    let workspace = opaque(UserWorkspaceId::new, "workspace-graph");
+    let first = OrchestrationIdentity::Task(opaque(OrchestrationTaskId::new, "task-cycle-a"));
+    let second = OrchestrationIdentity::Task(opaque(OrchestrationTaskId::new, "task-cycle-b"));
+    let record = |identity, parent| {
+        OrchestrationRecord::new(
+            identity,
+            workspace.clone(),
+            None,
+            Some(parent),
+            LineageStatus::Working,
+            fresh(),
+            None,
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        LineageProjection::new(
+            workspace.clone(),
+            Vec::new(),
+            vec![record(first.clone(), second.clone()), record(second, first)]
+        ),
+        Err(LineageError::OrchestrationCycle)
+    );
+    let missing = OrchestrationRecord::new(
+        OrchestrationIdentity::Dispatch(opaque(OrchestrationDispatchId::new, "dispatch-missing")),
+        workspace.clone(),
+        None,
+        Some(OrchestrationIdentity::Task(opaque(
+            OrchestrationTaskId::new,
+            "task-missing",
+        ))),
+        LineageStatus::Working,
+        fresh(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        LineageProjection::new(workspace, Vec::new(), vec![missing]),
+        Err(LineageError::OrchestrationParentInvalid)
+    );
+}
+
+#[test]
 fn create_and_resume_intents_use_opaque_selectors_exact_revisions_and_typed_conflicts() {
     let task = opaque(OrchestrationTaskId::new, "task-03");
     let workspace = opaque(UserWorkspaceId::new, "workspace-03");
@@ -346,5 +406,70 @@ fn shared_fixture_names_every_required_boundary_and_mixed_version_recovery() {
             .version()
             .number(),
         2
+    );
+}
+
+#[test]
+fn canonical_lineage_codec_is_exact_bidirectional_and_negotiation_gated() {
+    let projection = LineageProjection::new(
+        opaque(UserWorkspaceId::new, "workspace-codec"),
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    let exact = b"{\"platform_version\":2,\"schema\":\"automonique.platform/v2\",\"value\":{\"external_work_items\":[],\"orchestration\":[],\"schema\":\"automonique.platform/v2\",\"workspace\":\"workspace-codec\"}}";
+    assert_eq!(encode_lineage_projection(&projection).unwrap(), exact);
+    assert_eq!(decode_lineage_projection(exact).unwrap(), projection);
+
+    let intent = WorkspaceIntent::Create(WorkspaceCreateIntent::new(
+        WorkspaceIntentId::new("intent-codec").unwrap(),
+        OrchestrationTaskId::new("task-codec").unwrap(),
+        ExternalWorkIdentity::new(
+            ExternalWorkProvider::GitLab,
+            ExternalWorkAuthorityId::new("installation-codec").unwrap(),
+            ExternalWorkScope::new("scope-codec").unwrap(),
+            ExternalWorkKey::new("issue-codec").unwrap(),
+        ),
+        BaseSelectorId::new("base-codec").unwrap(),
+        BranchSelectorId::new("branch-codec").unwrap(),
+    ));
+    let exact_intent = b"{\"platform_version\":2,\"schema\":\"automonique.platform/v2\",\"value\":{\"kind\":\"create\",\"request\":{\"base_selector\":\"base-codec\",\"branch_selector\":\"branch-codec\",\"external_work\":{\"authority\":\"installation-codec\",\"key\":\"issue-codec\",\"provider\":\"gitlab\",\"scope\":\"scope-codec\"},\"intent_id\":\"intent-codec\",\"task\":\"task-codec\"}}}";
+    assert_eq!(encode_workspace_intent(&intent).unwrap(), exact_intent);
+    assert_eq!(decode_workspace_intent(exact_intent).unwrap(), intent);
+    let outcome = WorkspaceIntentOutcome::Accepted;
+    let exact_outcome = b"{\"platform_version\":2,\"schema\":\"automonique.platform/v2\",\"value\":{\"kind\":\"accepted\"}}";
+    assert_eq!(
+        encode_workspace_intent_outcome(&outcome).unwrap(),
+        exact_outcome
+    );
+    assert_eq!(
+        decode_workspace_intent_outcome(exact_outcome).unwrap(),
+        outcome
+    );
+
+    let v1 = negotiate_platform_version(
+        &PlatformVersionOffer::new(vec![1]).unwrap(),
+        &PlatformVersionOffer::new(vec![1, 2, 3]).unwrap(),
+    )
+    .unwrap();
+    let v2 = negotiate_platform_version(
+        &PlatformVersionOffer::new(vec![1, 2, 3]).unwrap(),
+        &PlatformVersionOffer::new(vec![1, 2, 4]).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        require_lineage_v2(&v1).unwrap_err().category(),
+        "work_context_value_invalid"
+    );
+    require_lineage_v2(&v2).unwrap();
+
+    let wrong = String::from_utf8(exact.to_vec())
+        .unwrap()
+        .replace("\"platform_version\":2", "\"platform_version\":1");
+    assert_eq!(
+        decode_lineage_projection(wrong.as_bytes())
+            .unwrap_err()
+            .category(),
+        "work_context_value_invalid"
     );
 }

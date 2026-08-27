@@ -4,6 +4,7 @@ import {readFileSync} from "node:fs";
 import {
   BaseSelectorId,
   BranchSelectorId,
+  ExternalWorkAuthorityId,
   ExternalWorkKey,
   ExternalWorkScope,
   LineageMessage,
@@ -25,6 +26,12 @@ import {
   decodeExternalWorkProvider,
   decodeExternalWorkState,
   decodeWorkspaceIntentConflict,
+  decodeLineageProjection,
+  decodeWorkspaceIntent,
+  decodeWorkspaceIntentOutcome,
+  encodeLineageProjection,
+  encodeWorkspaceIntent,
+  encodeWorkspaceIntentOutcome,
   negotiatePlatformVersion,
   validateExternalWorkIdentity,
   validateExternalWorkItem,
@@ -53,7 +60,7 @@ interface RawCase {
   readonly orchestration?: RawOrchestration;
   readonly decision_gate?: RawOrchestration;
   readonly intent?: {readonly kind: "create" | "resume"; readonly request: Readonly<Record<string, unknown>>};
-  readonly outcome?: {readonly kind: "conflict" | "created" | "resumed"; readonly conflict?: string; readonly workspace?: string};
+  readonly outcome?: {readonly kind: "accepted" | "unknown" | "conflict" | "created" | "resumed"; readonly conflict?: string; readonly workspace?: string};
   readonly client_versions?: readonly number[];
   readonly server_versions?: readonly number[];
   readonly negotiated_version?: number;
@@ -72,6 +79,7 @@ const fixture = JSON.parse(readFileSync("../../../../rust/crates/automonique-pro
 if (fixture.schema !== "automonique.platform/v2" || fixture.cases.length !== 9) throw new Error("lineage fixture header drifted");
 
 const external = (value: NonNullable<RawCase["external_work"]>): ExternalWorkIdentity => validateExternalWorkIdentity({
+  authority: ExternalWorkAuthorityId(`installation-${value.scope}`),
   key: ExternalWorkKey(value.key),
   provider: decodeExternalWorkProvider(value.provider),
   scope: ExternalWorkScope(value.scope),
@@ -104,8 +112,16 @@ const freshness = (value: NonNullable<RawOrchestration["freshness"]>): LineageFr
 });
 const outcome = (value: NonNullable<RawCase["outcome"]>): WorkspaceIntentOutcome => {
   if (value.kind === "conflict") return validateWorkspaceIntentOutcome({kind: value.kind, conflict: decodeWorkspaceIntentConflict(value.conflict ?? "")});
+  if (value.kind === "accepted" || value.kind === "unknown") return validateWorkspaceIntentOutcome({kind: value.kind});
   return validateWorkspaceIntentOutcome({kind: value.kind, workspace: UserWorkspaceId(value.workspace ?? "")});
 };
+
+const origin = (workspace: string) => ({
+  attempt: null,
+  pane: null,
+  session: null,
+  workspace: UserWorkspaceId(workspace),
+});
 
 const mustRefuse = (operation: () => unknown): void => {
   try {
@@ -134,11 +150,12 @@ for (const entry of fixture.cases) {
       identity: external(entry.external_work),
       latest_useful_message: null,
       moved_to: entry.moved_to ? external(entry.moved_to) : null,
+      origin: origin(entry.workspace),
       revision: WorkContextRevision(1n),
       state: decodeExternalWorkState(entry.external_state),
       workspace: UserWorkspaceId(entry.workspace),
     });
-    validateLineageProjection({external_work_items: [item], orchestration: [], schema: PLATFORM_SCHEMA_V2, workspace: item.workspace});
+    if (item.moved_to === null) validateLineageProjection({external_work_items: [item], orchestration: [], schema: PLATFORM_SCHEMA_V2, workspace: item.workspace});
     if (entry.name === "duplicate_intake") {
       mustRefuse(() => validateLineageProjection({external_work_items: [item, item], orchestration: [], schema: PLATFORM_SCHEMA_V2, workspace: item.workspace}));
     }
@@ -153,7 +170,9 @@ for (const entry of fixture.cases) {
       freshness: freshness(entry.orchestration.freshness),
       identity: identity(entry.orchestration.identity),
       latest_useful_message: latest,
+      origin: origin(entry.workspace),
       parent: entry.orchestration.parent ? identity(entry.orchestration.parent) : null,
+      revision: WorkContextRevision(1n),
       status: status(entry.orchestration.status),
       workspace: UserWorkspaceId(entry.workspace),
     };
@@ -188,7 +207,7 @@ for (const entry of fixture.cases) {
   }
 }
 
-mustRefuse(() => validateExternalWorkIdentity({provider: "unknown" as never, scope: ExternalWorkScope("scope"), key: ExternalWorkKey("key")}));
+mustRefuse(() => validateExternalWorkIdentity({authority: ExternalWorkAuthorityId("installation"), provider: "unknown" as never, scope: ExternalWorkScope("scope"), key: ExternalWorkKey("key")}));
 mustRefuse(() => validateLineageFreshness({observed_at_ms: 0n as never, stale_after_ms: LineageStaleAfterMs(1n), state: "fresh"}));
 const selfParent = {kind: "task" as const, id: OrchestrationTaskId("task-self")};
 mustRefuse(() => validateOrchestrationRecord({
@@ -196,7 +215,9 @@ mustRefuse(() => validateOrchestrationRecord({
   freshness: validateLineageFreshness({observed_at_ms: LineageObservedAtMs(1n), stale_after_ms: LineageStaleAfterMs(1n), state: "fresh"}),
   identity: selfParent,
   latest_useful_message: null,
+  origin: origin("workspace-self"),
   parent: selfParent,
+  revision: WorkContextRevision(1n),
   status: {kind: "working"},
   workspace: UserWorkspaceId("workspace-self"),
 }));
@@ -204,4 +225,13 @@ mustRefuse(() => validateOrchestrationRecord({
 for (const required of ["duplicate_intake", "moved_source", "closed_source", "orphan_dispatch", "stale_heartbeat", "question_and_gate", "cancelled_creation", "mixed_version_downgrade", "mixed_version_recovery"]) {
   if (!names.has(required)) throw new Error(`missing fixture ${required}`);
 }
-console.log(JSON.stringify({cases: names.size, providers: providers.size, question_links: questionLinks, stale_heartbeats: staleHeartbeats}));
+const exactProjection = "{\"platform_version\":2,\"schema\":\"automonique.platform/v2\",\"value\":{\"external_work_items\":[],\"orchestration\":[],\"schema\":\"automonique.platform/v2\",\"workspace\":\"workspace-codec\"}}";
+const decodedProjection = decodeLineageProjection(new TextEncoder().encode(exactProjection));
+if (new TextDecoder().decode(encodeLineageProjection(decodedProjection)) !== exactProjection) throw new Error("lineage codec exact-byte drifted");
+const exactIntent = "{\"platform_version\":2,\"schema\":\"automonique.platform/v2\",\"value\":{\"kind\":\"create\",\"request\":{\"base_selector\":\"base-codec\",\"branch_selector\":\"branch-codec\",\"external_work\":{\"authority\":\"installation-codec\",\"key\":\"issue-codec\",\"provider\":\"gitlab\",\"scope\":\"scope-codec\"},\"intent_id\":\"intent-codec\",\"task\":\"task-codec\"}}}";
+if (new TextDecoder().decode(encodeWorkspaceIntent(decodeWorkspaceIntent(new TextEncoder().encode(exactIntent)))) !== exactIntent) throw new Error("intent codec exact-byte drifted");
+const exactOutcome = "{\"platform_version\":2,\"schema\":\"automonique.platform/v2\",\"value\":{\"kind\":\"accepted\"}}";
+if (new TextDecoder().decode(encodeWorkspaceIntentOutcome(decodeWorkspaceIntentOutcome(new TextEncoder().encode(exactOutcome)))) !== exactOutcome) throw new Error("outcome codec exact-byte drifted");
+mustRefuse(() => decodeLineageProjection(new TextEncoder().encode(exactProjection.replace("\"platform_version\":2", "\"platform_version\":1"))));
+mustRefuse(() => decodeWorkspaceIntentOutcome(new TextEncoder().encode(exactOutcome.replace("accepted", "undefined"))));
+console.log(JSON.stringify({cases: names.size, codec_bytes: exactProjection.length + exactIntent.length + exactOutcome.length, providers: providers.size, question_links: questionLinks, stale_heartbeats: staleHeartbeats}));

@@ -4,7 +4,9 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use automonique_protocol::platform_v2::UserWorkspaceId;
+use automonique_protocol::platform_v2::{
+    AttemptWorkspaceId, PaneId, UserWorkspaceId, WorkSessionId,
+};
 use automonique_protocol::platform_v2_lineage::*;
 use automonique_protocol::primitives::Revision;
 use automonique_store::lineage_index::{
@@ -44,6 +46,7 @@ fn external_identity(
 ) -> ExternalWorkIdentity {
     ExternalWorkIdentity::new(
         provider,
+        ExternalWorkAuthorityId::new(format!("installation-{scope}")).unwrap(),
         ExternalWorkScope::new(scope).unwrap(),
         ExternalWorkKey::new(key).unwrap(),
     )
@@ -199,13 +202,28 @@ fn duplicate_intake_replays_exactly_and_conflicts_without_identity_collapse() {
         error.conflict(),
         Some(WorkspaceIntentConflict::DuplicateIntake)
     );
+    let other_installation = ExternalWorkIdentity::new(
+        ExternalWorkProvider::GitHub,
+        ExternalWorkAuthorityId::new("installation-other").unwrap(),
+        ExternalWorkScope::new("scope-1").unwrap(),
+        ExternalWorkKey::new("issue-1").unwrap(),
+    );
+    index
+        .intake_external(&item(
+            other_installation,
+            workspace("workspace-1"),
+            1,
+            ExternalWorkState::Open,
+            None,
+        ))
+        .unwrap();
     assert_eq!(
         index
             .projection(&workspace("workspace-1"))
             .unwrap()
             .external_work_items()
             .len(),
-        1
+        2
     );
     assert!(
         index
@@ -282,6 +300,15 @@ fn moved_and_closed_sources_are_revisioned_and_survive_reopen() {
             Revision::FIRST,
         )
         .unwrap();
+    index
+        .intake_external(&item(
+            replacement.clone(),
+            ws.clone(),
+            1,
+            ExternalWorkState::Open,
+            None,
+        ))
+        .unwrap();
     let create = WorkspaceIntent::Create(WorkspaceCreateIntent::new(
         WorkspaceIntentId::new("intent-moved").unwrap(),
         OrchestrationTaskId::new("task-source").unwrap(),
@@ -312,7 +339,7 @@ fn moved_and_closed_sources_are_revisioned_and_survive_reopen() {
 
     let reopened = LineageIndex::open(private.path()).unwrap();
     let projection = reopened.projection(&ws).unwrap();
-    assert_eq!(projection.external_work_items().len(), 2);
+    assert_eq!(projection.external_work_items().len(), 3);
     let moved = projection
         .external_work_items()
         .iter()
@@ -329,7 +356,7 @@ fn moved_and_closed_sources_are_revisioned_and_survive_reopen() {
 }
 
 #[test]
-fn an_authorized_projection_refuses_to_truncate_past_the_protocol_bound() {
+fn workspace_scoped_projection_refuses_to_truncate_past_the_protocol_bound() {
     let private = PrivateIndex::new();
     let mut index = LineageIndex::open(private.path()).unwrap();
     let ws = workspace("workspace-bounded");
@@ -355,6 +382,27 @@ fn an_authorized_projection_refuses_to_truncate_past_the_protocol_bound() {
             .expect_err("projection must not truncate")
             .category(),
         "projection_too_large"
+    );
+}
+
+#[test]
+fn authority_seam_refuses_before_reading_workspace_projection() {
+    let private = PrivateIndex::new();
+    let index = LineageIndex::open(private.path()).unwrap();
+    let ws = workspace("workspace-authority");
+    assert_eq!(
+        index
+            .projection_authorized(&ws, |_| false)
+            .unwrap_err()
+            .category(),
+        "unauthorized"
+    );
+    assert!(
+        index
+            .projection_authorized(&ws, |candidate| candidate == &ws)
+            .unwrap()
+            .external_work_items()
+            .is_empty()
     );
 }
 
@@ -444,14 +492,17 @@ fn orphan_stale_heartbeat_question_and_cancelled_creation_recover_durably() {
         LineageFreshnessState::Stale,
     );
     index.record_orchestration(&stale, None).unwrap();
-    let recovered = record(
+    let recovered = OrchestrationRecord::new_with_origin(
         heartbeat_id,
-        &ws,
-        Some(&external),
+        LineageOrigin::workspace_only(ws.clone()),
+        Some(external.clone()),
         Some(worker_id),
         LineageStatus::Working,
-        LineageFreshnessState::Fresh,
-    );
+        freshness(LineageFreshnessState::Fresh, 1_700_000_200_000),
+        None,
+        Revision::new(2).unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         index
             .record_orchestration(&recovered, Some(Revision::FIRST))
@@ -489,14 +540,17 @@ fn orphan_stale_heartbeat_question_and_cancelled_creation_recover_durably() {
         .unwrap();
     index
         .record_orchestration(
-            &record(
+            &OrchestrationRecord::new_with_origin(
                 question_id,
-                &ws,
-                Some(&external),
+                LineageOrigin::workspace_only(ws.clone()),
+                Some(external.clone()),
                 Some(task_id),
                 LineageStatus::Done(LineageMessage::new("answer recorded").unwrap()),
-                LineageFreshnessState::Fresh,
-            ),
+                freshness(LineageFreshnessState::Fresh, 1_700_000_200_000),
+                None,
+                Revision::new(2).unwrap(),
+            )
+            .unwrap(),
             Some(Revision::FIRST),
         )
         .unwrap();
@@ -605,4 +659,167 @@ fn two_handles_cannot_overwrite_a_revision_and_restart_rebuilds_the_winner() {
         reopened.projection(&ws).unwrap().external_work_items()[0],
         winner
     );
+}
+
+#[test]
+fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
+    let private = PrivateIndex::new();
+    let mut index = LineageIndex::open(private.path()).unwrap();
+    let ws = workspace("workspace-exact");
+    let attempt = AttemptWorkspaceId::new("attempt-exact").unwrap();
+    let session = WorkSessionId::new("session-exact").unwrap();
+    let pane = PaneId::new("pane-exact").unwrap();
+    let source = external_identity(ExternalWorkProvider::GitLab, "scope-exact", "issue-exact");
+    let source_origin = LineageOrigin::new(ws.clone(), Some(attempt.clone()), None, None).unwrap();
+    let source_item = |revision, state, observed| {
+        ExternalWorkItem::new_with_origin(
+            source.clone(),
+            source_origin.clone(),
+            Revision::new(revision).unwrap(),
+            state,
+            None,
+            freshness(LineageFreshnessState::Fresh, observed),
+            None,
+        )
+        .unwrap()
+    };
+    index
+        .intake_external(&source_item(1, ExternalWorkState::Open, 1_700_000_300_000))
+        .unwrap();
+
+    let run_id = run("run-exact");
+    let task_id = task("task-exact");
+    let invalid_first_revision = OrchestrationRecord::new_with_origin(
+        run_id.clone(),
+        source_origin.clone(),
+        Some(source.clone()),
+        None,
+        LineageStatus::Working,
+        freshness(LineageFreshnessState::Fresh, 1_700_000_300_000),
+        None,
+        Revision::new(2).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        index
+            .record_orchestration(&invalid_first_revision, None)
+            .unwrap_err()
+            .category(),
+        "invalid_field"
+    );
+    index
+        .record_orchestration(
+            &OrchestrationRecord::new_with_origin(
+                run_id.clone(),
+                source_origin.clone(),
+                Some(source.clone()),
+                None,
+                LineageStatus::Working,
+                freshness(LineageFreshnessState::Fresh, 1_700_000_300_000),
+                None,
+                Revision::FIRST,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+    let task_origin =
+        LineageOrigin::new(ws.clone(), Some(attempt), Some(session), Some(pane)).unwrap();
+    let task_record = |revision, status, observed| {
+        OrchestrationRecord::new_with_origin(
+            task_id.clone(),
+            task_origin.clone(),
+            Some(source.clone()),
+            Some(run_id.clone()),
+            status,
+            freshness(LineageFreshnessState::Fresh, observed),
+            None,
+            Revision::new(revision).unwrap(),
+        )
+        .unwrap()
+    };
+    index
+        .record_orchestration(
+            &task_record(1, LineageStatus::Working, 1_700_000_300_000),
+            None,
+        )
+        .unwrap();
+
+    let create = WorkspaceIntent::Create(WorkspaceCreateIntent::new(
+        WorkspaceIntentId::new("intent-exact").unwrap(),
+        OrchestrationTaskId::new("task-exact").unwrap(),
+        source.clone(),
+        BaseSelectorId::new("base-exact").unwrap(),
+        BranchSelectorId::new("branch-exact").unwrap(),
+    ));
+    index
+        .record_intent(&create, &WorkspaceIntentOutcome::Accepted)
+        .unwrap();
+    index
+        .update_external(
+            &source_item(2, ExternalWorkState::Closed, 1_700_000_300_100),
+            Revision::FIRST,
+        )
+        .unwrap();
+    assert_eq!(
+        index
+            .record_intent(&create, &WorkspaceIntentOutcome::Unknown)
+            .unwrap(),
+        WriteAdmission::Replayed { revision: 1 }
+    );
+    let stored = index.intent(create.intent_id()).unwrap().unwrap();
+    assert_eq!(stored.intent, create);
+    assert_eq!(stored.outcome, WorkspaceIntentOutcome::Accepted);
+    assert_ne!(stored.request_digest, [0; 32]);
+    let changed = WorkspaceIntent::Create(WorkspaceCreateIntent::new(
+        WorkspaceIntentId::new("intent-exact").unwrap(),
+        OrchestrationTaskId::new("task-does-not-exist").unwrap(),
+        source.clone(),
+        BaseSelectorId::new("base-exact").unwrap(),
+        BranchSelectorId::new("branch-exact").unwrap(),
+    ));
+    assert_eq!(
+        index
+            .record_intent(&changed, &WorkspaceIntentOutcome::Unknown)
+            .unwrap_err()
+            .category(),
+        "identity_conflict"
+    );
+
+    assert_eq!(
+        index
+            .record_orchestration(
+                &task_record(
+                    2,
+                    LineageStatus::Done(LineageMessage::new("complete").unwrap()),
+                    1_700_000_300_100
+                ),
+                Some(Revision::FIRST)
+            )
+            .unwrap()
+            .revision(),
+        2
+    );
+    assert_eq!(
+        index
+            .record_orchestration(
+                &task_record(3, LineageStatus::Working, 1_700_000_300_200),
+                Some(Revision::new(2).unwrap())
+            )
+            .unwrap_err()
+            .category(),
+        "identity_conflict"
+    );
+    drop(index);
+
+    let reopened = LineageIndex::open(private.path()).unwrap();
+    let projection = reopened.projection(&ws).unwrap();
+    assert_eq!(projection.external_work_items()[0].origin(), &source_origin);
+    let task = projection
+        .orchestration()
+        .iter()
+        .find(|record| record.identity() == &task_id)
+        .unwrap();
+    assert_eq!(task.origin(), &task_origin);
+    assert_eq!(task.revision().get(), 2);
 }

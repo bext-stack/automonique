@@ -99,7 +99,7 @@ mod work_context_surface {
         );
         assert_eq!(
             String::from_utf8_lossy(&output.stdout),
-            "{\"cases\":9,\"providers\":4,\"question_links\":2,\"stale_heartbeats\":1}\n"
+            "{\"cases\":9,\"codec_bytes\":578,\"providers\":4,\"question_links\":2,\"stale_heartbeats\":1}\n"
         );
     }
 }
