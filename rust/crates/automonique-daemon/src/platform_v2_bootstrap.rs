@@ -111,7 +111,7 @@ struct UserWorkspaceDocument {
 struct ValidatedBootstrap {
     tenant: String,
     projects: BTreeSet<ProjectId>,
-    identities: BTreeSet<WorkContextIdentity>,
+    ownership: BTreeMap<WorkContextIdentity, ProjectId>,
     externals: Vec<WorkContextBootstrapExternal>,
     records: Vec<WorkContextRecord>,
 }
@@ -142,7 +142,7 @@ pub fn run(
         geteuid().as_raw(),
         &graph.tenant,
         &graph.projects,
-        &graph.identities,
+        &graph.ownership,
     )?;
     let policy_digest = policy_generation.to_string();
 
@@ -277,7 +277,7 @@ fn validate_document(document: BootstrapDocument) -> Result<ValidatedBootstrap, 
         .map_err(|_| "platform_v2_bootstrap_manifest_invalid")?;
     let revision = Revision::new(1).map_err(|_| "platform_v2_bootstrap_manifest_invalid")?;
     let mut projects = BTreeSet::new();
-    let mut identities = BTreeSet::new();
+    let mut ownership = BTreeMap::new();
     let mut external_identities = BTreeSet::new();
     let mut externals = Vec::new();
     let mut records = Vec::new();
@@ -292,7 +292,10 @@ fn validate_document(document: BootstrapDocument) -> Result<ValidatedBootstrap, 
             return Err("platform_v2_bootstrap_manifest_invalid");
         }
         let project_identity = WorkContextIdentity::Project(project_id.clone());
-        if !identities.insert(project_identity.clone()) {
+        if ownership
+            .insert(project_identity.clone(), project_id.clone())
+            .is_some()
+        {
             return Err("platform_v2_bootstrap_manifest_invalid");
         }
         let mut repositories = BTreeMap::new();
@@ -331,7 +334,11 @@ fn validate_document(document: BootstrapDocument) -> Result<ValidatedBootstrap, 
                 .map_err(|_| "platform_v2_bootstrap_manifest_invalid")?;
             require_issued_id(WorkContextTargetKind::HostSetup, host_id.as_str())?;
             let host_identity = WorkContextIdentity::HostSetup(host_id);
-            if !identities.insert(host_identity.clone()) || host_doc.checkouts.is_empty() {
+            if ownership
+                .insert(host_identity.clone(), project_id.clone())
+                .is_some()
+                || host_doc.checkouts.is_empty()
+            {
                 return Err("platform_v2_bootstrap_manifest_invalid");
             }
             let host_kind = HostSetupKind::parse(&host_doc.kind)
@@ -351,7 +358,9 @@ fn validate_document(document: BootstrapDocument) -> Result<ValidatedBootstrap, 
                     .map_err(|_| "platform_v2_bootstrap_manifest_invalid")?;
                 require_issued_id(WorkContextTargetKind::Checkout, checkout_id.as_str())?;
                 let checkout_identity = WorkContextIdentity::Checkout(checkout_id);
-                if !identities.insert(checkout_identity.clone())
+                if ownership
+                    .insert(checkout_identity.clone(), project_id.clone())
+                    .is_some()
                     || checkout_doc.workspaces.is_empty()
                 {
                     return Err("platform_v2_bootstrap_manifest_invalid");
@@ -387,7 +396,10 @@ fn validate_document(document: BootstrapDocument) -> Result<ValidatedBootstrap, 
                         .map_err(|_| "platform_v2_bootstrap_manifest_invalid")?;
                     require_issued_id(WorkContextTargetKind::UserWorkspace, workspace_id.as_str())?;
                     let workspace_identity = WorkContextIdentity::UserWorkspace(workspace_id);
-                    if !identities.insert(workspace_identity.clone()) {
+                    if ownership
+                        .insert(workspace_identity.clone(), project_id.clone())
+                        .is_some()
+                    {
                         return Err("platform_v2_bootstrap_manifest_invalid");
                     }
                     records.push(record(
@@ -416,7 +428,7 @@ fn validate_document(document: BootstrapDocument) -> Result<ValidatedBootstrap, 
     Ok(ValidatedBootstrap {
         tenant: document.tenant,
         projects,
-        identities,
+        ownership,
         externals,
         records,
     })
@@ -489,6 +501,10 @@ mod tests {
     const HOST: &str = "wc2_host_setup_00000000000000000000000000000002";
     const CHECKOUT: &str = "wc2_checkout_00000000000000000000000000000003";
     const WORKSPACE: &str = "wc2_user_workspace_00000000000000000000000000000004";
+    const PROJECT_TWO: &str = "wc2_project_00000000000000000000000000000005";
+    const HOST_TWO: &str = "wc2_host_setup_00000000000000000000000000000006";
+    const CHECKOUT_TWO: &str = "wc2_checkout_00000000000000000000000000000007";
+    const WORKSPACE_TWO: &str = "wc2_user_workspace_00000000000000000000000000000008";
 
     fn manifest(label: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
@@ -552,12 +568,77 @@ mod tests {
         .unwrap()
     }
 
+    fn two_project_manifest() -> Vec<u8> {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&manifest("Bootstrap project one")).unwrap();
+        let mut project_two = value["projects"][0].clone();
+        project_two["id"] = serde_json::json!(PROJECT_TWO);
+        project_two["label"] = serde_json::json!("Bootstrap project two");
+        project_two["repositories"][0]["id"] = serde_json::json!("repository-2");
+        project_two["host_setups"][0]["id"] = serde_json::json!(HOST_TWO);
+        project_two["host_setups"][0]["checkouts"][0]["id"] = serde_json::json!(CHECKOUT_TWO);
+        project_two["host_setups"][0]["checkouts"][0]["repository"]["id"] =
+            serde_json::json!("repository-2");
+        project_two["host_setups"][0]["checkouts"][0]["workspaces"][0]["id"] =
+            serde_json::json!(WORKSPACE_TWO);
+        value["projects"].as_array_mut().unwrap().push(project_two);
+        serde_json::to_vec(&value).unwrap()
+    }
+
+    fn two_project_policy_with_swapped_owners(uid: u32) -> Vec<u8> {
+        let scope = |kind: &str, id: &str, project: &str| {
+            serde_json::json!({
+                "project": project,
+                "kind": kind,
+                "id": id,
+                "inherited_authority": {
+                    "filesystem": [], "credentials": [], "network": [],
+                    "tools": [], "providers": [], "models": []
+                }
+            })
+        };
+        let workspaces = vec![
+            scope("project", PROJECT, PROJECT),
+            scope("host_setup", HOST, PROJECT_TWO),
+            scope("checkout", CHECKOUT, PROJECT_TWO),
+            scope("user_workspace", WORKSPACE, PROJECT_TWO),
+            scope("project", PROJECT_TWO, PROJECT_TWO),
+            scope("host_setup", HOST_TWO, PROJECT),
+            scope("checkout", CHECKOUT_TWO, PROJECT),
+            scope("user_workspace", WORKSPACE_TWO, PROJECT),
+        ];
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "principals": [{
+                "uid": uid,
+                "tenant": "tenant-bootstrap",
+                "actor": "operator-bootstrap",
+                "serving_authority": "automonique",
+                "projects": [PROJECT, PROJECT_TWO],
+                "workspaces": workspaces,
+                "authority": {
+                    "filesystem": [], "credentials": [], "network": [],
+                    "tools": [], "providers": [], "models": []
+                },
+                "review_authorities": {}
+            }]
+        }))
+        .unwrap()
+    }
+
     fn write_private(path: &Path, bytes: &[u8]) {
         fs::write(path, bytes).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     fn fixture() -> (tempfile::TempDir, DaemonConfig, std::path::PathBuf) {
+        fixture_with_documents(&manifest("Bootstrap project"), &policy(geteuid().as_raw()))
+    }
+
+    fn fixture_with_documents(
+        manifest_bytes: &[u8],
+        policy_bytes: &[u8],
+    ) -> (tempfile::TempDir, DaemonConfig, std::path::PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         let state_root = temp.path().join("state");
         let state_dir = state_root.join("automonique");
@@ -569,12 +650,9 @@ mod tests {
             runtime_root: temp.path().join("runtime"),
             state_root,
         };
-        write_private(
-            &config.platform_v2_policy_path(),
-            &policy(geteuid().as_raw()),
-        );
+        write_private(&config.platform_v2_policy_path(), policy_bytes);
         let manifest_path = temp.path().join("bootstrap.json");
-        write_private(&manifest_path, &manifest("Bootstrap project"));
+        write_private(&manifest_path, manifest_bytes);
         (temp, config, manifest_path)
     }
 
@@ -697,6 +775,27 @@ mod tests {
             run(&config, &manifest_path, BootstrapMode::Plan).unwrap_err(),
             "platform_v2_bootstrap_policy_mismatch"
         );
+    }
+
+    #[test]
+    fn swapped_project_ownership_is_refused_before_plan_or_apply_can_write_the_graph() {
+        let (_temp, config, manifest_path) = fixture_with_documents(
+            &two_project_manifest(),
+            &two_project_policy_with_swapped_owners(geteuid().as_raw()),
+        );
+        let store_path = config.platform_v2_work_context_path();
+
+        assert_eq!(
+            run(&config, &manifest_path, BootstrapMode::Plan).unwrap_err(),
+            "platform_v2_bootstrap_policy_mismatch"
+        );
+        assert!(!store_path.exists());
+
+        assert_eq!(
+            run(&config, &manifest_path, BootstrapMode::Apply).unwrap_err(),
+            "platform_v2_bootstrap_policy_mismatch"
+        );
+        assert!(!store_path.exists());
     }
 
     #[test]

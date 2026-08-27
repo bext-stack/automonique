@@ -381,7 +381,7 @@ pub(crate) fn verify_bootstrap_policy(
     expected_uid: u32,
     tenant: &str,
     projects: &BTreeSet<ProjectId>,
-    identities: &BTreeSet<WorkContextIdentity>,
+    ownership: &BTreeMap<WorkContextIdentity, ProjectId>,
 ) -> Result<Sha256Digest, &'static str> {
     let snapshot = read_policy_snapshot(policy_path, expected_uid)?
         .ok_or("platform_v2_bootstrap_policy_missing")?;
@@ -396,8 +396,11 @@ pub(crate) fn verify_bootstrap_policy(
     .ok_or("platform_v2_bootstrap_policy_ambiguous")?;
     if principal.actor.tenant() != tenant
         || &principal.projects != projects
-        || principal.workspaces.keys().collect::<BTreeSet<_>>()
-            != identities.iter().collect::<BTreeSet<_>>()
+        || principal.workspaces.len() != ownership.len()
+        || principal
+            .workspaces
+            .iter()
+            .any(|(identity, scope)| ownership.get(identity) != Some(&scope.project))
     {
         return Err("platform_v2_bootstrap_policy_mismatch");
     }
@@ -1560,7 +1563,10 @@ fn mutation_store_refusal(
         WorkContextStoreError::ApprovalExpired => MutationRefusalCategory::ApprovalExpired,
         WorkContextStoreError::PreviewExpired => MutationRefusalCategory::PreviewExpired,
         WorkContextStoreError::Unavailable => MutationRefusalCategory::Unavailable,
-        WorkContextStoreError::ReconcileRequired => MutationRefusalCategory::Unknown,
+        WorkContextStoreError::ReconcileRequired
+        | WorkContextStoreError::BootstrapPartial
+        | WorkContextStoreError::BootstrapMismatch
+        | WorkContextStoreError::BootstrapDowngrade => MutationRefusalCategory::Unknown,
     };
     Ok(MutationRefusal::new(
         category,
