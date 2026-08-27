@@ -18,16 +18,17 @@
 //! Carrying is all it does: see that type's documentation for what a carried
 //! pair does *not* establish.
 //!
-//! # One socket, seven protocols
+//! # One socket, eight protocols
 //!
 //! [`LocalRequest`] is what a local endpoint decodes a frame into. The local
 //! socket serves this protocol, [`crate::runs_api`]'s read surface,
 //! [`crate::automation_api`]'s control surface, [`crate::approval_api`]'s
 //! decision surface, [`crate::batch_api`]'s batch control surface *and*
 //! [`crate::execute_api`]'s execution verb, plus [`crate::platform_api`]'s
-//! federated platform contract, and the
-//! envelope's declared protocol name is what separates them — not a heuristic,
-//! not a fallback chain, and not a widening of [`AdminCommand`]. That is the
+//! federated Platform v1 contract and [`crate::platform_v2_transport`]'s
+//! negotiation and structured Platform v2 contracts. The envelope's declared
+//! protocol name and major are what separate them — not a heuristic, not a
+//! fallback chain, and not a widening of [`AdminCommand`]. That is the
 //! arrangement `runs_api` asks for in as many words: its values travel "on the
 //! same canonical-JSON envelope [`crate::admin`] uses, under a separate protocol
 //! name so the admin lane's closed kind set stays closed." A run listing, an
@@ -39,7 +40,7 @@
 //! Adding the third lane cost this module one enum arm, one match arm and one
 //! frame-fit assertion, and cost the admin lane nothing at all — which is the
 //! property the arrangement was chosen for. The fourth cost exactly the same
-//! three lines, and so did the fifth, sixth, and seventh
+//! three lines, and so did the fifth, sixth, seventh, and eighth
 //! ([`crate::execute_api`], the one lane on this socket that *starts* something),
 //! which is the evidence that the property holds rather than merely having held
 //! once.
@@ -59,6 +60,11 @@ use crate::execute_api::{EXECUTE_PROTOCOL, ExecuteApiError, ExecuteRequest};
 use crate::platform::PLATFORM_PROTOCOL;
 use crate::platform_api::{
     MAX_PLATFORM_REQUEST_CANONICAL_BYTES, PlatformApiError, PlatformRequestMessage,
+};
+use crate::platform_v2_transport::{
+    MAX_PLATFORM_NEGOTIATION_REQUEST_CANONICAL_BYTES, MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES,
+    PLATFORM_NEGOTIATION_MAJOR, PLATFORM_NEGOTIATION_PROTOCOL, PLATFORM_V2_MAJOR,
+    PlatformNegotiationRequestMessage, PlatformV2RequestMessage, PlatformV2TransportError,
 };
 use crate::provenance::{CausationId, CorrelationId, TraceId};
 use crate::runs_api::{RUNS_PROTOCOL, RunsApiError, RunsRequest};
@@ -135,6 +141,9 @@ const _: () = assert!(
     2 * MAX_METRICS_EXPOSITION_BYTES + METRICS_RESPONSE_OVERHEAD_BYTES <= MAX_ADMIN_CANONICAL_BYTES,
     "a maximally escaped metrics response must fit one admin frame"
 );
+
+/// Largest canonical request accepted by the local multi-protocol dispatch.
+pub const MAX_LOCAL_REQUEST_CANONICAL_BYTES: usize = MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES;
 
 /// Maximum UTF-8 byte length of the actor named on an intake pause or resume.
 ///
@@ -1985,6 +1994,11 @@ const _: () = assert!(
     MAX_PLATFORM_REQUEST_CANONICAL_BYTES <= crate::codec::MAX_FRAME_BYTES,
     "a maximal platform frame must fit the shared framing bound"
 );
+const _: () = assert!(
+    MAX_PLATFORM_NEGOTIATION_REQUEST_CANONICAL_BYTES <= crate::codec::MAX_FRAME_BYTES
+        && MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES <= crate::codec::MAX_FRAME_BYTES,
+    "maximal Platform negotiation and v2 requests must fit the shared framing bound"
+);
 
 /// A refusal while deciding which protocol one local frame belongs to.
 ///
@@ -2014,6 +2028,10 @@ pub enum LocalRequestError {
     Execute(ExecuteApiError),
     /// The federated platform lane refused the message it was handed.
     Platform(PlatformApiError),
+    /// The Platform-major negotiation lane refused the message it was handed.
+    PlatformNegotiation(PlatformV2TransportError),
+    /// The structured Platform v2 lane refused the message it was handed.
+    PlatformV2(PlatformV2TransportError),
 }
 
 impl LocalRequestError {
@@ -2029,6 +2047,7 @@ impl LocalRequestError {
             Self::Batch(error) => error.category(),
             Self::Execute(error) => error.category(),
             Self::Platform(error) => error.category(),
+            Self::PlatformNegotiation(error) | Self::PlatformV2(error) => error.category(),
         }
     }
 }
@@ -2044,6 +2063,9 @@ impl fmt::Display for LocalRequestError {
             Self::Batch(error) => write!(formatter, "{error}"),
             Self::Execute(error) => write!(formatter, "{error}"),
             Self::Platform(error) => write!(formatter, "{error}"),
+            Self::PlatformNegotiation(error) | Self::PlatformV2(error) => {
+                write!(formatter, "{error}")
+            }
         }
     }
 }
@@ -2066,11 +2088,11 @@ impl Error for LocalRequestError {}
 /// so nothing is guessed, downgraded, or tried in sequence until something
 /// parses.
 ///
-/// The payload is parsed twice: once here to read the declared name, and once
+/// The payload is parsed twice: once here to read the declared name and major, and once
 /// by the lane that owns it. That is the cost of leaving each lane's decoder
-/// the sole authority over its own bytes, on a bounded local frame of at most
-/// [`MAX_ADMIN_CANONICAL_BYTES`], and it is preferred over a shape this module
-/// would have to keep in agreement with two others.
+/// the sole authority over its own bytes and lane-specific ceiling, and it is
+/// preferred over a shape this module would have to keep in agreement with the
+/// other protocol owners.
 /// The administration variant is boxed because an [`AdminRequest`] carries
 /// every command's body inline and is several times the size of a Runs
 /// request; an unboxed enum would move that much for a run listing too. One
@@ -2105,8 +2127,12 @@ pub enum LocalRequest {
     /// identifier beside its correlation identifier, so it is the smallest body
     /// on this socket, and boxing it would add an allocation to buy nothing.
     Execute(ExecuteRequest),
-    /// A request on the single federated operator surface.
+    /// A request on major one of the federated operator surface.
     Platform(Box<PlatformRequestMessage>),
+    /// A request to negotiate a Platform protocol major.
+    PlatformNegotiation(Box<PlatformNegotiationRequestMessage>),
+    /// A structured request on Platform major two.
+    PlatformV2(Box<PlatformV2RequestMessage>),
 }
 
 impl LocalRequest {
@@ -2118,34 +2144,62 @@ impl LocalRequest {
     /// well-formed envelope or that names a protocol this socket does not
     /// serve, and otherwise the owning lane's own refusal.
     pub fn from_canonical_bytes(payload: &[u8]) -> Result<Self, LocalRequestError> {
-        let envelope = Message::from_canonical_bytes(payload)
-            .map_err(LocalRequestError::Envelope)?
-            .envelope()
-            .protocol()
-            .as_str()
-            .to_owned();
-        match envelope.as_str() {
-            ADMIN_PROTOCOL => AdminRequest::from_canonical_bytes(payload)
+        if payload.len() > MAX_LOCAL_REQUEST_CANONICAL_BYTES {
+            return Err(LocalRequestError::Envelope(CodecError::FrameTooLarge {
+                max_bytes: MAX_LOCAL_REQUEST_CANONICAL_BYTES,
+                declared_bytes: payload.len(),
+            }));
+        }
+        let decoded =
+            Message::from_canonical_bytes(payload).map_err(LocalRequestError::Envelope)?;
+        let protocol = decoded.envelope().protocol().as_str().to_owned();
+        let major = decoded.envelope().version().get();
+        match (protocol.as_str(), major) {
+            (ADMIN_PROTOCOL, _) => AdminRequest::from_canonical_bytes(payload)
                 .map(|request| Self::Admin(Box::new(request)))
                 .map_err(LocalRequestError::Admin),
-            RUNS_PROTOCOL => RunsRequest::from_canonical_bytes(payload)
+            (RUNS_PROTOCOL, _) => RunsRequest::from_canonical_bytes(payload)
                 .map(Self::Runs)
                 .map_err(LocalRequestError::Runs),
-            AUTOMATION_PROTOCOL => AutomationRequest::from_canonical_bytes(payload)
+            (AUTOMATION_PROTOCOL, _) => AutomationRequest::from_canonical_bytes(payload)
                 .map(|request| Self::Automation(Box::new(request)))
                 .map_err(LocalRequestError::Automation),
-            APPROVAL_PROTOCOL => ApprovalRequest::from_canonical_bytes(payload)
+            (APPROVAL_PROTOCOL, _) => ApprovalRequest::from_canonical_bytes(payload)
                 .map(|request| Self::Approval(Box::new(request)))
                 .map_err(LocalRequestError::Approval),
-            BATCH_CONTROL_PROTOCOL => BatchRequest::from_canonical_bytes(payload)
+            (BATCH_CONTROL_PROTOCOL, _) => BatchRequest::from_canonical_bytes(payload)
                 .map(|request| Self::Batch(Box::new(request)))
                 .map_err(LocalRequestError::Batch),
-            EXECUTE_PROTOCOL => ExecuteRequest::from_canonical_bytes(payload)
+            (EXECUTE_PROTOCOL, _) => ExecuteRequest::from_canonical_bytes(payload)
                 .map(Self::Execute)
                 .map_err(LocalRequestError::Execute),
-            PLATFORM_PROTOCOL => PlatformRequestMessage::from_canonical_bytes(payload)
+            (PLATFORM_PROTOCOL, 1) => PlatformRequestMessage::from_canonical_bytes(payload)
                 .map(|request| Self::Platform(Box::new(request)))
                 .map_err(LocalRequestError::Platform),
+            (PLATFORM_PROTOCOL, PLATFORM_V2_MAJOR) => {
+                PlatformV2RequestMessage::from_canonical_bytes(payload)
+                    .map(|request| Self::PlatformV2(Box::new(request)))
+                    .map_err(LocalRequestError::PlatformV2)
+            }
+            (PLATFORM_PROTOCOL, offered) => Err(LocalRequestError::Envelope(
+                CodecError::UnsupportedVersion {
+                    supported_min: 1,
+                    supported_max: PLATFORM_V2_MAJOR,
+                    offered,
+                },
+            )),
+            (PLATFORM_NEGOTIATION_PROTOCOL, PLATFORM_NEGOTIATION_MAJOR) => {
+                PlatformNegotiationRequestMessage::from_canonical_bytes(payload)
+                    .map(|request| Self::PlatformNegotiation(Box::new(request)))
+                    .map_err(LocalRequestError::PlatformNegotiation)
+            }
+            (PLATFORM_NEGOTIATION_PROTOCOL, offered) => Err(LocalRequestError::Envelope(
+                CodecError::UnsupportedVersion {
+                    supported_min: PLATFORM_NEGOTIATION_MAJOR,
+                    supported_max: PLATFORM_NEGOTIATION_MAJOR,
+                    offered,
+                },
+            )),
             _ => Err(LocalRequestError::Envelope(CodecError::UnknownProtocol)),
         }
     }
@@ -2161,6 +2215,8 @@ impl LocalRequest {
             Self::Batch(_) => BATCH_CONTROL_PROTOCOL,
             Self::Execute(_) => EXECUTE_PROTOCOL,
             Self::Platform(_) => PLATFORM_PROTOCOL,
+            Self::PlatformNegotiation(_) => PLATFORM_NEGOTIATION_PROTOCOL,
+            Self::PlatformV2(_) => PLATFORM_PROTOCOL,
         }
     }
 }

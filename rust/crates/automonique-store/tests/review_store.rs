@@ -6,10 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 
 use automonique_protocol::platform::IdempotencyKey;
-use automonique_protocol::platform_v2_review::{
-    ReviewAction, ReviewActionReceipt, ReviewActionRequest, ReviewActorId, ReviewAuthentication,
-    ReviewCheckId, ReviewReceiptOutcome, ReviewReconciliation,
-};
+use automonique_protocol::platform_v2_review::*;
 use automonique_protocol::platform_v2_review_api::{
     decode_review_action_request, decode_review_snapshot,
 };
@@ -23,6 +20,8 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 const SNAPSHOT: &[u8] =
+    include_bytes!("../../automonique-protocol/fixtures/platform-v2-review-v2.json");
+const LEGACY_SNAPSHOT: &[u8] =
     include_bytes!("../../automonique-protocol/fixtures/platform-v2-review-v1.json");
 const ACTION: &[u8] =
     include_bytes!("../../automonique-protocol/fixtures/platform-v2-review-action-v1.json");
@@ -52,6 +51,101 @@ fn revision(value: u64) -> Revision {
 }
 fn snapshot() -> automonique_protocol::platform_v2_review::ReviewSnapshot {
     decode_review_snapshot(SNAPSHOT).expect("shared snapshot fixture")
+}
+fn legacy_snapshot() -> ReviewSnapshot {
+    decode_review_snapshot(LEGACY_SNAPSHOT).expect("historical review/v1 fixture")
+}
+fn downgrade_review_store_to_v1(path: &Path) {
+    let connection = Connection::open(path).expect("open v2 store for downgrade");
+    connection
+        .execute_batch(
+            "ALTER TABLE review_snapshots DROP COLUMN protocol_schema; PRAGMA user_version=1;",
+        )
+        .expect("construct historical v1 store");
+}
+fn action_snapshot(conflicted: bool) -> ReviewSnapshot {
+    let base = snapshot();
+    let original_file = &base.files()[0];
+    let file = ReviewFile::new(
+        original_file.id().clone(),
+        original_file.path().clone(),
+        original_file.change(),
+        original_file.worktree(),
+        original_file.preview().clone(),
+        if conflicted {
+            ConflictState::Unresolved
+        } else {
+            ConflictState::None
+        },
+        original_file.hunks().to_vec(),
+    )
+    .expect("file");
+    let original_comment = &base.comments()[0];
+    let comment = ReviewComment::new(
+        original_comment.id().clone(),
+        original_comment.revision(),
+        original_comment.actor().clone(),
+        original_comment.body().clone(),
+        original_comment.anchor().clone(),
+        CommentAgentState::NotSent,
+        original_comment.unread(),
+    );
+    let git = ReviewAuthority::new(
+        ReviewAuthorityKind::Git,
+        ReviewAuthorityId::new("authority-1").expect("git authority"),
+    );
+    let proposals = if conflicted {
+        vec![
+            ReviewProposal::new(
+                ReviewProposalId::new("proposal-resolve").expect("proposal"),
+                ReviewProposalKind::ResolveConflict,
+                git,
+                vec![file.id().clone()],
+                None,
+            )
+            .expect("resolve proposal"),
+        ]
+    } else {
+        vec![
+            ReviewProposal::new(
+                ReviewProposalId::new("proposal-commit").expect("proposal"),
+                ReviewProposalKind::Commit,
+                git.clone(),
+                vec![file.id().clone()],
+                Some(ReviewField::new("typed commit").expect("subject")),
+            )
+            .expect("commit proposal"),
+            ReviewProposal::new(
+                ReviewProposalId::new("proposal-stage").expect("proposal"),
+                ReviewProposalKind::Stage,
+                git.clone(),
+                vec![file.id().clone()],
+                None,
+            )
+            .expect("stage proposal"),
+            ReviewProposal::new(
+                ReviewProposalId::new("proposal-unstage").expect("proposal"),
+                ReviewProposalKind::Unstage,
+                git,
+                vec![file.id().clone()],
+                None,
+            )
+            .expect("unstage proposal"),
+        ]
+    };
+    ReviewSnapshot::new(
+        base.workspace().clone(),
+        base.revision(),
+        vec![file],
+        vec![comment],
+        proposals,
+        base.checks().to_vec(),
+        base.review().clone(),
+        base.pull_request().clone(),
+        base.delivery().clone(),
+        vec![],
+    )
+    .expect("action snapshot")
 }
 fn request() -> ReviewActionRequest {
     decode_review_action_request(ACTION).expect("shared action fixture")
@@ -121,6 +215,239 @@ fn restart_preserves_sanitized_snapshot_comments_and_sent_state() {
 }
 
 #[test]
+fn current_review_v2_snapshot_cannot_downgrade_to_v1() {
+    let private = PrivateStore::new();
+    let current = snapshot();
+    let workspace = current.workspace().clone();
+    let legacy_next_document = String::from_utf8(LEGACY_SNAPSHOT.to_vec())
+        .expect("legacy fixture utf8")
+        .replace("\"revision\":9,\"schema\"", "\"revision\":10,\"schema\"")
+        .into_bytes();
+    let legacy_next = decode_review_snapshot(&legacy_next_document).expect("legacy next revision");
+    assert_eq!(legacy_next.schema(), ReviewSchemaVersion::V1);
+    assert_eq!(legacy_next.revision(), revision(10));
+
+    let mut store = ReviewStore::open(private.path()).expect("open");
+    store.put_snapshot(&current, 10).expect("persist v2");
+    let before: (i64, Vec<u8>, Vec<u8>, String) = Connection::open(private.path())
+        .expect("raw before")
+        .query_row(
+            "SELECT c.revision,s.document,s.document_digest,s.protocol_schema FROM review_current c JOIN review_snapshots s USING(workspace_kind,workspace_id,revision) WHERE c.workspace_kind=?1 AND c.workspace_id=?2",
+            params![current.workspace().kind().as_str(), current.workspace().id()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("current bytes before refusal");
+
+    assert!(matches!(
+        store.put_snapshot(&legacy_next, 11),
+        Err(ReviewStoreError::Conflict("snapshot_schema_downgrade"))
+    ));
+    assert_eq!(
+        store
+            .snapshot(&workspace)
+            .expect("read current")
+            .expect("current snapshot"),
+        current
+    );
+    drop(store);
+
+    let raw = Connection::open(private.path()).expect("raw after");
+    let after: (i64, Vec<u8>, Vec<u8>, String) = raw
+        .query_row(
+            "SELECT c.revision,s.document,s.document_digest,s.protocol_schema FROM review_current c JOIN review_snapshots s USING(workspace_kind,workspace_id,revision) WHERE c.workspace_kind=?1 AND c.workspace_id=?2",
+            params![workspace.kind().as_str(), workspace.id()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("current bytes after refusal");
+    assert_eq!(after, before);
+    assert_eq!(
+        raw.query_row(
+            "SELECT count(*) FROM review_snapshots WHERE workspace_kind=?1 AND workspace_id=?2",
+            params![workspace.kind().as_str(), workspace.id()],
+            |row| row.get::<_, u32>(0),
+        )
+        .expect("snapshot count"),
+        1
+    );
+}
+
+#[test]
+fn populated_review_v1_store_migrates_exactly_and_remains_non_actionable() {
+    let private = PrivateStore::new();
+    let legacy = legacy_snapshot();
+    let workspace = legacy.workspace().clone();
+    {
+        let mut store = ReviewStore::open(private.path()).expect("open v2");
+        store
+            .put_snapshot(&legacy, 10)
+            .expect("persist legacy snapshot");
+    }
+    downgrade_review_store_to_v1(private.path());
+
+    {
+        let mut migrated = ReviewStore::open(private.path()).expect("migrate v1 to v2");
+        let loaded = migrated
+            .snapshot(&workspace)
+            .expect("read migrated snapshot")
+            .expect("snapshot exists");
+        assert_eq!(loaded, legacy);
+        assert_eq!(loaded.schema(), ReviewSchemaVersion::V1);
+        assert!(
+            loaded
+                .proposals()
+                .iter()
+                .all(|proposal| proposal.authority().is_none())
+        );
+
+        let actor = ReviewActorId::new("legacy-actor").expect("actor");
+        let git = ReviewAuthority::new(
+            ReviewAuthorityKind::Git,
+            ReviewAuthorityId::new("legacy-git").expect("authority"),
+        );
+        migrated
+            .grant_authority(
+                &workspace,
+                &actor,
+                ReviewAuthentication::UserSession,
+                &git,
+                11,
+            )
+            .expect("grant is independent of proposal custody");
+        let request = ReviewActionRequest::new(
+            workspace.clone(),
+            loaded.revision(),
+            actor,
+            ReviewAuthentication::UserSession,
+            git,
+            IdempotencyKey::new("legacy-action").expect("key"),
+            ReviewAction::Commit {
+                proposal_id: ReviewProposalId::new("proposal-1").expect("proposal"),
+            },
+        )
+        .expect("typed request");
+        assert!(matches!(
+            migrated.prepare_action(&request, ApprovalPolicy::NotRequired, 12),
+            Err(ReviewStoreError::Protocol(_))
+        ));
+    }
+
+    let reopened = ReviewStore::open(private.path()).expect("reopen migrated store");
+    assert_eq!(
+        reopened
+            .snapshot(&workspace)
+            .expect("read")
+            .expect("snapshot"),
+        legacy
+    );
+    let raw = Connection::open(private.path()).expect("raw reopen");
+    assert_eq!(
+        raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .expect("version"),
+        2
+    );
+    let schema: String = raw
+        .query_row("SELECT protocol_schema FROM review_snapshots", [], |row| {
+            row.get(0)
+        })
+        .expect("snapshot schema");
+    assert_eq!(schema, PLATFORM_REVIEW_SCHEMA_V1);
+}
+
+#[test]
+fn mislabeled_authority_bearing_v1_document_is_transactionally_upgraded_to_v2() {
+    let private = PrivateStore::new();
+    let expected = snapshot();
+    let workspace = expected.workspace().clone();
+    {
+        let mut store = ReviewStore::open(private.path()).expect("open v2");
+        store
+            .put_snapshot(&expected, 10)
+            .expect("persist v2 snapshot");
+    }
+    downgrade_review_store_to_v1(private.path());
+    let raw = Connection::open(private.path()).expect("raw legacy open");
+    let current: Vec<u8> = raw
+        .query_row("SELECT document FROM review_snapshots", [], |row| {
+            row.get(0)
+        })
+        .expect("document");
+    let mislabeled = String::from_utf8(current)
+        .expect("canonical utf8")
+        .replace(
+            "automonique.platform/review/v2",
+            "automonique.platform/review/v1",
+        )
+        .into_bytes();
+    let mislabeled_digest = Sha256::digest(&mislabeled);
+    raw.execute(
+        "UPDATE review_snapshots SET document=?1,document_digest=?2",
+        params![mislabeled, mislabeled_digest.as_slice()],
+    )
+    .expect("recreate briefly shipped mislabeled document");
+    drop(raw);
+
+    let migrated = ReviewStore::open(private.path()).expect("upgrade mislabeled snapshot");
+    assert_eq!(
+        migrated
+            .snapshot(&workspace)
+            .expect("read")
+            .expect("snapshot"),
+        expected
+    );
+    drop(migrated);
+    let raw = Connection::open(private.path()).expect("raw reopen");
+    assert_eq!(
+        raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .expect("version"),
+        2
+    );
+    let protocol_schema: String = raw
+        .query_row("SELECT protocol_schema FROM review_snapshots", [], |row| {
+            row.get(0)
+        })
+        .expect("schema projection");
+    assert_eq!(protocol_schema, PLATFORM_REVIEW_SCHEMA_V2);
+}
+
+#[test]
+fn corrupt_v1_migration_rolls_back_schema_and_data() {
+    let private = PrivateStore::new();
+    {
+        let mut store = ReviewStore::open(private.path()).expect("open v2");
+        store
+            .put_snapshot(&legacy_snapshot(), 10)
+            .expect("persist legacy snapshot");
+    }
+    downgrade_review_store_to_v1(private.path());
+    let raw = Connection::open(private.path()).expect("raw open");
+    raw.execute(
+        "UPDATE review_snapshots SET document_digest=zeroblob(32)",
+        [],
+    )
+    .expect("corrupt digest");
+    drop(raw);
+
+    assert!(matches!(
+        ReviewStore::open(private.path()),
+        Err(ReviewStoreError::Corrupt("snapshot_digest"))
+    ));
+    let raw = Connection::open(private.path()).expect("raw reopen");
+    assert_eq!(
+        raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .expect("version rolled back"),
+        1
+    );
+    let has_v2_column: bool = raw
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('review_snapshots') WHERE name='protocol_schema')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("schema inspection");
+    assert!(!has_v2_column);
+}
+
+#[test]
 fn exact_request_replays_and_different_body_under_same_key_conflicts() {
     let private = PrivateStore::new();
     let mut store = ReviewStore::open(private.path()).expect("open");
@@ -153,6 +480,164 @@ fn exact_request_replays_and_different_body_under_same_key_conflicts() {
     assert!(matches!(
         error,
         ReviewStoreError::Conflict("idempotency_key")
+    ));
+}
+
+#[test]
+fn typed_git_and_batch_actions_keep_one_write_custody() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).expect("open");
+    let snapshot = action_snapshot(false);
+    store.put_snapshot(&snapshot, 10).expect("snapshot");
+    let actor = ReviewActorId::new("actor-new-actions").expect("actor");
+    let git = snapshot.proposals()[0]
+        .authority()
+        .expect("v2 proposal authority")
+        .clone();
+    let review = snapshot.review().authority().clone();
+    for authority in [&git, &review] {
+        store
+            .grant_authority(
+                snapshot.workspace(),
+                &actor,
+                ReviewAuthentication::UserSession,
+                authority,
+                11,
+            )
+            .expect("grant");
+    }
+    let actions = vec![
+        (
+            "key-batch",
+            review.clone(),
+            ReviewAction::BatchSendCommentsToAgent {
+                comments: vec![ReviewCommentTarget::new(
+                    ReviewCommentId::new("comment-1").expect("comment"),
+                    revision(2),
+                )],
+            },
+        ),
+        (
+            "key-commit",
+            git.clone(),
+            ReviewAction::Commit {
+                proposal_id: ReviewProposalId::new("proposal-commit").expect("proposal"),
+            },
+        ),
+        (
+            "key-stage",
+            git.clone(),
+            ReviewAction::Stage {
+                proposal_id: ReviewProposalId::new("proposal-stage").expect("proposal"),
+            },
+        ),
+        (
+            "key-unstage",
+            git.clone(),
+            ReviewAction::Unstage {
+                proposal_id: ReviewProposalId::new("proposal-unstage").expect("proposal"),
+            },
+        ),
+    ];
+    for (index, (key, authority, action)) in actions.into_iter().enumerate() {
+        let request = ReviewActionRequest::new(
+            snapshot.workspace().clone(),
+            snapshot.revision(),
+            actor.clone(),
+            ReviewAuthentication::UserSession,
+            authority,
+            IdempotencyKey::new(key).expect("key"),
+            action,
+        )
+        .expect("request");
+        let ReviewActionAdmission::New(prepared) = store
+            .prepare_action(&request, ApprovalPolicy::NotRequired, 20 + index as i64)
+            .expect("prepare")
+        else {
+            panic!("first admission must be new")
+        };
+        assert!(matches!(
+            store
+                .prepare_action(&request, ApprovalPolicy::NotRequired, 30 + index as i64)
+                .expect("prepare replay"),
+            ReviewActionAdmission::Replay(_)
+        ));
+        assert!(matches!(
+            store
+                .start_write(
+                    &prepared.preview_id,
+                    prepared.request_digest,
+                    40 + index as i64
+                )
+                .expect("write"),
+            ReviewWriteAdmission::New(_)
+        ));
+        assert!(matches!(
+            store
+                .start_write(
+                    &prepared.preview_id,
+                    prepared.request_digest,
+                    50 + index as i64
+                )
+                .expect("write replay"),
+            ReviewWriteAdmission::Replay(_)
+        ));
+    }
+
+    let conflict_private = PrivateStore::new();
+    let mut conflict_store = ReviewStore::open(conflict_private.path()).expect("open");
+    let conflict_snapshot = action_snapshot(true);
+    conflict_store
+        .put_snapshot(&conflict_snapshot, 10)
+        .expect("snapshot");
+    let conflict_git = conflict_snapshot.proposals()[0]
+        .authority()
+        .expect("v2 proposal authority")
+        .clone();
+    conflict_store
+        .grant_authority(
+            conflict_snapshot.workspace(),
+            &actor,
+            ReviewAuthentication::UserSession,
+            &conflict_git,
+            11,
+        )
+        .expect("grant");
+    let resolve = ReviewActionRequest::new(
+        conflict_snapshot.workspace().clone(),
+        conflict_snapshot.revision(),
+        actor,
+        ReviewAuthentication::UserSession,
+        conflict_git,
+        IdempotencyKey::new("key-resolve").expect("key"),
+        ReviewAction::ResolveConflict {
+            proposal_id: ReviewProposalId::new("proposal-resolve").expect("proposal"),
+            file_id: ReviewFileId::new("file-1").expect("file"),
+            resolution: ConflictResolution::KeepIncoming,
+        },
+    )
+    .expect("request");
+    let ReviewActionAdmission::New(prepared) = conflict_store
+        .prepare_action(&resolve, ApprovalPolicy::NotRequired, 20)
+        .expect("prepare")
+    else {
+        panic!("first admission must be new")
+    };
+    assert_eq!(
+        prepared.request.action().kind(),
+        ReviewActionKind::ResolveConflict
+    );
+    assert!(matches!(
+        conflict_store
+            .start_write(&prepared.preview_id, prepared.request_digest, 21)
+            .expect("resolve write"),
+        ReviewWriteAdmission::New(_)
+    ));
+    assert!(matches!(
+        conflict_store
+            .start_write(&prepared.preview_id, prepared.request_digest, 22)
+            .expect("resolve replay"),
+        ReviewWriteAdmission::Replay(_)
     ));
 }
 

@@ -555,6 +555,7 @@ export function assertNeverWorkContextIdentity(value: never): never {
 }
 
 export type WorkspaceIntent =
+  | {readonly kind: "cancel"; readonly request: WorkspaceCancelIntent}
   | {readonly kind: "create"; readonly request: WorkspaceCreateIntent}
   | {readonly kind: "resume"; readonly request: WorkspaceResumeIntent};
 
@@ -564,6 +565,7 @@ export function assertNeverWorkspaceIntent(value: never): never {
 
 export type WorkspaceIntentOutcome =
   | {readonly kind: "accepted"}
+  | {readonly kind: "cancelled"; readonly target_intent_id: WorkspaceIntentId}
   | {readonly kind: "conflict"; readonly conflict: WorkspaceIntentConflict}
   | {readonly kind: "created"; readonly workspace: UserWorkspaceId}
   | {readonly kind: "resumed"; readonly workspace: UserWorkspaceId}
@@ -791,6 +793,20 @@ export const WorkContextResync_FIELDS: readonly string[] = [
   "expired_after",
   "outcome",
   "schema",
+];
+
+/** Cancellation intent fenced by exact target intent, workspace, and durable revision. */
+export interface WorkspaceCancelIntent {
+  readonly expected_revision: WorkContextRevision;
+  readonly intent_id: WorkspaceIntentId;
+  readonly target_intent_id: WorkspaceIntentId;
+  readonly workspace: UserWorkspaceId;
+}
+export const WorkspaceCancelIntent_FIELDS: readonly string[] = [
+  "expected_revision",
+  "intent_id",
+  "target_intent_id",
+  "workspace",
 ];
 
 /** Create intent using opaque registry selectors rather than host paths or branch names. */
@@ -1572,8 +1588,22 @@ export function validateWorkspaceResumeIntent(value: WorkspaceResumeIntent): Wor
   };
 }
 
+export function validateWorkspaceCancelIntent(value: WorkspaceCancelIntent): WorkspaceCancelIntent {
+  exactInput(value, WorkspaceCancelIntent_FIELDS);
+  const intent_id = WorkspaceIntentId(value.intent_id);
+  const target_intent_id = WorkspaceIntentId(value.target_intent_id);
+  if (intent_id === target_intent_id) workContextRefusal("cancellation intent cannot target itself");
+  return {
+    expected_revision: WorkContextRevision(workContextWireUnsigned(value.expected_revision, WorkContextRevision_MAX, "expected_revision")),
+    intent_id,
+    target_intent_id,
+    workspace: UserWorkspaceId(value.workspace),
+  };
+}
+
 export function validateWorkspaceIntent(value: WorkspaceIntent): WorkspaceIntent {
   switch (value.kind) {
+    case "cancel": exactInput(value, ["kind", "request"]); return {kind: value.kind, request: validateWorkspaceCancelIntent(value.request)};
     case "create": exactInput(value, ["kind", "request"]); return {kind: value.kind, request: validateWorkspaceCreateIntent(value.request)};
     case "resume": exactInput(value, ["kind", "request"]); return {kind: value.kind, request: validateWorkspaceResumeIntent(value.request)};
     default: return assertNeverWorkspaceIntent(value);
@@ -1583,6 +1613,7 @@ export function validateWorkspaceIntent(value: WorkspaceIntent): WorkspaceIntent
 export function validateWorkspaceIntentOutcome(value: WorkspaceIntentOutcome): WorkspaceIntentOutcome {
   switch (value.kind) {
     case "accepted": exactInput(value, ["kind"]); return {kind: value.kind};
+    case "cancelled": exactInput(value, ["kind", "target_intent_id"]); return {kind: value.kind, target_intent_id: WorkspaceIntentId(value.target_intent_id)};
     case "conflict": exactInput(value, ["conflict", "kind"]); return {kind: value.kind, conflict: decodeWorkspaceIntentConflict(value.conflict)};
     case "created": exactInput(value, ["kind", "workspace"]); return {kind: value.kind, workspace: UserWorkspaceId(value.workspace)};
     case "resumed": exactInput(value, ["kind", "workspace"]); return {kind: value.kind, workspace: UserWorkspaceId(value.workspace)};
@@ -1814,7 +1845,7 @@ function validateResolvedParents(intent: WorkContextMutationIntent, values: read
   return checked;
 }
 
-function validateIntent(value: WorkContextMutationIntent): WorkContextMutationIntent {
+export function validateWorkContextMutationIntent(value: WorkContextMutationIntent): WorkContextMutationIntent {
   const expectedKind = (expected: ExpectedWorkContext, kind: WorkContextTargetKind): ExpectedWorkContext => {
     const identity = validateWorkContextIdentity(expected.identity); if (identity.kind !== kind) workContextRefusal("operation target kind is invalid"); return {identity, revision: WorkContextRevision(expected.revision)};
   };
@@ -1839,7 +1870,7 @@ function validateIntent(value: WorkContextMutationIntent): WorkContextMutationIn
 function assertNeverLifecycleIntent(value: never): never { throw new RefusalError(WORK_CONTEXT_VALUE_INVALID, `unknown lifecycle intent ${(value as {kind?: unknown}).kind}`); }
 
 function intentJson(value: WorkContextMutationIntent): JsonValue {
-  const intent = validateIntent(value); const word = {kind: "string", value: intent.kind} as const;
+  const intent = validateWorkContextMutationIntent(value); const word = {kind: "string", value: intent.kind} as const;
   switch (intent.kind) {
     case "create_project": return object([["kind", word], ["label", {kind: "string", value: intent.label}], ["repositories", {kind: "array", items: intent.repositories.map(expectedJson)}]]);
     case "create_host_setup": return object([["kind", word], ["label", {kind: "string", value: intent.label}], ["project", expectedJson(intent.project)], ["registry", {kind: "string", value: intent.registry}], ["setup_kind", {kind: "string", value: intent.setup_kind}]]);
@@ -1855,13 +1886,13 @@ function decodeIntentValue(value: JsonValue): WorkContextMutationIntent {
   const loose = new Map(value.entries); const kindValue = loose.get("kind"); if (kindValue?.kind !== "string") throw new RefusalError(WORK_CONTEXT_INVALID_BODY, "intent kind is not a string"); const kind = kindValue.value;
   const fieldsFor = (names: readonly string[]) => exactFields(value, names, WORK_CONTEXT_INVALID_BODY);
   switch (kind) {
-    case "create_project": { const fields = fieldsFor(["kind", "label", "repositories"]); return validateIntent({kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), repositories: bodyArray(fields, "repositories", WORK_CONTEXT_INVALID_BODY, MAX_WORK_CONTEXT_RELATIONS, WORK_CONTEXT_VALUE_INVALID).map(decodeExpectedValue)}); }
-    case "create_host_setup": { const fields = fieldsFor(["kind", "label", "project", "registry", "setup_kind"]); return validateIntent({kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), project: decodeExpectedValue(bodyValue(fields, "project", WORK_CONTEXT_INVALID_BODY)), registry: WorkContextRegistrySelector(bodyString(fields, "registry", WORK_CONTEXT_INVALID_BODY)), setup_kind: decodeHostSetupKind(bodyString(fields, "setup_kind", WORK_CONTEXT_INVALID_BODY))}); }
-    case "create_checkout": { const fields = fieldsFor(["checkout_kind", "host_setup", "kind", "label", "project", "registry", "repository"]); return validateIntent({checkout_kind: decodeCheckoutKind(bodyString(fields, "checkout_kind", WORK_CONTEXT_INVALID_BODY)), host_setup: decodeExpectedValue(bodyValue(fields, "host_setup", WORK_CONTEXT_INVALID_BODY)), kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), project: decodeExpectedValue(bodyValue(fields, "project", WORK_CONTEXT_INVALID_BODY)), registry: WorkContextRegistrySelector(bodyString(fields, "registry", WORK_CONTEXT_INVALID_BODY)), repository: decodeExpectedValue(bodyValue(fields, "repository", WORK_CONTEXT_INVALID_BODY))}); }
-    case "create_user_workspace": { const fields = fieldsFor(["checkout", "kind", "label", "project"]); return validateIntent({checkout: decodeExpectedValue(bodyValue(fields, "checkout", WORK_CONTEXT_INVALID_BODY)), kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), project: decodeExpectedValue(bodyValue(fields, "project", WORK_CONTEXT_INVALID_BODY))}); }
-    case "create_attempt_workspace": { const fields = fieldsFor(["kind", "label", "requested_authority", "user_workspace"]); return validateIntent({kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), requested_authority: decodeAuthorityValue(bodyValue(fields, "requested_authority", WORK_CONTEXT_INVALID_BODY)), user_workspace: decodeExpectedValue(bodyValue(fields, "user_workspace", WORK_CONTEXT_INVALID_BODY))}); }
-    case "resume_attempt_workspace": case "resume_session": { const fields = fieldsFor(["kind", "requested_authority", "target"]); return validateIntent({kind, requested_authority: decodeAuthorityValue(bodyValue(fields, "requested_authority", WORK_CONTEXT_INVALID_BODY)), target: decodeExpectedValue(bodyValue(fields, "target", WORK_CONTEXT_INVALID_BODY))}); }
-    case "archive_project": case "archive_host_setup": case "archive_checkout": case "archive_user_workspace": { const fields = fieldsFor(["kind", "target"]); return validateIntent({kind, target: decodeExpectedValue(bodyValue(fields, "target", WORK_CONTEXT_INVALID_BODY))}); }
+    case "create_project": { const fields = fieldsFor(["kind", "label", "repositories"]); return validateWorkContextMutationIntent({kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), repositories: bodyArray(fields, "repositories", WORK_CONTEXT_INVALID_BODY, MAX_WORK_CONTEXT_RELATIONS, WORK_CONTEXT_VALUE_INVALID).map(decodeExpectedValue)}); }
+    case "create_host_setup": { const fields = fieldsFor(["kind", "label", "project", "registry", "setup_kind"]); return validateWorkContextMutationIntent({kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), project: decodeExpectedValue(bodyValue(fields, "project", WORK_CONTEXT_INVALID_BODY)), registry: WorkContextRegistrySelector(bodyString(fields, "registry", WORK_CONTEXT_INVALID_BODY)), setup_kind: decodeHostSetupKind(bodyString(fields, "setup_kind", WORK_CONTEXT_INVALID_BODY))}); }
+    case "create_checkout": { const fields = fieldsFor(["checkout_kind", "host_setup", "kind", "label", "project", "registry", "repository"]); return validateWorkContextMutationIntent({checkout_kind: decodeCheckoutKind(bodyString(fields, "checkout_kind", WORK_CONTEXT_INVALID_BODY)), host_setup: decodeExpectedValue(bodyValue(fields, "host_setup", WORK_CONTEXT_INVALID_BODY)), kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), project: decodeExpectedValue(bodyValue(fields, "project", WORK_CONTEXT_INVALID_BODY)), registry: WorkContextRegistrySelector(bodyString(fields, "registry", WORK_CONTEXT_INVALID_BODY)), repository: decodeExpectedValue(bodyValue(fields, "repository", WORK_CONTEXT_INVALID_BODY))}); }
+    case "create_user_workspace": { const fields = fieldsFor(["checkout", "kind", "label", "project"]); return validateWorkContextMutationIntent({checkout: decodeExpectedValue(bodyValue(fields, "checkout", WORK_CONTEXT_INVALID_BODY)), kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), project: decodeExpectedValue(bodyValue(fields, "project", WORK_CONTEXT_INVALID_BODY))}); }
+    case "create_attempt_workspace": { const fields = fieldsFor(["kind", "label", "requested_authority", "user_workspace"]); return validateWorkContextMutationIntent({kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), requested_authority: decodeAuthorityValue(bodyValue(fields, "requested_authority", WORK_CONTEXT_INVALID_BODY)), user_workspace: decodeExpectedValue(bodyValue(fields, "user_workspace", WORK_CONTEXT_INVALID_BODY))}); }
+    case "resume_attempt_workspace": case "resume_session": { const fields = fieldsFor(["kind", "requested_authority", "target"]); return validateWorkContextMutationIntent({kind, requested_authority: decodeAuthorityValue(bodyValue(fields, "requested_authority", WORK_CONTEXT_INVALID_BODY)), target: decodeExpectedValue(bodyValue(fields, "target", WORK_CONTEXT_INVALID_BODY))}); }
+    case "archive_project": case "archive_host_setup": case "archive_checkout": case "archive_user_workspace": { const fields = fieldsFor(["kind", "target"]); return validateWorkContextMutationIntent({kind, target: decodeExpectedValue(bodyValue(fields, "target", WORK_CONTEXT_INVALID_BODY))}); }
     default: workContextRefusal("unknown lifecycle operation");
   }
 }
@@ -1913,7 +1944,7 @@ function decodePreviewRefValue(value: JsonValue): MutationPreviewRef { const fie
 
 export function validateWorkContextMutationProposal(value: WorkContextMutationProposal): WorkContextMutationProposal {
   exactInput(value, PROPOSAL_FIELDS); if(value.schema!==PLATFORM_SCHEMA_V2) workContextRefusal("lifecycle schema is incompatible");
-  const proposal: WorkContextMutationProposal={actor:validateLifecycleActor(value.actor),actor_authority:validateAuthority(value.actor_authority),authority:decodeResourceAuthority(value.authority),idempotency_key:IdempotencyKey(value.idempotency_key),intent:validateIntent(value.intent),request_digest:WorkContextRequestDigest(value.request_digest),schema:PLATFORM_SCHEMA_V2};
+  const proposal: WorkContextMutationProposal={actor:validateLifecycleActor(value.actor),actor_authority:validateAuthority(value.actor_authority),authority:decodeResourceAuthority(value.authority),idempotency_key:IdempotencyKey(value.idempotency_key),intent:validateWorkContextMutationIntent(value.intent),request_digest:WorkContextRequestDigest(value.request_digest),schema:PLATFORM_SCHEMA_V2};
   if(lifecycleRequestDigest(proposal)!==proposal.request_digest) workContextRefusal("request digest does not bind proposal"); return proposal;
 }
 function proposalJson(value: WorkContextMutationProposal): JsonValue { const proposal=validateWorkContextMutationProposal(value); return object([["actor",actorJson(proposal.actor)],["actor_authority",authorityJson(proposal.actor_authority)],["authority",{kind:"string",value:proposal.authority}],["idempotency_key",{kind:"string",value:proposal.idempotency_key}],["intent",intentJson(proposal.intent)],["request_digest",{kind:"string",value:proposal.request_digest}],["schema",{kind:"string",value:proposal.schema}]]); }

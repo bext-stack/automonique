@@ -85,6 +85,7 @@ fn snapshot() -> ReviewSnapshot {
             ReviewProposal::new(
                 id("proposal-1"),
                 ReviewProposalKind::Commit,
+                authority(ReviewAuthorityKind::Git),
                 vec![id("file-1")],
                 Some(field("protocol: add review contract")),
             )
@@ -150,7 +151,7 @@ fn snapshot_is_exact_bounded_and_fixture_stable() {
         std::fs::write(
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/fixtures/platform-v2-review-v1.json"
+                "/fixtures/platform-v2-review-v2.json"
             ),
             &encoded,
         )
@@ -158,7 +159,7 @@ fn snapshot_is_exact_bounded_and_fixture_stable() {
     }
     assert_eq!(
         encoded.as_slice(),
-        include_bytes!("../fixtures/platform-v2-review-v1.json")
+        include_bytes!("../fixtures/platform-v2-review-v2.json")
     );
     assert!(encoded.len() < MAX_REVIEW_SNAPSHOT_CANONICAL_BYTES);
 }
@@ -228,7 +229,11 @@ fn preview_path_anchor_and_projection_invariants_fail_closed() {
         .is_err()
     );
     assert!(ReviewAnchor::new(id("file"), id("hunk"), DiffSide::New, 0).is_err());
-    assert!(AttentionProjection::derive(&[], rev(1)).is_err());
+    let idle = AttentionProjection::derive(&[], rev(1)).unwrap();
+    assert_eq!(idle.state(), AttentionState::Idle);
+    assert_eq!(idle.reason(), None);
+    assert_eq!(idle.source_revision(), None);
+    assert_eq!(idle.unread(), 0);
     assert!(
         CheckProjection::new(
             id("check"),
@@ -368,7 +373,6 @@ fn attention_ranges_proposals_and_u32_boundaries_are_authoritative() {
         ]),
         Err(ReviewContractError::AttentionInvalid)
     );
-
     let stale_done = ReviewSnapshot::new(
         base.workspace().clone(),
         base.revision(),
@@ -415,6 +419,12 @@ fn attention_ranges_proposals_and_u32_boundaries_are_authoritative() {
         ],
     );
     assert_eq!(stale_done, Err(ReviewContractError::AttentionInvalid));
+    let idle = rebuild(vec![]).unwrap();
+    assert_eq!(idle.attention().state(), AttentionState::Idle);
+    assert_eq!(
+        decode_review_snapshot(&encode_review_snapshot(&idle).unwrap()).unwrap(),
+        idle
+    );
 }
 
 fn request(
@@ -450,6 +460,38 @@ fn action_union_is_narrow_exact_revisioned_and_idempotent() {
                 expected_comment_revision: rev(2),
             },
             ReviewAuthorityKind::Review,
+        ),
+        (
+            ReviewAction::BatchSendCommentsToAgent {
+                comments: vec![ReviewCommentTarget::new(id("comment-1"), rev(2))],
+            },
+            ReviewAuthorityKind::Review,
+        ),
+        (
+            ReviewAction::Stage {
+                proposal_id: id("proposal-stage"),
+            },
+            ReviewAuthorityKind::Git,
+        ),
+        (
+            ReviewAction::Unstage {
+                proposal_id: id("proposal-unstage"),
+            },
+            ReviewAuthorityKind::Git,
+        ),
+        (
+            ReviewAction::Commit {
+                proposal_id: id("proposal-1"),
+            },
+            ReviewAuthorityKind::Git,
+        ),
+        (
+            ReviewAction::ResolveConflict {
+                proposal_id: id("proposal-resolve"),
+                file_id: id("file-1"),
+                resolution: ConflictResolution::KeepCurrent,
+            },
+            ReviewAuthorityKind::Git,
         ),
         (
             ReviewAction::ApproveReview {
@@ -571,6 +613,153 @@ fn actions_resolve_against_exact_target_authority_revision_and_state() {
         snapshot.resolve_action(&wrong_head),
         Err(ReviewContractError::ActionInvalid)
     );
+}
+
+#[test]
+fn git_proposals_batch_comments_and_conflicts_are_exactly_bound() {
+    let base = snapshot();
+    let commit = request(
+        ReviewAction::Commit {
+            proposal_id: id("proposal-1"),
+        },
+        ReviewAuthentication::UserSession,
+        ReviewAuthorityKind::Git,
+    )
+    .unwrap();
+    assert_eq!(base.resolve_action(&commit), Ok(()));
+
+    let wrong_git = ReviewActionRequest::new(
+        workspace(),
+        rev(9),
+        id("actor-1"),
+        ReviewAuthentication::UserSession,
+        ReviewAuthority::new(ReviewAuthorityKind::Git, id("another-git")),
+        IdempotencyKey::new("idem-wrong-git").unwrap(),
+        ReviewAction::Commit {
+            proposal_id: id("proposal-1"),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        base.resolve_action(&wrong_git),
+        Err(ReviewContractError::AuthorityInvalid)
+    );
+
+    let original = &base.comments()[0];
+    let pending_comment = ReviewComment::new(
+        original.id().clone(),
+        original.revision(),
+        original.actor().clone(),
+        original.body().clone(),
+        original.anchor().clone(),
+        CommentAgentState::NotSent,
+        original.unread(),
+    );
+    let batch_snapshot = ReviewSnapshot::new(
+        base.workspace().clone(),
+        base.revision(),
+        base.files().to_vec(),
+        vec![pending_comment],
+        base.proposals().to_vec(),
+        base.checks().to_vec(),
+        base.review().clone(),
+        base.pull_request().clone(),
+        base.delivery().clone(),
+        base.attention_events().to_vec(),
+    )
+    .unwrap();
+    let batch = request(
+        ReviewAction::BatchSendCommentsToAgent {
+            comments: vec![ReviewCommentTarget::new(id("comment-1"), rev(2))],
+        },
+        ReviewAuthentication::UserSession,
+        ReviewAuthorityKind::Review,
+    )
+    .unwrap();
+    assert_eq!(batch_snapshot.resolve_action(&batch), Ok(()));
+    assert!(
+        ReviewActionRequest::new(
+            workspace(),
+            rev(9),
+            id("actor-1"),
+            ReviewAuthentication::UserSession,
+            authority(ReviewAuthorityKind::Review),
+            IdempotencyKey::new("idem-duplicate-batch").unwrap(),
+            ReviewAction::BatchSendCommentsToAgent {
+                comments: vec![
+                    ReviewCommentTarget::new(id("comment-1"), rev(2)),
+                    ReviewCommentTarget::new(id("comment-1"), rev(2)),
+                ],
+            },
+        )
+        .is_err()
+    );
+
+    let conflicted_file = ReviewFile::new(
+        id("file-conflict"),
+        RepositoryRelativePath::new("src/conflict.rs").unwrap(),
+        DiffChangeKind::Modified,
+        WorktreeFileState::Unstaged,
+        PreviewMetadata::new(
+            PreviewKind::Text,
+            Some(field("text/plain")),
+            Some(10),
+            None,
+            None,
+            true,
+        )
+        .unwrap(),
+        ConflictState::Unresolved,
+        vec![],
+    )
+    .unwrap();
+    let conflict_snapshot = ReviewSnapshot::new(
+        workspace(),
+        rev(9),
+        vec![conflicted_file],
+        vec![],
+        vec![
+            ReviewProposal::new(
+                id("proposal-resolve"),
+                ReviewProposalKind::ResolveConflict,
+                authority(ReviewAuthorityKind::Git),
+                vec![id("file-conflict")],
+                None,
+            )
+            .unwrap(),
+        ],
+        vec![],
+        base.review().clone(),
+        base.pull_request().clone(),
+        base.delivery().clone(),
+        vec![
+            AttentionEvent::new(
+                id("attention-conflict"),
+                AttentionOrigin::new(
+                    AttentionOriginKind::File,
+                    Some(field("file-conflict")),
+                    authority(ReviewAuthorityKind::Review),
+                    rev(9),
+                )
+                .unwrap(),
+                AttentionReason::Conflict,
+                0,
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let resolve = request(
+        ReviewAction::ResolveConflict {
+            proposal_id: id("proposal-resolve"),
+            file_id: id("file-conflict"),
+            resolution: ConflictResolution::KeepIncoming,
+        },
+        ReviewAuthentication::UserSession,
+        ReviewAuthorityKind::Git,
+    )
+    .unwrap();
+    assert_eq!(conflict_snapshot.resolve_action(&resolve), Ok(()));
 }
 
 #[test]
@@ -763,4 +952,58 @@ fn mixed_version_and_noncanonical_documents_are_refused() {
         decode_review_snapshot(&spaced),
         Err(ReviewApiError::Codec(_))
     ));
+}
+
+#[test]
+fn legacy_v1_snapshot_is_exact_and_git_proposals_are_non_actionable() {
+    let fixture = include_bytes!("../fixtures/platform-v2-review-v1.json");
+    let source = if std::env::var_os("AUTOMONIQUE_PROTOCOL_REGENERATE").is_some() {
+        fixture.strip_suffix(b"\n").unwrap_or(fixture)
+    } else {
+        fixture
+    };
+    let legacy = decode_review_snapshot(source).unwrap();
+    assert_eq!(legacy.schema(), ReviewSchemaVersion::V1);
+    assert!(
+        legacy
+            .proposals()
+            .iter()
+            .all(|proposal| proposal.authority().is_none())
+    );
+    let encoded = encode_review_snapshot(&legacy).unwrap();
+    if std::env::var_os("AUTOMONIQUE_PROTOCOL_REGENERATE").is_some() {
+        std::fs::write(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/fixtures/platform-v2-review-v1.json"
+            ),
+            &encoded,
+        )
+        .unwrap();
+    }
+    assert_eq!(encoded.as_slice(), fixture);
+
+    let commit = request(
+        ReviewAction::Commit {
+            proposal_id: id("proposal-1"),
+        },
+        ReviewAuthentication::UserSession,
+        ReviewAuthorityKind::Git,
+    )
+    .unwrap();
+    assert_eq!(
+        legacy.resolve_action(&commit),
+        Err(ReviewContractError::ActionInvalid)
+    );
+
+    let authorized =
+        decode_review_snapshot(include_bytes!("../fixtures/platform-v2-review-v2.json")).unwrap();
+    assert_eq!(authorized.schema(), ReviewSchemaVersion::V2);
+    assert!(
+        authorized
+            .proposals()
+            .iter()
+            .all(|proposal| proposal.authority().is_some())
+    );
+    assert_eq!(authorized.resolve_action(&commit), Ok(()));
 }

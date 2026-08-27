@@ -847,10 +847,60 @@ impl WorkspaceResumeIntent {
     }
 }
 
+/// Idempotent request to cancel one still-pending workspace intent.
+///
+/// The cancellation has its own identity so retries cannot be confused with
+/// the target operation. The target workspace and durable intent revision are
+/// carried explicitly; possession of an intent ID alone is never authority to
+/// cancel it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceCancelIntent {
+    intent_id: WorkspaceIntentId,
+    target_intent_id: WorkspaceIntentId,
+    workspace: UserWorkspaceId,
+    expected_revision: Revision,
+}
+
+impl WorkspaceCancelIntent {
+    pub fn new(
+        intent_id: WorkspaceIntentId,
+        target_intent_id: WorkspaceIntentId,
+        workspace: UserWorkspaceId,
+        expected_revision: Revision,
+    ) -> Result<Self, LineageError> {
+        if intent_id == target_intent_id {
+            return Err(LineageError::InventoryInvalid);
+        }
+        Ok(Self {
+            intent_id,
+            target_intent_id,
+            workspace,
+            expected_revision,
+        })
+    }
+    #[must_use]
+    pub const fn intent_id(&self) -> &WorkspaceIntentId {
+        &self.intent_id
+    }
+    #[must_use]
+    pub const fn target_intent_id(&self) -> &WorkspaceIntentId {
+        &self.target_intent_id
+    }
+    #[must_use]
+    pub const fn workspace(&self) -> &UserWorkspaceId {
+        &self.workspace
+    }
+    #[must_use]
+    pub const fn expected_revision(&self) -> Revision {
+        self.expected_revision
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkspaceIntent {
     Create(WorkspaceCreateIntent),
     Resume(WorkspaceResumeIntent),
+    Cancel(WorkspaceCancelIntent),
 }
 impl WorkspaceIntent {
     #[must_use]
@@ -858,6 +908,7 @@ impl WorkspaceIntent {
         match self {
             Self::Create(v) => v.intent_id(),
             Self::Resume(v) => v.intent_id(),
+            Self::Cancel(v) => v.intent_id(),
         }
     }
 }
@@ -912,6 +963,7 @@ pub enum WorkspaceIntentOutcome {
     Unknown,
     Created(UserWorkspaceId),
     Resumed(UserWorkspaceId),
+    Cancelled(WorkspaceIntentId),
     Conflict(WorkspaceIntentConflict),
 }
 
@@ -935,7 +987,7 @@ impl WorkspaceIntentOutcome {
     pub const fn reconciliation(&self) -> WorkspaceIntentReconciliation {
         match self {
             Self::Accepted | Self::Unknown => WorkspaceIntentReconciliation::PollReceipt,
-            Self::Created(_) | Self::Resumed(_) | Self::Conflict(_) => {
+            Self::Created(_) | Self::Resumed(_) | Self::Cancelled(_) | Self::Conflict(_) => {
                 WorkspaceIntentReconciliation::Final
             }
         }

@@ -30,8 +30,8 @@ use automonique_protocol::platform_v2_lineage::{
     LineageProjection, LineageStatus, MAX_LINEAGE_RECORDS, OrchestrationDecisionGateId,
     OrchestrationDispatchId, OrchestrationHeartbeatId, OrchestrationIdentity, OrchestrationKind,
     OrchestrationQuestionId, OrchestrationRecord, OrchestrationRunId, OrchestrationTaskId,
-    OrchestrationWorkerId, WorkspaceIntent, WorkspaceIntentConflict, WorkspaceIntentId,
-    WorkspaceIntentOutcome, WorkspaceIntentReconciliation,
+    OrchestrationWorkerId, WorkspaceCancelIntent, WorkspaceIntent, WorkspaceIntentConflict,
+    WorkspaceIntentId, WorkspaceIntentOutcome, WorkspaceIntentReconciliation,
 };
 use automonique_protocol::platform_v2_lineage_api::require_lineage_v2;
 use automonique_protocol::primitives::Revision;
@@ -41,10 +41,10 @@ use sha2::{Digest, Sha256};
 use crate::{StoreError, validate_database_path};
 
 /// The only lineage-index schema this build reads or writes.
-pub const LINEAGE_INDEX_SCHEMA_VERSION: u32 = 3;
+pub const LINEAGE_INDEX_SCHEMA_VERSION: u32 = 4;
 const LEGACY_TENANT: &str = "legacy-unqualified";
 
-const SCHEMA_V3: &str = r#"
+const SCHEMA_V4: &str = r#"
 CREATE TABLE lineage_external_work (
     tenant TEXT NOT NULL,
     provider TEXT NOT NULL CHECK (provider IN ('github','gitlab','linear','jira_compatible')),
@@ -136,7 +136,7 @@ CREATE TABLE lineage_workspace_intents (
     tenant TEXT NOT NULL,
     intent_id TEXT NOT NULL,
     request_digest BLOB NOT NULL CHECK (length(request_digest) = 32),
-    intent_kind TEXT NOT NULL CHECK (intent_kind IN ('create','resume')),
+    intent_kind TEXT NOT NULL CHECK (intent_kind IN ('create','resume','cancel')),
     task_kind TEXT NOT NULL CHECK (task_kind = 'task'),
     task_id TEXT NOT NULL,
     workspace_id TEXT NOT NULL,
@@ -147,7 +147,9 @@ CREATE TABLE lineage_workspace_intents (
     base_selector TEXT,
     branch_selector TEXT,
     expected_revision INTEGER CHECK (expected_revision >= 1),
-    outcome_kind TEXT NOT NULL CHECK (outcome_kind IN ('accepted','unknown','created','resumed','conflict')),
+    target_intent_id TEXT,
+    revision INTEGER NOT NULL CHECK (revision >= 1 AND revision <= 2),
+    outcome_kind TEXT NOT NULL CHECK (outcome_kind IN ('accepted','unknown','created','resumed','cancelled','conflict')),
     outcome_conflict TEXT CHECK (outcome_conflict IN
         ('duplicate_intake','task_already_bound','workspace_not_found','revision_mismatch',
          'external_work_moved','external_work_closed','orphan_dispatch','stale_heartbeat',
@@ -159,13 +161,18 @@ CREATE TABLE lineage_workspace_intents (
         REFERENCES lineage_orchestration(tenant, orchestration_kind, orchestration_id, workspace_id),
     FOREIGN KEY (tenant, external_provider, external_authority_id, external_scope, external_key, workspace_id)
         REFERENCES lineage_external_work(tenant, provider, authority_id, scope, work_key, workspace_id),
+    FOREIGN KEY (tenant, target_intent_id)
+        REFERENCES lineage_workspace_intents(tenant, intent_id),
     CHECK (
         (intent_kind = 'create' AND external_provider IS NOT NULL AND external_authority_id IS NOT NULL AND external_scope IS NOT NULL
             AND external_key IS NOT NULL AND base_selector IS NOT NULL
-            AND branch_selector IS NOT NULL AND expected_revision IS NULL) OR
+            AND branch_selector IS NOT NULL AND expected_revision IS NULL AND target_intent_id IS NULL) OR
         (intent_kind = 'resume' AND external_provider IS NULL AND external_authority_id IS NULL AND external_scope IS NULL
             AND external_key IS NULL AND base_selector IS NULL
-            AND branch_selector IS NULL AND expected_revision IS NOT NULL)
+            AND branch_selector IS NULL AND expected_revision IS NOT NULL AND target_intent_id IS NULL) OR
+        (intent_kind = 'cancel' AND external_provider IS NULL AND external_authority_id IS NULL AND external_scope IS NULL
+            AND external_key IS NULL AND base_selector IS NULL
+            AND branch_selector IS NULL AND expected_revision IS NOT NULL AND target_intent_id IS NOT NULL)
     ),
     CHECK (
         (outcome_kind IN ('accepted','unknown') AND outcome_conflict IS NULL
@@ -173,17 +180,29 @@ CREATE TABLE lineage_workspace_intents (
         (outcome_kind = 'conflict' AND outcome_conflict IS NOT NULL
             AND outcome_workspace_id IS NULL AND reconciliation = 'final') OR
         (outcome_kind IN ('created','resumed') AND outcome_conflict IS NULL
-            AND outcome_workspace_id = workspace_id AND reconciliation = 'final')
+            AND outcome_workspace_id = workspace_id AND reconciliation = 'final') OR
+        (outcome_kind = 'cancelled' AND outcome_conflict IS NULL
+            AND outcome_workspace_id IS NULL AND target_intent_id IS NOT NULL AND reconciliation = 'final')
     ),
     CHECK (
         (intent_kind = 'create' AND outcome_kind IN ('accepted','unknown','created','conflict')) OR
-        (intent_kind = 'resume' AND outcome_kind IN ('accepted','unknown','resumed','conflict'))
+        (intent_kind = 'resume' AND outcome_kind IN ('accepted','unknown','resumed','conflict')) OR
+        (intent_kind = 'cancel' AND outcome_kind IN ('accepted','unknown','cancelled','conflict'))
+    ),
+    CHECK (
+        (reconciliation = 'poll_receipt' AND revision = 1) OR
+        (reconciliation = 'final' AND revision IN (1,2))
     )
 ) STRICT;
+
+CREATE UNIQUE INDEX lineage_cancel_by_target
+    ON lineage_workspace_intents(tenant,target_intent_id) WHERE intent_kind = 'cancel';
 "#;
 
 // Exact short-lived unscoped schema accepted only as a v2 migration source.
 const SCHEMA_V2: &str = include_str!("lineage_index_v2.sql");
+// Exact tenant-scoped schema accepted only as a v3 migration source.
+const SCHEMA_V3: &str = include_str!("lineage_index_v3.sql");
 
 /// Stable lineage-index refusal.
 #[derive(Debug)]
@@ -294,6 +313,7 @@ pub enum WriteAdmission {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredWorkspaceIntent {
     pub request_digest: [u8; 32],
+    pub revision: Revision,
     pub intent: WorkspaceIntent,
     pub outcome: WorkspaceIntentOutcome,
 }
@@ -526,7 +546,8 @@ impl LineageIndex {
         }
     }
 
-    /// Persist a create/resume decision under its exact idempotent intent ID.
+    /// Persist a create, resume, or cancellation decision under its exact
+    /// tenant-scoped idempotent intent ID.
     pub fn record_intent(
         &mut self,
         tenant: &str,
@@ -540,13 +561,18 @@ impl LineageIndex {
         let request_digest = intent_digest(intent);
         if let Some(existing) = read_intent(&transaction, tenant, intent.intent_id().as_str())? {
             return if existing.request_digest == request_digest {
-                Ok(WriteAdmission::Replayed { revision: 1 })
+                Ok(WriteAdmission::Replayed {
+                    revision: from_db(existing.revision, "intent_revision")?,
+                })
             } else {
                 Err(LineageIndexError::IdentityConflict)
             };
         }
         let fingerprint =
             intent_fingerprint(&transaction, tenant, intent, outcome, request_digest)?;
+        if matches!(outcome, WorkspaceIntentOutcome::Cancelled(_)) {
+            apply_cancellation(&transaction, tenant, &fingerprint)?;
+        }
         insert_intent(&transaction, tenant, &fingerprint)?;
         transaction.commit()?;
         Ok(WriteAdmission::Inserted { revision: 1 })
@@ -554,7 +580,7 @@ impl LineageIndex {
 
     /// Transactionally advance a durable accepted/unknown receipt to one exact
     /// final decision. This records reconciliation only; it never executes the
-    /// underlying create/resume operation.
+    /// underlying workspace operation.
     pub fn reconcile_intent(
         &mut self,
         tenant: &str,
@@ -573,9 +599,10 @@ impl LineageIndex {
             return Err(LineageIndexError::IdentityConflict);
         }
         if existing.reconciliation == "final" {
+            let revision = from_db(existing.revision, "intent_revision")?;
             let stored = existing.into_stored()?;
             return if stored.outcome == receipt.outcome {
-                Ok(WriteAdmission::Replayed { revision: 2 })
+                Ok(WriteAdmission::Replayed { revision })
             } else {
                 Err(LineageIndexError::IdentityConflict)
             };
@@ -594,6 +621,13 @@ impl LineageIndex {
                     Some(workspace.as_str()),
                     existing.intent_kind == "resume" && workspace.as_str() == existing.workspace,
                 ),
+                WorkspaceIntentOutcome::Cancelled(target) => (
+                    "cancelled",
+                    None,
+                    None,
+                    existing.intent_kind == "cancel"
+                        && existing.target_intent_id.as_deref() == Some(target.as_str()),
+                ),
                 WorkspaceIntentOutcome::Conflict(value) => {
                     ("conflict", Some(value.as_str()), None, true)
                 }
@@ -604,8 +638,11 @@ impl LineageIndex {
         if !valid_final {
             return Err(LineageIndexError::IdentityConflict);
         }
+        if matches!(receipt.outcome, WorkspaceIntentOutcome::Cancelled(_)) {
+            apply_cancellation(&transaction, tenant, &existing)?;
+        }
         let changed = transaction.execute(
-            "UPDATE lineage_workspace_intents SET outcome_kind=?3,outcome_conflict=?4,outcome_workspace_id=?5,reconciliation='final' WHERE tenant=?1 AND intent_id=?2 AND request_digest=?6 AND reconciliation='poll_receipt'",
+            "UPDATE lineage_workspace_intents SET outcome_kind=?3,outcome_conflict=?4,outcome_workspace_id=?5,reconciliation='final',revision=2 WHERE tenant=?1 AND intent_id=?2 AND request_digest=?6 AND reconciliation='poll_receipt' AND revision=1",
             params![tenant, receipt.intent_id.as_str(), outcome_kind, outcome_conflict, outcome_workspace, receipt.request_digest.as_slice()],
         )?;
         if changed != 1 {
@@ -1340,6 +1377,8 @@ struct IntentFingerprint {
     base_selector: Option<String>,
     branch_selector: Option<String>,
     expected_revision: Option<i64>,
+    target_intent_id: Option<String>,
+    revision: i64,
     outcome_kind: &'static str,
     outcome_conflict: Option<&'static str>,
     outcome_workspace: Option<String>,
@@ -1397,6 +1436,26 @@ impl IntentFingerprint {
                     .map_err(|_| LineageIndexError::Corrupt("expected_revision"))?,
                 ),
             ),
+            "cancel" => WorkspaceIntent::Cancel(
+                WorkspaceCancelIntent::new(
+                    intent_id,
+                    WorkspaceIntentId::new(
+                        self.target_intent_id
+                            .clone()
+                            .ok_or(LineageIndexError::Corrupt("cancel_intent"))?,
+                    )
+                    .map_err(|_| LineageIndexError::Corrupt("target_intent_id"))?,
+                    UserWorkspaceId::new(self.workspace.clone())
+                        .map_err(|_| LineageIndexError::Corrupt("workspace_id"))?,
+                    Revision::new(from_db(
+                        self.expected_revision
+                            .ok_or(LineageIndexError::Corrupt("cancel_intent"))?,
+                        "expected_revision",
+                    )?)
+                    .map_err(|_| LineageIndexError::Corrupt("expected_revision"))?,
+                )
+                .map_err(|_| LineageIndexError::Corrupt("cancel_intent"))?,
+            ),
             _ => return Err(LineageIndexError::Corrupt("intent_kind")),
         };
         let outcome = match self.outcome_kind {
@@ -1416,6 +1475,13 @@ impl IntentFingerprint {
                 )
                 .map_err(|_| LineageIndexError::Corrupt("intent_outcome"))?,
             ),
+            "cancelled" => WorkspaceIntentOutcome::Cancelled(
+                WorkspaceIntentId::new(
+                    self.target_intent_id
+                        .ok_or(LineageIndexError::Corrupt("intent_outcome"))?,
+                )
+                .map_err(|_| LineageIndexError::Corrupt("intent_outcome"))?,
+            ),
             "conflict" => WorkspaceIntentOutcome::Conflict(parse_conflict(
                 self.outcome_conflict
                     .ok_or(LineageIndexError::Corrupt("intent_outcome"))?,
@@ -1424,6 +1490,8 @@ impl IntentFingerprint {
         };
         Ok(StoredWorkspaceIntent {
             request_digest: self.request_digest,
+            revision: Revision::new(from_db(self.revision, "intent_revision")?)
+                .map_err(|_| LineageIndexError::Corrupt("intent_revision"))?,
             intent,
             outcome,
         })
@@ -1456,6 +1524,13 @@ fn intent_digest(intent: &WorkspaceIntent) -> [u8; 32] {
             field(&mut hasher, value.workspace().as_str());
             hasher.update(value.expected_revision().get().to_be_bytes());
         }
+        WorkspaceIntent::Cancel(value) => {
+            field(&mut hasher, "cancel");
+            field(&mut hasher, value.intent_id().as_str());
+            field(&mut hasher, value.target_intent_id().as_str());
+            field(&mut hasher, value.workspace().as_str());
+            hasher.update(value.expected_revision().get().to_be_bytes());
+        }
     }
     hasher.finalize().into()
 }
@@ -1467,34 +1542,79 @@ fn intent_fingerprint(
     outcome: &WorkspaceIntentOutcome,
     request_digest: [u8; 32],
 ) -> Indexed<IntentFingerprint> {
-    let (intent_id, intent_kind, task_id, requested_workspace, external, base, branch, expected) =
-        match intent {
-            WorkspaceIntent::Create(request) => (
-                request.intent_id().as_str().to_owned(),
-                "create",
-                request.task().as_str(),
-                None,
-                Some(request.external_work()),
-                Some(request.base_selector().as_str()),
-                Some(request.branch_selector().as_str()),
-                None,
-            ),
-            WorkspaceIntent::Resume(request) => (
-                request.intent_id().as_str().to_owned(),
-                "resume",
-                request.task().as_str(),
-                Some(request.workspace()),
-                None,
-                None,
-                None,
-                Some(to_db(
-                    request.expected_revision().get(),
-                    "expected_revision",
-                )?),
-            ),
-        };
+    let (
+        intent_id,
+        intent_kind,
+        requested_task_id,
+        requested_workspace,
+        external,
+        base,
+        branch,
+        expected,
+        target_intent_id,
+    ) = match intent {
+        WorkspaceIntent::Create(request) => (
+            request.intent_id().as_str().to_owned(),
+            "create",
+            Some(request.task().as_str()),
+            None,
+            Some(request.external_work()),
+            Some(request.base_selector().as_str()),
+            Some(request.branch_selector().as_str()),
+            None,
+            None,
+        ),
+        WorkspaceIntent::Resume(request) => (
+            request.intent_id().as_str().to_owned(),
+            "resume",
+            Some(request.task().as_str()),
+            Some(request.workspace()),
+            None,
+            None,
+            None,
+            Some(to_db(
+                request.expected_revision().get(),
+                "expected_revision",
+            )?),
+            None,
+        ),
+        WorkspaceIntent::Cancel(request) => (
+            request.intent_id().as_str().to_owned(),
+            "cancel",
+            None,
+            Some(request.workspace()),
+            None,
+            None,
+            None,
+            Some(to_db(
+                request.expected_revision().get(),
+                "expected_revision",
+            )?),
+            Some(request.target_intent_id().as_str().to_owned()),
+        ),
+    };
+    let target = target_intent_id
+        .as_deref()
+        .map(|target_id| {
+            read_intent(connection, tenant, target_id)?
+                .ok_or(LineageIndexError::NotFound("target intent"))
+        })
+        .transpose()?;
+    if let Some(target) = &target
+        && (target.revision != expected.ok_or(LineageIndexError::IdentityConflict)?
+            || requested_workspace.is_none_or(|workspace| workspace.as_str() != target.workspace)
+            || target.intent_kind == "cancel"
+            || !matches!(target.outcome_kind, "accepted" | "unknown")
+            || target.reconciliation != "poll_receipt")
+    {
+        return Err(LineageIndexError::IdentityConflict);
+    }
+    let task_id = requested_task_id
+        .map(str::to_owned)
+        .or_else(|| target.as_ref().map(|value| value.task_id.clone()))
+        .ok_or(LineageIndexError::IdentityConflict)?;
     let task_identity = OrchestrationIdentity::Task(
-        OrchestrationTaskId::new(task_id).map_err(|_| LineageIndexError::InvalidField("task"))?,
+        OrchestrationTaskId::new(&task_id).map_err(|_| LineageIndexError::InvalidField("task"))?,
     );
     let (task, _) = read_orchestration(connection, tenant, &task_identity)?
         .ok_or(LineageIndexError::OrphanDispatch)?;
@@ -1518,6 +1638,11 @@ fn intent_fingerprint(
         }
         WorkspaceIntentOutcome::Resumed(workspace) if intent_kind == "resume" => {
             ("resumed", None, Some(workspace.as_str().to_owned()))
+        }
+        WorkspaceIntentOutcome::Cancelled(target)
+            if intent_kind == "cancel" && target_intent_id.as_deref() == Some(target.as_str()) =>
+        {
+            ("cancelled", None, None)
         }
         WorkspaceIntentOutcome::Conflict(conflict) => ("conflict", Some(conflict.as_str()), None),
         _ => return Err(LineageIndexError::IdentityConflict),
@@ -1545,7 +1670,7 @@ fn intent_fingerprint(
         intent_id,
         request_digest,
         intent_kind,
-        task_id: task_id.to_owned(),
+        task_id,
         workspace: task.workspace().as_str().to_owned(),
         external_provider: external.map(|value| value.provider().as_str().to_owned()),
         external_authority: external.map(|value| value.authority().as_str().to_owned()),
@@ -1554,6 +1679,8 @@ fn intent_fingerprint(
         base_selector: base.map(str::to_owned),
         branch_selector: branch.map(str::to_owned),
         expected_revision: expected,
+        target_intent_id,
+        revision: 1,
         outcome_kind,
         outcome_conflict,
         outcome_workspace,
@@ -1564,7 +1691,7 @@ fn intent_fingerprint(
 fn insert_intent(connection: &Connection, tenant: &str, value: &IntentFingerprint) -> Indexed<()> {
     connection.execute(
         "INSERT INTO lineage_workspace_intents VALUES
-         (?1,?2,?3,?4,'task',?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+         (?1,?2,?3,?4,'task',?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
         params![
             tenant,
             value.intent_id,
@@ -1579,12 +1706,47 @@ fn insert_intent(connection: &Connection, tenant: &str, value: &IntentFingerprin
             value.base_selector,
             value.branch_selector,
             value.expected_revision,
+            value.target_intent_id,
+            value.revision,
             value.outcome_kind,
             value.outcome_conflict,
             value.outcome_workspace,
             value.reconciliation,
         ],
     )?;
+    Ok(())
+}
+
+fn apply_cancellation(
+    connection: &Connection,
+    tenant: &str,
+    cancellation: &IntentFingerprint,
+) -> Indexed<()> {
+    let target = cancellation
+        .target_intent_id
+        .as_deref()
+        .ok_or(LineageIndexError::IdentityConflict)?;
+    let expected = cancellation
+        .expected_revision
+        .ok_or(LineageIndexError::IdentityConflict)?;
+    let changed = connection.execute(
+        "UPDATE lineage_workspace_intents
+         SET outcome_kind='conflict',outcome_conflict='creation_cancelled',outcome_workspace_id=NULL,
+             reconciliation='final',revision=2
+         WHERE tenant=?1 AND intent_id=?2 AND workspace_id=?3 AND task_id=?4 AND revision=?5
+           AND intent_kind IN ('create','resume') AND outcome_kind IN ('accepted','unknown')
+           AND reconciliation='poll_receipt'",
+        params![
+            tenant,
+            target,
+            cancellation.workspace,
+            cancellation.task_id,
+            expected
+        ],
+    )?;
+    if changed != 1 {
+        return Err(LineageIndexError::IdentityConflict);
+    }
     Ok(())
 }
 
@@ -1606,14 +1768,16 @@ fn read_intent(
         Option<String>,
         Option<String>,
         Option<i64>,
+        Option<String>,
+        i64,
         String,
         Option<String>,
         Option<String>,
         String,
     );
     connection.query_row(
-        "SELECT intent_id,request_digest,intent_kind,task_id,workspace_id,external_provider,external_authority_id,external_scope,external_key,base_selector,branch_selector,expected_revision,outcome_kind,outcome_conflict,outcome_workspace_id,reconciliation FROM lineage_workspace_intents WHERE tenant=?1 AND intent_id=?2",
-        params![tenant, intent_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?,row.get(15)?)))
+        "SELECT intent_id,request_digest,intent_kind,task_id,workspace_id,external_provider,external_authority_id,external_scope,external_key,base_selector,branch_selector,expected_revision,target_intent_id,revision,outcome_kind,outcome_conflict,outcome_workspace_id,reconciliation FROM lineage_workspace_intents WHERE tenant=?1 AND intent_id=?2",
+        params![tenant, intent_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?,row.get(15)?,row.get(16)?,row.get(17)?)))
     .optional()?.map(|raw: Raw| {
             WorkspaceIntentId::new(&raw.0).map_err(|_| LineageIndexError::Corrupt("intent_id"))?;
             let request_digest: [u8;32] = raw.1.clone().try_into().map_err(|_| LineageIndexError::Corrupt("request_digest"))?;
@@ -1622,27 +1786,31 @@ fn read_intent(
             let intent_kind = match raw.2.as_str() {
                 "create" => "create",
                 "resume" => "resume",
+                "cancel" => "cancel",
                 _ => return Err(LineageIndexError::Corrupt("intent_kind")),
             };
-            let outcome_kind = match raw.12.as_str() {
+            let outcome_kind = match raw.14.as_str() {
                 "accepted" => "accepted",
                 "unknown" => "unknown",
                 "created" => "created",
                 "resumed" => "resumed",
+                "cancelled" => "cancelled",
                 "conflict" => "conflict",
                 _ => return Err(LineageIndexError::Corrupt("outcome_kind")),
             };
-            let outcome_conflict = raw.13.as_deref().map(parse_conflict).transpose()?;
+            let outcome_conflict = raw.15.as_deref().map(parse_conflict).transpose()?;
             if !matches!(
                 (intent_kind, outcome_kind),
-                ("create", "accepted" | "unknown" | "created" | "conflict") | ("resume", "accepted" | "unknown" | "resumed" | "conflict")
+                ("create", "accepted" | "unknown" | "created" | "conflict")
+                    | ("resume", "accepted" | "unknown" | "resumed" | "conflict")
+                    | ("cancel", "accepted" | "unknown" | "cancelled" | "conflict")
             ) {
                 return Err(LineageIndexError::Corrupt("intent_outcome"));
             }
             match intent_kind {
                 "create" => {
-                    let (Some(provider), Some(authority), Some(scope), Some(key), Some(base), Some(branch), None) =
-                        (&raw.5, &raw.6, &raw.7, &raw.8, &raw.9, &raw.10, raw.11)
+                    let (Some(provider), Some(authority), Some(scope), Some(key), Some(base), Some(branch), None, None) =
+                        (&raw.5, &raw.6, &raw.7, &raw.8, &raw.9, &raw.10, raw.11, &raw.12)
                     else {
                         return Err(LineageIndexError::Corrupt("create_intent"));
                     };
@@ -1655,16 +1823,30 @@ fn read_intent(
                 "resume" => {
                     if raw.5.is_some() || raw.6.is_some() || raw.7.is_some() || raw.8.is_some()
                         || raw.9.is_some() || raw.10.is_some() || raw.11.is_none_or(|value| value < 1)
+                        || raw.12.is_some()
                     {
                         return Err(LineageIndexError::Corrupt("resume_intent"));
                     }
                 }
+                "cancel" => {
+                    if raw.5.is_some() || raw.6.is_some() || raw.7.is_some() || raw.8.is_some()
+                        || raw.9.is_some() || raw.10.is_some()
+                        || raw.11.is_none_or(|value| value < 1)
+                        || raw.12.as_deref().is_none_or(|target| {
+                            WorkspaceIntentId::new(target).is_err() || target == raw.0
+                        })
+                    {
+                        return Err(LineageIndexError::Corrupt("cancel_intent"));
+                    }
+                }
                 _ => unreachable!(),
             }
-            match (outcome_kind, outcome_conflict, raw.14.as_deref(), raw.15.as_str()) {
-                ("accepted" | "unknown", None, None, "poll_receipt") => {}
-                ("conflict", Some(_), None, "final") => {}
-                ("created", None, Some(workspace), "final") | ("resumed", None, Some(workspace), "final")
+            match (outcome_kind, outcome_conflict, raw.16.as_deref(), raw.17.as_str(), raw.13) {
+                ("accepted" | "unknown", None, None, "poll_receipt", 1) => {}
+                ("conflict", Some(_), None, "final", 1 | 2) => {}
+                ("cancelled", None, None, "final", 1 | 2) if intent_kind == "cancel" => {}
+                ("created", None, Some(workspace), "final", 1 | 2)
+                | ("resumed", None, Some(workspace), "final", 1 | 2)
                     if workspace == raw.4 =>
                 {
                     UserWorkspaceId::new(workspace)
@@ -1679,10 +1861,12 @@ fn read_intent(
                 task_id: raw.3, workspace: raw.4, external_provider: raw.5, external_authority: raw.6,
                 external_scope: raw.7, external_key: raw.8, base_selector: raw.9, branch_selector: raw.10,
                 expected_revision: raw.11,
+                target_intent_id: raw.12,
+                revision: raw.13,
                 outcome_kind,
                 outcome_conflict: outcome_conflict.map(WorkspaceIntentConflict::as_str),
-                outcome_workspace: raw.14,
-                reconciliation: if raw.15 == "final" { "final" } else { "poll_receipt" },
+                outcome_workspace: raw.16,
+                reconciliation: if raw.17 == "final" { "final" } else { "poll_receipt" },
             })
         })
         .transpose()
@@ -1710,6 +1894,9 @@ fn initialize(connection: &mut Connection) -> Indexed<()> {
     if version == 2 {
         return migrate_v2(connection);
     }
+    if version == 3 {
+        return migrate_v3(connection);
+    }
     if version == LINEAGE_INDEX_SCHEMA_VERSION {
         validate_current_schema(connection)?;
         return validate_durable_graphs(connection);
@@ -1732,14 +1919,14 @@ fn initialize(connection: &mut Connection) -> Indexed<()> {
         });
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(SCHEMA_V3)?;
+    transaction.execute_batch(SCHEMA_V4)?;
     transaction.pragma_update(None, "user_version", LINEAGE_INDEX_SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
 }
 
 fn validate_current_schema(connection: &Connection) -> Indexed<()> {
-    validate_schema(connection, SCHEMA_V3)
+    validate_schema(connection, SCHEMA_V4)
 }
 
 fn validate_schema(connection: &Connection, schema: &str) -> Indexed<()> {
@@ -1893,12 +2080,79 @@ fn validate_durable_graphs(connection: &Connection) -> Indexed<()> {
                 return Err(LineageIndexError::Corrupt("intent_external"));
             }
         }
+        if fingerprint.intent_kind == "cancel" {
+            let target_id = fingerprint
+                .target_intent_id
+                .as_deref()
+                .ok_or(LineageIndexError::Corrupt("cancel_target"))?;
+            let target = read_intent(connection, &tenant, target_id)?
+                .ok_or(LineageIndexError::Corrupt("cancel_target"))?;
+            if target.intent_kind == "cancel"
+                || target.workspace != fingerprint.workspace
+                || target.task_id != fingerprint.task_id
+            {
+                return Err(LineageIndexError::Corrupt("cancel_target"));
+            }
+            if fingerprint.outcome_kind == "cancelled" {
+                let expected = fingerprint
+                    .expected_revision
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or(LineageIndexError::Corrupt("cancel_revision"))?;
+                if target.revision != expected
+                    || target.outcome_kind != "conflict"
+                    || target.outcome_conflict
+                        != Some(WorkspaceIntentConflict::CreationCancelled.as_str())
+                {
+                    return Err(LineageIndexError::Corrupt("cancel_target"));
+                }
+            } else if matches!(fingerprint.outcome_kind, "accepted" | "unknown")
+                && (target.revision != fingerprint.expected_revision.unwrap_or_default()
+                    || !matches!(target.outcome_kind, "accepted" | "unknown"))
+            {
+                return Err(LineageIndexError::Corrupt("cancel_target"));
+            }
+        }
         let stored = fingerprint.clone().into_stored()?;
         if intent_digest(&stored.intent) != fingerprint.request_digest {
             return Err(LineageIndexError::Corrupt("intent_digest"));
         }
     }
     Ok(())
+}
+
+/// Add tenant-composite cancellable intent fields to the exact v3 schema while
+/// preserving every tenant, digest, outcome, and reconciliation state.
+fn migrate_v3(connection: &mut Connection) -> Indexed<()> {
+    with_foreign_keys_disabled(connection, |connection| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_schema(&transaction, SCHEMA_V3)?;
+        transaction.execute_batch(
+            "ALTER TABLE lineage_workspace_intents RENAME TO lineage_workspace_intents_v3;",
+        )?;
+        let start = SCHEMA_V4
+            .find("CREATE TABLE lineage_workspace_intents")
+            .ok_or(LineageIndexError::Corrupt("schema_shape"))?;
+        transaction.execute_batch(&SCHEMA_V4[start..])?;
+        transaction.execute_batch(
+            r#"
+INSERT INTO lineage_workspace_intents (
+ tenant,intent_id,request_digest,intent_kind,task_kind,task_id,workspace_id,external_provider,
+ external_authority_id,external_scope,external_key,base_selector,branch_selector,expected_revision,
+ target_intent_id,revision,outcome_kind,outcome_conflict,outcome_workspace_id,reconciliation
+)
+SELECT tenant,intent_id,request_digest,intent_kind,task_kind,task_id,workspace_id,external_provider,
+ external_authority_id,external_scope,external_key,base_selector,branch_selector,expected_revision,
+ NULL,1,outcome_kind,outcome_conflict,outcome_workspace_id,reconciliation
+FROM lineage_workspace_intents_v3;
+DROP TABLE lineage_workspace_intents_v3;
+"#,
+        )?;
+        validate_durable_graphs(&transaction)?;
+        validate_current_schema(&transaction)?;
+        transaction.pragma_update(None, "user_version", LINEAGE_INDEX_SCHEMA_VERSION)?;
+        transaction.commit()?;
+        Ok(())
+    })
 }
 
 /// Quarantine the short-lived unscoped v2 rows under one explicit tenant while
@@ -1916,7 +2170,7 @@ DROP INDEX lineage_external_by_workspace;
 DROP INDEX lineage_orchestration_by_workspace;
 "#,
         )?;
-        transaction.execute_batch(SCHEMA_V3)?;
+        transaction.execute_batch(SCHEMA_V4)?;
         transaction.execute_batch(
             r#"
 INSERT INTO lineage_external_work (
@@ -1944,11 +2198,11 @@ FROM lineage_orchestration_v2;
 INSERT INTO lineage_workspace_intents (
  tenant,intent_id,request_digest,intent_kind,task_kind,task_id,workspace_id,external_provider,
  external_authority_id,external_scope,external_key,base_selector,branch_selector,expected_revision,
- outcome_kind,outcome_conflict,outcome_workspace_id,reconciliation
+ target_intent_id,revision,outcome_kind,outcome_conflict,outcome_workspace_id,reconciliation
 )
 SELECT 'legacy-unqualified',intent_id,request_digest,intent_kind,task_kind,task_id,workspace_id,
  external_provider,external_authority_id,external_scope,external_key,base_selector,branch_selector,
- expected_revision,outcome_kind,outcome_conflict,outcome_workspace_id,reconciliation
+ expected_revision,NULL,1,outcome_kind,outcome_conflict,outcome_workspace_id,reconciliation
 FROM lineage_workspace_intents_v2;
 "#,
         )?;
@@ -1978,7 +2232,7 @@ DROP INDEX lineage_external_by_workspace;
 DROP INDEX lineage_orchestration_by_workspace;
 "#,
         )?;
-        transaction.execute_batch(SCHEMA_V3)?;
+        transaction.execute_batch(SCHEMA_V4)?;
         transaction.execute_batch(
         r#"
 INSERT INTO lineage_external_work
@@ -1999,7 +2253,7 @@ FROM lineage_orchestration_v1;
 INSERT INTO lineage_workspace_intents
 SELECT 'legacy-unqualified',intent_id,zeroblob(32),intent_kind,task_kind,task_id,workspace_id,external_provider,
  CASE WHEN external_provider IS NULL THEN NULL ELSE 'legacy-unqualified-'||external_provider END,
- external_scope,external_key,base_selector,branch_selector,expected_revision,outcome_kind,
+ external_scope,external_key,base_selector,branch_selector,expected_revision,NULL,1,outcome_kind,
  outcome_conflict,outcome_workspace_id,
  CASE WHEN outcome_kind IN ('accepted','unknown') THEN 'poll_receipt' ELSE 'final' END
 FROM lineage_workspace_intents_v1;

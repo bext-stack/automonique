@@ -10,7 +10,8 @@ use automonique_protocol::codec::{
     MAX_FRAME_BYTES, MAX_MESSAGE_KIND_BYTES, MAX_NESTING_DEPTH, MAX_PROTOCOL_NAME_BYTES,
     MajorVersion, MessageKind, ProtocolName, ReadOnly, ReadOnlyEnum, RequestId,
     SecuritySensitiveEnum, SpoolReference, SupportedProtocol, VersionRange, decode_frame,
-    decode_read_only_enum, decode_security_enum, encode_frame,
+    decode_frame_with_limit, decode_read_only_enum, decode_security_enum, encode_frame,
+    encode_frame_with_limit,
 };
 use automonique_protocol::primitives::ValueError;
 
@@ -55,6 +56,20 @@ mod frame_boundaries {
         let payload = vec![0_u8; MAX_FRAME_BYTES + 1];
         let error = encode_frame(&payload, &mut Vec::new()).expect_err("over-limit is refused");
         assert_eq!(error.category(), "frame_too_large");
+    }
+
+    #[test]
+    fn an_explicit_lane_limit_does_not_widen_the_v1_default() {
+        let lane_limit = MAX_FRAME_BYTES + 512;
+        let payload = vec![0x5a; lane_limit];
+        assert!(encode_frame(&payload, &mut Vec::new()).is_err());
+        let mut encoded = Vec::new();
+        encode_frame_with_limit(&payload, &mut encoded, lane_limit).unwrap();
+        assert!(decode_frame(&encoded).is_err());
+        assert!(matches!(
+            decode_frame_with_limit(&encoded, lane_limit).unwrap(),
+            FrameDecode::Frame { payload: decoded, .. } if decoded == payload
+        ));
     }
 
     #[test]
