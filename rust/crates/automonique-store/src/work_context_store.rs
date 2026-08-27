@@ -4017,6 +4017,8 @@ fn consume_approval(
 }
 fn external_effect(intent: &WorkContextMutationIntent) -> Option<&'static str> {
     match intent {
+        WorkContextMutationIntent::CreateHostSetup(_) => Some("create_host_setup"),
+        WorkContextMutationIntent::CreateCheckout(_) => Some("create_checkout"),
         WorkContextMutationIntent::CreateAttemptWorkspace(_) => Some("create_attempt_workspace"),
         WorkContextMutationIntent::ResumeAttemptWorkspace(_) => Some("resume_attempt_workspace"),
         WorkContextMutationIntent::ResumeSession(_) => Some("resume_session"),
@@ -4025,7 +4027,9 @@ fn external_effect(intent: &WorkContextMutationIntent) -> Option<&'static str> {
 }
 fn effect_reservation_target(preview: &MutationPreview) -> Stored<ExpectedWorkContext> {
     match preview.proposal().intent() {
-        WorkContextMutationIntent::CreateAttemptWorkspace(_) => Ok(ExpectedWorkContext::new(
+        WorkContextMutationIntent::CreateHostSetup(_)
+        | WorkContextMutationIntent::CreateCheckout(_)
+        | WorkContextMutationIntent::CreateAttemptWorkspace(_) => Ok(ExpectedWorkContext::new(
             preview.resulting().identity().clone(),
             preview.resulting().revision(),
         )),
