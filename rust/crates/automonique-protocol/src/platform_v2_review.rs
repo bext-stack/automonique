@@ -15,6 +15,7 @@ use crate::platform_v2::{WorkContextIdentity, WorkContextTargetKind};
 use crate::primitives::{BoundedString, IdDomain, OpaqueId, Revision, ValueError};
 
 pub const PLATFORM_REVIEW_SCHEMA_V1: &str = "automonique.platform/review/v1";
+pub const PLATFORM_REVIEW_SCHEMA_V2: &str = "automonique.platform/review/v2";
 pub const PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR: u16 = 2;
 pub const MAX_REVIEW_FIELD_BYTES: usize = 256;
 pub const MAX_REVIEW_PATH_BYTES: usize = 1024;
@@ -129,6 +130,7 @@ wire_enum!(ReviewAuthentication { UserSession => "user_session", ServiceIdentity
 wire_enum!(ReviewActionKind { AddComment => "add_comment", SendCommentToAgent => "send_comment_to_agent", BatchSendCommentsToAgent => "batch_send_comments_to_agent", Stage => "stage", Unstage => "unstage", Commit => "commit", ResolveConflict => "resolve_conflict", ApproveReview => "approve_review", RerunCheck => "rerun_check", OpenPullRequest => "open_pull_request", UpdatePullRequest => "update_pull_request", MergePullRequest => "merge_pull_request" });
 wire_enum!(ReviewReceiptOutcome { Accepted => "accepted", Completed => "completed", Refused => "refused", Conflict => "conflict", Unknown => "unknown" });
 wire_enum!(ReviewReconciliation { Final => "final", PollReceipt => "poll_receipt" });
+wire_enum!(ReviewSchemaVersion { V1 => "automonique.platform/review/v1", V2 => "automonique.platform/review/v2" });
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReviewAuthority {
@@ -508,7 +510,7 @@ impl ReviewComment {
 pub struct ReviewProposal {
     id: ReviewProposalId,
     kind: ReviewProposalKind,
-    authority: ReviewAuthority,
+    authority: Option<ReviewAuthority>,
     files: Vec<ReviewFileId>,
     subject: Option<ReviewField>,
 }
@@ -533,7 +535,7 @@ impl ReviewProposal {
         Ok(Self {
             id,
             kind,
-            authority,
+            authority: Some(authority),
             files,
             subject,
         })
@@ -547,8 +549,8 @@ impl ReviewProposal {
         self.kind
     }
     #[must_use]
-    pub fn authority(&self) -> &ReviewAuthority {
-        &self.authority
+    pub fn authority(&self) -> Option<&ReviewAuthority> {
+        self.authority.as_ref()
     }
     #[must_use]
     pub fn files(&self) -> &[ReviewFileId] {
@@ -557,6 +559,29 @@ impl ReviewProposal {
     #[must_use]
     pub fn subject(&self) -> Option<&ReviewField> {
         self.subject.as_ref()
+    }
+
+    pub(crate) fn legacy(
+        id: ReviewProposalId,
+        kind: ReviewProposalKind,
+        files: Vec<ReviewFileId>,
+        subject: Option<ReviewField>,
+    ) -> Result<Self, ReviewContractError> {
+        if kind == ReviewProposalKind::ResolveConflict
+            || files.is_empty()
+            || files.len() > MAX_REVIEW_PROPOSAL_FILES
+            || !strict_by(&files, OpaqueId::as_str)
+            || (kind == ReviewProposalKind::Commit) != subject.is_some()
+        {
+            return Err(ReviewContractError::ProposalInvalid);
+        }
+        Ok(Self {
+            id,
+            kind,
+            authority: None,
+            files,
+            subject,
+        })
     }
 }
 
@@ -1070,6 +1095,7 @@ fn origin_id_is(origin: &AttentionOrigin, expected: &str) -> bool {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReviewSnapshot {
+    schema: ReviewSchemaVersion,
     workspace: WorkContextIdentity,
     revision: Revision,
     files: Vec<ReviewFile>,
@@ -1096,6 +1122,35 @@ impl ReviewSnapshot {
         delivery: DeliveryProjection,
         attention_events: Vec<AttentionEvent>,
     ) -> Result<Self, ReviewContractError> {
+        Self::new_versioned(
+            ReviewSchemaVersion::V2,
+            workspace,
+            revision,
+            files,
+            comments,
+            proposals,
+            checks,
+            review,
+            pull_request,
+            delivery,
+            attention_events,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_versioned(
+        schema: ReviewSchemaVersion,
+        workspace: WorkContextIdentity,
+        revision: Revision,
+        files: Vec<ReviewFile>,
+        comments: Vec<ReviewComment>,
+        proposals: Vec<ReviewProposal>,
+        checks: Vec<CheckProjection>,
+        review: ReviewStatusProjection,
+        pull_request: PullRequestProjection,
+        delivery: DeliveryProjection,
+        attention_events: Vec<AttentionEvent>,
+    ) -> Result<Self, ReviewContractError> {
         validate_workspace(&workspace)?;
         if files.len() > MAX_REVIEW_FILES
             || files.iter().map(|file| file.hunks().len()).sum::<usize>() > MAX_REVIEW_HUNKS
@@ -1110,6 +1165,19 @@ impl ReviewSnapshot {
             || !strict_by(&attention_events, |v| v.id().as_str())
         {
             return Err(ReviewContractError::CollectionInvalid);
+        }
+        if (schema == ReviewSchemaVersion::V1
+            && (attention_events.is_empty()
+                || proposals.iter().any(|proposal| {
+                    proposal.authority().is_some()
+                        || proposal.kind() == ReviewProposalKind::ResolveConflict
+                })))
+            || (schema == ReviewSchemaVersion::V2
+                && proposals
+                    .iter()
+                    .any(|proposal| proposal.authority().is_none()))
+        {
+            return Err(ReviewContractError::ProposalInvalid);
         }
         for comment in &comments {
             validate_anchor_in_files(&files, comment.anchor())?;
@@ -1166,6 +1234,7 @@ impl ReviewSnapshot {
         }
         let attention = AttentionProjection::derive(&attention_events, revision)?;
         Ok(Self {
+            schema,
             workspace,
             revision,
             files,
@@ -1178,6 +1247,10 @@ impl ReviewSnapshot {
             attention_events,
             attention,
         })
+    }
+    #[must_use]
+    pub const fn schema(&self) -> ReviewSchemaVersion {
+        self.schema
     }
     #[must_use]
     pub fn workspace(&self) -> &WorkContextIdentity {
@@ -1303,7 +1376,11 @@ impl ReviewSnapshot {
             }
             ReviewAction::Stage { proposal_id } => {
                 let proposal = proposal(proposal_id, ReviewProposalKind::Stage)?;
-                require_authority(proposal.authority())?;
+                require_authority(
+                    proposal
+                        .authority()
+                        .ok_or(ReviewContractError::ActionInvalid)?,
+                )?;
                 if proposal.files().iter().any(|id| {
                     self.files()
                         .iter()
@@ -1315,11 +1392,19 @@ impl ReviewSnapshot {
             }
             ReviewAction::Unstage { proposal_id } => {
                 let proposal = proposal(proposal_id, ReviewProposalKind::Unstage)?;
-                require_authority(proposal.authority())
+                require_authority(
+                    proposal
+                        .authority()
+                        .ok_or(ReviewContractError::ActionInvalid)?,
+                )
             }
             ReviewAction::Commit { proposal_id } => {
                 let proposal = proposal(proposal_id, ReviewProposalKind::Commit)?;
-                require_authority(proposal.authority())?;
+                require_authority(
+                    proposal
+                        .authority()
+                        .ok_or(ReviewContractError::ActionInvalid)?,
+                )?;
                 if proposal.files().iter().any(|id| {
                     self.files()
                         .iter()
@@ -1335,7 +1420,11 @@ impl ReviewSnapshot {
                 ..
             } => {
                 let proposal = proposal(proposal_id, ReviewProposalKind::ResolveConflict)?;
-                require_authority(proposal.authority())?;
+                require_authority(
+                    proposal
+                        .authority()
+                        .ok_or(ReviewContractError::ActionInvalid)?,
+                )?;
                 if !proposal.files().contains(file_id)
                     || !self.files().iter().any(|file| {
                         file.id() == file_id && file.conflict() == ConflictState::Unresolved

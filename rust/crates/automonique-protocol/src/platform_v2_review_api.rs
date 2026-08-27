@@ -371,9 +371,11 @@ fn comment(value: &JsonValue) -> Result<ReviewComment, ReviewApiError> {
         boolean(value, "unread")?,
     ))
 }
-fn proposal_json(value: &ReviewProposal) -> JsonValue {
-    object(vec![
-        ("authority", authority_json(value.authority())),
+fn proposal_json(
+    value: &ReviewProposal,
+    schema: ReviewSchemaVersion,
+) -> Result<JsonValue, ReviewApiError> {
+    let mut fields = vec![
         (
             "files",
             array(value.files().iter().map(|id| text(id.as_str()))),
@@ -384,30 +386,54 @@ fn proposal_json(value: &ReviewProposal) -> JsonValue {
             "subject",
             nullable_text(value.subject().map(ReviewField::as_str)),
         ),
-    ])
+    ];
+    match (schema, value.authority()) {
+        (ReviewSchemaVersion::V1, None) => {}
+        (ReviewSchemaVersion::V2, Some(authority)) => {
+            fields.push(("authority", authority_json(authority)));
+        }
+        _ => return Err(ReviewApiError::InvalidBody),
+    }
+    Ok(object(fields))
 }
-fn proposal(value: &JsonValue) -> Result<ReviewProposal, ReviewApiError> {
-    fields(value, &["authority", "files", "id", "kind", "subject"])?;
-    Ok(ReviewProposal::new(
-        ReviewProposalId::new(string(value, "id")?)?,
-        ReviewProposalKind::parse(string(value, "kind")?)?,
-        authority(get(value, "authority")?)?,
-        items(value, "files", MAX_REVIEW_PROPOSAL_FILES)?
-            .iter()
-            .map(|item| {
-                item.as_str()
-                    .ok_or(ReviewApiError::InvalidBody)
-                    .and_then(|v| {
-                        ReviewFileId::new(v)
-                            .map_err(ReviewContractError::from)
-                            .map_err(ReviewApiError::from)
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-        maybe_string(value, "subject")?
-            .map(ReviewField::new)
-            .transpose()?,
-    )?)
+fn proposal(
+    value: &JsonValue,
+    schema: ReviewSchemaVersion,
+) -> Result<ReviewProposal, ReviewApiError> {
+    fields(
+        value,
+        match schema {
+            ReviewSchemaVersion::V1 => &["files", "id", "kind", "subject"],
+            ReviewSchemaVersion::V2 => &["authority", "files", "id", "kind", "subject"],
+        },
+    )?;
+    let id = ReviewProposalId::new(string(value, "id")?)?;
+    let kind = ReviewProposalKind::parse(string(value, "kind")?)?;
+    let files = items(value, "files", MAX_REVIEW_PROPOSAL_FILES)?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .ok_or(ReviewApiError::InvalidBody)
+                .and_then(|v| {
+                    ReviewFileId::new(v)
+                        .map_err(ReviewContractError::from)
+                        .map_err(ReviewApiError::from)
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let subject = maybe_string(value, "subject")?
+        .map(ReviewField::new)
+        .transpose()?;
+    Ok(match schema {
+        ReviewSchemaVersion::V1 => ReviewProposal::legacy(id, kind, files, subject)?,
+        ReviewSchemaVersion::V2 => ReviewProposal::new(
+            id,
+            kind,
+            authority(get(value, "authority")?)?,
+            files,
+            subject,
+        )?,
+    })
 }
 fn check_json(value: &CheckProjection) -> Result<JsonValue, ReviewApiError> {
     Ok(object(vec![
@@ -628,12 +654,18 @@ pub fn encode_review_snapshot(value: &ReviewSnapshot) -> Result<Vec<u8>, ReviewA
             ),
             (
                 "proposals",
-                array(value.proposals().iter().map(proposal_json)),
+                array(
+                    value
+                        .proposals()
+                        .iter()
+                        .map(|proposal| proposal_json(proposal, value.schema()))
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
             ),
             ("pull_request", pull_request_json(value.pull_request())?),
             ("review", review_json(value.review())?),
             ("revision", integer(value.revision().get())?),
-            ("schema", text(PLATFORM_REVIEW_SCHEMA_V1)),
+            ("schema", text(value.schema().as_str())),
             ("workspace", workspace_json(value.workspace())),
         ]),
         MAX_REVIEW_SNAPSHOT_CANONICAL_BYTES,
@@ -659,14 +691,13 @@ pub fn decode_review_snapshot(payload: &[u8]) -> Result<ReviewSnapshot, ReviewAp
             "workspace",
         ],
     )?;
-    if string(&value, "schema")? != PLATFORM_REVIEW_SCHEMA_V1
-        || unsigned(&value, "platform_version")?
-            != u64::from(PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR)
-    {
+    let schema = ReviewSchemaVersion::parse(string(&value, "schema")?)?;
+    if unsigned(&value, "platform_version")? != u64::from(PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR) {
         return Err(ReviewApiError::InvalidBody);
     }
     let carried_attention = attention(get(&value, "attention")?)?;
-    let snapshot = ReviewSnapshot::new(
+    let snapshot = ReviewSnapshot::new_versioned(
+        schema,
         workspace(get(&value, "workspace")?)?,
         revision(unsigned(&value, "revision")?)?,
         items(&value, "files", MAX_REVIEW_FILES)?
@@ -679,7 +710,7 @@ pub fn decode_review_snapshot(payload: &[u8]) -> Result<ReviewSnapshot, ReviewAp
             .collect::<Result<Vec<_>, _>>()?,
         items(&value, "proposals", MAX_REVIEW_PROPOSALS)?
             .iter()
-            .map(proposal)
+            .map(|value| proposal(value, schema))
             .collect::<Result<Vec<_>, _>>()?,
         items(&value, "checks", MAX_REVIEW_CHECKS)?
             .iter()

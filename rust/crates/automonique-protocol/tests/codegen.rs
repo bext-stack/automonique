@@ -128,7 +128,7 @@ mod review_context_surface {
         );
         assert_eq!(
             String::from_utf8_lossy(&output.stdout),
-            "{\"action\":\"rerun_check\",\"attention\":\"needs_you\",\"bytes\":1902,\"receipt\":\"poll_receipt\",\"refusals\":13,\"schema\":\"automonique.platform/review/v1\"}\n"
+            "{\"action\":\"rerun_check\",\"attention\":\"needs_you\",\"bytes\":1902,\"receipt\":\"poll_receipt\",\"refusals\":14,\"schema\":\"automonique.platform/review/v2\"}\n"
         );
     }
 }

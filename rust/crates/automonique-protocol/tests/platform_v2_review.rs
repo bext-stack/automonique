@@ -153,7 +153,7 @@ fn snapshot_is_exact_bounded_and_fixture_stable() {
         std::fs::write(
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/fixtures/platform-v2-review-v1.json"
+                "/fixtures/platform-v2-review-v2.json"
             ),
             &encoded,
         )
@@ -161,7 +161,7 @@ fn snapshot_is_exact_bounded_and_fixture_stable() {
     }
     assert_eq!(
         encoded.as_slice(),
-        include_bytes!("../fixtures/platform-v2-review-v1.json")
+        include_bytes!("../fixtures/platform-v2-review-v2.json")
     );
     assert!(encoded.len() < MAX_REVIEW_SNAPSHOT_CANONICAL_BYTES);
 }
@@ -889,4 +889,58 @@ fn mixed_version_and_noncanonical_documents_are_refused() {
         decode_review_snapshot(&spaced),
         Err(ReviewApiError::Codec(_))
     ));
+}
+
+#[test]
+fn legacy_v1_snapshot_is_exact_and_git_proposals_are_non_actionable() {
+    let fixture = include_bytes!("../fixtures/platform-v2-review-v1.json");
+    let source = if std::env::var_os("AUTOMONIQUE_PROTOCOL_REGENERATE").is_some() {
+        fixture.strip_suffix(b"\n").unwrap_or(fixture)
+    } else {
+        fixture
+    };
+    let legacy = decode_review_snapshot(source).unwrap();
+    assert_eq!(legacy.schema(), ReviewSchemaVersion::V1);
+    assert!(
+        legacy
+            .proposals()
+            .iter()
+            .all(|proposal| proposal.authority().is_none())
+    );
+    let encoded = encode_review_snapshot(&legacy).unwrap();
+    if std::env::var_os("AUTOMONIQUE_PROTOCOL_REGENERATE").is_some() {
+        std::fs::write(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/fixtures/platform-v2-review-v1.json"
+            ),
+            &encoded,
+        )
+        .unwrap();
+    }
+    assert_eq!(encoded.as_slice(), fixture);
+
+    let commit = request(
+        ReviewAction::Commit {
+            proposal_id: id("proposal-1"),
+        },
+        ReviewAuthentication::UserSession,
+        ReviewAuthorityKind::Git,
+    )
+    .unwrap();
+    assert_eq!(
+        legacy.resolve_action(&commit),
+        Err(ReviewContractError::ActionInvalid)
+    );
+
+    let authorized =
+        decode_review_snapshot(include_bytes!("../fixtures/platform-v2-review-v2.json")).unwrap();
+    assert_eq!(authorized.schema(), ReviewSchemaVersion::V2);
+    assert!(
+        authorized
+            .proposals()
+            .iter()
+            .all(|proposal| proposal.authority().is_some())
+    );
+    assert_eq!(authorized.resolve_action(&commit), Ok(()));
 }

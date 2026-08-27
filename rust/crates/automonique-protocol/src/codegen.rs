@@ -8926,9 +8926,16 @@ fn review_context_module() -> GeneratedModule {
         constants: vec![
             Constant {
                 name: "PLATFORM_REVIEW_SCHEMA_V1".to_owned(),
-                doc: "Stable Platform v2 review sub-contract schema.".to_owned(),
+                doc: "Historical non-actionable Platform v2 review snapshot schema.".to_owned(),
                 value: ConstantValue::Text(
                     crate::platform_v2_review::PLATFORM_REVIEW_SCHEMA_V1.to_owned(),
+                ),
+            },
+            Constant {
+                name: "PLATFORM_REVIEW_SCHEMA_V2".to_owned(),
+                doc: "Authority-bound Platform v2 review snapshot schema.".to_owned(),
+                value: ConstantValue::Text(
+                    crate::platform_v2_review::PLATFORM_REVIEW_SCHEMA_V2.to_owned(),
                 ),
             },
             Constant {

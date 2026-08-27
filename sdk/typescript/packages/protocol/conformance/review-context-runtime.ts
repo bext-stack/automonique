@@ -17,6 +17,10 @@ import {RefusalError} from "../generated/runtime.ts";
 declare const Bun: {file(path: URL): {bytes(): Promise<Uint8Array>}};
 
 const fixture = await Bun.file(new URL(
+  "../../../../../rust/crates/automonique-protocol/fixtures/platform-v2-review-v2.json",
+  import.meta.url,
+)).bytes();
+const legacyFixture = await Bun.file(new URL(
   "../../../../../rust/crates/automonique-protocol/fixtures/platform-v2-review-v1.json",
   import.meta.url,
 )).bytes();
@@ -29,12 +33,20 @@ const receiptFixture = await Bun.file(new URL(
   import.meta.url,
 )).bytes();
 const snapshot = decodeReviewSnapshot(fixture);
+const legacySnapshot = decodeReviewSnapshot(legacyFixture);
 const roundTrip = encodeReviewSnapshot(snapshot);
 if (roundTrip.length !== fixture.length || roundTrip.some((byte, index) => byte !== fixture[index])) {
   throw new Error("TypeScript review snapshot did not preserve Rust canonical bytes");
 }
+const legacyRoundTrip = encodeReviewSnapshot(legacySnapshot);
+if (legacySnapshot.schema !== "automonique.platform/review/v1" || "authority" in legacySnapshot.proposals[0]! || legacyRoundTrip.length !== legacyFixture.length || legacyRoundTrip.some((byte, index) => byte !== legacyFixture[index])) {
+  throw new Error("TypeScript changed the historical non-actionable review/v1 snapshot");
+}
 if (snapshot.attention.state !== "needs_you" || snapshot.attention.unread !== 1n || snapshot.comments[0]?.agent_state !== "sent") {
   throw new Error("TypeScript review snapshot changed authoritative meaning");
+}
+if (snapshot.schema !== "automonique.platform/review/v2") {
+  throw new Error("authority-bearing fixture did not decode as review/v2");
 }
 
 const request: ReviewActionRequest = {
@@ -96,8 +108,8 @@ const duplicateAttentionOriginCategory = category(() => encodeReviewSnapshot({..
 const zeroCompletedRevisionCategory = category(() => encodeReviewActionReceipt({...receipt, outcome: "completed", reconciliation: "final", revision: 0n}));
 const zeroConflictRevisionCategory = category(() => encodeReviewActionReceipt({...receipt, current_revision: 0n, outcome: "conflict", reconciliation: "final"}));
 const text = new TextDecoder().decode(fixture);
-const v1 = new TextEncoder().encode(text.replace("\"platform_version\":2", "\"platform_version\":1"));
-const mixedCategory = category(() => decodeReviewSnapshot(v1));
+const mixed = new TextEncoder().encode(text.replace("\"platform_version\":2", "\"platform_version\":1"));
+const mixedCategory = category(() => decodeReviewSnapshot(mixed));
 const idleSnapshot = decodeReviewSnapshot(encodeReviewSnapshot({
   ...snapshot,
   attention: {reason: null, source_revision: null, state: "idle", unread: 0n},
@@ -124,6 +136,7 @@ gitRequests.forEach((gitRequest, index) => {
     throw new Error("typed Git action codec drifted");
   }
 });
+const legacyActionCategory = category(() => validateReviewActionAgainstSnapshot(gitRequests[0]!, legacySnapshot));
 
 const batchTarget = {comment_id: "comment-1", expected_comment_revision: 2n} as const;
 const batchRequest: ReviewActionRequest = {
@@ -152,7 +165,7 @@ const resolveRequest: ReviewActionRequest = {
 validateReviewActionAgainstSnapshot(resolveRequest, conflictSnapshot);
 const gitIdentityCategory = category(() => validateReviewActionAgainstSnapshot({...resolveRequest, authority: {...gitAuthority, id: "wrong-git"}}, conflictSnapshot));
 
-if (providerCategory !== "review_value_invalid" || authorityCategory !== "review_value_invalid" || authorityIdentityCategory !== "review_value_invalid" || attentionCategory !== "review_value_invalid" || u32Category !== "review_value_invalid" || attentionOriginCategory !== "review_value_invalid" || duplicateAttentionCategory !== "review_value_invalid" || duplicateAttentionOriginCategory !== "review_value_invalid" || zeroCompletedRevisionCategory !== "review_value_invalid" || zeroConflictRevisionCategory !== "review_value_invalid" || mixedCategory !== "review_invalid_body" || duplicateBatchCategory !== "review_value_invalid" || gitIdentityCategory !== "review_value_invalid") {
+if (providerCategory !== "review_value_invalid" || authorityCategory !== "review_value_invalid" || authorityIdentityCategory !== "review_value_invalid" || attentionCategory !== "review_value_invalid" || u32Category !== "review_value_invalid" || attentionOriginCategory !== "review_value_invalid" || duplicateAttentionCategory !== "review_value_invalid" || duplicateAttentionOriginCategory !== "review_value_invalid" || zeroCompletedRevisionCategory !== "review_value_invalid" || zeroConflictRevisionCategory !== "review_value_invalid" || mixedCategory !== "review_invalid_body" || duplicateBatchCategory !== "review_value_invalid" || gitIdentityCategory !== "review_value_invalid" || legacyActionCategory !== "review_value_invalid") {
   throw new Error("Rust/TypeScript review refusals do not share categories");
 }
 
@@ -161,6 +174,6 @@ console.log(JSON.stringify({
   attention: snapshot.attention.state,
   bytes: fixture.length,
   receipt: receiptDecoded.reconciliation,
-  refusals: 13,
+  refusals: 14,
   schema: snapshot.schema,
 }));

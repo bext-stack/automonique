@@ -20,6 +20,8 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 const SNAPSHOT: &[u8] =
+    include_bytes!("../../automonique-protocol/fixtures/platform-v2-review-v2.json");
+const LEGACY_SNAPSHOT: &[u8] =
     include_bytes!("../../automonique-protocol/fixtures/platform-v2-review-v1.json");
 const ACTION: &[u8] =
     include_bytes!("../../automonique-protocol/fixtures/platform-v2-review-action-v1.json");
@@ -49,6 +51,17 @@ fn revision(value: u64) -> Revision {
 }
 fn snapshot() -> automonique_protocol::platform_v2_review::ReviewSnapshot {
     decode_review_snapshot(SNAPSHOT).expect("shared snapshot fixture")
+}
+fn legacy_snapshot() -> ReviewSnapshot {
+    decode_review_snapshot(LEGACY_SNAPSHOT).expect("historical review/v1 fixture")
+}
+fn downgrade_review_store_to_v1(path: &Path) {
+    let connection = Connection::open(path).expect("open v2 store for downgrade");
+    connection
+        .execute_batch(
+            "ALTER TABLE review_snapshots DROP COLUMN protocol_schema; PRAGMA user_version=1;",
+        )
+        .expect("construct historical v1 store");
 }
 fn action_snapshot(conflicted: bool) -> ReviewSnapshot {
     let base = snapshot();
@@ -202,6 +215,182 @@ fn restart_preserves_sanitized_snapshot_comments_and_sent_state() {
 }
 
 #[test]
+fn populated_review_v1_store_migrates_exactly_and_remains_non_actionable() {
+    let private = PrivateStore::new();
+    let legacy = legacy_snapshot();
+    let workspace = legacy.workspace().clone();
+    {
+        let mut store = ReviewStore::open(private.path()).expect("open v2");
+        store
+            .put_snapshot(&legacy, 10)
+            .expect("persist legacy snapshot");
+    }
+    downgrade_review_store_to_v1(private.path());
+
+    {
+        let mut migrated = ReviewStore::open(private.path()).expect("migrate v1 to v2");
+        let loaded = migrated
+            .snapshot(&workspace)
+            .expect("read migrated snapshot")
+            .expect("snapshot exists");
+        assert_eq!(loaded, legacy);
+        assert_eq!(loaded.schema(), ReviewSchemaVersion::V1);
+        assert!(
+            loaded
+                .proposals()
+                .iter()
+                .all(|proposal| proposal.authority().is_none())
+        );
+
+        let actor = ReviewActorId::new("legacy-actor").expect("actor");
+        let git = ReviewAuthority::new(
+            ReviewAuthorityKind::Git,
+            ReviewAuthorityId::new("legacy-git").expect("authority"),
+        );
+        migrated
+            .grant_authority(
+                &workspace,
+                &actor,
+                ReviewAuthentication::UserSession,
+                &git,
+                11,
+            )
+            .expect("grant is independent of proposal custody");
+        let request = ReviewActionRequest::new(
+            workspace.clone(),
+            loaded.revision(),
+            actor,
+            ReviewAuthentication::UserSession,
+            git,
+            IdempotencyKey::new("legacy-action").expect("key"),
+            ReviewAction::Commit {
+                proposal_id: ReviewProposalId::new("proposal-1").expect("proposal"),
+            },
+        )
+        .expect("typed request");
+        assert!(matches!(
+            migrated.prepare_action(&request, ApprovalPolicy::NotRequired, 12),
+            Err(ReviewStoreError::Protocol(_))
+        ));
+    }
+
+    let reopened = ReviewStore::open(private.path()).expect("reopen migrated store");
+    assert_eq!(
+        reopened
+            .snapshot(&workspace)
+            .expect("read")
+            .expect("snapshot"),
+        legacy
+    );
+    let raw = Connection::open(private.path()).expect("raw reopen");
+    assert_eq!(
+        raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .expect("version"),
+        2
+    );
+    let schema: String = raw
+        .query_row("SELECT protocol_schema FROM review_snapshots", [], |row| {
+            row.get(0)
+        })
+        .expect("snapshot schema");
+    assert_eq!(schema, PLATFORM_REVIEW_SCHEMA_V1);
+}
+
+#[test]
+fn mislabeled_authority_bearing_v1_document_is_transactionally_upgraded_to_v2() {
+    let private = PrivateStore::new();
+    let expected = snapshot();
+    let workspace = expected.workspace().clone();
+    {
+        let mut store = ReviewStore::open(private.path()).expect("open v2");
+        store
+            .put_snapshot(&expected, 10)
+            .expect("persist v2 snapshot");
+    }
+    downgrade_review_store_to_v1(private.path());
+    let raw = Connection::open(private.path()).expect("raw legacy open");
+    let current: Vec<u8> = raw
+        .query_row("SELECT document FROM review_snapshots", [], |row| {
+            row.get(0)
+        })
+        .expect("document");
+    let mislabeled = String::from_utf8(current)
+        .expect("canonical utf8")
+        .replace(
+            "automonique.platform/review/v2",
+            "automonique.platform/review/v1",
+        )
+        .into_bytes();
+    let mislabeled_digest = Sha256::digest(&mislabeled);
+    raw.execute(
+        "UPDATE review_snapshots SET document=?1,document_digest=?2",
+        params![mislabeled, mislabeled_digest.as_slice()],
+    )
+    .expect("recreate briefly shipped mislabeled document");
+    drop(raw);
+
+    let migrated = ReviewStore::open(private.path()).expect("upgrade mislabeled snapshot");
+    assert_eq!(
+        migrated
+            .snapshot(&workspace)
+            .expect("read")
+            .expect("snapshot"),
+        expected
+    );
+    drop(migrated);
+    let raw = Connection::open(private.path()).expect("raw reopen");
+    assert_eq!(
+        raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .expect("version"),
+        2
+    );
+    let protocol_schema: String = raw
+        .query_row("SELECT protocol_schema FROM review_snapshots", [], |row| {
+            row.get(0)
+        })
+        .expect("schema projection");
+    assert_eq!(protocol_schema, PLATFORM_REVIEW_SCHEMA_V2);
+}
+
+#[test]
+fn corrupt_v1_migration_rolls_back_schema_and_data() {
+    let private = PrivateStore::new();
+    {
+        let mut store = ReviewStore::open(private.path()).expect("open v2");
+        store
+            .put_snapshot(&legacy_snapshot(), 10)
+            .expect("persist legacy snapshot");
+    }
+    downgrade_review_store_to_v1(private.path());
+    let raw = Connection::open(private.path()).expect("raw open");
+    raw.execute(
+        "UPDATE review_snapshots SET document_digest=zeroblob(32)",
+        [],
+    )
+    .expect("corrupt digest");
+    drop(raw);
+
+    assert!(matches!(
+        ReviewStore::open(private.path()),
+        Err(ReviewStoreError::Corrupt("snapshot_digest"))
+    ));
+    let raw = Connection::open(private.path()).expect("raw reopen");
+    assert_eq!(
+        raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .expect("version rolled back"),
+        1
+    );
+    let has_v2_column: bool = raw
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('review_snapshots') WHERE name='protocol_schema')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("schema inspection");
+    assert!(!has_v2_column);
+}
+
+#[test]
 fn exact_request_replays_and_different_body_under_same_key_conflicts() {
     let private = PrivateStore::new();
     let mut store = ReviewStore::open(private.path()).expect("open");
@@ -244,7 +433,10 @@ fn typed_git_and_batch_actions_keep_one_write_custody() {
     let snapshot = action_snapshot(false);
     store.put_snapshot(&snapshot, 10).expect("snapshot");
     let actor = ReviewActorId::new("actor-new-actions").expect("actor");
-    let git = snapshot.proposals()[0].authority().clone();
+    let git = snapshot.proposals()[0]
+        .authority()
+        .expect("v2 proposal authority")
+        .clone();
     let review = snapshot.review().authority().clone();
     for authority in [&git, &review] {
         store
@@ -341,7 +533,10 @@ fn typed_git_and_batch_actions_keep_one_write_custody() {
     conflict_store
         .put_snapshot(&conflict_snapshot, 10)
         .expect("snapshot");
-    let conflict_git = conflict_snapshot.proposals()[0].authority().clone();
+    let conflict_git = conflict_snapshot.proposals()[0]
+        .authority()
+        .expect("v2 proposal authority")
+        .clone();
     conflict_store
         .grant_authority(
             conflict_snapshot.workspace(),
