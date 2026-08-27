@@ -127,7 +127,9 @@ terminal replays are returned only after current actor authorization is checked.
 Every completed receipt read and terminal replay revalidates that durable
 basis: the exact historical authoritative snapshot must still exist or the
 canonical completion-evidence row must remain intact. A missing or corrupted
-basis fails closed after restart.
+basis fails closed after restart. Completion evidence integrity-binds its
+trusted observation time alongside the verifier, authority, result revision,
+request digest, and bounded sanitized document.
 Receipt polling likewise requires the current authenticated actor, exact
 authority scope, trusted time, and an active grant; an opaque receipt or
 idempotency key is never authority. Receipt canonical bytes, digest, outcome,

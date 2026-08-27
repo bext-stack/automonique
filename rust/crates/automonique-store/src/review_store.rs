@@ -791,8 +791,13 @@ impl ReviewStore {
             approval.authority(),
             decided_at_ms,
         )?;
-        let action = read_action_by_preview(&transaction, approval.preview_id())?
-            .ok_or(ReviewStoreError::NotFound)?;
+        let action = read_action_by_preview_in_scope(
+            &transaction,
+            approval.preview_id(),
+            approval.workspace(),
+            approval.authority(),
+        )?
+        .ok_or(ReviewStoreError::NotFound)?;
         if action.request_digest != approval.request_digest()
             || action.request.expected_revision() != approval.expected_revision()
             || action.request.workspace() != approval.workspace()
@@ -1005,9 +1010,14 @@ impl ReviewStore {
                 .ok_or(ReviewStoreError::Conflict("result_revision"))?;
             let evidence =
                 has_completion_evidence(&transaction, preview_id, request_digest, expected_result)?;
-            if receipt.revision() != Some(expected_result)
-                || (current != expected_result && !evidence)
-            {
+            let exact_snapshot = read_snapshot_revision(
+                &transaction,
+                workspace_kind,
+                workspace_id,
+                expected_result,
+            )?
+            .is_some();
+            if receipt.revision() != Some(expected_result) || (!exact_snapshot && !evidence) {
                 return Err(ReviewStoreError::Conflict("result_revision"));
             }
         }
@@ -1063,7 +1073,8 @@ impl ReviewStore {
             observed_at_ms,
         )?;
         let action =
-            read_action_by_preview(&transaction, preview_id)?.ok_or(ReviewStoreError::NotFound)?;
+            read_action_by_preview_in_scope(&transaction, preview_id, workspace, authority)?
+                .ok_or(ReviewStoreError::NotFound)?;
         if action.request_digest != request_digest
             || action.request.workspace() != workspace
             || action.request.authority() != authority
@@ -1090,6 +1101,7 @@ impl ReviewStore {
             authentication,
             authority,
             sanitized_document,
+            observed_at_ms,
         )?;
         if evidence_document.len() > MAX_PROVIDER_OBSERVATION_BYTES {
             return Err(ReviewStoreError::InvalidField("completion_evidence"));
@@ -1623,6 +1635,7 @@ fn encode_completion_evidence(
     authentication: ReviewAuthentication,
     authority: &ReviewAuthority,
     sanitized_document: &[u8],
+    observed_at_ms: i64,
 ) -> Stored<Vec<u8>> {
     let document = std::str::from_utf8(sanitized_document)
         .map_err(|_| ReviewStoreError::InvalidField("completion_evidence"))?;
@@ -1642,6 +1655,10 @@ fn encode_completion_evidence(
         (
             "evidence_id".to_owned(),
             JsonValue::String(evidence_id.to_owned()),
+        ),
+        (
+            "observed_at_ms".to_owned(),
+            JsonValue::Integer(observed_at_ms),
         ),
         (
             "preview_id".to_owned(),
@@ -1687,11 +1704,12 @@ fn has_completion_evidence(
         String,
         Vec<u8>,
         Vec<u8>,
+        i64,
     );
     let raw: Option<RawEvidence> = connection.query_row(
-        "SELECT request_digest,result_revision,evidence_id,verifying_actor_id,authentication,authority_kind,authority_id,evidence_document,evidence_digest FROM review_completion_evidence WHERE preview_id=?1",
+        "SELECT request_digest,result_revision,evidence_id,verifying_actor_id,authentication,authority_kind,authority_id,evidence_document,evidence_digest,observed_at_ms FROM review_completion_evidence WHERE preview_id=?1",
         [preview_id],
-        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?)),
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?)),
     ).optional()?;
     let Some((
         raw_request_digest,
@@ -1703,6 +1721,7 @@ fn has_completion_evidence(
         authority_id,
         document,
         raw_digest,
+        observed_at_ms,
     )) = raw
     else {
         return Ok(false);
@@ -1724,6 +1743,9 @@ fn has_completion_evidence(
     let actor =
         ReviewActorId::new(actor).map_err(|_| ReviewStoreError::Corrupt("completion_evidence"))?;
     let parsed_revision = parse_revision(raw_revision)?;
+    if observed_at_ms < 0 {
+        return Err(ReviewStoreError::Corrupt("completion_evidence"));
+    }
     let decoded = std::str::from_utf8(&document)
         .map_err(|_| ReviewStoreError::Corrupt("completion_evidence"))?;
     let parsed = automonique_protocol::wire::parse_canonical(decoded.as_bytes())
@@ -1741,6 +1763,7 @@ fn has_completion_evidence(
         authentication,
         &authority,
         sanitized.as_bytes(),
+        observed_at_ms,
     )?;
     if stored_request_digest != request_digest
         || parsed_revision != result_revision
@@ -2026,6 +2049,31 @@ fn read_action_by_key(
         })
         .transpose()
 }
+
+fn read_action_by_preview_in_scope(
+    connection: &Connection,
+    preview_id: &str,
+    workspace: &WorkContextIdentity,
+    authority: &ReviewAuthority,
+) -> Stored<Option<StoredReviewAction>> {
+    let (kind, id) = workspace_parts(workspace);
+    let in_scope: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM review_action_previews WHERE preview_id=?1 AND workspace_kind=?2 AND workspace_id=?3 AND authority_kind=?4 AND authority_id=?5)",
+        params![
+            preview_id,
+            kind,
+            id,
+            authority.kind().as_str(),
+            authority.id().as_str()
+        ],
+        |row| row.get(0),
+    )?;
+    if !in_scope {
+        return Ok(None);
+    }
+    read_action_by_preview(connection, preview_id)
+}
+
 fn read_action_by_preview(
     connection: &Connection,
     preview_id: &str,

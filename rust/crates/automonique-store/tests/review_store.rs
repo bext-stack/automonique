@@ -528,6 +528,127 @@ fn approval_is_authenticated_exact_bounded_and_expiring() {
 }
 
 #[test]
+fn authorized_scope_cannot_observe_a_foreign_preview() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).expect("open");
+    let local_request = seed(&mut store);
+    let foreign_document = String::from_utf8(SNAPSHOT.to_vec())
+        .expect("fixture")
+        .replace(
+            "\"id\":\"wc_user_1\",\"kind\":\"user_workspace\"",
+            "\"id\":\"wc_user_2\",\"kind\":\"user_workspace\"",
+        );
+    let foreign_snapshot =
+        decode_review_snapshot(foreign_document.as_bytes()).expect("foreign snapshot");
+    store
+        .put_snapshot(&foreign_snapshot, 12)
+        .expect("foreign snapshot persisted");
+    let foreign_request = ReviewActionRequest::new(
+        foreign_snapshot.workspace().clone(),
+        local_request.expected_revision(),
+        local_request.actor().clone(),
+        local_request.authentication(),
+        local_request.authority().clone(),
+        IdempotencyKey::new("foreign-preview").expect("foreign key"),
+        local_request.action().clone(),
+    )
+    .expect("foreign request");
+    store
+        .grant_authority(
+            foreign_request.workspace(),
+            foreign_request.actor(),
+            foreign_request.authentication(),
+            foreign_request.authority(),
+            13,
+        )
+        .expect("foreign request authority");
+    let ReviewActionAdmission::New(foreign_action) = store
+        .prepare_action(&foreign_request, ApprovalPolicy::NotRequired, 14)
+        .expect("foreign preview")
+    else {
+        panic!("new foreign preview");
+    };
+    store
+        .start_write(
+            &foreign_action.preview_id,
+            foreign_action.request_digest,
+            15,
+        )
+        .expect("foreign write admission");
+
+    let approver = ReviewActorId::new("local-reviewer").expect("approver");
+    store
+        .grant_authority(
+            local_request.workspace(),
+            &approver,
+            ReviewAuthentication::UserSession,
+            local_request.authority(),
+            16,
+        )
+        .expect("local approval authority");
+    let foreign_approval = ReviewApprovalDocument::new(
+        &foreign_action.preview_id,
+        local_request.workspace().clone(),
+        approver.clone(),
+        ReviewAuthentication::UserSession,
+        local_request.authority().clone(),
+        foreign_action.request_digest,
+        foreign_request.expected_revision(),
+        ReviewApprovalDecision::Approved,
+        30,
+    )
+    .expect("foreign approval probe");
+    let missing_approval = ReviewApprovalDocument::new(
+        "preview-missing",
+        local_request.workspace().clone(),
+        approver,
+        ReviewAuthentication::UserSession,
+        local_request.authority().clone(),
+        foreign_action.request_digest,
+        foreign_request.expected_revision(),
+        ReviewApprovalDecision::Approved,
+        30,
+    )
+    .expect("missing approval probe");
+    assert!(matches!(
+        store.decide_action(&foreign_approval, 17),
+        Err(ReviewStoreError::NotFound)
+    ));
+    assert!(matches!(
+        store.decide_action(&missing_approval, 17),
+        Err(ReviewStoreError::NotFound)
+    ));
+
+    let verifier = ReviewActorId::new("local-adapter").expect("verifier");
+    store
+        .grant_authority(
+            local_request.workspace(),
+            &verifier,
+            ReviewAuthentication::ServiceIdentity,
+            local_request.authority(),
+            18,
+        )
+        .expect("local evidence authority");
+    for preview_id in [&foreign_action.preview_id[..], "preview-missing"] {
+        assert!(matches!(
+            store.record_completion_evidence(
+                local_request.workspace(),
+                preview_id,
+                foreign_action.request_digest,
+                &verifier,
+                ReviewAuthentication::ServiceIdentity,
+                local_request.authority(),
+                revision(10),
+                "foreign-evidence-probe",
+                b"scope-confined evidence",
+                19,
+            ),
+            Err(ReviewStoreError::NotFound)
+        ));
+    }
+}
+
+#[test]
 fn approval_rechecks_the_current_snapshot_revision_transactionally() {
     let private = PrivateStore::new();
     let mut store = ReviewStore::open(private.path()).expect("open");
@@ -608,6 +729,54 @@ fn reconciled_revisions_match_authoritative_state() {
             .expect("current conflict")
             .current_revision(),
         Some(revision(9))
+    );
+}
+
+#[test]
+fn delayed_completion_uses_the_retained_exact_result_snapshot() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).expect("open");
+    let request = seed(&mut store);
+    let ReviewActionAdmission::New(action) = store
+        .prepare_action(&request, ApprovalPolicy::NotRequired, 20)
+        .expect("preview")
+    else {
+        panic!("new");
+    };
+    store
+        .start_write(&action.preview_id, action.request_digest, 21)
+        .expect("durable write admission");
+    let unknown = store
+        .mark_ambiguous(&action.preview_id, action.request_digest, 22)
+        .expect("ambiguous result");
+    for (next_revision, recorded_at_ms) in [(10_u64, 23_i64), (11, 24)] {
+        let document = String::from_utf8(SNAPSHOT.to_vec())
+            .expect("fixture")
+            .replace(
+                "\"revision\":9,\"schema\"",
+                &format!("\"revision\":{next_revision},\"schema\""),
+            );
+        let next = decode_review_snapshot(document.as_bytes()).expect("advanced snapshot");
+        store
+            .put_snapshot(&next, recorded_at_ms)
+            .expect("advance snapshot");
+    }
+    let completed = ReviewActionReceipt::new(
+        unknown.receipt_id().clone(),
+        unknown.idempotency_key().clone(),
+        unknown.action_id().clone(),
+        unknown.actor().clone(),
+        ReviewReceiptOutcome::Completed,
+        Some(revision(10)),
+        None,
+        ReviewReconciliation::Final,
+    )
+    .expect("completed receipt");
+    assert_eq!(
+        store
+            .reconcile_receipt(&action.preview_id, action.request_digest, &completed, 25)
+            .expect("retained result snapshot proves delayed completion"),
+        completed
     );
 }
 
@@ -1091,6 +1260,39 @@ fn write_admission_expires_before_start_but_reconciliation_survives_after_start(
             .expect("terminal retry after reopen"),
         completed
     );
+
+    let raw = Connection::open(private.path()).expect("raw evidence time corruption");
+    let final_evidence_observed_at_ms: i64 = raw
+        .query_row(
+            "SELECT observed_at_ms FROM review_completion_evidence WHERE preview_id=?1",
+            [&action.preview_id],
+            |row| row.get(0),
+        )
+        .expect("final evidence observed time");
+    raw.execute(
+        "UPDATE review_completion_evidence SET observed_at_ms=?1 WHERE preview_id=?2",
+        params![final_evidence_observed_at_ms + 1, action.preview_id],
+    )
+    .expect("corrupt finalized evidence observed time");
+    drop(raw);
+    assert!(matches!(
+        reopened.receipt(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            42,
+        ),
+        Err(ReviewStoreError::Corrupt("completion_evidence"))
+    ));
+    let raw = Connection::open(private.path()).expect("raw evidence time restore");
+    raw.execute(
+        "UPDATE review_completion_evidence SET observed_at_ms=?1 WHERE preview_id=?2",
+        params![final_evidence_observed_at_ms, action.preview_id],
+    )
+    .expect("restore finalized evidence observed time");
+    drop(raw);
 
     let raw = Connection::open(private.path()).expect("raw evidence corruption");
     let final_evidence_digest: Vec<u8> = raw
