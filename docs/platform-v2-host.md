@@ -382,17 +382,74 @@ v2 canonical limit. Local responses are length-prefixed and bounded before
 allocation by the corresponding response limit, then decoded against the
 original typed request to enforce correlation and response shape.
 
-This first bridge is deliberately single-principal. It accepts an HTTP
-Basic credential for the dashboard's one configured username; dashboard
-session cookies, mobile credentials, Manage service bearers, and other bearer
-credentials cannot enter this route. Before every local exchange, web-entry
+The bridge remains single-principal at the daemon socket. It accepts either
+the dashboard's one configured HTTP Basic credential or an `ma_` mobile access
+token with a live, separately persisted Platform v2 delegation. Dashboard
+session cookies, Manage service bearers, ungranted mobile credentials, and
+other bearer credentials cannot enter this route. An `ma_` token never falls
+back to Basic, a session cookie, or Manage authority. Before every local exchange, web-entry
 opens the private policy with the same descriptor checks as the daemon and
 requires that its server-owned integration tenant and actor exactly equal the
 sole principal mapped to its Unix uid. The HTTP authorization header is never
 forwarded to the daemon. A missing, changed, multi-principal, or mismatched
 policy produces a correlated typed refusal without opening the admin socket.
 
-The current local protocol cannot safely represent multiple HTTP principals
+Mobile Platform v2 authorization is additive to the unchanged
+`automonique.mobile-auth/v1` wire. An operator first issues or pairs a normal
+v1 mobile credential, then posts the exact credential ID, bounded Platform v2
+action set, and at most 32 canonical project IDs to
+`POST /api/mobile/platform-v2/grants` using
+`application/vnd.automonique.mobile-platform-v2-authorization.v1+json` and
+the dashboard Basic credential. This is the bootstrap source of truth:
+project roots must already exist in the daemon's server-owned principal policy.
+The request never accepts filesystem paths, repository paths, tenant IDs,
+actor IDs, expiry, revisions, or authority grants from the mobile client.
+
+The mobile client reads its exact delegation at
+`GET /api/mobile/platform-v2/authorization` with the same media type and its
+mobile bearer. The response binds the origin identity, credential and
+authorization revisions, delegation ID, principal generation, tenant, actor,
+access-token issuance/expiry, sorted project roots, and sorted per-operation
+grants. Refresh rotation advances both the credential revision and principal
+generation; regrant changes the delegation ID and generation; credential
+revocation revokes the delegation in the same transaction. Old generations
+cannot reuse cached mutation previews. Every request is action-checked and
+resolved to one admitted project before the local socket is opened. Targeted
+lineage and review reads additionally require the named workspace to belong to
+that declared project in the server policy; possession of both project roots
+does not permit a cross-project workspace coordinate. The daemon then
+independently applies its current policy fence and ownership checks.
+
+A v2 grant is issued only when the v1 credential's persisted actor exactly
+matches the web entry's configured actor; changing that configuration cannot
+rebind an older credential to the new actor. Before a mobile mutation submit is
+sent to the daemon, web entry durably binds its project and idempotency key to
+the exact credential, delegation, and principal generation. Mobile receipt
+polling accepts only that idempotency coordinate and checks the binding before
+opening the socket; receipt-ID lookup is refused because no mobile-owned
+receipt-ID binding exists before an ambiguous response. The private SQLite
+custody is capped at 128 live entries per credential, survives process restart
+and same-delegation access-token rotation, and is deleted on delegation
+regrant or credential revocation. Thus another same-project credential and a
+new delegation cannot read an older mutation receipt.
+
+The final credential, delegation, generation, and receipt-custody check runs
+inside a SQLite `IMMEDIATE` transaction that also records a request-digest-bound
+ten-second dispatch lease. The transaction commits before the daemon socket is
+opened, so ambiguous or completed mutation dispatch can never precede durable
+mobile receipt custody. Submit custody also retains the exact canonical request
+digest: the same coordinate may be retried only by the identical request, while
+legacy custody without a digest remains readable but cannot admit a new submit.
+Refresh, regrant, and both revocation paths check the same lease table in their
+own write transactions and refuse while a dispatch lease is live; they
+therefore cannot commit between authorization and dispatch. Socket read and
+write operations are capped at two seconds, the lease is released after the
+correlated response is validated, and a crashed process leaves only a bounded
+lease that expires while its receipt custody remains recoverable. Receipt
+custody is read or written in the same transaction that installs the lease,
+eliminating a separate reauthorization window.
+
+The current local protocol cannot safely represent multiple daemon principals
 behind one web-entry uid. Such a configuration stays blocked; adding more
 Basic users must first add a daemon-authenticated delegated-principal protocol
 instead of mapping them all to the process uid. Operators must restart the

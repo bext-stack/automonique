@@ -70,11 +70,12 @@ use zeroize::Zeroize;
 
 use crate::agent_auth::{AgentAuthAction, AgentAuthManager};
 use crate::mobile_auth::{
-    MOBILE_AUTH_MEDIA_TYPE, MOBILE_AUTH_SCHEMA_V1, MobileAuthorization, MobileCredentialAuthority,
-    MobileCredentialInventory, MobileCredentialInventoryRequest, MobileCredentialRevokeRequest,
+    MOBILE_AUTH_MEDIA_TYPE, MOBILE_AUTH_SCHEMA_V1, MOBILE_PLATFORM_V2_AUTH_MEDIA_TYPE,
+    MobileAuthorization, MobileCredentialAuthority, MobileCredentialInventory,
+    MobileCredentialInventoryRequest, MobileCredentialRevokeRequest,
     MobileOperatorProvisionRequest, MobilePairingExchangeRequest, MobilePairingOffer,
-    MobileRefreshRequest, MobileRevocation, authorize_platform_request, filter_command_state,
-    filter_sessions,
+    MobilePlatformV2Authorization, MobilePlatformV2GrantRequest, MobileRefreshRequest,
+    MobileRevocation, authorize_platform_request, filter_command_state, filter_sessions,
 };
 use crate::platform_v2_bridge::{PlatformV2Bridge, PlatformV2Lane};
 
@@ -150,6 +151,8 @@ pub enum Route {
     MobileRefresh,
     MobileRevoke,
     MobileAuthorization,
+    MobilePlatformV2Grant,
+    MobilePlatformV2Authorization,
     MobileUnauthorized,
     MobileAccessUnauthorized,
     ApiProcesses,
@@ -2042,9 +2045,10 @@ impl WebIntegration {
             mcp_server,
         };
         let shared_assistant = AskHost::open_paths(state_dir, runtime_dir).ok();
-        let mobile_auth = MobileCredentialAuthority::open(
+        let mobile_auth = MobileCredentialAuthority::open_scoped(
             state_dir.join("mobile-credentials.sqlite3"),
             config.hosts.canonical(),
+            &config.tenant,
             &config.actor,
         )
         .map_err(|_| "dashboard mobile credential authority unavailable")?;
@@ -2421,8 +2425,43 @@ impl WebIntegration {
         &self,
         lane: PlatformV2Lane,
         body: &[u8],
+        mobile: Option<&MobilePlatformV2Authorization>,
     ) -> Result<Vec<u8>, &'static str> {
-        self.platform_v2.exchange(lane, body)
+        let Some(mobile) = mobile else {
+            return self.platform_v2.exchange(lane, body);
+        };
+        let mut authority = self
+            .mobile_auth
+            .lock()
+            .map_err(|_| "mobile_credential_authority_busy")?;
+        let now_ms = now_ms_i64();
+        self.platform_v2
+            .exchange_mobile(lane, body, mobile, &mut authority, now_ms)
+    }
+
+    fn mobile_platform_v2_grant(
+        &self,
+        request: MobilePlatformV2GrantRequest,
+    ) -> Result<MobilePlatformV2Authorization, &'static str> {
+        self.platform_v2
+            .verify_project_roots(&request.project_roots)?;
+        self.mobile_auth
+            .lock()
+            .map_err(|_| "mobile_credential_authority_busy")?
+            .grant_platform_v2(request, now_ms_i64())
+            .map_err(|error| error.category())
+    }
+
+    fn mobile_platform_v2_authorization(
+        &self,
+        authorization: Option<&str>,
+    ) -> Result<MobilePlatformV2Authorization, &'static str> {
+        let token = bearer_token(authorization).ok_or("mobile_credential_invalid")?;
+        self.mobile_auth
+            .lock()
+            .map_err(|_| "mobile_credential_authority_busy")?
+            .authorize_platform_v2(token, now_ms_i64())
+            .map_err(|error| error.category())
     }
 
     fn mobile_discovery(&self) -> Result<mobile_auth::MobileDiscovery, &'static str> {
@@ -5194,6 +5233,10 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request<'_>, Route> {
         return Err(Route::BadRequest);
     }
     let platform_v2_path = path.split('?').next() == Some("/api/platform/v2");
+    let mobile_platform_v2_path = matches!(
+        path.split('?').next(),
+        Some("/api/mobile/platform-v2/grants" | "/api/mobile/platform-v2/authorization")
+    );
 
     let mut host = None;
     let mut authorization = None;
@@ -5241,7 +5284,7 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request<'_>, Route> {
                     .trim(),
             );
         } else if header.name.eq_ignore_ascii_case("accept") {
-            if platform_v2_path {
+            if platform_v2_path || mobile_platform_v2_path {
                 if accept.is_some() {
                     return Err(Route::BadRequest);
                 }
@@ -5335,6 +5378,8 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 "/api/mobile/refresh" => Route::MobileRefresh,
                 "/api/mobile/revoke" => Route::MobileRevoke,
                 "/api/mobile/authorization" => Route::MobileAuthorization,
+                "/api/mobile/platform-v2/grants" => Route::MobilePlatformV2Grant,
+                "/api/mobile/platform-v2/authorization" => Route::MobilePlatformV2Authorization,
                 "/api/processes" => Route::ApiProcesses,
                 "/api/chat" => Route::ApiChat,
                 "/api/chat/action" => Route::ApiChatAction,
@@ -5361,6 +5406,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                     | Route::MobileCredentialRevoke
                     | Route::MobileRefresh
                     | Route::MobileRevoke
+                    | Route::MobilePlatformV2Grant
                     | Route::ApiChat
                     | Route::ApiChatAction
                     | Route::ApiChatNew
@@ -5816,7 +5862,9 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         | Route::MobileCredentialRevoke
         | Route::MobileRefresh
         | Route::MobileRevoke
-        | Route::MobileAuthorization => empty_response("500 Internal Server Error"),
+        | Route::MobileAuthorization
+        | Route::MobilePlatformV2Grant
+        | Route::MobilePlatformV2Authorization => empty_response("500 Internal Server Error"),
         Route::MobileUnauthorized => {
             mobile_error("401 Unauthorized", "mobile_operator_authorization_required")
         }
@@ -5875,6 +5923,7 @@ fn api_response(
     integration: &WebIntegration,
     state: &AppState,
     mobile_authorization: Option<&MobileAuthorization>,
+    mobile_platform_v2_authorization: Option<&MobilePlatformV2Authorization>,
     platform_v2_lane: Option<PlatformV2Lane>,
 ) -> Response {
     match route {
@@ -5940,7 +5989,7 @@ fn api_response(
             let Some(lane) = platform_v2_lane else {
                 return json_error("400 Bad Request", "platform_v2_media_type_invalid");
             };
-            match integration.platform_v2_remote(lane, body) {
+            match integration.platform_v2_remote(lane, body, mobile_platform_v2_authorization) {
                 Ok(body) => Response {
                     status: "200 OK",
                     content_type: Some(lane.content_type()),
@@ -6028,6 +6077,19 @@ fn api_response(
         Route::MobileAuthorization => mobile_authorization.map_or_else(
             || mobile_error("401 Unauthorized", "mobile_credential_invalid"),
             |authorization| mobile_response("200 OK", authorization),
+        ),
+        Route::MobilePlatformV2Grant => {
+            match serde_json::from_slice::<MobilePlatformV2GrantRequest>(body) {
+                Ok(request) => match integration.mobile_platform_v2_grant(request) {
+                    Ok(authorization) => mobile_platform_v2_response("200 OK", &authorization),
+                    Err(category) => mobile_platform_v2_error("400 Bad Request", category),
+                },
+                Err(_) => mobile_platform_v2_error("400 Bad Request", "mobile_request_invalid"),
+            }
+        }
+        Route::MobilePlatformV2Authorization => mobile_platform_v2_authorization.map_or_else(
+            || mobile_platform_v2_error("401 Unauthorized", "mobile_credential_invalid"),
+            |authorization| mobile_platform_v2_response("200 OK", authorization),
         ),
         Route::ApiProcesses => json_response("200 OK", &integration.processes()),
         Route::ApiChat => match serde_json::from_slice::<ChatRequest>(body) {
@@ -6118,6 +6180,25 @@ fn mobile_error(status: &'static str, category: &'static str) -> Response {
     mobile_response(status, &ErrorBody { error: category })
 }
 
+fn mobile_platform_v2_response<T: Serialize>(status: &'static str, value: &T) -> Response {
+    Response {
+        status,
+        content_type: Some(MOBILE_PLATFORM_V2_AUTH_MEDIA_TYPE),
+        cache_control: "no-store",
+        location: None,
+        retry_after: None,
+        body: serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec()),
+    }
+}
+
+fn mobile_platform_v2_error(status: &'static str, category: &'static str) -> Response {
+    #[derive(Serialize)]
+    struct ErrorBody {
+        error: &'static str,
+    }
+    mobile_platform_v2_response(status, &ErrorBody { error: category })
+}
+
 fn json_error(status: &'static str, category: &'static str) -> Response {
     #[derive(Serialize)]
     struct ErrorBody {
@@ -6195,7 +6276,9 @@ fn response_bytes(
             headers.push_str("WWW-Authenticate: Bearer realm=\"Monique Manage Chat\"\r\n");
         } else if matches!(
             route,
-            Route::MobileAccessUnauthorized | Route::MobileAuthorization
+            Route::MobileAccessUnauthorized
+                | Route::MobileAuthorization
+                | Route::MobilePlatformV2Authorization
         ) {
             headers.push_str("WWW-Authenticate: Bearer realm=\"Automonique Mobile\"\r\n");
         } else if matches!(route, Route::MobileUnauthorized | Route::Unauthorized) {
@@ -6283,6 +6366,7 @@ fn handle(
                         | Route::MobilePairingSessions
                         | Route::MobileCredentialInventory
                         | Route::MobileCredentialRevoke
+                        | Route::MobilePlatformV2Grant
                 );
                 let mobile_lifecycle = matches!(
                     requested_route,
@@ -6295,6 +6379,8 @@ fn handle(
                         | Route::MobileRefresh
                         | Route::MobileRevoke
                         | Route::MobileAuthorization
+                        | Route::MobilePlatformV2Grant
+                        | Route::MobilePlatformV2Authorization
                 );
                 let needs_auth = !local_health
                     && !matches!(
@@ -6308,6 +6394,7 @@ fn handle(
                             | Route::MobileRefresh
                             | Route::MobileRevoke
                             | Route::MobileAuthorization
+                            | Route::MobilePlatformV2Authorization
                     );
                 let basic_authorized = auth.authorize(request.authorization);
                 let session_authorized = auth.authorize_session(request.cookie);
@@ -6319,8 +6406,23 @@ fn handle(
                         })
                     })
                     .flatten();
-                let mobile_access_presented =
-                    remote_platform && presents_mobile_access_token(request.authorization);
+                let mobile_platform_v2_authorization = (platform_v2
+                    || requested_route == Route::MobilePlatformV2Authorization)
+                    .then(|| {
+                        integration.and_then(|integration| {
+                            integration
+                                .mobile_platform_v2_authorization(request.authorization)
+                                .ok()
+                        })
+                    })
+                    .flatten();
+                let mobile_access_presented = (remote_platform || platform_v2)
+                    && presents_mobile_access_token(request.authorization);
+                let route_mobile_authorized = if platform_v2 {
+                    mobile_platform_v2_authorization.is_some()
+                } else {
+                    mobile_authorization.is_some()
+                };
                 let bearer_authorized = remote_platform
                     && authorize_remote_bearer(
                         request.authorization,
@@ -6335,7 +6437,7 @@ fn handle(
                     );
                 let credentials_authorized = request_credentials_authorized(
                     mobile_access_presented,
-                    mobile_authorization.is_some(),
+                    route_mobile_authorized,
                     basic_authorized,
                     session_authorized,
                     bearer_authorized,
@@ -6353,8 +6455,22 @@ fn handle(
                     Route::ManageUnauthorized
                 } else if operator_mobile && !basic_authorized {
                     Route::MobileUnauthorized
-                } else if platform_v2 && !basic_authorized {
-                    Route::Unauthorized
+                } else if platform_v2
+                    && if mobile_access_presented {
+                        mobile_platform_v2_authorization.is_none()
+                    } else {
+                        !basic_authorized
+                    }
+                {
+                    if mobile_access_presented {
+                        Route::MobileAccessUnauthorized
+                    } else {
+                        Route::Unauthorized
+                    }
+                } else if requested_route == Route::MobilePlatformV2Authorization
+                    && request.accept != Some(MOBILE_PLATFORM_V2_AUTH_MEDIA_TYPE)
+                {
+                    Route::BadRequest
                 } else if needs_auth && !manage_chat_route && !credentials_authorized {
                     if mobile_access_presented {
                         Route::MobileAccessUnauthorized
@@ -6367,6 +6483,9 @@ fn handle(
                         || !request.content_type.is_some_and(|value| {
                             if platform_v2 {
                                 platform_v2_lane.is_some() && request.accept == request.content_type
+                            } else if requested_route == Route::MobilePlatformV2Grant {
+                                value == MOBILE_PLATFORM_V2_AUTH_MEDIA_TYPE
+                                    && request.accept == request.content_type
                             } else {
                                 value.eq_ignore_ascii_case(if remote_platform {
                                     PLATFORM_CONTENT_TYPE
@@ -6399,6 +6518,7 @@ fn handle(
                     body,
                     issue_session,
                     mobile_authorization,
+                    mobile_platform_v2_authorization,
                     platform_v2_lane,
                 ));
             }
@@ -6409,11 +6529,18 @@ fn handle(
         }
     };
     bytes.zeroize();
-    let (route, head_only, mut body, issue_session, mobile_authorization, platform_v2_lane) =
-        match parsed {
-            Ok(value) => value,
-            Err(route) => (route, false, Vec::new(), false, None, None),
-        };
+    let (
+        route,
+        head_only,
+        mut body,
+        issue_session,
+        mobile_authorization,
+        mobile_platform_v2_authorization,
+        platform_v2_lane,
+    ) = match parsed {
+        Ok(value) => value,
+        Err(route) => (route, false, Vec::new(), false, None, None, None),
+    };
     let response = if matches!(
         route,
         Route::ApiMemory
@@ -6445,6 +6572,8 @@ fn handle(
             | Route::MobileRefresh
             | Route::MobileRevoke
             | Route::MobileAuthorization
+            | Route::MobilePlatformV2Grant
+            | Route::MobilePlatformV2Authorization
     ) {
         integration.map_or_else(
             || json_error("503 Service Unavailable", "integration_unavailable"),
@@ -6455,6 +6584,7 @@ fn handle(
                     integration,
                     state,
                     mobile_authorization.as_ref(),
+                    mobile_platform_v2_authorization.as_ref(),
                     platform_v2_lane,
                 )
             },
@@ -6932,6 +7062,7 @@ mod tests {
                     &AppState::new(fixture_status()),
                     None,
                     None,
+                    None,
                 ))
                 .expect("send platform projection");
         });
@@ -7159,6 +7290,7 @@ mod tests {
                 &serde_json::to_vec(&body).unwrap(),
                 &integration,
                 &state,
+                None,
                 None,
                 None,
             )
@@ -9157,6 +9289,26 @@ mod tests {
                 .any(|window| window == b"WWW-Authenticate: Basic")
         );
 
+        let mobile_response = exchange_without_integration(
+            request_with(
+                &format!("Authorization: Bearer ma_{}\r\n", "M".repeat(43)),
+                media,
+                media,
+            )
+            .as_bytes(),
+        );
+        assert!(mobile_response.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
+        assert!(
+            mobile_response
+                .windows(b"WWW-Authenticate: Bearer".len())
+                .any(|window| window == b"WWW-Authenticate: Bearer")
+        );
+        assert!(
+            !mobile_response
+                .windows(b"Basic".len())
+                .any(|window| window == b"Basic")
+        );
+
         let cookie = fixture_auth().session_cookie();
         let cookie = cookie.split(';').next().unwrap();
         let cookie_response = exchange_without_integration(
@@ -9460,6 +9612,163 @@ mod tests {
         assert!(
             status.success(),
             "TypeScript Platform v2 contract client failed"
+        );
+
+        web_server.join().expect("web server");
+        platform_server.join().expect("platform server");
+    }
+
+    #[test]
+    fn typescript_mobile_bearer_crosses_the_rust_v2_bridge_with_server_owned_scope() {
+        use automonique_protocol::platform_v2::{
+            NegotiatedPlatform, PLATFORM_SCHEMA_V2, PlatformVersion, WorkContextAvailability,
+        };
+        use automonique_protocol::platform_v2_transport::{
+            PlatformNegotiationRequestMessage, PlatformNegotiationResponse,
+            PlatformNegotiationResponseMessage, PlatformV2Refusal, PlatformV2RequestMessage,
+            PlatformV2Response, PlatformV2ResponseMessage,
+        };
+
+        const HTTP_EXCHANGES: usize = 8;
+        let state_dir = tempfile::tempdir().expect("temporary state");
+        let runtime_dir = tempfile::tempdir().expect("temporary runtime");
+        std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private state");
+        std::fs::set_permissions(runtime_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private runtime");
+        let uid = geteuid().as_raw();
+        let policy = serde_json::json!({
+            "version": 1,
+            "principals": [{
+                "uid": uid, "tenant": "operator", "actor": "operator:mobile-v2",
+                "serving_authority": "automonique", "projects": ["project-test"],
+                "workspaces": [{
+                    "project": "project-test", "kind": "project", "id": "project-test",
+                    "inherited_authority": {
+                        "filesystem": [], "credentials": [], "network": [],
+                        "tools": [], "providers": [], "models": []
+                    }
+                }],
+                "authority": {
+                    "filesystem": [], "credentials": [], "network": [],
+                    "tools": [], "providers": [], "models": []
+                },
+                "review_authorities": {}
+            }]
+        });
+        let policy_path = state_dir
+            .path()
+            .join(automonique_daemon::PLATFORM_V2_POLICY_FILE_NAME);
+        std::fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
+        std::fs::set_permissions(&policy_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let platform_listener = UnixListener::bind(runtime_dir.path().join("admin.sock"))
+            .expect("fixture platform socket");
+        let platform_server = thread::spawn(move || {
+            for index in 0..2 {
+                let (mut stream, _) = platform_listener.accept().expect("platform connection");
+                let mut prefix = [0_u8; 4];
+                stream.read_exact(&mut prefix).expect("platform prefix");
+                let mut payload = vec![0_u8; u32::from_be_bytes(prefix) as usize];
+                stream.read_exact(&mut payload).expect("platform request");
+                let response = if index == 0 {
+                    let request = PlatformNegotiationRequestMessage::from_canonical_bytes(&payload)
+                        .expect("mobile negotiation");
+                    let negotiated = NegotiatedPlatform::new(
+                        PlatformVersion::V2,
+                        PLATFORM_SCHEMA_V2,
+                        WorkContextAvailability::V2Structured,
+                    )
+                    .unwrap();
+                    PlatformNegotiationResponseMessage::for_request(
+                        &request,
+                        PlatformNegotiationResponse::Negotiated(negotiated),
+                    )
+                    .unwrap()
+                    .to_canonical_bytes()
+                    .unwrap()
+                } else {
+                    let request = PlatformV2RequestMessage::from_canonical_bytes(&payload)
+                        .expect("mobile v2 request");
+                    PlatformV2ResponseMessage::for_request(
+                        &request,
+                        PlatformV2Response::Refused(
+                            PlatformV2Refusal::new("fixture_mobile_v2", "mobile v2 crossed")
+                                .unwrap(),
+                        ),
+                    )
+                    .unwrap()
+                    .to_canonical_bytes()
+                    .unwrap()
+                };
+                stream
+                    .write_all(&u32::try_from(response.len()).unwrap().to_be_bytes())
+                    .unwrap();
+                stream.write_all(&response).unwrap();
+            }
+        });
+
+        let integration = Arc::new(
+            WebIntegration::open(
+                IntegrationConfig {
+                    tenant: String::from("operator"),
+                    actor: String::from("operator:mobile-v2"),
+                    hosts: fixture_hosts(),
+                },
+                state_dir.path(),
+                runtime_dir.path(),
+            )
+            .unwrap(),
+        );
+        let issued = integration
+            .mobile_operator_provision(MobileOperatorProvisionRequest {
+                actions: vec![mobile_auth::MobileAction::Attach],
+                session_scope: vec!["session-test".to_owned()],
+                limits: mobile_auth::MobileLimits {
+                    max_page_events: 16,
+                    max_follow_up_bytes: 32,
+                },
+            })
+            .expect("v1 mobile credential");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_integration = Arc::clone(&integration);
+        let web_server = thread::spawn(move || {
+            for _ in 0..HTTP_EXCHANGES {
+                let (stream, _) = listener.accept().expect("HTTP connection");
+                handle(
+                    stream,
+                    &AppState::new(fixture_status()),
+                    &fixture_auth(),
+                    &fixture_manage_chat_auth(),
+                    Some(&server_integration),
+                    &fixture_hosts(),
+                )
+                .expect("mobile Platform v2 HTTP route");
+            }
+        });
+
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let sdk = repository.join("sdk/typescript/packages/sdk");
+        let build = Command::new("bun")
+            .args(["run", "build"])
+            .current_dir(&sdk)
+            .status()
+            .expect("build TypeScript SDK");
+        assert!(build.success(), "TypeScript SDK build failed");
+        let script = sdk.join("conformance/mobile-rust-http-v2-contract.ts");
+        let status = Command::new("bun")
+            .arg("run")
+            .arg(script)
+            .arg(format!("http://localhost:{}", address.port()))
+            .arg(&issued.access_token)
+            .arg(&issued.authorization.credential_id)
+            .current_dir(repository)
+            .status()
+            .expect("run TypeScript mobile Platform v2 client");
+        assert!(
+            status.success(),
+            "TypeScript mobile Platform v2 client failed"
         );
 
         web_server.join().expect("web server");

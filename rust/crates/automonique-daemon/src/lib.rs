@@ -227,7 +227,8 @@ pub mod platform_v2_bootstrap;
 pub mod platform_v2_host;
 pub mod platform_v2_lifecycle_adapter;
 pub use platform_v2_host::{
-    POLICY_FILE_NAME as PLATFORM_V2_POLICY_FILE_NAME, verify_web_principal_binding,
+    POLICY_FILE_NAME as PLATFORM_V2_POLICY_FILE_NAME, resolve_web_mobile_request_project,
+    verify_web_principal_binding, verify_web_project_roots,
 };
 pub mod pm2_inventory;
 pub mod progress;

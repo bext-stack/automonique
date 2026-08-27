@@ -427,6 +427,106 @@ pub fn verify_web_principal_binding(
     tenant: &str,
     actor: &str,
 ) -> Result<(), &'static str> {
+    load_web_principal(policy_path, expected_uid, tenant, actor).map(|_| ())
+}
+
+/// Verify that an operator-provisioned mobile project set is a non-empty
+/// subset of the current server-owned principal policy.
+pub fn verify_web_project_roots(
+    policy_path: &Path,
+    expected_uid: u32,
+    tenant: &str,
+    actor: &str,
+    roots: &BTreeSet<ProjectId>,
+) -> Result<(), &'static str> {
+    let principal = load_web_principal(policy_path, expected_uid, tenant, actor)?;
+    if roots.is_empty() || !roots.is_subset(&principal.projects) {
+        return Err("platform_v2_mobile_project_denied");
+    }
+    Ok(())
+}
+
+/// Resolve only the project coordinate required to authorize one mobile
+/// Platform v2 request. No authority grant or unrelated policy entry leaves
+/// this boundary.
+pub fn resolve_web_mobile_request_project(
+    policy_path: &Path,
+    expected_uid: u32,
+    tenant: &str,
+    actor: &str,
+    roots: &BTreeSet<ProjectId>,
+    request: &PlatformV2Request,
+) -> Result<ProjectId, &'static str> {
+    let principal = load_web_principal(policy_path, expected_uid, tenant, actor)?;
+    let project = match request {
+        PlatformV2Request::QueryWorkContexts(query) => {
+            let project = query
+                .project()
+                .ok_or("platform_v2_mobile_project_required")?;
+            if query.parent().is_some_and(|parent| {
+                principal
+                    .workspaces
+                    .get(parent)
+                    .is_none_or(|scope| &scope.project != project)
+            }) {
+                return Err("platform_v2_mobile_project_denied");
+            }
+            project.clone()
+        }
+        PlatformV2Request::GetWorkContext(identity) => principal
+            .workspaces
+            .get(identity)
+            .map(|scope| scope.project.clone())
+            .ok_or("platform_v2_mobile_project_denied")?,
+        PlatformV2Request::PrepareMutation(value) => {
+            scope_for_intent(value.intent(), &principal)?.0
+        }
+        PlatformV2Request::DecideMutation(_) | PlatformV2Request::SubmitMutation(_) => {
+            return Err("platform_v2_mobile_preview_scope_required");
+        }
+        PlatformV2Request::GetMutationReceipt(value) => value.project().clone(),
+        PlatformV2Request::GetLineage(value) => {
+            let identity = WorkContextIdentity::UserWorkspace(value.workspace().clone());
+            if principal
+                .workspaces
+                .get(&identity)
+                .is_none_or(|scope| &scope.project != value.project())
+            {
+                return Err("platform_v2_mobile_project_denied");
+            }
+            value.project().clone()
+        }
+        PlatformV2Request::SubmitWorkspaceIntent(value) => value.project().clone(),
+        PlatformV2Request::GetWorkspaceIntent(value) => value.project().clone(),
+        PlatformV2Request::GetReview(value) => {
+            if principal
+                .workspaces
+                .get(value.workspace())
+                .is_none_or(|scope| &scope.project != value.project())
+            {
+                return Err("platform_v2_mobile_project_denied");
+            }
+            value.project().clone()
+        }
+        PlatformV2Request::ExecuteReviewAction(value) => principal
+            .workspaces
+            .get(value.workspace())
+            .map(|scope| scope.project.clone())
+            .ok_or("platform_v2_mobile_project_denied")?,
+        PlatformV2Request::GetReviewReceipt(value) => value.project().clone(),
+    };
+    if !principal.projects.contains(&project) || !roots.contains(&project) {
+        return Err("platform_v2_mobile_project_denied");
+    }
+    Ok(project)
+}
+
+fn load_web_principal(
+    policy_path: &Path,
+    expected_uid: u32,
+    tenant: &str,
+    actor: &str,
+) -> Result<PrincipalPolicy, &'static str> {
     let snapshot = read_policy_snapshot(policy_path, expected_uid)?
         .ok_or("platform_v2_web_binding_unavailable")?;
     let document: PolicyDocument =
@@ -441,7 +541,7 @@ pub fn verify_web_principal_binding(
     if principal.actor.tenant() != tenant || principal.actor.id() != actor {
         return Err("platform_v2_web_binding_mismatch");
     }
-    Ok(())
+    Ok(principal.clone())
 }
 
 pub(crate) fn verify_bootstrap_policy(
@@ -1818,6 +1918,8 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    use automonique_protocol::platform_v2_transport::{LineageReadRequest, ReviewReadRequest};
+
     fn policy(inherited_tools: serde_json::Value) -> PolicyDocument {
         serde_json::from_value(serde_json::json!({
             "version": 1,
@@ -2039,6 +2141,96 @@ mod tests {
         assert_eq!(
             verify_web_principal_binding(&path, uid, "tenant-test", "actor-test"),
             Err("platform_v2_web_binding_ambiguous")
+        );
+    }
+
+    #[test]
+    fn mobile_target_reads_require_workspace_ownership_in_the_declared_project() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("policy.json");
+        let uid = nix::unistd::geteuid().as_raw();
+        let empty_authority = serde_json::json!({
+            "filesystem": [], "credentials": [], "network": [],
+            "tools": [], "providers": [], "models": []
+        });
+        let document = serde_json::json!({
+            "version": 1,
+            "principals": [{
+                "uid": uid,
+                "tenant": "tenant-test",
+                "actor": "actor-test",
+                "serving_authority": "automonique",
+                "projects": ["project-a", "project-b"],
+                "workspaces": [
+                    {"project": "project-a", "kind": "project", "id": "project-a",
+                     "inherited_authority": empty_authority},
+                    {"project": "project-b", "kind": "project", "id": "project-b",
+                     "inherited_authority": empty_authority},
+                    {"project": "project-a", "kind": "user_workspace", "id": "workspace-a",
+                     "inherited_authority": empty_authority},
+                    {"project": "project-b", "kind": "user_workspace", "id": "workspace-b",
+                     "inherited_authority": empty_authority}
+                ],
+                "authority": empty_authority,
+                "review_authorities": {}
+            }]
+        });
+        write_generation_policy(&path, &document);
+        let roots = [
+            ProjectId::new("project-a").unwrap(),
+            ProjectId::new("project-b").unwrap(),
+        ]
+        .into_iter()
+        .collect();
+        let project_a = ProjectId::new("project-a").unwrap();
+        let project_b = ProjectId::new("project-b").unwrap();
+        let workspace_a = UserWorkspaceId::new("workspace-a").unwrap();
+
+        let valid_lineage = PlatformV2Request::GetLineage(LineageReadRequest::new(
+            project_a.clone(),
+            workspace_a.clone(),
+        ));
+        assert_eq!(
+            resolve_web_mobile_request_project(
+                &path,
+                uid,
+                "tenant-test",
+                "actor-test",
+                &roots,
+                &valid_lineage,
+            ),
+            Ok(project_a.clone())
+        );
+        let mismatched_lineage = PlatformV2Request::GetLineage(LineageReadRequest::new(
+            project_b.clone(),
+            workspace_a.clone(),
+        ));
+        assert_eq!(
+            resolve_web_mobile_request_project(
+                &path,
+                uid,
+                "tenant-test",
+                "actor-test",
+                &roots,
+                &mismatched_lineage,
+            ),
+            Err("platform_v2_mobile_project_denied")
+        );
+
+        let mismatched_review = PlatformV2Request::GetReview(
+            ReviewReadRequest::new(project_b, WorkContextIdentity::UserWorkspace(workspace_a))
+                .unwrap(),
+        );
+        assert_eq!(
+            resolve_web_mobile_request_project(
+                &path,
+                uid,
+                "tenant-test",
+                "actor-test",
+                &roots,
+                &mismatched_review,
+            ),
+            Err("platform_v2_mobile_project_denied")
         );
     }
 }

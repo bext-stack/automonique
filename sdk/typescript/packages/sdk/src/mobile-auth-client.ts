@@ -42,6 +42,14 @@ import {
   type MobilePairingOffer,
   type MobileRevocation,
 } from "../../protocol/src/index.js";
+import {
+  MOBILE_PLATFORM_V2_ACTIONS,
+  MOBILE_PLATFORM_V2_AUTHORIZATION_MEDIA_TYPE,
+  decodeMobilePlatformV2Authorization,
+  encodeMobilePlatformV2GrantRequest,
+  type MobilePlatformV2Authorization,
+  type MobilePlatformV2GrantRequest,
+} from "./mobile-platform-v2-authorization.js";
 
 export type {
   IssuedMobileCredentials,
@@ -250,8 +258,12 @@ function decodeBody<T>(
   }
 }
 
-function verifyResponseHeaders(response: Response, expectedUrl: string): void {
-  if (response.headers.get("content-type")?.trim() !== MOBILE_AUTH_MEDIA_TYPE) {
+function verifyResponseHeaders(
+  response: Response,
+  expectedUrl: string,
+  expectedMediaType = MOBILE_AUTH_MEDIA_TYPE,
+): void {
+  if (response.headers.get("content-type")?.trim() !== expectedMediaType) {
     throw new MobileLifecycleError(response.status, "content_type_mismatch");
   }
   const cacheControl = response.headers.get("cache-control")
@@ -544,6 +556,103 @@ export class MobileLifecycleClient {
     }
     const admitted = decodeBody(response, payload, decodeMobileAuthorization);
     verifyAuthorization(admitted, this.discovery.server_identity);
+    return admitted;
+  }
+
+  async grantPlatformV2(
+    request: MobilePlatformV2GrantRequest,
+    authorization: string | (() => string | Promise<string>),
+    signal?: AbortSignal,
+  ): Promise<MobilePlatformV2Authorization> {
+    const supplied = typeof authorization === "string" ? authorization : await authorization();
+    const endpoint = `${this.discovery.origin}/api/mobile/platform-v2/grants`;
+    const payload = toCanonicalBytes(encodeMobilePlatformV2GrantRequest(request));
+    const response = await this.fetcher(endpoint, {
+      method: "POST",
+      credentials: "omit",
+      headers: {
+        accept: MOBILE_PLATFORM_V2_AUTHORIZATION_MEDIA_TYPE,
+        authorization: operatorAuthorization(supplied),
+        "content-type": MOBILE_PLATFORM_V2_AUTHORIZATION_MEDIA_TYPE,
+      },
+      body: new TextDecoder().decode(payload),
+      redirect: "error",
+      ...(signal === undefined ? {} : {signal}),
+    });
+    verifyResponseHeaders(response, endpoint, MOBILE_PLATFORM_V2_AUTHORIZATION_MEDIA_TYPE);
+    const responsePayload = await readBounded(response);
+    if (!response.ok) {
+      const refusal = decodeBody(response, responsePayload, decodeMobileError);
+      throw new MobileLifecycleError(response.status, refusal.error);
+    }
+    if (response.status !== 200) {
+      throw new MobileLifecycleError(response.status, "unexpected_success_status");
+    }
+    const admitted = decodeBody(
+      response,
+      responsePayload,
+      decodeMobilePlatformV2Authorization,
+    );
+    const expectedActions = [...new Set(request.actions)]
+      .sort((left, right) => MOBILE_PLATFORM_V2_ACTIONS.indexOf(left) - MOBILE_PLATFORM_V2_ACTIONS.indexOf(right));
+    const expectedRoots = [...new Set(request.project_roots)].sort();
+    const now = BigInt(Date.now());
+    if (
+      admitted.server_identity !== this.discovery.server_identity
+      || admitted.credential_id !== request.credential_id
+      || admitted.issued_at_ms > now
+      || admitted.issued_at_ms >= admitted.expires_at_ms
+      || admitted.expires_at_ms <= now
+      || admitted.actions.length !== expectedActions.length
+      || admitted.actions.some((action, index) => action !== expectedActions[index])
+      || admitted.project_roots.length !== expectedRoots.length
+      || admitted.project_roots.some((root, index) => root !== expectedRoots[index])
+    ) {
+      throw new MobileLifecycleError(0, "mobile_v2_authorization_invalid");
+    }
+    return admitted;
+  }
+
+  async platformV2Authorization(
+    accessToken: string,
+    expected: MobileAuthorization,
+    signal?: AbortSignal,
+  ): Promise<MobilePlatformV2Authorization> {
+    const endpoint = `${this.discovery.origin}/api/mobile/platform-v2/authorization`;
+    const response = await this.fetcher(endpoint, {
+      method: "GET",
+      credentials: "omit",
+      headers: {
+        accept: MOBILE_PLATFORM_V2_AUTHORIZATION_MEDIA_TYPE,
+        authorization: `Bearer ${MobileAccessToken(accessToken)}`,
+      },
+      redirect: "error",
+      ...(signal === undefined ? {} : {signal}),
+    });
+    verifyResponseHeaders(response, endpoint, MOBILE_PLATFORM_V2_AUTHORIZATION_MEDIA_TYPE);
+    const payload = await readBounded(response);
+    if (!response.ok) {
+      const refusal = decodeBody(response, payload, decodeMobileError);
+      throw new MobileLifecycleError(response.status, refusal.error);
+    }
+    if (response.status !== 200) {
+      throw new MobileLifecycleError(response.status, "unexpected_success_status");
+    }
+    const admitted = decodeBody(response, payload, decodeMobilePlatformV2Authorization);
+    const now = BigInt(Date.now());
+    if (
+      admitted.server_identity !== this.discovery.server_identity
+      || admitted.server_identity !== expected.server_identity
+      || admitted.credential_id !== expected.credential_id
+      || admitted.credential_revision !== expected.credential_revision
+      || admitted.authorization_revision !== expected.authorization_revision
+      || admitted.issued_at_ms > now
+      || admitted.issued_at_ms >= admitted.expires_at_ms
+      || admitted.expires_at_ms !== expected.expires_at_ms
+      || admitted.expires_at_ms <= now
+    ) {
+      throw new MobileLifecycleError(0, "mobile_v2_authorization_invalid");
+    }
     return admitted;
   }
 
