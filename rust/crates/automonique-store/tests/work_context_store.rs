@@ -199,6 +199,126 @@ fn repository(id: &str) -> WorkContextIdentity {
         .unwrap(),
     )
 }
+
+fn seed_submitted_attempt(
+    store: &mut WorkContextStore,
+    key: &str,
+    receipt_id: &str,
+) -> (WorkContextMutationProposal, MutationPreview, Vec<u8>) {
+    let repository = ExpectedWorkContext::new(repository("repo-1"), revision(1));
+    store
+        .put_external_snapshot(
+            "tenant-1",
+            &repository,
+            ExternalParentResolution::Available,
+            Some(&ProjectId::new("project-1").unwrap()),
+        )
+        .unwrap();
+    let project = WorkContextRecord::new(
+        identity(WorkContextKind::Project, "project-1"),
+        revision(1),
+        WorkContextLifecycle::Active,
+        label("project-1"),
+        WorkContextAttributes::EMPTY,
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::ProjectRepository,
+                repository.identity().clone(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    store
+        .put_authoritative_record("tenant-1", &project)
+        .unwrap();
+    let host = WorkContextRecord::new(
+        identity(WorkContextKind::HostSetup, "setup-1"),
+        revision(1),
+        WorkContextLifecycle::Active,
+        label("setup-1"),
+        WorkContextAttributes::host_setup(HostSetupKind::Local),
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::HostSetupProject,
+                project.identity().clone(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    store.put_authoritative_record("tenant-1", &host).unwrap();
+    let checkout = WorkContextRecord::new(
+        identity(WorkContextKind::Checkout, "checkout-1"),
+        revision(1),
+        WorkContextLifecycle::Active,
+        label("Checkout"),
+        WorkContextAttributes::checkout(CheckoutKind::GitWorktree),
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::CheckoutProject,
+                project.identity().clone(),
+            )
+            .unwrap(),
+            WorkContextRelation::new(
+                WorkContextRelationKind::CheckoutHostSetup,
+                host.identity().clone(),
+            )
+            .unwrap(),
+            WorkContextRelation::new(
+                WorkContextRelationKind::CheckoutRepository,
+                repository.identity().clone(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    store
+        .put_authoritative_record("tenant-1", &checkout)
+        .unwrap();
+    store
+        .put_authoritative_record(
+            "tenant-1",
+            &user_workspace("workspace-1", "project-1", "checkout-1", 1),
+        )
+        .unwrap();
+    let request = proposal(
+        WorkContextMutationIntent::CreateAttemptWorkspace(
+            CreateAttemptWorkspaceIntent::new(
+                label("Attempt"),
+                expected(WorkContextKind::UserWorkspace, "workspace-1", 1),
+                WorkContextAuthority::EMPTY,
+            )
+            .unwrap(),
+        ),
+        key,
+    );
+    let mut nonces = Nonces::new();
+    let preview = unwrap_new(
+        store
+            .prepare_mutation(
+                &request,
+                &policy_for(&request, MutationApprovalRequirement::NotRequired),
+                10,
+                100,
+                &mut nonces,
+            )
+            .unwrap(),
+    );
+    let submission =
+        encode_work_context_mutation_submission(&preview, None, EpochMillis::from_millis(20))
+            .unwrap();
+    store
+        .submit_mutation(
+            preview.preview(),
+            &submission,
+            &policy_for(&request, MutationApprovalRequirement::NotRequired),
+            ReceiptId::new(receipt_id).unwrap(),
+            21,
+        )
+        .unwrap();
+    (request, preview, submission)
+}
 fn unwrap_new(admission: PreviewAdmission) -> MutationPreview {
     match admission {
         PreviewAdmission::New(value) => value,
@@ -1098,10 +1218,42 @@ fn external_effect_commits_outbox_then_result_and_completed_receipt_atomically()
     assert_eq!(claim.idempotency_key(), request.idempotency_key());
     assert_eq!(claim.effective_authority(), preview.effective_authority());
     assert_eq!(claim.effect_payload(), submission);
+    let winning_executor = claim.executor().clone();
+    drop(claim);
     let mut reopened = WorkContextStore::open(private.path()).unwrap();
+    let mut wrong_recovery_nonces = Nonces { next: 94, calls: 0 };
+    assert!(
+        reopened
+            .recover_next_ambiguous_external_effect(
+                &ExternalEffectRecoveryPolicy::for_lease_executor(
+                    Actor::new("tenant-1", "not-the-lease-executor").unwrap(),
+                    ResourceAuthority::Automonique,
+                    BTreeSet::from(["create_attempt_workspace".to_owned()]),
+                ),
+                80,
+                &mut wrong_recovery_nonces,
+            )
+            .unwrap()
+            .is_none()
+    );
+    let mut recovery_nonces = Nonces { next: 95, calls: 0 };
+    let recovered_claim = reopened
+        .recover_next_ambiguous_external_effect(
+            &ExternalEffectRecoveryPolicy::for_lease_executor(
+                winning_executor,
+                ResourceAuthority::Automonique,
+                BTreeSet::from(["create_attempt_workspace".to_owned()]),
+            ),
+            80,
+            &mut recovery_nonces,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered_claim.preview(), preview.preview());
+    assert_eq!(recovered_claim.effect_payload(), submission);
     assert_eq!(
         reopened
-            .complete_external_effect(&claim, 80)
+            .complete_external_effect(&recovered_claim, 80)
             .unwrap_err()
             .category(),
         "reconcile_required"
@@ -1109,19 +1261,101 @@ fn external_effect_commits_outbox_then_result_and_completed_receipt_atomically()
     assert_eq!(
         reopened
             .reconcile_external_effect(
-                &claim,
-                &ExternalEffectReconciliation::VerifiedNotStarted {
+                &recovered_claim,
+                &ExternalEffectReconciliation::Unknown {
                     evidence: ProviderEffectEvidence::new(
-                        claim.idempotency_key().clone(),
-                        b"provider verified no operation".to_vec(),
+                        recovered_claim.idempotency_key().clone(),
+                        b"provider result is initially unknown".to_vec(),
                     )
                     .unwrap(),
                 },
                 81,
             )
             .unwrap(),
+        ExternalEffectReconciliationOutcome::ReconcileRequired
+    );
+    assert_eq!(
+        reopened
+            .reconcile_external_effect(
+                &recovered_claim,
+                &ExternalEffectReconciliation::VerifiedNotStarted {
+                    evidence: ProviderEffectEvidence::new(
+                        recovered_claim.idempotency_key().clone(),
+                        b"provider verified no operation".to_vec(),
+                    )
+                    .unwrap(),
+                },
+                82,
+            )
+            .unwrap(),
         ExternalEffectReconciliationOutcome::Ready
     );
+    let connection = Connection::open(private.path()).unwrap();
+    let prior_evidence_digest: String = connection
+        .query_row(
+            "SELECT evidence_digest FROM work_context_effect_reconciliations WHERE lease_id=?1",
+            [recovered_claim.lease_id().as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE work_context_effect_reconciliations SET evidence_digest=?1 WHERE lease_id=?2",
+            rusqlite::params!["0".repeat(64), recovered_claim.lease_id().as_str()],
+        )
+        .unwrap();
+    let mut corrupt_release_nonces = Nonces { next: 96, calls: 0 };
+    assert_eq!(
+        reopened
+            .claim_next_external_effect(
+                &ExternalEffectExecutorPolicy::new(
+                    Actor::new("tenant-1", "executor-corrupt-release").unwrap(),
+                    ResourceAuthority::Automonique,
+                    BTreeSet::from(["create_attempt_workspace".to_owned()]),
+                ),
+                82,
+                20,
+                &mut corrupt_release_nonces,
+            )
+            .unwrap_err()
+            .category(),
+        "corrupt"
+    );
+    connection
+        .execute(
+            "UPDATE work_context_effect_reconciliations SET evidence_digest=?1 WHERE lease_id=?2",
+            rusqlite::params![prior_evidence_digest, recovered_claim.lease_id().as_str()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE work_context_effect_leases SET completed_at_ms=82 WHERE lease_id=?1",
+            [recovered_claim.lease_id().as_str()],
+        )
+        .unwrap();
+    assert_eq!(
+        reopened
+            .claim_next_external_effect(
+                &ExternalEffectExecutorPolicy::new(
+                    Actor::new("tenant-1", "executor-corrupt-release").unwrap(),
+                    ResourceAuthority::Automonique,
+                    BTreeSet::from(["create_attempt_workspace".to_owned()]),
+                ),
+                82,
+                20,
+                &mut corrupt_release_nonces,
+            )
+            .unwrap_err()
+            .category(),
+        "corrupt"
+    );
+    connection
+        .execute(
+            "UPDATE work_context_effect_leases SET completed_at_ms=NULL WHERE lease_id=?1",
+            [recovered_claim.lease_id().as_str()],
+        )
+        .unwrap();
+    drop(connection);
     let mut second_lease_nonces = Nonces { next: 92, calls: 0 };
     let second_claim = reopened
         .claim_next_external_effect(
@@ -1185,13 +1419,27 @@ fn external_effect_commits_outbox_then_result_and_completed_receipt_atomically()
             .category(),
         "reconcile_required"
     );
+    let mut privileged_recovery_nonces = Nonces { next: 97, calls: 0 };
+    let reconciliation_claim = reopened
+        .recover_next_ambiguous_external_effect(
+            &ExternalEffectRecoveryPolicy::for_privileged_reconciler(
+                Actor::new("tenant-1", "effect-reconciler").unwrap(),
+                ResourceAuthority::Automonique,
+                BTreeSet::from(["create_attempt_workspace".to_owned()]),
+            ),
+            102,
+            &mut privileged_recovery_nonces,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(reconciliation_claim.lease_id(), second_claim.lease_id());
     assert_eq!(
         reopened
             .reconcile_external_effect(
-                &second_claim,
+                &reconciliation_claim,
                 &ExternalEffectReconciliation::Unknown {
                     evidence: ProviderEffectEvidence::new(
-                        second_claim.idempotency_key().clone(),
+                        reconciliation_claim.idempotency_key().clone(),
                         b"provider lookup timed out".to_vec(),
                     )
                     .unwrap(),
@@ -1200,6 +1448,21 @@ fn external_effect_commits_outbox_then_result_and_completed_receipt_atomically()
             )
             .unwrap(),
         ExternalEffectReconciliationOutcome::ReconcileRequired
+    );
+    let completed_evidence = ProviderEffectEvidence::new(
+        reconciliation_claim.idempotency_key().clone(),
+        b"provider receipt operation-123".to_vec(),
+    )
+    .unwrap();
+    let completed_reconciliation = ExternalEffectReconciliation::Completed {
+        evidence: completed_evidence,
+    };
+    assert_eq!(
+        reopened
+            .reconcile_external_effect(&reconciliation_claim, &completed_reconciliation, 102)
+            .unwrap_err()
+            .category(),
+        "invalid_request"
     );
     let mut unknown_discovery_nonces = Nonces { next: 93, calls: 0 };
     assert!(
@@ -1217,16 +1480,29 @@ fn external_effect_commits_outbox_then_result_and_completed_receipt_atomically()
             .unwrap()
             .is_none()
     );
-    let completed_evidence = ProviderEffectEvidence::new(
-        second_claim.idempotency_key().clone(),
-        b"provider receipt operation-123".to_vec(),
-    )
-    .unwrap();
-    let completed_reconciliation = ExternalEffectReconciliation::Completed {
-        evidence: completed_evidence,
-    };
+    let connection = Connection::open(private.path()).unwrap();
+    connection
+        .execute(
+            "UPDATE work_context_effect_reconciliations SET receipt_id='receipt-corrupt' WHERE lease_id=?1",
+            [reconciliation_claim.lease_id().as_str()],
+        )
+        .unwrap();
+    assert_eq!(
+        reopened
+            .reconcile_external_effect(&reconciliation_claim, &completed_reconciliation, 104)
+            .unwrap_err()
+            .category(),
+        "corrupt"
+    );
+    connection
+        .execute(
+            "UPDATE work_context_effect_reconciliations SET receipt_id='receipt-attempt' WHERE lease_id=?1",
+            [reconciliation_claim.lease_id().as_str()],
+        )
+        .unwrap();
+    drop(connection);
     let ExternalEffectReconciliationOutcome::Completed(completed) = reopened
-        .reconcile_external_effect(&second_claim, &completed_reconciliation, 104)
+        .reconcile_external_effect(&reconciliation_claim, &completed_reconciliation, 104)
         .unwrap()
     else {
         panic!("completed reconciliation")
@@ -1238,13 +1514,13 @@ fn external_effect_commits_outbox_then_result_and_completed_receipt_atomically()
     assert_eq!(reopened.ready_outbox_count().unwrap(), 0);
     assert_eq!(
         reopened
-            .complete_external_effect(&second_claim, 105)
+            .complete_external_effect(&reconciliation_claim, 105)
             .unwrap(),
         completed
     );
     assert_eq!(
         reopened
-            .reconcile_external_effect(&second_claim, &completed_reconciliation, 106)
+            .reconcile_external_effect(&reconciliation_claim, &completed_reconciliation, 106)
             .unwrap(),
         ExternalEffectReconciliationOutcome::Completed(completed.clone())
     );
@@ -1846,14 +2122,37 @@ fn empty_v1_database_migrates_to_tenant_scoped_schema() {
 }
 
 #[test]
-fn v2_effect_schema_migrates_claims_to_ambiguous_v3_state() {
+fn v2_effect_schema_migrates_claims_to_ambiguous_v4_state() {
     let private = PrivateStore::new();
-    drop(WorkContextStore::open(private.path()).unwrap());
+    let mut store = WorkContextStore::open(private.path()).unwrap();
+    let (request, preview, _) =
+        seed_submitted_attempt(&mut store, "migration-attempt", "receipt-migration-attempt");
+    let executor = Actor::new("tenant-1", "migration-executor").unwrap();
+    let mut claim_nonces = Nonces {
+        next: 110,
+        calls: 0,
+    };
+    let claim = store
+        .claim_next_external_effect(
+            &ExternalEffectExecutorPolicy::new(
+                executor.clone(),
+                ResourceAuthority::Automonique,
+                BTreeSet::from(["create_attempt_workspace".to_owned()]),
+            ),
+            25,
+            55,
+            &mut claim_nonces,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.preview(), preview.preview());
+    drop(store);
     let connection = Connection::open(private.path()).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE work_context_effect_reconciliations;
-             ALTER TABLE work_context_effect_leases RENAME TO work_context_effect_leases_v3;
+            "DROP TABLE work_context_effect_recovery_audit;
+             DROP TABLE work_context_effect_reconciliations;
+             ALTER TABLE work_context_effect_leases RENAME TO work_context_effect_leases_v4;
              CREATE TABLE work_context_effect_leases (
                 lease_id TEXT PRIMARY KEY, preview_id TEXT NOT NULL UNIQUE,
                 tenant TEXT NOT NULL, executor_id TEXT NOT NULL,
@@ -1862,25 +2161,27 @@ fn v2_effect_schema_migrates_claims_to_ambiguous_v3_state() {
                 effect_digest TEXT NOT NULL, expires_at_ms INTEGER NOT NULL,
                 state TEXT NOT NULL CHECK(state IN ('claimed','completed'))
              ) STRICT;
-             DROP TABLE work_context_effect_leases_v3;
-             ALTER TABLE work_context_outbox RENAME TO work_context_outbox_v3;
+             INSERT INTO work_context_effect_leases SELECT lease_id,preview_id,tenant,executor_id,serving_authority,target_key,target_revision,effect_kind,effect_digest,expires_at_ms,CASE state WHEN 'completed' THEN 'completed' ELSE 'claimed' END FROM work_context_effect_leases_v4;
+             DROP TABLE work_context_effect_leases_v4;
+             ALTER TABLE work_context_outbox RENAME TO work_context_outbox_v4;
              CREATE TABLE work_context_outbox (
                 outbox_id TEXT PRIMARY KEY, preview_id TEXT NOT NULL UNIQUE,
                 effect_kind TEXT NOT NULL, effect_document BLOB NOT NULL,
                 state TEXT NOT NULL CHECK(state IN ('ready','completed')),
                 created_at_ms INTEGER NOT NULL, completed_at_ms INTEGER
              ) STRICT;
-             DROP TABLE work_context_outbox_v3;
+             INSERT INTO work_context_outbox SELECT outbox_id,preview_id,effect_kind,effect_document,CASE state WHEN 'completed' THEN 'completed' ELSE 'ready' END,created_at_ms,completed_at_ms FROM work_context_outbox_v4;
+             DROP TABLE work_context_outbox_v4;
              PRAGMA user_version=2;",
         )
         .unwrap();
     drop(connection);
-    let store = WorkContextStore::open(private.path()).unwrap();
+    let mut store = WorkContextStore::open(private.path()).unwrap();
     let connection = Connection::open(store.path()).unwrap();
     let version: u32 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let reconciliation_columns: u32 = connection
         .query_row(
             "SELECT count(*) FROM pragma_table_info('work_context_effect_reconciliations')",
@@ -1888,5 +2189,65 @@ fn v2_effect_schema_migrates_claims_to_ambiguous_v3_state() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(reconciliation_columns, 5);
+    assert_eq!(reconciliation_columns, 7);
+    let states: (String, String) = connection
+        .query_row(
+            "SELECT o.state,l.state FROM work_context_outbox o JOIN work_context_effect_leases l ON l.preview_id=o.preview_id WHERE o.preview_id=?1",
+            [preview.preview().id().as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(states, ("ambiguous".to_owned(), "ambiguous".to_owned()));
+    drop(connection);
+    let mut recovery_nonces = Nonces {
+        next: 111,
+        calls: 0,
+    };
+    let recovered = store
+        .recover_next_ambiguous_external_effect(
+            &ExternalEffectRecoveryPolicy::for_lease_executor(
+                executor,
+                ResourceAuthority::Automonique,
+                BTreeSet::from(["create_attempt_workspace".to_owned()]),
+            ),
+            30,
+            &mut recovery_nonces,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.preview(), preview.preview());
+    assert_eq!(recovered.idempotency_key(), request.idempotency_key());
+    assert_eq!(
+        store
+            .reconcile_external_effect(
+                &recovered,
+                &ExternalEffectReconciliation::VerifiedNotStarted {
+                    evidence: ProviderEffectEvidence::new(
+                        request.idempotency_key().clone(),
+                        b"migration provider confirms not started".to_vec(),
+                    )
+                    .unwrap(),
+                },
+                79,
+            )
+            .unwrap_err()
+            .category(),
+        "invalid_request"
+    );
+    assert_eq!(
+        store
+            .reconcile_external_effect(
+                &recovered,
+                &ExternalEffectReconciliation::VerifiedNotStarted {
+                    evidence: ProviderEffectEvidence::new(
+                        request.idempotency_key().clone(),
+                        b"migration provider confirms not started".to_vec(),
+                    )
+                    .unwrap(),
+                },
+                80,
+            )
+            .unwrap(),
+        ExternalEffectReconciliationOutcome::Ready
+    );
 }

@@ -205,6 +205,13 @@ bounded. Expiry moves an effect to `ambiguous`, never back to ready: a typed
 provider reconciliation tied to the original idempotency key must establish
 `not_started` before release, persist exact completion evidence before final
 receipt creation, or leave an `unknown` effect unavailable for replay.
+After a restart or lost claim response, only the original authenticated
+executor or an explicitly privileged tenant-scoped reconciler may reconstruct
+an ambiguous lease. Reconstruction validates the canonical receipt, outbox,
+reservation, lease, and preview and records the recovering identity without
+claiming or replaying the effect. A released effect becomes ready again only
+when the prior lease has an exact persisted `not_started` reconciliation whose
+evidence digest, receipt identity, and monotonic timestamps revalidate.
 Authoritative snapshot
 ingestion rejects revision regression, terminal lifecycle rollback, reparenting,
 and external owner changes. Durable readers re-encode documents and compare all
