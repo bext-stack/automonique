@@ -5,7 +5,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use automonique_protocol::platform_v2::{
-    AttemptWorkspaceId, PaneId, UserWorkspaceId, WorkSessionId,
+    AttemptWorkspaceId, NegotiatedPlatform, PaneId, PlatformVersionOffer, UserWorkspaceId,
+    WorkSessionId, negotiate_platform_version,
 };
 use automonique_protocol::platform_v2_lineage::*;
 use automonique_protocol::primitives::Revision;
@@ -38,6 +39,13 @@ impl PrivateIndex {
 
 fn workspace(value: &str) -> UserWorkspaceId {
     UserWorkspaceId::new(value).unwrap()
+}
+fn lineage_v2() -> NegotiatedPlatform {
+    negotiate_platform_version(
+        &PlatformVersionOffer::new(vec![2]).unwrap(),
+        &PlatformVersionOffer::new(vec![2]).unwrap(),
+    )
+    .unwrap()
 }
 fn external_identity(
     provider: ExternalWorkProvider,
@@ -219,7 +227,7 @@ fn duplicate_intake_replays_exactly_and_conflicts_without_identity_collapse() {
         .unwrap();
     assert_eq!(
         index
-            .projection_authorized(&workspace("workspace-1"), |_| true)
+            .projection_authorized(&lineage_v2(), &workspace("workspace-1"), |_| true)
             .unwrap()
             .external_work_items()
             .len(),
@@ -227,7 +235,7 @@ fn duplicate_intake_replays_exactly_and_conflicts_without_identity_collapse() {
     );
     assert!(
         index
-            .projection_authorized(&workspace("workspace-2"), |_| true)
+            .projection_authorized(&lineage_v2(), &workspace("workspace-2"), |_| true)
             .unwrap()
             .external_work_items()
             .is_empty()
@@ -311,7 +319,7 @@ fn moved_and_closed_sources_are_revisioned_and_survive_reopen() {
     );
     assert_eq!(
         index
-            .projection_authorized(&ws, |_| true)
+            .projection_authorized(&lineage_v2(), &ws, |_| true)
             .unwrap()
             .external_work_items()
             .iter()
@@ -370,7 +378,9 @@ fn moved_and_closed_sources_are_revisioned_and_survive_reopen() {
     drop(index);
 
     let reopened = LineageIndex::open(private.path()).unwrap();
-    let projection = reopened.projection_authorized(&ws, |_| true).unwrap();
+    let projection = reopened
+        .projection_authorized(&lineage_v2(), &ws, |_| true)
+        .unwrap();
     assert_eq!(projection.external_work_items().len(), 3);
     let moved = projection
         .external_work_items()
@@ -410,7 +420,7 @@ fn workspace_scoped_projection_refuses_to_truncate_past_the_protocol_bound() {
     }
     assert_eq!(
         index
-            .projection_authorized(&ws, |_| true)
+            .projection_authorized(&lineage_v2(), &ws, |_| true)
             .expect_err("projection must not truncate")
             .category(),
         "projection_too_large"
@@ -422,16 +432,30 @@ fn authority_seam_refuses_before_reading_workspace_projection() {
     let private = PrivateIndex::new();
     let index = LineageIndex::open(private.path()).unwrap();
     let ws = workspace("workspace-authority");
+    let v1 = negotiate_platform_version(
+        &PlatformVersionOffer::new(vec![1]).unwrap(),
+        &PlatformVersionOffer::new(vec![1]).unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         index
-            .projection_authorized(&ws, |_| false)
+            .projection_authorized(&v1, &ws, |_| panic!(
+                "authorization must follow negotiation"
+            ))
+            .unwrap_err()
+            .category(),
+        "invalid_field"
+    );
+    assert_eq!(
+        index
+            .projection_authorized(&lineage_v2(), &ws, |_| false)
             .unwrap_err()
             .category(),
         "unauthorized"
     );
     assert!(
         index
-            .projection_authorized(&ws, |candidate| candidate == &ws)
+            .projection_authorized(&lineage_v2(), &ws, |candidate| candidate == &ws)
             .unwrap()
             .external_work_items()
             .is_empty()
@@ -628,7 +652,9 @@ fn orphan_stale_heartbeat_question_and_cancelled_creation_recover_durably() {
             .unwrap(),
         WriteAdmission::Replayed { revision: 1 }
     );
-    let projection = reopened.projection_authorized(&ws, |_| true).unwrap();
+    let projection = reopened
+        .projection_authorized(&lineage_v2(), &ws, |_| true)
+        .unwrap();
     assert_eq!(projection.external_work_items().len(), 1);
     assert_eq!(projection.orchestration().len(), 7);
     let heartbeat = projection
@@ -691,7 +717,7 @@ fn two_handles_cannot_overwrite_a_revision_and_restart_rebuilds_the_winner() {
     let reopened = LineageIndex::open(private.path()).unwrap();
     assert_eq!(
         reopened
-            .projection_authorized(&ws, |_| true)
+            .projection_authorized(&lineage_v2(), &ws, |_| true)
             .unwrap()
             .external_work_items()[0],
         winner
@@ -864,7 +890,9 @@ fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
     drop(index);
 
     let reopened = LineageIndex::open(private.path()).unwrap();
-    let projection = reopened.projection_authorized(&ws, |_| true).unwrap();
+    let projection = reopened
+        .projection_authorized(&lineage_v2(), &ws, |_| true)
+        .unwrap();
     assert_eq!(projection.external_work_items()[0].origin(), &source_origin);
     let task = projection
         .orchestration()
@@ -897,7 +925,7 @@ PRAGMA user_version=1;
 
     let index = LineageIndex::open(private.path()).unwrap();
     let projection = index
-        .projection_authorized(&workspace("workspace-v1"), |_| true)
+        .projection_authorized(&lineage_v2(), &workspace("workspace-v1"), |_| true)
         .unwrap();
     assert_eq!(projection.external_work_items().len(), 1);
     assert_eq!(

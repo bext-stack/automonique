@@ -20,7 +20,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use automonique_protocol::platform_v2::{
-    AttemptWorkspaceId, PaneId, UserWorkspaceId, WorkSessionId,
+    AttemptWorkspaceId, NegotiatedPlatform, PaneId, UserWorkspaceId, WorkSessionId,
 };
 use automonique_protocol::platform_v2_lineage::{
     BaseSelectorId, BranchSelectorId, ExternalWorkAuthorityId, ExternalWorkIdentity,
@@ -32,6 +32,7 @@ use automonique_protocol::platform_v2_lineage::{
     OrchestrationWorkerId, WorkspaceIntent, WorkspaceIntentConflict, WorkspaceIntentId,
     WorkspaceIntentOutcome, WorkspaceIntentReconciliation,
 };
+use automonique_protocol::platform_v2_lineage_api::require_lineage_v2;
 use automonique_protocol::primitives::Revision;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -567,9 +568,12 @@ impl LineageIndex {
     /// not infer authorization from possession of a workspace identifier.
     pub fn projection_authorized(
         &self,
+        negotiated: &NegotiatedPlatform,
         workspace: &UserWorkspaceId,
         authorize: impl FnOnce(&UserWorkspaceId) -> bool,
     ) -> Indexed<LineageProjection> {
+        require_lineage_v2(negotiated)
+            .map_err(|_| LineageIndexError::InvalidField("negotiated_platform"))?;
         if !authorize(workspace) {
             return Err(LineageIndexError::Unauthorized);
         }
