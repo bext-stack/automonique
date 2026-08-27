@@ -209,6 +209,259 @@ fn validate_action_checks_authority_and_revision_without_admitting_custody() {
 }
 
 #[test]
+fn local_comment_effect_is_atomic_exactly_once_and_actor_attributed() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).expect("open");
+    let initial = snapshot();
+    let actor = ReviewActorId::new("actor-local-comment").expect("actor");
+    let authority = initial.review().authority().clone();
+    store.put_snapshot(&initial, 10).expect("snapshot");
+    store
+        .grant_authority(
+            initial.workspace(),
+            &actor,
+            ReviewAuthentication::UserSession,
+            &authority,
+            11,
+        )
+        .expect("grant");
+    let request = ReviewActionRequest::new(
+        initial.workspace().clone(),
+        initial.revision(),
+        actor.clone(),
+        ReviewAuthentication::UserSession,
+        authority,
+        IdempotencyKey::new("local-comment-once").expect("key"),
+        ReviewAction::AddComment {
+            comment_id: ReviewCommentId::new("comment-local").expect("comment"),
+            anchor: initial.comments()[0].anchor().clone(),
+            body: ReviewText::new("A bounded attributed comment.").expect("body"),
+        },
+    )
+    .expect("request");
+
+    let completed = store
+        .execute_local_action(&request, 12)
+        .expect("execute local action");
+    assert_eq!(completed.outcome(), ReviewReceiptOutcome::Completed);
+    assert_eq!(completed.revision(), Some(revision(10)));
+    assert_eq!(completed.actor(), &actor);
+    assert_eq!(
+        store
+            .execute_local_action(&request, 13)
+            .expect("terminal replay"),
+        completed
+    );
+    let current = store
+        .snapshot(initial.workspace())
+        .expect("read")
+        .expect("current");
+    assert_eq!(current.revision(), revision(10));
+    let comment = current
+        .comments()
+        .iter()
+        .find(|comment| comment.id().as_str() == "comment-local")
+        .expect("persisted comment");
+    assert_eq!(comment.actor(), &actor);
+    assert_eq!(comment.agent_state(), CommentAgentState::NotSent);
+
+    drop(store);
+    let raw = Connection::open(private.path()).expect("raw");
+    let rows: (i64, i64, i64) = raw
+        .query_row(
+            "SELECT (SELECT count(*) FROM review_action_previews),(SELECT count(*) FROM review_action_receipts),(SELECT count(*) FROM review_snapshots)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("custody rows");
+    assert_eq!(rows, (1, 1, 2));
+}
+
+#[test]
+fn completed_local_effect_without_its_write_admission_fails_after_reopen() {
+    let private = PrivateStore::new();
+    let request = {
+        let mut store = ReviewStore::open(private.path()).expect("open");
+        let initial = snapshot();
+        let actor = ReviewActorId::new("actor-local-admission").expect("actor");
+        let authority = initial.review().authority().clone();
+        store.put_snapshot(&initial, 10).expect("snapshot");
+        store
+            .grant_authority(
+                initial.workspace(),
+                &actor,
+                ReviewAuthentication::UserSession,
+                &authority,
+                11,
+            )
+            .expect("grant");
+        let request = ReviewActionRequest::new(
+            initial.workspace().clone(),
+            initial.revision(),
+            actor,
+            ReviewAuthentication::UserSession,
+            authority,
+            IdempotencyKey::new("local-comment-admission").expect("key"),
+            ReviewAction::AddComment {
+                comment_id: ReviewCommentId::new("comment-local-admission").expect("comment"),
+                anchor: initial.comments()[0].anchor().clone(),
+                body: ReviewText::new("A bounded attributed comment.").expect("body"),
+            },
+        )
+        .expect("request");
+        let receipt = store
+            .execute_local_action(&request, 12)
+            .expect("completed local action");
+        assert_eq!(receipt.outcome(), ReviewReceiptOutcome::Completed);
+        request
+    };
+
+    let connection = Connection::open(private.path()).expect("raw open");
+    connection
+        .execute(
+            "UPDATE review_action_previews SET write_admission_id=NULL,write_admitted_at_ms=NULL,write_admission_document=NULL,write_admission_digest=NULL",
+            [],
+        )
+        .expect("remove completed admission");
+    drop(connection);
+
+    let mut reopened = ReviewStore::open(private.path()).expect("reopen");
+    assert!(matches!(
+        reopened.receipt(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            13,
+        ),
+        Err(ReviewStoreError::Corrupt("write_admission"))
+    ));
+    assert!(matches!(
+        reopened.execute_local_action(&request, 14),
+        Err(ReviewStoreError::Corrupt("write_admission"))
+    ));
+}
+
+#[test]
+fn local_review_approval_advances_one_revision_and_replays_terminal_receipt() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).expect("open");
+    let initial = snapshot();
+    let actor = ReviewActorId::new("actor-local-approval").expect("actor");
+    let authority = initial.review().authority().clone();
+    store.put_snapshot(&initial, 10).expect("snapshot");
+    store
+        .grant_authority(
+            initial.workspace(),
+            &actor,
+            ReviewAuthentication::UserSession,
+            &authority,
+            11,
+        )
+        .expect("grant");
+    let request = ReviewActionRequest::new(
+        initial.workspace().clone(),
+        initial.revision(),
+        actor.clone(),
+        ReviewAuthentication::UserSession,
+        authority,
+        IdempotencyKey::new("local-approval-once").expect("key"),
+        ReviewAction::ApproveReview {
+            expected_review_revision: initial.review().freshness().observed_revision(),
+        },
+    )
+    .expect("request");
+
+    let receipt = store
+        .execute_local_action(&request, 12)
+        .expect("execute approval");
+    assert_eq!(receipt.outcome(), ReviewReceiptOutcome::Completed);
+    assert_eq!(receipt.actor(), &actor);
+    assert_eq!(
+        store
+            .execute_local_action(&request, 13)
+            .expect("terminal replay"),
+        receipt
+    );
+    let current = store
+        .snapshot(initial.workspace())
+        .expect("read")
+        .expect("current");
+    assert_eq!(current.revision(), revision(10));
+    assert_eq!(current.review().decision(), ReviewDecision::Approved);
+    assert_eq!(
+        current.review().freshness().observed_revision(),
+        revision(10)
+    );
+}
+
+#[test]
+fn unstarted_local_custody_settles_conflict_after_revision_advances() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).expect("open");
+    let initial = snapshot();
+    let actor = ReviewActorId::new("actor-local-stale").expect("actor");
+    let authority = initial.review().authority().clone();
+    store.put_snapshot(&initial, 10).expect("snapshot");
+    store
+        .grant_authority(
+            initial.workspace(),
+            &actor,
+            ReviewAuthentication::UserSession,
+            &authority,
+            11,
+        )
+        .expect("grant");
+    let make = |key: &str, id: &str| {
+        ReviewActionRequest::new(
+            initial.workspace().clone(),
+            initial.revision(),
+            actor.clone(),
+            ReviewAuthentication::UserSession,
+            authority.clone(),
+            IdempotencyKey::new(key).expect("key"),
+            ReviewAction::AddComment {
+                comment_id: ReviewCommentId::new(id).expect("comment"),
+                anchor: initial.comments()[0].anchor().clone(),
+                body: ReviewText::new("Bounded body.").expect("body"),
+            },
+        )
+        .expect("request")
+    };
+    let stranded = make("local-stale-first", "comment-stale-first");
+    store
+        .prepare_action(&stranded, ApprovalPolicy::NotRequired, 12)
+        .expect("accepted custody");
+    let winner = make("local-stale-winner", "comment-stale-winner");
+    store
+        .execute_local_action(&winner, 13)
+        .expect("winner completes");
+
+    let conflict = store
+        .execute_local_action(&stranded, 14)
+        .expect("stale custody settles");
+    assert_eq!(conflict.outcome(), ReviewReceiptOutcome::Conflict);
+    assert_eq!(conflict.current_revision(), Some(revision(10)));
+    assert_eq!(
+        store
+            .execute_local_action(&stranded, 15)
+            .expect("conflict replay"),
+        conflict
+    );
+    let current = store
+        .snapshot(initial.workspace())
+        .expect("read")
+        .expect("current");
+    assert!(
+        current
+            .comments()
+            .iter()
+            .all(|comment| comment.id().as_str() != "comment-stale-first")
+    );
+}
+
+#[test]
 fn restart_preserves_sanitized_snapshot_comments_and_sent_state() {
     let private = PrivateStore::new();
     let workspace = {
