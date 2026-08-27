@@ -985,11 +985,12 @@ kbd { padding: 1px 4px; border: 1px solid var(--line-bright); border-bottom-colo
 .process-monitor { margin-bottom: 14px; }
 .platform-monitor { margin-bottom: 14px; }
 .platform-monitor .process-semantics { margin: 0; }
-.platform-cockpit { display: grid; min-height: 470px; grid-template-columns: minmax(210px, 29%) minmax(0, 1fr); }
-.platform-session-rail { min-width: 0; border-right: 1px solid var(--line); background: var(--panel-2); }
+.platform-cockpit { display: grid; height: clamp(500px, 64vh, 680px); min-height: 470px; overflow: hidden; grid-template-columns: minmax(210px, 29%) minmax(0, 1fr); }
+.platform-session-rail { display: flex; min-width: 0; min-height: 0; flex-direction: column; border-right: 1px solid var(--line); background: var(--panel-2); }
 .platform-session-rail-head { display: flex; align-items: center; justify-content: space-between; padding: 13px 14px; border-bottom: 1px solid var(--line); color: var(--muted); }
 .platform-session-rail-head strong { font: var(--font-xs) ui-monospace, monospace; letter-spacing: .08em; text-transform: uppercase; }
 .platform-session-rail-head span { color: var(--green); font: 700 var(--font-sm) ui-monospace, monospace; }
+#platform-session-list { min-height: 0; flex: 1; overflow: auto; overscroll-behavior: contain; }
 .platform-session-option { display: block; width: 100%; padding: 13px 14px; border: 0; border-bottom: 1px solid var(--line); color: inherit; background: transparent; text-align: left; cursor: pointer; }
 .platform-session-option:hover, .platform-session-option.is-selected { background: var(--accent-surface); }
 .platform-session-option.is-selected { box-shadow: inset 3px 0 var(--green); }
@@ -998,7 +999,8 @@ kbd { padding: 1px 4px; border: 1px solid var(--line-bright); border-bottom-colo
 .platform-session-option strong { color: var(--violet); font: var(--font-sm) ui-monospace, monospace; }
 .platform-session-option span { margin-top: 5px; color: var(--muted); font-size: var(--font-xs); }
 .platform-session-option small { margin-top: 6px; color: var(--quiet); font-size: var(--font-2xs); }
-.platform-session-workspace { min-width: 0; background: var(--panel); }
+.platform-session-workspace { min-width: 0; min-height: 0; overflow: hidden; background: var(--panel); }
+#platform-session-detail:not([hidden]) { display: flex; height: 100%; min-height: 0; flex-direction: column; }
 .platform-session-empty { display: grid; min-height: 465px; place-items: center; align-content: center; padding: 30px; color: var(--muted); text-align: center; }
 .platform-session-empty strong { color: var(--violet); font-size: var(--font-lg); }
 .platform-session-empty p { max-width: 390px; margin: 8px 0 0; color: var(--quiet); line-height: 1.5; }
@@ -1009,7 +1011,7 @@ kbd { padding: 1px 4px; border: 1px solid var(--line-bright); border-bottom-colo
 .platform-session-head strong { margin-top: 5px; color: var(--violet); }
 .platform-session-head small { margin-top: 5px; color: var(--muted); font-size: var(--font-xs); }
 .platform-session-status { padding: 8px 16px; border-bottom: 1px solid var(--line); color: var(--quiet); background: var(--panel-2); font: var(--font-xs) ui-monospace, monospace; }
-.platform-history { max-height: 340px; min-height: 210px; overflow: auto; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+.platform-history { min-height: 160px; flex: 1; overflow: auto; padding: 14px 16px; border-bottom: 1px solid var(--line); overscroll-behavior: contain; }
 .platform-history-event { max-width: 82%; margin: 0 0 10px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-2); }
 .platform-history-event.is-message { border-color: var(--accent-border); }
 .platform-history-event > div { display: flex; gap: 10px; align-items: center; justify-content: space-between; }
@@ -1520,11 +1522,14 @@ html[data-health="unavailable"] .attention-bar { border-color: var(--danger-bord
   .attention-list li span { grid-column: 1 / -1; grid-row: 2; }
   .metric-grid { grid-template-columns: repeat(2, 1fr); }
   .operations-metrics { grid-template-columns: repeat(2, 1fr); }
-  .platform-cockpit { grid-template-columns: 1fr; }
-  .platform-session-rail { max-height: 230px; overflow: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+  .platform-cockpit { height: auto; min-height: 0; overflow: visible; grid-template-columns: 1fr; }
+  .platform-session-rail { height: 230px; max-height: 230px; overflow: hidden; border-right: 0; border-bottom: 1px solid var(--line); }
+  .platform-session-workspace { overflow: visible; }
+  #platform-session-detail:not([hidden]) { height: auto; }
   .platform-session-empty { min-height: 300px; }
   .platform-session-head { align-items: stretch; flex-direction: column; }
   .platform-session-head .button { align-self: flex-start; }
+  .platform-history { max-height: 340px; flex: none; }
   .platform-history-event { max-width: 94%; }
   .platform-composer > div { flex-direction: column; }
   .process-monitor-head { align-items: flex-start; flex-direction: column; padding-top: 14px; padding-bottom: 14px; }
