@@ -31,10 +31,12 @@ export const PLATFORM_NEGOTIATION_PROTOCOL = "automonique.platform.negotiation";
 export const PLATFORM_V2_MAJOR = 2;
 
 import {
+  byteLength,
   decodeFrameWithLimit,
   decodeMessageAdmitted,
   encodeFrameWithLimit,
   encodeMessage,
+  isWellFormedUnicode,
   parseCanonical,
   toCanonicalBytes,
   WireError,
@@ -53,6 +55,7 @@ import {
   MutationApprovalId,
   MutationPreviewDigest,
   MutationPreviewId,
+  MAX_MUTATION_CANONICAL_BYTES,
   PLATFORM_SCHEMA_V2,
   ProjectId,
   SupportedPlatformVersionNumber,
@@ -106,7 +109,6 @@ import {
   type ReviewSnapshot,
 } from "./review-context.js";
 
-const encoder = new TextEncoder();
 const negotiatedV2: NegotiatedPlatform = {
   schema: PLATFORM_SCHEMA_V2,
   version: SupportedPlatformVersionNumber(2n),
@@ -237,11 +239,24 @@ function valueField(value: Map<string, JsonValue>, name: string): JsonValue {
 }
 function document(bytes: Uint8Array): JsonValue { return parseCanonical(bytes); }
 function bodyBytes(value: JsonValue): Uint8Array { return toCanonicalBytes(value); }
+function boundedRefusalString(value: string, maximum: number): string {
+  if (!isWellFormedUnicode(value) || byteLength(value) === 0 || byteLength(value) > maximum || /\p{Cc}/u.test(value)) throw new WireError("invalid_json_value", "platform v2 refusal string");
+  return value;
+}
 function boundedRefusal(value: JsonValue): PlatformV2Refusal {
   const body = fields(value, ["category", "explanation", "schema"]);
-  const category = stringField(body, "category"); const explanation = stringField(body, "explanation");
-  if (encoder.encode(category).length === 0 || encoder.encode(category).length > 128 || encoder.encode(explanation).length === 0 || encoder.encode(explanation).length > 512 || stringField(body, "schema") !== PLATFORM_SCHEMA_V2) throw new WireError("invalid_json_value", "platform v2 refusal");
+  const category = boundedRefusalString(stringField(body, "category"), 128);
+  const explanation = boundedRefusalString(stringField(body, "explanation"), 512);
+  if (stringField(body, "schema") !== PLATFORM_SCHEMA_V2) throw new WireError("invalid_json_value", "platform v2 refusal");
   return {category, explanation, schema: PLATFORM_SCHEMA_V2};
+}
+const MUTATION_APPROVAL_FIELDS = ["approval", "schema"] as const;
+const MUTATION_RECEIPT_FIELDS = ["approval_id", "id", "idempotency_key", "outcome", "preview", "preview_digest", "recorded_at_ms", "request_digest", "resulting_revision", "schema"] as const;
+function rawMutationDocument(value: JsonValue, bytes: Uint8Array, expected: readonly string[]): Uint8Array {
+  if (bytes.length > MAX_MUTATION_CANONICAL_BYTES) throw new WireError("frame_too_large", `maximum is ${MAX_MUTATION_CANONICAL_BYTES}`);
+  const body = fields(value, expected);
+  if (stringField(body, "schema") !== PLATFORM_SCHEMA_V2) throw new WireError("invalid_json_value", "lifecycle schema is incompatible");
+  return bytes;
 }
 function message(protocol: string, version: number, requestId: PlatformRequestIdValue, kind: string, body: JsonValue, maximum: number): Uint8Array {
   const bytes = encodeMessage({envelope: {protocol, version, requestId: PlatformRequestId(requestId), kind}, body});
@@ -314,8 +329,8 @@ export function decodePlatformV2Response(payload: Uint8Array, requestId: Platfor
     case "work_context_resync":return {kind:"work_context_resync",resync:decodeWorkContextResync(bytes)};
     case "work_context_record":return {kind:"work_context_record",record:validateWorkContextRecord(plain(decoded.body) as WorkContextRecord)};
     case "mutation_preview":return {kind:"mutation_preview",preview:decodeWorkContextMutationPreview(bytes)};
-    case "mutation_approval":return {kind:"mutation_approval",approval:{canonical:bytes}};
-    case "mutation_receipt":return {kind:"mutation_receipt",receipt:{canonical:bytes}};
+    case "mutation_approval":return {kind:"mutation_approval",approval:{canonical:rawMutationDocument(decoded.body,bytes,MUTATION_APPROVAL_FIELDS)}};
+    case "mutation_receipt":return {kind:"mutation_receipt",receipt:{canonical:rawMutationDocument(decoded.body,bytes,MUTATION_RECEIPT_FIELDS)}};
     case "mutation_refused":return {kind:"mutation_refused",refusal:decodeWorkContextMutationRefusal(bytes)};
     case "lineage_result":return {kind:"lineage_result",lineage:decodeLineageProjection(negotiatedV2,bytes)};
     case "workspace_intent_result":return {kind:"workspace_intent_result",result:decodeWorkspaceIntentOutcome(negotiatedV2,bytes)};

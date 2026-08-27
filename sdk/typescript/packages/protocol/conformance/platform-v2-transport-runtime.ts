@@ -22,6 +22,7 @@ import {PLATFORM_PROTOCOL, PlatformRequestId} from "../generated/platform.ts";
 import {
   PLATFORM_NEGOTIATION_SCHEMA_V1,
   PLATFORM_SCHEMA_V2,
+  MAX_MUTATION_CANONICAL_BYTES,
   PlatformVersionNumber,
   SupportedPlatformVersionNumber,
   UserWorkspaceId,
@@ -35,6 +36,25 @@ import {
   parseCanonical,
 } from "../generated/runtime.ts";
 import {MAX_FRAME_BYTES, encodeFrame} from "../src/canonical.ts";
+
+const encoder = new TextEncoder();
+
+function expectWireRefusal(label: string, action: () => unknown): void {
+  try {
+    action();
+  } catch (error) {
+    if (error instanceof WireError) return;
+    throw error;
+  }
+  throw new Error(`${label} was accepted`);
+}
+
+function responsePayload(requestId: ReturnType<typeof PlatformRequestId>, kind: string, body: Uint8Array): Uint8Array {
+  return encodeMessage({
+    envelope: {protocol: PLATFORM_PROTOCOL, version: PLATFORM_V2_MAJOR, requestId, kind},
+    body: parseCanonical(body),
+  });
+}
 
 const fixture = readFileSync(
   "../../../../rust/crates/automonique-protocol/fixtures/platform-v2-transport-v1.txt",
@@ -95,6 +115,90 @@ const refusalPayload = encodeMessage({
 if (decodePlatformV2Response(refusalPayload, v2Id, "get_work_context").kind !== "platform_v2_refused") throw new Error("v2 refusal");
 const refusalFrame = encodeFrameWithLimit(refusalPayload, MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES);
 if (decodePlatformV2ResponseFrame(refusalFrame, v2Id, "get_work_context").kind !== "platform_v2_refused") throw new Error("v2 refusal frame");
+
+for (const [label, category, explanation] of [
+  ["control category", "bad\ncategory", "host wiring is not available"],
+  ["control explanation", "platform_v2_unavailable", "bad\texplanation"],
+  ["unicode control explanation", "platform_v2_unavailable", "bad\u0085explanation"],
+] as const) {
+  const payload = responsePayload(
+    v2Id,
+    "platform_v2_refused",
+    encoder.encode(JSON.stringify({category, explanation, schema: PLATFORM_SCHEMA_V2})),
+  );
+  expectWireRefusal(label, () => decodePlatformV2Response(payload, v2Id, "get_work_context"));
+}
+
+const rawReceipt = {
+  approval_id: null,
+  id: null,
+  idempotency_key: null,
+  outcome: null,
+  preview: null,
+  preview_digest: null,
+  recorded_at_ms: null,
+  request_digest: null,
+  resulting_revision: null,
+  schema: PLATFORM_SCHEMA_V2,
+};
+if (decodePlatformV2Response(
+  responsePayload(v2Id, "mutation_approval", encoder.encode(JSON.stringify({approval: null, schema: PLATFORM_SCHEMA_V2}))),
+  v2Id,
+  "decide_mutation",
+).kind !== "mutation_approval") throw new Error("structurally valid raw approval was refused");
+if (decodePlatformV2Response(
+  responsePayload(v2Id, "mutation_receipt", encoder.encode(JSON.stringify(rawReceipt))),
+  v2Id,
+  "get_mutation_receipt",
+).kind !== "mutation_receipt") throw new Error("structurally valid raw receipt was refused");
+
+const oversizedApproval = encoder.encode(JSON.stringify({
+  approval: Array.from({length: 5}, () => "x".repeat(60 * 1024)),
+  schema: PLATFORM_SCHEMA_V2,
+}));
+if (oversizedApproval.length <= MAX_MUTATION_CANONICAL_BYTES) throw new Error("oversized approval fixture is not oversized");
+
+const malformedLifecycleResponses = [
+  [
+    "approval missing field",
+    "mutation_approval",
+    "decide_mutation",
+    encoder.encode(JSON.stringify({schema: PLATFORM_SCHEMA_V2})),
+  ],
+  [
+    "approval extra field",
+    "mutation_approval",
+    "decide_mutation",
+    encoder.encode(JSON.stringify({approval: null, extra: true, schema: PLATFORM_SCHEMA_V2})),
+  ],
+  [
+    "receipt wrong schema",
+    "mutation_receipt",
+    "get_mutation_receipt",
+    encoder.encode(JSON.stringify({
+      approval_id: null,
+      id: null,
+      idempotency_key: null,
+      outcome: null,
+      preview: null,
+      preview_digest: null,
+      recorded_at_ms: null,
+      request_digest: null,
+      resulting_revision: null,
+      schema: "automonique.platform/v1",
+    })),
+  ],
+  [
+    "oversized approval",
+    "mutation_approval",
+    "decide_mutation",
+    oversizedApproval,
+  ],
+] as const;
+for (const [label, kind, requestKind, body] of malformedLifecycleResponses) {
+  const payload = responsePayload(v2Id, kind, body);
+  expectWireRefusal(label, () => decodePlatformV2Response(payload, v2Id, requestKind));
+}
 
 const maximalResponse = new Uint8Array(MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES);
 if (encodeFrameWithLimit(maximalResponse, MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES).length !== maximalResponse.length + 4) throw new Error("maximal response frame");
