@@ -5,7 +5,7 @@ use std::net::TcpListener;
 use std::thread;
 
 use automonique_platform_client::{
-    ActionResult, BearerToken, ClientError, ControlClaimResult, HttpsTransport,
+    ActionResult, BasicCredential, BearerToken, ClientError, ControlClaimResult, HttpsTransport,
     PLATFORM_CONTENT_TYPE, PlatformClient, PlatformTransport, PlatformView,
     SessionCommandStateResult, SessionHistoryResult, SessionListResult, SubscriptionApply,
     SubscriptionResult,
@@ -122,6 +122,81 @@ fn https_transport_carries_the_canonical_frame_and_redacts_the_bearer() {
         Capabilities::platform_v1()
     );
     server.join().expect("server thread");
+}
+
+#[test]
+fn explicit_basic_https_transport_is_canonical_and_redacts_material() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+    let address = listener.local_addr().expect("listener address");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("client connection");
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let header_end = loop {
+            let read = stream.read(&mut chunk).expect("request bytes");
+            assert!(read > 0, "request ended before headers");
+            bytes.extend_from_slice(&chunk[..read]);
+            if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&bytes[..header_end]).expect("request headers");
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("authorization: basic b3bzomzpehr1cmutcgfzc3dvcmq=\r\n")
+        );
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+            .unwrap();
+        while bytes.len() < header_end + content_length {
+            let read = stream.read(&mut chunk).unwrap();
+            assert!(read > 0);
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        let request = PlatformRequestMessage::from_canonical_bytes(
+            &bytes[header_end..header_end + content_length],
+        )
+        .unwrap();
+        let response = PlatformResponseMessage::new(
+            request.request_id().clone(),
+            PlatformResponse::Capabilities(Capabilities::platform_v1()),
+        )
+        .to_message()
+        .unwrap()
+        .to_canonical_bytes();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: {PLATFORM_CONTENT_TYPE}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response.len()
+        )
+        .unwrap();
+        stream.write_all(&response).unwrap();
+    });
+
+    let credential = BasicCredential::new("ops", "fixture-password").unwrap();
+    assert_eq!(format!("{credential:?}"), "BasicCredential(<redacted>)");
+    let transport = HttpsTransport::new_basic(format!("http://{address}/platform"), credential)
+        .expect("loopback endpoint");
+    let rendered = format!("{transport:?}");
+    assert!(!rendered.contains("fixture-password"));
+    assert!(!rendered.contains("b3Bz"));
+    let mut client = PlatformClient::new(transport);
+    assert!(client.capabilities().is_ok());
+    server.join().unwrap();
+}
+
+#[test]
+fn basic_credential_refuses_unbounded_or_ambiguous_usernames() {
+    assert!(BasicCredential::new("", "password").is_err());
+    assert!(BasicCredential::new("ops:admin", "password").is_err());
+    assert!(BasicCredential::new("ops", "").is_err());
+    assert!(BasicCredential::new("ops", "x".repeat(509)).is_err());
 }
 
 #[test]

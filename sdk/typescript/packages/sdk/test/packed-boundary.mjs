@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import assert from "node:assert/strict";
-import {access} from "node:fs/promises";
+import {access, readFile} from "node:fs/promises";
 import {join} from "node:path";
 import {pathToFileURL} from "node:url";
 
@@ -11,18 +11,26 @@ assert.equal(typeof packageRoot, "string", "usage: packed-boundary.mjs <extracte
 const sdkRoot = join(packageRoot, "dist", "sdk", "src");
 const main = await import(pathToFileURL(join(sdkRoot, "index.js")).href);
 const testing = await import(pathToFileURL(join(sdkRoot, "testing.js")).href);
+const testingInternal = await import(pathToFileURL(join(sdkRoot, "testing", "internal.js")).href);
 const v2 = await import(pathToFileURL(join(sdkRoot, "platform-v2-client.js")).href);
+const v2Source = await readFile(join(sdkRoot, "platform-v2-client.js"), "utf8");
 
 assert.equal(typeof main.PlatformV2Client, "function");
 assert.equal(typeof main.HttpsPlatformV2Transport, "function");
 assert.equal(typeof testing.DeterministicPlatformV2Adapter, "function");
 assert.deepEqual(Object.keys(v2).sort(), [
+  "BasicHttpsPlatformV2Transport",
   "HttpsPlatformV2Transport",
   "PLATFORM_NEGOTIATION_MEDIA_TYPE",
   "PLATFORM_V2_MEDIA_TYPE",
-  "PlatformV2CanonicalTestingTransport",
+  "PlatformV2BasicCredential",
   "PlatformV2Client",
 ]);
+assert.equal("PlatformV2CanonicalTestingTransport" in main, false);
+assert.equal("PlatformV2CanonicalTestingTransport" in v2, false);
+assert.equal(v2Source.includes("testing/internal"), false);
+assert.equal(v2Source.includes("PlatformV2CanonicalTestingTransport"), false);
+assert.equal(typeof testingInternal.PlatformV2CanonicalTestingTransport, "function");
 const testingAdapter = new testing.DeterministicPlatformV2Adapter([]);
 assert.equal("request" in testingAdapter, false);
 assert.equal("requestCanonical" in testingAdapter, false);
@@ -91,3 +99,27 @@ await assert.rejects(client.negotiate({
 assert.equal(credentialCalls, 1);
 assert.equal(fetchCalls, 1);
 assert.equal(injectedCalls, 0);
+
+let basicAuthorization = "";
+const basic = new main.PlatformV2BasicCredential("ops", "packed-password");
+assert.deepEqual(Reflect.ownKeys(basic), []);
+assert.deepEqual(Reflect.ownKeys(Object.getPrototypeOf(basic)), ["constructor"]);
+const basicTransport = new main.BasicHttpsPlatformV2Transport(
+  "https://manage.example/api/platform/v2",
+  () => basic,
+  async (_input, init) => {
+    basicAuthorization = new Headers(init.headers).get("authorization");
+    return new Response("{}", {
+      headers: {
+        "cache-control": "no-store",
+        "content-type": main.PLATFORM_NEGOTIATION_MEDIA_TYPE,
+      },
+    });
+  },
+);
+assert.deepEqual(Reflect.ownKeys(basicTransport), []);
+await assert.rejects(new main.PlatformV2Client(basicTransport).negotiate({
+  schema: main.PLATFORM_NEGOTIATION_SCHEMA_V1,
+  versions: [main.PlatformVersionNumber(2n)],
+}));
+assert.equal(basicAuthorization, "Basic b3BzOnBhY2tlZC1wYXNzd29yZA==");

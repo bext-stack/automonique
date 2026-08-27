@@ -67,7 +67,7 @@ import type {
   PlatformClientResponse,
   SessionHistoryPage,
 } from "./platform-client.js";
-import {PlatformV2CanonicalTestingTransport} from "./platform-v2-client.js";
+import {PlatformV2CanonicalTestingTransport} from "./testing/internal.js";
 
 export class DeterministicFixtureError extends Error {
   readonly category: "aborted" | "script_exhausted" | "unexpected_request";

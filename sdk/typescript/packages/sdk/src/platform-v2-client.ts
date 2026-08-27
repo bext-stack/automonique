@@ -12,6 +12,7 @@ import {
   decodePlatformV2Response,
   encodePlatformNegotiationRequest,
   encodePlatformV2Request,
+  parseCanonical,
   type IdempotencyKey,
   type MutationApprovalDecision,
   type MutationApprovalId,
@@ -35,44 +36,13 @@ import {
   type WorkContextRevision,
 } from "../../protocol/src/index.js";
 import {PlatformTransportError} from "./platform-client.js";
-
-type PlatformV2Lane = "negotiation" | "v2";
-type PlatformV2Exchange = (
-  lane: PlatformV2Lane,
-  payload: Uint8Array,
-  signal?: AbortSignal,
-) => Promise<{readonly payload: Uint8Array; readonly status: number}>;
-
-interface PlatformV2CanonicalTestingHandlers {
-  readonly negotiate: (
-    requestId: ReturnType<typeof PlatformRequestId>,
-    offer: PlatformVersionOffer,
-    signal?: AbortSignal,
-  ) => Promise<PlatformNegotiationResponse>;
-  readonly request: (
-    requestId: ReturnType<typeof PlatformRequestId>,
-    request: PlatformV2Request,
-    signal?: AbortSignal,
-  ) => Promise<PlatformV2Response>;
-}
-
-const canonicalTestingTransports = new WeakMap<
-  PlatformV2CanonicalTestingTransport,
-  PlatformV2CanonicalTestingHandlers
->();
-
-/**
- * Testing-only typed registration. Instances expose no request method and
- * cannot receive or recover the authenticated HTTPS bearer capability.
- */
-export class PlatformV2CanonicalTestingTransport {
-  constructor(
-    negotiate: PlatformV2CanonicalTestingHandlers["negotiate"],
-    request: PlatformV2CanonicalTestingHandlers["request"],
-  ) {
-    canonicalTestingTransports.set(this, {negotiate, request});
-  }
-}
+import {
+  platformV2TransportCapability,
+  registerPlatformV2Transport,
+  type PlatformV2CanonicalHandlers,
+  type PlatformV2Exchange,
+  type PlatformV2Lane,
+} from "./platform-v2-transport-capability.js";
 
 export const PLATFORM_NEGOTIATION_MEDIA_TYPE = "application/vnd.automonique.platform.negotiation.v1+json";
 export const PLATFORM_V2_MEDIA_TYPE = "application/vnd.automonique.platform.v2+json";
@@ -88,6 +58,41 @@ function bearerToken(value: unknown): string {
     throw new PlatformTransportError(0, "authorization_invalid");
   }
   return value;
+}
+
+const basicCredentials = new WeakMap<PlatformV2BasicCredential, string>();
+
+/** Opaque HTTP Basic material for the dedicated single-principal web bridge. */
+export class PlatformV2BasicCredential {
+  constructor(username: string, password: string) {
+    if (
+      typeof username !== "string"
+      || username.length === 0
+      || username.length > 64
+      || !/^[A-Za-z0-9._-]+$/u.test(username)
+      || typeof password !== "string"
+      || password.length === 0
+    ) {
+      throw new PlatformTransportError(0, "authorization_invalid");
+    }
+    const decoded = new TextEncoder().encode(`${username}:${password}`);
+    if (decoded.byteLength > 512) {
+      throw new PlatformTransportError(0, "authorization_invalid");
+    }
+    const encoded = btoa(String.fromCharCode(...decoded));
+    basicCredentials.set(this, `Basic ${encoded}`);
+  }
+}
+
+type PlatformV2Credential = string | PlatformV2BasicCredential;
+
+function authorizationHeader(value: PlatformV2Credential): string {
+  if (typeof value === "string") return `Bearer ${bearerToken(value)}`;
+  const authorization = basicCredentials.get(value);
+  if (authorization === undefined) {
+    throw new PlatformTransportError(0, "authorization_invalid");
+  }
+  return authorization;
 }
 
 async function readBoundedResponse(response: Response, maximumBytes: number): Promise<Uint8Array> {
@@ -199,7 +204,7 @@ function combineAbortSignals(primary: AbortSignal, secondary?: AbortSignal): Com
 
 async function exchangeHttps(
   endpointValue: string,
-  credentialProvider: () => string | Promise<string>,
+  credentialProvider: () => PlatformV2Credential | Promise<PlatformV2Credential>,
   fetcher: typeof fetch,
   lane: PlatformV2Lane,
   payload: Uint8Array,
@@ -210,14 +215,14 @@ async function exchangeHttps(
     ? MAX_PLATFORM_NEGOTIATION_RESPONSE_CANONICAL_BYTES
     : MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES;
   throwIfAborted(signal);
-  const token = await abortableCredential(credentialProvider, signal);
+  const credential = await abortableCredential(credentialProvider, signal);
   throwIfAborted(signal);
   const response = await fetcher(endpointValue, {
     method: "POST",
     credentials: "omit",
     headers: {
       accept: mediaType,
-      authorization: `Bearer ${bearerToken(token)}`,
+      authorization: authorizationHeader(credential),
       "content-type": mediaType,
     },
     body: new TextDecoder().decode(payload),
@@ -243,8 +248,6 @@ async function exchangeHttps(
   return {payload: await readBoundedResponse(response, maximumResponseBytes), status: response.status};
 }
 
-const httpsExchanges = new WeakMap<HttpsPlatformV2Transport, PlatformV2Exchange>();
-
 /** Authenticated HTTPS transport with an exact endpoint and no redirect forwarding. */
 export class HttpsPlatformV2Transport {
   readonly #endpoint: string;
@@ -260,25 +263,57 @@ export class HttpsPlatformV2Transport {
     this.#endpoint = pinnedEndpoint;
     this.#credentialProvider = credentialProvider;
     this.#fetcher = fetcher;
-    httpsExchanges.set(this, (lane, payload, signal) => exchangeHttps(
-      this.#endpoint,
-      this.#credentialProvider,
-      this.#fetcher,
-      lane,
-      payload,
-      signal,
-    ));
+    registerPlatformV2Transport(this, {
+      kind: "exchange",
+      exchange: (lane, payload, signal) => exchangeHttps(
+        this.#endpoint,
+        this.#credentialProvider,
+        this.#fetcher,
+        lane,
+        payload,
+        signal,
+      ),
+    });
   }
 }
 
-function abortableCredential(
-  provider: () => string | Promise<string>,
+/** Explicit HTTP Basic transport for the single-principal web-entry bridge. */
+export class BasicHttpsPlatformV2Transport {
+  readonly #endpoint: string;
+  readonly #credentialProvider: () => PlatformV2BasicCredential | Promise<PlatformV2BasicCredential>;
+  readonly #fetcher: typeof fetch;
+
+  constructor(
+    endpointValue: string,
+    credentialProvider: () => PlatformV2BasicCredential | Promise<PlatformV2BasicCredential>,
+    fetcher: typeof fetch = fetch,
+  ) {
+    const pinnedEndpoint = endpoint(endpointValue);
+    this.#endpoint = pinnedEndpoint;
+    this.#credentialProvider = credentialProvider;
+    this.#fetcher = fetcher;
+    registerPlatformV2Transport(this, {
+      kind: "exchange",
+      exchange: (lane, payload, signal) => exchangeHttps(
+        this.#endpoint,
+        this.#credentialProvider,
+        this.#fetcher,
+        lane,
+        payload,
+        signal,
+      ),
+    });
+  }
+}
+
+function abortableCredential<T>(
+  provider: () => T | Promise<T>,
   signal?: AbortSignal,
-): Promise<string> {
+): Promise<T> {
   if (signal?.aborted === true) {
     return Promise.reject(new PlatformTransportError(0, "aborted", {cause: signal.reason}));
   }
-  let credential: Promise<string>;
+  let credential: Promise<T>;
   try {
     credential = Promise.resolve(provider());
   } catch (error) {
@@ -341,29 +376,45 @@ function requireResponse<K extends PlatformV2Response["kind"]>(
   throw new PlatformTransportError(502, "response_kind_mismatch");
 }
 
+function rawMutationApprovalDecision(canonical: Uint8Array): MutationApprovalDecision {
+  try {
+    const document = parseCanonical(canonical);
+    if (document.kind !== "object") throw new Error("approval document");
+    const approval = document.entries.find(([key]) => key === "approval")?.[1];
+    if (approval?.kind !== "object") throw new Error("approval body");
+    const expected = [
+      "decided_at_ms", "decided_by", "decision", "expires_at_ms", "id",
+      "idempotency_key", "preview", "preview_digest", "request_digest",
+    ];
+    if (approval.entries.length !== expected.length
+      || approval.entries.some(([key], index) => key !== expected[index])) {
+      throw new Error("approval shape");
+    }
+    const decision = approval.entries.find(([key]) => key === "decision")?.[1];
+    if (decision?.kind !== "string" || (decision.value !== "granted" && decision.value !== "denied")) {
+      throw new Error("approval decision");
+    }
+    return decision.value;
+  } catch (error) {
+    throw new PlatformTransportError(502, "invalid_response", {cause: error});
+  }
+}
+
 /** Operation-specific facade. V2 calls fail closed until major two is negotiated. */
 export class PlatformV2Client {
   readonly #exchange: PlatformV2Exchange | null;
-  readonly #testingTransport: PlatformV2CanonicalTestingHandlers | null;
+  readonly #canonicalHandlers: PlatformV2CanonicalHandlers | null;
   #negotiationGeneration = 0n;
   #generationAbort = new AbortController();
   #negotiated: {readonly generation: bigint; readonly value: NegotiatedPlatform} | null = null;
 
-  constructor(transport: HttpsPlatformV2Transport | PlatformV2CanonicalTestingTransport) {
-    const exchange = transport instanceof HttpsPlatformV2Transport
-      ? httpsExchanges.get(transport)
-      : undefined;
-    if (transport instanceof HttpsPlatformV2Transport && exchange === undefined) {
+  constructor(transport: HttpsPlatformV2Transport | BasicHttpsPlatformV2Transport | object) {
+    const capability = platformV2TransportCapability(transport);
+    if (capability === undefined) {
       throw new TypeError("platform v2 transport capability is unavailable");
     }
-    const testingTransport = transport instanceof PlatformV2CanonicalTestingTransport
-      ? canonicalTestingTransports.get(transport)
-      : undefined;
-    if (exchange === undefined && testingTransport === undefined) {
-      throw new TypeError("platform v2 transport capability is unavailable");
-    }
-    this.#exchange = exchange ?? null;
-    this.#testingTransport = testingTransport ?? null;
+    this.#exchange = capability.kind === "exchange" ? capability.exchange : null;
+    this.#canonicalHandlers = capability.kind === "canonical" ? capability.handlers : null;
   }
 
   get negotiated(): NegotiatedPlatform | null {
@@ -397,7 +448,7 @@ export class PlatformV2Client {
           throw protocolError(error, exchanged.status);
         }
       } else {
-        response = await this.#testingTransport!.negotiate(requestId, offer, combined.signal);
+        response = await this.#canonicalHandlers!.negotiate(requestId, offer, combined.signal);
       }
       if (generation !== this.#negotiationGeneration) {
         throw new PlatformTransportError(0, "negotiation_superseded");
@@ -450,7 +501,7 @@ export class PlatformV2Client {
           throw protocolError(error, exchanged.status);
         }
       } else {
-        response = await this.#testingTransport!.request(requestId, request, combined.signal);
+        response = await this.#canonicalHandlers!.request(requestId, request, combined.signal);
       }
       if (invalidated()) {
         throw new PlatformTransportError(0, "negotiation_invalidated");
@@ -503,7 +554,11 @@ export class PlatformV2Client {
   }
 
   async decideMutation(preview: MutationPreviewRef, previewDigest: MutationPreviewDigest, decision: MutationApprovalDecision, signal?: AbortSignal) {
-    return requireResponse(await this.#request({kind: "decide_mutation", request: {decision, preview, preview_digest: previewDigest}}, signal), ["mutation_approval", "mutation_refused"] as const);
+    const response = requireResponse(await this.#request({kind: "decide_mutation", request: {decision, preview, preview_digest: previewDigest}}, signal), ["mutation_approval", "mutation_refused"] as const);
+    if (response.kind === "mutation_approval" && rawMutationApprovalDecision(response.approval.canonical) !== decision) {
+      throw new PlatformTransportError(502, "response_decision_mismatch");
+    }
+    return response;
   }
 
   async submitMutation(preview: MutationPreviewRef, previewDigest: MutationPreviewDigest, approvalId: MutationApprovalId | null, signal?: AbortSignal) {
