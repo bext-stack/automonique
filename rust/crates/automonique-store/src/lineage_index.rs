@@ -3,10 +3,11 @@
 //! Authoritative durable index for Platform v2 external work and orchestration lineage.
 //!
 //! External provider records and internal orchestration records occupy separate
-//! tables and identity domains. Both are bound to an exact user workspace, but
-//! neither table uses that workspace identity as its primary key. Mutations use
-//! immediate transactions, exact idempotent replay, and revision fencing. The
-//! only projection read is scoped by one caller-supplied workspace identity.
+//! tables and identity domains. Every durable identity is namespaced by tenant
+//! and bound to an exact user workspace, but neither table uses that workspace
+//! identity alone as its primary key. Mutations use immediate transactions,
+//! exact idempotent replay, and revision fencing. Projection and receipt reads
+//! require one caller-authorized tenant/project/workspace scope.
 //!
 //! This index stores normalized contract fields only. It stores no provider
 //! payload, provider URL, repository ref, command fragment, or host path. It
@@ -40,10 +41,12 @@ use sha2::{Digest, Sha256};
 use crate::{StoreError, validate_database_path};
 
 /// The only lineage-index schema this build reads or writes.
-pub const LINEAGE_INDEX_SCHEMA_VERSION: u32 = 3;
+pub const LINEAGE_INDEX_SCHEMA_VERSION: u32 = 4;
+const LEGACY_TENANT: &str = "legacy-unqualified";
 
-const SCHEMA_V3: &str = r#"
+const SCHEMA_V4: &str = r#"
 CREATE TABLE lineage_external_work (
+    tenant TEXT NOT NULL,
     provider TEXT NOT NULL CHECK (provider IN ('github','gitlab','linear','jira_compatible')),
     authority_id TEXT NOT NULL,
     scope TEXT NOT NULL,
@@ -63,8 +66,8 @@ CREATE TABLE lineage_external_work (
     origin_attempt_id TEXT,
     origin_session_id TEXT,
     origin_pane_id TEXT,
-    PRIMARY KEY (provider, authority_id, scope, work_key),
-    UNIQUE (provider, authority_id, scope, work_key, workspace_id),
+    PRIMARY KEY (tenant, provider, authority_id, scope, work_key),
+    UNIQUE (tenant, provider, authority_id, scope, work_key, workspace_id),
     CHECK ((external_state = 'moved') = (moved_provider IS NOT NULL)),
     CHECK ((moved_provider IS NULL) = (moved_scope IS NULL)),
     CHECK ((moved_provider IS NULL) = (moved_authority_id IS NULL)),
@@ -75,9 +78,10 @@ CREATE TABLE lineage_external_work (
 ) STRICT;
 
 CREATE INDEX lineage_external_by_workspace
-    ON lineage_external_work(workspace_id, provider, authority_id, scope, work_key);
+    ON lineage_external_work(tenant, workspace_id, provider, authority_id, scope, work_key);
 
 CREATE TABLE lineage_orchestration (
+    tenant TEXT NOT NULL,
     orchestration_kind TEXT NOT NULL CHECK (orchestration_kind IN
         ('run','task','dispatch','worker','heartbeat','question','decision_gate')),
     orchestration_id TEXT NOT NULL,
@@ -99,12 +103,12 @@ CREATE TABLE lineage_orchestration (
     origin_attempt_id TEXT,
     origin_session_id TEXT,
     origin_pane_id TEXT,
-    PRIMARY KEY (orchestration_kind, orchestration_id),
-    UNIQUE (orchestration_kind, orchestration_id, workspace_id),
-    FOREIGN KEY (external_provider, external_authority_id, external_scope, external_key, workspace_id)
-        REFERENCES lineage_external_work(provider, authority_id, scope, work_key, workspace_id),
-    FOREIGN KEY (parent_kind, parent_id, workspace_id)
-        REFERENCES lineage_orchestration(orchestration_kind, orchestration_id, workspace_id),
+    PRIMARY KEY (tenant, orchestration_kind, orchestration_id),
+    UNIQUE (tenant, orchestration_kind, orchestration_id, workspace_id),
+    FOREIGN KEY (tenant, external_provider, external_authority_id, external_scope, external_key, workspace_id)
+        REFERENCES lineage_external_work(tenant, provider, authority_id, scope, work_key, workspace_id),
+    FOREIGN KEY (tenant, parent_kind, parent_id, workspace_id)
+        REFERENCES lineage_orchestration(tenant, orchestration_kind, orchestration_id, workspace_id),
     CHECK ((external_provider IS NULL) = (external_scope IS NULL)),
     CHECK ((external_provider IS NULL) = (external_authority_id IS NULL)),
     CHECK ((external_provider IS NULL) = (external_key IS NULL)),
@@ -126,10 +130,11 @@ CREATE TABLE lineage_orchestration (
 ) STRICT;
 
 CREATE INDEX lineage_orchestration_by_workspace
-    ON lineage_orchestration(workspace_id, orchestration_kind, orchestration_id);
+    ON lineage_orchestration(tenant, workspace_id, orchestration_kind, orchestration_id);
 
 CREATE TABLE lineage_workspace_intents (
-    intent_id TEXT PRIMARY KEY,
+    tenant TEXT NOT NULL,
+    intent_id TEXT NOT NULL,
     request_digest BLOB NOT NULL CHECK (length(request_digest) = 32),
     intent_kind TEXT NOT NULL CHECK (intent_kind IN ('create','resume','cancel')),
     task_kind TEXT NOT NULL CHECK (task_kind = 'task'),
@@ -151,11 +156,13 @@ CREATE TABLE lineage_workspace_intents (
          'question_pending','creation_cancelled')),
     outcome_workspace_id TEXT,
     reconciliation TEXT NOT NULL CHECK (reconciliation IN ('final','poll_receipt')),
-    FOREIGN KEY (task_kind, task_id, workspace_id)
-        REFERENCES lineage_orchestration(orchestration_kind, orchestration_id, workspace_id),
-    FOREIGN KEY (external_provider, external_authority_id, external_scope, external_key, workspace_id)
-        REFERENCES lineage_external_work(provider, authority_id, scope, work_key, workspace_id),
-    FOREIGN KEY (target_intent_id) REFERENCES lineage_workspace_intents(intent_id),
+    PRIMARY KEY (tenant, intent_id),
+    FOREIGN KEY (tenant, task_kind, task_id, workspace_id)
+        REFERENCES lineage_orchestration(tenant, orchestration_kind, orchestration_id, workspace_id),
+    FOREIGN KEY (tenant, external_provider, external_authority_id, external_scope, external_key, workspace_id)
+        REFERENCES lineage_external_work(tenant, provider, authority_id, scope, work_key, workspace_id),
+    FOREIGN KEY (tenant, target_intent_id)
+        REFERENCES lineage_workspace_intents(tenant, intent_id),
     CHECK (
         (intent_kind = 'create' AND external_provider IS NOT NULL AND external_authority_id IS NOT NULL AND external_scope IS NOT NULL
             AND external_key IS NOT NULL AND base_selector IS NOT NULL
@@ -189,8 +196,13 @@ CREATE TABLE lineage_workspace_intents (
 ) STRICT;
 
 CREATE UNIQUE INDEX lineage_cancel_by_target
-    ON lineage_workspace_intents(target_intent_id) WHERE intent_kind = 'cancel';
+    ON lineage_workspace_intents(tenant,target_intent_id) WHERE intent_kind = 'cancel';
 "#;
+
+// Exact short-lived unscoped schema accepted only as a v2 migration source.
+const SCHEMA_V2: &str = include_str!("lineage_index_v2.sql");
+// Exact tenant-scoped schema accepted only as a v3 migration source.
+const SCHEMA_V3: &str = include_str!("lineage_index_v3.sql");
 
 /// Stable lineage-index refusal.
 #[derive(Debug)]
@@ -322,9 +334,7 @@ pub struct IntentAuthorizationScope {
 
 impl IntentAuthorizationScope {
     pub fn new(tenant: String, project: ProjectId, workspace: UserWorkspaceId) -> Indexed<Self> {
-        if tenant.is_empty() || tenant.len() > 255 || tenant.chars().any(char::is_control) {
-            return Err(LineageIndexError::InvalidField("tenant"));
-        }
+        validate_tenant(&tenant)?;
         Ok(Self {
             tenant,
             project,
@@ -391,15 +401,20 @@ impl LineageIndex {
         &self.path
     }
 
-    /// Insert one external item or replay the exact already-durable intake.
-    pub fn intake_external(&mut self, item: &ExternalWorkItem) -> Indexed<WriteAdmission> {
+    /// Insert one tenant-scoped external item or replay the exact durable intake.
+    pub fn intake_external(
+        &mut self,
+        tenant: &str,
+        item: &ExternalWorkItem,
+    ) -> Indexed<WriteAdmission> {
+        validate_tenant(tenant)?;
         if item.revision() != Revision::FIRST {
             return Err(LineageIndexError::InvalidField("revision"));
         }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(existing) = read_external(&transaction, item.identity())? {
+        if let Some(existing) = read_external(&transaction, tenant, item.identity())? {
             return if &existing == item {
                 Ok(WriteAdmission::Replayed {
                     revision: existing.revision().get(),
@@ -408,8 +423,8 @@ impl LineageIndex {
                 Err(LineageIndexError::DuplicateIntake)
             };
         }
-        validate_moved_target(&transaction, item)?;
-        insert_external(&transaction, item)?;
+        validate_moved_target(&transaction, tenant, item)?;
+        insert_external(&transaction, tenant, item)?;
         transaction.commit()?;
         Ok(WriteAdmission::Inserted { revision: 1 })
     }
@@ -417,13 +432,15 @@ impl LineageIndex {
     /// Revision-fenced update of external source state and observation fields.
     pub fn update_external(
         &mut self,
+        tenant: &str,
         item: &ExternalWorkItem,
         expected_revision: Revision,
     ) -> Indexed<WriteAdmission> {
+        validate_tenant(tenant)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing = read_external(&transaction, item.identity())?
+        let existing = read_external(&transaction, tenant, item.identity())?
             .ok_or(LineageIndexError::NotFound("external work item"))?;
         if &existing == item {
             if expected_revision.get().checked_add(1) == Some(existing.revision().get()) {
@@ -453,8 +470,8 @@ impl LineageIndex {
         {
             return Err(LineageIndexError::IdentityConflict);
         }
-        validate_moved_target(&transaction, item)?;
-        update_external_row(&transaction, item, expected_revision)?;
+        validate_moved_target(&transaction, tenant, item)?;
+        update_external_row(&transaction, tenant, item, expected_revision)?;
         transaction.commit()?;
         Ok(WriteAdmission::Updated { revision: next })
     }
@@ -462,20 +479,22 @@ impl LineageIndex {
     /// Insert, update, or replay one internal orchestration record.
     pub fn record_orchestration(
         &mut self,
+        tenant: &str,
         record: &OrchestrationRecord,
         expected_revision: Option<Revision>,
     ) -> Indexed<WriteAdmission> {
+        validate_tenant(tenant)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        validate_record_links(&transaction, record)?;
-        let existing = read_orchestration(&transaction, record.identity())?;
+        validate_record_links(&transaction, tenant, record)?;
+        let existing = read_orchestration(&transaction, tenant, record.identity())?;
         match (existing, expected_revision) {
             (None, None) => {
                 if record.revision() != Revision::FIRST {
                     return Err(LineageIndexError::InvalidField("revision"));
                 }
-                insert_orchestration(&transaction, record)?;
+                insert_orchestration(&transaction, tenant, record)?;
                 transaction.commit()?;
                 Ok(WriteAdmission::Inserted { revision: 1 })
             }
@@ -520,7 +539,7 @@ impl LineageIndex {
                 let next = durable
                     .checked_add(1)
                     .ok_or(LineageIndexError::InvalidField("revision"))?;
-                update_orchestration_row(&transaction, record, expected, next)?;
+                update_orchestration_row(&transaction, tenant, record, expected, next)?;
                 transaction.commit()?;
                 Ok(WriteAdmission::Updated { revision: next })
             }
@@ -528,17 +547,19 @@ impl LineageIndex {
     }
 
     /// Persist a create, resume, or cancellation decision under its exact
-    /// idempotent intent ID.
+    /// tenant-scoped idempotent intent ID.
     pub fn record_intent(
         &mut self,
+        tenant: &str,
         intent: &WorkspaceIntent,
         outcome: &WorkspaceIntentOutcome,
     ) -> Indexed<WriteAdmission> {
+        validate_tenant(tenant)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let request_digest = intent_digest(intent);
-        if let Some(existing) = read_intent(&transaction, intent.intent_id().as_str())? {
+        if let Some(existing) = read_intent(&transaction, tenant, intent.intent_id().as_str())? {
             return if existing.request_digest == request_digest {
                 Ok(WriteAdmission::Replayed {
                     revision: from_db(existing.revision, "intent_revision")?,
@@ -547,11 +568,12 @@ impl LineageIndex {
                 Err(LineageIndexError::IdentityConflict)
             };
         }
-        let fingerprint = intent_fingerprint(&transaction, intent, outcome, request_digest)?;
+        let fingerprint =
+            intent_fingerprint(&transaction, tenant, intent, outcome, request_digest)?;
         if matches!(outcome, WorkspaceIntentOutcome::Cancelled(_)) {
-            apply_cancellation(&transaction, &fingerprint)?;
+            apply_cancellation(&transaction, tenant, &fingerprint)?;
         }
-        insert_intent(&transaction, &fingerprint)?;
+        insert_intent(&transaction, tenant, &fingerprint)?;
         transaction.commit()?;
         Ok(WriteAdmission::Inserted { revision: 1 })
     }
@@ -561,15 +583,17 @@ impl LineageIndex {
     /// underlying workspace operation.
     pub fn reconcile_intent(
         &mut self,
+        tenant: &str,
         receipt: &WorkspaceIntentExecutionReceipt,
     ) -> Indexed<WriteAdmission> {
+        validate_tenant(tenant)?;
         if receipt.outcome.reconciliation() != WorkspaceIntentReconciliation::Final {
             return Err(LineageIndexError::InvalidField("final_outcome"));
         }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing = read_intent(&transaction, receipt.intent_id.as_str())?
+        let existing = read_intent(&transaction, tenant, receipt.intent_id.as_str())?
             .ok_or(LineageIndexError::NotFound("workspace intent"))?;
         if existing.request_digest != receipt.request_digest {
             return Err(LineageIndexError::IdentityConflict);
@@ -615,11 +639,11 @@ impl LineageIndex {
             return Err(LineageIndexError::IdentityConflict);
         }
         if matches!(receipt.outcome, WorkspaceIntentOutcome::Cancelled(_)) {
-            apply_cancellation(&transaction, &existing)?;
+            apply_cancellation(&transaction, tenant, &existing)?;
         }
         let changed = transaction.execute(
-            "UPDATE lineage_workspace_intents SET outcome_kind=?2,outcome_conflict=?3,outcome_workspace_id=?4,reconciliation='final',revision=2 WHERE intent_id=?1 AND request_digest=?5 AND reconciliation='poll_receipt' AND revision=1",
-            params![receipt.intent_id.as_str(), outcome_kind, outcome_conflict, outcome_workspace, receipt.request_digest.as_slice()],
+            "UPDATE lineage_workspace_intents SET outcome_kind=?3,outcome_conflict=?4,outcome_workspace_id=?5,reconciliation='final',revision=2 WHERE tenant=?1 AND intent_id=?2 AND request_digest=?6 AND reconciliation='poll_receipt' AND revision=1",
+            params![tenant, receipt.intent_id.as_str(), outcome_kind, outcome_conflict, outcome_workspace, receipt.request_digest.as_slice()],
         )?;
         if changed != 1 {
             return Err(LineageIndexError::IdentityConflict);
@@ -641,7 +665,7 @@ impl LineageIndex {
         if !authorize(scope) {
             return Err(LineageIndexError::Unauthorized);
         }
-        let Some(value) = read_intent(&self.connection, id.as_str())? else {
+        let Some(value) = read_intent(&self.connection, scope.tenant(), id.as_str())? else {
             return Ok(None);
         };
         if value.workspace != scope.workspace.as_str() {
@@ -650,10 +674,14 @@ impl LineageIndex {
         value.into_stored().map(Some)
     }
 
-    /// Rebuild the bounded projection for one exact authorized workspace.
-    fn projection_unchecked(&self, workspace: &UserWorkspaceId) -> Indexed<LineageProjection> {
-        let external = read_external_workspace(&self.connection, workspace)?;
-        let orchestration = read_orchestration_workspace(&self.connection, workspace)?;
+    /// Rebuild the bounded projection for one exact authorized tenant/workspace.
+    fn projection_unchecked(
+        &self,
+        tenant: &str,
+        workspace: &UserWorkspaceId,
+    ) -> Indexed<LineageProjection> {
+        let external = read_external_workspace(&self.connection, tenant, workspace)?;
+        let orchestration = read_orchestration_workspace(&self.connection, tenant, workspace)?;
         if external.len().saturating_add(orchestration.len()) > MAX_LINEAGE_RECORDS {
             return Err(LineageIndexError::ProjectionTooLarge);
         }
@@ -662,20 +690,20 @@ impl LineageIndex {
     }
 
     /// Rebuild a projection only after the embedding authority accepts the
-    /// exact workspace scope. This is the daemon-facing seam; the index does
-    /// not infer authorization from possession of a workspace identifier.
+    /// exact tenant/project/workspace scope. This is the daemon-facing seam;
+    /// the index does not infer authorization from possession of identifiers.
     pub fn projection_authorized(
         &self,
         negotiated: &NegotiatedPlatform,
-        workspace: &UserWorkspaceId,
-        authorize: impl FnOnce(&UserWorkspaceId) -> bool,
+        scope: &IntentAuthorizationScope,
+        authorize: impl FnOnce(&IntentAuthorizationScope) -> bool,
     ) -> Indexed<LineageProjection> {
         require_lineage_v2(negotiated)
             .map_err(|_| LineageIndexError::InvalidField("negotiated_platform"))?;
-        if !authorize(workspace) {
+        if !authorize(scope) {
             return Err(LineageIndexError::Unauthorized);
         }
-        self.projection_unchecked(workspace)
+        self.projection_unchecked(scope.tenant(), scope.workspace())
     }
 }
 
@@ -697,11 +725,15 @@ fn external_transition_allowed(previous: &ExternalWorkItem, next: &ExternalWorkI
     }
 }
 
-fn validate_moved_target(connection: &Connection, item: &ExternalWorkItem) -> Indexed<()> {
+fn validate_moved_target(
+    connection: &Connection,
+    tenant: &str,
+    item: &ExternalWorkItem,
+) -> Indexed<()> {
     let Some(target_id) = item.moved_to() else {
         return Ok(());
     };
-    let target = read_external(connection, target_id)?
+    let target = read_external(connection, tenant, target_id)?
         .ok_or(LineageIndexError::NotFound("moved external work target"))?;
     if target.workspace() != item.workspace() || !target.origin().refines(item.origin()) {
         return Err(LineageIndexError::IdentityConflict);
@@ -715,7 +747,7 @@ fn validate_moved_target(connection: &Connection, item: &ExternalWorkItem) -> In
         cursor = current
             .moved_to()
             .map(|identity| {
-                read_external(connection, identity)?.ok_or(LineageIndexError::NotFound(
+                read_external(connection, tenant, identity)?.ok_or(LineageIndexError::NotFound(
                     "moved external work descendant",
                 ))
             })
@@ -744,9 +776,13 @@ fn observation_monotonic(
     }
 }
 
-fn validate_record_links(connection: &Connection, record: &OrchestrationRecord) -> Indexed<()> {
+fn validate_record_links(
+    connection: &Connection,
+    tenant: &str,
+    record: &OrchestrationRecord,
+) -> Indexed<()> {
     if let Some(external) = record.external_work() {
-        let item = read_external(connection, external)?
+        let item = read_external(connection, tenant, external)?
             .ok_or(LineageIndexError::NotFound("external work item"))?;
         if item.workspace() != record.workspace() {
             return Err(LineageIndexError::IdentityConflict);
@@ -756,8 +792,8 @@ fn validate_record_links(connection: &Connection, record: &OrchestrationRecord) 
         }
     }
     if let Some(parent) = record.parent() {
-        let parent =
-            read_orchestration(connection, parent)?.ok_or(LineageIndexError::OrphanDispatch)?;
+        let parent = read_orchestration(connection, tenant, parent)?
+            .ok_or(LineageIndexError::OrphanDispatch)?;
         if parent.0.workspace() != record.workspace() {
             return Err(LineageIndexError::IdentityConflict);
         }
@@ -768,13 +804,14 @@ fn validate_record_links(connection: &Connection, record: &OrchestrationRecord) 
     Ok(())
 }
 
-fn insert_external(connection: &Connection, item: &ExternalWorkItem) -> Indexed<()> {
+fn insert_external(connection: &Connection, tenant: &str, item: &ExternalWorkItem) -> Indexed<()> {
     let moved = item.moved_to();
     let latest = item.latest_useful_message();
     connection.execute(
         "INSERT INTO lineage_external_work VALUES
-         (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+         (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
         params![
+            tenant,
             item.identity().provider().as_str(),
             item.identity().authority().as_str(),
             item.identity().scope().as_str(),
@@ -803,17 +840,19 @@ fn insert_external(connection: &Connection, item: &ExternalWorkItem) -> Indexed<
 
 fn update_external_row(
     connection: &Connection,
+    tenant: &str,
     item: &ExternalWorkItem,
     expected: Revision,
 ) -> Indexed<()> {
     let moved = item.moved_to();
     let latest = item.latest_useful_message();
     let changed = connection.execute(
-        "UPDATE lineage_external_work SET revision=?6,external_state=?7,moved_provider=?8,
-         moved_authority_id=?9,moved_scope=?10,moved_key=?11,observed_at_ms=?12,stale_after_ms=?13,freshness_state=?14,
-         latest_message=?15,latest_observed_at_ms=?16
-         WHERE provider=?1 AND authority_id=?2 AND scope=?3 AND work_key=?4 AND revision=?5",
+        "UPDATE lineage_external_work SET revision=?7,external_state=?8,moved_provider=?9,
+         moved_authority_id=?10,moved_scope=?11,moved_key=?12,observed_at_ms=?13,stale_after_ms=?14,freshness_state=?15,
+         latest_message=?16,latest_observed_at_ms=?17
+         WHERE tenant=?1 AND provider=?2 AND authority_id=?3 AND scope=?4 AND work_key=?5 AND revision=?6",
         params![
+            tenant,
             item.identity().provider().as_str(),
             item.identity().authority().as_str(),
             item.identity().scope().as_str(),
@@ -849,21 +888,27 @@ fn status_parts(status: &LineageStatus) -> (&'static str, Option<&str>) {
     }
 }
 
-fn insert_orchestration(connection: &Connection, record: &OrchestrationRecord) -> Indexed<()> {
-    write_orchestration(connection, record, None, 1, true)
+fn insert_orchestration(
+    connection: &Connection,
+    tenant: &str,
+    record: &OrchestrationRecord,
+) -> Indexed<()> {
+    write_orchestration(connection, tenant, record, None, 1, true)
 }
 
 fn update_orchestration_row(
     connection: &Connection,
+    tenant: &str,
     record: &OrchestrationRecord,
     expected: Revision,
     next: u64,
 ) -> Indexed<()> {
-    write_orchestration(connection, record, Some(expected), next, false)
+    write_orchestration(connection, tenant, record, Some(expected), next, false)
 }
 
 fn write_orchestration(
     connection: &Connection,
+    tenant: &str,
     record: &OrchestrationRecord,
     expected: Option<Revision>,
     revision: u64,
@@ -874,6 +919,7 @@ fn write_orchestration(
     let latest = record.latest_useful_message();
     let (status_kind, status_message) = status_parts(record.status());
     let values = params![
+        tenant,
         record.identity().kind().as_str(),
         record.identity().id(),
         record.workspace().as_str(),
@@ -903,15 +949,15 @@ fn write_orchestration(
     let changed = if insert {
         connection.execute(
             "INSERT INTO lineage_orchestration
-             SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20
-             WHERE ?21 IS NULL",
+             SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21
+             WHERE ?22 IS NULL",
             values,
         )?
     } else {
         connection.execute(
-            "UPDATE lineage_orchestration SET status_kind=?10,status_message=?11,observed_at_ms=?12,
-             stale_after_ms=?13,freshness_state=?14,latest_message=?15,latest_observed_at_ms=?16,revision=?17
-             WHERE orchestration_kind=?1 AND orchestration_id=?2 AND revision=?21", values)?
+            "UPDATE lineage_orchestration SET status_kind=?11,status_message=?12,observed_at_ms=?13,
+             stale_after_ms=?14,freshness_state=?15,latest_message=?16,latest_observed_at_ms=?17,revision=?18
+             WHERE tenant=?1 AND orchestration_kind=?2 AND orchestration_id=?3 AND revision=?22", values)?
     };
     if changed != 1 {
         return Err(LineageIndexError::Corrupt("orchestration_write"));
@@ -972,15 +1018,17 @@ fn raw_external(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawExternal> {
 
 fn read_external(
     connection: &Connection,
+    tenant: &str,
     identity: &ExternalWorkIdentity,
 ) -> Indexed<Option<ExternalWorkItem>> {
     let raw = connection
         .query_row(
             &format!(
                 "SELECT {EXTERNAL_COLUMNS} FROM lineage_external_work
-                  WHERE provider=?1 AND authority_id=?2 AND scope=?3 AND work_key=?4"
+                  WHERE tenant=?1 AND provider=?2 AND authority_id=?3 AND scope=?4 AND work_key=?5"
             ),
             params![
+                tenant,
                 identity.provider().as_str(),
                 identity.authority().as_str(),
                 identity.scope().as_str(),
@@ -994,15 +1042,16 @@ fn read_external(
 
 fn read_external_workspace(
     connection: &Connection,
+    tenant: &str,
     workspace: &UserWorkspaceId,
 ) -> Indexed<Vec<ExternalWorkItem>> {
     let mut statement = connection.prepare(&format!(
-        "SELECT {EXTERNAL_COLUMNS} FROM lineage_external_work WHERE workspace_id=?1
-         ORDER BY provider,authority_id,scope,work_key LIMIT ?2"
+        "SELECT {EXTERNAL_COLUMNS} FROM lineage_external_work WHERE tenant=?1 AND workspace_id=?2
+         ORDER BY provider,authority_id,scope,work_key LIMIT ?3"
     ))?;
     let limit = i64::try_from(MAX_LINEAGE_RECORDS + 1)
         .map_err(|_| LineageIndexError::InvalidField("limit"))?;
-    let rows = statement.query_map(params![workspace.as_str(), limit], raw_external)?;
+    let rows = statement.query_map(params![tenant, workspace.as_str(), limit], raw_external)?;
     rows.map(|row| {
         row.map_err(LineageIndexError::from)
             .and_then(decode_external)
@@ -1169,15 +1218,16 @@ fn raw_orchestration(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawOrchestrati
 
 fn read_orchestration(
     connection: &Connection,
+    tenant: &str,
     identity: &OrchestrationIdentity,
 ) -> Indexed<Option<(OrchestrationRecord, u64)>> {
     let raw = connection
         .query_row(
             &format!(
                 "SELECT {ORCHESTRATION_COLUMNS} FROM lineage_orchestration
-                  WHERE orchestration_kind=?1 AND orchestration_id=?2"
+                  WHERE tenant=?1 AND orchestration_kind=?2 AND orchestration_id=?3"
             ),
-            params![identity.kind().as_str(), identity.id()],
+            params![tenant, identity.kind().as_str(), identity.id()],
             raw_orchestration,
         )
         .optional()?;
@@ -1186,15 +1236,19 @@ fn read_orchestration(
 
 fn read_orchestration_workspace(
     connection: &Connection,
+    tenant: &str,
     workspace: &UserWorkspaceId,
 ) -> Indexed<Vec<OrchestrationRecord>> {
     let mut statement = connection.prepare(&format!(
-        "SELECT {ORCHESTRATION_COLUMNS} FROM lineage_orchestration WHERE workspace_id=?1
-         ORDER BY orchestration_kind,orchestration_id LIMIT ?2"
+        "SELECT {ORCHESTRATION_COLUMNS} FROM lineage_orchestration WHERE tenant=?1 AND workspace_id=?2
+         ORDER BY orchestration_kind,orchestration_id LIMIT ?3"
     ))?;
     let limit = i64::try_from(MAX_LINEAGE_RECORDS + 1)
         .map_err(|_| LineageIndexError::InvalidField("limit"))?;
-    let rows = statement.query_map(params![workspace.as_str(), limit], raw_orchestration)?;
+    let rows = statement.query_map(
+        params![tenant, workspace.as_str(), limit],
+        raw_orchestration,
+    )?;
     rows.map(|row| {
         row.map_err(LineageIndexError::from)
             .and_then(decode_orchestration)
@@ -1483,6 +1537,7 @@ fn intent_digest(intent: &WorkspaceIntent) -> [u8; 32] {
 
 fn intent_fingerprint(
     connection: &Connection,
+    tenant: &str,
     intent: &WorkspaceIntent,
     outcome: &WorkspaceIntentOutcome,
     request_digest: [u8; 32],
@@ -1541,7 +1596,8 @@ fn intent_fingerprint(
     let target = target_intent_id
         .as_deref()
         .map(|target_id| {
-            read_intent(connection, target_id)?.ok_or(LineageIndexError::NotFound("target intent"))
+            read_intent(connection, tenant, target_id)?
+                .ok_or(LineageIndexError::NotFound("target intent"))
         })
         .transpose()?;
     if let Some(target) = &target
@@ -1560,14 +1616,14 @@ fn intent_fingerprint(
     let task_identity = OrchestrationIdentity::Task(
         OrchestrationTaskId::new(&task_id).map_err(|_| LineageIndexError::InvalidField("task"))?,
     );
-    let (task, _) =
-        read_orchestration(connection, &task_identity)?.ok_or(LineageIndexError::OrphanDispatch)?;
+    let (task, _) = read_orchestration(connection, tenant, &task_identity)?
+        .ok_or(LineageIndexError::OrphanDispatch)?;
     if requested_workspace.is_some_and(|workspace| workspace != task.workspace()) {
         return Err(LineageIndexError::IdentityConflict);
     }
     let mut external_state = None;
     if let Some(external) = external {
-        let item = read_external(connection, external)?
+        let item = read_external(connection, tenant, external)?
             .ok_or(LineageIndexError::NotFound("external work item"))?;
         if item.workspace() != task.workspace() || task.external_work() != Some(external) {
             return Err(LineageIndexError::IdentityConflict);
@@ -1632,11 +1688,12 @@ fn intent_fingerprint(
     })
 }
 
-fn insert_intent(connection: &Connection, value: &IntentFingerprint) -> Indexed<()> {
+fn insert_intent(connection: &Connection, tenant: &str, value: &IntentFingerprint) -> Indexed<()> {
     connection.execute(
         "INSERT INTO lineage_workspace_intents VALUES
-         (?1,?2,?3,'task',?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+         (?1,?2,?3,?4,'task',?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
         params![
+            tenant,
             value.intent_id,
             value.request_digest.as_slice(),
             value.intent_kind,
@@ -1660,7 +1717,11 @@ fn insert_intent(connection: &Connection, value: &IntentFingerprint) -> Indexed<
     Ok(())
 }
 
-fn apply_cancellation(connection: &Connection, cancellation: &IntentFingerprint) -> Indexed<()> {
+fn apply_cancellation(
+    connection: &Connection,
+    tenant: &str,
+    cancellation: &IntentFingerprint,
+) -> Indexed<()> {
     let target = cancellation
         .target_intent_id
         .as_deref()
@@ -1672,10 +1733,16 @@ fn apply_cancellation(connection: &Connection, cancellation: &IntentFingerprint)
         "UPDATE lineage_workspace_intents
          SET outcome_kind='conflict',outcome_conflict='creation_cancelled',outcome_workspace_id=NULL,
              reconciliation='final',revision=2
-         WHERE intent_id=?1 AND workspace_id=?2 AND task_id=?3 AND revision=?4
+         WHERE tenant=?1 AND intent_id=?2 AND workspace_id=?3 AND task_id=?4 AND revision=?5
            AND intent_kind IN ('create','resume') AND outcome_kind IN ('accepted','unknown')
            AND reconciliation='poll_receipt'",
-        params![target, cancellation.workspace, cancellation.task_id, expected],
+        params![
+            tenant,
+            target,
+            cancellation.workspace,
+            cancellation.task_id,
+            expected
+        ],
     )?;
     if changed != 1 {
         return Err(LineageIndexError::IdentityConflict);
@@ -1683,50 +1750,46 @@ fn apply_cancellation(connection: &Connection, cancellation: &IntentFingerprint)
     Ok(())
 }
 
-fn read_intent(connection: &Connection, intent_id: &str) -> Indexed<Option<IntentFingerprint>> {
-    struct Raw {
-        intent_id: String,
-        request_digest: Vec<u8>,
-        intent_kind: String,
-        task_id: String,
-        workspace: String,
-        external_provider: Option<String>,
-        external_authority: Option<String>,
-        external_scope: Option<String>,
-        external_key: Option<String>,
-        base_selector: Option<String>,
-        branch_selector: Option<String>,
-        expected_revision: Option<i64>,
-        target_intent_id: Option<String>,
-        revision: i64,
-        outcome_kind: String,
-        outcome_conflict: Option<String>,
-        outcome_workspace: Option<String>,
-        reconciliation: String,
-    }
+fn read_intent(
+    connection: &Connection,
+    tenant: &str,
+    intent_id: &str,
+) -> Indexed<Option<IntentFingerprint>> {
+    type Raw = (
+        String,
+        Vec<u8>,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+    );
     connection.query_row(
-        "SELECT intent_id,request_digest,intent_kind,task_id,workspace_id,external_provider,external_authority_id,external_scope,external_key,base_selector,branch_selector,expected_revision,target_intent_id,revision,outcome_kind,outcome_conflict,outcome_workspace_id,reconciliation FROM lineage_workspace_intents WHERE intent_id=?1",
-        [intent_id],
-        |row| Ok(Raw {
-            intent_id: row.get(0)?, request_digest: row.get(1)?, intent_kind: row.get(2)?,
-            task_id: row.get(3)?, workspace: row.get(4)?, external_provider: row.get(5)?,
-            external_authority: row.get(6)?, external_scope: row.get(7)?, external_key: row.get(8)?,
-            base_selector: row.get(9)?, branch_selector: row.get(10)?, expected_revision: row.get(11)?,
-            target_intent_id: row.get(12)?, revision: row.get(13)?, outcome_kind: row.get(14)?,
-            outcome_conflict: row.get(15)?, outcome_workspace: row.get(16)?, reconciliation: row.get(17)?,
-        }))
-    .optional()?.map(|raw| {
-            WorkspaceIntentId::new(&raw.intent_id).map_err(|_| LineageIndexError::Corrupt("intent_id"))?;
-            let request_digest: [u8;32] = raw.request_digest.clone().try_into().map_err(|_| LineageIndexError::Corrupt("request_digest"))?;
-            OrchestrationTaskId::new(&raw.task_id).map_err(|_| LineageIndexError::Corrupt("task_id"))?;
-            UserWorkspaceId::new(&raw.workspace).map_err(|_| LineageIndexError::Corrupt("workspace_id"))?;
-            let intent_kind = match raw.intent_kind.as_str() {
+        "SELECT intent_id,request_digest,intent_kind,task_id,workspace_id,external_provider,external_authority_id,external_scope,external_key,base_selector,branch_selector,expected_revision,target_intent_id,revision,outcome_kind,outcome_conflict,outcome_workspace_id,reconciliation FROM lineage_workspace_intents WHERE tenant=?1 AND intent_id=?2",
+        params![tenant, intent_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?,row.get(15)?,row.get(16)?,row.get(17)?)))
+    .optional()?.map(|raw: Raw| {
+            WorkspaceIntentId::new(&raw.0).map_err(|_| LineageIndexError::Corrupt("intent_id"))?;
+            let request_digest: [u8;32] = raw.1.clone().try_into().map_err(|_| LineageIndexError::Corrupt("request_digest"))?;
+            OrchestrationTaskId::new(&raw.3).map_err(|_| LineageIndexError::Corrupt("task_id"))?;
+            UserWorkspaceId::new(&raw.4).map_err(|_| LineageIndexError::Corrupt("workspace_id"))?;
+            let intent_kind = match raw.2.as_str() {
                 "create" => "create",
                 "resume" => "resume",
                 "cancel" => "cancel",
                 _ => return Err(LineageIndexError::Corrupt("intent_kind")),
             };
-            let outcome_kind = match raw.outcome_kind.as_str() {
+            let outcome_kind = match raw.14.as_str() {
                 "accepted" => "accepted",
                 "unknown" => "unknown",
                 "created" => "created",
@@ -1735,7 +1798,7 @@ fn read_intent(connection: &Connection, intent_id: &str) -> Indexed<Option<Inten
                 "conflict" => "conflict",
                 _ => return Err(LineageIndexError::Corrupt("outcome_kind")),
             };
-            let outcome_conflict = raw.outcome_conflict.as_deref().map(parse_conflict).transpose()?;
+            let outcome_conflict = raw.15.as_deref().map(parse_conflict).transpose()?;
             if !matches!(
                 (intent_kind, outcome_kind),
                 ("create", "accepted" | "unknown" | "created" | "conflict")
@@ -1747,7 +1810,7 @@ fn read_intent(connection: &Connection, intent_id: &str) -> Indexed<Option<Inten
             match intent_kind {
                 "create" => {
                     let (Some(provider), Some(authority), Some(scope), Some(key), Some(base), Some(branch), None, None) =
-                        (&raw.external_provider, &raw.external_authority, &raw.external_scope, &raw.external_key, &raw.base_selector, &raw.branch_selector, raw.expected_revision, &raw.target_intent_id)
+                        (&raw.5, &raw.6, &raw.7, &raw.8, &raw.9, &raw.10, raw.11, &raw.12)
                     else {
                         return Err(LineageIndexError::Corrupt("create_intent"));
                     };
@@ -1758,22 +1821,19 @@ fn read_intent(connection: &Connection, intent_id: &str) -> Indexed<Option<Inten
                         .map_err(|_| LineageIndexError::Corrupt("branch_selector"))?;
                 }
                 "resume" => {
-                    if raw.external_provider.is_some() || raw.external_authority.is_some()
-                        || raw.external_scope.is_some() || raw.external_key.is_some()
-                        || raw.base_selector.is_some() || raw.branch_selector.is_some()
-                        || raw.expected_revision.is_none_or(|value| value < 1)
-                        || raw.target_intent_id.is_some()
+                    if raw.5.is_some() || raw.6.is_some() || raw.7.is_some() || raw.8.is_some()
+                        || raw.9.is_some() || raw.10.is_some() || raw.11.is_none_or(|value| value < 1)
+                        || raw.12.is_some()
                     {
                         return Err(LineageIndexError::Corrupt("resume_intent"));
                     }
                 }
                 "cancel" => {
-                    if raw.external_provider.is_some() || raw.external_authority.is_some()
-                        || raw.external_scope.is_some() || raw.external_key.is_some()
-                        || raw.base_selector.is_some() || raw.branch_selector.is_some()
-                        || raw.expected_revision.is_none_or(|value| value < 1)
-                        || raw.target_intent_id.as_deref().is_none_or(|target| {
-                            WorkspaceIntentId::new(target).is_err() || target == raw.intent_id
+                    if raw.5.is_some() || raw.6.is_some() || raw.7.is_some() || raw.8.is_some()
+                        || raw.9.is_some() || raw.10.is_some()
+                        || raw.11.is_none_or(|value| value < 1)
+                        || raw.12.as_deref().is_none_or(|target| {
+                            WorkspaceIntentId::new(target).is_err() || target == raw.0
                         })
                     {
                         return Err(LineageIndexError::Corrupt("cancel_intent"));
@@ -1781,13 +1841,13 @@ fn read_intent(connection: &Connection, intent_id: &str) -> Indexed<Option<Inten
                 }
                 _ => unreachable!(),
             }
-            match (outcome_kind, outcome_conflict, raw.outcome_workspace.as_deref(), raw.reconciliation.as_str(), raw.revision) {
+            match (outcome_kind, outcome_conflict, raw.16.as_deref(), raw.17.as_str(), raw.13) {
                 ("accepted" | "unknown", None, None, "poll_receipt", 1) => {}
                 ("conflict", Some(_), None, "final", 1 | 2) => {}
                 ("cancelled", None, None, "final", 1 | 2) if intent_kind == "cancel" => {}
                 ("created", None, Some(workspace), "final", 1 | 2)
                 | ("resumed", None, Some(workspace), "final", 1 | 2)
-                    if workspace == raw.workspace =>
+                    if workspace == raw.4 =>
                 {
                     UserWorkspaceId::new(workspace)
                         .map_err(|_| LineageIndexError::Corrupt("outcome_workspace_id"))?;
@@ -1795,19 +1855,18 @@ fn read_intent(connection: &Connection, intent_id: &str) -> Indexed<Option<Inten
                 _ => return Err(LineageIndexError::Corrupt("intent_outcome")),
             }
             Ok(IntentFingerprint {
-                intent_id: raw.intent_id,
+                intent_id: raw.0,
                 request_digest,
                 intent_kind,
-                task_id: raw.task_id, workspace: raw.workspace, external_provider: raw.external_provider,
-                external_authority: raw.external_authority, external_scope: raw.external_scope,
-                external_key: raw.external_key, base_selector: raw.base_selector,
-                branch_selector: raw.branch_selector, expected_revision: raw.expected_revision,
-                target_intent_id: raw.target_intent_id,
-                revision: raw.revision,
+                task_id: raw.3, workspace: raw.4, external_provider: raw.5, external_authority: raw.6,
+                external_scope: raw.7, external_key: raw.8, base_selector: raw.9, branch_selector: raw.10,
+                expected_revision: raw.11,
+                target_intent_id: raw.12,
+                revision: raw.13,
                 outcome_kind,
                 outcome_conflict: outcome_conflict.map(WorkspaceIntentConflict::as_str),
-                outcome_workspace: raw.outcome_workspace,
-                reconciliation: if raw.reconciliation == "final" { "final" } else { "poll_receipt" },
+                outcome_workspace: raw.16,
+                reconciliation: if raw.17 == "final" { "final" } else { "poll_receipt" },
             })
         })
         .transpose()
@@ -1835,6 +1894,9 @@ fn initialize(connection: &mut Connection) -> Indexed<()> {
     if version == 2 {
         return migrate_v2(connection);
     }
+    if version == 3 {
+        return migrate_v3(connection);
+    }
     if version == LINEAGE_INDEX_SCHEMA_VERSION {
         validate_current_schema(connection)?;
         return validate_durable_graphs(connection);
@@ -1857,13 +1919,17 @@ fn initialize(connection: &mut Connection) -> Indexed<()> {
         });
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(SCHEMA_V3)?;
+    transaction.execute_batch(SCHEMA_V4)?;
     transaction.pragma_update(None, "user_version", LINEAGE_INDEX_SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
 }
 
 fn validate_current_schema(connection: &Connection) -> Indexed<()> {
+    validate_schema(connection, SCHEMA_V4)
+}
+
+fn validate_schema(connection: &Connection, schema: &str) -> Indexed<()> {
     let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if integrity != "ok" {
         return Err(LineageIndexError::Corrupt("integrity_check"));
@@ -1876,7 +1942,7 @@ fn validate_current_schema(connection: &Connection) -> Indexed<()> {
         return Err(LineageIndexError::Corrupt("foreign_keys"));
     }
     let expected = Connection::open_in_memory()?;
-    expected.execute_batch(SCHEMA_V3)?;
+    expected.execute_batch(schema)?;
     if schema_snapshot(connection)? != schema_snapshot(&expected)? {
         return Err(LineageIndexError::Corrupt("schema_shape"));
     }
@@ -1898,17 +1964,20 @@ fn schema_snapshot(connection: &Connection) -> Indexed<Vec<SchemaObject>> {
 
 fn validate_durable_graphs(connection: &Connection) -> Indexed<()> {
     let mut statement = connection.prepare(
-        "SELECT workspace_id FROM lineage_external_work UNION SELECT workspace_id FROM lineage_orchestration",
+        "SELECT tenant,workspace_id FROM lineage_external_work UNION SELECT tenant,workspace_id FROM lineage_orchestration",
     )?;
     let workspaces = statement
-        .query_map([], |row| row.get::<_, String>(0))?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
-    for raw in workspaces {
+    for (tenant, raw) in workspaces {
+        validate_tenant(&tenant).map_err(|_| LineageIndexError::Corrupt("tenant"))?;
         let workspace =
             UserWorkspaceId::new(raw).map_err(|_| LineageIndexError::Corrupt("workspace_id"))?;
-        let external = read_external_workspace(connection, &workspace)?;
-        let orchestration = read_orchestration_workspace(connection, &workspace)?;
+        let external = read_external_workspace(connection, &tenant, &workspace)?;
+        let orchestration = read_orchestration_workspace(connection, &tenant, &workspace)?;
         for item in &external {
             if item.origin().workspace() != &workspace {
                 return Err(LineageIndexError::Corrupt("lineage_origin"));
@@ -1961,16 +2030,21 @@ fn validate_durable_graphs(connection: &Connection) -> Indexed<()> {
             }
         }
     }
-    let mut statement = connection.prepare("SELECT intent_id FROM lineage_workspace_intents")?;
+    let mut statement =
+        connection.prepare("SELECT tenant,intent_id FROM lineage_workspace_intents")?;
     let intent_ids = statement
-        .query_map([], |row| row.get::<_, String>(0))?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
-    for id in intent_ids {
+    for (tenant, id) in intent_ids {
+        validate_tenant(&tenant).map_err(|_| LineageIndexError::Corrupt("tenant"))?;
         let fingerprint =
-            read_intent(connection, &id)?.ok_or(LineageIndexError::Corrupt("intent"))?;
+            read_intent(connection, &tenant, &id)?.ok_or(LineageIndexError::Corrupt("intent"))?;
         let task = read_orchestration(
             connection,
+            &tenant,
             &OrchestrationIdentity::Task(
                 OrchestrationTaskId::new(fingerprint.task_id.clone())
                     .map_err(|_| LineageIndexError::Corrupt("intent_task"))?,
@@ -2000,7 +2074,7 @@ fn validate_durable_graphs(connection: &Connection) -> Indexed<()> {
                     .as_deref()
                     .ok_or(LineageIndexError::Corrupt("intent_external"))?,
             )?;
-            let item = read_external(connection, &external)?
+            let item = read_external(connection, &tenant, &external)?
                 .ok_or(LineageIndexError::Corrupt("intent_external"))?;
             if item.workspace() != task.workspace() || task.external_work() != Some(&external) {
                 return Err(LineageIndexError::Corrupt("intent_external"));
@@ -2011,7 +2085,7 @@ fn validate_durable_graphs(connection: &Connection) -> Indexed<()> {
                 .target_intent_id
                 .as_deref()
                 .ok_or(LineageIndexError::Corrupt("cancel_target"))?;
-            let target = read_intent(connection, target_id)?
+            let target = read_intent(connection, &tenant, target_id)?
                 .ok_or(LineageIndexError::Corrupt("cancel_target"))?;
             if target.intent_kind == "cancel"
                 || target.workspace != fingerprint.workspace
@@ -2046,26 +2120,123 @@ fn validate_durable_graphs(connection: &Connection) -> Indexed<()> {
     Ok(())
 }
 
+/// Add tenant-composite cancellable intent fields to the exact v3 schema while
+/// preserving every tenant, digest, outcome, and reconciliation state.
+fn migrate_v3(connection: &mut Connection) -> Indexed<()> {
+    with_foreign_keys_disabled(connection, |connection| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_schema(&transaction, SCHEMA_V3)?;
+        transaction.execute_batch(
+            "ALTER TABLE lineage_workspace_intents RENAME TO lineage_workspace_intents_v3;",
+        )?;
+        let start = SCHEMA_V4
+            .find("CREATE TABLE lineage_workspace_intents")
+            .ok_or(LineageIndexError::Corrupt("schema_shape"))?;
+        transaction.execute_batch(&SCHEMA_V4[start..])?;
+        transaction.execute_batch(
+            r#"
+INSERT INTO lineage_workspace_intents (
+ tenant,intent_id,request_digest,intent_kind,task_kind,task_id,workspace_id,external_provider,
+ external_authority_id,external_scope,external_key,base_selector,branch_selector,expected_revision,
+ target_intent_id,revision,outcome_kind,outcome_conflict,outcome_workspace_id,reconciliation
+)
+SELECT tenant,intent_id,request_digest,intent_kind,task_kind,task_id,workspace_id,external_provider,
+ external_authority_id,external_scope,external_key,base_selector,branch_selector,expected_revision,
+ NULL,1,outcome_kind,outcome_conflict,outcome_workspace_id,reconciliation
+FROM lineage_workspace_intents_v3;
+DROP TABLE lineage_workspace_intents_v3;
+"#,
+        )?;
+        validate_durable_graphs(&transaction)?;
+        validate_current_schema(&transaction)?;
+        transaction.pragma_update(None, "user_version", LINEAGE_INDEX_SCHEMA_VERSION)?;
+        transaction.commit()?;
+        Ok(())
+    })
+}
+
+/// Quarantine the short-lived unscoped v2 rows under one explicit tenant while
+/// preserving every already-normalized value exactly.
+fn migrate_v2(connection: &mut Connection) -> Indexed<()> {
+    with_foreign_keys_disabled(connection, |connection| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_schema(&transaction, SCHEMA_V2)?;
+        transaction.execute_batch(
+            r#"
+ALTER TABLE lineage_workspace_intents RENAME TO lineage_workspace_intents_v2;
+ALTER TABLE lineage_orchestration RENAME TO lineage_orchestration_v2;
+ALTER TABLE lineage_external_work RENAME TO lineage_external_work_v2;
+DROP INDEX lineage_external_by_workspace;
+DROP INDEX lineage_orchestration_by_workspace;
+"#,
+        )?;
+        transaction.execute_batch(SCHEMA_V4)?;
+        transaction.execute_batch(
+            r#"
+INSERT INTO lineage_external_work (
+ tenant,provider,authority_id,scope,work_key,workspace_id,revision,external_state,
+ moved_provider,moved_authority_id,moved_scope,moved_key,observed_at_ms,stale_after_ms,
+ freshness_state,latest_message,latest_observed_at_ms,origin_attempt_id,origin_session_id,origin_pane_id
+)
+SELECT 'legacy-unqualified',provider,authority_id,scope,work_key,workspace_id,revision,external_state,
+ moved_provider,moved_authority_id,moved_scope,moved_key,observed_at_ms,stale_after_ms,
+ freshness_state,latest_message,latest_observed_at_ms,origin_attempt_id,origin_session_id,origin_pane_id
+FROM lineage_external_work_v2;
+
+INSERT INTO lineage_orchestration (
+ tenant,orchestration_kind,orchestration_id,workspace_id,external_provider,external_authority_id,
+ external_scope,external_key,parent_kind,parent_id,status_kind,status_message,observed_at_ms,
+ stale_after_ms,freshness_state,latest_message,latest_observed_at_ms,revision,
+ origin_attempt_id,origin_session_id,origin_pane_id
+)
+SELECT 'legacy-unqualified',orchestration_kind,orchestration_id,workspace_id,external_provider,
+ external_authority_id,external_scope,external_key,parent_kind,parent_id,status_kind,status_message,
+ observed_at_ms,stale_after_ms,freshness_state,latest_message,latest_observed_at_ms,revision,
+ origin_attempt_id,origin_session_id,origin_pane_id
+FROM lineage_orchestration_v2;
+
+INSERT INTO lineage_workspace_intents (
+ tenant,intent_id,request_digest,intent_kind,task_kind,task_id,workspace_id,external_provider,
+ external_authority_id,external_scope,external_key,base_selector,branch_selector,expected_revision,
+ target_intent_id,revision,outcome_kind,outcome_conflict,outcome_workspace_id,reconciliation
+)
+SELECT 'legacy-unqualified',intent_id,request_digest,intent_kind,task_kind,task_id,workspace_id,
+ external_provider,external_authority_id,external_scope,external_key,base_selector,branch_selector,
+ expected_revision,NULL,1,outcome_kind,outcome_conflict,outcome_workspace_id,reconciliation
+FROM lineage_workspace_intents_v2;
+"#,
+        )?;
+        validate_durable_graphs(&transaction)?;
+        transaction.execute_batch(
+            "DROP TABLE lineage_workspace_intents_v2; DROP TABLE lineage_orchestration_v2; DROP TABLE lineage_external_work_v2;",
+        )?;
+        validate_current_schema(&transaction)?;
+        transaction.pragma_update(None, "user_version", LINEAGE_INDEX_SCHEMA_VERSION)?;
+        transaction.commit()?;
+        Ok(())
+    })
+}
+
 /// Upgrade the short-lived pre-authority branch schema without losing durable
 /// rows. Its provider-only custody is retained under an explicit opaque legacy
 /// authority; no hostname or provider payload is invented during migration.
 fn migrate_v1(connection: &mut Connection) -> Indexed<()> {
-    connection.pragma_update(None, "foreign_keys", false)?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(
-        r#"
+    with_foreign_keys_disabled(connection, |connection| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            r#"
 ALTER TABLE lineage_workspace_intents RENAME TO lineage_workspace_intents_v1;
 ALTER TABLE lineage_orchestration RENAME TO lineage_orchestration_v1;
 ALTER TABLE lineage_external_work RENAME TO lineage_external_work_v1;
 DROP INDEX lineage_external_by_workspace;
 DROP INDEX lineage_orchestration_by_workspace;
 "#,
-    )?;
-    transaction.execute_batch(SCHEMA_V3)?;
-    transaction.execute_batch(
+        )?;
+        transaction.execute_batch(SCHEMA_V4)?;
+        transaction.execute_batch(
         r#"
 INSERT INTO lineage_external_work
-SELECT provider,'legacy-unqualified-'||provider,scope,work_key,workspace_id,revision,
+SELECT 'legacy-unqualified',provider,'legacy-unqualified-'||provider,scope,work_key,workspace_id,revision,
  external_state,moved_provider,
  CASE WHEN moved_provider IS NULL THEN NULL ELSE 'legacy-unqualified-'||moved_provider END,
  moved_scope,moved_key,observed_at_ms,stale_after_ms,freshness_state,latest_message,
@@ -2073,75 +2244,67 @@ SELECT provider,'legacy-unqualified-'||provider,scope,work_key,workspace_id,revi
 FROM lineage_external_work_v1;
 
 INSERT INTO lineage_orchestration
-SELECT orchestration_kind,orchestration_id,workspace_id,external_provider,
+SELECT 'legacy-unqualified',orchestration_kind,orchestration_id,workspace_id,external_provider,
  CASE WHEN external_provider IS NULL THEN NULL ELSE 'legacy-unqualified-'||external_provider END,
  external_scope,external_key,parent_kind,parent_id,status_kind,status_message,observed_at_ms,
  stale_after_ms,freshness_state,latest_message,latest_observed_at_ms,revision,NULL,NULL,NULL
 FROM lineage_orchestration_v1;
 
 INSERT INTO lineage_workspace_intents
-SELECT intent_id,zeroblob(32),intent_kind,task_kind,task_id,workspace_id,external_provider,
+SELECT 'legacy-unqualified',intent_id,zeroblob(32),intent_kind,task_kind,task_id,workspace_id,external_provider,
  CASE WHEN external_provider IS NULL THEN NULL ELSE 'legacy-unqualified-'||external_provider END,
  external_scope,external_key,base_selector,branch_selector,expected_revision,NULL,1,outcome_kind,
- outcome_conflict,outcome_workspace_id,'final'
+ outcome_conflict,outcome_workspace_id,
+ CASE WHEN outcome_kind IN ('accepted','unknown') THEN 'poll_receipt' ELSE 'final' END
 FROM lineage_workspace_intents_v1;
 "#,
     )?;
-    let ids = {
-        let mut statement =
-            transaction.prepare("SELECT intent_id FROM lineage_workspace_intents")?;
-        statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    for id in ids {
-        let stored = read_intent(&transaction, &id)?
-            .ok_or(LineageIndexError::Corrupt("migrated_intent"))?
-            .into_stored()?;
-        let digest = intent_digest(&stored.intent);
-        transaction.execute(
-            "UPDATE lineage_workspace_intents SET request_digest=?2 WHERE intent_id=?1",
-            params![id, digest.as_slice()],
+        let ids = {
+            let mut statement = transaction
+                .prepare("SELECT intent_id FROM lineage_workspace_intents WHERE tenant=?1")?;
+            statement
+                .query_map([LEGACY_TENANT], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for id in ids {
+            let stored = read_intent(&transaction, LEGACY_TENANT, &id)?
+                .ok_or(LineageIndexError::Corrupt("migrated_intent"))?
+                .into_stored()?;
+            let digest = intent_digest(&stored.intent);
+            transaction.execute(
+            "UPDATE lineage_workspace_intents SET request_digest=?3 WHERE tenant=?1 AND intent_id=?2",
+            params![LEGACY_TENANT, id, digest.as_slice()],
         )?;
-    }
-    validate_durable_graphs(&transaction)?;
-    transaction.execute_batch(
+        }
+        validate_durable_graphs(&transaction)?;
+        transaction.execute_batch(
         "DROP TABLE lineage_workspace_intents_v1; DROP TABLE lineage_orchestration_v1; DROP TABLE lineage_external_work_v1;",
     )?;
-    validate_current_schema(&transaction)?;
-    transaction.pragma_update(None, "user_version", LINEAGE_INDEX_SCHEMA_VERSION)?;
-    transaction.commit()?;
-    connection.pragma_update(None, "foreign_keys", true)?;
-    Ok(())
+        validate_current_schema(&transaction)?;
+        transaction.pragma_update(None, "user_version", LINEAGE_INDEX_SCHEMA_VERSION)?;
+        transaction.commit()?;
+        Ok(())
+    })
 }
 
-/// Add cancellable, revision-fenced workspace intents while preserving every
-/// v2 row and its canonical request digest.
-fn migrate_v2(connection: &mut Connection) -> Indexed<()> {
+fn with_foreign_keys_disabled(
+    connection: &mut Connection,
+    migration: impl FnOnce(&mut Connection) -> Indexed<()>,
+) -> Indexed<()> {
     connection.pragma_update(None, "foreign_keys", false)?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(
-        "ALTER TABLE lineage_workspace_intents RENAME TO lineage_workspace_intents_v2;",
-    )?;
-    let start = SCHEMA_V3
-        .find("CREATE TABLE lineage_workspace_intents")
-        .ok_or(LineageIndexError::Corrupt("schema_shape"))?;
-    transaction.execute_batch(&SCHEMA_V3[start..])?;
-    transaction.execute_batch(
-        r#"
-INSERT INTO lineage_workspace_intents
-SELECT intent_id,request_digest,intent_kind,task_kind,task_id,workspace_id,external_provider,
- external_authority_id,external_scope,external_key,base_selector,branch_selector,expected_revision,
- NULL,1,outcome_kind,outcome_conflict,outcome_workspace_id,reconciliation
-FROM lineage_workspace_intents_v2;
-DROP TABLE lineage_workspace_intents_v2;
-"#,
-    )?;
-    validate_durable_graphs(&transaction)?;
-    validate_current_schema(&transaction)?;
-    transaction.pragma_update(None, "user_version", LINEAGE_INDEX_SCHEMA_VERSION)?;
-    transaction.commit()?;
-    connection.pragma_update(None, "foreign_keys", true)?;
+    let result = migration(connection);
+    let restore = connection.pragma_update(None, "foreign_keys", true);
+    match (result, restore) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(LineageIndexError::Sqlite(error)),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn validate_tenant(tenant: &str) -> Indexed<()> {
+    if tenant.is_empty() || tenant.len() > 255 || tenant.chars().any(char::is_control) {
+        return Err(LineageIndexError::InvalidField("tenant"));
+    }
     Ok(())
 }
 

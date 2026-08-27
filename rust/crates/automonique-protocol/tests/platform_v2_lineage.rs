@@ -430,7 +430,7 @@ fn shared_fixture_names_every_required_boundary_and_mixed_version_recovery() {
     let fixture = include_str!("../fixtures/platform-v2-lineage-v1.json");
     assert_eq!(
         Sha256::digest(fixture.as_bytes()).to_hex(),
-        "d1b90d8145d0388bcd75bbba16ce464090235d17e31105e95adf0f4fa8d9ea3e"
+        "c18a8a2ab399cff584ffafd200e83ccfe132d6f297e89fa1b1c3fecfcc31f4e3"
     );
     for name in [
         "duplicate_intake",
