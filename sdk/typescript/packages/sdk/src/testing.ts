@@ -21,6 +21,10 @@ import {
   type MobileAuthorization,
   type PlatformCursor,
   type PlatformRequest,
+  type PlatformNegotiationResponse,
+  type PlatformV2Request,
+  type PlatformV2Response,
+  type PlatformVersionOffer,
   type ResourceCoordinate,
   type ResourceRecord,
   type Snapshot,
@@ -35,6 +39,7 @@ import type {
   PlatformClientResponse,
   SessionHistoryPage,
 } from "./platform-client.js";
+import type {PlatformV2Adapter} from "./platform-v2-client.js";
 
 export class DeterministicFixtureError extends Error {
   readonly category: "aborted" | "script_exhausted" | "unexpected_request";
@@ -100,6 +105,50 @@ export class DeterministicPlatformAdapter implements PlatformAdapter {
     return step.result.kind === "response"
       ? Promise.resolve(step.result.value)
       : Promise.reject(step.result.value);
+  }
+}
+
+export type DeterministicPlatformV2Step =
+  | {readonly lane: "negotiation"; readonly result: PlatformNegotiationResponse}
+  | {readonly lane: "v2"; readonly result: PlatformV2Response}
+  | {readonly lane: "error"; readonly error: Error};
+
+/** Exact-order typed Platform v2 adapter with retained request coordinates. */
+export class DeterministicPlatformV2Adapter implements PlatformV2Adapter {
+  readonly negotiations: PlatformVersionOffer[] = [];
+  readonly requests: PlatformV2Request[] = [];
+  readonly #steps: DeterministicPlatformV2Step[];
+
+  constructor(steps: readonly DeterministicPlatformV2Step[]) {
+    this.#steps = [...steps];
+  }
+
+  get pendingSteps(): number {
+    return this.#steps.length;
+  }
+
+  negotiate(offer: PlatformVersionOffer, signal?: AbortSignal): Promise<PlatformNegotiationResponse> {
+    if (signal?.aborted === true) {
+      return Promise.reject(new DeterministicFixtureError("aborted", {cause: signal.reason}));
+    }
+    const step = this.#steps.shift();
+    if (step === undefined) return Promise.reject(new DeterministicFixtureError("script_exhausted"));
+    if (step.lane === "error") return Promise.reject(step.error);
+    if (step.lane !== "negotiation") return Promise.reject(new DeterministicFixtureError("unexpected_request"));
+    this.negotiations.push(offer);
+    return Promise.resolve(step.result);
+  }
+
+  request(request: PlatformV2Request, signal?: AbortSignal): Promise<PlatformV2Response> {
+    if (signal?.aborted === true) {
+      return Promise.reject(new DeterministicFixtureError("aborted", {cause: signal.reason}));
+    }
+    const step = this.#steps.shift();
+    if (step === undefined) return Promise.reject(new DeterministicFixtureError("script_exhausted"));
+    if (step.lane === "error") return Promise.reject(step.error);
+    if (step.lane !== "v2") return Promise.reject(new DeterministicFixtureError("unexpected_request"));
+    this.requests.push(request);
+    return Promise.resolve(step.result);
   }
 }
 

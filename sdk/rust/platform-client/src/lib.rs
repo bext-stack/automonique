@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Transport-neutral Rust client and presentation reducer for platform v1.
+//! Transport-neutral Rust clients and presentation reducer for Platform v1 and v2.
+
+pub mod platform_v2_client;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -41,6 +43,7 @@ pub enum ClientError {
     Io,
     Protocol,
     Correlation,
+    NotNegotiated,
     ResponseTooLarge,
     Endpoint,
     Unauthorized,
@@ -55,6 +58,7 @@ impl ClientError {
             Self::Io => "io",
             Self::Protocol => "protocol",
             Self::Correlation => "correlation",
+            Self::NotNegotiated => "not_negotiated",
             Self::ResponseTooLarge => "response_too_large",
             Self::Endpoint => "endpoint",
             Self::Unauthorized => "unauthorized",
@@ -215,7 +219,10 @@ impl HttpsTransport {
             endpoint,
             token,
             timeout: Duration::from_secs(10),
-            agent: ureq::Agent::config_builder().build().new_agent(),
+            agent: ureq::Agent::config_builder()
+                .max_redirects(0)
+                .build()
+                .new_agent(),
         })
     }
 
