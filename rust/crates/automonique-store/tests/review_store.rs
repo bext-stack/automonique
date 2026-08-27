@@ -413,6 +413,38 @@ fn approval_is_authenticated_exact_bounded_and_expiring() {
         store.decide_action(&approval, 21),
         Err(ReviewStoreError::Unauthorized)
     ));
+    let missing = ReviewApprovalDocument::new(
+        "preview-missing",
+        request.workspace().clone(),
+        approver.clone(),
+        ReviewAuthentication::UserSession,
+        request.authority().clone(),
+        action.request_digest,
+        request.expected_revision(),
+        ReviewApprovalDecision::Approved,
+        30,
+    )
+    .expect("missing preview approval");
+    let wrong_binding = ReviewApprovalDocument::new(
+        &action.preview_id,
+        request.workspace().clone(),
+        approver.clone(),
+        ReviewAuthentication::UserSession,
+        request.authority().clone(),
+        [7; 32],
+        request.expected_revision(),
+        ReviewApprovalDecision::Approved,
+        30,
+    )
+    .expect("wrong binding approval");
+    assert!(matches!(
+        store.decide_action(&missing, 21),
+        Err(ReviewStoreError::Unauthorized)
+    ));
+    assert!(matches!(
+        store.decide_action(&wrong_binding, 21),
+        Err(ReviewStoreError::Unauthorized)
+    ));
     store
         .grant_authority(
             request.workspace(),
@@ -952,6 +984,36 @@ fn write_admission_expires_before_start_but_reconciliation_survives_after_start(
         Err(ReviewStoreError::Conflict("result_revision"))
     ));
     let verifier = ReviewActorId::new("adapter-1").expect("verifier");
+    assert!(matches!(
+        store.record_completion_evidence(
+            request.workspace(),
+            "preview-missing",
+            action.request_digest,
+            &verifier,
+            ReviewAuthentication::ServiceIdentity,
+            request.authority(),
+            revision(10),
+            "ci-result-missing",
+            b"not observable without authority",
+            36,
+        ),
+        Err(ReviewStoreError::Unauthorized)
+    ));
+    assert!(matches!(
+        store.record_completion_evidence(
+            request.workspace(),
+            &action.preview_id,
+            [7; 32],
+            &verifier,
+            ReviewAuthentication::ServiceIdentity,
+            request.authority(),
+            revision(10),
+            "ci-result-wrong-binding",
+            b"not observable without authority",
+            36,
+        ),
+        Err(ReviewStoreError::Unauthorized)
+    ));
     store
         .grant_authority(
             request.workspace(),
@@ -963,6 +1025,7 @@ fn write_admission_expires_before_start_but_reconciliation_survives_after_start(
         .expect("verifier authority");
     store
         .record_completion_evidence(
+            request.workspace(),
             &action.preview_id,
             action.request_digest,
             &verifier,
@@ -976,6 +1039,7 @@ fn write_admission_expires_before_start_but_reconciliation_survives_after_start(
         .expect("verified evidence");
     assert!(matches!(
         store.record_completion_evidence(
+            request.workspace(),
             &action.preview_id,
             action.request_digest,
             &verifier,
@@ -1027,6 +1091,77 @@ fn write_admission_expires_before_start_but_reconciliation_survives_after_start(
             .expect("terminal retry after reopen"),
         completed
     );
+
+    let raw = Connection::open(private.path()).expect("raw evidence corruption");
+    let final_evidence_digest: Vec<u8> = raw
+        .query_row(
+            "SELECT evidence_digest FROM review_completion_evidence WHERE preview_id=?1",
+            [&action.preview_id],
+            |row| row.get(0),
+        )
+        .expect("final evidence digest");
+    raw.execute(
+        "UPDATE review_completion_evidence SET evidence_digest=zeroblob(32) WHERE preview_id=?1",
+        [&action.preview_id],
+    )
+    .expect("corrupt finalized evidence");
+    drop(raw);
+    assert!(matches!(
+        reopened.receipt(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            42,
+        ),
+        Err(ReviewStoreError::Corrupt("completion_evidence"))
+    ));
+    let raw = Connection::open(private.path()).expect("raw evidence restore");
+    raw.execute(
+        "UPDATE review_completion_evidence SET evidence_digest=?1 WHERE preview_id=?2",
+        params![final_evidence_digest, action.preview_id],
+    )
+    .expect("restore finalized evidence");
+    drop(raw);
+    assert_eq!(
+        reopened
+            .receipt(
+                request.workspace(),
+                request.actor(),
+                request.authentication(),
+                request.authority(),
+                request.idempotency_key(),
+                43,
+            )
+            .expect("restored finalized evidence")
+            .expect("completed receipt"),
+        completed
+    );
+    let raw = Connection::open(private.path()).expect("raw evidence deletion");
+    raw.execute(
+        "DELETE FROM review_completion_evidence WHERE preview_id=?1",
+        [&action.preview_id],
+    )
+    .expect("delete finalized evidence");
+    drop(raw);
+    assert!(matches!(
+        reopened.receipt(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            44,
+        ),
+        Err(ReviewStoreError::Corrupt("completion_basis"))
+    ));
+    drop(reopened);
+    let mut reopened = ReviewStore::open(private.path()).expect("reopen without evidence");
+    assert!(matches!(
+        reopened.reconcile_receipt(&action.preview_id, action.request_digest, &completed, 45),
+        Err(ReviewStoreError::Corrupt("completion_basis"))
+    ));
 
     let second_request = request_variant(
         &request,

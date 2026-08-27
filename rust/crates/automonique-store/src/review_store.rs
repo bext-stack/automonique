@@ -781,6 +781,16 @@ impl ReviewStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Authorize the claimed approver scope before resolving an opaque
+        // preview identifier or exposing any of its persisted bindings.
+        require_active_grant(
+            &transaction,
+            approval.workspace(),
+            approval.approving_actor(),
+            approval.authentication(),
+            approval.authority(),
+            decided_at_ms,
+        )?;
         let action = read_action_by_preview(&transaction, approval.preview_id())?
             .ok_or(ReviewStoreError::NotFound)?;
         if action.request_digest != approval.request_digest()
@@ -793,14 +803,6 @@ impl ReviewStore {
         if !action.approval_required {
             return Err(ReviewStoreError::InvalidField("approval_not_required"));
         }
-        require_active_grant(
-            &transaction,
-            approval.workspace(),
-            approval.approving_actor(),
-            approval.authentication(),
-            approval.authority(),
-            decided_at_ms,
-        )?;
         let (kind, id) = workspace_parts(approval.workspace());
         let current: i64 = transaction
             .query_row(
@@ -1025,6 +1027,7 @@ impl ReviewStore {
     #[allow(clippy::too_many_arguments)]
     pub fn record_completion_evidence(
         &mut self,
+        workspace: &WorkContextIdentity,
         preview_id: &str,
         request_digest: [u8; 32],
         verifying_actor: &ReviewActorId,
@@ -1049,9 +1052,20 @@ impl ReviewStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // The verifier's supplied scope is authenticated before the opaque
+        // preview identifier is resolved, preventing an existence oracle.
+        require_active_grant(
+            &transaction,
+            workspace,
+            verifying_actor,
+            authentication,
+            authority,
+            observed_at_ms,
+        )?;
         let action =
             read_action_by_preview(&transaction, preview_id)?.ok_or(ReviewStoreError::NotFound)?;
         if action.request_digest != request_digest
+            || action.request.workspace() != workspace
             || action.request.authority() != authority
             || action.write_admitted_at_ms.is_none()
         {
@@ -1067,14 +1081,6 @@ impl ReviewStore {
         if result_revision != expected {
             return Err(ReviewStoreError::Conflict("result_revision"));
         }
-        require_active_grant(
-            &transaction,
-            action.request.workspace(),
-            verifying_actor,
-            authentication,
-            authority,
-            observed_at_ms,
-        )?;
         let evidence_document = encode_completion_evidence(
             preview_id,
             &request_digest,
@@ -1761,21 +1767,33 @@ fn read_current_snapshot(
     let Some(current_revision) = current_revision else {
         return Ok(None);
     };
+    read_snapshot_revision(connection, kind, id, parse_revision(current_revision)?)?
+        .ok_or(ReviewStoreError::Corrupt("current_snapshot"))
+        .map(Some)
+}
+
+fn read_snapshot_revision(
+    connection: &Connection,
+    kind: &str,
+    id: &str,
+    revision: Revision,
+) -> Stored<Option<ReviewSnapshot>> {
     type RawSnapshot = (Vec<u8>, Vec<u8>, String, String, i64);
+    let stored_revision = db_revision(revision)?;
     let raw: Option<RawSnapshot> = connection
         .query_row(
             "SELECT document,document_digest,workspace_kind,workspace_id,revision FROM review_snapshots WHERE workspace_kind=?1 AND workspace_id=?2 AND revision=?3",
-            params![kind, id, current_revision],
+            params![kind, id, stored_revision],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .optional()?;
-    let Some((document, raw_digest, stored_kind, stored_id, stored_revision)) = raw else {
-        return Err(ReviewStoreError::Corrupt("current_snapshot"));
+    let Some((document, raw_digest, stored_kind, stored_id, raw_revision)) = raw else {
+        return Ok(None);
     };
     let document_digest: [u8; 32] = raw_digest
         .try_into()
         .map_err(|_| ReviewStoreError::Corrupt("snapshot_digest"))?;
-    if digest(&document) != document_digest || stored_revision != current_revision {
+    if digest(&document) != document_digest || raw_revision != stored_revision {
         return Err(ReviewStoreError::Corrupt("snapshot_digest"));
     }
     let snapshot =
@@ -1785,11 +1803,43 @@ fn read_current_snapshot(
         || stored_id != id
         || decoded_kind != stored_kind
         || decoded_id != stored_id
-        || db_revision(snapshot.revision())? != stored_revision
+        || snapshot.revision() != revision
     {
         return Err(ReviewStoreError::Corrupt("snapshot_projection"));
     }
     Ok(Some(snapshot))
+}
+
+fn validate_completed_basis(connection: &Connection, action: &StoredReviewAction) -> Stored<()> {
+    if action.receipt.outcome() != ReviewReceiptOutcome::Completed {
+        return Ok(());
+    }
+    let expected_result = action
+        .request
+        .expected_revision()
+        .get()
+        .checked_add(1)
+        .and_then(|value| Revision::new(value).ok())
+        .ok_or(ReviewStoreError::Corrupt("completion_basis"))?;
+    if action.receipt.revision() != Some(expected_result) {
+        return Err(ReviewStoreError::Corrupt("completion_basis"));
+    }
+    // Validate an evidence row whenever one exists; malformed evidence may
+    // not be hidden by a separately valid snapshot. Missing evidence is safe
+    // only when the exact historical authoritative snapshot is retained.
+    let evidence = has_completion_evidence(
+        connection,
+        &action.preview_id,
+        action.request_digest,
+        expected_result,
+    )?;
+    let (kind, id) = workspace_parts(action.request.workspace());
+    let snapshot = read_snapshot_revision(connection, kind, id, expected_result)?.is_some();
+    if snapshot || evidence {
+        Ok(())
+    } else {
+        Err(ReviewStoreError::Corrupt("completion_basis"))
+    }
 }
 
 fn encode_approval(value: &ReviewApprovalDocument) -> Stored<Vec<u8>> {
@@ -2179,7 +2229,7 @@ fn read_action_by_preview(
             return Err(ReviewStoreError::Corrupt("write_admission"));
         }
     }
-    Ok(Some(StoredReviewAction {
+    let action = StoredReviewAction {
         preview_id: preview_id.to_owned(),
         request_digest,
         request,
@@ -2190,7 +2240,9 @@ fn read_action_by_preview(
         approval,
         write_admission_id: raw.write_admission_id,
         write_admitted_at_ms: raw.write_admitted_at_ms,
-    }))
+    };
+    validate_completed_basis(connection, &action)?;
+    Ok(Some(action))
 }
 fn update_receipt(
     connection: &Connection,

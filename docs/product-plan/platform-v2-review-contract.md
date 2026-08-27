@@ -71,7 +71,12 @@ are refused. The projection is derived from those events
 with `Blocked` taking precedence over `NeedsYou`, then `Working`, then `Done`;
 unread counts are summed and the newest event revision is retained. Callers
 cannot author a different projection, and no event may cite a revision newer
-than the snapshot. Authority-bearing and invariant-bearing Rust fields are private;
+than the snapshot. Every embedded review, check, pull-request, and delivery
+observation is likewise bounded by the aggregate snapshot revision. An
+attention reason that relies on one of those projections requires its source
+to be explicitly fresh; `Done` requires fresh review, every required check,
+pull-request, and delivery state, so stale last-known success cannot complete a
+workspace. Authority-bearing and invariant-bearing Rust fields are private;
 constructors and both codecs revalidate the same invariants.
 
 ## Scoped proposals and actions
@@ -119,6 +124,10 @@ approval expires. A completed result is final only when its revision is the
 authoritative snapshot revision or separately stored evidence from an
 authenticated exact-authority service adapter proves that revision. Exact
 terminal replays are returned only after current actor authorization is checked.
+Every completed receipt read and terminal replay revalidates that durable
+basis: the exact historical authoritative snapshot must still exist or the
+canonical completion-evidence row must remain intact. A missing or corrupted
+basis fails closed after restart.
 Receipt polling likewise requires the current authenticated actor, exact
 authority scope, trusted time, and an active grant; an opaque receipt or
 idempotency key is never authority. Receipt canonical bytes, digest, outcome,
@@ -129,6 +138,11 @@ a differently timed revocation can resurrect authority. Reauthorization after
 expiry or revocation requires a distinct identity, the exact preceding grant
 revision, and a later trusted instant. Authorization identities are retained
 and cannot be reused by a later grant revision.
+
+Approval and completion-evidence entry points authenticate the caller's exact
+workspace, actor, authentication class, and authority before resolving an
+opaque preview identity or comparing its bindings. Unauthorized callers
+therefore cannot distinguish a missing preview from an existing one.
 
 On every read, snapshot, preview, approval, receipt, completion-evidence and
 duplicated normalized fields are re-derived; corruption fails closed across

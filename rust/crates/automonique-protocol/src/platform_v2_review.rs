@@ -944,6 +944,7 @@ fn validate_attention_event(
         AttentionReason::ReviewRequested | AttentionReason::ApprovalRequired => {
             origin.kind() == AttentionOriginKind::Review
                 && origin.id().is_none()
+                && review.freshness().state() == ReviewFreshnessState::Fresh
                 && matches_authority_revision(
                     review.authority(),
                     review.freshness().observed_revision(),
@@ -956,6 +957,7 @@ fn validate_attention_event(
         AttentionReason::CommentReply => {
             origin.kind() == AttentionOriginKind::Comment
                 && origin.authority() == review.authority()
+                && review.freshness().state() == ReviewFreshnessState::Fresh
                 && comments.iter().any(|comment| {
                     origin_id_is(origin, comment.id().as_str())
                         && origin.revision() == comment.revision()
@@ -970,6 +972,7 @@ fn validate_attention_event(
                             check.authority(),
                             check.freshness().observed_revision(),
                         )
+                        && check.freshness().state() == ReviewFreshnessState::Fresh
                         && check.state() == CheckState::Running
                 })
         }
@@ -981,6 +984,7 @@ fn validate_attention_event(
                             check.authority(),
                             check.freshness().observed_revision(),
                         )
+                        && check.freshness().state() == ReviewFreshnessState::Fresh
                         && check.state() == CheckState::Failed
                 })
         }
@@ -988,6 +992,7 @@ fn validate_attention_event(
             origin.kind() == AttentionOriginKind::File
                 && origin.authority() == review.authority()
                 && origin.revision() == snapshot_revision
+                && review.freshness().state() == ReviewFreshnessState::Fresh
                 && files.iter().any(|file| {
                     origin_id_is(origin, file.id().as_str())
                         && file.conflict() == ConflictState::Unresolved
@@ -1002,6 +1007,7 @@ fn validate_attention_event(
                     delivery.authority(),
                     delivery.freshness().observed_revision(),
                 )
+                && delivery.freshness().state() == ReviewFreshnessState::Fresh
                 && delivery.state() == DeliveryState::Pending
         }
         AttentionReason::Complete => {
@@ -1009,18 +1015,21 @@ fn validate_attention_event(
                 && origin.id().is_none()
                 && origin.authority() == review.authority()
                 && origin.revision() == snapshot_revision
+                && review.freshness().state() == ReviewFreshnessState::Fresh
                 && review.decision() == ReviewDecision::Approved
                 && files
                     .iter()
                     .all(|file| file.conflict() != ConflictState::Unresolved)
-                && checks
-                    .iter()
-                    .filter(|check| check.required())
-                    .all(|check| check.state() == CheckState::Passed)
+                && checks.iter().filter(|check| check.required()).all(|check| {
+                    check.freshness().state() == ReviewFreshnessState::Fresh
+                        && check.state() == CheckState::Passed
+                })
+                && pull_request.freshness().state() == ReviewFreshnessState::Fresh
                 && matches!(
                     pull_request.state(),
                     PullRequestState::Absent | PullRequestState::Merged
                 )
+                && delivery.freshness().state() == ReviewFreshnessState::Fresh
                 && matches!(
                     delivery.state(),
                     DeliveryState::NotDelivered | DeliveryState::Delivered
@@ -1035,6 +1044,7 @@ fn validate_attention_event(
                     delivery.authority(),
                     delivery.freshness().observed_revision(),
                 )
+                && delivery.freshness().state() == ReviewFreshnessState::Fresh
                 && delivery.state() == DeliveryState::Failed
         }
     };
@@ -1122,6 +1132,15 @@ impl ReviewSnapshot {
                     return Err(ReviewContractError::ProposalInvalid);
                 }
             }
+        }
+        if review.freshness().observed_revision() > revision
+            || pull_request.freshness().observed_revision() > revision
+            || delivery.freshness().observed_revision() > revision
+            || checks
+                .iter()
+                .any(|check| check.freshness().observed_revision() > revision)
+        {
+            return Err(ReviewContractError::AttentionInvalid);
         }
         for event in &attention_events {
             validate_attention_event(

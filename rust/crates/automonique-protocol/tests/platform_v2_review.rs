@@ -28,12 +28,10 @@ fn authority(kind: ReviewAuthorityKind) -> ReviewAuthority {
     ReviewAuthority::new(kind, id("authority-1"))
 }
 fn freshness(revision: u64) -> ReviewFreshness {
-    ReviewFreshness::new(
-        ReviewFreshnessState::Fresh,
-        rev(revision),
-        1_800_000_000_000,
-    )
-    .unwrap()
+    freshness_with(ReviewFreshnessState::Fresh, revision)
+}
+fn freshness_with(state: ReviewFreshnessState, revision: u64) -> ReviewFreshness {
+    ReviewFreshness::new(state, rev(revision), 1_800_000_000_000).unwrap()
 }
 fn workspace() -> WorkContextIdentity {
     WorkContextIdentity::UserWorkspace(UserWorkspaceId::new("wc_user_1").unwrap())
@@ -298,6 +296,25 @@ fn attention_ranges_proposals_and_u32_boundaries_are_authoritative() {
         ))
     ));
 
+    let stale_review = encoded.replace(
+        "\"decision\":\"pending\",\"freshness\":{\"observed_at_ms\":1800000000000,\"observed_revision\":8,\"state\":\"fresh\"}",
+        "\"decision\":\"pending\",\"freshness\":{\"observed_at_ms\":1800000000000,\"observed_revision\":8,\"state\":\"stale\"}",
+    );
+    assert!(matches!(
+        decode_review_snapshot(stale_review.as_bytes()),
+        Err(ReviewApiError::Contract(
+            ReviewContractError::AttentionInvalid
+        ))
+    ));
+    let future_projection =
+        encoded.replacen("\"observed_revision\":7", "\"observed_revision\":10", 1);
+    assert!(matches!(
+        decode_review_snapshot(future_projection.as_bytes()),
+        Err(ReviewApiError::Contract(
+            ReviewContractError::AttentionInvalid
+        ))
+    ));
+
     let base = snapshot();
     let rebuild = |attention_events| {
         ReviewSnapshot::new(
@@ -351,6 +368,53 @@ fn attention_ranges_proposals_and_u32_boundaries_are_authoritative() {
         ]),
         Err(ReviewContractError::AttentionInvalid)
     );
+
+    let stale_done = ReviewSnapshot::new(
+        base.workspace().clone(),
+        base.revision(),
+        base.files().to_vec(),
+        base.comments().to_vec(),
+        base.proposals().to_vec(),
+        base.checks().to_vec(),
+        ReviewStatusProjection::new(
+            ReviewDecision::Approved,
+            authority(ReviewAuthorityKind::Review),
+            freshness_with(ReviewFreshnessState::Stale, 8),
+        )
+        .unwrap(),
+        PullRequestProjection::new(
+            None,
+            PullRequestState::Absent,
+            MergeReadiness::Unknown,
+            None,
+            authority(ReviewAuthorityKind::PullRequest),
+            freshness(8),
+        )
+        .unwrap(),
+        DeliveryProjection::new(
+            None,
+            DeliveryState::NotDelivered,
+            authority(ReviewAuthorityKind::Delivery),
+            freshness(7),
+        )
+        .unwrap(),
+        vec![
+            AttentionEvent::new(
+                id("attention-complete"),
+                AttentionOrigin::new(
+                    AttentionOriginKind::Snapshot,
+                    None,
+                    authority(ReviewAuthorityKind::Review),
+                    base.revision(),
+                )
+                .unwrap(),
+                AttentionReason::Complete,
+                0,
+            )
+            .unwrap(),
+        ],
+    );
+    assert_eq!(stale_done, Err(ReviewContractError::AttentionInvalid));
 }
 
 fn request(
