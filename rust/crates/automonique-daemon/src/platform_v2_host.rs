@@ -667,14 +667,6 @@ impl PlatformV2Runtime {
     }
 }
 
-fn read_policy_file(
-    policy_path: &Path,
-    expected_uid: u32,
-) -> Result<Option<Vec<u8>>, &'static str> {
-    read_policy_snapshot(policy_path, expected_uid)
-        .map(|snapshot| snapshot.map(|value| value.bytes))
-}
-
 #[cfg(test)]
 fn read_policy_file_after_open(
     policy_path: &Path,
