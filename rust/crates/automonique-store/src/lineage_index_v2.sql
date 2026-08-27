@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: Elastic-2.0
+
 CREATE TABLE lineage_external_work (
     provider TEXT NOT NULL CHECK (provider IN ('github','gitlab','linear','jira_compatible')),
     authority_id TEXT NOT NULL,
@@ -129,3 +131,4 @@ CREATE TABLE lineage_workspace_intents (
         (intent_kind = 'resume' AND outcome_kind IN ('accepted','unknown','resumed','conflict'))
     )
 ) STRICT;
+-- SPDX-License-Identifier: Elastic-2.0
