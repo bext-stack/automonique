@@ -176,8 +176,8 @@ for an active workspace at the requested revision whose identical checkout
 binding was previously adopted into the journal. Neither operation creates a
 directory, changes a ref, starts a provider, or creates an attempt/session.
 
-Workspace effects use a prepared/completed/unknown journal record bound to the full
-registry file generation and a digest of the full policy file generation. The
+Workspace effects use a prepared/completed/unknown journal record bound to the
+full registry file generation and a digest of the full policy file generation. The
 workspace adoption and completed state install in one atomic journal rewrite.
 After restart a prepared record is therefore provably not completed and may be
 completed only after the exact bindings revalidate; a completed record is an
@@ -196,9 +196,24 @@ an orchestration task is authority-bound to an existing logical
 exact pre-authorized logical workspace was newly adopted into runtime custody,
 not that Automonique synthesized a path or repository. Creating an unbound
 identity remains future schema work.
-Review actions
-still validate the server-selected role and current review revision, then
-refuse before custody because git/CI/pull-request workers are not configured.
+
+Review actions validate the server-selected role, exact authority identity,
+current snapshot revision, target revision, lifecycle, and freshness. Anchored
+`add_comment` and `approve_review` effects are store-owned: the next canonical
+snapshot, immutable write admission, actor-attributed request, and completed
+receipt commit in one SQLite `IMMEDIATE` transaction. A crash therefore cannot
+expose an accepted local write, and an exact idempotency replay returns the
+same terminal receipt without advancing the snapshot again. The policy file is
+fenced immediately before and after this transaction.
+
+Agent comment delivery, stage/unstage/commit/conflict resolution, CI reruns,
+and pull-request open/update/merge still have no credential-and-target-bound
+provider registry. After full authority and target validation they refuse
+before custody as `platform_v2_review_agent_adapter_unavailable`,
+`platform_v2_review_git_adapter_unavailable`,
+`platform_v2_review_ci_adapter_unavailable`, or
+`platform_v2_review_pull_request_adapter_unavailable`. No request text becomes
+a path, command, provider payload, or credential.
 Cancellations of already-existing durable lineage intents remain immediate,
 final store operations.
 

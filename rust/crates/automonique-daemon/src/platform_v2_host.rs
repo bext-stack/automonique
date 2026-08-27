@@ -48,6 +48,8 @@ use automonique_store::work_context_store::{
 };
 use serde::Deserialize;
 
+use crate::platform_v2_review_adapter::{ProductionReviewEffectAdapter, ReviewEffectPlan};
+
 pub const POLICY_FILE_NAME: &str = "platform-v2-policy.json";
 pub const WORK_CONTEXT_STORE_NAME: &str = "platform-v2-work-context.sqlite3";
 pub const LINEAGE_STORE_NAME: &str = "platform-v2-lineage.sqlite3";
@@ -70,6 +72,7 @@ pub struct PlatformV2Runtime {
     work_contexts: WorkContextStore,
     lineage: LineageIndex,
     reviews: ReviewStore,
+    review_effects: ProductionReviewEffectAdapter,
     nonces: HostNonces,
     lifecycle_effects: Box<dyn PlatformV2LifecycleEffectAdapter>,
     clock: Box<dyn PlatformV2Clock>,
@@ -84,6 +87,7 @@ impl std::fmt::Debug for PlatformV2Runtime {
             .field("work_contexts", &self.work_contexts)
             .field("lineage", &self.lineage)
             .field("reviews", &self.reviews)
+            .field("review_effects", &self.review_effects)
             .field("nonces", &self.nonces)
             .field("lifecycle_effects", &"typed adapter")
             .field("clock", &"trusted clock")
@@ -697,6 +701,7 @@ impl PlatformV2Runtime {
             work_contexts,
             lineage,
             reviews,
+            review_effects: ProductionReviewEffectAdapter,
             nonces: HostNonces::new()?,
             lifecycle_effects,
             clock,
@@ -1295,10 +1300,25 @@ impl PlatformV2Runtime {
                     value.action().clone(),
                 )
                 .map_err(|_| "platform_v2_request_invalid")?;
-                self.reviews
-                    .validate_action(&request, now_ms)
-                    .map_err(|_| "platform_v2_review_refused")?;
-                Err("platform_v2_review_adapter_pending")
+                match self.review_effects.plan(request.action()) {
+                    Ok(ReviewEffectPlan::LocalStore) => {
+                        self.policy_fence.verify()?;
+                        let receipt = self
+                            .reviews
+                            .execute_local_action(&request, now_ms)
+                            .map_err(review_store_category)?;
+                        self.policy_fence.verify()?;
+                        Ok(PlatformV2Response::ReviewReceipt(receipt))
+                    }
+                    Err(category) => {
+                        // Resolve the exact grant, revision, freshness and
+                        // target before exposing an adapter capability reason.
+                        self.reviews
+                            .validate_action(&request, now_ms)
+                            .map_err(review_store_category)?;
+                        Err(category)
+                    }
+                }
             }
             PlatformV2Request::GetReviewReceipt(value) => {
                 authorize_identity(&principal, value.project(), value.workspace())?;
@@ -1528,6 +1548,24 @@ fn lifecycle_effect_kind(intent: &WorkContextMutationIntent) -> Option<&'static 
         WorkContextMutationIntent::ResumeAttemptWorkspace(_) => Some("resume_attempt_workspace"),
         WorkContextMutationIntent::ResumeSession(_) => Some("resume_session"),
         _ => None,
+    }
+}
+
+fn review_store_category(error: ReviewStoreError) -> &'static str {
+    match error {
+        ReviewStoreError::StaleRevision { .. } => "platform_v2_review_stale",
+        ReviewStoreError::Conflict(_) => "platform_v2_review_conflict",
+        ReviewStoreError::Unauthorized => "platform_v2_review_role_denied",
+        ReviewStoreError::ApprovalRequired => "platform_v2_review_approval_required",
+        ReviewStoreError::NotFound => "platform_v2_not_found",
+        ReviewStoreError::InvalidField(_) | ReviewStoreError::Protocol(_) => {
+            "platform_v2_review_refused"
+        }
+        ReviewStoreError::InsecurePath(_)
+        | ReviewStoreError::SchemaVersion { .. }
+        | ReviewStoreError::Corrupt(_)
+        | ReviewStoreError::Io(_)
+        | ReviewStoreError::Sqlite(_) => "platform_v2_store_refused",
     }
 }
 

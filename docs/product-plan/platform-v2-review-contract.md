@@ -29,11 +29,19 @@ grant, current snapshot revision, and action target are rechecked in the same
 transaction that records the decision. A refusal closes the receipt without
 executing the proposal; an expired approval cannot authorize a later write.
 
-There is still no daemon route, git adapter, shell adapter, CI adapter,
-pull-request adapter, provider adapter, or client UI. A future daemon must
-obtain authority decisions from its local policy registry before installing a
-store grant, and adapters must reconcile the existing receipt after ambiguous
-writes rather than replaying a mutation.
+The daemon route now executes the two effects that can be completed wholly by
+the authoritative review store: adding one anchored comment and approving the
+current review. Each transition advances the snapshot exactly one revision in
+the same SQLite transaction that records the immutable write admission and
+terminal receipt, preserving the authenticated actor on the request, receipt,
+and new comment. An exact idempotency replay is a read of that receipt.
+
+There is still no credential-bound agent-delivery, git, CI, or pull-request
+provider adapter. Those action families validate their exact target and
+authority first, then return distinct unavailable categories without creating
+custody. A future external adapter must obtain its authority and target from a
+private typed registry and reconcile an admitted ambiguous write rather than
+replay it; no shell or generic execute boundary is introduced here.
 
 ## One authoritative snapshot
 
@@ -162,8 +170,9 @@ bound at fresh-schema creation to one explicit authority namespace. A missing
 namespace singleton in any previously opened or populated database is
 corruption, not an invitation to infer or replace the tenant. Hosted
 deployments must use a different database for every tenant/authority domain
-until a later schema introduces row-level tenancy. The store still has no
-daemon route or real git, CI, provider, or pull-request adapter.
+until a later schema introduces row-level tenancy. The store-owned comment and
+approval transitions are composed by the daemon. The store still has no real
+git, CI, provider, or pull-request adapter.
 
 ## Shared conformance
 

@@ -45,6 +45,9 @@ use automonique_protocol::platform_v2_lineage::{
     OrchestrationRecord, OrchestrationRunId, OrchestrationTaskId, WorkspaceCreateIntent,
     WorkspaceIntent, WorkspaceIntentId, WorkspaceIntentOutcome, WorkspaceResumeIntent,
 };
+use automonique_protocol::platform_v2_review::{
+    ReviewAction, ReviewCommentId, ReviewReceiptOutcome, ReviewText,
+};
 use automonique_protocol::platform_v2_review_api::{
     decode_review_action_request, decode_review_snapshot,
 };
@@ -224,7 +227,7 @@ fn configure_v2(config: &DaemonConfig) {
                 "filesystem": [], "credentials": [], "network": [],
                 "tools": [], "providers": [], "models": []
             },
-            "review_authorities": {"ci": "authority-1"}
+            "review_authorities": {"ci": "authority-1", "review": "authority-1"}
         }]
     });
     let path = config.platform_v2_policy_path();
@@ -1004,7 +1007,7 @@ fn configured_v2_uses_kernel_principal_scope_and_durable_idempotency() {
             PlatformV2Request::ExecuteReviewAction(action.clone()),
         ),
         PlatformV2Response::Refused(refusal)
-            if refusal.category().as_str() == "platform_v2_review_adapter_pending"
+            if refusal.category().as_str() == "platform_v2_review_ci_adapter_unavailable"
     ));
     assert!(matches!(
         platform_v2(
@@ -1021,6 +1024,52 @@ fn configured_v2_uses_kernel_principal_scope_and_durable_idempotency() {
         ),
         PlatformV2Response::Refused(refusal)
             if refusal.category().as_str() == "platform_v2_not_found"
+    ));
+
+    let review_snapshot = decode_review_snapshot(REVIEW_SNAPSHOT).unwrap();
+    let comment_action = ReviewActionTransportRequest::new(
+        review_snapshot.workspace().clone(),
+        review_snapshot.revision(),
+        ReviewAction::AddComment {
+            comment_id: ReviewCommentId::new("comment-live-local").unwrap(),
+            anchor: review_snapshot.comments()[0].anchor().clone(),
+            body: ReviewText::new("A durable local review comment.").unwrap(),
+        },
+        IdempotencyKey::new("review-comment-live-once").unwrap(),
+    )
+    .unwrap();
+    let PlatformV2Response::ReviewReceipt(comment_receipt) = platform_v2(
+        &config,
+        "v2-review-local-comment",
+        PlatformV2Request::ExecuteReviewAction(comment_action.clone()),
+    ) else {
+        panic!("local comment receipt")
+    };
+    assert_eq!(comment_receipt.outcome(), ReviewReceiptOutcome::Completed);
+    assert_eq!(comment_receipt.revision(), Some(Revision::new(10).unwrap()));
+    assert_eq!(comment_receipt.actor().as_str(), "operator-live");
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-review-local-comment-replay",
+            PlatformV2Request::ExecuteReviewAction(comment_action.clone()),
+        ),
+        PlatformV2Response::ReviewReceipt(replay) if replay == comment_receipt
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-review-local-comment-lookup",
+            PlatformV2Request::GetReviewReceipt(
+                ReviewReceiptLookup::new(
+                    ProjectId::new("project-live").unwrap(),
+                    comment_action.workspace().clone(),
+                    comment_action.idempotency_key().clone(),
+                )
+                .unwrap()
+            )
+        ),
+        PlatformV2Response::ReviewReceipt(found) if found == comment_receipt
     ));
 
     serving.shutdown(&config);
@@ -1065,6 +1114,21 @@ fn configured_v2_uses_kernel_principal_scope_and_durable_idempotency() {
         ),
         PlatformV2Response::Refused(refusal)
             if refusal.category().as_str() == "platform_v2_not_found"
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-review-local-comment-after-restart",
+            PlatformV2Request::GetReviewReceipt(
+                ReviewReceiptLookup::new(
+                    ProjectId::new("project-live").unwrap(),
+                    comment_action.workspace().clone(),
+                    comment_action.idempotency_key().clone(),
+                )
+                .unwrap(),
+            )
+        ),
+        PlatformV2Response::ReviewReceipt(found) if found == comment_receipt
     ));
     serving.shutdown(&config);
 }
