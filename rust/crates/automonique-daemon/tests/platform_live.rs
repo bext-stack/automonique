@@ -1080,6 +1080,7 @@ enum LifecycleRecoveryScenario {
     CrashBefore,
     CrashAfter,
     ExpiredLease,
+    GenerationChanged,
 }
 
 impl automonique_daemon::platform_v2_host::PlatformV2LifecycleEffectAdapter
@@ -1109,6 +1110,9 @@ impl automonique_daemon::platform_v2_host::PlatformV2LifecycleEffectAdapter
             (LifecycleRecoveryScenario::ExpiredLease, _) => {
                 automonique_daemon::platform_v2_host::PlatformV2EffectExecution::Completed
             }
+            (LifecycleRecoveryScenario::GenerationChanged, _) => {
+                automonique_daemon::platform_v2_host::PlatformV2EffectExecution::Completed
+            }
         }
     }
 
@@ -1129,6 +1133,17 @@ impl automonique_daemon::platform_v2_host::PlatformV2LifecycleEffectAdapter
             LifecycleRecoveryScenario::ExpiredLease => automonique_daemon::platform_v2_host::PlatformV2EffectReconciliation::Completed(
                 b"typed provider proved the over-lease effect completed".to_vec(),
             ),
+            LifecycleRecoveryScenario::GenerationChanged => automonique_daemon::platform_v2_host::PlatformV2EffectReconciliation::Completed(
+                b"stale adapter generation must not complete custody".to_vec(),
+            ),
+        }
+    }
+
+    fn verify_generation(&self) -> Result<(), &'static str> {
+        if matches!(self.scenario, LifecycleRecoveryScenario::GenerationChanged) {
+            Err("platform_v2_lifecycle_registry_changed")
+        } else {
+            Ok(())
         }
     }
 }
@@ -1146,6 +1161,7 @@ fn lifecycle_effect_claim_recovers_crash_boundaries_without_blind_replay() {
     run_lifecycle_recovery_scenario(LifecycleRecoveryScenario::CrashBefore);
     run_lifecycle_recovery_scenario(LifecycleRecoveryScenario::CrashAfter);
     run_lifecycle_recovery_scenario(LifecycleRecoveryScenario::ExpiredLease);
+    run_lifecycle_recovery_scenario(LifecycleRecoveryScenario::GenerationChanged);
 }
 
 fn run_lifecycle_recovery_scenario(scenario: LifecycleRecoveryScenario) {
@@ -1187,6 +1203,7 @@ fn run_lifecycle_recovery_scenario(scenario: LifecycleRecoveryScenario) {
         LifecycleRecoveryScenario::CrashBefore => "attempt-recover-not-started",
         LifecycleRecoveryScenario::CrashAfter => "attempt-recover-completed",
         LifecycleRecoveryScenario::ExpiredLease => "attempt-recover-expired-lease",
+        LifecycleRecoveryScenario::GenerationChanged => "attempt-generation-changed",
     })
     .unwrap();
     let prepare = MutationPrepareRequest::new(
@@ -1253,9 +1270,25 @@ fn run_lifecycle_recovery_scenario(scenario: LifecycleRecoveryScenario) {
         ReceiptLookupKey::IdempotencyKey(key),
     ));
     let first_claim_at = submitted_at + 1;
-    let PlatformV2Response::MutationReceipt(still_accepted) =
-        host.handle(uid, &lookup, first_claim_at)
-    else {
+    let first_lookup = host.handle(uid, &lookup, first_claim_at);
+    if matches!(scenario, LifecycleRecoveryScenario::GenerationChanged) {
+        assert!(matches!(
+            first_lookup,
+            PlatformV2Response::Refused(refusal)
+                if refusal.category().as_str() == "platform_v2_lifecycle_registry_changed"
+        ));
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert_eq!(reconciliations.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            host.handle(uid, &lookup, first_claim_at + 30_000),
+            PlatformV2Response::Refused(refusal)
+                if refusal.category().as_str() == "platform_v2_lifecycle_registry_changed"
+        ));
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert_eq!(reconciliations.load(Ordering::SeqCst), 1);
+        return;
+    }
+    let PlatformV2Response::MutationReceipt(still_accepted) = first_lookup else {
         panic!("claimed receipt")
     };
     assert_eq!(
@@ -1282,6 +1315,7 @@ fn run_lifecycle_recovery_scenario(scenario: LifecycleRecoveryScenario) {
         match scenario {
             LifecycleRecoveryScenario::CrashBefore => 2,
             LifecycleRecoveryScenario::CrashAfter | LifecycleRecoveryScenario::ExpiredLease => 1,
+            LifecycleRecoveryScenario::GenerationChanged => unreachable!(),
         }
     );
     assert_eq!(reconciliations.load(Ordering::SeqCst), 1);
