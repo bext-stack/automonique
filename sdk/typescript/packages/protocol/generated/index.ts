@@ -20,8 +20,9 @@ export * from "./platform.js";
 export * from "./progress.js";
 export * from "./runs.js";
 export * from "./runtime.js";
+export * from "./work-context.js";
 
 // The digest of the surface re-exported above. It identifies the schema
 // these files were generated from; it is not a checksum of this file.
 export const SCHEMA_DIGEST_ALGORITHM = "sha256";
-export const SCHEMA_DIGEST = "6e9d862680917801aa232bda916a4e9dc9871f0a1d28cce705e44b113e4d45de";
+export const SCHEMA_DIGEST = "6a29f29bc1f5be4d576c59d0118b1ab09590ec9d15c9cc7e55fbf709c1302dbe";

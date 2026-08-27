@@ -310,6 +310,10 @@ use crate::platform::{
     FreshnessState, PlatformAction, PlatformMethod, PlatformTransport, ReceiptOutcome,
     ResourceAuthority, ResourceKind,
 };
+use crate::platform_v2::{
+    CheckoutKind, HostSetupKind, WorkContextKind, WorkContextLifecycle, WorkContextRelationKind,
+    WorkContextTargetKind,
+};
 use crate::primitives::ValueError;
 use crate::progress_api::{StreamMessageKind, StreamRefusal};
 use crate::provenance::MAX_PROVENANCE_ID_BYTES;
@@ -828,6 +832,8 @@ pub const PROGRESS_MODULE: &str = "progress";
 
 /// The federated `automonique.platform/v1` client contract.
 pub const PLATFORM_MODULE: &str = "platform";
+/// Negotiated `automonique.platform/v2` work-context read contract.
+pub const WORK_CONTEXT_MODULE: &str = "work-context";
 /// Generated mobile authentication and authorization module stem.
 pub const MOBILE_AUTH_MODULE: &str = "mobile-auth";
 
@@ -8292,6 +8298,249 @@ fn platform_module() -> GeneratedModule {
     }
 }
 
+/// Platform v2 work-context identities and bounded query/page types.
+fn work_context_module() -> GeneratedModule {
+    let security_enum = |name: &str, values: Vec<String>| GeneratedEnum {
+        name: name.to_owned(),
+        sensitivity: EnumSensitivity::SecuritySensitive,
+        values,
+        wire_order: None,
+    };
+    GeneratedModule {
+        file_name: module_file_name(WORK_CONTEXT_MODULE),
+        doc: "Negotiated Platform v2 project, host, checkout, workspace, session, and pane types."
+            .to_owned(),
+        source: "automonique_protocol::platform_v2".to_owned(),
+        constants: vec![
+            Constant {
+                name: "MAX_PLATFORM_VERSION_OFFERS".to_owned(),
+                doc: "Maximum advertised Platform protocol versions.".to_owned(),
+                value: ConstantValue::Count(crate::platform_v2::MAX_PLATFORM_VERSION_OFFERS),
+            },
+            Constant {
+                name: "MAX_WORK_CONTEXT_PAGE_ITEMS".to_owned(),
+                doc: "Maximum records returned by one filtered page.".to_owned(),
+                value: ConstantValue::Count(crate::platform_v2::MAX_WORK_CONTEXT_PAGE_ITEMS),
+            },
+            Constant {
+                name: "MAX_WORK_CONTEXT_RELATIONS".to_owned(),
+                doc: "Maximum structured relations carried by one record.".to_owned(),
+                value: ConstantValue::Count(crate::platform_v2::MAX_WORK_CONTEXT_RELATIONS),
+            },
+            Constant {
+                name: "MIN_PLATFORM_VERSION".to_owned(),
+                doc: "Lowest Platform major version this contract negotiates.".to_owned(),
+                value: ConstantValue::Count(usize::from(crate::platform_v2::MIN_PLATFORM_VERSION)),
+            },
+            Constant {
+                name: "MAX_PLATFORM_VERSION".to_owned(),
+                doc: "Highest Platform major version this contract negotiates.".to_owned(),
+                value: ConstantValue::Count(usize::from(crate::platform_v2::MAX_PLATFORM_VERSION)),
+            },
+            Constant {
+                name: "PLATFORM_SCHEMA_V2".to_owned(),
+                doc: "Stable version-two work-context schema identifier.".to_owned(),
+                value: ConstantValue::Text(crate::platform_v2::PLATFORM_SCHEMA_V2.to_owned()),
+            },
+        ],
+        branded_ids: [
+            "AttemptWorkspaceId",
+            "CheckoutId",
+            "HostSetupId",
+            "PaneId",
+            "PlatformSessionId",
+            "ProjectId",
+            "UserWorkspaceId",
+            "WorkContextCursor",
+            "WorkContextRepositoryId",
+            "WorkSessionId",
+        ]
+        .into_iter()
+        .map(|name| BrandedId {
+            name: name.to_owned(),
+            max_bytes: crate::platform_v2::MAX_WORK_CONTEXT_FIELD_BYTES,
+            pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),
+        })
+        .collect(),
+        bounded_strings: vec![BoundedString {
+            name: "WorkContextLabel".to_owned(),
+            max_bytes: crate::platform_v2::MAX_WORK_CONTEXT_LABEL_BYTES,
+            pattern: Some(NO_CONTROL_CHARACTERS.to_owned()),
+        }],
+        bounded_integers: vec![
+            BoundedInteger {
+                name: "PlatformVersionNumber".to_owned(),
+                min: i64::from(crate::platform_v2::MIN_PLATFORM_VERSION),
+                max: i64::from(crate::platform_v2::MAX_PLATFORM_VERSION),
+            },
+            BoundedInteger {
+                name: "WorkContextPageLimit".to_owned(),
+                min: 1,
+                max: i64::try_from(crate::platform_v2::MAX_WORK_CONTEXT_PAGE_ITEMS)
+                    .expect("work-context page limit"),
+            },
+            BoundedInteger {
+                name: "WorkContextRevision".to_owned(),
+                min: 1,
+                max: i64::MAX,
+            },
+        ],
+        enums: vec![
+            security_enum(
+                "CheckoutKind",
+                platform_values(&CheckoutKind::ALL, CheckoutKind::as_str),
+            ),
+            security_enum(
+                "HostSetupKind",
+                platform_values(&HostSetupKind::ALL, HostSetupKind::as_str),
+            ),
+            security_enum(
+                "WorkContextKind",
+                platform_values(&WorkContextKind::ALL, WorkContextKind::as_str),
+            ),
+            security_enum(
+                "WorkContextLifecycle",
+                platform_values(&WorkContextLifecycle::ALL, WorkContextLifecycle::as_str),
+            ),
+            security_enum(
+                "WorkContextRelationKind",
+                platform_values(
+                    &WorkContextRelationKind::ALL,
+                    WorkContextRelationKind::as_str,
+                ),
+            ),
+            security_enum(
+                "WorkContextTargetKind",
+                platform_values(&WorkContextTargetKind::ALL, WorkContextTargetKind::as_str),
+            ),
+        ],
+        unions: vec![Union {
+            name: "WorkContextIdentity".to_owned(),
+            discriminant: "kind".to_owned(),
+            variants: vec![
+                UnionVariant {
+                    tag: "attempt_workspace".to_owned(),
+                    payload: Some(("id".to_owned(), "AttemptWorkspaceId".to_owned())),
+                },
+                UnionVariant {
+                    tag: "checkout".to_owned(),
+                    payload: Some(("id".to_owned(), "CheckoutId".to_owned())),
+                },
+                UnionVariant {
+                    tag: "host_setup".to_owned(),
+                    payload: Some(("id".to_owned(), "HostSetupId".to_owned())),
+                },
+                UnionVariant {
+                    tag: "pane".to_owned(),
+                    payload: Some(("id".to_owned(), "PaneId".to_owned())),
+                },
+                UnionVariant {
+                    tag: "platform_session".to_owned(),
+                    payload: Some(("id".to_owned(), "PlatformSessionId".to_owned())),
+                },
+                UnionVariant {
+                    tag: "project".to_owned(),
+                    payload: Some(("id".to_owned(), "ProjectId".to_owned())),
+                },
+                UnionVariant {
+                    tag: "repository".to_owned(),
+                    payload: Some(("id".to_owned(), "WorkContextRepositoryId".to_owned())),
+                },
+                UnionVariant {
+                    tag: "session".to_owned(),
+                    payload: Some(("id".to_owned(), "WorkSessionId".to_owned())),
+                },
+                UnionVariant {
+                    tag: "user_workspace".to_owned(),
+                    payload: Some(("id".to_owned(), "UserWorkspaceId".to_owned())),
+                },
+            ],
+        }],
+        interfaces: vec![
+            Interface {
+                name: "NegotiatedPlatform".to_owned(),
+                doc: "Highest shared Platform version and truthful work-context availability."
+                    .to_owned(),
+                fields: vec![
+                    required(
+                        "schema",
+                        "typeof PLATFORM_SCHEMA_V1 | typeof PLATFORM_SCHEMA_V2",
+                    ),
+                    required("version", "PlatformVersionNumber"),
+                    required("work_context", "boolean"),
+                ],
+            },
+            Interface {
+                name: "PlatformVersionOffer".to_owned(),
+                doc: "Bounded set of Platform versions supported by one peer.".to_owned(),
+                fields: vec![required("versions", "readonly PlatformVersionNumber[]")],
+            },
+            Interface {
+                name: "WorkContextAttributes".to_owned(),
+                doc: "Kind-specific host or checkout classification; never a host path.".to_owned(),
+                fields: vec![
+                    nullable("checkout", "CheckoutKind"),
+                    nullable("host_setup", "HostSetupKind"),
+                ],
+            },
+            Interface {
+                name: "WorkContextRelation".to_owned(),
+                doc: "One bounded typed graph edge; identity is never parsed from summary text."
+                    .to_owned(),
+                fields: vec![
+                    required("kind", "WorkContextRelationKind"),
+                    required("target", "WorkContextIdentity"),
+                ],
+            },
+            Interface {
+                name: "WorkContextRecord".to_owned(),
+                doc: "One revisioned work-context node with bounded structured relations."
+                    .to_owned(),
+                fields: vec![
+                    required("attributes", "WorkContextAttributes"),
+                    required("identity", "WorkContextIdentity"),
+                    required("label", "WorkContextLabel"),
+                    required("lifecycle", "WorkContextLifecycle"),
+                    required("relations", "readonly WorkContextRelation[]"),
+                    required("revision", "WorkContextRevision"),
+                ],
+            },
+            Interface {
+                name: "WorkContextQuery".to_owned(),
+                doc: "Filtered cursor query bounded independently of total inventory.".to_owned(),
+                fields: vec![
+                    nullable("after", "WorkContextCursor"),
+                    required("kinds", "readonly WorkContextKind[]"),
+                    required("lifecycles", "readonly WorkContextLifecycle[]"),
+                    required("limit", "WorkContextPageLimit"),
+                    nullable("parent", "WorkContextIdentity"),
+                    nullable("project", "ProjectId"),
+                    required("schema", "typeof PLATFORM_SCHEMA_V2"),
+                ],
+            },
+            Interface {
+                name: "WorkContextPage".to_owned(),
+                doc: "One bounded page; next_cursor is present exactly when more records exist."
+                    .to_owned(),
+                fields: vec![
+                    nullable("after", "WorkContextCursor"),
+                    required("has_more", "boolean"),
+                    required("items", "readonly WorkContextRecord[]"),
+                    nullable("next_cursor", "WorkContextCursor"),
+                    required("requested_limit", "WorkContextPageLimit"),
+                    required("schema", "typeof PLATFORM_SCHEMA_V2"),
+                ],
+            },
+        ],
+        imports: vec![ModuleImport {
+            module: PLATFORM_MODULE.to_owned(),
+            values: vec!["PLATFORM_SCHEMA_V1".to_owned()],
+            types: Vec::new(),
+        }],
+        ..GeneratedModule::default()
+    }
+}
+
 /// The stream message arms, each carrying its body under one shared key.
 ///
 /// Written as a match over the closed kind set rather than a list, so a kind
@@ -8333,6 +8582,7 @@ pub fn maintained_modules() -> Vec<GeneratedModule> {
         batch_module(),
         mobile_auth_module(),
         platform_module(),
+        work_context_module(),
         progress_module(),
     ];
     modules.sort_by(|left, right| left.file_name.cmp(&right.file_name));

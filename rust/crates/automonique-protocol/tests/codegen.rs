@@ -50,6 +50,35 @@ mod platform_surface {
     }
 }
 
+mod work_context_surface {
+    use super::*;
+
+    #[test]
+    fn generated_typescript_keeps_distinct_identities_and_pages_past_512() {
+        let runtime = javascript_runtime().unwrap_or_else(|| {
+            record_js_gap("the work-context cross-language fixture did not run");
+            "bun"
+        });
+        if javascript_runtime().is_none() {
+            return;
+        }
+        let output = Command::new(runtime)
+            .arg(package_root().join("conformance/work-context-runtime.ts"))
+            .current_dir(package_root())
+            .output()
+            .expect("the TypeScript runtime starts");
+        assert!(
+            output.status.success(),
+            "work-context fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "{\"identities\":9,\"items\":640,\"page_limit\":128,\"schema\":\"automonique.platform/v2\",\"version\":2}\n"
+        );
+    }
+}
+
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }

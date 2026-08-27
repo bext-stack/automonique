@@ -83,6 +83,10 @@ The Rust domain schema in Automonique remains the source for generated Rust and
 TypeScript clients. Local clients use the peer-authenticated Unix socket;
 remote clients use HTTPS plus WebSocket with identical domain semantics.
 
+The additive, separately negotiated v2 project/workspace model is specified in
+[Platform v2 work-context contract](platform-v2-work-context.md). It does not
+change any v1 wire shape or reinterpret v1 resource summaries.
+
 The minimum shared service surface is:
 
 | Service | Contract |
