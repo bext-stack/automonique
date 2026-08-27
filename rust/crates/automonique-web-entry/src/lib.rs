@@ -2435,13 +2435,27 @@ impl WebIntegration {
             .lock()
             .map_err(|_| "mobile_credential_authority_busy")?;
         let now_ms = now_ms_i64();
-        if authority.reauthorize_platform_v2(mobile, now_ms).is_err() {
-            return self
-                .platform_v2
-                .refuse(lane, body, "platform_v2_mobile_generation_changed");
+        let mut fence = match authority.begin_platform_v2_dispatch(mobile, now_ms) {
+            Ok(fence) => fence,
+            Err(_) => {
+                return self.platform_v2.refuse(
+                    lane,
+                    body,
+                    "platform_v2_mobile_generation_changed",
+                );
+            }
+        };
+        let response = self
+            .platform_v2
+            .exchange_mobile(lane, body, &mut fence, now_ms);
+        if fence.commit().is_err() {
+            return self.platform_v2.refuse(
+                lane,
+                body,
+                "platform_v2_mobile_dispatch_fence_unavailable",
+            );
         }
-        self.platform_v2
-            .exchange_mobile(lane, body, mobile, &mut authority, now_ms)
+        response
     }
 
     fn mobile_platform_v2_grant(

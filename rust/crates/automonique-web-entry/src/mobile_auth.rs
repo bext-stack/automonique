@@ -23,7 +23,9 @@ use automonique_protocol::platform::{
 use automonique_protocol::platform_v2::ProjectId;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
@@ -495,7 +497,131 @@ pub struct MobileCredentialAuthority {
     actor: String,
 }
 
+/// One current mobile Platform v2 principal held under SQLite's writer lock.
+///
+/// The immediate transaction prevents refresh, regrant, and revocation through
+/// another authority connection from committing until the bounded daemon
+/// exchange and any receipt-custody update have completed.
+pub(crate) struct MobilePlatformV2DispatchFence<'connection> {
+    transaction: Transaction<'connection>,
+    authorization: MobilePlatformV2Authorization,
+    now_ms: i64,
+}
+
+impl MobilePlatformV2DispatchFence<'_> {
+    pub(crate) fn authorization(&self) -> &MobilePlatformV2Authorization {
+        &self.authorization
+    }
+
+    pub(crate) fn bind_receipt_custody(
+        &mut self,
+        project: &ProjectId,
+        idempotency_key: &str,
+    ) -> Result<(), MobileAuthError> {
+        validate_receipt_coordinate(idempotency_key)?;
+        self.transaction.execute(
+            "DELETE FROM mobile_platform_v2_receipt_custody WHERE expires_at_ms<=?1",
+            params![self.now_ms],
+        )?;
+        let existing = self
+            .transaction
+            .query_row(
+                "SELECT credential_id,delegation_id,principal_generation
+                 FROM mobile_platform_v2_receipt_custody
+                 WHERE project_id=?1 AND idempotency_key=?2",
+                params![project.as_str(), idempotency_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((credential_id, delegation_id, generation)) = existing {
+            if credential_id != self.authorization.credential_id
+                || delegation_id != self.authorization.delegation_id
+                || generation != self.authorization.principal_generation
+            {
+                return Err(MobileAuthError::InvalidCredential);
+            }
+            return Ok(());
+        }
+        let count = self.transaction.query_row(
+            "SELECT COUNT(*) FROM mobile_platform_v2_receipt_custody
+             WHERE credential_id=?1",
+            params![self.authorization.credential_id],
+            |row| row.get::<_, u64>(0),
+        )?;
+        if count >= MAX_MOBILE_V2_RECEIPT_CUSTODY as u64 {
+            return Err(MobileAuthError::InvalidRequest);
+        }
+        self.transaction.execute(
+            "INSERT INTO mobile_platform_v2_receipt_custody(
+               project_id,idempotency_key,credential_id,delegation_id,
+               principal_generation,created_at_ms,expires_at_ms
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                project.as_str(),
+                idempotency_key,
+                self.authorization.credential_id,
+                self.authorization.delegation_id,
+                self.authorization.principal_generation,
+                self.now_ms,
+                self.authorization.expires_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn authorize_receipt_custody(
+        &self,
+        project: &ProjectId,
+        idempotency_key: &str,
+    ) -> Result<(), MobileAuthError> {
+        validate_receipt_coordinate(idempotency_key)?;
+        let custody = self
+            .transaction
+            .query_row(
+                "SELECT credential_id,delegation_id,principal_generation,expires_at_ms
+                 FROM mobile_platform_v2_receipt_custody
+                 WHERE project_id=?1 AND idempotency_key=?2",
+                params![project.as_str(), idempotency_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(MobileAuthError::InvalidCredential)?;
+        (custody.0 == self.authorization.credential_id
+            && custody.1 == self.authorization.delegation_id
+            && custody.2 <= self.authorization.principal_generation
+            && custody.3 > self.now_ms)
+            .then_some(())
+            .ok_or(MobileAuthError::InvalidCredential)
+    }
+
+    pub(crate) fn commit(self) -> Result<(), MobileAuthError> {
+        self.transaction.commit().map_err(Into::into)
+    }
+}
+
 impl MobileCredentialAuthority {
+    #[cfg(test)]
+    pub(crate) fn set_busy_handler_for_test(
+        &self,
+        callback: fn(i32) -> bool,
+    ) -> Result<(), MobileAuthError> {
+        self.connection.busy_handler(Some(callback))?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn open(
         path: impl AsRef<Path>,
@@ -924,32 +1050,49 @@ impl MobileCredentialAuthority {
         Ok(descriptor)
     }
 
+    #[cfg(test)]
     pub fn reauthorize_platform_v2(
         &self,
         expected: &MobilePlatformV2Authorization,
         now_ms: i64,
     ) -> Result<(), MobileAuthError> {
-        validate_time(now_ms)?;
-        let credential = read_by_id(&self.connection, &expected.credential_id)?
-            .ok_or(MobileAuthError::InvalidCredential)?;
-        let authorization =
-            credential.authorization(&self.discovery.server_identity, now_ms, false)?;
-        let mut current = read_platform_v2(&self.connection, &expected.credential_id)?
-            .ok_or(MobileAuthError::InvalidCredential)?;
-        current.server_identity = self.discovery.server_identity.clone();
-        validate_platform_v2_descriptor(
-            &current,
-            &authorization,
+        reauthorize_platform_v2_on(
+            &self.connection,
+            expected,
             &self.discovery.server_identity,
             &self.tenant,
             &self.actor,
             now_ms,
-        )?;
-        (current == *expected)
-            .then_some(())
-            .ok_or(MobileAuthError::InvalidCredential)
+        )
     }
 
+    pub(crate) fn begin_platform_v2_dispatch(
+        &mut self,
+        expected: &MobilePlatformV2Authorization,
+        now_ms: i64,
+    ) -> Result<MobilePlatformV2DispatchFence<'_>, MobileAuthError> {
+        let server_identity = self.discovery.server_identity.clone();
+        let tenant = self.tenant.clone();
+        let actor = self.actor.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        reauthorize_platform_v2_on(
+            &transaction,
+            expected,
+            &server_identity,
+            &tenant,
+            &actor,
+            now_ms,
+        )?;
+        Ok(MobilePlatformV2DispatchFence {
+            transaction,
+            authorization: expected.clone(),
+            now_ms,
+        })
+    }
+
+    #[cfg(test)]
     pub fn bind_platform_v2_receipt_custody(
         &mut self,
         authorization: &MobilePlatformV2Authorization,
@@ -957,101 +1100,22 @@ impl MobileCredentialAuthority {
         idempotency_key: &str,
         now_ms: i64,
     ) -> Result<(), MobileAuthError> {
-        self.reauthorize_platform_v2(authorization, now_ms)?;
-        validate_receipt_coordinate(idempotency_key)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "DELETE FROM mobile_platform_v2_receipt_custody WHERE expires_at_ms<=?1",
-            params![now_ms],
-        )?;
-        let existing = transaction
-            .query_row(
-                "SELECT credential_id,delegation_id,principal_generation
-                 FROM mobile_platform_v2_receipt_custody
-                 WHERE project_id=?1 AND idempotency_key=?2",
-                params![project.as_str(), idempotency_key],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, u64>(2)?,
-                    ))
-                },
-            )
-            .optional()?;
-        if let Some((credential_id, delegation_id, generation)) = existing {
-            if credential_id != authorization.credential_id
-                || delegation_id != authorization.delegation_id
-                || generation != authorization.principal_generation
-            {
-                return Err(MobileAuthError::InvalidCredential);
-            }
-            transaction.commit()?;
-            return Ok(());
-        }
-        let count = transaction.query_row(
-            "SELECT COUNT(*) FROM mobile_platform_v2_receipt_custody
-             WHERE credential_id=?1",
-            params![authorization.credential_id],
-            |row| row.get::<_, u64>(0),
-        )?;
-        if count >= MAX_MOBILE_V2_RECEIPT_CUSTODY as u64 {
-            return Err(MobileAuthError::InvalidRequest);
-        }
-        transaction.execute(
-            "INSERT INTO mobile_platform_v2_receipt_custody(
-               project_id,idempotency_key,credential_id,delegation_id,
-               principal_generation,created_at_ms,expires_at_ms
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            params![
-                project.as_str(),
-                idempotency_key,
-                authorization.credential_id,
-                authorization.delegation_id,
-                authorization.principal_generation,
-                now_ms,
-                authorization.expires_at_ms,
-            ],
-        )?;
-        transaction.commit()?;
-        Ok(())
+        let mut fence = self.begin_platform_v2_dispatch(authorization, now_ms)?;
+        fence.bind_receipt_custody(project, idempotency_key)?;
+        fence.commit()
     }
 
+    #[cfg(test)]
     pub fn authorize_platform_v2_receipt_custody(
-        &self,
+        &mut self,
         authorization: &MobilePlatformV2Authorization,
         project: &ProjectId,
         idempotency_key: &str,
         now_ms: i64,
     ) -> Result<(), MobileAuthError> {
-        self.reauthorize_platform_v2(authorization, now_ms)?;
-        validate_receipt_coordinate(idempotency_key)?;
-        let custody = self
-            .connection
-            .query_row(
-                "SELECT credential_id,delegation_id,principal_generation,expires_at_ms
-                 FROM mobile_platform_v2_receipt_custody
-                 WHERE project_id=?1 AND idempotency_key=?2",
-                params![project.as_str(), idempotency_key],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, u64>(2)?,
-                        row.get::<_, i64>(3)?,
-                    ))
-                },
-            )
-            .optional()?
-            .ok_or(MobileAuthError::InvalidCredential)?;
-        (custody.0 == authorization.credential_id
-            && custody.1 == authorization.delegation_id
-            && custody.2 <= authorization.principal_generation
-            && custody.3 > now_ms)
-            .then_some(())
-            .ok_or(MobileAuthError::InvalidCredential)
+        let fence = self.begin_platform_v2_dispatch(authorization, now_ms)?;
+        fence.authorize_receipt_custody(project, idempotency_key)?;
+        fence.commit()
     }
 
     pub fn refresh(
@@ -1601,6 +1665,34 @@ fn validate_platform_v2_descriptor(
         return Err(MobileAuthError::ServerIdentityMismatch);
     }
     Ok(())
+}
+
+fn reauthorize_platform_v2_on(
+    connection: &Connection,
+    expected: &MobilePlatformV2Authorization,
+    server_identity: &str,
+    tenant: &str,
+    actor: &str,
+    now_ms: i64,
+) -> Result<(), MobileAuthError> {
+    validate_time(now_ms)?;
+    let credential = read_by_id(connection, &expected.credential_id)?
+        .ok_or(MobileAuthError::InvalidCredential)?;
+    let authorization = credential.authorization(server_identity, now_ms, false)?;
+    let mut current = read_platform_v2(connection, &expected.credential_id)?
+        .ok_or(MobileAuthError::InvalidCredential)?;
+    current.server_identity = server_identity.to_owned();
+    validate_platform_v2_descriptor(
+        &current,
+        &authorization,
+        server_identity,
+        tenant,
+        actor,
+        now_ms,
+    )?;
+    (current == *expected)
+        .then_some(())
+        .ok_or(MobileAuthError::InvalidCredential)
 }
 
 fn admit_platform_v2_scope(

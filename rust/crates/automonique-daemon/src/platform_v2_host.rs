@@ -417,10 +417,29 @@ pub fn resolve_web_mobile_request_project(
             return Err("platform_v2_mobile_preview_scope_required");
         }
         PlatformV2Request::GetMutationReceipt(value) => value.project().clone(),
-        PlatformV2Request::GetLineage(value) => value.project().clone(),
+        PlatformV2Request::GetLineage(value) => {
+            let identity = WorkContextIdentity::UserWorkspace(value.workspace().clone());
+            if principal
+                .workspaces
+                .get(&identity)
+                .is_none_or(|scope| &scope.project != value.project())
+            {
+                return Err("platform_v2_mobile_project_denied");
+            }
+            value.project().clone()
+        }
         PlatformV2Request::SubmitWorkspaceIntent(value) => value.project().clone(),
         PlatformV2Request::GetWorkspaceIntent(value) => value.project().clone(),
-        PlatformV2Request::GetReview(value) => value.project().clone(),
+        PlatformV2Request::GetReview(value) => {
+            if principal
+                .workspaces
+                .get(value.workspace())
+                .is_none_or(|scope| &scope.project != value.project())
+            {
+                return Err("platform_v2_mobile_project_denied");
+            }
+            value.project().clone()
+        }
         PlatformV2Request::ExecuteReviewAction(value) => principal
             .workspaces
             .get(value.workspace())
@@ -1656,6 +1675,8 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    use automonique_protocol::platform_v2_transport::{LineageReadRequest, ReviewReadRequest};
+
     fn policy(inherited_tools: serde_json::Value) -> PolicyDocument {
         serde_json::from_value(serde_json::json!({
             "version": 1,
@@ -1877,6 +1898,96 @@ mod tests {
         assert_eq!(
             verify_web_principal_binding(&path, uid, "tenant-test", "actor-test"),
             Err("platform_v2_web_binding_ambiguous")
+        );
+    }
+
+    #[test]
+    fn mobile_target_reads_require_workspace_ownership_in_the_declared_project() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("policy.json");
+        let uid = nix::unistd::geteuid().as_raw();
+        let empty_authority = serde_json::json!({
+            "filesystem": [], "credentials": [], "network": [],
+            "tools": [], "providers": [], "models": []
+        });
+        let document = serde_json::json!({
+            "version": 1,
+            "principals": [{
+                "uid": uid,
+                "tenant": "tenant-test",
+                "actor": "actor-test",
+                "serving_authority": "automonique",
+                "projects": ["project-a", "project-b"],
+                "workspaces": [
+                    {"project": "project-a", "kind": "project", "id": "project-a",
+                     "inherited_authority": empty_authority},
+                    {"project": "project-b", "kind": "project", "id": "project-b",
+                     "inherited_authority": empty_authority},
+                    {"project": "project-a", "kind": "user_workspace", "id": "workspace-a",
+                     "inherited_authority": empty_authority},
+                    {"project": "project-b", "kind": "user_workspace", "id": "workspace-b",
+                     "inherited_authority": empty_authority}
+                ],
+                "authority": empty_authority,
+                "review_authorities": {}
+            }]
+        });
+        write_generation_policy(&path, &document);
+        let roots = [
+            ProjectId::new("project-a").unwrap(),
+            ProjectId::new("project-b").unwrap(),
+        ]
+        .into_iter()
+        .collect();
+        let project_a = ProjectId::new("project-a").unwrap();
+        let project_b = ProjectId::new("project-b").unwrap();
+        let workspace_a = UserWorkspaceId::new("workspace-a").unwrap();
+
+        let valid_lineage = PlatformV2Request::GetLineage(LineageReadRequest::new(
+            project_a.clone(),
+            workspace_a.clone(),
+        ));
+        assert_eq!(
+            resolve_web_mobile_request_project(
+                &path,
+                uid,
+                "tenant-test",
+                "actor-test",
+                &roots,
+                &valid_lineage,
+            ),
+            Ok(project_a.clone())
+        );
+        let mismatched_lineage = PlatformV2Request::GetLineage(LineageReadRequest::new(
+            project_b.clone(),
+            workspace_a.clone(),
+        ));
+        assert_eq!(
+            resolve_web_mobile_request_project(
+                &path,
+                uid,
+                "tenant-test",
+                "actor-test",
+                &roots,
+                &mismatched_lineage,
+            ),
+            Err("platform_v2_mobile_project_denied")
+        );
+
+        let mismatched_review = PlatformV2Request::GetReview(
+            ReviewReadRequest::new(project_b, WorkContextIdentity::UserWorkspace(workspace_a))
+                .unwrap(),
+        );
+        assert_eq!(
+            resolve_web_mobile_request_project(
+                &path,
+                uid,
+                "tenant-test",
+                "actor-test",
+                &roots,
+                &mismatched_review,
+            ),
+            Err("platform_v2_mobile_project_denied")
         );
     }
 }

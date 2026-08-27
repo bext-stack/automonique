@@ -225,8 +225,11 @@ grants. Refresh rotation advances both the credential revision and principal
 generation; regrant changes the delegation ID and generation; credential
 revocation revokes the delegation in the same transaction. Old generations
 cannot reuse cached mutation previews. Every request is action-checked and
-resolved to one admitted project before the local socket is opened; the daemon
-then independently applies its current policy fence and ownership checks.
+resolved to one admitted project before the local socket is opened. Targeted
+lineage and review reads additionally require the named workspace to belong to
+that declared project in the server policy; possession of both project roots
+does not permit a cross-project workspace coordinate. The daemon then
+independently applies its current policy fence and ownership checks.
 
 A v2 grant is issued only when the v1 credential's persisted actor exactly
 matches the web entry's configured actor; changing that configuration cannot
@@ -240,6 +243,15 @@ custody is capped at 128 live entries per credential, survives process restart
 and same-delegation access-token rotation, and is deleted on delegation
 regrant or credential revocation. Thus another same-project credential and a
 new delegation cannot read an older mutation receipt.
+
+The final credential, delegation, generation, and receipt-custody check runs
+inside a SQLite `IMMEDIATE` transaction held through the mobile daemon socket
+exchange, whose read and write operations are capped at two seconds. Refresh,
+regrant, and revocation through another web-entry process therefore cannot
+commit between authorization and dispatch. Receipt custody is read or written
+inside that same transaction, eliminating a separate pre-transaction
+reauthorization window. A fence commit failure is returned as a correlated
+typed refusal rather than forwarding a response under uncertain custody.
 
 The current local protocol cannot safely represent multiple daemon principals
 behind one web-entry uid. Such a configuration stays blocked; adding more
