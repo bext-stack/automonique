@@ -14,7 +14,7 @@
     "protocol": "automonique.platform",
     "protocolRange": "1",
     "schema": "automonique.platform/v1",
-    "schemaDigest": "sha256:6e9d862680917801aa232bda916a4e9dc9871f0a1d28cce705e44b113e4d45de"
+    "schemaDigest": "sha256:1c3f561d137a14321cee480b8035341dd70b526ca501f2d5efd7f817a6e4b845"
   },
   "files": [
     "dist"

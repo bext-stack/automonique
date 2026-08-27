@@ -20,8 +20,13 @@ export * from "./platform.js";
 export * from "./progress.js";
 export * from "./runs.js";
 export * from "./runtime.js";
+export * from "./work-context.js";
 
 // The digest of the surface re-exported above. It identifies the schema
 // these files were generated from; it is not a checksum of this file.
 export const SCHEMA_DIGEST_ALGORITHM = "sha256";
-export const SCHEMA_DIGEST = "6e9d862680917801aa232bda916a4e9dc9871f0a1d28cce705e44b113e4d45de";
+export const SCHEMA_DIGEST = "0fc6346cea24c9f83c4e9acc5d6631d601af83c1a27b04406c14e166c5c5bb9c";
+
+// The exact generated Platform v1 module digest. A package that advertises
+// protocolRange/schema v1 uses this pin, not the aggregate surface digest.
+export const PLATFORM_V1_SCHEMA_DIGEST = "1c3f561d137a14321cee480b8035341dd70b526ca501f2d5efd7f817a6e4b845";

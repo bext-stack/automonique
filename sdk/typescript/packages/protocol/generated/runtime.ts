@@ -22,6 +22,7 @@ export {
   decodeMessageAdmitted,
   encodeMessage,
   isWellFormedUnicode,
+  parseCanonical,
   toCanonicalBytes,
   type JsonValue,
 } from "../src/canonical.js";
