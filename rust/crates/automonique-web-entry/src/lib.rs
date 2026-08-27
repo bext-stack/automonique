@@ -6684,6 +6684,7 @@ mod tests {
             ("/api/status?fresh=1", Route::ApiStatus),
             ("/api/operations", Route::ApiOperations),
             ("/api/platform", Route::ApiPlatform),
+            ("/api/chat/history", Route::ApiChatHistory),
             ("/.well-known/automonique-mobile", Route::MobileDiscovery),
             ("/api/mobile/pairing-sessions", Route::MobilePairingSessions),
             ("/api/mobile/authorization", Route::MobileAuthorization),
@@ -8412,6 +8413,7 @@ mod tests {
             "platform-session-detail",
             "platform-history",
             "platform-composer",
+            "data-open-sessions",
             "attention-toggle",
             "processes-refresh",
             "process-list",
@@ -8463,6 +8465,38 @@ mod tests {
         ] {
             assert!(DASHBOARD_HTML.contains(&format!("value=\"{theme}\"")));
         }
+    }
+
+    #[test]
+    fn dashboard_makes_retained_sessions_the_primary_conversation_surface() {
+        let retained_nav = DASHBOARD_HTML
+            .find("data-view=\"sessions\"")
+            .expect("retained sessions navigation");
+        let recovery_nav = DASHBOARD_HTML
+            .find("id=\"sidebar-new-chat\"")
+            .expect("generic recovery navigation");
+        assert!(retained_nav < recovery_nav);
+        assert!(
+            DASHBOARD_HTML.contains("href=\"#sessions\" aria-label=\"Open retained sessions\"")
+        );
+        assert!(
+            DASHBOARD_HTML.contains("data-panel=\"sessions\" aria-labelledby=\"sessions-title\"")
+        );
+        assert!(DASHBOARD_HTML.contains("PRIMARY CONVERSATION SURFACE"));
+        assert!(DASHBOARD_HTML.contains("SECONDARY / RECOVERY"));
+        assert!(DASHBOARD_HTML.contains(
+            "This assistant is not attached to an authority-qualified Platform session."
+        ));
+        assert!(DASHBOARD_HTML.contains("data-open-sessions>Return to retained sessions"));
+        assert!(DASHBOARD_JS.contains(
+            "const startupViews = [\"sessions\", \"overview\", \"operations\", \"tickets\", \"chat\"]"
+        ));
+        assert!(
+            DASHBOARD_JS
+                .contains("storedPreference(\"monique-start-view\", startupViews, \"sessions\")")
+        );
+        assert!(DASHBOARD_JS.contains("if (name === \"sessions\") loadPlatform()"));
+        assert!(DASHBOARD_JS.contains("if (name === \"chat\") loadChatHistory()"));
     }
 
     #[test]
@@ -8953,6 +8987,23 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
         assert!(response.contains("WWW-Authenticate: Basic"));
         assert!(!response.contains("Operations overview"));
+    }
+
+    #[test]
+    fn retained_and_recovery_conversation_apis_share_the_authenticated_boundary() {
+        for path in ["/api/platform", "/api/chat/history"] {
+            let request = format!(
+                "GET {path} HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nX-Forwarded-Proto: https\r\nConnection: close\r\n\r\n"
+            );
+            let response = String::from_utf8(exchange_without_integration(request.as_bytes()))
+                .expect("HTTP response");
+            assert!(
+                response.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+                "unauthenticated {path} response: {response:?}"
+            );
+            assert!(response.contains("WWW-Authenticate: Basic"));
+            assert!(!response.contains("PRIMARY CONVERSATION SURFACE"));
+        }
     }
 
     #[test]
