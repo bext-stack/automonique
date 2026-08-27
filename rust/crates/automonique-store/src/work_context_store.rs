@@ -15,7 +15,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use automonique_protocol::identity::Actor;
-use automonique_protocol::platform::{ReceiptId, ReceiptOutcome, ResourceAuthority};
+use automonique_protocol::platform::{
+    IdempotencyKey, ReceiptId, ReceiptOutcome, ResourceAuthority,
+};
 use automonique_protocol::platform_v2::{
     AuthorizedWorkContextRecord, ProjectId, WorkContextIdentity, WorkContextKind,
     WorkContextLifecycle, WorkContextPage, WorkContextQuery, WorkContextQueryResult,
@@ -27,7 +29,7 @@ use automonique_protocol::platform_v2_lifecycle::{
     MutationApprovalId, MutationApprovalRequirement, MutationPreview, MutationPreviewId,
     MutationPreviewRef, MutationReceipt, MutationSubmission, ResolvedParentSnapshot,
     WorkContextAuthority, WorkContextMutationIntent, WorkContextMutationProposal,
-    WorkContextRegistrySelector,
+    WorkContextRegistrySelector, WorkContextRequestDigest,
 };
 use automonique_protocol::platform_v2_lifecycle_api::{
     decode_work_context_mutation_approval, decode_work_context_mutation_preview,
@@ -44,9 +46,11 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{StoreError, validate_database_path};
 
-pub const WORK_CONTEXT_STORE_SCHEMA_VERSION: u32 = 2;
+pub const WORK_CONTEXT_STORE_SCHEMA_VERSION: u32 = 3;
+pub const MAX_EXTERNAL_EFFECT_LEASE_MILLIS: i64 = 300_000;
+const MAX_RECONCILIATION_EVIDENCE_BYTES: usize = 16 * 1024;
 
-const SCHEMA_V2: &str = r#"
+const SCHEMA_V3: &str = r#"
 CREATE TABLE work_context_meta (
     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
     inventory_generation INTEGER NOT NULL CHECK(inventory_generation>=1)
@@ -142,7 +146,7 @@ CREATE TABLE work_context_outbox (
     preview_id TEXT NOT NULL UNIQUE REFERENCES work_context_previews(preview_id),
     effect_kind TEXT NOT NULL,
     effect_document BLOB NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('ready','completed')),
+    state TEXT NOT NULL CHECK(state IN ('ready','claimed','ambiguous','completed')),
     created_at_ms INTEGER NOT NULL,
     completed_at_ms INTEGER
 ) STRICT;
@@ -167,7 +171,16 @@ CREATE TABLE work_context_effect_leases (
     effect_kind TEXT NOT NULL,
     effect_digest TEXT NOT NULL CHECK(length(effect_digest)=64 AND effect_digest NOT GLOB '*[^0-9a-f]*'),
     expires_at_ms INTEGER NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('claimed','completed'))
+    state TEXT NOT NULL CHECK(state IN ('claimed','ambiguous','released','completed')),
+    completed_at_ms INTEGER
+) STRICT;
+
+CREATE TABLE work_context_effect_reconciliations (
+    lease_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK(outcome IN ('not_started','completed','unknown')),
+    evidence_document BLOB NOT NULL,
+    recorded_at_ms INTEGER NOT NULL
 ) STRICT;
 
 CREATE TABLE work_context_cursor_state (
@@ -197,6 +210,7 @@ pub enum WorkContextStoreError {
     ApprovalConsumed,
     PreviewExpired,
     Unavailable,
+    ReconcileRequired,
     NotFound,
     Corrupt(&'static str),
     Protocol(String),
@@ -222,6 +236,7 @@ impl WorkContextStoreError {
             Self::ApprovalConsumed => "approval_consumed",
             Self::PreviewExpired => "preview_expired",
             Self::Unavailable => "unavailable",
+            Self::ReconcileRequired => "reconcile_required",
             Self::NotFound => "not_found",
             Self::Corrupt(_) => "corrupt",
             Self::Protocol(_) => "protocol",
@@ -261,10 +276,12 @@ pub struct MutationPolicyDecision {
     inherited_authority: WorkContextAuthority,
     authorized_project: Option<ProjectId>,
     authorized_targets: BTreeSet<WorkContextIdentity>,
+    request_digest: Option<WorkContextRequestDigest>,
     approval: MutationApprovalRequirement,
 }
 impl MutationPolicyDecision {
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         authenticated_actor: Actor,
         serving_authority: ResourceAuthority,
@@ -272,6 +289,7 @@ impl MutationPolicyDecision {
         inherited_authority: WorkContextAuthority,
         authorized_project: Option<ProjectId>,
         authorized_targets: BTreeSet<WorkContextIdentity>,
+        request_digest: WorkContextRequestDigest,
         approval: MutationApprovalRequirement,
     ) -> Self {
         Self {
@@ -281,7 +299,27 @@ impl MutationPolicyDecision {
             inherited_authority,
             authorized_project,
             authorized_targets,
+            request_digest: Some(request_digest),
             approval,
+        }
+    }
+
+    #[must_use]
+    pub fn for_read(
+        authenticated_actor: Actor,
+        serving_authority: ResourceAuthority,
+        authorized_project: Option<ProjectId>,
+        authorized_targets: BTreeSet<WorkContextIdentity>,
+    ) -> Self {
+        Self {
+            authenticated_actor,
+            serving_authority,
+            actor_authority: WorkContextAuthority::EMPTY,
+            inherited_authority: WorkContextAuthority::EMPTY,
+            authorized_project,
+            authorized_targets,
+            request_digest: None,
+            approval: MutationApprovalRequirement::NotRequired,
         }
     }
 }
@@ -366,6 +404,10 @@ pub struct ExternalEffectCompletionPolicy {
     effect_kind: String,
     effect_document: Vec<u8>,
     expires_at: EpochMillis,
+    intent: WorkContextMutationIntent,
+    resulting_identity: WorkContextIdentity,
+    effective_authority: WorkContextAuthority,
+    idempotency_key: IdempotencyKey,
 }
 impl ExternalEffectCompletionPolicy {
     #[must_use]
@@ -376,6 +418,70 @@ impl ExternalEffectCompletionPolicy {
     pub const fn preview(&self) -> &MutationPreviewRef {
         &self.preview
     }
+    #[must_use]
+    pub const fn intent(&self) -> &WorkContextMutationIntent {
+        &self.intent
+    }
+    #[must_use]
+    pub const fn resulting_identity(&self) -> &WorkContextIdentity {
+        &self.resulting_identity
+    }
+    #[must_use]
+    pub const fn effective_authority(&self) -> &WorkContextAuthority {
+        &self.effective_authority
+    }
+    #[must_use]
+    pub const fn idempotency_key(&self) -> &IdempotencyKey {
+        &self.idempotency_key
+    }
+    #[must_use]
+    pub fn effect_payload(&self) -> &[u8] {
+        &self.effect_document
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExternalEffectReconciliation {
+    VerifiedNotStarted { evidence: ProviderEffectEvidence },
+    Completed { evidence: ProviderEffectEvidence },
+    Unknown { evidence: ProviderEffectEvidence },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderEffectEvidence {
+    idempotency_key: IdempotencyKey,
+    document: Vec<u8>,
+}
+impl ProviderEffectEvidence {
+    pub fn new(
+        idempotency_key: IdempotencyKey,
+        document: Vec<u8>,
+    ) -> Result<Self, WorkContextStoreError> {
+        if document.is_empty() || document.len() > MAX_RECONCILIATION_EVIDENCE_BYTES {
+            return Err(WorkContextStoreError::InvalidField(
+                "reconciliation_evidence",
+            ));
+        }
+        Ok(Self {
+            idempotency_key,
+            document,
+        })
+    }
+    #[must_use]
+    pub const fn idempotency_key(&self) -> &IdempotencyKey {
+        &self.idempotency_key
+    }
+    #[must_use]
+    pub fn document(&self) -> &[u8] {
+        &self.document
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExternalEffectReconciliationOutcome {
+    Ready,
+    Completed(MutationReceipt),
+    ReconcileRequired,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -533,6 +639,7 @@ impl WorkContextStore {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        mark_expired_external_effects(&tx, trusted_now_ms)?;
         authorize_transaction_scope(&tx, proposal.intent(), policy)?;
         let scope = (
             proposal.actor().tenant(),
@@ -622,6 +729,7 @@ impl WorkContextStore {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        mark_expired_external_effects(&tx, trusted_now_ms)?;
         let preview = load_preview_for_scope(
             &tx,
             preview_ref,
@@ -733,7 +841,7 @@ impl WorkContextStore {
         tx.execute("UPDATE work_context_previews SET submitted_at_ms=?1 WHERE preview_id=?2 AND submitted_at_ms IS NULL",params![submission.submitted_at().as_millis(),preview_ref.id().as_str()])?;
         tx.execute("INSERT INTO work_context_events(preview_id,event_kind,event_document,recorded_at_ms) VALUES(?1,?2,?3,?4)",params![preview_ref.id().as_str(),outcome.as_str(),receipt_document,trusted_now_ms])?;
         if let Some(kind) = external {
-            let target = effect_target(preview.proposal().intent())?;
+            let target = effect_reservation_target(&preview)?;
             let reserved = tx.execute("INSERT OR IGNORE INTO work_context_effect_reservations(tenant,target_key,target_revision,effect_kind,preview_id) VALUES(?1,?2,?3,?4,?5)", params![preview.proposal().actor().tenant(), identity_key(target.identity()), to_i64(target.revision())?, kind, preview_ref.id().as_str()])?;
             if reserved != 1 {
                 return Err(WorkContextStoreError::GraphConflict);
@@ -745,6 +853,64 @@ impl WorkContextStore {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn claim_next_external_effect(
+        &mut self,
+        policy: &ExternalEffectExecutorPolicy,
+        trusted_now_ms: i64,
+        lease_duration_ms: i64,
+        nonces: &mut impl WorkContextNonceSource,
+    ) -> Stored<Option<ExternalEffectCompletionPolicy>> {
+        if trusted_now_ms < 0
+            || !(1..=MAX_EXTERNAL_EFFECT_LEASE_MILLIS).contains(&lease_duration_ms)
+        {
+            return Err(WorkContextStoreError::InvalidField("effect_lease_duration"));
+        }
+        let expires_at_ms = trusted_now_ms
+            .checked_add(lease_duration_ms)
+            .ok_or(WorkContextStoreError::InvalidField("effect_lease_expiry"))?;
+        {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            mark_expired_external_effects(&tx, trusted_now_ms)?;
+            tx.commit()?;
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT p.preview_id,p.preview_revision,o.effect_kind FROM work_context_outbox o JOIN work_context_previews p ON p.preview_id=o.preview_id WHERE p.tenant=?1 AND p.serving_authority=?2 AND o.state='ready' ORDER BY o.created_at_ms,o.outbox_id",
+        )?;
+        let candidates: Vec<(String, i64, String)> = statement
+            .query_map(
+                params![policy.executor.tenant(), policy.serving_authority.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?
+            .collect::<Result<_, _>>()?;
+        drop(statement);
+        for (preview_id, revision, effect_kind) in candidates {
+            if !policy.allowed_effect_kinds.contains(&effect_kind) {
+                continue;
+            }
+            let preview_id = MutationPreviewId::new(preview_id)
+                .map_err(|_| WorkContextStoreError::Corrupt("preview_id"))?;
+            let revision = u64::try_from(revision)
+                .ok()
+                .and_then(|value| Revision::new(value).ok())
+                .ok_or(WorkContextStoreError::Corrupt("preview_revision"))?;
+            match self.claim_external_effect(
+                &MutationPreviewRef::new(preview_id, revision),
+                policy,
+                trusted_now_ms,
+                expires_at_ms,
+                nonces,
+            ) {
+                Ok(claim) => return Ok(Some(claim)),
+                Err(WorkContextStoreError::Unavailable | WorkContextStoreError::NotFound) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn claim_external_effect(
         &mut self,
         preview_ref: &MutationPreviewRef,
@@ -753,12 +919,16 @@ impl WorkContextStore {
         expires_at_ms: i64,
         nonces: &mut impl WorkContextNonceSource,
     ) -> Stored<ExternalEffectCompletionPolicy> {
-        if trusted_now_ms < 0 || expires_at_ms <= trusted_now_ms {
+        if trusted_now_ms < 0
+            || expires_at_ms <= trusted_now_ms
+            || expires_at_ms - trusted_now_ms > MAX_EXTERNAL_EFFECT_LEASE_MILLIS
+        {
             return Err(WorkContextStoreError::InvalidField("effect_lease_expiry"));
         }
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        mark_expired_external_effects(&tx, trusted_now_ms)?;
         let preview = load_preview_for_scope(
             &tx,
             preview_ref,
@@ -770,21 +940,34 @@ impl WorkContextStore {
         if !policy.allowed_effect_kinds.contains(effect_kind) {
             return Err(WorkContextStoreError::Unauthorized);
         }
-        let target = effect_target(preview.proposal().intent())?.clone();
+        let target = effect_reservation_target(&preview)?;
         recheck_preview_state(&tx, &preview)?;
-        type OutboxRow = (Vec<u8>, String, String, i64, String, String, i64, String);
+        type OutboxRow = (
+            String,
+            Vec<u8>,
+            String,
+            String,
+            i64,
+            Option<i64>,
+            String,
+            String,
+            i64,
+            String,
+        );
         let row: Option<OutboxRow> = tx
             .query_row(
-                "SELECT o.effect_document,o.state,o.effect_kind,o.created_at_ms,e.tenant,e.target_key,e.target_revision,e.effect_kind FROM work_context_outbox o JOIN work_context_effect_reservations e ON e.preview_id=o.preview_id WHERE o.preview_id=?1",
+                "SELECT o.outbox_id,o.effect_document,o.state,o.effect_kind,o.created_at_ms,o.completed_at_ms,e.tenant,e.target_key,e.target_revision,e.effect_kind FROM work_context_outbox o JOIN work_context_effect_reservations e ON e.preview_id=o.preview_id WHERE o.preview_id=?1",
                 [preview_ref.id().as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?)),
             )
             .optional()?;
         let Some((
+            outbox_id,
             effect_document,
             outbox_state,
             outbox_kind,
             created_at,
+            completed_at,
             reservation_tenant,
             reservation_target,
             reservation_revision,
@@ -797,7 +980,9 @@ impl WorkContextStore {
             return Err(WorkContextStoreError::NotFound);
         }
         if trusted_now_ms < created_at
+            || outbox_id != format!("outbox_{}", preview_ref.id().as_str())
             || outbox_kind != effect_kind
+            || completed_at.is_some()
             || reservation_tenant != policy.executor.tenant()
             || reservation_target != identity_key(target.identity())
             || reservation_revision != to_i64(target.revision())?
@@ -805,6 +990,7 @@ impl WorkContextStore {
         {
             return Err(WorkContextStoreError::Corrupt("effect_reservation"));
         }
+        validate_ready_effect_documents(&tx, &preview, &effect_document, created_at)?;
         let digest = document_digest(&effect_document);
         type LeaseRow = (
             String,
@@ -825,7 +1011,7 @@ impl WorkContextStore {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?)),
             )
             .optional()?;
-        let mut claim_expiry = expires_at_ms;
+        let claim_expiry = expires_at_ms;
         let lease_id = if let Some((
             lease_id,
             tenant,
@@ -839,30 +1025,24 @@ impl WorkContextStore {
             state,
         )) = existing
         {
-            if state != "claimed"
+            if state != "released"
                 || tenant != policy.executor.tenant()
                 || authority != policy.serving_authority.as_str()
                 || target_key != identity_key(target.identity())
                 || revision != to_i64(target.revision())?
                 || stored_kind != effect_kind
                 || stored_digest != digest
+                || stored_expiry > trusted_now_ms
             {
                 return Err(WorkContextStoreError::Corrupt("effect_lease"));
             }
-            if stored_expiry > trusted_now_ms {
-                if executor_id != policy.executor.id() {
-                    return Err(WorkContextStoreError::Unavailable);
-                }
-                claim_expiry = stored_expiry;
-                ExternalEffectLeaseId(lease_id)
-            } else {
-                let replacement = ExternalEffectLeaseId::issue(nonces.nonce());
-                tx.execute(
-                    "UPDATE work_context_effect_leases SET lease_id=?1,executor_id=?2,expires_at_ms=?3 WHERE preview_id=?4 AND state='claimed' AND expires_at_ms<=?5",
-                    params![replacement.as_str(), policy.executor.id(), expires_at_ms, preview_ref.id().as_str(), trusted_now_ms],
-                )?;
-                replacement
-            }
+            let _ = (lease_id, executor_id);
+            let replacement = ExternalEffectLeaseId::issue(nonces.nonce());
+            tx.execute(
+                "UPDATE work_context_effect_leases SET lease_id=?1,tenant=?2,executor_id=?3,serving_authority=?4,target_key=?5,target_revision=?6,effect_kind=?7,effect_digest=?8,expires_at_ms=?9,state='claimed',completed_at_ms=NULL WHERE preview_id=?10 AND state='released'",
+                params![replacement.as_str(), policy.executor.tenant(), policy.executor.id(), policy.serving_authority.as_str(), identity_key(target.identity()), to_i64(target.revision())?, effect_kind, digest, expires_at_ms, preview_ref.id().as_str()],
+            )?;
+            replacement
         } else {
             let issued = ExternalEffectLeaseId::issue(nonces.nonce());
             tx.execute(
@@ -871,6 +1051,13 @@ impl WorkContextStore {
             )?;
             issued
         };
+        let claimed = tx.execute(
+            "UPDATE work_context_outbox SET state='claimed' WHERE preview_id=?1 AND state='ready'",
+            [preview_ref.id().as_str()],
+        )?;
+        if claimed != 1 {
+            return Err(WorkContextStoreError::Unavailable);
+        }
         let claim = ExternalEffectCompletionPolicy {
             lease_id,
             executor: policy.executor.clone(),
@@ -880,6 +1067,10 @@ impl WorkContextStore {
             effect_kind: effect_kind.to_owned(),
             effect_document,
             expires_at: EpochMillis::from_millis(claim_expiry),
+            intent: preview.proposal().intent().clone(),
+            resulting_identity: preview.resulting().identity().clone(),
+            effective_authority: preview.effective_authority().clone(),
+            idempotency_key: preview.proposal().idempotency_key().clone(),
         };
         tx.commit()?;
         Ok(claim)
@@ -896,14 +1087,15 @@ impl WorkContextStore {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        mark_expired_external_effects(&tx, trusted_now_ms)?;
         let preview = load_preview_for_scope(
             &tx,
             &policy.preview,
             policy.executor.tenant(),
             policy.serving_authority,
         )?;
-        let target = effect_target(preview.proposal().intent())?;
-        if target != &policy.target
+        let target = effect_reservation_target(&preview)?;
+        if target != policy.target
             || external_effect(preview.proposal().intent()) != Some(policy.effect_kind.as_str())
         {
             return Err(WorkContextStoreError::Unauthorized);
@@ -911,7 +1103,9 @@ impl WorkContextStore {
         type CompletionRow = (
             String,
             Vec<u8>,
+            String,
             Vec<u8>,
+            String,
             String,
             i64,
             Option<i64>,
@@ -924,16 +1118,23 @@ impl WorkContextStore {
             String,
             i64,
             String,
+            String,
+            String,
+            i64,
+            String,
+            Option<i64>,
         );
         let row: Option<CompletionRow>=tx.query_row(
-            "SELECT r.receipt_id,r.submission_document,o.effect_document,o.state,o.created_at_ms,o.completed_at_ms,r.outcome,r.recorded_at_ms,r.receipt_document,l.lease_id,l.executor_id,l.serving_authority,l.effect_digest,l.expires_at_ms,l.state FROM work_context_receipts r JOIN work_context_outbox o ON o.preview_id=r.preview_id JOIN work_context_effect_reservations e ON e.preview_id=r.preview_id JOIN work_context_effect_leases l ON l.preview_id=r.preview_id WHERE r.preview_id=?1 AND e.tenant=?2 AND e.target_key=?3 AND e.target_revision=?4 AND e.effect_kind=?5",
+            "SELECT r.receipt_id,r.submission_document,o.outbox_id,o.effect_document,o.effect_kind,o.state,o.created_at_ms,o.completed_at_ms,r.outcome,r.recorded_at_ms,r.receipt_document,l.lease_id,l.executor_id,l.serving_authority,l.effect_digest,l.expires_at_ms,l.state,l.tenant,l.target_key,l.target_revision,l.effect_kind,l.completed_at_ms FROM work_context_receipts r JOIN work_context_outbox o ON o.preview_id=r.preview_id JOIN work_context_effect_reservations e ON e.preview_id=r.preview_id JOIN work_context_effect_leases l ON l.preview_id=r.preview_id WHERE r.preview_id=?1 AND e.tenant=?2 AND e.target_key=?3 AND e.target_revision=?4 AND e.effect_kind=?5",
             params![policy.preview.id().as_str(), policy.executor.tenant(), identity_key(target.identity()), to_i64(target.revision())?, policy.effect_kind],
-            |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?)),
+            |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?,row.get(15)?,row.get(16)?,row.get(17)?,row.get(18)?,row.get(19)?,row.get(20)?,row.get(21)?)),
         ).optional()?;
         let Some((
             receipt_id,
             submission_document,
+            outbox_id,
             effect_document,
+            outbox_kind,
             state,
             created_at,
             completed_at,
@@ -946,6 +1147,11 @@ impl WorkContextStore {
             lease_digest,
             lease_expiry,
             lease_state,
+            lease_tenant,
+            lease_target,
+            lease_revision,
+            lease_kind,
+            lease_completed_at,
         )) = row
         else {
             return Err(WorkContextStoreError::NotFound);
@@ -955,10 +1161,19 @@ impl WorkContextStore {
             || lease_id != policy.lease_id.as_str()
             || executor_id != policy.executor.id()
             || lease_authority != policy.serving_authority.as_str()
-            || lease_digest != document_digest(&effect_document)
-            || lease_expiry != policy.expires_at.as_millis()
         {
             return Err(WorkContextStoreError::Unauthorized);
+        }
+        if outbox_id != format!("outbox_{}", policy.preview.id().as_str())
+            || outbox_kind != policy.effect_kind
+            || lease_digest != document_digest(&effect_document)
+            || lease_expiry != policy.expires_at.as_millis()
+            || lease_tenant != policy.executor.tenant()
+            || lease_target != identity_key(target.identity())
+            || lease_revision != to_i64(target.revision())?
+            || lease_kind != policy.effect_kind
+        {
+            return Err(WorkContextStoreError::Corrupt("effect_lease"));
         }
         let submission = decode_work_context_mutation_submission(&submission_document, &preview)
             .map_err(protocol)?;
@@ -977,15 +1192,27 @@ impl WorkContextStore {
             if prior_outcome != ReceiptOutcome::Completed.as_str()
                 || completed_at.is_none()
                 || lease_state != "completed"
+                || completed_at != Some(prior_recorded_at)
+                || lease_completed_at != Some(prior_recorded_at)
+                || created_at > prior_recorded_at
+                || submission.submitted_at().as_millis() > created_at
             {
                 return Err(WorkContextStoreError::Corrupt("completed_effect"));
             }
             return decode_work_context_mutation_receipt(&prior_receipt, &submission, &preview)
                 .map_err(protocol);
         }
-        if state != "ready"
+        if state == "ambiguous" && lease_state == "ambiguous" {
+            if completed_at.is_some() || lease_completed_at.is_some() {
+                return Err(WorkContextStoreError::Corrupt("effect_state"));
+            }
+            return Err(WorkContextStoreError::ReconcileRequired);
+        }
+        if state != "claimed"
             || prior_outcome != ReceiptOutcome::Accepted.as_str()
             || lease_state != "claimed"
+            || completed_at.is_some()
+            || lease_completed_at.is_some()
         {
             return Err(WorkContextStoreError::Corrupt("effect_state"));
         }
@@ -995,6 +1222,7 @@ impl WorkContextStore {
         {
             return Err(WorkContextStoreError::InvalidField("completed_at"));
         }
+        validate_ready_effect_documents(&tx, &preview, &effect_document, created_at)?;
         recheck_preview_state(&tx, &preview)?;
         store_record(
             &tx,
@@ -1013,11 +1241,220 @@ impl WorkContextStore {
         .map_err(protocol)?;
         let document = encode_work_context_mutation_receipt(&receipt).map_err(protocol)?;
         tx.execute("UPDATE work_context_receipts SET receipt_document=?1,outcome='completed',recorded_at_ms=?2 WHERE preview_id=?3",params![document,trusted_now_ms,policy.preview.id().as_str()])?;
-        tx.execute("UPDATE work_context_outbox SET state='completed',completed_at_ms=?1 WHERE preview_id=?2 AND state='ready'",params![trusted_now_ms,policy.preview.id().as_str()])?;
-        tx.execute("UPDATE work_context_effect_leases SET state='completed' WHERE lease_id=?1 AND state='claimed'", [policy.lease_id.as_str()])?;
+        tx.execute("UPDATE work_context_outbox SET state='completed',completed_at_ms=?1 WHERE preview_id=?2 AND state='claimed'",params![trusted_now_ms,policy.preview.id().as_str()])?;
+        tx.execute("UPDATE work_context_effect_leases SET state='completed',completed_at_ms=?1 WHERE lease_id=?2 AND state='claimed'", params![trusted_now_ms,policy.lease_id.as_str()])?;
         tx.execute("INSERT INTO work_context_events(preview_id,event_kind,event_document,recorded_at_ms) VALUES(?1,'completed',?2,?3)",params![policy.preview.id().as_str(),document,trusted_now_ms])?;
         tx.commit()?;
         Ok(receipt)
+    }
+
+    pub fn reconcile_external_effect(
+        &mut self,
+        policy: &ExternalEffectCompletionPolicy,
+        reconciliation: &ExternalEffectReconciliation,
+        trusted_now_ms: i64,
+    ) -> Stored<ExternalEffectReconciliationOutcome> {
+        let (outcome, evidence) = match reconciliation {
+            ExternalEffectReconciliation::VerifiedNotStarted { evidence } => {
+                ("not_started", evidence)
+            }
+            ExternalEffectReconciliation::Completed { evidence } => ("completed", evidence),
+            ExternalEffectReconciliation::Unknown { evidence } => ("unknown", evidence),
+        };
+        if trusted_now_ms < 0 || evidence.idempotency_key() != policy.idempotency_key() {
+            return Err(WorkContextStoreError::InvalidField(
+                "reconciliation_evidence",
+            ));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        mark_expired_external_effects(&tx, trusted_now_ms)?;
+        let preview = load_preview_for_scope(
+            &tx,
+            &policy.preview,
+            policy.executor.tenant(),
+            policy.serving_authority,
+        )?;
+        let target = effect_reservation_target(&preview)?;
+        type ReconcileRow = (
+            String,
+            String,
+            Vec<u8>,
+            i64,
+            Option<i64>,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            String,
+            String,
+            i64,
+            Option<i64>,
+        );
+        let row: Option<ReconcileRow> = tx
+            .query_row(
+                "SELECT o.state,o.outbox_id,o.effect_document,o.created_at_ms,o.completed_at_ms,o.effect_kind,l.state,l.executor_id,l.serving_authority,l.tenant,l.target_key,l.target_revision,l.effect_kind,l.effect_digest,l.expires_at_ms,l.completed_at_ms FROM work_context_outbox o JOIN work_context_effect_leases l ON l.preview_id=o.preview_id WHERE l.lease_id=?1 AND o.preview_id=?2",
+                params![policy.lease_id.as_str(), policy.preview.id().as_str()],
+                |row| {
+                    Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?,row.get(15)?))
+                },
+            )
+            .optional()?;
+        let Some((
+            outbox_state,
+            outbox_id,
+            effect_document,
+            created_at,
+            outbox_completed_at,
+            outbox_kind,
+            lease_state,
+            lease_executor,
+            lease_authority,
+            lease_tenant,
+            lease_target,
+            lease_revision,
+            lease_kind,
+            lease_digest,
+            lease_expiry,
+            lease_completed_at,
+        )) = row
+        else {
+            return Err(WorkContextStoreError::NotFound);
+        };
+        let prior: Option<(String, String, Vec<u8>)> = tx.query_row(
+                "SELECT outcome,idempotency_key,evidence_document FROM work_context_effect_reconciliations WHERE lease_id=?1",
+                [policy.lease_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).optional()?;
+        if let Some(prior) = &prior
+            && (prior.1 != evidence.idempotency_key().as_str()
+                || ((prior.0 != outcome || prior.2 != evidence.document())
+                    && !(prior.0 == "unknown" && outcome == "completed")))
+        {
+            return Err(WorkContextStoreError::BodyConflict);
+        }
+        if target != policy.target
+            || effect_document != policy.effect_document
+            || outbox_id != format!("outbox_{}", policy.preview.id().as_str())
+            || outbox_kind != policy.effect_kind
+            || lease_executor != policy.executor.id()
+            || lease_authority != policy.serving_authority.as_str()
+            || lease_tenant != policy.executor.tenant()
+            || lease_target != identity_key(target.identity())
+            || lease_revision != to_i64(target.revision())?
+            || lease_kind != policy.effect_kind
+            || lease_digest != document_digest(&effect_document)
+            || lease_expiry != policy.expires_at.as_millis()
+            || trusted_now_ms < created_at
+        {
+            return Err(WorkContextStoreError::Corrupt("effect_reconciliation"));
+        }
+        if outbox_state == "completed" && lease_state == "completed" {
+            if !matches!(
+                reconciliation,
+                ExternalEffectReconciliation::Completed { .. }
+            ) || !matches!(prior.as_ref(), Some(value) if value.0 == "completed" && value.1 == evidence.idempotency_key().as_str() && value.2 == evidence.document())
+            {
+                return Err(WorkContextStoreError::BodyConflict);
+            }
+            let (submission_document, receipt_document, receipt_outcome, recorded_at): (
+                Vec<u8>,
+                Vec<u8>,
+                String,
+                i64,
+            ) = tx.query_row(
+                "SELECT submission_document,receipt_document,outcome,recorded_at_ms FROM work_context_receipts WHERE preview_id=?1",
+                [policy.preview.id().as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+            let submission =
+                decode_work_context_mutation_submission(&submission_document, &preview)
+                    .map_err(protocol)?;
+            let receipt =
+                decode_work_context_mutation_receipt(&receipt_document, &submission, &preview)
+                    .map_err(protocol)?;
+            if submission_document != effect_document
+                || receipt_outcome != ReceiptOutcome::Completed.as_str()
+                || receipt.outcome() != ReceiptOutcome::Completed
+                || receipt.recorded_at().as_millis() != recorded_at
+                || outbox_completed_at != Some(recorded_at)
+                || lease_completed_at != Some(recorded_at)
+                || created_at > recorded_at
+                || encode_work_context_mutation_receipt(&receipt).map_err(protocol)?
+                    != receipt_document
+            {
+                return Err(WorkContextStoreError::Corrupt("completed_reconciliation"));
+            }
+            tx.commit()?;
+            return Ok(ExternalEffectReconciliationOutcome::Completed(receipt));
+        }
+        if outbox_completed_at.is_some() || lease_completed_at.is_some() {
+            return Err(WorkContextStoreError::Corrupt("effect_reconciliation"));
+        }
+        if outbox_state != "ambiguous" || lease_state != "ambiguous" {
+            return Err(WorkContextStoreError::ReconcileRequired);
+        }
+        validate_ready_effect_documents(&tx, &preview, &effect_document, created_at)?;
+        tx.execute(
+            "INSERT INTO work_context_effect_reconciliations(lease_id,idempotency_key,outcome,evidence_document,recorded_at_ms) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(lease_id) DO UPDATE SET outcome=excluded.outcome,evidence_document=excluded.evidence_document,recorded_at_ms=excluded.recorded_at_ms WHERE work_context_effect_reconciliations.outcome='unknown' AND excluded.outcome='completed'",
+            params![policy.lease_id.as_str(), policy.idempotency_key().as_str(), outcome, evidence.document(), trusted_now_ms],
+        )?;
+        match reconciliation {
+            ExternalEffectReconciliation::VerifiedNotStarted { .. } => {
+                tx.execute(
+                    "UPDATE work_context_effect_leases SET state='released' WHERE lease_id=?1 AND state='ambiguous'",
+                    [policy.lease_id.as_str()],
+                )?;
+                tx.execute(
+                    "UPDATE work_context_outbox SET state='ready' WHERE preview_id=?1 AND state='ambiguous'",
+                    [policy.preview.id().as_str()],
+                )?;
+                tx.commit()?;
+                Ok(ExternalEffectReconciliationOutcome::Ready)
+            }
+            ExternalEffectReconciliation::Unknown { .. } => {
+                tx.commit()?;
+                Ok(ExternalEffectReconciliationOutcome::ReconcileRequired)
+            }
+            ExternalEffectReconciliation::Completed { .. } => {
+                recheck_preview_state(&tx, &preview)?;
+                store_record(
+                    &tx,
+                    preview.proposal().actor().tenant(),
+                    preview.resulting(),
+                )?;
+                bump_generation(&tx)?;
+                let (receipt_id, submission_document): (String, Vec<u8>) = tx.query_row(
+                    "SELECT receipt_id,submission_document FROM work_context_receipts WHERE preview_id=?1 AND outcome='accepted'",
+                    [policy.preview.id().as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let submission =
+                    decode_work_context_mutation_submission(&submission_document, &preview)
+                        .map_err(protocol)?;
+                let receipt = MutationReceipt::new(
+                    ReceiptId::new(receipt_id)
+                        .map_err(|_| WorkContextStoreError::Corrupt("receipt_id"))?,
+                    &submission,
+                    &preview,
+                    work_context_mutation_preview_digest(&preview).map_err(protocol)?,
+                    ReceiptOutcome::Completed,
+                    EpochMillis::from_millis(trusted_now_ms),
+                )
+                .map_err(protocol)?;
+                let document = encode_work_context_mutation_receipt(&receipt).map_err(protocol)?;
+                tx.execute("UPDATE work_context_receipts SET receipt_document=?1,outcome='completed',recorded_at_ms=?2 WHERE preview_id=?3 AND outcome='accepted'",params![document,trusted_now_ms,policy.preview.id().as_str()])?;
+                tx.execute("UPDATE work_context_outbox SET state='completed',completed_at_ms=?1 WHERE preview_id=?2 AND state='ambiguous'",params![trusted_now_ms,policy.preview.id().as_str()])?;
+                tx.execute("UPDATE work_context_effect_leases SET state='completed',completed_at_ms=?1 WHERE lease_id=?2 AND state='ambiguous'",params![trusted_now_ms,policy.lease_id.as_str()])?;
+                tx.execute("INSERT INTO work_context_events(preview_id,event_kind,event_document,recorded_at_ms) VALUES(?1,'completed',?2,?3)",params![policy.preview.id().as_str(),document,trusted_now_ms])?;
+                tx.commit()?;
+                Ok(ExternalEffectReconciliationOutcome::Completed(receipt))
+            }
+        }
     }
 
     pub fn receipt_by_id(
@@ -1117,7 +1554,10 @@ fn initialize(connection: &mut Connection) -> Stored<()> {
         return Ok(());
     }
     if version == 1 {
-        return migrate_v1_to_v2(connection);
+        return migrate_v1_to_v3(connection);
+    }
+    if version == 2 {
+        return migrate_v2_to_v3(connection);
     }
     if version != 0 {
         return Err(WorkContextStoreError::SchemaVersion {
@@ -1137,12 +1577,12 @@ fn initialize(connection: &mut Connection) -> Stored<()> {
         });
     }
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    tx.execute_batch(SCHEMA_V2)?;
+    tx.execute_batch(SCHEMA_V3)?;
     tx.pragma_update(None, "user_version", WORK_CONTEXT_STORE_SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
 }
-fn migrate_v1_to_v2(connection: &mut Connection) -> Stored<()> {
+fn migrate_v1_to_v3(connection: &mut Connection) -> Stored<()> {
     let populated: i64 = connection.query_row(
         "SELECT (SELECT count(*) FROM work_context_records)+(SELECT count(*) FROM work_context_expected_revisions)+(SELECT count(*) FROM work_context_previews)+(SELECT count(*) FROM work_context_selector_bindings)",
         [],
@@ -1159,6 +1599,7 @@ fn migrate_v1_to_v2(connection: &mut Connection) -> Stored<()> {
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute_batch(
         "DROP TABLE work_context_cursor_state;
+         DROP TABLE IF EXISTS work_context_effect_reconciliations;
          DROP TABLE IF EXISTS work_context_effect_leases;
          DROP TABLE IF EXISTS work_context_effect_reservations;
          DROP TABLE work_context_outbox;
@@ -1172,7 +1613,58 @@ fn migrate_v1_to_v2(connection: &mut Connection) -> Stored<()> {
          DROP TABLE work_context_records;
          DROP TABLE work_context_meta;",
     )?;
-    tx.execute_batch(SCHEMA_V2)?;
+    tx.execute_batch(SCHEMA_V3)?;
+    tx.pragma_update(None, "user_version", WORK_CONTEXT_STORE_SCHEMA_VERSION)?;
+    tx.commit()?;
+    Ok(())
+}
+fn migrate_v2_to_v3(connection: &mut Connection) -> Stored<()> {
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch(
+        "ALTER TABLE work_context_outbox RENAME TO work_context_outbox_v2;
+         ALTER TABLE work_context_effect_leases RENAME TO work_context_effect_leases_v2;
+         CREATE TABLE work_context_outbox (
+            outbox_id TEXT PRIMARY KEY,
+            preview_id TEXT NOT NULL UNIQUE REFERENCES work_context_previews(preview_id),
+            effect_kind TEXT NOT NULL,
+            effect_document BLOB NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('ready','claimed','ambiguous','completed')),
+            created_at_ms INTEGER NOT NULL,
+            completed_at_ms INTEGER
+         ) STRICT;
+         CREATE TABLE work_context_effect_leases (
+            lease_id TEXT PRIMARY KEY,
+            preview_id TEXT NOT NULL UNIQUE REFERENCES work_context_previews(preview_id),
+            tenant TEXT NOT NULL,
+            executor_id TEXT NOT NULL,
+            serving_authority TEXT NOT NULL,
+            target_key TEXT NOT NULL,
+            target_revision INTEGER NOT NULL CHECK(target_revision>=1),
+            effect_kind TEXT NOT NULL,
+            effect_digest TEXT NOT NULL CHECK(length(effect_digest)=64 AND effect_digest NOT GLOB '*[^0-9a-f]*'),
+            expires_at_ms INTEGER NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('claimed','ambiguous','released','completed')),
+            completed_at_ms INTEGER
+         ) STRICT;
+         CREATE TABLE work_context_effect_reconciliations (
+            lease_id TEXT PRIMARY KEY,
+            idempotency_key TEXT NOT NULL,
+            outcome TEXT NOT NULL CHECK(outcome IN ('not_started','completed','unknown')),
+            evidence_document BLOB NOT NULL,
+            recorded_at_ms INTEGER NOT NULL
+         ) STRICT;
+         INSERT INTO work_context_outbox(outbox_id,preview_id,effect_kind,effect_document,state,created_at_ms,completed_at_ms)
+         SELECT outbox_id,preview_id,effect_kind,effect_document,
+                CASE WHEN state='ready' AND preview_id IN (SELECT preview_id FROM work_context_effect_leases_v2 WHERE state='claimed') THEN 'ambiguous' ELSE state END,
+                created_at_ms,completed_at_ms FROM work_context_outbox_v2;
+         INSERT INTO work_context_effect_leases(lease_id,preview_id,tenant,executor_id,serving_authority,target_key,target_revision,effect_kind,effect_digest,expires_at_ms,state,completed_at_ms)
+         SELECT lease_id,preview_id,tenant,executor_id,serving_authority,target_key,target_revision,effect_kind,effect_digest,expires_at_ms,
+                CASE state WHEN 'claimed' THEN 'ambiguous' ELSE state END,
+                CASE WHEN state='completed' THEN (SELECT completed_at_ms FROM work_context_outbox_v2 o WHERE o.preview_id=work_context_effect_leases_v2.preview_id) ELSE NULL END
+         FROM work_context_effect_leases_v2;
+         DROP TABLE work_context_effect_leases_v2;
+         DROP TABLE work_context_outbox_v2;",
+    )?;
     tx.pragma_update(None, "user_version", WORK_CONTEXT_STORE_SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
@@ -1494,6 +1986,17 @@ fn bump_generation(tx: &Transaction<'_>) -> Stored<()> {
     tx.execute("UPDATE work_context_meta SET inventory_generation=inventory_generation+1 WHERE singleton=1",[])?;
     Ok(())
 }
+fn mark_expired_external_effects(tx: &Transaction<'_>, trusted_now_ms: i64) -> Stored<()> {
+    tx.execute(
+        "UPDATE work_context_effect_leases SET state='ambiguous' WHERE state='claimed' AND expires_at_ms<=?1",
+        [trusted_now_ms],
+    )?;
+    tx.execute(
+        "UPDATE work_context_outbox SET state='ambiguous' WHERE state='claimed' AND preview_id IN (SELECT preview_id FROM work_context_effect_leases WHERE state='ambiguous')",
+        [],
+    )?;
+    Ok(())
+}
 fn load_preview_for_scope(
     connection: &Connection,
     preview_ref: &MutationPreviewRef,
@@ -1809,6 +2312,7 @@ fn recheck_policy(preview: &MutationPreview, policy: &MutationPolicyDecision) ->
     let proposal = preview.proposal();
     if proposal.actor() != &policy.authenticated_actor
         || proposal.authority() != policy.serving_authority
+        || policy.request_digest != Some(proposal.request_digest())
     {
         return Err(WorkContextStoreError::Unauthorized);
     }
@@ -1856,6 +2360,7 @@ fn authorize_proposal(
 ) -> Stored<()> {
     if proposal.actor() != &policy.authenticated_actor
         || proposal.authority() != policy.serving_authority
+        || policy.request_digest != Some(proposal.request_digest())
     {
         return Err(WorkContextStoreError::Unauthorized);
     }
@@ -2005,6 +2510,66 @@ fn load_receipt_lookup(
     }
     Ok(ReceiptLookup::Found(receipt))
 }
+fn validate_ready_effect_documents(
+    connection: &Connection,
+    preview: &MutationPreview,
+    effect_document: &[u8],
+    created_at_ms: i64,
+) -> Stored<()> {
+    type AcceptedRow = (String, Vec<u8>, Vec<u8>, String, i64);
+    let row: Option<AcceptedRow> = connection
+        .query_row(
+            "SELECT receipt_id,submission_document,receipt_document,outcome,recorded_at_ms FROM work_context_receipts WHERE preview_id=?1",
+            [preview.preview().id().as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()?;
+    let Some((receipt_id, submission_document, receipt_document, outcome, recorded_at)) = row
+    else {
+        return Err(WorkContextStoreError::Corrupt("effect_receipt"));
+    };
+    if submission_document != effect_document
+        || outcome != ReceiptOutcome::Accepted.as_str()
+        || recorded_at != created_at_ms
+    {
+        return Err(WorkContextStoreError::Corrupt("effect_receipt"));
+    }
+    let submission =
+        decode_work_context_mutation_submission(&submission_document, preview).map_err(protocol)?;
+    let approval = submission
+        .approval_id()
+        .map(|id| {
+            let document: Vec<u8> = connection
+                .query_row(
+                    "SELECT approval_document FROM work_context_approvals WHERE approval_id=?1 AND preview_id=?2",
+                    params![id.as_str(), preview.preview().id().as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(WorkContextStoreError::from)?;
+            decode_work_context_mutation_approval(&document, preview).map_err(protocol)
+        })
+        .transpose()?;
+    if encode_work_context_mutation_submission(
+        preview,
+        approval.as_ref(),
+        submission.submitted_at(),
+    )
+    .map_err(protocol)?
+        != submission_document
+    {
+        return Err(WorkContextStoreError::Corrupt("effect_submission"));
+    }
+    let receipt = decode_work_context_mutation_receipt(&receipt_document, &submission, preview)
+        .map_err(protocol)?;
+    if receipt.id().as_str() != receipt_id
+        || receipt.outcome() != ReceiptOutcome::Accepted
+        || receipt.recorded_at().as_millis() != recorded_at
+        || encode_work_context_mutation_receipt(&receipt).map_err(protocol)? != receipt_document
+    {
+        return Err(WorkContextStoreError::Corrupt("effect_receipt"));
+    }
+    Ok(())
+}
 fn consume_approval(
     tx: &Transaction<'_>,
     preview: &MutationPreview,
@@ -2075,11 +2640,14 @@ fn external_effect(intent: &WorkContextMutationIntent) -> Option<&'static str> {
         _ => None,
     }
 }
-fn effect_target(intent: &WorkContextMutationIntent) -> Stored<&ExpectedWorkContext> {
-    match intent {
-        WorkContextMutationIntent::CreateAttemptWorkspace(value) => Ok(value.user_workspace()),
-        WorkContextMutationIntent::ResumeAttemptWorkspace(value) => Ok(value.target()),
-        WorkContextMutationIntent::ResumeSession(value) => Ok(value.target()),
+fn effect_reservation_target(preview: &MutationPreview) -> Stored<ExpectedWorkContext> {
+    match preview.proposal().intent() {
+        WorkContextMutationIntent::CreateAttemptWorkspace(_) => Ok(ExpectedWorkContext::new(
+            preview.resulting().identity().clone(),
+            preview.resulting().revision(),
+        )),
+        WorkContextMutationIntent::ResumeAttemptWorkspace(value) => Ok(value.target().clone()),
+        WorkContextMutationIntent::ResumeSession(value) => Ok(value.target().clone()),
         _ => Err(WorkContextStoreError::InvalidField("external_effect")),
     }
 }

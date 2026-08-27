@@ -124,6 +124,7 @@ fn policy_for(
         WorkContextAuthority::EMPTY,
         project,
         targets,
+        proposal.request_digest(),
         requirement,
     )
 }
@@ -138,14 +139,11 @@ fn approval_policy(preview: &MutationPreview, expires_at_ms: i64) -> ApprovalPol
     )
 }
 fn read_policy(identity: &WorkContextIdentity, project: Option<&str>) -> MutationPolicyDecision {
-    MutationPolicyDecision::new(
+    MutationPolicyDecision::for_read(
         actor(),
         ResourceAuthority::Automonique,
-        WorkContextAuthority::EMPTY,
-        WorkContextAuthority::EMPTY,
         project.map(|value| ProjectId::new(value).unwrap()),
         BTreeSet::from([identity.clone()]),
-        MutationApprovalRequirement::NotRequired,
     )
 }
 fn proposal(intent: WorkContextMutationIntent, key: &str) -> WorkContextMutationProposal {
@@ -489,11 +487,31 @@ fn stale_parent_graph_scope_and_authority_widening_fail_before_reservation() {
         WorkContextAuthority::EMPTY,
         Some(ProjectId::new("project-1").unwrap()),
         BTreeSet::from([identity(WorkContextKind::Project, "project-1")]),
+        valid.request_digest(),
         MutationApprovalRequirement::NotRequired,
     );
     assert_eq!(
         store
             .prepare_mutation(&valid, &wrong, 1, 10, &mut nonces)
+            .unwrap_err()
+            .category(),
+        "unauthorized"
+    );
+    let archive = proposal(
+        WorkContextMutationIntent::ArchiveProject(
+            ArchiveIntent::new(expected(WorkContextKind::Project, "project-1", 2)).unwrap(),
+        ),
+        "cross-operation-policy",
+    );
+    assert_eq!(
+        store
+            .prepare_mutation(
+                &archive,
+                &policy_for(&valid, MutationApprovalRequirement::NotRequired),
+                1,
+                10,
+                &mut nonces,
+            )
             .unwrap_err()
             .category(),
         "unauthorized"
@@ -804,7 +822,7 @@ fn approval_is_exact_one_time_and_archive_is_one_way_after_restart() {
             )
             .unwrap_err()
             .category(),
-        "protocol"
+        "unauthorized"
     );
 }
 
@@ -952,37 +970,6 @@ fn external_effect_commits_outbox_then_result_and_completed_receipt_atomically()
             .unwrap(),
         ReceiptLookup::Unknown
     );
-    let duplicate_request = proposal(request.intent().clone(), "attempt-distinct-key");
-    let duplicate_preview = unwrap_new(
-        store
-            .prepare_mutation(
-                &duplicate_request,
-                &policy_for(&duplicate_request, MutationApprovalRequirement::NotRequired),
-                22,
-                100,
-                &mut nonces,
-            )
-            .unwrap(),
-    );
-    let duplicate_submission = encode_work_context_mutation_submission(
-        &duplicate_preview,
-        None,
-        EpochMillis::from_millis(23),
-    )
-    .unwrap();
-    assert_eq!(
-        store
-            .submit_mutation(
-                duplicate_preview.preview(),
-                &duplicate_submission,
-                &policy_for(&duplicate_request, MutationApprovalRequirement::NotRequired),
-                ReceiptId::new("receipt-duplicate-effect").unwrap(),
-                24,
-            )
-            .unwrap_err()
-            .category(),
-        "conflict"
-    );
     assert!(
         store
             .record(
@@ -993,6 +980,55 @@ fn external_effect_commits_outbox_then_result_and_completed_receipt_atomically()
             .is_none()
     );
     drop(store);
+    Connection::open(private.path())
+        .unwrap()
+        .execute(
+            "UPDATE work_context_outbox SET effect_document=x'00' WHERE preview_id=?1",
+            [preview.preview().id().as_str()],
+        )
+        .unwrap();
+    let mut corrupt_store = WorkContextStore::open(private.path()).unwrap();
+    let mut corrupt_nonces = Nonces { next: 79, calls: 0 };
+    assert_eq!(
+        corrupt_store
+            .claim_next_external_effect(
+                &ExternalEffectExecutorPolicy::new(
+                    Actor::new("tenant-1", "executor-duration-check").unwrap(),
+                    ResourceAuthority::Automonique,
+                    BTreeSet::from(["create_attempt_workspace".to_owned()]),
+                ),
+                25,
+                MAX_EXTERNAL_EFFECT_LEASE_MILLIS + 1,
+                &mut corrupt_nonces,
+            )
+            .unwrap_err()
+            .category(),
+        "invalid_request"
+    );
+    assert_eq!(
+        corrupt_store
+            .claim_next_external_effect(
+                &ExternalEffectExecutorPolicy::new(
+                    Actor::new("tenant-1", "executor-corrupt-check").unwrap(),
+                    ResourceAuthority::Automonique,
+                    BTreeSet::from(["create_attempt_workspace".to_owned()]),
+                ),
+                25,
+                55,
+                &mut corrupt_nonces,
+            )
+            .unwrap_err()
+            .category(),
+        "corrupt"
+    );
+    drop(corrupt_store);
+    Connection::open(private.path())
+        .unwrap()
+        .execute(
+            "UPDATE work_context_outbox SET effect_document=?1 WHERE preview_id=?2",
+            rusqlite::params![submission, preview.preview().id().as_str()],
+        )
+        .unwrap();
     let mut unauthorized_store = WorkContextStore::open(private.path()).unwrap();
     let mut unauthorized_nonces = Nonces { next: 80, calls: 0 };
     assert_eq!(
@@ -1017,21 +1053,19 @@ fn external_effect_commits_outbox_then_result_and_completed_receipt_atomically()
     let mut claimers = Vec::new();
     for (executor, next) in [("executor-1", 90), ("executor-2", 91)] {
         let path = private.path().to_path_buf();
-        let preview_ref = preview.preview().clone();
         let barrier = barrier.clone();
         claimers.push(thread::spawn(move || {
             let mut store = WorkContextStore::open(path).unwrap();
             let mut nonces = Nonces { next, calls: 0 };
             barrier.wait();
-            store.claim_external_effect(
-                &preview_ref,
+            store.claim_next_external_effect(
                 &ExternalEffectExecutorPolicy::new(
                     Actor::new("tenant-1", executor).unwrap(),
                     ResourceAuthority::Automonique,
                     BTreeSet::from(["create_attempt_workspace".to_owned()]),
                 ),
                 25,
-                80,
+                55,
                 &mut nonces,
             )
         }));
@@ -1040,27 +1074,179 @@ fn external_effect_commits_outbox_then_result_and_completed_receipt_atomically()
         .into_iter()
         .map(|thread| thread.join().unwrap())
         .collect();
-    assert_eq!(claims.iter().filter(|result| result.is_ok()).count(), 1);
     assert_eq!(
         claims
             .iter()
-            .filter_map(|result| result.as_ref().err())
-            .next()
-            .unwrap()
-            .category(),
-        "unavailable"
+            .filter(|result| matches!(result, Ok(Some(_))))
+            .count(),
+        1
     );
-    let claim = claims.into_iter().find_map(Result::ok).unwrap();
+    assert_eq!(
+        claims
+            .iter()
+            .filter(|result| matches!(result, Ok(None)))
+            .count(),
+        1
+    );
+    let claim = claims
+        .into_iter()
+        .find_map(|result| result.unwrap())
+        .unwrap();
+    assert_eq!(claim.preview(), preview.preview());
+    assert_eq!(claim.resulting_identity(), preview.resulting().identity());
+    assert_eq!(claim.intent(), request.intent());
+    assert_eq!(claim.idempotency_key(), request.idempotency_key());
+    assert_eq!(claim.effective_authority(), preview.effective_authority());
+    assert_eq!(claim.effect_payload(), submission);
     let mut reopened = WorkContextStore::open(private.path()).unwrap();
-    let completed = reopened.complete_external_effect(&claim, 30).unwrap();
+    assert_eq!(
+        reopened
+            .complete_external_effect(&claim, 80)
+            .unwrap_err()
+            .category(),
+        "reconcile_required"
+    );
+    assert_eq!(
+        reopened
+            .reconcile_external_effect(
+                &claim,
+                &ExternalEffectReconciliation::VerifiedNotStarted {
+                    evidence: ProviderEffectEvidence::new(
+                        claim.idempotency_key().clone(),
+                        b"provider verified no operation".to_vec(),
+                    )
+                    .unwrap(),
+                },
+                81,
+            )
+            .unwrap(),
+        ExternalEffectReconciliationOutcome::Ready
+    );
+    let mut second_lease_nonces = Nonces { next: 92, calls: 0 };
+    let second_claim = reopened
+        .claim_next_external_effect(
+            &ExternalEffectExecutorPolicy::new(
+                Actor::new("tenant-1", "executor-3").unwrap(),
+                ResourceAuthority::Automonique,
+                BTreeSet::from(["create_attempt_workspace".to_owned()]),
+            ),
+            82,
+            20,
+            &mut second_lease_nonces,
+        )
+        .unwrap()
+        .unwrap();
+    Connection::open(private.path())
+        .unwrap()
+        .execute(
+            "UPDATE work_context_outbox SET effect_kind='corrupt_kind' WHERE preview_id=?1",
+            [second_claim.preview().id().as_str()],
+        )
+        .unwrap();
+    assert_eq!(
+        reopened
+            .complete_external_effect(&second_claim, 90)
+            .unwrap_err()
+            .category(),
+        "corrupt"
+    );
+    Connection::open(private.path())
+        .unwrap()
+        .execute(
+            "UPDATE work_context_outbox SET effect_kind='create_attempt_workspace' WHERE preview_id=?1",
+            [second_claim.preview().id().as_str()],
+        )
+        .unwrap();
+    Connection::open(private.path())
+        .unwrap()
+        .execute(
+            "UPDATE work_context_effect_leases SET target_revision=target_revision+1 WHERE lease_id=?1",
+            [second_claim.lease_id().as_str()],
+        )
+        .unwrap();
+    assert_eq!(
+        reopened
+            .complete_external_effect(&second_claim, 90)
+            .unwrap_err()
+            .category(),
+        "corrupt"
+    );
+    Connection::open(private.path())
+        .unwrap()
+        .execute(
+            "UPDATE work_context_effect_leases SET target_revision=target_revision-1 WHERE lease_id=?1",
+            [second_claim.lease_id().as_str()],
+        )
+        .unwrap();
+    assert_eq!(
+        reopened
+            .complete_external_effect(&second_claim, 102)
+            .unwrap_err()
+            .category(),
+        "reconcile_required"
+    );
+    assert_eq!(
+        reopened
+            .reconcile_external_effect(
+                &second_claim,
+                &ExternalEffectReconciliation::Unknown {
+                    evidence: ProviderEffectEvidence::new(
+                        second_claim.idempotency_key().clone(),
+                        b"provider lookup timed out".to_vec(),
+                    )
+                    .unwrap(),
+                },
+                103,
+            )
+            .unwrap(),
+        ExternalEffectReconciliationOutcome::ReconcileRequired
+    );
+    let mut unknown_discovery_nonces = Nonces { next: 93, calls: 0 };
+    assert!(
+        reopened
+            .claim_next_external_effect(
+                &ExternalEffectExecutorPolicy::new(
+                    Actor::new("tenant-1", "executor-4").unwrap(),
+                    ResourceAuthority::Automonique,
+                    BTreeSet::from(["create_attempt_workspace".to_owned()]),
+                ),
+                103,
+                20,
+                &mut unknown_discovery_nonces,
+            )
+            .unwrap()
+            .is_none()
+    );
+    let completed_evidence = ProviderEffectEvidence::new(
+        second_claim.idempotency_key().clone(),
+        b"provider receipt operation-123".to_vec(),
+    )
+    .unwrap();
+    let completed_reconciliation = ExternalEffectReconciliation::Completed {
+        evidence: completed_evidence,
+    };
+    let ExternalEffectReconciliationOutcome::Completed(completed) = reopened
+        .reconcile_external_effect(&second_claim, &completed_reconciliation, 104)
+        .unwrap()
+    else {
+        panic!("completed reconciliation")
+    };
     assert_eq!(
         completed.outcome(),
         automonique_protocol::platform::ReceiptOutcome::Completed
     );
     assert_eq!(reopened.ready_outbox_count().unwrap(), 0);
     assert_eq!(
-        reopened.complete_external_effect(&claim, 31).unwrap(),
+        reopened
+            .complete_external_effect(&second_claim, 105)
+            .unwrap(),
         completed
+    );
+    assert_eq!(
+        reopened
+            .reconcile_external_effect(&second_claim, &completed_reconciliation, 106)
+            .unwrap(),
+        ExternalEffectReconciliationOutcome::Completed(completed.clone())
     );
     assert!(matches!(
         reopened
@@ -1079,6 +1265,41 @@ fn external_effect_commits_outbox_then_result_and_completed_receipt_atomically()
             .unwrap(),
         *preview.resulting()
     );
+    let second_request = proposal(request.intent().clone(), "second-sequential-attempt");
+    let second_preview = unwrap_new(
+        reopened
+            .prepare_mutation(
+                &second_request,
+                &policy_for(&second_request, MutationApprovalRequirement::NotRequired),
+                110,
+                200,
+                &mut nonces,
+            )
+            .unwrap(),
+    );
+    assert_ne!(
+        second_preview.resulting().identity(),
+        preview.resulting().identity()
+    );
+    let second_submission = encode_work_context_mutation_submission(
+        &second_preview,
+        None,
+        EpochMillis::from_millis(111),
+    )
+    .unwrap();
+    assert!(matches!(
+        reopened
+            .submit_mutation(
+                second_preview.preview(),
+                &second_submission,
+                &policy_for(&second_request, MutationApprovalRequirement::NotRequired),
+                ReceiptId::new("receipt-second-attempt").unwrap(),
+                112,
+            )
+            .unwrap(),
+        ReceiptAdmission::New(ref receipt)
+            if receipt.outcome() == automonique_protocol::platform::ReceiptOutcome::Accepted
+    ));
 }
 
 #[test]
@@ -1200,14 +1421,11 @@ fn tenant_scopes_records_targets_and_replay_authorization() {
         )
         .unwrap();
     let tenant_two = Actor::new("tenant-2", "operator-2").unwrap();
-    let tenant_two_policy = MutationPolicyDecision::new(
+    let tenant_two_policy = MutationPolicyDecision::for_read(
         tenant_two.clone(),
         ResourceAuthority::Automonique,
-        WorkContextAuthority::EMPTY,
-        WorkContextAuthority::EMPTY,
         Some(ProjectId::new("shared-project-id").unwrap()),
         BTreeSet::from([target.clone()]),
-        MutationApprovalRequirement::NotRequired,
     );
     assert_eq!(
         store
@@ -1269,6 +1487,7 @@ fn tenant_scopes_records_targets_and_replay_authorization() {
         WorkContextAuthority::EMPTY,
         Some(ProjectId::new("tenant-one-only").unwrap()),
         BTreeSet::from([absent]),
+        tenant_two_request.request_digest(),
         MutationApprovalRequirement::NotRequired,
     );
     assert_eq!(
@@ -1624,4 +1843,50 @@ fn empty_v1_database_migrates_to_tenant_scoped_schema() {
         )
         .unwrap();
     assert_eq!(primary_key_columns, 3);
+}
+
+#[test]
+fn v2_effect_schema_migrates_claims_to_ambiguous_v3_state() {
+    let private = PrivateStore::new();
+    drop(WorkContextStore::open(private.path()).unwrap());
+    let connection = Connection::open(private.path()).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE work_context_effect_reconciliations;
+             ALTER TABLE work_context_effect_leases RENAME TO work_context_effect_leases_v3;
+             CREATE TABLE work_context_effect_leases (
+                lease_id TEXT PRIMARY KEY, preview_id TEXT NOT NULL UNIQUE,
+                tenant TEXT NOT NULL, executor_id TEXT NOT NULL,
+                serving_authority TEXT NOT NULL, target_key TEXT NOT NULL,
+                target_revision INTEGER NOT NULL, effect_kind TEXT NOT NULL,
+                effect_digest TEXT NOT NULL, expires_at_ms INTEGER NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('claimed','completed'))
+             ) STRICT;
+             DROP TABLE work_context_effect_leases_v3;
+             ALTER TABLE work_context_outbox RENAME TO work_context_outbox_v3;
+             CREATE TABLE work_context_outbox (
+                outbox_id TEXT PRIMARY KEY, preview_id TEXT NOT NULL UNIQUE,
+                effect_kind TEXT NOT NULL, effect_document BLOB NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('ready','completed')),
+                created_at_ms INTEGER NOT NULL, completed_at_ms INTEGER
+             ) STRICT;
+             DROP TABLE work_context_outbox_v3;
+             PRAGMA user_version=2;",
+        )
+        .unwrap();
+    drop(connection);
+    let store = WorkContextStore::open(private.path()).unwrap();
+    let connection = Connection::open(store.path()).unwrap();
+    let version: u32 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 3);
+    let reconciliation_columns: u32 = connection
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('work_context_effect_reconciliations')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reconciliation_columns, 5);
 }

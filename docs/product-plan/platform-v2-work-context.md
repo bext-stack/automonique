@@ -193,11 +193,19 @@ the complete tenant/actor/serving-authority/idempotency scope; absence is an
 explicit `unknown` lookup result.
 
 External effects reserve the exact tenant/target/revision/effect tuple before
-enqueue. Workers atomically claim a ready effect under an opaque durable lease
+enqueue. Attempt creation reserves its newly issued `AttemptWorkspace`
+identity, not the parent `UserWorkspace`, so separately requested attempts can
+run sequentially without weakening same-request replay protection. Workers
+discover and atomically claim ready effects under an opaque durable lease
 bound to executor identity, serving authority, preview, target revision,
 effect kind and document digest, and expiry. Completion consumes that exact
 lease, validates the prior accepted receipt and current authoritative snapshot,
-and returns the completed receipt idempotently on retry. Authoritative snapshot
+and returns the completed receipt idempotently on retry. Lease duration is
+bounded. Expiry moves an effect to `ambiguous`, never back to ready: a typed
+provider reconciliation tied to the original idempotency key must establish
+`not_started` before release, persist exact completion evidence before final
+receipt creation, or leave an `unknown` effect unavailable for replay.
+Authoritative snapshot
 ingestion rejects revision regression, terminal lifecycle rollback, reparenting,
 and external owner changes. Durable readers re-encode documents and compare all
 duplicated normalized columns before returning a value.
