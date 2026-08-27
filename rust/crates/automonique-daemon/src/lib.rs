@@ -224,6 +224,7 @@ pub mod memory_config;
 pub mod model_inventory;
 pub mod parity_trace;
 pub mod platform_v2_host;
+pub mod platform_v2_lifecycle_adapter;
 pub use platform_v2_host::{
     POLICY_FILE_NAME as PLATFORM_V2_POLICY_FILE_NAME, verify_web_principal_binding,
 };
