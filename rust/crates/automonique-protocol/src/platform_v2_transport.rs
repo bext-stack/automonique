@@ -9,7 +9,7 @@
 
 use core::fmt;
 use core::str::FromStr;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::codec::{
     CodecError, Envelope, FrameDecode, MajorVersion, MessageKind, ProtocolName, RequestId,
@@ -378,26 +378,146 @@ impl MutationReceiptLookup {
     }
 }
 
-/// Closed, server-observed lifecycle effects available in this daemon generation.
+/// Closed lifecycle operations a capability response must describe for every
+/// server-issued project root. Keeping unavailable operations in the response
+/// prevents clients from confusing an omitted future action with permission.
+pub const LIFECYCLE_CAPABILITY_EFFECT_KINDS: [&str; 5] = [
+    "create_attempt_workspace",
+    "create_checkout",
+    "create_host_setup",
+    "resume_attempt_workspace",
+    "resume_session",
+];
+
+pub type LifecycleCapabilityCategory = BoundedString<128>;
+
+/// One action-specific capability under one authenticated project root.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LifecycleCapabilities {
-    effect_kinds: BTreeSet<String>,
+pub struct LifecycleOperationCapability {
+    project: ProjectId,
+    effect_kind: String,
+    category: Option<LifecycleCapabilityCategory>,
 }
 
-impl LifecycleCapabilities {
-    pub fn new(effect_kinds: BTreeSet<String>) -> Result<Self, PlatformV2TransportError> {
-        if effect_kinds
-            .iter()
-            .any(|kind| !matches!(kind.as_str(), "create_host_setup" | "create_checkout"))
-        {
+impl LifecycleOperationCapability {
+    pub fn available(
+        project: ProjectId,
+        effect_kind: impl Into<String>,
+    ) -> Result<Self, PlatformV2TransportError> {
+        Self::new(project, effect_kind.into(), None)
+    }
+
+    pub fn unavailable(
+        project: ProjectId,
+        effect_kind: impl Into<String>,
+        category: impl Into<String>,
+    ) -> Result<Self, PlatformV2TransportError> {
+        Self::new(
+            project,
+            effect_kind.into(),
+            Some(
+                LifecycleCapabilityCategory::new(category.into())
+                    .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+            ),
+        )
+    }
+
+    fn new(
+        project: ProjectId,
+        effect_kind: String,
+        category: Option<LifecycleCapabilityCategory>,
+    ) -> Result<Self, PlatformV2TransportError> {
+        if !LIFECYCLE_CAPABILITY_EFFECT_KINDS.contains(&effect_kind.as_str()) {
             return Err(PlatformV2TransportError::InvalidBody);
         }
-        Ok(Self { effect_kinds })
+        Ok(Self {
+            project,
+            effect_kind,
+            category,
+        })
     }
 
     #[must_use]
-    pub const fn effect_kinds(&self) -> &BTreeSet<String> {
-        &self.effect_kinds
+    pub const fn project(&self) -> &ProjectId {
+        &self.project
+    }
+
+    #[must_use]
+    pub fn effect_kind(&self) -> &str {
+        &self.effect_kind
+    }
+
+    #[must_use]
+    pub const fn available_now(&self) -> bool {
+        self.category.is_none()
+    }
+
+    #[must_use]
+    pub const fn category(&self) -> Option<&LifecycleCapabilityCategory> {
+        self.category.as_ref()
+    }
+}
+
+/// Fenced project roots and complete action-specific lifecycle capability
+/// truth observed by the daemon for one authenticated principal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LifecycleCapabilities {
+    projects: BTreeSet<ProjectId>,
+    operations: Vec<LifecycleOperationCapability>,
+}
+
+impl LifecycleCapabilities {
+    pub fn new(
+        projects: BTreeSet<ProjectId>,
+        mut operations: Vec<LifecycleOperationCapability>,
+    ) -> Result<Self, PlatformV2TransportError> {
+        if projects.is_empty() || projects.len() > 128 {
+            return Err(PlatformV2TransportError::InvalidBody);
+        }
+        operations.sort_by(|left, right| {
+            (left.project().as_str(), left.effect_kind())
+                .cmp(&(right.project().as_str(), right.effect_kind()))
+        });
+        let expected = projects
+            .len()
+            .checked_mul(LIFECYCLE_CAPABILITY_EFFECT_KINDS.len())
+            .ok_or(PlatformV2TransportError::InvalidBody)?;
+        if operations.len() != expected {
+            return Err(PlatformV2TransportError::InvalidBody);
+        }
+        let mut observed = BTreeMap::<&str, BTreeSet<&str>>::new();
+        for operation in &operations {
+            if !projects.contains(operation.project())
+                || !observed
+                    .entry(operation.project().as_str())
+                    .or_default()
+                    .insert(operation.effect_kind())
+            {
+                return Err(PlatformV2TransportError::InvalidBody);
+            }
+        }
+        if observed.values().any(|effects| {
+            effects.len() != LIFECYCLE_CAPABILITY_EFFECT_KINDS.len()
+                || LIFECYCLE_CAPABILITY_EFFECT_KINDS
+                    .iter()
+                    .any(|kind| !effects.contains(kind))
+        }) {
+            return Err(PlatformV2TransportError::InvalidBody);
+        }
+        Ok(Self {
+            projects,
+            operations,
+        })
+    }
+
+    #[must_use]
+    pub const fn projects(&self) -> &BTreeSet<ProjectId> {
+        &self.projects
+    }
+
+    #[must_use]
+    pub fn operations(&self) -> &[LifecycleOperationCapability] {
+        &self.operations
     }
 }
 
@@ -1510,13 +1630,40 @@ fn response_body(value: &PlatformV2Response) -> Result<JsonValue, PlatformV2Tran
     Ok(match value {
         PlatformV2Response::LifecycleCapabilities(value) => object(vec![
             (
-                "effect_kinds",
+                "operations",
                 JsonValue::Array(
                     value
-                        .effect_kinds()
+                        .operations()
                         .iter()
-                        .cloned()
-                        .map(JsonValue::String)
+                        .map(|operation| {
+                            object(vec![
+                                ("available", JsonValue::Bool(operation.available_now())),
+                                (
+                                    "category",
+                                    operation.category().map_or(JsonValue::Null, |category| {
+                                        JsonValue::String(category.as_str().to_owned())
+                                    }),
+                                ),
+                                (
+                                    "effect_kind",
+                                    JsonValue::String(operation.effect_kind().to_owned()),
+                                ),
+                                (
+                                    "project",
+                                    JsonValue::String(operation.project().as_str().to_owned()),
+                                ),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "projects",
+                JsonValue::Array(
+                    value
+                        .projects()
+                        .iter()
+                        .map(|project| JsonValue::String(project.as_str().to_owned()))
                         .collect(),
                 ),
             ),
@@ -1552,25 +1699,61 @@ fn response_from_message(
     let bytes = body_document(message);
     Ok(match message.envelope().kind().as_str() {
         "lifecycle_capabilities" => {
-            exact_fields(message.body(), &["effect_kinds", "schema"])?;
+            exact_fields(message.body(), &["operations", "projects", "schema"])?;
             if string(message.body(), "schema")? != PLATFORM_SCHEMA_V2 {
                 return Err(PlatformV2TransportError::InvalidBody);
             }
-            let JsonValue::Array(effect_kinds) = message
+            let JsonValue::Array(projects) = message
                 .body()
-                .get("effect_kinds")
+                .get("projects")
                 .ok_or(PlatformV2TransportError::InvalidBody)?
             else {
                 return Err(PlatformV2TransportError::InvalidBody);
             };
-            let effect_kinds = effect_kinds
+            let projects = projects
                 .iter()
                 .map(|value| match value {
-                    JsonValue::String(value) => Ok(value.clone()),
+                    JsonValue::String(value) => ProjectId::new(value.clone())
+                        .map_err(|_| PlatformV2TransportError::InvalidBody),
                     _ => Err(PlatformV2TransportError::InvalidBody),
                 })
                 .collect::<Result<BTreeSet<_>, _>>()?;
-            PlatformV2Response::LifecycleCapabilities(LifecycleCapabilities::new(effect_kinds)?)
+            let JsonValue::Array(operations) = message
+                .body()
+                .get("operations")
+                .ok_or(PlatformV2TransportError::InvalidBody)?
+            else {
+                return Err(PlatformV2TransportError::InvalidBody);
+            };
+            let operations = operations
+                .iter()
+                .map(|value| {
+                    exact_fields(value, &["available", "category", "effect_kind", "project"])?;
+                    let project = ProjectId::new(string(value, "project")?.to_owned())
+                        .map_err(|_| PlatformV2TransportError::InvalidBody)?;
+                    let effect_kind = string(value, "effect_kind")?.to_owned();
+                    let available = match value.get("available") {
+                        Some(JsonValue::Bool(value)) => *value,
+                        _ => return Err(PlatformV2TransportError::InvalidBody),
+                    };
+                    match (available, value.get("category")) {
+                        (true, Some(JsonValue::Null)) => {
+                            LifecycleOperationCapability::available(project, effect_kind)
+                        }
+                        (false, Some(JsonValue::String(category))) => {
+                            LifecycleOperationCapability::unavailable(
+                                project,
+                                effect_kind,
+                                category.clone(),
+                            )
+                        }
+                        _ => Err(PlatformV2TransportError::InvalidBody),
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            PlatformV2Response::LifecycleCapabilities(LifecycleCapabilities::new(
+                projects, operations,
+            )?)
         }
         "work_context_page" => {
             PlatformV2Response::WorkContextPage(decode_work_context_page(&bytes)?)

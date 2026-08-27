@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use automonique_protocol::platform::IdempotencyKey;
 use automonique_protocol::platform_v2::{
-    PlatformVersion, UserWorkspaceId, WorkContextIdentity, WorkContextKind, WorkContextQuery,
-    WorkContextRecord, WorkContextRelationKind,
+    PlatformVersion, ProjectId, UserWorkspaceId, WorkContextCursor, WorkContextIdentity,
+    WorkContextKind, WorkContextQuery, WorkContextRecord, WorkContextRelationKind,
 };
 use automonique_protocol::platform_v2_lineage_api::encode_lineage_projection;
 use automonique_protocol::platform_v2_review::{ReviewAction, ReviewActionReceipt};
@@ -16,8 +16,8 @@ use automonique_protocol::platform_v2_review_api::{
     encode_review_action_receipt, encode_review_snapshot,
 };
 use automonique_protocol::platform_v2_transport::{
-    LineageReadRequest, PlatformV2Request, PlatformV2Response, ReviewActionTransportRequest,
-    ReviewReadRequest,
+    LifecycleCapabilities, LineageReadRequest, PlatformV2Request, PlatformV2Response,
+    ReviewActionTransportRequest, ReviewReadRequest,
 };
 use automonique_protocol::primitives::Revision;
 use serde::Deserialize;
@@ -29,6 +29,9 @@ const SCHEMA: &str = "automonique.dashboard.cockpit/v2";
 const ADAPTER_PENDING: &str = "platform_v2_lifecycle_adapter_pending";
 const REVIEW_ADAPTER_PENDING: &str = "platform_v2_review_adapter_pending";
 const MAX_ATTENTION_WORKSPACES: usize = 16;
+const MAX_COCKPIT_PROJECTS: usize = 128;
+const MAX_COCKPIT_WORK_CONTEXTS: usize = 1024;
+const WORK_CONTEXT_PAGE_LIMIT: u16 = 128;
 const ATTENTION_READ_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
@@ -88,41 +91,23 @@ fn read(
         Ok(_) => return Ok(fallback(retained_v1, "platform_v2_not_negotiated")),
         Err(category) => return Ok(fallback(retained_v1, category)),
     };
-    let lifecycle = match bridge.request(PlatformV2Request::GetLifecycleCapabilities) {
-        Ok(PlatformV2Response::LifecycleCapabilities(value)) => {
-            lifecycle_actions(value.effect_kinds())
-        }
-        Ok(PlatformV2Response::Refused(value)) => {
-            lifecycle_actions_unavailable(value.category().as_str())
-        }
-        Ok(_) => return Err("platform_v2_response_invalid"),
-        Err(category) => lifecycle_actions_unavailable(category),
-    };
-    let query = WorkContextQuery::new(
-        WorkContextKind::ALL.to_vec(),
-        Vec::new(),
-        None,
-        None,
-        None,
-        128,
-    )
-    .map_err(|_| "platform_cockpit_query_invalid")?;
-    let page = match bridge.request(PlatformV2Request::QueryWorkContexts(query)) {
-        Err(category) => return Ok(fallback(retained_v1, category)),
-        Ok(PlatformV2Response::WorkContextPage(page)) if !page.has_more() => page,
-        Ok(PlatformV2Response::WorkContextPage(_)) => {
-            return Ok(fallback(retained_v1, "platform_v2_inventory_exceeds_bound"));
-        }
+    let capabilities = match bridge.request(PlatformV2Request::GetLifecycleCapabilities) {
+        Ok(PlatformV2Response::LifecycleCapabilities(value)) => value,
         Ok(PlatformV2Response::Refused(value)) => {
             return Ok(fallback(retained_v1, value.category().as_str()));
         }
         Ok(_) => return Err("platform_v2_response_invalid"),
+        Err(category) => return Ok(fallback(retained_v1, category)),
     };
-    let records = page.items();
-    let selected = select_workspace(records, selected_id.as_ref().map(UserWorkspaceId::as_str))?;
+    let records = match inventory(bridge, capabilities.projects()) {
+        Ok(records) => records,
+        Err(category) => return Ok(fallback(retained_v1, &category)),
+    };
+    let selected = select_workspace(&records, selected_id.as_ref().map(UserWorkspaceId::as_str))?;
     let selected_identity = selected.map(|record| record.identity().clone());
     let selected_project =
         selected.and_then(|record| relation(record, WorkContextRelationKind::UserWorkspaceProject));
+    let lifecycle = lifecycle_actions(&capabilities, selected_project.as_ref());
 
     let lineage = match (selected_identity.as_ref(), selected_project.as_ref()) {
         (
@@ -164,15 +149,15 @@ fn read(
         }
         _ => unavailable("no_selected_workspace"),
     };
-    let attention = attention_inventory(bridge, records, selected_identity.as_ref(), &review);
+    let attention = attention_inventory(bridge, &records, selected_identity.as_ref(), &review);
     Ok(json!({
         "schema": SCHEMA,
         "mode": "v2",
         "degradation": Value::Null,
         "retained_v1": retained_v1,
-        "projects": named_records(records, WorkContextKind::Project),
-        "hosts": host_records(records),
-        "workspaces": workspace_records(records, &attention.observations),
+        "projects": named_records(&records, WorkContextKind::Project),
+        "hosts": host_records(&records),
+        "workspaces": workspace_records(&records, &attention.observations),
         "selected": { "workspace": selected_identity.as_ref().map(WorkContextIdentity::id) },
         "lineage": lineage,
         "review": review,
@@ -184,19 +169,100 @@ fn read(
     }))
 }
 
-fn lifecycle_actions(effect_kinds: &std::collections::BTreeSet<String>) -> Value {
+fn inventory(
+    bridge: &PlatformV2Bridge,
+    projects: &std::collections::BTreeSet<ProjectId>,
+) -> Result<Vec<WorkContextRecord>, String> {
+    if projects.is_empty() || projects.len() > MAX_COCKPIT_PROJECTS {
+        return Err("platform_v2_project_inventory_invalid".to_owned());
+    }
+    let mut records = BTreeMap::<WorkContextIdentity, WorkContextRecord>::new();
+    for project in projects {
+        let mut after: Option<WorkContextCursor> = None;
+        loop {
+            let query = WorkContextQuery::new(
+                WorkContextKind::ALL.to_vec(),
+                Vec::new(),
+                Some(project.clone()),
+                None,
+                after.clone(),
+                WORK_CONTEXT_PAGE_LIMIT,
+            )
+            .map_err(|_| "platform_cockpit_query_invalid".to_owned())?;
+            let page = match bridge.request(PlatformV2Request::QueryWorkContexts(query)) {
+                Err(category) => return Err(category.to_owned()),
+                Ok(PlatformV2Response::WorkContextPage(page)) => page,
+                Ok(PlatformV2Response::WorkContextResync(_)) => {
+                    return Err("platform_v2_inventory_resync_required".to_owned());
+                }
+                Ok(PlatformV2Response::Refused(value)) => {
+                    return Err(value.category().as_str().to_owned());
+                }
+                Ok(_) => return Err("platform_v2_response_invalid".to_owned()),
+            };
+            verify_inventory_capacity(records.len(), page.items().len())?;
+            for record in page.items() {
+                if records
+                    .insert(record.identity().clone(), record.clone())
+                    .is_some()
+                {
+                    return Err("platform_v2_inventory_duplicate".to_owned());
+                }
+            }
+            let Some(next) = page.next_cursor().cloned() else {
+                break;
+            };
+            after = Some(next);
+        }
+    }
+    Ok(records.into_values().collect())
+}
+
+fn verify_inventory_capacity(current: usize, incoming: usize) -> Result<(), String> {
+    if current.saturating_add(incoming) > MAX_COCKPIT_WORK_CONTEXTS {
+        Err("platform_v2_inventory_exceeds_bound".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+fn lifecycle_actions(
+    capabilities: &LifecycleCapabilities,
+    selected_project: Option<&WorkContextIdentity>,
+) -> Value {
+    let project = match selected_project {
+        Some(WorkContextIdentity::Project(project)) => Some(project),
+        _ => capabilities.projects().iter().next(),
+    };
     let operation = |kind: &str, local: bool| {
-        let available = effect_kinds.contains(kind);
+        let capability = project.and_then(|project| {
+            capabilities
+                .operations()
+                .iter()
+                .find(|value| value.project() == project && value.effect_kind() == kind)
+        });
+        let available = capability.is_some_and(|value| value.available_now());
+        let category = capability
+            .and_then(|value| value.category())
+            .map(|value| value.as_str())
+            .unwrap_or("platform_v2_project_scope_unavailable");
         json!({
             "available": available,
-            "category": if available { Value::Null } else { json!(ADAPTER_PENDING) },
-            "scope": if local { json!("local") } else { Value::Null },
+            "category": if available { Value::Null } else { json!(category) },
+            "scope": if available && local { json!("local") } else { Value::Null },
             "preview_operation": if available { json!("prepare_mutation") } else { Value::Null },
             "receipt_operation": if available { json!("get_mutation_receipt") } else { Value::Null }
         })
     };
+    let any_available = project.is_some_and(|project| {
+        capabilities
+            .operations()
+            .iter()
+            .any(|value| value.project() == project && value.available_now())
+    });
     json!({
-        "available": !effect_kinds.is_empty(),
+        "available": any_available,
+        "project": project.map(ProjectId::as_str),
         "operations": {
             "create_host_setup": operation("create_host_setup", true),
             "create_checkout": operation("create_checkout", true),
@@ -205,17 +271,6 @@ fn lifecycle_actions(effect_kinds: &std::collections::BTreeSet<String>) -> Value
             "resume_session": operation("resume_session", false)
         }
     })
-}
-
-fn lifecycle_actions_unavailable(category: &str) -> Value {
-    let mut value = lifecycle_actions(&std::collections::BTreeSet::new());
-    value["category"] = json!(category);
-    if let Some(operations) = value["operations"].as_object_mut() {
-        for operation in operations.values_mut() {
-            operation["category"] = json!(category);
-        }
-    }
-    value
 }
 
 fn approve_review(
@@ -597,10 +652,28 @@ mod tests {
 
     #[test]
     fn lifecycle_projection_exposes_only_installed_local_effects() {
-        let installed = lifecycle_actions(&std::collections::BTreeSet::from([
-            String::from("create_host_setup"),
-            String::from("create_checkout"),
-        ]));
+        let project = ProjectId::new("project-test").unwrap();
+        let capabilities = LifecycleCapabilities::new(
+            std::collections::BTreeSet::from([project.clone()]),
+            automonique_protocol::platform_v2_transport::LIFECYCLE_CAPABILITY_EFFECT_KINDS
+                .into_iter()
+                .map(|kind| {
+                    if matches!(kind, "create_host_setup" | "create_checkout") {
+                        automonique_protocol::platform_v2_transport::LifecycleOperationCapability::available(project.clone(), kind)
+                    } else {
+                        automonique_protocol::platform_v2_transport::LifecycleOperationCapability::unavailable(
+                            project.clone(), kind, ADAPTER_PENDING,
+                        )
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        )
+        .unwrap();
+        let installed = lifecycle_actions(
+            &capabilities,
+            Some(&WorkContextIdentity::Project(project.clone())),
+        );
         assert_eq!(installed["available"], true);
         assert_eq!(
             installed["operations"]["create_host_setup"]["preview_operation"],
@@ -619,7 +692,23 @@ mod tests {
             false
         );
 
-        let absent = lifecycle_actions_unavailable("platform_v2_selector_registry_unavailable");
+        let absent_capabilities = LifecycleCapabilities::new(
+            std::collections::BTreeSet::from([project.clone()]),
+            automonique_protocol::platform_v2_transport::LIFECYCLE_CAPABILITY_EFFECT_KINDS
+                .into_iter()
+                .map(|kind| {
+                    automonique_protocol::platform_v2_transport::LifecycleOperationCapability::unavailable(
+                        project.clone(), kind, "platform_v2_selector_registry_unavailable",
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        )
+        .unwrap();
+        let absent = lifecycle_actions(
+            &absent_capabilities,
+            Some(&WorkContextIdentity::Project(project)),
+        );
         assert_eq!(absent["available"], false);
         assert_eq!(
             absent["operations"]["create_host_setup"]["category"],
@@ -680,5 +769,21 @@ mod tests {
         assert_eq!(value["state"], "unavailable");
         assert_eq!(value["known_workspaces"], "0");
         assert_eq!(value["total_workspaces"], "17");
+    }
+
+    #[test]
+    fn work_context_inventory_accepts_the_bound_and_refuses_overflow() {
+        assert_eq!(
+            verify_inventory_capacity(MAX_COCKPIT_WORK_CONTEXTS - 128, 128),
+            Ok(())
+        );
+        assert_eq!(
+            verify_inventory_capacity(MAX_COCKPIT_WORK_CONTEXTS, 1),
+            Err(String::from("platform_v2_inventory_exceeds_bound"))
+        );
+        assert_eq!(
+            verify_inventory_capacity(usize::MAX, usize::MAX),
+            Err(String::from("platform_v2_inventory_exceeds_bound"))
+        );
     }
 }

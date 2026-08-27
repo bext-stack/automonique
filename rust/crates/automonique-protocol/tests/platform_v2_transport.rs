@@ -159,7 +159,7 @@ fn rust_transport_encoding_matches_the_shared_typescript_corpus() {
         .trim_end()
         .lines()
         .collect::<Vec<_>>();
-    assert_eq!(fixture.len(), 2);
+    assert_eq!(fixture.len(), 3);
 
     let negotiation = PlatformNegotiationRequestMessage::new(
         request_id("transport-negotiate"),
@@ -175,6 +175,15 @@ fn rust_transport_encoding_matches_the_shared_typescript_corpus() {
         PlatformV2Request::GetWorkContext(workspace()),
     );
     assert_eq!(v2.to_canonical_bytes().unwrap(), fixture[1].as_bytes());
+
+    let capabilities = PlatformV2RequestMessage::new(
+        request_id("transport-capabilities"),
+        PlatformV2Request::GetLifecycleCapabilities,
+    );
+    assert_eq!(
+        capabilities.to_canonical_bytes().unwrap(),
+        fixture[2].as_bytes()
+    );
 }
 
 #[test]
@@ -404,10 +413,24 @@ fn response_documents_round_trip_and_review_envelope_fits_its_declared_ceiling()
     let capability_response = PlatformV2ResponseMessage::for_request(
         &capability_request,
         PlatformV2Response::LifecycleCapabilities(
-            LifecycleCapabilities::new(std::collections::BTreeSet::from([
-                String::from("create_checkout"),
-                String::from("create_host_setup"),
-            ]))
+            LifecycleCapabilities::new(
+                std::collections::BTreeSet::from([project()]),
+                LIFECYCLE_CAPABILITY_EFFECT_KINDS
+                    .into_iter()
+                    .map(|kind| {
+                        if matches!(kind, "create_checkout" | "create_host_setup") {
+                            LifecycleOperationCapability::available(project(), kind)
+                        } else {
+                            LifecycleOperationCapability::unavailable(
+                                project(),
+                                kind,
+                                "platform_v2_lifecycle_adapter_pending",
+                            )
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+            )
             .unwrap(),
         ),
     )
@@ -416,6 +439,18 @@ fn response_documents_round_trip_and_review_envelope_fits_its_declared_ceiling()
     assert_eq!(
         PlatformV2ResponseMessage::from_canonical_bytes(&bytes, &capability_request).unwrap(),
         capability_response
+    );
+    assert_eq!(
+        LifecycleCapabilities::new(std::collections::BTreeSet::from([project()]), Vec::new()),
+        Err(PlatformV2TransportError::InvalidBody)
+    );
+    assert_eq!(
+        LifecycleOperationCapability::unavailable(
+            project(),
+            "generic_execute",
+            "platform_v2_lifecycle_adapter_pending"
+        ),
+        Err(PlatformV2TransportError::InvalidBody)
     );
 
     let query = WorkContextQuery::new(

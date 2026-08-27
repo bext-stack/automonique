@@ -9502,6 +9502,356 @@ mod tests {
     }
 
     #[test]
+    fn bound_platform_host_issues_project_scoped_cockpit_inventory_and_capabilities() {
+        use automonique_daemon::platform_v2_host::{
+            LINEAGE_STORE_NAME, PlatformV2Host, REVIEW_STORE_NAME, WORK_CONTEXT_STORE_NAME,
+        };
+        use automonique_protocol::codec::LENGTH_PREFIX_BYTES;
+        use automonique_protocol::platform::{
+            ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
+        };
+        use automonique_protocol::platform_v2::{
+            CheckoutKind, HostSetupKind, NegotiatedPlatform, PLATFORM_SCHEMA_V2, PlatformVersion,
+            ProjectId, V1RepositoryRef, WorkContextAttributes, WorkContextAvailability,
+            WorkContextIdentity, WorkContextLabel, WorkContextLifecycle, WorkContextRecord,
+            WorkContextRelation, WorkContextRelationKind, WorkContextTargetKind,
+        };
+        use automonique_protocol::platform_v2_lifecycle::{
+            ExpectedWorkContext, ExternalParentResolution,
+        };
+        use automonique_protocol::platform_v2_transport::{
+            PlatformNegotiationRequestMessage, PlatformNegotiationResponse,
+            PlatformNegotiationResponseMessage, PlatformV2Request, PlatformV2RequestMessage,
+            PlatformV2Response, PlatformV2ResponseMessage,
+        };
+        use automonique_store::work_context_store::WorkContextStore;
+
+        const PLATFORM_EXCHANGES: usize = 8;
+        let state_dir = tempfile::tempdir().expect("temporary state");
+        let runtime_dir = tempfile::tempdir().expect("temporary runtime");
+        std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private state");
+        std::fs::set_permissions(runtime_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private runtime");
+        let authorized_root = state_dir.path().join("authorized-root");
+        std::fs::create_dir(&authorized_root).unwrap();
+        std::fs::set_permissions(&authorized_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = geteuid().as_raw();
+        let authority = serde_json::json!({
+            "filesystem": [], "credentials": [], "network": [],
+            "tools": [], "providers": [], "models": []
+        });
+        let mut policy_workspaces = vec![
+            serde_json::json!({"project":"project-a","kind":"project","id":"project-a","inherited_authority":authority}),
+            serde_json::json!({"project":"project-a","kind":"host_setup","id":"host-a","inherited_authority":authority}),
+            serde_json::json!({"project":"project-a","kind":"checkout","id":"checkout-a","inherited_authority":authority}),
+            serde_json::json!({"project":"project-a","kind":"user_workspace","id":"workspace-a","inherited_authority":authority}),
+            serde_json::json!({"project":"project-b","kind":"project","id":"project-b","inherited_authority":authority}),
+        ];
+        for index in 0..129 {
+            policy_workspaces.push(serde_json::json!({
+                "project":"project-a", "kind":"host_setup",
+                "id":format!("paged-host-{index:03}"), "inherited_authority":authority
+            }));
+        }
+        let policy = serde_json::json!({
+            "version": 1,
+            "principals": [{
+                "uid": uid, "tenant": "operator", "actor": "operator:cockpit-bound",
+                "serving_authority": "automonique",
+                "projects": ["project-a", "project-b"],
+                "workspaces": policy_workspaces,
+                "authority": authority,
+                "review_authorities": {}
+            }]
+        });
+        let policy_path = state_dir
+            .path()
+            .join(automonique_daemon::PLATFORM_V2_POLICY_FILE_NAME);
+        std::fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
+        std::fs::set_permissions(&policy_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let registry = serde_json::json!({
+            "version":1,"generation":"cockpit-bound-generation",
+            "host_setups":[{"selector":"host-selector-a","host_setup":"host-a","project":"project-a","setup_kind":"local","canonical_root":authorized_root}],
+            "checkouts":[{"selector":"checkout-selector-a","checkout":"checkout-a","project":"project-a","host_setup":"host-a","repository_authority":"github","repository":"owner/repository","checkout_kind":"authorized_folder","canonical_root":authorized_root,"repository_root":null,"base_commit":null,"branch_ref":null}],
+            "workspaces":[{"workspace":"workspace-a","project":"project-a","checkout":"checkout-a","canonical_root":authorized_root}],
+            "task_selectors":[]
+        });
+        let registry_path = state_dir
+            .path()
+            .join(automonique_daemon::platform_v2_lifecycle_adapter::LIFECYCLE_REGISTRY_FILE_NAME);
+        std::fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
+        std::fs::set_permissions(&registry_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let store_path = state_dir.path().join(WORK_CONTEXT_STORE_NAME);
+        let mut store = WorkContextStore::open(&store_path).unwrap();
+        let repository = WorkContextIdentity::Repository(
+            V1RepositoryRef::new(ResourceCoordinate::new(
+                ResourceAuthority::GitHub,
+                ResourceKind::Repository,
+                ResourceId::new("repository-a").unwrap(),
+            ))
+            .unwrap(),
+        );
+        store
+            .put_external_snapshot(
+                "operator",
+                &ExpectedWorkContext::new(repository.clone(), Revision::FIRST),
+                ExternalParentResolution::Available,
+                Some(&ProjectId::new("project-a").unwrap()),
+            )
+            .unwrap();
+        let project_a = WorkContextRecord::new(
+            WorkContextIdentity::Project(ProjectId::new("project-a").unwrap()),
+            Revision::FIRST,
+            WorkContextLifecycle::Active,
+            WorkContextLabel::new("Project A").unwrap(),
+            WorkContextAttributes::EMPTY,
+            vec![
+                WorkContextRelation::new(
+                    WorkContextRelationKind::ProjectRepository,
+                    repository.clone(),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let project_b = WorkContextRecord::new(
+            WorkContextIdentity::Project(ProjectId::new("project-b").unwrap()),
+            Revision::FIRST,
+            WorkContextLifecycle::Active,
+            WorkContextLabel::new("Project B").unwrap(),
+            WorkContextAttributes::EMPTY,
+            Vec::new(),
+        )
+        .unwrap();
+        let host = WorkContextRecord::new(
+            WorkContextIdentity::parse_local(
+                automonique_protocol::platform_v2::WorkContextTargetKind::HostSetup,
+                "host-a",
+            )
+            .unwrap(),
+            Revision::FIRST,
+            WorkContextLifecycle::Active,
+            WorkContextLabel::new("Host A").unwrap(),
+            WorkContextAttributes::host_setup(HostSetupKind::Local),
+            vec![
+                WorkContextRelation::new(
+                    WorkContextRelationKind::HostSetupProject,
+                    project_a.identity().clone(),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let checkout = WorkContextRecord::new(
+            WorkContextIdentity::parse_local(
+                automonique_protocol::platform_v2::WorkContextTargetKind::Checkout,
+                "checkout-a",
+            )
+            .unwrap(),
+            Revision::FIRST,
+            WorkContextLifecycle::Active,
+            WorkContextLabel::new("Checkout A").unwrap(),
+            WorkContextAttributes::checkout(CheckoutKind::AuthorizedFolder),
+            vec![
+                WorkContextRelation::new(
+                    WorkContextRelationKind::CheckoutProject,
+                    project_a.identity().clone(),
+                )
+                .unwrap(),
+                WorkContextRelation::new(
+                    WorkContextRelationKind::CheckoutHostSetup,
+                    host.identity().clone(),
+                )
+                .unwrap(),
+                WorkContextRelation::new(WorkContextRelationKind::CheckoutRepository, repository)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let workspace = WorkContextRecord::new(
+            WorkContextIdentity::UserWorkspace(
+                automonique_protocol::platform_v2::UserWorkspaceId::new("workspace-a").unwrap(),
+            ),
+            Revision::FIRST,
+            WorkContextLifecycle::Active,
+            WorkContextLabel::new("Workspace A").unwrap(),
+            WorkContextAttributes::EMPTY,
+            vec![
+                WorkContextRelation::new(
+                    WorkContextRelationKind::UserWorkspaceProject,
+                    project_a.identity().clone(),
+                )
+                .unwrap(),
+                WorkContextRelation::new(
+                    WorkContextRelationKind::UserWorkspaceCheckout,
+                    checkout.identity().clone(),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        for record in [&project_a, &project_b, &host, &checkout, &workspace] {
+            store.put_authoritative_record("operator", record).unwrap();
+        }
+        for index in 0..129 {
+            let record = WorkContextRecord::new(
+                WorkContextIdentity::parse_local(
+                    WorkContextTargetKind::HostSetup,
+                    &format!("paged-host-{index:03}"),
+                )
+                .unwrap(),
+                Revision::FIRST,
+                WorkContextLifecycle::Active,
+                WorkContextLabel::new(format!("Paged host {index:03}")).unwrap(),
+                WorkContextAttributes::host_setup(HostSetupKind::Ssh),
+                vec![
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::HostSetupProject,
+                        project_a.identity().clone(),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+            store.put_authoritative_record("operator", &record).unwrap();
+        }
+        drop(store);
+
+        let socket = runtime_dir.path().join("admin.sock");
+        let platform_listener = UnixListener::bind(&socket).unwrap();
+        let mut host = PlatformV2Host::open(
+            &policy_path,
+            &store_path,
+            &state_dir.path().join(LINEAGE_STORE_NAME),
+            &state_dir.path().join(REVIEW_STORE_NAME),
+            uid,
+        );
+        let platform_server = thread::spawn(move || {
+            let mut queried_projects = Vec::new();
+            for index in 0..PLATFORM_EXCHANGES {
+                let (mut stream, _) = platform_listener.accept().unwrap();
+                let mut prefix = [0_u8; LENGTH_PREFIX_BYTES];
+                stream.read_exact(&mut prefix).unwrap();
+                let mut payload = vec![0_u8; u32::from_be_bytes(prefix) as usize];
+                stream.read_exact(&mut payload).unwrap();
+                let frame = if index == 0 {
+                    let request = PlatformRequestMessage::from_canonical_bytes(&payload).unwrap();
+                    let response = PlatformResponseMessage::new(
+                        request.request_id().clone(),
+                        PlatformResponse::Refused {
+                            outcome: ReceiptOutcome::Rejected,
+                            explanation: PlatformText::new("fixture retained v1 unavailable")
+                                .unwrap(),
+                        },
+                    )
+                    .to_message()
+                    .unwrap()
+                    .to_canonical_bytes();
+                    let mut frame = u32::try_from(response.len())
+                        .unwrap()
+                        .to_be_bytes()
+                        .to_vec();
+                    frame.extend(response);
+                    frame
+                } else if index == 1 {
+                    let request =
+                        PlatformNegotiationRequestMessage::from_canonical_bytes(&payload).unwrap();
+                    let negotiated = NegotiatedPlatform::new(
+                        PlatformVersion::V2,
+                        PLATFORM_SCHEMA_V2,
+                        WorkContextAvailability::V2Structured,
+                    )
+                    .unwrap();
+                    PlatformNegotiationResponseMessage::for_request(
+                        &request,
+                        PlatformNegotiationResponse::Negotiated(negotiated),
+                    )
+                    .unwrap()
+                    .to_frame()
+                    .unwrap()
+                } else {
+                    let request = PlatformV2RequestMessage::from_canonical_bytes(&payload).unwrap();
+                    if let PlatformV2Request::QueryWorkContexts(query) = request.request() {
+                        queried_projects.push(query.project().unwrap().as_str().to_owned());
+                    }
+                    let response = host.handle(uid, request.request(), 1_000);
+                    if index == 2 {
+                        assert!(
+                            matches!(response, PlatformV2Response::LifecycleCapabilities(_)),
+                            "unexpected capability response: {response:?}"
+                        );
+                    }
+                    PlatformV2ResponseMessage::for_request(&request, response)
+                        .unwrap()
+                        .to_frame()
+                        .unwrap()
+                };
+                stream.write_all(&frame).unwrap();
+            }
+            queried_projects
+        });
+
+        let integration = WebIntegration::open(
+            IntegrationConfig {
+                tenant: String::from("operator"),
+                actor: String::from("operator:cockpit-bound"),
+                hosts: fixture_hosts(),
+            },
+            state_dir.path(),
+            runtime_dir.path(),
+        )
+        .unwrap();
+        let body = r#"{"action":"read","workspace_id":"workspace-a"}"#;
+        let basic = BASE64_STANDARD.encode("ops:fixture-password");
+        let wire = format!(
+            "POST /api/platform/cockpit HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nX-Forwarded-Proto: https\r\nAuthorization: Basic {basic}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let web_server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle(
+                stream,
+                &AppState::new(fixture_status()),
+                &fixture_auth(),
+                &fixture_manage_chat_auth(),
+                Some(&integration),
+                &fixture_hosts(),
+            )
+            .unwrap();
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client.write_all(wire.as_bytes()).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        web_server.join().unwrap();
+        let queried_projects = platform_server.join().unwrap();
+        assert_eq!(queried_projects, ["project-a", "project-a", "project-b"]);
+        let boundary = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        let projection: Value = serde_json::from_slice(&response[boundary + 4..]).unwrap();
+        assert_eq!(projection["mode"], "v2");
+        assert_eq!(projection["projects"].as_array().unwrap().len(), 2);
+        assert_eq!(projection["workspaces"][0]["id"], "workspace-a");
+        assert_eq!(projection["actions"]["lifecycle"]["project"], "project-a");
+        assert_eq!(
+            projection["actions"]["lifecycle"]["operations"]["create_host_setup"]["available"],
+            true
+        );
+        assert_eq!(
+            projection["actions"]["lifecycle"]["operations"]["create_attempt_workspace"]["category"],
+            "platform_v2_lifecycle_adapter_pending"
+        );
+    }
+
+    #[test]
     fn platform_v2_http_route_relays_a_correlated_typed_response() {
         use automonique_protocol::platform_v2::{ProjectId, WorkContextIdentity};
         use automonique_protocol::platform_v2_transport::{

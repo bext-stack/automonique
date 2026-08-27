@@ -1,2 +1,3 @@
 {"body":{"schema":"automonique.platform/negotiation/v1","versions":[1,2]},"kind":"negotiate","protocol":"automonique.platform.negotiation","request_id":"transport-negotiate","version":1}
 {"body":{"id":"workspace-1","kind":"user_workspace"},"kind":"get_work_context","protocol":"automonique.platform","request_id":"transport-v2","version":2}
+{"body":{"schema":"automonique.platform/v2"},"kind":"get_lifecycle_capabilities","protocol":"automonique.platform","request_id":"transport-capabilities","version":2}

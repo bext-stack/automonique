@@ -32,8 +32,9 @@ use automonique_protocol::platform_v2_review::{
     ReviewAuthorityKind,
 };
 use automonique_protocol::platform_v2_transport::{
-    LifecycleCapabilities, PlatformV2Refusal, PlatformV2Request, PlatformV2Response,
-    RawMutationApprovalDocument, RawMutationReceiptDocument, ReceiptLookupKey,
+    LIFECYCLE_CAPABILITY_EFFECT_KINDS, LifecycleCapabilities, LifecycleOperationCapability,
+    PlatformV2Refusal, PlatformV2Request, PlatformV2Response, RawMutationApprovalDocument,
+    RawMutationReceiptDocument, ReceiptLookupKey,
 };
 use automonique_protocol::primitives::EpochMillis;
 use automonique_store::lineage_index::WorkspaceIntentExecutionReceipt;
@@ -109,6 +110,18 @@ pub enum PlatformV2EffectReconciliation {
 /// intent and server-issued identities; paths and commands are never accepted.
 pub trait PlatformV2LifecycleEffectAdapter: Send {
     fn supported_effect_kinds(&self) -> BTreeSet<String>;
+
+    fn capability_for_project(
+        &self,
+        _project: &ProjectId,
+        effect_kind: &str,
+    ) -> Result<(), &'static str> {
+        if self.supported_effect_kinds().contains(effect_kind) {
+            Ok(())
+        } else {
+            Err("platform_v2_lifecycle_adapter_pending")
+        }
+    }
 
     fn preflight(&self, _intent: &WorkContextMutationIntent) -> Result<(), &'static str> {
         Ok(())
@@ -193,6 +206,19 @@ impl PlatformV2LifecycleEffectAdapter for UnavailableLifecycleEffectAdapter {
                 Err("platform_v2_selector_registry_unavailable")
             }
             _ => Ok(()),
+        }
+    }
+
+    fn capability_for_project(
+        &self,
+        _project: &ProjectId,
+        effect_kind: &str,
+    ) -> Result<(), &'static str> {
+        match effect_kind {
+            "create_host_setup" | "create_checkout" => {
+                Err("platform_v2_selector_registry_unavailable")
+            }
+            _ => Err("platform_v2_lifecycle_adapter_pending"),
         }
     }
 
@@ -696,8 +722,32 @@ impl PlatformV2Runtime {
         match request {
             PlatformV2Request::GetLifecycleCapabilities => {
                 self.lifecycle_effects.verify_generation()?;
+                let mut operations = Vec::with_capacity(
+                    principal.projects.len() * LIFECYCLE_CAPABILITY_EFFECT_KINDS.len(),
+                );
+                for project in &principal.projects {
+                    for effect_kind in LIFECYCLE_CAPABILITY_EFFECT_KINDS {
+                        operations.push(
+                            match self
+                                .lifecycle_effects
+                                .capability_for_project(project, effect_kind)
+                            {
+                                Ok(()) => LifecycleOperationCapability::available(
+                                    project.clone(),
+                                    effect_kind,
+                                ),
+                                Err(category) => LifecycleOperationCapability::unavailable(
+                                    project.clone(),
+                                    effect_kind,
+                                    category,
+                                ),
+                            }
+                            .map_err(|_| "platform_v2_response_invalid")?,
+                        );
+                    }
+                }
                 Ok(PlatformV2Response::LifecycleCapabilities(
-                    LifecycleCapabilities::new(self.lifecycle_effects.supported_effect_kinds())
+                    LifecycleCapabilities::new(principal.projects.clone(), operations)
                         .map_err(|_| "platform_v2_response_invalid")?,
                 ))
             }

@@ -74,7 +74,7 @@ mod platform_v2_transport_surface {
         );
         assert_eq!(
             String::from_utf8_lossy(&output.stdout),
-            "{\"fixture_lines\":2,\"negotiation_bytes\":186,\"unoffered_refused\":true,\"v1_ceiling_preserved\":true,\"v2_bytes\":153}\n"
+            "{\"capability_bytes\":165,\"fixture_lines\":3,\"negotiation_bytes\":186,\"unoffered_refused\":true,\"v1_ceiling_preserved\":true,\"v2_bytes\":153}\n"
         );
     }
 }
