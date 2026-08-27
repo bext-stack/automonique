@@ -98,7 +98,61 @@ const zeroConflictRevisionCategory = category(() => encodeReviewActionReceipt({.
 const text = new TextDecoder().decode(fixture);
 const v1 = new TextEncoder().encode(text.replace("\"platform_version\":2", "\"platform_version\":1"));
 const mixedCategory = category(() => decodeReviewSnapshot(v1));
-if (providerCategory !== "review_value_invalid" || authorityCategory !== "review_value_invalid" || authorityIdentityCategory !== "review_value_invalid" || attentionCategory !== "review_value_invalid" || u32Category !== "review_value_invalid" || attentionOriginCategory !== "review_value_invalid" || duplicateAttentionCategory !== "review_value_invalid" || duplicateAttentionOriginCategory !== "review_value_invalid" || zeroCompletedRevisionCategory !== "review_value_invalid" || zeroConflictRevisionCategory !== "review_value_invalid" || mixedCategory !== "review_invalid_body") {
+const idleSnapshot = decodeReviewSnapshot(encodeReviewSnapshot({
+  ...snapshot,
+  attention: {reason: null, source_revision: null, state: "idle", unread: 0n},
+  attention_events: [],
+}));
+if (idleSnapshot.attention.state !== "idle" || idleSnapshot.attention_events.length !== 0) {
+  throw new Error("empty attention event truth was not preserved as idle");
+}
+
+const gitAuthority = snapshot.proposals[0]!.authority;
+const gitRequests: readonly ReviewActionRequest[] = [
+  {...request, action: {kind: "commit", payload: {proposal_id: "proposal-1"}}, authority: gitAuthority, idempotency_key: "commit-1"},
+  {...request, action: {kind: "stage", payload: {proposal_id: "proposal-1"}}, authority: gitAuthority, idempotency_key: "stage-1"},
+  {...request, action: {kind: "unstage", payload: {proposal_id: "proposal-1"}}, authority: gitAuthority, idempotency_key: "unstage-1"},
+];
+const gitSnapshots = [
+  snapshot,
+  {...idleSnapshot, proposals: [{...snapshot.proposals[0]!, kind: "stage" as const, subject: null}]},
+  {...idleSnapshot, proposals: [{...snapshot.proposals[0]!, kind: "unstage" as const, subject: null}]},
+] as const;
+gitRequests.forEach((gitRequest, index) => {
+  validateReviewActionAgainstSnapshot(gitRequest, gitSnapshots[index]!);
+  if (decodeReviewActionRequest(encodeReviewActionRequest(gitRequest)).action.kind !== gitRequest.action.kind) {
+    throw new Error("typed Git action codec drifted");
+  }
+});
+
+const batchTarget = {comment_id: "comment-1", expected_comment_revision: 2n} as const;
+const batchRequest: ReviewActionRequest = {
+  ...request,
+  action: {kind: "batch_send_comments_to_agent", payload: {comments: [batchTarget]}},
+  authority: snapshot.review.authority,
+  idempotency_key: "batch-1",
+};
+validateReviewActionAgainstSnapshot(batchRequest, {...idleSnapshot, comments: [{...snapshot.comments[0]!, agent_state: "not_sent"}]});
+const duplicateBatchCategory = category(() => validateReviewActionRequest({
+  ...batchRequest,
+  action: {kind: "batch_send_comments_to_agent", payload: {comments: [batchTarget, batchTarget]}},
+}));
+
+const conflictSnapshot = {
+  ...idleSnapshot,
+  files: [{...snapshot.files[0]!, conflict: "unresolved" as const}],
+  proposals: [{...snapshot.proposals[0]!, kind: "resolve_conflict" as const, subject: null}],
+};
+const resolveRequest: ReviewActionRequest = {
+  ...request,
+  action: {kind: "resolve_conflict", payload: {file_id: "file-1", proposal_id: "proposal-1", resolution: "keep_current"}},
+  authority: gitAuthority,
+  idempotency_key: "resolve-1",
+};
+validateReviewActionAgainstSnapshot(resolveRequest, conflictSnapshot);
+const gitIdentityCategory = category(() => validateReviewActionAgainstSnapshot({...resolveRequest, authority: {...gitAuthority, id: "wrong-git"}}, conflictSnapshot));
+
+if (providerCategory !== "review_value_invalid" || authorityCategory !== "review_value_invalid" || authorityIdentityCategory !== "review_value_invalid" || attentionCategory !== "review_value_invalid" || u32Category !== "review_value_invalid" || attentionOriginCategory !== "review_value_invalid" || duplicateAttentionCategory !== "review_value_invalid" || duplicateAttentionOriginCategory !== "review_value_invalid" || zeroCompletedRevisionCategory !== "review_value_invalid" || zeroConflictRevisionCategory !== "review_value_invalid" || mixedCategory !== "review_invalid_body" || duplicateBatchCategory !== "review_value_invalid" || gitIdentityCategory !== "review_value_invalid") {
   throw new Error("Rust/TypeScript review refusals do not share categories");
 }
 
@@ -107,6 +161,6 @@ console.log(JSON.stringify({
   attention: snapshot.attention.state,
   bytes: fixture.length,
   receipt: receiptDecoded.reconciliation,
-  refusals: 11,
+  refusals: 13,
   schema: snapshot.schema,
 }));

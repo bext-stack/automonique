@@ -353,7 +353,7 @@ fn complete_projection_resolves_relations_and_rejects_cycles() {
 }
 
 #[test]
-fn create_and_resume_intents_use_opaque_selectors_exact_revisions_and_typed_conflicts() {
+fn create_resume_and_cancel_intents_are_exact_revisioned_and_idempotent() {
     let task = opaque(OrchestrationTaskId::new, "task-03");
     let workspace = opaque(UserWorkspaceId::new, "workspace-03");
     let create = WorkspaceCreateIntent::new(
@@ -374,6 +374,24 @@ fn create_and_resume_intents_use_opaque_selectors_exact_revisions_and_typed_conf
         Revision::new(4).unwrap(),
     );
     assert_eq!(resume.expected_revision().get(), 4);
+    let cancel = WorkspaceCancelIntent::new(
+        opaque(WorkspaceIntentId::new, "intent-cancel-01"),
+        create.intent_id().clone(),
+        workspace.clone(),
+        Revision::FIRST,
+    )
+    .unwrap();
+    assert_eq!(cancel.target_intent_id(), create.intent_id());
+    assert_eq!(cancel.expected_revision(), Revision::FIRST);
+    assert!(
+        WorkspaceCancelIntent::new(
+            cancel.intent_id().clone(),
+            cancel.intent_id().clone(),
+            workspace.clone(),
+            Revision::FIRST,
+        )
+        .is_err()
+    );
     assert_eq!(
         WorkspaceIntentConflict::DuplicateIntake.as_str(),
         "duplicate_intake"
@@ -393,6 +411,10 @@ fn create_and_resume_intents_use_opaque_selectors_exact_revisions_and_typed_conf
     assert_eq!(
         WorkspaceIntentOutcome::Resumed(workspace),
         WorkspaceIntentOutcome::Resumed(resume.workspace().clone())
+    );
+    assert_eq!(
+        WorkspaceIntentOutcome::Cancelled(create.intent_id().clone()).reconciliation(),
+        WorkspaceIntentReconciliation::Final
     );
 }
 
@@ -500,6 +522,35 @@ fn canonical_lineage_codec_is_exact_bidirectional_and_negotiation_gated() {
     assert_eq!(
         decode_workspace_intent_outcome(&lineage_v2(), exact_outcome).unwrap(),
         outcome
+    );
+    let cancel = WorkspaceIntent::Cancel(
+        WorkspaceCancelIntent::new(
+            WorkspaceIntentId::new("intent-cancel-codec").unwrap(),
+            WorkspaceIntentId::new("intent-codec").unwrap(),
+            UserWorkspaceId::new("workspace-codec").unwrap(),
+            Revision::FIRST,
+        )
+        .unwrap(),
+    );
+    let exact_cancel = b"{\"platform_version\":2,\"schema\":\"automonique.platform/v2\",\"value\":{\"kind\":\"cancel\",\"request\":{\"expected_revision\":1,\"intent_id\":\"intent-cancel-codec\",\"target_intent_id\":\"intent-codec\",\"workspace\":\"workspace-codec\"}}}";
+    assert_eq!(
+        encode_workspace_intent(&lineage_v2(), &cancel).unwrap(),
+        exact_cancel
+    );
+    assert_eq!(
+        decode_workspace_intent(&lineage_v2(), exact_cancel).unwrap(),
+        cancel
+    );
+    let cancelled =
+        WorkspaceIntentOutcome::Cancelled(WorkspaceIntentId::new("intent-codec").unwrap());
+    let exact_cancelled = b"{\"platform_version\":2,\"schema\":\"automonique.platform/v2\",\"value\":{\"kind\":\"cancelled\",\"target_intent_id\":\"intent-codec\"}}";
+    assert_eq!(
+        encode_workspace_intent_outcome(&lineage_v2(), &cancelled).unwrap(),
+        exact_cancelled
+    );
+    assert_eq!(
+        decode_workspace_intent_outcome(&lineage_v2(), exact_cancelled).unwrap(),
+        cancelled
     );
 
     let v1 = negotiate_platform_version(

@@ -373,6 +373,7 @@ fn comment(value: &JsonValue) -> Result<ReviewComment, ReviewApiError> {
 }
 fn proposal_json(value: &ReviewProposal) -> JsonValue {
     object(vec![
+        ("authority", authority_json(value.authority())),
         (
             "files",
             array(value.files().iter().map(|id| text(id.as_str()))),
@@ -386,10 +387,11 @@ fn proposal_json(value: &ReviewProposal) -> JsonValue {
     ])
 }
 fn proposal(value: &JsonValue) -> Result<ReviewProposal, ReviewApiError> {
-    fields(value, &["files", "id", "kind", "subject"])?;
+    fields(value, &["authority", "files", "id", "kind", "subject"])?;
     Ok(ReviewProposal::new(
         ReviewProposalId::new(string(value, "id")?)?,
         ReviewProposalKind::parse(string(value, "kind")?)?,
+        authority(get(value, "authority")?)?,
         items(value, "files", MAX_REVIEW_PROPOSAL_FILES)?
             .iter()
             .map(|item| {
@@ -503,21 +505,39 @@ fn delivery(value: &JsonValue) -> Result<DeliveryProjection, ReviewApiError> {
 }
 fn attention_json(value: AttentionProjection) -> Result<JsonValue, ReviewApiError> {
     Ok(object(vec![
-        ("reason", text(value.reason().as_str())),
-        ("source_revision", integer(value.source_revision().get())?),
+        (
+            "reason",
+            nullable_text(value.reason().map(AttentionReason::as_str)),
+        ),
+        (
+            "source_revision",
+            nullable_integer(value.source_revision().map(Revision::get))?,
+        ),
         ("state", text(value.state().as_str())),
         ("unread", integer(u64::from(value.unread()))?),
     ]))
 }
 fn attention(
     value: &JsonValue,
-) -> Result<(AttentionState, AttentionReason, u32, Revision), ReviewApiError> {
+) -> Result<
+    (
+        AttentionState,
+        Option<AttentionReason>,
+        u32,
+        Option<Revision>,
+    ),
+    ReviewApiError,
+> {
     fields(value, &["reason", "source_revision", "state", "unread"])?;
     Ok((
         AttentionState::parse(string(value, "state")?)?,
-        AttentionReason::parse(string(value, "reason")?)?,
+        maybe_string(value, "reason")?
+            .map(AttentionReason::parse)
+            .transpose()?,
         u32::try_from(unsigned(value, "unread")?).map_err(|_| ReviewApiError::InvalidBody)?,
-        revision(unsigned(value, "source_revision")?)?,
+        maybe_unsigned(value, "source_revision")?
+            .map(revision)
+            .transpose()?,
     ))
 }
 fn attention_origin_json(value: &AttentionOrigin) -> Result<JsonValue, ReviewApiError> {
@@ -714,6 +734,48 @@ fn action_json(value: &ReviewAction) -> Result<JsonValue, ReviewApiError> {
                 ),
             ]),
         ),
+        ReviewAction::BatchSendCommentsToAgent { comments } => {
+            let comments = comments
+                .iter()
+                .map(|target| {
+                    Ok(object(vec![
+                        ("comment_id", text(target.comment_id().as_str())),
+                        (
+                            "expected_comment_revision",
+                            integer(target.expected_revision().get())?,
+                        ),
+                    ]))
+                })
+                .collect::<Result<Vec<_>, ReviewApiError>>()?;
+            (
+                ReviewActionKind::BatchSendCommentsToAgent,
+                object(vec![("comments", array(comments))]),
+            )
+        }
+        ReviewAction::Stage { proposal_id } => (
+            ReviewActionKind::Stage,
+            object(vec![("proposal_id", text(proposal_id.as_str()))]),
+        ),
+        ReviewAction::Unstage { proposal_id } => (
+            ReviewActionKind::Unstage,
+            object(vec![("proposal_id", text(proposal_id.as_str()))]),
+        ),
+        ReviewAction::Commit { proposal_id } => (
+            ReviewActionKind::Commit,
+            object(vec![("proposal_id", text(proposal_id.as_str()))]),
+        ),
+        ReviewAction::ResolveConflict {
+            proposal_id,
+            file_id,
+            resolution,
+        } => (
+            ReviewActionKind::ResolveConflict,
+            object(vec![
+                ("file_id", text(file_id.as_str())),
+                ("proposal_id", text(proposal_id.as_str())),
+                ("resolution", text(resolution.as_str())),
+            ]),
+        ),
         ReviewAction::ApproveReview {
             expected_review_revision,
         } => (
@@ -808,6 +870,47 @@ fn action(value: &JsonValue) -> Result<ReviewAction, ReviewApiError> {
                     payload,
                     "expected_comment_revision",
                 )?)?,
+            }
+        }
+        ReviewActionKind::BatchSendCommentsToAgent => {
+            fields(payload, &["comments"])?;
+            ReviewAction::BatchSendCommentsToAgent {
+                comments: items(payload, "comments", MAX_REVIEW_COMMENTS)?
+                    .iter()
+                    .map(|value| {
+                        fields(value, &["comment_id", "expected_comment_revision"])?;
+                        Ok(ReviewCommentTarget::new(
+                            ReviewCommentId::new(string(value, "comment_id")?)?,
+                            revision(unsigned(value, "expected_comment_revision")?)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, ReviewApiError>>()?,
+            }
+        }
+        ReviewActionKind::Stage => {
+            fields(payload, &["proposal_id"])?;
+            ReviewAction::Stage {
+                proposal_id: ReviewProposalId::new(string(payload, "proposal_id")?)?,
+            }
+        }
+        ReviewActionKind::Unstage => {
+            fields(payload, &["proposal_id"])?;
+            ReviewAction::Unstage {
+                proposal_id: ReviewProposalId::new(string(payload, "proposal_id")?)?,
+            }
+        }
+        ReviewActionKind::Commit => {
+            fields(payload, &["proposal_id"])?;
+            ReviewAction::Commit {
+                proposal_id: ReviewProposalId::new(string(payload, "proposal_id")?)?,
+            }
+        }
+        ReviewActionKind::ResolveConflict => {
+            fields(payload, &["file_id", "proposal_id", "resolution"])?;
+            ReviewAction::ResolveConflict {
+                proposal_id: ReviewProposalId::new(string(payload, "proposal_id")?)?,
+                file_id: ReviewFileId::new(string(payload, "file_id")?)?,
+                resolution: ConflictResolution::parse(string(payload, "resolution")?)?,
             }
         }
         ReviewActionKind::ApproveReview => {

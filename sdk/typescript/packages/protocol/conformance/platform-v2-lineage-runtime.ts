@@ -63,7 +63,7 @@ interface RawCase {
   readonly orchestration?: RawOrchestration;
   readonly decision_gate?: RawOrchestration;
   readonly intent?: {readonly kind: "create" | "resume"; readonly request: Readonly<Record<string, unknown>>};
-  readonly outcome?: {readonly kind: "accepted" | "unknown" | "conflict" | "created" | "resumed"; readonly conflict?: string; readonly workspace?: string};
+  readonly outcome?: {readonly kind: "accepted" | "unknown" | "conflict" | "created" | "resumed" | "cancelled"; readonly conflict?: string; readonly workspace?: string; readonly target_intent_id?: string};
   readonly client_versions?: readonly number[];
   readonly server_versions?: readonly number[];
   readonly negotiated_version?: number;
@@ -116,6 +116,7 @@ const freshness = (value: NonNullable<RawOrchestration["freshness"]>): LineageFr
 const outcome = (value: NonNullable<RawCase["outcome"]>): WorkspaceIntentOutcome => {
   if (value.kind === "conflict") return validateWorkspaceIntentOutcome({kind: value.kind, conflict: decodeWorkspaceIntentConflict(value.conflict ?? "")});
   if (value.kind === "accepted" || value.kind === "unknown") return validateWorkspaceIntentOutcome({kind: value.kind});
+  if (value.kind === "cancelled") return validateWorkspaceIntentOutcome({kind: value.kind, target_intent_id: WorkspaceIntentId(value.target_intent_id ?? "")});
   return validateWorkspaceIntentOutcome({kind: value.kind, workspace: UserWorkspaceId(value.workspace ?? "")});
 };
 
@@ -248,6 +249,11 @@ const exactIntent = "{\"platform_version\":2,\"schema\":\"automonique.platform/v
 if (new TextDecoder().decode(encodeWorkspaceIntent(lineageV2, decodeWorkspaceIntent(lineageV2, new TextEncoder().encode(exactIntent)))) !== exactIntent) throw new Error("intent codec exact-byte drifted");
 const exactOutcome = "{\"platform_version\":2,\"schema\":\"automonique.platform/v2\",\"value\":{\"kind\":\"accepted\"}}";
 if (new TextDecoder().decode(encodeWorkspaceIntentOutcome(lineageV2, decodeWorkspaceIntentOutcome(lineageV2, new TextEncoder().encode(exactOutcome)))) !== exactOutcome) throw new Error("outcome codec exact-byte drifted");
+const exactCancel = "{\"platform_version\":2,\"schema\":\"automonique.platform/v2\",\"value\":{\"kind\":\"cancel\",\"request\":{\"expected_revision\":1,\"intent_id\":\"cancel-codec\",\"target_intent_id\":\"intent-codec\",\"workspace\":\"workspace-codec\"}}}";
+if (new TextDecoder().decode(encodeWorkspaceIntent(lineageV2, decodeWorkspaceIntent(lineageV2, new TextEncoder().encode(exactCancel)))) !== exactCancel) throw new Error("cancel intent codec exact-byte drifted");
+const exactCancelled = "{\"platform_version\":2,\"schema\":\"automonique.platform/v2\",\"value\":{\"kind\":\"cancelled\",\"target_intent_id\":\"intent-codec\"}}";
+if (new TextDecoder().decode(encodeWorkspaceIntentOutcome(lineageV2, decodeWorkspaceIntentOutcome(lineageV2, new TextEncoder().encode(exactCancelled)))) !== exactCancelled) throw new Error("cancel outcome codec exact-byte drifted");
+mustRefuse(() => validateWorkspaceIntent({kind: "cancel", request: {expected_revision: WorkContextRevision(1n), intent_id: WorkspaceIntentId("self"), target_intent_id: WorkspaceIntentId("self"), workspace: UserWorkspaceId("workspace-codec")}}));
 mustRefuse(() => decodeLineageProjection(lineageV2, new TextEncoder().encode(exactProjection.replace("\"platform_version\":2", "\"platform_version\":1"))));
 mustRefuse(() => decodeWorkspaceIntentOutcome(lineageV2, new TextEncoder().encode(exactOutcome.replace("accepted", "undefined"))));
 const negativeObservation = "{\"platform_version\":2,\"schema\":\"automonique.platform/v2\",\"value\":{\"external_work_items\":[{\"freshness\":{\"observed_at_ms\":-1,\"stale_after_ms\":30000,\"state\":\"fresh\"},\"identity\":{\"authority\":\"installation-codec\",\"key\":\"issue-codec\",\"provider\":\"gitlab\",\"scope\":\"scope-codec\"},\"latest_useful_message\":null,\"moved_to\":null,\"origin\":{\"attempt\":null,\"pane\":null,\"session\":null,\"workspace\":\"workspace-codec\"},\"revision\":1,\"state\":\"open\",\"workspace\":\"workspace-codec\"}],\"orchestration\":[],\"schema\":\"automonique.platform/v2\",\"workspace\":\"workspace-codec\"}}";
@@ -259,4 +265,4 @@ if (new TextDecoder().decode(encodeLineageProjection(lineageV2, movedProjection)
 const movedA = movedProjection.external_work_items[0]!;
 const movedB = movedProjection.external_work_items[1]!;
 mustRefuse(() => validateLineageProjection({...movedProjection, external_work_items: [movedA, {...movedB, moved_to: movedA.identity, state: "moved"}]}));
-console.log(JSON.stringify({cases: names.size, codec_bytes: exactProjection.length + exactIntent.length + exactOutcome.length, providers: providers.size, question_links: questionLinks, stale_heartbeats: staleHeartbeats}));
+console.log(JSON.stringify({cases: names.size, codec_bytes: exactProjection.length + exactIntent.length + exactOutcome.length + exactCancel.length + exactCancelled.length, providers: providers.size, question_links: questionLinks, stale_heartbeats: staleHeartbeats}));

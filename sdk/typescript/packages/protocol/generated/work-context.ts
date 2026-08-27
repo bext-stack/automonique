@@ -555,6 +555,7 @@ export function assertNeverWorkContextIdentity(value: never): never {
 }
 
 export type WorkspaceIntent =
+  | {readonly kind: "cancel"; readonly request: WorkspaceCancelIntent}
   | {readonly kind: "create"; readonly request: WorkspaceCreateIntent}
   | {readonly kind: "resume"; readonly request: WorkspaceResumeIntent};
 
@@ -564,6 +565,7 @@ export function assertNeverWorkspaceIntent(value: never): never {
 
 export type WorkspaceIntentOutcome =
   | {readonly kind: "accepted"}
+  | {readonly kind: "cancelled"; readonly target_intent_id: WorkspaceIntentId}
   | {readonly kind: "conflict"; readonly conflict: WorkspaceIntentConflict}
   | {readonly kind: "created"; readonly workspace: UserWorkspaceId}
   | {readonly kind: "resumed"; readonly workspace: UserWorkspaceId}
@@ -791,6 +793,20 @@ export const WorkContextResync_FIELDS: readonly string[] = [
   "expired_after",
   "outcome",
   "schema",
+];
+
+/** Cancellation intent fenced by exact target intent, workspace, and durable revision. */
+export interface WorkspaceCancelIntent {
+  readonly expected_revision: WorkContextRevision;
+  readonly intent_id: WorkspaceIntentId;
+  readonly target_intent_id: WorkspaceIntentId;
+  readonly workspace: UserWorkspaceId;
+}
+export const WorkspaceCancelIntent_FIELDS: readonly string[] = [
+  "expected_revision",
+  "intent_id",
+  "target_intent_id",
+  "workspace",
 ];
 
 /** Create intent using opaque registry selectors rather than host paths or branch names. */
@@ -1572,8 +1588,22 @@ export function validateWorkspaceResumeIntent(value: WorkspaceResumeIntent): Wor
   };
 }
 
+export function validateWorkspaceCancelIntent(value: WorkspaceCancelIntent): WorkspaceCancelIntent {
+  exactInput(value, WorkspaceCancelIntent_FIELDS);
+  const intent_id = WorkspaceIntentId(value.intent_id);
+  const target_intent_id = WorkspaceIntentId(value.target_intent_id);
+  if (intent_id === target_intent_id) workContextRefusal("cancellation intent cannot target itself");
+  return {
+    expected_revision: WorkContextRevision(workContextWireUnsigned(value.expected_revision, WorkContextRevision_MAX, "expected_revision")),
+    intent_id,
+    target_intent_id,
+    workspace: UserWorkspaceId(value.workspace),
+  };
+}
+
 export function validateWorkspaceIntent(value: WorkspaceIntent): WorkspaceIntent {
   switch (value.kind) {
+    case "cancel": exactInput(value, ["kind", "request"]); return {kind: value.kind, request: validateWorkspaceCancelIntent(value.request)};
     case "create": exactInput(value, ["kind", "request"]); return {kind: value.kind, request: validateWorkspaceCreateIntent(value.request)};
     case "resume": exactInput(value, ["kind", "request"]); return {kind: value.kind, request: validateWorkspaceResumeIntent(value.request)};
     default: return assertNeverWorkspaceIntent(value);
@@ -1583,6 +1613,7 @@ export function validateWorkspaceIntent(value: WorkspaceIntent): WorkspaceIntent
 export function validateWorkspaceIntentOutcome(value: WorkspaceIntentOutcome): WorkspaceIntentOutcome {
   switch (value.kind) {
     case "accepted": exactInput(value, ["kind"]); return {kind: value.kind};
+    case "cancelled": exactInput(value, ["kind", "target_intent_id"]); return {kind: value.kind, target_intent_id: WorkspaceIntentId(value.target_intent_id)};
     case "conflict": exactInput(value, ["conflict", "kind"]); return {kind: value.kind, conflict: decodeWorkspaceIntentConflict(value.conflict)};
     case "created": exactInput(value, ["kind", "workspace"]); return {kind: value.kind, workspace: UserWorkspaceId(value.workspace)};
     case "resumed": exactInput(value, ["kind", "workspace"]); return {kind: value.kind, workspace: UserWorkspaceId(value.workspace)};

@@ -925,6 +925,91 @@ fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
             .unwrap(),
         WriteAdmission::Replayed { revision: 2 }
     );
+
+    let resume = WorkspaceIntent::Resume(WorkspaceResumeIntent::new(
+        WorkspaceIntentId::new("intent-resume-cancel").unwrap(),
+        OrchestrationTaskId::new("task-exact").unwrap(),
+        ws.clone(),
+        Revision::FIRST,
+    ));
+    index
+        .record_intent(&resume, &WorkspaceIntentOutcome::Accepted)
+        .unwrap();
+    let cancel = WorkspaceIntent::Cancel(
+        WorkspaceCancelIntent::new(
+            WorkspaceIntentId::new("intent-cancel-exact").unwrap(),
+            resume.intent_id().clone(),
+            ws.clone(),
+            Revision::FIRST,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        index
+            .record_intent(&cancel, &WorkspaceIntentOutcome::Accepted)
+            .unwrap(),
+        WriteAdmission::Inserted { revision: 1 }
+    );
+    let stored_cancel = index
+        .intent_authorized(&lineage_v2(), &scope, cancel.intent_id(), |_| true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_cancel.revision, Revision::FIRST);
+    let cancelled = WorkspaceIntentOutcome::Cancelled(resume.intent_id().clone());
+    assert_eq!(
+        index
+            .reconcile_intent(&WorkspaceIntentExecutionReceipt {
+                intent_id: cancel.intent_id().clone(),
+                request_digest: stored_cancel.request_digest,
+                outcome: cancelled.clone(),
+            })
+            .unwrap(),
+        WriteAdmission::Updated { revision: 2 }
+    );
+    let cancelled_target = index
+        .intent_authorized(&lineage_v2(), &scope, resume.intent_id(), |_| true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(cancelled_target.revision, Revision::new(2).unwrap());
+    assert_eq!(
+        cancelled_target.outcome,
+        WorkspaceIntentOutcome::Conflict(WorkspaceIntentConflict::CreationCancelled)
+    );
+    assert_eq!(
+        index
+            .reconcile_intent(&WorkspaceIntentExecutionReceipt {
+                intent_id: cancel.intent_id().clone(),
+                request_digest: stored_cancel.request_digest,
+                outcome: cancelled,
+            })
+            .unwrap(),
+        WriteAdmission::Replayed { revision: 2 }
+    );
+    assert_eq!(
+        index
+            .record_intent(&cancel, &WorkspaceIntentOutcome::Accepted)
+            .unwrap(),
+        WriteAdmission::Replayed { revision: 2 }
+    );
+    let stale_cancel = WorkspaceIntent::Cancel(
+        WorkspaceCancelIntent::new(
+            WorkspaceIntentId::new("intent-cancel-stale").unwrap(),
+            resume.intent_id().clone(),
+            ws.clone(),
+            Revision::FIRST,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        index
+            .record_intent(
+                &stale_cancel,
+                &WorkspaceIntentOutcome::Cancelled(resume.intent_id().clone()),
+            )
+            .unwrap_err()
+            .category(),
+        "identity_conflict"
+    );
     let changed = WorkspaceIntent::Create(WorkspaceCreateIntent::new(
         WorkspaceIntentId::new("intent-exact").unwrap(),
         OrchestrationTaskId::new("task-does-not-exist").unwrap(),
@@ -1068,6 +1153,131 @@ PRAGMA user_version=1;
     assert_eq!(
         LineageIndex::open(private.path()).unwrap_err().category(),
         "corrupt"
+    );
+}
+
+#[test]
+fn populated_v2_index_migrates_intents_to_revision_one_and_adds_cancellation() {
+    let private = PrivateIndex::new();
+    let ws = workspace("workspace-v2");
+    let external = external_identity(ExternalWorkProvider::GitHub, "scope-v2", "issue-v2");
+    let mut index = LineageIndex::open(private.path()).unwrap();
+    index
+        .intake_external(&item(
+            external.clone(),
+            ws.clone(),
+            1,
+            ExternalWorkState::Open,
+            None,
+        ))
+        .unwrap();
+    index
+        .record_orchestration(
+            &record(
+                run("run-v2"),
+                &ws,
+                Some(&external),
+                None,
+                LineageStatus::Working,
+                LineageFreshnessState::Fresh,
+            ),
+            None,
+        )
+        .unwrap();
+    index
+        .record_orchestration(
+            &record(
+                task("task-v2"),
+                &ws,
+                Some(&external),
+                Some(run("run-v2")),
+                LineageStatus::Working,
+                LineageFreshnessState::Fresh,
+            ),
+            None,
+        )
+        .unwrap();
+    let resume = WorkspaceIntent::Resume(WorkspaceResumeIntent::new(
+        WorkspaceIntentId::new("intent-v2").unwrap(),
+        OrchestrationTaskId::new("task-v2").unwrap(),
+        ws.clone(),
+        Revision::FIRST,
+    ));
+    index
+        .record_intent(&resume, &WorkspaceIntentOutcome::Accepted)
+        .unwrap();
+    drop(index);
+
+    let db = Connection::open(private.path()).unwrap();
+    db.execute_batch(
+        r#"
+PRAGMA foreign_keys=OFF;
+DROP INDEX lineage_cancel_by_target;
+ALTER TABLE lineage_workspace_intents RENAME TO lineage_workspace_intents_v3;
+CREATE TABLE lineage_workspace_intents (
+    intent_id TEXT PRIMARY KEY,
+    request_digest BLOB NOT NULL CHECK (length(request_digest) = 32),
+    intent_kind TEXT NOT NULL CHECK (intent_kind IN ('create','resume')),
+    task_kind TEXT NOT NULL CHECK (task_kind = 'task'),
+    task_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    external_provider TEXT,
+    external_authority_id TEXT,
+    external_scope TEXT,
+    external_key TEXT,
+    base_selector TEXT,
+    branch_selector TEXT,
+    expected_revision INTEGER CHECK (expected_revision >= 1),
+    outcome_kind TEXT NOT NULL CHECK (outcome_kind IN ('accepted','unknown','created','resumed','conflict')),
+    outcome_conflict TEXT,
+    outcome_workspace_id TEXT,
+    reconciliation TEXT NOT NULL CHECK (reconciliation IN ('final','poll_receipt')),
+    FOREIGN KEY (task_kind, task_id, workspace_id)
+        REFERENCES lineage_orchestration(orchestration_kind, orchestration_id, workspace_id),
+    CHECK (
+        (intent_kind = 'create' AND external_provider IS NOT NULL AND expected_revision IS NULL) OR
+        (intent_kind = 'resume' AND external_provider IS NULL AND expected_revision IS NOT NULL)
+    )
+) STRICT;
+INSERT INTO lineage_workspace_intents
+SELECT intent_id,request_digest,intent_kind,task_kind,task_id,workspace_id,external_provider,
+ external_authority_id,external_scope,external_key,base_selector,branch_selector,expected_revision,
+ outcome_kind,outcome_conflict,outcome_workspace_id,reconciliation
+FROM lineage_workspace_intents_v3;
+DROP TABLE lineage_workspace_intents_v3;
+PRAGMA user_version=2;
+PRAGMA foreign_keys=ON;
+"#,
+    )
+    .unwrap();
+    drop(db);
+
+    let mut migrated = LineageIndex::open(private.path()).unwrap();
+    let stored = migrated
+        .intent_authorized(
+            &lineage_v2(),
+            &intent_scope(&ws),
+            resume.intent_id(),
+            |_| true,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.revision, Revision::FIRST);
+    assert_eq!(stored.intent, resume);
+    let cancel = WorkspaceIntent::Cancel(
+        WorkspaceCancelIntent::new(
+            WorkspaceIntentId::new("cancel-v2").unwrap(),
+            WorkspaceIntentId::new("intent-v2").unwrap(),
+            ws,
+            Revision::FIRST,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        migrated
+            .record_intent(&cancel, &WorkspaceIntentOutcome::Accepted)
+            .unwrap(),
+        WriteAdmission::Inserted { revision: 1 }
     );
 }
 

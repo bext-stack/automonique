@@ -6,10 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 
 use automonique_protocol::platform::IdempotencyKey;
-use automonique_protocol::platform_v2_review::{
-    ReviewAction, ReviewActionReceipt, ReviewActionRequest, ReviewActorId, ReviewAuthentication,
-    ReviewCheckId, ReviewReceiptOutcome, ReviewReconciliation,
-};
+use automonique_protocol::platform_v2_review::*;
 use automonique_protocol::platform_v2_review_api::{
     decode_review_action_request, decode_review_snapshot,
 };
@@ -52,6 +49,90 @@ fn revision(value: u64) -> Revision {
 }
 fn snapshot() -> automonique_protocol::platform_v2_review::ReviewSnapshot {
     decode_review_snapshot(SNAPSHOT).expect("shared snapshot fixture")
+}
+fn action_snapshot(conflicted: bool) -> ReviewSnapshot {
+    let base = snapshot();
+    let original_file = &base.files()[0];
+    let file = ReviewFile::new(
+        original_file.id().clone(),
+        original_file.path().clone(),
+        original_file.change(),
+        original_file.worktree(),
+        original_file.preview().clone(),
+        if conflicted {
+            ConflictState::Unresolved
+        } else {
+            ConflictState::None
+        },
+        original_file.hunks().to_vec(),
+    )
+    .expect("file");
+    let original_comment = &base.comments()[0];
+    let comment = ReviewComment::new(
+        original_comment.id().clone(),
+        original_comment.revision(),
+        original_comment.actor().clone(),
+        original_comment.body().clone(),
+        original_comment.anchor().clone(),
+        CommentAgentState::NotSent,
+        original_comment.unread(),
+    );
+    let git = ReviewAuthority::new(
+        ReviewAuthorityKind::Git,
+        ReviewAuthorityId::new("authority-1").expect("git authority"),
+    );
+    let proposals = if conflicted {
+        vec![
+            ReviewProposal::new(
+                ReviewProposalId::new("proposal-resolve").expect("proposal"),
+                ReviewProposalKind::ResolveConflict,
+                git,
+                vec![file.id().clone()],
+                None,
+            )
+            .expect("resolve proposal"),
+        ]
+    } else {
+        vec![
+            ReviewProposal::new(
+                ReviewProposalId::new("proposal-commit").expect("proposal"),
+                ReviewProposalKind::Commit,
+                git.clone(),
+                vec![file.id().clone()],
+                Some(ReviewField::new("typed commit").expect("subject")),
+            )
+            .expect("commit proposal"),
+            ReviewProposal::new(
+                ReviewProposalId::new("proposal-stage").expect("proposal"),
+                ReviewProposalKind::Stage,
+                git.clone(),
+                vec![file.id().clone()],
+                None,
+            )
+            .expect("stage proposal"),
+            ReviewProposal::new(
+                ReviewProposalId::new("proposal-unstage").expect("proposal"),
+                ReviewProposalKind::Unstage,
+                git,
+                vec![file.id().clone()],
+                None,
+            )
+            .expect("unstage proposal"),
+        ]
+    };
+    ReviewSnapshot::new(
+        base.workspace().clone(),
+        base.revision(),
+        vec![file],
+        vec![comment],
+        proposals,
+        base.checks().to_vec(),
+        base.review().clone(),
+        base.pull_request().clone(),
+        base.delivery().clone(),
+        vec![],
+    )
+    .expect("action snapshot")
 }
 fn request() -> ReviewActionRequest {
     decode_review_action_request(ACTION).expect("shared action fixture")
@@ -153,6 +234,158 @@ fn exact_request_replays_and_different_body_under_same_key_conflicts() {
     assert!(matches!(
         error,
         ReviewStoreError::Conflict("idempotency_key")
+    ));
+}
+
+#[test]
+fn typed_git_and_batch_actions_keep_one_write_custody() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).expect("open");
+    let snapshot = action_snapshot(false);
+    store.put_snapshot(&snapshot, 10).expect("snapshot");
+    let actor = ReviewActorId::new("actor-new-actions").expect("actor");
+    let git = snapshot.proposals()[0].authority().clone();
+    let review = snapshot.review().authority().clone();
+    for authority in [&git, &review] {
+        store
+            .grant_authority(
+                snapshot.workspace(),
+                &actor,
+                ReviewAuthentication::UserSession,
+                authority,
+                11,
+            )
+            .expect("grant");
+    }
+    let actions = vec![
+        (
+            "key-batch",
+            review.clone(),
+            ReviewAction::BatchSendCommentsToAgent {
+                comments: vec![ReviewCommentTarget::new(
+                    ReviewCommentId::new("comment-1").expect("comment"),
+                    revision(2),
+                )],
+            },
+        ),
+        (
+            "key-commit",
+            git.clone(),
+            ReviewAction::Commit {
+                proposal_id: ReviewProposalId::new("proposal-commit").expect("proposal"),
+            },
+        ),
+        (
+            "key-stage",
+            git.clone(),
+            ReviewAction::Stage {
+                proposal_id: ReviewProposalId::new("proposal-stage").expect("proposal"),
+            },
+        ),
+        (
+            "key-unstage",
+            git.clone(),
+            ReviewAction::Unstage {
+                proposal_id: ReviewProposalId::new("proposal-unstage").expect("proposal"),
+            },
+        ),
+    ];
+    for (index, (key, authority, action)) in actions.into_iter().enumerate() {
+        let request = ReviewActionRequest::new(
+            snapshot.workspace().clone(),
+            snapshot.revision(),
+            actor.clone(),
+            ReviewAuthentication::UserSession,
+            authority,
+            IdempotencyKey::new(key).expect("key"),
+            action,
+        )
+        .expect("request");
+        let ReviewActionAdmission::New(prepared) = store
+            .prepare_action(&request, ApprovalPolicy::NotRequired, 20 + index as i64)
+            .expect("prepare")
+        else {
+            panic!("first admission must be new")
+        };
+        assert!(matches!(
+            store
+                .prepare_action(&request, ApprovalPolicy::NotRequired, 30 + index as i64)
+                .expect("prepare replay"),
+            ReviewActionAdmission::Replay(_)
+        ));
+        assert!(matches!(
+            store
+                .start_write(
+                    &prepared.preview_id,
+                    prepared.request_digest,
+                    40 + index as i64
+                )
+                .expect("write"),
+            ReviewWriteAdmission::New(_)
+        ));
+        assert!(matches!(
+            store
+                .start_write(
+                    &prepared.preview_id,
+                    prepared.request_digest,
+                    50 + index as i64
+                )
+                .expect("write replay"),
+            ReviewWriteAdmission::Replay(_)
+        ));
+    }
+
+    let conflict_private = PrivateStore::new();
+    let mut conflict_store = ReviewStore::open(conflict_private.path()).expect("open");
+    let conflict_snapshot = action_snapshot(true);
+    conflict_store
+        .put_snapshot(&conflict_snapshot, 10)
+        .expect("snapshot");
+    let conflict_git = conflict_snapshot.proposals()[0].authority().clone();
+    conflict_store
+        .grant_authority(
+            conflict_snapshot.workspace(),
+            &actor,
+            ReviewAuthentication::UserSession,
+            &conflict_git,
+            11,
+        )
+        .expect("grant");
+    let resolve = ReviewActionRequest::new(
+        conflict_snapshot.workspace().clone(),
+        conflict_snapshot.revision(),
+        actor,
+        ReviewAuthentication::UserSession,
+        conflict_git,
+        IdempotencyKey::new("key-resolve").expect("key"),
+        ReviewAction::ResolveConflict {
+            proposal_id: ReviewProposalId::new("proposal-resolve").expect("proposal"),
+            file_id: ReviewFileId::new("file-1").expect("file"),
+            resolution: ConflictResolution::KeepIncoming,
+        },
+    )
+    .expect("request");
+    let ReviewActionAdmission::New(prepared) = conflict_store
+        .prepare_action(&resolve, ApprovalPolicy::NotRequired, 20)
+        .expect("prepare")
+    else {
+        panic!("first admission must be new")
+    };
+    assert_eq!(
+        prepared.request.action().kind(),
+        ReviewActionKind::ResolveConflict
+    );
+    assert!(matches!(
+        conflict_store
+            .start_write(&prepared.preview_id, prepared.request_digest, 21)
+            .expect("resolve write"),
+        ReviewWriteAdmission::New(_)
+    ));
+    assert!(matches!(
+        conflict_store
+            .start_write(&prepared.preview_id, prepared.request_digest, 22)
+            .expect("resolve replay"),
+        ReviewWriteAdmission::Replay(_)
     ));
 }
 

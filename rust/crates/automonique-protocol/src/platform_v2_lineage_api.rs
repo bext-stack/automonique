@@ -558,6 +558,27 @@ fn intent_json(value: &WorkspaceIntent) -> Result<JsonValue, LineageApiError> {
                 ]),
             ),
         ]),
+        WorkspaceIntent::Cancel(v) => obj(vec![
+            ("kind", JsonValue::String("cancel".to_owned())),
+            (
+                "request",
+                obj(vec![
+                    ("expected_revision", integer(v.expected_revision().get())?),
+                    (
+                        "intent_id",
+                        JsonValue::String(v.intent_id().as_str().to_owned()),
+                    ),
+                    (
+                        "target_intent_id",
+                        JsonValue::String(v.target_intent_id().as_str().to_owned()),
+                    ),
+                    (
+                        "workspace",
+                        JsonValue::String(v.workspace().as_str().to_owned()),
+                    ),
+                ]),
+            ),
+        ]),
     })
 }
 fn intent(value: &JsonValue) -> Result<WorkspaceIntent, LineageApiError> {
@@ -595,6 +616,23 @@ fn intent(value: &JsonValue) -> Result<WorkspaceIntent, LineageApiError> {
                 Revision::new(uint(request, "expected_revision")?)?,
             ))
         }
+        "cancel" => {
+            fields(
+                request,
+                &[
+                    "expected_revision",
+                    "intent_id",
+                    "target_intent_id",
+                    "workspace",
+                ],
+            )?;
+            WorkspaceIntent::Cancel(WorkspaceCancelIntent::new(
+                WorkspaceIntentId::new(string(request, "intent_id")?.to_owned())?,
+                WorkspaceIntentId::new(string(request, "target_intent_id")?.to_owned())?,
+                UserWorkspaceId::new(string(request, "workspace")?.to_owned())?,
+                Revision::new(uint(request, "expected_revision")?)?,
+            )?)
+        }
         _ => return Err(LineageApiError::InvalidBody),
     })
 }
@@ -629,6 +667,10 @@ fn outcome_json(value: &WorkspaceIntentOutcome) -> JsonValue {
             ("kind", JsonValue::String("resumed".to_owned())),
             ("workspace", JsonValue::String(v.as_str().to_owned())),
         ]),
+        WorkspaceIntentOutcome::Cancelled(v) => obj(vec![
+            ("kind", JsonValue::String("cancelled".to_owned())),
+            ("target_intent_id", JsonValue::String(v.as_str().to_owned())),
+        ]),
         WorkspaceIntentOutcome::Conflict(v) => obj(vec![
             ("conflict", JsonValue::String(v.as_str().to_owned())),
             ("kind", JsonValue::String("conflict".to_owned())),
@@ -655,6 +697,12 @@ fn outcome(value: &JsonValue) -> Result<WorkspaceIntentOutcome, LineageApiError>
             fields(value, &["kind", "workspace"])?;
             WorkspaceIntentOutcome::Resumed(UserWorkspaceId::new(
                 string(value, "workspace")?.to_owned(),
+            )?)
+        }
+        "cancelled" => {
+            fields(value, &["kind", "target_intent_id"])?;
+            WorkspaceIntentOutcome::Cancelled(WorkspaceIntentId::new(
+                string(value, "target_intent_id")?.to_owned(),
             )?)
         }
         "conflict" => {
