@@ -101,27 +101,19 @@
     });
   }
 
-  function mutationCapability(document, workspace, action) {
-    const actions = Array.isArray(document?.capabilities?.workspace_actions) ? document.capabilities.workspace_actions : [];
-    const capability = actions.find((item) => item?.action === action);
-    if (!workspace || !capability || document.stale === true) {
-      return Object.freeze({ available: false, reason: document?.stale === true ? "stale" : "not_advertised" });
-    }
-    const exactRevision = boundedText(capability.exact_revision, 128);
-    const authority = boundedText(capability.authority, 512);
-    if (!validDecimal(exactRevision, false) || !authority || capability.workspace_id !== workspace.id
-      || workspace.revision === null || exactRevision !== workspace.revision) {
-      return Object.freeze({ available: false, reason: "incomplete_capability" });
-    }
-    return Object.freeze({ available: true, action, authority, exact_revision: exactRevision, workspace_id: workspace.id });
+  function mutationCapability(document) {
+    const lifecycle = document?.actions?.lifecycle;
+    return Object.freeze({
+      available: false,
+      reason: boundedText(lifecycle?.category, 128) || "platform_v2_lifecycle_adapter_pending",
+    });
   }
 
   function derivePresentation(document, selection = {}) {
-    // This narrow, dependency-free envelope is the browser seam for shared v2
-    // fixtures. Unknown or malformed fields stay unavailable instead of being
-    // reconstructed from retained-session summaries.
-    const structured = document?.schema === "automonique.cockpit/presentation/v1"
-      || document?.schema === "automonique.platform/v2";
+    // Only the authenticated server-owned cockpit projection is accepted.
+    // Raw Platform v2 documents and retained-session summaries never become
+    // browser-inferred workspaces.
+    const structured = document?.schema === "automonique.dashboard.cockpit/v2";
     const projects = structured && Array.isArray(document.projects) ? document.projects.map(normalizeNamed).filter(Boolean) : [];
     const hosts = structured && Array.isArray(document.hosts) ? document.hosts.map(normalizeNamed).filter(Boolean) : [];
     const workspaces = structured && Array.isArray(document.workspaces) ? document.workspaces.map(normalizeWorkspace).filter(Boolean) : [];
@@ -131,20 +123,17 @@
       || workspaces.find((item) => item.session_id === sessionId)
       || workspaces[0]
       || null;
-    const partial = structured && document.capabilities?.workspace_context !== true;
-    const mode = !structured ? "v1" : partial ? "partial" : "v2";
+    const mode = structured && document.mode === "v2" ? "v2" : "v1";
     const degradation = mode === "v2"
       ? null
-      : mode === "partial"
-        ? "Workspace context is partial. Missing fields and actions remain unavailable."
-        : "Platform v1: workspace context is unavailable. Retained sessions remain available.";
+      : `Platform v1: workspace context is unavailable (${boundedText(document?.degradation?.category, 128) || "Platform v2 unavailable"}). Retained sessions remain available.`;
     const activities = structured && Array.isArray(document.activities)
       ? document.activities.map(normalizeActivity).filter(Boolean).sort((left, right) => left.at.localeCompare(right.at) || left.id.localeCompare(right.id))
       : [];
     return Object.freeze({
       mode,
       degradation,
-      stale: document?.stale === true,
+      stale: false,
       projects: Object.freeze(projects),
       hosts: Object.freeze(hosts),
       workspaces: Object.freeze(workspaces),
@@ -152,13 +141,13 @@
       attention: Object.freeze(Object.fromEntries(ATTENTION_STATES.map((state) => [state, workspaces.filter((item) => item.attention === state).length]))),
       activities: Object.freeze(activities),
       receipt: normalizeReceipt(document?.receipt),
-      create: mutationCapability(document, selectedWorkspace, "create"),
-      resume: mutationCapability(document, selectedWorkspace, "resume"),
+      create: mutationCapability(document),
+      resume: mutationCapability(document),
       readModels: Object.freeze({
-        files: Array.isArray(document?.read_models?.files) ? document.read_models.files : null,
-        review: document?.read_models?.review && typeof document.read_models.review === "object" ? document.read_models.review : null,
-        checks: Array.isArray(document?.read_models?.checks) ? document.read_models.checks : null,
-        delivery: document?.read_models?.delivery && typeof document.read_models.delivery === "object" ? document.read_models.delivery : null,
+        files: Array.isArray(document?.review?.document?.files) ? document.review.document.files : null,
+        review: document?.review?.document?.review && typeof document.review.document.review === "object" ? document.review.document.review : null,
+        checks: Array.isArray(document?.review?.document?.checks) ? document.review.document.checks : null,
+        delivery: document?.review?.document?.delivery && typeof document.review.document.delivery === "object" ? document.review.document.delivery : null,
       }),
     });
   }

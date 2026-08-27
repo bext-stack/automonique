@@ -826,6 +826,13 @@ const frenchUi = Object.freeze({
   "The session list is unavailable, so the invite could not be scoped.": "La liste des sessions est indisponible : l’invitation n’a pas pu être cadrée.",
   "Select at least one session. A phone can only reach the sessions named here.": "Sélectionnez au moins une session. Un téléphone n’atteint que les sessions nommées ici.",
   "The QR encoder did not load. Use Copy invite instead.": "L’encodeur QR n’a pas été chargé. Utilisez plutôt Copier l’invitation.",
+  "LIFECYCLE ACTIONS": "ACTIONS DU CYCLE DE VIE",
+  "Create or resume a workspace": "Créer ou reprendre un espace de travail",
+  "Unavailable: the Platform v2 lifecycle host adapter is not installed.": "Indisponible : l’adaptateur hôte du cycle de vie Platform v2 n’est pas installé.",
+  "Task input remains local while lifecycle actions are unavailable": "La tâche reste locale tant que les actions du cycle de vie sont indisponibles",
+  "Create unavailable": "Création indisponible",
+  "Resume unavailable": "Reprise indisponible",
+  "Unavailable: the Platform v2 lifecycle host adapter is not installed (platform_v2_lifecycle_adapter_pending).": "Indisponible : l’adaptateur hôte du cycle de vie Platform v2 n’est pas installé (platform_v2_lifecycle_adapter_pending).",
 });
 const localizedTextSources = new WeakMap();
 const localizedAttributeSources = new WeakMap();
@@ -2119,12 +2126,6 @@ async function loadProcesses({ announce = false } = {}) {
   }
 }
 
-function cockpitDocument(view) {
-  if (view?.workspace_cockpit && typeof view.workspace_cockpit === "object") return view.workspace_cockpit;
-  if (view?.presentation && typeof view.presentation === "object") return view.presentation;
-  return view;
-}
-
 function cockpitReplaceNamedList(id, values, emptyMessage) {
   const root = byId(id);
   root.replaceChildren();
@@ -2201,8 +2202,7 @@ function updateCockpitLink(workspace, sessionId = null) {
 function selectCockpitWorkspace(workspace) {
   cockpitState = globalThis.AutomoniquePlatformCockpit.reduce(cockpitState, { type: "select_workspace", workspace: workspace.id });
   updateCockpitLink(workspace);
-  renderHostedCockpit(platformSnapshot || {});
-  if (workspace.session_id) selectPlatformSession(workspace.session_id);
+  loadPlatform();
 }
 
 function renderHostedCockpit(view) {
@@ -2211,7 +2211,7 @@ function renderHostedCockpit(view) {
     workspace: cockpitState.selection.workspace || link.workspace,
     session: cockpitState.selection.session || link.session || platformSelectedSession,
   };
-  cockpitPresentation = globalThis.AutomoniquePlatformCockpit.derivePresentation(cockpitDocument(view), selection);
+  cockpitPresentation = globalThis.AutomoniquePlatformCockpit.derivePresentation(view, selection);
   const capability = byId("cockpit-capability-state");
   capability.dataset.mode = cockpitPresentation.mode;
   capability.replaceChildren();
@@ -2268,11 +2268,7 @@ function renderHostedCockpit(view) {
   const resume = byId("cockpit-resume-preview");
   create.disabled = cockpitPresentation.create.available !== true;
   resume.disabled = cockpitPresentation.resume.available !== true;
-  byId("cockpit-action-reason").textContent = cockpitPresentation.create.available || cockpitPresentation.resume.available
-    ? "Preview uses the advertised exact authority, workspace, action, and revision. It does not execute the action."
-    : cockpitPresentation.stale
-      ? "Read-only: the workspace snapshot is stale."
-      : "Unavailable until structured capability data supplies the exact action, authority, workspace, and revision.";
+  byId("cockpit-action-reason").textContent = "Unavailable: the Platform v2 lifecycle host adapter is not installed (platform_v2_lifecycle_adapter_pending).";
   if (workspace?.id !== cockpitTaskWorkspaceId) {
     byId("cockpit-task-input").value = workspace?.task || "";
     cockpitTaskWorkspaceId = workspace?.id || null;
@@ -2318,15 +2314,16 @@ function renderHostedCockpit(view) {
 }
 
 function renderPlatform(view) {
-  const sessions = Array.isArray(view.sessions) ? view.sessions : [];
-  const inventory = view.inventory || {};
-  platformSnapshot = view;
+  const retained = view?.retained_v1 && typeof view.retained_v1 === "object" ? view.retained_v1 : {};
+  const sessions = Array.isArray(retained.sessions) ? retained.sessions : [];
+  const inventory = retained.inventory || {};
+  platformSnapshot = retained;
   renderHostedCockpit(view);
   byId("platform-sessions").textContent = count(sessions.length);
-  byId("platform-health").textContent = words(view.health || "unavailable").toUpperCase();
-  byId("platform-health").dataset.state = view.health || "unavailable";
-  byId("platform-cursor").textContent = view.sessions_cursor
-    ? `${words(view.sessions_cursor.authority)} / ${view.sessions_cursor.topic} / seq ${String(view.sessions_cursor.sequence)}`
+  byId("platform-health").textContent = words(retained.health || "unavailable").toUpperCase();
+  byId("platform-health").dataset.state = retained.health || "unavailable";
+  byId("platform-cursor").textContent = retained.sessions_cursor
+    ? `${words(retained.sessions_cursor.authority)} / ${retained.sessions_cursor.topic} / seq ${String(retained.sessions_cursor.sequence)}`
     : inventory.state === "refused"
       ? "Session inventory refused"
       : "No session cursor";
@@ -2638,13 +2635,25 @@ async function loadPlatform({ announce = false } = {}) {
   const button = byId("platform-refresh");
   button.disabled = true;
   try {
-    renderPlatform(await api("/api/platform"));
+    const link = globalThis.AutomoniquePlatformCockpit.parseDeepLink(window.location.hash);
+    const workspaceId = cockpitState.selection.workspace || link.workspace;
+    renderPlatform(await api("/api/platform/cockpit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "read", ...(workspaceId ? { workspace_id: workspaceId } : {}) }),
+    }));
     if (platformMutation) await reconcilePlatformMutation();
     else if (platformSelectedSession && platformSelectedSessionVisible() && byId("platform-session-detail").hidden) await openPlatformSession(platformSelectedSession);
     else if (platformSelectedSession && platformSelectedSessionVisible() && !platformBusy) await pagePlatformHistory();
     if (announce) toast("Shared platform projection refreshed.");
   } catch (_error) {
-    renderPlatform({ health: "unavailable", capabilities: {}, resources: [], sessions: [] });
+    renderPlatform({
+      schema: "automonique.dashboard.cockpit/v2",
+      mode: "v1",
+      degradation: { category: "platform_cockpit_unavailable" },
+      retained_v1: { health: "unavailable", capabilities: {}, resources: [], sessions: [] },
+      projects: [], hosts: [], workspaces: [], selected: {}, actions: {},
+    });
     if (announce) toast("The shared platform projection is unavailable.", "error");
   } finally {
     button.disabled = false;

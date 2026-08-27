@@ -11,15 +11,21 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use automonique_protocol::codec::{LENGTH_PREFIX_BYTES, encode_frame_with_limit};
 use automonique_protocol::platform_v2_transport::{
     MAX_PLATFORM_NEGOTIATION_REQUEST_CANONICAL_BYTES,
     MAX_PLATFORM_NEGOTIATION_RESPONSE_CANONICAL_BYTES, MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES,
-    MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES, PlatformNegotiationRequestMessage,
-    PlatformNegotiationResponse, PlatformNegotiationResponseMessage, PlatformV2Refusal,
+    MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES, PlatformNegotiationRequest,
+    PlatformNegotiationRequestMessage, PlatformNegotiationResponse,
+    PlatformNegotiationResponseMessage, PlatformV2Refusal, PlatformV2Request,
     PlatformV2RequestMessage, PlatformV2Response, PlatformV2ResponseMessage,
+};
+use automonique_protocol::{
+    codec::RequestId,
+    platform_v2::{NegotiatedPlatform, PlatformVersionOffer},
 };
 
 pub(crate) const PLATFORM_NEGOTIATION_CONTENT_TYPE: &str =
@@ -71,6 +77,7 @@ pub(crate) struct PlatformV2Bridge {
     tenant: String,
     actor: String,
     timeout: Duration,
+    sequence: AtomicU64,
 }
 
 impl PlatformV2Bridge {
@@ -89,7 +96,47 @@ impl PlatformV2Bridge {
             tenant,
             actor,
             timeout,
+            sequence: AtomicU64::new(1),
         }
+    }
+
+    pub(crate) fn negotiate(&self) -> Result<NegotiatedPlatform, &'static str> {
+        let request = PlatformNegotiationRequestMessage::new(
+            self.request_id("negotiation")?,
+            PlatformNegotiationRequest::Negotiate(
+                PlatformVersionOffer::new(vec![1, 2]).map_err(|_| "platform_v2_request_invalid")?,
+            ),
+        );
+        let bytes = request
+            .to_canonical_bytes()
+            .map_err(|_| "platform_v2_request_invalid")?;
+        let response = self.exchange(PlatformV2Lane::Negotiation, &bytes)?;
+        match PlatformNegotiationResponseMessage::from_canonical_bytes(&response, &request)
+            .map_err(|_| "platform_v2_response_invalid")?
+            .response()
+        {
+            PlatformNegotiationResponse::Negotiated(value) => Ok(*value),
+            PlatformNegotiationResponse::Refused(value) => Err(category(value.category().as_str())),
+        }
+    }
+
+    pub(crate) fn request(
+        &self,
+        request: PlatformV2Request,
+    ) -> Result<PlatformV2Response, &'static str> {
+        let request = PlatformV2RequestMessage::new(self.request_id("cockpit")?, request);
+        let bytes = request
+            .to_canonical_bytes()
+            .map_err(|_| "platform_v2_request_invalid")?;
+        let response = self.exchange(PlatformV2Lane::V2, &bytes)?;
+        PlatformV2ResponseMessage::from_canonical_bytes(&response, &request)
+            .map(|message| message.response().clone())
+            .map_err(|_| "platform_v2_response_invalid")
+    }
+
+    fn request_id(&self, lane: &str) -> Result<RequestId, &'static str> {
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        RequestId::new(format!("web-{lane}-{sequence}")).map_err(|_| "platform_v2_request_invalid")
     }
 
     pub(crate) fn exchange(
@@ -178,6 +225,14 @@ impl PlatformV2Bridge {
             .read_exact(&mut response)
             .map_err(|_| "platform_v2_bridge_unavailable")?;
         Ok(response)
+    }
+}
+
+fn category(value: &str) -> &'static str {
+    match value {
+        "platform_v2_web_binding_unavailable" => "platform_v2_web_binding_unavailable",
+        "platform_v2_web_binding_mismatch" => "platform_v2_web_binding_mismatch",
+        _ => "platform_v2_refused",
     }
 }
 

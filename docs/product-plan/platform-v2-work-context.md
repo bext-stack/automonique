@@ -333,3 +333,27 @@ Server routes, retention workers, SDK client ergonomics, and production
 clock/random-ID and authentication-policy providers remain separate
 integration work. The protocol helpers alone do not claim to implement those
 authority or durability boundaries.
+
+## Hosted web cockpit projection
+
+The hosted dashboard uses `POST /api/platform/cockpit` as a bounded,
+server-owned JSON projection over the local canonical Platform v2 bridge. The
+route accepts the configured Basic principal only; session cookies, mobile
+credentials, and bearer credentials cannot enter it. Each read negotiates v2,
+queries at most 128 typed work-context records, and refuses to present an
+incomplete inventory when the authority reports another page. A selected
+opaque `UserWorkspace` is resolved from that inventory, then read through the
+exact project-qualified lineage and review operations. Canonical integer
+fields are rendered as decimal strings before they cross the browser boundary,
+so JavaScript never parses authoritative revisions through `Number`.
+
+If v2 is refused, unavailable, downgraded, or exceeds the cockpit bound, the
+response carries the retained Platform v1 session projection separately and
+an explicit degradation category. It returns no projects, hosts, or workspaces
+in that mode and never reconstructs them from summaries. Create and resume
+remain disabled with `platform_v2_lifecycle_adapter_pending`; the daemon does
+not yet install the lifecycle effect adapter. Review action requests preserve
+the exact selected workspace, expected snapshot/review revisions, and
+idempotency key on the typed v2 request, but remain visibly unavailable while
+the daemon returns `platform_v2_review_adapter_pending`. These are integration
+gaps, not browser capabilities.

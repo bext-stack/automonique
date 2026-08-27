@@ -4,6 +4,7 @@
 
 mod agent_auth;
 mod mobile_auth;
+mod platform_cockpit;
 mod platform_v2_bridge;
 
 pub use agent_auth::AgentAuthConfig;
@@ -137,6 +138,7 @@ pub enum Route {
     ApiAgentAccountsAction,
     ApiOperations,
     ApiPlatform,
+    ApiPlatformCockpit,
     ApiPlatformSession,
     ApiPlatformRemote,
     ApiPlatformV2Remote,
@@ -2423,6 +2425,24 @@ impl WebIntegration {
         body: &[u8],
     ) -> Result<Vec<u8>, &'static str> {
         self.platform_v2.exchange(lane, body)
+    }
+
+    fn platform_cockpit(
+        &self,
+        request: platform_cockpit::CockpitRequest,
+    ) -> Result<Value, &'static str> {
+        let retained_v1 = self
+            .platform()
+            .ok()
+            .and_then(|view| serde_json::to_value(view).ok())
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "schema": "automonique.dashboard.platform/v2",
+                    "health": "unavailable",
+                    "sessions": []
+                })
+            });
+        platform_cockpit::execute(&self.platform_v2, request, retained_v1)
     }
 
     fn mobile_discovery(&self) -> Result<mobile_auth::MobileDiscovery, &'static str> {
@@ -5324,6 +5344,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                         Route::ApiPlatform
                     }
                 }
+                "/api/platform/cockpit" => Route::ApiPlatformCockpit,
                 "/api/platform/session" => Route::ApiPlatformSession,
                 "/api/platform/v2" => Route::ApiPlatformV2Remote,
                 "/api/mobile/operator-provision" => Route::MobileOperatorProvision,
@@ -5351,6 +5372,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 route,
                 Route::ApiMemorySearch
                     | Route::ApiAgentAccountsAction
+                    | Route::ApiPlatformCockpit
                     | Route::ApiPlatformSession
                     | Route::ApiPlatformRemote
                     | Route::ApiPlatformV2Remote
@@ -5795,6 +5817,7 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         | Route::ApiAgentAccountsAction
         | Route::ApiOperations
         | Route::ApiPlatform
+        | Route::ApiPlatformCockpit
         | Route::ApiPlatformSession
         | Route::ApiPlatformRemote
         | Route::ApiPlatformV2Remote
@@ -5909,6 +5932,18 @@ fn api_response(
             Ok(view) => json_response("200 OK", &view),
             Err(category) => json_error("503 Service Unavailable", category),
         },
+        Route::ApiPlatformCockpit => {
+            match serde_json::from_slice::<platform_cockpit::CockpitRequest>(body) {
+                Ok(request) => match integration.platform_cockpit(request) {
+                    Ok(view) => json_response("200 OK", &view),
+                    Err(
+                        "platform_cockpit_request_invalid" | "platform_cockpit_workspace_not_found",
+                    ) => json_error("400 Bad Request", "platform_cockpit_request_invalid"),
+                    Err(category) => json_error("503 Service Unavailable", category),
+                },
+                Err(_) => json_error("400 Bad Request", "invalid_json"),
+            }
+        }
         Route::ApiPlatformSession => match serde_json::from_slice::<PlatformSessionAction>(body) {
             Ok(request) => match integration.platform_session(request) {
                 Ok(view) => json_response("200 OK", &view),
@@ -6269,6 +6304,7 @@ fn handle(
                     && requested_route == Route::Health;
                 let remote_platform = requested_route == Route::ApiPlatformRemote;
                 let platform_v2 = requested_route == Route::ApiPlatformV2Remote;
+                let platform_cockpit = requested_route == Route::ApiPlatformCockpit;
                 let platform_v2_lane = platform_v2
                     .then(|| {
                         request
@@ -6353,7 +6389,7 @@ fn handle(
                     Route::ManageUnauthorized
                 } else if operator_mobile && !basic_authorized {
                     Route::MobileUnauthorized
-                } else if platform_v2 && !basic_authorized {
+                } else if (platform_v2 || platform_cockpit) && !basic_authorized {
                     Route::Unauthorized
                 } else if needs_auth && !manage_chat_route && !credentials_authorized {
                     if mobile_access_presented {
@@ -6390,6 +6426,7 @@ fn handle(
                 let issue_session = needs_auth
                     && !remote_platform
                     && !platform_v2
+                    && !platform_cockpit
                     && !mobile_lifecycle
                     && basic_authorized
                     && !session_authorized;
@@ -8533,7 +8570,7 @@ mod tests {
         }
         assert!(DASHBOARD_JS.contains("monique-theme"));
         assert!(DASHBOARD_JS.contains("processHierarchy(jobs)"));
-        assert!(DASHBOARD_JS.contains("api(\"/api/platform\")"));
+        assert!(DASHBOARD_JS.contains("api(\"/api/platform/cockpit\""));
         assert!(DASHBOARD_JS.contains("renderPlatform"));
         assert!(DASHBOARD_JS.contains("/api/platform/session"));
         assert!(DASHBOARD_JS.contains("monique-platform-reconciliation"));
@@ -8655,17 +8692,18 @@ mod tests {
         }
         assert!(DASHBOARD_JS.contains("Platform v1 retained-session mode"));
         assert!(DASHBOARD_HTML.contains("no inference from conversation summaries"));
-        assert!(DASHBOARD_JS.contains("derivePresentation(cockpitDocument(view), selection)"));
+        assert!(DASHBOARD_JS.contains("derivePresentation(view, selection)"));
+        assert!(!DASHBOARD_JS.contains("function cockpitDocument"));
+        assert!(DASHBOARD_JS.contains("/api/platform/cockpit"));
         assert!(DASHBOARD_JS.contains("buildDeepLink"));
-        assert!(DASHBOARD_JS.contains("exact revision ${capability.exact_revision}"));
-        assert!(DASHBOARD_JS.contains("no mutation sent"));
+        assert!(DASHBOARD_JS.contains("platform_v2_lifecycle_adapter_pending"));
         assert!(
             DASHBOARD_JS
                 .contains("Outcome is ambiguous. Lookup by receipt identity without replay.")
         );
         assert!(!PLATFORM_COCKPIT_JS.contains(".summary"));
-        assert!(PLATFORM_COCKPIT_JS.contains("document.stale === true"));
-        assert!(PLATFORM_COCKPIT_JS.contains("capability.workspace_id !== workspace.id"));
+        assert!(PLATFORM_COCKPIT_JS.contains("automonique.dashboard.cockpit/v2"));
+        assert!(!PLATFORM_COCKPIT_JS.contains("automonique.cockpit/presentation/v1"));
         assert!(DASHBOARD_CSS.contains(".hosted-workspace-grid"));
         assert!(DASHBOARD_CSS.contains("@media (max-width: 760px)"));
         assert!(DASHBOARD_CSS.contains("@media (max-width: 460px)"));
@@ -9215,6 +9253,33 @@ mod tests {
             .as_bytes(),
         );
         assert!(wrong_lane.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+    }
+
+    #[test]
+    fn platform_cockpit_http_route_is_basic_only_json() {
+        let body = r#"{"action":"read"}"#;
+        let basic = format!("Basic {}", BASE64_STANDARD.encode("ops:fixture-password"));
+        let request_with = |authorization: &str| {
+            format!(
+                "POST /api/platform/cockpit HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nX-Forwarded-Proto: https\r\n{authorization}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let basic_response = exchange_without_integration(
+            request_with(&format!("Authorization: {basic}\r\n")).as_bytes(),
+        );
+        assert!(basic_response.starts_with(b"HTTP/1.1 500 Internal Server Error\r\n"));
+
+        let bearer_response = exchange_without_integration(
+            request_with("Authorization: Bearer fixture-token\r\n").as_bytes(),
+        );
+        assert!(bearer_response.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
+
+        let cookie = fixture_auth().session_cookie();
+        let cookie = cookie.split(';').next().unwrap();
+        let cookie_response =
+            exchange_without_integration(request_with(&format!("Cookie: {cookie}\r\n")).as_bytes());
+        assert!(cookie_response.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
     }
 
     #[test]

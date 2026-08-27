@@ -6,10 +6,11 @@ import "./platform-cockpit-core.js";
 const cockpit = globalThis.AutomoniquePlatformCockpit;
 
 const fixture = {
-  schema: "automonique.cockpit/presentation/v1",
-  capabilities: {
-    workspace_context: true,
-    workspace_actions: [{ action: "resume", workspace_id: "workspace-1", authority: "tenant.example", exact_revision: "9007199254740995" }],
+  schema: "automonique.dashboard.cockpit/v2",
+  mode: "v2",
+  actions: {
+    lifecycle: { available: false, category: "platform_v2_lifecycle_adapter_pending" },
+    review: { available: false, category: "platform_v2_review_adapter_pending" },
   },
   projects: [{ id: "project-1", label: "Automonique" }],
   hosts: [{ id: "host-1", label: "Hosted runner" }],
@@ -19,18 +20,10 @@ const fixture = {
     host_id: "host-1",
     session_id: "session-1",
     label: "Cockpit shell",
-    task: "Adapt the hosted shell",
-    branch: "feat/cockpit",
     attention: "needs_you",
     revision: "9007199254740995",
-    external_work: { state: "in_review", freshness: "fresh", unread: 3, reference: "issue-170" },
-    internal_agent: { state: "waiting", freshness: "stale", unread: 1 },
   }],
-  activities: [
-    { id: "later", at: "2026-08-27T10:05:00Z", kind: "check", label: "Checks completed", source: "checks" },
-    { id: "earlier", at: "2026-08-27T10:00:00Z", kind: "agent", label: "Agent paused", source: "agent", link: { workspace: "workspace-1", session: "session-1", pane: "pane-1", file: "file-1", hunk: "hunk-1", side: "head", line: "42" } },
-  ],
-  receipt: { state: "ambiguous", id: "receipt-1", message: "Lookup required" },
+  review: { state: "available", document: { files: [], checks: [], review: { decision: "pending" }, delivery: { state: "pending" } } },
 };
 
 test("decimal fences stay exact beyond Number.MAX_SAFE_INTEGER", () => {
@@ -61,7 +54,6 @@ test("v1 degrades explicitly and never infers workspace state from summaries", (
 test("malformed structured collections fail closed to unavailable presentation state", () => {
   const view = cockpit.derivePresentation({
     schema: "automonique.platform/v2",
-    capabilities: { workspace_context: true, workspace_actions: {} },
     projects: {},
     hosts: "host/path",
     workspaces: { summary: "working" },
@@ -74,32 +66,26 @@ test("malformed structured collections fail closed to unavailable presentation s
   expect(view.create.available).toBe(false);
 });
 
-test("structured fixtures keep external work and internal agent signals distinct", () => {
+test("server-owned structured fixture exposes exact selected workspace and review", () => {
   const view = cockpit.derivePresentation(fixture, { workspace: "workspace-1" });
   expect(view.mode).toBe("v2");
-  expect(view.selectedWorkspace.external_work).toEqual({ state: "in_review", freshness: "fresh", unread: 3, observed_at: null, reference: "issue-170" });
-  expect(view.selectedWorkspace.internal_agent).toEqual({ state: "waiting", freshness: "stale", unread: 1, observed_at: null, reference: null });
-  expect(view.selectedWorkspace.task).toBe("Adapt the hosted shell");
+  expect(view.selectedWorkspace.id).toBe("workspace-1");
+  expect(view.selectedWorkspace.revision).toBe("9007199254740995");
   expect(view.attention.needs_you).toBe(1);
-  expect(view.activities.map((item) => item.id)).toEqual(["earlier", "later"]);
-  expect(view.activities[0].deep_link).toBe("#sessions?workspace=workspace-1&session=session-1&pane=pane-1&file=file-1&hunk=hunk-1&side=head&line=42");
-  expect(view.receipt.state).toBe("ambiguous");
+  expect(view.readModels.files).toEqual([]);
+  expect(view.readModels.review).toEqual({ decision: "pending" });
 });
 
-test("action previews require a fresh exact revision, matching action, workspace, and authority", () => {
+test("lifecycle actions remain honestly disabled at the missing host adapter seam", () => {
   const view = cockpit.derivePresentation(fixture);
-  expect(view.create).toEqual({ available: false, reason: "not_advertised" });
-  expect(view.resume).toEqual({ available: true, action: "resume", authority: "tenant.example", exact_revision: "9007199254740995", workspace_id: "workspace-1" });
-  expect(cockpit.derivePresentation({ ...fixture, stale: true }).resume).toEqual({ available: false, reason: "stale" });
-  expect(cockpit.derivePresentation({ ...fixture, capabilities: { ...fixture.capabilities, workspace_actions: [{ action: "resume", workspace_id: "workspace-1", exact_revision: "2" }] } }).resume.reason).toBe("incomplete_capability");
-  expect(cockpit.derivePresentation({ ...fixture, capabilities: { ...fixture.capabilities, workspace_actions: [{ action: "resume", workspace_id: "workspace-1", authority: "tenant.example", exact_revision: "9007199254740996" }] } }).resume.reason).toBe("incomplete_capability");
+  expect(view.create).toEqual({ available: false, reason: "platform_v2_lifecycle_adapter_pending" });
+  expect(view.resume).toEqual({ available: false, reason: "platform_v2_lifecycle_adapter_pending" });
 });
 
-test("reducer exposes preview and typed receipt states without performing mutations", () => {
-  const capability = cockpit.derivePresentation(fixture).resume;
+test("reducer cannot manufacture a preview from an unavailable server action", () => {
   let state = cockpit.initialState({ workspace: "workspace-1" });
-  state = cockpit.reduce(state, { type: "preview", action: "resume", capability });
-  expect(state.preview).toEqual({ action: "resume", workspace_id: "workspace-1", authority: "tenant.example", exact_revision: "9007199254740995" });
+  state = cockpit.reduce(state, { type: "preview", action: "resume", capability: cockpit.derivePresentation(fixture).resume });
+  expect(state.preview).toBe(null);
   state = cockpit.reduce(state, { type: "receipt", receipt: { state: "pending", id: "receipt-2" } });
   expect(state.receipt.state).toBe("pending");
   state = cockpit.reduce(state, { type: "receipt", receipt: { state: "refused", message: "stale revision" } });
