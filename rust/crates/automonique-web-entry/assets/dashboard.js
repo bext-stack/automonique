@@ -4122,9 +4122,6 @@ byId("new-chat").addEventListener("click", async () => {
   }
 });
 
-byId("sidebar-new-chat").addEventListener("click", () => {
-  showView("chat");
-});
 byId("sidebar-sessions").addEventListener("click", () => showView("sessions"));
 
 function seedChatPrompt(prompt) {
@@ -4174,8 +4171,6 @@ platformMutation = readPlatformMutation();
 try { platformSelectedSession = sessionStorage.getItem("monique-platform-session"); } catch (_error) { platformSelectedSession = null; }
 if (platformMutation) platformSelectedSession = platformMutation.sessionId;
 refreshStatus();
-loadPlatform();
-loadProcesses();
 loadConfiguration();
 showView(window.location.hash.slice(1) || storedPreference("monique-start-view", startupViews, "sessions"));
 function scheduleStatusRefresh(delay = 10000) {

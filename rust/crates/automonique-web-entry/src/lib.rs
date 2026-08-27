@@ -8500,6 +8500,36 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_sidebar_keeps_recovery_controls_scrollable_and_focus_visible() {
+        assert!(DASHBOARD_CSS.contains("height: 100vh; height: 100dvh"));
+        assert!(DASHBOARD_CSS.contains("overflow-x: hidden; overflow-y: auto"));
+        assert!(DASHBOARD_CSS.contains("overscroll-behavior-y: contain"));
+        assert!(DASHBOARD_CSS.contains("scroll-padding-block: 12px"));
+        assert!(DASHBOARD_CSS.contains(".sidebar :is(a, button) { scroll-margin-block: 12px; }"));
+        assert!(DASHBOARD_CSS.contains("button:focus-visible"));
+        assert!(DASHBOARD_HTML.contains("class=\"nav-section-label recovery-nav-label\""));
+        assert!(DASHBOARD_HTML.contains("id=\"sidebar-new-chat\" data-view=\"chat\""));
+    }
+
+    #[test]
+    fn dashboard_navigation_loads_each_selected_conversation_surface_once() {
+        let show_view_start = DASHBOARD_JS.find("function showView(name)").unwrap();
+        let show_view_end = DASHBOARD_JS[show_view_start..]
+            .find("document.querySelectorAll(\"[data-view]\").forEach((button)")
+            .map(|offset| show_view_start + offset)
+            .unwrap();
+        let show_view = &DASHBOARD_JS[show_view_start..show_view_end];
+        assert_eq!(show_view.matches("loadChatHistory()").count(), 1);
+        assert_eq!(show_view.matches("loadPlatform()").count(), 1);
+        assert!(!DASHBOARD_JS.contains("byId(\"sidebar-new-chat\").addEventListener"));
+        assert!(DASHBOARD_JS.contains(
+            "refreshStatus();\nloadConfiguration();\nshowView(window.location.hash.slice(1)"
+        ));
+        assert!(!DASHBOARD_JS.contains("refreshStatus();\nloadPlatform();"));
+        assert!(!DASHBOARD_JS.contains("loadPlatform();\nloadProcesses();\nloadConfiguration();"));
+    }
+
+    #[test]
     fn dashboard_allows_same_origin_microphone_for_opt_in_voice_input() {
         let state = AppState::new(fixture_status());
         let response = String::from_utf8(response_bytes(

@@ -610,7 +610,9 @@ a { color: inherit; }
 .skip-link:focus { transform: none; }
 
 .app-shell { display: grid; grid-template-columns: var(--sidebar) minmax(0, 1fr); min-height: 100vh; transition: grid-template-columns .2s ease; }
-.sidebar { position: fixed; z-index: 12; display: flex; width: var(--sidebar); height: 100vh; flex-direction: column; border-right: 1px solid var(--line); background: linear-gradient(180deg, var(--sidebar-start), var(--sidebar-end)); transition: width .2s ease, transform .2s ease; }
+.sidebar { position: fixed; z-index: 12; display: flex; width: var(--sidebar); height: 100vh; height: 100dvh; overflow-x: hidden; overflow-y: auto; flex-direction: column; border-right: 1px solid var(--line); background: linear-gradient(180deg, var(--sidebar-start), var(--sidebar-end)); overscroll-behavior-y: contain; scroll-padding-block: 12px; scrollbar-gutter: stable; transition: width .2s ease, transform .2s ease; }
+.sidebar > :not(.sidebar-spacer) { flex-shrink: 0; }
+.sidebar :is(a, button) { scroll-margin-block: 12px; }
 .sidebar-header { display: flex; min-height: 72px; align-items: center; padding: 0 12px 0 8px; }
 .identity { display: flex; min-width: 0; flex: 1; gap: 12px; align-items: center; padding: 0 10px; text-decoration: none; }
 .identity-mark { display: grid; width: 38px; height: 38px; flex: 0 0 auto; place-items: center; border: 1px solid var(--accent-border); border-radius: 12px; color: var(--green); background: linear-gradient(145deg, var(--accent-surface-strong), var(--accent-surface)); font-family: ui-monospace, monospace; font-weight: 800; box-shadow: 0 8px 24px var(--accent-haze); transition: transform .18s ease, box-shadow .18s ease; }
@@ -637,7 +639,7 @@ a { color: inherit; }
 .nav-item.is-active { color: var(--text); background: var(--selected-surface); }
 .nav-item.is-active::after { width: 6px; height: 6px; border-radius: 50%; background: var(--green); content: ""; box-shadow: 0 0 0 3px var(--accent-glow); }
 .nav-item.is-active .nav-icon { color: var(--green); }
-.sidebar-spacer { flex: 1; }
+.sidebar-spacer { min-height: 12px; flex: 1 0 12px; }
 .recovery-nav-label { padding-top: 10px; border-top: 1px solid var(--line); }
 .secondary-nav { margin-bottom: 6px; }
 .recovery-nav-item { min-height: 40px; color: var(--quiet); font-size: var(--font-md); }
