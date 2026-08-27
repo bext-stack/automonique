@@ -18,10 +18,13 @@ use std::path::{Path, PathBuf};
 use automonique_protocol::platform::{IdempotencyKey, ReceiptId};
 use automonique_protocol::platform_v2::WorkContextIdentity;
 use automonique_protocol::platform_v2_review::{
-    ReviewActionId, ReviewActionReceipt, ReviewActionRequest, ReviewActorId, ReviewAuthentication,
-    ReviewAuthority, ReviewAuthorityId, ReviewAuthorityKind, ReviewComment, ReviewCommentId,
-    ReviewField, ReviewReceiptOutcome, ReviewReconciliation, ReviewSchemaVersion, ReviewSnapshot,
-    ReviewText,
+    AttentionEvent, AttentionOrigin, AttentionOriginKind, AttentionReason, CheckState,
+    CommentAgentState, ConflictState, DeliveryState, PullRequestState, ReviewAction,
+    ReviewActionId, ReviewActionReceipt, ReviewActionRequest, ReviewActorId,
+    ReviewAttentionEventId, ReviewAuthentication, ReviewAuthority, ReviewAuthorityId,
+    ReviewAuthorityKind, ReviewComment, ReviewCommentId, ReviewDecision, ReviewField,
+    ReviewFreshness, ReviewFreshnessState, ReviewReceiptOutcome, ReviewReconciliation,
+    ReviewSchemaVersion, ReviewSnapshot, ReviewStatusProjection, ReviewText,
 };
 use automonique_protocol::platform_v2_review_api::{
     decode_review_action_receipt, decode_review_action_request, decode_review_snapshot,
@@ -472,66 +475,10 @@ impl ReviewStore {
     /// Persist a revalidated sanitized snapshot and its normalized comments.
     pub fn put_snapshot(&mut self, snapshot: &ReviewSnapshot, recorded_at_ms: i64) -> Stored<()> {
         validate_time(recorded_at_ms)?;
-        let document = encode_review_snapshot(snapshot).map_err(protocol)?;
-        // This second pass pins the invariant that storage never accepts a value
-        // its wire decoder would later refuse.
-        decode_review_snapshot(&document).map_err(protocol)?;
-        let document_digest = digest(&document);
-        let (kind, workspace_id) = workspace_parts(snapshot.workspace());
-        let revision = db_revision(snapshot.revision())?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current: Option<i64> = transaction
-            .query_row(
-                "SELECT revision FROM review_current WHERE workspace_kind=?1 AND workspace_id=?2",
-                params![kind, workspace_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(current) = current {
-            if current == revision {
-                let existing: (Vec<u8>, Vec<u8>, String) = transaction.query_row(
-                    "SELECT document,document_digest,protocol_schema FROM review_snapshots WHERE workspace_kind=?1 AND workspace_id=?2 AND revision=?3",
-                    params![kind, workspace_id, revision], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
-                if digest(&existing.0).as_slice() != existing.1
-                    || existing.1.as_slice() != document_digest
-                    || existing.2 != snapshot.schema().as_str()
-                {
-                    return Err(ReviewStoreError::Conflict("snapshot_revision"));
-                }
-                transaction.commit()?;
-                return Ok(());
-            }
-            if revision
-                != current
-                    .checked_add(1)
-                    .ok_or(ReviewStoreError::InvalidField("revision"))?
-            {
-                return Err(ReviewStoreError::StaleRevision {
-                    current: parse_revision(current)?,
-                });
-            }
-            let previous = read_current_snapshot(&transaction, kind, workspace_id)?
-                .ok_or(ReviewStoreError::Corrupt("current_snapshot"))?;
-            if previous.schema() == ReviewSchemaVersion::V2
-                && snapshot.schema() == ReviewSchemaVersion::V1
-            {
-                return Err(ReviewStoreError::Conflict("snapshot_schema_downgrade"));
-            }
-            validate_comment_history(&previous, snapshot)?;
-        }
-        transaction.execute(
-            "INSERT INTO review_snapshots(workspace_kind,workspace_id,revision,document,document_digest,recorded_at_ms,protocol_schema) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            params![kind, workspace_id, revision, document, document_digest.as_slice(), recorded_at_ms, snapshot.schema().as_str()])?;
-        for comment in snapshot.comments() {
-            transaction.execute(
-                "INSERT INTO review_comments(workspace_kind,workspace_id,snapshot_revision,comment_id,comment_revision,actor_id,body,file_id,hunk_id,side,line,agent_state,unread) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-                params![kind, workspace_id, revision, comment.id().as_str(), db_revision(comment.revision())?, comment.actor().as_str(), comment.body().as_str(), comment.anchor().file_id().as_str(), comment.anchor().hunk_id().as_str(), comment.anchor().side().as_str(), i64::from(comment.anchor().line()), comment.agent_state().as_str(), i64::from(comment.unread())])?;
-        }
-        transaction.execute(
-            "INSERT INTO review_current(workspace_kind,workspace_id,revision) VALUES(?1,?2,?3) ON CONFLICT(workspace_kind,workspace_id) DO UPDATE SET revision=excluded.revision",
-            params![kind, workspace_id, revision])?;
+        persist_snapshot(&transaction, snapshot, recorded_at_ms)?;
         transaction.commit()?;
         Ok(())
     }
@@ -788,6 +735,157 @@ impl ReviewStore {
         validate_time(now_ms)?;
         require_active_authority(&self.connection, request, now_ms)?;
         validate_current_action(&self.connection, request)
+    }
+
+    /// Apply a store-owned review mutation in the same transaction that
+    /// records its write admission and terminal receipt. No accepted receipt
+    /// or externally replayable write can be stranded by a process crash.
+    pub fn execute_local_action(
+        &mut self,
+        request: &ReviewActionRequest,
+        recorded_at_ms: i64,
+    ) -> Stored<ReviewActionReceipt> {
+        validate_time(recorded_at_ms)?;
+        if !matches!(
+            request.action(),
+            ReviewAction::AddComment { .. } | ReviewAction::ApproveReview { .. }
+        ) {
+            return Err(ReviewStoreError::InvalidField("local_action"));
+        }
+        let request_document = encode_review_action_request(request).map_err(protocol)?;
+        decode_review_action_request(&request_document).map_err(protocol)?;
+        let protocol_request_digest = digest(&request_document);
+        let approval_policy = ApprovalPolicy::NotRequired;
+        let preview_document = encode_preview_document(&protocol_request_digest, approval_policy);
+        let request_digest = digest(&preview_document);
+        let (workspace_kind, workspace_id) = workspace_parts(request.workspace());
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_active_authority(&transaction, request, recorded_at_ms)?;
+
+        if let Some(existing) = read_action_by_key(
+            &transaction,
+            workspace_kind,
+            workspace_id,
+            request.actor().as_str(),
+            request.idempotency_key().as_str(),
+        )? {
+            if existing.request_digest != request_digest
+                || existing.approval_policy != approval_policy
+            {
+                return Err(ReviewStoreError::Conflict("idempotency_key"));
+            }
+            if is_terminal(existing.receipt.outcome()) {
+                transaction.commit()?;
+                return Ok(existing.receipt);
+            }
+            // An admission created by another execution path may already have
+            // crossed an effect boundary. Never reinterpret or replay it as a
+            // local write.
+            if existing.write_admitted_at_ms.is_some() {
+                let unknown = ReviewActionReceipt::new(
+                    existing.receipt.receipt_id().clone(),
+                    existing.receipt.idempotency_key().clone(),
+                    existing.receipt.action_id().clone(),
+                    existing.receipt.actor().clone(),
+                    ReviewReceiptOutcome::Unknown,
+                    None,
+                    None,
+                    ReviewReconciliation::PollReceipt,
+                )
+                .map_err(protocol)?;
+                update_receipt(&transaction, &existing.preview_id, &unknown, recorded_at_ms)?;
+                transaction.commit()?;
+                return Ok(unknown);
+            }
+        } else {
+            validate_current_action(&transaction, request)?;
+            let token = digest_token(&request_digest);
+            let preview_id = format!("preview_{token}");
+            let action_id = ReviewActionId::new(format!("action_{token}"))
+                .map_err(|_| ReviewStoreError::Corrupt("action_id"))?;
+            let receipt_id = ReceiptId::new(format!("receipt_{token}"))
+                .map_err(|_| ReviewStoreError::Corrupt("receipt_id"))?;
+            let accepted = ReviewActionReceipt::new(
+                receipt_id,
+                request.idempotency_key().clone(),
+                action_id,
+                request.actor().clone(),
+                ReviewReceiptOutcome::Accepted,
+                None,
+                None,
+                ReviewReconciliation::PollReceipt,
+            )
+            .map_err(protocol)?;
+            let receipt_document = encode_review_action_receipt(&accepted).map_err(protocol)?;
+            let receipt_digest = digest(&receipt_document);
+            transaction.execute(
+                "INSERT INTO review_action_previews(preview_id,workspace_kind,workspace_id,expected_revision,actor_id,authentication,authority_kind,authority_id,idempotency_key,action_kind,action_id,request_document,protocol_request_digest,preview_document,request_digest,approval_policy,approval_required,created_at_ms,write_admission_id,write_admitted_at_ms,write_admission_document,write_admission_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,0,?17,NULL,NULL,NULL,NULL)",
+                params![preview_id, workspace_kind, workspace_id, db_revision(request.expected_revision())?, request.actor().as_str(), request.authentication().as_str(), request.authority().kind().as_str(), request.authority().id().as_str(), request.idempotency_key().as_str(), request.action().kind().as_str(), accepted.action_id().as_str(), request_document, protocol_request_digest.as_slice(), preview_document, request_digest.as_slice(), approval_policy.as_str(), recorded_at_ms],
+            )?;
+            transaction.execute(
+                "INSERT INTO review_action_receipts(receipt_id,preview_id,receipt_document,receipt_digest,request_digest,approval_digest,outcome,result_revision,current_revision,updated_at_ms) VALUES(?1,?2,?3,?4,?5,NULL,?6,NULL,NULL,?7)",
+                params![accepted.receipt_id().as_str(), preview_id, receipt_document, receipt_digest.as_slice(), request_digest.as_slice(), accepted.outcome().as_str(), recorded_at_ms],
+            )?;
+        }
+
+        let action = read_action_by_key(
+            &transaction,
+            workspace_kind,
+            workspace_id,
+            request.actor().as_str(),
+            request.idempotency_key().as_str(),
+        )?
+        .ok_or(ReviewStoreError::Corrupt("preview"))?;
+        if let Err(error) = validate_current_action(&transaction, &action.request) {
+            if let ReviewStoreError::StaleRevision { current } = error {
+                let conflict = ReviewActionReceipt::new(
+                    action.receipt.receipt_id().clone(),
+                    action.receipt.idempotency_key().clone(),
+                    action.receipt.action_id().clone(),
+                    action.receipt.actor().clone(),
+                    ReviewReceiptOutcome::Conflict,
+                    None,
+                    Some(current),
+                    ReviewReconciliation::Final,
+                )
+                .map_err(protocol)?;
+                update_receipt(&transaction, &action.preview_id, &conflict, recorded_at_ms)?;
+                transaction.commit()?;
+                return Ok(conflict);
+            }
+            return Err(error);
+        }
+        let admission_id = write_admission_id(&action, None, recorded_at_ms)?;
+        let admission_document =
+            encode_write_admission(&action, None, recorded_at_ms, &admission_id)?;
+        let admission_digest = digest(&admission_document);
+        let changed = transaction.execute(
+            "UPDATE review_action_previews SET write_admission_id=?1,write_admitted_at_ms=?2,write_admission_document=?3,write_admission_digest=?4 WHERE preview_id=?5 AND write_admitted_at_ms IS NULL",
+            params![admission_id, recorded_at_ms, admission_document, admission_digest.as_slice(), action.preview_id],
+        )?;
+        if changed != 1 {
+            return Err(ReviewStoreError::Conflict("write_admission"));
+        }
+        let current = read_current_snapshot(&transaction, workspace_kind, workspace_id)?
+            .ok_or(ReviewStoreError::Corrupt("current_snapshot"))?;
+        let next = local_action_snapshot(&current, request, &action.receipt, recorded_at_ms)?;
+        persist_snapshot(&transaction, &next, recorded_at_ms)?;
+        let completed = ReviewActionReceipt::new(
+            action.receipt.receipt_id().clone(),
+            action.receipt.idempotency_key().clone(),
+            action.receipt.action_id().clone(),
+            action.receipt.actor().clone(),
+            ReviewReceiptOutcome::Completed,
+            Some(next.revision()),
+            None,
+            ReviewReconciliation::Final,
+        )
+        .map_err(protocol)?;
+        update_receipt(&transaction, &action.preview_id, &completed, recorded_at_ms)?;
+        transaction.commit()?;
+        Ok(completed)
     }
 
     pub fn decide_action(
@@ -1906,6 +2004,215 @@ fn read_current_snapshot(
     read_snapshot_revision(connection, kind, id, parse_revision(current_revision)?)?
         .ok_or(ReviewStoreError::Corrupt("current_snapshot"))
         .map(Some)
+}
+
+fn persist_snapshot(
+    connection: &Connection,
+    snapshot: &ReviewSnapshot,
+    recorded_at_ms: i64,
+) -> Stored<()> {
+    let document = encode_review_snapshot(snapshot).map_err(protocol)?;
+    // Storage accepts only a value that its canonical decoder accepts again.
+    decode_review_snapshot(&document).map_err(protocol)?;
+    let document_digest = digest(&document);
+    let (kind, workspace_id) = workspace_parts(snapshot.workspace());
+    let revision = db_revision(snapshot.revision())?;
+    let current: Option<i64> = connection
+        .query_row(
+            "SELECT revision FROM review_current WHERE workspace_kind=?1 AND workspace_id=?2",
+            params![kind, workspace_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(current) = current {
+        if current == revision {
+            let existing: (Vec<u8>, Vec<u8>, String) = connection.query_row(
+                "SELECT document,document_digest,protocol_schema FROM review_snapshots WHERE workspace_kind=?1 AND workspace_id=?2 AND revision=?3",
+                params![kind, workspace_id, revision],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            if digest(&existing.0).as_slice() != existing.1
+                || existing.1.as_slice() != document_digest
+                || existing.2 != snapshot.schema().as_str()
+            {
+                return Err(ReviewStoreError::Conflict("snapshot_revision"));
+            }
+            return Ok(());
+        }
+        if revision
+            != current
+                .checked_add(1)
+                .ok_or(ReviewStoreError::InvalidField("revision"))?
+        {
+            return Err(ReviewStoreError::StaleRevision {
+                current: parse_revision(current)?,
+            });
+        }
+        let previous = read_current_snapshot(connection, kind, workspace_id)?
+            .ok_or(ReviewStoreError::Corrupt("current_snapshot"))?;
+        if previous.schema() == ReviewSchemaVersion::V2
+            && snapshot.schema() == ReviewSchemaVersion::V1
+        {
+            return Err(ReviewStoreError::Conflict("snapshot_schema_downgrade"));
+        }
+        validate_comment_history(&previous, snapshot)?;
+    }
+    connection.execute(
+        "INSERT INTO review_snapshots(workspace_kind,workspace_id,revision,document,document_digest,recorded_at_ms,protocol_schema) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        params![kind, workspace_id, revision, document, document_digest.as_slice(), recorded_at_ms, snapshot.schema().as_str()],
+    )?;
+    for comment in snapshot.comments() {
+        connection.execute(
+            "INSERT INTO review_comments(workspace_kind,workspace_id,snapshot_revision,comment_id,comment_revision,actor_id,body,file_id,hunk_id,side,line,agent_state,unread) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![kind, workspace_id, revision, comment.id().as_str(), db_revision(comment.revision())?, comment.actor().as_str(), comment.body().as_str(), comment.anchor().file_id().as_str(), comment.anchor().hunk_id().as_str(), comment.anchor().side().as_str(), i64::from(comment.anchor().line()), comment.agent_state().as_str(), i64::from(comment.unread())],
+        )?;
+    }
+    connection.execute(
+        "INSERT INTO review_current(workspace_kind,workspace_id,revision) VALUES(?1,?2,?3) ON CONFLICT(workspace_kind,workspace_id) DO UPDATE SET revision=excluded.revision",
+        params![kind, workspace_id, revision],
+    )?;
+    Ok(())
+}
+
+fn local_action_snapshot(
+    current: &ReviewSnapshot,
+    request: &ReviewActionRequest,
+    receipt: &ReviewActionReceipt,
+    recorded_at_ms: i64,
+) -> Stored<ReviewSnapshot> {
+    if current.schema() != ReviewSchemaVersion::V2
+        || current.workspace() != request.workspace()
+        || current.revision() != request.expected_revision()
+    {
+        return Err(ReviewStoreError::Conflict("local_action_snapshot"));
+    }
+    let next_revision = current
+        .revision()
+        .get()
+        .checked_add(1)
+        .and_then(|value| Revision::new(value).ok())
+        .ok_or(ReviewStoreError::InvalidField("revision"))?;
+    let mut comments = current.comments().to_vec();
+    let mut review = current.review().clone();
+    let approving = match request.action() {
+        ReviewAction::AddComment {
+            comment_id,
+            anchor,
+            body,
+        } => {
+            comments.push(ReviewComment::new(
+                comment_id.clone(),
+                Revision::FIRST,
+                request.actor().clone(),
+                body.clone(),
+                anchor.clone(),
+                CommentAgentState::NotSent,
+                false,
+            ));
+            comments.sort_by(|left, right| left.id().as_str().cmp(right.id().as_str()));
+            false
+        }
+        ReviewAction::ApproveReview { .. } => {
+            let observed_at_ms = u64::try_from(recorded_at_ms)
+                .map_err(|_| ReviewStoreError::InvalidField("time"))?;
+            review = ReviewStatusProjection::new(
+                ReviewDecision::Approved,
+                current.review().authority().clone(),
+                ReviewFreshness::new(ReviewFreshnessState::Fresh, next_revision, observed_at_ms)
+                    .map_err(protocol)?,
+            )
+            .map_err(protocol)?;
+            true
+        }
+        _ => return Err(ReviewStoreError::InvalidField("local_action")),
+    };
+
+    let mut attention_events = Vec::with_capacity(current.attention_events().len() + 1);
+    for event in current.attention_events() {
+        if approving
+            && matches!(
+                event.reason(),
+                AttentionReason::ReviewRequested | AttentionReason::ApprovalRequired
+            )
+        {
+            continue;
+        }
+        if matches!(
+            event.reason(),
+            AttentionReason::Conflict | AttentionReason::Complete
+        ) {
+            let origin = AttentionOrigin::new(
+                event.origin().kind(),
+                event.origin().id().cloned(),
+                event.origin().authority().clone(),
+                next_revision,
+            )
+            .map_err(protocol)?;
+            attention_events.push(
+                AttentionEvent::new(event.id().clone(), origin, event.reason(), event.unread())
+                    .map_err(protocol)?,
+            );
+        } else {
+            attention_events.push(event.clone());
+        }
+    }
+    let complete = approving
+        && current
+            .files()
+            .iter()
+            .all(|file| file.conflict() != ConflictState::Unresolved)
+        && current
+            .checks()
+            .iter()
+            .filter(|check| check.required())
+            .all(|check| {
+                check.freshness().state() == ReviewFreshnessState::Fresh
+                    && check.state() == CheckState::Passed
+            })
+        && current.pull_request().freshness().state() == ReviewFreshnessState::Fresh
+        && matches!(
+            current.pull_request().state(),
+            PullRequestState::Absent | PullRequestState::Merged
+        )
+        && current.delivery().freshness().state() == ReviewFreshnessState::Fresh
+        && matches!(
+            current.delivery().state(),
+            DeliveryState::NotDelivered | DeliveryState::Delivered
+        );
+    if complete
+        && !attention_events
+            .iter()
+            .any(|event| event.reason() == AttentionReason::Complete)
+    {
+        let event_id =
+            ReviewAttentionEventId::new(format!("complete_{}", receipt.action_id().as_str()))
+                .map_err(protocol)?;
+        let origin = AttentionOrigin::new(
+            AttentionOriginKind::Snapshot,
+            None,
+            review.authority().clone(),
+            next_revision,
+        )
+        .map_err(protocol)?;
+        attention_events.push(
+            AttentionEvent::new(event_id, origin, AttentionReason::Complete, 0)
+                .map_err(protocol)?,
+        );
+    }
+    attention_events.sort_by(|left, right| left.id().as_str().cmp(right.id().as_str()));
+    ReviewSnapshot::new(
+        current.workspace().clone(),
+        next_revision,
+        current.files().to_vec(),
+        comments,
+        current.proposals().to_vec(),
+        current.checks().to_vec(),
+        review,
+        current.pull_request().clone(),
+        current.delivery().clone(),
+        attention_events,
+    )
+    .map_err(protocol)
 }
 
 fn read_snapshot_revision(

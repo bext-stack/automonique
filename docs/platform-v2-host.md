@@ -179,9 +179,23 @@ that existing directory as a successful `create` would fabricate a lifecycle
 effect, so this release does not do so. Issuing a genuinely new task workspace
 requires a future lineage schema that can hold an unbound task without
 weakening its foreign-key authority.
-Review actions
-still validate the server-selected role and current review revision, then
-refuse before custody because git/CI/pull-request workers are not configured.
+Review actions validate the server-selected role, exact authority identity,
+current snapshot revision, target revision, lifecycle, and freshness. Anchored
+`add_comment` and `approve_review` effects are store-owned: the next canonical
+snapshot, immutable write admission, actor-attributed request, and completed
+receipt commit in one SQLite `IMMEDIATE` transaction. A crash therefore cannot
+expose an accepted local write, and an exact idempotency replay returns the
+same terminal receipt without advancing the snapshot again. The policy file is
+fenced immediately before and after this transaction.
+
+Agent comment delivery, stage/unstage/commit/conflict resolution, CI reruns,
+and pull-request open/update/merge still have no credential-and-target-bound
+provider registry. After full authority and target validation they refuse
+before custody as `platform_v2_review_agent_adapter_unavailable`,
+`platform_v2_review_git_adapter_unavailable`,
+`platform_v2_review_ci_adapter_unavailable`, or
+`platform_v2_review_pull_request_adapter_unavailable`. No request text becomes
+a path, command, provider payload, or credential.
 Cancellations of already-existing durable lineage intents remain immediate,
 final store operations.
 
