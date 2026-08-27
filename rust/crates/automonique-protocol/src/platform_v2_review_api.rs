@@ -738,7 +738,7 @@ pub fn decode_review_snapshot(payload: &[u8]) -> Result<ReviewSnapshot, ReviewAp
     Ok(snapshot)
 }
 
-fn action_json(value: &ReviewAction) -> Result<JsonValue, ReviewApiError> {
+pub(crate) fn action_json(value: &ReviewAction) -> Result<JsonValue, ReviewApiError> {
     let (kind, payload) = match value {
         ReviewAction::AddComment {
             comment_id,
@@ -881,7 +881,7 @@ fn action_json(value: &ReviewAction) -> Result<JsonValue, ReviewApiError> {
         ("payload", payload),
     ]))
 }
-fn action(value: &JsonValue) -> Result<ReviewAction, ReviewApiError> {
+pub(crate) fn action(value: &JsonValue) -> Result<ReviewAction, ReviewApiError> {
     fields(value, &["kind", "payload"])?;
     let payload = get(value, "payload")?;
     Ok(match ReviewActionKind::parse(string(value, "kind")?)? {

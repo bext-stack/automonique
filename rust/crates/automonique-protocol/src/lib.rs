@@ -40,6 +40,7 @@ pub mod platform_v2_lineage;
 pub mod platform_v2_lineage_api;
 pub mod platform_v2_review;
 pub mod platform_v2_review_api;
+pub mod platform_v2_transport;
 pub mod primitives;
 pub mod progress_api;
 pub mod protocols;

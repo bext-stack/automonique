@@ -1,0 +1,319 @@
+// SPDX-License-Identifier: Elastic-2.0
+
+import {
+  byteLength,
+  decodeFrameWithLimit,
+  decodeMessageAdmitted,
+  encodeFrameWithLimit,
+  encodeMessage,
+  isWellFormedUnicode,
+  parseCanonical,
+  toCanonicalBytes,
+  WireError,
+  type JsonValue,
+} from "./runtime.js";
+import {
+  IdempotencyKey,
+  PLATFORM_PROTOCOL,
+  PlatformRequestId,
+  ReceiptId,
+  type IdempotencyKey as IdempotencyKeyValue,
+  type PlatformRequestId as PlatformRequestIdValue,
+  type ReceiptId as ReceiptIdValue,
+} from "./platform.js";
+import {
+  MutationApprovalId,
+  MutationPreviewDigest,
+  MutationPreviewId,
+  MAX_MUTATION_CANONICAL_BYTES,
+  PLATFORM_SCHEMA_V2,
+  ProjectId,
+  SupportedPlatformVersionNumber,
+  UserWorkspaceId,
+  WorkspaceIntentId,
+  WorkContextRevision,
+  decodeLineageProjection,
+  decodeNegotiatedPlatform,
+  decodePlatformVersionOffer,
+  decodeWorkContextMutationPreview,
+  decodeWorkContextMutationRefusal,
+  decodeWorkContextPage,
+  decodeWorkContextResync,
+  decodeWorkspaceIntentOutcome,
+  encodePlatformVersionOffer,
+  encodeWorkContextQuery,
+  encodeWorkspaceIntent,
+  validateWorkContextIdentity,
+  validateWorkContextMutationIntent,
+  validateWorkContextRecord,
+  type LineageProjection,
+  type MutationApprovalDecision,
+  type MutationPreview,
+  type MutationApprovalId as MutationApprovalIdValue,
+  type MutationPreviewDigest as MutationPreviewDigestValue,
+  type MutationPreviewRef,
+  type MutationRefusal,
+  type NegotiatedPlatform,
+  type PlatformVersionOffer,
+  type ProjectId as ProjectIdValue,
+  type UserWorkspaceId as UserWorkspaceIdValue,
+  type WorkspaceIntent,
+  type WorkspaceIntentId as WorkspaceIntentIdValue,
+  type WorkspaceIntentOutcome,
+  type WorkContextIdentity,
+  type WorkContextMutationIntent,
+  type WorkContextPage,
+  type WorkContextQuery,
+  type WorkContextRecord,
+  type WorkContextResync,
+  type WorkContextRevision as WorkContextRevisionValue,
+} from "./work-context.js";
+import {
+  PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR,
+  PLATFORM_REVIEW_SCHEMA_V1,
+  decodeReviewActionReceipt,
+  decodeReviewSnapshot,
+  validateReviewAction,
+  type ReviewAction,
+  type ReviewActionReceipt,
+  type ReviewSnapshot,
+} from "./review-context.js";
+
+const negotiatedV2: NegotiatedPlatform = {
+  schema: PLATFORM_SCHEMA_V2,
+  version: SupportedPlatformVersionNumber(2n),
+  work_context: "v2_structured",
+};
+
+export interface PlatformV2Refusal {
+  readonly category: string;
+  readonly explanation: string;
+  readonly schema: typeof PLATFORM_SCHEMA_V2;
+}
+
+export type PlatformNegotiationRequest = {
+  readonly kind: "negotiate";
+  readonly offer: PlatformVersionOffer;
+};
+export type PlatformNegotiationResponse =
+  | {readonly kind: "negotiated"; readonly negotiated: NegotiatedPlatform}
+  | {readonly kind: "platform_v2_refused"; readonly refusal: PlatformV2Refusal};
+
+export interface MutationPrepareRequest {
+  readonly idempotency_key: IdempotencyKeyValue;
+  readonly intent: WorkContextMutationIntent;
+}
+export interface MutationDecisionRequest {
+  readonly decision: MutationApprovalDecision;
+  readonly preview: MutationPreviewRef;
+  readonly preview_digest: MutationPreviewDigestValue;
+}
+export interface MutationSubmitRequest {
+  readonly approval_id: MutationApprovalIdValue | null;
+  readonly preview: MutationPreviewRef;
+  readonly preview_digest: MutationPreviewDigestValue;
+}
+export type MutationReceiptLookup =
+  | {readonly project: ProjectIdValue; readonly receipt_id: ReceiptIdValue}
+  | {readonly project: ProjectIdValue; readonly idempotency_key: IdempotencyKeyValue};
+export interface LineageReadRequest {
+  readonly project: ProjectIdValue;
+  readonly workspace: UserWorkspaceIdValue;
+}
+export interface WorkspaceIntentRequest {
+  readonly project: ProjectIdValue;
+  readonly intent: WorkspaceIntent;
+}
+export interface WorkspaceIntentLookup {
+  readonly project: ProjectIdValue;
+  readonly intent_id: WorkspaceIntentIdValue;
+}
+export interface ReviewReadRequest {
+  readonly project: ProjectIdValue;
+  readonly workspace: ReviewWorkspaceIdentity;
+}
+export type ReviewWorkspaceIdentity = Extract<WorkContextIdentity, {readonly kind: "user_workspace" | "attempt_workspace" | "session"}>;
+export interface ReviewActionTransportRequest {
+  readonly workspace: ReviewWorkspaceIdentity;
+  readonly expected_revision: WorkContextRevisionValue;
+  readonly action: ReviewAction;
+  readonly idempotency_key: IdempotencyKeyValue;
+}
+export interface ReviewReceiptLookup {
+  readonly project: ProjectIdValue;
+  readonly workspace: ReviewWorkspaceIdentity;
+  readonly idempotency_key: IdempotencyKeyValue;
+}
+
+export type PlatformV2Request =
+  | {readonly kind: "query_work_contexts"; readonly query: WorkContextQuery & {readonly project: ProjectIdValue}}
+  | {readonly kind: "get_work_context"; readonly identity: WorkContextIdentity}
+  | {readonly kind: "prepare_mutation"; readonly request: MutationPrepareRequest}
+  | {readonly kind: "decide_mutation"; readonly request: MutationDecisionRequest}
+  | {readonly kind: "submit_mutation"; readonly request: MutationSubmitRequest}
+  | {readonly kind: "get_mutation_receipt"; readonly lookup: MutationReceiptLookup}
+  | {readonly kind: "get_lineage"; readonly request: LineageReadRequest}
+  | {readonly kind: "submit_workspace_intent"; readonly request: WorkspaceIntentRequest}
+  | {readonly kind: "get_workspace_intent"; readonly lookup: WorkspaceIntentLookup}
+  | {readonly kind: "get_review"; readonly request: ReviewReadRequest}
+  | {readonly kind: "execute_review_action"; readonly request: ReviewActionTransportRequest}
+  | {readonly kind: "get_review_receipt"; readonly lookup: ReviewReceiptLookup};
+
+export interface RawMutationApprovalDocument { readonly canonical: Uint8Array }
+export interface RawMutationReceiptDocument { readonly canonical: Uint8Array }
+export type PlatformV2Response =
+  | {readonly kind: "work_context_page"; readonly page: WorkContextPage}
+  | {readonly kind: "work_context_resync"; readonly resync: WorkContextResync}
+  | {readonly kind: "work_context_record"; readonly record: WorkContextRecord}
+  | {readonly kind: "mutation_preview"; readonly preview: MutationPreview}
+  | {readonly kind: "mutation_approval"; readonly approval: RawMutationApprovalDocument}
+  | {readonly kind: "mutation_receipt"; readonly receipt: RawMutationReceiptDocument}
+  | {readonly kind: "mutation_refused"; readonly refusal: MutationRefusal}
+  | {readonly kind: "lineage_result"; readonly lineage: LineageProjection}
+  | {readonly kind: "workspace_intent_result"; readonly result: WorkspaceIntentOutcome}
+  | {readonly kind: "review_result"; readonly review: ReviewSnapshot}
+  | {readonly kind: "review_receipt"; readonly receipt: ReviewActionReceipt}
+  | {readonly kind: "platform_v2_refused"; readonly refusal: PlatformV2Refusal};
+
+function json(value: unknown): JsonValue {
+  if (value === null) return {kind: "null"};
+  if (typeof value === "boolean") return {kind: "bool", value};
+  if (typeof value === "bigint") return {kind: "integer", value};
+  if (typeof value === "string") return {kind: "string", value};
+  if (Array.isArray(value)) return {kind: "array", items: value.map(json)};
+  if (typeof value === "object") return {kind: "object", entries: Object.entries(value as Readonly<Record<string, unknown>>).map(([key, item]) => [key, json(item)] as const)};
+  throw new WireError("invalid_json_value", "unsupported transport body value");
+}
+function plain(value: JsonValue): unknown {
+  switch (value.kind) {
+    case "null": return null;
+    case "bool": case "integer": case "string": return value.value;
+    case "array": return value.items.map(plain);
+    case "object": return Object.fromEntries(value.entries.map(([key, item]) => [key, plain(item)]));
+  }
+}
+function fields(value: JsonValue, expected: readonly string[]): Map<string, JsonValue> {
+  if (value.kind !== "object" || value.entries.length !== expected.length) throw new WireError("invalid_json_value", "transport body shape");
+  const result = new Map(value.entries);
+  if (result.size !== expected.length || expected.some((field) => !result.has(field))) throw new WireError("invalid_json_value", "transport body fields");
+  return result;
+}
+function stringField(value: Map<string, JsonValue>, name: string): string {
+  const item = value.get(name); if (item?.kind !== "string") throw new WireError("invalid_json_value", name); return item.value;
+}
+function integerField(value: Map<string, JsonValue>, name: string): bigint {
+  const item = value.get(name); if (item?.kind !== "integer") throw new WireError("invalid_json_value", name); return item.value;
+}
+function valueField(value: Map<string, JsonValue>, name: string): JsonValue {
+  const item = value.get(name); if (item === undefined) throw new WireError("missing_field", name); return item;
+}
+function document(bytes: Uint8Array): JsonValue { return parseCanonical(bytes); }
+function bodyBytes(value: JsonValue): Uint8Array { return toCanonicalBytes(value); }
+function boundedRefusalString(value: string, maximum: number): string {
+  if (!isWellFormedUnicode(value) || byteLength(value) === 0 || byteLength(value) > maximum || /\p{Cc}/u.test(value)) throw new WireError("invalid_json_value", "platform v2 refusal string");
+  return value;
+}
+function boundedRefusal(value: JsonValue): PlatformV2Refusal {
+  const body = fields(value, ["category", "explanation", "schema"]);
+  const category = boundedRefusalString(stringField(body, "category"), 128);
+  const explanation = boundedRefusalString(stringField(body, "explanation"), 512);
+  if (stringField(body, "schema") !== PLATFORM_SCHEMA_V2) throw new WireError("invalid_json_value", "platform v2 refusal");
+  return {category, explanation, schema: PLATFORM_SCHEMA_V2};
+}
+const MUTATION_APPROVAL_FIELDS = ["approval", "schema"] as const;
+const MUTATION_RECEIPT_FIELDS = ["approval_id", "id", "idempotency_key", "outcome", "preview", "preview_digest", "recorded_at_ms", "request_digest", "resulting_revision", "schema"] as const;
+function rawMutationDocument(value: JsonValue, bytes: Uint8Array, expected: readonly string[]): Uint8Array {
+  if (bytes.length > MAX_MUTATION_CANONICAL_BYTES) throw new WireError("frame_too_large", `maximum is ${MAX_MUTATION_CANONICAL_BYTES}`);
+  const body = fields(value, expected);
+  if (stringField(body, "schema") !== PLATFORM_SCHEMA_V2) throw new WireError("invalid_json_value", "lifecycle schema is incompatible");
+  return bytes;
+}
+function message(protocol: string, version: number, requestId: PlatformRequestIdValue, kind: string, body: JsonValue, maximum: number): Uint8Array {
+  const bytes = encodeMessage({envelope: {protocol, version, requestId: PlatformRequestId(requestId), kind}, body});
+  if (bytes.length > maximum) throw new WireError("frame_too_large", `maximum is ${maximum}`);
+  return bytes;
+}
+function admitted(payload: Uint8Array, maximum: number, protocol: string, version: number) {
+  if (payload.length > maximum) throw new WireError("frame_too_large", `maximum is ${maximum}`);
+  return decodeMessageAdmitted(payload, [{protocol, minVersion: version, maxVersion: version}]);
+}
+function reviewWorkspace(value: WorkContextIdentity): ReviewWorkspaceIdentity {
+  const workspace = validateWorkContextIdentity(value);
+  if (!(["user_workspace", "attempt_workspace", "session"] as const).includes(workspace.kind as "user_workspace" | "attempt_workspace" | "session")) throw new WireError("invalid_json_value", "review workspace kind");
+  return workspace as ReviewWorkspaceIdentity;
+}
+function previewRef(value: MutationPreviewRef): MutationPreviewRef {
+  return {id: MutationPreviewId(value.id), revision: WorkContextRevision(value.revision)};
+}
+
+export function encodePlatformNegotiationRequest(requestId: PlatformRequestIdValue, request: PlatformNegotiationRequest): Uint8Array {
+  if (request.kind !== "negotiate") throw new WireError("invalid_json_value", "negotiation kind");
+  return message(PLATFORM_NEGOTIATION_PROTOCOL, PLATFORM_NEGOTIATION_MAJOR, requestId, request.kind, document(encodePlatformVersionOffer(request.offer)), MAX_PLATFORM_NEGOTIATION_REQUEST_CANONICAL_BYTES);
+}
+export function decodePlatformNegotiationRequest(payload: Uint8Array): {readonly request_id: PlatformRequestIdValue; readonly request: PlatformNegotiationRequest} {
+  const decoded = admitted(payload, MAX_PLATFORM_NEGOTIATION_REQUEST_CANONICAL_BYTES, PLATFORM_NEGOTIATION_PROTOCOL, PLATFORM_NEGOTIATION_MAJOR);
+  if (decoded.envelope.kind !== "negotiate") throw new WireError("invalid_json_value", "negotiation kind");
+  return {request_id: PlatformRequestId(decoded.envelope.requestId), request: {kind: "negotiate", offer: decodePlatformVersionOffer(bodyBytes(decoded.body))}};
+}
+export function decodePlatformNegotiationResponse(payload: Uint8Array, requestId: PlatformRequestIdValue, offer: PlatformVersionOffer): PlatformNegotiationResponse {
+  const decoded = admitted(payload, MAX_PLATFORM_NEGOTIATION_RESPONSE_CANONICAL_BYTES, PLATFORM_NEGOTIATION_PROTOCOL, PLATFORM_NEGOTIATION_MAJOR);
+  if (decoded.envelope.requestId !== requestId) throw new WireError("invalid_json_value", "response correlation");
+  if (decoded.envelope.kind === "platform_v2_refused") return {kind: "platform_v2_refused", refusal: boundedRefusal(decoded.body)};
+  if (decoded.envelope.kind !== "negotiated") throw new WireError("invalid_json_value", "negotiation response kind");
+  const negotiated = decodeNegotiatedPlatform(bodyBytes(decoded.body));
+  if (!offer.versions.some((version) => BigInt(version) === BigInt(negotiated.version))) throw new WireError("invalid_json_value", "server selected an unoffered Platform major");
+  return {kind: "negotiated", negotiated};
+}
+
+function requestBody(request: PlatformV2Request): JsonValue {
+  switch (request.kind) {
+    case "query_work_contexts": { if (request.query.project === null) throw new WireError("invalid_json_value", "project scope"); return document(encodeWorkContextQuery(request.query)); }
+    case "get_work_context": return json(validateWorkContextIdentity(request.identity));
+    case "prepare_mutation": return json({idempotency_key: IdempotencyKey(request.request.idempotency_key), intent: validateWorkContextMutationIntent(request.request.intent), schema: PLATFORM_SCHEMA_V2});
+    case "decide_mutation": { const value=request.request; if (value.decision!=="granted"&&value.decision!=="denied") throw new WireError("invalid_json_value", "decision"); return json({decision:value.decision,preview:previewRef(value.preview),preview_digest:MutationPreviewDigest(value.preview_digest),schema:PLATFORM_SCHEMA_V2}); }
+    case "submit_mutation": { const value=request.request; return json({approval_id:value.approval_id===null?null:MutationApprovalId(value.approval_id),preview:previewRef(value.preview),preview_digest:MutationPreviewDigest(value.preview_digest),schema:PLATFORM_SCHEMA_V2}); }
+    case "get_mutation_receipt": return "receipt_id" in request.lookup ? json({idempotency_key:null,project:ProjectId(request.lookup.project),receipt_id:ReceiptId(request.lookup.receipt_id),schema:PLATFORM_SCHEMA_V2,workspace:null}) : json({idempotency_key:IdempotencyKey(request.lookup.idempotency_key),project:ProjectId(request.lookup.project),receipt_id:null,schema:PLATFORM_SCHEMA_V2,workspace:null});
+    case "get_lineage": return json({project:ProjectId(request.request.project),schema:PLATFORM_SCHEMA_V2,workspace:UserWorkspaceId(request.request.workspace)});
+    case "submit_workspace_intent": return json({intent:plain(document(encodeWorkspaceIntent(negotiatedV2,request.request.intent))),project:ProjectId(request.request.project),schema:PLATFORM_SCHEMA_V2});
+    case "get_workspace_intent": return json({intent_id:WorkspaceIntentId(request.lookup.intent_id),project:ProjectId(request.lookup.project),schema:PLATFORM_SCHEMA_V2});
+    case "get_review": return json({project:ProjectId(request.request.project),schema:PLATFORM_SCHEMA_V2,workspace:reviewWorkspace(request.request.workspace)});
+    case "execute_review_action": { const value=request.request; return json({action:validateReviewAction(value.action),expected_revision:WorkContextRevision(value.expected_revision),idempotency_key:IdempotencyKey(value.idempotency_key),platform_version:BigInt(PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR),schema:PLATFORM_REVIEW_SCHEMA_V1,workspace:reviewWorkspace(value.workspace)}); }
+    case "get_review_receipt": return json({idempotency_key:IdempotencyKey(request.lookup.idempotency_key),project:ProjectId(request.lookup.project),schema:PLATFORM_SCHEMA_V2,workspace:reviewWorkspace(request.lookup.workspace)});
+  }
+}
+export function encodePlatformV2Request(requestId: PlatformRequestIdValue, request: PlatformV2Request): Uint8Array {
+  return message(PLATFORM_PROTOCOL, PLATFORM_V2_MAJOR, requestId, request.kind, requestBody(request), MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES);
+}
+
+const responseKinds: Readonly<Record<PlatformV2Request["kind"], readonly string[]>> = {
+  query_work_contexts:["work_context_page","work_context_resync"],get_work_context:["work_context_record"],prepare_mutation:["mutation_preview","mutation_refused"],decide_mutation:["mutation_approval","mutation_refused"],submit_mutation:["mutation_receipt","mutation_refused"],get_mutation_receipt:["mutation_receipt","mutation_refused"],get_lineage:["lineage_result"],submit_workspace_intent:["workspace_intent_result"],get_workspace_intent:["workspace_intent_result"],get_review:["review_result"],execute_review_action:["review_receipt"],get_review_receipt:["review_receipt"],
+};
+export function decodePlatformV2Response(payload: Uint8Array, requestId: PlatformRequestIdValue, requestKind: PlatformV2Request["kind"]): PlatformV2Response {
+  const decoded = admitted(payload, MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES, PLATFORM_PROTOCOL, PLATFORM_V2_MAJOR);
+  if (decoded.envelope.requestId !== requestId) throw new WireError("invalid_json_value", "response correlation");
+  if (decoded.envelope.kind === "platform_v2_refused") return {kind:"platform_v2_refused",refusal:boundedRefusal(decoded.body)};
+  if (!responseKinds[requestKind].includes(decoded.envelope.kind)) throw new WireError("invalid_json_value", "response kind does not answer request");
+  const bytes=bodyBytes(decoded.body);
+  switch(decoded.envelope.kind){
+    case "work_context_page":return {kind:"work_context_page",page:decodeWorkContextPage(bytes)};
+    case "work_context_resync":return {kind:"work_context_resync",resync:decodeWorkContextResync(bytes)};
+    case "work_context_record":return {kind:"work_context_record",record:validateWorkContextRecord(plain(decoded.body) as WorkContextRecord)};
+    case "mutation_preview":return {kind:"mutation_preview",preview:decodeWorkContextMutationPreview(bytes)};
+    case "mutation_approval":return {kind:"mutation_approval",approval:{canonical:rawMutationDocument(decoded.body,bytes,MUTATION_APPROVAL_FIELDS)}};
+    case "mutation_receipt":return {kind:"mutation_receipt",receipt:{canonical:rawMutationDocument(decoded.body,bytes,MUTATION_RECEIPT_FIELDS)}};
+    case "mutation_refused":return {kind:"mutation_refused",refusal:decodeWorkContextMutationRefusal(bytes)};
+    case "lineage_result":return {kind:"lineage_result",lineage:decodeLineageProjection(negotiatedV2,bytes)};
+    case "workspace_intent_result":return {kind:"workspace_intent_result",result:decodeWorkspaceIntentOutcome(negotiatedV2,bytes)};
+    case "review_result":return {kind:"review_result",review:decodeReviewSnapshot(bytes)};
+    case "review_receipt":return {kind:"review_receipt",receipt:decodeReviewActionReceipt(bytes)};
+    default:throw new WireError("invalid_json_value","unknown Platform v2 response kind");
+  }
+}
+
+function completeFrame(frame: Uint8Array, maximum: number): Uint8Array {
+  const decoded=decodeFrameWithLimit(frame,maximum);if(decoded.kind!=="frame"||decoded.consumed!==frame.length)throw new WireError("invalid_json_value","incomplete or concatenated frame");return decoded.payload;
+}
+export function encodePlatformNegotiationRequestFrame(requestId: PlatformRequestIdValue, request: PlatformNegotiationRequest): Uint8Array { return encodeFrameWithLimit(encodePlatformNegotiationRequest(requestId,request),MAX_PLATFORM_NEGOTIATION_REQUEST_CANONICAL_BYTES); }
+export function decodePlatformNegotiationResponseFrame(frame: Uint8Array, requestId: PlatformRequestIdValue, offer: PlatformVersionOffer): PlatformNegotiationResponse { return decodePlatformNegotiationResponse(completeFrame(frame,MAX_PLATFORM_NEGOTIATION_RESPONSE_CANONICAL_BYTES),requestId,offer); }
+export function encodePlatformV2RequestFrame(requestId: PlatformRequestIdValue, request: PlatformV2Request): Uint8Array { return encodeFrameWithLimit(encodePlatformV2Request(requestId,request),MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES); }
+export function decodePlatformV2ResponseFrame(frame: Uint8Array, requestId: PlatformRequestIdValue, requestKind: PlatformV2Request["kind"]): PlatformV2Response { return decodePlatformV2Response(completeFrame(frame,MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES),requestId,requestKind); }

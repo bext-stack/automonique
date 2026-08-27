@@ -50,6 +50,35 @@ mod platform_surface {
     }
 }
 
+mod platform_v2_transport_surface {
+    use super::*;
+
+    #[test]
+    fn generated_typescript_matches_rust_transport_bytes_and_response_policy() {
+        let runtime = javascript_runtime().unwrap_or_else(|| {
+            record_js_gap("the Platform v2 transport cross-language fixture did not run");
+            "bun"
+        });
+        if javascript_runtime().is_none() {
+            return;
+        }
+        let output = Command::new(runtime)
+            .arg(package_root().join("conformance/platform-v2-transport-runtime.ts"))
+            .current_dir(package_root())
+            .output()
+            .expect("the TypeScript transport runtime starts");
+        assert!(
+            output.status.success(),
+            "Platform v2 transport fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "{\"fixture_lines\":2,\"negotiation_bytes\":186,\"unoffered_refused\":true,\"v1_ceiling_preserved\":true,\"v2_bytes\":153}\n"
+        );
+    }
+}
+
 mod work_context_surface {
     use super::*;
 
