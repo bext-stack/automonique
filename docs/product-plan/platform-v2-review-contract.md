@@ -11,11 +11,18 @@ meaning into a v1 summary string. A v1-only peer continues to receive exactly
 the installed Platform v1 contract and no structured review projection.
 
 This slice defines shared values, exact canonical codecs, generated TypeScript,
-and deterministic fixtures. It does not implement a daemon route, durable
-store, git adapter, CI adapter, pull-request adapter, or client UI. Runtime
-implementations must construct these values only from already authorized,
-sanitized observations and must persist actions and receipts before claiming an
-outcome.
+deterministic fixtures, and an authoritative SQLite custody layer. The store
+persists only revalidated canonical snapshots; normalizes anchored comments and
+their explicit sent-to-agent state; and atomically binds action previews,
+approvals, receipts, actor, workspace, expected revision, authority, request
+digest, and idempotency key. External provider observations are kept in a
+separate table and cannot create local authority grants.
+
+There is still no daemon route, git adapter, shell adapter, CI adapter,
+pull-request adapter, provider adapter, or client UI. A future daemon must
+obtain authority decisions from its local policy registry before installing a
+store grant, and adapters must reconcile the existing receipt after ambiguous
+writes rather than replaying a mutation.
 
 ## One authoritative snapshot
 
