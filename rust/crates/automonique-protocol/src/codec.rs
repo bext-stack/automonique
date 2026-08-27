@@ -22,7 +22,7 @@ use crate::primitives::ValueError;
 pub const LENGTH_PREFIX_BYTES: usize = 4;
 
 /// Maximum payload bytes in one frame.
-pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024 + 512;
 
 /// Maximum structural nesting depth accepted during decode.
 pub const MAX_NESTING_DEPTH: usize = 32;

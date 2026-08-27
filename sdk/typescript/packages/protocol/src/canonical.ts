@@ -18,7 +18,7 @@ export const MAX_REQUEST_ID_BYTES = 128;
 export const MAX_MESSAGE_KIND_BYTES = 64;
 export const MAX_ENUM_VALUE_BYTES = 64;
 export const LENGTH_PREFIX_BYTES = 4;
-export const MAX_FRAME_BYTES = 8 * 1024 * 1024;
+export const MAX_FRAME_BYTES = 8 * 1024 * 1024 + 512;
 
 const I64_MIN = -(2n ** 63n);
 const I64_MAX = 2n ** 63n - 1n;
