@@ -5123,9 +5123,7 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         },
         Route::Styles => Response::static_asset("text/css; charset=utf-8", DASHBOARD_CSS),
         Route::Script => Response::static_asset("text/javascript; charset=utf-8", DASHBOARD_JS),
-        Route::QrCodeScript => {
-            Response::static_asset("text/javascript; charset=utf-8", QRCODE_JS)
-        }
+        Route::QrCodeScript => Response::static_asset("text/javascript; charset=utf-8", QRCODE_JS),
         Route::Favicon => Response::static_asset("image/svg+xml", FAVICON_SVG),
         Route::Robots => Response::static_asset("text/plain; charset=utf-8", ROBOTS_TXT),
         Route::ApiStatus => Response {
