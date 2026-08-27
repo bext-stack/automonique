@@ -189,7 +189,7 @@ impl PlatformV2LifecycleEffectAdapter for UnavailableLifecycleEffectAdapter {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct PolicyGeneration {
+pub(crate) struct PolicyGeneration {
     device: u64,
     inode: u64,
     changed_seconds: i64,
@@ -198,6 +198,12 @@ struct PolicyGeneration {
     modified_nanoseconds: i64,
     length: u64,
     digest: Sha256Digest,
+}
+
+impl PolicyGeneration {
+    pub(crate) const fn digest(&self) -> Sha256Digest {
+        self.digest
+    }
 }
 
 #[derive(Debug)]
@@ -409,6 +415,57 @@ pub fn verify_web_principal_binding(
         return Err("platform_v2_web_binding_mismatch");
     }
     Ok(())
+}
+
+pub(crate) fn verify_bootstrap_policy(
+    policy_path: &Path,
+    expected_uid: u32,
+    tenant: &str,
+    projects: &BTreeSet<ProjectId>,
+    ownership: &BTreeMap<WorkContextIdentity, ProjectId>,
+) -> Result<PolicyGeneration, &'static str> {
+    let snapshot = read_policy_snapshot(policy_path, expected_uid)?
+        .ok_or("platform_v2_bootstrap_policy_missing")?;
+    let document: PolicyDocument =
+        serde_json::from_slice(&snapshot.bytes).map_err(|_| "platform_v2_policy_invalid")?;
+    let principals = parse_policy(document)?;
+    let principal = if principals.len() == 1 {
+        principals.get(&expected_uid)
+    } else {
+        None
+    }
+    .ok_or("platform_v2_bootstrap_policy_ambiguous")?;
+    if principal.actor.tenant() != tenant
+        || &principal.projects != projects
+        || principal.workspaces.len() != ownership.len()
+        || principal
+            .workspaces
+            .iter()
+            .any(|(identity, scope)| ownership.get(identity) != Some(&scope.project))
+    {
+        return Err("platform_v2_bootstrap_policy_mismatch");
+    }
+    Ok(snapshot.generation)
+}
+
+pub(crate) fn verify_bootstrap_store(
+    policy_path: &Path,
+    expected_uid: u32,
+    store: &WorkContextStore,
+) -> Result<PolicyGeneration, &'static str> {
+    let snapshot = read_policy_snapshot(policy_path, expected_uid)?
+        .ok_or("platform_v2_bootstrap_policy_missing")?;
+    let document: PolicyDocument =
+        serde_json::from_slice(&snapshot.bytes).map_err(|_| "platform_v2_policy_invalid")?;
+    let principals = parse_policy(document)?;
+    let principal = if principals.len() == 1 {
+        principals.get(&expected_uid)
+    } else {
+        None
+    }
+    .ok_or("platform_v2_bootstrap_policy_ambiguous")?;
+    validate_principal_mappings(store, principal)?;
+    Ok(snapshot.generation)
 }
 
 impl PlatformV2Runtime {
@@ -1600,7 +1657,11 @@ fn mutation_store_refusal(
         WorkContextStoreError::ApprovalExpired => MutationRefusalCategory::ApprovalExpired,
         WorkContextStoreError::PreviewExpired => MutationRefusalCategory::PreviewExpired,
         WorkContextStoreError::Unavailable => MutationRefusalCategory::Unavailable,
-        WorkContextStoreError::ReconcileRequired => MutationRefusalCategory::Unknown,
+        WorkContextStoreError::ReconcileRequired
+        | WorkContextStoreError::BootstrapPartial
+        | WorkContextStoreError::BootstrapMismatch
+        | WorkContextStoreError::BootstrapDowngrade
+        | WorkContextStoreError::BootstrapGuard => MutationRefusalCategory::Unknown,
     };
     Ok(MutationRefusal::new(
         category,
