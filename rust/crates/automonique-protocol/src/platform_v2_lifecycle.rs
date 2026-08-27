@@ -20,9 +20,9 @@ use crate::digest::{DigestError, Sha256, Sha256Digest};
 use crate::identity::Actor;
 use crate::platform::{IdempotencyKey, ReceiptId, ReceiptOutcome, ResourceAuthority};
 use crate::platform_v2::{
-    CheckoutKind, HostSetupKind, WorkContextAttributes, WorkContextIdentity, WorkContextKind,
-    WorkContextLabel, WorkContextLifecycle, WorkContextRecord, WorkContextRelation,
-    WorkContextRelationKind,
+    CheckoutKind, HostSetupKind, ProjectId, WorkContextAttributes, WorkContextIdentity,
+    WorkContextKind, WorkContextLabel, WorkContextLifecycle, WorkContextRecord,
+    WorkContextRelation, WorkContextRelationKind,
 };
 use crate::primitives::{BoundedString, EpochMillis, IdDomain, OpaqueId, Revision, ValueError};
 
@@ -221,6 +221,68 @@ impl ExpectedWorkContext {
     #[must_use]
     pub const fn revision(&self) -> Revision {
         self.revision
+    }
+}
+
+/// Whether an authority-qualified external relation target was resolved while
+/// the server assembled a mutation preview.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ExternalParentResolution {
+    Available,
+    Unavailable,
+}
+
+impl ExternalParentResolution {
+    pub const ALL: [Self; 2] = [Self::Available, Self::Unavailable];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, LifecycleError> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == value)
+            .ok_or(LifecycleError::UnknownExternalResolution)
+    }
+}
+
+/// An authoritative parent observation captured by the server when it builds
+/// a preview. Work-context parents carry their entire record. Only repository
+/// relations may use the external form, which preserves the exact v1 identity,
+/// revision, resolution result, and optional informational project owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolvedParentSnapshot {
+    WorkContext {
+        record: WorkContextRecord,
+    },
+    External {
+        identity: WorkContextIdentity,
+        revision: Revision,
+        resolution: ExternalParentResolution,
+        owning_project: Option<ProjectId>,
+    },
+}
+
+impl ResolvedParentSnapshot {
+    #[must_use]
+    pub const fn identity(&self) -> &WorkContextIdentity {
+        match self {
+            Self::WorkContext { record } => record.identity(),
+            Self::External { identity, .. } => identity,
+        }
+    }
+
+    #[must_use]
+    pub const fn revision(&self) -> Revision {
+        match self {
+            Self::WorkContext { record } => record.revision(),
+            Self::External { revision, .. } => *revision,
+        }
     }
 }
 
@@ -777,6 +839,36 @@ impl WorkContextRequestDigest {
     }
 }
 
+/// SHA-256 of the exact canonical preview document. This is distinct from the
+/// proposal request digest because it also binds server-resolved parents,
+/// current/resulting records, authority ceilings, policy, and expiry.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct MutationPreviewDigest(Sha256Digest);
+
+impl MutationPreviewDigest {
+    #[must_use]
+    pub const fn from_digest(digest: Sha256Digest) -> Self {
+        Self(digest)
+    }
+    #[must_use]
+    pub const fn digest(self) -> Sha256Digest {
+        self.0
+    }
+}
+
+impl fmt::Display for MutationPreviewDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for MutationPreviewDigest {
+    type Err = DigestError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value.parse().map(Self)
+    }
+}
+
 impl fmt::Display for WorkContextRequestDigest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
@@ -1002,11 +1094,145 @@ impl MutationApprovalRequirement {
     }
 }
 
+fn parent_expectations(intent: &WorkContextMutationIntent) -> Vec<&ExpectedWorkContext> {
+    match intent {
+        WorkContextMutationIntent::CreateProject(value) => value.repositories().iter().collect(),
+        WorkContextMutationIntent::CreateHostSetup(value) => vec![value.project()],
+        WorkContextMutationIntent::CreateCheckout(value) => {
+            vec![value.project(), value.host_setup(), value.repository()]
+        }
+        WorkContextMutationIntent::CreateUserWorkspace(value) => {
+            vec![value.project(), value.checkout()]
+        }
+        WorkContextMutationIntent::CreateAttemptWorkspace(value) => vec![value.user_workspace()],
+        WorkContextMutationIntent::ResumeAttemptWorkspace(_)
+        | WorkContextMutationIntent::ResumeSession(_)
+        | WorkContextMutationIntent::ArchiveProject(_)
+        | WorkContextMutationIntent::ArchiveHostSetup(_)
+        | WorkContextMutationIntent::ArchiveCheckout(_)
+        | WorkContextMutationIntent::ArchiveUserWorkspace(_) => Vec::new(),
+    }
+}
+
+fn validate_parent_snapshots(
+    intent: &WorkContextMutationIntent,
+    snapshots: &[ResolvedParentSnapshot],
+) -> Result<(), LifecycleError> {
+    let expected = parent_expectations(intent);
+    if expected.len() != snapshots.len() {
+        return Err(LifecycleError::ParentSnapshotMismatch);
+    }
+    for (expected, snapshot) in expected.into_iter().zip(snapshots) {
+        if expected.identity() != snapshot.identity() || expected.revision() != snapshot.revision()
+        {
+            return Err(LifecycleError::ParentSnapshotMismatch);
+        }
+        match snapshot {
+            ResolvedParentSnapshot::WorkContext { record } => {
+                if matches!(
+                    record.identity().kind(),
+                    crate::platform_v2::WorkContextTargetKind::Repository
+                        | crate::platform_v2::WorkContextTargetKind::PlatformSession
+                ) {
+                    return Err(LifecycleError::ParentSnapshotMismatch);
+                }
+            }
+            ResolvedParentSnapshot::External {
+                identity,
+                resolution,
+                owning_project,
+                ..
+            } => {
+                if identity.kind() != crate::platform_v2::WorkContextTargetKind::Repository {
+                    return Err(LifecycleError::ParentSnapshotMismatch);
+                }
+                if *resolution == ExternalParentResolution::Unavailable {
+                    return Err(LifecycleError::ParentUnavailable);
+                }
+                if let WorkContextMutationIntent::CreateCheckout(value) = intent {
+                    let WorkContextIdentity::Project(selected_project) = value.project().identity()
+                    else {
+                        return Err(LifecycleError::ParentSnapshotMismatch);
+                    };
+                    if owning_project
+                        .as_ref()
+                        .is_some_and(|owner| owner != selected_project)
+                    {
+                        return Err(LifecycleError::ParentProjectMismatch);
+                    }
+                }
+            }
+        }
+    }
+    let work_context = |index: usize| match snapshots.get(index) {
+        Some(ResolvedParentSnapshot::WorkContext { record }) => Ok(record),
+        _ => Err(LifecycleError::ParentSnapshotMismatch),
+    };
+    let active = |record: &WorkContextRecord| {
+        if record.lifecycle() == WorkContextLifecycle::Active {
+            Ok(())
+        } else {
+            Err(LifecycleError::ParentLifecycleInvalid)
+        }
+    };
+    let has_relation = |record: &WorkContextRecord,
+                        kind: WorkContextRelationKind,
+                        target: &WorkContextIdentity| {
+        record
+            .relations()
+            .iter()
+            .any(|relation| relation.kind() == kind && relation.target() == target)
+    };
+    match intent {
+        WorkContextMutationIntent::CreateProject(_) => {}
+        WorkContextMutationIntent::CreateHostSetup(_) => active(work_context(0)?)?,
+        WorkContextMutationIntent::CreateCheckout(value) => {
+            let project = work_context(0)?;
+            let host_setup = work_context(1)?;
+            active(project)?;
+            active(host_setup)?;
+            if !has_relation(
+                host_setup,
+                WorkContextRelationKind::HostSetupProject,
+                value.project().identity(),
+            ) || !has_relation(
+                project,
+                WorkContextRelationKind::ProjectRepository,
+                value.repository().identity(),
+            ) {
+                return Err(LifecycleError::ParentProjectMismatch);
+            }
+        }
+        WorkContextMutationIntent::CreateUserWorkspace(value) => {
+            let project = work_context(0)?;
+            let checkout = work_context(1)?;
+            active(project)?;
+            active(checkout)?;
+            if !has_relation(
+                checkout,
+                WorkContextRelationKind::CheckoutProject,
+                value.project().identity(),
+            ) {
+                return Err(LifecycleError::ParentProjectMismatch);
+            }
+        }
+        WorkContextMutationIntent::CreateAttemptWorkspace(_) => active(work_context(0)?)?,
+        WorkContextMutationIntent::ResumeAttemptWorkspace(_)
+        | WorkContextMutationIntent::ResumeSession(_)
+        | WorkContextMutationIntent::ArchiveProject(_)
+        | WorkContextMutationIntent::ArchiveHostSetup(_)
+        | WorkContextMutationIntent::ArchiveCheckout(_)
+        | WorkContextMutationIntent::ArchiveUserWorkspace(_) => {}
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MutationPreview {
     preview: MutationPreviewRef,
     proposal: WorkContextMutationProposal,
     current: Option<WorkContextRecord>,
+    parent_snapshots: Vec<ResolvedParentSnapshot>,
     resulting: WorkContextRecord,
     inherited_authority: WorkContextAuthority,
     effective_authority: WorkContextAuthority,
@@ -1022,6 +1248,7 @@ impl MutationPreview {
         proposal: WorkContextMutationProposal,
         current: Option<WorkContextRecord>,
         issued_identity: Option<WorkContextIdentity>,
+        parent_snapshots: Vec<ResolvedParentSnapshot>,
         inherited_authority: WorkContextAuthority,
         effective_authority: WorkContextAuthority,
         approval: MutationApprovalRequirement,
@@ -1036,6 +1263,7 @@ impl MutationPreview {
         {
             return Err(LifecycleError::CurrentRecordMismatch);
         }
+        validate_parent_snapshots(proposal.intent(), &parent_snapshots)?;
         match proposal.intent().requested_authority() {
             Some(requested) => {
                 if requested != &effective_authority
@@ -1057,6 +1285,7 @@ impl MutationPreview {
             preview,
             proposal,
             current,
+            parent_snapshots,
             resulting,
             inherited_authority,
             effective_authority,
@@ -1076,6 +1305,10 @@ impl MutationPreview {
     #[must_use]
     pub const fn current(&self) -> Option<&WorkContextRecord> {
         self.current.as_ref()
+    }
+    #[must_use]
+    pub fn parent_snapshots(&self) -> &[ResolvedParentSnapshot] {
+        &self.parent_snapshots
     }
     #[must_use]
     pub const fn resulting(&self) -> &WorkContextRecord {
@@ -1130,6 +1363,7 @@ pub struct MutationApproval {
     id: MutationApprovalId,
     preview: MutationPreviewRef,
     request_digest: WorkContextRequestDigest,
+    preview_digest: MutationPreviewDigest,
     idempotency_key: IdempotencyKey,
     decision: MutationApprovalDecision,
     decided_by: Actor,
@@ -1141,6 +1375,7 @@ impl MutationApproval {
     pub fn new(
         id: MutationApprovalId,
         preview: &MutationPreview,
+        preview_digest: MutationPreviewDigest,
         decision: MutationApprovalDecision,
         decided_by: Actor,
         decided_at: EpochMillis,
@@ -1156,6 +1391,7 @@ impl MutationApproval {
             id,
             preview: preview.preview.clone(),
             request_digest: preview.proposal.request_digest,
+            preview_digest,
             idempotency_key: preview.proposal.idempotency_key.clone(),
             decision,
             decided_by,
@@ -1174,6 +1410,10 @@ impl MutationApproval {
     #[must_use]
     pub const fn request_digest(&self) -> WorkContextRequestDigest {
         self.request_digest
+    }
+    #[must_use]
+    pub const fn preview_digest(&self) -> MutationPreviewDigest {
+        self.preview_digest
     }
     #[must_use]
     pub const fn idempotency_key(&self) -> &IdempotencyKey {
@@ -1201,6 +1441,7 @@ impl MutationApproval {
 pub struct MutationSubmission {
     preview: MutationPreviewRef,
     request_digest: WorkContextRequestDigest,
+    preview_digest: MutationPreviewDigest,
     idempotency_key: IdempotencyKey,
     approval_id: Option<MutationApprovalId>,
     submitted_at: EpochMillis,
@@ -1209,6 +1450,7 @@ pub struct MutationSubmission {
 impl MutationSubmission {
     pub fn new(
         preview: &MutationPreview,
+        preview_digest: MutationPreviewDigest,
         approval: Option<&MutationApproval>,
         submitted_at: EpochMillis,
     ) -> Result<Self, LifecycleError> {
@@ -1228,6 +1470,7 @@ impl MutationSubmission {
             (MutationApprovalRequirement::Required, Some(approval)) => {
                 if approval.preview() != preview.preview()
                     || approval.request_digest() != preview.proposal().request_digest()
+                    || approval.preview_digest() != preview_digest
                     || approval.idempotency_key() != preview.proposal().idempotency_key()
                 {
                     return Err(LifecycleError::ApprovalMismatch);
@@ -1244,6 +1487,7 @@ impl MutationSubmission {
         Ok(Self {
             preview: preview.preview.clone(),
             request_digest: preview.proposal.request_digest,
+            preview_digest,
             idempotency_key: preview.proposal.idempotency_key.clone(),
             approval_id,
             submitted_at,
@@ -1256,6 +1500,10 @@ impl MutationSubmission {
     #[must_use]
     pub const fn request_digest(&self) -> WorkContextRequestDigest {
         self.request_digest
+    }
+    #[must_use]
+    pub const fn preview_digest(&self) -> MutationPreviewDigest {
+        self.preview_digest
     }
     #[must_use]
     pub const fn idempotency_key(&self) -> &IdempotencyKey {
@@ -1276,6 +1524,7 @@ pub struct MutationReceipt {
     id: ReceiptId,
     preview: MutationPreviewRef,
     request_digest: WorkContextRequestDigest,
+    preview_digest: MutationPreviewDigest,
     idempotency_key: IdempotencyKey,
     approval_id: Option<MutationApprovalId>,
     outcome: ReceiptOutcome,
@@ -1288,11 +1537,13 @@ impl MutationReceipt {
         id: ReceiptId,
         submission: &MutationSubmission,
         preview: &MutationPreview,
+        preview_digest: MutationPreviewDigest,
         outcome: ReceiptOutcome,
         recorded_at: EpochMillis,
     ) -> Result<Self, LifecycleError> {
         if submission.preview() != preview.preview()
             || submission.request_digest() != preview.proposal().request_digest()
+            || submission.preview_digest() != preview_digest
             || submission.idempotency_key() != preview.proposal().idempotency_key()
         {
             return Err(LifecycleError::SubmissionMismatch);
@@ -1311,6 +1562,7 @@ impl MutationReceipt {
             id,
             preview: submission.preview.clone(),
             request_digest: submission.request_digest,
+            preview_digest: submission.preview_digest,
             idempotency_key: submission.idempotency_key.clone(),
             approval_id: submission.approval_id.clone(),
             outcome,
@@ -1329,6 +1581,10 @@ impl MutationReceipt {
     #[must_use]
     pub const fn request_digest(&self) -> WorkContextRequestDigest {
         self.request_digest
+    }
+    #[must_use]
+    pub const fn preview_digest(&self) -> MutationPreviewDigest {
+        self.preview_digest
     }
     #[must_use]
     pub const fn idempotency_key(&self) -> &IdempotencyKey {
@@ -1457,6 +1713,10 @@ pub enum LifecycleError {
     TargetKindInvalid,
     TargetMismatch,
     ExpectedRevisionMismatch,
+    ParentSnapshotMismatch,
+    ParentProjectMismatch,
+    ParentLifecycleInvalid,
+    ParentUnavailable,
     RelationLimit,
     RelationOrder,
     IssuedIdentityRequired,
@@ -1470,6 +1730,7 @@ pub enum LifecycleError {
     PreviewExpired,
     UnknownApprovalRequirement,
     UnknownApprovalDecision,
+    UnknownExternalResolution,
     ApprovalRequired,
     ApprovalUnexpected,
     ApprovalMismatch,
@@ -1498,6 +1759,10 @@ impl fmt::Display for LifecycleError {
             Self::ExpectedRevisionMismatch => {
                 "current record revision does not match expected revision"
             }
+            Self::ParentSnapshotMismatch => "resolved parent snapshot does not match the intent",
+            Self::ParentProjectMismatch => "resolved parent belongs to another project",
+            Self::ParentLifecycleInvalid => "resolved parent lifecycle does not admit children",
+            Self::ParentUnavailable => "resolved external parent is unavailable",
             Self::RelationLimit => "operation relation limit exceeded",
             Self::RelationOrder => "operation relations are repeated or unordered",
             Self::IssuedIdentityRequired => "create preview requires an issued identity",
@@ -1513,6 +1778,7 @@ impl fmt::Display for LifecycleError {
             Self::PreviewExpired => "mutation preview has expired",
             Self::UnknownApprovalRequirement => "approval requirement is unknown",
             Self::UnknownApprovalDecision => "approval decision is unknown",
+            Self::UnknownExternalResolution => "external parent resolution is unknown",
             Self::ApprovalRequired => "approval is required",
             Self::ApprovalUnexpected => "approval is unexpected",
             Self::ApprovalMismatch => "approval does not bind the exact preview",

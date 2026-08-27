@@ -150,14 +150,23 @@ reserved for a hibernated `AttemptWorkspace` or `Session`. Archive remains
 non-destructive and does not cancel an active attempt implicitly.
 
 Before submission, the server produces a bounded preview of the exact current
-record, resulting record, inherited authority, and effective authority. Actor,
+record, resulting record, inherited authority, effective authority, and every
+resolved parent. Work-context parents carry their complete authoritative
+record. Repository parents carry their complete v1 identity, exact revision,
+an explicit available/unavailable resolution, and an optional informational
+owning project. Unavailable repositories are refused. Checkout creation also
+refuses an available repository owned by a different selected project and
+proves the selected project's repository relation plus the host setup's project
+relation; project creation does not treat the optional owner as exclusive
+membership. Actor,
 serving resource authority, idempotency key, all six authority axes
 (filesystem, credentials, network, tools, providers, and models), and the typed
 intent are bound by the canonical request digest. Effective authority must be
 a subset of both the authenticated actor ceiling and inherited ceiling.
 Approval, when policy requires it, targets the exact preview ID and revision,
-request digest, idempotency key, and expiry. Submission and receipt repeat
-those bindings. Ambiguous outcomes are reconciled by receipt identity or
+the SHA-256 digest of the complete canonical preview body, request digest,
+idempotency key, and expiry. Submission and receipt repeat those bindings.
+Ambiguous outcomes are reconciled by receipt identity or
 idempotency key and never replayed blindly; `unknown` and `resync_required` are
 lookup outcomes and cannot be persisted as mutation receipts.
 

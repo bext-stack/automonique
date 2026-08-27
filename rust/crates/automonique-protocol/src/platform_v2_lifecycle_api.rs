@@ -5,9 +5,10 @@
 use core::fmt;
 use core::str::FromStr;
 
+use crate::digest::Sha256;
 use crate::identity::Actor;
 use crate::platform::{IdempotencyKey, ReceiptId, ReceiptOutcome, ResourceAuthority};
-use crate::platform_v2::{PLATFORM_SCHEMA_V2, WorkContextLabel};
+use crate::platform_v2::{PLATFORM_SCHEMA_V2, ProjectId, WorkContextLabel};
 use crate::platform_v2_api::{
     WorkContextApiError, admitted_document, array, exact_fields, identity, identity_json, integer,
     object, record, record_json, string, unsigned,
@@ -475,6 +476,76 @@ fn preview_ref(value: &JsonValue) -> Result<MutationPreviewRef, LifecycleApiErro
     ))
 }
 
+fn parent_snapshot_json(value: &ResolvedParentSnapshot) -> Result<JsonValue, LifecycleApiError> {
+    Ok(match value {
+        ResolvedParentSnapshot::WorkContext { record } => object(vec![
+            ("kind", JsonValue::String("work_context".to_owned())),
+            ("record", record_json(record)?),
+        ]),
+        ResolvedParentSnapshot::External {
+            identity,
+            revision,
+            resolution,
+            owning_project,
+        } => object(vec![
+            ("identity", identity_json(identity)),
+            ("kind", JsonValue::String("external".to_owned())),
+            (
+                "owning_project",
+                owning_project.as_ref().map_or(JsonValue::Null, |project| {
+                    JsonValue::String(project.as_str().to_owned())
+                }),
+            ),
+            (
+                "resolution",
+                JsonValue::String(resolution.as_str().to_owned()),
+            ),
+            ("revision", integer(revision.get(), "revision")?),
+        ]),
+    })
+}
+
+fn parent_snapshot(value: &JsonValue) -> Result<ResolvedParentSnapshot, LifecycleApiError> {
+    match string(value, "kind")? {
+        "work_context" => {
+            exact_fields(value, &["kind", "record"])?;
+            Ok(ResolvedParentSnapshot::WorkContext {
+                record: record(field(value, "record")?)?,
+            })
+        }
+        "external" => {
+            exact_fields(
+                value,
+                &[
+                    "identity",
+                    "kind",
+                    "owning_project",
+                    "resolution",
+                    "revision",
+                ],
+            )?;
+            let owning_project =
+                match field(value, "owning_project")? {
+                    JsonValue::Null => None,
+                    JsonValue::String(value) => Some(ProjectId::new(value.clone()).map_err(
+                        |_| LifecycleError::Field {
+                            field: "owning_project",
+                        },
+                    )?),
+                    _ => return Err(LifecycleApiError::InvalidBody),
+                };
+            Ok(ResolvedParentSnapshot::External {
+                identity: identity(field(value, "identity")?)?,
+                revision: Revision::new(unsigned(value, "revision")?)
+                    .map_err(|_| LifecycleError::Field { field: "revision" })?,
+                resolution: ExternalParentResolution::parse(string(value, "resolution")?)?,
+                owning_project,
+            })
+        }
+        _ => Err(LifecycleError::Field { field: "kind" }.into()),
+    }
+}
+
 fn preview_json(preview: &MutationPreview) -> Result<JsonValue, LifecycleApiError> {
     Ok(object(vec![
         (
@@ -505,6 +576,16 @@ fn preview_json(preview: &MutationPreview) -> Result<JsonValue, LifecycleApiErro
             JsonValue::Integer(preview.issued_at().as_millis()),
         ),
         ("preview", preview_ref_json(preview.preview())?),
+        (
+            "resolved_parents",
+            JsonValue::Array(
+                preview
+                    .parent_snapshots()
+                    .iter()
+                    .map(parent_snapshot_json)
+                    .collect::<Result<_, _>>()?,
+            ),
+        ),
         ("proposal", proposal_json(preview.proposal())?),
         ("resulting", record_json(preview.resulting())?),
         ("schema", JsonValue::String(PLATFORM_SCHEMA_V2.to_owned())),
@@ -522,6 +603,7 @@ fn preview(value: &JsonValue) -> Result<MutationPreview, LifecycleApiError> {
             "issued_at_ms",
             "preview",
             "proposal",
+            "resolved_parents",
             "resulting",
             "schema",
         ],
@@ -542,6 +624,10 @@ fn preview(value: &JsonValue) -> Result<MutationPreview, LifecycleApiError> {
         proposal,
         current,
         issued,
+        array(value, "resolved_parents")?
+            .iter()
+            .map(parent_snapshot)
+            .collect::<Result<_, _>>()?,
         authority(field(value, "inherited_authority")?)?,
         authority(field(value, "effective_authority")?)?,
         MutationApprovalRequirement::parse(string(value, "approval")?)?,
@@ -552,6 +638,13 @@ fn preview(value: &JsonValue) -> Result<MutationPreview, LifecycleApiError> {
         return Err(LifecycleError::CurrentRecordMismatch.into());
     }
     Ok(result)
+}
+
+pub fn work_context_mutation_preview_digest(
+    preview: &MutationPreview,
+) -> Result<MutationPreviewDigest, LifecycleApiError> {
+    let bytes = canonical_document(preview_json(preview)?)?;
+    Ok(MutationPreviewDigest::from_digest(Sha256::digest(&bytes)))
 }
 pub fn encode_work_context_mutation_preview(
     preview: &MutationPreview,
@@ -586,6 +679,10 @@ fn approval_json(approval: &MutationApproval) -> Result<JsonValue, LifecycleApiE
         ),
         ("preview", preview_ref_json(approval.preview())?),
         (
+            "preview_digest",
+            JsonValue::String(approval.preview_digest().to_string()),
+        ),
+        (
             "request_digest",
             JsonValue::String(approval.request_digest().to_string()),
         ),
@@ -605,9 +702,11 @@ fn approval(
             "id",
             "idempotency_key",
             "preview",
+            "preview_digest",
             "request_digest",
         ],
     )?;
+    let preview_digest = work_context_mutation_preview_digest(preview)?;
     let result = MutationApproval::new(
         MutationApprovalId::new(string(value, "id")?.to_owned()).map_err(|_| {
             LifecycleError::Field {
@@ -615,12 +714,14 @@ fn approval(
             }
         })?,
         preview,
+        preview_digest,
         MutationApprovalDecision::parse(string(value, "decision")?)?,
         actor(field(value, "decided_by")?)?,
         EpochMillis::from_millis(signed(value, "decided_at_ms")?),
         EpochMillis::from_millis(signed(value, "expires_at_ms")?),
     )?;
     if result.preview() != &preview_ref(field(value, "preview")?)?
+        || result.preview_digest().to_string() != string(value, "preview_digest")?
         || result.request_digest().to_string() != string(value, "request_digest")?
         || result.idempotency_key().as_str() != string(value, "idempotency_key")?
     {
@@ -651,7 +752,8 @@ pub fn encode_work_context_mutation_submission(
     approval: Option<&MutationApproval>,
     submitted_at: EpochMillis,
 ) -> Result<Vec<u8>, LifecycleApiError> {
-    let submission = MutationSubmission::new(preview, approval, submitted_at)?;
+    let preview_digest = work_context_mutation_preview_digest(preview)?;
+    let submission = MutationSubmission::new(preview, preview_digest, approval, submitted_at)?;
     canonical_document(object(vec![
         (
             "approval",
@@ -665,6 +767,10 @@ pub fn encode_work_context_mutation_submission(
             JsonValue::String(submission.idempotency_key().as_str().to_owned()),
         ),
         ("preview", preview_ref_json(submission.preview())?),
+        (
+            "preview_digest",
+            JsonValue::String(submission.preview_digest().to_string()),
+        ),
         (
             "request_digest",
             JsonValue::String(submission.request_digest().to_string()),
@@ -687,6 +793,7 @@ pub fn decode_work_context_mutation_submission(
             "approval",
             "idempotency_key",
             "preview",
+            "preview_digest",
             "request_digest",
             "schema",
             "submitted_at_ms",
@@ -697,12 +804,15 @@ pub fn decode_work_context_mutation_submission(
         JsonValue::Null => None,
         value => Some(approval(value, preview_value)?),
     };
+    let preview_digest = work_context_mutation_preview_digest(preview_value)?;
     let result = MutationSubmission::new(
         preview_value,
+        preview_digest,
         approval.as_ref(),
         EpochMillis::from_millis(signed(&value, "submitted_at_ms")?),
     )?;
     if result.preview() != &preview_ref(field(&value, "preview")?)?
+        || result.preview_digest().to_string() != string(&value, "preview_digest")?
         || result.request_digest().to_string() != string(&value, "request_digest")?
         || result.idempotency_key().as_str() != string(&value, "idempotency_key")?
     {
@@ -731,6 +841,10 @@ pub fn encode_work_context_mutation_receipt(
             JsonValue::String(receipt.outcome().as_str().to_owned()),
         ),
         ("preview", preview_ref_json(receipt.preview())?),
+        (
+            "preview_digest",
+            JsonValue::String(receipt.preview_digest().to_string()),
+        ),
         (
             "recorded_at_ms",
             JsonValue::Integer(receipt.recorded_at().as_millis()),
@@ -763,6 +877,7 @@ pub fn decode_work_context_mutation_receipt(
             "idempotency_key",
             "outcome",
             "preview",
+            "preview_digest",
             "recorded_at_ms",
             "request_digest",
             "resulting_revision",
@@ -772,12 +887,14 @@ pub fn decode_work_context_mutation_receipt(
     check_schema(&value)?;
     let outcome = ReceiptOutcome::parse(string(&value, "outcome")?)
         .map_err(|_| LifecycleError::Field { field: "outcome" })?;
+    let preview_digest = work_context_mutation_preview_digest(preview_value)?;
     let result = MutationReceipt::new(
         ReceiptId::new(string(&value, "id")?.to_owned()).map_err(|_| LifecycleError::Field {
             field: "receipt_id",
         })?,
         submission,
         preview_value,
+        preview_digest,
         outcome,
         EpochMillis::from_millis(signed(&value, "recorded_at_ms")?),
     )?;
@@ -798,6 +915,7 @@ pub fn decode_work_context_mutation_receipt(
         _ => return Err(LifecycleApiError::InvalidBody),
     };
     if result.preview() != &preview_ref(field(&value, "preview")?)?
+        || result.preview_digest().to_string() != string(&value, "preview_digest")?
         || result.request_digest().to_string() != string(&value, "request_digest")?
         || result.idempotency_key().as_str() != string(&value, "idempotency_key")?
         || result.approval_id().map(|id| id.as_str()) != wire_approval

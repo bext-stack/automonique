@@ -121,6 +121,7 @@ fn resume_preview(requirement: MutationApprovalRequirement) -> MutationPreview {
         proposal(intent, ceiling.clone()),
         Some(attempt_record(WorkContextLifecycle::Hibernated, 7)),
         None,
+        vec![],
         ceiling,
         effective,
         requirement,
@@ -128,6 +129,115 @@ fn resume_preview(requirement: MutationApprovalRequirement) -> MutationPreview {
         EpochMillis::from_millis(2_000),
     )
     .unwrap()
+}
+fn preview_digest(preview: &MutationPreview) -> MutationPreviewDigest {
+    work_context_mutation_preview_digest(preview).unwrap()
+}
+
+#[test]
+fn creation_parent_snapshots_refuse_archived_and_cross_project_graphs() {
+    let project_identity = identity(WorkContextKind::Project, "project-1");
+    let other_project = identity(WorkContextKind::Project, "project-2");
+    let host_identity = identity(WorkContextKind::HostSetup, "host-1");
+    let repository_identity = WorkContextIdentity::Repository(
+        V1RepositoryRef::new(ResourceCoordinate::new(
+            ResourceAuthority::GitHub,
+            ResourceKind::Repository,
+            ResourceId::new("repository-1").unwrap(),
+        ))
+        .unwrap(),
+    );
+    let project_record = |lifecycle| {
+        WorkContextRecord::new(
+            project_identity.clone(),
+            Revision::FIRST,
+            lifecycle,
+            label("Project"),
+            WorkContextAttributes::EMPTY,
+            vec![
+                WorkContextRelation::new(
+                    WorkContextRelationKind::ProjectRepository,
+                    repository_identity.clone(),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap()
+    };
+    let host_record = |project: WorkContextIdentity| {
+        WorkContextRecord::new(
+            host_identity.clone(),
+            Revision::FIRST,
+            WorkContextLifecycle::Active,
+            label("Host"),
+            WorkContextAttributes::host_setup(HostSetupKind::Local),
+            vec![
+                WorkContextRelation::new(WorkContextRelationKind::HostSetupProject, project)
+                    .unwrap(),
+            ],
+        )
+        .unwrap()
+    };
+    let intent = WorkContextMutationIntent::CreateCheckout(
+        CreateCheckoutIntent::new(
+            label("Checkout"),
+            ExpectedWorkContext::new(project_identity.clone(), Revision::FIRST),
+            ExpectedWorkContext::new(host_identity.clone(), Revision::FIRST),
+            ExpectedWorkContext::new(repository_identity.clone(), Revision::FIRST),
+            CheckoutKind::GitWorktree,
+            WorkContextRegistrySelector::new("checkout-registry").unwrap(),
+        )
+        .unwrap(),
+    );
+    let WorkContextIdentity::Project(project_id) = &project_identity else {
+        unreachable!()
+    };
+    let snapshots = |project: WorkContextRecord, host: WorkContextRecord| {
+        vec![
+            ResolvedParentSnapshot::WorkContext { record: project },
+            ResolvedParentSnapshot::WorkContext { record: host },
+            ResolvedParentSnapshot::External {
+                identity: repository_identity.clone(),
+                revision: Revision::FIRST,
+                resolution: ExternalParentResolution::Available,
+                owning_project: Some(project_id.clone()),
+            },
+        ]
+    };
+    let build = |parents| {
+        MutationPreview::new(
+            MutationPreviewRef::new(
+                MutationPreviewId::new("preview-checkout").unwrap(),
+                Revision::FIRST,
+            ),
+            proposal(intent.clone(), WorkContextAuthority::EMPTY),
+            None,
+            Some(issue_work_context_identity_from_random_nonce(
+                WorkContextKind::Checkout,
+                [7; 16],
+            )),
+            parents,
+            WorkContextAuthority::EMPTY,
+            WorkContextAuthority::EMPTY,
+            MutationApprovalRequirement::NotRequired,
+            EpochMillis::from_millis(1),
+            EpochMillis::from_millis(2),
+        )
+    };
+    assert_eq!(
+        build(snapshots(
+            project_record(WorkContextLifecycle::Archived),
+            host_record(project_identity.clone())
+        )),
+        Err(LifecycleError::ParentLifecycleInvalid)
+    );
+    assert_eq!(
+        build(snapshots(
+            project_record(WorkContextLifecycle::Active),
+            host_record(other_project)
+        )),
+        Err(LifecycleError::ParentProjectMismatch)
+    );
 }
 
 #[test]
@@ -144,7 +254,7 @@ fn operation_specific_create_issues_identity_only_in_preview() {
         Revision::new(9).unwrap(),
     );
     let intent = WorkContextMutationIntent::CreateProject(
-        CreateProjectIntent::new(label("Project"), vec![repository]).unwrap(),
+        CreateProjectIntent::new(label("Project"), vec![repository.clone()]).unwrap(),
     );
     let proposal = proposal(intent, WorkContextAuthority::EMPTY);
     let issued =
@@ -157,6 +267,12 @@ fn operation_specific_create_issues_identity_only_in_preview() {
         proposal,
         None,
         Some(issued.clone()),
+        vec![ResolvedParentSnapshot::External {
+            identity: repository.identity().clone(),
+            revision: repository.revision(),
+            resolution: ExternalParentResolution::Available,
+            owning_project: None,
+        }],
         WorkContextAuthority::EMPTY,
         WorkContextAuthority::EMPTY,
         MutationApprovalRequirement::NotRequired,
@@ -271,6 +387,7 @@ fn preview_rejects_widening_and_revision_or_lifecycle_drift() {
         proposal(intent, authority("narrow")),
         Some(attempt_record(WorkContextLifecycle::Hibernated, 7)),
         None,
+        vec![],
         authority("narrow"),
         requested,
         MutationApprovalRequirement::NotRequired,
@@ -295,6 +412,7 @@ fn preview_rejects_widening_and_revision_or_lifecycle_drift() {
         proposal(intent, requested.clone()),
         Some(attempt_record(WorkContextLifecycle::Hibernated, 7)),
         None,
+        vec![],
         requested.clone(),
         requested,
         MutationApprovalRequirement::NotRequired,
@@ -329,6 +447,7 @@ fn lifecycle_matrix_is_explicit_and_user_workspace_archive_is_one_way() {
         proposal(session_intent, grants.clone()),
         Some(session_record(WorkContextLifecycle::Hibernated, 4)),
         None,
+        vec![],
         grants.clone(),
         grants,
         MutationApprovalRequirement::NotRequired,
@@ -490,19 +609,25 @@ fn approval_submission_and_receipt_bind_exact_preview_and_expiry() {
     let approval = MutationApproval::new(
         MutationApprovalId::new("approval-1").unwrap(),
         &preview,
+        preview_digest(&preview),
         MutationApprovalDecision::Granted,
         Actor::new("tenant-1", "approver-1").unwrap(),
         EpochMillis::from_millis(1_100),
         EpochMillis::from_millis(1_900),
     )
     .unwrap();
-    let submission =
-        MutationSubmission::new(&preview, Some(&approval), EpochMillis::from_millis(1_200))
-            .unwrap();
+    let submission = MutationSubmission::new(
+        &preview,
+        preview_digest(&preview),
+        Some(&approval),
+        EpochMillis::from_millis(1_200),
+    )
+    .unwrap();
     let receipt = MutationReceipt::new(
         ReceiptId::new("receipt-1").unwrap(),
         &submission,
         &preview,
+        preview_digest(&preview),
         ReceiptOutcome::Completed,
         EpochMillis::from_millis(1_300),
     )
@@ -512,11 +637,21 @@ fn approval_submission_and_receipt_bind_exact_preview_and_expiry() {
         Some(Revision::new(8).unwrap())
     );
     assert_eq!(
-        MutationSubmission::new(&preview, None, EpochMillis::from_millis(1_200)),
+        MutationSubmission::new(
+            &preview,
+            preview_digest(&preview),
+            None,
+            EpochMillis::from_millis(1_200)
+        ),
         Err(LifecycleError::ApprovalRequired)
     );
     assert_eq!(
-        MutationSubmission::new(&preview, Some(&approval), EpochMillis::from_millis(1_950)),
+        MutationSubmission::new(
+            &preview,
+            preview_digest(&preview),
+            Some(&approval),
+            EpochMillis::from_millis(1_950)
+        ),
         Err(LifecycleError::ApprovalExpired)
     );
     assert_eq!(
@@ -524,6 +659,7 @@ fn approval_submission_and_receipt_bind_exact_preview_and_expiry() {
             ReceiptId::new("receipt-2").unwrap(),
             &submission,
             &preview,
+            preview_digest(&preview),
             ReceiptOutcome::Unknown,
             EpochMillis::from_millis(1_300)
         ),
@@ -545,6 +681,7 @@ fn canonical_lifecycle_documents_round_trip_and_refuse_drift() {
     let approval = MutationApproval::new(
         MutationApprovalId::new("approval-1").unwrap(),
         &preview,
+        preview_digest(&preview),
         MutationApprovalDecision::Granted,
         Actor::new("tenant-1", "approver-1").unwrap(),
         EpochMillis::from_millis(1_100),
@@ -555,6 +692,13 @@ fn canonical_lifecycle_documents_round_trip_and_refuse_drift() {
     assert_eq!(
         decode_work_context_mutation_approval(&approval_bytes, &preview).unwrap(),
         approval
+    );
+    let altered_preview_digest = String::from_utf8(approval_bytes.clone()).unwrap().replace(
+        &approval.preview_digest().to_string(),
+        &format!("sha256:{}", "0".repeat(64)),
+    );
+    assert!(
+        decode_work_context_mutation_approval(altered_preview_digest.as_bytes(), &preview).is_err()
     );
     let submission_bytes = encode_work_context_mutation_submission(
         &preview,
@@ -567,6 +711,7 @@ fn canonical_lifecycle_documents_round_trip_and_refuse_drift() {
         ReceiptId::new("receipt-1").unwrap(),
         &submission,
         &preview,
+        preview_digest(&preview),
         ReceiptOutcome::Completed,
         EpochMillis::from_millis(1_300),
     )
@@ -622,6 +767,7 @@ fn rust_and_typescript_exchange_exact_lifecycle_bytes_and_refusals() {
     let approval = MutationApproval::new(
         MutationApprovalId::new("approval-1").unwrap(),
         &preview,
+        preview_digest(&preview),
         MutationApprovalDecision::Granted,
         Actor::new("tenant-1", "approver-1").unwrap(),
         EpochMillis::from_millis(1_100),
@@ -639,6 +785,7 @@ fn rust_and_typescript_exchange_exact_lifecycle_bytes_and_refusals() {
         ReceiptId::new("receipt-1").unwrap(),
         &submission,
         &preview,
+        preview_digest(&preview),
         ReceiptOutcome::Completed,
         EpochMillis::from_millis(1_300),
     )
