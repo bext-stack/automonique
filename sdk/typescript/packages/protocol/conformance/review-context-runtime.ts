@@ -8,6 +8,7 @@ import {
   encodeReviewActionRequest,
   encodeReviewSnapshot,
   validateReviewActionRequest,
+  validateReviewActionAgainstSnapshot,
   type ReviewActionReceipt,
   type ReviewActionRequest,
 } from "../generated/review-context.ts";
@@ -83,10 +84,16 @@ function category(run: () => unknown): string {
 }
 const providerCategory = category(() => validateReviewActionRequest({...request, authentication: "provider_session"}));
 const authorityCategory = category(() => validateReviewActionRequest({...request, authority: {...request.authority, kind: "pull_request"}}));
+validateReviewActionAgainstSnapshot(request, snapshot);
+const authorityIdentityCategory = category(() => validateReviewActionAgainstSnapshot({...request, authority: {...request.authority, id: "another-ci"}}, snapshot));
+const attentionCategory = category(() => encodeReviewSnapshot({...snapshot, attention: {...snapshot.attention, unread: 2n}}));
+const maximumU32 = encodeReviewSnapshot({...snapshot, files: [{...snapshot.files[0]!, hunks: [{...snapshot.files[0]!.hunks[0]!, old_start: 4294967295n}]}]});
+decodeReviewSnapshot(maximumU32);
+const u32Category = category(() => encodeReviewSnapshot({...snapshot, files: [{...snapshot.files[0]!, hunks: [{...snapshot.files[0]!.hunks[0]!, old_start: 4294967296n}]}]}));
 const text = new TextDecoder().decode(fixture);
 const v1 = new TextEncoder().encode(text.replace("\"platform_version\":2", "\"platform_version\":1"));
 const mixedCategory = category(() => decodeReviewSnapshot(v1));
-if (providerCategory !== "review_value_invalid" || authorityCategory !== "review_value_invalid" || mixedCategory !== "review_invalid_body") {
+if (providerCategory !== "review_value_invalid" || authorityCategory !== "review_value_invalid" || authorityIdentityCategory !== "review_value_invalid" || attentionCategory !== "review_value_invalid" || u32Category !== "review_value_invalid" || mixedCategory !== "review_invalid_body") {
   throw new Error("Rust/TypeScript review refusals do not share categories");
 }
 
@@ -95,6 +102,6 @@ console.log(JSON.stringify({
   attention: snapshot.attention.state,
   bytes: fixture.length,
   receipt: receiptDecoded.reconciliation,
-  refusals: 3,
+  refusals: 6,
   schema: snapshot.schema,
 }));

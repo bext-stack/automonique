@@ -49,7 +49,7 @@ fn snapshot() -> ReviewSnapshot {
                 id("file-1"),
                 RepositoryRelativePath::new("src/review.rs").unwrap(),
                 DiffChangeKind::Modified,
-                WorktreeFileState::Unstaged,
+                WorktreeFileState::PartiallyStaged,
                 PreviewMetadata::new(
                     PreviewKind::Text,
                     Some(field("text/plain")),
@@ -112,6 +112,7 @@ fn snapshot() -> ReviewSnapshot {
             Some(id("pr-1")),
             PullRequestState::Open,
             MergeReadiness::Ready,
+            Some(field("0123456789abcdef")),
             authority(ReviewAuthorityKind::PullRequest),
             freshness(8),
         )
@@ -123,13 +124,10 @@ fn snapshot() -> ReviewSnapshot {
             freshness(7),
         )
         .unwrap(),
-        AttentionProjection::new(
-            AttentionState::NeedsYou,
-            AttentionReason::ReviewRequested,
-            1,
-            rev(9),
-        )
-        .unwrap(),
+        vec![
+            AttentionEvent::new(AttentionReason::Complete, 0, rev(8)).unwrap(),
+            AttentionEvent::new(AttentionReason::ReviewRequested, 1, rev(9)).unwrap(),
+        ],
     )
     .unwrap()
 }
@@ -221,10 +219,7 @@ fn preview_path_anchor_and_projection_invariants_fail_closed() {
         .is_err()
     );
     assert!(ReviewAnchor::new(id("file"), id("hunk"), DiffSide::New, 0).is_err());
-    assert!(
-        AttentionProjection::new(AttentionState::Done, AttentionReason::Conflict, 0, rev(1))
-            .is_err()
-    );
+    assert!(AttentionProjection::derive(&[], rev(1)).is_err());
     assert!(
         CheckProjection::new(
             id("check"),
@@ -252,6 +247,45 @@ fn comments_remain_anchored_and_sent_state_is_explicit() {
         snapshot().comments()[0].agent_state(),
         CommentAgentState::Sent
     );
+}
+
+#[test]
+fn attention_ranges_proposals_and_u32_boundaries_are_authoritative() {
+    let encoded = String::from_utf8(encode_review_snapshot(&snapshot()).unwrap()).unwrap();
+    let forged_attention = encoded.replace(
+        "\"state\":\"needs_you\",\"unread\":1}",
+        "\"state\":\"needs_you\",\"unread\":2}",
+    );
+    assert!(matches!(
+        decode_review_snapshot(forged_attention.as_bytes()),
+        Err(ReviewApiError::InvalidBody)
+    ));
+
+    let maximum = encoded.replace("\"old_start\":10", "\"old_start\":4294967295");
+    assert!(decode_review_snapshot(maximum.as_bytes()).is_ok());
+    let overflow = encoded.replace("\"old_start\":10", "\"old_start\":4294967296");
+    assert!(matches!(
+        decode_review_snapshot(overflow.as_bytes()),
+        Err(ReviewApiError::InvalidBody)
+    ));
+
+    assert!(DiffHunk::new(id("zero-old"), 0, 0, 1, 1, hunk_text("preview")).is_ok());
+    assert!(DiffHunk::new(id("bad-zero"), 0, 1, 1, 1, hunk_text("preview")).is_err());
+    let outside = encoded.replace("\"line\":11", "\"line\":13");
+    assert!(matches!(
+        decode_review_snapshot(outside.as_bytes()),
+        Err(ReviewApiError::Contract(ReviewContractError::AnchorInvalid))
+    ));
+    let invalid_proposal = encoded.replace(
+        "\"worktree\":\"partially_staged\"",
+        "\"worktree\":\"unstaged\"",
+    );
+    assert!(matches!(
+        decode_review_snapshot(invalid_proposal.as_bytes()),
+        Err(ReviewApiError::Contract(
+            ReviewContractError::ProposalInvalid
+        ))
+    ));
 }
 
 fn request(
@@ -303,6 +337,7 @@ fn action_union_is_narrow_exact_revisioned_and_idempotent() {
         ),
         (
             ReviewAction::OpenPullRequest {
+                expected_pull_request_revision: rev(8),
                 title: field("Typed review"),
             },
             ReviewAuthorityKind::PullRequest,
@@ -333,6 +368,80 @@ fn action_union_is_narrow_exact_revisioned_and_idempotent() {
         assert_eq!(request.expected_revision(), rev(9));
         assert_eq!(request.idempotency_key().as_str(), "idem-1");
     }
+}
+
+#[test]
+fn actions_resolve_against_exact_target_authority_revision_and_state() {
+    let snapshot = snapshot();
+    let valid = request(
+        ReviewAction::RerunCheck {
+            check_id: id("check-1"),
+            expected_check_revision: rev(7),
+        },
+        ReviewAuthentication::UserSession,
+        ReviewAuthorityKind::Ci,
+    )
+    .unwrap();
+    assert_eq!(snapshot.resolve_action(&valid), Ok(()));
+
+    let wrong_target = request(
+        ReviewAction::RerunCheck {
+            check_id: id("missing"),
+            expected_check_revision: rev(7),
+        },
+        ReviewAuthentication::UserSession,
+        ReviewAuthorityKind::Ci,
+    )
+    .unwrap();
+    assert_eq!(
+        snapshot.resolve_action(&wrong_target),
+        Err(ReviewContractError::ActionInvalid)
+    );
+    let wrong_authority = ReviewActionRequest::new(
+        workspace(),
+        rev(9),
+        id("actor-1"),
+        ReviewAuthentication::UserSession,
+        ReviewAuthority::new(ReviewAuthorityKind::Ci, id("another-ci")),
+        IdempotencyKey::new("idem-2").unwrap(),
+        ReviewAction::RerunCheck {
+            check_id: id("check-1"),
+            expected_check_revision: rev(7),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        snapshot.resolve_action(&wrong_authority),
+        Err(ReviewContractError::AuthorityInvalid)
+    );
+    let duplicate_comment = request(
+        ReviewAction::AddComment {
+            comment_id: id("comment-1"),
+            anchor: ReviewAnchor::new(id("file-1"), id("hunk-1"), DiffSide::New, 11).unwrap(),
+            body: text("duplicate"),
+        },
+        ReviewAuthentication::UserSession,
+        ReviewAuthorityKind::Review,
+    )
+    .unwrap();
+    assert_eq!(
+        snapshot.resolve_action(&duplicate_comment),
+        Err(ReviewContractError::ActionInvalid)
+    );
+    let wrong_head = request(
+        ReviewAction::MergePullRequest {
+            pull_request_id: id("pr-1"),
+            expected_pull_request_revision: rev(8),
+            expected_head_revision: field("different-head"),
+        },
+        ReviewAuthentication::UserSession,
+        ReviewAuthorityKind::PullRequest,
+    )
+    .unwrap();
+    assert_eq!(
+        snapshot.resolve_action(&wrong_head),
+        Err(ReviewContractError::ActionInvalid)
+    );
 }
 
 #[test]

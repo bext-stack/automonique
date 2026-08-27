@@ -27,6 +27,7 @@ pub const MAX_REVIEW_COMMENTS: usize = 256;
 pub const MAX_REVIEW_CHECKS: usize = 128;
 pub const MAX_REVIEW_PROPOSALS: usize = 32;
 pub const MAX_REVIEW_PROPOSAL_FILES: usize = 128;
+pub const MAX_REVIEW_ATTENTION_EVENTS: usize = 256;
 pub const MAX_REVIEW_UNREAD: u32 = 1_000_000;
 
 macro_rules! id_domain {
@@ -290,7 +291,10 @@ impl DiffHunk {
         new_lines: u32,
         preview: ReviewHunkPreview,
     ) -> Result<Self, ReviewContractError> {
-        if old_start == 0 || new_start == 0 || old_lines.saturating_add(new_lines) == 0 {
+        if (old_start == 0 && old_lines != 0)
+            || (new_start == 0 && new_lines != 0)
+            || old_lines.saturating_add(new_lines) == 0
+        {
             return Err(ReviewContractError::HunkInvalid);
         }
         Ok(Self {
@@ -634,6 +638,7 @@ pub struct PullRequestProjection {
     id: Option<PullRequestId>,
     state: PullRequestState,
     readiness: MergeReadiness,
+    head_revision: Option<ReviewField>,
     authority: ReviewAuthority,
     freshness: ReviewFreshness,
 }
@@ -642,11 +647,13 @@ impl PullRequestProjection {
         id: Option<PullRequestId>,
         state: PullRequestState,
         readiness: MergeReadiness,
+        head_revision: Option<ReviewField>,
         authority: ReviewAuthority,
         freshness: ReviewFreshness,
     ) -> Result<Self, ReviewContractError> {
         if authority.kind() != ReviewAuthorityKind::PullRequest
             || (state == PullRequestState::Absent) != id.is_none()
+            || (state == PullRequestState::Absent) != head_revision.is_none()
         {
             return Err(ReviewContractError::AuthorityInvalid);
         }
@@ -654,6 +661,7 @@ impl PullRequestProjection {
             id,
             state,
             readiness,
+            head_revision,
             authority,
             freshness,
         })
@@ -669,6 +677,10 @@ impl PullRequestProjection {
     #[must_use]
     pub const fn readiness(&self) -> MergeReadiness {
         self.readiness
+    }
+    #[must_use]
+    pub fn head_revision(&self) -> Option<&ReviewField> {
+        self.head_revision.as_ref()
     }
     #[must_use]
     pub fn authority(&self) -> &ReviewAuthority {
@@ -725,15 +737,13 @@ impl DeliveryProjection {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AttentionProjection {
-    state: AttentionState,
+pub struct AttentionEvent {
     reason: AttentionReason,
     unread: u32,
     source_revision: Revision,
 }
-impl AttentionProjection {
+impl AttentionEvent {
     pub fn new(
-        state: AttentionState,
         reason: AttentionReason,
         unread: u32,
         source_revision: Revision,
@@ -741,33 +751,72 @@ impl AttentionProjection {
         if unread > MAX_REVIEW_UNREAD {
             return Err(ReviewContractError::CounterOutOfRange);
         }
-        let compatible = match state {
-            AttentionState::NeedsYou => matches!(
-                reason,
-                AttentionReason::ReviewRequested
-                    | AttentionReason::CommentReply
-                    | AttentionReason::ApprovalRequired
-            ),
-            AttentionState::Working => matches!(
-                reason,
-                AttentionReason::CheckRunning | AttentionReason::DeliveryPending
-            ),
-            AttentionState::Done => reason == AttentionReason::Complete,
-            AttentionState::Blocked => matches!(
-                reason,
-                AttentionReason::CheckFailed
-                    | AttentionReason::Conflict
-                    | AttentionReason::ExternalBlocker
-            ),
-        };
-        if !compatible {
-            return Err(ReviewContractError::AttentionInvalid);
-        }
         Ok(Self {
-            state,
             reason,
             unread,
             source_revision,
+        })
+    }
+    #[must_use]
+    pub const fn reason(&self) -> AttentionReason {
+        self.reason
+    }
+    #[must_use]
+    pub const fn unread(&self) -> u32 {
+        self.unread
+    }
+    #[must_use]
+    pub const fn source_revision(&self) -> Revision {
+        self.source_revision
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttentionProjection {
+    state: AttentionState,
+    reason: AttentionReason,
+    unread: u32,
+    source_revision: Revision,
+}
+impl AttentionProjection {
+    pub fn derive(
+        events: &[AttentionEvent],
+        snapshot_revision: Revision,
+    ) -> Result<Self, ReviewContractError> {
+        if events.is_empty()
+            || events.len() > MAX_REVIEW_ATTENTION_EVENTS
+            || events
+                .iter()
+                .any(|event| event.source_revision() > snapshot_revision)
+        {
+            return Err(ReviewContractError::AttentionInvalid);
+        }
+        let mut selected = events[0];
+        let mut unread = 0_u32;
+        for event in events {
+            unread = unread
+                .checked_add(event.unread())
+                .filter(|value| *value <= MAX_REVIEW_UNREAD)
+                .ok_or(ReviewContractError::CounterOutOfRange)?;
+            if attention_precedence(event.reason()) > attention_precedence(selected.reason())
+                || (attention_precedence(event.reason()) == attention_precedence(selected.reason())
+                    && (event.source_revision() > selected.source_revision()
+                        || (event.source_revision() == selected.source_revision()
+                            && event.reason() < selected.reason())))
+            {
+                selected = *event;
+            }
+        }
+        let state = attention_state(selected.reason());
+        Ok(Self {
+            state,
+            reason: selected.reason(),
+            unread,
+            source_revision: events
+                .iter()
+                .map(AttentionEvent::source_revision)
+                .max()
+                .ok_or(ReviewContractError::AttentionInvalid)?,
         })
     }
     #[must_use]
@@ -788,6 +837,28 @@ impl AttentionProjection {
     }
 }
 
+const fn attention_state(reason: AttentionReason) -> AttentionState {
+    match reason {
+        AttentionReason::Conflict
+        | AttentionReason::CheckFailed
+        | AttentionReason::ExternalBlocker => AttentionState::Blocked,
+        AttentionReason::ApprovalRequired
+        | AttentionReason::ReviewRequested
+        | AttentionReason::CommentReply => AttentionState::NeedsYou,
+        AttentionReason::CheckRunning | AttentionReason::DeliveryPending => AttentionState::Working,
+        AttentionReason::Complete => AttentionState::Done,
+    }
+}
+
+const fn attention_precedence(reason: AttentionReason) -> u8 {
+    match attention_state(reason) {
+        AttentionState::Blocked => 4,
+        AttentionState::NeedsYou => 3,
+        AttentionState::Working => 2,
+        AttentionState::Done => 1,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReviewSnapshot {
     workspace: WorkContextIdentity,
@@ -799,6 +870,7 @@ pub struct ReviewSnapshot {
     review: ReviewStatusProjection,
     pull_request: PullRequestProjection,
     delivery: DeliveryProjection,
+    attention_events: Vec<AttentionEvent>,
     attention: AttentionProjection,
 }
 impl ReviewSnapshot {
@@ -813,7 +885,7 @@ impl ReviewSnapshot {
         review: ReviewStatusProjection,
         pull_request: PullRequestProjection,
         delivery: DeliveryProjection,
-        attention: AttentionProjection,
+        attention_events: Vec<AttentionEvent>,
     ) -> Result<Self, ReviewContractError> {
         validate_workspace(&workspace)?;
         if files.len() > MAX_REVIEW_FILES
@@ -821,6 +893,8 @@ impl ReviewSnapshot {
             || comments.len() > MAX_REVIEW_COMMENTS
             || proposals.len() > MAX_REVIEW_PROPOSALS
             || checks.len() > MAX_REVIEW_CHECKS
+            || attention_events.is_empty()
+            || attention_events.len() > MAX_REVIEW_ATTENTION_EVENTS
             || !strict_by(&files, |v| v.id().as_str())
             || !strict_by(&comments, |v| v.id().as_str())
             || !strict_by(&proposals, |v| v.id().as_str())
@@ -829,23 +903,36 @@ impl ReviewSnapshot {
             return Err(ReviewContractError::CollectionInvalid);
         }
         for comment in &comments {
-            let Some(file) = files
-                .iter()
-                .find(|file| file.id() == comment.anchor().file_id())
-            else {
-                return Err(ReviewContractError::AnchorInvalid);
-            };
-            if !file
-                .hunks()
-                .iter()
-                .any(|hunk| hunk.id() == comment.anchor().hunk_id())
-            {
-                return Err(ReviewContractError::AnchorInvalid);
+            validate_anchor_in_files(&files, comment.anchor())?;
+        }
+        for proposal in &proposals {
+            for file_id in proposal.files() {
+                let file = files
+                    .iter()
+                    .find(|file| file.id() == file_id)
+                    .ok_or(ReviewContractError::ProposalInvalid)?;
+                let valid = match proposal.kind() {
+                    ReviewProposalKind::Stage => matches!(
+                        file.worktree(),
+                        WorktreeFileState::Unstaged
+                            | WorktreeFileState::PartiallyStaged
+                            | WorktreeFileState::Untracked
+                    ),
+                    ReviewProposalKind::Unstage => matches!(
+                        file.worktree(),
+                        WorktreeFileState::Staged | WorktreeFileState::PartiallyStaged
+                    ),
+                    ReviewProposalKind::Commit => matches!(
+                        file.worktree(),
+                        WorktreeFileState::Staged | WorktreeFileState::PartiallyStaged
+                    ),
+                };
+                if !valid {
+                    return Err(ReviewContractError::ProposalInvalid);
+                }
             }
         }
-        if attention.source_revision() > revision {
-            return Err(ReviewContractError::AttentionInvalid);
-        }
+        let attention = AttentionProjection::derive(&attention_events, revision)?;
         Ok(Self {
             workspace,
             revision,
@@ -856,6 +943,7 @@ impl ReviewSnapshot {
             review,
             pull_request,
             delivery,
+            attention_events,
             attention,
         })
     }
@@ -896,8 +984,188 @@ impl ReviewSnapshot {
         &self.delivery
     }
     #[must_use]
+    pub fn attention_events(&self) -> &[AttentionEvent] {
+        &self.attention_events
+    }
+    #[must_use]
     pub const fn attention(&self) -> AttentionProjection {
         self.attention
+    }
+
+    /// Resolve a proposed mutation against the exact authoritative snapshot.
+    /// Kind-only authority is insufficient: the authority identity, target
+    /// identity, target revision, lifecycle and freshness must all agree.
+    pub fn resolve_action(&self, request: &ReviewActionRequest) -> Result<(), ReviewContractError> {
+        if request.workspace() != self.workspace() || request.expected_revision() != self.revision()
+        {
+            return Err(ReviewContractError::ActionInvalid);
+        }
+        let require_authority = |expected: &ReviewAuthority| {
+            if request.authority() == expected {
+                Ok(())
+            } else {
+                Err(ReviewContractError::AuthorityInvalid)
+            }
+        };
+        match request.action() {
+            ReviewAction::AddComment {
+                comment_id, anchor, ..
+            } => {
+                require_authority(self.review().authority())?;
+                require_fresh(self.review().freshness())?;
+                if self
+                    .comments()
+                    .iter()
+                    .any(|comment| comment.id() == comment_id)
+                {
+                    return Err(ReviewContractError::ActionInvalid);
+                }
+                validate_anchor_in_files(self.files(), anchor)
+            }
+            ReviewAction::SendCommentToAgent {
+                comment_id,
+                expected_comment_revision,
+            } => {
+                require_authority(self.review().authority())?;
+                require_fresh(self.review().freshness())?;
+                let comment = self
+                    .comments()
+                    .iter()
+                    .find(|comment| comment.id() == comment_id)
+                    .ok_or(ReviewContractError::ActionInvalid)?;
+                if comment.revision() != *expected_comment_revision
+                    || !matches!(
+                        comment.agent_state(),
+                        CommentAgentState::NotSent | CommentAgentState::Refused
+                    )
+                {
+                    return Err(ReviewContractError::ActionInvalid);
+                }
+                Ok(())
+            }
+            ReviewAction::ApproveReview {
+                expected_review_revision,
+            } => {
+                require_authority(self.review().authority())?;
+                require_fresh(self.review().freshness())?;
+                if self.review().freshness().observed_revision() != *expected_review_revision
+                    || !matches!(
+                        self.review().decision(),
+                        ReviewDecision::Pending | ReviewDecision::ChangesRequested
+                    )
+                {
+                    return Err(ReviewContractError::ActionInvalid);
+                }
+                Ok(())
+            }
+            ReviewAction::RerunCheck {
+                check_id,
+                expected_check_revision,
+            } => {
+                let check = self
+                    .checks()
+                    .iter()
+                    .find(|check| check.id() == check_id)
+                    .ok_or(ReviewContractError::ActionInvalid)?;
+                require_authority(check.authority())?;
+                require_fresh(check.freshness())?;
+                if check.freshness().observed_revision() != *expected_check_revision
+                    || !matches!(
+                        check.state(),
+                        CheckState::Passed | CheckState::Failed | CheckState::Cancelled
+                    )
+                {
+                    return Err(ReviewContractError::ActionInvalid);
+                }
+                Ok(())
+            }
+            ReviewAction::OpenPullRequest {
+                expected_pull_request_revision,
+                ..
+            } => {
+                require_authority(self.pull_request().authority())?;
+                require_fresh(self.pull_request().freshness())?;
+                if self.pull_request().state() != PullRequestState::Absent
+                    || self.pull_request().freshness().observed_revision()
+                        != *expected_pull_request_revision
+                {
+                    return Err(ReviewContractError::ActionInvalid);
+                }
+                Ok(())
+            }
+            ReviewAction::UpdatePullRequest {
+                pull_request_id,
+                expected_pull_request_revision,
+                ..
+            } => {
+                require_authority(self.pull_request().authority())?;
+                require_fresh(self.pull_request().freshness())?;
+                if self.pull_request().id() != Some(pull_request_id)
+                    || self.pull_request().freshness().observed_revision()
+                        != *expected_pull_request_revision
+                    || !matches!(
+                        self.pull_request().state(),
+                        PullRequestState::Draft | PullRequestState::Open
+                    )
+                {
+                    return Err(ReviewContractError::ActionInvalid);
+                }
+                Ok(())
+            }
+            ReviewAction::MergePullRequest {
+                pull_request_id,
+                expected_pull_request_revision,
+                expected_head_revision,
+            } => {
+                require_authority(self.pull_request().authority())?;
+                require_fresh(self.pull_request().freshness())?;
+                if self.pull_request().id() != Some(pull_request_id)
+                    || self.pull_request().freshness().observed_revision()
+                        != *expected_pull_request_revision
+                    || self.pull_request().head_revision() != Some(expected_head_revision)
+                    || self.pull_request().state() != PullRequestState::Open
+                    || self.pull_request().readiness() != MergeReadiness::Ready
+                {
+                    return Err(ReviewContractError::ActionInvalid);
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn require_fresh(freshness: ReviewFreshness) -> Result<(), ReviewContractError> {
+    if freshness.state() == ReviewFreshnessState::Fresh {
+        Ok(())
+    } else {
+        Err(ReviewContractError::ActionInvalid)
+    }
+}
+
+fn validate_anchor_in_files(
+    files: &[ReviewFile],
+    anchor: &ReviewAnchor,
+) -> Result<(), ReviewContractError> {
+    let file = files
+        .iter()
+        .find(|file| file.id() == anchor.file_id())
+        .ok_or(ReviewContractError::AnchorInvalid)?;
+    let hunk = file
+        .hunks()
+        .iter()
+        .find(|hunk| hunk.id() == anchor.hunk_id())
+        .ok_or(ReviewContractError::AnchorInvalid)?;
+    let (start, lines) = match anchor.side() {
+        DiffSide::Old => (hunk.old_start(), hunk.old_lines()),
+        DiffSide::New => (hunk.new_start(), hunk.new_lines()),
+    };
+    let end = start
+        .checked_add(lines)
+        .ok_or(ReviewContractError::AnchorInvalid)?;
+    if lines == 0 || anchor.line() < start || anchor.line() >= end {
+        Err(ReviewContractError::AnchorInvalid)
+    } else {
+        Ok(())
     }
 }
 
@@ -920,6 +1188,7 @@ pub enum ReviewAction {
         expected_check_revision: Revision,
     },
     OpenPullRequest {
+        expected_pull_request_revision: Revision,
         title: ReviewField,
     },
     UpdatePullRequest {
@@ -1159,6 +1428,7 @@ pub enum ReviewContractError {
     WorkspaceInvalid,
     CollectionInvalid,
     ReceiptInvalid,
+    ActionInvalid,
 }
 impl From<ValueError> for ReviewContractError {
     fn from(value: ValueError) -> Self {

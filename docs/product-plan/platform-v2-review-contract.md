@@ -39,9 +39,9 @@ the same meaning:
 | proposal | Typed stage, unstage, or commit proposal over an exact bounded ordered file set; only commit carries a bounded subject |
 | check | Typed lifecycle plus owning CI authority and freshness |
 | review | Pending/approved/changes-requested/dismissed plus owning review authority and freshness |
-| pull request | Absent/draft/open/closed/merged, merge readiness, owning PR authority, and freshness |
+| pull request | Absent/draft/open/closed/merged, exact head revision when present, merge readiness, owning PR authority, and freshness |
 | delivery | Not-delivered/pending/delivered/failed plus owning delivery authority and freshness |
-| attention | Authoritative `NeedsYou`, `Working`, `Done`, or `Blocked`, a compatible closed reason, unread count, and source revision |
+| attention | Deterministically derived `NeedsYou`, `Working`, `Done`, or `Blocked`, a compatible closed reason, aggregate unread count, and newest source revision |
 
 Binary bytes, raw HTML, credentials, provider payloads, repository roots, and
 host paths have no representation. Paths are repository-relative presentation
@@ -51,9 +51,15 @@ render a separately obtained preview in its own sandbox.
 
 The current bounds are 128 files, 128 hunks per file and 512 hunks total, 512
 UTF-8 bytes per sanitized hunk preview, 256 comments, 128 checks, 32 proposals,
-and 128 file identities per proposal. Comments must resolve to a
-file and hunk in the same snapshot. Attention cannot cite a revision newer than
-the snapshot. Authority-bearing and invariant-bearing Rust fields are private;
+and 128 file identities per proposal. Comments must resolve to an exact line
+inside the selected side of a file and hunk in the same snapshot. Proposal
+files must exist and their staged/unstaged state must permit the proposed
+operation. At most 256 bounded attention events are retained. The projection
+is derived from those events with `Blocked` taking precedence over `NeedsYou`,
+then `Working`, then `Done`; unread counts are summed and the newest event
+revision is retained. Callers cannot author a different projection, and no
+event may cite a revision newer than the snapshot. Authority-bearing and
+invariant-bearing Rust fields are private;
 constructors and both codecs revalidate the same invariants.
 
 ## Scoped proposals and actions
@@ -72,7 +78,10 @@ Mutation requests are a closed union:
 
 Every request carries the exact workspace, expected snapshot revision,
 authenticated actor, authentication class, owning authority, and idempotency
-key. A provider session authentication class is refused for every mutation.
+key. Before a preview or execution is accepted, the exact authority identity,
+target identity, target revision, freshness, and target lifecycle are resolved
+against the current authoritative snapshot. A provider session authentication
+class is refused for every mutation.
 Observing or controlling a provider session never grants filesystem, git, CI,
 review, delivery, or pull-request authority. Runtime policy may require more
 authority or approval; it may not require less.
@@ -93,5 +102,7 @@ The generated TypeScript decoder must preserve its fully decoded values and
 re-encode its exact canonical bytes. The cross-language corpus also verifies
 the exact-revision/idempotency action, no-replay unknown receipt, provider-only
 authorization refusal, authority mismatch, and a coherent-but-inapplicable v1
-document. All clients should use this same generated contract rather than infer
-review or attention state from summaries.
+document. The shared corpus also checks the Rust `u32` boundary used for hunk,
+anchor, image-dimension, and unread fields, derived-attention refusal, and
+authority-identity target resolution. All clients should use this same
+generated contract rather than infer review or attention state from summaries.

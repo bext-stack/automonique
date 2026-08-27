@@ -8750,6 +8750,11 @@ fn review_context_module() -> GeneratedModule {
                 value: ConstantValue::Count(crate::platform_v2_review::MAX_REVIEW_PROPOSAL_FILES),
             },
             Constant {
+                name: "MAX_REVIEW_ATTENTION_EVENTS".to_owned(),
+                doc: "Maximum source attention events in one review snapshot.".to_owned(),
+                value: ConstantValue::Count(crate::platform_v2_review::MAX_REVIEW_ATTENTION_EVENTS),
+            },
+            Constant {
                 name: "MAX_REVIEW_UNREAD".to_owned(),
                 doc: "Maximum authoritative unread count.".to_owned(),
                 value: ConstantValue::Count(crate::platform_v2_review::MAX_REVIEW_UNREAD as usize),

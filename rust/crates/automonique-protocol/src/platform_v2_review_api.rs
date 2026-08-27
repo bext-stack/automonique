@@ -448,6 +448,10 @@ fn pull_request_json(value: &PullRequestProjection) -> Result<JsonValue, ReviewA
     Ok(object(vec![
         ("authority", authority_json(value.authority())),
         ("freshness", freshness_json(value.freshness())?),
+        (
+            "head_revision",
+            nullable_text(value.head_revision().map(ReviewField::as_str)),
+        ),
         ("id", nullable_text(value.id().map(OpaqueId::as_str))),
         ("readiness", text(value.readiness().as_str())),
         ("state", text(value.state().as_str())),
@@ -456,7 +460,14 @@ fn pull_request_json(value: &PullRequestProjection) -> Result<JsonValue, ReviewA
 fn pull_request(value: &JsonValue) -> Result<PullRequestProjection, ReviewApiError> {
     fields(
         value,
-        &["authority", "freshness", "id", "readiness", "state"],
+        &[
+            "authority",
+            "freshness",
+            "head_revision",
+            "id",
+            "readiness",
+            "state",
+        ],
     )?;
     Ok(PullRequestProjection::new(
         maybe_string(value, "id")?
@@ -464,6 +475,9 @@ fn pull_request(value: &JsonValue) -> Result<PullRequestProjection, ReviewApiErr
             .transpose()?,
         PullRequestState::parse(string(value, "state")?)?,
         MergeReadiness::parse(string(value, "readiness")?)?,
+        maybe_string(value, "head_revision")?
+            .map(ReviewField::new)
+            .transpose()?,
         authority(get(value, "authority")?)?,
         freshness(get(value, "freshness")?)?,
     )?)
@@ -497,8 +511,28 @@ fn attention_json(value: AttentionProjection) -> Result<JsonValue, ReviewApiErro
 }
 fn attention(value: &JsonValue) -> Result<AttentionProjection, ReviewApiError> {
     fields(value, &["reason", "source_revision", "state", "unread"])?;
-    Ok(AttentionProjection::new(
-        AttentionState::parse(string(value, "state")?)?,
+    let reason = AttentionReason::parse(string(value, "reason")?)?;
+    let event = AttentionEvent::new(
+        reason,
+        u32::try_from(unsigned(value, "unread")?).map_err(|_| ReviewApiError::InvalidBody)?,
+        revision(unsigned(value, "source_revision")?)?,
+    )?;
+    let projection = AttentionProjection::derive(&[event], event.source_revision())?;
+    if projection.state() != AttentionState::parse(string(value, "state")?)? {
+        return Err(ReviewApiError::InvalidBody);
+    }
+    Ok(projection)
+}
+fn attention_event_json(value: AttentionEvent) -> Result<JsonValue, ReviewApiError> {
+    Ok(object(vec![
+        ("reason", text(value.reason().as_str())),
+        ("source_revision", integer(value.source_revision().get())?),
+        ("unread", integer(u64::from(value.unread()))?),
+    ]))
+}
+fn attention_event(value: &JsonValue) -> Result<AttentionEvent, ReviewApiError> {
+    fields(value, &["reason", "source_revision", "unread"])?;
+    Ok(AttentionEvent::new(
         AttentionReason::parse(string(value, "reason")?)?,
         u32::try_from(unsigned(value, "unread")?).map_err(|_| ReviewApiError::InvalidBody)?,
         revision(unsigned(value, "source_revision")?)?,
@@ -509,6 +543,17 @@ pub fn encode_review_snapshot(value: &ReviewSnapshot) -> Result<Vec<u8>, ReviewA
     encode(
         object(vec![
             ("attention", attention_json(value.attention())?),
+            (
+                "attention_events",
+                array(
+                    value
+                        .attention_events()
+                        .iter()
+                        .copied()
+                        .map(attention_event_json)
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+            ),
             (
                 "checks",
                 array(
@@ -563,6 +608,7 @@ pub fn decode_review_snapshot(payload: &[u8]) -> Result<ReviewSnapshot, ReviewAp
         &value,
         &[
             "attention",
+            "attention_events",
             "checks",
             "comments",
             "delivery",
@@ -582,7 +628,8 @@ pub fn decode_review_snapshot(payload: &[u8]) -> Result<ReviewSnapshot, ReviewAp
     {
         return Err(ReviewApiError::InvalidBody);
     }
-    ReviewSnapshot::new(
+    let carried_attention = attention(get(&value, "attention")?)?;
+    let snapshot = ReviewSnapshot::new(
         workspace(get(&value, "workspace")?)?,
         revision(unsigned(&value, "revision")?)?,
         items(&value, "files", MAX_REVIEW_FILES)?
@@ -604,9 +651,15 @@ pub fn decode_review_snapshot(payload: &[u8]) -> Result<ReviewSnapshot, ReviewAp
         review(get(&value, "review")?)?,
         pull_request(get(&value, "pull_request")?)?,
         delivery(get(&value, "delivery")?)?,
-        attention(get(&value, "attention")?)?,
-    )
-    .map_err(Into::into)
+        items(&value, "attention_events", MAX_REVIEW_ATTENTION_EVENTS)?
+            .iter()
+            .map(attention_event)
+            .collect::<Result<Vec<_>, _>>()?,
+    )?;
+    if snapshot.attention() != carried_attention {
+        return Err(ReviewApiError::InvalidBody);
+    }
+    Ok(snapshot)
 }
 
 fn action_json(value: &ReviewAction) -> Result<JsonValue, ReviewApiError> {
@@ -658,9 +711,18 @@ fn action_json(value: &ReviewAction) -> Result<JsonValue, ReviewApiError> {
                 ),
             ]),
         ),
-        ReviewAction::OpenPullRequest { title } => (
+        ReviewAction::OpenPullRequest {
+            expected_pull_request_revision,
+            title,
+        } => (
             ReviewActionKind::OpenPullRequest,
-            object(vec![("title", text(title.as_str()))]),
+            object(vec![
+                (
+                    "expected_pull_request_revision",
+                    integer(expected_pull_request_revision.get())?,
+                ),
+                ("title", text(title.as_str())),
+            ]),
         ),
         ReviewAction::UpdatePullRequest {
             pull_request_id,
@@ -737,8 +799,12 @@ fn action(value: &JsonValue) -> Result<ReviewAction, ReviewApiError> {
             }
         }
         ReviewActionKind::OpenPullRequest => {
-            fields(payload, &["title"])?;
+            fields(payload, &["expected_pull_request_revision", "title"])?;
             ReviewAction::OpenPullRequest {
+                expected_pull_request_revision: revision(unsigned(
+                    payload,
+                    "expected_pull_request_revision",
+                )?)?,
                 title: ReviewField::new(string(payload, "title")?)?,
             }
         }
