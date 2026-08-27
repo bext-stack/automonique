@@ -1821,7 +1821,10 @@ fn validate_durable_graphs(connection: &Connection) -> Indexed<()> {
                 return Err(LineageIndexError::Corrupt("intent_external"));
             }
         }
-        fingerprint.into_stored()?;
+        let stored = fingerprint.clone().into_stored()?;
+        if intent_digest(&stored.intent) != fingerprint.request_digest {
+            return Err(LineageIndexError::Corrupt("intent_digest"));
+        }
     }
     Ok(())
 }

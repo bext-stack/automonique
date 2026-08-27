@@ -992,6 +992,18 @@ fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
         .unwrap();
     assert_eq!(task.origin(), &task_origin);
     assert_eq!(task.revision().get(), 3);
+    drop(reopened);
+    let db = Connection::open(private.path()).unwrap();
+    db.execute(
+        "UPDATE lineage_workspace_intents SET request_digest=zeroblob(32) WHERE intent_id='intent-exact'",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    assert_eq!(
+        LineageIndex::open(private.path()).unwrap_err().category(),
+        "corrupt"
+    );
 }
 
 #[test]
@@ -1041,12 +1053,21 @@ PRAGMA user_version=1;
         WorkspaceIntentOutcome::Created(workspace("workspace-v1"))
     );
     drop(index);
+    let db = Connection::open(private.path()).unwrap();
     assert_eq!(
-        Connection::open(private.path())
-            .unwrap()
-            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+        db.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .unwrap(),
         LINEAGE_INDEX_SCHEMA_VERSION
+    );
+    db.execute(
+        "UPDATE lineage_workspace_intents SET request_digest=zeroblob(32) WHERE intent_id='intent-v1'",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    assert_eq!(
+        LineageIndex::open(private.path()).unwrap_err().category(),
+        "corrupt"
     );
 }
 
