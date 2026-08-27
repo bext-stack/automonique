@@ -11,10 +11,10 @@
     },
     {
       "name": "moved_source",
-      "external_work": {"provider":"gitlab","scope":"scope-gl-01","key":"work-17"},
+      "external_work": {"provider":"gitlab","authority":"installation-gl-01","scope":"scope-gl-01","key":"work-17"},
       "external_state": "moved",
       "workspace": "workspace-02",
-      "moved_to": {"provider":"gitlab","scope":"scope-gl-02","key":"work-17"},
+      "moved_to": {"provider":"gitlab","authority":"installation-gl-01","scope":"scope-gl-02","key":"work-17"},
       "outcome": {"kind":"conflict","conflict":"external_work_moved"}
     },
     {

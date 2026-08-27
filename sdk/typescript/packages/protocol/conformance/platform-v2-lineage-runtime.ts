@@ -3,6 +3,7 @@
 import {readFileSync} from "node:fs";
 import {
   BaseSelectorId,
+  AttemptWorkspaceId,
   BranchSelectorId,
   ExternalWorkAuthorityId,
   ExternalWorkKey,
@@ -17,10 +18,12 @@ import {
   OrchestrationRunId,
   OrchestrationTaskId,
   OrchestrationWorkerId,
+  PaneId,
   PlatformVersionNumber,
   PLATFORM_SCHEMA_V2,
   SupportedPlatformVersionNumber,
   UserWorkspaceId,
+  WorkSessionId,
   WorkContextRevision,
   WorkspaceIntentId,
   decodeExternalWorkProvider,
@@ -53,10 +56,10 @@ import {
 
 interface RawCase {
   readonly name: string;
-  readonly external_work?: {readonly provider: "github" | "gitlab" | "linear" | "jira_compatible"; readonly scope: string; readonly key: string};
+  readonly external_work?: {readonly provider: "github" | "gitlab" | "linear" | "jira_compatible"; readonly authority?: string; readonly scope: string; readonly key: string};
   readonly external_state?: ExternalWorkState;
   readonly workspace?: string;
-  readonly moved_to?: {readonly provider: "github" | "gitlab" | "linear" | "jira_compatible"; readonly scope: string; readonly key: string};
+  readonly moved_to?: {readonly provider: "github" | "gitlab" | "linear" | "jira_compatible"; readonly authority?: string; readonly scope: string; readonly key: string};
   readonly orchestration?: RawOrchestration;
   readonly decision_gate?: RawOrchestration;
   readonly intent?: {readonly kind: "create" | "resume"; readonly request: Readonly<Record<string, unknown>>};
@@ -79,7 +82,7 @@ const fixture = JSON.parse(readFileSync("../../../../rust/crates/automonique-pro
 if (fixture.schema !== "automonique.platform/v2" || fixture.cases.length !== 9) throw new Error("lineage fixture header drifted");
 
 const external = (value: NonNullable<RawCase["external_work"]>): ExternalWorkIdentity => validateExternalWorkIdentity({
-  authority: ExternalWorkAuthorityId(`installation-${value.scope}`),
+  authority: ExternalWorkAuthorityId(value.authority ?? `installation-${value.scope}`),
   key: ExternalWorkKey(value.key),
   provider: decodeExternalWorkProvider(value.provider),
   scope: ExternalWorkScope(value.scope),
@@ -117,9 +120,9 @@ const outcome = (value: NonNullable<RawCase["outcome"]>): WorkspaceIntentOutcome
 };
 
 const origin = (workspace: string) => ({
-  attempt: null,
-  pane: null,
-  session: null,
+  attempt: AttemptWorkspaceId(`attempt-${workspace}`),
+  pane: PaneId(`pane-${workspace}`),
+  session: WorkSessionId(`session-${workspace}`),
   workspace: UserWorkspaceId(workspace),
 });
 
@@ -156,6 +159,10 @@ for (const entry of fixture.cases) {
       workspace: UserWorkspaceId(entry.workspace),
     });
     if (item.moved_to === null) validateLineageProjection({external_work_items: [item], orchestration: [], schema: PLATFORM_SCHEMA_V2, workspace: item.workspace});
+    else {
+      const target = validateExternalWorkItem({...item, identity: item.moved_to, moved_to: null, state: "open"});
+      validateLineageProjection({external_work_items: [item, target], orchestration: [], schema: PLATFORM_SCHEMA_V2, workspace: item.workspace});
+    }
     if (entry.name === "duplicate_intake") {
       mustRefuse(() => validateLineageProjection({external_work_items: [item, item], orchestration: [], schema: PLATFORM_SCHEMA_V2, workspace: item.workspace}));
     }
@@ -226,12 +233,14 @@ for (const required of ["duplicate_intake", "moved_source", "closed_source", "or
   if (!names.has(required)) throw new Error(`missing fixture ${required}`);
 }
 const exactProjection = "{\"platform_version\":2,\"schema\":\"automonique.platform/v2\",\"value\":{\"external_work_items\":[],\"orchestration\":[],\"schema\":\"automonique.platform/v2\",\"workspace\":\"workspace-codec\"}}";
-const decodedProjection = decodeLineageProjection(new TextEncoder().encode(exactProjection));
-if (new TextDecoder().decode(encodeLineageProjection(decodedProjection)) !== exactProjection) throw new Error("lineage codec exact-byte drifted");
+const v2Offer = {schema: "automonique.platform/negotiation/v1" as const, versions: [PlatformVersionNumber(2n)]};
+const lineageV2 = negotiatePlatformVersion(v2Offer, v2Offer);
+const decodedProjection = decodeLineageProjection(lineageV2, new TextEncoder().encode(exactProjection));
+if (new TextDecoder().decode(encodeLineageProjection(lineageV2, decodedProjection)) !== exactProjection) throw new Error("lineage codec exact-byte drifted");
 const exactIntent = "{\"platform_version\":2,\"schema\":\"automonique.platform/v2\",\"value\":{\"kind\":\"create\",\"request\":{\"base_selector\":\"base-codec\",\"branch_selector\":\"branch-codec\",\"external_work\":{\"authority\":\"installation-codec\",\"key\":\"issue-codec\",\"provider\":\"gitlab\",\"scope\":\"scope-codec\"},\"intent_id\":\"intent-codec\",\"task\":\"task-codec\"}}}";
-if (new TextDecoder().decode(encodeWorkspaceIntent(decodeWorkspaceIntent(new TextEncoder().encode(exactIntent)))) !== exactIntent) throw new Error("intent codec exact-byte drifted");
+if (new TextDecoder().decode(encodeWorkspaceIntent(lineageV2, decodeWorkspaceIntent(lineageV2, new TextEncoder().encode(exactIntent)))) !== exactIntent) throw new Error("intent codec exact-byte drifted");
 const exactOutcome = "{\"platform_version\":2,\"schema\":\"automonique.platform/v2\",\"value\":{\"kind\":\"accepted\"}}";
-if (new TextDecoder().decode(encodeWorkspaceIntentOutcome(decodeWorkspaceIntentOutcome(new TextEncoder().encode(exactOutcome)))) !== exactOutcome) throw new Error("outcome codec exact-byte drifted");
-mustRefuse(() => decodeLineageProjection(new TextEncoder().encode(exactProjection.replace("\"platform_version\":2", "\"platform_version\":1"))));
-mustRefuse(() => decodeWorkspaceIntentOutcome(new TextEncoder().encode(exactOutcome.replace("accepted", "undefined"))));
+if (new TextDecoder().decode(encodeWorkspaceIntentOutcome(lineageV2, decodeWorkspaceIntentOutcome(lineageV2, new TextEncoder().encode(exactOutcome)))) !== exactOutcome) throw new Error("outcome codec exact-byte drifted");
+mustRefuse(() => decodeLineageProjection(lineageV2, new TextEncoder().encode(exactProjection.replace("\"platform_version\":2", "\"platform_version\":1"))));
+mustRefuse(() => decodeWorkspaceIntentOutcome(lineageV2, new TextEncoder().encode(exactOutcome.replace("accepted", "undefined"))));
 console.log(JSON.stringify({cases: names.size, codec_bytes: exactProjection.length + exactIntent.length + exactOutcome.length, providers: providers.size, question_links: questionLinks, stale_heartbeats: staleHeartbeats}));

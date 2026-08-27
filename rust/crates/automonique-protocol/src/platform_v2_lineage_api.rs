@@ -447,7 +447,11 @@ fn encoded(value: JsonValue) -> Result<Vec<u8>, LineageApiError> {
     }
 }
 
-pub fn encode_lineage_projection(value: &LineageProjection) -> Result<Vec<u8>, LineageApiError> {
+pub fn encode_lineage_projection(
+    negotiated: &NegotiatedPlatform,
+    value: &LineageProjection,
+) -> Result<Vec<u8>, LineageApiError> {
+    require_lineage_v2(negotiated)?;
     encoded(obj(vec![
         (
             "external_work_items",
@@ -476,7 +480,11 @@ pub fn encode_lineage_projection(value: &LineageProjection) -> Result<Vec<u8>, L
         ),
     ]))
 }
-pub fn decode_lineage_projection(payload: &[u8]) -> Result<LineageProjection, LineageApiError> {
+pub fn decode_lineage_projection(
+    negotiated: &NegotiatedPlatform,
+    payload: &[u8],
+) -> Result<LineageProjection, LineageApiError> {
+    require_lineage_v2(negotiated)?;
     let value = decoded_value(payload)?;
     fields(
         &value,
@@ -508,8 +516,8 @@ pub fn decode_lineage_projection(payload: &[u8]) -> Result<LineageProjection, Li
     )?)
 }
 
-fn intent_json(value: &WorkspaceIntent) -> JsonValue {
-    match value {
+fn intent_json(value: &WorkspaceIntent) -> Result<JsonValue, LineageApiError> {
+    Ok(match value {
         WorkspaceIntent::Create(v) => obj(vec![
             ("kind", JsonValue::String("create".to_owned())),
             (
@@ -537,13 +545,7 @@ fn intent_json(value: &WorkspaceIntent) -> JsonValue {
             (
                 "request",
                 obj(vec![
-                    (
-                        "expected_revision",
-                        JsonValue::Integer(
-                            i64::try_from(v.expected_revision().get())
-                                .expect("validated revision fits wire"),
-                        ),
-                    ),
+                    ("expected_revision", integer(v.expected_revision().get())?),
                     (
                         "intent_id",
                         JsonValue::String(v.intent_id().as_str().to_owned()),
@@ -556,7 +558,7 @@ fn intent_json(value: &WorkspaceIntent) -> JsonValue {
                 ]),
             ),
         ]),
-    }
+    })
 }
 fn intent(value: &JsonValue) -> Result<WorkspaceIntent, LineageApiError> {
     fields(value, &["kind", "request"])?;
@@ -596,10 +598,18 @@ fn intent(value: &JsonValue) -> Result<WorkspaceIntent, LineageApiError> {
         _ => return Err(LineageApiError::InvalidBody),
     })
 }
-pub fn encode_workspace_intent(value: &WorkspaceIntent) -> Result<Vec<u8>, LineageApiError> {
-    encoded(intent_json(value))
+pub fn encode_workspace_intent(
+    negotiated: &NegotiatedPlatform,
+    value: &WorkspaceIntent,
+) -> Result<Vec<u8>, LineageApiError> {
+    require_lineage_v2(negotiated)?;
+    encoded(intent_json(value)?)
 }
-pub fn decode_workspace_intent(payload: &[u8]) -> Result<WorkspaceIntent, LineageApiError> {
+pub fn decode_workspace_intent(
+    negotiated: &NegotiatedPlatform,
+    payload: &[u8],
+) -> Result<WorkspaceIntent, LineageApiError> {
+    require_lineage_v2(negotiated)?;
     intent(&decoded_value(payload)?)
 }
 
@@ -659,12 +669,16 @@ fn outcome(value: &JsonValue) -> Result<WorkspaceIntentOutcome, LineageApiError>
     })
 }
 pub fn encode_workspace_intent_outcome(
+    negotiated: &NegotiatedPlatform,
     value: &WorkspaceIntentOutcome,
 ) -> Result<Vec<u8>, LineageApiError> {
+    require_lineage_v2(negotiated)?;
     encoded(outcome_json(value))
 }
 pub fn decode_workspace_intent_outcome(
+    negotiated: &NegotiatedPlatform,
     payload: &[u8],
 ) -> Result<WorkspaceIntentOutcome, LineageApiError> {
+    require_lineage_v2(negotiated)?;
     outcome(&decoded_value(payload)?)
 }

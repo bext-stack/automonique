@@ -1422,14 +1422,14 @@ function originRefines(value: LineageOrigin, parent: LineageOrigin): boolean {
 
 export function validateLatestUsefulMessage(value: LatestUsefulMessage): LatestUsefulMessage {
   exactInput(value, LatestUsefulMessage_FIELDS);
-  return {observed_at_ms: LineageObservedAtMs(value.observed_at_ms), text: LineageMessage(value.text)};
+  return {observed_at_ms: LineageObservedAtMs(workContextWireUnsigned(value.observed_at_ms, LineageObservedAtMs_MAX, "observed_at_ms")), text: LineageMessage(value.text)};
 }
 
 export function validateLineageFreshness(value: LineageFreshness): LineageFreshness {
   exactInput(value, LineageFreshness_FIELDS);
   return {
-    observed_at_ms: LineageObservedAtMs(value.observed_at_ms),
-    stale_after_ms: LineageStaleAfterMs(value.stale_after_ms),
+    observed_at_ms: LineageObservedAtMs(workContextWireUnsigned(value.observed_at_ms, LineageObservedAtMs_MAX, "observed_at_ms")),
+    stale_after_ms: LineageStaleAfterMs(workContextWireUnsigned(value.stale_after_ms, LineageStaleAfterMs_MAX, "stale_after_ms")),
     state: decodeLineageFreshnessState(value.state),
   };
 }
@@ -1477,7 +1477,8 @@ export function validateExternalWorkItem(value: ExternalWorkItem): ExternalWorkI
   const state = decodeExternalWorkState(value.state);
   const freshness = validateLineageFreshness(value.freshness);
   const latest = value.latest_useful_message === null ? null : validateLatestUsefulMessage(value.latest_useful_message);
-  if ((state === "moved") !== (moved_to !== null) || (moved_to !== null && sameExternalWorkIdentity(identity, moved_to))
+  if ((state === "moved") !== (moved_to !== null) || (moved_to !== null && (sameExternalWorkIdentity(identity, moved_to)
+      || moved_to.provider !== identity.provider || moved_to.authority !== identity.authority))
       || (latest !== null && latest.observed_at_ms > freshness.observed_at_ms)) {
     workContextRefusal("external work transition is invalid");
   }
@@ -1487,7 +1488,7 @@ export function validateExternalWorkItem(value: ExternalWorkItem): ExternalWorkI
     latest_useful_message: latest,
     moved_to,
     origin: validateLineageOrigin(value.origin),
-    revision: WorkContextRevision(value.revision),
+    revision: WorkContextRevision(workContextWireUnsigned(value.revision, WorkContextRevision_MAX, "revision")),
     state,
     workspace: UserWorkspaceId(value.workspace),
   };
@@ -1511,7 +1512,7 @@ export function validateOrchestrationRecord(value: OrchestrationRecord): Orchest
     latest_useful_message: latest,
     origin: validateLineageOrigin(value.origin),
     parent,
-    revision: WorkContextRevision(value.revision),
+    revision: WorkContextRevision(workContextWireUnsigned(value.revision, WorkContextRevision_MAX, "revision")),
     status: validateLineageStatus(value.status),
     workspace: UserWorkspaceId(value.workspace),
   };
@@ -1563,7 +1564,7 @@ export function validateWorkspaceCreateIntent(value: WorkspaceCreateIntent): Wor
 export function validateWorkspaceResumeIntent(value: WorkspaceResumeIntent): WorkspaceResumeIntent {
   exactInput(value, WorkspaceResumeIntent_FIELDS);
   return {
-    expected_revision: WorkContextRevision(value.expected_revision),
+    expected_revision: WorkContextRevision(workContextWireUnsigned(value.expected_revision, WorkContextRevision_MAX, "expected_revision")),
     intent_id: WorkspaceIntentId(value.intent_id),
     task: OrchestrationTaskId(value.task),
     workspace: UserWorkspaceId(value.workspace),
@@ -1629,9 +1630,9 @@ function lineageChecked<T>(operation: () => T): T {
     throw new RefusalError(WORK_CONTEXT_VALUE_INVALID, "lineage value is invalid");
   }
 }
-export function encodeLineageProjection(value: LineageProjection): Uint8Array { return lineageChecked(() => lineageDocument(validateLineageProjection(value))); }
-export function decodeLineageProjection(payload: Uint8Array): LineageProjection { return lineageChecked(() => validateLineageProjection(decodeLineageDocument(payload) as LineageProjection)); }
-export function encodeWorkspaceIntent(value: WorkspaceIntent): Uint8Array { return lineageChecked(() => lineageDocument(validateWorkspaceIntent(value))); }
-export function decodeWorkspaceIntent(payload: Uint8Array): WorkspaceIntent { return lineageChecked(() => validateWorkspaceIntent(decodeLineageDocument(payload) as WorkspaceIntent)); }
-export function encodeWorkspaceIntentOutcome(value: WorkspaceIntentOutcome): Uint8Array { return lineageChecked(() => lineageDocument(validateWorkspaceIntentOutcome(value))); }
-export function decodeWorkspaceIntentOutcome(payload: Uint8Array): WorkspaceIntentOutcome { return lineageChecked(() => validateWorkspaceIntentOutcome(decodeLineageDocument(payload) as WorkspaceIntentOutcome)); }
+export function encodeLineageProjection(negotiated: NegotiatedPlatform, value: LineageProjection): Uint8Array { return lineageChecked(() => { requireLineageV2(negotiated); return lineageDocument(validateLineageProjection(value)); }); }
+export function decodeLineageProjection(negotiated: NegotiatedPlatform, payload: Uint8Array): LineageProjection { return lineageChecked(() => { requireLineageV2(negotiated); return validateLineageProjection(decodeLineageDocument(payload) as LineageProjection); }); }
+export function encodeWorkspaceIntent(negotiated: NegotiatedPlatform, value: WorkspaceIntent): Uint8Array { return lineageChecked(() => { requireLineageV2(negotiated); return lineageDocument(validateWorkspaceIntent(value)); }); }
+export function decodeWorkspaceIntent(negotiated: NegotiatedPlatform, payload: Uint8Array): WorkspaceIntent { return lineageChecked(() => { requireLineageV2(negotiated); return validateWorkspaceIntent(decodeLineageDocument(payload) as WorkspaceIntent); }); }
+export function encodeWorkspaceIntentOutcome(negotiated: NegotiatedPlatform, value: WorkspaceIntentOutcome): Uint8Array { return lineageChecked(() => { requireLineageV2(negotiated); return lineageDocument(validateWorkspaceIntentOutcome(value)); }); }
+export function decodeWorkspaceIntentOutcome(negotiated: NegotiatedPlatform, payload: Uint8Array): WorkspaceIntentOutcome { return lineageChecked(() => { requireLineageV2(negotiated); return validateWorkspaceIntentOutcome(decodeLineageDocument(payload) as WorkspaceIntentOutcome); }); }

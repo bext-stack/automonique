@@ -5,6 +5,14 @@ use automonique_protocol::digest::Sha256;
 use automonique_protocol::platform_v2::{
     PlatformVersionOffer, UserWorkspaceId, negotiate_platform_version,
 };
+
+fn lineage_v2() -> automonique_protocol::platform_v2::NegotiatedPlatform {
+    negotiate_platform_version(
+        &PlatformVersionOffer::new(vec![2]).unwrap(),
+        &PlatformVersionOffer::new(vec![2]).unwrap(),
+    )
+    .unwrap()
+}
 use automonique_protocol::platform_v2_lineage::*;
 use automonique_protocol::platform_v2_lineage_api::{
     decode_lineage_projection, decode_workspace_intent, decode_workspace_intent_outcome,
@@ -365,7 +373,7 @@ fn shared_fixture_names_every_required_boundary_and_mixed_version_recovery() {
     let fixture = include_str!("../fixtures/platform-v2-lineage-v1.json");
     assert_eq!(
         Sha256::digest(fixture.as_bytes()).to_hex(),
-        "130be5da4a7eff9fb656f1e8506b1ce9fb37f64f812548e2a8009b5f1f902714"
+        "d1b90d8145d0388bcd75bbba16ce464090235d17e31105e95adf0f4fa8d9ea3e"
     );
     for name in [
         "duplicate_intake",
@@ -418,8 +426,14 @@ fn canonical_lineage_codec_is_exact_bidirectional_and_negotiation_gated() {
     )
     .unwrap();
     let exact = b"{\"platform_version\":2,\"schema\":\"automonique.platform/v2\",\"value\":{\"external_work_items\":[],\"orchestration\":[],\"schema\":\"automonique.platform/v2\",\"workspace\":\"workspace-codec\"}}";
-    assert_eq!(encode_lineage_projection(&projection).unwrap(), exact);
-    assert_eq!(decode_lineage_projection(exact).unwrap(), projection);
+    assert_eq!(
+        encode_lineage_projection(&lineage_v2(), &projection).unwrap(),
+        exact
+    );
+    assert_eq!(
+        decode_lineage_projection(&lineage_v2(), exact).unwrap(),
+        projection
+    );
 
     let intent = WorkspaceIntent::Create(WorkspaceCreateIntent::new(
         WorkspaceIntentId::new("intent-codec").unwrap(),
@@ -434,16 +448,22 @@ fn canonical_lineage_codec_is_exact_bidirectional_and_negotiation_gated() {
         BranchSelectorId::new("branch-codec").unwrap(),
     ));
     let exact_intent = b"{\"platform_version\":2,\"schema\":\"automonique.platform/v2\",\"value\":{\"kind\":\"create\",\"request\":{\"base_selector\":\"base-codec\",\"branch_selector\":\"branch-codec\",\"external_work\":{\"authority\":\"installation-codec\",\"key\":\"issue-codec\",\"provider\":\"gitlab\",\"scope\":\"scope-codec\"},\"intent_id\":\"intent-codec\",\"task\":\"task-codec\"}}}";
-    assert_eq!(encode_workspace_intent(&intent).unwrap(), exact_intent);
-    assert_eq!(decode_workspace_intent(exact_intent).unwrap(), intent);
+    assert_eq!(
+        encode_workspace_intent(&lineage_v2(), &intent).unwrap(),
+        exact_intent
+    );
+    assert_eq!(
+        decode_workspace_intent(&lineage_v2(), exact_intent).unwrap(),
+        intent
+    );
     let outcome = WorkspaceIntentOutcome::Accepted;
     let exact_outcome = b"{\"platform_version\":2,\"schema\":\"automonique.platform/v2\",\"value\":{\"kind\":\"accepted\"}}";
     assert_eq!(
-        encode_workspace_intent_outcome(&outcome).unwrap(),
+        encode_workspace_intent_outcome(&lineage_v2(), &outcome).unwrap(),
         exact_outcome
     );
     assert_eq!(
-        decode_workspace_intent_outcome(exact_outcome).unwrap(),
+        decode_workspace_intent_outcome(&lineage_v2(), exact_outcome).unwrap(),
         outcome
     );
 
@@ -462,12 +482,31 @@ fn canonical_lineage_codec_is_exact_bidirectional_and_negotiation_gated() {
         "work_context_value_invalid"
     );
     require_lineage_v2(&v2).unwrap();
+    assert_eq!(
+        decode_lineage_projection(&v1, exact)
+            .unwrap_err()
+            .category(),
+        "work_context_value_invalid"
+    );
+
+    let overflow = WorkspaceIntent::Resume(WorkspaceResumeIntent::new(
+        WorkspaceIntentId::new("intent-overflow").unwrap(),
+        OrchestrationTaskId::new("task-overflow").unwrap(),
+        UserWorkspaceId::new("workspace-overflow").unwrap(),
+        Revision::new(i64::MAX as u64 + 1).unwrap(),
+    ));
+    assert_eq!(
+        encode_workspace_intent(&v2, &overflow)
+            .unwrap_err()
+            .category(),
+        "work_context_counter_out_of_range"
+    );
 
     let wrong = String::from_utf8(exact.to_vec())
         .unwrap()
         .replace("\"platform_version\":2", "\"platform_version\":1");
     assert_eq!(
-        decode_lineage_projection(wrong.as_bytes())
+        decode_lineage_projection(&v2, wrong.as_bytes())
             .unwrap_err()
             .category(),
         "work_context_value_invalid"

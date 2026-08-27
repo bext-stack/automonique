@@ -338,7 +338,11 @@ impl ExternalWorkItem {
         latest_useful_message: Option<LatestUsefulMessage>,
     ) -> Result<Self, LineageError> {
         if (state == ExternalWorkState::Moved) != moved_to.is_some()
-            || moved_to.as_ref().is_some_and(|target| target == &identity)
+            || moved_to.as_ref().is_some_and(|target| {
+                target == &identity
+                    || target.provider() != identity.provider()
+                    || target.authority() != identity.authority()
+            })
             || latest_useful_message
                 .as_ref()
                 .is_some_and(|message| message.observed_at_ms() > freshness.observed_at_ms())
