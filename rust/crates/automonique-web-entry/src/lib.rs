@@ -2064,8 +2064,8 @@ impl WebIntegration {
     fn platform(&self) -> Result<PlatformProjectionView, &'static str> {
         let mut client = self
             .platform
-            .try_lock()
-            .map_err(|_| "platform_client_busy")?;
+            .lock()
+            .map_err(|_| "platform_client_unavailable")?;
         let capabilities = client.capabilities().map_err(|_| "platform_unavailable")?;
         let (health, inventory, cursor, resources) = match client
             .request(PlatformRequest::Snapshot(
@@ -2122,8 +2122,8 @@ impl WebIntegration {
     ) -> Result<PlatformSessionActionView, &'static str> {
         let mut client = self
             .platform
-            .try_lock()
-            .map_err(|_| "platform_client_busy")?;
+            .lock()
+            .map_err(|_| "platform_client_unavailable")?;
         let dashboard_client = ClientId::new(DASHBOARD_PLATFORM_CLIENT)
             .map_err(|_| "platform_session_request_invalid")?;
         let schema = "automonique.dashboard.retained-session/v1";
@@ -2341,8 +2341,8 @@ impl WebIntegration {
     fn platform_sessions(&self) -> Result<PlatformSessionsView, &'static str> {
         let mut client = self
             .platform
-            .try_lock()
-            .map_err(|_| "platform_client_busy")?;
+            .lock()
+            .map_err(|_| "platform_client_unavailable")?;
         let sessions = match client
             .request(PlatformRequest::ListSessions(ListSessionsRequest {
                 authority: ResourceAuthority::Automonique,
@@ -2375,8 +2375,8 @@ impl WebIntegration {
         let request_id = request.request_id().clone();
         let mut client = self
             .platform
-            .try_lock()
-            .map_err(|_| "platform_client_busy")?;
+            .lock()
+            .map_err(|_| "platform_client_unavailable")?;
         let mut response = client
             .request_correlated(request_id.clone(), request.request().clone())
             .map_err(|_| "platform_unavailable")?;
@@ -6807,23 +6807,44 @@ mod tests {
             }
         });
 
-        let integration = WebIntegration::open(
-            IntegrationConfig {
-                tenant: String::from("operator"),
-                actor: String::from("operator:platform-degraded"),
-                hosts: fixture_hosts(),
-            },
-            state_dir.path(),
-            runtime_dir.path(),
-        )
-        .expect("web integration");
-        let response = api_response(
-            Route::ApiPlatform,
-            &[],
-            &integration,
-            &AppState::new(fixture_status()),
-            None,
+        let integration = Arc::new(
+            WebIntegration::open(
+                IntegrationConfig {
+                    tenant: String::from("operator"),
+                    actor: String::from("operator:platform-degraded"),
+                    hosts: fixture_hosts(),
+                },
+                state_dir.path(),
+                runtime_dir.path(),
+            )
+            .expect("web integration"),
         );
+        let guard = integration.platform.lock().expect("platform client");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker_integration = Arc::clone(&integration);
+        let worker = thread::spawn(move || {
+            started_tx.send(()).expect("signal worker start");
+            result_tx
+                .send(api_response(
+                    Route::ApiPlatform,
+                    &[],
+                    &worker_integration,
+                    &AppState::new(fixture_status()),
+                    None,
+                ))
+                .expect("send platform projection");
+        });
+        started_rx.recv().expect("worker started");
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(guard);
+        let response = result_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("contended platform projection completed");
+        worker.join().expect("platform projection worker");
         platform_server.join().expect("platform server");
 
         assert_eq!(response.status, "200 OK");
@@ -7229,6 +7250,88 @@ mod tests {
             integration.mobile_authorization(Some(&bearer)),
             Err("mobile_credential_revoked")
         );
+    }
+
+    #[test]
+    fn mobile_platform_requests_wait_for_the_shared_client_instead_of_refusing_busy() {
+        let state_dir = tempfile::tempdir().expect("temporary state");
+        let runtime_dir = tempfile::tempdir().expect("temporary runtime");
+        std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private state");
+        std::fs::set_permissions(runtime_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private runtime");
+        let platform_listener = UnixListener::bind(runtime_dir.path().join("admin.sock"))
+            .expect("fixture platform socket");
+        let platform_server = thread::spawn(move || {
+            let (mut stream, _) = platform_listener.accept().expect("platform connection");
+            let mut prefix = [0_u8; 4];
+            stream.read_exact(&mut prefix).expect("platform prefix");
+            let length = usize::try_from(u32::from_be_bytes(prefix)).unwrap();
+            let mut payload = vec![0_u8; length];
+            stream.read_exact(&mut payload).expect("platform request");
+            let request = PlatformRequestMessage::from_canonical_bytes(&payload)
+                .expect("canonical platform request");
+            assert_eq!(request.request(), &PlatformRequest::Capabilities);
+            let body = PlatformResponseMessage::new(
+                request.request_id().clone(),
+                PlatformResponse::Capabilities(Capabilities::platform_v1()),
+            )
+            .to_message()
+            .unwrap()
+            .to_canonical_bytes();
+            stream
+                .write_all(&u32::try_from(body.len()).unwrap().to_be_bytes())
+                .unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        let integration = Arc::new(
+            WebIntegration::open(
+                IntegrationConfig {
+                    tenant: String::from("operator"),
+                    actor: String::from("operator:platform-mutex-contract"),
+                    hosts: fixture_hosts(),
+                },
+                state_dir.path(),
+                runtime_dir.path(),
+            )
+            .expect("web integration"),
+        );
+        let request = PlatformRequestMessage::new(
+            RequestId::new("mobile-concurrent-capabilities").unwrap(),
+            PlatformRequest::Capabilities,
+        )
+        .to_message()
+        .unwrap()
+        .to_canonical_bytes();
+        let guard = integration.platform.lock().expect("platform client");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker_integration = Arc::clone(&integration);
+        let worker = thread::spawn(move || {
+            started_tx.send(()).expect("signal worker start");
+            result_tx
+                .send(worker_integration.platform_remote(&request, None))
+                .expect("send platform result");
+        });
+        started_rx.recv().expect("worker started");
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        drop(guard);
+        let response = result_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("contended platform request completed")
+            .expect("platform response");
+        let response = PlatformResponseMessage::from_canonical_bytes(&response)
+            .expect("canonical platform response");
+        assert_eq!(
+            response.response(),
+            &PlatformResponse::Capabilities(Capabilities::platform_v1())
+        );
+        worker.join().expect("platform worker");
+        platform_server.join().expect("platform server");
     }
 
     #[test]
