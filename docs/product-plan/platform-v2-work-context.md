@@ -133,30 +133,91 @@ snapshot ceiling: for example, 640 records remain five ordinary 128-item pages.
 The helper is deterministic protocol behavior, not a persistence, indexing, or
 authorization implementation.
 
-## Mutation contract for the next slice
+## Mutation contract
 
-Create project/setup/checkout/workspace, resume workspace/attempt/session, and
-archive project/setup/checkout/workspace operations must be dedicated typed v2
-methods. Each request will carry actor authority, exact parent identities,
-expected revisions where a record already exists, an idempotency key, and no
-host path. Responses use durable receipts with accepted, completed, rejected,
-conflict, unknown, and resynchronization-required outcomes.
+Create project, host setup, checkout, user workspace, and attempt workspace;
+resume attempt workspace and session; and archive project, host setup, checkout,
+and user workspace are distinct typed v2 intents. A caller never supplies a
+new record, authoritative lifecycle, revision, or ID. The issuer creates a new
+identity while producing the preview. Every existing target and parent carries
+its authority-qualified identity and exact expected revision.
 
-Before a create or resume is admitted, the server produces a bounded preview
-of resulting relations and the effective attempt authority. Approval, when
-policy requires it, targets that exact preview revision. Ambiguous outcomes are
-reconciled by receipt identity or idempotency key and never replayed blindly.
-Archive is non-destructive and does not cancel an active attempt implicitly.
+`UserWorkspace` archive is one-way. It has no resume or unarchive operation.
+Reopening human work under an active `UserWorkspace` means creating a new
+`AttemptWorkspace`. An archived `UserWorkspace` itself never reopens; returning
+after archive requires a new `UserWorkspace` and then a new attempt. Resume is
+reserved for a hibernated `AttemptWorkspace` or `Session`. Archive remains
+non-destructive and does not cancel an active attempt implicitly.
 
-This first contract slice supplies the identities, graph, strict negotiation,
-exact query/page/resynchronization codecs, a deterministic pager over already
-authorized input, generated TypeScript validators/codecs, and bidirectional
-Rust/TypeScript conformance fixtures. `SCHEMA_DIGEST` identifies the complete
-additive generated surface and therefore moves when the v2 module changes. The
-SDK still advertises `protocolRange: 1` and `automonique.platform/v1`, so its
-manifest pins the separately generated `PLATFORM_V1_SCHEMA_DIGEST`; the
-checked-in Platform v1 module remains byte-identical.
+Before submission, the server produces a bounded preview of the exact current
+record, resulting record, inherited authority, effective authority, and every
+resolved parent. Work-context parents carry their complete authoritative
+record. Repository parents carry their complete v1 identity, exact revision,
+an explicit available/unavailable resolution, and an optional informational
+owning project. Unavailable repositories are refused. Checkout creation also
+refuses an available repository owned by a different selected project and
+proves the selected project's repository relation plus the host setup's project
+relation; project creation does not treat the optional owner as exclusive
+membership. Actor,
+serving resource authority, idempotency key, all six authority axes
+(filesystem, credentials, network, tools, providers, and models), and the typed
+intent are bound by the canonical request digest. Effective authority must be
+a subset of both the authenticated actor ceiling and inherited ceiling.
+Approval, when policy requires it, targets the exact preview ID and revision,
+the SHA-256 digest of the complete canonical preview body, request digest,
+idempotency key, and expiry. Submission and receipt repeat those bindings.
+Ambiguous outcomes are reconciled by receipt identity or
+idempotency key and never replayed blindly; `unknown` and `resync_required` are
+lookup outcomes and cannot be persisted as mutation receipts.
 
-The mutation methods, durable persistence/index and authorization integration,
-SDK client ergonomics, daemon routes, and internal terminology cleanup remain
-separate implementation work.
+The contract slices now supply the identities and graph, strict negotiation,
+exact query/page/resynchronization codecs, deterministic pager over already
+authorized input, and lifecycle proposal/preview/approval/submission/receipt
+documents. Rust values keep authoritative and binding fields private;
+generated TypeScript validates the same canonical bytes and refusal corpus.
+`SCHEMA_DIGEST` identifies the complete additive generated surface and
+therefore moves when the v2 module changes. The SDK still advertises
+`protocolRange: 1` and `automonique.platform/v1`, so its manifest pins the
+separately generated `PLATFORM_V1_SCHEMA_DIGEST`; the checked-in Platform v1
+module remains byte-identical.
+
+The authoritative SQLite slice stores records, relations, expected revisions,
+previews, approvals, receipts, inventory cursors, and external-effect work in
+tenant-scoped transactions. Its checked mutation policy names the exact
+authenticated actor, selected project, target identities, authority ceilings,
+and approval requirement. Policy is rechecked before an idempotency replay or
+conflict is disclosed. Approval recording requires a checked lifecycle-approval
+authority bound to the same tenant, exact preview body digest, revision, and
+expiry. Receipt reconciliation is available both by receipt identity and by
+the complete tenant/actor/serving-authority/idempotency scope; absence is an
+explicit `unknown` lookup result.
+
+External effects reserve the exact tenant/target/revision/effect tuple before
+enqueue. Attempt creation reserves its newly issued `AttemptWorkspace`
+identity, not the parent `UserWorkspace`, so separately requested attempts can
+run sequentially without weakening same-request replay protection. Workers
+discover and atomically claim ready effects under an opaque durable lease
+bound to executor identity, serving authority, preview, target revision,
+effect kind and document digest, and expiry. Completion consumes that exact
+lease, validates the prior accepted receipt and current authoritative snapshot,
+and returns the completed receipt idempotently on retry. Lease duration is
+bounded. Expiry moves an effect to `ambiguous`, never back to ready: a typed
+provider reconciliation tied to the original idempotency key must establish
+`not_started` before release, persist exact completion evidence before final
+receipt creation, or leave an `unknown` effect unavailable for replay.
+After a restart or lost claim response, only the original authenticated
+executor or an explicitly privileged tenant-scoped reconciler may reconstruct
+an ambiguous lease. Reconstruction validates the canonical receipt, outbox,
+reservation, lease, and preview and records the recovering identity without
+claiming or replaying the effect. A released effect becomes ready again only
+when the prior lease has an exact persisted `not_started` reconciliation whose
+evidence digest, receipt identity, and monotonic timestamps revalidate.
+Authoritative snapshot
+ingestion rejects revision regression, terminal lifecycle rollback, reparenting,
+and external owner changes. Durable readers re-encode documents and compare all
+duplicated normalized columns before returning a value.
+
+Server routes, retention workers, SDK client ergonomics, and production
+clock/random-ID and authentication-policy providers remain separate
+integration work. The protocol helpers alone do not claim to implement those
+authority or durability boundaries.

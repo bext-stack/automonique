@@ -15,6 +15,11 @@ import {
   WorkContextPageLimit,
   WorkContextRevision,
   WorkSessionId,
+  AuthorityGrantId,
+  MutationApprovalId,
+  MutationPreviewDigest,
+  MutationPreviewId,
+  WorkContextRegistrySelector,
   decodeCheckoutKind,
   decodeHostSetupKind,
   decodeWorkContextKind,
@@ -29,6 +34,20 @@ import {
   encodePlatformVersionOffer,
   encodeWorkContextPage,
   encodeWorkContextQuery,
+  decodeWorkContextMutationApproval,
+  decodeWorkContextMutationPreview,
+  decodeWorkContextMutationProposal,
+  decodeWorkContextMutationReceipt,
+  decodeWorkContextMutationRefusal,
+  decodeWorkContextMutationSubmission,
+  encodeWorkContextMutationApproval,
+  encodeWorkContextMutationPreview,
+  encodeWorkContextMutationProposal,
+  encodeWorkContextMutationReceipt,
+  encodeWorkContextMutationRefusal,
+  encodeWorkContextMutationSubmission,
+  lifecycleRequestDigest,
+  mutationPreviewDigest,
   negotiatePlatformVersion,
   validateWorkContextIdentity,
   validateWorkContextPage,
@@ -38,8 +57,15 @@ import {
   type WorkContextPage,
   type WorkContextQuery,
   type WorkContextRecord,
+  type MutationApproval,
+  type MutationPreview,
+  type MutationReceipt,
+  type MutationRefusal,
+  type MutationSubmission,
+  type WorkContextAuthority,
+  type WorkContextMutationProposal,
 } from "../generated/work-context.ts";
-import {ResourceId} from "../generated/platform.ts";
+import {IdempotencyKey, ReceiptId, ResourceId} from "../generated/platform.ts";
 
 const record = (index: number): WorkContextRecord => ({
   attributes: {checkout: null, host_setup: null},
@@ -75,6 +101,133 @@ const query: WorkContextQuery = {
   project: null,
   schema: "automonique.platform/v2",
 };
+
+const grants = (prefix: string): WorkContextAuthority => ({
+  credentials: [AuthorityGrantId(`${prefix}:credential`)],
+  filesystem: [AuthorityGrantId(`${prefix}:fs`)],
+  models: [AuthorityGrantId(`${prefix}:model`)],
+  network: [AuthorityGrantId(`${prefix}:network`)],
+  providers: [AuthorityGrantId(`${prefix}:provider`)],
+  tools: [AuthorityGrantId(`${prefix}:tool`)],
+});
+const ceiling: WorkContextAuthority = {
+  credentials: [AuthorityGrantId("narrow:credential"), AuthorityGrantId("wide:credential")],
+  filesystem: [AuthorityGrantId("narrow:fs"), AuthorityGrantId("wide:fs")],
+  models: [AuthorityGrantId("narrow:model"), AuthorityGrantId("wide:model")],
+  network: [AuthorityGrantId("narrow:network"), AuthorityGrantId("wide:network")],
+  providers: [AuthorityGrantId("narrow:provider"), AuthorityGrantId("wide:provider")],
+  tools: [AuthorityGrantId("narrow:tool"), AuthorityGrantId("wide:tool")],
+};
+const proposalBase = {
+  actor: {id: "operator-1", tenant: "tenant-1"},
+  actor_authority: ceiling,
+  authority: "automonique" as const,
+  idempotency_key: IdempotencyKey("idem-lifecycle-1"),
+  intent: {
+    kind: "resume_attempt_workspace" as const,
+    requested_authority: grants("narrow"),
+    target: {
+      identity: {id: AttemptWorkspaceId("attempt-1"), kind: "attempt_workspace" as const},
+      revision: WorkContextRevision(7n),
+    },
+  },
+};
+const lifecycleProposal: WorkContextMutationProposal = {
+  ...proposalBase,
+  request_digest: lifecycleRequestDigest(proposalBase),
+  schema: "automonique.platform/v2",
+};
+const currentAttempt: WorkContextRecord = {
+  attributes: {checkout: null, host_setup: null},
+  identity: {id: AttemptWorkspaceId("attempt-1"), kind: "attempt_workspace"},
+  label: WorkContextLabel("Attempt"),
+  lifecycle: "hibernated",
+  relations: [{kind: "attempt_user_workspace", target: {id: UserWorkspaceId("workspace-1"), kind: "user_workspace"}}],
+  revision: WorkContextRevision(7n),
+};
+const resultingAttempt: WorkContextRecord = {...currentAttempt, lifecycle: "running", revision: WorkContextRevision(8n)};
+const lifecyclePreview: MutationPreview = {
+  approval: "required",
+  current: currentAttempt,
+  effective_authority: grants("narrow"),
+  expires_at_ms: 2000n,
+  inherited_authority: ceiling,
+  issued_at_ms: 1000n,
+  preview: {id: MutationPreviewId("preview-1"), revision: WorkContextRevision(3n)},
+  proposal: lifecycleProposal,
+  resolved_parents: [],
+  resulting: resultingAttempt,
+  schema: "automonique.platform/v2",
+};
+const lifecyclePreviewDigest = mutationPreviewDigest(lifecyclePreview);
+const lifecycleApproval: MutationApproval = {
+  decided_at_ms: 1100n,
+  decided_by: {id: "approver-1", tenant: "tenant-1"},
+  decision: "granted",
+  expires_at_ms: 1900n,
+  id: MutationApprovalId("approval-1"),
+  idempotency_key: lifecycleProposal.idempotency_key,
+  preview: lifecyclePreview.preview,
+  preview_digest: lifecyclePreviewDigest,
+  request_digest: lifecycleProposal.request_digest,
+};
+const lifecycleSubmission: MutationSubmission = {
+  approval: lifecycleApproval,
+  idempotency_key: lifecycleProposal.idempotency_key,
+  preview: lifecyclePreview.preview,
+  preview_digest: lifecyclePreviewDigest,
+  request_digest: lifecycleProposal.request_digest,
+  schema: "automonique.platform/v2",
+  submitted_at_ms: 1200n,
+};
+const lifecycleReceipt: MutationReceipt = {
+  approval_id: lifecycleApproval.id,
+  id: ReceiptId("receipt-1"),
+  idempotency_key: lifecycleProposal.idempotency_key,
+  outcome: "completed",
+  preview: lifecyclePreview.preview,
+  preview_digest: lifecyclePreviewDigest,
+  recorded_at_ms: 1300n,
+  request_digest: lifecycleProposal.request_digest,
+  resulting_revision: WorkContextRevision(8n),
+  schema: "automonique.platform/v2",
+};
+const emptyAuthority: WorkContextAuthority = {credentials: [], filesystem: [], models: [], network: [], providers: [], tools: []};
+const checkoutProjectIdentity = {id: ProjectId("checkout-project"), kind: "project" as const};
+const checkoutOtherProjectIdentity = {id: ProjectId("other-project"), kind: "project" as const};
+const checkoutHostIdentity = {id: HostSetupId("checkout-host"), kind: "host_setup" as const};
+const checkoutRepositoryIdentity = validateWorkContextIdentity({kind: "repository", resource: {authority: "github", id: ResourceId("checkout-repository"), kind: "repository"}});
+const checkoutIntent = {
+  checkout_kind: "git_worktree" as const,
+  host_setup: {identity: checkoutHostIdentity, revision: WorkContextRevision(1n)},
+  kind: "create_checkout" as const,
+  label: WorkContextLabel("Checkout"),
+  project: {identity: checkoutProjectIdentity, revision: WorkContextRevision(1n)},
+  registry: WorkContextRegistrySelector("checkout-registry"),
+  repository: {identity: checkoutRepositoryIdentity, revision: WorkContextRevision(1n)},
+};
+const checkoutProposalBase = {actor: {id: "operator-1", tenant: "tenant-1"}, actor_authority: emptyAuthority, authority: "automonique" as const, idempotency_key: IdempotencyKey("checkout-negative"), intent: checkoutIntent};
+const checkoutProposal: WorkContextMutationProposal = {...checkoutProposalBase, request_digest: lifecycleRequestDigest(checkoutProposalBase), schema: "automonique.platform/v2"};
+const checkoutProjectRecord = (lifecycle: "active" | "archived"): WorkContextRecord => ({attributes: {checkout: null, host_setup: null}, identity: checkoutProjectIdentity, label: WorkContextLabel("Project"), lifecycle, relations: [{kind: "project_repository", target: checkoutRepositoryIdentity}], revision: WorkContextRevision(1n)});
+const checkoutHostRecord = (project: {readonly id: ReturnType<typeof ProjectId>; readonly kind: "project"}): WorkContextRecord => ({attributes: {checkout: null, host_setup: "local"}, identity: checkoutHostIdentity, label: WorkContextLabel("Host"), lifecycle: "active", relations: [{kind: "host_setup_project", target: project}], revision: WorkContextRevision(1n)});
+const checkoutResult: WorkContextRecord = {attributes: {checkout: "git_worktree", host_setup: null}, identity: {id: CheckoutId("issued-checkout"), kind: "checkout"}, label: WorkContextLabel("Checkout"), lifecycle: "active", relations: [{kind: "checkout_project", target: checkoutProjectIdentity}, {kind: "checkout_host_setup", target: checkoutHostIdentity}, {kind: "checkout_repository", target: checkoutRepositoryIdentity}], revision: WorkContextRevision(1n)};
+const checkoutPreview = (project: WorkContextRecord, host: WorkContextRecord): MutationPreview => ({approval: "not_required", current: null, effective_authority: emptyAuthority, expires_at_ms: 2n, inherited_authority: emptyAuthority, issued_at_ms: 1n, preview: {id: MutationPreviewId("preview-checkout-negative"), revision: WorkContextRevision(1n)}, proposal: checkoutProposal, resolved_parents: [{kind: "work_context", record: project}, {kind: "work_context", record: host}, {identity: checkoutRepositoryIdentity, kind: "external", owning_project: checkoutProjectIdentity.id, resolution: "available", revision: WorkContextRevision(1n)}], resulting: checkoutResult, schema: "automonique.platform/v2"});
+const mustRefusePreview = (value: MutationPreview): void => {try { encodeWorkContextMutationPreview(value); } catch { return; } throw new Error("invalid creation parent preview was admitted");};
+mustRefusePreview(checkoutPreview(checkoutProjectRecord("archived"), checkoutHostRecord(checkoutProjectIdentity)));
+mustRefusePreview(checkoutPreview(checkoutProjectRecord("active"), checkoutHostRecord(checkoutOtherProjectIdentity)));
+mustRefusePreview({...lifecyclePreview, expires_at_ms: 9223372036854775808n});
+const mustRefuseEncode = (encode: () => Uint8Array): void => {try { encode(); } catch { return; } throw new Error("out-of-range lifecycle epoch was admitted");};
+mustRefuseEncode(() => encodeWorkContextMutationApproval({...lifecycleApproval, expires_at_ms: 9223372036854775808n}, lifecyclePreview));
+mustRefuseEncode(() => encodeWorkContextMutationSubmission({...lifecycleSubmission, submitted_at_ms: 9223372036854775808n}, lifecyclePreview));
+mustRefuseEncode(() => encodeWorkContextMutationReceipt({...lifecycleReceipt, recorded_at_ms: 9223372036854775808n}, lifecycleSubmission, lifecyclePreview));
+mustRefuseEncode(() => encodeWorkContextMutationApproval({...lifecycleApproval, preview_digest: MutationPreviewDigest(`sha256:${"0".repeat(64)}`)}, lifecyclePreview));
+const lifecycleRefusal: MutationRefusal = {
+  category: "stale_revision",
+  explanation: "parent_revision_changed",
+  request_digest: lifecycleProposal.request_digest,
+  schema: "automonique.platform/v2",
+};
+WorkContextRegistrySelector("registry:checkout_1");
 
 // Exercise every distinct identity constructor so accidental brand collapse is
 // caught by the checked conformance source as well as the generated surface.
@@ -189,6 +342,68 @@ const refusalCategory = (decoder: RefusalDecoder, payload: Uint8Array): string =
   throw new Error(`${decoder} admitted a refusal corpus document`);
 };
 const bunArgs = (globalThis as typeof globalThis & {Bun?: {argv: readonly string[]}}).Bun?.argv ?? [];
+const lifecycleDocuments = (): readonly Uint8Array[] => [
+  encodeWorkContextMutationProposal(lifecycleProposal),
+  encodeWorkContextMutationPreview(lifecyclePreview),
+  encodeWorkContextMutationApproval(lifecycleApproval, lifecyclePreview),
+  encodeWorkContextMutationSubmission(lifecycleSubmission, lifecyclePreview),
+  encodeWorkContextMutationReceipt(lifecycleReceipt, lifecycleSubmission, lifecyclePreview),
+  encodeWorkContextMutationRefusal(lifecycleRefusal),
+];
+if (bunArgs[2] === "encode-lifecycle-corpus") {
+  console.log(lifecycleDocuments().map(hex).join("\n"));
+  (globalThis as typeof globalThis & {process?: {exit(code: number): never}}).process?.exit(0);
+}
+if (bunArgs[2] === "decode-lifecycle-corpus") {
+  const documents = bunArgs.slice(3, 9).map(unhex);
+  const proposal = decodeWorkContextMutationProposal(documents[0]!);
+  const preview = decodeWorkContextMutationPreview(documents[1]!);
+  const approval = decodeWorkContextMutationApproval(documents[2]!, preview);
+  const submission = decodeWorkContextMutationSubmission(documents[3]!, preview);
+  const receipt = decodeWorkContextMutationReceipt(documents[4]!, submission, preview);
+  const refusal = decodeWorkContextMutationRefusal(documents[5]!);
+  if (proposal.request_digest !== preview.proposal.request_digest || approval.preview.id !== preview.preview.id || submission.request_digest !== proposal.request_digest || receipt.resulting_revision !== 8n || refusal.category !== "stale_revision") throw new Error("lifecycle value drifted");
+  console.log([
+    hex(encodeWorkContextMutationProposal(proposal)),
+    hex(encodeWorkContextMutationPreview(preview)),
+    hex(encodeWorkContextMutationApproval(approval, preview)),
+    hex(encodeWorkContextMutationSubmission(submission, preview)),
+    hex(encodeWorkContextMutationReceipt(receipt, submission, preview)),
+    hex(encodeWorkContextMutationRefusal(refusal)),
+  ].join("\n"));
+  (globalThis as typeof globalThis & {process?: {exit(code: number): never}}).process?.exit(0);
+}
+type LifecycleRefusalDecoder = "proposal" | "preview" | "refusal";
+const lifecycleDecodeCategory = (decoder: LifecycleRefusalDecoder, payload: Uint8Array): string => {
+  try {
+    if (decoder === "proposal") decodeWorkContextMutationProposal(payload);
+    else if (decoder === "preview") decodeWorkContextMutationPreview(payload);
+    else decodeWorkContextMutationRefusal(payload);
+  } catch (error) {
+    const category = (error as {category?: unknown}).category;
+    if (typeof category === "string") return category;
+    throw error;
+  }
+  throw new Error(`${decoder} admitted a lifecycle refusal corpus document`);
+};
+const validLifecycleText = lifecycleDocuments().map((bytes) => textDecoder.decode(bytes));
+const lifecycleRefusals: readonly {decoder: LifecycleRefusalDecoder; category: string; payload: Uint8Array}[] = [
+  {decoder: "proposal", category: "work_context_value_invalid", payload: canonical(validLifecycleText[0]!.replace(/sha256:[0-9a-f]{64}/, `sha256:${"0".repeat(64)}`))},
+  {decoder: "preview", category: "work_context_value_invalid", payload: canonical(validLifecycleText[1]!.replace('["narrow:fs","wide:fs"]', '["wide:fs","narrow:fs"]'))},
+  {decoder: "preview", category: "work_context_value_invalid", payload: canonical(validLifecycleText[1]!.replace('"lifecycle":"running"', '"lifecycle":"active"'))},
+  {decoder: "refusal", category: "work_context_value_invalid", payload: canonical(validLifecycleText[5]!.replace('"stale_revision"', '"future_refusal"'))},
+];
+if (bunArgs[2] === "encode-lifecycle-refusal-corpus") {
+  console.log(lifecycleRefusals.map((fixture) => `${fixture.decoder}\t${fixture.category}\t${hex(fixture.payload)}`).join("\n"));
+  (globalThis as typeof globalThis & {process?: {exit(code: number): never}}).process?.exit(0);
+}
+if (bunArgs[2] === "decode-lifecycle-refusal-corpus") {
+  console.log(bunArgs.slice(3).map((argument) => {
+    const separator = argument.indexOf(":");
+    return lifecycleDecodeCategory(argument.slice(0, separator) as LifecycleRefusalDecoder, unhex(argument.slice(separator + 1)));
+  }).join(","));
+  (globalThis as typeof globalThis & {process?: {exit(code: number): never}}).process?.exit(0);
+}
 if (bunArgs[2] === "encode-corpus") {
   console.log([
     hex(encodePlatformVersionOffer(offer)),
