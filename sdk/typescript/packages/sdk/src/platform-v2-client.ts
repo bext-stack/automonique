@@ -383,6 +383,14 @@ function rawMutationApprovalDecision(canonical: Uint8Array): MutationApprovalDec
     if (document.kind !== "object") throw new Error("approval document");
     const approval = document.entries.find(([key]) => key === "approval")?.[1];
     if (approval?.kind !== "object") throw new Error("approval body");
+    const expected = [
+      "decided_at_ms", "decided_by", "decision", "expires_at_ms", "id",
+      "idempotency_key", "preview", "preview_digest", "request_digest",
+    ];
+    if (approval.entries.length !== expected.length
+      || approval.entries.some(([key], index) => key !== expected[index])) {
+      throw new Error("approval shape");
+    }
     const decision = approval.entries.find(([key]) => key === "decision")?.[1];
     if (decision?.kind !== "string" || (decision.value !== "granted" && decision.value !== "denied")) {
       throw new Error("approval decision");
