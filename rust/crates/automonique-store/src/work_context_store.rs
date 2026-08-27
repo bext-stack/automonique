@@ -218,6 +218,10 @@ pub enum WorkContextStoreError {
     StaleRevision,
     GraphConflict,
     BodyConflict,
+    BootstrapPartial,
+    BootstrapMismatch,
+    BootstrapDowngrade,
+    BootstrapGuard,
     ApprovalRequired,
     ApprovalMismatch,
     ApprovalDenied,
@@ -244,6 +248,10 @@ impl WorkContextStoreError {
             Self::AuthorityWidening => "authority_widening",
             Self::StaleRevision => "stale_revision",
             Self::GraphConflict | Self::BodyConflict => "conflict",
+            Self::BootstrapPartial => "bootstrap_partial",
+            Self::BootstrapMismatch => "bootstrap_mismatch",
+            Self::BootstrapDowngrade => "bootstrap_downgrade",
+            Self::BootstrapGuard => "bootstrap_guard",
             Self::ApprovalRequired => "approval_required",
             Self::ApprovalMismatch => "approval_mismatch",
             Self::ApprovalDenied => "approval_denied",
@@ -602,6 +610,22 @@ pub struct WorkContextStore {
     path: PathBuf,
 }
 
+/// One immutable external repository projection admitted by an offline
+/// operator bootstrap.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkContextBootstrapExternal {
+    pub expected: ExpectedWorkContext,
+    pub resolution: ExternalParentResolution,
+    pub owning_project: ProjectId,
+}
+
+/// The only two non-error states of an atomic bootstrap comparison.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkContextBootstrapState {
+    Absent,
+    Identical,
+}
+
 impl WorkContextStore {
     pub fn open(path: impl AsRef<Path>) -> Stored<Self> {
         let path = path.as_ref();
@@ -622,6 +646,90 @@ impl WorkContextStore {
         let mut connection = Connection::open_with_flags(path, flags)?;
         crate::sqlite_policy::configure_authoritative(&connection)?;
         initialize(&mut connection)?;
+        Ok(Self {
+            connection,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Create and initialize a new current-schema store, refusing if any file
+    /// already occupies the path. This keeps callers that admitted an absent
+    /// store from accidentally migrating a concurrently introduced database.
+    pub fn create_new(path: impl AsRef<Path>) -> Stored<Self> {
+        let path = path.as_ref();
+        secure_path(path)?;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        secure_path(path)?;
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let mut connection = Connection::open_with_flags(path, flags)?;
+        crate::sqlite_policy::configure_authoritative(&connection)?;
+        initialize(&mut connection)?;
+        Ok(Self {
+            connection,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Open an existing current-schema store without migrations, journal-mode
+    /// changes, file creation, or write authority.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Stored<Self> {
+        let path = path.as_ref();
+        secure_path(path)?;
+        if !path.exists() {
+            return Err(WorkContextStoreError::NotFound);
+        }
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let connection = Connection::open_with_flags(path, flags)?;
+        connection.pragma_update(None, "query_only", true)?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version != WORK_CONTEXT_STORE_SCHEMA_VERSION {
+            return Err(WorkContextStoreError::SchemaVersion {
+                found: version,
+                supported: WORK_CONTEXT_STORE_SCHEMA_VERSION,
+            });
+        }
+        Ok(Self {
+            connection,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Open an existing current-schema store with write authority but without
+    /// creating the file or running any schema migration.
+    ///
+    /// The schema version is checked before authoritative write pragmas are
+    /// configured, so an older or newer store is refused without mutation.
+    pub fn open_existing_current(path: impl AsRef<Path>) -> Stored<Self> {
+        let path = path.as_ref();
+        secure_path(path)?;
+        if !path.exists() {
+            return Err(WorkContextStoreError::NotFound);
+        }
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let connection = Connection::open_with_flags(path, flags)?;
+        let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version != WORK_CONTEXT_STORE_SCHEMA_VERSION {
+            return Err(WorkContextStoreError::SchemaVersion {
+                found: version,
+                supported: WORK_CONTEXT_STORE_SCHEMA_VERSION,
+            });
+        }
+        crate::sqlite_policy::configure_authoritative(&connection)?;
         Ok(Self {
             connection,
             path: path.to_path_buf(),
@@ -662,6 +770,69 @@ impl WorkContextStore {
         bump_generation(&tx)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Compare a complete operator-owned bootstrap graph in one SQLite
+    /// snapshot without changing it.
+    pub fn inspect_bootstrap(
+        &self,
+        tenant: &str,
+        externals: &[WorkContextBootstrapExternal],
+        records: &[WorkContextRecord],
+    ) -> Stored<WorkContextBootstrapState> {
+        validate_bootstrap_input(tenant, externals, records)?;
+        let tx = self.connection.unchecked_transaction()?;
+        let state = inspect_bootstrap_on(&tx, tenant, externals, records)?;
+        tx.commit()?;
+        Ok(state)
+    }
+
+    /// Seed a complete operator-owned graph atomically. A retry succeeds only
+    /// when every durable projection is byte-for-byte identical. Partial,
+    /// mismatched, or newer state is refused without writing any row.
+    pub fn apply_bootstrap(
+        &mut self,
+        tenant: &str,
+        externals: &[WorkContextBootstrapExternal],
+        records: &[WorkContextRecord],
+    ) -> Stored<WorkContextBootstrapState> {
+        self.apply_bootstrap_guarded(tenant, externals, records, || Ok(()))
+    }
+
+    /// Seed a complete operator-owned graph atomically, running `precommit`
+    /// inside the immediate SQLite transaction after the final state change
+    /// and immediately before commit. A failed guard rolls back every graph
+    /// write made by this call.
+    pub fn apply_bootstrap_guarded<F>(
+        &mut self,
+        tenant: &str,
+        externals: &[WorkContextBootstrapExternal],
+        records: &[WorkContextRecord],
+        precommit: F,
+    ) -> Stored<WorkContextBootstrapState>
+    where
+        F: FnOnce() -> Stored<()>,
+    {
+        validate_bootstrap_input(tenant, externals, records)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state = inspect_bootstrap_on(&tx, tenant, externals, records)?;
+        if state == WorkContextBootstrapState::Identical {
+            precommit()?;
+            tx.commit()?;
+            return Ok(state);
+        }
+        for external in externals {
+            store_bootstrap_external(&tx, tenant, external)?;
+        }
+        for record in records {
+            store_record(&tx, tenant, record)?;
+        }
+        bump_generation(&tx)?;
+        precommit()?;
+        tx.commit()?;
+        Ok(WorkContextBootstrapState::Absent)
     }
 
     pub fn put_external_snapshot(
@@ -2774,6 +2945,118 @@ fn decode_record_document(bytes: &[u8]) -> Stored<WorkContextRecord> {
     }
     Ok(items.remove(0))
 }
+
+fn validate_bootstrap_input(
+    tenant: &str,
+    externals: &[WorkContextBootstrapExternal],
+    records: &[WorkContextRecord],
+) -> Stored<()> {
+    validate_tenant(tenant)?;
+    if externals.is_empty() || externals.len() > 128 || records.is_empty() || records.len() > 1024 {
+        return Err(WorkContextStoreError::InvalidField("bootstrap_graph"));
+    }
+    let mut identities = BTreeSet::new();
+    for external in externals {
+        if external.expected.identity().kind() != WorkContextTargetKind::Repository
+            || external.expected.revision().get() != 1
+            || external.resolution != ExternalParentResolution::Available
+            || !identities.insert(external.expected.identity().clone())
+        {
+            return Err(WorkContextStoreError::InvalidField("bootstrap_external"));
+        }
+    }
+    for record in records {
+        if record.revision().get() != 1 || !identities.insert(record.identity().clone()) {
+            return Err(WorkContextStoreError::InvalidField("bootstrap_record"));
+        }
+    }
+    Ok(())
+}
+
+fn inspect_bootstrap_on(
+    tx: &Transaction<'_>,
+    tenant: &str,
+    externals: &[WorkContextBootstrapExternal],
+    records: &[WorkContextRecord],
+) -> Stored<WorkContextBootstrapState> {
+    let tenant_counts: (i64, i64, i64) = tx.query_row(
+        "SELECT (SELECT count(*) FROM work_context_records WHERE tenant=?1), (SELECT count(*) FROM work_context_expected_revisions WHERE tenant=?1), (SELECT count(*) FROM work_context_selector_bindings WHERE tenant=?1)",
+        params![tenant],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let mut exact = 0usize;
+    let expected_total = externals.len() + records.len();
+    for external in externals {
+        let key = identity_key(external.expected.identity());
+        let row: Option<(i64, Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT revision,owning_project_id,external_resolution FROM work_context_expected_revisions WHERE tenant=?1 AND identity_key=?2",
+                params![tenant, key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((revision, owner, resolution)) = row {
+            let wanted = to_i64(external.expected.revision())?;
+            if revision > wanted {
+                return Err(WorkContextStoreError::BootstrapDowngrade);
+            }
+            if revision != wanted
+                || owner.as_deref() != Some(external.owning_project.as_str())
+                || resolution.as_deref() != Some(external.resolution.as_str())
+            {
+                return Err(WorkContextStoreError::BootstrapMismatch);
+            }
+            exact += 1;
+        }
+    }
+    for record in records {
+        if let Some(stored) = load_record(tx, tenant, record.identity())? {
+            if stored.revision().get() > record.revision().get() {
+                return Err(WorkContextStoreError::BootstrapDowngrade);
+            }
+            if &stored != record {
+                return Err(WorkContextStoreError::BootstrapMismatch);
+            }
+            exact += 1;
+        }
+    }
+    if exact == expected_total {
+        if tenant_counts.0 != i64::try_from(records.len()).unwrap_or(i64::MAX)
+            || tenant_counts.1 != i64::try_from(expected_total).unwrap_or(i64::MAX)
+            || tenant_counts.2 != 0
+        {
+            return Err(WorkContextStoreError::BootstrapMismatch);
+        }
+        return Ok(WorkContextBootstrapState::Identical);
+    }
+    if exact != 0 {
+        return Err(WorkContextStoreError::BootstrapPartial);
+    }
+    let existing = tenant_counts.0 + tenant_counts.1 + tenant_counts.2;
+    if existing != 0 {
+        return Err(WorkContextStoreError::BootstrapMismatch);
+    }
+    Ok(WorkContextBootstrapState::Absent)
+}
+
+fn store_bootstrap_external(
+    tx: &Transaction<'_>,
+    tenant: &str,
+    external: &WorkContextBootstrapExternal,
+) -> Stored<()> {
+    tx.execute(
+        "INSERT INTO work_context_expected_revisions(tenant,identity_key,revision,owning_project_id,external_resolution) VALUES(?1,?2,?3,?4,?5)",
+        params![
+            tenant,
+            identity_key(external.expected.identity()),
+            to_i64(external.expected.revision())?,
+            external.owning_project.as_str(),
+            external.resolution.as_str()
+        ],
+    )?;
+    Ok(())
+}
+
 fn store_record(tx: &Transaction<'_>, tenant: &str, record: &WorkContextRecord) -> Stored<()> {
     validate_tenant(tenant)?;
     let key = identity_key(record.identity());

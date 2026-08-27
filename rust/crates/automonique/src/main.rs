@@ -49,6 +49,9 @@ fn main() -> ExitCode {
             Err(_) => ExitCode::FAILURE,
         };
     }
+    if command.as_deref() == Some(std::ffi::OsStr::new("platform-v2-bootstrap")) {
+        return platform_v2_bootstrap_command(arguments.collect());
+    }
     if command.as_deref() == Some(std::ffi::OsStr::new("daemon")) {
         let values = arguments.collect::<Vec<_>>();
         let disconnected = values.as_slice()
@@ -134,6 +137,59 @@ fn main() -> ExitCode {
         std::io::stdout().lock(),
         std::io::stderr().lock(),
     ))
+}
+
+fn platform_v2_bootstrap_command(values: Vec<std::ffi::OsString>) -> ExitCode {
+    use automonique_daemon::platform_v2_bootstrap::BootstrapMode;
+
+    let (mode, manifest) = match values.as_slice() {
+        [action, manifest_flag, manifest] if manifest_flag == "--manifest" && action == "plan" => {
+            (BootstrapMode::Plan, manifest)
+        }
+        [action, manifest_flag, manifest] if manifest_flag == "--manifest" && action == "apply" => {
+            (BootstrapMode::Apply, manifest)
+        }
+        [action, manifest_flag, manifest, dry_run]
+            if manifest_flag == "--manifest" && action == "apply" && dry_run == "--dry-run" =>
+        {
+            (BootstrapMode::Plan, manifest)
+        }
+        [action, manifest_flag, manifest]
+            if manifest_flag == "--manifest" && action == "verify" =>
+        {
+            (BootstrapMode::Verify, manifest)
+        }
+        _ => {
+            eprintln!(
+                "usage: automonique platform-v2-bootstrap (plan|apply|verify) --manifest PATH [--dry-run]"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let config = match automonique_daemon::DaemonConfig::from_environment() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("platform-v2 bootstrap refused: {}", error.category());
+            return ExitCode::FAILURE;
+        }
+    };
+    match automonique_daemon::platform_v2_bootstrap::run(
+        &config,
+        std::path::Path::new(manifest),
+        mode,
+    ) {
+        Ok(report) => match serde_json::to_writer(std::io::stdout().lock(), &report) {
+            Ok(()) => {
+                println!();
+                ExitCode::SUCCESS
+            }
+            Err(_) => ExitCode::FAILURE,
+        },
+        Err(category) => {
+            eprintln!("platform-v2 bootstrap refused: {category}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn reload_candidate_command(values: Vec<std::ffi::OsString>) -> ExitCode {

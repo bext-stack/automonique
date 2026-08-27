@@ -175,6 +175,104 @@ refuse before custody because git/CI/pull-request workers are not configured.
 Cancellations of already-existing durable lineage intents remain immediate,
 final store operations.
 
+## Offline production bootstrap
+
+An empty work-context store is provisioned with the operator-only
+`platform-v2-bootstrap` command. Stop the daemon first. The command acquires
+the same `daemon.lock` process fence as the foreground daemon and refuses if a
+generation is running. Its destination is always the product state directory
+resolved from `XDG_STATE_HOME`; neither the manifest nor a command-line flag
+can select a database, checkout path, executable, selector binding, or shell
+command.
+
+Write the policy above first, then write a separate manifest owned by the
+daemon uid with exact mode `0600`. The manifest is opened with `O_NOFOLLOW`,
+must be a regular file, and is bounded to 256 KiB. Unknown fields are refused.
+It contains only the initial active project → host setup → checkout → user
+workspace graph and GitHub repository coordinates:
+
+```json
+{
+  "version": 1,
+  "tenant": "tenant-example",
+  "projects": [{
+    "id": "wc2_project_00000000000000000000000000000001",
+    "label": "Example project",
+    "repositories": [{"authority": "github", "id": "owner/repository"}],
+    "host_setups": [{
+      "id": "wc2_host_setup_00000000000000000000000000000002",
+      "label": "Production host",
+      "kind": "local",
+      "checkouts": [{
+        "id": "wc2_checkout_00000000000000000000000000000003",
+        "label": "Main checkout",
+        "kind": "git_worktree",
+        "repository": {"authority": "github", "id": "owner/repository"},
+        "workspaces": [{
+          "id": "wc2_user_workspace_00000000000000000000000000000004",
+          "label": "Operator workspace"
+        }]
+      }]
+    }]
+  }]
+}
+```
+
+All local identities must use the canonical `wc2_<kind>_<32 lowercase hex
+digits>` server-issued shape. Every checkout repository must be declared by
+its own project. The bootstrap fixes all initial revisions to 1 and lifecycle
+to `active`, derives attributes from the closed `kind` values, and derives all
+relations and project ownership from nesting. External repositories are
+seeded as revision-1 available GitHub coordinates owned by that exact project.
+Selectors are deliberately absent: this bootstrap never translates a
+selector into a private path, and runtime creation remains unavailable until a
+typed server adapter owns that translation.
+
+The policy must contain exactly one principal for the effective uid, the same
+tenant and project set, and exactly the local identities in the manifest. Its
+existing authority and inherited-authority checks still apply. Bootstrap does
+not copy, infer, or widen grants.
+
+Use the graph-non-mutating plan first, apply while the daemon is stopped, and
+verify the durable graph against both the manifest and policy before restart:
+
+```text
+automonique platform-v2-bootstrap plan --manifest /operator/private/bootstrap.json
+automonique platform-v2-bootstrap apply --manifest /operator/private/bootstrap.json --dry-run
+automonique platform-v2-bootstrap apply --manifest /operator/private/bootstrap.json
+automonique platform-v2-bootstrap verify --manifest /operator/private/bootstrap.json
+```
+
+`plan` and `apply --dry-run` do not create the work-context database. Every
+mode opens an existing database read-only first, requires the exact current
+schema, and inspects its complete state without migrations. Apply then reopens
+that same current-schema database read-write without migration and repeats the
+comparison in one immediate SQLite transaction. An older or newer schema is
+therefore refused byte-for-byte unchanged.
+
+Apply uses that transaction for the complete external and local graph. It
+seeds only a tenant with no authoritative work-context state. Immediately
+before commit, while the transaction still owns its write lock, it securely
+reopens and validates the policy and requires the exact generation admitted by
+preflight. A changed or invalid policy fails the guard and rolls back every
+graph row. A retry succeeds only when every record and external projection is
+identical; partial state, changed labels/attributes/relations/ownership, and a
+durable revision newer than the manifest are distinct refusals and leave the
+graph unchanged.
+
+The successful policy guard plus SQLite commit is the bootstrap operation's
+linearization boundary. The policy file and SQLite database are separate
+filesystem objects, so this is not a cross-filesystem atomic transaction and
+does not prevent an external operator from replacing the policy in the narrow
+interval after its guarded read. Operators must serialize policy replacement
+with bootstrap and run `verify` before daemon restart. On a first Apply,
+database schema creation necessarily precedes the guarded graph transaction;
+a failed guard may therefore leave an empty current-schema database container,
+but no external or local graph rows. The JSON report includes only counts,
+tenant, and SHA-256 digests of the securely read manifest and policy. This
+command adds no Platform request or response shape and does not change
+Platform v1.
+
 ## Authenticated web bridge
 
 `automonique-web-entry` exposes Platform v2 only at the additive
@@ -193,17 +291,74 @@ v2 canonical limit. Local responses are length-prefixed and bounded before
 allocation by the corresponding response limit, then decoded against the
 original typed request to enforce correlation and response shape.
 
-This first bridge is deliberately single-principal. It accepts an HTTP
-Basic credential for the dashboard's one configured username; dashboard
-session cookies, mobile credentials, Manage service bearers, and other bearer
-credentials cannot enter this route. Before every local exchange, web-entry
+The bridge remains single-principal at the daemon socket. It accepts either
+the dashboard's one configured HTTP Basic credential or an `ma_` mobile access
+token with a live, separately persisted Platform v2 delegation. Dashboard
+session cookies, Manage service bearers, ungranted mobile credentials, and
+other bearer credentials cannot enter this route. An `ma_` token never falls
+back to Basic, a session cookie, or Manage authority. Before every local exchange, web-entry
 opens the private policy with the same descriptor checks as the daemon and
 requires that its server-owned integration tenant and actor exactly equal the
 sole principal mapped to its Unix uid. The HTTP authorization header is never
 forwarded to the daemon. A missing, changed, multi-principal, or mismatched
 policy produces a correlated typed refusal without opening the admin socket.
 
-The current local protocol cannot safely represent multiple HTTP principals
+Mobile Platform v2 authorization is additive to the unchanged
+`automonique.mobile-auth/v1` wire. An operator first issues or pairs a normal
+v1 mobile credential, then posts the exact credential ID, bounded Platform v2
+action set, and at most 32 canonical project IDs to
+`POST /api/mobile/platform-v2/grants` using
+`application/vnd.automonique.mobile-platform-v2-authorization.v1+json` and
+the dashboard Basic credential. This is the bootstrap source of truth:
+project roots must already exist in the daemon's server-owned principal policy.
+The request never accepts filesystem paths, repository paths, tenant IDs,
+actor IDs, expiry, revisions, or authority grants from the mobile client.
+
+The mobile client reads its exact delegation at
+`GET /api/mobile/platform-v2/authorization` with the same media type and its
+mobile bearer. The response binds the origin identity, credential and
+authorization revisions, delegation ID, principal generation, tenant, actor,
+access-token issuance/expiry, sorted project roots, and sorted per-operation
+grants. Refresh rotation advances both the credential revision and principal
+generation; regrant changes the delegation ID and generation; credential
+revocation revokes the delegation in the same transaction. Old generations
+cannot reuse cached mutation previews. Every request is action-checked and
+resolved to one admitted project before the local socket is opened. Targeted
+lineage and review reads additionally require the named workspace to belong to
+that declared project in the server policy; possession of both project roots
+does not permit a cross-project workspace coordinate. The daemon then
+independently applies its current policy fence and ownership checks.
+
+A v2 grant is issued only when the v1 credential's persisted actor exactly
+matches the web entry's configured actor; changing that configuration cannot
+rebind an older credential to the new actor. Before a mobile mutation submit is
+sent to the daemon, web entry durably binds its project and idempotency key to
+the exact credential, delegation, and principal generation. Mobile receipt
+polling accepts only that idempotency coordinate and checks the binding before
+opening the socket; receipt-ID lookup is refused because no mobile-owned
+receipt-ID binding exists before an ambiguous response. The private SQLite
+custody is capped at 128 live entries per credential, survives process restart
+and same-delegation access-token rotation, and is deleted on delegation
+regrant or credential revocation. Thus another same-project credential and a
+new delegation cannot read an older mutation receipt.
+
+The final credential, delegation, generation, and receipt-custody check runs
+inside a SQLite `IMMEDIATE` transaction that also records a request-digest-bound
+ten-second dispatch lease. The transaction commits before the daemon socket is
+opened, so ambiguous or completed mutation dispatch can never precede durable
+mobile receipt custody. Submit custody also retains the exact canonical request
+digest: the same coordinate may be retried only by the identical request, while
+legacy custody without a digest remains readable but cannot admit a new submit.
+Refresh, regrant, and both revocation paths check the same lease table in their
+own write transactions and refuse while a dispatch lease is live; they
+therefore cannot commit between authorization and dispatch. Socket read and
+write operations are capped at two seconds, the lease is released after the
+correlated response is validated, and a crashed process leaves only a bounded
+lease that expires while its receipt custody remains recoverable. Receipt
+custody is read or written in the same transaction that installs the lease,
+eliminating a separate reauthorization window.
+
+The current local protocol cannot safely represent multiple daemon principals
 behind one web-entry uid. Such a configuration stays blocked; adding more
 Basic users must first add a daemon-authenticated delegated-principal protocol
 instead of mapping them all to the process uid. Operators must restart the
