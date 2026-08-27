@@ -41,10 +41,10 @@ use sha2::{Digest, Sha256};
 use crate::{StoreError, validate_database_path};
 
 /// The only lineage-index schema this build reads or writes.
-pub const LINEAGE_INDEX_SCHEMA_VERSION: u32 = 2;
+pub const LINEAGE_INDEX_SCHEMA_VERSION: u32 = 3;
 const LEGACY_TENANT: &str = "legacy-unqualified";
 
-const SCHEMA_V2: &str = r#"
+const SCHEMA_V3: &str = r#"
 CREATE TABLE lineage_external_work (
     tenant TEXT NOT NULL,
     provider TEXT NOT NULL CHECK (provider IN ('github','gitlab','linear','jira_compatible')),
@@ -181,6 +181,9 @@ CREATE TABLE lineage_workspace_intents (
     )
 ) STRICT;
 "#;
+
+// Exact short-lived unscoped schema accepted only as a v2 migration source.
+const SCHEMA_V2: &str = include_str!("lineage_index_v2.sql");
 
 /// Stable lineage-index refusal.
 #[derive(Debug)]
@@ -1704,6 +1707,9 @@ fn initialize(connection: &mut Connection) -> Indexed<()> {
     if version == 1 {
         return migrate_v1(connection);
     }
+    if version == 2 {
+        return migrate_v2(connection);
+    }
     if version == LINEAGE_INDEX_SCHEMA_VERSION {
         validate_current_schema(connection)?;
         return validate_durable_graphs(connection);
@@ -1726,13 +1732,17 @@ fn initialize(connection: &mut Connection) -> Indexed<()> {
         });
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(SCHEMA_V2)?;
+    transaction.execute_batch(SCHEMA_V3)?;
     transaction.pragma_update(None, "user_version", LINEAGE_INDEX_SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
 }
 
 fn validate_current_schema(connection: &Connection) -> Indexed<()> {
+    validate_schema(connection, SCHEMA_V3)
+}
+
+fn validate_schema(connection: &Connection, schema: &str) -> Indexed<()> {
     let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if integrity != "ok" {
         return Err(LineageIndexError::Corrupt("integrity_check"));
@@ -1745,7 +1755,7 @@ fn validate_current_schema(connection: &Connection) -> Indexed<()> {
         return Err(LineageIndexError::Corrupt("foreign_keys"));
     }
     let expected = Connection::open_in_memory()?;
-    expected.execute_batch(SCHEMA_V2)?;
+    expected.execute_batch(schema)?;
     if schema_snapshot(connection)? != schema_snapshot(&expected)? {
         return Err(LineageIndexError::Corrupt("schema_shape"));
     }
@@ -1891,23 +1901,85 @@ fn validate_durable_graphs(connection: &Connection) -> Indexed<()> {
     Ok(())
 }
 
+/// Quarantine the short-lived unscoped v2 rows under one explicit tenant while
+/// preserving every already-normalized value exactly.
+fn migrate_v2(connection: &mut Connection) -> Indexed<()> {
+    with_foreign_keys_disabled(connection, |connection| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_schema(&transaction, SCHEMA_V2)?;
+        transaction.execute_batch(
+            r#"
+ALTER TABLE lineage_workspace_intents RENAME TO lineage_workspace_intents_v2;
+ALTER TABLE lineage_orchestration RENAME TO lineage_orchestration_v2;
+ALTER TABLE lineage_external_work RENAME TO lineage_external_work_v2;
+DROP INDEX lineage_external_by_workspace;
+DROP INDEX lineage_orchestration_by_workspace;
+"#,
+        )?;
+        transaction.execute_batch(SCHEMA_V3)?;
+        transaction.execute_batch(
+            r#"
+INSERT INTO lineage_external_work (
+ tenant,provider,authority_id,scope,work_key,workspace_id,revision,external_state,
+ moved_provider,moved_authority_id,moved_scope,moved_key,observed_at_ms,stale_after_ms,
+ freshness_state,latest_message,latest_observed_at_ms,origin_attempt_id,origin_session_id,origin_pane_id
+)
+SELECT 'legacy-unqualified',provider,authority_id,scope,work_key,workspace_id,revision,external_state,
+ moved_provider,moved_authority_id,moved_scope,moved_key,observed_at_ms,stale_after_ms,
+ freshness_state,latest_message,latest_observed_at_ms,origin_attempt_id,origin_session_id,origin_pane_id
+FROM lineage_external_work_v2;
+
+INSERT INTO lineage_orchestration (
+ tenant,orchestration_kind,orchestration_id,workspace_id,external_provider,external_authority_id,
+ external_scope,external_key,parent_kind,parent_id,status_kind,status_message,observed_at_ms,
+ stale_after_ms,freshness_state,latest_message,latest_observed_at_ms,revision,
+ origin_attempt_id,origin_session_id,origin_pane_id
+)
+SELECT 'legacy-unqualified',orchestration_kind,orchestration_id,workspace_id,external_provider,
+ external_authority_id,external_scope,external_key,parent_kind,parent_id,status_kind,status_message,
+ observed_at_ms,stale_after_ms,freshness_state,latest_message,latest_observed_at_ms,revision,
+ origin_attempt_id,origin_session_id,origin_pane_id
+FROM lineage_orchestration_v2;
+
+INSERT INTO lineage_workspace_intents (
+ tenant,intent_id,request_digest,intent_kind,task_kind,task_id,workspace_id,external_provider,
+ external_authority_id,external_scope,external_key,base_selector,branch_selector,expected_revision,
+ outcome_kind,outcome_conflict,outcome_workspace_id,reconciliation
+)
+SELECT 'legacy-unqualified',intent_id,request_digest,intent_kind,task_kind,task_id,workspace_id,
+ external_provider,external_authority_id,external_scope,external_key,base_selector,branch_selector,
+ expected_revision,outcome_kind,outcome_conflict,outcome_workspace_id,reconciliation
+FROM lineage_workspace_intents_v2;
+"#,
+        )?;
+        validate_durable_graphs(&transaction)?;
+        transaction.execute_batch(
+            "DROP TABLE lineage_workspace_intents_v2; DROP TABLE lineage_orchestration_v2; DROP TABLE lineage_external_work_v2;",
+        )?;
+        validate_current_schema(&transaction)?;
+        transaction.pragma_update(None, "user_version", LINEAGE_INDEX_SCHEMA_VERSION)?;
+        transaction.commit()?;
+        Ok(())
+    })
+}
+
 /// Upgrade the short-lived pre-authority branch schema without losing durable
 /// rows. Its provider-only custody is retained under an explicit opaque legacy
 /// authority; no hostname or provider payload is invented during migration.
 fn migrate_v1(connection: &mut Connection) -> Indexed<()> {
-    connection.pragma_update(None, "foreign_keys", false)?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(
-        r#"
+    with_foreign_keys_disabled(connection, |connection| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            r#"
 ALTER TABLE lineage_workspace_intents RENAME TO lineage_workspace_intents_v1;
 ALTER TABLE lineage_orchestration RENAME TO lineage_orchestration_v1;
 ALTER TABLE lineage_external_work RENAME TO lineage_external_work_v1;
 DROP INDEX lineage_external_by_workspace;
 DROP INDEX lineage_orchestration_by_workspace;
 "#,
-    )?;
-    transaction.execute_batch(SCHEMA_V2)?;
-    transaction.execute_batch(
+        )?;
+        transaction.execute_batch(SCHEMA_V3)?;
+        transaction.execute_batch(
         r#"
 INSERT INTO lineage_external_work
 SELECT 'legacy-unqualified',provider,'legacy-unqualified-'||provider,scope,work_key,workspace_id,revision,
@@ -1933,32 +2005,46 @@ SELECT 'legacy-unqualified',intent_id,zeroblob(32),intent_kind,task_kind,task_id
 FROM lineage_workspace_intents_v1;
 "#,
     )?;
-    let ids = {
-        let mut statement = transaction
-            .prepare("SELECT intent_id FROM lineage_workspace_intents WHERE tenant=?1")?;
-        statement
-            .query_map([LEGACY_TENANT], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    for id in ids {
-        let stored = read_intent(&transaction, LEGACY_TENANT, &id)?
-            .ok_or(LineageIndexError::Corrupt("migrated_intent"))?
-            .into_stored()?;
-        let digest = intent_digest(&stored.intent);
-        transaction.execute(
+        let ids = {
+            let mut statement = transaction
+                .prepare("SELECT intent_id FROM lineage_workspace_intents WHERE tenant=?1")?;
+            statement
+                .query_map([LEGACY_TENANT], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for id in ids {
+            let stored = read_intent(&transaction, LEGACY_TENANT, &id)?
+                .ok_or(LineageIndexError::Corrupt("migrated_intent"))?
+                .into_stored()?;
+            let digest = intent_digest(&stored.intent);
+            transaction.execute(
             "UPDATE lineage_workspace_intents SET request_digest=?3 WHERE tenant=?1 AND intent_id=?2",
             params![LEGACY_TENANT, id, digest.as_slice()],
         )?;
-    }
-    validate_durable_graphs(&transaction)?;
-    transaction.execute_batch(
+        }
+        validate_durable_graphs(&transaction)?;
+        transaction.execute_batch(
         "DROP TABLE lineage_workspace_intents_v1; DROP TABLE lineage_orchestration_v1; DROP TABLE lineage_external_work_v1;",
     )?;
-    validate_current_schema(&transaction)?;
-    transaction.pragma_update(None, "user_version", LINEAGE_INDEX_SCHEMA_VERSION)?;
-    transaction.commit()?;
-    connection.pragma_update(None, "foreign_keys", true)?;
-    Ok(())
+        validate_current_schema(&transaction)?;
+        transaction.pragma_update(None, "user_version", LINEAGE_INDEX_SCHEMA_VERSION)?;
+        transaction.commit()?;
+        Ok(())
+    })
+}
+
+fn with_foreign_keys_disabled(
+    connection: &mut Connection,
+    migration: impl FnOnce(&mut Connection) -> Indexed<()>,
+) -> Indexed<()> {
+    connection.pragma_update(None, "foreign_keys", false)?;
+    let result = migration(connection);
+    let restore = connection.pragma_update(None, "foreign_keys", true);
+    match (result, restore) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(LineageIndexError::Sqlite(error)),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 fn validate_tenant(tenant: &str) -> Indexed<()> {

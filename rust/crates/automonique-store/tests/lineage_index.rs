@@ -18,6 +18,7 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 const TENANT: &str = "tenant-test";
+const LEGACY_LINEAGE_INDEX_SCHEMA_V2: &str = include_str!("../src/lineage_index_v2.sql");
 
 struct PrivateIndex {
     _directory: TempDir,
@@ -38,6 +39,57 @@ impl PrivateIndex {
     fn path(&self) -> &Path {
         &self.path
     }
+}
+
+fn downgrade_current_fixture_to_v2(path: &Path) {
+    let mut db = Connection::open(path).unwrap();
+    db.pragma_update(None, "foreign_keys", false).unwrap();
+    let transaction = db.transaction().unwrap();
+    transaction
+        .execute_batch(
+            r#"
+ALTER TABLE lineage_workspace_intents RENAME TO lineage_workspace_intents_v3;
+ALTER TABLE lineage_orchestration RENAME TO lineage_orchestration_v3;
+ALTER TABLE lineage_external_work RENAME TO lineage_external_work_v3;
+DROP INDEX lineage_external_by_workspace;
+DROP INDEX lineage_orchestration_by_workspace;
+"#,
+        )
+        .unwrap();
+    transaction
+        .execute_batch(LEGACY_LINEAGE_INDEX_SCHEMA_V2)
+        .unwrap();
+    transaction
+        .execute_batch(
+            r#"
+INSERT INTO lineage_external_work
+SELECT provider,authority_id,scope,work_key,workspace_id,revision,external_state,
+ moved_provider,moved_authority_id,moved_scope,moved_key,observed_at_ms,stale_after_ms,
+ freshness_state,latest_message,latest_observed_at_ms,origin_attempt_id,origin_session_id,origin_pane_id
+FROM lineage_external_work_v3 WHERE tenant='tenant-test';
+
+INSERT INTO lineage_orchestration
+SELECT orchestration_kind,orchestration_id,workspace_id,external_provider,external_authority_id,
+ external_scope,external_key,parent_kind,parent_id,status_kind,status_message,observed_at_ms,
+ stale_after_ms,freshness_state,latest_message,latest_observed_at_ms,revision,
+ origin_attempt_id,origin_session_id,origin_pane_id
+FROM lineage_orchestration_v3 WHERE tenant='tenant-test';
+
+INSERT INTO lineage_workspace_intents
+SELECT intent_id,request_digest,intent_kind,task_kind,task_id,workspace_id,external_provider,
+ external_authority_id,external_scope,external_key,base_selector,branch_selector,expected_revision,
+ outcome_kind,outcome_conflict,outcome_workspace_id,reconciliation
+FROM lineage_workspace_intents_v3 WHERE tenant='tenant-test';
+
+DROP TABLE lineage_workspace_intents_v3;
+DROP TABLE lineage_orchestration_v3;
+DROP TABLE lineage_external_work_v3;
+PRAGMA user_version=2;
+"#,
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    db.pragma_update(None, "foreign_keys", true).unwrap();
 }
 
 fn workspace(value: &str) -> UserWorkspaceId {
@@ -147,6 +199,217 @@ fn record(
         None,
     )
     .unwrap()
+}
+
+fn populate_current_fixture_for_v2_migration(path: &Path) {
+    let mut index = LineageIndex::open(path).unwrap();
+    let workspace = workspace("workspace-v2");
+    let attempt = AttemptWorkspaceId::new("attempt-v2").unwrap();
+    let session = WorkSessionId::new("session-v2").unwrap();
+    let pane = PaneId::new("pane-v2").unwrap();
+    let source_origin =
+        LineageOrigin::new(workspace.clone(), Some(attempt.clone()), None, None).unwrap();
+    let exact_origin =
+        LineageOrigin::new(workspace.clone(), Some(attempt), Some(session), Some(pane)).unwrap();
+    let source = external_identity(ExternalWorkProvider::GitLab, "scope-v2-a", "issue-v2");
+    let target = external_identity(ExternalWorkProvider::GitLab, "scope-v2-b", "issue-v2");
+    let external = |identity, origin, revision, state, moved_to, observed, message: &str| {
+        ExternalWorkItem::new_with_origin(
+            identity,
+            origin,
+            Revision::new(revision).unwrap(),
+            state,
+            moved_to,
+            freshness(LineageFreshnessState::Fresh, observed),
+            Some(
+                LatestUsefulMessage::new(LineageMessage::new(message).unwrap(), observed).unwrap(),
+            ),
+        )
+        .unwrap()
+    };
+    index
+        .intake_external(
+            TENANT,
+            &external(
+                target.clone(),
+                exact_origin.clone(),
+                1,
+                ExternalWorkState::Open,
+                None,
+                1_700_000_400_000,
+                "target observation",
+            ),
+        )
+        .unwrap();
+    index
+        .intake_external(
+            TENANT,
+            &external(
+                source.clone(),
+                source_origin.clone(),
+                1,
+                ExternalWorkState::Open,
+                None,
+                1_700_000_400_001,
+                "source observation",
+            ),
+        )
+        .unwrap();
+
+    let run_id = run("run-v2");
+    let task_id = task("task-v2");
+    index
+        .record_orchestration(
+            TENANT,
+            &OrchestrationRecord::new_with_origin(
+                run_id.clone(),
+                LineageOrigin::workspace_only(workspace.clone()),
+                None,
+                None,
+                LineageStatus::Working,
+                freshness(LineageFreshnessState::Fresh, 1_700_000_400_002),
+                None,
+                Revision::FIRST,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+    let task_record = |revision, status, observed, message: &str| {
+        OrchestrationRecord::new_with_origin(
+            task_id.clone(),
+            exact_origin.clone(),
+            Some(source.clone()),
+            Some(run_id.clone()),
+            status,
+            freshness(LineageFreshnessState::Fresh, observed),
+            Some(
+                LatestUsefulMessage::new(LineageMessage::new(message).unwrap(), observed).unwrap(),
+            ),
+            Revision::new(revision).unwrap(),
+        )
+        .unwrap()
+    };
+    index
+        .record_orchestration(
+            TENANT,
+            &task_record(1, LineageStatus::Working, 1_700_000_400_003, "working"),
+            None,
+        )
+        .unwrap();
+
+    let create = |id: &str| {
+        WorkspaceIntent::Create(WorkspaceCreateIntent::new(
+            WorkspaceIntentId::new(id).unwrap(),
+            OrchestrationTaskId::new("task-v2").unwrap(),
+            source.clone(),
+            BaseSelectorId::new("base-v2").unwrap(),
+            BranchSelectorId::new("branch-v2").unwrap(),
+        ))
+    };
+    for (id, outcome) in [
+        ("intent-v2-accepted", WorkspaceIntentOutcome::Accepted),
+        ("intent-v2-unknown", WorkspaceIntentOutcome::Unknown),
+        (
+            "intent-v2-created",
+            WorkspaceIntentOutcome::Created(workspace.clone()),
+        ),
+        (
+            "intent-v2-conflict",
+            WorkspaceIntentOutcome::Conflict(WorkspaceIntentConflict::CreationCancelled),
+        ),
+    ] {
+        index.record_intent(TENANT, &create(id), &outcome).unwrap();
+    }
+    let resume = WorkspaceIntent::Resume(WorkspaceResumeIntent::new(
+        WorkspaceIntentId::new("intent-v2-resumed").unwrap(),
+        OrchestrationTaskId::new("task-v2").unwrap(),
+        workspace.clone(),
+        Revision::FIRST,
+    ));
+    index
+        .record_intent(
+            TENANT,
+            &resume,
+            &WorkspaceIntentOutcome::Resumed(workspace.clone()),
+        )
+        .unwrap();
+
+    index
+        .record_orchestration(
+            TENANT,
+            &task_record(
+                2,
+                LineageStatus::Done(LineageMessage::new("complete").unwrap()),
+                1_700_000_400_004,
+                "completed",
+            ),
+            Some(Revision::FIRST),
+        )
+        .unwrap();
+    index
+        .update_external(
+            TENANT,
+            &external(
+                source,
+                source_origin,
+                2,
+                ExternalWorkState::Moved,
+                Some(target),
+                1_700_000_400_005,
+                "source moved",
+            ),
+            Revision::FIRST,
+        )
+        .unwrap();
+}
+
+fn raw_intent_digests(path: &Path) -> Vec<(String, Vec<u8>)> {
+    let db = Connection::open(path).unwrap();
+    let mut statement = db
+        .prepare(
+            "SELECT intent_id,request_digest FROM lineage_workspace_intents ORDER BY intent_id",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+type RawRows = Vec<Vec<rusqlite::types::Value>>;
+
+fn raw_rows(path: &Path, query: &str) -> RawRows {
+    let db = Connection::open(path).unwrap();
+    let mut statement = db.prepare(query).unwrap();
+    let columns = statement.column_count();
+    statement
+        .query_map([], |row| {
+            (0..columns)
+                .map(|column| row.get(column))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn raw_v2_payload(path: &Path) -> (RawRows, RawRows, RawRows) {
+    (
+        raw_rows(
+            path,
+            "SELECT provider,authority_id,scope,work_key,workspace_id,revision,external_state,moved_provider,moved_authority_id,moved_scope,moved_key,observed_at_ms,stale_after_ms,freshness_state,latest_message,latest_observed_at_ms,origin_attempt_id,origin_session_id,origin_pane_id FROM lineage_external_work ORDER BY provider,authority_id,scope,work_key",
+        ),
+        raw_rows(
+            path,
+            "SELECT orchestration_kind,orchestration_id,workspace_id,external_provider,external_authority_id,external_scope,external_key,parent_kind,parent_id,status_kind,status_message,observed_at_ms,stale_after_ms,freshness_state,latest_message,latest_observed_at_ms,revision,origin_attempt_id,origin_session_id,origin_pane_id FROM lineage_orchestration ORDER BY orchestration_kind,orchestration_id",
+        ),
+        raw_rows(
+            path,
+            "SELECT intent_id,request_digest,intent_kind,task_kind,task_id,workspace_id,external_provider,external_authority_id,external_scope,external_key,base_selector,branch_selector,expected_revision,outcome_kind,outcome_conflict,outcome_workspace_id,reconciliation FROM lineage_workspace_intents ORDER BY intent_id",
+        ),
+    )
 }
 
 #[test]
@@ -1215,6 +1478,202 @@ fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
         LineageIndex::open(private.path()).unwrap_err().category(),
         "corrupt"
     );
+}
+
+#[test]
+fn populated_v2_migrates_exactly_and_pending_receipts_reconcile_after_restart() {
+    let private = PrivateIndex::new();
+    populate_current_fixture_for_v2_migration(private.path());
+    let expected_digests = raw_intent_digests(private.path());
+    downgrade_current_fixture_to_v2(private.path());
+    let expected_payload = raw_v2_payload(private.path());
+
+    let mut index = LineageIndex::open(private.path()).unwrap();
+    assert_eq!(raw_v2_payload(private.path()), expected_payload);
+    let workspace = workspace("workspace-v2");
+    let scope = legacy_intent_scope(&workspace);
+    let projection = index
+        .projection_authorized(&lineage_v2(), &scope, |_| true)
+        .unwrap();
+    let source = projection
+        .external_work_items()
+        .iter()
+        .find(|item| item.identity().scope().as_str() == "scope-v2-a")
+        .unwrap();
+    assert_eq!(source.revision().get(), 2);
+    assert_eq!(source.state(), ExternalWorkState::Moved);
+    assert_eq!(
+        source.moved_to().unwrap().authority().as_str(),
+        "installation-scope-v2-b"
+    );
+    assert_eq!(source.origin().attempt().unwrap().as_str(), "attempt-v2");
+    assert!(source.origin().session().is_none());
+    let target = projection
+        .external_work_items()
+        .iter()
+        .find(|item| item.identity().scope().as_str() == "scope-v2-b")
+        .unwrap();
+    assert_eq!(target.origin().session().unwrap().as_str(), "session-v2");
+    assert_eq!(target.origin().pane().unwrap().as_str(), "pane-v2");
+    let task = projection
+        .orchestration()
+        .iter()
+        .find(|record| record.identity().id() == "task-v2")
+        .unwrap();
+    assert_eq!(task.revision().get(), 2);
+    assert_eq!(task.origin(), target.origin());
+    assert_eq!(
+        task.latest_useful_message().unwrap().text().as_str(),
+        "completed"
+    );
+
+    for (id, expected) in [
+        (
+            "intent-v2-created",
+            WorkspaceIntentOutcome::Created(workspace.clone()),
+        ),
+        (
+            "intent-v2-conflict",
+            WorkspaceIntentOutcome::Conflict(WorkspaceIntentConflict::CreationCancelled),
+        ),
+        (
+            "intent-v2-resumed",
+            WorkspaceIntentOutcome::Resumed(workspace.clone()),
+        ),
+    ] {
+        assert_eq!(
+            index
+                .intent_authorized(
+                    &lineage_v2(),
+                    &scope,
+                    &WorkspaceIntentId::new(id).unwrap(),
+                    |_| true,
+                )
+                .unwrap()
+                .unwrap()
+                .outcome,
+            expected
+        );
+    }
+    for (id, expected) in [
+        ("intent-v2-accepted", WorkspaceIntentOutcome::Accepted),
+        ("intent-v2-unknown", WorkspaceIntentOutcome::Unknown),
+    ] {
+        let pending = index
+            .intent_authorized(
+                &lineage_v2(),
+                &scope,
+                &WorkspaceIntentId::new(id).unwrap(),
+                |_| true,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.outcome, expected);
+        index
+            .reconcile_intent(
+                "legacy-unqualified",
+                &WorkspaceIntentExecutionReceipt {
+                    intent_id: WorkspaceIntentId::new(id).unwrap(),
+                    request_digest: pending.request_digest,
+                    outcome: WorkspaceIntentOutcome::Created(workspace.clone()),
+                },
+            )
+            .unwrap();
+    }
+    drop(index);
+
+    let reopened = LineageIndex::open(private.path()).unwrap();
+    for id in ["intent-v2-accepted", "intent-v2-unknown"] {
+        assert_eq!(
+            reopened
+                .intent_authorized(
+                    &lineage_v2(),
+                    &scope,
+                    &WorkspaceIntentId::new(id).unwrap(),
+                    |_| true,
+                )
+                .unwrap()
+                .unwrap()
+                .outcome,
+            WorkspaceIntentOutcome::Created(workspace.clone())
+        );
+    }
+    drop(reopened);
+    assert_eq!(raw_intent_digests(private.path()), expected_digests);
+    let db = Connection::open(private.path()).unwrap();
+    assert_eq!(
+        db.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .unwrap(),
+        3
+    );
+    for table in [
+        "lineage_external_work",
+        "lineage_orchestration",
+        "lineage_workspace_intents",
+    ] {
+        let sql = format!("SELECT count(*) FROM {table} WHERE tenant='legacy-unqualified'");
+        assert!(db.query_row(&sql, [], |row| row.get::<_, u32>(0)).unwrap() > 0);
+    }
+}
+
+#[test]
+fn broken_v2_graph_rolls_back_the_whole_migration() {
+    for cyclic in [false, true] {
+        let private = PrivateIndex::new();
+        populate_current_fixture_for_v2_migration(private.path());
+        downgrade_current_fixture_to_v2(private.path());
+        let db = Connection::open(private.path()).unwrap();
+        if cyclic {
+            db.execute(
+                "UPDATE lineage_external_work SET revision=2,external_state='moved',moved_provider='gitlab',moved_authority_id='installation-scope-v2-a',moved_scope='scope-v2-a',moved_key='issue-v2' WHERE scope='scope-v2-b'",
+                [],
+            )
+            .unwrap();
+        } else {
+            db.execute(
+                "DELETE FROM lineage_external_work WHERE scope='scope-v2-b'",
+                [],
+            )
+            .unwrap();
+        }
+        let expected_rows: u32 = db
+            .query_row("SELECT count(*) FROM lineage_external_work", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let expected_payload = raw_v2_payload(private.path());
+        drop(db);
+
+        assert_eq!(
+            LineageIndex::open(private.path()).unwrap_err().category(),
+            "corrupt"
+        );
+        let db = Connection::open(private.path()).unwrap();
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM lineage_external_work", [], |row| row
+                .get::<_, u32>(
+                0
+            ))
+            .unwrap(),
+            expected_rows
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name LIKE '%_v2'",
+                [],
+                |row| row.get::<_, u32>(0),
+            )
+            .unwrap(),
+            0
+        );
+        drop(db);
+        assert_eq!(raw_v2_payload(private.path()), expected_payload);
+    }
 }
 
 #[test]
