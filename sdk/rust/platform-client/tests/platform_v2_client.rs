@@ -15,12 +15,13 @@ use automonique_protocol::platform_v2::{
     WorkContextRecord, WorkContextResync,
 };
 use automonique_protocol::platform_v2_lifecycle::{
-    CreateProjectIntent, MutationApprovalRequirement, MutationPreview, MutationPreviewId,
-    MutationPreviewRef, WorkContextAuthority, WorkContextMutationIntent,
-    WorkContextMutationProposal,
+    CreateProjectIntent, MutationApproval, MutationApprovalDecision, MutationApprovalId,
+    MutationApprovalRequirement, MutationPreview, MutationPreviewId, MutationPreviewRef,
+    WorkContextAuthority, WorkContextMutationIntent, WorkContextMutationProposal,
 };
+use automonique_protocol::platform_v2_lifecycle_api::work_context_mutation_preview_digest;
 use automonique_protocol::platform_v2_transport::{
-    PlatformNegotiationResponse, PlatformV2Refusal, PlatformV2Response,
+    PlatformNegotiationResponse, PlatformV2Refusal, PlatformV2Response, RawMutationApprovalDocument,
 };
 use automonique_protocol::primitives::{EpochMillis, Revision};
 
@@ -256,6 +257,67 @@ fn rejects_mutation_preview_for_a_substituted_intent() {
         .unwrap();
     assert_eq!(
         client.prepare_mutation(key, requested),
+        Err(ClientError::Protocol)
+    );
+}
+
+#[test]
+fn rejects_a_mutation_approval_that_reverses_the_requested_decision() {
+    let key = IdempotencyKey::new("mutation-decision-1").unwrap();
+    let intent = WorkContextMutationIntent::CreateProject(
+        CreateProjectIntent::new(WorkContextLabel::new("Requested").unwrap(), vec![]).unwrap(),
+    );
+    let proposal = WorkContextMutationProposal::new(
+        Actor::new("tenant-1", "operator-1").unwrap(),
+        ResourceAuthority::Automonique,
+        WorkContextAuthority::EMPTY,
+        key,
+        intent,
+    )
+    .unwrap();
+    let preview = MutationPreview::new(
+        MutationPreviewRef::new(
+            MutationPreviewId::new("preview-decision-1").unwrap(),
+            Revision::FIRST,
+        ),
+        proposal,
+        None,
+        Some(project("created-project")),
+        vec![],
+        WorkContextAuthority::EMPTY,
+        WorkContextAuthority::EMPTY,
+        MutationApprovalRequirement::Required,
+        EpochMillis::from_millis(1_000),
+        EpochMillis::from_millis(2_000),
+    )
+    .unwrap();
+    let digest = work_context_mutation_preview_digest(&preview).unwrap();
+    let approval = MutationApproval::new(
+        MutationApprovalId::new("approval-1").unwrap(),
+        &preview,
+        digest,
+        MutationApprovalDecision::Denied,
+        Actor::new("tenant-1", "operator-1").unwrap(),
+        EpochMillis::from_millis(1_100),
+        EpochMillis::from_millis(1_900),
+    )
+    .unwrap();
+    let transport = DeterministicPlatformV2Transport::new([
+        v2_negotiation(),
+        DeterministicPlatformV2Step::V2(Box::new(PlatformV2Response::MutationApproval(
+            RawMutationApprovalDocument::from_approval(&approval).unwrap(),
+        ))),
+    ]);
+    let mut client = PlatformV2Client::new_testing(transport);
+    client
+        .negotiate(PlatformVersionOffer::new(vec![2]).unwrap())
+        .unwrap();
+    assert_eq!(
+        client.decide_mutation(
+            preview.preview().clone(),
+            digest,
+            MutationApprovalDecision::Granted,
+        ),
         Err(ClientError::Protocol)
     );
 }

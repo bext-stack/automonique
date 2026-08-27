@@ -78,6 +78,27 @@ if (work.negotiated !== null) {
 }
 ```
 
+The dedicated single-principal web bridge is Basic-only. Use its explicit,
+opaque credential and transport types; the default v2 transport remains
+Bearer-based for mobile and Manage endpoints:
+
+```ts
+import {
+  BasicHttpsPlatformV2Transport,
+  PlatformV2BasicCredential,
+  PlatformV2Client,
+} from "@automonique/sdk";
+
+const credential = new PlatformV2BasicCredential(username, password);
+const work = new PlatformV2Client(new BasicHttpsPlatformV2Transport(
+  "https://automonique.example/api/platform/v2",
+  () => credential,
+));
+```
+
+Credential objects expose no username, password, encoded value, or header
+accessor. Do not use this mode to translate a mobile or Manage bearer token.
+
 The v2 facade exposes only typed work-context, lifecycle, lineage, and review
 operations. Actor, tenant, and authority grants are resolved by the authenticated
 server and cannot be asserted through these client methods. Both v2 HTTP lanes

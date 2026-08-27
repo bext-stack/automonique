@@ -10,6 +10,7 @@ import {
   PLATFORM_SCHEMA_V1,
   PLATFORM_SCHEMA_V2,
   MutationPreviewId,
+  MutationApprovalId,
   PlatformVersionNumber,
   ProjectId,
   UserWorkspaceId,
@@ -19,20 +20,25 @@ import {
   WorkContextRevision,
   decodeMessage,
   encodeMessage,
+  encodeWorkContextMutationApproval,
   lifecycleRequestDigest,
+  mutationPreviewDigest,
   type JsonValue,
   type PlatformNegotiationResponse,
   type PlatformV2Response,
   type PlatformVersionOffer,
   type MutationPreview,
+  type MutationApprovalDecision,
   type WorkContextIdentity,
   type WorkContextMutationIntent,
 } from "../../protocol/src/index.ts";
 import {
+  BasicHttpsPlatformV2Transport,
   HttpsPlatformV2Transport,
   PLATFORM_NEGOTIATION_MEDIA_TYPE,
   PLATFORM_V2_MEDIA_TYPE,
   PlatformV2Client,
+  PlatformV2BasicCredential,
 } from "../src/platform-v2-client.ts";
 import {DeterministicPlatformV2Adapter} from "../src/testing.ts";
 
@@ -131,6 +137,22 @@ function mutationPreview(intent: WorkContextMutationIntent, key: ReturnType<type
   };
 }
 
+function rawMutationApproval(preview: MutationPreview, decision: MutationApprovalDecision) {
+  return {
+    canonical: encodeWorkContextMutationApproval({
+      decided_at_ms: 1_100n,
+      decided_by: {id: "operator-1", tenant: "tenant-1"},
+      decision,
+      expires_at_ms: 1_900n,
+      id: MutationApprovalId("approval-1"),
+      idempotency_key: preview.proposal.idempotency_key,
+      preview: preview.preview,
+      preview_digest: mutationPreviewDigest(preview),
+      request_digest: preview.proposal.request_digest,
+    }, preview),
+  };
+}
+
 describe("canonical HTTPS Platform v2 client", () => {
   test("does not expose a generic production request path", () => {
     const transport = new HttpsPlatformV2Transport("https://manage.example/api/platform/v2", () => "token");
@@ -158,6 +180,62 @@ describe("canonical HTTPS Platform v2 client", () => {
     }
     expect(() => new HttpsPlatformV2Transport("http://localhost/api/platform/v2", () => "token"))
       .not.toThrow();
+  });
+
+  test("uses explicit opaque Basic credentials without changing the Bearer default", async () => {
+    const observed: string[] = [];
+    const fetcher = (async (_input: string | URL | Request, init?: RequestInit) => {
+      observed.push(new Headers(init?.headers).get("authorization") ?? "");
+      const body = typeof init?.body === "string" ? init.body : "";
+      const message = decodeMessage(new TextEncoder().encode(body));
+      return canonicalResponse(
+        message.envelope.requestId,
+        "automonique.platform.negotiation",
+        1,
+        "negotiated",
+        negotiatedBody(2n),
+        PLATFORM_NEGOTIATION_MEDIA_TYPE,
+      );
+    }) as typeof fetch;
+    const basic = new PlatformV2BasicCredential("ops", "fixture-password");
+    expect(Reflect.ownKeys(basic)).toEqual([]);
+    expect(Reflect.ownKeys(Object.getPrototypeOf(basic))).toEqual(["constructor"]);
+    const basicTransport = new BasicHttpsPlatformV2Transport(
+      "https://manage.example/api/platform/v2",
+      () => basic,
+      fetcher,
+    );
+    expect(Reflect.ownKeys(basicTransport)).toEqual([]);
+    expect((await new PlatformV2Client(basicTransport).negotiate(offer)).kind).toBe("negotiated");
+    expect(observed).toEqual(["Basic b3BzOmZpeHR1cmUtcGFzc3dvcmQ="]);
+
+    const bearerTransport = new HttpsPlatformV2Transport(
+      "https://manage.example/api/platform/v2",
+      () => "fixture-token",
+      fetcher,
+    );
+    expect((await new PlatformV2Client(bearerTransport).negotiate(offer)).kind).toBe("negotiated");
+    expect(observed[1]).toBe("Bearer fixture-token");
+  });
+
+  test("refuses malformed Basic material and forged credential objects", async () => {
+    expect(() => new PlatformV2BasicCredential("", "password")).toThrow();
+    expect(() => new PlatformV2BasicCredential("ops:admin", "password")).toThrow();
+    expect(() => new PlatformV2BasicCredential("ops", "")).toThrow();
+    expect(() => new PlatformV2BasicCredential("ops", "x".repeat(509))).toThrow();
+    let fetchCalls = 0;
+    const transport = new BasicHttpsPlatformV2Transport(
+      "https://manage.example/api/platform/v2",
+      () => Object.create(PlatformV2BasicCredential.prototype) as PlatformV2BasicCredential,
+      (async () => {
+        fetchCalls += 1;
+        return new Response();
+      }) as typeof fetch,
+    );
+    await expect(new PlatformV2Client(transport).negotiate(offer)).rejects.toMatchObject({
+      category: "authorization_invalid",
+    });
+    expect(fetchCalls).toBe(0);
   });
 
   test("ignores reflective property injection and keeps credentials on the pinned typed path", async () => {
@@ -403,6 +481,29 @@ describe("canonical HTTPS Platform v2 client", () => {
     await expect(client.prepareMutation(key, requested)).rejects.toMatchObject({category: "response_request_mismatch"});
   });
 
+  test("rejects a mutation approval that reverses the requested decision", async () => {
+    const key = IdempotencyKey("mutation-decision-1");
+    const preview = mutationPreview(
+      {kind: "create_project", label: WorkContextLabel("Requested"), repositories: []},
+      key,
+    );
+    const adapter = new DeterministicPlatformV2Adapter([
+      {lane: "negotiation", result: {kind: "negotiated", negotiated: negotiatedBody(2n)}},
+      {
+        lane: "v2",
+        request: {
+          kind: "decide_mutation",
+          request: {decision: "granted", preview: preview.preview, preview_digest: mutationPreviewDigest(preview)},
+        },
+        result: {kind: "mutation_approval", approval: rawMutationApproval(preview, "denied")},
+      },
+    ]);
+    const client = new PlatformV2Client(adapter);
+    await client.negotiate(offer);
+    await expect(client.decideMutation(preview.preview, mutationPreviewDigest(preview), "granted"))
+      .rejects.toMatchObject({category: "response_decision_mismatch"});
+  });
+
   test("does not let a stale negotiation success overwrite a newer refusal", async () => {
     const stale = deferred<PlatformNegotiationResponse>();
     const newer = deferred<PlatformNegotiationResponse>();
@@ -527,6 +628,42 @@ describe("canonical HTTPS Platform v2 client", () => {
       expect(fetchedKinds).toEqual(["negotiate", "negotiate"]);
       expect(fetchedAuthorizations).toEqual(["Bearer token-1", "Bearer token-3"]);
     }
+  });
+
+  test("renegotiation fences delayed Basic credentials before stale fetch", async () => {
+    const delayed = deferred<PlatformV2BasicCredential>();
+    let credentialCalls = 0;
+    const authorizations: string[] = [];
+    const transport = new BasicHttpsPlatformV2Transport(
+      "https://manage.example/api/platform/v2",
+      () => {
+        credentialCalls += 1;
+        if (credentialCalls === 2) return delayed.promise;
+        return new PlatformV2BasicCredential("ops", `password-${credentialCalls}`);
+      },
+      (async (_input, init) => {
+        const body = typeof init?.body === "string" ? init.body : "";
+        const message = decodeMessage(new TextEncoder().encode(body));
+        authorizations.push(new Headers(init?.headers).get("authorization") ?? "");
+        if (authorizations.length === 1) {
+          return canonicalResponse(message.envelope.requestId, "automonique.platform.negotiation", 1, "negotiated", negotiatedBody(2n), PLATFORM_NEGOTIATION_MEDIA_TYPE);
+        }
+        return canonicalResponse(message.envelope.requestId, "automonique.platform.negotiation", 1, "platform_v2_refused", {
+          category: "unsupported", explanation: "v2 disabled", schema: PLATFORM_SCHEMA_V2,
+        }, PLATFORM_NEGOTIATION_MEDIA_TYPE);
+      }) as typeof fetch,
+    );
+    const client = new PlatformV2Client(transport);
+    await client.negotiate(offer);
+    const stale = client.getWorkContext(projectA);
+    expect((await client.negotiate(offer)).kind).toBe("platform_v2_refused");
+    await expect(stale).rejects.toMatchObject({category: "negotiation_invalidated"});
+    delayed.resolve(new PlatformV2BasicCredential("ops", "stale-password"));
+    await Promise.resolve();
+    expect(authorizations).toEqual([
+      "Basic b3BzOnBhc3N3b3JkLTE=",
+      "Basic b3BzOnBhc3N3b3JkLTM=",
+    ]);
   });
 
   test("fences an in-flight v2 response when renegotiation invalidates its generation", async () => {

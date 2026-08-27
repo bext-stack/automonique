@@ -192,7 +192,7 @@ impl PlatformV2Transport for HttpsTransport {
         lane: PlatformV2Lane,
         canonical_request: &[u8],
     ) -> Result<Vec<u8>, ClientError> {
-        let authorization = self.token.authorization();
+        let authorization = self.credential.authorization();
         let mut response = self
             .v2_agent
             .post(&self.endpoint)
@@ -471,10 +471,11 @@ impl<T> PlatformV2Client<T> {
         preview_digest: MutationPreviewDigest,
         decision: MutationApprovalDecision,
     ) -> Result<MutationDecisionResult, ClientError> {
+        let expected_decision = decision;
         match self.request(PlatformV2Request::DecideMutation(
             MutationDecisionRequest::new(preview, preview_digest, decision),
         ))? {
-            PlatformV2Response::MutationApproval(value) => {
+            PlatformV2Response::MutationApproval(value) if matches!(value.decision(), Ok(decision) if decision == expected_decision) => {
                 Ok(MutationDecisionResult::Approval(value))
             }
             PlatformV2Response::MutationRefused(value) => {
