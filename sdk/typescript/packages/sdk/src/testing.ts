@@ -11,20 +11,52 @@ import {
   MobileServerIdentity,
   MobileSessionId,
   PlatformEpochMillis,
+  PlatformRequestId,
   PlatformRevision,
   PlatformText,
   ReceiptId,
   ResourceId,
   SessionHistoryCursor,
   SessionHistoryLimit,
+  MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES,
+  PLATFORM_NEGOTIATION_MAJOR,
+  PLATFORM_NEGOTIATION_PROTOCOL,
+  PLATFORM_PROTOCOL,
+  PLATFORM_SCHEMA_V2,
+  PLATFORM_V2_MAJOR,
+  SupportedPlatformVersionNumber,
+  decodeMessage,
+  decodePlatformNegotiationRequest,
+  decodePlatformNegotiationResponse,
+  decodePlatformV2Response,
+  encodeLineageProjection,
+  encodeMessage,
+  encodeNegotiatedPlatform,
+  encodePlatformNegotiationRequest,
+  encodePlatformV2Request as encodePlatformV2FixtureRequest,
+  encodeReviewActionReceipt,
+  encodeReviewSnapshot,
+  encodeWorkContextMutationPreview,
+  encodeWorkContextMutationRefusal,
+  encodeWorkContextPage,
+  encodeWorkContextResync,
+  encodeWorkspaceIntentOutcome,
+  parseCanonical,
+  validateWorkContextRecord,
   type ActionReceipt,
   type MobileAuthorization,
   type PlatformCursor,
   type PlatformRequest,
+  type PlatformNegotiationResponse,
+  type NegotiatedPlatform,
+  type PlatformV2Request,
+  type PlatformV2Response,
+  type PlatformVersionOffer,
   type ResourceCoordinate,
   type ResourceRecord,
   type Snapshot,
   type Subscription,
+  type JsonValue,
 } from "../../protocol/src/index.js";
 import type {
   MobileFollowUpRequest,
@@ -35,6 +67,7 @@ import type {
   PlatformClientResponse,
   SessionHistoryPage,
 } from "./platform-client.js";
+import {PlatformV2CanonicalTestingTransport} from "./platform-v2-client.js";
 
 export class DeterministicFixtureError extends Error {
   readonly category: "aborted" | "script_exhausted" | "unexpected_request";
@@ -102,6 +135,147 @@ export class DeterministicPlatformAdapter implements PlatformAdapter {
       : Promise.reject(step.result.value);
   }
 }
+
+export type DeterministicPlatformV2Step =
+  | {readonly lane: "negotiation"; readonly result: PlatformNegotiationResponse | Promise<PlatformNegotiationResponse>}
+  | {readonly lane: "v2"; readonly request: PlatformV2Request; readonly result: PlatformV2Response | Promise<PlatformV2Response>}
+  | {readonly lane: "error"; readonly error: Error};
+
+interface DeterministicPlatformV2State {
+  readonly negotiations: PlatformVersionOffer[];
+  readonly requests: PlatformV2Request[];
+  readonly steps: DeterministicPlatformV2Step[];
+}
+
+function abortDeterministicPlatformV2(signal?: AbortSignal): void {
+  if (signal?.aborted === true) {
+    throw new DeterministicFixtureError("aborted", {cause: signal.reason});
+  }
+}
+
+async function deterministicPlatformV2Negotiation(
+  state: DeterministicPlatformV2State,
+  requestId: ReturnType<typeof PlatformRequestId>,
+  offer: PlatformVersionOffer,
+  signal?: AbortSignal,
+): Promise<PlatformNegotiationResponse> {
+  abortDeterministicPlatformV2(signal);
+  const payload = encodePlatformNegotiationRequest(requestId, {kind: "negotiate", offer});
+  const decoded = decodePlatformNegotiationRequest(payload);
+  const step = state.steps.shift();
+  if (step === undefined) throw new DeterministicFixtureError("script_exhausted");
+  if (step.lane === "error") throw step.error;
+  if (step.lane !== "negotiation") throw new DeterministicFixtureError("unexpected_request");
+  state.negotiations.push(decoded.request.offer);
+  return decodePlatformNegotiationResponse(
+    encodeNegotiationFixtureResponse(decoded.request_id, await step.result),
+    requestId,
+    offer,
+  );
+}
+
+async function deterministicPlatformV2Request(
+  state: DeterministicPlatformV2State,
+  requestId: ReturnType<typeof PlatformRequestId>,
+  request: PlatformV2Request,
+  signal?: AbortSignal,
+): Promise<PlatformV2Response> {
+  abortDeterministicPlatformV2(signal);
+  const payload = encodePlatformV2FixtureRequest(requestId, request);
+  if (payload.length > MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES) {
+    throw new DeterministicFixtureError("unexpected_request");
+  }
+  const step = state.steps.shift();
+  if (step === undefined) throw new DeterministicFixtureError("script_exhausted");
+  if (step.lane === "error") throw step.error;
+  if (step.lane !== "v2") throw new DeterministicFixtureError("unexpected_request");
+  const envelope = decodeMessage(payload).envelope;
+  const expected = encodePlatformV2FixtureRequest(PlatformRequestId(envelope.requestId), step.request);
+  if (!bytesEqual(payload, expected)) throw new DeterministicFixtureError("unexpected_request");
+  state.requests.push(step.request);
+  return decodePlatformV2Response(
+    encodeV2FixtureResponse(envelope.requestId, await step.result),
+    requestId,
+    request.kind,
+  );
+}
+
+/** Exact-order typed Platform v2 adapter with retained request coordinates. */
+export class DeterministicPlatformV2Adapter extends PlatformV2CanonicalTestingTransport {
+  readonly #state: DeterministicPlatformV2State;
+
+  constructor(steps: readonly DeterministicPlatformV2Step[]) {
+    const state: DeterministicPlatformV2State = {negotiations: [], requests: [], steps: [...steps]};
+    super(
+      (requestId, offer, signal) => deterministicPlatformV2Negotiation(state, requestId, offer, signal),
+      (requestId, request, signal) => deterministicPlatformV2Request(state, requestId, request, signal),
+    );
+    this.#state = state;
+  }
+
+  get negotiations(): readonly PlatformVersionOffer[] {
+    return this.#state.negotiations;
+  }
+
+  get requests(): readonly PlatformV2Request[] {
+    return this.#state.requests;
+  }
+
+  get pendingSteps(): number {
+    return this.#state.steps.length;
+  }
+}
+
+function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function json(value: unknown): JsonValue {
+  if (value === null) return {kind: "null"};
+  if (typeof value === "boolean") return {kind: "bool", value};
+  if (typeof value === "bigint") return {kind: "integer", value};
+  if (typeof value === "string") return {kind: "string", value};
+  if (value instanceof Uint8Array) return parseCanonical(value);
+  if (Array.isArray(value)) return {kind: "array", items: value.map(json)};
+  if (typeof value === "object") return {kind: "object", entries: Object.entries(value as Readonly<Record<string, unknown>>).map(([key, item]) => [key, json(item)] as const)};
+  throw new DeterministicFixtureError("unexpected_request");
+}
+
+function fixtureMessage(protocol: string, version: number, requestId: string, kind: string, body: JsonValue): Uint8Array {
+  return encodeMessage({envelope: {protocol, version, requestId, kind}, body});
+}
+
+function encodeNegotiationFixtureResponse(requestId: string, response: PlatformNegotiationResponse): Uint8Array {
+  const body = response.kind === "negotiated"
+    ? parseCanonical(encodeNegotiatedPlatform(response.negotiated))
+    : json(response.refusal);
+  return fixtureMessage(PLATFORM_NEGOTIATION_PROTOCOL, PLATFORM_NEGOTIATION_MAJOR, requestId, response.kind, body);
+}
+
+const negotiatedV2: NegotiatedPlatform = {
+  schema: PLATFORM_SCHEMA_V2,
+  version: SupportedPlatformVersionNumber(2n),
+  work_context: "v2_structured" as const,
+};
+
+function encodeV2FixtureResponse(requestId: string, response: PlatformV2Response): Uint8Array {
+  let body: JsonValue;
+  switch (response.kind) {
+    case "work_context_page": body = parseCanonical(encodeWorkContextPage(response.page)); break;
+    case "work_context_resync": body = parseCanonical(encodeWorkContextResync(response.resync)); break;
+    case "work_context_record": body = json(validateWorkContextRecord(response.record)); break;
+    case "mutation_preview": body = parseCanonical(encodeWorkContextMutationPreview(response.preview)); break;
+    case "mutation_approval": case "mutation_receipt": body = parseCanonical(response.kind === "mutation_approval" ? response.approval.canonical : response.receipt.canonical); break;
+    case "mutation_refused": body = parseCanonical(encodeWorkContextMutationRefusal(response.refusal)); break;
+    case "lineage_result": body = parseCanonical(encodeLineageProjection(negotiatedV2, response.lineage)); break;
+    case "workspace_intent_result": body = parseCanonical(encodeWorkspaceIntentOutcome(negotiatedV2, response.result)); break;
+    case "review_result": body = parseCanonical(encodeReviewSnapshot(response.review)); break;
+    case "review_receipt": body = parseCanonical(encodeReviewActionReceipt(response.receipt)); break;
+    case "platform_v2_refused": body = json(response.refusal); break;
+  }
+  return fixtureMessage(PLATFORM_PROTOCOL, PLATFORM_V2_MAJOR, requestId, response.kind, body);
+}
+
 
 export interface DeterministicSdkFixture {
   readonly now: number;

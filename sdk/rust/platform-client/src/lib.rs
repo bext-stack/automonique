@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Transport-neutral Rust client and presentation reducer for platform v1.
+//! Transport-neutral Rust clients and presentation reducer for Platform v1 and v2.
+
+pub mod platform_v2_client;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -205,6 +207,7 @@ pub struct HttpsTransport {
     token: BearerToken,
     timeout: Duration,
     agent: ureq::Agent,
+    v2_agent: ureq::Agent,
 }
 
 impl HttpsTransport {
@@ -216,6 +219,10 @@ impl HttpsTransport {
             token,
             timeout: Duration::from_secs(10),
             agent: ureq::Agent::config_builder().build().new_agent(),
+            v2_agent: ureq::Agent::config_builder()
+                .max_redirects(0)
+                .build()
+                .new_agent(),
         })
     }
 

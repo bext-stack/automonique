@@ -1,6 +1,9 @@
 # `@automonique/sdk`
 
-The canonical TypeScript client for Automonique Platform v1. It is an ESM package for browsers, React Native, and server-side JavaScript, with no Node- or Bun-specific runtime imports.
+The canonical TypeScript client for Automonique Platform v1 and the separately
+negotiated Platform v2 work-context surface. It is an ESM package for browsers,
+React Native, and server-side JavaScript, with no Node- or Bun-specific runtime
+imports.
 
 ## Installation
 
@@ -50,6 +53,36 @@ const transport = new HttpsPlatformTransport(endpoint, token, expoFetch as typeo
 ```
 
 Protocol integer fields use JavaScript `bigint` so revisions and cursor sequences remain lossless above `Number.MAX_SAFE_INTEGER`. Resource summaries are deliberately opaque strings in Platform v1; consumers must not infer structured state from them.
+
+Platform v2 must be negotiated before any structured operation. A downgrade or
+refusal remains explicit and does not enable the v2 methods:
+
+```ts
+import {
+  HttpsPlatformV2Transport,
+  PLATFORM_NEGOTIATION_SCHEMA_V1,
+  PlatformV2Client,
+  PlatformVersionNumber,
+} from "@automonique/sdk";
+
+const work = new PlatformV2Client(new HttpsPlatformV2Transport(
+  "https://automonique.example/api/platform/v2",
+  () => accessToken,
+));
+const result = await work.negotiate({
+  schema: PLATFORM_NEGOTIATION_SCHEMA_V1,
+  versions: [PlatformVersionNumber(1n), PlatformVersionNumber(2n)],
+});
+if (work.negotiated !== null) {
+  const page = await work.queryWorkContexts(query);
+}
+```
+
+The v2 facade exposes only typed work-context, lifecycle, lineage, and review
+operations. Actor, tenant, and authority grants are resolved by the authenticated
+server and cannot be asserted through these client methods. Both v2 HTTP lanes
+use exact media types, independent response limits, strict correlation, a pinned
+endpoint URL, omitted ambient credentials, and `redirect: "error"`.
 
 Mobile applications should use the dedicated session facade instead of the
 generic `PlatformClient` mutation method:
@@ -106,5 +139,8 @@ expiry, stale revisions, sanitized unknown history events, unknown mutation
 outcomes, and idempotency-key receipt reconciliation. The scripted adapter
 records exact requests and fails closed on an unexpected order or exhausted
 script.
+
+`DeterministicPlatformV2Adapter` provides the equivalent exact-order fixture
+surface for negotiation and structured v2 requests.
 
 This package is licensed under Apache-2.0. Automonique product code outside `sdk/` has a separate licensing boundary.

@@ -12,9 +12,14 @@
   },
   "automonique": {
     "protocol": "automonique.platform",
-    "protocolRange": "1",
+    "protocolRange": "1-2",
     "schema": "automonique.platform/v1",
-    "schemaDigest": "sha256:1c3f561d137a14321cee480b8035341dd70b526ca501f2d5efd7f817a6e4b845"
+    "schemas": [
+      "automonique.platform/v1",
+      "automonique.platform/v2"
+    ],
+    "schemaDigest": "sha256:1c3f561d137a14321cee480b8035341dd70b526ca501f2d5efd7f817a6e4b845",
+    "aggregateSchemaDigest": "sha256:c35a469abe05f948763c8713d69d147dfbbd5c918033462b7dca01d76a7262fe"
   },
   "files": [
     "dist"
