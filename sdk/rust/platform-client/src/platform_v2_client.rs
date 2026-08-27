@@ -9,6 +9,7 @@
 use std::io::Read;
 #[cfg(unix)]
 use std::io::Write;
+use std::{error::Error, fmt};
 
 use automonique_protocol::codec::{
     FrameDecode, LENGTH_PREFIX_BYTES, RequestId, decode_frame_with_limit, encode_frame_with_limit,
@@ -39,9 +40,53 @@ use automonique_protocol::platform_v2_transport::{
 };
 use automonique_protocol::primitives::Revision;
 
+use crate::HttpsTransport;
 #[cfg(unix)]
 use crate::UnixTransport;
-use crate::{ClientError, HttpsTransport};
+
+/// Platform v2-specific client and transport refusal categories.
+///
+/// This is intentionally separate from the stable Platform v1 [`crate::ClientError`]
+/// so adding negotiated v2 does not change exhaustive v1 matches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlatformV2ClientError {
+    Io,
+    Protocol,
+    Correlation,
+    NotNegotiated,
+    ResponseTooLarge,
+    Endpoint,
+    Unauthorized,
+    UnexpectedStatus,
+    UnexpectedContentType,
+}
+
+impl PlatformV2ClientError {
+    #[must_use]
+    pub const fn category(self) -> &'static str {
+        match self {
+            Self::Io => "io",
+            Self::Protocol => "protocol",
+            Self::Correlation => "correlation",
+            Self::NotNegotiated => "not_negotiated",
+            Self::ResponseTooLarge => "response_too_large",
+            Self::Endpoint => "endpoint",
+            Self::Unauthorized => "unauthorized",
+            Self::UnexpectedStatus => "unexpected_status",
+            Self::UnexpectedContentType => "unexpected_content_type",
+        }
+    }
+}
+
+impl fmt::Display for PlatformV2ClientError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "platform v2 client refused: {}", self.category())
+    }
+}
+
+impl Error for PlatformV2ClientError {}
+
+type ClientError = PlatformV2ClientError;
 
 pub const PLATFORM_NEGOTIATION_CONTENT_TYPE: &str =
     "application/vnd.automonique.platform.negotiation.v1+json";
@@ -136,7 +181,7 @@ impl PlatformV2Transport for HttpsTransport {
     ) -> Result<Vec<u8>, ClientError> {
         let authorization = self.token.authorization();
         let mut response = self
-            .agent
+            .v2_agent
             .post(&self.endpoint)
             .header("authorization", authorization.as_str())
             .header("content-type", lane.content_type())
@@ -335,9 +380,18 @@ impl<T: PlatformV2Transport> PlatformV2Client<T> {
         &mut self,
         query: WorkContextQuery,
     ) -> Result<WorkContextQueryResult, ClientError> {
+        let expected_after = query.after().cloned();
+        let expected_limit = query.limit();
         match self.request(PlatformV2Request::QueryWorkContexts(query))? {
-            PlatformV2Response::WorkContextPage(value) => Ok(WorkContextQueryResult::Page(value)),
-            PlatformV2Response::WorkContextResync(value) => {
+            PlatformV2Response::WorkContextPage(value)
+                if value.requested_limit() == expected_limit
+                    && value.after() == expected_after.as_ref() =>
+            {
+                Ok(WorkContextQueryResult::Page(value))
+            }
+            PlatformV2Response::WorkContextResync(value)
+                if expected_after.as_ref() == Some(value.expired_after()) =>
+            {
                 Ok(WorkContextQueryResult::Resync(value))
             }
             PlatformV2Response::Refused(value) => Ok(WorkContextQueryResult::Refused(value)),
@@ -364,11 +418,13 @@ impl<T: PlatformV2Transport> PlatformV2Client<T> {
         intent: WorkContextMutationIntent,
     ) -> Result<MutationPrepareResult, ClientError> {
         let expected_key = idempotency_key.clone();
+        let expected_intent = intent.clone();
         match self.request(PlatformV2Request::PrepareMutation(
             MutationPrepareRequest::new(idempotency_key, intent),
         ))? {
             PlatformV2Response::MutationPreview(value)
-                if value.proposal().idempotency_key() == &expected_key =>
+                if value.proposal().idempotency_key() == &expected_key
+                    && value.proposal().intent() == &expected_intent =>
             {
                 Ok(MutationPrepareResult::Preview(Box::new(value)))
             }

@@ -43,7 +43,6 @@ pub enum ClientError {
     Io,
     Protocol,
     Correlation,
-    NotNegotiated,
     ResponseTooLarge,
     Endpoint,
     Unauthorized,
@@ -58,7 +57,6 @@ impl ClientError {
             Self::Io => "io",
             Self::Protocol => "protocol",
             Self::Correlation => "correlation",
-            Self::NotNegotiated => "not_negotiated",
             Self::ResponseTooLarge => "response_too_large",
             Self::Endpoint => "endpoint",
             Self::Unauthorized => "unauthorized",
@@ -209,6 +207,7 @@ pub struct HttpsTransport {
     token: BearerToken,
     timeout: Duration,
     agent: ureq::Agent,
+    v2_agent: ureq::Agent,
 }
 
 impl HttpsTransport {
@@ -219,7 +218,8 @@ impl HttpsTransport {
             endpoint,
             token,
             timeout: Duration::from_secs(10),
-            agent: ureq::Agent::config_builder()
+            agent: ureq::Agent::config_builder().build().new_agent(),
+            v2_agent: ureq::Agent::config_builder()
                 .max_redirects(0)
                 .build()
                 .new_agent(),

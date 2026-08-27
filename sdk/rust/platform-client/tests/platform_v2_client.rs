@@ -1,24 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use automonique_platform_client::ClientError;
 use automonique_platform_client::platform_v2_client::testing::{
     DeterministicPlatformV2Step, DeterministicPlatformV2Transport,
 };
 use automonique_platform_client::platform_v2_client::{
-    NegotiationResult, PlatformV2Client, PlatformV2Lane, PlatformV2Transport, WorkContextGetResult,
+    NegotiationResult, PlatformV2Client, PlatformV2ClientError as ClientError, PlatformV2Lane,
+    PlatformV2Transport, WorkContextGetResult,
 };
 use automonique_protocol::codec::RequestId;
+use automonique_protocol::identity::Actor;
+use automonique_protocol::platform::{IdempotencyKey, ResourceAuthority};
 use automonique_protocol::platform_v2::{
     NegotiatedPlatform, PLATFORM_SCHEMA_V2, PlatformVersion, PlatformVersionOffer, ProjectId,
-    WorkContextAttributes, WorkContextAvailability, WorkContextIdentity, WorkContextLabel,
-    WorkContextLifecycle, WorkContextRecord,
+    WorkContextAttributes, WorkContextAvailability, WorkContextCursor, WorkContextIdentity,
+    WorkContextKind, WorkContextLabel, WorkContextLifecycle, WorkContextPage, WorkContextQuery,
+    WorkContextRecord, WorkContextResync,
+};
+use automonique_protocol::platform_v2_lifecycle::{
+    CreateProjectIntent, MutationApprovalRequirement, MutationPreview, MutationPreviewId,
+    MutationPreviewRef, WorkContextAuthority, WorkContextMutationIntent,
+    WorkContextMutationProposal,
 };
 use automonique_protocol::platform_v2_transport::{
     MAX_PLATFORM_NEGOTIATION_RESPONSE_CANONICAL_BYTES, PlatformNegotiationRequest,
     PlatformNegotiationRequestMessage, PlatformNegotiationResponse,
     PlatformNegotiationResponseMessage, PlatformV2Refusal, PlatformV2Response,
 };
-use automonique_protocol::primitives::Revision;
+use automonique_protocol::primitives::{EpochMillis, Revision};
 
 fn negotiated(version: PlatformVersion) -> NegotiatedPlatform {
     NegotiatedPlatform::new(
@@ -46,6 +54,12 @@ fn project_record(id: &str) -> WorkContextRecord {
         vec![],
     )
     .unwrap()
+}
+
+fn v2_negotiation() -> DeterministicPlatformV2Step {
+    DeterministicPlatformV2Step::Negotiation(PlatformNegotiationResponse::Negotiated(negotiated(
+        PlatformVersion::V2,
+    )))
 }
 
 #[test]
@@ -175,6 +189,95 @@ fn rejects_a_valid_record_for_the_wrong_coordinate() {
         .unwrap();
     assert_eq!(
         client.get_work_context(project("project-a")),
+        Err(ClientError::Protocol)
+    );
+}
+
+#[test]
+fn rejects_pages_and_resyncs_for_other_request_coordinates() {
+    let after = WorkContextCursor::new("cursor-1").unwrap();
+    let query = WorkContextQuery::new(
+        vec![WorkContextKind::Project],
+        vec![],
+        Some(ProjectId::new("project-a").unwrap()),
+        None,
+        Some(after.clone()),
+        10,
+    )
+    .unwrap();
+    let wrong_page = WorkContextPage::new(9, Some(after.clone()), None, false, vec![]).unwrap();
+    let transport = DeterministicPlatformV2Transport::new([
+        v2_negotiation(),
+        DeterministicPlatformV2Step::V2(Box::new(PlatformV2Response::WorkContextPage(wrong_page))),
+    ]);
+    let mut client = PlatformV2Client::new(transport);
+    client
+        .negotiate(PlatformVersionOffer::new(vec![2]).unwrap())
+        .unwrap();
+    assert_eq!(
+        client.query_work_contexts(query.clone()),
+        Err(ClientError::Protocol)
+    );
+
+    let transport = DeterministicPlatformV2Transport::new([
+        v2_negotiation(),
+        DeterministicPlatformV2Step::V2(Box::new(PlatformV2Response::WorkContextResync(
+            WorkContextResync::new(WorkContextCursor::new("cursor-2").unwrap()),
+        ))),
+    ]);
+    let mut client = PlatformV2Client::new(transport);
+    client
+        .negotiate(PlatformVersionOffer::new(vec![2]).unwrap())
+        .unwrap();
+    assert_eq!(
+        client.query_work_contexts(query),
+        Err(ClientError::Protocol)
+    );
+}
+
+#[test]
+fn rejects_mutation_preview_for_a_substituted_intent() {
+    let requested = WorkContextMutationIntent::CreateProject(
+        CreateProjectIntent::new(WorkContextLabel::new("Requested").unwrap(), vec![]).unwrap(),
+    );
+    let substituted = WorkContextMutationIntent::CreateProject(
+        CreateProjectIntent::new(WorkContextLabel::new("Substituted").unwrap(), vec![]).unwrap(),
+    );
+    let key = IdempotencyKey::new("mutation-1").unwrap();
+    let proposal = WorkContextMutationProposal::new(
+        Actor::new("tenant-1", "operator-1").unwrap(),
+        ResourceAuthority::Automonique,
+        WorkContextAuthority::EMPTY,
+        key.clone(),
+        substituted,
+    )
+    .unwrap();
+    let preview = MutationPreview::new(
+        MutationPreviewRef::new(
+            MutationPreviewId::new("preview-1").unwrap(),
+            Revision::FIRST,
+        ),
+        proposal,
+        None,
+        Some(project("created-project")),
+        vec![],
+        WorkContextAuthority::EMPTY,
+        WorkContextAuthority::EMPTY,
+        MutationApprovalRequirement::NotRequired,
+        EpochMillis::from_millis(1_000),
+        EpochMillis::from_millis(2_000),
+    )
+    .unwrap();
+    let transport = DeterministicPlatformV2Transport::new([
+        v2_negotiation(),
+        DeterministicPlatformV2Step::V2(Box::new(PlatformV2Response::MutationPreview(preview))),
+    ]);
+    let mut client = PlatformV2Client::new(transport);
+    client
+        .negotiate(PlatformVersionOffer::new(vec![2]).unwrap())
+        .unwrap();
+    assert_eq!(
+        client.prepare_mutation(key, requested),
         Err(ClientError::Protocol)
     );
 }

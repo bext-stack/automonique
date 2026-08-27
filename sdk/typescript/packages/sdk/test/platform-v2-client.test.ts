@@ -9,15 +9,22 @@ import {
   PLATFORM_REVIEW_SCHEMA_V1,
   PLATFORM_SCHEMA_V1,
   PLATFORM_SCHEMA_V2,
+  MutationPreviewId,
   PlatformVersionNumber,
   ProjectId,
   UserWorkspaceId,
+  WorkContextCursor,
   WorkContextLabel,
+  WorkContextPageLimit,
+  WorkContextRevision,
   decodeMessage,
   encodeMessage,
+  lifecycleRequestDigest,
   type JsonValue,
   type PlatformVersionOffer,
+  type MutationPreview,
   type WorkContextIdentity,
+  type WorkContextMutationIntent,
 } from "../../protocol/src/index.ts";
 import {
   HttpsPlatformV2Transport,
@@ -79,7 +86,51 @@ function record(identity: WorkContextIdentity) {
   };
 }
 
+const emptyAuthority = {
+  credentials: [], filesystem: [], models: [], network: [], providers: [], tools: [],
+} as const;
+
+function mutationPreview(intent: WorkContextMutationIntent, key: ReturnType<typeof IdempotencyKey>): MutationPreview {
+  const resulting = {
+    ...record({kind: "project", id: ProjectId("created-project")}),
+    label: intent.kind === "create_project" ? intent.label : WorkContextLabel("Project"),
+  };
+  const proposalInput = {
+    actor: {id: "operator-1", tenant: "tenant-1"},
+    actor_authority: emptyAuthority,
+    authority: "automonique" as const,
+    idempotency_key: key,
+    intent,
+  };
+  return {
+    approval: "not_required",
+    current: null,
+    effective_authority: emptyAuthority,
+    expires_at_ms: 2_000n,
+    inherited_authority: emptyAuthority,
+    issued_at_ms: 1_000n,
+    preview: {id: MutationPreviewId("preview-1"), revision: WorkContextRevision(1n)},
+    proposal: {
+      ...proposalInput,
+      request_digest: lifecycleRequestDigest(proposalInput),
+      schema: PLATFORM_SCHEMA_V2,
+    },
+    resolved_parents: [],
+    resulting,
+    schema: PLATFORM_SCHEMA_V2,
+  };
+}
+
 describe("canonical HTTPS Platform v2 client", () => {
+  test("does not expose a generic production request path", () => {
+    const transport = new HttpsPlatformV2Transport("https://manage.example/api/platform/v2", () => "token");
+    const client = new PlatformV2Client(transport);
+    expect("request" in transport).toBe(false);
+    expect("negotiate" in transport).toBe(false);
+    expect("request" in client).toBe(false);
+    expect("transport" in client).toBe(false);
+  });
+
   test("pins a credential-free HTTPS endpoint", () => {
     for (const invalid of [
       "http://manage.example/api/platform/v2",
@@ -94,7 +145,6 @@ describe("canonical HTTPS Platform v2 client", () => {
   });
 
   test("negotiates and sends an exact typed request without identity assertions", async () => {
-    const requestIds = ["negotiation-1", "work-context-1"];
     let calls = 0;
     const fetcher = (async (_input: string | URL | Request, init?: RequestInit) => {
       const body = typeof init?.body === "string" ? init.body : "";
@@ -106,21 +156,20 @@ describe("canonical HTTPS Platform v2 client", () => {
       if (calls++ === 0) {
         expect(headers.get("content-type")).toBe(PLATFORM_NEGOTIATION_MEDIA_TYPE);
         expect(message.envelope.kind).toBe("negotiate");
-        return canonicalResponse("negotiation-1", "automonique.platform.negotiation", 1, "negotiated", negotiatedBody(2n), PLATFORM_NEGOTIATION_MEDIA_TYPE);
+        return canonicalResponse(message.envelope.requestId, "automonique.platform.negotiation", 1, "negotiated", negotiatedBody(2n), PLATFORM_NEGOTIATION_MEDIA_TYPE);
       }
       expect(headers.get("content-type")).toBe(PLATFORM_V2_MEDIA_TYPE);
-      expect(message.envelope).toMatchObject({kind: "get_work_context", protocol: "automonique.platform", requestId: "work-context-1", version: 2});
+      expect(message.envelope).toMatchObject({kind: "get_work_context", protocol: "automonique.platform", version: 2});
       const encoded = body;
       expect(encoded).not.toContain("actor");
       expect(encoded).not.toContain("tenant");
       expect(encoded).not.toContain("authority_ceiling");
-      return canonicalResponse("work-context-1", "automonique.platform", 2, "work_context_record", record(projectA), PLATFORM_V2_MEDIA_TYPE);
+      return canonicalResponse(message.envelope.requestId, "automonique.platform", 2, "work_context_record", record(projectA), PLATFORM_V2_MEDIA_TYPE);
     }) as typeof fetch;
     const transport = new HttpsPlatformV2Transport(
       "https://manage.example/api/platform/v2",
       () => "token",
       fetcher,
-      () => requestIds.shift() ?? "exhausted",
     );
     const client = new PlatformV2Client(transport);
     expect((await client.negotiate(offer)).kind).toBe("negotiated");
@@ -139,6 +188,18 @@ describe("canonical HTTPS Platform v2 client", () => {
       await expect(client.getWorkContext(projectA)).rejects.toMatchObject({category: "platform_v2_not_negotiated"});
       expect(adapter.pendingSteps).toBe(0);
     }
+  });
+
+  test("deterministic negotiation still rejects an unoffered server version", async () => {
+    const v1Only: PlatformVersionOffer = {
+      schema: PLATFORM_NEGOTIATION_SCHEMA_V1,
+      versions: [PlatformVersionNumber(1n)],
+    };
+    const adapter = new DeterministicPlatformV2Adapter([
+      {lane: "negotiation", result: {kind: "negotiated", negotiated: negotiatedBody(2n)}},
+    ]);
+    await expect(new PlatformV2Client(adapter).negotiate(v1Only))
+      .rejects.toMatchObject({category: "invalid_json_value"});
   });
 
   test("refuses malformed, oversized, correlated-to-another-request, and redirected responses", async () => {
@@ -169,7 +230,6 @@ describe("canonical HTTPS Platform v2 client", () => {
         "https://manage.example/api/platform/v2",
         () => "token",
         (async () => entry.response()) as typeof fetch,
-        () => "request-1",
       );
       await expect(new PlatformV2Client(transport).negotiate(offer)).rejects.toMatchObject({category: entry.category});
     }
@@ -178,7 +238,7 @@ describe("canonical HTTPS Platform v2 client", () => {
   test("rejects a valid response for another exact coordinate", async () => {
     const adapter = new DeterministicPlatformV2Adapter([
       {lane: "negotiation", result: {kind: "negotiated", negotiated: negotiatedBody(2n)}},
-      {lane: "v2", result: {kind: "work_context_record", record: record(projectB)}},
+      {lane: "v2", request: {kind: "get_work_context", identity: projectA}, result: {kind: "work_context_record", record: record(projectB)}},
     ]);
     const client = new PlatformV2Client(adapter);
     await client.negotiate(offer);
@@ -189,7 +249,7 @@ describe("canonical HTTPS Platform v2 client", () => {
     const key = IdempotencyKey("mutation-1");
     const adapter = new DeterministicPlatformV2Adapter([
       {lane: "negotiation", result: {kind: "negotiated", negotiated: negotiatedBody(2n)}},
-      {lane: "v2", result: {kind: "platform_v2_refused", refusal: {category: "unavailable", explanation: "pending", schema: PLATFORM_SCHEMA_V2}}},
+      {lane: "v2", request: {kind: "get_mutation_receipt", lookup: {project: ProjectId("project-a"), idempotency_key: key}}, result: {kind: "platform_v2_refused", refusal: {category: "unavailable", explanation: "pending", schema: PLATFORM_SCHEMA_V2}}},
     ]);
     const client = new PlatformV2Client(adapter);
     await client.negotiate(offer);
@@ -208,7 +268,7 @@ describe("canonical HTTPS Platform v2 client", () => {
     const workspace = {kind: "user_workspace" as const, id: UserWorkspaceId("workspace-a")};
     const adapter = new DeterministicPlatformV2Adapter([
       {lane: "negotiation", result: {kind: "negotiated", negotiated: negotiatedBody(2n)}},
-      {lane: "v2", result: {kind: "review_receipt", receipt: {
+      {lane: "v2", request: {kind: "get_review_receipt", lookup: {project: ProjectId("project-a"), workspace, idempotency_key: IdempotencyKey("expected-key")}}, result: {kind: "review_receipt", receipt: {
         action_id: "action-1",
         actor: "actor-1",
         current_revision: null,
@@ -228,5 +288,80 @@ describe("canonical HTTPS Platform v2 client", () => {
       workspace,
       IdempotencyKey("expected-key"),
     )).rejects.toMatchObject({category: "response_idempotency_mismatch"});
+  });
+
+  test("binds pages and resyncs to the exact requested cursor and limit", async () => {
+    const first = WorkContextCursor("cursor-1");
+    const other = WorkContextCursor("cursor-2");
+    const query = {
+      after: first,
+      kinds: ["project" as const],
+      lifecycles: [],
+      limit: WorkContextPageLimit(10n),
+      parent: null,
+      project: ProjectId("project-a"),
+      schema: PLATFORM_SCHEMA_V2,
+    };
+    const wrongPage = new DeterministicPlatformV2Adapter([
+      {lane: "negotiation", result: {kind: "negotiated", negotiated: negotiatedBody(2n)}},
+      {lane: "v2", request: {kind: "query_work_contexts", query}, result: {kind: "work_context_page", page: {
+        after: first, has_more: false, items: [], next_cursor: null,
+        requested_limit: WorkContextPageLimit(9n), schema: PLATFORM_SCHEMA_V2,
+      }}},
+    ]);
+    const pageClient = new PlatformV2Client(wrongPage);
+    await pageClient.negotiate(offer);
+    await expect(pageClient.queryWorkContexts(query)).rejects.toMatchObject({category: "response_coordinate_mismatch"});
+
+    const wrongResync = new DeterministicPlatformV2Adapter([
+      {lane: "negotiation", result: {kind: "negotiated", negotiated: negotiatedBody(2n)}},
+      {lane: "v2", request: {kind: "query_work_contexts", query}, result: {kind: "work_context_resync", resync: {
+        expired_after: other, outcome: "resync_required", schema: PLATFORM_SCHEMA_V2,
+      }}},
+    ]);
+    const resyncClient = new PlatformV2Client(wrongResync);
+    await resyncClient.negotiate(offer);
+    await expect(resyncClient.queryWorkContexts(query)).rejects.toMatchObject({category: "response_coordinate_mismatch"});
+  });
+
+  test("binds mutation previews to the exact submitted intent", async () => {
+    const key = IdempotencyKey("mutation-intent-1");
+    const requested: WorkContextMutationIntent = {kind: "create_project", label: WorkContextLabel("Requested"), repositories: []};
+    const substituted: WorkContextMutationIntent = {kind: "create_project", label: WorkContextLabel("Substituted"), repositories: []};
+    const adapter = new DeterministicPlatformV2Adapter([
+      {lane: "negotiation", result: {kind: "negotiated", negotiated: negotiatedBody(2n)}},
+      {lane: "v2", request: {kind: "prepare_mutation", request: {idempotency_key: key, intent: requested}}, result: {
+        kind: "mutation_preview", preview: mutationPreview(substituted, key),
+      }},
+    ]);
+    const client = new PlatformV2Client(adapter);
+    await client.negotiate(offer);
+    await expect(client.prepareMutation(key, requested)).rejects.toMatchObject({category: "response_request_mismatch"});
+  });
+
+  test("aborts before credentials and races a nonresolving credential provider", async () => {
+    let credentialCalls = 0;
+    let fetchCalls = 0;
+    const never = () => {
+      credentialCalls += 1;
+      return new Promise<string>(() => undefined);
+    };
+    const fetcher = (async () => {
+      fetchCalls += 1;
+      throw new Error("fetch must not run");
+    }) as unknown as typeof fetch;
+    const transport = new HttpsPlatformV2Transport("https://manage.example/api/platform/v2", never, fetcher);
+
+    const already = new AbortController();
+    already.abort("already");
+    await expect(new PlatformV2Client(transport).negotiate(offer, already.signal)).rejects.toMatchObject({category: "aborted"});
+    expect(credentialCalls).toBe(0);
+
+    const later = new AbortController();
+    const pending = new PlatformV2Client(transport).negotiate(offer, later.signal);
+    later.abort("later");
+    await expect(pending).rejects.toMatchObject({category: "aborted"});
+    expect(credentialCalls).toBe(1);
+    expect(fetchCalls).toBe(0);
   });
 });

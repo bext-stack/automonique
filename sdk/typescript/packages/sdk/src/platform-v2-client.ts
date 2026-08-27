@@ -35,14 +35,14 @@ import {
   type WorkContextRevision,
 } from "../../protocol/src/index.js";
 import {PlatformTransportError} from "./platform-client.js";
+import {
+  platformV2Exchange,
+  type InternalPlatformV2Transport,
+  type PlatformV2Lane,
+} from "./platform-v2-internal.js";
 
 export const PLATFORM_NEGOTIATION_MEDIA_TYPE = "application/vnd.automonique.platform.negotiation.v1+json";
 export const PLATFORM_V2_MEDIA_TYPE = "application/vnd.automonique.platform.v2+json";
-
-export interface PlatformV2Adapter {
-  negotiate(offer: PlatformVersionOffer, signal?: AbortSignal): Promise<PlatformNegotiationResponse>;
-  request(request: PlatformV2Request, signal?: AbortSignal): Promise<PlatformV2Response>;
-}
 
 let nextV2RequestSequence = 0;
 function defaultRequestId(): string {
@@ -134,70 +134,40 @@ function protocolError(error: unknown, status = 0): PlatformTransportError {
 }
 
 /** Authenticated HTTPS transport with an exact endpoint and no redirect forwarding. */
-export class HttpsPlatformV2Transport implements PlatformV2Adapter {
+export class HttpsPlatformV2Transport implements InternalPlatformV2Transport {
   readonly endpoint: string;
   readonly token: () => string | Promise<string>;
   readonly fetcher: typeof fetch;
-  readonly requestId: () => string;
 
   constructor(
     endpointValue: string,
     token: () => string | Promise<string>,
     fetcher: typeof fetch = fetch,
-    requestId: () => string = defaultRequestId,
   ) {
     this.endpoint = endpoint(endpointValue);
     this.token = token;
     this.fetcher = fetcher;
-    this.requestId = requestId;
   }
 
-  async negotiate(offer: PlatformVersionOffer, signal?: AbortSignal): Promise<PlatformNegotiationResponse> {
-    let requestId: ReturnType<typeof PlatformRequestId>;
-    let payload: Uint8Array;
-    try {
-      requestId = PlatformRequestId(this.requestId());
-      payload = encodePlatformNegotiationRequest(requestId, {kind: "negotiate", offer});
-    } catch (error) {
-      throw protocolError(error);
-    }
-    const response = await this.exchange(payload, PLATFORM_NEGOTIATION_MEDIA_TYPE, MAX_PLATFORM_NEGOTIATION_RESPONSE_CANONICAL_BYTES, signal);
-    try {
-      return decodePlatformNegotiationResponse(response.payload, requestId, offer);
-    } catch (error) {
-      throw protocolError(error, response.status);
-    }
-  }
-
-  async request(request: PlatformV2Request, signal?: AbortSignal): Promise<PlatformV2Response> {
-    let requestId: ReturnType<typeof PlatformRequestId>;
-    let payload: Uint8Array;
-    try {
-      requestId = PlatformRequestId(this.requestId());
-      payload = encodePlatformV2Request(requestId, request);
-    } catch (error) {
-      throw protocolError(error);
-    }
-    const response = await this.exchange(payload, PLATFORM_V2_MEDIA_TYPE, MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES, signal);
-    try {
-      return decodePlatformV2Response(response.payload, requestId, request.kind);
-    } catch (error) {
-      throw protocolError(error, response.status);
-    }
-  }
-
-  private async exchange(
+  async [platformV2Exchange](
+    lane: PlatformV2Lane,
     payload: Uint8Array,
-    mediaType: string,
-    maximumResponseBytes: number,
     signal?: AbortSignal,
   ): Promise<{readonly payload: Uint8Array; readonly status: number}> {
+    const mediaType = lane === "negotiation" ? PLATFORM_NEGOTIATION_MEDIA_TYPE : PLATFORM_V2_MEDIA_TYPE;
+    const maximumResponseBytes = lane === "negotiation"
+      ? MAX_PLATFORM_NEGOTIATION_RESPONSE_CANONICAL_BYTES
+      : MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES;
+    if (signal?.aborted === true) {
+      throw new PlatformTransportError(0, "aborted", {cause: signal.reason});
+    }
+    const token = await abortableCredential(this.token, signal);
     const response = await this.fetcher(this.endpoint, {
       method: "POST",
       credentials: "omit",
       headers: {
         accept: mediaType,
-        authorization: `Bearer ${bearerToken(await this.token())}`,
+        authorization: `Bearer ${bearerToken(token)}`,
         "content-type": mediaType,
       },
       body: new TextDecoder().decode(payload),
@@ -224,6 +194,36 @@ export class HttpsPlatformV2Transport implements PlatformV2Adapter {
   }
 }
 
+function abortableCredential(
+  provider: () => string | Promise<string>,
+  signal?: AbortSignal,
+): Promise<string> {
+  if (signal?.aborted === true) {
+    return Promise.reject(new PlatformTransportError(0, "aborted", {cause: signal.reason}));
+  }
+  let credential: Promise<string>;
+  try {
+    credential = Promise.resolve(provider());
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  if (signal === undefined) return credential;
+  return new Promise((resolve, reject) => {
+    const aborted = () => reject(new PlatformTransportError(0, "aborted", {cause: signal.reason}));
+    signal.addEventListener("abort", aborted, {once: true});
+    credential.then(
+      (value) => {
+        signal.removeEventListener("abort", aborted);
+        if (signal.aborted) aborted(); else resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", aborted);
+        reject(error);
+      },
+    );
+  });
+}
+
 function sameIdentity(left: WorkContextIdentity, right: WorkContextIdentity): boolean {
   if (left.kind !== right.kind) return false;
   if (left.kind === "repository" || left.kind === "platform_session") {
@@ -233,6 +233,21 @@ function sameIdentity(left: WorkContextIdentity, right: WorkContextIdentity): bo
       && left.resource.id === right.resource.id;
   }
   return right.kind !== "repository" && right.kind !== "platform_session" && left.id === right.id;
+}
+
+function sameStructuredValue(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left)
+      && Array.isArray(right)
+      && left.length === right.length
+      && left.every((value, index) => sameStructuredValue(value, right[index]));
+  }
+  if (left === null || right === null || typeof left !== "object" || typeof right !== "object") return false;
+  const leftEntries = Object.entries(left as Readonly<Record<string, unknown>>);
+  const rightRecord = right as Readonly<Record<string, unknown>>;
+  return leftEntries.length === Object.keys(rightRecord).length
+    && leftEntries.every(([key, value]) => Object.hasOwn(rightRecord, key) && sameStructuredValue(value, rightRecord[key]));
 }
 
 type ResponseOf<K extends PlatformV2Response["kind"]> =
@@ -251,11 +266,11 @@ function requireResponse<K extends PlatformV2Response["kind"]>(
 
 /** Operation-specific facade. V2 calls fail closed until major two is negotiated. */
 export class PlatformV2Client {
-  readonly transport: PlatformV2Adapter;
+  readonly #transport: InternalPlatformV2Transport;
   #negotiated: NegotiatedPlatform | null = null;
 
-  constructor(transport: PlatformV2Adapter) {
-    this.transport = transport;
+  constructor(transport: InternalPlatformV2Transport) {
+    this.#transport = transport;
   }
 
   get negotiated(): NegotiatedPlatform | null {
@@ -264,7 +279,21 @@ export class PlatformV2Client {
 
   async negotiate(offer: PlatformVersionOffer, signal?: AbortSignal): Promise<PlatformNegotiationResponse> {
     this.#negotiated = null;
-    const response = await this.transport.negotiate(offer, signal);
+    let requestId: ReturnType<typeof PlatformRequestId>;
+    let payload: Uint8Array;
+    try {
+      requestId = PlatformRequestId(defaultRequestId());
+      payload = encodePlatformNegotiationRequest(requestId, {kind: "negotiate", offer});
+    } catch (error) {
+      throw protocolError(error);
+    }
+    const exchanged = await this.#transport[platformV2Exchange]("negotiation", payload, signal);
+    let response: PlatformNegotiationResponse;
+    try {
+      response = decodePlatformNegotiationResponse(exchanged.payload, requestId, offer);
+    } catch (error) {
+      throw protocolError(error, exchanged.status);
+    }
     if (
       response.kind === "negotiated"
       && response.negotiated.version === 2n
@@ -276,19 +305,46 @@ export class PlatformV2Client {
     return response;
   }
 
-  private request(request: PlatformV2Request, signal?: AbortSignal): Promise<PlatformV2Response> {
+  #request(request: PlatformV2Request, signal?: AbortSignal): Promise<PlatformV2Response> {
     if (this.#negotiated === null) {
       return Promise.reject(new PlatformTransportError(0, "platform_v2_not_negotiated"));
     }
-    return this.transport.request(request, signal);
+    let requestId: ReturnType<typeof PlatformRequestId>;
+    let payload: Uint8Array;
+    try {
+      requestId = PlatformRequestId(defaultRequestId());
+      payload = encodePlatformV2Request(requestId, request);
+    } catch (error) {
+      return Promise.reject(protocolError(error));
+    }
+    return this.#transport[platformV2Exchange]("v2", payload, signal).then((response) => {
+      try {
+        return decodePlatformV2Response(response.payload, requestId, request.kind);
+      } catch (error) {
+        throw protocolError(error, response.status);
+      }
+    });
   }
 
   async queryWorkContexts(query: WorkContextQuery & {readonly project: ProjectId}, signal?: AbortSignal) {
-    return requireResponse(await this.request({kind: "query_work_contexts", query}, signal), ["work_context_page", "work_context_resync"] as const);
+    const response = requireResponse(await this.#request({kind: "query_work_contexts", query}, signal), ["work_context_page", "work_context_resync"] as const);
+    if (
+      response.kind === "work_context_page"
+      && (response.page.requested_limit !== query.limit || response.page.after !== query.after)
+    ) {
+      throw new PlatformTransportError(502, "response_coordinate_mismatch");
+    }
+    if (
+      response.kind === "work_context_resync"
+      && (query.after === null || response.resync.expired_after !== query.after)
+    ) {
+      throw new PlatformTransportError(502, "response_coordinate_mismatch");
+    }
+    return response;
   }
 
   async getWorkContext(identity: WorkContextIdentity, signal?: AbortSignal) {
-    const response = requireResponse(await this.request({kind: "get_work_context", identity}, signal), ["work_context_record"] as const);
+    const response = requireResponse(await this.#request({kind: "get_work_context", identity}, signal), ["work_context_record"] as const);
     if (response.kind === "work_context_record" && !sameIdentity(response.record.identity, identity)) {
       throw new PlatformTransportError(502, "response_coordinate_mismatch");
     }
@@ -296,27 +352,30 @@ export class PlatformV2Client {
   }
 
   async prepareMutation(idempotencyKey: IdempotencyKey, intent: WorkContextMutationIntent, signal?: AbortSignal) {
-    const response = requireResponse(await this.request({kind: "prepare_mutation", request: {idempotency_key: idempotencyKey, intent}}, signal), ["mutation_preview", "mutation_refused"] as const);
+    const response = requireResponse(await this.#request({kind: "prepare_mutation", request: {idempotency_key: idempotencyKey, intent}}, signal), ["mutation_preview", "mutation_refused"] as const);
     if (response.kind === "mutation_preview" && response.preview.proposal.idempotency_key !== idempotencyKey) {
       throw new PlatformTransportError(502, "response_idempotency_mismatch");
+    }
+    if (response.kind === "mutation_preview" && !sameStructuredValue(response.preview.proposal.intent, intent)) {
+      throw new PlatformTransportError(502, "response_request_mismatch");
     }
     return response;
   }
 
   async decideMutation(preview: MutationPreviewRef, previewDigest: MutationPreviewDigest, decision: MutationApprovalDecision, signal?: AbortSignal) {
-    return requireResponse(await this.request({kind: "decide_mutation", request: {decision, preview, preview_digest: previewDigest}}, signal), ["mutation_approval", "mutation_refused"] as const);
+    return requireResponse(await this.#request({kind: "decide_mutation", request: {decision, preview, preview_digest: previewDigest}}, signal), ["mutation_approval", "mutation_refused"] as const);
   }
 
   async submitMutation(preview: MutationPreviewRef, previewDigest: MutationPreviewDigest, approvalId: MutationApprovalId | null, signal?: AbortSignal) {
-    return requireResponse(await this.request({kind: "submit_mutation", request: {approval_id: approvalId, preview, preview_digest: previewDigest}}, signal), ["mutation_receipt", "mutation_refused"] as const);
+    return requireResponse(await this.#request({kind: "submit_mutation", request: {approval_id: approvalId, preview, preview_digest: previewDigest}}, signal), ["mutation_receipt", "mutation_refused"] as const);
   }
 
   async getMutationReceipt(lookup: {readonly project: ProjectId; readonly receipt_id: ReceiptId} | {readonly project: ProjectId; readonly idempotency_key: IdempotencyKey}, signal?: AbortSignal) {
-    return requireResponse(await this.request({kind: "get_mutation_receipt", lookup}, signal), ["mutation_receipt", "mutation_refused"] as const);
+    return requireResponse(await this.#request({kind: "get_mutation_receipt", lookup}, signal), ["mutation_receipt", "mutation_refused"] as const);
   }
 
   async getLineage(project: ProjectId, workspace: UserWorkspaceId, signal?: AbortSignal) {
-    const response = requireResponse(await this.request({kind: "get_lineage", request: {project, workspace}}, signal), ["lineage_result"] as const);
+    const response = requireResponse(await this.#request({kind: "get_lineage", request: {project, workspace}}, signal), ["lineage_result"] as const);
     if (response.kind === "lineage_result" && response.lineage.workspace !== workspace) {
       throw new PlatformTransportError(502, "response_coordinate_mismatch");
     }
@@ -324,15 +383,15 @@ export class PlatformV2Client {
   }
 
   async submitWorkspaceIntent(project: ProjectId, intent: WorkspaceIntent, signal?: AbortSignal) {
-    return requireResponse(await this.request({kind: "submit_workspace_intent", request: {project, intent}}, signal), ["workspace_intent_result"] as const);
+    return requireResponse(await this.#request({kind: "submit_workspace_intent", request: {project, intent}}, signal), ["workspace_intent_result"] as const);
   }
 
   async getWorkspaceIntent(project: ProjectId, intentId: WorkspaceIntentId, signal?: AbortSignal) {
-    return requireResponse(await this.request({kind: "get_workspace_intent", lookup: {project, intent_id: intentId}}, signal), ["workspace_intent_result"] as const);
+    return requireResponse(await this.#request({kind: "get_workspace_intent", lookup: {project, intent_id: intentId}}, signal), ["workspace_intent_result"] as const);
   }
 
   async getReview(project: ProjectId, workspace: ReviewWorkspaceIdentity, signal?: AbortSignal) {
-    const response = requireResponse(await this.request({kind: "get_review", request: {project, workspace}}, signal), ["review_result"] as const);
+    const response = requireResponse(await this.#request({kind: "get_review", request: {project, workspace}}, signal), ["review_result"] as const);
     if (response.kind === "review_result" && !sameIdentity(response.review.workspace, workspace)) {
       throw new PlatformTransportError(502, "response_coordinate_mismatch");
     }
@@ -340,7 +399,7 @@ export class PlatformV2Client {
   }
 
   async executeReviewAction(workspace: ReviewWorkspaceIdentity, expectedRevision: WorkContextRevision, action: ReviewAction, idempotencyKey: IdempotencyKey, signal?: AbortSignal) {
-    const response = requireResponse(await this.request({kind: "execute_review_action", request: {workspace, expected_revision: expectedRevision, action, idempotency_key: idempotencyKey}}, signal), ["review_receipt"] as const);
+    const response = requireResponse(await this.#request({kind: "execute_review_action", request: {workspace, expected_revision: expectedRevision, action, idempotency_key: idempotencyKey}}, signal), ["review_receipt"] as const);
     if (response.kind === "review_receipt" && response.receipt.idempotency_key !== idempotencyKey) {
       throw new PlatformTransportError(502, "response_idempotency_mismatch");
     }
@@ -348,7 +407,7 @@ export class PlatformV2Client {
   }
 
   async getReviewReceipt(project: ProjectId, workspace: ReviewWorkspaceIdentity, idempotencyKey: IdempotencyKey, signal?: AbortSignal) {
-    const response = requireResponse(await this.request({kind: "get_review_receipt", lookup: {project, workspace, idempotency_key: idempotencyKey}}, signal), ["review_receipt"] as const);
+    const response = requireResponse(await this.#request({kind: "get_review_receipt", lookup: {project, workspace, idempotency_key: idempotencyKey}}, signal), ["review_receipt"] as const);
     if (response.kind === "review_receipt" && response.receipt.idempotency_key !== idempotencyKey) {
       throw new PlatformTransportError(502, "response_idempotency_mismatch");
     }
