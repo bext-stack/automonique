@@ -948,6 +948,56 @@ fn configured_v2_uses_kernel_principal_scope_and_durable_idempotency() {
 }
 
 #[test]
+fn changed_policy_refuses_negotiation_and_requests_until_restart() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    set_tool_authority(&config, false);
+    let serving = serve(&config);
+
+    set_tool_authority(&config, true);
+    let negotiation = PlatformNegotiationRequestMessage::new(
+        RequestId::new("negotiate-stale-policy").unwrap(),
+        PlatformNegotiationRequest::Negotiate(PlatformVersionOffer::new(vec![2]).unwrap()),
+    );
+    let response = PlatformNegotiationResponseMessage::from_canonical_bytes(
+        &exchange(&config, &negotiation.to_canonical_bytes().unwrap()),
+        &negotiation,
+    )
+    .unwrap();
+    assert!(matches!(
+        response.response(),
+        PlatformNegotiationResponse::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_policy_changed"
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-stale-policy-refusal",
+            PlatformV2Request::GetWorkContext(WorkContextIdentity::Project(
+                ProjectId::new("project-live").unwrap()
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_policy_changed"
+    ));
+    serving.shutdown(&config);
+
+    let restarted = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-narrowed-policy-after-restart",
+            PlatformV2Request::GetWorkContext(WorkContextIdentity::Project(
+                ProjectId::new("project-live").unwrap()
+            ))
+        ),
+        PlatformV2Response::WorkContextRecord(_)
+    ));
+    restarted.shutdown(&config);
+}
+
+#[test]
 fn resume_requires_live_durable_workspace_and_never_admits_without_adapter() {
     let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();

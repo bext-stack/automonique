@@ -171,9 +171,17 @@ sole principal mapped to its Unix uid. The HTTP authorization header is never
 forwarded to the daemon. A missing, changed, multi-principal, or mismatched
 policy produces a correlated typed refusal without opening the admin socket.
 
+The daemon retains the startup policy descriptor identity, metadata, length,
+and SHA-256 digest. It securely reopens and compares that complete generation
+before every negotiation and every v2 request. Deletion, replacement, mode or
+owner changes, and even an in-place same-principal grant change therefore
+refuse with `platform_v2_policy_changed` (or the applicable insecure-policy
+category) until the daemon restarts and loads the new generation.
+
 The current local protocol cannot safely represent multiple HTTP principals
 behind one web-entry uid. Such a configuration stays blocked; adding more
 Basic users must first add a daemon-authenticated delegated-principal protocol
 instead of mapping them all to the process uid. Operators must restart the
-daemon and web entry together after changing the principal policy so their
-in-memory policy generations cannot diverge.
+daemon first, then restart web-entry, after changing the principal policy.
+Until that ordering completes, the old daemon generation stays fail-closed
+and web-entry cannot authorize against a generation the daemon has not loaded.
