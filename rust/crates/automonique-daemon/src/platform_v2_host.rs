@@ -12,6 +12,7 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use automonique_protocol::digest::{Sha256, Sha256Digest};
 use automonique_protocol::identity::Actor;
@@ -70,6 +71,7 @@ pub struct PlatformV2Runtime {
     reviews: ReviewStore,
     nonces: HostNonces,
     lifecycle_effects: Box<dyn PlatformV2LifecycleEffectAdapter>,
+    clock: Box<dyn PlatformV2Clock>,
 }
 
 impl std::fmt::Debug for PlatformV2Runtime {
@@ -83,6 +85,7 @@ impl std::fmt::Debug for PlatformV2Runtime {
             .field("reviews", &self.reviews)
             .field("nonces", &self.nonces)
             .field("lifecycle_effects", &"typed adapter")
+            .field("clock", &"trusted clock")
             .finish()
     }
 }
@@ -119,6 +122,22 @@ pub trait PlatformV2LifecycleEffectAdapter: Send {
         resulting_identity: &WorkContextIdentity,
         idempotency_key: &automonique_protocol::platform::IdempotencyKey,
     ) -> PlatformV2EffectReconciliation;
+}
+
+pub trait PlatformV2Clock: Send {
+    fn now_ms(&mut self) -> Result<i64, &'static str>;
+}
+
+struct SystemPlatformV2Clock;
+
+impl PlatformV2Clock for SystemPlatformV2Clock {
+    fn now_ms(&mut self) -> Result<i64, &'static str> {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "platform_v2_clock_invalid")?
+            .as_millis();
+        i64::try_from(millis).map_err(|_| "platform_v2_clock_invalid")
+    }
 }
 
 struct UnavailableLifecycleEffectAdapter;
@@ -265,6 +284,26 @@ impl PlatformV2Host {
         expected_uid: u32,
         lifecycle_effects: Box<dyn PlatformV2LifecycleEffectAdapter>,
     ) -> Self {
+        Self::open_with_lifecycle_adapter_and_clock(
+            policy_path,
+            work_context_path,
+            lineage_path,
+            review_path,
+            expected_uid,
+            lifecycle_effects,
+            Box::new(SystemPlatformV2Clock),
+        )
+    }
+
+    pub fn open_with_lifecycle_adapter_and_clock(
+        policy_path: &Path,
+        work_context_path: &Path,
+        lineage_path: &Path,
+        review_path: &Path,
+        expected_uid: u32,
+        lifecycle_effects: Box<dyn PlatformV2LifecycleEffectAdapter>,
+        clock: Box<dyn PlatformV2Clock>,
+    ) -> Self {
         match PlatformV2Runtime::open(
             policy_path,
             work_context_path,
@@ -272,6 +311,7 @@ impl PlatformV2Host {
             review_path,
             expected_uid,
             lifecycle_effects,
+            clock,
         ) {
             Ok(Some(runtime)) => Self::Enabled(Box::new(runtime)),
             Ok(None) => Self::Disabled("platform_v2_unavailable"),
@@ -314,6 +354,7 @@ impl PlatformV2Runtime {
         review_path: &Path,
         expected_uid: u32,
         lifecycle_effects: Box<dyn PlatformV2LifecycleEffectAdapter>,
+        clock: Box<dyn PlatformV2Clock>,
     ) -> Result<Option<Self>, &'static str> {
         let Some(snapshot) = read_policy_snapshot(policy_path, expected_uid)? else {
             return Ok(None);
@@ -380,6 +421,7 @@ impl PlatformV2Runtime {
             reviews,
             nonces: HostNonces::new()?,
             lifecycle_effects,
+            clock,
         }))
     }
 
@@ -448,6 +490,13 @@ impl PlatformV2Runtime {
                     automonique_protocol::platform_v2_lifecycle::WorkContextMutationIntent::CreateProject(_)
                 ) {
                     return Err("platform_v2_create_project_adapter_pending");
+                }
+                if matches!(
+                    value.intent(),
+                    WorkContextMutationIntent::CreateHostSetup(_)
+                        | WorkContextMutationIntent::CreateCheckout(_)
+                ) {
+                    return Err("platform_v2_selector_registry_unavailable");
                 }
                 let proposal = WorkContextMutationProposal::new(
                     principal.actor.clone(),
@@ -547,6 +596,21 @@ impl PlatformV2Runtime {
                     request_digest,
                     candidate.approval(),
                 );
+                if lifecycle_effect_kind(candidate.proposal().intent()).is_some_and(|kind| {
+                    !self
+                        .lifecycle_effects
+                        .supported_effect_kinds()
+                        .contains(kind)
+                }) {
+                    return Ok(PlatformV2Response::MutationRefused(MutationRefusal::new(
+                        MutationRefusalCategory::Unavailable,
+                        Some(request_digest),
+                        MutationExplanation::new(
+                            "no configured executor supports this lifecycle effect",
+                        )
+                        .map_err(|_| "platform_v2_response_invalid")?,
+                    )));
+                }
                 let receipt_id = ReceiptId::new(format!("receipt_{}", self.nonces.token()))
                     .map_err(|_| "platform_v2_nonce_invalid")?;
                 match self.work_contexts.submit_approved_mutation(
@@ -693,7 +757,7 @@ impl PlatformV2Runtime {
                                 "unavailable" => "platform_v2_resume_not_resumable",
                                 _ => "platform_v2_resume_refused",
                             })?;
-                        WorkspaceIntentOutcome::Accepted
+                        return Err("platform_v2_resume_adapter_pending");
                     }
                     WorkspaceIntent::Cancel(intent) => {
                         authorize_workspace(&principal, value.project(), intent.workspace())?;
@@ -850,7 +914,12 @@ impl PlatformV2Runtime {
         );
         if let Some(effect) = self
             .work_contexts
-            .recover_next_ambiguous_external_effect(&recovery_policy, now_ms, &mut self.nonces)
+            .recover_next_ambiguous_external_effect_with_policy(
+                &recovery_policy,
+                now_ms,
+                &mut self.nonces,
+                |preview| current_mutation_policy(principal, preview),
+            )
             .map_err(|_| "platform_v2_effect_recovery_refused")?
         {
             self.authorize_lifecycle_effect(principal, &effect)?;
@@ -889,9 +958,10 @@ impl PlatformV2Runtime {
                     }
                 }
             };
+            let reconciliation_now = self.clock.now_ms()?.max(now_ms);
             match self
                 .work_contexts
-                .reconcile_external_effect(&effect, &reconciliation, now_ms)
+                .reconcile_external_effect(&effect, &reconciliation, reconciliation_now)
                 .map_err(|_| "platform_v2_effect_recovery_refused")?
             {
                 ExternalEffectReconciliationOutcome::Ready
@@ -903,11 +973,12 @@ impl PlatformV2Runtime {
             ExternalEffectExecutorPolicy::new(executor, principal.serving_authority, allowed);
         if let Some(effect) = self
             .work_contexts
-            .claim_next_external_effect(
+            .claim_next_external_effect_with_policy(
                 &executor_policy,
                 now_ms,
                 EFFECT_LEASE_LIFETIME_MS,
                 &mut self.nonces,
+                |preview| current_mutation_policy(principal, preview),
             )
             .map_err(|_| "platform_v2_effect_claim_refused")?
         {
@@ -919,9 +990,14 @@ impl PlatformV2Runtime {
                 effect.idempotency_key(),
             ) == PlatformV2EffectExecution::Completed
             {
-                self.work_contexts
-                    .complete_external_effect(&effect, now_ms)
-                    .map_err(|_| "platform_v2_effect_completion_refused")?;
+                let completion_now = self.clock.now_ms()?.max(now_ms);
+                match self
+                    .work_contexts
+                    .complete_external_effect(&effect, completion_now)
+                {
+                    Ok(_) | Err(WorkContextStoreError::ReconcileRequired) => {}
+                    Err(_) => return Err("platform_v2_effect_completion_refused"),
+                }
             }
         }
         Ok(())
@@ -954,6 +1030,30 @@ impl PlatformV2Runtime {
             .authorize_existing_preview(effect.preview(), &policy)
             .map(|_| ())
             .map_err(|_| "platform_v2_effect_policy_refused")
+    }
+}
+
+fn current_mutation_policy(
+    principal: &PrincipalPolicy,
+    preview: &automonique_protocol::platform_v2_lifecycle::MutationPreview,
+) -> Option<MutationPolicyDecision> {
+    let (project, inherited_authority) =
+        scope_for_intent(preview.proposal().intent(), principal).ok()?;
+    Some(principal.mutation_policy(
+        Some(project),
+        inherited_authority,
+        preview.proposal().intent(),
+        preview.proposal().request_digest(),
+        preview.approval(),
+    ))
+}
+
+fn lifecycle_effect_kind(intent: &WorkContextMutationIntent) -> Option<&'static str> {
+    match intent {
+        WorkContextMutationIntent::CreateAttemptWorkspace(_) => Some("create_attempt_workspace"),
+        WorkContextMutationIntent::ResumeAttemptWorkspace(_) => Some("resume_attempt_workspace"),
+        WorkContextMutationIntent::ResumeSession(_) => Some("resume_session"),
+        _ => None,
     }
 }
 

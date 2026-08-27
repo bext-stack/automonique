@@ -794,12 +794,11 @@ fn configured_v2_uses_kernel_principal_scope_and_durable_idempotency() {
     assert!(matches!(
         platform_v2(
             &config,
-            "v2-resume-durable-acceptance",
+            "v2-resume-refuses-without-adapter",
             PlatformV2Request::SubmitWorkspaceIntent(resume_request)
         ),
-        PlatformV2Response::WorkspaceIntentResult(
-            automonique_protocol::platform_v2_lineage::WorkspaceIntentOutcome::Accepted
-        )
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_resume_adapter_pending"
     ));
     let wrong_workspace = WorkspaceIntent::Resume(WorkspaceResumeIntent::new(
         WorkspaceIntentId::new("intent-resume-wrong-workspace").unwrap(),
@@ -859,15 +858,14 @@ fn configured_v2_uses_kernel_principal_scope_and_durable_idempotency() {
     assert!(matches!(
         platform_v2(
             &config,
-            "v2-resume-durable-lookup",
+            "v2-resume-without-adapter-not-stored",
             PlatformV2Request::GetWorkspaceIntent(WorkspaceIntentLookup::new(
                 ProjectId::new("project-live").unwrap(),
                 resume.intent_id().clone(),
             ))
         ),
-        PlatformV2Response::WorkspaceIntentResult(
-            automonique_protocol::platform_v2_lineage::WorkspaceIntentOutcome::Accepted
-        )
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_not_found"
     ));
 
     let prepare = MutationPrepareRequest::new(
@@ -1043,15 +1041,14 @@ fn configured_v2_uses_kernel_principal_scope_and_durable_idempotency() {
     assert!(matches!(
         platform_v2(
             &config,
-            "v2-resume-recovered-after-restart",
+            "v2-resume-remains-absent-after-restart",
             PlatformV2Request::GetWorkspaceIntent(WorkspaceIntentLookup::new(
                 ProjectId::new("project-live").unwrap(),
                 resume.intent_id().clone(),
             ))
         ),
-        PlatformV2Response::WorkspaceIntentResult(
-            automonique_protocol::platform_v2_lineage::WorkspaceIntentOutcome::Accepted
-        )
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_not_found"
     ));
     assert!(matches!(
         platform_v2(
@@ -1080,8 +1077,9 @@ struct RecoveringLifecycleAdapter {
 
 #[derive(Clone, Copy)]
 enum LifecycleRecoveryScenario {
-    CrashBeforeEffect,
-    CrashAfterEffect,
+    CrashBefore,
+    CrashAfter,
+    ExpiredLease,
 }
 
 impl automonique_daemon::platform_v2_host::PlatformV2LifecycleEffectAdapter
@@ -1099,14 +1097,17 @@ impl automonique_daemon::platform_v2_host::PlatformV2LifecycleEffectAdapter
     ) -> automonique_daemon::platform_v2_host::PlatformV2EffectExecution {
         let execution = self.executions.fetch_add(1, Ordering::SeqCst);
         match (self.scenario, execution) {
-            (LifecycleRecoveryScenario::CrashBeforeEffect, 0) => {
+            (LifecycleRecoveryScenario::CrashBefore, 0) => {
                 automonique_daemon::platform_v2_host::PlatformV2EffectExecution::NotStarted
             }
-            (LifecycleRecoveryScenario::CrashBeforeEffect, _) => {
+            (LifecycleRecoveryScenario::CrashBefore, _) => {
                 automonique_daemon::platform_v2_host::PlatformV2EffectExecution::Completed
             }
-            (LifecycleRecoveryScenario::CrashAfterEffect, _) => {
+            (LifecycleRecoveryScenario::CrashAfter, _) => {
                 automonique_daemon::platform_v2_host::PlatformV2EffectExecution::Unknown
+            }
+            (LifecycleRecoveryScenario::ExpiredLease, _) => {
+                automonique_daemon::platform_v2_host::PlatformV2EffectExecution::Completed
             }
         }
     }
@@ -1119,20 +1120,32 @@ impl automonique_daemon::platform_v2_host::PlatformV2LifecycleEffectAdapter
     ) -> automonique_daemon::platform_v2_host::PlatformV2EffectReconciliation {
         self.reconciliations.fetch_add(1, Ordering::SeqCst);
         match self.scenario {
-            LifecycleRecoveryScenario::CrashBeforeEffect => automonique_daemon::platform_v2_host::PlatformV2EffectReconciliation::VerifiedNotStarted(
+            LifecycleRecoveryScenario::CrashBefore => automonique_daemon::platform_v2_host::PlatformV2EffectReconciliation::VerifiedNotStarted(
                 b"typed provider verified the original effect did not start".to_vec(),
             ),
-            LifecycleRecoveryScenario::CrashAfterEffect => automonique_daemon::platform_v2_host::PlatformV2EffectReconciliation::Completed(
+            LifecycleRecoveryScenario::CrashAfter => automonique_daemon::platform_v2_host::PlatformV2EffectReconciliation::Completed(
                 b"typed provider proved the original effect completed".to_vec(),
+            ),
+            LifecycleRecoveryScenario::ExpiredLease => automonique_daemon::platform_v2_host::PlatformV2EffectReconciliation::Completed(
+                b"typed provider proved the over-lease effect completed".to_vec(),
             ),
         }
     }
 }
 
+struct FixedPlatformV2Clock(i64);
+
+impl automonique_daemon::platform_v2_host::PlatformV2Clock for FixedPlatformV2Clock {
+    fn now_ms(&mut self) -> Result<i64, &'static str> {
+        Ok(self.0)
+    }
+}
+
 #[test]
 fn lifecycle_effect_claim_recovers_crash_boundaries_without_blind_replay() {
-    run_lifecycle_recovery_scenario(LifecycleRecoveryScenario::CrashBeforeEffect);
-    run_lifecycle_recovery_scenario(LifecycleRecoveryScenario::CrashAfterEffect);
+    run_lifecycle_recovery_scenario(LifecycleRecoveryScenario::CrashBefore);
+    run_lifecycle_recovery_scenario(LifecycleRecoveryScenario::CrashAfter);
+    run_lifecycle_recovery_scenario(LifecycleRecoveryScenario::ExpiredLease);
 }
 
 fn run_lifecycle_recovery_scenario(scenario: LifecycleRecoveryScenario) {
@@ -1147,19 +1160,33 @@ fn run_lifecycle_recovery_scenario(scenario: LifecycleRecoveryScenario) {
         scenario,
     };
     let uid = nix::unistd::geteuid().as_raw();
-    let mut host =
+    let issued_at = 1_800_000_000_000_i64;
+    let adapter: Box<dyn automonique_daemon::platform_v2_host::PlatformV2LifecycleEffectAdapter> =
+        Box::new(adapter);
+    let mut host = if matches!(scenario, LifecycleRecoveryScenario::ExpiredLease) {
+        automonique_daemon::platform_v2_host::PlatformV2Host::open_with_lifecycle_adapter_and_clock(
+            &config.platform_v2_policy_path(),
+            &config.platform_v2_work_context_path(),
+            &config.platform_v2_lineage_path(),
+            &config.platform_v2_review_path(),
+            uid,
+            adapter,
+            Box::new(FixedPlatformV2Clock(issued_at + 30_004)),
+        )
+    } else {
         automonique_daemon::platform_v2_host::PlatformV2Host::open_with_lifecycle_adapter(
             &config.platform_v2_policy_path(),
             &config.platform_v2_work_context_path(),
             &config.platform_v2_lineage_path(),
             &config.platform_v2_review_path(),
             uid,
-            Box::new(adapter),
-        );
-    let issued_at = 1_800_000_000_000_i64;
+            adapter,
+        )
+    };
     let key = IdempotencyKey::new(match scenario {
-        LifecycleRecoveryScenario::CrashBeforeEffect => "attempt-recover-not-started",
-        LifecycleRecoveryScenario::CrashAfterEffect => "attempt-recover-completed",
+        LifecycleRecoveryScenario::CrashBefore => "attempt-recover-not-started",
+        LifecycleRecoveryScenario::CrashAfter => "attempt-recover-completed",
+        LifecycleRecoveryScenario::ExpiredLease => "attempt-recover-expired-lease",
     })
     .unwrap();
     let prepare = MutationPrepareRequest::new(
@@ -1253,11 +1280,86 @@ fn run_lifecycle_recovery_scenario(scenario: LifecycleRecoveryScenario) {
     assert_eq!(
         executions.load(Ordering::SeqCst),
         match scenario {
-            LifecycleRecoveryScenario::CrashBeforeEffect => 2,
-            LifecycleRecoveryScenario::CrashAfterEffect => 1,
+            LifecycleRecoveryScenario::CrashBefore => 2,
+            LifecycleRecoveryScenario::CrashAfter | LifecycleRecoveryScenario::ExpiredLease => 1,
         }
     );
     assert_eq!(reconciliations.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn production_default_adapter_refuses_before_external_effect_custody() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let uid = nix::unistd::geteuid().as_raw();
+    let mut host = automonique_daemon::platform_v2_host::PlatformV2Host::open(
+        &config.platform_v2_policy_path(),
+        &config.platform_v2_work_context_path(),
+        &config.platform_v2_lineage_path(),
+        &config.platform_v2_review_path(),
+        uid,
+    );
+    let issued_at = 1_800_000_000_000_i64;
+    let prepare = MutationPrepareRequest::new(
+        IdempotencyKey::new("attempt-no-production-adapter").unwrap(),
+        WorkContextMutationIntent::CreateAttemptWorkspace(
+            CreateAttemptWorkspaceIntent::new(
+                WorkContextLabel::new("Unavailable attempt").unwrap(),
+                ExpectedWorkContext::new(
+                    WorkContextIdentity::UserWorkspace(
+                        UserWorkspaceId::new("workspace-live").unwrap(),
+                    ),
+                    Revision::FIRST,
+                ),
+                WorkContextAuthority::EMPTY,
+            )
+            .unwrap(),
+        ),
+    );
+    let PlatformV2Response::MutationPreview(preview) =
+        host.handle(uid, &PlatformV2Request::PrepareMutation(prepare), issued_at)
+    else {
+        panic!("preview")
+    };
+    let PlatformV2Response::MutationApproval(raw_approval) = host.handle(
+        uid,
+        &PlatformV2Request::DecideMutation(MutationDecisionRequest::new(
+            preview.preview().clone(),
+            work_context_mutation_preview_digest(&preview).unwrap(),
+            MutationApprovalDecision::Granted,
+        )),
+        issued_at + 1,
+    ) else {
+        panic!("approval")
+    };
+    let approval = raw_approval.decode(&preview).unwrap();
+    assert!(matches!(
+        host.handle(
+            uid,
+            &PlatformV2Request::SubmitMutation(MutationSubmitRequest::new(
+                preview.preview().clone(),
+                work_context_mutation_preview_digest(&preview).unwrap(),
+                Some(approval.id().clone()),
+            )),
+            issued_at + 2,
+        ),
+        PlatformV2Response::MutationRefused(refusal)
+            if refusal.category()
+                == automonique_protocol::platform_v2_lifecycle::MutationRefusalCategory::Unavailable
+    ));
+    let connection = rusqlite::Connection::open(config.platform_v2_work_context_path()).unwrap();
+    let receipts: i64 = connection
+        .query_row("SELECT count(*) FROM work_context_receipts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let outbox: i64 = connection
+        .query_row("SELECT count(*) FROM work_context_outbox", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!((receipts, outbox), (0, 0));
 }
 
 #[test]
@@ -1498,12 +1600,12 @@ fn session_and_pane_ceilings_cannot_exceed_their_direct_parents() {
 }
 
 #[test]
-fn create_checkout_authorizes_only_the_intents_durable_project_repository() {
+fn checkout_creation_refuses_until_a_typed_private_selector_registry_exists() {
     let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     configure_v2(&config);
     let serving = serve(&config);
-    let create_checkout = |repository, repository_revision, key: &str| {
+    let create_checkout = |checkout_kind, key: &str| {
         MutationPrepareRequest::new(
             IdempotencyKey::new(key).unwrap(),
             WorkContextMutationIntent::CreateCheckout(
@@ -1521,61 +1623,31 @@ fn create_checkout_authorizes_only_the_intents_durable_project_repository() {
                         .unwrap(),
                         Revision::FIRST,
                     ),
-                    ExpectedWorkContext::new(repository, repository_revision),
-                    CheckoutKind::GitWorktree,
+                    ExpectedWorkContext::new(live_repository("repo-live"), Revision::FIRST),
+                    checkout_kind,
                     WorkContextRegistrySelector::new("checkout-live-selector").unwrap(),
                 )
                 .unwrap(),
             ),
         )
     };
-    let prepare = create_checkout(
-        live_repository("repo-live"),
-        Revision::FIRST,
-        "checkout-authorized-once",
-    );
-    let PlatformV2Response::MutationPreview(first) = platform_v2(
-        &config,
-        "v2-checkout-authorized",
-        PlatformV2Request::PrepareMutation(prepare.clone()),
-    ) else {
-        panic!("authorized repository must produce a preview")
-    };
-    let PlatformV2Response::MutationPreview(replay) = platform_v2(
-        &config,
-        "v2-checkout-authorized-replay",
-        PlatformV2Request::PrepareMutation(prepare),
-    ) else {
-        panic!("authorized repository replay must produce the same preview")
-    };
-    assert_eq!(replay, first);
-
-    assert!(matches!(
-        platform_v2(
-            &config,
-            "v2-checkout-wrong-repository-revision",
-            PlatformV2Request::PrepareMutation(create_checkout(
-                live_repository("repo-live"),
-                Revision::new(2).unwrap(),
-                "checkout-wrong-repository-revision",
-            )),
+    for (kind, key) in [
+        (CheckoutKind::GitWorktree, "checkout-git-unavailable"),
+        (
+            CheckoutKind::AuthorizedFolder,
+            "checkout-folder-unavailable",
         ),
-        PlatformV2Response::Refused(refusal)
-            if refusal.category().as_str() == "platform_v2_mutation_refused"
-    ));
-    assert!(matches!(
-        platform_v2(
-            &config,
-            "v2-checkout-unrelated-repository",
-            PlatformV2Request::PrepareMutation(create_checkout(
-                live_repository("repo-unrelated"),
-                Revision::FIRST,
-                "checkout-unrelated-repository",
-            )),
-        ),
-        PlatformV2Response::Refused(refusal)
-            if refusal.category().as_str() == "platform_v2_mutation_refused"
-    ));
+    ] {
+        assert!(matches!(
+            platform_v2(
+                &config,
+                key,
+                PlatformV2Request::PrepareMutation(create_checkout(kind, key)),
+            ),
+            PlatformV2Response::Refused(refusal)
+                if refusal.category().as_str() == "platform_v2_selector_registry_unavailable"
+        ));
+    }
     serving.shutdown(&config);
 }
 
@@ -1666,6 +1738,36 @@ fn restart_narrowing_revokes_old_preview_decision_and_receipt_reads() {
         .unwrap();
     drop(store);
 
+    let prior_executions = Arc::new(AtomicUsize::new(0));
+    let prior_reconciliations = Arc::new(AtomicUsize::new(0));
+    let uid = nix::unistd::geteuid().as_raw();
+    let mut prior_host =
+        automonique_daemon::platform_v2_host::PlatformV2Host::open_with_lifecycle_adapter(
+            &config.platform_v2_policy_path(),
+            &config.platform_v2_work_context_path(),
+            &config.platform_v2_lineage_path(),
+            &config.platform_v2_review_path(),
+            uid,
+            Box::new(RecoveringLifecycleAdapter {
+                executions: Arc::clone(&prior_executions),
+                reconciliations: Arc::clone(&prior_reconciliations),
+                scenario: LifecycleRecoveryScenario::CrashAfter,
+            }),
+        );
+    assert!(matches!(
+        prior_host.handle(
+            uid,
+            &PlatformV2Request::GetWorkContext(WorkContextIdentity::Project(
+                ProjectId::new("project-live").unwrap(),
+            )),
+            now_ms.saturating_add(2),
+        ),
+        PlatformV2Response::WorkContextRecord(_)
+    ));
+    assert_eq!(prior_executions.load(Ordering::SeqCst), 1);
+    assert_eq!(prior_reconciliations.load(Ordering::SeqCst), 0);
+    drop(prior_host);
+
     let serving = serve(&config);
     assert!(matches!(
         platform_v2(
@@ -1723,6 +1825,60 @@ fn restart_narrowing_revokes_old_preview_decision_and_receipt_reads() {
         ));
     }
     serving.shutdown(&config);
+
+    let executions = Arc::new(AtomicUsize::new(0));
+    let reconciliations = Arc::new(AtomicUsize::new(0));
+    let adapter = RecoveringLifecycleAdapter {
+        executions: Arc::clone(&executions),
+        reconciliations: Arc::clone(&reconciliations),
+        scenario: LifecycleRecoveryScenario::CrashAfter,
+    };
+    let mut host =
+        automonique_daemon::platform_v2_host::PlatformV2Host::open_with_lifecycle_adapter(
+            &config.platform_v2_policy_path(),
+            &config.platform_v2_work_context_path(),
+            &config.platform_v2_lineage_path(),
+            &config.platform_v2_review_path(),
+            uid,
+            Box::new(adapter),
+        );
+    assert!(matches!(
+        host.handle(
+            uid,
+            &PlatformV2Request::GetWorkContext(WorkContextIdentity::Project(
+                ProjectId::new("project-live").unwrap(),
+            )),
+            now_ms.saturating_add(30_003),
+        ),
+        PlatformV2Response::WorkContextRecord(_)
+    ));
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    assert_eq!(reconciliations.load(Ordering::SeqCst), 0);
+    let connection = rusqlite::Connection::open(config.platform_v2_work_context_path()).unwrap();
+    let outbox_state: String = connection
+        .query_row(
+            "SELECT state FROM work_context_outbox WHERE preview_id=?1",
+            [preview.preview().id().as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let leases: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM work_context_effect_leases",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let recovery_audits: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM work_context_effect_recovery_audit",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(outbox_state, "ambiguous");
+    assert_eq!(leases, 1);
+    assert_eq!(recovery_audits, 0);
 }
 
 struct Serving {

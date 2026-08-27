@@ -138,26 +138,34 @@ external snapshot exists.
 
 Lifecycle submission is wired through the exact retained preview, current
 policy, preview digest, durable approval and server-issued receipt identity.
-Purely logical changes, including a `UserWorkspace` over a registry-authorized
-`authorized_folder` checkout, commit atomically and return `completed`.
-Attempt creation and attempt/session resume return an honest `accepted`
-receipt after reserving their durable outbox effect; no process or filesystem
-result is fabricated.
+Supported purely logical changes, including a `UserWorkspace` over an already
+authorized checkout and lifecycle archives, commit atomically and return
+`completed`. Host-setup and checkout creation refuse before preview custody
+until a typed private selector registry can bind the selector to the exact
+project, host, repository, kind, and canonical root. Attempt creation and
+attempt/session resume return `accepted` only when the configured adapter
+explicitly supports that effect kind and the durable outbox reservation
+succeeds; no process or filesystem result is fabricated.
 
 The host exposes a typed lifecycle-effect adapter. An enabled adapter receives
 only the closed mutation intent, server-issued resulting identity and bound
 idempotency key. The host claims work under a bounded durable lease and records
-completion only after the adapter reports success. A lost or uncertain claim
-becomes ambiguous after expiry. It is never replayed until the same adapter
+completion only after the adapter reports success and a freshly sampled
+trusted time remains inside the lease. A lost, over-lease, or uncertain claim
+becomes ambiguous after expiry. Claim and recovery reauthorize the retained
+preview against current server policy in the same transaction, so revoked
+work is skipped without changing custody or blocking unrelated reads. An
+ambiguous effect is never replayed until the same adapter
 reconciles the original idempotency key as verified not-started; exact completed
 evidence closes it without replay, and unknown evidence remains unavailable.
-The default adapter supports no effects, so accepted attempt/session work stays
-ready for a configured worker rather than being claimed or falsely completed.
+The production default adapter supports no effects, so unsupported submissions
+return `unavailable` before receipt or outbox custody.
 
-Workspace resume intents now prove the task's server-stored workspace against
-the requested project's bounded policy set, recheck the active workspace and
-exact revision, and then retain an idempotent `accepted` polling receipt across
-restart. Workspace create remains unavailable: its base and branch selectors
+Workspace resume intents prove the task's server-stored workspace against the
+requested project's bounded policy set and recheck the active workspace and
+exact revision, then refuse before custody until a workspace executor and
+reconciliation path are configured. Workspace create remains unavailable: its
+base and branch selectors
 are deliberately separate domains and this release has no typed private
 selector-to-canonical-root/repository/base registry. Treating the existing
 opaque selector bytes as paths, refs, or commands would be an unsafe authority

@@ -1210,6 +1210,46 @@ impl WorkContextStore {
         lease_duration_ms: i64,
         nonces: &mut impl WorkContextNonceSource,
     ) -> Stored<Option<ExternalEffectCompletionPolicy>> {
+        self.claim_next_external_effect_authorized(
+            policy,
+            trusted_now_ms,
+            lease_duration_ms,
+            nonces,
+            |_| None,
+            false,
+        )
+    }
+
+    /// Claim the next effect only after its retained preview has been
+    /// reauthorized against the caller's current mutation policy in the same
+    /// transaction that creates the lease.
+    pub fn claim_next_external_effect_with_policy(
+        &mut self,
+        policy: &ExternalEffectExecutorPolicy,
+        trusted_now_ms: i64,
+        lease_duration_ms: i64,
+        nonces: &mut impl WorkContextNonceSource,
+        authorize: impl FnMut(&MutationPreview) -> Option<MutationPolicyDecision>,
+    ) -> Stored<Option<ExternalEffectCompletionPolicy>> {
+        self.claim_next_external_effect_authorized(
+            policy,
+            trusted_now_ms,
+            lease_duration_ms,
+            nonces,
+            authorize,
+            true,
+        )
+    }
+
+    fn claim_next_external_effect_authorized(
+        &mut self,
+        policy: &ExternalEffectExecutorPolicy,
+        trusted_now_ms: i64,
+        lease_duration_ms: i64,
+        nonces: &mut impl WorkContextNonceSource,
+        mut authorize: impl FnMut(&MutationPreview) -> Option<MutationPolicyDecision>,
+        require_current_policy: bool,
+    ) -> Stored<Option<ExternalEffectCompletionPolicy>> {
         if trusted_now_ms < 0
             || !(1..=MAX_EXTERNAL_EFFECT_LEASE_MILLIS).contains(&lease_duration_ms)
         {
@@ -1245,15 +1285,20 @@ impl WorkContextStore {
                 .ok()
                 .and_then(|value| Revision::new(value).ok())
                 .ok_or(WorkContextStoreError::Corrupt("preview_revision"))?;
-            match self.claim_external_effect(
+            match self.claim_external_effect_authorized(
                 &MutationPreviewRef::new(preview_id, revision),
                 policy,
                 trusted_now_ms,
                 expires_at_ms,
                 nonces,
+                &mut authorize,
+                require_current_policy,
             ) {
                 Ok(claim) => return Ok(Some(claim)),
                 Err(WorkContextStoreError::Unavailable | WorkContextStoreError::NotFound) => {}
+                Err(
+                    WorkContextStoreError::Unauthorized | WorkContextStoreError::AuthorityWidening,
+                ) if require_current_policy => {}
                 Err(error) => return Err(error),
             }
         }
@@ -1265,6 +1310,41 @@ impl WorkContextStore {
         policy: &ExternalEffectRecoveryPolicy,
         trusted_now_ms: i64,
         nonces: &mut impl WorkContextNonceSource,
+    ) -> Stored<Option<ExternalEffectCompletionPolicy>> {
+        self.recover_next_ambiguous_external_effect_authorized(
+            policy,
+            trusted_now_ms,
+            nonces,
+            |_| None,
+            false,
+        )
+    }
+
+    /// Recover an ambiguous effect only after transactionally reauthorizing
+    /// the immutable preview against current server policy.
+    pub fn recover_next_ambiguous_external_effect_with_policy(
+        &mut self,
+        policy: &ExternalEffectRecoveryPolicy,
+        trusted_now_ms: i64,
+        nonces: &mut impl WorkContextNonceSource,
+        authorize: impl FnMut(&MutationPreview) -> Option<MutationPolicyDecision>,
+    ) -> Stored<Option<ExternalEffectCompletionPolicy>> {
+        self.recover_next_ambiguous_external_effect_authorized(
+            policy,
+            trusted_now_ms,
+            nonces,
+            authorize,
+            true,
+        )
+    }
+
+    fn recover_next_ambiguous_external_effect_authorized(
+        &mut self,
+        policy: &ExternalEffectRecoveryPolicy,
+        trusted_now_ms: i64,
+        nonces: &mut impl WorkContextNonceSource,
+        mut authorize: impl FnMut(&MutationPreview) -> Option<MutationPolicyDecision>,
+        require_current_policy: bool,
     ) -> Stored<Option<ExternalEffectCompletionPolicy>> {
         if trusted_now_ms < 0 {
             return Err(WorkContextStoreError::InvalidField("trusted_now"));
@@ -1315,10 +1395,19 @@ impl WorkContextStore {
                 continue;
             }
             let lease_id = ExternalEffectLeaseId::parse(lease_id)?;
-            match self.recover_ambiguous_external_effect(&lease_id, policy, trusted_now_ms, nonces)
-            {
+            match self.recover_ambiguous_external_effect_authorized(
+                &lease_id,
+                policy,
+                trusted_now_ms,
+                nonces,
+                &mut authorize,
+                require_current_policy,
+            ) {
                 Ok(handle) => return Ok(Some(handle)),
                 Err(WorkContextStoreError::NotFound) => {}
+                Err(
+                    WorkContextStoreError::Unauthorized | WorkContextStoreError::AuthorityWidening,
+                ) if require_current_policy => {}
                 Err(error) => return Err(error),
             }
         }
@@ -1331,6 +1420,25 @@ impl WorkContextStore {
         policy: &ExternalEffectRecoveryPolicy,
         trusted_now_ms: i64,
         nonces: &mut impl WorkContextNonceSource,
+    ) -> Stored<ExternalEffectCompletionPolicy> {
+        self.recover_ambiguous_external_effect_authorized(
+            lease_id,
+            policy,
+            trusted_now_ms,
+            nonces,
+            &mut |_| None,
+            false,
+        )
+    }
+
+    fn recover_ambiguous_external_effect_authorized(
+        &mut self,
+        lease_id: &ExternalEffectLeaseId,
+        policy: &ExternalEffectRecoveryPolicy,
+        trusted_now_ms: i64,
+        nonces: &mut impl WorkContextNonceSource,
+        authorize: &mut impl FnMut(&MutationPreview) -> Option<MutationPolicyDecision>,
+        require_current_policy: bool,
     ) -> Stored<ExternalEffectCompletionPolicy> {
         if trusted_now_ms < 0 {
             return Err(WorkContextStoreError::InvalidField("trusted_now"));
@@ -1412,6 +1520,11 @@ impl WorkContextStore {
             policy.authenticated_actor.tenant(),
             policy.serving_authority,
         )?;
+        if require_current_policy {
+            let mutation_policy = authorize(&preview).ok_or(WorkContextStoreError::Unauthorized)?;
+            recheck_policy(&preview, &mutation_policy)?;
+            authorize_transaction_scope(&tx, preview.proposal().intent(), &mutation_policy)?;
+        }
         let target = effect_reservation_target(&preview)?;
         let canonical_kind = external_effect(preview.proposal().intent())
             .ok_or(WorkContextStoreError::Corrupt("effect_kind"))?;
@@ -1471,6 +1584,28 @@ impl WorkContextStore {
         expires_at_ms: i64,
         nonces: &mut impl WorkContextNonceSource,
     ) -> Stored<ExternalEffectCompletionPolicy> {
+        self.claim_external_effect_authorized(
+            preview_ref,
+            policy,
+            trusted_now_ms,
+            expires_at_ms,
+            nonces,
+            &mut |_| None,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn claim_external_effect_authorized(
+        &mut self,
+        preview_ref: &MutationPreviewRef,
+        policy: &ExternalEffectExecutorPolicy,
+        trusted_now_ms: i64,
+        expires_at_ms: i64,
+        nonces: &mut impl WorkContextNonceSource,
+        authorize: &mut impl FnMut(&MutationPreview) -> Option<MutationPolicyDecision>,
+        require_current_policy: bool,
+    ) -> Stored<ExternalEffectCompletionPolicy> {
         if trusted_now_ms < 0
             || expires_at_ms <= trusted_now_ms
             || expires_at_ms - trusted_now_ms > MAX_EXTERNAL_EFFECT_LEASE_MILLIS
@@ -1487,6 +1622,11 @@ impl WorkContextStore {
             policy.executor.tenant(),
             policy.serving_authority,
         )?;
+        if require_current_policy {
+            let mutation_policy = authorize(&preview).ok_or(WorkContextStoreError::Unauthorized)?;
+            recheck_policy(&preview, &mutation_policy)?;
+            authorize_transaction_scope(&tx, preview.proposal().intent(), &mutation_policy)?;
+        }
         let effect_kind =
             external_effect(preview.proposal().intent()).ok_or(WorkContextStoreError::NotFound)?;
         if !policy.allowed_effect_kinds.contains(effect_kind) {
