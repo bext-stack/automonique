@@ -1439,7 +1439,10 @@ export function validateOrchestrationRecord(value: OrchestrationRecord): Orchest
   exactInput(value, OrchestrationRecord_FIELDS);
   const identity = validateOrchestrationIdentity(value.identity);
   const parent = value.parent === null ? null : validateOrchestrationIdentity(value.parent);
-  if (!orchestrationParentAllowed(identity, parent)) workContextRefusal("orchestration parent is invalid");
+  if (!orchestrationParentAllowed(identity, parent)
+      || (parent !== null && sameOrchestrationIdentity(identity, parent))) {
+    workContextRefusal("orchestration parent is invalid");
+  }
   return {
     external_work: value.external_work === null ? null : validateExternalWorkIdentity(value.external_work),
     freshness: validateLineageFreshness(value.freshness),

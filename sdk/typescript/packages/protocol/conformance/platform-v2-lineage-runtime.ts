@@ -190,6 +190,16 @@ for (const entry of fixture.cases) {
 
 mustRefuse(() => validateExternalWorkIdentity({provider: "unknown" as never, scope: ExternalWorkScope("scope"), key: ExternalWorkKey("key")}));
 mustRefuse(() => validateLineageFreshness({observed_at_ms: 0n as never, stale_after_ms: LineageStaleAfterMs(1n), state: "fresh"}));
+const selfParent = {kind: "task" as const, id: OrchestrationTaskId("task-self")};
+mustRefuse(() => validateOrchestrationRecord({
+  external_work: null,
+  freshness: validateLineageFreshness({observed_at_ms: LineageObservedAtMs(1n), stale_after_ms: LineageStaleAfterMs(1n), state: "fresh"}),
+  identity: selfParent,
+  latest_useful_message: null,
+  parent: selfParent,
+  status: {kind: "working"},
+  workspace: UserWorkspaceId("workspace-self"),
+}));
 
 for (const required of ["duplicate_intake", "moved_source", "closed_source", "orphan_dispatch", "stale_heartbeat", "question_and_gate", "cancelled_creation", "mixed_version_downgrade", "mixed_version_recovery"]) {
   if (!names.has(required)) throw new Error(`missing fixture ${required}`);

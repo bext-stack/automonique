@@ -398,7 +398,8 @@ impl OrchestrationRecord {
         if !parent_allowed(
             identity.kind(),
             parent.as_ref().map(OrchestrationIdentity::kind),
-        ) {
+        ) || parent.as_ref() == Some(&identity)
+        {
             return Err(LineageError::OrchestrationParentInvalid);
         }
         Ok(Self {

@@ -206,6 +206,15 @@ fn orchestration_parentage_is_typed_and_orphans_are_refused() {
         )
         .is_ok()
     );
+    assert_eq!(
+        record(
+            task.clone(),
+            Some(task.clone()),
+            LineageStatus::Working,
+            fresh()
+        ),
+        Err(LineageError::OrchestrationParentInvalid)
+    );
     assert!(
         record(
             gate,

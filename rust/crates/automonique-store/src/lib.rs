@@ -19,6 +19,7 @@ pub mod context_memory;
 pub mod durable_scheduler;
 pub mod generation_audit;
 pub mod improvements;
+pub mod lineage_index;
 pub mod operator_members;
 pub mod platform_store;
 pub mod provider_deployments;

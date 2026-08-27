@@ -224,8 +224,14 @@ SDK still advertises `protocolRange: 1` and `automonique.platform/v1`, so its
 manifest pins the separately generated `PLATFORM_V1_SCHEMA_DIGEST`; the
 checked-in Platform v1 module remains byte-identical.
 
-The durable lineage store/index, external-provider ingestion, workspace
-create/resume execution, authorization and selector registries, daemon routes,
-SDK client ergonomics, and UI projection remain separate runtime work. The
-contract does not claim that a provider item was fetched, a worker is live, or
-a workspace was created.
+`automonique-store::lineage_index` is the authoritative normalized SQLite
+index for this slice. It keeps external work, internal orchestration, and
+workspace intents in separate constrained tables; uses exact idempotent replay
+and revision fencing; and rebuilds only a bounded projection for one exact
+`UserWorkspaceId` after restart. It stores neither provider payloads nor host
+paths.
+
+External-provider ingestion, workspace create/resume execution, authorization
+and selector registries, daemon routes, SDK client ergonomics, and UI
+projection remain separate runtime work. The contract and index do not claim
+that a provider item was fetched, a worker is live, or a workspace was created.
