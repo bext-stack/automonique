@@ -211,9 +211,9 @@ fn coordinate(value: &JsonValue) -> Result<ResourceCoordinate, WorkContextApiErr
     exact_fields(value, &["authority", "id", "kind"])?;
     Ok(ResourceCoordinate::new(
         ResourceAuthority::parse(string(value, "authority")?)
-            .map_err(|_| WorkContextApiError::InvalidBody)?,
+            .map_err(|_| WorkContextError::V1CoordinateInvalid)?,
         ResourceKind::parse(string(value, "kind")?)
-            .map_err(|_| WorkContextApiError::InvalidBody)?,
+            .map_err(|_| WorkContextError::V1CoordinateInvalid)?,
         ResourceId::new(string(value, "id")?.to_owned()).map_err(WorkContextError::Field)?,
     ))
 }
@@ -326,7 +326,7 @@ fn record(value: &JsonValue) -> Result<WorkContextRecord, WorkContextApiError> {
                 .ok_or(WorkContextApiError::InvalidBody)?,
         )?,
         Revision::new(unsigned(value, "revision")?)
-            .map_err(|_| WorkContextApiError::InvalidBody)?,
+            .map_err(|_| WorkContextError::RevisionInvalid)?,
         WorkContextLifecycle::parse(string(value, "lifecycle")?)?,
         WorkContextLabel::new(string(value, "label")?.to_owned())
             .map_err(WorkContextError::Field)?,
@@ -361,7 +361,7 @@ pub fn encode_platform_version_offer(
                 offer
                     .versions()
                     .iter()
-                    .map(|version| JsonValue::Integer(i64::from(version.number())))
+                    .map(|version| JsonValue::Integer(i64::from(*version)))
                     .collect(),
             ),
         ),
@@ -375,7 +375,7 @@ pub fn decode_platform_version_offer(
     let value = admitted_document(bytes, MAX_PLATFORM_NEGOTIATION_CANONICAL_BYTES)?;
     exact_fields(&value, &["schema", "versions"])?;
     if string(&value, "schema")? != PLATFORM_NEGOTIATION_SCHEMA_V1 {
-        return Err(WorkContextApiError::InvalidBody);
+        return Err(WorkContextError::SchemaInvalid.into());
     }
     PlatformVersionOffer::new(
         array(&value, "versions")?
@@ -386,7 +386,7 @@ pub fn decode_platform_version_offer(
                 };
                 let number = u16::try_from(*value)
                     .map_err(|_| WorkContextApiError::CounterOutOfRange { field: "versions" })?;
-                PlatformVersion::from_number(number).map_err(Into::into)
+                Ok(number)
             })
             .collect::<Result<Vec<_>, WorkContextApiError>>()?,
     )
@@ -422,7 +422,7 @@ pub fn decode_negotiated_platform(bytes: &[u8]) -> Result<NegotiatedPlatform, Wo
         match string(&value, "schema")? {
             crate::platform::PLATFORM_SCHEMA_V1 => crate::platform::PLATFORM_SCHEMA_V1,
             PLATFORM_SCHEMA_V2 => PLATFORM_SCHEMA_V2,
-            _ => return Err(WorkContextApiError::InvalidBody),
+            _ => return Err(WorkContextError::SchemaInvalid.into()),
         },
         WorkContextAvailability::parse(string(&value, "work_context")?)?,
     )
@@ -489,7 +489,7 @@ pub fn decode_work_context_query(bytes: &[u8]) -> Result<WorkContextQuery, WorkC
         ],
     )?;
     if string(&value, "schema")? != PLATFORM_SCHEMA_V2 {
-        return Err(WorkContextApiError::InvalidBody);
+        return Err(WorkContextError::SchemaInvalid.into());
     }
     let kinds = array(&value, "kinds")?
         .iter()
@@ -578,7 +578,7 @@ pub fn decode_work_context_page(bytes: &[u8]) -> Result<WorkContextPage, WorkCon
         ],
     )?;
     if string(&value, "schema")? != PLATFORM_SCHEMA_V2 {
-        return Err(WorkContextApiError::InvalidBody);
+        return Err(WorkContextError::SchemaInvalid.into());
     }
     let requested_limit = u16::try_from(unsigned(&value, "requested_limit")?).map_err(|_| {
         WorkContextApiError::CounterOutOfRange {
@@ -618,7 +618,7 @@ pub fn decode_work_context_resync(bytes: &[u8]) -> Result<WorkContextResync, Wor
     if string(&value, "outcome")? != "resync_required"
         || string(&value, "schema")? != PLATFORM_SCHEMA_V2
     {
-        return Err(WorkContextApiError::InvalidBody);
+        return Err(WorkContextError::SchemaInvalid.into());
     }
     Ok(WorkContextResync::new(
         WorkContextCursor::new(string(&value, "expired_after")?.to_owned())

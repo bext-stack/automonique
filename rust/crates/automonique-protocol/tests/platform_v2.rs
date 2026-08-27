@@ -74,12 +74,22 @@ fn platform_session(id: &str, authority: ResourceAuthority) -> WorkContextIdenti
 
 #[test]
 fn version_negotiation_prefers_v2_and_downgrades_truthfully() {
-    let both = PlatformVersionOffer::new(vec![PlatformVersion::V1, PlatformVersion::V2]).unwrap();
-    let v1 = PlatformVersionOffer::new(vec![PlatformVersion::V1]).unwrap();
-    let v2 = PlatformVersionOffer::new(vec![PlatformVersion::V2]).unwrap();
+    let both = PlatformVersionOffer::new(vec![1, 2]).unwrap();
+    let v1 = PlatformVersionOffer::new(vec![1]).unwrap();
+    let v2 = PlatformVersionOffer::new(vec![2]).unwrap();
+    let future = PlatformVersionOffer::new(vec![1, 2, 3]).unwrap();
 
     assert_eq!(
         negotiate_platform_version(&both, &both).unwrap(),
+        NegotiatedPlatform::new(
+            PlatformVersion::V2,
+            PLATFORM_SCHEMA_V2,
+            WorkContextAvailability::V2Structured,
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        negotiate_platform_version(&future, &future).unwrap(),
         NegotiatedPlatform::new(
             PlatformVersion::V2,
             PLATFORM_SCHEMA_V2,
@@ -101,8 +111,8 @@ fn version_negotiation_prefers_v2_and_downgrades_truthfully() {
         Err(WorkContextError::VersionOverlapMissing)
     );
 
-    let offer_bytes = encode_platform_version_offer(&both).unwrap();
-    assert_eq!(decode_platform_version_offer(&offer_bytes).unwrap(), both);
+    let offer_bytes = encode_platform_version_offer(&future).unwrap();
+    assert_eq!(decode_platform_version_offer(&offer_bytes).unwrap(), future);
     let negotiated = negotiate_platform_version(&both, &both).unwrap();
     let negotiated_bytes = encode_negotiated_platform(&negotiated).unwrap();
     assert_eq!(
@@ -465,6 +475,57 @@ fn exact_query_and_page_codecs_refuse_shape_and_semantic_drift() {
 }
 
 #[test]
+fn multi_kind_pager_uses_the_page_identity_order() {
+    let project = project(7);
+    let WorkContextIdentity::Project(project_id) = project.identity().clone() else {
+        unreachable!("project helper always builds a project identity");
+    };
+    let project_identity = project.identity().clone();
+    let host = WorkContextRecord::new(
+        WorkContextIdentity::HostSetup(HostSetupId::new("host-mixed").unwrap()),
+        Revision::FIRST,
+        WorkContextLifecycle::Active,
+        label("Mixed host"),
+        WorkContextAttributes::host_setup(HostSetupKind::Local),
+        vec![relation(
+            WorkContextRelationKind::HostSetupProject,
+            project_identity.clone(),
+        )],
+    )
+    .unwrap();
+    let inventory = vec![
+        AuthorizedWorkContextRecord::new(host, project_id.clone(), vec![project_identity]).unwrap(),
+        AuthorizedWorkContextRecord::new(project, project_id, Vec::new()).unwrap(),
+    ];
+    let query = WorkContextQuery::new(
+        vec![WorkContextKind::Project, WorkContextKind::HostSetup],
+        Vec::new(),
+        None,
+        None,
+        None,
+        2,
+    )
+    .unwrap();
+
+    let WorkContextQueryResult::Page(page) =
+        page_authorized_work_context(&query, &inventory).unwrap()
+    else {
+        panic!("a fresh mixed-kind query must return a page");
+    };
+    assert_eq!(
+        page.items()
+            .iter()
+            .map(WorkContextRecord::kind)
+            .collect::<Vec<_>>(),
+        vec![WorkContextKind::Project, WorkContextKind::HostSetup]
+    );
+    assert_eq!(
+        decode_work_context_page(&encode_work_context_page(&page).unwrap()).unwrap(),
+        page
+    );
+}
+
+#[test]
 fn inventory_above_512_remains_available_through_bounded_pages() {
     let inventory: Vec<AuthorizedWorkContextRecord> = (0..640)
         .map(|index| {
@@ -572,7 +633,7 @@ fn rust_and_typescript_exchange_the_same_valid_corpus() {
         .map(decode_hex)
         .collect();
     assert_eq!(documents.len(), 4);
-    let offer = PlatformVersionOffer::new(vec![PlatformVersion::V1, PlatformVersion::V2]).unwrap();
+    let offer = PlatformVersionOffer::new(vec![1, 2, 3]).unwrap();
     let negotiated = negotiate_platform_version(&offer, &offer).unwrap();
     let query = WorkContextQuery::new(
         vec![WorkContextKind::Project],
@@ -622,53 +683,60 @@ fn rust_and_typescript_exchange_the_same_valid_corpus() {
         expected_round_trip
     );
 
-    let mut refusals = vec![
-        br#"{"schema":"automonique.platform/negotiation/v1","versions":[1,1]}"#.to_vec(),
-        br#"{"schema":"automonique.platform/v2","version":1,"work_context":"v2_structured"}"#.to_vec(),
-        br#"{"after":null,"kinds":["project","project"],"lifecycles":[],"limit":1,"parent":null,"project":null,"schema":"automonique.platform/v2"}"#.to_vec(),
-        br#"{"after":null,"has_more":true,"items":[],"next_cursor":null,"requested_limit":1,"schema":"automonique.platform/v2"}"#.to_vec(),
-        br#"{"after":null,"kinds":["project"],"lifecycles":[],"limit":129,"parent":null,"project":null,"schema":"automonique.platform/v2"}"#.to_vec(),
-        br#"{"after":null,"has_more":false,"items":[{"attributes":{"checkout":null,"host_setup":null},"identity":{"id":"project-1","kind":"project"},"label":"Project","lifecycle":"active","relations":[{"kind":"project_repository","target":{"kind":"repository","resource":{"authority":"github","id":"repo-a","kind":"session"}}}],"revision":1}],"next_cursor":null,"requested_limit":1,"schema":"automonique.platform/v2"}"#.to_vec(),
-    ];
+    let valid_query = String::from_utf8(encode_work_context_query(&query).unwrap()).unwrap();
     let valid_page = String::from_utf8(encode_work_context_page(&page).unwrap()).unwrap();
     let items_start = valid_page.find("\"items\":[").unwrap() + "\"items\":[".len();
     let items_end = valid_page.find("],\"next_cursor\"").unwrap();
     let item = &valid_page[items_start..items_end];
-    refusals.push(
-        format!(
-            "{}{item},{item}{}",
-            &valid_page[..items_start],
-            &valid_page[items_end..]
-        )
-        .into_bytes(),
+    let duplicate_page = format!(
+        "{}{item},{item}{}",
+        &valid_page[..items_start],
+        &valid_page[items_end..]
     );
-    let categories = [
-        decode_platform_version_offer(&refusals[0])
-            .unwrap_err()
-            .category(),
-        decode_negotiated_platform(&refusals[1])
-            .unwrap_err()
-            .category(),
-        decode_work_context_query(&refusals[2])
-            .unwrap_err()
-            .category(),
-        decode_work_context_page(&refusals[3])
-            .unwrap_err()
-            .category(),
-        decode_work_context_query(&refusals[4])
-            .unwrap_err()
-            .category(),
-        decode_work_context_page(&refusals[5])
-            .unwrap_err()
-            .category(),
-        decode_work_context_page(&refusals[6])
-            .unwrap_err()
-            .category(),
+    let replaced = |source: &str, from: &str, to: &str| {
+        assert!(source.contains(from), "refusal mutation source is present");
+        source.replacen(from, to, 1).into_bytes()
+    };
+    let refusals: Vec<(&str, Vec<u8>)> = vec![
+        ("offer", br#"{"schema":"automonique.platform/negotiation/v1","versions":[1,1]}"#.to_vec()),
+        ("negotiated", br#"{"schema":"automonique.platform/v2","version":1,"work_context":"v2_structured"}"#.to_vec()),
+        ("query", br#"{"after":null,"kinds":["project","project"],"lifecycles":[],"limit":1,"parent":null,"project":null,"schema":"automonique.platform/v2"}"#.to_vec()),
+        ("page", br#"{"after":null,"has_more":true,"items":[],"next_cursor":null,"requested_limit":1,"schema":"automonique.platform/v2"}"#.to_vec()),
+        ("query", br#"{"after":null,"kinds":["project"],"lifecycles":[],"limit":129,"parent":null,"project":null,"schema":"automonique.platform/v2"}"#.to_vec()),
+        ("page", br#"{"after":null,"has_more":false,"items":[{"attributes":{"checkout":null,"host_setup":null},"identity":{"id":"project-1","kind":"project"},"label":"Project","lifecycle":"active","relations":[{"kind":"project_repository","target":{"kind":"repository","resource":{"authority":"github","id":"repo-a","kind":"session"}}}],"revision":1}],"next_cursor":null,"requested_limit":1,"schema":"automonique.platform/v2"}"#.to_vec()),
+        ("page", duplicate_page.into_bytes()),
+        ("offer", br#"{"schema":"automonique.platform/negotiation/v9","versions":[1,2,3]}"#.to_vec()),
+        ("offer", br#"{"schema":"automonique.platform/negotiation/v1","versions":[-1,2]}"#.to_vec()),
+        ("offer", br#"{"schema":"automonique.platform/negotiation/v1","versions":[1,65536]}"#.to_vec()),
+        ("offer", br#"{"schema":"automonique.platform/negotiation/v1","versions":[0,1]}"#.to_vec()),
+        ("negotiated", br#"{"schema":"automonique.platform/v9","version":2,"work_context":"v2_structured"}"#.to_vec()),
+        ("negotiated", br#"{"schema":"automonique.platform/v1","version":-1,"work_context":"v1_existing_resources_only"}"#.to_vec()),
+        ("negotiated", br#"{"schema":"automonique.platform/v2","version":65536,"work_context":"v2_structured"}"#.to_vec()),
+        ("negotiated", br#"{"schema":"automonique.platform/v3","version":3,"work_context":"v2_structured"}"#.to_vec()),
+        ("query", replaced(&valid_query, "\"schema\":\"automonique.platform/v2\"", "\"schema\":\"automonique.platform/v9\"")),
+        ("query", replaced(&valid_query, "\"limit\":128", "\"limit\":-1")),
+        ("query", replaced(&valid_query, "\"limit\":128", "\"limit\":65536")),
+        ("page", replaced(&valid_page, "\"schema\":\"automonique.platform/v2\"", "\"schema\":\"automonique.platform/v9\"")),
+        ("page", replaced(&valid_page, "\"requested_limit\":128", "\"requested_limit\":-1")),
+        ("page", replaced(&valid_page, "\"requested_limit\":128", "\"requested_limit\":65536")),
+        ("page", replaced(&valid_page, "\"authority\":\"github\"", "\"authority\":\"future_authority\"")),
+        ("page", replaced(&valid_page, "\"kind\":\"repository\"}", "\"kind\":\"future_kind\"}")),
+        ("page", replaced(&valid_page, "\"revision\":1", "\"revision\":-1")),
+        ("page", replaced(&valid_page, "\"revision\":1", "\"revision\":0")),
+        ("page", replaced(&valid_page, "\"revision\":1", "\"revision\":9223372036854775808")),
     ];
+    let categories: Vec<&str> = refusals
+        .iter()
+        .map(|(decoder, bytes)| work_context_refusal_category(decoder, bytes))
+        .collect();
     let refused = Command::new("bun")
         .arg(&fixture)
         .arg("decode-refusal-corpus")
-        .args(refusals.iter().map(|bytes| encode_hex(bytes)))
+        .args(
+            refusals
+                .iter()
+                .map(|(decoder, bytes)| format!("{decoder}:{}", encode_hex(bytes))),
+        )
         .current_dir(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../../sdk/typescript/packages/protocol"),
@@ -684,6 +752,48 @@ fn rust_and_typescript_exchange_the_same_valid_corpus() {
         String::from_utf8_lossy(&refused.stdout),
         categories.join(",") + "\n"
     );
+
+    let typescript_refusals = Command::new("bun")
+        .arg(&fixture)
+        .arg("encode-refusal-corpus")
+        .current_dir(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../sdk/typescript/packages/protocol"),
+        )
+        .output()
+        .expect("TypeScript work-context refusal fixture starts");
+    assert!(
+        typescript_refusals.status.success(),
+        "TypeScript refusal encode failed: {}",
+        String::from_utf8_lossy(&typescript_refusals.stderr)
+    );
+    let mut typescript_refusal_count = 0;
+    for line in String::from_utf8(typescript_refusals.stdout)
+        .unwrap()
+        .lines()
+    {
+        let mut fields = line.splitn(3, '\t');
+        let decoder = fields.next().unwrap();
+        let expected_category = fields.next().unwrap();
+        let bytes = decode_hex(fields.next().unwrap());
+        assert_eq!(
+            work_context_refusal_category(decoder, &bytes),
+            expected_category,
+            "TypeScript-originated {decoder} refusal category drifted"
+        );
+        typescript_refusal_count += 1;
+    }
+    assert_eq!(typescript_refusal_count, 19);
+}
+
+fn work_context_refusal_category(decoder: &str, bytes: &[u8]) -> &'static str {
+    match decoder {
+        "offer" => decode_platform_version_offer(bytes).unwrap_err().category(),
+        "negotiated" => decode_negotiated_platform(bytes).unwrap_err().category(),
+        "query" => decode_work_context_query(bytes).unwrap_err().category(),
+        "page" => decode_work_context_page(bytes).unwrap_err().category(),
+        _ => panic!("unknown work-context refusal decoder {decoder}"),
+    }
 }
 
 fn encode_hex(bytes: &[u8]) -> String {

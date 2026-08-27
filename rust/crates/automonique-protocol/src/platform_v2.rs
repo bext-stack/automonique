@@ -19,6 +19,7 @@ use crate::primitives::{BoundedString, IdDomain, OpaqueId, Revision, ValueError}
 pub const PLATFORM_SCHEMA_V2: &str = "automonique.platform/v2";
 pub const MIN_PLATFORM_VERSION: u16 = 1;
 pub const MAX_PLATFORM_VERSION: u16 = 2;
+pub const MAX_PLATFORM_VERSION_NUMBER: u16 = u16::MAX;
 pub const MAX_PLATFORM_VERSION_OFFERS: usize = 8;
 pub const MAX_WORK_CONTEXT_FIELD_BYTES: usize = 256;
 pub const MAX_WORK_CONTEXT_LABEL_BYTES: usize = 512;
@@ -83,22 +84,22 @@ impl PlatformVersion {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlatformVersionOffer {
-    versions: Vec<PlatformVersion>,
+    versions: Vec<u16>,
 }
 
 impl PlatformVersionOffer {
-    pub fn new(versions: Vec<PlatformVersion>) -> Result<Self, WorkContextError> {
+    pub fn new(versions: Vec<u16>) -> Result<Self, WorkContextError> {
         if versions.is_empty() || versions.len() > MAX_PLATFORM_VERSION_OFFERS {
             return Err(WorkContextError::VersionOfferInvalid);
         }
-        if !strictly_increasing(&versions) {
+        if versions[0] < MIN_PLATFORM_VERSION || !strictly_increasing(&versions) {
             return Err(WorkContextError::VersionOfferInvalid);
         }
         Ok(Self { versions })
     }
 
     #[must_use]
-    pub fn versions(&self) -> &[PlatformVersion] {
+    pub fn versions(&self) -> &[u16] {
         &self.versions
     }
 }
@@ -181,8 +182,8 @@ pub fn negotiate_platform_version(
         .versions()
         .iter()
         .rev()
-        .find(|candidate| server.versions().contains(candidate))
-        .copied()
+        .filter(|candidate| server.versions().contains(candidate))
+        .find_map(|candidate| PlatformVersion::from_number(*candidate).ok())
         .ok_or(WorkContextError::VersionOverlapMissing)?;
     NegotiatedPlatform::new(
         version,
@@ -1127,11 +1128,11 @@ pub fn page_authorized_work_context(
     records: &[AuthorizedWorkContextRecord],
 ) -> Result<WorkContextQueryResult, WorkContextError> {
     let mut ordered: Vec<&AuthorizedWorkContextRecord> = records.iter().collect();
-    ordered.sort_by_key(|item| identity_order_key(item.record().identity()));
-    if ordered.windows(2).any(|pair| {
-        identity_order_key(pair[0].record().identity())
-            == identity_order_key(pair[1].record().identity())
-    }) {
+    ordered.sort_by(|left, right| left.record().identity().cmp(right.record().identity()));
+    if ordered
+        .windows(2)
+        .any(|pair| pair[0].record().identity() == pair[1].record().identity())
+    {
         return Err(WorkContextError::InventoryInvalid);
     }
     let inventory = inventory_fingerprint(&ordered);
@@ -1308,6 +1309,9 @@ pub enum WorkContextError {
     RelationTargetInvalid,
     V1CoordinateRequired,
     V1CoordinateKindInvalid,
+    V1CoordinateInvalid,
+    SchemaInvalid,
+    RevisionInvalid,
     DuplicateRelation,
     RelationOrderInvalid,
     RequiredRelationInvalid,
@@ -1343,6 +1347,9 @@ impl fmt::Display for WorkContextError {
             Self::RelationTargetInvalid => "relation target kind is invalid",
             Self::V1CoordinateRequired => "v1 relation target requires a full coordinate",
             Self::V1CoordinateKindInvalid => "v1 relation coordinate kind is invalid",
+            Self::V1CoordinateInvalid => "v1 relation coordinate is invalid",
+            Self::SchemaInvalid => "work-context schema is incompatible",
+            Self::RevisionInvalid => "work-context revision is invalid",
             Self::DuplicateRelation => "work-context relation is duplicated",
             Self::RelationOrderInvalid => "work-context relations are unordered",
             Self::RequiredRelationInvalid => {

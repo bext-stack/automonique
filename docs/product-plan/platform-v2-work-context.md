@@ -10,9 +10,12 @@ installed exact contract: its schema identifier, resource vocabulary, record
 shapes, request kinds, response kinds, and 512-resource ceilings are unchanged.
 
 A connection advertises a bounded, strictly ordered set of supported major
-versions. Peers select the highest shared version. Generated TypeScript exposes
-the same negotiation function and a transcript verifier; a coherent v1 result
-is still refused as a suboptimal downgrade when both offers include v2. A v2
+versions. An offer may contain bounded future majors that this build does not
+yet understand; peers select the highest shared major for which this build has
+a known schema. Generated TypeScript exposes the same negotiation function,
+distinct types for offered and selectable versions, and a transcript verifier;
+a coherent v1 result is still refused as a suboptimal downgrade when both
+offers include v2. A v2
 implementation that meets a v1-only client
 continues to serve the existing v1 resources, session discovery, attachment,
 history, commands, and receipts. It does not encode a project or workspace ID

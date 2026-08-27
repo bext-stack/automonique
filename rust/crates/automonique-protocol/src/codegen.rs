@@ -8348,6 +8348,13 @@ fn work_context_module() -> GeneratedModule {
                 value: ConstantValue::Count(usize::from(crate::platform_v2::MAX_PLATFORM_VERSION)),
             },
             Constant {
+                name: "MAX_PLATFORM_VERSION_NUMBER".to_owned(),
+                doc: "Largest future Platform major admitted in a bounded offer.".to_owned(),
+                value: ConstantValue::Count(usize::from(
+                    crate::platform_v2::MAX_PLATFORM_VERSION_NUMBER,
+                )),
+            },
+            Constant {
                 name: "PLATFORM_SCHEMA_V2".to_owned(),
                 doc: "Stable version-two work-context schema identifier.".to_owned(),
                 value: ConstantValue::Text(crate::platform_v2::PLATFORM_SCHEMA_V2.to_owned()),
@@ -8455,6 +8462,11 @@ fn work_context_module() -> GeneratedModule {
             BoundedInteger {
                 name: "PlatformVersionNumber".to_owned(),
                 min: i64::from(crate::platform_v2::MIN_PLATFORM_VERSION),
+                max: i64::from(crate::platform_v2::MAX_PLATFORM_VERSION_NUMBER),
+            },
+            BoundedInteger {
+                name: "SupportedPlatformVersionNumber".to_owned(),
+                min: i64::from(crate::platform_v2::MIN_PLATFORM_VERSION),
                 max: i64::from(crate::platform_v2::MAX_PLATFORM_VERSION),
             },
             BoundedInteger {
@@ -8557,7 +8569,7 @@ fn work_context_module() -> GeneratedModule {
                         "schema",
                         "typeof PLATFORM_SCHEMA_V1 | typeof PLATFORM_SCHEMA_V2",
                     ),
-                    required("version", "PlatformVersionNumber"),
+                    required("version", "SupportedPlatformVersionNumber"),
                     required("work_context", "WorkContextAvailability"),
                 ],
             },
@@ -10329,9 +10341,17 @@ fn emit_work_context_implementation(out: &mut String) {
 
 const WORK_CONTEXT_INVALID_BODY = "work_context_invalid_body";
 const WORK_CONTEXT_VALUE_INVALID = "work_context_value_invalid";
+const WORK_CONTEXT_COUNTER_OUT_OF_RANGE = "work_context_counter_out_of_range";
 
 function workContextRefusal(detail: string): never {
   throw new RefusalError(WORK_CONTEXT_VALUE_INVALID, detail);
+}
+
+function workContextWireUnsigned(value: bigint, maximum: bigint, field: string): bigint {
+  if (value < 0n || value > maximum) {
+    throw new RefusalError(WORK_CONTEXT_COUNTER_OUT_OF_RANGE, `${field} is outside its wire range`);
+  }
+  return value;
 }
 
 function object(entries: readonly (readonly [string, JsonValue])[]): JsonValue {
@@ -10624,7 +10644,7 @@ function decodeWorkContextRecordValue(value: JsonValue): WorkContextRecord {
     label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)),
     lifecycle: decodeWorkContextLifecycle(bodyString(fields, "lifecycle", WORK_CONTEXT_INVALID_BODY)),
     relations: bodyArray(fields, "relations", WORK_CONTEXT_INVALID_BODY, MAX_WORK_CONTEXT_RELATIONS, WORK_CONTEXT_VALUE_INVALID).map(decodeWorkContextRelationValue),
-    revision: WorkContextRevision(bodyInteger(fields, "revision", WORK_CONTEXT_INVALID_BODY)),
+    revision: WorkContextRevision(workContextWireUnsigned(bodyInteger(fields, "revision", WORK_CONTEXT_INVALID_BODY), WorkContextRevision_MAX, "revision")),
   });
 }
 
@@ -10669,7 +10689,7 @@ export function decodePlatformVersionOffer(payload: Uint8Array): PlatformVersion
     const schema = bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY);
     const versions = bodyArray(fields, "versions", WORK_CONTEXT_INVALID_BODY, MAX_PLATFORM_VERSION_OFFERS, WORK_CONTEXT_VALUE_INVALID).map((value) => {
       if (value.kind !== "integer") throw new RefusalError(WORK_CONTEXT_INVALID_BODY, "version is not an integer");
-      return PlatformVersionNumber(value.value);
+      return PlatformVersionNumber(workContextWireUnsigned(value.value, BigInt(MAX_PLATFORM_VERSION_NUMBER), "versions"));
     });
     return validatePlatformVersionOffer({schema: schema as typeof PLATFORM_NEGOTIATION_SCHEMA_V1, versions});
   });
@@ -10677,14 +10697,17 @@ export function decodePlatformVersionOffer(payload: Uint8Array): PlatformVersion
 
 export function validateNegotiatedPlatform(value: NegotiatedPlatform): NegotiatedPlatform {
   exactInput(value, NegotiatedPlatform_FIELDS);
-  const version = PlatformVersionNumber(value.version);
+  const version = SupportedPlatformVersionNumber(value.version);
   const work_context = decodeWorkContextAvailability(value.work_context);
   if (version === 1n) {
     if (value.schema !== PLATFORM_SCHEMA_V1 || work_context !== "v1_existing_resources_only") workContextRefusal("v1 negotiation result is incoherent");
     return {schema: PLATFORM_SCHEMA_V1, version, work_context};
   }
-  if (value.schema !== PLATFORM_SCHEMA_V2 || work_context !== "v2_structured") workContextRefusal("v2 negotiation result is incoherent");
-  return {schema: PLATFORM_SCHEMA_V2, version, work_context};
+  if (version === 2n) {
+    if (value.schema !== PLATFORM_SCHEMA_V2 || work_context !== "v2_structured") workContextRefusal("v2 negotiation result is incoherent");
+    return {schema: PLATFORM_SCHEMA_V2, version, work_context};
+  }
+  workContextRefusal("selected platform version has no known schema");
 }
 
 export function encodeNegotiatedPlatform(value: NegotiatedPlatform): Uint8Array {
@@ -10701,7 +10724,7 @@ export function decodeNegotiatedPlatform(payload: Uint8Array): NegotiatedPlatfor
     const fields = exactFields(parseDocument(payload, MAX_PLATFORM_NEGOTIATION_CANONICAL_BYTES), NegotiatedPlatform_FIELDS, WORK_CONTEXT_INVALID_BODY);
     return validateNegotiatedPlatform({
       schema: bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY) as NegotiatedPlatform["schema"],
-      version: PlatformVersionNumber(bodyInteger(fields, "version", WORK_CONTEXT_INVALID_BODY)),
+      version: SupportedPlatformVersionNumber(workContextWireUnsigned(bodyInteger(fields, "version", WORK_CONTEXT_INVALID_BODY), BigInt(MAX_PLATFORM_VERSION_NUMBER), "version")),
       work_context: decodeWorkContextAvailability(bodyString(fields, "work_context", WORK_CONTEXT_INVALID_BODY)),
     });
   });
@@ -10710,11 +10733,12 @@ export function decodeNegotiatedPlatform(payload: Uint8Array): NegotiatedPlatfor
 export function negotiatePlatformVersion(clientValue: PlatformVersionOffer, serverValue: PlatformVersionOffer): NegotiatedPlatform {
   const client = validatePlatformVersionOffer(clientValue);
   const server = validatePlatformVersionOffer(serverValue);
-  const version = [...client.versions].reverse().find((candidate) => server.versions.includes(candidate));
+  const version = [...client.versions].reverse().find((candidate) => candidate <= BigInt(MAX_PLATFORM_VERSION) && server.versions.includes(candidate));
   if (version === undefined) workContextRefusal("platform versions do not overlap");
-  return version === 2n
-    ? {schema: PLATFORM_SCHEMA_V2, version, work_context: "v2_structured"}
-    : {schema: PLATFORM_SCHEMA_V1, version, work_context: "v1_existing_resources_only"};
+  const selected = SupportedPlatformVersionNumber(version);
+  return selected === 2n
+    ? {schema: PLATFORM_SCHEMA_V2, version: selected, work_context: "v2_structured"}
+    : {schema: PLATFORM_SCHEMA_V1, version: selected, work_context: "v1_existing_resources_only"};
 }
 
 export function verifyPlatformNegotiationTranscript(
@@ -10780,7 +10804,7 @@ export function decodeWorkContextQuery(payload: Uint8Array): WorkContextQuery {
         if (value.kind !== "string") throw new RefusalError(WORK_CONTEXT_INVALID_BODY, "lifecycle filter is not a string");
         return decodeWorkContextLifecycle(value.value);
       }),
-      limit: WorkContextPageLimit(bodyInteger(fields, "limit", WORK_CONTEXT_INVALID_BODY)),
+      limit: WorkContextPageLimit(workContextWireUnsigned(bodyInteger(fields, "limit", WORK_CONTEXT_INVALID_BODY), BigInt(MAX_PLATFORM_VERSION_NUMBER), "limit")),
       parent: bodyValueOrNull(fields, "parent", WORK_CONTEXT_INVALID_BODY) === null ? null : decodeWorkContextIdentityValue(bodyValue(fields, "parent", WORK_CONTEXT_INVALID_BODY)),
       project: project === null ? null : ProjectId(project),
       schema: bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY) as typeof PLATFORM_SCHEMA_V2,
@@ -10830,7 +10854,7 @@ export function decodeWorkContextPage(payload: Uint8Array): WorkContextPage {
       has_more: bodyBool(fields, "has_more", WORK_CONTEXT_INVALID_BODY),
       items: bodyArray(fields, "items", WORK_CONTEXT_INVALID_BODY, MAX_WORK_CONTEXT_PAGE_ITEMS, WORK_CONTEXT_VALUE_INVALID).map(decodeWorkContextRecordValue),
       next_cursor: next === null ? null : WorkContextCursor(next),
-      requested_limit: WorkContextPageLimit(bodyInteger(fields, "requested_limit", WORK_CONTEXT_INVALID_BODY)),
+      requested_limit: WorkContextPageLimit(workContextWireUnsigned(bodyInteger(fields, "requested_limit", WORK_CONTEXT_INVALID_BODY), BigInt(MAX_PLATFORM_VERSION_NUMBER), "requested_limit")),
       schema: bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY) as typeof PLATFORM_SCHEMA_V2,
     });
   });
