@@ -8,10 +8,10 @@
     <meta name="theme-color" id="theme-color" content="#0b0d10">
     <title>Monique</title>
     <link rel="icon" href="/favicon.svg?v=3" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/dashboard.css?v=15">
+    <link rel="stylesheet" href="/assets/dashboard.css?v=16">
     <script src="/assets/qrcode.js?v=1" defer></script>
-    <script src="/assets/platform-cockpit-core.js?v=1" defer></script>
-    <script src="/assets/dashboard.js?v=17" defer></script>
+    <script src="/assets/platform-cockpit-core.js?v=2" defer></script>
+    <script src="/assets/dashboard.js?v=18" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#workspace">Skip to workspace</a>
@@ -142,19 +142,42 @@
 
           <section class="view is-visible" data-panel="sessions" aria-labelledby="sessions-title">
             <div class="page-heading compact">
-              <div><p class="kicker">AUTOMONIQUE.PLATFORM / AUTHORITY-QUALIFIED</p><h1 id="sessions-title">Retained sessions</h1><p class="page-lede">Continue work in its durable Platform session, with exact authority, revision, approval, and receipt context preserved across every follow-up.</p></div>
+              <div><p class="kicker">TASK / WORKSPACE / RETAINED SESSION</p><h1 id="sessions-title">Hosted workspaces</h1><p class="page-lede">Stay with a task from workspace context through its retained conversation. External work and internal agent state remain distinct, explicitly sourced signals.</p></div>
               <div class="heading-actions"><button class="button secondary" id="platform-refresh" type="button">Refresh</button><span class="tag" id="platform-health">LOADING</span></div>
             </div>
             <article class="panel platform-monitor" aria-labelledby="platform-monitor-title">
-              <div class="panel-head process-monitor-head"><div><p class="kicker">PRIMARY CONVERSATION SURFACE</p><h2 id="platform-monitor-title">Hosted session cockpit</h2></div><div class="process-monitor-actions"><small id="platform-cursor">Waiting for session inventory</small></div></div>
+              <div class="panel-head process-monitor-head"><div><p class="kicker">PRIMARY WORK SURFACE</p><h2 id="platform-monitor-title">Task and workspace cockpit</h2></div><div class="process-monitor-actions"><small id="platform-cursor">Waiting for workspace context</small></div></div>
+              <div class="cockpit-capability-state" id="cockpit-capability-state" data-mode="loading" role="status" aria-live="polite"><strong>Checking workspace capabilities</strong><span>Retained sessions remain available while capability discovery completes.</span></div>
+              <div class="cockpit-attention" role="group" aria-label="Filter hosted workspaces by attention state">
+                <button class="is-active" type="button" aria-pressed="true" data-cockpit-attention="all">All</button>
+                <button type="button" aria-pressed="false" data-cockpit-attention="needs_you">Needs You <b id="cockpit-needs-you-count">0</b></button>
+                <button type="button" aria-pressed="false" data-cockpit-attention="working">Working <b id="cockpit-working-count">0</b></button>
+                <button type="button" aria-pressed="false" data-cockpit-attention="blocked">Blocked <b id="cockpit-blocked-count">0</b></button>
+                <button type="button" aria-pressed="false" data-cockpit-attention="done">Done <b id="cockpit-done-count">0</b></button>
+              </div>
+              <div class="hosted-workspace-grid">
+                <nav class="cockpit-context-nav" id="cockpit-workspace-navigation" aria-label="Project, host, and workspace navigation" tabindex="-1">
+                  <section aria-labelledby="cockpit-projects-label"><div class="cockpit-rail-heading"><strong id="cockpit-projects-label">Projects</strong><span id="cockpit-project-count">—</span></div><div class="cockpit-compact-list" id="cockpit-project-list"><div class="cockpit-unavailable">Structured project context unavailable.</div></div></section>
+                  <section aria-labelledby="cockpit-hosts-label"><div class="cockpit-rail-heading"><strong id="cockpit-hosts-label">Hosts</strong><span id="cockpit-host-count">—</span></div><div class="cockpit-compact-list" id="cockpit-host-list"><div class="cockpit-unavailable">Structured host context unavailable.</div></div></section>
+                  <section aria-labelledby="cockpit-workspaces-label"><div class="cockpit-rail-heading"><strong id="cockpit-workspaces-label">Workspaces</strong><span id="cockpit-workspace-count">—</span></div><div class="cockpit-compact-list" id="cockpit-workspace-list" role="listbox" aria-label="Hosted workspaces"><div class="cockpit-unavailable">No structured workspaces advertised.</div></div></section>
+                </nav>
+                <section class="cockpit-workspace-summary" id="cockpit-workspace-summary" tabindex="-1" aria-labelledby="cockpit-workspace-title">
+                  <header><div><span id="cockpit-workspace-coordinate">NO STRUCTURED WORKSPACE</span><h3 id="cockpit-workspace-title">Retained session mode</h3><p id="cockpit-workspace-branch">Branch unavailable · no inference from conversation summaries</p></div><button class="button secondary" id="cockpit-copy-link" type="button" disabled>Copy exact link</button></header>
+                  <div class="cockpit-signal-grid" aria-label="Workspace status signals"><article id="cockpit-external-signal"><small>EXTERNAL WORK</small><strong>Unavailable</strong><span>Freshness unknown · unread unknown</span></article><article id="cockpit-agent-signal"><small>INTERNAL AGENT</small><strong>Unavailable</strong><span>Freshness unknown · unread unknown</span></article></div>
+                  <section class="cockpit-task-preview" aria-labelledby="cockpit-task-preview-title"><div><small>TYPED ACTION PREVIEW</small><h3 id="cockpit-task-preview-title">Create or resume from this task</h3><p id="cockpit-action-reason">Unavailable until structured capability data supplies the exact action, authority, workspace, and revision.</p></div><label for="cockpit-task-input"><span>Task</span><textarea id="cockpit-task-input" maxlength="2048" rows="2" placeholder="Describe the task for a review-only preview"></textarea></label><div class="cockpit-preview-actions"><button class="button secondary" id="cockpit-create-preview" type="button" disabled>Preview create</button><button class="button secondary" id="cockpit-resume-preview" type="button" disabled>Preview resume</button></div><div class="cockpit-action-preview" id="cockpit-action-preview" role="status" aria-live="polite" hidden></div><div class="cockpit-action-receipt" id="cockpit-action-receipt" data-state="idle" role="status" aria-live="polite" hidden></div></section>
+                </section>
+                <aside class="cockpit-inspector" id="cockpit-workspace-inspector" aria-label="Workspace context inspector" tabindex="-1"><small>EXACT CONTEXT</small><strong id="cockpit-inspector-workspace">No workspace selected</strong><dl><div><dt>Session</dt><dd id="cockpit-inspector-session">—</dd></div><div><dt>Pane</dt><dd id="cockpit-inspector-pane">—</dd></div><div><dt>Review anchor</dt><dd id="cockpit-inspector-anchor">—</dd></div></dl><p>Workspace, session, pane, and review anchors are only linkable when their exact structured identities are present.</p><div class="cockpit-keyboard-help"><small>KEYBOARD</small><span><kbd>W</kbd> workspaces</span><span><kbd>C</kbd> conversation</span><span><kbd>A</kbd> activity</span></div></aside>
+              </div>
+              <div class="cockpit-surface-tabs" role="tablist" aria-label="Selected workspace surfaces"><button class="is-active" type="button" role="tab" aria-selected="true" aria-controls="cockpit-conversation" data-cockpit-surface="conversation">Conversation</button><button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="cockpit-files" data-cockpit-surface="files">Files &amp; review</button><button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="cockpit-activity" data-cockpit-surface="activity">Activity</button></div>
+              <section class="cockpit-surface is-active" id="cockpit-conversation" role="tabpanel" aria-label="Retained session conversation">
               <p class="process-semantics">Select an authority-qualified session to attach as an observer. Observation never grants control; follow-ups use the session’s exact revision and reconcile uncertain receipts without replay.</p>
               <div class="platform-cockpit">
                 <aside class="platform-session-rail" aria-label="Retained sessions">
-                  <div class="platform-session-rail-head"><strong>Sessions</strong><span id="platform-sessions">—</span></div>
+                  <div class="platform-session-rail-head"><div><small>OPERATIONAL INVENTORY</small><strong>Retained sessions</strong></div><span id="platform-sessions">—</span></div>
                   <div id="platform-session-list"><div class="integration-empty">Loading retained sessions…</div></div>
                 </aside>
                 <section class="platform-session-workspace" aria-live="polite">
-                  <div class="platform-session-empty" id="platform-session-empty"><strong>Select a retained session</strong><p>History, run state, approvals, and receipt certainty stay scoped to the selected authority-qualified session.</p></div>
+                  <div class="platform-session-empty" id="platform-session-empty" tabindex="-1"><strong>Select a retained session</strong><p>History, run state, approvals, and receipt certainty stay scoped to the selected authority-qualified session.</p></div>
                   <div id="platform-session-detail" hidden>
                     <header class="platform-session-head"><div><span id="platform-session-coordinate">—</span><strong id="platform-session-summary">—</strong><small id="platform-session-posture">Observer · control not claimed</small></div><button class="button secondary" id="platform-session-detach" type="button">Disconnect</button></header>
                     <div class="platform-session-status" id="platform-session-status">Attaching…</div>
@@ -165,6 +188,9 @@
                   </div>
                 </section>
               </div>
+              </section>
+              <section class="cockpit-surface" id="cockpit-files" role="tabpanel" aria-label="Files and review" hidden><div class="cockpit-read-model-grid"><article><small>FILES &amp; PREVIEW</small><strong id="cockpit-files-state">Unavailable</strong><p>Requires an explicit bounded files read model.</p></article><article><small>REVIEW</small><strong id="cockpit-review-state">Unavailable</strong><p>Requires persisted review anchors and freshness.</p></article><article><small>CHECKS</small><strong id="cockpit-checks-state">Unavailable</strong><p>Requires an authority-qualified checks projection.</p></article><article><small>DELIVERY</small><strong id="cockpit-delivery-state">Unavailable</strong><p>Requires explicit PR and delivery state.</p></article></div></section>
+              <section class="cockpit-surface" id="cockpit-activity" role="tabpanel" aria-label="Chronological workspace activity" tabindex="-1" hidden><ol class="cockpit-activity-list" id="cockpit-activity-list"><li><strong>No structured activity</strong><span>Retained history remains in Conversation.</span></li></ol></section>
             </article>
           </section>
 

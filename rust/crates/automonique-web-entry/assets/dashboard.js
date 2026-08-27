@@ -27,6 +27,11 @@ let platformHistoryCursor = null;
 let platformMutation = null;
 let platformBusy = false;
 let platformExactRevision = null;
+let cockpitState = globalThis.AutomoniquePlatformCockpit.initialState(
+  globalThis.AutomoniquePlatformCockpit.parseDeepLink(window.location.hash),
+);
+let cockpitPresentation = null;
+let cockpitTaskWorkspaceId = null;
 let processFilter = "all";
 const expandedProcesses = new Set();
 let ticketFilter = "all";
@@ -1397,7 +1402,12 @@ async function refreshStatus({ announce = false } = {}) {
 
 function showView(name) {
   const allowed = ["overview", "sessions", "chat", "operations", "tickets", "memory", "configuration"];
-  if (!allowed.includes(name)) name = "sessions";
+  const link = globalThis.AutomoniquePlatformCockpit.parseDeepLink(typeof name === "string" && name.startsWith("#") ? name : `#${name || ""}`);
+  name = allowed.includes(link.view) ? link.view : "sessions";
+  if (link.workspace || link.session || link.pane) {
+    cockpitState = globalThis.AutomoniquePlatformCockpit.initialState(link);
+    if (link.session) platformSelectedSession = link.session;
+  }
   document.querySelectorAll("[data-panel]").forEach((node) => node.classList.toggle("is-visible", node.dataset.panel === name));
   document.querySelectorAll("[data-view]").forEach((node) => {
     const active = node.dataset.view === name;
@@ -1405,7 +1415,9 @@ function showView(name) {
     if (active) node.setAttribute("aria-current", "page"); else node.removeAttribute("aria-current");
   });
   byId("current-view").textContent = name === "tickets" ? "WORK QUEUES" : name.toUpperCase();
-  if (window.location.hash !== `#${name}`) history.replaceState(null, "", `#${name}`);
+  const linkedSessions = name === "sessions" && (link.workspace || link.session || link.pane || link.file);
+  const targetHash = linkedSessions ? globalThis.AutomoniquePlatformCockpit.buildDeepLink(link) : `#${name}`;
+  if (window.location.hash !== targetHash) history.replaceState(null, "", targetHash);
   if (name === "memory") loadMemory(memoryQuery);
   if (name === "operations" || name === "tickets") loadOperations();
   if (name === "sessions") loadPlatform();
@@ -1416,7 +1428,7 @@ function showView(name) {
 }
 
 document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => showView(button.dataset.view)));
-window.addEventListener("hashchange", () => showView(window.location.hash.slice(1)));
+window.addEventListener("hashchange", () => showView(window.location.hash));
 byId("status-refresh").addEventListener("click", () => refreshStatus({ announce: true }));
 
 function selectedMemoryEntries() {
@@ -2107,10 +2119,209 @@ async function loadProcesses({ announce = false } = {}) {
   }
 }
 
+function cockpitDocument(view) {
+  if (view?.workspace_cockpit && typeof view.workspace_cockpit === "object") return view.workspace_cockpit;
+  if (view?.presentation && typeof view.presentation === "object") return view.presentation;
+  return view;
+}
+
+function cockpitReplaceNamedList(id, values, emptyMessage) {
+  const root = byId(id);
+  root.replaceChildren();
+  if (values.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "cockpit-unavailable";
+    empty.textContent = emptyMessage;
+    root.append(empty);
+    return;
+  }
+  values.forEach((value) => {
+    const item = document.createElement("span");
+    item.className = "cockpit-compact-option";
+    item.textContent = value.label;
+    item.title = value.id;
+    root.append(item);
+  });
+}
+
+function cockpitSignal(id, label, signal) {
+  const root = byId(id);
+  root.replaceChildren();
+  const source = document.createElement("small");
+  source.textContent = label;
+  const state = document.createElement("strong");
+  state.textContent = signal ? words(signal.state) : "Unavailable";
+  const detail = document.createElement("span");
+  detail.textContent = signal
+    ? `${signal.reference ? `${signal.reference} · ` : ""}${words(signal.freshness)} · ${signal.unread === null ? "unread unknown" : `${count(signal.unread)} unread`}`
+    : "Freshness unknown · unread unknown";
+  root.dataset.freshness = signal?.freshness || "unknown";
+  root.append(source, state, detail);
+}
+
+function renderCockpitReadModels(readModels) {
+  const values = [
+    ["cockpit-files-state", readModels.files, (value) => `${count(value.length)} bounded file${value.length === 1 ? "" : "s"}`],
+    ["cockpit-review-state", readModels.review, () => "Structured review available"],
+    ["cockpit-checks-state", readModels.checks, (value) => `${count(value.length)} structured check${value.length === 1 ? "" : "s"}`],
+    ["cockpit-delivery-state", readModels.delivery, () => "Structured delivery available"],
+  ];
+  values.forEach(([id, value, available]) => {
+    const node = byId(id);
+    node.textContent = value === null ? "Unavailable" : available(value);
+    node.dataset.available = String(value !== null);
+  });
+}
+
+function renderCockpitReceipt(receipt) {
+  const root = byId("cockpit-action-receipt");
+  root.dataset.state = receipt.state;
+  root.hidden = receipt.state === "idle";
+  if (receipt.state === "idle") return;
+  const descriptions = {
+    pending: "Action receipt is pending. Reconcile by receipt identity; do not replay.",
+    refused: "Action was refused. Review the exact reason before preparing another preview.",
+    ambiguous: "Outcome is ambiguous. Lookup by receipt identity without replay.",
+    completed: "Action receipt is terminal. Refresh the exact workspace revision before another action.",
+  };
+  root.textContent = `${words(receipt.state)} · ${receipt.message || descriptions[receipt.state] || "Structured receipt state"}`;
+}
+
+function updateCockpitLink(workspace, sessionId = null) {
+  const current = globalThis.AutomoniquePlatformCockpit.parseDeepLink(window.location.hash);
+  const switchingWorkspace = Boolean(workspace && current.workspace && current.workspace !== workspace.id);
+  const hash = globalThis.AutomoniquePlatformCockpit.buildDeepLink({
+    ...(!switchingWorkspace ? current : {}),
+    workspace: workspace?.id || current.workspace,
+    session: workspace ? (sessionId || workspace.session_id) : (sessionId || current.session),
+  });
+  history.replaceState(null, "", hash);
+}
+
+function selectCockpitWorkspace(workspace) {
+  cockpitState = globalThis.AutomoniquePlatformCockpit.reduce(cockpitState, { type: "select_workspace", workspace: workspace.id });
+  updateCockpitLink(workspace);
+  renderHostedCockpit(platformSnapshot || {});
+  if (workspace.session_id) selectPlatformSession(workspace.session_id);
+}
+
+function renderHostedCockpit(view) {
+  const link = globalThis.AutomoniquePlatformCockpit.parseDeepLink(window.location.hash);
+  const selection = {
+    workspace: cockpitState.selection.workspace || link.workspace,
+    session: cockpitState.selection.session || link.session || platformSelectedSession,
+  };
+  cockpitPresentation = globalThis.AutomoniquePlatformCockpit.derivePresentation(cockpitDocument(view), selection);
+  const capability = byId("cockpit-capability-state");
+  capability.dataset.mode = cockpitPresentation.mode;
+  capability.replaceChildren();
+  const capabilityTitle = document.createElement("strong");
+  capabilityTitle.textContent = cockpitPresentation.mode === "v2" ? "Structured workspace context" : cockpitPresentation.mode === "partial" ? "Partial workspace capability" : "Platform v1 retained-session mode";
+  const capabilityDetail = document.createElement("span");
+  capabilityDetail.textContent = cockpitPresentation.stale
+    ? "Snapshot is stale. Workspace actions are read-only until a fresh exact capability arrives."
+    : cockpitPresentation.degradation || "Structured projects, hosts, workspaces, status signals, and read models are available.";
+  capability.append(capabilityTitle, capabilityDetail);
+
+  byId("cockpit-project-count").textContent = count(cockpitPresentation.projects.length);
+  byId("cockpit-host-count").textContent = count(cockpitPresentation.hosts.length);
+  byId("cockpit-workspace-count").textContent = count(cockpitPresentation.workspaces.length);
+  cockpitReplaceNamedList("cockpit-project-list", cockpitPresentation.projects, "Structured project context unavailable.");
+  cockpitReplaceNamedList("cockpit-host-list", cockpitPresentation.hosts, "Structured host context unavailable.");
+
+  const workspaceRoot = byId("cockpit-workspace-list");
+  workspaceRoot.replaceChildren();
+  const filtered = cockpitPresentation.workspaces.filter((workspace) => cockpitState.attentionFilter === "all" || workspace.attention === cockpitState.attentionFilter);
+  if (filtered.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "cockpit-unavailable";
+    empty.textContent = cockpitPresentation.workspaces.length === 0 ? "No structured workspaces advertised." : "No workspaces match this attention state.";
+    workspaceRoot.append(empty);
+  }
+  filtered.forEach((workspace) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "cockpit-workspace-option";
+    button.setAttribute("role", "option");
+    button.setAttribute("aria-selected", String(cockpitPresentation.selectedWorkspace?.id === workspace.id));
+    button.classList.toggle("is-selected", cockpitPresentation.selectedWorkspace?.id === workspace.id);
+    const labelNode = document.createElement("strong");
+    labelNode.textContent = workspace.label;
+    const context = document.createElement("span");
+    context.textContent = `${workspace.branch || "branch unavailable"} · ${workspace.attention ? words(workspace.attention) : "attention unavailable"}`;
+    button.append(labelNode, context);
+    button.addEventListener("click", () => selectCockpitWorkspace(workspace));
+    workspaceRoot.append(button);
+  });
+
+  Object.entries({ needs_you: "cockpit-needs-you-count", working: "cockpit-working-count", blocked: "cockpit-blocked-count", done: "cockpit-done-count" })
+    .forEach(([state, id]) => { byId(id).textContent = count(cockpitPresentation.attention[state]); });
+
+  const workspace = cockpitPresentation.selectedWorkspace;
+  byId("cockpit-workspace-coordinate").textContent = workspace ? workspace.id : "NO STRUCTURED WORKSPACE";
+  byId("cockpit-workspace-title").textContent = workspace?.label || "Retained session mode";
+  byId("cockpit-workspace-branch").textContent = workspace?.branch ? `Branch ${workspace.branch}` : "Branch unavailable · no inference from conversation summaries";
+  cockpitSignal("cockpit-external-signal", "EXTERNAL WORK", workspace?.external_work);
+  cockpitSignal("cockpit-agent-signal", "INTERNAL AGENT", workspace?.internal_agent);
+
+  const create = byId("cockpit-create-preview");
+  const resume = byId("cockpit-resume-preview");
+  create.disabled = cockpitPresentation.create.available !== true;
+  resume.disabled = cockpitPresentation.resume.available !== true;
+  byId("cockpit-action-reason").textContent = cockpitPresentation.create.available || cockpitPresentation.resume.available
+    ? "Preview uses the advertised exact authority, workspace, action, and revision. It does not execute the action."
+    : cockpitPresentation.stale
+      ? "Read-only: the workspace snapshot is stale."
+      : "Unavailable until structured capability data supplies the exact action, authority, workspace, and revision.";
+  if (workspace?.id !== cockpitTaskWorkspaceId) {
+    byId("cockpit-task-input").value = workspace?.task || "";
+    cockpitTaskWorkspaceId = workspace?.id || null;
+  }
+
+  const copy = byId("cockpit-copy-link");
+  copy.disabled = !workspace;
+  byId("cockpit-inspector-workspace").textContent = workspace?.id || "No workspace selected";
+  byId("cockpit-inspector-session").textContent = workspace?.session_id || link.session || "—";
+  byId("cockpit-inspector-pane").textContent = link.pane || "—";
+  byId("cockpit-inspector-anchor").textContent = link.file ? `${link.file} · ${link.hunk} · ${link.side}:${link.line}` : "—";
+
+  renderCockpitReadModels(cockpitPresentation.readModels);
+  renderCockpitReceipt(cockpitPresentation.receipt);
+  const activity = byId("cockpit-activity-list");
+  activity.replaceChildren();
+  if (cockpitPresentation.activities.length === 0) {
+    const item = document.createElement("li");
+    const title = document.createElement("strong");
+    title.textContent = "No structured activity";
+    const detail = document.createElement("span");
+    detail.textContent = "Retained history remains in Conversation.";
+    item.append(title, detail);
+    activity.append(item);
+  } else {
+    cockpitPresentation.activities.forEach((entry) => {
+      const item = document.createElement("li");
+      const title = document.createElement("strong");
+      title.textContent = entry.label;
+      const detail = document.createElement("span");
+      detail.textContent = `${entry.at} · ${entry.source || entry.kind}`;
+      if (entry.deep_link) {
+        const link = document.createElement("a");
+        link.href = entry.deep_link;
+        link.textContent = "Open exact context";
+        item.append(title, detail, link);
+      } else {
+        item.append(title, detail);
+      }
+      activity.append(item);
+    });
+  }
+}
+
 function renderPlatform(view) {
   const sessions = Array.isArray(view.sessions) ? view.sessions : [];
   const inventory = view.inventory || {};
   platformSnapshot = view;
+  renderHostedCockpit(view);
   byId("platform-sessions").textContent = count(sessions.length);
   byId("platform-health").textContent = words(view.health || "unavailable").toUpperCase();
   byId("platform-health").dataset.state = view.health || "unavailable";
@@ -2327,10 +2538,16 @@ async function selectPlatformSession(sessionId) {
   if (!sessionId || sessionId === platformSelectedSession) return openPlatformSession(sessionId);
   const previous = platformSelectedSession;
   platformSelectedSession = sessionId;
+  cockpitState = globalThis.AutomoniquePlatformCockpit.reduce(cockpitState, { type: "select_session", session: sessionId });
+  const matchingWorkspace = cockpitPresentation?.workspaces.find((workspace) => workspace.session_id === sessionId) || null;
+  if (matchingWorkspace) {
+    cockpitState = globalThis.AutomoniquePlatformCockpit.reduce(cockpitState, { type: "select_workspace", workspace: matchingWorkspace.id });
+  }
   platformHistoryCursor = null;
   platformExactRevision = null;
   try { sessionStorage.setItem("monique-platform-session", sessionId); } catch (_error) { /* memory-only fallback */ }
   renderPlatform(platformSnapshot || {});
+  updateCockpitLink(matchingWorkspace || cockpitPresentation?.selectedWorkspace, sessionId);
   if (previous) platformPost({ action: "detach", session_id: previous }).catch(() => {});
   await openPlatformSession(sessionId);
 }
@@ -2408,6 +2625,10 @@ async function detachPlatformSession() {
   platformHistoryCursor = null;
   platformExactRevision = null;
   try { sessionStorage.removeItem("monique-platform-session"); } catch (_error) { /* memory-only fallback */ }
+  history.replaceState(null, "", globalThis.AutomoniquePlatformCockpit.buildDeepLink({
+    view: "sessions",
+    workspace: cockpitPresentation?.selectedWorkspace?.id,
+  }));
   byId("platform-session-detail").hidden = true;
   byId("platform-session-empty").hidden = false;
   renderPlatform(platformSnapshot || {});
@@ -2805,6 +3026,83 @@ byId("platform-refresh").addEventListener("click", () => loadPlatform({ announce
 byId("platform-history-more").addEventListener("click", () => pagePlatformHistory());
 byId("platform-session-detach").addEventListener("click", () => detachPlatformSession());
 byId("platform-composer").addEventListener("submit", sendPlatformFollowUp);
+document.querySelectorAll("[data-cockpit-attention]").forEach((button) => button.addEventListener("click", () => {
+  cockpitState = globalThis.AutomoniquePlatformCockpit.reduce(cockpitState, { type: "filter_attention", attention: button.dataset.cockpitAttention });
+  document.querySelectorAll("[data-cockpit-attention]").forEach((item) => {
+    item.classList.toggle("is-active", item === button);
+    item.setAttribute("aria-pressed", String(item === button));
+  });
+  renderHostedCockpit(platformSnapshot || {});
+}));
+byId("cockpit-workspace-list").addEventListener("keydown", (event) => {
+  if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+  const options = [...byId("cockpit-workspace-list").querySelectorAll(".cockpit-workspace-option:not(:disabled)")];
+  if (options.length === 0) return;
+  const current = options.indexOf(event.target);
+  event.preventDefault();
+  const next = event.key === "Home" ? 0
+    : event.key === "End" ? options.length - 1
+      : (Math.max(current, 0) + (event.key === "ArrowDown" ? 1 : -1) + options.length) % options.length;
+  options[next].focus();
+});
+document.querySelectorAll("[data-cockpit-surface]").forEach((button) => button.addEventListener("click", () => {
+  cockpitState = globalThis.AutomoniquePlatformCockpit.reduce(cockpitState, { type: "show_surface", surface: button.dataset.cockpitSurface });
+  document.querySelectorAll("[data-cockpit-surface]").forEach((item) => {
+    const active = item.dataset.cockpitSurface === cockpitState.surface;
+    item.classList.toggle("is-active", active);
+    item.setAttribute("aria-selected", String(active));
+    item.tabIndex = active ? 0 : -1;
+    const panel = byId(item.getAttribute("aria-controls"));
+    panel.hidden = !active;
+    panel.classList.toggle("is-active", active);
+  });
+}));
+document.querySelector(".cockpit-surface-tabs").addEventListener("keydown", (event) => {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  const tabs = [...document.querySelectorAll("[data-cockpit-surface]")];
+  const current = tabs.indexOf(event.target);
+  if (current < 0) return;
+  event.preventDefault();
+  const next = event.key === "Home" ? 0
+    : event.key === "End" ? tabs.length - 1
+      : (current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+  tabs[next].click();
+  tabs[next].focus();
+});
+function previewCockpitAction(action) {
+  const capability = cockpitPresentation?.[action];
+  if (!capability?.available) return;
+  cockpitState = globalThis.AutomoniquePlatformCockpit.reduce(cockpitState, { type: "preview", action, capability });
+  const root = byId("cockpit-action-preview");
+  root.hidden = false;
+  root.replaceChildren();
+  const title = document.createElement("strong");
+  title.textContent = `${words(action)} preview · no mutation sent`;
+  const details = document.createElement("span");
+  details.textContent = `${capability.authority} · ${capability.workspace_id} · exact revision ${capability.exact_revision}`;
+  const task = document.createElement("p");
+  task.textContent = byId("cockpit-task-input").value.trim() || "No task text supplied.";
+  root.append(title, details, task);
+}
+byId("cockpit-create-preview").addEventListener("click", () => previewCockpitAction("create"));
+byId("cockpit-resume-preview").addEventListener("click", () => previewCockpitAction("resume"));
+byId("cockpit-copy-link").addEventListener("click", async () => {
+  const workspace = cockpitPresentation?.selectedWorkspace;
+  if (!workspace) return;
+  const current = globalThis.AutomoniquePlatformCockpit.parseDeepLink(window.location.hash);
+  const link = `${window.location.origin}${window.location.pathname}${globalThis.AutomoniquePlatformCockpit.buildDeepLink({
+    ...(current.workspace === workspace.id ? current : {}),
+    view: "sessions",
+    workspace: workspace.id,
+    session: workspace.session_id || platformSelectedSession,
+  })}`;
+  try {
+    await navigator.clipboard.writeText(link);
+    toast("Exact workspace link copied.");
+  } catch (_error) {
+    toast("The browser did not allow clipboard access.", "error");
+  }
+});
 byId("attention-toggle").addEventListener("click", () => {
   const button = byId("attention-toggle");
   const expanded = button.getAttribute("aria-expanded") === "true";
@@ -4150,6 +4448,17 @@ document.addEventListener("keydown", (event) => {
     event.preventDefault();
     showView("chat");
     byId("chat-input").focus();
+  } else if (!editing && document.querySelector('[data-panel="sessions"]')?.classList.contains("is-visible") && event.key.toLowerCase() === "w") {
+    event.preventDefault();
+    byId("cockpit-workspace-navigation").focus();
+  } else if (!editing && document.querySelector('[data-panel="sessions"]')?.classList.contains("is-visible") && event.key.toLowerCase() === "c") {
+    event.preventDefault();
+    document.querySelector('[data-cockpit-surface="conversation"]').click();
+    byId("platform-session-empty").focus({ preventScroll: false });
+  } else if (!editing && document.querySelector('[data-panel="sessions"]')?.classList.contains("is-visible") && event.key.toLowerCase() === "a") {
+    event.preventDefault();
+    document.querySelector('[data-cockpit-surface="activity"]').click();
+    byId("cockpit-activity").focus({ preventScroll: false });
   } else if (!editing && event.key.toLowerCase() === "r") {
     event.preventDefault();
     refreshStatus({ announce: true });
@@ -4172,7 +4481,7 @@ try { platformSelectedSession = sessionStorage.getItem("monique-platform-session
 if (platformMutation) platformSelectedSession = platformMutation.sessionId;
 refreshStatus();
 loadConfiguration();
-showView(window.location.hash.slice(1) || storedPreference("monique-start-view", startupViews, "sessions"));
+showView(window.location.hash || storedPreference("monique-start-view", startupViews, "sessions"));
 function scheduleStatusRefresh(delay = 10000) {
   if (statusRefreshTimer !== null) window.clearTimeout(statusRefreshTimer);
   statusRefreshTimer = window.setTimeout(async () => {
