@@ -2430,20 +2430,18 @@ impl WebIntegration {
         let Some(mobile) = mobile else {
             return self.platform_v2.exchange(lane, body);
         };
-        let authority = self
+        let mut authority = self
             .mobile_auth
             .lock()
             .map_err(|_| "mobile_credential_authority_busy")?;
-        if authority
-            .reauthorize_platform_v2(mobile, now_ms_i64())
-            .is_err()
-        {
+        let now_ms = now_ms_i64();
+        if authority.reauthorize_platform_v2(mobile, now_ms).is_err() {
             return self
                 .platform_v2
                 .refuse(lane, body, "platform_v2_mobile_generation_changed");
         }
         self.platform_v2
-            .exchange_mobile(lane, body, mobile, now_ms_i64())
+            .exchange_mobile(lane, body, mobile, &mut authority, now_ms)
     }
 
     fn mobile_platform_v2_grant(

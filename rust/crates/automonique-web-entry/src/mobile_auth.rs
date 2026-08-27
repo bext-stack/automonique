@@ -36,6 +36,7 @@ pub const MOBILE_PLATFORM_V2_AUTH_MEDIA_TYPE: &str =
     "application/vnd.automonique.mobile-platform-v2-authorization.v1+json";
 pub const MAX_MOBILE_ACTIONS: usize = 4;
 pub const MAX_MOBILE_V2_PROJECT_ROOTS: usize = 32;
+const MAX_MOBILE_V2_RECEIPT_CUSTODY: usize = 128;
 pub const MAX_MOBILE_SESSIONS: usize = 100;
 pub const MAX_PAGE_EVENTS: u16 = 512;
 pub const MAX_FOLLOW_UP_BYTES: u32 = 65_536;
@@ -115,6 +116,18 @@ CREATE TABLE IF NOT EXISTS mobile_platform_v2_authorizations (
   revoked_at_ms INTEGER CHECK(revoked_at_ms BETWEEN 0 AND 9007199254740991),
   project_roots_json TEXT NOT NULL CHECK(length(project_roots_json) BETWEEN 3 AND 8192),
   actions_json TEXT NOT NULL CHECK(length(actions_json) BETWEEN 3 AND 512),
+  FOREIGN KEY(credential_id) REFERENCES mobile_credentials(credential_id) ON DELETE CASCADE
+) STRICT;
+CREATE TABLE IF NOT EXISTS mobile_platform_v2_receipt_custody (
+  project_id TEXT NOT NULL CHECK(length(project_id) BETWEEN 1 AND 128),
+  idempotency_key TEXT NOT NULL CHECK(length(idempotency_key) BETWEEN 1 AND 128),
+  credential_id TEXT NOT NULL CHECK(length(credential_id) = 46),
+  delegation_id TEXT NOT NULL CHECK(length(delegation_id) = 46),
+  principal_generation INTEGER NOT NULL
+    CHECK(principal_generation BETWEEN 1 AND 9007199254740991),
+  created_at_ms INTEGER NOT NULL CHECK(created_at_ms BETWEEN 0 AND 9007199254740991),
+  expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms BETWEEN 0 AND 9007199254740991),
+  PRIMARY KEY(project_id,idempotency_key),
   FOREIGN KEY(credential_id) REFERENCES mobile_credentials(credential_id) ON DELETE CASCADE
 ) STRICT;
 "#;
@@ -819,7 +832,11 @@ impl MobileCredentialAuthority {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let credential = read_by_id(&transaction, &request.credential_id)?
             .ok_or(MobileAuthError::InvalidCredential)?;
-        let _ = credential.authorization(&self.discovery.server_identity, now_ms, false)?;
+        let credential_authorization =
+            credential.authorization(&self.discovery.server_identity, now_ms, false)?;
+        if credential_authorization.actor != self.actor {
+            return Err(MobileAuthError::InvalidCredential);
+        }
         let current_generation = transaction
             .query_row(
                 "SELECT principal_generation FROM mobile_platform_v2_authorizations
@@ -835,6 +852,10 @@ impl MobileCredentialAuthority {
             .ok_or(MobileAuthError::InvalidRequest)?;
         let authorization_revision = credential.authorization_revision;
         let delegation_id = random_token("md")?;
+        transaction.execute(
+            "DELETE FROM mobile_platform_v2_receipt_custody WHERE credential_id=?1",
+            params![request.credential_id],
+        )?;
         transaction.execute(
             "INSERT INTO mobile_platform_v2_authorizations(
                credential_id,credential_revision,authorization_revision,
@@ -925,6 +946,110 @@ impl MobileCredentialAuthority {
             now_ms,
         )?;
         (current == *expected)
+            .then_some(())
+            .ok_or(MobileAuthError::InvalidCredential)
+    }
+
+    pub fn bind_platform_v2_receipt_custody(
+        &mut self,
+        authorization: &MobilePlatformV2Authorization,
+        project: &ProjectId,
+        idempotency_key: &str,
+        now_ms: i64,
+    ) -> Result<(), MobileAuthError> {
+        self.reauthorize_platform_v2(authorization, now_ms)?;
+        validate_receipt_coordinate(idempotency_key)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM mobile_platform_v2_receipt_custody WHERE expires_at_ms<=?1",
+            params![now_ms],
+        )?;
+        let existing = transaction
+            .query_row(
+                "SELECT credential_id,delegation_id,principal_generation
+                 FROM mobile_platform_v2_receipt_custody
+                 WHERE project_id=?1 AND idempotency_key=?2",
+                params![project.as_str(), idempotency_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((credential_id, delegation_id, generation)) = existing {
+            if credential_id != authorization.credential_id
+                || delegation_id != authorization.delegation_id
+                || generation != authorization.principal_generation
+            {
+                return Err(MobileAuthError::InvalidCredential);
+            }
+            transaction.commit()?;
+            return Ok(());
+        }
+        let count = transaction.query_row(
+            "SELECT COUNT(*) FROM mobile_platform_v2_receipt_custody
+             WHERE credential_id=?1",
+            params![authorization.credential_id],
+            |row| row.get::<_, u64>(0),
+        )?;
+        if count >= MAX_MOBILE_V2_RECEIPT_CUSTODY as u64 {
+            return Err(MobileAuthError::InvalidRequest);
+        }
+        transaction.execute(
+            "INSERT INTO mobile_platform_v2_receipt_custody(
+               project_id,idempotency_key,credential_id,delegation_id,
+               principal_generation,created_at_ms,expires_at_ms
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                project.as_str(),
+                idempotency_key,
+                authorization.credential_id,
+                authorization.delegation_id,
+                authorization.principal_generation,
+                now_ms,
+                authorization.expires_at_ms,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn authorize_platform_v2_receipt_custody(
+        &self,
+        authorization: &MobilePlatformV2Authorization,
+        project: &ProjectId,
+        idempotency_key: &str,
+        now_ms: i64,
+    ) -> Result<(), MobileAuthError> {
+        self.reauthorize_platform_v2(authorization, now_ms)?;
+        validate_receipt_coordinate(idempotency_key)?;
+        let custody = self
+            .connection
+            .query_row(
+                "SELECT credential_id,delegation_id,principal_generation,expires_at_ms
+                 FROM mobile_platform_v2_receipt_custody
+                 WHERE project_id=?1 AND idempotency_key=?2",
+                params![project.as_str(), idempotency_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(MobileAuthError::InvalidCredential)?;
+        (custody.0 == authorization.credential_id
+            && custody.1 == authorization.delegation_id
+            && custody.2 <= authorization.principal_generation
+            && custody.3 > now_ms)
             .then_some(())
             .ok_or(MobileAuthError::InvalidCredential)
     }
@@ -1072,6 +1197,11 @@ impl MobileCredentialAuthority {
             if updated != 1 {
                 return Err(MobileAuthError::InvalidCredential);
             }
+            transaction.execute(
+                "UPDATE mobile_platform_v2_receipt_custody SET expires_at_ms=?1
+                 WHERE credential_id=?2",
+                params![access_expires_at_ms, row.credential_id],
+            )?;
         }
         transaction.commit()?;
         Ok(IssuedMobileCredentials {
@@ -1510,6 +1640,10 @@ fn revoke_platform_v2(
     credential_id: &str,
     now_ms: i64,
 ) -> Result<(), MobileAuthError> {
+    connection.execute(
+        "DELETE FROM mobile_platform_v2_receipt_custody WHERE credential_id=?1",
+        params![credential_id],
+    )?;
     let generation = connection
         .query_row(
             "SELECT principal_generation FROM mobile_platform_v2_authorizations
@@ -1728,6 +1862,17 @@ fn admit_scope(
 fn validate_identifier(value: &str) -> Result<(), MobileAuthError> {
     (!value.is_empty()
         && value.len() <= MAX_IDENTIFIER_BYTES
+        && value.is_ascii()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')))
+    .then_some(())
+    .ok_or(MobileAuthError::InvalidRequest)
+}
+
+fn validate_receipt_coordinate(value: &str) -> Result<(), MobileAuthError> {
+    (!value.is_empty()
+        && value.len() <= 128
         && value.is_ascii()
         && value
             .bytes()
@@ -2090,13 +2235,167 @@ mod tests {
     }
 
     #[test]
+    fn platform_v2_receipt_custody_survives_restart_and_rotation_but_not_regrant() {
+        let (root, mut auth) = authority();
+        let first = auth.operator_provision(request(), NOW).expect("first");
+        let first_descriptor = auth
+            .grant_platform_v2(
+                platform_v2_grant(&first.authorization.credential_id),
+                NOW + 1,
+            )
+            .expect("first grant");
+        let project = ProjectId::new("project-a").expect("project");
+        auth.bind_platform_v2_receipt_custody(
+            &first_descriptor,
+            &project,
+            "mobile:mutation:one",
+            NOW + 2,
+        )
+        .expect("bind custody");
+        auth.authorize_platform_v2_receipt_custody(
+            &first_descriptor,
+            &project,
+            "mobile:mutation:one",
+            NOW + 2,
+        )
+        .expect("same generation owns custody");
+
+        drop(auth);
+        let mut auth = MobileCredentialAuthority::open(
+            root.path().join("mobile.sqlite3"),
+            "ops.example.test",
+            "operator:mobile",
+        )
+        .expect("restart");
+        auth.authorize_platform_v2_receipt_custody(
+            &first_descriptor,
+            &project,
+            "mobile:mutation:one",
+            NOW + 3,
+        )
+        .expect("durable custody");
+
+        let second = auth.operator_provision(request(), NOW + 3).expect("second");
+        let second_descriptor = auth
+            .grant_platform_v2(
+                platform_v2_grant(&second.authorization.credential_id),
+                NOW + 4,
+            )
+            .expect("second grant");
+        assert!(
+            auth.authorize_platform_v2_receipt_custody(
+                &second_descriptor,
+                &project,
+                "mobile:mutation:one",
+                NOW + 4,
+            )
+            .is_err()
+        );
+
+        let mut refresh = first.refresh_token.clone();
+        let rotated = auth
+            .refresh(&mut refresh, &first.authorization.server_identity, NOW + 5)
+            .expect("rotate first");
+        let rotated_descriptor = auth
+            .authorize_platform_v2(&rotated.access_token, NOW + 5)
+            .expect("rotated descriptor");
+        assert_eq!(
+            rotated_descriptor.principal_generation,
+            first_descriptor.principal_generation + 1
+        );
+        auth.authorize_platform_v2_receipt_custody(
+            &rotated_descriptor,
+            &project,
+            "mobile:mutation:one",
+            NOW + 5,
+        )
+        .expect("same delegation rotation retains custody");
+
+        let regranted = auth
+            .grant_platform_v2(
+                platform_v2_grant(&rotated.authorization.credential_id),
+                NOW + 6,
+            )
+            .expect("regrant");
+        assert_ne!(regranted.delegation_id, rotated_descriptor.delegation_id);
+        assert!(
+            auth.authorize_platform_v2_receipt_custody(
+                &regranted,
+                &project,
+                "mobile:mutation:one",
+                NOW + 6,
+            )
+            .is_err()
+        );
+        for index in 0..MAX_MOBILE_V2_RECEIPT_CUSTODY {
+            auth.bind_platform_v2_receipt_custody(
+                &regranted,
+                &project,
+                &format!("mobile:bounded:{index}"),
+                NOW + 7,
+            )
+            .expect("bounded custody entry");
+        }
+        assert!(matches!(
+            auth.bind_platform_v2_receipt_custody(
+                &regranted,
+                &project,
+                "mobile:bounded:overflow",
+                NOW + 7,
+            ),
+            Err(MobileAuthError::InvalidRequest)
+        ));
+        auth.revoke_credential_id(
+            MobileCredentialRevokeRequest {
+                credential_id: rotated.authorization.credential_id.clone(),
+            },
+            NOW + 8,
+        )
+        .expect("revoke");
+        assert_eq!(
+            auth.connection
+                .query_row(
+                    "SELECT COUNT(*) FROM mobile_platform_v2_receipt_custody",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )
+                .expect("custody count"),
+            0
+        );
+    }
+
+    #[test]
+    fn platform_v2_grant_rejects_a_v1_credential_owned_by_the_old_actor() {
+        let (root, mut auth) = authority();
+        let issued = auth.operator_provision(request(), NOW).expect("credential");
+        drop(auth);
+
+        let mut changed_actor = MobileCredentialAuthority::open(
+            root.path().join("mobile.sqlite3"),
+            "ops.example.test",
+            "operator:replacement",
+        )
+        .expect("changed actor configuration");
+        assert!(matches!(
+            changed_actor.grant_platform_v2(
+                platform_v2_grant(&issued.authorization.credential_id),
+                NOW + 1,
+            ),
+            Err(MobileAuthError::InvalidCredential)
+        ));
+    }
+
+    #[test]
     fn additive_platform_v2_table_is_bootstrapped_for_an_existing_v1_store() {
         let (root, mut auth) = authority();
         let issued = auth
             .operator_provision(request(), NOW)
             .expect("v1 credential");
         auth.connection
-            .execute_batch("DROP TABLE mobile_platform_v2_authorizations")
+            .execute_batch(
+                "DROP TABLE mobile_platform_v2_receipt_custody;
+                 DROP TABLE mobile_platform_v2_authorizations;",
+            )
             .expect("simulate pre-v2 schema");
         drop(auth);
         let mut reopened = MobileCredentialAuthority::open(

@@ -22,10 +22,12 @@ use automonique_protocol::platform_v2_transport::{
     MAX_PLATFORM_NEGOTIATION_RESPONSE_CANONICAL_BYTES, MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES,
     MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES, PlatformNegotiationRequestMessage,
     PlatformNegotiationResponse, PlatformNegotiationResponseMessage, PlatformV2Refusal,
-    PlatformV2RequestMessage, PlatformV2Response, PlatformV2ResponseMessage,
+    PlatformV2RequestMessage, PlatformV2Response, PlatformV2ResponseMessage, ReceiptLookupKey,
 };
 
-use crate::mobile_auth::{MobilePlatformV2Action, MobilePlatformV2Authorization};
+use crate::mobile_auth::{
+    MobileCredentialAuthority, MobilePlatformV2Action, MobilePlatformV2Authorization,
+};
 
 pub(crate) const PLATFORM_NEGOTIATION_CONTENT_TYPE: &str =
     "application/vnd.automonique.platform.negotiation.v1+json";
@@ -77,7 +79,7 @@ pub(crate) struct PlatformV2Bridge {
     tenant: String,
     actor: String,
     timeout: Duration,
-    preview_scopes: Mutex<BTreeMap<String, (ProjectId, i64, String, u64)>>,
+    preview_scopes: Mutex<BTreeMap<String, (ProjectId, String, i64, String, u64)>>,
 }
 
 impl PlatformV2Bridge {
@@ -121,6 +123,7 @@ impl PlatformV2Bridge {
         lane: PlatformV2Lane,
         request: &[u8],
         authorization: &MobilePlatformV2Authorization,
+        authority: &mut MobileCredentialAuthority,
         now_ms: i64,
     ) -> Result<Vec<u8>, &'static str> {
         if request.is_empty() || request.len() > lane.request_limit() {
@@ -161,11 +164,48 @@ impl PlatformV2Bridge {
                 {
                     return typed_v2_refusal(&request, "platform_v2_mobile_authorization_invalid");
                 }
-                let project =
+                let (project, submit_idempotency_key) =
                     match self.authorize_mobile_request(authorization, request.request(), now_ms) {
                         Ok(project) => project,
                         Err(category) => return typed_v2_refusal(&request, category),
                     };
+                if let automonique_protocol::platform_v2_transport::PlatformV2Request::GetMutationReceipt(
+                    lookup,
+                ) = request.request()
+                {
+                    let ReceiptLookupKey::IdempotencyKey(idempotency_key) = lookup.key() else {
+                        return typed_v2_refusal(
+                            &request,
+                            "platform_v2_mobile_receipt_custody_required",
+                        );
+                    };
+                    if authority
+                        .authorize_platform_v2_receipt_custody(
+                            authorization,
+                            &project,
+                            idempotency_key.as_str(),
+                            now_ms,
+                        )
+                        .is_err()
+                    {
+                        return typed_v2_refusal(
+                            &request,
+                            "platform_v2_mobile_receipt_custody_denied",
+                        );
+                    }
+                }
+                if let Some(idempotency_key) = submit_idempotency_key
+                    && authority
+                        .bind_platform_v2_receipt_custody(
+                            authorization,
+                            &project,
+                            &idempotency_key,
+                            now_ms,
+                        )
+                        .is_err()
+                {
+                    return typed_v2_refusal(&request, "platform_v2_mobile_receipt_custody_denied");
+                }
                 let response = self.exchange_local(
                     lane,
                     &request
@@ -179,7 +219,7 @@ impl PlatformV2Bridge {
                         .preview_scopes
                         .lock()
                         .map_err(|_| "platform_v2_bridge_unavailable")?;
-                    scopes.retain(|_, (_, expiry, _, _)| *expiry > now_ms);
+                    scopes.retain(|_, (_, _, expiry, _, _)| *expiry > now_ms);
                     if scopes.len() >= MAX_MOBILE_PREVIEW_SCOPES
                         && !scopes.contains_key(preview.preview().id().as_str())
                     {
@@ -189,6 +229,7 @@ impl PlatformV2Bridge {
                         preview.preview().id().as_str().to_owned(),
                         (
                             project,
+                            preview.proposal().idempotency_key().as_str().to_owned(),
                             preview.expires_at().as_millis(),
                             authorization.credential_id.clone(),
                             authorization.principal_generation,
@@ -227,7 +268,7 @@ impl PlatformV2Bridge {
         authorization: &MobilePlatformV2Authorization,
         request: &automonique_protocol::platform_v2_transport::PlatformV2Request,
         now_ms: i64,
-    ) -> Result<ProjectId, &'static str> {
+    ) -> Result<(ProjectId, Option<String>), &'static str> {
         use automonique_protocol::platform_v2_transport::PlatformV2Request;
 
         let action = match request {
@@ -258,46 +299,53 @@ impl PlatformV2Bridge {
             .map(ProjectId::new)
             .collect::<Result<BTreeSet<_>, _>>()
             .map_err(|_| "platform_v2_mobile_project_denied")?;
-        let project = match request {
+        let (project, submit_idempotency_key) = match request {
             PlatformV2Request::DecideMutation(value) => {
-                self.preview_project(value.preview().id().as_str(), authorization, now_ms)?
+                let (project, _) =
+                    self.preview_scope(value.preview().id().as_str(), authorization, now_ms)?;
+                (project, None)
             }
             PlatformV2Request::SubmitMutation(value) => {
-                self.preview_project(value.preview().id().as_str(), authorization, now_ms)?
+                let (project, idempotency_key) =
+                    self.preview_scope(value.preview().id().as_str(), authorization, now_ms)?;
+                (project, Some(idempotency_key))
             }
-            _ => automonique_daemon::resolve_web_mobile_request_project(
-                &self.policy,
-                self.uid,
-                &self.tenant,
-                &self.actor,
-                &roots,
-                request,
-            )?,
+            _ => (
+                automonique_daemon::resolve_web_mobile_request_project(
+                    &self.policy,
+                    self.uid,
+                    &self.tenant,
+                    &self.actor,
+                    &roots,
+                    request,
+                )?,
+                None,
+            ),
         };
         if !authorization.allows_project(&project) {
             return Err("platform_v2_mobile_project_denied");
         }
-        Ok(project)
+        Ok((project, submit_idempotency_key))
     }
 
-    fn preview_project(
+    fn preview_scope(
         &self,
         preview_id: &str,
         authorization: &MobilePlatformV2Authorization,
         now_ms: i64,
-    ) -> Result<ProjectId, &'static str> {
+    ) -> Result<(ProjectId, String), &'static str> {
         let mut scopes = self
             .preview_scopes
             .lock()
             .map_err(|_| "platform_v2_bridge_unavailable")?;
-        scopes.retain(|_, (_, expiry, _, _)| *expiry > now_ms);
+        scopes.retain(|_, (_, _, expiry, _, _)| *expiry > now_ms);
         scopes
             .get(preview_id)
-            .filter(|(_, _, credential_id, generation)| {
+            .filter(|(_, _, _, credential_id, generation)| {
                 credential_id == &authorization.credential_id
                     && *generation == authorization.principal_generation
             })
-            .map(|(project, _, _, _)| project.clone())
+            .map(|(project, idempotency_key, _, _, _)| (project.clone(), idempotency_key.clone()))
             .ok_or("platform_v2_mobile_preview_scope_required")
     }
 
@@ -427,11 +475,20 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::thread;
 
-    use automonique_protocol::codec::RequestId;
-    use automonique_protocol::platform_v2::{PlatformVersionOffer, ProjectId, WorkContextIdentity};
-    use automonique_protocol::platform_v2_transport::{
-        PlatformNegotiationRequest, PlatformV2Request,
+    use crate::mobile_auth::{
+        MobileAction, MobileLimits, MobileOperatorProvisionRequest, MobilePlatformV2GrantRequest,
     };
+    use automonique_protocol::codec::RequestId;
+    use automonique_protocol::digest::Sha256;
+    use automonique_protocol::platform::{IdempotencyKey, ReceiptId};
+    use automonique_protocol::platform_v2::{PlatformVersionOffer, ProjectId, WorkContextIdentity};
+    use automonique_protocol::platform_v2_lifecycle::{
+        MutationPreviewDigest, MutationPreviewId, MutationPreviewRef,
+    };
+    use automonique_protocol::platform_v2_transport::{
+        MutationReceiptLookup, MutationSubmitRequest, PlatformNegotiationRequest, PlatformV2Request,
+    };
+    use automonique_protocol::primitives::Revision;
 
     fn write_policy(root: &Path, uid: u32, tenant: &str, actor: &str) {
         let policy = serde_json::json!({
@@ -512,6 +569,7 @@ mod tests {
     #[test]
     fn mobile_action_and_project_scope_refuse_before_opening_the_socket() {
         let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let uid = nix::unistd::geteuid().as_raw();
         write_policy(root.path(), uid, "tenant-test", "actor-test");
         let bridge = bridge(
@@ -520,6 +578,13 @@ mod tests {
             "tenant-test",
             "actor-test",
         );
+        let mut authority = MobileCredentialAuthority::open_scoped(
+            root.path().join("mobile.sqlite3"),
+            "ops.example.test",
+            "tenant-test",
+            "actor-test",
+        )
+        .unwrap();
         let request = v2_request();
         let wrong_action = bridge
             .exchange_mobile(
@@ -529,6 +594,7 @@ mod tests {
                     vec![MobilePlatformV2Action::GetLineage],
                     vec!["project-test"],
                 ),
+                &mut authority,
                 1_000,
             )
             .unwrap();
@@ -562,6 +628,7 @@ mod tests {
                     vec![MobilePlatformV2Action::QueryWorkContexts],
                     vec!["project-other"],
                 ),
+                &mut authority,
                 1_000,
             )
             .unwrap();
@@ -572,6 +639,181 @@ mod tests {
             PlatformV2Response::Refused(value)
                 if value.category().as_str() == "platform_v2_mobile_project_denied"
         ));
+    }
+
+    #[test]
+    fn mobile_receipt_lookup_requires_durable_exact_custody_before_the_socket() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = nix::unistd::geteuid().as_raw();
+        write_policy(root.path(), uid, "tenant-test", "actor-test");
+        let bridge = bridge(
+            root.path(),
+            root.path().join("absent.sock"),
+            "tenant-test",
+            "actor-test",
+        );
+        let mut authority = MobileCredentialAuthority::open_scoped(
+            root.path().join("mobile.sqlite3"),
+            "ops.example.test",
+            "tenant-test",
+            "actor-test",
+        )
+        .unwrap();
+        let issued = authority
+            .operator_provision(
+                MobileOperatorProvisionRequest {
+                    actions: vec![MobileAction::Attach],
+                    session_scope: vec!["session-test".to_owned()],
+                    limits: MobileLimits {
+                        max_page_events: 16,
+                        max_follow_up_bytes: 1_024,
+                    },
+                },
+                1_000,
+            )
+            .unwrap();
+        let authorization = authority
+            .grant_platform_v2(
+                MobilePlatformV2GrantRequest {
+                    credential_id: issued.authorization.credential_id.clone(),
+                    project_roots: vec!["project-test".to_owned()],
+                    actions: vec![MobilePlatformV2Action::GetMutationReceipt],
+                },
+                1_001,
+            )
+            .unwrap();
+
+        let absent = PlatformV2RequestMessage::new(
+            RequestId::new("mobile-receipt-no-custody").unwrap(),
+            PlatformV2Request::GetMutationReceipt(MutationReceiptLookup::new(
+                ProjectId::new("project-test").unwrap(),
+                ReceiptLookupKey::IdempotencyKey(
+                    IdempotencyKey::new("mobile:mutation:absent").unwrap(),
+                ),
+            )),
+        );
+        let response = bridge
+            .exchange_mobile(
+                PlatformV2Lane::V2,
+                &absent.to_canonical_bytes().unwrap(),
+                &authorization,
+                &mut authority,
+                1_002,
+            )
+            .unwrap();
+        let response = PlatformV2ResponseMessage::from_canonical_bytes(&response, &absent).unwrap();
+        assert!(matches!(
+            response.response(),
+            PlatformV2Response::Refused(value)
+                if value.category().as_str() == "platform_v2_mobile_receipt_custody_denied"
+        ));
+
+        let by_receipt_id = PlatformV2RequestMessage::new(
+            RequestId::new("mobile-receipt-id-no-custody").unwrap(),
+            PlatformV2Request::GetMutationReceipt(MutationReceiptLookup::new(
+                ProjectId::new("project-test").unwrap(),
+                ReceiptLookupKey::ReceiptId(ReceiptId::new("receipt-absent").unwrap()),
+            )),
+        );
+        let response = bridge
+            .exchange_mobile(
+                PlatformV2Lane::V2,
+                &by_receipt_id.to_canonical_bytes().unwrap(),
+                &authorization,
+                &mut authority,
+                1_002,
+            )
+            .unwrap();
+        let response =
+            PlatformV2ResponseMessage::from_canonical_bytes(&response, &by_receipt_id).unwrap();
+        assert!(matches!(
+            response.response(),
+            PlatformV2Response::Refused(value)
+                if value.category().as_str() == "platform_v2_mobile_receipt_custody_required"
+        ));
+    }
+
+    #[test]
+    fn mobile_submit_durably_binds_receipt_custody_before_socket_exchange() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = nix::unistd::geteuid().as_raw();
+        write_policy(root.path(), uid, "tenant-test", "actor-test");
+        let bridge = bridge(
+            root.path(),
+            root.path().join("absent.sock"),
+            "tenant-test",
+            "actor-test",
+        );
+        let mut authority = MobileCredentialAuthority::open_scoped(
+            root.path().join("mobile.sqlite3"),
+            "ops.example.test",
+            "tenant-test",
+            "actor-test",
+        )
+        .unwrap();
+        let issued = authority
+            .operator_provision(
+                MobileOperatorProvisionRequest {
+                    actions: vec![MobileAction::Attach],
+                    session_scope: vec!["session-test".to_owned()],
+                    limits: MobileLimits {
+                        max_page_events: 16,
+                        max_follow_up_bytes: 1_024,
+                    },
+                },
+                1_000,
+            )
+            .unwrap();
+        let authorization = authority
+            .grant_platform_v2(
+                MobilePlatformV2GrantRequest {
+                    credential_id: issued.authorization.credential_id.clone(),
+                    project_roots: vec!["project-test".to_owned()],
+                    actions: vec![MobilePlatformV2Action::SubmitMutation],
+                },
+                1_001,
+            )
+            .unwrap();
+        let preview_id = MutationPreviewId::new("preview-mobile-submit").unwrap();
+        let idempotency_key = "mobile:mutation:bound";
+        bridge.preview_scopes.lock().unwrap().insert(
+            preview_id.as_str().to_owned(),
+            (
+                ProjectId::new("project-test").unwrap(),
+                idempotency_key.to_owned(),
+                2_000,
+                authorization.credential_id.clone(),
+                authorization.principal_generation,
+            ),
+        );
+        let submit = PlatformV2RequestMessage::new(
+            RequestId::new("mobile-submit-bind-custody").unwrap(),
+            PlatformV2Request::SubmitMutation(MutationSubmitRequest::new(
+                MutationPreviewRef::new(preview_id, Revision::FIRST),
+                MutationPreviewDigest::from_digest(Sha256::digest(b"preview")),
+                None,
+            )),
+        );
+        assert_eq!(
+            bridge.exchange_mobile(
+                PlatformV2Lane::V2,
+                &submit.to_canonical_bytes().unwrap(),
+                &authorization,
+                &mut authority,
+                1_002,
+            ),
+            Err("platform_v2_bridge_unavailable")
+        );
+        authority
+            .authorize_platform_v2_receipt_custody(
+                &authorization,
+                &ProjectId::new("project-test").unwrap(),
+                idempotency_key,
+                1_002,
+            )
+            .expect("custody precedes socket exchange");
     }
 
     #[test]

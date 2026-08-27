@@ -228,6 +228,19 @@ cannot reuse cached mutation previews. Every request is action-checked and
 resolved to one admitted project before the local socket is opened; the daemon
 then independently applies its current policy fence and ownership checks.
 
+A v2 grant is issued only when the v1 credential's persisted actor exactly
+matches the web entry's configured actor; changing that configuration cannot
+rebind an older credential to the new actor. Before a mobile mutation submit is
+sent to the daemon, web entry durably binds its project and idempotency key to
+the exact credential, delegation, and principal generation. Mobile receipt
+polling accepts only that idempotency coordinate and checks the binding before
+opening the socket; receipt-ID lookup is refused because no mobile-owned
+receipt-ID binding exists before an ambiguous response. The private SQLite
+custody is capped at 128 live entries per credential, survives process restart
+and same-delegation access-token rotation, and is deleted on delegation
+regrant or credential revocation. Thus another same-project credential and a
+new delegation cannot read an older mutation receipt.
+
 The current local protocol cannot safely represent multiple daemon principals
 behind one web-entry uid. Such a configuration stays blocked; adding more
 Basic users must first add a daemon-authenticated delegated-principal protocol
