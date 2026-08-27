@@ -3,10 +3,10 @@
   "cases": [
     {
       "name": "duplicate_intake",
-      "external_work": {"provider":"github","scope":"scope-gh-01","key":"issue-42"},
+      "external_work": {"provider":"github","authority":"installation-gh-01","scope":"scope-gh-01","key":"issue-42"},
       "external_state": "open",
       "workspace": "workspace-01",
-      "intent": {"kind":"create","request":{"intent_id":"intent-duplicate-01","task":"task-01","external_work":{"provider":"github","scope":"scope-gh-01","key":"issue-42"},"base_selector":"base-opaque-01","branch_selector":"branch-opaque-01"}},
+      "intent": {"kind":"create","request":{"intent_id":"intent-duplicate-01","task":"task-01","external_work":{"provider":"github","authority":"installation-gh-01","scope":"scope-gh-01","key":"issue-42"},"base_selector":"base-opaque-01","branch_selector":"branch-opaque-01"}},
       "outcome": {"kind":"conflict","conflict":"duplicate_intake"}
     },
     {
@@ -19,14 +19,14 @@
     },
     {
       "name": "closed_source",
-      "external_work": {"provider":"linear","scope":"scope-linear-01","key":"lin-9"},
+      "external_work": {"provider":"linear","authority":"installation-linear-01","scope":"scope-linear-01","key":"lin-9"},
       "external_state": "closed",
       "workspace": "workspace-03",
       "outcome": {"kind":"conflict","conflict":"external_work_closed"}
     },
     {
       "name": "orphan_dispatch",
-      "external_work": {"provider":"jira_compatible","scope":"scope-jira-01","key":"jira-8"},
+      "external_work": {"provider":"jira_compatible","authority":"installation-jira-01","scope":"scope-jira-01","key":"jira-8"},
       "external_state": "open",
       "workspace": "workspace-04",
       "orchestration": {"identity":{"kind":"dispatch","id":"dispatch-orphan-01"},"parent":null,"status":{"kind":"blocked","reason":"Owning task is unavailable."},"freshness":{"observed_at_ms":1700000000100,"stale_after_ms":30000,"state":"fresh"}},
@@ -34,7 +34,7 @@
     },
     {
       "name": "stale_heartbeat",
-      "external_work": {"provider":"github","scope":"scope-gh-01","key":"issue-43"},
+      "external_work": {"provider":"github","authority":"installation-gh-01","scope":"scope-gh-01","key":"issue-43"},
       "external_state": "open",
       "workspace": "workspace-05",
       "orchestration": {"identity":{"kind":"heartbeat","id":"heartbeat-01"},"parent":{"kind":"worker","id":"worker-01"},"status":{"kind":"waiting","reason":"A fresh worker observation is required."},"freshness":{"observed_at_ms":1700000000200,"stale_after_ms":15000,"state":"stale"}},
@@ -42,7 +42,7 @@
     },
     {
       "name": "question_and_gate",
-      "external_work": {"provider":"linear","scope":"scope-linear-02","key":"lin-10"},
+      "external_work": {"provider":"linear","authority":"installation-linear-02","scope":"scope-linear-02","key":"lin-10"},
       "external_state": "open",
       "workspace": "workspace-06",
       "orchestration": {"identity":{"kind":"question","id":"question-01"},"parent":{"kind":"task","id":"task-06"},"status":{"kind":"waiting","reason":"User decision is required."},"freshness":{"observed_at_ms":1700000000300,"stale_after_ms":60000,"state":"fresh"},"latest_useful_message":{"text":"Choose whether to preserve the existing compatibility alias.","observed_at_ms":1700000000300}},
@@ -51,10 +51,10 @@
     },
     {
       "name": "cancelled_creation",
-      "external_work": {"provider":"gitlab","scope":"scope-gl-03","key":"work-18"},
+      "external_work": {"provider":"gitlab","authority":"installation-gl-03","scope":"scope-gl-03","key":"work-18"},
       "external_state": "open",
       "workspace": "workspace-07",
-      "intent": {"kind":"create","request":{"intent_id":"intent-cancelled-01","task":"task-07","external_work":{"provider":"gitlab","scope":"scope-gl-03","key":"work-18"},"base_selector":"base-opaque-02","branch_selector":"branch-opaque-02"}},
+      "intent": {"kind":"create","request":{"intent_id":"intent-cancelled-01","task":"task-07","external_work":{"provider":"gitlab","authority":"installation-gl-03","scope":"scope-gl-03","key":"work-18"},"base_selector":"base-opaque-02","branch_selector":"branch-opaque-02"}},
       "outcome": {"kind":"conflict","conflict":"creation_cancelled"}
     },
     {
@@ -70,7 +70,7 @@
       "server_versions": [1,2,4],
       "negotiated_version": 2,
       "lineage_available": true,
-      "external_work": {"provider":"jira_compatible","scope":"scope-jira-02","key":"jira-9"},
+      "external_work": {"provider":"jira_compatible","authority":"installation-jira-02","scope":"scope-jira-02","key":"jira-9"},
       "external_state": "open",
       "workspace": "workspace-08",
       "intent": {"kind":"resume","request":{"intent_id":"intent-resume-01","task":"task-08","workspace":"workspace-08","expected_revision":4}},

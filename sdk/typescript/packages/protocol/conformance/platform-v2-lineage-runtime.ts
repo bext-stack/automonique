@@ -56,10 +56,10 @@ import {
 
 interface RawCase {
   readonly name: string;
-  readonly external_work?: {readonly provider: "github" | "gitlab" | "linear" | "jira_compatible"; readonly authority?: string; readonly scope: string; readonly key: string};
+  readonly external_work?: {readonly provider: "github" | "gitlab" | "linear" | "jira_compatible"; readonly authority: string; readonly scope: string; readonly key: string};
   readonly external_state?: ExternalWorkState;
   readonly workspace?: string;
-  readonly moved_to?: {readonly provider: "github" | "gitlab" | "linear" | "jira_compatible"; readonly authority?: string; readonly scope: string; readonly key: string};
+  readonly moved_to?: {readonly provider: "github" | "gitlab" | "linear" | "jira_compatible"; readonly authority: string; readonly scope: string; readonly key: string};
   readonly orchestration?: RawOrchestration;
   readonly decision_gate?: RawOrchestration;
   readonly intent?: {readonly kind: "create" | "resume"; readonly request: Readonly<Record<string, unknown>>};
@@ -82,7 +82,7 @@ const fixture = JSON.parse(readFileSync("../../../../rust/crates/automonique-pro
 if (fixture.schema !== "automonique.platform/v2" || fixture.cases.length !== 9) throw new Error("lineage fixture header drifted");
 
 const external = (value: NonNullable<RawCase["external_work"]>): ExternalWorkIdentity => validateExternalWorkIdentity({
-  authority: ExternalWorkAuthorityId(value.authority ?? `installation-${value.scope}`),
+  authority: ExternalWorkAuthorityId(value.authority),
   key: ExternalWorkKey(value.key),
   provider: decodeExternalWorkProvider(value.provider),
   scope: ExternalWorkScope(value.scope),
