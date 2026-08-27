@@ -119,6 +119,26 @@
     });
   }
 
+  function lifecycleStatus(localLifecycle) {
+    const host = localLifecycle?.createHostSetup || {};
+    const checkout = localLifecycle?.createCheckout || {};
+    const hostAvailable = host.available === true;
+    const checkoutAvailable = checkout.available === true;
+    if (hostAvailable && checkoutAvailable) {
+      return Object.freeze({
+        state: "available",
+        message: "Task create and resume remain unavailable. Local host setup and checkout support typed preview and receipt operations.",
+      });
+    }
+    const describe = (label, capability) => capability.available === true
+      ? `${label} supports typed preview and receipt operations.`
+      : `${label} unavailable (${boundedText(capability.reason, 128) || "platform_v2_lifecycle_adapter_pending"}).`;
+    return Object.freeze({
+      state: hostAvailable || checkoutAvailable ? "partial" : "unavailable",
+      message: `Task create and resume remain unavailable. ${describe("Local host setup", host)} ${describe("Local checkout", checkout)}`,
+    });
+  }
+
   function freshnessStates(document) {
     const lineage = document?.lineage?.document?.value || document?.lineage?.document || {};
     const review = document?.review?.document || {};
@@ -290,6 +310,7 @@
     decimalGreater,
     derivePresentation,
     initialState,
+    lifecycleStatus,
     parseDeepLink,
     receiptDirective,
     reduce,

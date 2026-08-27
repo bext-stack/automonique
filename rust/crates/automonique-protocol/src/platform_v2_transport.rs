@@ -1710,14 +1710,17 @@ fn response_from_message(
             else {
                 return Err(PlatformV2TransportError::InvalidBody);
             };
-            let projects = projects
-                .iter()
-                .map(|value| match value {
-                    JsonValue::String(value) => ProjectId::new(value.clone())
-                        .map_err(|_| PlatformV2TransportError::InvalidBody),
-                    _ => Err(PlatformV2TransportError::InvalidBody),
-                })
-                .collect::<Result<BTreeSet<_>, _>>()?;
+            let mut decoded_projects = BTreeSet::new();
+            for value in projects {
+                let JsonValue::String(value) = value else {
+                    return Err(PlatformV2TransportError::InvalidBody);
+                };
+                let project = ProjectId::new(value.clone())
+                    .map_err(|_| PlatformV2TransportError::InvalidBody)?;
+                if !decoded_projects.insert(project) {
+                    return Err(PlatformV2TransportError::InvalidBody);
+                }
+            }
             let JsonValue::Array(operations) = message
                 .body()
                 .get("operations")
@@ -1752,7 +1755,8 @@ fn response_from_message(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             PlatformV2Response::LifecycleCapabilities(LifecycleCapabilities::new(
-                projects, operations,
+                decoded_projects,
+                operations,
             )?)
         }
         "work_context_page" => {

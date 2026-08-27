@@ -127,6 +127,54 @@ test("installed local adapter is visible without enabling task or session action
   }
 });
 
+test("missing local selectors render their exact action-specific categories", async ({ page }) => {
+  const previous = cockpit.actions.lifecycle;
+  cockpit.actions.lifecycle = {
+    available: false,
+    operations: {
+      create_host_setup: { available: false, category: "platform_v2_local_host_selector_unavailable" },
+      create_checkout: { available: false, category: "platform_v2_local_checkout_selector_unavailable" },
+      create_attempt_workspace: { available: false, category: "platform_v2_lifecycle_adapter_pending" },
+      resume_attempt_workspace: { available: false, category: "platform_v2_lifecycle_adapter_pending" },
+      resume_session: { available: false, category: "platform_v2_lifecycle_adapter_pending" },
+    },
+  };
+  try {
+    await page.reload();
+    const reason = page.locator("#cockpit-action-reason");
+    await expect(reason).toHaveAttribute("data-local-lifecycle", "unavailable");
+    await expect(reason).toContainText("Local host setup unavailable (platform_v2_local_host_selector_unavailable)");
+    await expect(reason).toContainText("Local checkout unavailable (platform_v2_local_checkout_selector_unavailable)");
+    await expect(reason).not.toContainText("adapter is not installed");
+  } finally {
+    cockpit.actions.lifecycle = previous;
+  }
+});
+
+test("partial local lifecycle renders the exact fenced registry category", async ({ page }) => {
+  const previous = cockpit.actions.lifecycle;
+  cockpit.actions.lifecycle = {
+    available: true,
+    operations: {
+      create_host_setup: { available: true, scope: "local", preview_operation: "prepare_mutation", receipt_operation: "get_mutation_receipt" },
+      create_checkout: { available: false, category: "platform_v2_lifecycle_registry_changed" },
+      create_attempt_workspace: { available: false, category: "platform_v2_lifecycle_adapter_pending" },
+      resume_attempt_workspace: { available: false, category: "platform_v2_lifecycle_adapter_pending" },
+      resume_session: { available: false, category: "platform_v2_lifecycle_adapter_pending" },
+    },
+  };
+  try {
+    await page.reload();
+    const reason = page.locator("#cockpit-action-reason");
+    await expect(reason).toHaveAttribute("data-local-lifecycle", "partial");
+    await expect(reason).toContainText("Local host setup supports typed preview and receipt operations");
+    await expect(reason).toContainText("Local checkout unavailable (platform_v2_lifecycle_registry_changed)");
+    await expect(reason).not.toContainText("platform_v2_lifecycle_adapter_pending");
+  } finally {
+    cockpit.actions.lifecycle = previous;
+  }
+});
+
 test("workspace-first layout does not overflow the active viewport", async ({ page }) => {
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
   expect(overflow).toBe(false);

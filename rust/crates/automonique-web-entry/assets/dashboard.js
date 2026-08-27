@@ -2278,13 +2278,10 @@ function renderHostedCockpit(view) {
   const resume = byId("cockpit-resume-preview");
   create.disabled = cockpitPresentation.create.available !== true;
   resume.disabled = cockpitPresentation.resume.available !== true;
-  const localLifecycleAvailable = cockpitPresentation.localLifecycle.createHostSetup.available === true
-    && cockpitPresentation.localLifecycle.createCheckout.available === true;
+  const localLifecycle = globalThis.AutomoniquePlatformCockpit.lifecycleStatus(cockpitPresentation.localLifecycle);
   const lifecycleReason = byId("cockpit-action-reason");
-  lifecycleReason.dataset.localLifecycle = localLifecycleAvailable ? "available" : "unavailable";
-  lifecycleReason.textContent = localLifecycleAvailable
-    ? "Task create and resume remain unavailable. Local host setup and checkout support typed preview and receipt operations."
-    : `Unavailable: the Platform v2 lifecycle host adapter is not installed (${cockpitPresentation.create.reason || "platform_v2_lifecycle_adapter_pending"}).`;
+  lifecycleReason.dataset.localLifecycle = localLifecycle.state;
+  lifecycleReason.textContent = localLifecycle.message;
   if (workspace?.id !== cockpitTaskWorkspaceId) {
     byId("cockpit-task-input").value = workspace?.task || "";
     cockpitTaskWorkspaceId = workspace?.id || null;

@@ -8831,7 +8831,8 @@ mod tests {
         assert!(!DASHBOARD_JS.contains("function cockpitDocument"));
         assert!(DASHBOARD_JS.contains("/api/platform/cockpit"));
         assert!(DASHBOARD_JS.contains("buildDeepLink"));
-        assert!(DASHBOARD_JS.contains("platform_v2_lifecycle_adapter_pending"));
+        assert!(DASHBOARD_JS.contains("lifecycleStatus(cockpitPresentation.localLifecycle)"));
+        assert!(!DASHBOARD_JS.contains("adapter is not installed"));
         assert!(
             DASHBOARD_JS
                 .contains("Outcome is ambiguous. Lookup by receipt identity without replay.")

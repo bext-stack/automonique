@@ -159,7 +159,7 @@ fn rust_transport_encoding_matches_the_shared_typescript_corpus() {
         .trim_end()
         .lines()
         .collect::<Vec<_>>();
-    assert_eq!(fixture.len(), 3);
+    assert_eq!(fixture.len(), 4);
 
     let negotiation = PlatformNegotiationRequestMessage::new(
         request_id("transport-negotiate"),
@@ -183,6 +183,61 @@ fn rust_transport_encoding_matches_the_shared_typescript_corpus() {
     assert_eq!(
         capabilities.to_canonical_bytes().unwrap(),
         fixture[2].as_bytes()
+    );
+
+    let capability_response = PlatformV2ResponseMessage::for_request(
+        &capabilities,
+        PlatformV2Response::LifecycleCapabilities(
+            LifecycleCapabilities::new(
+                std::collections::BTreeSet::from([project()]),
+                LIFECYCLE_CAPABILITY_EFFECT_KINDS
+                    .into_iter()
+                    .map(|kind| {
+                        if matches!(kind, "create_checkout" | "create_host_setup") {
+                            LifecycleOperationCapability::available(project(), kind)
+                        } else {
+                            LifecycleOperationCapability::unavailable(
+                                project(),
+                                kind,
+                                "platform_v2_lifecycle_adapter_pending",
+                            )
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        capability_response.to_canonical_bytes().unwrap(),
+        fixture[3].as_bytes()
+    );
+    assert_eq!(
+        PlatformV2ResponseMessage::from_canonical_bytes(fixture[3].as_bytes(), &capabilities)
+            .unwrap(),
+        capability_response
+    );
+
+    let valid = Message::from_canonical_bytes(fixture[3].as_bytes()).unwrap();
+    let mut duplicate_body = valid.body().clone();
+    let JsonValue::Object(fields) = &mut duplicate_body else {
+        panic!("capability response body is an object");
+    };
+    let JsonValue::Array(projects) = fields
+        .iter_mut()
+        .find(|(name, _)| name == "projects")
+        .map(|(_, value)| value)
+        .unwrap()
+    else {
+        panic!("capability projects are an array");
+    };
+    projects.push(JsonValue::String(String::from("project-1")));
+    let duplicate = Message::new(valid.envelope().clone(), duplicate_body).to_canonical_bytes();
+    assert_eq!(
+        PlatformV2ResponseMessage::from_canonical_bytes(&duplicate, &capabilities),
+        Err(PlatformV2TransportError::InvalidBody)
     );
 }
 

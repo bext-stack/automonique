@@ -169,6 +169,41 @@ test("installed adapter exposes only local host and checkout preview/receipt ope
   expect(view.resume.available).toBe(false);
 });
 
+test("lifecycle status preserves each exact daemon-issued unavailable category", () => {
+  const view = cockpit.derivePresentation({
+    ...fixture,
+    actions: {
+      ...fixture.actions,
+      lifecycle: {
+        available: false,
+        operations: {
+          create_host_setup: { available: false, category: "platform_v2_lifecycle_path_insecure" },
+          create_checkout: { available: false, category: "platform_v2_local_checkout_selector_unavailable" },
+          create_attempt_workspace: { available: false, category: "platform_v2_lifecycle_adapter_pending" },
+          resume_attempt_workspace: { available: false, category: "platform_v2_lifecycle_adapter_pending" },
+          resume_session: { available: false, category: "platform_v2_lifecycle_adapter_pending" },
+        },
+      },
+    },
+  });
+  expect(cockpit.lifecycleStatus(view.localLifecycle)).toEqual({
+    state: "unavailable",
+    message: "Task create and resume remain unavailable. Local host setup unavailable (platform_v2_lifecycle_path_insecure). Local checkout unavailable (platform_v2_local_checkout_selector_unavailable).",
+  });
+});
+
+test("partial lifecycle status names only the unavailable action's fenced registry category", () => {
+  const status = cockpit.lifecycleStatus({
+    createHostSetup: { available: true, reason: null },
+    createCheckout: { available: false, reason: "platform_v2_lifecycle_registry_changed" },
+  });
+  expect(status.state).toBe("partial");
+  expect(status.message).toContain("Local host setup supports typed preview and receipt operations.");
+  expect(status.message).toContain("Local checkout unavailable (platform_v2_lifecycle_registry_changed).");
+  expect(status.message).not.toContain("adapter is not installed");
+  expect(status.message).not.toContain("platform_v2_lifecycle_adapter_pending");
+});
+
 test("reducer cannot manufacture a preview from an unavailable server action", () => {
   let state = cockpit.initialState({ workspace: "workspace-1" });
   state = cockpit.reduce(state, { type: "preview", action: "resume", capability: cockpit.derivePresentation(fixture).resume });
