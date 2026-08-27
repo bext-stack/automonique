@@ -69,7 +69,7 @@ impl From<WorkContextError> for WorkContextApiError {
     }
 }
 
-fn object(entries: Vec<(&str, JsonValue)>) -> JsonValue {
+pub(crate) fn object(entries: Vec<(&str, JsonValue)>) -> JsonValue {
     JsonValue::Object(
         entries
             .into_iter()
@@ -78,7 +78,7 @@ fn object(entries: Vec<(&str, JsonValue)>) -> JsonValue {
     )
 }
 
-fn exact_fields(value: &JsonValue, fields: &[&str]) -> Result<(), WorkContextApiError> {
+pub(crate) fn exact_fields(value: &JsonValue, fields: &[&str]) -> Result<(), WorkContextApiError> {
     let JsonValue::Object(entries) = value else {
         return Err(WorkContextApiError::InvalidBody);
     };
@@ -92,14 +92,17 @@ fn exact_fields(value: &JsonValue, fields: &[&str]) -> Result<(), WorkContextApi
     Ok(())
 }
 
-fn string<'a>(value: &'a JsonValue, field: &'static str) -> Result<&'a str, WorkContextApiError> {
+pub(crate) fn string<'a>(
+    value: &'a JsonValue,
+    field: &'static str,
+) -> Result<&'a str, WorkContextApiError> {
     value
         .get(field)
         .and_then(JsonValue::as_str)
         .ok_or(WorkContextApiError::InvalidBody)
 }
 
-fn array<'a>(
+pub(crate) fn array<'a>(
     value: &'a JsonValue,
     field: &'static str,
 ) -> Result<&'a [JsonValue], WorkContextApiError> {
@@ -116,7 +119,7 @@ fn boolean(value: &JsonValue, field: &'static str) -> Result<bool, WorkContextAp
     }
 }
 
-fn unsigned(value: &JsonValue, field: &'static str) -> Result<u64, WorkContextApiError> {
+pub(crate) fn unsigned(value: &JsonValue, field: &'static str) -> Result<u64, WorkContextApiError> {
     let value = value
         .get(field)
         .and_then(JsonValue::as_integer)
@@ -124,7 +127,7 @@ fn unsigned(value: &JsonValue, field: &'static str) -> Result<u64, WorkContextAp
     u64::try_from(value).map_err(|_| WorkContextApiError::CounterOutOfRange { field })
 }
 
-fn integer(value: u64, field: &'static str) -> Result<JsonValue, WorkContextApiError> {
+pub(crate) fn integer(value: u64, field: &'static str) -> Result<JsonValue, WorkContextApiError> {
     i64::try_from(value)
         .map(JsonValue::Integer)
         .map_err(|_| WorkContextApiError::CounterOutOfRange { field })
@@ -148,7 +151,7 @@ fn optional_json<T>(value: Option<&T>, encode: impl FnOnce(&T) -> JsonValue) -> 
     value.map_or(JsonValue::Null, encode)
 }
 
-fn identity_json(identity: &WorkContextIdentity) -> JsonValue {
+pub(crate) fn identity_json(identity: &WorkContextIdentity) -> JsonValue {
     let kind = JsonValue::String(identity.kind().as_str().to_owned());
     identity.v1_coordinate().map_or_else(
         || {
@@ -166,7 +169,7 @@ fn identity_json(identity: &WorkContextIdentity) -> JsonValue {
     )
 }
 
-fn identity(value: &JsonValue) -> Result<WorkContextIdentity, WorkContextApiError> {
+pub(crate) fn identity(value: &JsonValue) -> Result<WorkContextIdentity, WorkContextApiError> {
     let kind = WorkContextTargetKind::parse(string(value, "kind")?)?;
     match kind {
         WorkContextTargetKind::Repository | WorkContextTargetKind::PlatformSession => {
@@ -280,7 +283,7 @@ fn relation(value: &JsonValue) -> Result<WorkContextRelation, WorkContextApiErro
     .map_err(Into::into)
 }
 
-fn record_json(record: &WorkContextRecord) -> Result<JsonValue, WorkContextApiError> {
+pub(crate) fn record_json(record: &WorkContextRecord) -> Result<JsonValue, WorkContextApiError> {
     Ok(object(vec![
         ("attributes", attributes_json(record.attributes())),
         ("identity", identity_json(record.identity())),
@@ -300,7 +303,7 @@ fn record_json(record: &WorkContextRecord) -> Result<JsonValue, WorkContextApiEr
     ]))
 }
 
-fn record(value: &JsonValue) -> Result<WorkContextRecord, WorkContextApiError> {
+pub(crate) fn record(value: &JsonValue) -> Result<WorkContextRecord, WorkContextApiError> {
     exact_fields(
         value,
         &[
@@ -340,7 +343,10 @@ fn record(value: &JsonValue) -> Result<WorkContextRecord, WorkContextApiError> {
     .map_err(Into::into)
 }
 
-fn admitted_document(bytes: &[u8], ceiling: usize) -> Result<JsonValue, WorkContextApiError> {
+pub(crate) fn admitted_document(
+    bytes: &[u8],
+    ceiling: usize,
+) -> Result<JsonValue, WorkContextApiError> {
     if bytes.len() > ceiling {
         return Err(WorkContextApiError::FrameTooLarge);
     }

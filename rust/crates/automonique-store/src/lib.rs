@@ -19,6 +19,7 @@ pub mod context_memory;
 pub mod durable_scheduler;
 pub mod generation_audit;
 pub mod improvements;
+pub mod lineage_index;
 pub mod operator_members;
 pub mod platform_store;
 pub mod provider_deployments;
@@ -32,6 +33,7 @@ pub mod slack_ingress;
 pub mod slack_interactions;
 pub mod sqlite_policy;
 pub mod support_tickets;
+pub mod work_context_store;
 
 use std::error::Error;
 use std::fmt;

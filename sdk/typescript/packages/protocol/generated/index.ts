@@ -26,7 +26,7 @@ export * from "./work-context.js";
 // The digest of the surface re-exported above. It identifies the schema
 // these files were generated from; it is not a checksum of this file.
 export const SCHEMA_DIGEST_ALGORITHM = "sha256";
-export const SCHEMA_DIGEST = "9fed8fe86565871da3609df9de1d8757119a7e0ad32bda775c346164b518f207";
+export const SCHEMA_DIGEST = "3894b961c8709ca8cbc65b695cccaddaccf1ddd3e2a72c9da4dfb9de82967ee9";
 
 // The exact generated Platform v1 module digest. A package that advertises
 // protocolRange/schema v1 uses this pin, not the aggregate surface digest.
