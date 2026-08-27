@@ -571,6 +571,33 @@ impl RawMutationApprovalDocument {
     pub fn decode(&self, preview: &MutationPreview) -> Result<MutationApproval, LifecycleApiError> {
         decode_work_context_mutation_approval(&self.0, preview)
     }
+    /// Read only the approval decision needed to correlate a decision response.
+    ///
+    /// The remaining approval stays raw until the caller supplies the exact
+    /// preview required for full lifecycle validation.
+    pub fn decision(&self) -> Result<MutationApprovalDecision, PlatformV2TransportError> {
+        let document = parse_canonical(&self.0)?;
+        exact_fields(&document, &["approval", "schema"])?;
+        let approval = document
+            .get("approval")
+            .ok_or(PlatformV2TransportError::InvalidBody)?;
+        exact_fields(
+            approval,
+            &[
+                "decided_at_ms",
+                "decided_by",
+                "decision",
+                "expires_at_ms",
+                "id",
+                "idempotency_key",
+                "preview",
+                "preview_digest",
+                "request_digest",
+            ],
+        )?;
+        MutationApprovalDecision::parse(string(approval, "decision")?)
+            .map_err(|_| PlatformV2TransportError::InvalidBody)
+    }
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.0

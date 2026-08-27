@@ -349,6 +349,7 @@ name = "automonique-platform-client"
 version = "0.1.0"
 dependencies = [
  "automonique-protocol",
+ "base64 0.22.1",
  "ureq",
  "zeroize",
 ]
