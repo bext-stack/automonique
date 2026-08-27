@@ -6,15 +6,18 @@ use std::thread;
 
 use automonique_platform_client::{
     ActionResult, BearerToken, ClientError, ControlClaimResult, HttpsTransport,
-    PLATFORM_CONTENT_TYPE, PlatformClient, PlatformTransport, PlatformView, SessionListResult,
-    SubscriptionApply, SubscriptionResult,
+    PLATFORM_CONTENT_TYPE, PlatformClient, PlatformTransport, PlatformView,
+    SessionCommandStateResult, SessionHistoryResult, SessionListResult, SubscriptionApply,
+    SubscriptionResult,
 };
 use automonique_protocol::codec::RequestId;
 use automonique_protocol::platform::{
     ActionReceipt, Attachment, Capabilities, ClientId, CursorTopic, ExecuteRequest, IdempotencyKey,
-    PlatformAction, PlatformCursor, PlatformEvent, PlatformRequest, PlatformResponse, PlatformText,
-    ReceiptId, ReceiptOutcome, ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
-    ResourceRecord, SessionList, Snapshot, Subscription,
+    PlatformAction, PlatformCursor, PlatformEvent, PlatformParameter, PlatformRequest,
+    PlatformResponse, PlatformText, ReceiptId, ReceiptOutcome, ResourceAuthority,
+    ResourceCoordinate, ResourceId, ResourceKind, ResourceRecord, SessionCommandState,
+    SessionFollowUpRequest, SessionHistoryEvent, SessionHistoryPage, SessionHistoryResync,
+    SessionList, Snapshot, Subscription,
 };
 use automonique_protocol::platform_api::{PlatformRequestMessage, PlatformResponseMessage};
 use automonique_protocol::primitives::{EpochMillis, Revision};
@@ -261,6 +264,413 @@ fn session_refresh_and_mutation_keep_typed_refusals() {
     );
 }
 
+const LOSSLESS_CURSOR: u64 = 9_007_199_254_740_993;
+
+struct RetainedSessionTransport {
+    calls: usize,
+    session: ResourceCoordinate,
+    client: ClientId,
+}
+
+impl PlatformTransport for RetainedSessionTransport {
+    fn request(
+        &mut self,
+        _request_id: RequestId,
+        request: PlatformRequest,
+    ) -> Result<PlatformResponse, ClientError> {
+        let response = match self.calls {
+            0 => {
+                let PlatformRequest::Attach(request) = request else {
+                    panic!("expected attach")
+                };
+                assert_eq!(request.session, self.session);
+                assert_eq!(request.client, self.client);
+                PlatformResponse::Attached(Attachment {
+                    session: self.session.clone(),
+                    client: self.client.clone(),
+                    cursor: cursor("attachment:fixture", 7),
+                })
+            }
+            1 => {
+                let PlatformRequest::SessionHistorySnapshot(request) = request else {
+                    panic!("expected history snapshot")
+                };
+                assert_eq!(request.session, self.session);
+                assert_eq!(request.limit, 2);
+                PlatformResponse::SessionHistory(
+                    SessionHistoryPage::new(
+                        self.session.clone(),
+                        2,
+                        2,
+                        LOSSLESS_CURSOR,
+                        LOSSLESS_CURSOR + 1,
+                        false,
+                        vec![SessionHistoryEvent::Unknown {
+                            cursor: LOSSLESS_CURSOR + 1,
+                            at: EpochMillis::from_millis(100),
+                            source: automonique_protocol::platform::SessionHistoryUnknownSource::AdapterEvent,
+                        }],
+                    )
+                    .expect("history page"),
+                )
+            }
+            2 => {
+                let PlatformRequest::SessionHistoryPage(request) = request else {
+                    panic!("expected history page")
+                };
+                assert_eq!(request.session, self.session);
+                assert_eq!(request.after, LOSSLESS_CURSOR + 1);
+                assert_eq!(request.limit, 2);
+                PlatformResponse::SessionHistoryResync(
+                    SessionHistoryResync::new(
+                        self.session.clone(),
+                        LOSSLESS_CURSOR + 4,
+                        LOSSLESS_CURSOR + 8,
+                    )
+                    .expect("history replacement"),
+                )
+            }
+            3 => {
+                let PlatformRequest::SessionCommandState(request) = request else {
+                    panic!("expected command state")
+                };
+                assert_eq!(request.session, self.session);
+                PlatformResponse::SessionCommandState(
+                    SessionCommandState::new(
+                        record(self.session.clone(), LOSSLESS_CURSOR + 10, "open"),
+                        None,
+                        Vec::new(),
+                    )
+                    .expect("command state"),
+                )
+            }
+            4 => {
+                let PlatformRequest::SessionFollowUp(request) = request else {
+                    panic!("expected session follow-up")
+                };
+                assert_eq!(request.client, self.client);
+                assert_eq!(request.session, self.session);
+                assert_eq!(
+                    request.expected_session_revision.get(),
+                    LOSSLESS_CURSOR + 10
+                );
+                assert_eq!(request.idempotency_key.as_str(), "fixture-follow-up");
+                assert_eq!(request.text.as_str(), "continue exactly once");
+                PlatformResponse::Receipt(follow_up_receipt(
+                    &self.session,
+                    ReceiptOutcome::Accepted,
+                    1,
+                ))
+            }
+            5 => {
+                let PlatformRequest::GetReceipt(request) = request else {
+                    panic!("expected receipt reconciliation")
+                };
+                assert_eq!(request.client.as_ref(), Some(&self.client));
+                assert!(request.id.is_none());
+                assert_eq!(
+                    request.idempotency_key.as_ref().map(IdempotencyKey::as_str),
+                    Some("fixture-follow-up")
+                );
+                PlatformResponse::Receipt(follow_up_receipt(
+                    &self.session,
+                    ReceiptOutcome::Completed,
+                    2,
+                ))
+            }
+            6 => {
+                let PlatformRequest::GetReceipt(request) = request else {
+                    panic!("expected receipt-id reconciliation")
+                };
+                assert_eq!(request.client.as_ref(), Some(&self.client));
+                assert_eq!(
+                    request.id.as_ref().map(ReceiptId::as_str),
+                    Some("fixture-follow-up-receipt")
+                );
+                assert!(request.idempotency_key.is_none());
+                PlatformResponse::Receipt(follow_up_receipt(
+                    &self.session,
+                    ReceiptOutcome::Completed,
+                    2,
+                ))
+            }
+            _ => panic!("unexpected retained-session request"),
+        };
+        self.calls += 1;
+        Ok(response)
+    }
+}
+
+#[test]
+fn retained_session_helpers_preserve_identity_lossless_revisions_and_independent_cursors() {
+    let session = coordinate("fixture-session");
+    let client_id = ClientId::new("fixture-client").expect("client");
+    let mut client = PlatformClient::new(RetainedSessionTransport {
+        calls: 0,
+        session: session.clone(),
+        client: client_id.clone(),
+    });
+
+    let attachment = client
+        .attach(session.clone(), client_id.clone())
+        .expect("attachment");
+    assert_eq!(attachment.cursor.topic.as_str(), "attachment:fixture");
+    assert_eq!(attachment.cursor.sequence.get(), 7);
+
+    let SessionHistoryResult::Page(history) = client
+        .session_history_snapshot(session.clone(), 2)
+        .expect("history snapshot")
+    else {
+        panic!("expected retained history")
+    };
+    assert_eq!(history.from_cursor, LOSSLESS_CURSOR);
+    assert_eq!(history.terminal_cursor, LOSSLESS_CURSOR + 1);
+    assert!(matches!(
+        history.events.as_slice(),
+        [SessionHistoryEvent::Unknown { .. }]
+    ));
+    assert_ne!(attachment.cursor.sequence.get(), history.terminal_cursor);
+
+    let SessionHistoryResult::ReplaceWithSnapshot(replacement) = client
+        .session_history_page(session.clone(), history.terminal_cursor, 2)
+        .expect("typed history gap")
+    else {
+        panic!("expected explicit snapshot replacement")
+    };
+    assert_eq!(replacement.snapshot_from, LOSSLESS_CURSOR + 4);
+    assert_eq!(replacement.snapshot_to, LOSSLESS_CURSOR + 8);
+
+    let state = client
+        .session_command_state(session.clone())
+        .expect("command state");
+    assert_eq!(state.session.freshness.revision.get(), LOSSLESS_CURSOR + 10);
+    let follow_up = SessionFollowUpRequest {
+        client: client_id.clone(),
+        session: session.clone(),
+        expected_session_revision: state.session.freshness.revision,
+        idempotency_key: IdempotencyKey::new("fixture-follow-up").expect("key"),
+        text: PlatformParameter::new("continue exactly once").expect("text"),
+    };
+    let ActionResult::Receipt(admitted) = client
+        .session_follow_up_outcome(follow_up)
+        .expect("follow-up outcome")
+    else {
+        panic!("expected admitted follow-up")
+    };
+    assert_eq!(admitted.outcome, ReceiptOutcome::Accepted);
+
+    let settled = client
+        .reconcile_receipt_by_idempotency_key(
+            client_id.clone(),
+            IdempotencyKey::new("fixture-follow-up").expect("key"),
+            PlatformAction::FollowUp,
+            session.clone(),
+        )
+        .expect("settled receipt");
+    assert_eq!(settled.outcome, ReceiptOutcome::Completed);
+    assert_eq!(
+        client
+            .reconcile_receipt_by_id(
+                client_id,
+                settled.id.clone(),
+                PlatformAction::FollowUp,
+                session,
+            )
+            .expect("receipt-id reconciliation"),
+        settled
+    );
+    assert_eq!(client.transport().calls, 7);
+}
+
+struct AmbiguousFollowUpTransport {
+    calls: usize,
+    session: ResourceCoordinate,
+    client: ClientId,
+}
+
+impl PlatformTransport for AmbiguousFollowUpTransport {
+    fn request(
+        &mut self,
+        _request_id: RequestId,
+        request: PlatformRequest,
+    ) -> Result<PlatformResponse, ClientError> {
+        self.calls += 1;
+        match request {
+            PlatformRequest::SessionFollowUp(request) if self.calls == 1 => {
+                assert_eq!(request.session, self.session);
+                assert_eq!(request.client, self.client);
+                Err(ClientError::Io)
+            }
+            PlatformRequest::GetReceipt(request) if self.calls == 2 => {
+                assert_eq!(request.client.as_ref(), Some(&self.client));
+                assert_eq!(
+                    request.idempotency_key.as_ref().map(IdempotencyKey::as_str),
+                    Some("ambiguous-follow-up")
+                );
+                Ok(PlatformResponse::Receipt(follow_up_receipt(
+                    &self.session,
+                    ReceiptOutcome::Completed,
+                    3,
+                )))
+            }
+            _ => panic!("follow-up was replayed or reconciliation was malformed"),
+        }
+    }
+}
+
+#[test]
+fn ambiguous_follow_up_reconciles_by_client_and_key_without_replay() {
+    let session = coordinate("ambiguous-session");
+    let client_id = ClientId::new("ambiguous-client").expect("client");
+    let mut client = PlatformClient::new(AmbiguousFollowUpTransport {
+        calls: 0,
+        session: session.clone(),
+        client: client_id.clone(),
+    });
+    let request = SessionFollowUpRequest {
+        client: client_id.clone(),
+        session: session.clone(),
+        expected_session_revision: revision(4),
+        idempotency_key: IdempotencyKey::new("ambiguous-follow-up").expect("key"),
+        text: PlatformParameter::new("continue once").expect("text"),
+    };
+    assert_eq!(
+        client.session_follow_up_outcome(request),
+        Err(ClientError::Io)
+    );
+
+    let receipt = client
+        .reconcile_receipt_by_idempotency_key(
+            client_id,
+            IdempotencyKey::new("ambiguous-follow-up").expect("key"),
+            PlatformAction::FollowUp,
+            session,
+        )
+        .expect("reconciled receipt");
+    assert_eq!(receipt.outcome, ReceiptOutcome::Completed);
+    assert_eq!(client.transport().calls, 2);
+}
+
+struct SessionRefusalTransport;
+
+impl PlatformTransport for SessionRefusalTransport {
+    fn request(
+        &mut self,
+        _request_id: RequestId,
+        request: PlatformRequest,
+    ) -> Result<PlatformResponse, ClientError> {
+        match request {
+            PlatformRequest::SessionCommandState(_) => Ok(PlatformResponse::Refused {
+                outcome: ReceiptOutcome::Rejected,
+                explanation: text("session unavailable"),
+            }),
+            PlatformRequest::SessionFollowUp(_) => Ok(PlatformResponse::Refused {
+                outcome: ReceiptOutcome::Conflict,
+                explanation: text("stale revision"),
+            }),
+            _ => panic!("unexpected refusal request"),
+        }
+    }
+}
+
+#[test]
+fn retained_session_helpers_keep_command_and_stale_revision_refusals_typed() {
+    let session = coordinate("stale-session");
+    let client_id = ClientId::new("stale-client").expect("client");
+    let mut client = PlatformClient::new(SessionRefusalTransport);
+    assert_eq!(
+        client
+            .session_command_state_outcome(session.clone())
+            .expect("command refusal"),
+        SessionCommandStateResult::Refused {
+            outcome: ReceiptOutcome::Rejected,
+            explanation: text("session unavailable")
+        }
+    );
+    assert_eq!(
+        client
+            .session_follow_up_outcome(SessionFollowUpRequest {
+                client: client_id,
+                session,
+                expected_session_revision: revision(1),
+                idempotency_key: IdempotencyKey::new("stale-follow-up").expect("key"),
+                text: PlatformParameter::new("continue").expect("text"),
+            })
+            .expect("follow-up refusal"),
+        ActionResult::Refused {
+            outcome: ReceiptOutcome::Conflict,
+            explanation: text("stale revision")
+        }
+    );
+}
+
+struct MismatchedSessionTransport {
+    calls: usize,
+}
+
+impl PlatformTransport for MismatchedSessionTransport {
+    fn request(
+        &mut self,
+        _request_id: RequestId,
+        request: PlatformRequest,
+    ) -> Result<PlatformResponse, ClientError> {
+        let response = match (self.calls, request) {
+            (0, PlatformRequest::SessionCommandState(_)) => PlatformResponse::SessionCommandState(
+                SessionCommandState::new(
+                    record(coordinate("wrong-session"), 1, "open"),
+                    None,
+                    Vec::new(),
+                )
+                .expect("wrong command state"),
+            ),
+            (1, PlatformRequest::SessionFollowUp(_)) => PlatformResponse::Receipt(
+                follow_up_receipt(&coordinate("wrong-session"), ReceiptOutcome::Completed, 1),
+            ),
+            (2, PlatformRequest::GetReceipt(_)) => PlatformResponse::Receipt(ActionReceipt {
+                action: PlatformAction::StopRun,
+                ..follow_up_receipt(
+                    &coordinate("expected-session"),
+                    ReceiptOutcome::Completed,
+                    2,
+                )
+            }),
+            _ => panic!("unexpected mismatch request"),
+        };
+        self.calls += 1;
+        Ok(response)
+    }
+}
+
+#[test]
+fn retained_session_helpers_reject_mismatched_state_and_receipt_bindings() {
+    let session = coordinate("expected-session");
+    let client_id = ClientId::new("expected-client").expect("client");
+    let mut client = PlatformClient::new(MismatchedSessionTransport { calls: 0 });
+    assert_eq!(
+        client.session_command_state(session.clone()),
+        Err(ClientError::Protocol)
+    );
+    assert_eq!(
+        client.session_follow_up_outcome(SessionFollowUpRequest {
+            client: client_id.clone(),
+            session: session.clone(),
+            expected_session_revision: revision(1),
+            idempotency_key: IdempotencyKey::new("mismatched-follow-up").expect("key"),
+            text: PlatformParameter::new("continue").expect("text"),
+        }),
+        Err(ClientError::Protocol)
+    );
+    assert_eq!(
+        client.reconcile_receipt_by_idempotency_key(
+            client_id,
+            IdempotencyKey::new("mismatched-follow-up").expect("key"),
+            PlatformAction::FollowUp,
+            session,
+        ),
+        Err(ClientError::Protocol)
+    );
+}
+
 #[test]
 fn platform_view_tracks_independent_attachments_and_reconciles_receipts() {
     let session_a = coordinate("session-a");
@@ -437,5 +847,21 @@ fn attachment(session: ResourceCoordinate, topic: &str, sequence: u64) -> Attach
         session,
         client: ClientId::new("shelldeck-test").expect("client id"),
         cursor: cursor(topic, sequence),
+    }
+}
+
+fn follow_up_receipt(
+    session: &ResourceCoordinate,
+    outcome: ReceiptOutcome,
+    revision_value: u64,
+) -> ActionReceipt {
+    ActionReceipt {
+        id: ReceiptId::new("fixture-follow-up-receipt").expect("receipt id"),
+        action: PlatformAction::FollowUp,
+        target: session.clone(),
+        outcome,
+        revision: revision(revision_value),
+        recorded_at: EpochMillis::from_millis(i64::from(revision_value as u32)),
+        explanation: None,
     }
 }

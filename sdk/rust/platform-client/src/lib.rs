@@ -20,9 +20,12 @@ use automonique_protocol::codec::{FrameDecode, LENGTH_PREFIX_BYTES, decode_frame
 use automonique_protocol::platform::{
     ActionReceipt, AttachRequest, Attachment, Capabilities, ClaimControlRequest, ClientId,
     ControlLease, DetachRequest, ExecuteRequest, GetReceiptRequest, IdempotencyKey,
-    ListSessionsRequest, PlatformCursor, PlatformRequest, PlatformResponse, PlatformText,
-    ReceiptId, ReceiptOutcome, ReleaseControlRequest, ResourceAuthority, ResourceCoordinate,
-    ResourceRecord, SessionList, Snapshot, SnapshotRequest, SubscribeRequest, Subscription,
+    ListSessionsRequest, PlatformAction, PlatformCursor, PlatformRequest, PlatformResponse,
+    PlatformText, ReceiptId, ReceiptOutcome, ReleaseControlRequest, ResourceAuthority,
+    ResourceCoordinate, ResourceRecord, SessionCommandState, SessionCommandStateRequest,
+    SessionFollowUpRequest, SessionHistoryPage, SessionHistoryPageRequest, SessionHistoryResync,
+    SessionHistorySnapshotRequest, SessionList, Snapshot, SnapshotRequest, SubscribeRequest,
+    Subscription,
 };
 use automonique_protocol::platform_api::{
     MAX_PLATFORM_CANONICAL_BYTES, PlatformRequestMessage, PlatformResponseMessage,
@@ -342,6 +345,32 @@ pub enum SessionListResult {
     ResyncRequired { explanation: PlatformText },
 }
 
+/// Recoverable retained-history read.
+///
+/// Resource subscriptions, attachment subscriptions, and retained history use
+/// independent cursors. A history retention gap therefore carries the exact
+/// session-owned replacement window and is never converted into a resource or
+/// attachment resynchronization.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionHistoryResult {
+    Page(SessionHistoryPage),
+    ReplaceWithSnapshot(SessionHistoryResync),
+    Refused {
+        outcome: ReceiptOutcome,
+        explanation: PlatformText,
+    },
+}
+
+/// Typed result of reading the exact revision fences for one session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionCommandStateResult {
+    State(SessionCommandState),
+    Refused {
+        outcome: ReceiptOutcome,
+        explanation: PlatformText,
+    },
+}
+
 /// Typed result of an explicit platform mutation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ActionResult {
@@ -473,6 +502,39 @@ impl<T: PlatformTransport> PlatformClient<T> {
         }
     }
 
+    /// Reconcile one client-owned receipt by its durable receipt identity.
+    ///
+    /// `expected_action` and `expected_target` are checked locally so a
+    /// response for another command cannot settle the caller's pending
+    /// session mutation.
+    pub fn reconcile_receipt_by_id(
+        &mut self,
+        client: ClientId,
+        id: ReceiptId,
+        expected_action: PlatformAction,
+        expected_target: ResourceCoordinate,
+    ) -> Result<ActionReceipt, ClientError> {
+        let receipt = self.get_receipt(GetReceiptRequest::by_id(id).with_client(client))?;
+        validate_receipt(receipt, expected_action, &expected_target)
+    }
+
+    /// Reconcile one ambiguous client-owned command without replaying it.
+    ///
+    /// Callers retain only this lookup obligation after an uncertain
+    /// `session_follow_up` response. They must not send the follow-up again.
+    pub fn reconcile_receipt_by_idempotency_key(
+        &mut self,
+        client: ClientId,
+        idempotency_key: IdempotencyKey,
+        expected_action: PlatformAction,
+        expected_target: ResourceCoordinate,
+    ) -> Result<ActionReceipt, ClientError> {
+        let receipt = self.get_receipt(
+            GetReceiptRequest::by_idempotency_key(idempotency_key).with_client(client),
+        )?;
+        validate_receipt(receipt, expected_action, &expected_target)
+    }
+
     pub fn list_sessions(
         &mut self,
         authority: ResourceAuthority,
@@ -500,6 +562,132 @@ impl<T: PlatformTransport> PlatformClient<T> {
                 outcome: ReceiptOutcome::ResyncRequired,
                 explanation,
             } => Ok(SessionListResult::ResyncRequired { explanation }),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    /// Read a bounded retained-history snapshot for exactly one session.
+    pub fn session_history_snapshot(
+        &mut self,
+        session: ResourceCoordinate,
+        limit: u16,
+    ) -> Result<SessionHistoryResult, ClientError> {
+        let request = SessionHistorySnapshotRequest::new(session.clone(), limit)
+            .map_err(|_| ClientError::Protocol)?;
+        self.session_history_result(session, PlatformRequest::SessionHistorySnapshot(request))
+    }
+
+    /// Continue retained history strictly after `after`.
+    pub fn session_history_page(
+        &mut self,
+        session: ResourceCoordinate,
+        after: u64,
+        limit: u16,
+    ) -> Result<SessionHistoryResult, ClientError> {
+        let request = SessionHistoryPageRequest::new(session.clone(), after, limit)
+            .map_err(|_| ClientError::Protocol)?;
+        self.session_history_result(session, PlatformRequest::SessionHistoryPage(request))
+    }
+
+    fn session_history_result(
+        &mut self,
+        session: ResourceCoordinate,
+        request: PlatformRequest,
+    ) -> Result<SessionHistoryResult, ClientError> {
+        match self.request(request)? {
+            PlatformResponse::SessionHistory(page) if page.session == session => {
+                Ok(SessionHistoryResult::Page(page))
+            }
+            PlatformResponse::SessionHistoryResync(replacement)
+                if replacement.session == session =>
+            {
+                Ok(SessionHistoryResult::ReplaceWithSnapshot(replacement))
+            }
+            PlatformResponse::Refused {
+                outcome,
+                explanation,
+            } => Ok(SessionHistoryResult::Refused {
+                outcome,
+                explanation,
+            }),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    /// Read the exact session, run, and approval revisions required by the
+    /// dedicated retained-session mutation methods.
+    pub fn session_command_state(
+        &mut self,
+        session: ResourceCoordinate,
+    ) -> Result<SessionCommandState, ClientError> {
+        match self.session_command_state_outcome(session)? {
+            SessionCommandStateResult::State(state) => Ok(state),
+            SessionCommandStateResult::Refused { .. } => Err(ClientError::Protocol),
+        }
+    }
+
+    /// Read command state without erasing an authority refusal.
+    pub fn session_command_state_outcome(
+        &mut self,
+        session: ResourceCoordinate,
+    ) -> Result<SessionCommandStateResult, ClientError> {
+        match self.request(PlatformRequest::SessionCommandState(
+            SessionCommandStateRequest {
+                session: session.clone(),
+            },
+        ))? {
+            PlatformResponse::SessionCommandState(state) if state.session.resource == session => {
+                Ok(SessionCommandStateResult::State(state))
+            }
+            PlatformResponse::Refused {
+                outcome,
+                explanation,
+            } => Ok(SessionCommandStateResult::Refused {
+                outcome,
+                explanation,
+            }),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    /// Continue one retained conversation through the dedicated session-bound
+    /// method. Conversation clients must not translate this into generic
+    /// `execute`: the dedicated request retains the client identity and exact
+    /// session revision fence.
+    ///
+    /// After any admitted receipt, callers must fence another mutation until
+    /// a fresh `session_command_state` reports a session revision newer than
+    /// `request.expected_session_revision`. After an ambiguous transport
+    /// error, reconcile this request's idempotency key and never replay it.
+    pub fn session_follow_up(
+        &mut self,
+        request: SessionFollowUpRequest,
+    ) -> Result<ActionReceipt, ClientError> {
+        match self.session_follow_up_outcome(request)? {
+            ActionResult::Receipt(receipt) => Ok(receipt),
+            ActionResult::Refused { .. } => Err(ClientError::Protocol),
+        }
+    }
+
+    /// Continue one retained conversation without erasing a stale-revision or
+    /// authorization refusal.
+    pub fn session_follow_up_outcome(
+        &mut self,
+        request: SessionFollowUpRequest,
+    ) -> Result<ActionResult, ClientError> {
+        let expected_target = request.session.clone();
+        match self.request(PlatformRequest::SessionFollowUp(request))? {
+            PlatformResponse::Receipt(receipt) => {
+                validate_receipt(receipt, PlatformAction::FollowUp, &expected_target)
+                    .map(ActionResult::Receipt)
+            }
+            PlatformResponse::Refused {
+                outcome,
+                explanation,
+            } => Ok(ActionResult::Refused {
+                outcome,
+                explanation,
+            }),
             _ => Err(ClientError::Protocol),
         }
     }
@@ -592,6 +780,17 @@ impl<T: PlatformTransport> PlatformClient<T> {
     pub const fn transport(&self) -> &T {
         &self.transport
     }
+}
+
+fn validate_receipt(
+    receipt: ActionReceipt,
+    expected_action: PlatformAction,
+    expected_target: &ResourceCoordinate,
+) -> Result<ActionReceipt, ClientError> {
+    if receipt.action != expected_action || receipt.target != *expected_target {
+        return Err(ClientError::Protocol);
+    }
+    Ok(receipt)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
