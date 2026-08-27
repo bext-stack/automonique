@@ -431,7 +431,7 @@ fn decoded_value(payload: &[u8]) -> Result<JsonValue, LineageApiError> {
     }
     let envelope = parse_canonical(payload)?;
     fields(&envelope, &["platform_version", "schema", "value"])?;
-    if uint(&envelope, "platform_version")? != 2
+    if get(&envelope, "platform_version")?.as_integer() != Some(2)
         || string(&envelope, "schema")? != PLATFORM_SCHEMA_V2
     {
         return Err(LineageApiError::VersionUnavailable);

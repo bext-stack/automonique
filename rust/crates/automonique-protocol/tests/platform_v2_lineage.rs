@@ -511,4 +511,24 @@ fn canonical_lineage_codec_is_exact_bidirectional_and_negotiation_gated() {
             .category(),
         "work_context_value_invalid"
     );
+    let negative_observation = b"{\"platform_version\":2,\"schema\":\"automonique.platform/v2\",\"value\":{\"external_work_items\":[{\"freshness\":{\"observed_at_ms\":-1,\"stale_after_ms\":30000,\"state\":\"fresh\"},\"identity\":{\"authority\":\"installation-codec\",\"key\":\"issue-codec\",\"provider\":\"gitlab\",\"scope\":\"scope-codec\"},\"latest_useful_message\":null,\"moved_to\":null,\"origin\":{\"attempt\":null,\"pane\":null,\"session\":null,\"workspace\":\"workspace-codec\"},\"revision\":1,\"state\":\"open\",\"workspace\":\"workspace-codec\"}],\"orchestration\":[],\"schema\":\"automonique.platform/v2\",\"workspace\":\"workspace-codec\"}}";
+    assert_eq!(
+        decode_lineage_projection(&v2, negative_observation)
+            .unwrap_err()
+            .category(),
+        "work_context_counter_out_of_range"
+    );
+    let exact_moved = b"{\"platform_version\":2,\"schema\":\"automonique.platform/v2\",\"value\":{\"external_work_items\":[{\"freshness\":{\"observed_at_ms\":1700000000001,\"stale_after_ms\":30000,\"state\":\"fresh\"},\"identity\":{\"authority\":\"installation-self-hosted\",\"key\":\"issue-7\",\"provider\":\"gitlab\",\"scope\":\"scope-a\"},\"latest_useful_message\":null,\"moved_to\":{\"authority\":\"installation-self-hosted\",\"key\":\"issue-7\",\"provider\":\"gitlab\",\"scope\":\"scope-b\"},\"origin\":{\"attempt\":\"attempt-codec\",\"pane\":\"pane-codec\",\"session\":\"session-codec\",\"workspace\":\"workspace-codec\"},\"revision\":2,\"state\":\"moved\",\"workspace\":\"workspace-codec\"},{\"freshness\":{\"observed_at_ms\":1700000000000,\"stale_after_ms\":30000,\"state\":\"fresh\"},\"identity\":{\"authority\":\"installation-self-hosted\",\"key\":\"issue-7\",\"provider\":\"gitlab\",\"scope\":\"scope-b\"},\"latest_useful_message\":null,\"moved_to\":null,\"origin\":{\"attempt\":\"attempt-codec\",\"pane\":\"pane-codec\",\"session\":\"session-codec\",\"workspace\":\"workspace-codec\"},\"revision\":1,\"state\":\"open\",\"workspace\":\"workspace-codec\"}],\"orchestration\":[],\"schema\":\"automonique.platform/v2\",\"workspace\":\"workspace-codec\"}}";
+    let moved_projection = decode_lineage_projection(&v2, exact_moved).unwrap();
+    assert_eq!(moved_projection.external_work_items().len(), 2);
+    assert!(
+        moved_projection.external_work_items()[0]
+            .origin()
+            .pane()
+            .is_some()
+    );
+    assert_eq!(
+        encode_lineage_projection(&v2, &moved_projection).unwrap(),
+        exact_moved
+    );
 }

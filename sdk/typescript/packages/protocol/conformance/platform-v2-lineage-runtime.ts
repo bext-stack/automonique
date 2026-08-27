@@ -134,6 +134,13 @@ const mustRefuse = (operation: () => unknown): void => {
   }
   throw new Error("malformed lineage value was accepted");
 };
+const mustRefuseCategory = (category: string, operation: () => unknown): void => {
+  try { operation(); } catch (error) {
+    if ((error as {readonly category?: string}).category === category) return;
+    throw error;
+  }
+  throw new Error(`missing refusal ${category}`);
+};
 
 const names = new Set<string>();
 const providers = new Set<string>();
@@ -243,4 +250,10 @@ const exactOutcome = "{\"platform_version\":2,\"schema\":\"automonique.platform/
 if (new TextDecoder().decode(encodeWorkspaceIntentOutcome(lineageV2, decodeWorkspaceIntentOutcome(lineageV2, new TextEncoder().encode(exactOutcome)))) !== exactOutcome) throw new Error("outcome codec exact-byte drifted");
 mustRefuse(() => decodeLineageProjection(lineageV2, new TextEncoder().encode(exactProjection.replace("\"platform_version\":2", "\"platform_version\":1"))));
 mustRefuse(() => decodeWorkspaceIntentOutcome(lineageV2, new TextEncoder().encode(exactOutcome.replace("accepted", "undefined"))));
+const negativeObservation = "{\"platform_version\":2,\"schema\":\"automonique.platform/v2\",\"value\":{\"external_work_items\":[{\"freshness\":{\"observed_at_ms\":-1,\"stale_after_ms\":30000,\"state\":\"fresh\"},\"identity\":{\"authority\":\"installation-codec\",\"key\":\"issue-codec\",\"provider\":\"gitlab\",\"scope\":\"scope-codec\"},\"latest_useful_message\":null,\"moved_to\":null,\"origin\":{\"attempt\":null,\"pane\":null,\"session\":null,\"workspace\":\"workspace-codec\"},\"revision\":1,\"state\":\"open\",\"workspace\":\"workspace-codec\"}],\"orchestration\":[],\"schema\":\"automonique.platform/v2\",\"workspace\":\"workspace-codec\"}}";
+mustRefuseCategory("work_context_counter_out_of_range", () => decodeLineageProjection(lineageV2, new TextEncoder().encode(negativeObservation)));
+const exactMoved = "{\"platform_version\":2,\"schema\":\"automonique.platform/v2\",\"value\":{\"external_work_items\":[{\"freshness\":{\"observed_at_ms\":1700000000001,\"stale_after_ms\":30000,\"state\":\"fresh\"},\"identity\":{\"authority\":\"installation-self-hosted\",\"key\":\"issue-7\",\"provider\":\"gitlab\",\"scope\":\"scope-a\"},\"latest_useful_message\":null,\"moved_to\":{\"authority\":\"installation-self-hosted\",\"key\":\"issue-7\",\"provider\":\"gitlab\",\"scope\":\"scope-b\"},\"origin\":{\"attempt\":\"attempt-codec\",\"pane\":\"pane-codec\",\"session\":\"session-codec\",\"workspace\":\"workspace-codec\"},\"revision\":2,\"state\":\"moved\",\"workspace\":\"workspace-codec\"},{\"freshness\":{\"observed_at_ms\":1700000000000,\"stale_after_ms\":30000,\"state\":\"fresh\"},\"identity\":{\"authority\":\"installation-self-hosted\",\"key\":\"issue-7\",\"provider\":\"gitlab\",\"scope\":\"scope-b\"},\"latest_useful_message\":null,\"moved_to\":null,\"origin\":{\"attempt\":\"attempt-codec\",\"pane\":\"pane-codec\",\"session\":\"session-codec\",\"workspace\":\"workspace-codec\"},\"revision\":1,\"state\":\"open\",\"workspace\":\"workspace-codec\"}],\"orchestration\":[],\"schema\":\"automonique.platform/v2\",\"workspace\":\"workspace-codec\"}}";
+const movedProjection = decodeLineageProjection(lineageV2, new TextEncoder().encode(exactMoved));
+if (movedProjection.external_work_items.length !== 2 || movedProjection.external_work_items[0]?.origin.pane === null) throw new Error("moved lineage corpus lost origin or target");
+if (new TextDecoder().decode(encodeLineageProjection(lineageV2, movedProjection)) !== exactMoved) throw new Error("moved lineage exact-byte drifted");
 console.log(JSON.stringify({cases: names.size, codec_bytes: exactProjection.length + exactIntent.length + exactOutcome.length, providers: providers.size, question_links: questionLinks, stale_heartbeats: staleHeartbeats}));
