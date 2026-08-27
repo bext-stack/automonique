@@ -2085,6 +2085,7 @@ async function loadProcesses({ announce = false } = {}) {
 function renderPlatform(view) {
   const resources = Array.isArray(view.resources) ? view.resources : [];
   const sessions = Array.isArray(view.sessions) ? view.sessions : [];
+  const inventory = view.inventory || {};
   const methods = Array.isArray(view.capabilities?.methods) ? view.capabilities.methods : [];
   const transports = Array.isArray(view.capabilities?.transports) ? view.capabilities.transports : [];
   byId("platform-resources").textContent = count(resources.length);
@@ -2094,18 +2095,32 @@ function renderPlatform(view) {
   byId("platform-health").textContent = words(view.health || "unavailable").toUpperCase();
   byId("platform-cursor").textContent = view.cursor
     ? `${words(view.cursor.authority)} / ${view.cursor.topic} / seq ${count(view.cursor.sequence)}`
-    : "No cursor";
+    : inventory.state === "refused"
+      ? "Inventory snapshot refused"
+      : "No cursor";
   const sessionById = new Map(sessions.map((session) => [session.session?.resource?.id, session]));
   const root = byId("platform-resource-grid");
   root.replaceChildren();
-  if (resources.length === 0) {
+  if (inventory.state === "refused") {
     const empty = document.createElement("div");
     empty.className = "integration-empty";
-    empty.textContent = "The platform endpoint returned no visible resources.";
+    empty.setAttribute("data-i18n-skip", "");
+    empty.textContent = `Full resource inventory unavailable: ${inventory.explanation || "the platform authority refused the snapshot without an explanation"}. Showing sessions from the paged session listing.`;
     root.append(empty);
+  }
+  const visibleResources = resources.length > 0
+    ? resources
+    : sessions.map((session) => session.session).filter((record) => record?.resource);
+  if (visibleResources.length === 0) {
+    if (inventory.state !== "refused") {
+      const empty = document.createElement("div");
+      empty.className = "integration-empty";
+      empty.textContent = "The platform endpoint returned no visible resources.";
+      root.append(empty);
+    }
     return;
   }
-  resources.forEach((record) => {
+  visibleResources.forEach((record) => {
     const coordinate = record.resource || {};
     const session = sessionById.get(coordinate.id);
     const card = document.createElement("article");
