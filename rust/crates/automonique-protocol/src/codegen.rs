@@ -11211,8 +11211,7 @@ export function validateExternalWorkItem(value: ExternalWorkItem): ExternalWorkI
   const state = decodeExternalWorkState(value.state);
   const freshness = validateLineageFreshness(value.freshness);
   const latest = value.latest_useful_message === null ? null : validateLatestUsefulMessage(value.latest_useful_message);
-  if ((state === "moved") !== (moved_to !== null) || (moved_to !== null && (sameExternalWorkIdentity(identity, moved_to)
-      || moved_to.provider !== identity.provider || moved_to.authority !== identity.authority))
+  if ((state === "moved") !== (moved_to !== null) || (moved_to !== null && sameExternalWorkIdentity(identity, moved_to))
       || (latest !== null && latest.observed_at_ms > freshness.observed_at_ms)) {
     workContextRefusal("external work transition is invalid");
   }
@@ -11273,6 +11272,8 @@ export function validateLineageProjection(value: LineageProjection): LineageProj
   for (const item of external_work_items) {
     if (item.origin.workspace !== workspace) workContextRefusal("lineage origin crosses workspaces");
     if (item.moved_to !== null) { const target = external_work_items.find((candidate) => sameExternalWorkIdentity(candidate.identity, item.moved_to!)); if (target === undefined || !originRefines(target.origin, item.origin)) workContextRefusal("lineage external link is unresolved"); }
+    const seen = new Set<string>(); let cursor: ExternalWorkItem | undefined = item;
+    while (cursor !== undefined && cursor.moved_to !== null) { const target: ExternalWorkIdentity = cursor.moved_to; const key = `${target.provider}\u0000${target.authority}\u0000${target.scope}\u0000${target.key}`; if (seen.has(key) || sameExternalWorkIdentity(target, item.identity)) workContextRefusal("lineage external cycle"); seen.add(key); cursor = external_work_items.find((candidate) => sameExternalWorkIdentity(candidate.identity, target)); }
   }
   for (const record of orchestration) {
     if (record.origin.workspace !== workspace) workContextRefusal("lineage origin crosses workspaces");

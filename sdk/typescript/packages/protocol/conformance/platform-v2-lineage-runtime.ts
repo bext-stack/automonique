@@ -256,4 +256,7 @@ const exactMoved = "{\"platform_version\":2,\"schema\":\"automonique.platform/v2
 const movedProjection = decodeLineageProjection(lineageV2, new TextEncoder().encode(exactMoved));
 if (movedProjection.external_work_items.length !== 2 || movedProjection.external_work_items[0]?.origin.pane === null) throw new Error("moved lineage corpus lost origin or target");
 if (new TextDecoder().decode(encodeLineageProjection(lineageV2, movedProjection)) !== exactMoved) throw new Error("moved lineage exact-byte drifted");
+const movedA = movedProjection.external_work_items[0]!;
+const movedB = movedProjection.external_work_items[1]!;
+mustRefuse(() => validateLineageProjection({...movedProjection, external_work_items: [movedA, {...movedB, moved_to: movedA.identity, state: "moved"}]}));
 console.log(JSON.stringify({cases: names.size, codec_bytes: exactProjection.length + exactIntent.length + exactOutcome.length, providers: providers.size, question_links: questionLinks, stale_heartbeats: staleHeartbeats}));

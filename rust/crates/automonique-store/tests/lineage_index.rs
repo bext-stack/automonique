@@ -5,13 +5,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use automonique_protocol::platform_v2::{
-    AttemptWorkspaceId, NegotiatedPlatform, PaneId, PlatformVersionOffer, UserWorkspaceId,
-    WorkSessionId, negotiate_platform_version,
+    AttemptWorkspaceId, NegotiatedPlatform, PaneId, PlatformVersionOffer, ProjectId,
+    UserWorkspaceId, WorkSessionId, negotiate_platform_version,
 };
 use automonique_protocol::platform_v2_lineage::*;
 use automonique_protocol::primitives::Revision;
 use automonique_store::lineage_index::{
-    LINEAGE_INDEX_SCHEMA_VERSION, LineageIndex, WriteAdmission,
+    IntentAuthorizationScope, LINEAGE_INDEX_SCHEMA_VERSION, LineageIndex,
+    WorkspaceIntentExecutionReceipt, WriteAdmission,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -44,6 +45,14 @@ fn lineage_v2() -> NegotiatedPlatform {
     negotiate_platform_version(
         &PlatformVersionOffer::new(vec![2]).unwrap(),
         &PlatformVersionOffer::new(vec![2]).unwrap(),
+    )
+    .unwrap()
+}
+fn intent_scope(workspace: &UserWorkspaceId) -> IntentAuthorizationScope {
+    IntentAuthorizationScope::new(
+        "tenant-test".to_owned(),
+        ProjectId::new("project-test").unwrap(),
+        workspace.clone(),
     )
     .unwrap()
 }
@@ -248,13 +257,26 @@ fn moved_and_closed_sources_are_revisioned_and_survive_reopen() {
     let mut index = LineageIndex::open(private.path()).unwrap();
     let moved_id = external_identity(ExternalWorkProvider::GitLab, "scope-1", "work-1");
     let replacement = ExternalWorkIdentity::new(
-        ExternalWorkProvider::GitLab,
-        moved_id.authority().clone(),
+        ExternalWorkProvider::JiraCompatible,
+        ExternalWorkAuthorityId::new("installation-replacement").unwrap(),
         ExternalWorkScope::new("scope-2").unwrap(),
         ExternalWorkKey::new("work-1").unwrap(),
     );
     let closed_id = external_identity(ExternalWorkProvider::Linear, "team-1", "lin-1");
     let ws = workspace("workspace-source");
+    assert_eq!(
+        index
+            .intake_external(&item(
+                moved_id.clone(),
+                ws.clone(),
+                1,
+                ExternalWorkState::Moved,
+                Some(replacement.clone()),
+            ))
+            .unwrap_err()
+            .category(),
+        "not_found"
+    );
     index
         .intake_external(&item(
             moved_id.clone(),
@@ -349,6 +371,22 @@ fn moved_and_closed_sources_are_revisioned_and_survive_reopen() {
             Revision::FIRST,
         )
         .unwrap();
+    assert_eq!(
+        index
+            .update_external(
+                &item(
+                    replacement.clone(),
+                    ws.clone(),
+                    2,
+                    ExternalWorkState::Moved,
+                    Some(moved_id.clone()),
+                ),
+                Revision::FIRST,
+            )
+            .unwrap_err()
+            .category(),
+        "identity_conflict"
+    );
     let create = WorkspaceIntent::Create(WorkspaceCreateIntent::new(
         WorkspaceIntentId::new("intent-moved").unwrap(),
         OrchestrationTaskId::new("task-source").unwrap(),
@@ -830,22 +868,61 @@ fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
             .unwrap(),
         WriteAdmission::Replayed { revision: 1 }
     );
-    let stored = index.intent(create.intent_id()).unwrap().unwrap();
+    let scope = intent_scope(&ws);
+    assert!(
+        index
+            .intent_authorized(
+                &lineage_v2(),
+                &intent_scope(&workspace("workspace-other")),
+                create.intent_id(),
+                |_| true
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        index
+            .intent_authorized(&lineage_v2(), &scope, create.intent_id(), |_| false)
+            .unwrap_err()
+            .category(),
+        "unauthorized"
+    );
+    let stored = index
+        .intent_authorized(&lineage_v2(), &scope, create.intent_id(), |_| true)
+        .unwrap()
+        .unwrap();
     assert_eq!(stored.intent, create);
     assert_eq!(stored.outcome, WorkspaceIntentOutcome::Accepted);
     assert_ne!(stored.request_digest, [0; 32]);
-    let final_outcome =
-        WorkspaceIntentOutcome::Conflict(WorkspaceIntentConflict::ExternalWorkClosed);
+    // Execution was admitted while the source was open. A later source close
+    // must not rewrite the immutable admitted snapshot into a false conflict.
+    let final_outcome = WorkspaceIntentOutcome::Created(ws.clone());
     assert_eq!(
-        index.reconcile_intent(&create, &final_outcome).unwrap(),
+        index
+            .reconcile_intent(&WorkspaceIntentExecutionReceipt {
+                intent_id: create.intent_id().clone(),
+                request_digest: stored.request_digest,
+                outcome: final_outcome.clone()
+            })
+            .unwrap(),
         WriteAdmission::Updated { revision: 2 }
     );
     assert_eq!(
-        index.intent(create.intent_id()).unwrap().unwrap().outcome,
+        index
+            .intent_authorized(&lineage_v2(), &scope, create.intent_id(), |_| true)
+            .unwrap()
+            .unwrap()
+            .outcome,
         final_outcome
     );
     assert_eq!(
-        index.reconcile_intent(&create, &final_outcome).unwrap(),
+        index
+            .reconcile_intent(&WorkspaceIntentExecutionReceipt {
+                intent_id: create.intent_id().clone(),
+                request_digest: stored.request_digest,
+                outcome: final_outcome.clone()
+            })
+            .unwrap(),
         WriteAdmission::Replayed { revision: 2 }
     );
     let changed = WorkspaceIntent::Create(WorkspaceCreateIntent::new(
@@ -880,8 +957,22 @@ fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
     assert_eq!(
         index
             .record_orchestration(
-                &task_record(3, LineageStatus::Working, 1_700_000_300_200),
+                &task_record(
+                    3,
+                    LineageStatus::Done(LineageMessage::new("complete").unwrap()),
+                    1_700_000_300_200
+                ),
                 Some(Revision::new(2).unwrap())
+            )
+            .unwrap()
+            .revision(),
+        3
+    );
+    assert_eq!(
+        index
+            .record_orchestration(
+                &task_record(4, LineageStatus::Working, 1_700_000_300_300),
+                Some(Revision::new(3).unwrap())
             )
             .unwrap_err()
             .category(),
@@ -900,7 +991,7 @@ fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
         .find(|record| record.identity() == &task_id)
         .unwrap();
     assert_eq!(task.origin(), &task_origin);
-    assert_eq!(task.revision().get(), 2);
+    assert_eq!(task.revision().get(), 3);
 }
 
 #[test]
@@ -936,7 +1027,12 @@ PRAGMA user_version=1;
         "legacy-unqualified-gitlab"
     );
     let stored = index
-        .intent(&WorkspaceIntentId::new("intent-v1").unwrap())
+        .intent_authorized(
+            &lineage_v2(),
+            &intent_scope(&workspace("workspace-v1")),
+            &WorkspaceIntentId::new("intent-v1").unwrap(),
+            |_| true,
+        )
         .unwrap()
         .unwrap();
     assert_ne!(stored.request_digest, [0; 32]);
@@ -951,5 +1047,19 @@ PRAGMA user_version=1;
             .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .unwrap(),
         LINEAGE_INDEX_SCHEMA_VERSION
+    );
+}
+
+#[test]
+fn current_version_with_missing_schema_shape_refuses_on_open() {
+    let private = PrivateIndex::new();
+    drop(LineageIndex::open(private.path()).unwrap());
+    let db = Connection::open(private.path()).unwrap();
+    db.execute("DROP INDEX lineage_external_by_workspace", [])
+        .unwrap();
+    drop(db);
+    assert_eq!(
+        LineageIndex::open(private.path()).unwrap_err().category(),
+        "corrupt"
     );
 }

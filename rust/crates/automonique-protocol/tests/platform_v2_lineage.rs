@@ -276,6 +276,41 @@ fn orchestration_parentage_is_typed_and_orphans_are_refused() {
 #[test]
 fn complete_projection_resolves_relations_and_rejects_cycles() {
     let workspace = opaque(UserWorkspaceId::new, "workspace-graph");
+    let source_a = ExternalWorkIdentity::new(
+        ExternalWorkProvider::GitLab,
+        ExternalWorkAuthorityId::new("installation-a").unwrap(),
+        ExternalWorkScope::new("scope-a").unwrap(),
+        ExternalWorkKey::new("issue-a").unwrap(),
+    );
+    let source_b = ExternalWorkIdentity::new(
+        ExternalWorkProvider::JiraCompatible,
+        ExternalWorkAuthorityId::new("installation-b").unwrap(),
+        ExternalWorkScope::new("scope-b").unwrap(),
+        ExternalWorkKey::new("issue-b").unwrap(),
+    );
+    let moved = |identity: ExternalWorkIdentity, target: ExternalWorkIdentity| {
+        ExternalWorkItem::new(
+            identity,
+            workspace.clone(),
+            Revision::FIRST,
+            ExternalWorkState::Moved,
+            Some(target),
+            fresh(),
+            None,
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        LineageProjection::new(
+            workspace.clone(),
+            vec![
+                moved(source_a.clone(), source_b.clone()),
+                moved(source_b, source_a)
+            ],
+            Vec::new(),
+        ),
+        Err(LineageError::ExternalLinkInvalid)
+    );
     let first = OrchestrationIdentity::Task(opaque(OrchestrationTaskId::new, "task-cycle-a"));
     let second = OrchestrationIdentity::Task(opaque(OrchestrationTaskId::new, "task-cycle-b"));
     let record = |identity, parent| {

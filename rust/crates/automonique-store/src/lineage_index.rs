@@ -20,7 +20,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use automonique_protocol::platform_v2::{
-    AttemptWorkspaceId, NegotiatedPlatform, PaneId, UserWorkspaceId, WorkSessionId,
+    AttemptWorkspaceId, NegotiatedPlatform, PaneId, ProjectId, UserWorkspaceId, WorkSessionId,
 };
 use automonique_protocol::platform_v2_lineage::{
     BaseSelectorId, BranchSelectorId, ExternalWorkAuthorityId, ExternalWorkIdentity,
@@ -289,6 +289,42 @@ pub struct StoredWorkspaceIntent {
     pub outcome: WorkspaceIntentOutcome,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceIntentExecutionReceipt {
+    pub intent_id: WorkspaceIntentId,
+    pub request_digest: [u8; 32],
+    pub outcome: WorkspaceIntentOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IntentAuthorizationScope {
+    tenant: String,
+    project: ProjectId,
+    workspace: UserWorkspaceId,
+}
+
+impl IntentAuthorizationScope {
+    pub fn new(tenant: String, project: ProjectId, workspace: UserWorkspaceId) -> Indexed<Self> {
+        if tenant.is_empty() || tenant.len() > 255 || tenant.chars().any(char::is_control) {
+            return Err(LineageIndexError::InvalidField("tenant"));
+        }
+        Ok(Self {
+            tenant,
+            project,
+            workspace,
+        })
+    }
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+    pub const fn project(&self) -> &ProjectId {
+        &self.project
+    }
+    pub const fn workspace(&self) -> &UserWorkspaceId {
+        &self.workspace
+    }
+}
+
 impl WriteAdmission {
     #[must_use]
     pub const fn revision(self) -> u64 {
@@ -355,6 +391,7 @@ impl LineageIndex {
                 Err(LineageIndexError::DuplicateIntake)
             };
         }
+        validate_moved_target(&transaction, item)?;
         insert_external(&transaction, item)?;
         transaction.commit()?;
         Ok(WriteAdmission::Inserted { revision: 1 })
@@ -399,17 +436,7 @@ impl LineageIndex {
         {
             return Err(LineageIndexError::IdentityConflict);
         }
-        if let Some(target_id) = item.moved_to() {
-            let target = read_external(&transaction, target_id)?
-                .ok_or(LineageIndexError::NotFound("moved external work target"))?;
-            if target.workspace() != item.workspace()
-                || target.identity().provider() != item.identity().provider()
-                || target.identity().authority() != item.identity().authority()
-                || !target.origin().refines(item.origin())
-            {
-                return Err(LineageIndexError::IdentityConflict);
-            }
-        }
+        validate_moved_target(&transaction, item)?;
         update_external_row(&transaction, item, expected_revision)?;
         transaction.commit()?;
         Ok(WriteAdmission::Updated { revision: next })
@@ -468,7 +495,8 @@ impl LineageIndex {
                         record.freshness().observed_at_ms(),
                         record.latest_useful_message(),
                     )
-                    || matches!(stored.status(), LineageStatus::Done(_))
+                    || (matches!(stored.status(), LineageStatus::Done(_))
+                        && stored.status() != record.status())
                 {
                     return Err(LineageIndexError::IdentityConflict);
                 }
@@ -510,33 +538,54 @@ impl LineageIndex {
     /// underlying create/resume operation.
     pub fn reconcile_intent(
         &mut self,
-        intent: &WorkspaceIntent,
-        final_outcome: &WorkspaceIntentOutcome,
+        receipt: &WorkspaceIntentExecutionReceipt,
     ) -> Indexed<WriteAdmission> {
-        if final_outcome.reconciliation() != WorkspaceIntentReconciliation::Final {
+        if receipt.outcome.reconciliation() != WorkspaceIntentReconciliation::Final {
             return Err(LineageIndexError::InvalidField("final_outcome"));
         }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let digest = intent_digest(intent);
-        let existing = read_intent(&transaction, intent.intent_id().as_str())?
+        let existing = read_intent(&transaction, receipt.intent_id.as_str())?
             .ok_or(LineageIndexError::NotFound("workspace intent"))?;
-        if existing.request_digest != digest {
+        if existing.request_digest != receipt.request_digest {
             return Err(LineageIndexError::IdentityConflict);
         }
         if existing.reconciliation == "final" {
             let stored = existing.into_stored()?;
-            return if &stored.outcome == final_outcome {
+            return if stored.outcome == receipt.outcome {
                 Ok(WriteAdmission::Replayed { revision: 2 })
             } else {
                 Err(LineageIndexError::IdentityConflict)
             };
         }
-        let final_value = intent_fingerprint(&transaction, intent, final_outcome, digest)?;
+        let (outcome_kind, outcome_conflict, outcome_workspace, valid_final) =
+            match &receipt.outcome {
+                WorkspaceIntentOutcome::Created(workspace) => (
+                    "created",
+                    None,
+                    Some(workspace.as_str()),
+                    existing.intent_kind == "create" && workspace.as_str() == existing.workspace,
+                ),
+                WorkspaceIntentOutcome::Resumed(workspace) => (
+                    "resumed",
+                    None,
+                    Some(workspace.as_str()),
+                    existing.intent_kind == "resume" && workspace.as_str() == existing.workspace,
+                ),
+                WorkspaceIntentOutcome::Conflict(value) => {
+                    ("conflict", Some(value.as_str()), None, true)
+                }
+                WorkspaceIntentOutcome::Accepted | WorkspaceIntentOutcome::Unknown => {
+                    ("", None, None, false)
+                }
+            };
+        if !valid_final {
+            return Err(LineageIndexError::IdentityConflict);
+        }
         let changed = transaction.execute(
             "UPDATE lineage_workspace_intents SET outcome_kind=?2,outcome_conflict=?3,outcome_workspace_id=?4,reconciliation='final' WHERE intent_id=?1 AND request_digest=?5 AND reconciliation='poll_receipt'",
-            params![final_value.intent_id, final_value.outcome_kind, final_value.outcome_conflict, final_value.outcome_workspace, digest.as_slice()],
+            params![receipt.intent_id.as_str(), outcome_kind, outcome_conflict, outcome_workspace, receipt.request_digest.as_slice()],
         )?;
         if changed != 1 {
             return Err(LineageIndexError::IdentityConflict);
@@ -545,11 +594,26 @@ impl LineageIndex {
         Ok(WriteAdmission::Updated { revision: 2 })
     }
 
-    /// Look up the immutable request and its accepted/unknown/final decision.
-    pub fn intent(&self, id: &WorkspaceIntentId) -> Indexed<Option<StoredWorkspaceIntent>> {
-        read_intent(&self.connection, id.as_str())?
-            .map(IntentFingerprint::into_stored)
-            .transpose()
+    /// Look up an intent only through an exact negotiated tenant/project/workspace scope.
+    pub fn intent_authorized(
+        &self,
+        negotiated: &NegotiatedPlatform,
+        scope: &IntentAuthorizationScope,
+        id: &WorkspaceIntentId,
+        authorize: impl FnOnce(&IntentAuthorizationScope) -> bool,
+    ) -> Indexed<Option<StoredWorkspaceIntent>> {
+        require_lineage_v2(negotiated)
+            .map_err(|_| LineageIndexError::InvalidField("negotiated_platform"))?;
+        if !authorize(scope) {
+            return Err(LineageIndexError::Unauthorized);
+        }
+        let Some(value) = read_intent(&self.connection, id.as_str())? else {
+            return Ok(None);
+        };
+        if value.workspace != scope.workspace.as_str() {
+            return Ok(None);
+        }
+        value.into_stored().map(Some)
     }
 
     /// Rebuild the bounded projection for one exact authorized workspace.
@@ -597,6 +661,31 @@ fn external_transition_allowed(previous: &ExternalWorkItem, next: &ExternalWorkI
         }
         ExternalWorkState::Closed => next.state() == ExternalWorkState::Closed,
     }
+}
+
+fn validate_moved_target(connection: &Connection, item: &ExternalWorkItem) -> Indexed<()> {
+    let Some(target_id) = item.moved_to() else {
+        return Ok(());
+    };
+    let target = read_external(connection, target_id)?
+        .ok_or(LineageIndexError::NotFound("moved external work target"))?;
+    if target.workspace() != item.workspace() || !target.origin().refines(item.origin()) {
+        return Err(LineageIndexError::IdentityConflict);
+    }
+    let mut cursor = Some(target);
+    let mut steps = 0usize;
+    while let Some(current) = cursor {
+        if current.identity() == item.identity() || steps >= MAX_LINEAGE_RECORDS {
+            return Err(LineageIndexError::IdentityConflict);
+        }
+        cursor = current
+            .moved_to()
+            .map(|identity| read_external(connection, identity))
+            .transpose()?
+            .flatten();
+        steps += 1;
+    }
+    Ok(())
 }
 
 fn observation_monotonic(
@@ -1559,7 +1648,7 @@ fn initialize(connection: &mut Connection) -> Indexed<()> {
         return migrate_v1(connection);
     }
     if version == LINEAGE_INDEX_SCHEMA_VERSION {
-        return Ok(());
+        return validate_current_schema(connection);
     }
     if version != 0 {
         return Err(LineageIndexError::SchemaVersion {
@@ -1582,6 +1671,118 @@ fn initialize(connection: &mut Connection) -> Indexed<()> {
     transaction.execute_batch(SCHEMA_V2)?;
     transaction.pragma_update(None, "user_version", LINEAGE_INDEX_SCHEMA_VERSION)?;
     transaction.commit()?;
+    Ok(())
+}
+
+fn validate_current_schema(connection: &Connection) -> Indexed<()> {
+    let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(LineageIndexError::Corrupt("integrity_check"));
+    }
+    let foreign_key_failures: u32 =
+        connection.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if foreign_key_failures != 0 {
+        return Err(LineageIndexError::Corrupt("foreign_keys"));
+    }
+    for (object, kind) in [
+        ("lineage_external_work", "table"),
+        ("lineage_orchestration", "table"),
+        ("lineage_workspace_intents", "table"),
+        ("lineage_external_by_workspace", "index"),
+        ("lineage_orchestration_by_workspace", "index"),
+    ] {
+        let present: u32 = connection.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE name=?1 AND type=?2",
+            params![object, kind],
+            |row| row.get(0),
+        )?;
+        if present != 1 {
+            return Err(LineageIndexError::Corrupt("schema_object"));
+        }
+    }
+    for (table, required) in [
+        (
+            "lineage_external_work",
+            &[
+                "provider",
+                "authority_id",
+                "scope",
+                "work_key",
+                "workspace_id",
+                "revision",
+                "external_state",
+                "moved_provider",
+                "moved_authority_id",
+                "moved_scope",
+                "moved_key",
+                "observed_at_ms",
+                "stale_after_ms",
+                "freshness_state",
+                "latest_message",
+                "latest_observed_at_ms",
+                "origin_attempt_id",
+                "origin_session_id",
+                "origin_pane_id",
+            ][..],
+        ),
+        (
+            "lineage_orchestration",
+            &[
+                "orchestration_kind",
+                "orchestration_id",
+                "workspace_id",
+                "external_provider",
+                "external_authority_id",
+                "external_scope",
+                "external_key",
+                "parent_kind",
+                "parent_id",
+                "status_kind",
+                "status_message",
+                "observed_at_ms",
+                "stale_after_ms",
+                "freshness_state",
+                "latest_message",
+                "latest_observed_at_ms",
+                "revision",
+                "origin_attempt_id",
+                "origin_session_id",
+                "origin_pane_id",
+            ][..],
+        ),
+        (
+            "lineage_workspace_intents",
+            &[
+                "intent_id",
+                "request_digest",
+                "intent_kind",
+                "task_kind",
+                "task_id",
+                "workspace_id",
+                "external_provider",
+                "external_authority_id",
+                "external_scope",
+                "external_key",
+                "base_selector",
+                "branch_selector",
+                "expected_revision",
+                "outcome_kind",
+                "outcome_conflict",
+                "outcome_workspace_id",
+                "reconciliation",
+            ][..],
+        ),
+    ] {
+        let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if columns != required {
+            return Err(LineageIndexError::Corrupt("schema_columns"));
+        }
+    }
     Ok(())
 }
 

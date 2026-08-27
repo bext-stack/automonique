@@ -338,11 +338,7 @@ impl ExternalWorkItem {
         latest_useful_message: Option<LatestUsefulMessage>,
     ) -> Result<Self, LineageError> {
         if (state == ExternalWorkState::Moved) != moved_to.is_some()
-            || moved_to.as_ref().is_some_and(|target| {
-                target == &identity
-                    || target.provider() != identity.provider()
-                    || target.authority() != identity.authority()
-            })
+            || moved_to.as_ref().is_some_and(|target| target == &identity)
             || latest_useful_message
                 .as_ref()
                 .is_some_and(|message| message.observed_at_ms() > freshness.observed_at_ms())
@@ -650,6 +646,20 @@ impl LineageProjection {
                 if !target.origin().refines(item.origin()) {
                     return Err(LineageError::OriginInvalid);
                 }
+            }
+        }
+        for item in &external_work_items {
+            let mut cursor = item.moved_to();
+            let mut steps = 0usize;
+            while let Some(identity) = cursor {
+                if identity == item.identity() || steps >= external_work_items.len() {
+                    return Err(LineageError::ExternalLinkInvalid);
+                }
+                cursor = external_work_items
+                    .iter()
+                    .find(|candidate| candidate.identity() == identity)
+                    .and_then(ExternalWorkItem::moved_to);
+                steps += 1;
             }
         }
         for record in &orchestration {

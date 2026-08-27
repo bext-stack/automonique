@@ -143,7 +143,10 @@ shows them together:
   closed set `github`, `gitlab`, `linear`, and `jira_compatible`. The authority
   component prevents two self-hosted GitLab or Jira-compatible instances from
   colliding even when their scope/key bytes match. A moved item carries its
-  complete replacement identity; a closed item has no replacement.
+  complete replacement identity, which may name another supported provider or
+  installation when both exact identities are authorized. Durable intake and
+  update require that replacement to exist first; dangling targets and moved
+  cycles are refused. A closed item has no replacement.
 - `UserWorkspaceId` is the durable human workspace to which work is bound. It
   is neither an issue key nor an execution identity, and observing the binding
   grants no provider, repository, filesystem, or execution authority.
@@ -172,7 +175,8 @@ bounded to 1,024 UTF-8 bytes. Status is a discriminated value: `working` has no
 invented explanation, `blocked` and `waiting` carry a bounded reason, and
 `done` carries a bounded outcome. A stale heartbeat cannot prove a worker is
 running. Messages are presentation evidence, never IDs, authority, or implicit
-state transitions.
+state transitions. A `done` outcome cannot change, while later monotonic
+freshness observations and useful evidence may advance its revision.
 
 Each external and orchestration record also carries a path-free origin
 coordinate: workspace plus optional attempt, session, and pane. Session
@@ -191,9 +195,12 @@ expected revision. Neither request accepts a generic string selector.
 
 Outcomes are `accepted` or `unknown` polling receipts, `created` or `resumed`
 final receipts, or a closed typed conflict. The immutable request digest is
-looked up by intent ID before mutable task/source validation, so retry after an
-ambiguous response returns the prior receipt instead of being reinterpreted
-against newer state. Stable conflicts
+looked up by intent ID before reconciliation. An exact authoritative execution
+receipt advances `accepted|unknown` from that admitted snapshot, so a creation
+that succeeded remains `created` even if the separately observed source later
+moves or closes. Lookup requires negotiated v2 and an authorized
+tenant/project/workspace scope; possession of an opaque intent ID grants no
+read authority. Stable conflicts
 cover duplicate intake, task already bound, workspace absent, revision
 mismatch, moved/closed external work, orphan dispatch, stale heartbeat,
 pending question, and cancelled creation. Duplicate intake returns the prior
@@ -236,7 +243,8 @@ manifest pins the separately generated `PLATFORM_V1_SCHEMA_DIGEST`; the
 checked-in Platform v1 module remains byte-identical.
 
 `automonique-store::lineage_index` is the authoritative normalized SQLite
-index for this slice. It keeps external work, internal orchestration, and
+index for this slice. It validates current-version tables, indexes, required
+columns, foreign keys, and SQLite integrity on open. It keeps external work, internal orchestration, and
 workspace intents in separate constrained tables; uses exact idempotent replay
 and revision fencing; enforces monotonic observations, immutable terminal
 status, and non-zero orchestration revisions; and rebuilds only a bounded
