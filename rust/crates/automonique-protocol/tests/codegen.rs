@@ -99,7 +99,7 @@ mod work_context_surface {
         );
         assert_eq!(
             String::from_utf8_lossy(&output.stdout),
-            "{\"cases\":9,\"codec_bytes\":578,\"providers\":4,\"question_links\":2,\"stale_heartbeats\":1}\n"
+            "{\"cases\":9,\"codec_bytes\":906,\"providers\":4,\"question_links\":2,\"stale_heartbeats\":1}\n"
         );
     }
 }
@@ -128,7 +128,7 @@ mod review_context_surface {
         );
         assert_eq!(
             String::from_utf8_lossy(&output.stdout),
-            "{\"action\":\"rerun_check\",\"attention\":\"needs_you\",\"bytes\":1856,\"receipt\":\"poll_receipt\",\"refusals\":13,\"schema\":\"automonique.platform/review/v1\"}\n"
+            "{\"action\":\"rerun_check\",\"attention\":\"needs_you\",\"bytes\":1902,\"receipt\":\"poll_receipt\",\"refusals\":16,\"schema\":\"automonique.platform/review/v2\"}\n"
         );
     }
 }

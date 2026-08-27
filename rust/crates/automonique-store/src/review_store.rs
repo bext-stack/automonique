@@ -20,7 +20,8 @@ use automonique_protocol::platform_v2::WorkContextIdentity;
 use automonique_protocol::platform_v2_review::{
     ReviewActionId, ReviewActionReceipt, ReviewActionRequest, ReviewActorId, ReviewAuthentication,
     ReviewAuthority, ReviewAuthorityId, ReviewAuthorityKind, ReviewComment, ReviewCommentId,
-    ReviewField, ReviewReceiptOutcome, ReviewReconciliation, ReviewSnapshot, ReviewText,
+    ReviewField, ReviewReceiptOutcome, ReviewReconciliation, ReviewSchemaVersion, ReviewSnapshot,
+    ReviewText,
 };
 use automonique_protocol::platform_v2_review_api::{
     decode_review_action_receipt, decode_review_action_request, decode_review_snapshot,
@@ -33,7 +34,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{StoreError, validate_database_path};
 
-pub const REVIEW_STORE_SCHEMA_VERSION: u32 = 1;
+pub const REVIEW_STORE_SCHEMA_VERSION: u32 = 2;
 const MAX_PROVIDER_OBSERVATION_BYTES: usize = 4096;
 
 const SCHEMA_V1: &str = r#"
@@ -187,6 +188,12 @@ CREATE TABLE review_provider_observations (
     observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= 0),
     PRIMARY KEY (workspace_kind, workspace_id, provider_session_id, observed_revision)
 ) STRICT;
+"#;
+
+const ADD_SNAPSHOT_PROTOCOL_SCHEMA_V2: &str = r#"
+ALTER TABLE review_snapshots ADD COLUMN protocol_schema TEXT NOT NULL
+    DEFAULT 'automonique.platform/review/v1'
+    CHECK (protocol_schema IN ('automonique.platform/review/v1', 'automonique.platform/review/v2'));
 "#;
 
 #[derive(Debug)]
@@ -484,11 +491,12 @@ impl ReviewStore {
             .optional()?;
         if let Some(current) = current {
             if current == revision {
-                let existing: (Vec<u8>, Vec<u8>) = transaction.query_row(
-                    "SELECT document,document_digest FROM review_snapshots WHERE workspace_kind=?1 AND workspace_id=?2 AND revision=?3",
-                    params![kind, workspace_id, revision], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                let existing: (Vec<u8>, Vec<u8>, String) = transaction.query_row(
+                    "SELECT document,document_digest,protocol_schema FROM review_snapshots WHERE workspace_kind=?1 AND workspace_id=?2 AND revision=?3",
+                    params![kind, workspace_id, revision], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
                 if digest(&existing.0).as_slice() != existing.1
                     || existing.1.as_slice() != document_digest
+                    || existing.2 != snapshot.schema().as_str()
                 {
                     return Err(ReviewStoreError::Conflict("snapshot_revision"));
                 }
@@ -506,11 +514,16 @@ impl ReviewStore {
             }
             let previous = read_current_snapshot(&transaction, kind, workspace_id)?
                 .ok_or(ReviewStoreError::Corrupt("current_snapshot"))?;
+            if previous.schema() == ReviewSchemaVersion::V2
+                && snapshot.schema() == ReviewSchemaVersion::V1
+            {
+                return Err(ReviewStoreError::Conflict("snapshot_schema_downgrade"));
+            }
             validate_comment_history(&previous, snapshot)?;
         }
         transaction.execute(
-            "INSERT INTO review_snapshots(workspace_kind,workspace_id,revision,document,document_digest,recorded_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
-            params![kind, workspace_id, revision, document, document_digest.as_slice(), recorded_at_ms])?;
+            "INSERT INTO review_snapshots(workspace_kind,workspace_id,revision,document,document_digest,recorded_at_ms,protocol_schema) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![kind, workspace_id, revision, document, document_digest.as_slice(), recorded_at_ms, snapshot.schema().as_str()])?;
         for comment in snapshot.comments() {
             transaction.execute(
                 "INSERT INTO review_comments(workspace_kind,workspace_id,snapshot_revision,comment_id,comment_revision,actor_id,body,file_id,hunk_id,side,line,agent_state,unread) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
@@ -1277,17 +1290,109 @@ fn initialize(connection: &mut Connection) -> Stored<bool> {
     if version == REVIEW_STORE_SCHEMA_VERSION {
         return Ok(false);
     }
-    if version != 0 {
+    if version > REVIEW_STORE_SCHEMA_VERSION {
         return Err(ReviewStoreError::SchemaVersion {
             found: version,
             supported: REVIEW_STORE_SCHEMA_VERSION,
         });
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(SCHEMA_V1)?;
+    let fresh = version == 0;
+    if fresh {
+        transaction.execute_batch(SCHEMA_V1)?;
+        transaction.execute_batch(ADD_SNAPSHOT_PROTOCOL_SCHEMA_V2)?;
+    } else if version == 1 {
+        transaction.execute_batch(ADD_SNAPSHOT_PROTOCOL_SCHEMA_V2)?;
+        migrate_review_v1_snapshots(&transaction)?;
+    } else {
+        return Err(ReviewStoreError::SchemaVersion {
+            found: version,
+            supported: REVIEW_STORE_SCHEMA_VERSION,
+        });
+    }
     transaction.pragma_update(None, "user_version", REVIEW_STORE_SCHEMA_VERSION)?;
     transaction.commit()?;
-    Ok(true)
+    Ok(fresh)
+}
+
+fn migrate_review_v1_snapshots(connection: &Connection) -> Stored<()> {
+    type LegacySnapshot = (String, String, i64, Vec<u8>, Vec<u8>);
+    let snapshots: Vec<LegacySnapshot> = {
+        let mut statement = connection.prepare(
+            "SELECT workspace_kind,workspace_id,revision,document,document_digest FROM review_snapshots ORDER BY workspace_kind,workspace_id,revision",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .collect::<Result<_, _>>()?
+    };
+    for (kind, id, revision, document, raw_digest) in snapshots {
+        let stored_digest: [u8; 32] = raw_digest
+            .try_into()
+            .map_err(|_| ReviewStoreError::Corrupt("snapshot_digest"))?;
+        if digest(&document) != stored_digest {
+            return Err(ReviewStoreError::Corrupt("snapshot_digest"));
+        }
+        let (snapshot, canonical, protocol_schema) = match decode_review_snapshot(&document) {
+            Ok(snapshot) if snapshot.schema() == ReviewSchemaVersion::V1 => {
+                let canonical = encode_review_snapshot(&snapshot)
+                    .map_err(|_| ReviewStoreError::Corrupt("legacy_snapshot"))?;
+                (snapshot, canonical, ReviewSchemaVersion::V1)
+            }
+            _ => migrate_mislabeled_authority_snapshot(&document)?,
+        };
+        let (decoded_kind, decoded_id) = workspace_parts(snapshot.workspace());
+        if decoded_kind != kind
+            || decoded_id != id
+            || db_revision(snapshot.revision())? != revision
+            || (protocol_schema == ReviewSchemaVersion::V1 && canonical != document)
+        {
+            return Err(ReviewStoreError::Corrupt("legacy_snapshot_projection"));
+        }
+        validate_snapshot_comments(connection, &kind, &id, revision, &snapshot)?;
+        let canonical_digest = digest(&canonical);
+        connection.execute(
+            "UPDATE review_snapshots SET document=?1,document_digest=?2,protocol_schema=?3 WHERE workspace_kind=?4 AND workspace_id=?5 AND revision=?6",
+            params![canonical, canonical_digest.as_slice(), protocol_schema.as_str(), kind, id, revision],
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_mislabeled_authority_snapshot(
+    document: &[u8],
+) -> Stored<(ReviewSnapshot, Vec<u8>, ReviewSchemaVersion)> {
+    // The first implementation of authority-bearing proposals was briefly
+    // persisted with the historical v1 schema tag. This rewrite is deliberately
+    // private to the v1 -> v2 store transaction: ordinary v1 decoding stays
+    // exact and never accepts or invents proposal authority.
+    automonique_protocol::wire::parse_canonical(document)
+        .map_err(|_| ReviewStoreError::Corrupt("legacy_snapshot"))?;
+    let text =
+        std::str::from_utf8(document).map_err(|_| ReviewStoreError::Corrupt("legacy_snapshot"))?;
+    const V1_FIELD: &str = "\"schema\":\"automonique.platform/review/v1\"";
+    const V2_FIELD: &str = "\"schema\":\"automonique.platform/review/v2\"";
+    if text.matches(V1_FIELD).count() != 1 {
+        return Err(ReviewStoreError::Corrupt("legacy_snapshot"));
+    }
+    let canonical = text.replacen(V1_FIELD, V2_FIELD, 1).into_bytes();
+    let snapshot = decode_review_snapshot(&canonical)
+        .map_err(|_| ReviewStoreError::Corrupt("legacy_snapshot"))?;
+    if snapshot.schema() != ReviewSchemaVersion::V2
+        || encode_review_snapshot(&snapshot)
+            .map_err(|_| ReviewStoreError::Corrupt("legacy_snapshot"))?
+            != canonical
+    {
+        return Err(ReviewStoreError::Corrupt("legacy_snapshot"));
+    }
+    Ok((snapshot, canonical, ReviewSchemaVersion::V2))
 }
 fn bind_authority_namespace(
     connection: &Connection,
@@ -1801,16 +1906,17 @@ fn read_snapshot_revision(
     id: &str,
     revision: Revision,
 ) -> Stored<Option<ReviewSnapshot>> {
-    type RawSnapshot = (Vec<u8>, Vec<u8>, String, String, i64);
+    type RawSnapshot = (Vec<u8>, Vec<u8>, String, String, i64, String);
     let stored_revision = db_revision(revision)?;
     let raw: Option<RawSnapshot> = connection
         .query_row(
-            "SELECT document,document_digest,workspace_kind,workspace_id,revision FROM review_snapshots WHERE workspace_kind=?1 AND workspace_id=?2 AND revision=?3",
+            "SELECT document,document_digest,workspace_kind,workspace_id,revision,protocol_schema FROM review_snapshots WHERE workspace_kind=?1 AND workspace_id=?2 AND revision=?3",
             params![kind, id, stored_revision],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
         )
         .optional()?;
-    let Some((document, raw_digest, stored_kind, stored_id, raw_revision)) = raw else {
+    let Some((document, raw_digest, stored_kind, stored_id, raw_revision, protocol_schema)) = raw
+    else {
         return Ok(None);
     };
     let document_digest: [u8; 32] = raw_digest
@@ -1827,10 +1933,73 @@ fn read_snapshot_revision(
         || decoded_kind != stored_kind
         || decoded_id != stored_id
         || snapshot.revision() != revision
+        || snapshot.schema().as_str() != protocol_schema
     {
         return Err(ReviewStoreError::Corrupt("snapshot_projection"));
     }
+    validate_snapshot_comments(connection, kind, id, stored_revision, &snapshot)?;
     Ok(Some(snapshot))
+}
+
+fn validate_snapshot_comments(
+    connection: &Connection,
+    kind: &str,
+    id: &str,
+    revision: i64,
+    snapshot: &ReviewSnapshot,
+) -> Stored<()> {
+    type RawComment = (
+        String,
+        i64,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        i64,
+    );
+    let rows: Vec<RawComment> = {
+        let mut statement = connection.prepare(
+            "SELECT comment_id,comment_revision,actor_id,body,file_id,hunk_id,side,line,agent_state,unread FROM review_comments WHERE workspace_kind=?1 AND workspace_id=?2 AND snapshot_revision=?3 ORDER BY comment_id",
+        )?;
+        statement
+            .query_map(params![kind, id, revision], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            })?
+            .collect::<Result<_, _>>()?
+    };
+    if rows.len() != snapshot.comments().len() {
+        return Err(ReviewStoreError::Corrupt("snapshot_comments"));
+    }
+    for (raw, comment) in rows.iter().zip(snapshot.comments()) {
+        if raw.0 != comment.id().as_str()
+            || raw.1 != db_revision(comment.revision())?
+            || raw.2 != comment.actor().as_str()
+            || raw.3 != comment.body().as_str()
+            || raw.4 != comment.anchor().file_id().as_str()
+            || raw.5 != comment.anchor().hunk_id().as_str()
+            || raw.6 != comment.anchor().side().as_str()
+            || raw.7 != i64::from(comment.anchor().line())
+            || raw.8 != comment.agent_state().as_str()
+            || raw.9 != i64::from(comment.unread())
+        {
+            return Err(ReviewStoreError::Corrupt("snapshot_comments"));
+        }
+    }
+    Ok(())
 }
 
 fn validate_completed_basis(connection: &Connection, action: &StoredReviewAction) -> Stored<()> {

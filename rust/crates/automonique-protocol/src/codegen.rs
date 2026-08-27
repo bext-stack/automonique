@@ -320,10 +320,10 @@ use crate::platform_v2_lineage::{
 };
 use crate::platform_v2_review::{
     AttentionOriginKind, AttentionReason, AttentionState, CheckState, CommentAgentState,
-    ConflictState, DeliveryState, DiffChangeKind, DiffSide, MergeReadiness, PreviewKind,
-    PullRequestState, ReviewActionKind, ReviewAuthentication, ReviewAuthorityKind, ReviewDecision,
-    ReviewFreshnessState, ReviewProposalKind, ReviewReceiptOutcome, ReviewReconciliation,
-    WorktreeFileState,
+    ConflictResolution, ConflictState, DeliveryState, DiffChangeKind, DiffSide, MergeReadiness,
+    PreviewKind, PullRequestState, ReviewActionKind, ReviewAuthentication, ReviewAuthorityKind,
+    ReviewDecision, ReviewFreshnessState, ReviewProposalKind, ReviewReceiptOutcome,
+    ReviewReconciliation, WorktreeFileState,
 };
 use crate::primitives::ValueError;
 use crate::progress_api::{StreamMessageKind, StreamRefusal};
@@ -8638,6 +8638,7 @@ fn work_context_module() -> GeneratedModule {
                 variants: vec![
                     UnionVariant { tag: "create".to_owned(), payload: Some(("request".to_owned(), "WorkspaceCreateIntent".to_owned())) },
                     UnionVariant { tag: "resume".to_owned(), payload: Some(("request".to_owned(), "WorkspaceResumeIntent".to_owned())) },
+                    UnionVariant { tag: "cancel".to_owned(), payload: Some(("request".to_owned(), "WorkspaceCancelIntent".to_owned())) },
                 ],
             },
             Union {
@@ -8648,6 +8649,7 @@ fn work_context_module() -> GeneratedModule {
                     UnionVariant { tag: "conflict".to_owned(), payload: Some(("conflict".to_owned(), "WorkspaceIntentConflict".to_owned())) },
                     UnionVariant { tag: "created".to_owned(), payload: Some(("workspace".to_owned(), "UserWorkspaceId".to_owned())) },
                     UnionVariant { tag: "resumed".to_owned(), payload: Some(("workspace".to_owned(), "UserWorkspaceId".to_owned())) },
+                    UnionVariant { tag: "cancelled".to_owned(), payload: Some(("target_intent_id".to_owned(), "WorkspaceIntentId".to_owned())) },
                     UnionVariant { tag: "unknown".to_owned(), payload: None },
                 ],
             },
@@ -8856,6 +8858,16 @@ fn work_context_module() -> GeneratedModule {
                 ],
             },
             Interface {
+                name: "WorkspaceCancelIntent".to_owned(),
+                doc: "Cancellation intent fenced by exact target intent, workspace, and durable revision.".to_owned(),
+                fields: vec![
+                    required("expected_revision", "WorkContextRevision"),
+                    required("intent_id", "WorkspaceIntentId"),
+                    required("target_intent_id", "WorkspaceIntentId"),
+                    required("workspace", "UserWorkspaceId"),
+                ],
+            },
+            Interface {
                 name: "WorkspaceCreateIntent".to_owned(),
                 doc: "Create intent using opaque registry selectors rather than host paths or branch names.".to_owned(),
                 fields: vec![
@@ -8914,9 +8926,16 @@ fn review_context_module() -> GeneratedModule {
         constants: vec![
             Constant {
                 name: "PLATFORM_REVIEW_SCHEMA_V1".to_owned(),
-                doc: "Stable Platform v2 review sub-contract schema.".to_owned(),
+                doc: "Historical non-actionable Platform v2 review snapshot schema.".to_owned(),
                 value: ConstantValue::Text(
                     crate::platform_v2_review::PLATFORM_REVIEW_SCHEMA_V1.to_owned(),
+                ),
+            },
+            Constant {
+                name: "PLATFORM_REVIEW_SCHEMA_V2".to_owned(),
+                doc: "Authority-bound Platform v2 review snapshot schema.".to_owned(),
+                value: ConstantValue::Text(
+                    crate::platform_v2_review::PLATFORM_REVIEW_SCHEMA_V2.to_owned(),
                 ),
             },
             Constant {
@@ -9028,6 +9047,10 @@ fn review_context_module() -> GeneratedModule {
             security_enum(
                 "CommentAgentState",
                 platform_values(&CommentAgentState::ALL, CommentAgentState::as_str),
+            ),
+            security_enum(
+                "ConflictResolution",
+                platform_values(&ConflictResolution::ALL, ConflictResolution::as_str),
             ),
             security_enum(
                 "ConflictState",
@@ -11542,8 +11565,22 @@ export function validateWorkspaceResumeIntent(value: WorkspaceResumeIntent): Wor
   };
 }
 
+export function validateWorkspaceCancelIntent(value: WorkspaceCancelIntent): WorkspaceCancelIntent {
+  exactInput(value, WorkspaceCancelIntent_FIELDS);
+  const intent_id = WorkspaceIntentId(value.intent_id);
+  const target_intent_id = WorkspaceIntentId(value.target_intent_id);
+  if (intent_id === target_intent_id) workContextRefusal("cancellation intent cannot target itself");
+  return {
+    expected_revision: WorkContextRevision(workContextWireUnsigned(value.expected_revision, WorkContextRevision_MAX, "expected_revision")),
+    intent_id,
+    target_intent_id,
+    workspace: UserWorkspaceId(value.workspace),
+  };
+}
+
 export function validateWorkspaceIntent(value: WorkspaceIntent): WorkspaceIntent {
   switch (value.kind) {
+    case "cancel": exactInput(value, ["kind", "request"]); return {kind: value.kind, request: validateWorkspaceCancelIntent(value.request)};
     case "create": exactInput(value, ["kind", "request"]); return {kind: value.kind, request: validateWorkspaceCreateIntent(value.request)};
     case "resume": exactInput(value, ["kind", "request"]); return {kind: value.kind, request: validateWorkspaceResumeIntent(value.request)};
     default: return assertNeverWorkspaceIntent(value);
@@ -11553,6 +11590,7 @@ export function validateWorkspaceIntent(value: WorkspaceIntent): WorkspaceIntent
 export function validateWorkspaceIntentOutcome(value: WorkspaceIntentOutcome): WorkspaceIntentOutcome {
   switch (value.kind) {
     case "accepted": exactInput(value, ["kind"]); return {kind: value.kind};
+    case "cancelled": exactInput(value, ["kind", "target_intent_id"]); return {kind: value.kind, target_intent_id: WorkspaceIntentId(value.target_intent_id)};
     case "conflict": exactInput(value, ["conflict", "kind"]); return {kind: value.kind, conflict: decodeWorkspaceIntentConflict(value.conflict)};
     case "created": exactInput(value, ["kind", "workspace"]); return {kind: value.kind, workspace: UserWorkspaceId(value.workspace)};
     case "resumed": exactInput(value, ["kind", "workspace"]); return {kind: value.kind, workspace: UserWorkspaceId(value.workspace)};

@@ -19,6 +19,7 @@ use tempfile::TempDir;
 
 const TENANT: &str = "tenant-test";
 const LEGACY_LINEAGE_INDEX_SCHEMA_V2: &str = include_str!("../src/lineage_index_v2.sql");
+const LEGACY_LINEAGE_INDEX_SCHEMA_V3: &str = include_str!("../src/lineage_index_v3.sql");
 
 struct PrivateIndex {
     _directory: TempDir,
@@ -85,6 +86,51 @@ DROP TABLE lineage_workspace_intents_v3;
 DROP TABLE lineage_orchestration_v3;
 DROP TABLE lineage_external_work_v3;
 PRAGMA user_version=2;
+"#,
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    db.pragma_update(None, "foreign_keys", true).unwrap();
+}
+
+fn downgrade_current_fixture_to_v3(path: &Path) {
+    let mut db = Connection::open(path).unwrap();
+    db.pragma_update(None, "foreign_keys", false).unwrap();
+    let transaction = db.transaction().unwrap();
+    transaction
+        .execute_batch(
+            r#"
+ALTER TABLE lineage_workspace_intents RENAME TO lineage_workspace_intents_v4;
+ALTER TABLE lineage_orchestration RENAME TO lineage_orchestration_v4;
+ALTER TABLE lineage_external_work RENAME TO lineage_external_work_v4;
+DROP INDEX lineage_cancel_by_target;
+DROP INDEX lineage_external_by_workspace;
+DROP INDEX lineage_orchestration_by_workspace;
+"#,
+        )
+        .unwrap();
+    transaction
+        .execute_batch(LEGACY_LINEAGE_INDEX_SCHEMA_V3)
+        .unwrap();
+    transaction
+        .execute_batch(
+            r#"
+INSERT INTO lineage_external_work
+SELECT * FROM lineage_external_work_v4;
+
+INSERT INTO lineage_orchestration
+SELECT * FROM lineage_orchestration_v4;
+
+INSERT INTO lineage_workspace_intents
+SELECT tenant,intent_id,request_digest,intent_kind,task_kind,task_id,workspace_id,
+ external_provider,external_authority_id,external_scope,external_key,base_selector,
+ branch_selector,expected_revision,outcome_kind,outcome_conflict,outcome_workspace_id,reconciliation
+FROM lineage_workspace_intents_v4;
+
+DROP TABLE lineage_workspace_intents_v4;
+DROP TABLE lineage_orchestration_v4;
+DROP TABLE lineage_external_work_v4;
+PRAGMA user_version=3;
 "#,
         )
         .unwrap();
@@ -604,6 +650,49 @@ fn identical_lineage_identities_are_isolated_by_tenant() {
     index
         .record_intent(tenant_b, &create, &WorkspaceIntentOutcome::Unknown)
         .unwrap();
+    let cancel_a = WorkspaceIntent::Cancel(
+        WorkspaceCancelIntent::new(
+            WorkspaceIntentId::new("cancel-shared").unwrap(),
+            create.intent_id().clone(),
+            workspace_a.clone(),
+            Revision::FIRST,
+        )
+        .unwrap(),
+    );
+    let cancel_b = WorkspaceIntent::Cancel(
+        WorkspaceCancelIntent::new(
+            WorkspaceIntentId::new("cancel-shared").unwrap(),
+            create.intent_id().clone(),
+            workspace_b.clone(),
+            Revision::FIRST,
+        )
+        .unwrap(),
+    );
+    index
+        .record_intent(tenant_a, &cancel_a, &WorkspaceIntentOutcome::Accepted)
+        .unwrap();
+    index
+        .record_intent(tenant_b, &cancel_b, &WorkspaceIntentOutcome::Accepted)
+        .unwrap();
+    let cancel_a_stored = index
+        .intent_authorized(
+            &lineage_v2(),
+            &tenant_scope(tenant_a, &workspace_a),
+            cancel_a.intent_id(),
+            |_| true,
+        )
+        .unwrap()
+        .unwrap();
+    index
+        .reconcile_intent(
+            tenant_a,
+            &WorkspaceIntentExecutionReceipt {
+                intent_id: cancel_a.intent_id().clone(),
+                request_digest: cancel_a_stored.request_digest,
+                outcome: WorkspaceIntentOutcome::Cancelled(create.intent_id().clone()),
+            },
+        )
+        .unwrap();
     drop(index);
 
     let index = LineageIndex::open(private.path()).unwrap();
@@ -615,7 +704,7 @@ fn identical_lineage_identities_are_isolated_by_tenant() {
             .unwrap()
             .unwrap()
             .outcome,
-        WorkspaceIntentOutcome::Accepted
+        WorkspaceIntentOutcome::Conflict(WorkspaceIntentConflict::CreationCancelled)
     );
     assert_eq!(
         index
@@ -624,6 +713,14 @@ fn identical_lineage_identities_are_isolated_by_tenant() {
             .unwrap()
             .outcome,
         WorkspaceIntentOutcome::Unknown
+    );
+    assert_eq!(
+        index
+            .intent_authorized(&lineage_v2(), &scope_b, cancel_b.intent_id(), |_| true,)
+            .unwrap()
+            .unwrap()
+            .outcome,
+        WorkspaceIntentOutcome::Accepted
     );
     assert!(
         index
@@ -1396,6 +1493,98 @@ fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
             .unwrap(),
         WriteAdmission::Replayed { revision: 2 }
     );
+
+    let resume = WorkspaceIntent::Resume(WorkspaceResumeIntent::new(
+        WorkspaceIntentId::new("intent-resume-cancel").unwrap(),
+        OrchestrationTaskId::new("task-exact").unwrap(),
+        ws.clone(),
+        Revision::FIRST,
+    ));
+    index
+        .record_intent(TENANT, &resume, &WorkspaceIntentOutcome::Accepted)
+        .unwrap();
+    let cancel = WorkspaceIntent::Cancel(
+        WorkspaceCancelIntent::new(
+            WorkspaceIntentId::new("intent-cancel-exact").unwrap(),
+            resume.intent_id().clone(),
+            ws.clone(),
+            Revision::FIRST,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        index
+            .record_intent(TENANT, &cancel, &WorkspaceIntentOutcome::Accepted)
+            .unwrap(),
+        WriteAdmission::Inserted { revision: 1 }
+    );
+    let stored_cancel = index
+        .intent_authorized(&lineage_v2(), &scope, cancel.intent_id(), |_| true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_cancel.revision, Revision::FIRST);
+    let cancelled = WorkspaceIntentOutcome::Cancelled(resume.intent_id().clone());
+    assert_eq!(
+        index
+            .reconcile_intent(
+                TENANT,
+                &WorkspaceIntentExecutionReceipt {
+                    intent_id: cancel.intent_id().clone(),
+                    request_digest: stored_cancel.request_digest,
+                    outcome: cancelled.clone(),
+                }
+            )
+            .unwrap(),
+        WriteAdmission::Updated { revision: 2 }
+    );
+    let cancelled_target = index
+        .intent_authorized(&lineage_v2(), &scope, resume.intent_id(), |_| true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(cancelled_target.revision, Revision::new(2).unwrap());
+    assert_eq!(
+        cancelled_target.outcome,
+        WorkspaceIntentOutcome::Conflict(WorkspaceIntentConflict::CreationCancelled)
+    );
+    assert_eq!(
+        index
+            .reconcile_intent(
+                TENANT,
+                &WorkspaceIntentExecutionReceipt {
+                    intent_id: cancel.intent_id().clone(),
+                    request_digest: stored_cancel.request_digest,
+                    outcome: cancelled,
+                }
+            )
+            .unwrap(),
+        WriteAdmission::Replayed { revision: 2 }
+    );
+    assert_eq!(
+        index
+            .record_intent(TENANT, &cancel, &WorkspaceIntentOutcome::Accepted)
+            .unwrap(),
+        WriteAdmission::Replayed { revision: 2 }
+    );
+    let stale_cancel = WorkspaceIntent::Cancel(
+        WorkspaceCancelIntent::new(
+            WorkspaceIntentId::new("intent-cancel-stale").unwrap(),
+            resume.intent_id().clone(),
+            ws.clone(),
+            Revision::FIRST,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        index
+            .record_intent(
+                TENANT,
+                &stale_cancel,
+                &WorkspaceIntentOutcome::Cancelled(resume.intent_id().clone()),
+            )
+            .unwrap_err()
+            .category(),
+        "identity_conflict"
+    );
     let changed = WorkspaceIntent::Create(WorkspaceCreateIntent::new(
         WorkspaceIntentId::new("intent-exact").unwrap(),
         OrchestrationTaskId::new("task-does-not-exist").unwrap(),
@@ -1604,7 +1793,7 @@ fn populated_v2_migrates_exactly_and_pending_receipts_reconcile_after_restart() 
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .unwrap(),
-        3
+        LINEAGE_INDEX_SCHEMA_VERSION
     );
     for table in [
         "lineage_external_work",
@@ -1674,6 +1863,124 @@ fn broken_v2_graph_rolls_back_the_whole_migration() {
         drop(db);
         assert_eq!(raw_v2_payload(private.path()), expected_payload);
     }
+}
+
+#[test]
+fn populated_v3_migrates_exactly_and_cancellation_reconciles_after_restart() {
+    let private = PrivateIndex::new();
+    populate_current_fixture_for_v2_migration(private.path());
+    let expected_digests = raw_intent_digests(private.path());
+    downgrade_current_fixture_to_v3(private.path());
+
+    let db = Connection::open(private.path()).unwrap();
+    assert_eq!(
+        db.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM lineage_workspace_intents WHERE outcome_kind IN ('accepted','unknown') AND reconciliation='poll_receipt'",
+            [],
+            |row| row.get::<_, u32>(0),
+        )
+        .unwrap(),
+        2
+    );
+    drop(db);
+
+    let workspace = workspace("workspace-v2");
+    let scope = intent_scope(&workspace);
+    let mut migrated = LineageIndex::open(private.path()).unwrap();
+    assert_eq!(raw_intent_digests(private.path()), expected_digests);
+    let target_id = WorkspaceIntentId::new("intent-v2-accepted").unwrap();
+    let target = migrated
+        .intent_authorized(&lineage_v2(), &scope, &target_id, |_| true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(target.revision, Revision::FIRST);
+    assert_eq!(target.outcome, WorkspaceIntentOutcome::Accepted);
+    let cancel = WorkspaceIntent::Cancel(
+        WorkspaceCancelIntent::new(
+            WorkspaceIntentId::new("cancel-migrated-v3").unwrap(),
+            target_id.clone(),
+            workspace.clone(),
+            Revision::FIRST,
+        )
+        .unwrap(),
+    );
+    migrated
+        .record_intent(TENANT, &cancel, &WorkspaceIntentOutcome::Accepted)
+        .unwrap();
+    let stored_cancel = migrated
+        .intent_authorized(&lineage_v2(), &scope, cancel.intent_id(), |_| true)
+        .unwrap()
+        .unwrap();
+    drop(migrated);
+
+    let mut reopened = LineageIndex::open(private.path()).unwrap();
+    assert_eq!(
+        reopened
+            .reconcile_intent(
+                TENANT,
+                &WorkspaceIntentExecutionReceipt {
+                    intent_id: cancel.intent_id().clone(),
+                    request_digest: stored_cancel.request_digest,
+                    outcome: WorkspaceIntentOutcome::Cancelled(target_id.clone()),
+                },
+            )
+            .unwrap(),
+        WriteAdmission::Updated { revision: 2 }
+    );
+    drop(reopened);
+
+    let reopened = LineageIndex::open(private.path()).unwrap();
+    let cancelled = reopened
+        .intent_authorized(&lineage_v2(), &scope, &target_id, |_| true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(cancelled.revision, Revision::new(2).unwrap());
+    assert_eq!(
+        cancelled.outcome,
+        WorkspaceIntentOutcome::Conflict(WorkspaceIntentConflict::CreationCancelled)
+    );
+}
+
+#[test]
+fn broken_v3_graph_rolls_back_the_whole_migration() {
+    let private = PrivateIndex::new();
+    populate_current_fixture_for_v2_migration(private.path());
+    downgrade_current_fixture_to_v3(private.path());
+    let db = Connection::open(private.path()).unwrap();
+    db.execute(
+        "UPDATE lineage_external_work SET revision=2,external_state='moved',moved_provider='gitlab',moved_authority_id='installation-scope-v2-a',moved_scope='scope-v2-a',moved_key='issue-v2' WHERE scope='scope-v2-b'",
+        [],
+    )
+    .unwrap();
+    let expected_payload = raw_v2_payload(private.path());
+    drop(db);
+
+    assert_eq!(
+        LineageIndex::open(private.path()).unwrap_err().category(),
+        "corrupt"
+    );
+    let db = Connection::open(private.path()).unwrap();
+    assert_eq!(
+        db.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE name LIKE '%_v3'",
+            [],
+            |row| row.get::<_, u32>(0),
+        )
+        .unwrap(),
+        0
+    );
+    drop(db);
+    assert_eq!(raw_v2_payload(private.path()), expected_payload);
 }
 
 #[test]

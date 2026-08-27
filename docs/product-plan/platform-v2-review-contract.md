@@ -4,11 +4,15 @@
 
 ## Compatibility and scope
 
-`automonique.platform/review/v1` is an additive sub-contract available only
-after Platform major version 2 is negotiated. It does not add a Platform v1
-resource kind, field, request, or response, and it never serializes review
-meaning into a v1 summary string. A v1-only peer continues to receive exactly
-the installed Platform v1 contract and no structured review projection.
+`automonique.platform/review/v2` is the current additive sub-contract available
+only after Platform major version 2 is negotiated. Historical
+`automonique.platform/review/v1` snapshots remain exactly decodable, but their
+proposals did not identify a Git authority and are therefore explicitly
+non-actionable. No authority is inferred while decoding them. This does not
+add a Platform v1 resource kind, field, request, or response, and it never
+serializes review meaning into a v1 summary string. A v1-only peer continues to
+receive exactly the installed Platform v1 contract and no structured review
+projection.
 
 This slice defines shared values, exact canonical codecs, generated TypeScript,
 deterministic fixtures, and an authoritative SQLite custody layer. The store
@@ -43,12 +47,12 @@ the same meaning:
 | file and hunk | Repository-relative display path, added/modified/deleted/renamed state, staged/unstaged/partially-staged/untracked state, conflict state, and bounded sanitized hunk preview |
 | preview | Explicit none/text/binary/image/HTML kind, bounded media type and size, optional image dimensions, and a required sanitization claim for rendered text/image/HTML previews |
 | comment | Persisted comment identity and revision, authenticated actor, exact file/hunk/side/line anchor, unread state, and explicit not-sent/pending/sent/refused agent-delivery state |
-| proposal | Typed stage, unstage, or commit proposal over an exact bounded ordered file set; only commit carries a bounded subject |
+| proposal | In review/v2, an exact Git-authority-bound stage, unstage, commit, or conflict-resolution proposal over an exact bounded ordered file set; only commit carries a bounded subject |
 | check | Typed lifecycle plus owning CI authority and freshness |
 | review | Pending/approved/changes-requested/dismissed plus owning review authority and freshness |
 | pull request | Absent/draft/open/closed/merged, exact head revision when present, merge readiness, owning PR authority, and freshness |
 | delivery | Not-delivered/pending/delivered/failed plus owning delivery authority and freshness |
-| attention | Deterministically derived `NeedsYou`, `Working`, `Done`, or `Blocked`, a compatible closed reason, aggregate unread count, and newest source revision |
+| attention | Deterministically derived `Idle`, `NeedsYou`, `Working`, `Done`, or `Blocked`, a compatible closed reason, aggregate unread count, and newest source revision; an empty event list is truthfully `Idle` |
 
 Binary bytes, raw HTML, credentials, provider payloads, repository roots, and
 host paths have no representation. Paths are repository-relative presentation
@@ -81,7 +85,9 @@ constructors and both codecs revalidate the same invariants.
 
 ## Scoped proposals and actions
 
-Stage, unstage, and commit values are proposals, not generic git execution.
+Stage, unstage, commit, and conflict-resolution values are review/v2 proposals,
+not generic git execution. Each proposal carries its exact Git authority;
+review/v1 proposals cannot authorize any of these actions.
 This contract exposes no `execute`, command, shell, argument vector, host path,
 or arbitrary provider operation.
 
@@ -89,7 +95,8 @@ Mutation requests are a closed union:
 
 | Action | Required independent authority |
 | --- | --- |
-| add an anchored comment, send a persisted comment to the agent, approve a review | review authority |
+| add an anchored comment, send one or a batch of persisted comments to the agent, approve a review | review authority |
+| stage, unstage, commit, or resolve one conflict from an exact review/v2 proposal | proposal's Git authority |
 | rerun one named check at its exact revision | CI authority |
 | open, update, or merge one pull request at exact projection/head revisions | pull-request authority |
 
@@ -160,9 +167,12 @@ daemon route or real git, CI, provider, or pull-request adapter.
 
 ## Shared conformance
 
-`fixtures/platform-v2-review-v1.json` is produced by the Rust source of truth.
-The generated TypeScript decoder must preserve its fully decoded values and
-re-encode its exact canonical bytes. The cross-language corpus also verifies
+`fixtures/platform-v2-review-v1.json` preserves the historical non-actionable
+wire document and `fixtures/platform-v2-review-v2.json` is produced by the Rust
+source of truth for authority-bearing snapshots. The generated TypeScript
+decoder distinguishes the versions, preserves both fully decoded values, and
+re-encodes their exact canonical bytes. The cross-language corpus also verifies
+that review/v1 proposals cannot authorize a Git action, and verifies
 the exact-revision/idempotency action, no-replay unknown receipt, provider-only
 authorization refusal, authority mismatch, and a coherent-but-inapplicable v1
 document. The shared corpus also checks the Rust `u32` boundary used for hunk,
