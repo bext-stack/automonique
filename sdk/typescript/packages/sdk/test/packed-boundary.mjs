@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import assert from "node:assert/strict";
-import {access} from "node:fs/promises";
+import {access, readFile} from "node:fs/promises";
 import {join} from "node:path";
 import {pathToFileURL} from "node:url";
 
@@ -13,6 +13,7 @@ const main = await import(pathToFileURL(join(sdkRoot, "index.js")).href);
 const testing = await import(pathToFileURL(join(sdkRoot, "testing.js")).href);
 const testingInternal = await import(pathToFileURL(join(sdkRoot, "testing", "internal.js")).href);
 const v2 = await import(pathToFileURL(join(sdkRoot, "platform-v2-client.js")).href);
+const v2Source = await readFile(join(sdkRoot, "platform-v2-client.js"), "utf8");
 
 assert.equal(typeof main.PlatformV2Client, "function");
 assert.equal(typeof main.HttpsPlatformV2Transport, "function");
@@ -27,6 +28,8 @@ assert.deepEqual(Object.keys(v2).sort(), [
 ]);
 assert.equal("PlatformV2CanonicalTestingTransport" in main, false);
 assert.equal("PlatformV2CanonicalTestingTransport" in v2, false);
+assert.equal(v2Source.includes("testing/internal"), false);
+assert.equal(v2Source.includes("PlatformV2CanonicalTestingTransport"), false);
 assert.equal(typeof testingInternal.PlatformV2CanonicalTestingTransport, "function");
 const testingAdapter = new testing.DeterministicPlatformV2Adapter([]);
 assert.equal("request" in testingAdapter, false);

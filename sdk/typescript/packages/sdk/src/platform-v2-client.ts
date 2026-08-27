@@ -37,17 +37,12 @@ import {
 } from "../../protocol/src/index.js";
 import {PlatformTransportError} from "./platform-client.js";
 import {
-  platformV2CanonicalTestingHandlers,
-  type PlatformV2CanonicalTestingHandlers,
-  type PlatformV2CanonicalTestingTransport,
-} from "./testing/internal.js";
-
-type PlatformV2Lane = "negotiation" | "v2";
-type PlatformV2Exchange = (
-  lane: PlatformV2Lane,
-  payload: Uint8Array,
-  signal?: AbortSignal,
-) => Promise<{readonly payload: Uint8Array; readonly status: number}>;
+  platformV2TransportCapability,
+  registerPlatformV2Transport,
+  type PlatformV2CanonicalHandlers,
+  type PlatformV2Exchange,
+  type PlatformV2Lane,
+} from "./platform-v2-transport-capability.js";
 
 export const PLATFORM_NEGOTIATION_MEDIA_TYPE = "application/vnd.automonique.platform.negotiation.v1+json";
 export const PLATFORM_V2_MEDIA_TYPE = "application/vnd.automonique.platform.v2+json";
@@ -253,8 +248,6 @@ async function exchangeHttps(
   return {payload: await readBoundedResponse(response, maximumResponseBytes), status: response.status};
 }
 
-const httpsExchanges = new WeakMap<object, PlatformV2Exchange>();
-
 /** Authenticated HTTPS transport with an exact endpoint and no redirect forwarding. */
 export class HttpsPlatformV2Transport {
   readonly #endpoint: string;
@@ -270,14 +263,17 @@ export class HttpsPlatformV2Transport {
     this.#endpoint = pinnedEndpoint;
     this.#credentialProvider = credentialProvider;
     this.#fetcher = fetcher;
-    httpsExchanges.set(this, (lane, payload, signal) => exchangeHttps(
-      this.#endpoint,
-      this.#credentialProvider,
-      this.#fetcher,
-      lane,
-      payload,
-      signal,
-    ));
+    registerPlatformV2Transport(this, {
+      kind: "exchange",
+      exchange: (lane, payload, signal) => exchangeHttps(
+        this.#endpoint,
+        this.#credentialProvider,
+        this.#fetcher,
+        lane,
+        payload,
+        signal,
+      ),
+    });
   }
 }
 
@@ -296,14 +292,17 @@ export class BasicHttpsPlatformV2Transport {
     this.#endpoint = pinnedEndpoint;
     this.#credentialProvider = credentialProvider;
     this.#fetcher = fetcher;
-    httpsExchanges.set(this, (lane, payload, signal) => exchangeHttps(
-      this.#endpoint,
-      this.#credentialProvider,
-      this.#fetcher,
-      lane,
-      payload,
-      signal,
-    ));
+    registerPlatformV2Transport(this, {
+      kind: "exchange",
+      exchange: (lane, payload, signal) => exchangeHttps(
+        this.#endpoint,
+        this.#credentialProvider,
+        this.#fetcher,
+        lane,
+        payload,
+        signal,
+      ),
+    });
   }
 }
 
@@ -404,26 +403,18 @@ function rawMutationApprovalDecision(canonical: Uint8Array): MutationApprovalDec
 /** Operation-specific facade. V2 calls fail closed until major two is negotiated. */
 export class PlatformV2Client {
   readonly #exchange: PlatformV2Exchange | null;
-  readonly #testingTransport: PlatformV2CanonicalTestingHandlers | null;
+  readonly #canonicalHandlers: PlatformV2CanonicalHandlers | null;
   #negotiationGeneration = 0n;
   #generationAbort = new AbortController();
   #negotiated: {readonly generation: bigint; readonly value: NegotiatedPlatform} | null = null;
 
-  constructor(transport: HttpsPlatformV2Transport | BasicHttpsPlatformV2Transport | PlatformV2CanonicalTestingTransport) {
-    const productionTransport = transport instanceof HttpsPlatformV2Transport
-      || transport instanceof BasicHttpsPlatformV2Transport;
-    const exchange = productionTransport
-      ? httpsExchanges.get(transport)
-      : undefined;
-    if (productionTransport && exchange === undefined) {
+  constructor(transport: HttpsPlatformV2Transport | BasicHttpsPlatformV2Transport | object) {
+    const capability = platformV2TransportCapability(transport);
+    if (capability === undefined) {
       throw new TypeError("platform v2 transport capability is unavailable");
     }
-    const testingTransport = platformV2CanonicalTestingHandlers(transport);
-    if (exchange === undefined && testingTransport === undefined) {
-      throw new TypeError("platform v2 transport capability is unavailable");
-    }
-    this.#exchange = exchange ?? null;
-    this.#testingTransport = testingTransport ?? null;
+    this.#exchange = capability.kind === "exchange" ? capability.exchange : null;
+    this.#canonicalHandlers = capability.kind === "canonical" ? capability.handlers : null;
   }
 
   get negotiated(): NegotiatedPlatform | null {
@@ -457,7 +448,7 @@ export class PlatformV2Client {
           throw protocolError(error, exchanged.status);
         }
       } else {
-        response = await this.#testingTransport!.negotiate(requestId, offer, combined.signal);
+        response = await this.#canonicalHandlers!.negotiate(requestId, offer, combined.signal);
       }
       if (generation !== this.#negotiationGeneration) {
         throw new PlatformTransportError(0, "negotiation_superseded");
@@ -510,7 +501,7 @@ export class PlatformV2Client {
           throw protocolError(error, exchanged.status);
         }
       } else {
-        response = await this.#testingTransport!.request(requestId, request, combined.signal);
+        response = await this.#canonicalHandlers!.request(requestId, request, combined.signal);
       }
       if (invalidated()) {
         throw new PlatformTransportError(0, "negotiation_invalidated");
