@@ -40,16 +40,22 @@ use automonique_daemon::{
     mcp_client::{McpCallResult, McpRegistry, McpToolDescriptor},
     site_inventory::{NGINX_SITES_ENABLED, enabled_hosts, manage_profiles, prism_sites},
 };
-use automonique_platform_client::{PLATFORM_CONTENT_TYPE, PlatformClient, UnixTransport};
+use automonique_platform_client::{
+    ActionResult, PLATFORM_CONTENT_TYPE, PlatformClient, SessionCommandStateResult,
+    SessionHistoryResult, UnixTransport,
+};
 use automonique_protocol::codec::RequestId;
 use automonique_protocol::platform::{
-    Capabilities, ListSessionsRequest, PlatformCursor, PlatformRequest, PlatformResponse,
-    PlatformTransport, ResourceAuthority, ResourceCoordinate, ResourceRecord, SessionRecord,
-    SnapshotRequest,
+    AttachRequest, Capabilities, ClientId, DetachRequest, IdempotencyKey, ListSessionsRequest,
+    PlatformAction, PlatformCursor, PlatformParameter, PlatformRequest, PlatformResponse,
+    PlatformTransport, ReceiptOutcome, ResourceAuthority, ResourceCoordinate, ResourceId,
+    ResourceKind, ResourceRecord, SessionCommandState, SessionFollowUpRequest, SessionHistoryEvent,
+    SessionHistoryPage, SessionHistoryResync, SessionRecord, SnapshotRequest,
 };
 use automonique_protocol::platform_api::{
     MAX_PLATFORM_REQUEST_CANONICAL_BYTES, PlatformRequestMessage, PlatformResponseMessage,
 };
+use automonique_protocol::primitives::Revision;
 use automonique_store::agent_memory::{AgentMemoryStore, MemoryRecord, MessageInput};
 use automonique_transport_runtime::ChannelName;
 use base64::Engine;
@@ -73,6 +79,7 @@ use crate::mobile_auth::{
 const DASHBOARD_HTML: &str = include_str!("../assets/dashboard.html");
 const DASHBOARD_CSS: &str = include_str!("../assets/dashboard.css");
 const DASHBOARD_JS: &str = include_str!("../assets/dashboard.js");
+const PLATFORM_COCKPIT_JS: &str = include_str!("../assets/platform-cockpit-core.js");
 /// The vendored QR encoder the pairing panel draws its symbol from.
 ///
 /// Embedded rather than fetched because the dashboard's own policy is
@@ -116,6 +123,7 @@ pub enum Route {
     Dashboard,
     Styles,
     Script,
+    PlatformCockpitScript,
     QrCodeScript,
     Favicon,
     Robots,
@@ -127,6 +135,7 @@ pub enum Route {
     ApiAgentAccountsAction,
     ApiOperations,
     ApiPlatform,
+    ApiPlatformSession,
     ApiPlatformRemote,
     MobileDiscovery,
     MobileOperatorProvision,
@@ -1048,7 +1057,7 @@ struct PlatformCapabilitiesView {
 struct PlatformCursorView {
     authority: &'static str,
     topic: String,
-    sequence: u64,
+    sequence: String,
 }
 
 #[derive(Serialize)]
@@ -1062,8 +1071,8 @@ struct PlatformCoordinateView {
 struct PlatformResourceView {
     resource: PlatformCoordinateView,
     freshness: &'static str,
-    observed_at_ms: i64,
-    revision: u64,
+    observed_at_ms: String,
+    revision: String,
     summary: String,
 }
 
@@ -1080,6 +1089,178 @@ struct PlatformSessionView {
     run: Option<PlatformCoordinateView>,
     attachable: bool,
     controllable: bool,
+}
+
+const PLATFORM_SESSION_HISTORY_LIMIT: u16 = 64;
+const DASHBOARD_PLATFORM_CLIENT: &str = "automonique-web-retained-session";
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum PlatformSessionAction {
+    Open {
+        session_id: String,
+    },
+    Page {
+        session_id: String,
+        after: String,
+    },
+    FollowUp {
+        session_id: String,
+        expected_revision: String,
+        idempotency_key: String,
+        text: String,
+    },
+    Reconcile {
+        session_id: String,
+        idempotency_key: String,
+    },
+    Detach {
+        session_id: String,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum PlatformSessionActionView {
+    Open {
+        schema: &'static str,
+        session: PlatformSessionView,
+        attachment_cursor: PlatformCursorTextView,
+        history: PlatformSessionHistoryView,
+        command: Box<PlatformSessionCommandView>,
+        control: PlatformSessionControlView,
+    },
+    Page {
+        schema: &'static str,
+        session: PlatformCoordinateView,
+        history: PlatformSessionHistoryView,
+    },
+    Receipt {
+        schema: &'static str,
+        session: PlatformCoordinateView,
+        receipt: PlatformReceiptView,
+    },
+    Ambiguous {
+        schema: &'static str,
+        session: PlatformCoordinateView,
+        idempotency_key: String,
+        explanation: &'static str,
+    },
+    Detached {
+        schema: &'static str,
+        session: PlatformCoordinateView,
+    },
+    Refused {
+        schema: &'static str,
+        session: Option<PlatformCoordinateView>,
+        outcome: &'static str,
+        explanation: String,
+    },
+}
+
+#[derive(Serialize)]
+struct PlatformCursorTextView {
+    authority: &'static str,
+    topic: String,
+    sequence: String,
+}
+
+#[derive(Serialize)]
+struct PlatformSessionControlView {
+    state: &'static str,
+    available: bool,
+    explanation: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum PlatformSessionHistoryView {
+    Page {
+        from_cursor: String,
+        terminal_cursor: String,
+        has_more: bool,
+        events: Vec<PlatformSessionHistoryEventView>,
+    },
+    ResyncRequired {
+        snapshot_from: String,
+        snapshot_to: String,
+    },
+    Refused {
+        outcome: &'static str,
+        explanation: String,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PlatformSessionHistoryEventView {
+    Message {
+        cursor: String,
+        at_ms: String,
+        evidence: &'static str,
+        role: &'static str,
+        text: String,
+        truncated: bool,
+    },
+    ToolState {
+        cursor: String,
+        at_ms: String,
+        evidence: &'static str,
+        state: &'static str,
+        label: Option<String>,
+        truncated: bool,
+    },
+    RunState {
+        cursor: String,
+        at_ms: String,
+        state: &'static str,
+    },
+    Unknown {
+        cursor: String,
+        at_ms: String,
+        source: &'static str,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum PlatformSessionCommandView {
+    Ready {
+        session: Box<PlatformResourceTextView>,
+        run: Option<PlatformCommandTargetView>,
+        pending_approvals: Vec<PlatformCommandTargetView>,
+    },
+    Refused {
+        outcome: &'static str,
+        explanation: String,
+    },
+}
+
+#[derive(Serialize)]
+struct PlatformResourceTextView {
+    resource: PlatformCoordinateView,
+    freshness: &'static str,
+    observed_at_ms: String,
+    revision: String,
+    summary: String,
+}
+
+#[derive(Serialize)]
+struct PlatformCommandTargetView {
+    target: PlatformCoordinateView,
+    revision: String,
+}
+
+#[derive(Serialize)]
+struct PlatformReceiptView {
+    id: String,
+    action: &'static str,
+    target: PlatformCoordinateView,
+    outcome: &'static str,
+    lifecycle: &'static str,
+    revision: String,
+    recorded_at_ms: String,
+    explanation: Option<String>,
 }
 
 impl From<Capabilities> for PlatformCapabilitiesView {
@@ -1106,7 +1287,7 @@ impl From<PlatformCursor> for PlatformCursorView {
         Self {
             authority: value.authority.as_str(),
             topic: value.topic.as_str().to_owned(),
-            sequence: value.sequence.get(),
+            sequence: value.sequence.get().to_string(),
         }
     }
 }
@@ -1126,8 +1307,8 @@ impl From<ResourceRecord> for PlatformResourceView {
         Self {
             resource: value.resource.into(),
             freshness: value.freshness.state.as_str(),
-            observed_at_ms: value.freshness.observed_at.as_millis(),
-            revision: value.freshness.revision.get(),
+            observed_at_ms: value.freshness.observed_at.as_millis().to_string(),
+            revision: value.freshness.revision.get().to_string(),
             summary: value.summary.as_str().to_owned(),
         }
     }
@@ -1142,6 +1323,187 @@ impl From<SessionRecord> for PlatformSessionView {
             controllable: value.controllable,
         }
     }
+}
+
+impl From<PlatformCursor> for PlatformCursorTextView {
+    fn from(value: PlatformCursor) -> Self {
+        Self {
+            authority: value.authority.as_str(),
+            topic: value.topic.into_inner(),
+            sequence: value.sequence.get().to_string(),
+        }
+    }
+}
+
+impl From<ResourceRecord> for PlatformResourceTextView {
+    fn from(value: ResourceRecord) -> Self {
+        Self {
+            resource: value.resource.into(),
+            freshness: value.freshness.state.as_str(),
+            observed_at_ms: value.freshness.observed_at.as_millis().to_string(),
+            revision: value.freshness.revision.get().to_string(),
+            summary: value.summary.into_inner(),
+        }
+    }
+}
+
+impl From<SessionHistoryEvent> for PlatformSessionHistoryEventView {
+    fn from(value: SessionHistoryEvent) -> Self {
+        match value {
+            SessionHistoryEvent::Message {
+                cursor,
+                at,
+                evidence,
+                role,
+                text,
+                truncated,
+            } => Self::Message {
+                cursor: cursor.to_string(),
+                at_ms: at.as_millis().to_string(),
+                evidence: evidence.as_str(),
+                role: role.as_str(),
+                text: text.into_inner(),
+                truncated,
+            },
+            SessionHistoryEvent::ToolState {
+                cursor,
+                at,
+                evidence,
+                state,
+                label,
+                truncated,
+            } => Self::ToolState {
+                cursor: cursor.to_string(),
+                at_ms: at.as_millis().to_string(),
+                evidence: evidence.as_str(),
+                state: state.as_str(),
+                label: label.map(|value| value.into_inner()),
+                truncated,
+            },
+            SessionHistoryEvent::RunState { cursor, at, state } => Self::RunState {
+                cursor: cursor.to_string(),
+                at_ms: at.as_millis().to_string(),
+                state: state.as_str(),
+            },
+            SessionHistoryEvent::Unknown { cursor, at, source } => Self::Unknown {
+                cursor: cursor.to_string(),
+                at_ms: at.as_millis().to_string(),
+                source: source.as_str(),
+            },
+        }
+    }
+}
+
+impl From<SessionHistoryPage> for PlatformSessionHistoryView {
+    fn from(value: SessionHistoryPage) -> Self {
+        Self::Page {
+            from_cursor: value.from_cursor.to_string(),
+            terminal_cursor: value.terminal_cursor.to_string(),
+            has_more: value.has_more,
+            events: value.events.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<SessionHistoryResync> for PlatformSessionHistoryView {
+    fn from(value: SessionHistoryResync) -> Self {
+        Self::ResyncRequired {
+            snapshot_from: value.snapshot_from.to_string(),
+            snapshot_to: value.snapshot_to.to_string(),
+        }
+    }
+}
+
+fn platform_history_view(value: SessionHistoryResult) -> PlatformSessionHistoryView {
+    match value {
+        SessionHistoryResult::Page(page) => page.into(),
+        SessionHistoryResult::ReplaceWithSnapshot(replacement) => replacement.into(),
+        SessionHistoryResult::Refused {
+            outcome,
+            explanation,
+        } => PlatformSessionHistoryView::Refused {
+            outcome: outcome.as_str(),
+            explanation: explanation.into_inner(),
+        },
+    }
+}
+
+fn platform_command_view(value: SessionCommandStateResult) -> PlatformSessionCommandView {
+    match value {
+        SessionCommandStateResult::State(SessionCommandState {
+            session,
+            run,
+            pending_approvals,
+        }) => PlatformSessionCommandView::Ready {
+            session: Box::new(session.into()),
+            run: run.map(|value| PlatformCommandTargetView {
+                target: value.target.into(),
+                revision: value.revision.get().to_string(),
+            }),
+            pending_approvals: pending_approvals
+                .into_iter()
+                .map(|value| PlatformCommandTargetView {
+                    target: value.target.into(),
+                    revision: value.revision.get().to_string(),
+                })
+                .collect(),
+        },
+        SessionCommandStateResult::Refused {
+            outcome,
+            explanation,
+        } => PlatformSessionCommandView::Refused {
+            outcome: outcome.as_str(),
+            explanation: explanation.into_inner(),
+        },
+    }
+}
+
+fn platform_receipt_view(
+    receipt: automonique_protocol::platform::ActionReceipt,
+) -> PlatformReceiptView {
+    let lifecycle = match receipt.outcome {
+        ReceiptOutcome::Accepted => "pending",
+        ReceiptOutcome::Unknown => "ambiguous",
+        ReceiptOutcome::Completed | ReceiptOutcome::Rejected | ReceiptOutcome::Conflict => {
+            "terminal"
+        }
+        ReceiptOutcome::ResyncRequired => "refused",
+    };
+    PlatformReceiptView {
+        id: receipt.id.into_inner(),
+        action: receipt.action.as_str(),
+        target: receipt.target.into(),
+        outcome: receipt.outcome.as_str(),
+        lifecycle,
+        revision: receipt.revision.get().to_string(),
+        recorded_at_ms: receipt.recorded_at.as_millis().to_string(),
+        explanation: receipt.explanation.map(|value| value.into_inner()),
+    }
+}
+
+fn platform_session_coordinate(session_id: String) -> Result<ResourceCoordinate, &'static str> {
+    let id = ResourceId::new(session_id).map_err(|_| "platform_session_request_invalid")?;
+    Ok(ResourceCoordinate::new(
+        ResourceAuthority::Automonique,
+        ResourceKind::Session,
+        id,
+    ))
+}
+
+fn parse_platform_decimal(value: &str, allow_zero: bool) -> Result<u64, &'static str> {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err("platform_session_request_invalid");
+    }
+    let value = value
+        .parse::<u64>()
+        .map_err(|_| "platform_session_request_invalid")?;
+    if !allow_zero && value == 0 {
+        return Err("platform_session_request_invalid");
+    }
+    Ok(value)
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1743,7 +2105,7 @@ impl WebIntegration {
             _ => return Err("platform_protocol_invalid"),
         };
         Ok(PlatformProjectionView {
-            schema: "automonique.dashboard.platform/v1",
+            schema: "automonique.dashboard.platform/v2",
             health,
             capabilities: capabilities.into(),
             inventory,
@@ -1752,6 +2114,219 @@ impl WebIntegration {
             resources,
             sessions: sessions.sessions.into_iter().map(Into::into).collect(),
         })
+    }
+
+    fn platform_session(
+        &self,
+        action: PlatformSessionAction,
+    ) -> Result<PlatformSessionActionView, &'static str> {
+        let mut client = self
+            .platform
+            .try_lock()
+            .map_err(|_| "platform_client_busy")?;
+        let dashboard_client = ClientId::new(DASHBOARD_PLATFORM_CLIENT)
+            .map_err(|_| "platform_session_request_invalid")?;
+        let schema = "automonique.dashboard.retained-session/v1";
+
+        match action {
+            PlatformSessionAction::Open { session_id } => {
+                let coordinate = platform_session_coordinate(session_id)?;
+                let sessions = match client
+                    .request(PlatformRequest::ListSessions(ListSessionsRequest {
+                        authority: ResourceAuthority::Automonique,
+                        cursor: None,
+                    }))
+                    .map_err(|_| "platform_unavailable")?
+                {
+                    PlatformResponse::Sessions(sessions) => sessions,
+                    PlatformResponse::Refused {
+                        outcome,
+                        explanation,
+                    } => {
+                        return Ok(PlatformSessionActionView::Refused {
+                            schema,
+                            session: Some(coordinate.into()),
+                            outcome: outcome.as_str(),
+                            explanation: explanation.into_inner(),
+                        });
+                    }
+                    _ => return Err("platform_protocol_invalid"),
+                };
+                let Some(session) = sessions
+                    .sessions
+                    .into_iter()
+                    .find(|session| session.session.resource == coordinate)
+                else {
+                    return Ok(PlatformSessionActionView::Refused {
+                        schema,
+                        session: Some(coordinate.into()),
+                        outcome: ReceiptOutcome::Rejected.as_str(),
+                        explanation: String::from("session_not_visible"),
+                    });
+                };
+                if !session.attachable {
+                    return Ok(PlatformSessionActionView::Refused {
+                        schema,
+                        session: Some(coordinate.into()),
+                        outcome: ReceiptOutcome::Rejected.as_str(),
+                        explanation: String::from("session_not_attachable"),
+                    });
+                }
+                let attachment = match client
+                    .request(PlatformRequest::Attach(AttachRequest {
+                        session: coordinate.clone(),
+                        client: dashboard_client,
+                    }))
+                    .map_err(|_| "platform_unavailable")?
+                {
+                    PlatformResponse::Attached(attachment) if attachment.session == coordinate => {
+                        attachment
+                    }
+                    PlatformResponse::Refused {
+                        outcome,
+                        explanation,
+                    } => {
+                        return Ok(PlatformSessionActionView::Refused {
+                            schema,
+                            session: Some(coordinate.into()),
+                            outcome: outcome.as_str(),
+                            explanation: explanation.into_inner(),
+                        });
+                    }
+                    _ => return Err("platform_protocol_invalid"),
+                };
+                let history = client
+                    .session_history_snapshot(coordinate.clone(), PLATFORM_SESSION_HISTORY_LIMIT)
+                    .map(platform_history_view)
+                    .map_err(|_| "platform_unavailable")?;
+                let command = client
+                    .session_command_state_outcome(coordinate)
+                    .map(platform_command_view)
+                    .map_err(|_| "platform_unavailable")?;
+                let control_available = session.controllable;
+                Ok(PlatformSessionActionView::Open {
+                    schema,
+                    session: session.into(),
+                    attachment_cursor: attachment.cursor.into(),
+                    history,
+                    command: Box::new(command),
+                    control: PlatformSessionControlView {
+                        state: "not_claimed",
+                        available: control_available,
+                        explanation: "Observation does not grant control; this cockpit has not claimed a lease.",
+                    },
+                })
+            }
+            PlatformSessionAction::Page { session_id, after } => {
+                let coordinate = platform_session_coordinate(session_id)?;
+                let after = parse_platform_decimal(&after, true)?;
+                let history = client
+                    .session_history_page(coordinate.clone(), after, PLATFORM_SESSION_HISTORY_LIMIT)
+                    .map(platform_history_view)
+                    .map_err(|_| "platform_unavailable")?;
+                Ok(PlatformSessionActionView::Page {
+                    schema,
+                    session: coordinate.into(),
+                    history,
+                })
+            }
+            PlatformSessionAction::FollowUp {
+                session_id,
+                expected_revision,
+                idempotency_key,
+                text,
+            } => {
+                let coordinate = platform_session_coordinate(session_id)?;
+                let revision = Revision::new(parse_platform_decimal(&expected_revision, false)?)
+                    .map_err(|_| "platform_session_request_invalid")?;
+                let key = IdempotencyKey::new(idempotency_key.clone())
+                    .map_err(|_| "platform_session_request_invalid")?;
+                let text =
+                    PlatformParameter::new(text).map_err(|_| "platform_session_request_invalid")?;
+                let request = SessionFollowUpRequest {
+                    client: dashboard_client,
+                    session: coordinate.clone(),
+                    expected_session_revision: revision,
+                    idempotency_key: key,
+                    text,
+                };
+                match client.session_follow_up_outcome(request) {
+                    Ok(ActionResult::Receipt(receipt)) => Ok(PlatformSessionActionView::Receipt {
+                        schema,
+                        session: coordinate.into(),
+                        receipt: platform_receipt_view(receipt),
+                    }),
+                    Ok(ActionResult::Refused {
+                        outcome,
+                        explanation,
+                    }) => Ok(PlatformSessionActionView::Refused {
+                        schema,
+                        session: Some(coordinate.into()),
+                        outcome: outcome.as_str(),
+                        explanation: explanation.into_inner(),
+                    }),
+                    Err(_) => Ok(PlatformSessionActionView::Ambiguous {
+                        schema,
+                        session: coordinate.into(),
+                        idempotency_key,
+                        explanation: "follow_up_outcome_unknown_reconcile_without_replay",
+                    }),
+                }
+            }
+            PlatformSessionAction::Reconcile {
+                session_id,
+                idempotency_key,
+            } => {
+                let coordinate = platform_session_coordinate(session_id)?;
+                let key = IdempotencyKey::new(idempotency_key.clone())
+                    .map_err(|_| "platform_session_request_invalid")?;
+                match client.reconcile_receipt_by_idempotency_key(
+                    dashboard_client,
+                    key,
+                    PlatformAction::FollowUp,
+                    coordinate.clone(),
+                ) {
+                    Ok(receipt) => Ok(PlatformSessionActionView::Receipt {
+                        schema,
+                        session: coordinate.into(),
+                        receipt: platform_receipt_view(receipt),
+                    }),
+                    Err(_) => Ok(PlatformSessionActionView::Ambiguous {
+                        schema,
+                        session: coordinate.into(),
+                        idempotency_key,
+                        explanation: "receipt_not_available_yet_reconcile_again_without_replay",
+                    }),
+                }
+            }
+            PlatformSessionAction::Detach { session_id } => {
+                let coordinate = platform_session_coordinate(session_id)?;
+                match client
+                    .request(PlatformRequest::Detach(DetachRequest {
+                        session: coordinate.clone(),
+                        client: dashboard_client,
+                    }))
+                    .map_err(|_| "platform_unavailable")?
+                {
+                    PlatformResponse::Detached { session, .. } if session == coordinate => {
+                        Ok(PlatformSessionActionView::Detached {
+                            schema,
+                            session: coordinate.into(),
+                        })
+                    }
+                    PlatformResponse::Refused {
+                        outcome,
+                        explanation,
+                    } => Ok(PlatformSessionActionView::Refused {
+                        schema,
+                        session: Some(coordinate.into()),
+                        outcome: outcome.as_str(),
+                        explanation: explanation.into_inner(),
+                    }),
+                    _ => Err("platform_protocol_invalid"),
+                }
+            }
+        }
     }
 
     /// The sessions a pairing offer can be scoped to, and nothing else.
@@ -1780,7 +2355,7 @@ impl WebIntegration {
             _ => return Err("platform_protocol_invalid"),
         };
         Ok(PlatformSessionsView {
-            schema: "automonique.dashboard.pairing-sessions/v1",
+            schema: "automonique.dashboard.pairing-sessions/v2",
             sessions_cursor: sessions.cursor.into(),
             sessions: sessions.sessions.into_iter().map(Into::into).collect(),
         })
@@ -4683,6 +5258,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 "/" => Route::Dashboard,
                 "/assets/dashboard.css" => Route::Styles,
                 "/assets/dashboard.js" => Route::Script,
+                "/assets/platform-cockpit-core.js" => Route::PlatformCockpitScript,
                 "/assets/qrcode.js" => Route::QrCodeScript,
                 "/favicon.svg" => Route::Favicon,
                 "/robots.txt" => Route::Robots,
@@ -4701,6 +5277,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                         Route::ApiPlatform
                     }
                 }
+                "/api/platform/session" => Route::ApiPlatformSession,
                 "/api/mobile/operator-provision" => Route::MobileOperatorProvision,
                 "/api/mobile/pairings" => Route::MobilePairingCreate,
                 "/api/mobile/pairing-sessions" => Route::MobilePairingSessions,
@@ -4726,6 +5303,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 route,
                 Route::ApiMemorySearch
                     | Route::ApiAgentAccountsAction
+                    | Route::ApiPlatformSession
                     | Route::ApiPlatformRemote
                     | Route::MobileOperatorProvision
                     | Route::MobilePairingCreate
@@ -5147,6 +5725,9 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         },
         Route::Styles => Response::static_asset("text/css; charset=utf-8", DASHBOARD_CSS),
         Route::Script => Response::static_asset("text/javascript; charset=utf-8", DASHBOARD_JS),
+        Route::PlatformCockpitScript => {
+            Response::static_asset("text/javascript; charset=utf-8", PLATFORM_COCKPIT_JS)
+        }
         Route::QrCodeScript => Response::static_asset("text/javascript; charset=utf-8", QRCODE_JS),
         Route::Favicon => Response::static_asset("image/svg+xml", FAVICON_SVG),
         Route::Robots => Response::static_asset("text/plain; charset=utf-8", ROBOTS_TXT),
@@ -5165,6 +5746,7 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         | Route::ApiAgentAccountsAction
         | Route::ApiOperations
         | Route::ApiPlatform
+        | Route::ApiPlatformSession
         | Route::ApiPlatformRemote
         | Route::ApiProcesses
         | Route::ApiChat
@@ -5275,6 +5857,16 @@ fn api_response(
         Route::ApiPlatform => match integration.platform() {
             Ok(view) => json_response("200 OK", &view),
             Err(category) => json_error("503 Service Unavailable", category),
+        },
+        Route::ApiPlatformSession => match serde_json::from_slice::<PlatformSessionAction>(body) {
+            Ok(request) => match integration.platform_session(request) {
+                Ok(view) => json_response("200 OK", &view),
+                Err("platform_session_request_invalid") => {
+                    json_error("400 Bad Request", "platform_session_request_invalid")
+                }
+                Err(category) => json_error("503 Service Unavailable", category),
+            },
+            Err(_) => json_error("400 Bad Request", "invalid_json"),
         },
         Route::ApiPlatformRemote => match integration.platform_remote(body, mobile_authorization) {
             Ok(body) => Response {
@@ -5744,6 +6336,7 @@ fn handle(
             | Route::ApiAgentAccountsAction
             | Route::ApiOperations
             | Route::ApiPlatform
+            | Route::ApiPlatformSession
             | Route::ApiPlatformRemote
             | Route::ApiProcesses
             | Route::ApiChat
@@ -6083,6 +6676,10 @@ mod tests {
             ("/", Route::Dashboard),
             ("/assets/dashboard.css", Route::Styles),
             ("/assets/dashboard.js", Route::Script),
+            (
+                "/assets/platform-cockpit-core.js",
+                Route::PlatformCockpitScript,
+            ),
             ("/assets/qrcode.js", Route::QrCodeScript),
             ("/api/status?fresh=1", Route::ApiStatus),
             ("/api/operations", Route::ApiOperations),
@@ -6105,6 +6702,13 @@ mod tests {
         assert_eq!(
             Route::ApiPlatformRemote,
             route(&parse_request(&bytes).unwrap(), &fixture_hosts())
+        );
+        let bytes = format!(
+            "POST /api/platform/session HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nContent-Length: 2\r\nContent-Type: application/json\r\n\r\n{{}}"
+        );
+        assert_eq!(
+            Route::ApiPlatformSession,
+            route(&parse_request(bytes.as_bytes()).unwrap(), &fixture_hosts())
         );
         for (path, expected) in [
             (
@@ -6225,6 +6829,7 @@ mod tests {
         assert_eq!(response.status, "200 OK");
         let body: Value = serde_json::from_slice(&response.body).expect("platform projection JSON");
         assert_eq!(body["health"], "degraded");
+        assert_eq!(body["schema"], "automonique.dashboard.platform/v2");
         assert_eq!(body["cursor"], Value::Null);
         assert_eq!(body["inventory"]["state"], "refused");
         assert_eq!(
@@ -6233,6 +6838,7 @@ mod tests {
         );
         assert_eq!(body["resources"], Value::Array(Vec::new()));
         assert_eq!(body["sessions"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["sessions_cursor"]["sequence"], "7");
         assert_eq!(
             body["sessions"][0]["session"]["resource"]["id"],
             "session-visible-without-inventory"
@@ -6242,11 +6848,265 @@ mod tests {
             "waiting for operator"
         );
         assert_eq!(body["sessions"][0]["attachable"], true);
+        assert_eq!(body["sessions"][0]["session"]["revision"], "6");
+        assert_eq!(body["sessions"][0]["session"]["observed_at_ms"], "6");
         assert!(
             body["capabilities"]["methods"].as_array().is_some_and(
                 |methods| methods.contains(&Value::String(String::from("list_sessions")))
             )
         );
+    }
+
+    #[test]
+    fn retained_session_cockpit_preserves_fences_resync_and_ambiguous_receipts() {
+        const LARGE: u64 = 9_007_199_254_740_995;
+        let state_dir = tempfile::tempdir().expect("temporary state");
+        let runtime_dir = tempfile::tempdir().expect("temporary runtime");
+        std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private state");
+        std::fs::set_permissions(runtime_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private runtime");
+
+        let platform_listener = UnixListener::bind(runtime_dir.path().join("admin.sock"))
+            .expect("fixture platform socket");
+        let platform_server = thread::spawn(move || {
+            let session = ResourceCoordinate::new(
+                ResourceAuthority::Automonique,
+                ResourceKind::Session,
+                ResourceId::new("retained-1").unwrap(),
+            );
+            let run = ResourceCoordinate::new(
+                ResourceAuthority::Automonique,
+                ResourceKind::Run,
+                ResourceId::new("run-1").unwrap(),
+            );
+            let cursor = PlatformCursor {
+                authority: ResourceAuthority::Automonique,
+                topic: CursorTopic::new("sessions").unwrap(),
+                sequence: Revision::new(LARGE).unwrap(),
+            };
+            let record = ResourceRecord {
+                resource: session.clone(),
+                freshness: Freshness {
+                    state: FreshnessState::Fresh,
+                    observed_at: EpochMillis::from_millis(i64::try_from(LARGE).unwrap()),
+                    revision: Revision::new(LARGE).unwrap(),
+                },
+                summary: PlatformText::new("sanitized retained conversation").unwrap(),
+            };
+            for index in 0..8 {
+                let (mut stream, _) = platform_listener.accept().expect("platform connection");
+                let mut prefix = [0_u8; 4];
+                stream.read_exact(&mut prefix).expect("platform prefix");
+                let length = usize::try_from(u32::from_be_bytes(prefix)).unwrap();
+                let mut payload = vec![0_u8; length];
+                stream.read_exact(&mut payload).expect("platform request");
+                let request = PlatformRequestMessage::from_canonical_bytes(&payload)
+                    .expect("canonical platform request");
+                let response = match (index, request.request()) {
+                    (0, PlatformRequest::ListSessions(value)) => {
+                        assert_eq!(value.authority, ResourceAuthority::Automonique);
+                        PlatformResponse::Sessions(
+                            SessionList::new(
+                                vec![SessionRecord {
+                                    session: record.clone(),
+                                    run: Some(run.clone()),
+                                    attachable: true,
+                                    controllable: true,
+                                }],
+                                cursor.clone(),
+                            )
+                            .unwrap(),
+                        )
+                    }
+                    (1, PlatformRequest::Attach(value)) => {
+                        assert_eq!(value.session, session);
+                        assert_eq!(value.client.as_str(), DASHBOARD_PLATFORM_CLIENT);
+                        PlatformResponse::Attached(Attachment {
+                            session: value.session.clone(),
+                            client: value.client.clone(),
+                            cursor: cursor.clone(),
+                        })
+                    }
+                    (2, PlatformRequest::SessionHistorySnapshot(value)) => {
+                        assert_eq!(value.session, session);
+                        assert_eq!(value.limit, PLATFORM_SESSION_HISTORY_LIMIT);
+                        PlatformResponse::SessionHistory(
+                            SessionHistoryPage::new(
+                                session.clone(),
+                                value.limit,
+                                value.limit,
+                                LARGE,
+                                LARGE + 1,
+                                false,
+                                vec![SessionHistoryEvent::Message {
+                                    cursor: LARGE + 1,
+                                    at: EpochMillis::from_millis(i64::try_from(LARGE + 1).unwrap()),
+                                    evidence: SessionHistoryEvidence::Authoritative,
+                                    role: SessionHistoryRole::Assistant,
+                                    text: SessionHistoryText::new("safe history").unwrap(),
+                                    truncated: false,
+                                }],
+                            )
+                            .unwrap(),
+                        )
+                    }
+                    (3, PlatformRequest::SessionCommandState(value)) => {
+                        assert_eq!(value.session, session);
+                        PlatformResponse::SessionCommandState(
+                            SessionCommandState::new(
+                                record.clone(),
+                                Some(SessionCommandTarget {
+                                    target: run.clone(),
+                                    revision: Revision::new(LARGE + 1).unwrap(),
+                                }),
+                                Vec::new(),
+                            )
+                            .unwrap(),
+                        )
+                    }
+                    (4, PlatformRequest::SessionHistoryPage(value)) => {
+                        assert_eq!(value.after, LARGE + 1);
+                        PlatformResponse::SessionHistoryResync(
+                            SessionHistoryResync::new(session.clone(), LARGE, LARGE + 9).unwrap(),
+                        )
+                    }
+                    (5, PlatformRequest::SessionFollowUp(value)) => {
+                        assert_eq!(value.client.as_str(), DASHBOARD_PLATFORM_CLIENT);
+                        assert_eq!(value.expected_session_revision.get(), LARGE);
+                        assert_eq!(value.idempotency_key.as_str(), "follow-up-ambiguous");
+                        continue;
+                    }
+                    (6, PlatformRequest::GetReceipt(value)) => {
+                        assert_eq!(
+                            value.client.as_ref().map(ClientId::as_str),
+                            Some(DASHBOARD_PLATFORM_CLIENT)
+                        );
+                        assert_eq!(
+                            value.idempotency_key.as_ref().map(IdempotencyKey::as_str),
+                            Some("follow-up-ambiguous")
+                        );
+                        PlatformResponse::Receipt(ActionReceipt {
+                            id: ReceiptId::new("receipt-1").unwrap(),
+                            action: PlatformAction::FollowUp,
+                            target: session.clone(),
+                            outcome: ReceiptOutcome::Completed,
+                            revision: Revision::new(LARGE + 2).unwrap(),
+                            recorded_at: EpochMillis::from_millis(
+                                i64::try_from(LARGE + 2).unwrap(),
+                            ),
+                            explanation: None,
+                        })
+                    }
+                    (7, PlatformRequest::SessionFollowUp(value)) => {
+                        assert_eq!(value.expected_session_revision.get(), LARGE);
+                        PlatformResponse::Refused {
+                            outcome: ReceiptOutcome::Conflict,
+                            explanation: PlatformText::new("stale_session_revision").unwrap(),
+                        }
+                    }
+                    _ => panic!(
+                        "unexpected cockpit request {index}: {:?}",
+                        request.request()
+                    ),
+                };
+                let body = PlatformResponseMessage::new(request.request_id().clone(), response)
+                    .to_message()
+                    .unwrap()
+                    .to_canonical_bytes();
+                stream
+                    .write_all(&u32::try_from(body.len()).unwrap().to_be_bytes())
+                    .unwrap();
+                stream.write_all(&body).unwrap();
+            }
+        });
+
+        let integration = WebIntegration::open(
+            IntegrationConfig {
+                tenant: String::from("operator"),
+                actor: String::from("operator:retained-cockpit"),
+                hosts: fixture_hosts(),
+            },
+            state_dir.path(),
+            runtime_dir.path(),
+        )
+        .expect("web integration");
+        let state = AppState::new(fixture_status());
+        let call = |body: Value| {
+            api_response(
+                Route::ApiPlatformSession,
+                &serde_json::to_vec(&body).unwrap(),
+                &integration,
+                &state,
+                None,
+            )
+        };
+
+        let open: Value = serde_json::from_slice(
+            &call(serde_json::json!({"action":"open","session_id":"retained-1"})).body,
+        )
+        .unwrap();
+        assert_eq!(open["state"], "open");
+        assert_eq!(open["attachment_cursor"]["sequence"], LARGE.to_string());
+        assert_eq!(open["history"]["terminal_cursor"], (LARGE + 1).to_string());
+        assert_eq!(
+            open["history"]["events"][0]["at_ms"],
+            (LARGE + 1).to_string()
+        );
+        assert_eq!(open["command"]["session"]["revision"], LARGE.to_string());
+        assert_eq!(open["control"]["state"], "not_claimed");
+
+        let page: Value = serde_json::from_slice(
+            &call(serde_json::json!({
+                "action":"page","session_id":"retained-1","after":(LARGE + 1).to_string()
+            }))
+            .body,
+        )
+        .unwrap();
+        assert_eq!(page["history"]["state"], "resync_required");
+        assert_eq!(page["history"]["snapshot_to"], (LARGE + 9).to_string());
+
+        let ambiguous: Value = serde_json::from_slice(
+            &call(serde_json::json!({
+                "action":"follow_up","session_id":"retained-1",
+                "expected_revision":LARGE.to_string(),
+                "idempotency_key":"follow-up-ambiguous","text":"continue safely"
+            }))
+            .body,
+        )
+        .unwrap();
+        assert_eq!(ambiguous["state"], "ambiguous");
+        assert_eq!(ambiguous["idempotency_key"], "follow-up-ambiguous");
+
+        let receipt: Value = serde_json::from_slice(
+            &call(serde_json::json!({
+                "action":"reconcile","session_id":"retained-1",
+                "idempotency_key":"follow-up-ambiguous"
+            }))
+            .body,
+        )
+        .unwrap();
+        assert_eq!(receipt["state"], "receipt");
+        assert_eq!(receipt["receipt"]["lifecycle"], "terminal");
+        assert_eq!(receipt["receipt"]["revision"], (LARGE + 2).to_string());
+        assert_eq!(
+            receipt["receipt"]["recorded_at_ms"],
+            (LARGE + 2).to_string()
+        );
+
+        let refused: Value = serde_json::from_slice(
+            &call(serde_json::json!({
+                "action":"follow_up","session_id":"retained-1",
+                "expected_revision":LARGE.to_string(),
+                "idempotency_key":"follow-up-stale","text":"do not admit"
+            }))
+            .body,
+        )
+        .unwrap();
+        assert_eq!(refused["state"], "refused");
+        assert_eq!(refused["outcome"], "conflict");
+        assert_eq!(refused["explanation"], "stale_session_revision");
+        platform_server.join().expect("platform server");
     }
 
     #[test]
@@ -7445,7 +8305,10 @@ mod tests {
             "appearance-panel",
             "operations-refresh",
             "platform-refresh",
-            "platform-resource-grid",
+            "platform-session-list",
+            "platform-session-detail",
+            "platform-history",
+            "platform-composer",
             "attention-toggle",
             "processes-refresh",
             "process-list",
@@ -7467,8 +8330,14 @@ mod tests {
         assert!(DASHBOARD_JS.contains("processHierarchy(jobs)"));
         assert!(DASHBOARD_JS.contains("api(\"/api/platform\")"));
         assert!(DASHBOARD_JS.contains("renderPlatform"));
-        assert!(DASHBOARD_JS.contains("Full resource inventory unavailable:"));
-        assert!(DASHBOARD_JS.contains("Showing sessions from the paged session listing."));
+        assert!(DASHBOARD_JS.contains("/api/platform/session"));
+        assert!(DASHBOARD_JS.contains("monique-platform-reconciliation"));
+        assert!(DASHBOARD_JS.contains("reconcile"));
+        assert!(DASHBOARD_JS.contains("validPlatformDecimal"));
+        assert!(DASHBOARD_JS.contains("AutomoniquePlatformCockpit.receiptDirective"));
+        assert!(PLATFORM_COCKPIT_JS.contains("decimalGreater"));
+        assert!(!DASHBOARD_JS.contains("Number(view.sessions_cursor.sequence)"));
+        assert!(!DASHBOARD_JS.contains("Number(event.cursor)"));
         assert!(DASHBOARD_JS.contains("Manage control-plane state"));
         assert!(DASHBOARD_JS.contains("monique-text-scale"));
         assert!(DASHBOARD_JS.contains("monique-sidebar"));
