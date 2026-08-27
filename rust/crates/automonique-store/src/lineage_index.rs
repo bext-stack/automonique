@@ -680,9 +680,12 @@ fn validate_moved_target(connection: &Connection, item: &ExternalWorkItem) -> In
         }
         cursor = current
             .moved_to()
-            .map(|identity| read_external(connection, identity))
-            .transpose()?
-            .flatten();
+            .map(|identity| {
+                read_external(connection, identity)?.ok_or(LineageIndexError::NotFound(
+                    "moved external work descendant",
+                ))
+            })
+            .transpose()?;
         steps += 1;
     }
     Ok(())
@@ -1648,7 +1651,8 @@ fn initialize(connection: &mut Connection) -> Indexed<()> {
         return migrate_v1(connection);
     }
     if version == LINEAGE_INDEX_SCHEMA_VERSION {
-        return validate_current_schema(connection);
+        validate_current_schema(connection)?;
+        return validate_durable_graphs(connection);
     }
     if version != 0 {
         return Err(LineageIndexError::SchemaVersion {
@@ -1686,102 +1690,138 @@ fn validate_current_schema(connection: &Connection) -> Indexed<()> {
     if foreign_key_failures != 0 {
         return Err(LineageIndexError::Corrupt("foreign_keys"));
     }
-    for (object, kind) in [
-        ("lineage_external_work", "table"),
-        ("lineage_orchestration", "table"),
-        ("lineage_workspace_intents", "table"),
-        ("lineage_external_by_workspace", "index"),
-        ("lineage_orchestration_by_workspace", "index"),
-    ] {
-        let present: u32 = connection.query_row(
-            "SELECT count(*) FROM sqlite_schema WHERE name=?1 AND type=?2",
-            params![object, kind],
-            |row| row.get(0),
-        )?;
-        if present != 1 {
-            return Err(LineageIndexError::Corrupt("schema_object"));
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(SCHEMA_V2)?;
+    if schema_snapshot(connection)? != schema_snapshot(&expected)? {
+        return Err(LineageIndexError::Corrupt("schema_shape"));
+    }
+    Ok(())
+}
+
+type SchemaObject = (String, String, String, Option<String>);
+
+fn schema_snapshot(connection: &Connection) -> Indexed<Vec<SchemaObject>> {
+    let mut statement = connection.prepare(
+        "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name",
+    )?;
+    Ok(statement
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+fn validate_durable_graphs(connection: &Connection) -> Indexed<()> {
+    let mut statement = connection.prepare(
+        "SELECT workspace_id FROM lineage_external_work UNION SELECT workspace_id FROM lineage_orchestration",
+    )?;
+    let workspaces = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for raw in workspaces {
+        let workspace =
+            UserWorkspaceId::new(raw).map_err(|_| LineageIndexError::Corrupt("workspace_id"))?;
+        let external = read_external_workspace(connection, &workspace)?;
+        let orchestration = read_orchestration_workspace(connection, &workspace)?;
+        for item in &external {
+            if item.origin().workspace() != &workspace {
+                return Err(LineageIndexError::Corrupt("lineage_origin"));
+            }
+            let mut cursor = item.moved_to();
+            let mut steps = 0usize;
+            while let Some(identity) = cursor {
+                let target = external
+                    .iter()
+                    .find(|candidate| candidate.identity() == identity)
+                    .ok_or(LineageIndexError::Corrupt("moved_target"))?;
+                if target.identity() == item.identity()
+                    || steps >= external.len()
+                    || !target.origin().refines(item.origin())
+                {
+                    return Err(LineageIndexError::Corrupt("moved_cycle"));
+                }
+                cursor = target.moved_to();
+                steps += 1;
+            }
+        }
+        for record in &orchestration {
+            if record.origin().workspace() != &workspace {
+                return Err(LineageIndexError::Corrupt("lineage_origin"));
+            }
+            if let Some(identity) = record.external_work() {
+                let target = external
+                    .iter()
+                    .find(|candidate| candidate.identity() == identity)
+                    .ok_or(LineageIndexError::Corrupt("orchestration_external"))?;
+                if !record.origin().refines(target.origin()) {
+                    return Err(LineageIndexError::Corrupt("lineage_origin"));
+                }
+            }
+            let mut cursor = record.parent();
+            let mut steps = 0usize;
+            while let Some(identity) = cursor {
+                let parent = orchestration
+                    .iter()
+                    .find(|candidate| candidate.identity() == identity)
+                    .ok_or(LineageIndexError::Corrupt("orchestration_parent"))?;
+                if parent.identity() == record.identity()
+                    || steps >= orchestration.len()
+                    || !record.origin().refines(parent.origin())
+                {
+                    return Err(LineageIndexError::Corrupt("orchestration_cycle"));
+                }
+                cursor = parent.parent();
+                steps += 1;
+            }
         }
     }
-    for (table, required) in [
-        (
-            "lineage_external_work",
-            &[
-                "provider",
-                "authority_id",
-                "scope",
-                "work_key",
-                "workspace_id",
-                "revision",
-                "external_state",
-                "moved_provider",
-                "moved_authority_id",
-                "moved_scope",
-                "moved_key",
-                "observed_at_ms",
-                "stale_after_ms",
-                "freshness_state",
-                "latest_message",
-                "latest_observed_at_ms",
-                "origin_attempt_id",
-                "origin_session_id",
-                "origin_pane_id",
-            ][..],
-        ),
-        (
-            "lineage_orchestration",
-            &[
-                "orchestration_kind",
-                "orchestration_id",
-                "workspace_id",
-                "external_provider",
-                "external_authority_id",
-                "external_scope",
-                "external_key",
-                "parent_kind",
-                "parent_id",
-                "status_kind",
-                "status_message",
-                "observed_at_ms",
-                "stale_after_ms",
-                "freshness_state",
-                "latest_message",
-                "latest_observed_at_ms",
-                "revision",
-                "origin_attempt_id",
-                "origin_session_id",
-                "origin_pane_id",
-            ][..],
-        ),
-        (
-            "lineage_workspace_intents",
-            &[
-                "intent_id",
-                "request_digest",
-                "intent_kind",
-                "task_kind",
-                "task_id",
-                "workspace_id",
-                "external_provider",
-                "external_authority_id",
-                "external_scope",
-                "external_key",
-                "base_selector",
-                "branch_selector",
-                "expected_revision",
-                "outcome_kind",
-                "outcome_conflict",
-                "outcome_workspace_id",
-                "reconciliation",
-            ][..],
-        ),
-    ] {
-        let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-        let columns = statement
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<Result<Vec<_>, _>>()?;
-        if columns != required {
-            return Err(LineageIndexError::Corrupt("schema_columns"));
+    let mut statement = connection.prepare("SELECT intent_id FROM lineage_workspace_intents")?;
+    let intent_ids = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for id in intent_ids {
+        let fingerprint =
+            read_intent(connection, &id)?.ok_or(LineageIndexError::Corrupt("intent"))?;
+        let task = read_orchestration(
+            connection,
+            &OrchestrationIdentity::Task(
+                OrchestrationTaskId::new(fingerprint.task_id.clone())
+                    .map_err(|_| LineageIndexError::Corrupt("intent_task"))?,
+            ),
+        )?
+        .ok_or(LineageIndexError::Corrupt("intent_task"))?
+        .0;
+        if task.workspace().as_str() != fingerprint.workspace {
+            return Err(LineageIndexError::Corrupt("intent_workspace"));
         }
+        if fingerprint.intent_kind == "create" {
+            let external = decode_external_identity(
+                fingerprint
+                    .external_provider
+                    .as_deref()
+                    .ok_or(LineageIndexError::Corrupt("intent_external"))?,
+                fingerprint
+                    .external_authority
+                    .as_deref()
+                    .ok_or(LineageIndexError::Corrupt("intent_external"))?,
+                fingerprint
+                    .external_scope
+                    .as_deref()
+                    .ok_or(LineageIndexError::Corrupt("intent_external"))?,
+                fingerprint
+                    .external_key
+                    .as_deref()
+                    .ok_or(LineageIndexError::Corrupt("intent_external"))?,
+            )?;
+            let item = read_external(connection, &external)?
+                .ok_or(LineageIndexError::Corrupt("intent_external"))?;
+            if item.workspace() != task.workspace() || task.external_work() != Some(&external) {
+                return Err(LineageIndexError::Corrupt("intent_external"));
+            }
+        }
+        fingerprint.into_stored()?;
     }
     Ok(())
 }
@@ -1844,9 +1884,11 @@ FROM lineage_workspace_intents_v1;
             params![id, digest.as_slice()],
         )?;
     }
+    validate_durable_graphs(&transaction)?;
     transaction.execute_batch(
         "DROP TABLE lineage_workspace_intents_v1; DROP TABLE lineage_orchestration_v1; DROP TABLE lineage_external_work_v1;",
     )?;
+    validate_current_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", LINEAGE_INDEX_SCHEMA_VERSION)?;
     transaction.commit()?;
     connection.pragma_update(None, "foreign_keys", true)?;

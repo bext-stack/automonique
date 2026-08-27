@@ -1055,11 +1055,172 @@ fn current_version_with_missing_schema_shape_refuses_on_open() {
     let private = PrivateIndex::new();
     drop(LineageIndex::open(private.path()).unwrap());
     let db = Connection::open(private.path()).unwrap();
-    db.execute("DROP INDEX lineage_external_by_workspace", [])
-        .unwrap();
+    db.execute_batch("DROP INDEX lineage_external_by_workspace; CREATE INDEX lineage_external_by_workspace ON lineage_external_work(work_key);").unwrap();
     drop(db);
     assert_eq!(
         LineageIndex::open(private.path()).unwrap_err().category(),
         "corrupt"
     );
+}
+
+#[test]
+fn current_version_with_stripped_constraints_or_trigger_refuses_on_open() {
+    for mutation in [
+        "PRAGMA writable_schema=ON; UPDATE sqlite_schema SET sql=replace(sql, ') STRICT', ')') WHERE name='lineage_external_work'; PRAGMA writable_schema=OFF; PRAGMA schema_version=99;",
+        "CREATE TRIGGER unexpected_lineage_trigger AFTER INSERT ON lineage_external_work BEGIN SELECT 1; END;",
+    ] {
+        let private = PrivateIndex::new();
+        drop(LineageIndex::open(private.path()).unwrap());
+        let db = Connection::open(private.path()).unwrap();
+        db.execute_batch(mutation).unwrap();
+        drop(db);
+        assert_eq!(
+            LineageIndex::open(private.path()).unwrap_err().category(),
+            "corrupt"
+        );
+    }
+}
+
+#[test]
+fn reopen_refuses_dangling_and_cyclic_moved_chains() {
+    for cyclic in [false, true] {
+        let private = PrivateIndex::new();
+        let mut index = LineageIndex::open(private.path()).unwrap();
+        let ws = workspace("workspace-corrupt-move");
+        let a = external_identity(ExternalWorkProvider::GitLab, "scope-a", "issue-a");
+        let b = external_identity(ExternalWorkProvider::JiraCompatible, "scope-b", "issue-b");
+        index
+            .intake_external(&item(
+                b.clone(),
+                ws.clone(),
+                1,
+                ExternalWorkState::Open,
+                None,
+            ))
+            .unwrap();
+        index
+            .intake_external(&item(a.clone(), ws, 1, ExternalWorkState::Open, None))
+            .unwrap();
+        index
+            .update_external(
+                &item(
+                    a.clone(),
+                    workspace("workspace-corrupt-move"),
+                    2,
+                    ExternalWorkState::Moved,
+                    Some(b.clone()),
+                ),
+                Revision::FIRST,
+            )
+            .unwrap();
+        drop(index);
+        let db = Connection::open(private.path()).unwrap();
+        if cyclic {
+            db.execute(
+                "UPDATE lineage_external_work SET revision=2,external_state='moved',moved_provider=?1,moved_authority_id=?2,moved_scope=?3,moved_key=?4 WHERE provider=?5 AND authority_id=?6 AND scope=?7 AND work_key=?8",
+                rusqlite::params![a.provider().as_str(), a.authority().as_str(), a.scope().as_str(), a.key().as_str(), b.provider().as_str(), b.authority().as_str(), b.scope().as_str(), b.key().as_str()],
+            ).unwrap();
+        } else {
+            db.execute(
+                "DELETE FROM lineage_external_work WHERE provider=?1 AND authority_id=?2 AND scope=?3 AND work_key=?4",
+                rusqlite::params![b.provider().as_str(), b.authority().as_str(), b.scope().as_str(), b.key().as_str()],
+            ).unwrap();
+        }
+        drop(db);
+        assert_eq!(
+            LineageIndex::open(private.path()).unwrap_err().category(),
+            "corrupt"
+        );
+    }
+}
+
+#[test]
+fn attaching_to_a_chain_with_an_absent_descendant_is_refused() {
+    let private = PrivateIndex::new();
+    let mut index = LineageIndex::open(private.path()).unwrap();
+    let ws = workspace("workspace-attach-dangling");
+    let a = external_identity(ExternalWorkProvider::GitHub, "scope-a", "a");
+    let b = external_identity(ExternalWorkProvider::GitLab, "scope-b", "b");
+    let c = external_identity(ExternalWorkProvider::Linear, "scope-c", "c");
+    for identity in [&a, &b, &c] {
+        index
+            .intake_external(&item(
+                identity.clone(),
+                ws.clone(),
+                1,
+                ExternalWorkState::Open,
+                None,
+            ))
+            .unwrap();
+    }
+    index
+        .update_external(
+            &item(
+                b.clone(),
+                ws.clone(),
+                2,
+                ExternalWorkState::Moved,
+                Some(c.clone()),
+            ),
+            Revision::FIRST,
+        )
+        .unwrap();
+    let db = Connection::open(private.path()).unwrap();
+    db.execute(
+        "DELETE FROM lineage_external_work WHERE provider=?1 AND authority_id=?2 AND scope=?3 AND work_key=?4",
+        rusqlite::params![c.provider().as_str(), c.authority().as_str(), c.scope().as_str(), c.key().as_str()],
+    ).unwrap();
+    drop(db);
+    assert_eq!(
+        index
+            .update_external(
+                &item(a, ws, 2, ExternalWorkState::Moved, Some(b)),
+                Revision::FIRST
+            )
+            .unwrap_err()
+            .category(),
+        "not_found"
+    );
+}
+
+#[test]
+fn v1_migration_refuses_dangling_moved_data_without_partial_commit() {
+    for cyclic in [false, true] {
+        let private = PrivateIndex::new();
+        fs::File::create(private.path()).unwrap();
+        fs::set_permissions(private.path(), fs::Permissions::from_mode(0o600)).unwrap();
+        let db = Connection::open(private.path()).unwrap();
+        db.execute_batch(r#"
+CREATE TABLE lineage_external_work(provider TEXT,scope TEXT,work_key TEXT,workspace_id TEXT,revision INTEGER,external_state TEXT,moved_provider TEXT,moved_scope TEXT,moved_key TEXT,observed_at_ms INTEGER,stale_after_ms INTEGER,freshness_state TEXT,latest_message TEXT,latest_observed_at_ms INTEGER);
+CREATE INDEX lineage_external_by_workspace ON lineage_external_work(workspace_id,provider,scope,work_key);
+CREATE TABLE lineage_orchestration(orchestration_kind TEXT,orchestration_id TEXT,workspace_id TEXT,external_provider TEXT,external_scope TEXT,external_key TEXT,parent_kind TEXT,parent_id TEXT,status_kind TEXT,status_message TEXT,observed_at_ms INTEGER,stale_after_ms INTEGER,freshness_state TEXT,latest_message TEXT,latest_observed_at_ms INTEGER,revision INTEGER);
+CREATE INDEX lineage_orchestration_by_workspace ON lineage_orchestration(workspace_id,orchestration_kind,orchestration_id);
+CREATE TABLE lineage_workspace_intents(intent_id TEXT,intent_kind TEXT,task_kind TEXT,task_id TEXT,workspace_id TEXT,external_provider TEXT,external_scope TEXT,external_key TEXT,base_selector TEXT,branch_selector TEXT,expected_revision INTEGER,outcome_kind TEXT,outcome_conflict TEXT,outcome_workspace_id TEXT);
+PRAGMA user_version=1;
+"#).unwrap();
+        db.execute_batch(if cyclic {
+        "INSERT INTO lineage_external_work VALUES('gitlab','scope-a','issue-a','workspace-v1-broken',1,'moved','jira_compatible','scope-b','issue-b',1700000000000,30000,'fresh',NULL,NULL); INSERT INTO lineage_external_work VALUES('jira_compatible','scope-b','issue-b','workspace-v1-broken',1,'moved','gitlab','scope-a','issue-a',1700000000000,30000,'fresh',NULL,NULL);"
+    } else {
+        "INSERT INTO lineage_external_work VALUES('gitlab','scope-a','issue-a','workspace-v1-broken',1,'moved','jira_compatible','scope-missing','issue-missing',1700000000000,30000,'fresh',NULL,NULL);"
+    }).unwrap();
+        drop(db);
+        assert_eq!(
+            LineageIndex::open(private.path()).unwrap_err().category(),
+            "corrupt"
+        );
+        let db = Connection::open(private.path()).unwrap();
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM lineage_external_work", [], |row| row
+                .get::<_, u32>(
+                0
+            ))
+            .unwrap(),
+            if cyclic { 2 } else { 1 }
+        );
+    }
 }
