@@ -1135,6 +1135,14 @@ impl ReviewSnapshot {
                 &delivery,
             )?;
         }
+        for (index, event) in attention_events.iter().enumerate() {
+            if attention_events[index + 1..]
+                .iter()
+                .any(|other| other.origin() == event.origin() && other.reason() == event.reason())
+            {
+                return Err(ReviewContractError::AttentionInvalid);
+            }
+        }
         let attention = AttentionProjection::derive(&attention_events, revision)?;
         Ok(Self {
             workspace,

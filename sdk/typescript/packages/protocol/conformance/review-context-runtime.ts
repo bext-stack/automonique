@@ -92,12 +92,13 @@ decodeReviewSnapshot(maximumU32);
 const u32Category = category(() => encodeReviewSnapshot({...snapshot, files: [{...snapshot.files[0]!, hunks: [{...snapshot.files[0]!.hunks[0]!, old_start: 4294967296n}]}]}));
 const attentionOriginCategory = category(() => encodeReviewSnapshot({...snapshot, attention_events: [{...snapshot.attention_events[0]!, origin: {...snapshot.attention_events[0]!.origin, authority: {...snapshot.attention_events[0]!.origin.authority, id: "forged-review"}}}]}));
 const duplicateAttentionCategory = category(() => encodeReviewSnapshot({...snapshot, attention_events: [snapshot.attention_events[0]!, snapshot.attention_events[0]!]}));
+const duplicateAttentionOriginCategory = category(() => encodeReviewSnapshot({...snapshot, attention_events: [snapshot.attention_events[0]!, {...snapshot.attention_events[0]!, id: "attention-2"}]}));
 const zeroCompletedRevisionCategory = category(() => encodeReviewActionReceipt({...receipt, outcome: "completed", reconciliation: "final", revision: 0n}));
 const zeroConflictRevisionCategory = category(() => encodeReviewActionReceipt({...receipt, current_revision: 0n, outcome: "conflict", reconciliation: "final"}));
 const text = new TextDecoder().decode(fixture);
 const v1 = new TextEncoder().encode(text.replace("\"platform_version\":2", "\"platform_version\":1"));
 const mixedCategory = category(() => decodeReviewSnapshot(v1));
-if (providerCategory !== "review_value_invalid" || authorityCategory !== "review_value_invalid" || authorityIdentityCategory !== "review_value_invalid" || attentionCategory !== "review_value_invalid" || u32Category !== "review_value_invalid" || attentionOriginCategory !== "review_value_invalid" || duplicateAttentionCategory !== "review_value_invalid" || zeroCompletedRevisionCategory !== "review_value_invalid" || zeroConflictRevisionCategory !== "review_value_invalid" || mixedCategory !== "review_invalid_body") {
+if (providerCategory !== "review_value_invalid" || authorityCategory !== "review_value_invalid" || authorityIdentityCategory !== "review_value_invalid" || attentionCategory !== "review_value_invalid" || u32Category !== "review_value_invalid" || attentionOriginCategory !== "review_value_invalid" || duplicateAttentionCategory !== "review_value_invalid" || duplicateAttentionOriginCategory !== "review_value_invalid" || zeroCompletedRevisionCategory !== "review_value_invalid" || zeroConflictRevisionCategory !== "review_value_invalid" || mixedCategory !== "review_invalid_body") {
   throw new Error("Rust/TypeScript review refusals do not share categories");
 }
 
@@ -106,6 +107,6 @@ console.log(JSON.stringify({
   attention: snapshot.attention.state,
   bytes: fixture.length,
   receipt: receiptDecoded.reconciliation,
-  refusals: 10,
+  refusals: 11,
   schema: snapshot.schema,
 }));

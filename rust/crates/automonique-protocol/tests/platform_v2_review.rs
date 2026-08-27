@@ -321,6 +321,17 @@ fn attention_ranges_proposals_and_u32_boundaries_are_authoritative() {
         rebuild(duplicate_events),
         Err(ReviewContractError::CollectionInvalid)
     );
+    let duplicate_origin = AttentionEvent::new(
+        id("attention-2"),
+        base.attention_events()[0].origin().clone(),
+        base.attention_events()[0].reason(),
+        1,
+    )
+    .unwrap();
+    assert_eq!(
+        rebuild(vec![base.attention_events()[0].clone(), duplicate_origin,]),
+        Err(ReviewContractError::AttentionInvalid)
+    );
     let forged_origin = AttentionOrigin::new(
         AttentionOriginKind::Review,
         None,

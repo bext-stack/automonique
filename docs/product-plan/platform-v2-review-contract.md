@@ -65,8 +65,9 @@ operation. At most 256 bounded attention events are retained. Every event has
 a unique identity and an exact typed origin coordinate: origin kind and
 identity where applicable, owning authority identity, and source revision.
 The reason must agree with the cited authoritative file, comment, check,
-review, pull-request, delivery, or complete-snapshot projection. Duplicate or
-unattributable events are refused. The projection is derived from those events
+review, pull-request, delivery, or complete-snapshot projection. Duplicate IDs
+and duplicate reason/origin coordinates, including aliases under different IDs,
+are refused. The projection is derived from those events
 with `Blocked` taking precedence over `NeedsYou`, then `Working`, then `Done`;
 unread counts are summed and the newest event revision is retained. Callers
 cannot author a different projection, and no event may cite a revision newer
