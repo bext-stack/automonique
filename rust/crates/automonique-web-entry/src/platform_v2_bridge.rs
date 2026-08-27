@@ -9,12 +9,13 @@
 //! carries no actor, tenant, grant, or review-authority assertion.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use automonique_protocol::codec::{LENGTH_PREFIX_BYTES, encode_frame_with_limit};
 use automonique_protocol::platform_v2::ProjectId;
@@ -34,6 +35,11 @@ use crate::mobile_auth::{
 use automonique_protocol::{
     codec::RequestId,
     platform_v2::{NegotiatedPlatform, PlatformVersionOffer},
+};
+use nix::errno::Errno;
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+use nix::sys::socket::{
+    AddressFamily, SockFlag, SockType, UnixAddr, connect, getsockopt, socket, sockopt::SocketError,
 };
 
 pub(crate) const PLATFORM_NEGOTIATION_CONTENT_TYPE: &str =
@@ -518,20 +524,16 @@ impl PlatformV2Bridge {
         let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + request.len());
         encode_frame_with_limit(request, &mut frame, lane.request_limit())
             .map_err(|_| "platform_v2_request_invalid")?;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or("platform_v2_bridge_unavailable")?;
         let mut stream =
-            UnixStream::connect(&self.socket).map_err(|_| "platform_v2_bridge_unavailable")?;
-        stream
-            .set_read_timeout(Some(timeout))
-            .and_then(|()| stream.set_write_timeout(Some(timeout)))
-            .map_err(|_| "platform_v2_bridge_unavailable")?;
-        stream
-            .write_all(&frame)
-            .and_then(|()| stream.flush())
+            connect_until(&self.socket, deadline).map_err(|_| "platform_v2_bridge_unavailable")?;
+        write_all_until(&mut stream, &frame, deadline)
             .map_err(|_| "platform_v2_bridge_unavailable")?;
 
         let mut prefix = [0_u8; LENGTH_PREFIX_BYTES];
-        stream
-            .read_exact(&mut prefix)
+        read_exact_until(&mut stream, &mut prefix, deadline)
             .map_err(|_| "platform_v2_bridge_unavailable")?;
         let length = usize::try_from(u32::from_be_bytes(prefix))
             .map_err(|_| "platform_v2_response_invalid")?;
@@ -539,11 +541,110 @@ impl PlatformV2Bridge {
             return Err("platform_v2_response_too_large");
         }
         let mut response = vec![0_u8; length];
-        stream
-            .read_exact(&mut response)
+        read_exact_until(&mut stream, &mut response, deadline)
             .map_err(|_| "platform_v2_bridge_unavailable")?;
         Ok(response)
     }
+}
+
+fn connect_until(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
+    let fd: OwnedFd = socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        None,
+    )
+    .map_err(errno_io)?;
+    let address = UnixAddr::new(path).map_err(errno_io)?;
+    match connect(fd.as_raw_fd(), &address) {
+        Ok(()) => {}
+        Err(Errno::EINPROGRESS | Errno::EALREADY | Errno::EAGAIN) => {
+            wait_until(&fd, PollFlags::POLLOUT, deadline)?;
+            let error = getsockopt(&fd, SocketError).map_err(errno_io)?;
+            if error != 0 {
+                return Err(io::Error::from_raw_os_error(error));
+            }
+        }
+        Err(error) => return Err(errno_io(error)),
+    }
+    Ok(UnixStream::from(fd))
+}
+
+fn write_all_until(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
+    while !bytes.is_empty() {
+        ensure_before(deadline)?;
+        match stream.write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                wait_until(stream, PollFlags::POLLOUT, deadline)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn read_exact_until(
+    stream: &mut UnixStream,
+    mut bytes: &mut [u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        ensure_before(deadline)?;
+        match stream.read(bytes) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(read) => bytes = &mut bytes[read..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                wait_until(stream, PollFlags::POLLIN, deadline)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn wait_until(fd: &impl AsFd, events: PollFlags, deadline: Instant) -> io::Result<()> {
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(io::ErrorKind::TimedOut)?;
+        let milliseconds =
+            u16::try_from(remaining.as_millis().clamp(1, u16::MAX.into())).unwrap_or(u16::MAX);
+        let mut poll_fd = [PollFd::new(fd.as_fd(), events)];
+        let result = match poll(&mut poll_fd, PollTimeout::from(milliseconds)) {
+            Ok(result) => result,
+            Err(Errno::EINTR) => continue,
+            Err(error) => return Err(errno_io(error)),
+        };
+        if result > 0 {
+            if poll_fd[0]
+                .revents()
+                .is_some_and(|flags| flags.contains(PollFlags::POLLNVAL))
+            {
+                return Err(io::Error::from_raw_os_error(nix::libc::EBADF));
+            }
+            return Ok(());
+        }
+        if result == 0 {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+    }
+}
+
+fn ensure_before(deadline: Instant) -> io::Result<()> {
+    if Instant::now() < deadline {
+        Ok(())
+    } else {
+        Err(io::ErrorKind::TimedOut.into())
+    }
+}
+
+fn errno_io(error: Errno) -> io::Error {
+    io::Error::from_raw_os_error(error as i32)
 }
 
 fn category(value: &str) -> &'static str {
@@ -1403,5 +1504,53 @@ mod tests {
             );
             server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn bounded_request_uses_one_wall_clock_deadline_against_trickled_responses() {
+        let root = tempfile::tempdir().unwrap();
+        write_policy(
+            root.path(),
+            nix::unistd::geteuid().as_raw(),
+            "tenant-test",
+            "actor-test",
+        );
+        let socket = root.path().join("admin.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut prefix = [0_u8; LENGTH_PREFIX_BYTES];
+            stream.read_exact(&mut prefix).unwrap();
+            let mut payload = vec![0_u8; u32::from_be_bytes(prefix) as usize];
+            stream.read_exact(&mut payload).unwrap();
+            let request = PlatformV2RequestMessage::from_canonical_bytes(&payload).unwrap();
+            let response = PlatformV2ResponseMessage::for_request(
+                &request,
+                PlatformV2Response::Refused(
+                    PlatformV2Refusal::new("fixture_refused", "fixture refusal").unwrap(),
+                ),
+            )
+            .unwrap()
+            .to_canonical_bytes()
+            .unwrap();
+            stream
+                .write_all(&u32::try_from(response.len()).unwrap().to_be_bytes())
+                .unwrap();
+            for byte in response {
+                if stream.write_all(&[byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        let started = Instant::now();
+        let result = bridge(root.path(), socket, "tenant-test", "actor-test")
+            .request_with_timeout(v2_request().request().clone(), Duration::from_millis(100));
+        let elapsed = started.elapsed();
+        assert_eq!(result, Err("platform_v2_bridge_unavailable"));
+        assert!(elapsed >= Duration::from_millis(70), "elapsed {elapsed:?}");
+        assert!(elapsed < Duration::from_millis(500), "elapsed {elapsed:?}");
+        server.join().unwrap();
     }
 }

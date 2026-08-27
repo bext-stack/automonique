@@ -350,11 +350,17 @@ so JavaScript never parses authoritative revisions through `Number`.
 Attention filters are advertised as complete only when every workspace in the
 bounded inventory has an authority-qualified review projection. The web entry
 enriches at most 16 workspaces and gives each non-selected enrichment read a
-100 ms local-socket deadline. A larger inventory, a refusal, or a timed-out
-workspace produces explicit `partial` or `unavailable` attention coverage;
-unknown workspaces receive no inferred attention state. The browser keeps the
+single 100 ms local-socket wall-clock budget across connect, write, and every
+response byte; a trickling peer cannot restart that budget. A larger
+inventory, a refusal, or a timed-out workspace produces explicit `partial` or
+`unavailable` attention coverage; unknown workspaces receive no inferred
+attention state. Canonical `idle` remains a known workspace state while the
+four actionable filter counters remain unchanged. The browser keeps the
 structured cockpit snapshot separate from the retained Platform v1 snapshot,
-so filtering, selecting, and detaching cannot discard either surface.
+so filtering, selecting, and detaching cannot discard either surface. When a
+retained session maps to another known workspace, the cached structured shell,
+URL, inspector, and conversation selection move together before attachment;
+anchors from the previous workspace are removed.
 
 If v2 is refused, unavailable, downgraded, or exceeds the cockpit bound, the
 response carries the retained Platform v1 session projection separately and

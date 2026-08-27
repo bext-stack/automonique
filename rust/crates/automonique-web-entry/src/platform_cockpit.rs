@@ -574,6 +574,13 @@ mod tests {
         assert_eq!(complete["known_workspaces"], "2");
         assert_eq!(observations["workspace-a"]["value"], "needs_you");
         assert_eq!(observations["workspace-b"]["value"], "blocked");
+        assert_eq!(
+            attention_observation(&json!({
+                "state": "available",
+                "document": { "attention": { "state": "idle" } }
+            }))["value"],
+            "idle"
+        );
 
         let mut partial = observations;
         partial.insert(

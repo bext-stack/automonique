@@ -85,11 +85,13 @@ test("attention counts remain inventory-wide across several structured workspace
       ...fixture.workspaces,
       { id: "workspace-2", label: "Blocked work", revision: "2", attention: "blocked" },
       { id: "workspace-3", label: "Background work", revision: "3", attention: "working" },
+      { id: "workspace-4", label: "Quiet work", revision: "4", attention: "idle" },
     ],
-    attention: { state: "available", known_workspaces: "3", total_workspaces: "3" },
+    attention: { state: "available", known_workspaces: "4", total_workspaces: "4" },
   });
   expect(view.mode).toBe("v2");
   expect(view.attention).toEqual({ needs_you: 1, working: 1, blocked: 1, done: 0 });
+  expect(view.workspaces.find((workspace) => workspace.id === "workspace-4").attention).toBe("idle");
 });
 
 test("partial lineage or review refusal never claims complete v2 capability", () => {

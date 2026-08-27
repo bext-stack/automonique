@@ -4,6 +4,7 @@
 
 ((root) => {
   const ATTENTION_STATES = Object.freeze(["needs_you", "working", "blocked", "done"]);
+  const WORKSPACE_ATTENTION_STATES = Object.freeze(["idle", ...ATTENTION_STATES]);
   const SURFACES = Object.freeze(["conversation", "files", "activity"]);
   const RECEIPT_STATES = Object.freeze(["idle", "pending", "refused", "ambiguous", "completed"]);
   const LINK_KEYS = Object.freeze(["workspace", "session", "pane", "file", "hunk", "side", "line"]);
@@ -73,7 +74,7 @@
       label: boundedText(value.label, 256) || id,
       task: boundedText(value.task, 2048),
       branch: boundedText(value.branch, 512),
-      attention: explicitEnum(value.attention, ATTENTION_STATES),
+      attention: explicitEnum(value.attention, WORKSPACE_ATTENTION_STATES),
       external_work: normalizeSignal(value.external_work, ["open", "in_review", "merged", "closed", "unknown"]),
       internal_agent: normalizeSignal(value.internal_agent, ["idle", "queued", "running", "waiting", "failed", "completed", "unknown"]),
       revision: validDecimal(value.revision, false) ? value.revision : null,

@@ -2557,8 +2557,9 @@ async function selectPlatformSession(sessionId) {
   platformHistoryCursor = null;
   platformExactRevision = null;
   try { sessionStorage.setItem("monique-platform-session", sessionId); } catch (_error) { /* memory-only fallback */ }
-  renderRetainedPlatform(platformSnapshot || {});
   updateCockpitLink(matchingWorkspace || cockpitPresentation?.selectedWorkspace, sessionId);
+  renderHostedCockpit(cockpitSnapshot || {});
+  renderRetainedPlatform(platformSnapshot || {});
   if (previous) platformPost({ action: "detach", session_id: previous }).catch(() => {});
   await openPlatformSession(sessionId);
 }
