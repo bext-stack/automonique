@@ -142,3 +142,38 @@ final store operations. A future worker must
 use the stores' typed reservation, write-admission, ambiguity, and
 reconciliation APIs. It must not replay a write after an ambiguous result and
 must never substitute a shell command for an adapter.
+
+## Authenticated web bridge
+
+`automonique-web-entry` exposes Platform v2 only at the additive
+`POST /api/platform/v2` route. `POST /api/platform` remains the Platform v1
+route with its existing media type, body limit, mobile filtering, and wire
+behavior.
+
+The v2 route accepts exactly one of these matching request/response lanes:
+
+- `application/vnd.automonique.platform.negotiation.v1+json`
+- `application/vnd.automonique.platform.v2+json`
+
+`Content-Type` and `Accept` must both name the same lane. Negotiation requests
+are bounded by the negotiation canonical limit; v2 requests are bounded by the
+v2 canonical limit. Local responses are length-prefixed and bounded before
+allocation by the corresponding response limit, then decoded against the
+original typed request to enforce correlation and response shape.
+
+This first bridge is deliberately single-principal. It accepts an HTTP
+Basic credential for the dashboard's one configured username; dashboard
+session cookies, mobile credentials, Manage service bearers, and other bearer
+credentials cannot enter this route. Before every local exchange, web-entry
+opens the private policy with the same descriptor checks as the daemon and
+requires that its server-owned integration tenant and actor exactly equal the
+sole principal mapped to its Unix uid. The HTTP authorization header is never
+forwarded to the daemon. A missing, changed, multi-principal, or mismatched
+policy produces a correlated typed refusal without opening the admin socket.
+
+The current local protocol cannot safely represent multiple HTTP principals
+behind one web-entry uid. Such a configuration stays blocked; adding more
+Basic users must first add a daemon-authenticated delegated-principal protocol
+instead of mapping them all to the process uid. Operators must restart the
+daemon and web entry together after changing the principal policy so their
+in-memory policy generations cannot diverge.

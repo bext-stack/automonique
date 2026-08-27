@@ -166,6 +166,36 @@ impl PlatformV2Host {
     }
 }
 
+/// Verify the one principal a same-uid web bridge is allowed to represent.
+///
+/// The local admin socket authenticates a Unix uid, not an HTTP identity.  A
+/// web process may therefore bridge Platform v2 only when its server-owned
+/// tenant/actor binding is exactly the sole principal the daemon policy maps
+/// to that uid.  This helper intentionally returns no grants or policy
+/// document to the caller.
+pub fn verify_web_principal_binding(
+    policy_path: &Path,
+    expected_uid: u32,
+    tenant: &str,
+    actor: &str,
+) -> Result<(), &'static str> {
+    let bytes = read_policy_file(policy_path, expected_uid)?
+        .ok_or("platform_v2_web_binding_unavailable")?;
+    let document: PolicyDocument =
+        serde_json::from_slice(&bytes).map_err(|_| "platform_v2_policy_invalid")?;
+    let principals = parse_policy(document)?;
+    let principal = if principals.len() == 1 {
+        principals.get(&expected_uid)
+    } else {
+        None
+    }
+    .ok_or("platform_v2_web_binding_ambiguous")?;
+    if principal.actor.tenant() != tenant || principal.actor.id() != actor {
+        return Err("platform_v2_web_binding_mismatch");
+    }
+    Ok(())
+}
+
 impl PlatformV2Runtime {
     fn open(
         policy_path: &Path,
@@ -1120,5 +1150,59 @@ mod tests {
         .unwrap();
         assert_eq!(bytes, b"opened document");
         assert_eq!(fs::read(path).unwrap(), b"replacement document");
+    }
+
+    #[test]
+    fn web_bridge_binding_is_exact_and_single_principal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("policy.json");
+        let uid = nix::unistd::geteuid().as_raw();
+        let document = serde_json::json!({
+            "version": 1,
+            "principals": [{
+                "uid": uid,
+                "tenant": "tenant-test",
+                "actor": "actor-test",
+                "serving_authority": "automonique",
+                "projects": ["project-test"],
+                "workspaces": [{
+                    "project": "project-test", "kind": "project", "id": "project-test",
+                    "inherited_authority": {
+                        "filesystem": [], "credentials": [], "network": [],
+                        "tools": [], "providers": [], "models": []
+                    }
+                }],
+                "authority": {
+                    "filesystem": [], "credentials": [], "network": [],
+                    "tools": [], "providers": [], "models": []
+                },
+                "review_authorities": {}
+            }]
+        });
+        fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert_eq!(
+            verify_web_principal_binding(&path, uid, "tenant-test", "actor-test"),
+            Ok(())
+        );
+        assert_eq!(
+            verify_web_principal_binding(&path, uid, "tenant-other", "actor-test"),
+            Err("platform_v2_web_binding_mismatch")
+        );
+        assert_eq!(
+            verify_web_principal_binding(&path, uid, "tenant-test", "actor-other"),
+            Err("platform_v2_web_binding_mismatch")
+        );
+
+        let mut ambiguous = document;
+        let second = ambiguous["principals"][0].clone();
+        ambiguous["principals"].as_array_mut().unwrap().push(second);
+        ambiguous["principals"][1]["uid"] = serde_json::json!(uid.saturating_add(1));
+        fs::write(&path, serde_json::to_vec(&ambiguous).unwrap()).unwrap();
+        assert_eq!(
+            verify_web_principal_binding(&path, uid, "tenant-test", "actor-test"),
+            Err("platform_v2_web_binding_ambiguous")
+        );
     }
 }
