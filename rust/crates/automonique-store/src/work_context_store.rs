@@ -840,6 +840,25 @@ impl WorkContextStore {
         {
             return Err(WorkContextStoreError::Unauthorized);
         }
+        let existing: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT approval_document FROM work_context_approvals WHERE preview_id=?1 ORDER BY approval_id LIMIT 1",
+                [preview.preview().id().as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(document) = existing {
+            let approval =
+                decode_work_context_mutation_approval(&document, &preview).map_err(protocol)?;
+            if approval.decision() == decision
+                && approval.decided_by() == &policy.authenticated_approver
+                && approval.preview_digest() == digest
+            {
+                tx.commit()?;
+                return Ok(approval);
+            }
+            return Err(WorkContextStoreError::BodyConflict);
+        }
         let approval = MutationApproval::new(
             id,
             &preview,
@@ -1927,6 +1946,119 @@ impl WorkContextStore {
             "p.idempotency_key=?4",
             key.as_str(),
         )
+    }
+
+    /// Resolve a receipt from server-owned actor and scope inputs when the
+    /// request wire cannot know the proposal digest retained by this store.
+    /// A receipt in another authorized project is deliberately reported as
+    /// unknown, so an opaque receipt id is not a cross-project existence
+    /// oracle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn receipt_by_id_authorized(
+        &self,
+        authenticated_actor: &Actor,
+        serving_authority: ResourceAuthority,
+        actor_authority: &WorkContextAuthority,
+        authorized_project: &ProjectId,
+        authorized_targets: &BTreeSet<WorkContextIdentity>,
+        receipt_id: &ReceiptId,
+    ) -> Stored<ReceiptLookup> {
+        self.receipt_authorized(
+            authenticated_actor,
+            serving_authority,
+            actor_authority,
+            authorized_project,
+            authorized_targets,
+            "r.receipt_id=?4",
+            receipt_id.as_str(),
+        )
+    }
+
+    /// Idempotency-key form of [`Self::receipt_by_id_authorized`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn receipt_by_idempotency_key_authorized(
+        &self,
+        authenticated_actor: &Actor,
+        serving_authority: ResourceAuthority,
+        actor_authority: &WorkContextAuthority,
+        authorized_project: &ProjectId,
+        authorized_targets: &BTreeSet<WorkContextIdentity>,
+        key: &automonique_protocol::platform::IdempotencyKey,
+    ) -> Stored<ReceiptLookup> {
+        self.receipt_authorized(
+            authenticated_actor,
+            serving_authority,
+            actor_authority,
+            authorized_project,
+            authorized_targets,
+            "p.idempotency_key=?4",
+            key.as_str(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn receipt_authorized(
+        &self,
+        authenticated_actor: &Actor,
+        serving_authority: ResourceAuthority,
+        actor_authority: &WorkContextAuthority,
+        authorized_project: &ProjectId,
+        authorized_targets: &BTreeSet<WorkContextIdentity>,
+        predicate: &'static str,
+        value: &str,
+    ) -> Stored<ReceiptLookup> {
+        let sql = match predicate {
+            "r.receipt_id=?4" => {
+                "SELECT p.preview_id,p.preview_revision FROM work_context_receipts r JOIN work_context_previews p ON p.preview_id=r.preview_id WHERE p.tenant=?1 AND p.actor_id=?2 AND p.serving_authority=?3 AND r.receipt_id=?4"
+            }
+            "p.idempotency_key=?4" => {
+                "SELECT p.preview_id,p.preview_revision FROM work_context_receipts r JOIN work_context_previews p ON p.preview_id=r.preview_id WHERE p.tenant=?1 AND p.actor_id=?2 AND p.serving_authority=?3 AND p.idempotency_key=?4"
+            }
+            _ => return Err(WorkContextStoreError::InvalidField("receipt_lookup")),
+        };
+        let row: Option<(String, i64)> = self
+            .connection
+            .query_row(
+                sql,
+                params![
+                    authenticated_actor.tenant(),
+                    authenticated_actor.id(),
+                    serving_authority.as_str(),
+                    value
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((preview_id, preview_revision)) = row else {
+            return Ok(ReceiptLookup::Unknown);
+        };
+        let preview = load_preview_for_scope(
+            &self.connection,
+            &MutationPreviewRef::new(
+                MutationPreviewId::new(preview_id)
+                    .map_err(|_| WorkContextStoreError::Corrupt("preview_id"))?,
+                u64::try_from(preview_revision)
+                    .ok()
+                    .and_then(|revision| Revision::new(revision).ok())
+                    .ok_or(WorkContextStoreError::Corrupt("preview_revision"))?,
+            ),
+            authenticated_actor.tenant(),
+            serving_authority,
+        )?;
+        let policy = MutationPolicyDecision::new(
+            authenticated_actor.clone(),
+            serving_authority,
+            actor_authority.clone(),
+            actor_authority.clone(),
+            Some(authorized_project.clone()),
+            authorized_targets.clone(),
+            preview.proposal().request_digest(),
+            preview.approval(),
+        );
+        match load_receipt_lookup(&self.connection, &policy, predicate, value) {
+            Err(WorkContextStoreError::Unauthorized) => Ok(ReceiptLookup::Unknown),
+            result => result,
+        }
     }
 
     pub fn inventory(

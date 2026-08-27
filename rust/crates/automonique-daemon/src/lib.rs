@@ -129,7 +129,7 @@ use automonique_protocol::platform_v2::{PlatformVersionOffer, negotiate_platform
 use automonique_protocol::platform_v2_transport::{
     MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES, PlatformNegotiationRequestMessage,
     PlatformNegotiationResponse, PlatformNegotiationResponseMessage, PlatformV2Refusal,
-    PlatformV2RequestMessage, PlatformV2Response, PlatformV2ResponseMessage,
+    PlatformV2RequestMessage, PlatformV2ResponseMessage,
 };
 use automonique_protocol::primitives::Revision;
 use automonique_protocol::provenance::{CausationId, CorrelationId, Provenance, TraceId};
@@ -223,6 +223,7 @@ pub mod mcp_client;
 pub mod memory_config;
 pub mod model_inventory;
 pub mod parity_trace;
+mod platform_v2_host;
 pub mod pm2_inventory;
 pub mod progress;
 pub mod progress_hub;
@@ -622,6 +623,31 @@ impl DaemonConfig {
     #[must_use]
     pub fn platform_store_path(&self) -> PathBuf {
         self.state_dir().join(PLATFORM_STORE_NAME)
+    }
+
+    /// Server-owned Platform v2 principal and scope policy.
+    #[must_use]
+    pub fn platform_v2_policy_path(&self) -> PathBuf {
+        self.state_dir().join(platform_v2_host::POLICY_FILE_NAME)
+    }
+
+    /// Durable authoritative Platform v2 work-context lifecycle store.
+    #[must_use]
+    pub fn platform_v2_work_context_path(&self) -> PathBuf {
+        self.state_dir()
+            .join(platform_v2_host::WORK_CONTEXT_STORE_NAME)
+    }
+
+    /// Durable Platform v2 lineage index.
+    #[must_use]
+    pub fn platform_v2_lineage_path(&self) -> PathBuf {
+        self.state_dir().join(platform_v2_host::LINEAGE_STORE_NAME)
+    }
+
+    /// Durable Platform v2 review custody store.
+    #[must_use]
+    pub fn platform_v2_review_path(&self) -> PathBuf {
+        self.state_dir().join(platform_v2_host::REVIEW_STORE_NAME)
     }
 
     /// Durable normalized provider-session bindings.
@@ -1386,6 +1412,9 @@ pub struct Daemon {
     run_index: RunIndex,
     /// Durable platform-v1 action, cursor, attachment, and control state.
     platform: PlatformStore,
+    /// Platform v2 stores and server-owned principal policy. A refused policy
+    /// disables only v2; Platform v1 continues to serve unchanged.
+    platform_v2: platform_v2_host::PlatformV2Host,
     /// Durable normalized provider-session to latest-run bindings.
     managed_sessions: managed_sessions::ManagedSessionStore,
     /// Wall-clock instant of the last provider model-catalog projection.
@@ -2382,6 +2411,13 @@ impl Daemon {
 
         let platform = PlatformStore::open(config.platform_store_path())
             .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
+        let platform_v2 = platform_v2_host::PlatformV2Host::open(
+            &config.platform_v2_policy_path(),
+            &config.platform_v2_work_context_path(),
+            &config.platform_v2_lineage_path(),
+            &config.platform_v2_review_path(),
+            geteuid().as_raw(),
+        );
         let managed_sessions =
             managed_sessions::ManagedSessionStore::open(config.managed_sessions_path())
                 .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?;
@@ -2614,6 +2650,7 @@ impl Daemon {
             run_submissions,
             run_index,
             platform,
+            platform_v2,
             managed_sessions,
             platform_models_observed_ms: None,
             audit_chain,
@@ -3973,7 +4010,7 @@ impl Daemon {
         stream: &mut UnixStream,
         stop: &AtomicBool,
     ) -> Result<(), DaemonError> {
-        authenticate_peer(stream)?;
+        let admission = authenticate_peer(stream)?;
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
         let payload = read_payload(stream)?;
@@ -4006,10 +4043,10 @@ impl Daemon {
             LocalRequest::Execute(request) => self.handle_execute(stream, &request),
             LocalRequest::Platform(request) => self.handle_platform(stream, &request),
             LocalRequest::PlatformNegotiation(request) => {
-                self.handle_platform_negotiation(stream, &request)
+                self.handle_platform_negotiation(stream, &request, admission.uid())
             }
             LocalRequest::PlatformV2(request) => {
-                self.handle_platform_v2_unavailable(stream, &request)
+                self.handle_platform_v2(stream, &request, admission.uid())
             }
         }
     }
@@ -5146,15 +5183,20 @@ impl Daemon {
         &self,
         stream: &mut UnixStream,
         message: &PlatformNegotiationRequestMessage,
+        peer_uid: u32,
     ) -> Result<(), DaemonError> {
-        let supported = PlatformVersionOffer::new(vec![1])
-            .map_err(|_| DaemonError::ProtocolRefused("platform_negotiation"))?;
+        let supported = PlatformVersionOffer::new(if self.platform_v2.available_for(peer_uid) {
+            vec![1, 2]
+        } else {
+            vec![1]
+        })
+        .map_err(|_| DaemonError::ProtocolRefused("platform_negotiation"))?;
         let response = match negotiate_platform_version(message.offer(), &supported) {
             Ok(selected) => PlatformNegotiationResponse::Negotiated(selected),
             Err(_) => PlatformNegotiationResponse::Refused(
                 PlatformV2Refusal::new(
-                    "platform_v2_unavailable",
-                    "this daemon currently serves Platform major 1 only",
+                    self.platform_v2.refusal_category(),
+                    "Platform major 2 is unavailable for this authenticated peer",
                 )
                 .map_err(|_| DaemonError::ProtocolRefused("platform_negotiation"))?,
             ),
@@ -5167,21 +5209,19 @@ impl Daemon {
         Ok(())
     }
 
-    /// Fail closed until Platform v2 domain handlers are wired into the host.
-    fn handle_platform_v2_unavailable(
-        &self,
+    /// Dispatch Platform v2 through the server-owned principal and durable
+    /// stores. Every refusal remains correlated to the exact request.
+    fn handle_platform_v2(
+        &mut self,
         stream: &mut UnixStream,
         message: &PlatformV2RequestMessage,
+        peer_uid: u32,
     ) -> Result<(), DaemonError> {
-        let refusal = PlatformV2Refusal::new(
-            "platform_v2_unavailable",
-            "Platform major 2 transport is recognized but not served by this daemon",
-        )
-        .map_err(|_| DaemonError::ProtocolRefused("platform_v2_unavailable"))?;
-        let frame =
-            PlatformV2ResponseMessage::for_request(message, PlatformV2Response::Refused(refusal))
-                .and_then(|response| response.to_frame())
-                .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
+        let now_ms = unix_millis()?;
+        let response = self.platform_v2.handle(peer_uid, message.request(), now_ms);
+        let frame = PlatformV2ResponseMessage::for_request(message, response)
+            .and_then(|response| response.to_frame())
+            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
         stream.write_all(&frame)?;
         stream.flush()?;
         Ok(())

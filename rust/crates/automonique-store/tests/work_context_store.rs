@@ -1191,6 +1191,34 @@ fn external_effect_commits_outbox_then_result_and_completed_receipt_atomically()
             .unwrap(),
         ReceiptLookup::Unknown
     );
+    let authorized_targets =
+        BTreeSet::from([identity(WorkContextKind::UserWorkspace, "workspace-1")]);
+    assert!(matches!(
+        store
+            .receipt_by_id_authorized(
+                &actor(),
+                ResourceAuthority::Automonique,
+                &WorkContextAuthority::EMPTY,
+                &ProjectId::new("project-1").unwrap(),
+                &authorized_targets,
+                &ReceiptId::new("receipt-attempt").unwrap(),
+            )
+            .unwrap(),
+        ReceiptLookup::Found(_)
+    ));
+    assert_eq!(
+        store
+            .receipt_by_idempotency_key_authorized(
+                &actor(),
+                ResourceAuthority::Automonique,
+                &WorkContextAuthority::EMPTY,
+                &ProjectId::new("project-other").unwrap(),
+                &authorized_targets,
+                request.idempotency_key(),
+            )
+            .unwrap(),
+        ReceiptLookup::Unknown
+    );
     assert!(
         store
             .record(
