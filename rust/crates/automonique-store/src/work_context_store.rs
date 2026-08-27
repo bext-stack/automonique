@@ -1647,13 +1647,18 @@ impl WorkContextStore {
             String,
             i64,
             Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
         );
         let row: Option<ReconcileRow> = tx
             .query_row(
-                "SELECT o.state,o.outbox_id,o.effect_document,o.created_at_ms,o.completed_at_ms,o.effect_kind,l.state,l.executor_id,l.serving_authority,l.tenant,l.target_key,l.target_revision,l.effect_kind,l.effect_digest,l.expires_at_ms,l.completed_at_ms FROM work_context_outbox o JOIN work_context_effect_leases l ON l.preview_id=o.preview_id WHERE l.lease_id=?1 AND o.preview_id=?2",
+                "SELECT o.state,o.outbox_id,o.effect_document,o.created_at_ms,o.completed_at_ms,o.effect_kind,l.state,l.executor_id,l.serving_authority,l.tenant,l.target_key,l.target_revision,l.effect_kind,l.effect_digest,l.expires_at_ms,l.completed_at_ms,e.preview_id,e.tenant,e.target_key,e.target_revision,e.effect_kind FROM work_context_outbox o JOIN work_context_effect_leases l ON l.preview_id=o.preview_id LEFT JOIN work_context_effect_reservations e ON e.preview_id=o.preview_id WHERE l.lease_id=?1 AND o.preview_id=?2",
                 params![policy.lease_id.as_str(), policy.preview.id().as_str()],
                 |row| {
-                    Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?,row.get(15)?))
+                    Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?,row.get(15)?,row.get(16)?,row.get(17)?,row.get(18)?,row.get(19)?,row.get(20)?))
                 },
             )
             .optional()?;
@@ -1674,6 +1679,11 @@ impl WorkContextStore {
             lease_digest,
             lease_expiry,
             lease_completed_at,
+            reservation_preview,
+            reservation_tenant,
+            reservation_target,
+            reservation_revision,
+            reservation_kind,
         )) = row
         else {
             return Err(WorkContextStoreError::NotFound);
@@ -1717,6 +1727,11 @@ impl WorkContextStore {
             || lease_digest != document_digest(&effect_document)
             || lease_expiry != policy.expires_at.as_millis()
             || lease_expiry <= created_at
+            || reservation_preview.as_deref() != Some(policy.preview.id().as_str())
+            || reservation_tenant.as_deref() != Some(policy.executor.tenant())
+            || reservation_target.as_deref() != Some(identity_key(target.identity()).as_str())
+            || reservation_revision != Some(to_i64(target.revision())?)
+            || reservation_kind.as_deref() != Some(policy.effect_kind.as_str())
             || trusted_now_ms < created_at
         {
             return Err(WorkContextStoreError::Corrupt("effect_reconciliation"));

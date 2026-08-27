@@ -18,7 +18,7 @@ use automonique_protocol::platform_v2_lifecycle_api::{
 };
 use automonique_protocol::primitives::{EpochMillis, Revision};
 use automonique_store::work_context_store::*;
-use rusqlite::Connection;
+use rusqlite::{Connection, params, types::Value};
 use tempfile::TempDir;
 
 struct PrivateStore {
@@ -318,6 +318,107 @@ fn seed_submitted_attempt(
         )
         .unwrap();
     (request, preview, submission)
+}
+
+fn assert_reconciliation_refuses_reservation_corruption(
+    path: &Path,
+    store: &mut WorkContextStore,
+    policy: &ExternalEffectCompletionPolicy,
+    reconciliation: &ExternalEffectReconciliation,
+    trusted_now_ms: i64,
+) {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", false)
+        .unwrap();
+    let preview_id = policy.preview().id().as_str();
+    let canonical: (String, String, i64, String, String) = connection
+        .query_row(
+            "SELECT tenant,target_key,target_revision,effect_kind,preview_id FROM work_context_effect_reservations WHERE preview_id=?1",
+            [preview_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .unwrap();
+    connection
+        .execute(
+            "DELETE FROM work_context_effect_reservations WHERE preview_id=?1",
+            [preview_id],
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .reconcile_external_effect(policy, reconciliation, trusted_now_ms)
+            .unwrap_err()
+            .category(),
+        "corrupt"
+    );
+    connection
+        .execute(
+            "INSERT INTO work_context_effect_reservations(tenant,target_key,target_revision,effect_kind,preview_id) VALUES(?1,?2,?3,?4,?5)",
+            params![&canonical.0, &canonical.1, canonical.2, &canonical.3, &canonical.4],
+        )
+        .unwrap();
+
+    connection
+        .execute(
+            "UPDATE work_context_effect_reservations SET preview_id='preview-corrupt' WHERE preview_id=?1",
+            [preview_id],
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .reconcile_external_effect(policy, reconciliation, trusted_now_ms)
+            .unwrap_err()
+            .category(),
+        "corrupt"
+    );
+    connection
+        .execute(
+            "UPDATE work_context_effect_reservations SET preview_id=?1 WHERE preview_id='preview-corrupt'",
+            [preview_id],
+        )
+        .unwrap();
+
+    let fields = [
+        (
+            "tenant",
+            Value::Text(String::from("tenant-corrupt")),
+            Value::Text(canonical.0.clone()),
+        ),
+        (
+            "target_key",
+            Value::Text(String::from("attempt_workspace:corrupt")),
+            Value::Text(canonical.1.clone()),
+        ),
+        (
+            "target_revision",
+            Value::Integer(canonical.2 + 1),
+            Value::Integer(canonical.2),
+        ),
+        (
+            "effect_kind",
+            Value::Text(String::from("corrupt_kind")),
+            Value::Text(canonical.3.clone()),
+        ),
+    ];
+    for (field, corrupt, original) in fields {
+        let update =
+            format!("UPDATE work_context_effect_reservations SET {field}=?1 WHERE preview_id=?2");
+        connection
+            .execute(&update, params![corrupt, preview_id])
+            .unwrap();
+        assert_eq!(
+            store
+                .reconcile_external_effect(policy, reconciliation, trusted_now_ms)
+                .unwrap_err()
+                .category(),
+            "corrupt",
+            "reservation field {field}"
+        );
+        connection
+            .execute(&update, params![original, preview_id])
+            .unwrap();
+    }
 }
 fn unwrap_new(admission: PreviewAdmission) -> MutationPreview {
     match admission {
@@ -1433,19 +1534,23 @@ fn external_effect_commits_outbox_then_result_and_completed_receipt_atomically()
         .unwrap()
         .unwrap();
     assert_eq!(reconciliation_claim.lease_id(), second_claim.lease_id());
+    let unknown_reconciliation = ExternalEffectReconciliation::Unknown {
+        evidence: ProviderEffectEvidence::new(
+            reconciliation_claim.idempotency_key().clone(),
+            b"provider lookup timed out".to_vec(),
+        )
+        .unwrap(),
+    };
+    assert_reconciliation_refuses_reservation_corruption(
+        private.path(),
+        &mut reopened,
+        &reconciliation_claim,
+        &unknown_reconciliation,
+        103,
+    );
     assert_eq!(
         reopened
-            .reconcile_external_effect(
-                &reconciliation_claim,
-                &ExternalEffectReconciliation::Unknown {
-                    evidence: ProviderEffectEvidence::new(
-                        reconciliation_claim.idempotency_key().clone(),
-                        b"provider lookup timed out".to_vec(),
-                    )
-                    .unwrap(),
-                },
-                103,
-            )
+            .reconcile_external_effect(&reconciliation_claim, &unknown_reconciliation, 103,)
             .unwrap(),
         ExternalEffectReconciliationOutcome::ReconcileRequired
     );
@@ -1517,6 +1622,13 @@ fn external_effect_commits_outbox_then_result_and_completed_receipt_atomically()
             .complete_external_effect(&reconciliation_claim, 105)
             .unwrap(),
         completed
+    );
+    assert_reconciliation_refuses_reservation_corruption(
+        private.path(),
+        &mut reopened,
+        &reconciliation_claim,
+        &completed_reconciliation,
+        106,
     );
     assert_eq!(
         reopened
