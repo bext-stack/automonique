@@ -215,6 +215,63 @@ fn restart_preserves_sanitized_snapshot_comments_and_sent_state() {
 }
 
 #[test]
+fn current_review_v2_snapshot_cannot_downgrade_to_v1() {
+    let private = PrivateStore::new();
+    let current = snapshot();
+    let workspace = current.workspace().clone();
+    let legacy_next_document = String::from_utf8(LEGACY_SNAPSHOT.to_vec())
+        .expect("legacy fixture utf8")
+        .replace("\"revision\":9,\"schema\"", "\"revision\":10,\"schema\"")
+        .into_bytes();
+    let legacy_next = decode_review_snapshot(&legacy_next_document).expect("legacy next revision");
+    assert_eq!(legacy_next.schema(), ReviewSchemaVersion::V1);
+    assert_eq!(legacy_next.revision(), revision(10));
+
+    let mut store = ReviewStore::open(private.path()).expect("open");
+    store.put_snapshot(&current, 10).expect("persist v2");
+    let before: (i64, Vec<u8>, Vec<u8>, String) = Connection::open(private.path())
+        .expect("raw before")
+        .query_row(
+            "SELECT c.revision,s.document,s.document_digest,s.protocol_schema FROM review_current c JOIN review_snapshots s USING(workspace_kind,workspace_id,revision) WHERE c.workspace_kind=?1 AND c.workspace_id=?2",
+            params![current.workspace().kind().as_str(), current.workspace().id()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("current bytes before refusal");
+
+    assert!(matches!(
+        store.put_snapshot(&legacy_next, 11),
+        Err(ReviewStoreError::Conflict("snapshot_schema_downgrade"))
+    ));
+    assert_eq!(
+        store
+            .snapshot(&workspace)
+            .expect("read current")
+            .expect("current snapshot"),
+        current
+    );
+    drop(store);
+
+    let raw = Connection::open(private.path()).expect("raw after");
+    let after: (i64, Vec<u8>, Vec<u8>, String) = raw
+        .query_row(
+            "SELECT c.revision,s.document,s.document_digest,s.protocol_schema FROM review_current c JOIN review_snapshots s USING(workspace_kind,workspace_id,revision) WHERE c.workspace_kind=?1 AND c.workspace_id=?2",
+            params![workspace.kind().as_str(), workspace.id()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("current bytes after refusal");
+    assert_eq!(after, before);
+    assert_eq!(
+        raw.query_row(
+            "SELECT count(*) FROM review_snapshots WHERE workspace_kind=?1 AND workspace_id=?2",
+            params![workspace.kind().as_str(), workspace.id()],
+            |row| row.get::<_, u32>(0),
+        )
+        .expect("snapshot count"),
+        1
+    );
+}
+
+#[test]
 fn populated_review_v1_store_migrates_exactly_and_remains_non_actionable() {
     let private = PrivateStore::new();
     let legacy = legacy_snapshot();

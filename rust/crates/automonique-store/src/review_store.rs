@@ -514,6 +514,11 @@ impl ReviewStore {
             }
             let previous = read_current_snapshot(&transaction, kind, workspace_id)?
                 .ok_or(ReviewStoreError::Corrupt("current_snapshot"))?;
+            if previous.schema() == ReviewSchemaVersion::V2
+                && snapshot.schema() == ReviewSchemaVersion::V1
+            {
+                return Err(ReviewStoreError::Conflict("snapshot_schema_downgrade"));
+            }
             validate_comment_history(&previous, snapshot)?;
         }
         transaction.execute(
