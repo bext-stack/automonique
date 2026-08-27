@@ -36,8 +36,9 @@ import {
 } from "../../protocol/src/index.js";
 import {PlatformTransportError} from "./platform-client.js";
 import {
-  platformV2Exchange,
-  type InternalPlatformV2Transport,
+  claimPlatformV2Exchange,
+  RegisteredPlatformV2Transport,
+  type PlatformV2Exchange,
   type PlatformV2Lane,
 } from "./platform-v2-internal.js";
 
@@ -133,64 +134,81 @@ function protocolError(error: unknown, status = 0): PlatformTransportError {
   return new PlatformTransportError(status, category, {cause: error});
 }
 
+async function exchangeHttps(
+  endpointValue: string,
+  credentialProvider: () => string | Promise<string>,
+  fetcher: typeof fetch,
+  lane: PlatformV2Lane,
+  payload: Uint8Array,
+  signal?: AbortSignal,
+): Promise<{readonly payload: Uint8Array; readonly status: number}> {
+  const mediaType = lane === "negotiation" ? PLATFORM_NEGOTIATION_MEDIA_TYPE : PLATFORM_V2_MEDIA_TYPE;
+  const maximumResponseBytes = lane === "negotiation"
+    ? MAX_PLATFORM_NEGOTIATION_RESPONSE_CANONICAL_BYTES
+    : MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES;
+  if (signal?.aborted === true) {
+    throw new PlatformTransportError(0, "aborted", {cause: signal.reason});
+  }
+  const token = await abortableCredential(credentialProvider, signal);
+  const response = await fetcher(endpointValue, {
+    method: "POST",
+    credentials: "omit",
+    headers: {
+      accept: mediaType,
+      authorization: `Bearer ${bearerToken(token)}`,
+      "content-type": mediaType,
+    },
+    body: new TextDecoder().decode(payload),
+    redirect: "error",
+    ...(signal === undefined ? {} : {signal}),
+  });
+  if (typeof response.url === "string" && response.url !== "" && response.url !== endpointValue) {
+    throw new PlatformTransportError(response.status, "response_url_mismatch");
+  }
+  if (response.status === 401 || response.status === 403) {
+    throw new PlatformTransportError(response.status, "unauthorized");
+  }
+  if (!response.ok) throw new PlatformTransportError(response.status, "remote_refusal");
+  if (response.headers.get("content-type")?.trim() !== mediaType) {
+    throw new PlatformTransportError(response.status, "content_type_mismatch");
+  }
+  const cacheControl = response.headers.get("cache-control")
+    ?.split(",")
+    .map((value) => value.trim().toLowerCase());
+  if (!cacheControl?.includes("no-store")) {
+    throw new PlatformTransportError(response.status, "cache_control_mismatch");
+  }
+  return {payload: await readBoundedResponse(response, maximumResponseBytes), status: response.status};
+}
+
 /** Authenticated HTTPS transport with an exact endpoint and no redirect forwarding. */
-export class HttpsPlatformV2Transport implements InternalPlatformV2Transport {
-  readonly endpoint: string;
-  readonly token: () => string | Promise<string>;
-  readonly fetcher: typeof fetch;
+export class HttpsPlatformV2Transport extends RegisteredPlatformV2Transport {
+  readonly #endpoint: string;
+  readonly #credentialProvider: () => string | Promise<string>;
+  readonly #fetcher: typeof fetch;
 
   constructor(
     endpointValue: string,
-    token: () => string | Promise<string>,
+    credentialProvider: () => string | Promise<string>,
     fetcher: typeof fetch = fetch,
   ) {
-    this.endpoint = endpoint(endpointValue);
-    this.token = token;
-    this.fetcher = fetcher;
-  }
-
-  async [platformV2Exchange](
-    lane: PlatformV2Lane,
-    payload: Uint8Array,
-    signal?: AbortSignal,
-  ): Promise<{readonly payload: Uint8Array; readonly status: number}> {
-    const mediaType = lane === "negotiation" ? PLATFORM_NEGOTIATION_MEDIA_TYPE : PLATFORM_V2_MEDIA_TYPE;
-    const maximumResponseBytes = lane === "negotiation"
-      ? MAX_PLATFORM_NEGOTIATION_RESPONSE_CANONICAL_BYTES
-      : MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES;
-    if (signal?.aborted === true) {
-      throw new PlatformTransportError(0, "aborted", {cause: signal.reason});
-    }
-    const token = await abortableCredential(this.token, signal);
-    const response = await this.fetcher(this.endpoint, {
-      method: "POST",
-      credentials: "omit",
-      headers: {
-        accept: mediaType,
-        authorization: `Bearer ${bearerToken(token)}`,
-        "content-type": mediaType,
-      },
-      body: new TextDecoder().decode(payload),
-      redirect: "error",
-      ...(signal === undefined ? {} : {signal}),
+    const pinnedEndpoint = endpoint(endpointValue);
+    let invoke: PlatformV2Exchange | undefined;
+    super((lane, payload, signal) => {
+      if (invoke === undefined) return Promise.reject(new TypeError("platform v2 transport is not initialized"));
+      return invoke(lane, payload, signal);
     });
-    if (typeof response.url === "string" && response.url !== "" && response.url !== this.endpoint) {
-      throw new PlatformTransportError(response.status, "response_url_mismatch");
-    }
-    if (response.status === 401 || response.status === 403) {
-      throw new PlatformTransportError(response.status, "unauthorized");
-    }
-    if (!response.ok) throw new PlatformTransportError(response.status, "remote_refusal");
-    if (response.headers.get("content-type")?.trim() !== mediaType) {
-      throw new PlatformTransportError(response.status, "content_type_mismatch");
-    }
-    const cacheControl = response.headers.get("cache-control")
-      ?.split(",")
-      .map((value) => value.trim().toLowerCase());
-    if (!cacheControl?.includes("no-store")) {
-      throw new PlatformTransportError(response.status, "cache_control_mismatch");
-    }
-    return {payload: await readBoundedResponse(response, maximumResponseBytes), status: response.status};
+    this.#endpoint = pinnedEndpoint;
+    this.#credentialProvider = credentialProvider;
+    this.#fetcher = fetcher;
+    invoke = (lane, payload, signal) => exchangeHttps(
+      this.#endpoint,
+      this.#credentialProvider,
+      this.#fetcher,
+      lane,
+      payload,
+      signal,
+    );
   }
 }
 
@@ -266,18 +284,20 @@ function requireResponse<K extends PlatformV2Response["kind"]>(
 
 /** Operation-specific facade. V2 calls fail closed until major two is negotiated. */
 export class PlatformV2Client {
-  readonly #transport: InternalPlatformV2Transport;
-  #negotiated: NegotiatedPlatform | null = null;
+  readonly #exchange: PlatformV2Exchange;
+  #negotiationGeneration = 0n;
+  #negotiated: {readonly generation: bigint; readonly value: NegotiatedPlatform} | null = null;
 
-  constructor(transport: InternalPlatformV2Transport) {
-    this.#transport = transport;
+  constructor(transport: RegisteredPlatformV2Transport) {
+    this.#exchange = claimPlatformV2Exchange(transport);
   }
 
   get negotiated(): NegotiatedPlatform | null {
-    return this.#negotiated;
+    return this.#negotiated?.value ?? null;
   }
 
   async negotiate(offer: PlatformVersionOffer, signal?: AbortSignal): Promise<PlatformNegotiationResponse> {
+    const generation = ++this.#negotiationGeneration;
     this.#negotiated = null;
     let requestId: ReturnType<typeof PlatformRequestId>;
     let payload: Uint8Array;
@@ -287,12 +307,15 @@ export class PlatformV2Client {
     } catch (error) {
       throw protocolError(error);
     }
-    const exchanged = await this.#transport[platformV2Exchange]("negotiation", payload, signal);
+    const exchanged = await this.#exchange("negotiation", payload, signal);
     let response: PlatformNegotiationResponse;
     try {
       response = decodePlatformNegotiationResponse(exchanged.payload, requestId, offer);
     } catch (error) {
       throw protocolError(error, exchanged.status);
+    }
+    if (generation !== this.#negotiationGeneration) {
+      throw new PlatformTransportError(0, "negotiation_superseded");
     }
     if (
       response.kind === "negotiated"
@@ -300,13 +323,14 @@ export class PlatformV2Client {
       && response.negotiated.schema === PLATFORM_SCHEMA_V2
       && response.negotiated.work_context === "v2_structured"
     ) {
-      this.#negotiated = response.negotiated;
+      this.#negotiated = {generation, value: response.negotiated};
     }
     return response;
   }
 
   #request(request: PlatformV2Request, signal?: AbortSignal): Promise<PlatformV2Response> {
-    if (this.#negotiated === null) {
+    const negotiated = this.#negotiated;
+    if (negotiated === null) {
       return Promise.reject(new PlatformTransportError(0, "platform_v2_not_negotiated"));
     }
     let requestId: ReturnType<typeof PlatformRequestId>;
@@ -317,7 +341,13 @@ export class PlatformV2Client {
     } catch (error) {
       return Promise.reject(protocolError(error));
     }
-    return this.#transport[platformV2Exchange]("v2", payload, signal).then((response) => {
+    return this.#exchange("v2", payload, signal).then((response) => {
+      if (
+        negotiated.generation !== this.#negotiationGeneration
+        || this.#negotiated?.generation !== negotiated.generation
+      ) {
+        throw new PlatformTransportError(0, "negotiation_invalidated");
+      }
       try {
         return decodePlatformV2Response(response.payload, requestId, request.kind);
       } catch (error) {

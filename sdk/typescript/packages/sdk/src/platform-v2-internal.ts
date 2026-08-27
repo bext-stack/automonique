@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-export const platformV2Exchange = Symbol("automonique.platform.v2.exchange");
-
 export type PlatformV2Lane = "negotiation" | "v2";
 
 export interface PlatformV2ExchangeResult {
@@ -9,11 +7,26 @@ export interface PlatformV2ExchangeResult {
   readonly status: number;
 }
 
-/** Package-internal transport seam; it is not exported by the public package. */
-export interface InternalPlatformV2Transport {
-  [platformV2Exchange](
-    lane: PlatformV2Lane,
-    payload: Uint8Array,
-    signal?: AbortSignal,
-  ): Promise<PlatformV2ExchangeResult>;
+export type PlatformV2Exchange = (
+  lane: PlatformV2Lane,
+  payload: Uint8Array,
+  signal?: AbortSignal,
+) => Promise<PlatformV2ExchangeResult>;
+
+const exchanges = new WeakMap<RegisteredPlatformV2Transport, PlatformV2Exchange>();
+
+/** Package-internal nominal base for an inaccessible v2 transport capability. */
+export abstract class RegisteredPlatformV2Transport {
+  declare private readonly __registeredPlatformV2Transport: void;
+
+  protected constructor(exchange: PlatformV2Exchange) {
+    exchanges.set(this, exchange);
+  }
+}
+
+/** Obtains the raw exchange closure without exposing it on the transport. */
+export function claimPlatformV2Exchange(transport: RegisteredPlatformV2Transport): PlatformV2Exchange {
+  const exchange = exchanges.get(transport);
+  if (exchange === undefined) throw new TypeError("platform v2 transport capability is unavailable");
+  return exchange;
 }

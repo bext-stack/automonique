@@ -21,6 +21,8 @@ import {
   encodeMessage,
   lifecycleRequestDigest,
   type JsonValue,
+  type PlatformNegotiationResponse,
+  type PlatformV2Response,
   type PlatformVersionOffer,
   type MutationPreview,
   type WorkContextIdentity,
@@ -86,6 +88,14 @@ function record(identity: WorkContextIdentity) {
   };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((complete) => {
+    resolve = complete;
+  });
+  return {promise, resolve};
+}
+
 const emptyAuthority = {
   credentials: [], filesystem: [], models: [], network: [], providers: [], tools: [],
 } as const;
@@ -129,6 +139,12 @@ describe("canonical HTTPS Platform v2 client", () => {
     expect("negotiate" in transport).toBe(false);
     expect("request" in client).toBe(false);
     expect("transport" in client).toBe(false);
+    expect(Reflect.ownKeys(transport)).toEqual([]);
+    expect(Reflect.ownKeys(Object.getPrototypeOf(transport))).toEqual(["constructor"]);
+    expect(Object.getOwnPropertySymbols(transport)).toEqual([]);
+    expect(Object.getOwnPropertySymbols(Object.getPrototypeOf(transport))).toEqual([]);
+    expect(Reflect.ownKeys(Object.getPrototypeOf(Object.getPrototypeOf(transport)))).toEqual(["constructor"]);
+    expect(Reflect.ownKeys(client)).toEqual([]);
   });
 
   test("pins a credential-free HTTPS endpoint", () => {
@@ -140,8 +156,56 @@ describe("canonical HTTPS Platform v2 client", () => {
     ]) {
       expect(() => new HttpsPlatformV2Transport(invalid, () => "token")).toThrow();
     }
-    expect(new HttpsPlatformV2Transport("http://localhost/api/platform/v2", () => "token").endpoint)
-      .toBe("http://localhost/api/platform/v2");
+    expect(() => new HttpsPlatformV2Transport("http://localhost/api/platform/v2", () => "token"))
+      .not.toThrow();
+  });
+
+  test("ignores reflective property injection and keeps credentials on the pinned typed path", async () => {
+    let originalCredentialCalls = 0;
+    let attackerCredentialCalls = 0;
+    let attackerFetchCalls = 0;
+    let attackerSymbolCalls = 0;
+    let observedEndpoint = "";
+    const fetcher = (async (input: string | URL | Request, init?: RequestInit) => {
+      observedEndpoint = String(input);
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer original-token");
+      const body = typeof init?.body === "string" ? init.body : "";
+      const requestId = decodeMessage(new TextEncoder().encode(body)).envelope.requestId;
+      return canonicalResponse(requestId, "automonique.platform.negotiation", 1, "negotiated", negotiatedBody(2n), PLATFORM_NEGOTIATION_MEDIA_TYPE);
+    }) as typeof fetch;
+    const transport = new HttpsPlatformV2Transport(
+      "https://manage.example/api/platform/v2",
+      () => {
+        originalCredentialCalls += 1;
+        return "original-token";
+      },
+      fetcher,
+    );
+    Object.assign(transport as unknown as Record<string, unknown>, {
+      endpoint: "https://attacker.example/arbitrary",
+      credentialProvider: () => {
+        attackerCredentialCalls += 1;
+        return "attacker-token";
+      },
+      fetcher: async () => {
+        attackerFetchCalls += 1;
+        return new Response();
+      },
+    });
+    const attackerExchange = Symbol("attacker.exchange");
+    Object.defineProperty(transport, attackerExchange, {
+      value: async () => {
+        attackerSymbolCalls += 1;
+        return {payload: new Uint8Array(), status: 200};
+      },
+    });
+
+    expect((await new PlatformV2Client(transport).negotiate(offer)).kind).toBe("negotiated");
+    expect(observedEndpoint).toBe("https://manage.example/api/platform/v2");
+    expect(originalCredentialCalls).toBe(1);
+    expect(attackerCredentialCalls).toBe(0);
+    expect(attackerFetchCalls).toBe(0);
+    expect(attackerSymbolCalls).toBe(0);
   });
 
   test("negotiates and sends an exact typed request without identity assertions", async () => {
@@ -337,6 +401,42 @@ describe("canonical HTTPS Platform v2 client", () => {
     const client = new PlatformV2Client(adapter);
     await client.negotiate(offer);
     await expect(client.prepareMutation(key, requested)).rejects.toMatchObject({category: "response_request_mismatch"});
+  });
+
+  test("does not let a stale negotiation success overwrite a newer refusal", async () => {
+    const stale = deferred<PlatformNegotiationResponse>();
+    const newer = deferred<PlatformNegotiationResponse>();
+    const adapter = new DeterministicPlatformV2Adapter([
+      {lane: "negotiation", result: stale.promise},
+      {lane: "negotiation", result: newer.promise},
+    ]);
+    const client = new PlatformV2Client(adapter);
+    const staleAttempt = client.negotiate(offer);
+    const newerAttempt = client.negotiate(offer);
+
+    newer.resolve({kind: "platform_v2_refused", refusal: {category: "unsupported", explanation: "v2 disabled", schema: PLATFORM_SCHEMA_V2}});
+    expect((await newerAttempt).kind).toBe("platform_v2_refused");
+    expect(client.negotiated).toBeNull();
+
+    stale.resolve({kind: "negotiated", negotiated: negotiatedBody(2n)});
+    await expect(staleAttempt).rejects.toMatchObject({category: "negotiation_superseded"});
+    expect(client.negotiated).toBeNull();
+  });
+
+  test("fences an in-flight v2 response when renegotiation invalidates its generation", async () => {
+    const response = deferred<PlatformV2Response>();
+    const adapter = new DeterministicPlatformV2Adapter([
+      {lane: "negotiation", result: {kind: "negotiated", negotiated: negotiatedBody(2n)}},
+      {lane: "v2", request: {kind: "get_work_context", identity: projectA}, result: response.promise},
+      {lane: "negotiation", result: {kind: "platform_v2_refused", refusal: {category: "unsupported", explanation: "v2 disabled", schema: PLATFORM_SCHEMA_V2}}},
+    ]);
+    const client = new PlatformV2Client(adapter);
+    await client.negotiate(offer);
+    const pending = client.getWorkContext(projectA);
+    expect((await client.negotiate(offer)).kind).toBe("platform_v2_refused");
+    response.resolve({kind: "work_context_record", record: record(projectA)});
+    await expect(pending).rejects.toMatchObject({category: "negotiation_invalidated"});
+    expect(client.negotiated).toBeNull();
   });
 
   test("aborts before credentials and races a nonresolving credential provider", async () => {

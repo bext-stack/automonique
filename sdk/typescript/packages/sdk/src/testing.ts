@@ -65,8 +65,7 @@ import type {
   SessionHistoryPage,
 } from "./platform-client.js";
 import {
-  platformV2Exchange,
-  type InternalPlatformV2Transport,
+  RegisteredPlatformV2Transport,
   type PlatformV2Lane,
 } from "./platform-v2-internal.js";
 
@@ -138,48 +137,67 @@ export class DeterministicPlatformAdapter implements PlatformAdapter {
 }
 
 export type DeterministicPlatformV2Step =
-  | {readonly lane: "negotiation"; readonly result: PlatformNegotiationResponse}
-  | {readonly lane: "v2"; readonly request: PlatformV2Request; readonly result: PlatformV2Response}
+  | {readonly lane: "negotiation"; readonly result: PlatformNegotiationResponse | Promise<PlatformNegotiationResponse>}
+  | {readonly lane: "v2"; readonly request: PlatformV2Request; readonly result: PlatformV2Response | Promise<PlatformV2Response>}
   | {readonly lane: "error"; readonly error: Error};
 
+interface DeterministicPlatformV2State {
+  readonly negotiations: PlatformVersionOffer[];
+  readonly requests: PlatformV2Request[];
+  readonly steps: DeterministicPlatformV2Step[];
+}
+
+async function deterministicPlatformV2Exchange(
+  state: DeterministicPlatformV2State,
+  lane: PlatformV2Lane,
+  payload: Uint8Array,
+  signal?: AbortSignal,
+): Promise<{readonly payload: Uint8Array; readonly status: number}> {
+  if (signal?.aborted === true) {
+    throw new DeterministicFixtureError("aborted", {cause: signal.reason});
+  }
+  const step = state.steps.shift();
+  if (step === undefined) throw new DeterministicFixtureError("script_exhausted");
+  if (step.lane === "error") throw step.error;
+  if (step.lane !== lane) throw new DeterministicFixtureError("unexpected_request");
+  if (lane === "negotiation" && step.lane === "negotiation") {
+    const decoded = decodePlatformNegotiationRequest(payload);
+    state.negotiations.push(decoded.request.offer);
+    return {payload: encodeNegotiationFixtureResponse(decoded.request_id, await step.result), status: 200};
+  }
+  if (lane === "v2" && step.lane === "v2") {
+    if (payload.length > MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES) {
+      throw new DeterministicFixtureError("unexpected_request");
+    }
+    const envelope = decodeMessage(payload).envelope;
+    const expected = encodePlatformV2FixtureRequest(PlatformRequestId(envelope.requestId), step.request);
+    if (!bytesEqual(payload, expected)) throw new DeterministicFixtureError("unexpected_request");
+    state.requests.push(step.request);
+    return {payload: encodeV2FixtureResponse(envelope.requestId, await step.result), status: 200};
+  }
+  throw new DeterministicFixtureError("unexpected_request");
+}
+
 /** Exact-order typed Platform v2 adapter with retained request coordinates. */
-export class DeterministicPlatformV2Adapter implements InternalPlatformV2Transport {
-  readonly negotiations: PlatformVersionOffer[] = [];
-  readonly requests: PlatformV2Request[] = [];
-  readonly #steps: DeterministicPlatformV2Step[];
+export class DeterministicPlatformV2Adapter extends RegisteredPlatformV2Transport {
+  readonly #state: DeterministicPlatformV2State;
 
   constructor(steps: readonly DeterministicPlatformV2Step[]) {
-    this.#steps = [...steps];
+    const state: DeterministicPlatformV2State = {negotiations: [], requests: [], steps: [...steps]};
+    super((lane, payload, signal) => deterministicPlatformV2Exchange(state, lane, payload, signal));
+    this.#state = state;
+  }
+
+  get negotiations(): readonly PlatformVersionOffer[] {
+    return this.#state.negotiations;
+  }
+
+  get requests(): readonly PlatformV2Request[] {
+    return this.#state.requests;
   }
 
   get pendingSteps(): number {
-    return this.#steps.length;
-  }
-
-  async [platformV2Exchange](lane: PlatformV2Lane, payload: Uint8Array, signal?: AbortSignal): Promise<{readonly payload: Uint8Array; readonly status: number}> {
-    if (signal?.aborted === true) {
-      throw new DeterministicFixtureError("aborted", {cause: signal.reason});
-    }
-    const step = this.#steps.shift();
-    if (step === undefined) throw new DeterministicFixtureError("script_exhausted");
-    if (step.lane === "error") throw step.error;
-    if (step.lane !== lane) throw new DeterministicFixtureError("unexpected_request");
-    if (lane === "negotiation" && step.lane === "negotiation") {
-      const decoded = decodePlatformNegotiationRequest(payload);
-      this.negotiations.push(decoded.request.offer);
-      return {payload: encodeNegotiationFixtureResponse(decoded.request_id, step.result), status: 200};
-    }
-    if (lane === "v2" && step.lane === "v2") {
-      if (payload.length > MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES) {
-        throw new DeterministicFixtureError("unexpected_request");
-      }
-      const envelope = decodeMessage(payload).envelope;
-      const expected = encodePlatformV2FixtureRequest(PlatformRequestId(envelope.requestId), step.request);
-      if (!bytesEqual(payload, expected)) throw new DeterministicFixtureError("unexpected_request");
-      this.requests.push(step.request);
-      return {payload: encodeV2FixtureResponse(envelope.requestId, step.result), status: 200};
-    }
-    throw new DeterministicFixtureError("unexpected_request");
+    return this.#state.steps.length;
   }
 }
 
