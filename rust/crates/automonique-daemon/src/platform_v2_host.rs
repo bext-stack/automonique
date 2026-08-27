@@ -167,7 +167,7 @@ impl PlatformV2LifecycleEffectAdapter for UnavailableLifecycleEffectAdapter {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct PolicyGeneration {
+pub(crate) struct PolicyGeneration {
     device: u64,
     inode: u64,
     changed_seconds: i64,
@@ -176,6 +176,12 @@ struct PolicyGeneration {
     modified_nanoseconds: i64,
     length: u64,
     digest: Sha256Digest,
+}
+
+impl PolicyGeneration {
+    pub(crate) const fn digest(&self) -> Sha256Digest {
+        self.digest
+    }
 }
 
 #[derive(Debug)]
@@ -382,7 +388,7 @@ pub(crate) fn verify_bootstrap_policy(
     tenant: &str,
     projects: &BTreeSet<ProjectId>,
     ownership: &BTreeMap<WorkContextIdentity, ProjectId>,
-) -> Result<Sha256Digest, &'static str> {
+) -> Result<PolicyGeneration, &'static str> {
     let snapshot = read_policy_snapshot(policy_path, expected_uid)?
         .ok_or("platform_v2_bootstrap_policy_missing")?;
     let document: PolicyDocument =
@@ -404,14 +410,14 @@ pub(crate) fn verify_bootstrap_policy(
     {
         return Err("platform_v2_bootstrap_policy_mismatch");
     }
-    Ok(snapshot.generation.digest)
+    Ok(snapshot.generation)
 }
 
 pub(crate) fn verify_bootstrap_store(
     policy_path: &Path,
     expected_uid: u32,
     store: &WorkContextStore,
-) -> Result<Sha256Digest, &'static str> {
+) -> Result<PolicyGeneration, &'static str> {
     let snapshot = read_policy_snapshot(policy_path, expected_uid)?
         .ok_or("platform_v2_bootstrap_policy_missing")?;
     let document: PolicyDocument =
@@ -424,7 +430,7 @@ pub(crate) fn verify_bootstrap_store(
     }
     .ok_or("platform_v2_bootstrap_policy_ambiguous")?;
     validate_principal_mappings(store, principal)?;
-    Ok(snapshot.generation.digest)
+    Ok(snapshot.generation)
 }
 
 impl PlatformV2Runtime {

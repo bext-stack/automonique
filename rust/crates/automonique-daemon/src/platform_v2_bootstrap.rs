@@ -8,7 +8,7 @@ use std::io::Read as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::Path;
 
-use automonique_protocol::digest::{Sha256, Sha256Digest};
+use automonique_protocol::digest::Sha256;
 use automonique_protocol::platform::{
     ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
 };
@@ -157,7 +157,7 @@ where
         &graph.projects,
         &graph.ownership,
     )?;
-    let policy_digest = policy_generation.to_string();
+    let policy_digest = policy_generation.digest().to_string();
 
     let store_path = config.platform_v2_work_context_path();
     let state = if store_path.exists() {
@@ -235,7 +235,7 @@ fn apply_with_policy_guard<F>(
     store: &mut WorkContextStore,
     config: &DaemonConfig,
     graph: &ValidatedBootstrap,
-    expected_generation: Sha256Digest,
+    expected_generation: platform_v2_host::PolicyGeneration,
     precommit_hook: &mut F,
 ) -> Result<WorkContextBootstrapState, &'static str>
 where
@@ -796,6 +796,50 @@ mod tests {
             );
             assert!(guard_ran);
             assert!(store_path.exists());
+
+            let connection = rusqlite::Connection::open_with_flags(
+                &store_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            for table in [
+                "work_context_records",
+                "work_context_expected_revisions",
+                "work_context_selector_bindings",
+            ] {
+                let count: i64 = connection
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 0, "{table} stayed empty");
+            }
+        }
+    }
+
+    #[test]
+    fn byte_identical_policy_replacement_is_an_aba_change_and_rolls_back() {
+        for existing_store in [false, true] {
+            let (_temp, config, manifest_path) = fixture();
+            let store_path = config.platform_v2_work_context_path();
+            if existing_store {
+                drop(WorkContextStore::open(&store_path).unwrap());
+            }
+
+            let policy_path = config.platform_v2_policy_path();
+            let replacement = config.state_dir().join(if existing_store {
+                "identical-existing.next"
+            } else {
+                "identical-new.next"
+            });
+            write_private(&replacement, &fs::read(&policy_path).unwrap());
+            assert_eq!(
+                run_with_precommit_hook(&config, &manifest_path, BootstrapMode::Apply, || {
+                    fs::rename(&replacement, &policy_path).unwrap();
+                })
+                .unwrap_err(),
+                "platform_v2_bootstrap_policy_changed"
+            );
 
             let connection = rusqlite::Connection::open_with_flags(
                 &store_path,
