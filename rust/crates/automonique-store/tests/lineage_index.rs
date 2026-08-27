@@ -17,6 +17,8 @@ use automonique_store::lineage_index::{
 use rusqlite::Connection;
 use tempfile::TempDir;
 
+const TENANT: &str = "tenant-test";
+
 struct PrivateIndex {
     _directory: TempDir,
     path: PathBuf,
@@ -49,8 +51,19 @@ fn lineage_v2() -> NegotiatedPlatform {
     .unwrap()
 }
 fn intent_scope(workspace: &UserWorkspaceId) -> IntentAuthorizationScope {
+    tenant_scope(TENANT, workspace)
+}
+fn tenant_scope(tenant: &str, workspace: &UserWorkspaceId) -> IntentAuthorizationScope {
     IntentAuthorizationScope::new(
-        "tenant-test".to_owned(),
+        tenant.to_owned(),
+        ProjectId::new("project-test").unwrap(),
+        workspace.clone(),
+    )
+    .unwrap()
+}
+fn legacy_intent_scope(workspace: &UserWorkspaceId) -> IntentAuthorizationScope {
+    IntentAuthorizationScope::new(
+        "legacy-unqualified".to_owned(),
         ProjectId::new("project-test").unwrap(),
         workspace.clone(),
     )
@@ -196,11 +209,11 @@ fn duplicate_intake_replays_exactly_and_conflicts_without_identity_collapse() {
         None,
     );
     assert_eq!(
-        index.intake_external(&first).unwrap(),
+        index.intake_external(TENANT, &first).unwrap(),
         WriteAdmission::Inserted { revision: 1 }
     );
     assert_eq!(
-        index.intake_external(&first).unwrap(),
+        index.intake_external(TENANT, &first).unwrap(),
         WriteAdmission::Replayed { revision: 1 }
     );
 
@@ -212,7 +225,7 @@ fn duplicate_intake_replays_exactly_and_conflicts_without_identity_collapse() {
         None,
     );
     let error = index
-        .intake_external(&conflicting)
+        .intake_external(TENANT, &conflicting)
         .expect_err("duplicate conflict");
     assert_eq!(error.category(), "duplicate_intake");
     assert_eq!(
@@ -226,17 +239,24 @@ fn duplicate_intake_replays_exactly_and_conflicts_without_identity_collapse() {
         ExternalWorkKey::new("issue-1").unwrap(),
     );
     index
-        .intake_external(&item(
-            other_installation,
-            workspace("workspace-1"),
-            1,
-            ExternalWorkState::Open,
-            None,
-        ))
+        .intake_external(
+            TENANT,
+            &item(
+                other_installation,
+                workspace("workspace-1"),
+                1,
+                ExternalWorkState::Open,
+                None,
+            ),
+        )
         .unwrap();
     assert_eq!(
         index
-            .projection_authorized(&lineage_v2(), &workspace("workspace-1"), |_| true)
+            .projection_authorized(
+                &lineage_v2(),
+                &intent_scope(&workspace("workspace-1")),
+                |_| true
+            )
             .unwrap()
             .external_work_items()
             .len(),
@@ -244,10 +264,128 @@ fn duplicate_intake_replays_exactly_and_conflicts_without_identity_collapse() {
     );
     assert!(
         index
-            .projection_authorized(&lineage_v2(), &workspace("workspace-2"), |_| true)
+            .projection_authorized(
+                &lineage_v2(),
+                &intent_scope(&workspace("workspace-2")),
+                |_| true
+            )
             .unwrap()
             .external_work_items()
             .is_empty()
+    );
+}
+
+#[test]
+fn identical_lineage_identities_are_isolated_by_tenant() {
+    let private = PrivateIndex::new();
+    let mut index = LineageIndex::open(private.path()).unwrap();
+    let tenant_a = "tenant-a";
+    let tenant_b = "tenant-b";
+    let workspace_a = workspace("workspace-tenant-a");
+    let workspace_b = workspace("workspace-tenant-b");
+    let external = external_identity(ExternalWorkProvider::GitHub, "scope-shared", "issue-shared");
+
+    for (tenant, workspace) in [(tenant_a, &workspace_a), (tenant_b, &workspace_b)] {
+        index
+            .intake_external(
+                tenant,
+                &item(
+                    external.clone(),
+                    workspace.clone(),
+                    1,
+                    ExternalWorkState::Open,
+                    None,
+                ),
+            )
+            .unwrap();
+        index
+            .record_orchestration(
+                tenant,
+                &record(
+                    run("run-shared"),
+                    workspace,
+                    None,
+                    None,
+                    LineageStatus::Working,
+                    LineageFreshnessState::Fresh,
+                ),
+                None,
+            )
+            .unwrap();
+        index
+            .record_orchestration(
+                tenant,
+                &record(
+                    task("task-shared"),
+                    workspace,
+                    Some(&external),
+                    Some(run("run-shared")),
+                    LineageStatus::Working,
+                    LineageFreshnessState::Fresh,
+                ),
+                None,
+            )
+            .unwrap();
+    }
+
+    let create = WorkspaceIntent::Create(WorkspaceCreateIntent::new(
+        WorkspaceIntentId::new("intent-shared").unwrap(),
+        OrchestrationTaskId::new("task-shared").unwrap(),
+        external,
+        BaseSelectorId::new("base-shared").unwrap(),
+        BranchSelectorId::new("branch-shared").unwrap(),
+    ));
+    index
+        .record_intent(tenant_a, &create, &WorkspaceIntentOutcome::Accepted)
+        .unwrap();
+    index
+        .record_intent(tenant_b, &create, &WorkspaceIntentOutcome::Unknown)
+        .unwrap();
+    drop(index);
+
+    let index = LineageIndex::open(private.path()).unwrap();
+    let scope_a = tenant_scope(tenant_a, &workspace_a);
+    let scope_b = tenant_scope(tenant_b, &workspace_b);
+    assert_eq!(
+        index
+            .intent_authorized(&lineage_v2(), &scope_a, create.intent_id(), |_| true)
+            .unwrap()
+            .unwrap()
+            .outcome,
+        WorkspaceIntentOutcome::Accepted
+    );
+    assert_eq!(
+        index
+            .intent_authorized(&lineage_v2(), &scope_b, create.intent_id(), |_| true)
+            .unwrap()
+            .unwrap()
+            .outcome,
+        WorkspaceIntentOutcome::Unknown
+    );
+    assert!(
+        index
+            .intent_authorized(
+                &lineage_v2(),
+                &tenant_scope(tenant_a, &workspace_b),
+                create.intent_id(),
+                |_| true,
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        index
+            .projection_authorized(&lineage_v2(), &scope_a, |_| true)
+            .unwrap()
+            .workspace(),
+        &workspace_a
+    );
+    assert_eq!(
+        index
+            .projection_authorized(&lineage_v2(), &scope_b, |_| true)
+            .unwrap()
+            .workspace(),
+        &workspace_b
     );
 }
 
@@ -266,39 +404,49 @@ fn moved_and_closed_sources_are_revisioned_and_survive_reopen() {
     let ws = workspace("workspace-source");
     assert_eq!(
         index
-            .intake_external(&item(
-                moved_id.clone(),
-                ws.clone(),
-                1,
-                ExternalWorkState::Moved,
-                Some(replacement.clone()),
-            ))
+            .intake_external(
+                TENANT,
+                &item(
+                    moved_id.clone(),
+                    ws.clone(),
+                    1,
+                    ExternalWorkState::Moved,
+                    Some(replacement.clone()),
+                )
+            )
             .unwrap_err()
             .category(),
         "not_found"
     );
     index
-        .intake_external(&item(
-            moved_id.clone(),
-            ws.clone(),
-            1,
-            ExternalWorkState::Open,
-            None,
-        ))
+        .intake_external(
+            TENANT,
+            &item(
+                moved_id.clone(),
+                ws.clone(),
+                1,
+                ExternalWorkState::Open,
+                None,
+            ),
+        )
         .unwrap();
     index
-        .intake_external(&item(
-            closed_id.clone(),
-            ws.clone(),
-            1,
-            ExternalWorkState::Open,
-            None,
-        ))
+        .intake_external(
+            TENANT,
+            &item(
+                closed_id.clone(),
+                ws.clone(),
+                1,
+                ExternalWorkState::Open,
+                None,
+            ),
+        )
         .unwrap();
     let run_id = run("run-source");
     let task_id = task("task-source");
     index
         .record_orchestration(
+            TENANT,
             &record(
                 run_id.clone(),
                 &ws,
@@ -312,6 +460,7 @@ fn moved_and_closed_sources_are_revisioned_and_survive_reopen() {
         .unwrap();
     index
         .record_orchestration(
+            TENANT,
             &record(
                 task_id,
                 &ws,
@@ -326,6 +475,7 @@ fn moved_and_closed_sources_are_revisioned_and_survive_reopen() {
     assert_eq!(
         index
             .update_external(
+                TENANT,
                 &item(
                     moved_id.clone(),
                     ws.clone(),
@@ -341,7 +491,7 @@ fn moved_and_closed_sources_are_revisioned_and_survive_reopen() {
     );
     assert_eq!(
         index
-            .projection_authorized(&lineage_v2(), &ws, |_| true)
+            .projection_authorized(&lineage_v2(), &intent_scope(&ws), |_| true)
             .unwrap()
             .external_work_items()
             .iter()
@@ -351,16 +501,20 @@ fn moved_and_closed_sources_are_revisioned_and_survive_reopen() {
         ExternalWorkState::Open
     );
     index
-        .intake_external(&item(
-            replacement.clone(),
-            ws.clone(),
-            1,
-            ExternalWorkState::Open,
-            None,
-        ))
+        .intake_external(
+            TENANT,
+            &item(
+                replacement.clone(),
+                ws.clone(),
+                1,
+                ExternalWorkState::Open,
+                None,
+            ),
+        )
         .unwrap();
     index
         .update_external(
+            TENANT,
             &item(
                 moved_id.clone(),
                 ws.clone(),
@@ -374,6 +528,7 @@ fn moved_and_closed_sources_are_revisioned_and_survive_reopen() {
     assert_eq!(
         index
             .update_external(
+                TENANT,
                 &item(
                     replacement.clone(),
                     ws.clone(),
@@ -396,19 +551,25 @@ fn moved_and_closed_sources_are_revisioned_and_survive_reopen() {
     ));
     assert_eq!(
         index
-            .record_intent(&create, &WorkspaceIntentOutcome::Created(ws.clone()))
+            .record_intent(
+                TENANT,
+                &create,
+                &WorkspaceIntentOutcome::Created(ws.clone())
+            )
             .expect_err("moved source cannot create")
             .category(),
         "identity_conflict"
     );
     index
         .record_intent(
+            TENANT,
             &create,
             &WorkspaceIntentOutcome::Conflict(WorkspaceIntentConflict::ExternalWorkMoved),
         )
         .unwrap();
     index
         .update_external(
+            TENANT,
             &item(closed_id, ws.clone(), 2, ExternalWorkState::Closed, None),
             Revision::FIRST,
         )
@@ -417,7 +578,7 @@ fn moved_and_closed_sources_are_revisioned_and_survive_reopen() {
 
     let reopened = LineageIndex::open(private.path()).unwrap();
     let projection = reopened
-        .projection_authorized(&lineage_v2(), &ws, |_| true)
+        .projection_authorized(&lineage_v2(), &intent_scope(&ws), |_| true)
         .unwrap();
     assert_eq!(projection.external_work_items().len(), 3);
     let moved = projection
@@ -447,18 +608,15 @@ fn workspace_scoped_projection_refuses_to_truncate_past_the_protocol_bound() {
             &format!("issue-{number:03}"),
         );
         index
-            .intake_external(&item(
-                identity,
-                ws.clone(),
-                1,
-                ExternalWorkState::Open,
-                None,
-            ))
+            .intake_external(
+                TENANT,
+                &item(identity, ws.clone(), 1, ExternalWorkState::Open, None),
+            )
             .unwrap();
     }
     assert_eq!(
         index
-            .projection_authorized(&lineage_v2(), &ws, |_| true)
+            .projection_authorized(&lineage_v2(), &intent_scope(&ws), |_| true)
             .expect_err("projection must not truncate")
             .category(),
         "projection_too_large"
@@ -477,7 +635,7 @@ fn authority_seam_refuses_before_reading_workspace_projection() {
     .unwrap();
     assert_eq!(
         index
-            .projection_authorized(&v1, &ws, |_| panic!(
+            .projection_authorized(&v1, &intent_scope(&ws), |_| panic!(
                 "authorization must follow negotiation"
             ))
             .unwrap_err()
@@ -486,17 +644,31 @@ fn authority_seam_refuses_before_reading_workspace_projection() {
     );
     assert_eq!(
         index
-            .projection_authorized(&lineage_v2(), &ws, |_| false)
+            .projection_authorized(&lineage_v2(), &intent_scope(&ws), |_| false)
             .unwrap_err()
             .category(),
         "unauthorized"
     );
     assert!(
         index
-            .projection_authorized(&lineage_v2(), &ws, |candidate| candidate == &ws)
+            .projection_authorized(&lineage_v2(), &intent_scope(&ws), |candidate| candidate
+                .workspace()
+                == &ws)
             .unwrap()
             .external_work_items()
             .is_empty()
+    );
+    assert_eq!(
+        index
+            .intent_authorized(
+                &lineage_v2(),
+                &intent_scope(&ws),
+                &WorkspaceIntentId::new("intent-does-not-exist").unwrap(),
+                |_| false,
+            )
+            .expect_err("authorization must precede existence lookup")
+            .category(),
+        "unauthorized"
     );
 }
 
@@ -507,13 +679,16 @@ fn orphan_stale_heartbeat_question_and_cancelled_creation_recover_durably() {
     let ws = workspace("workspace-recovery");
     let external = external_identity(ExternalWorkProvider::JiraCompatible, "project-1", "jira-1");
     index
-        .intake_external(&item(
-            external.clone(),
-            ws.clone(),
-            1,
-            ExternalWorkState::Open,
-            None,
-        ))
+        .intake_external(
+            TENANT,
+            &item(
+                external.clone(),
+                ws.clone(),
+                1,
+                ExternalWorkState::Open,
+                None,
+            ),
+        )
         .unwrap();
 
     let run_id = run("run-1");
@@ -528,7 +703,7 @@ fn orphan_stale_heartbeat_question_and_cancelled_creation_recover_durably() {
         LineageFreshnessState::Fresh,
     );
     let orphan = index
-        .record_orchestration(&dispatch_record, None)
+        .record_orchestration(TENANT, &dispatch_record, None)
         .expect_err("orphan");
     assert_eq!(
         orphan.conflict(),
@@ -537,6 +712,7 @@ fn orphan_stale_heartbeat_question_and_cancelled_creation_recover_durably() {
 
     index
         .record_orchestration(
+            TENANT,
             &record(
                 run_id.clone(),
                 &ws,
@@ -550,6 +726,7 @@ fn orphan_stale_heartbeat_question_and_cancelled_creation_recover_durably() {
         .unwrap();
     index
         .record_orchestration(
+            TENANT,
             &record(
                 task_id.clone(),
                 &ws,
@@ -561,10 +738,13 @@ fn orphan_stale_heartbeat_question_and_cancelled_creation_recover_durably() {
             None,
         )
         .unwrap();
-    index.record_orchestration(&dispatch_record, None).unwrap();
+    index
+        .record_orchestration(TENANT, &dispatch_record, None)
+        .unwrap();
     let worker_id = worker("worker-1");
     index
         .record_orchestration(
+            TENANT,
             &record(
                 worker_id.clone(),
                 &ws,
@@ -585,7 +765,7 @@ fn orphan_stale_heartbeat_question_and_cancelled_creation_recover_durably() {
         LineageStatus::Waiting(LineageMessage::new("fresh observation required").unwrap()),
         LineageFreshnessState::Stale,
     );
-    index.record_orchestration(&stale, None).unwrap();
+    index.record_orchestration(TENANT, &stale, None).unwrap();
     let recovered = OrchestrationRecord::new_with_origin(
         heartbeat_id,
         LineageOrigin::workspace_only(ws.clone()),
@@ -599,7 +779,7 @@ fn orphan_stale_heartbeat_question_and_cancelled_creation_recover_durably() {
     .unwrap();
     assert_eq!(
         index
-            .record_orchestration(&recovered, Some(Revision::FIRST))
+            .record_orchestration(TENANT, &recovered, Some(Revision::FIRST))
             .unwrap()
             .revision(),
         2
@@ -608,6 +788,7 @@ fn orphan_stale_heartbeat_question_and_cancelled_creation_recover_durably() {
     let question_id = question("question-1");
     index
         .record_orchestration(
+            TENANT,
             &record(
                 question_id.clone(),
                 &ws,
@@ -621,6 +802,7 @@ fn orphan_stale_heartbeat_question_and_cancelled_creation_recover_durably() {
         .unwrap();
     index
         .record_orchestration(
+            TENANT,
             &record(
                 gate("gate-1"),
                 &ws,
@@ -634,6 +816,7 @@ fn orphan_stale_heartbeat_question_and_cancelled_creation_recover_durably() {
         .unwrap();
     index
         .record_orchestration(
+            TENANT,
             &OrchestrationRecord::new_with_origin(
                 question_id,
                 LineageOrigin::workspace_only(ws.clone()),
@@ -658,11 +841,11 @@ fn orphan_stale_heartbeat_question_and_cancelled_creation_recover_durably() {
     ));
     let cancelled = WorkspaceIntentOutcome::Conflict(WorkspaceIntentConflict::CreationCancelled);
     assert_eq!(
-        index.record_intent(&create, &cancelled).unwrap(),
+        index.record_intent(TENANT, &create, &cancelled).unwrap(),
         WriteAdmission::Inserted { revision: 1 }
     );
     assert_eq!(
-        index.record_intent(&create, &cancelled).unwrap(),
+        index.record_intent(TENANT, &create, &cancelled).unwrap(),
         WriteAdmission::Replayed { revision: 1 }
     );
     let resume = WorkspaceIntent::Resume(WorkspaceResumeIntent::new(
@@ -673,7 +856,11 @@ fn orphan_stale_heartbeat_question_and_cancelled_creation_recover_durably() {
     ));
     assert_eq!(
         index
-            .record_intent(&resume, &WorkspaceIntentOutcome::Resumed(ws.clone()))
+            .record_intent(
+                TENANT,
+                &resume,
+                &WorkspaceIntentOutcome::Resumed(ws.clone())
+            )
             .unwrap(),
         WriteAdmission::Inserted { revision: 1 }
     );
@@ -681,17 +868,21 @@ fn orphan_stale_heartbeat_question_and_cancelled_creation_recover_durably() {
 
     let mut reopened = LineageIndex::open(private.path()).unwrap();
     assert_eq!(
-        reopened.record_intent(&create, &cancelled).unwrap(),
+        reopened.record_intent(TENANT, &create, &cancelled).unwrap(),
         WriteAdmission::Replayed { revision: 1 }
     );
     assert_eq!(
         reopened
-            .record_intent(&resume, &WorkspaceIntentOutcome::Resumed(ws.clone()))
+            .record_intent(
+                TENANT,
+                &resume,
+                &WorkspaceIntentOutcome::Resumed(ws.clone())
+            )
             .unwrap(),
         WriteAdmission::Replayed { revision: 1 }
     );
     let projection = reopened
-        .projection_authorized(&lineage_v2(), &ws, |_| true)
+        .projection_authorized(&lineage_v2(), &intent_scope(&ws), |_| true)
         .unwrap();
     assert_eq!(projection.external_work_items().len(), 1);
     assert_eq!(projection.orchestration().len(), 7);
@@ -717,13 +908,16 @@ fn two_handles_cannot_overwrite_a_revision_and_restart_rebuilds_the_winner() {
     let ws = workspace("workspace-concurrent");
     let identity = external_identity(ExternalWorkProvider::GitHub, "scope-c", "issue-c");
     first
-        .intake_external(&item(
-            identity.clone(),
-            ws.clone(),
-            1,
-            ExternalWorkState::Open,
-            None,
-        ))
+        .intake_external(
+            TENANT,
+            &item(
+                identity.clone(),
+                ws.clone(),
+                1,
+                ExternalWorkState::Open,
+                None,
+            ),
+        )
         .unwrap();
     let winner = item(
         identity.clone(),
@@ -732,7 +926,9 @@ fn two_handles_cannot_overwrite_a_revision_and_restart_rebuilds_the_winner() {
         ExternalWorkState::Closed,
         None,
     );
-    first.update_external(&winner, Revision::FIRST).unwrap();
+    first
+        .update_external(TENANT, &winner, Revision::FIRST)
+        .unwrap();
     let stale_target = ExternalWorkIdentity::new(
         ExternalWorkProvider::GitHub,
         identity.authority().clone(),
@@ -747,7 +943,7 @@ fn two_handles_cannot_overwrite_a_revision_and_restart_rebuilds_the_winner() {
         Some(stale_target),
     );
     let error = second
-        .update_external(&stale, Revision::FIRST)
+        .update_external(TENANT, &stale, Revision::FIRST)
         .expect_err("stale writer");
     assert_eq!(error.category(), "revision_mismatch");
     drop(first);
@@ -755,7 +951,7 @@ fn two_handles_cannot_overwrite_a_revision_and_restart_rebuilds_the_winner() {
     let reopened = LineageIndex::open(private.path()).unwrap();
     assert_eq!(
         reopened
-            .projection_authorized(&lineage_v2(), &ws, |_| true)
+            .projection_authorized(&lineage_v2(), &intent_scope(&ws), |_| true)
             .unwrap()
             .external_work_items()[0],
         winner
@@ -785,7 +981,10 @@ fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
         .unwrap()
     };
     index
-        .intake_external(&source_item(1, ExternalWorkState::Open, 1_700_000_300_000))
+        .intake_external(
+            TENANT,
+            &source_item(1, ExternalWorkState::Open, 1_700_000_300_000),
+        )
         .unwrap();
 
     let run_id = run("run-exact");
@@ -803,13 +1002,14 @@ fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
     .unwrap();
     assert_eq!(
         index
-            .record_orchestration(&invalid_first_revision, None)
+            .record_orchestration(TENANT, &invalid_first_revision, None)
             .unwrap_err()
             .category(),
         "invalid_field"
     );
     index
         .record_orchestration(
+            TENANT,
             &OrchestrationRecord::new_with_origin(
                 run_id.clone(),
                 source_origin.clone(),
@@ -841,6 +1041,7 @@ fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
     };
     index
         .record_orchestration(
+            TENANT,
             &task_record(1, LineageStatus::Working, 1_700_000_300_000),
             None,
         )
@@ -854,17 +1055,18 @@ fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
         BranchSelectorId::new("branch-exact").unwrap(),
     ));
     index
-        .record_intent(&create, &WorkspaceIntentOutcome::Accepted)
+        .record_intent(TENANT, &create, &WorkspaceIntentOutcome::Accepted)
         .unwrap();
     index
         .update_external(
+            TENANT,
             &source_item(2, ExternalWorkState::Closed, 1_700_000_300_100),
             Revision::FIRST,
         )
         .unwrap();
     assert_eq!(
         index
-            .record_intent(&create, &WorkspaceIntentOutcome::Unknown)
+            .record_intent(TENANT, &create, &WorkspaceIntentOutcome::Unknown)
             .unwrap(),
         WriteAdmission::Replayed { revision: 1 }
     );
@@ -899,11 +1101,14 @@ fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
     let final_outcome = WorkspaceIntentOutcome::Created(ws.clone());
     assert_eq!(
         index
-            .reconcile_intent(&WorkspaceIntentExecutionReceipt {
-                intent_id: create.intent_id().clone(),
-                request_digest: stored.request_digest,
-                outcome: final_outcome.clone()
-            })
+            .reconcile_intent(
+                TENANT,
+                &WorkspaceIntentExecutionReceipt {
+                    intent_id: create.intent_id().clone(),
+                    request_digest: stored.request_digest,
+                    outcome: final_outcome.clone()
+                }
+            )
             .unwrap(),
         WriteAdmission::Updated { revision: 2 }
     );
@@ -917,11 +1122,14 @@ fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
     );
     assert_eq!(
         index
-            .reconcile_intent(&WorkspaceIntentExecutionReceipt {
-                intent_id: create.intent_id().clone(),
-                request_digest: stored.request_digest,
-                outcome: final_outcome.clone()
-            })
+            .reconcile_intent(
+                TENANT,
+                &WorkspaceIntentExecutionReceipt {
+                    intent_id: create.intent_id().clone(),
+                    request_digest: stored.request_digest,
+                    outcome: final_outcome.clone()
+                }
+            )
             .unwrap(),
         WriteAdmission::Replayed { revision: 2 }
     );
@@ -934,7 +1142,7 @@ fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
     ));
     assert_eq!(
         index
-            .record_intent(&changed, &WorkspaceIntentOutcome::Unknown)
+            .record_intent(TENANT, &changed, &WorkspaceIntentOutcome::Unknown)
             .unwrap_err()
             .category(),
         "identity_conflict"
@@ -943,6 +1151,7 @@ fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
     assert_eq!(
         index
             .record_orchestration(
+                TENANT,
                 &task_record(
                     2,
                     LineageStatus::Done(LineageMessage::new("complete").unwrap()),
@@ -957,6 +1166,7 @@ fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
     assert_eq!(
         index
             .record_orchestration(
+                TENANT,
                 &task_record(
                     3,
                     LineageStatus::Done(LineageMessage::new("complete").unwrap()),
@@ -971,6 +1181,7 @@ fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
     assert_eq!(
         index
             .record_orchestration(
+                TENANT,
                 &task_record(4, LineageStatus::Working, 1_700_000_300_300),
                 Some(Revision::new(3).unwrap())
             )
@@ -982,7 +1193,7 @@ fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
 
     let reopened = LineageIndex::open(private.path()).unwrap();
     let projection = reopened
-        .projection_authorized(&lineage_v2(), &ws, |_| true)
+        .projection_authorized(&lineage_v2(), &intent_scope(&ws), |_| true)
         .unwrap();
     assert_eq!(projection.external_work_items()[0].origin(), &source_origin);
     let task = projection
@@ -1022,13 +1233,19 @@ INSERT INTO lineage_external_work VALUES('gitlab','scope-v1','issue-v1','workspa
 INSERT INTO lineage_orchestration VALUES('run','run-v1','workspace-v1',NULL,NULL,NULL,NULL,NULL,'working',NULL,1700000000000,30000,'fresh',NULL,NULL,1);
 INSERT INTO lineage_orchestration VALUES('task','task-v1','workspace-v1','gitlab','scope-v1','issue-v1','run','run-v1','working',NULL,1700000000000,30000,'fresh',NULL,NULL,1);
 INSERT INTO lineage_workspace_intents VALUES('intent-v1','create','task','task-v1','workspace-v1','gitlab','scope-v1','issue-v1','base-v1','branch-v1',NULL,'created',NULL,'workspace-v1');
+INSERT INTO lineage_workspace_intents VALUES('intent-v1-accepted','create','task','task-v1','workspace-v1','gitlab','scope-v1','issue-v1','base-v1','branch-v1',NULL,'accepted',NULL,NULL);
+INSERT INTO lineage_workspace_intents VALUES('intent-v1-unknown','create','task','task-v1','workspace-v1','gitlab','scope-v1','issue-v1','base-v1','branch-v1',NULL,'unknown',NULL,NULL);
 PRAGMA user_version=1;
 "#).unwrap();
     drop(db);
 
-    let index = LineageIndex::open(private.path()).unwrap();
+    let mut index = LineageIndex::open(private.path()).unwrap();
     let projection = index
-        .projection_authorized(&lineage_v2(), &workspace("workspace-v1"), |_| true)
+        .projection_authorized(
+            &lineage_v2(),
+            &legacy_intent_scope(&workspace("workspace-v1")),
+            |_| true,
+        )
         .unwrap();
     assert_eq!(projection.external_work_items().len(), 1);
     assert_eq!(
@@ -1041,7 +1258,7 @@ PRAGMA user_version=1;
     let stored = index
         .intent_authorized(
             &lineage_v2(),
-            &intent_scope(&workspace("workspace-v1")),
+            &legacy_intent_scope(&workspace("workspace-v1")),
             &WorkspaceIntentId::new("intent-v1").unwrap(),
             |_| true,
         )
@@ -1052,6 +1269,34 @@ PRAGMA user_version=1;
         stored.outcome,
         WorkspaceIntentOutcome::Created(workspace("workspace-v1"))
     );
+    for (id, expected) in [
+        ("intent-v1-accepted", WorkspaceIntentOutcome::Accepted),
+        ("intent-v1-unknown", WorkspaceIntentOutcome::Unknown),
+    ] {
+        let pending = index
+            .intent_authorized(
+                &lineage_v2(),
+                &legacy_intent_scope(&workspace("workspace-v1")),
+                &WorkspaceIntentId::new(id).unwrap(),
+                |_| true,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.outcome, expected);
+        assert_eq!(
+            index
+                .reconcile_intent(
+                    "legacy-unqualified",
+                    &WorkspaceIntentExecutionReceipt {
+                        intent_id: WorkspaceIntentId::new(id).unwrap(),
+                        request_digest: pending.request_digest,
+                        outcome: WorkspaceIntentOutcome::Created(workspace("workspace-v1")),
+                    },
+                )
+                .unwrap(),
+            WriteAdmission::Updated { revision: 2 }
+        );
+    }
     drop(index);
     let db = Connection::open(private.path()).unwrap();
     assert_eq!(
@@ -1111,19 +1356,20 @@ fn reopen_refuses_dangling_and_cyclic_moved_chains() {
         let a = external_identity(ExternalWorkProvider::GitLab, "scope-a", "issue-a");
         let b = external_identity(ExternalWorkProvider::JiraCompatible, "scope-b", "issue-b");
         index
-            .intake_external(&item(
-                b.clone(),
-                ws.clone(),
-                1,
-                ExternalWorkState::Open,
-                None,
-            ))
+            .intake_external(
+                TENANT,
+                &item(b.clone(), ws.clone(), 1, ExternalWorkState::Open, None),
+            )
             .unwrap();
         index
-            .intake_external(&item(a.clone(), ws, 1, ExternalWorkState::Open, None))
+            .intake_external(
+                TENANT,
+                &item(a.clone(), ws, 1, ExternalWorkState::Open, None),
+            )
             .unwrap();
         index
             .update_external(
+                TENANT,
                 &item(
                     a.clone(),
                     workspace("workspace-corrupt-move"),
@@ -1165,17 +1411,21 @@ fn attaching_to_a_chain_with_an_absent_descendant_is_refused() {
     let c = external_identity(ExternalWorkProvider::Linear, "scope-c", "c");
     for identity in [&a, &b, &c] {
         index
-            .intake_external(&item(
-                identity.clone(),
-                ws.clone(),
-                1,
-                ExternalWorkState::Open,
-                None,
-            ))
+            .intake_external(
+                TENANT,
+                &item(
+                    identity.clone(),
+                    ws.clone(),
+                    1,
+                    ExternalWorkState::Open,
+                    None,
+                ),
+            )
             .unwrap();
     }
     index
         .update_external(
+            TENANT,
             &item(
                 b.clone(),
                 ws.clone(),
@@ -1195,6 +1445,7 @@ fn attaching_to_a_chain_with_an_absent_descendant_is_refused() {
     assert_eq!(
         index
             .update_external(
+                TENANT,
                 &item(a, ws, 2, ExternalWorkState::Moved, Some(b)),
                 Revision::FIRST
             )
