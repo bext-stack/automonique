@@ -8870,12 +8870,19 @@ fn work_context_module() -> GeneratedModule {
         imports: vec![ModuleImport {
             module: PLATFORM_MODULE.to_owned(),
             values: vec![
+                "IdempotencyKey".to_owned(),
                 "PLATFORM_SCHEMA_V1".to_owned(),
+                "ReceiptId".to_owned(),
                 "ResourceId".to_owned(),
+                "decodeReceiptOutcome".to_owned(),
                 "decodeResourceAuthority".to_owned(),
                 "decodeResourceKind".to_owned(),
             ],
-            types: vec!["ResourceCoordinate".to_owned()],
+            types: vec![
+                "ReceiptOutcome".to_owned(),
+                "ResourceAuthority".to_owned(),
+                "ResourceCoordinate".to_owned(),
+            ],
         }],
         implementation: Some(GeneratedImplementation::WorkContext),
         ..GeneratedModule::default()
@@ -11371,6 +11378,343 @@ export function encodeWorkspaceIntent(negotiated: NegotiatedPlatform, value: Wor
 export function decodeWorkspaceIntent(negotiated: NegotiatedPlatform, payload: Uint8Array): WorkspaceIntent { return lineageChecked(() => { requireLineageV2(negotiated); return validateWorkspaceIntent(decodeLineageDocument(payload) as WorkspaceIntent); }); }
 export function encodeWorkspaceIntentOutcome(negotiated: NegotiatedPlatform, value: WorkspaceIntentOutcome): Uint8Array { return lineageChecked(() => { requireLineageV2(negotiated); return lineageDocument(validateWorkspaceIntentOutcome(value)); }); }
 export function decodeWorkspaceIntentOutcome(negotiated: NegotiatedPlatform, payload: Uint8Array): WorkspaceIntentOutcome { return lineageChecked(() => { requireLineageV2(negotiated); return validateWorkspaceIntentOutcome(decodeLineageDocument(payload) as WorkspaceIntentOutcome); }); }
+// Platform v2 lifecycle is additive to the read contract above. All fields are
+// exact and all authority arrays are already in canonical UTF-8 order.
+export const MAX_AUTHORITY_GRANTS_PER_AXIS = 64;
+export const MAX_MUTATION_CANONICAL_BYTES = 262144;
+const LIFECYCLE_EPOCH_MAX = 9223372036854775807n;
+
+export type AuthorityGrantId = string & {readonly __brand: "AuthorityGrantId"};
+export type WorkContextRegistrySelector = string & {readonly __brand: "WorkContextRegistrySelector"};
+export type MutationPreviewId = string & {readonly __brand: "MutationPreviewId"};
+export type MutationApprovalId = string & {readonly __brand: "MutationApprovalId"};
+export type WorkContextRequestDigest = string & {readonly __brand: "WorkContextRequestDigest"};
+export type MutationPreviewDigest = string & {readonly __brand: "MutationPreviewDigest"};
+
+function lifecycleToken(value: string, field: string): string {
+  if (byteLength(value) === 0 || byteLength(value) > 128 || !/^[A-Za-z0-9][A-Za-z0-9_.:-]*$/.test(value) || value.includes("..")) {
+    throw new RefusalError("work_context_lifecycle_value_invalid", `${field} is not a wire-safe opaque token`);
+  }
+  return value;
+}
+export function AuthorityGrantId(value: string): AuthorityGrantId { return lifecycleToken(value, "authority_grant") as AuthorityGrantId; }
+export function WorkContextRegistrySelector(value: string): WorkContextRegistrySelector { return lifecycleToken(value, "registry_selector") as WorkContextRegistrySelector; }
+export function MutationPreviewId(value: string): MutationPreviewId { return WorkContextCursor(value) as unknown as MutationPreviewId; }
+export function MutationApprovalId(value: string): MutationApprovalId { return WorkContextCursor(value) as unknown as MutationApprovalId; }
+export function WorkContextRequestDigest(value: string): WorkContextRequestDigest {
+  if (!/^sha256:[0-9a-f]{64}$/.test(value)) throw new RefusalError("work_context_lifecycle_value_invalid", "request_digest is not canonical SHA-256");
+  return value as WorkContextRequestDigest;
+}
+export function MutationPreviewDigest(value: string): MutationPreviewDigest {
+  if (!/^sha256:[0-9a-f]{64}$/.test(value)) throw new RefusalError("work_context_lifecycle_value_invalid", "preview_digest is not canonical SHA-256");
+  return value as MutationPreviewDigest;
+}
+
+export interface LifecycleActor {readonly id: string; readonly tenant: string;}
+export interface WorkContextAuthority {
+  readonly credentials: readonly AuthorityGrantId[];
+  readonly filesystem: readonly AuthorityGrantId[];
+  readonly models: readonly AuthorityGrantId[];
+  readonly network: readonly AuthorityGrantId[];
+  readonly providers: readonly AuthorityGrantId[];
+  readonly tools: readonly AuthorityGrantId[];
+}
+export interface ExpectedWorkContext {readonly identity: WorkContextIdentity; readonly revision: WorkContextRevision;}
+export type ExternalParentResolution = "available" | "unavailable";
+export type ResolvedParentSnapshot =
+  | {readonly kind: "work_context"; readonly record: WorkContextRecord}
+  | {readonly identity: WorkContextIdentity; readonly kind: "external"; readonly owning_project: ProjectId | null; readonly resolution: ExternalParentResolution; readonly revision: WorkContextRevision};
+export type MutationApprovalRequirement = "not_required" | "required";
+export type MutationApprovalDecision = "denied" | "granted";
+export type MutationRefusalCategory = "invalid_request" | "unauthorized" | "authority_widening" | "stale_revision" | "conflict" | "preview_expired" | "approval_required" | "approval_unexpected" | "approval_mismatch" | "approval_denied" | "approval_expired" | "unknown" | "resync_required" | "unavailable";
+
+export type WorkContextMutationIntent =
+  | {readonly kind: "create_project"; readonly label: WorkContextLabel; readonly repositories: readonly ExpectedWorkContext[]}
+  | {readonly kind: "create_host_setup"; readonly label: WorkContextLabel; readonly project: ExpectedWorkContext; readonly registry: WorkContextRegistrySelector; readonly setup_kind: HostSetupKind}
+  | {readonly checkout_kind: CheckoutKind; readonly host_setup: ExpectedWorkContext; readonly kind: "create_checkout"; readonly label: WorkContextLabel; readonly project: ExpectedWorkContext; readonly registry: WorkContextRegistrySelector; readonly repository: ExpectedWorkContext}
+  | {readonly checkout: ExpectedWorkContext; readonly kind: "create_user_workspace"; readonly label: WorkContextLabel; readonly project: ExpectedWorkContext}
+  | {readonly kind: "create_attempt_workspace"; readonly label: WorkContextLabel; readonly requested_authority: WorkContextAuthority; readonly user_workspace: ExpectedWorkContext}
+  | {readonly kind: "resume_attempt_workspace"; readonly requested_authority: WorkContextAuthority; readonly target: ExpectedWorkContext}
+  | {readonly kind: "resume_session"; readonly requested_authority: WorkContextAuthority; readonly target: ExpectedWorkContext}
+  | {readonly kind: "archive_project" | "archive_host_setup" | "archive_checkout" | "archive_user_workspace"; readonly target: ExpectedWorkContext};
+
+export interface WorkContextMutationProposal {
+  readonly actor: LifecycleActor;
+  readonly actor_authority: WorkContextAuthority;
+  readonly authority: ResourceAuthority;
+  readonly idempotency_key: IdempotencyKey;
+  readonly intent: WorkContextMutationIntent;
+  readonly request_digest: WorkContextRequestDigest;
+  readonly schema: typeof PLATFORM_SCHEMA_V2;
+}
+export interface MutationPreviewRef {readonly id: MutationPreviewId; readonly revision: WorkContextRevision;}
+export interface MutationPreview {
+  readonly approval: MutationApprovalRequirement;
+  readonly current: WorkContextRecord | null;
+  readonly effective_authority: WorkContextAuthority;
+  readonly expires_at_ms: bigint;
+  readonly inherited_authority: WorkContextAuthority;
+  readonly issued_at_ms: bigint;
+  readonly preview: MutationPreviewRef;
+  readonly proposal: WorkContextMutationProposal;
+  readonly resolved_parents: readonly ResolvedParentSnapshot[];
+  readonly resulting: WorkContextRecord;
+  readonly schema: typeof PLATFORM_SCHEMA_V2;
+}
+export interface MutationApproval {
+  readonly decided_at_ms: bigint; readonly decided_by: LifecycleActor; readonly decision: MutationApprovalDecision;
+  readonly expires_at_ms: bigint; readonly id: MutationApprovalId; readonly idempotency_key: IdempotencyKey;
+  readonly preview: MutationPreviewRef; readonly preview_digest: MutationPreviewDigest; readonly request_digest: WorkContextRequestDigest;
+}
+export interface MutationSubmission {
+  readonly approval: MutationApproval | null; readonly idempotency_key: IdempotencyKey;
+  readonly preview: MutationPreviewRef; readonly preview_digest: MutationPreviewDigest; readonly request_digest: WorkContextRequestDigest;
+  readonly schema: typeof PLATFORM_SCHEMA_V2; readonly submitted_at_ms: bigint;
+}
+export interface MutationReceipt {
+  readonly approval_id: MutationApprovalId | null; readonly id: ReceiptId; readonly idempotency_key: IdempotencyKey;
+  readonly outcome: "accepted" | "completed" | "conflict" | "rejected"; readonly preview: MutationPreviewRef; readonly preview_digest: MutationPreviewDigest; readonly recorded_at_ms: bigint;
+  readonly request_digest: WorkContextRequestDigest; readonly resulting_revision: WorkContextRevision | null;
+  readonly schema: typeof PLATFORM_SCHEMA_V2;
+}
+export interface MutationRefusal {
+  readonly category: MutationRefusalCategory; readonly explanation: string;
+  readonly request_digest: WorkContextRequestDigest | null; readonly schema: typeof PLATFORM_SCHEMA_V2;
+}
+
+const AUTHORITY_FIELDS = ["credentials", "filesystem", "models", "network", "providers", "tools"] as const;
+const PROPOSAL_FIELDS = ["actor", "actor_authority", "authority", "idempotency_key", "intent", "request_digest", "schema"] as const;
+const PREVIEW_FIELDS = ["approval", "current", "effective_authority", "expires_at_ms", "inherited_authority", "issued_at_ms", "preview", "proposal", "resolved_parents", "resulting", "schema"] as const;
+const APPROVAL_FIELDS = ["decided_at_ms", "decided_by", "decision", "expires_at_ms", "id", "idempotency_key", "preview", "preview_digest", "request_digest"] as const;
+const SUBMISSION_FIELDS = ["approval", "idempotency_key", "preview", "preview_digest", "request_digest", "schema", "submitted_at_ms"] as const;
+const RECEIPT_FIELDS = ["approval_id", "id", "idempotency_key", "outcome", "preview", "preview_digest", "recorded_at_ms", "request_digest", "resulting_revision", "schema"] as const;
+const REFUSAL_FIELDS = ["category", "explanation", "request_digest", "schema"] as const;
+
+function strictUtf8(values: readonly string[]): boolean {
+  const encoder = new TextEncoder();
+  const compare = (left: string, right: string): number => {
+    const a = encoder.encode(left); const b = encoder.encode(right); const length = Math.min(a.length, b.length);
+    for (let index = 0; index < length; index += 1) { if (a[index] !== b[index]) return a[index]! - b[index]!; }
+    return a.length - b.length;
+  };
+  return values.every((value, index) => index === 0 || compare(values[index - 1]!, value) < 0);
+}
+function lifecycleActorComponent(value: string, field: string): string {
+  if (!isWellFormedUnicode(value) || byteLength(value) === 0 || byteLength(value) > 128 || !/^[^\p{Cc}]+$/u.test(value)) workContextRefusal(`${field} is invalid`);
+  return value;
+}
+function validateLifecycleActor(value: LifecycleActor): LifecycleActor {
+  exactInput(value, ["id", "tenant"]); return {id: lifecycleActorComponent(value.id,"actor_id"), tenant: lifecycleActorComponent(value.tenant,"tenant")};
+}
+function validateAuthority(value: WorkContextAuthority): WorkContextAuthority {
+  exactInput(value, AUTHORITY_FIELDS);
+  const axis = (items: readonly AuthorityGrantId[]): readonly AuthorityGrantId[] => {
+    if (!Array.isArray(items) || items.length > MAX_AUTHORITY_GRANTS_PER_AXIS) workContextRefusal("authority grant limit exceeded");
+    const checked = items.map(AuthorityGrantId); if (!strictUtf8(checked)) workContextRefusal("authority grants are repeated or unordered"); return checked;
+  };
+  return {credentials: axis(value.credentials), filesystem: axis(value.filesystem), models: axis(value.models), network: axis(value.network), providers: axis(value.providers), tools: axis(value.tools)};
+}
+function authoritySubset(value: WorkContextAuthority, ceiling: WorkContextAuthority): boolean {
+  return AUTHORITY_FIELDS.every((field) => value[field].every((grant) => ceiling[field].includes(grant)));
+}
+function authorityEqual(left: WorkContextAuthority, right: WorkContextAuthority): boolean {
+  return AUTHORITY_FIELDS.every((field) => left[field].length === right[field].length && left[field].every((grant, index) => grant === right[field][index]));
+}
+function authorityJson(value: WorkContextAuthority): JsonValue {
+  const checked = validateAuthority(value); return object(AUTHORITY_FIELDS.map((field) => [field, {kind: "array", items: checked[field].map((grant) => ({kind: "string", value: grant}))}] as const));
+}
+function decodeAuthorityValue(value: JsonValue): WorkContextAuthority {
+  const fields = exactFields(value, AUTHORITY_FIELDS, WORK_CONTEXT_INVALID_BODY);
+  const axis = (field: typeof AUTHORITY_FIELDS[number]): readonly AuthorityGrantId[] => bodyArray(fields, field, WORK_CONTEXT_INVALID_BODY, MAX_AUTHORITY_GRANTS_PER_AXIS, WORK_CONTEXT_VALUE_INVALID).map((item) => {
+    if (item.kind !== "string") throw new RefusalError(WORK_CONTEXT_INVALID_BODY, `${field} grant is not a string`); return AuthorityGrantId(item.value);
+  });
+  return validateAuthority({credentials: axis("credentials"), filesystem: axis("filesystem"), models: axis("models"), network: axis("network"), providers: axis("providers"), tools: axis("tools")});
+}
+function expectedJson(value: ExpectedWorkContext): JsonValue { return object([["identity", workContextIdentityJson(value.identity)], ["revision", {kind: "integer", value: WorkContextRevision(value.revision)}]]); }
+function decodeExpectedValue(value: JsonValue): ExpectedWorkContext {
+  const fields = exactFields(value, ["identity", "revision"], WORK_CONTEXT_INVALID_BODY);
+  return {identity: decodeWorkContextIdentityValue(bodyValue(fields, "identity", WORK_CONTEXT_INVALID_BODY)), revision: WorkContextRevision(workContextWireUnsigned(bodyInteger(fields, "revision", WORK_CONTEXT_INVALID_BODY), 9223372036854775807n, "revision"))};
+}
+function resolvedParentJson(value: ResolvedParentSnapshot): JsonValue {
+  if(value.kind==="work_context") return object([["kind",{kind:"string",value:"work_context"}],["record",recordJson(value.record)]]);
+  return object([["identity",workContextIdentityJson(value.identity)],["kind",{kind:"string",value:"external"}],["owning_project",value.owning_project===null?{kind:"null"}:{kind:"string",value:ProjectId(value.owning_project)}],["resolution",{kind:"string",value:value.resolution}],["revision",{kind:"integer",value:WorkContextRevision(value.revision)}]]);
+}
+function decodeResolvedParentValue(value: JsonValue): ResolvedParentSnapshot {
+  if(value.kind!=="object")workContextRefusal("resolved parent is not an object");const loose=new Map(value.entries);const kind=loose.get("kind");if(kind?.kind!=="string")workContextRefusal("resolved parent kind is invalid");
+  if(kind.value==="work_context"){const fields=exactFields(value,["kind","record"],WORK_CONTEXT_INVALID_BODY);return {kind:"work_context",record:decodeWorkContextRecordValue(bodyValue(fields,"record",WORK_CONTEXT_INVALID_BODY))};}
+  if(kind.value!=="external")workContextRefusal("resolved parent kind is invalid");const fields=exactFields(value,["identity","kind","owning_project","resolution","revision"],WORK_CONTEXT_INVALID_BODY);const owner=bodyStringOrNull(fields,"owning_project",WORK_CONTEXT_INVALID_BODY);const resolution=bodyString(fields,"resolution",WORK_CONTEXT_INVALID_BODY);if(resolution!=="available"&&resolution!=="unavailable")workContextRefusal("external parent resolution is invalid");return {identity:decodeWorkContextIdentityValue(bodyValue(fields,"identity",WORK_CONTEXT_INVALID_BODY)),kind:"external",owning_project:owner===null?null:ProjectId(owner),resolution,revision:WorkContextRevision(workContextWireUnsigned(bodyInteger(fields,"revision",WORK_CONTEXT_INVALID_BODY),9223372036854775807n,"revision"))};
+}
+function parentExpectations(intent: WorkContextMutationIntent): readonly ExpectedWorkContext[] {
+  switch(intent.kind){case "create_project":return intent.repositories;case "create_host_setup":return [intent.project];case "create_checkout":return [intent.project,intent.host_setup,intent.repository];case "create_user_workspace":return [intent.project,intent.checkout];case "create_attempt_workspace":return [intent.user_workspace];default:return [];}
+}
+function validateResolvedParents(intent: WorkContextMutationIntent, values: readonly ResolvedParentSnapshot[]): readonly ResolvedParentSnapshot[] {
+  if(!Array.isArray(values))workContextRefusal("resolved parents are invalid");const expected=parentExpectations(intent);if(values.length!==expected.length)workContextRefusal("resolved parents do not match intent");
+  const checked=values.map((value,index):ResolvedParentSnapshot=>{const target=expected[index]!;if(value.kind==="work_context"){exactInput(value,["kind","record"]);const record=validateWorkContextRecord(value.record);if(target.identity.kind==="repository"||!canonicalEqual(workContextIdentityJson(record.identity),workContextIdentityJson(target.identity))||record.revision!==target.revision)workContextRefusal("resolved parent does not match intent");return {kind:"work_context",record};}exactInput(value,["identity","kind","owning_project","resolution","revision"]);const identity=validateWorkContextIdentity(value.identity);const owner=value.owning_project===null?null:ProjectId(value.owning_project);if(identity.kind!=="repository"||value.resolution!=="available"||!canonicalEqual(workContextIdentityJson(identity),workContextIdentityJson(target.identity))||value.revision!==target.revision)workContextRefusal("external parent is unavailable or does not match intent");return {identity,kind:"external",owning_project:owner,resolution:"available",revision:WorkContextRevision(value.revision)};});
+  const work=(index:number):WorkContextRecord=>{const value=checked[index];if(value?.kind!=="work_context")workContextRefusal("work-context parent snapshot is required");return value.record;};const active=(record:WorkContextRecord):void=>{if(record.lifecycle!=="active")workContextRefusal("parent lifecycle does not admit children");};const related=(record:WorkContextRecord,kind:WorkContextRelationKind,target:WorkContextIdentity):boolean=>record.relations.some((relation)=>relation.kind===kind&&canonicalEqual(workContextIdentityJson(relation.target),workContextIdentityJson(target)));
+  switch(intent.kind){case "create_host_setup":active(work(0));break;case "create_checkout":{const project=work(0),host=work(1),repository=checked[2]!,selected=intent.project.identity;if(selected.kind!=="project")workContextRefusal("selected project identity is invalid");active(project);active(host);if(!related(host,"host_setup_project",selected)||!related(project,"project_repository",intent.repository.identity)||repository.kind!=="external"||(repository.owning_project!==null&&repository.owning_project!==selected.id))workContextRefusal("checkout parents cross project boundaries");break;}case "create_user_workspace":{const project=work(0),checkout=work(1);active(project);active(checkout);if(!related(checkout,"checkout_project",intent.project.identity))workContextRefusal("checkout belongs to another project");break;}case "create_attempt_workspace":active(work(0));break;default:break;}
+  return checked;
+}
+
+function validateIntent(value: WorkContextMutationIntent): WorkContextMutationIntent {
+  const expectedKind = (expected: ExpectedWorkContext, kind: WorkContextTargetKind): ExpectedWorkContext => {
+    const identity = validateWorkContextIdentity(expected.identity); if (identity.kind !== kind) workContextRefusal("operation target kind is invalid"); return {identity, revision: WorkContextRevision(expected.revision)};
+  };
+  switch (value.kind) {
+    case "create_project": {
+      exactInput(value, ["kind", "label", "repositories"]); const repositories = value.repositories.map((item) => expectedKind(item, "repository"));
+      if (repositories.length > MAX_WORK_CONTEXT_RELATIONS || !strictlyOrdered(repositories, (item) => identityOrderKey(item.identity))) workContextRefusal("project repositories are repeated, unordered, or excessive");
+      return {kind: value.kind, label: WorkContextLabel(value.label), repositories};
+    }
+    case "create_host_setup": exactInput(value, ["kind", "label", "project", "registry", "setup_kind"]); return {kind: value.kind, label: WorkContextLabel(value.label), project: expectedKind(value.project, "project"), registry: WorkContextRegistrySelector(value.registry), setup_kind: decodeHostSetupKind(value.setup_kind)};
+    case "create_checkout": exactInput(value, ["checkout_kind", "host_setup", "kind", "label", "project", "registry", "repository"]); return {checkout_kind: decodeCheckoutKind(value.checkout_kind), host_setup: expectedKind(value.host_setup, "host_setup"), kind: value.kind, label: WorkContextLabel(value.label), project: expectedKind(value.project, "project"), registry: WorkContextRegistrySelector(value.registry), repository: expectedKind(value.repository, "repository")};
+    case "create_user_workspace": exactInput(value, ["checkout", "kind", "label", "project"]); return {checkout: expectedKind(value.checkout, "checkout"), kind: value.kind, label: WorkContextLabel(value.label), project: expectedKind(value.project, "project")};
+    case "create_attempt_workspace": exactInput(value, ["kind", "label", "requested_authority", "user_workspace"]); return {kind: value.kind, label: WorkContextLabel(value.label), requested_authority: validateAuthority(value.requested_authority), user_workspace: expectedKind(value.user_workspace, "user_workspace")};
+    case "resume_attempt_workspace": exactInput(value, ["kind", "requested_authority", "target"]); return {kind: value.kind, requested_authority: validateAuthority(value.requested_authority), target: expectedKind(value.target, "attempt_workspace")};
+    case "resume_session": exactInput(value, ["kind", "requested_authority", "target"]); return {kind: value.kind, requested_authority: validateAuthority(value.requested_authority), target: expectedKind(value.target, "session")};
+    case "archive_project": case "archive_host_setup": case "archive_checkout": case "archive_user_workspace": {
+      exactInput(value, ["kind", "target"]); const kind = value.kind.slice("archive_".length) as WorkContextTargetKind; return {kind: value.kind, target: expectedKind(value.target, kind)};
+    }
+    default: return assertNeverLifecycleIntent(value);
+  }
+}
+function assertNeverLifecycleIntent(value: never): never { throw new RefusalError(WORK_CONTEXT_VALUE_INVALID, `unknown lifecycle intent ${(value as {kind?: unknown}).kind}`); }
+
+function intentJson(value: WorkContextMutationIntent): JsonValue {
+  const intent = validateIntent(value); const word = {kind: "string", value: intent.kind} as const;
+  switch (intent.kind) {
+    case "create_project": return object([["kind", word], ["label", {kind: "string", value: intent.label}], ["repositories", {kind: "array", items: intent.repositories.map(expectedJson)}]]);
+    case "create_host_setup": return object([["kind", word], ["label", {kind: "string", value: intent.label}], ["project", expectedJson(intent.project)], ["registry", {kind: "string", value: intent.registry}], ["setup_kind", {kind: "string", value: intent.setup_kind}]]);
+    case "create_checkout": return object([["checkout_kind", {kind: "string", value: intent.checkout_kind}], ["host_setup", expectedJson(intent.host_setup)], ["kind", word], ["label", {kind: "string", value: intent.label}], ["project", expectedJson(intent.project)], ["registry", {kind: "string", value: intent.registry}], ["repository", expectedJson(intent.repository)]]);
+    case "create_user_workspace": return object([["checkout", expectedJson(intent.checkout)], ["kind", word], ["label", {kind: "string", value: intent.label}], ["project", expectedJson(intent.project)]]);
+    case "create_attempt_workspace": return object([["kind", word], ["label", {kind: "string", value: intent.label}], ["requested_authority", authorityJson(intent.requested_authority)], ["user_workspace", expectedJson(intent.user_workspace)]]);
+    case "resume_attempt_workspace": case "resume_session": return object([["kind", word], ["requested_authority", authorityJson(intent.requested_authority)], ["target", expectedJson(intent.target)]]);
+    default: return object([["kind", word], ["target", expectedJson(intent.target)]]);
+  }
+}
+function decodeIntentValue(value: JsonValue): WorkContextMutationIntent {
+  if (value.kind !== "object") throw new RefusalError(WORK_CONTEXT_INVALID_BODY, "intent is not an object");
+  const loose = new Map(value.entries); const kindValue = loose.get("kind"); if (kindValue?.kind !== "string") throw new RefusalError(WORK_CONTEXT_INVALID_BODY, "intent kind is not a string"); const kind = kindValue.value;
+  const fieldsFor = (names: readonly string[]) => exactFields(value, names, WORK_CONTEXT_INVALID_BODY);
+  switch (kind) {
+    case "create_project": { const fields = fieldsFor(["kind", "label", "repositories"]); return validateIntent({kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), repositories: bodyArray(fields, "repositories", WORK_CONTEXT_INVALID_BODY, MAX_WORK_CONTEXT_RELATIONS, WORK_CONTEXT_VALUE_INVALID).map(decodeExpectedValue)}); }
+    case "create_host_setup": { const fields = fieldsFor(["kind", "label", "project", "registry", "setup_kind"]); return validateIntent({kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), project: decodeExpectedValue(bodyValue(fields, "project", WORK_CONTEXT_INVALID_BODY)), registry: WorkContextRegistrySelector(bodyString(fields, "registry", WORK_CONTEXT_INVALID_BODY)), setup_kind: decodeHostSetupKind(bodyString(fields, "setup_kind", WORK_CONTEXT_INVALID_BODY))}); }
+    case "create_checkout": { const fields = fieldsFor(["checkout_kind", "host_setup", "kind", "label", "project", "registry", "repository"]); return validateIntent({checkout_kind: decodeCheckoutKind(bodyString(fields, "checkout_kind", WORK_CONTEXT_INVALID_BODY)), host_setup: decodeExpectedValue(bodyValue(fields, "host_setup", WORK_CONTEXT_INVALID_BODY)), kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), project: decodeExpectedValue(bodyValue(fields, "project", WORK_CONTEXT_INVALID_BODY)), registry: WorkContextRegistrySelector(bodyString(fields, "registry", WORK_CONTEXT_INVALID_BODY)), repository: decodeExpectedValue(bodyValue(fields, "repository", WORK_CONTEXT_INVALID_BODY))}); }
+    case "create_user_workspace": { const fields = fieldsFor(["checkout", "kind", "label", "project"]); return validateIntent({checkout: decodeExpectedValue(bodyValue(fields, "checkout", WORK_CONTEXT_INVALID_BODY)), kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), project: decodeExpectedValue(bodyValue(fields, "project", WORK_CONTEXT_INVALID_BODY))}); }
+    case "create_attempt_workspace": { const fields = fieldsFor(["kind", "label", "requested_authority", "user_workspace"]); return validateIntent({kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), requested_authority: decodeAuthorityValue(bodyValue(fields, "requested_authority", WORK_CONTEXT_INVALID_BODY)), user_workspace: decodeExpectedValue(bodyValue(fields, "user_workspace", WORK_CONTEXT_INVALID_BODY))}); }
+    case "resume_attempt_workspace": case "resume_session": { const fields = fieldsFor(["kind", "requested_authority", "target"]); return validateIntent({kind, requested_authority: decodeAuthorityValue(bodyValue(fields, "requested_authority", WORK_CONTEXT_INVALID_BODY)), target: decodeExpectedValue(bodyValue(fields, "target", WORK_CONTEXT_INVALID_BODY))}); }
+    case "archive_project": case "archive_host_setup": case "archive_checkout": case "archive_user_workspace": { const fields = fieldsFor(["kind", "target"]); return validateIntent({kind, target: decodeExpectedValue(bodyValue(fields, "target", WORK_CONTEXT_INVALID_BODY))}); }
+    default: workContextRefusal("unknown lifecycle operation");
+  }
+}
+
+// FIPS 180-4 SHA-256 used only for the small deterministic request binding.
+function lifecycleSha256(bytes: Uint8Array): string {
+  const k = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+  const padded = new Uint8Array(Math.ceil((bytes.length + 9) / 64) * 64); padded.set(bytes); padded[bytes.length] = 0x80;
+  const bitLength = BigInt(bytes.length) * 8n; for (let index = 0; index < 8; index += 1) padded[padded.length - 1 - index] = Number((bitLength >> BigInt(index * 8)) & 0xffn);
+  const h = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]; const w = new Uint32Array(64); const rotate = (value: number, by: number) => (value >>> by) | (value << (32 - by));
+  for (let offset = 0; offset < padded.length; offset += 64) {
+    for (let index = 0; index < 16; index += 1) { const at = offset + index * 4; w[index] = ((padded[at]! << 24) | (padded[at + 1]! << 16) | (padded[at + 2]! << 8) | padded[at + 3]!) >>> 0; }
+    for (let index = 16; index < 64; index += 1) { const a = w[index - 15]!; const b = w[index - 2]!; const s0 = rotate(a,7)^rotate(a,18)^(a>>>3); const s1 = rotate(b,17)^rotate(b,19)^(b>>>10); w[index] = (w[index-16]! + s0 + w[index-7]! + s1) >>> 0; }
+    let [a,b,c,d,e,f,g,z] = h;
+    for (let index = 0; index < 64; index += 1) { const s1=rotate(e!,6)^rotate(e!,11)^rotate(e!,25); const ch=(e!&f!)^(~e!&g!); const t1=(z!+s1+ch+k[index]!+w[index]!)>>>0; const s0=rotate(a!,2)^rotate(a!,13)^rotate(a!,22); const maj=(a!&b!)^(a!&c!)^(b!&c!); const t2=(s0+maj)>>>0; z=g;g=f;f=e;e=(d!+t1)>>>0;d=c;c=b;b=a;a=(t1+t2)>>>0; }
+    for (const [index,value] of [a,b,c,d,e,f,g,z].entries()) h[index] = (h[index]! + value!) >>> 0;
+  }
+  return h.map((value) => value.toString(16).padStart(8,"0")).join("");
+}
+class LifecycleMaterial {
+  readonly bytes: number[] = []; private encoder = new TextEncoder();
+  text(value: string): void { this.number(BigInt(this.encoder.encode(value).length)); this.bytes.push(...this.encoder.encode(value)); }
+  number(value: bigint): void { for (let shift = 56n; shift >= 0n; shift -= 8n) this.bytes.push(Number((value >> shift) & 0xffn)); }
+  identity(value: WorkContextIdentity): void { this.text(value.kind); if ("resource" in value) { this.text(value.resource.authority); this.text(value.resource.kind); this.text(value.resource.id); } else this.text(value.id); }
+  expected(value: ExpectedWorkContext): void { this.identity(value.identity); this.number(value.revision); }
+  authority(value: WorkContextAuthority): void { for (const field of ["filesystem","credentials","network","tools","providers","models"] as const) { this.number(BigInt(value[field].length)); for (const grant of value[field]) this.text(grant); } }
+  intent(value: WorkContextMutationIntent): void {
+    this.text(value.kind);
+    switch (value.kind) {
+      case "create_project": this.text(value.label); this.number(BigInt(value.repositories.length)); value.repositories.forEach((item)=>this.expected(item)); break;
+      case "create_host_setup": this.text(value.label); this.expected(value.project); this.text(value.setup_kind); this.text(value.registry); break;
+      case "create_checkout": this.text(value.label); this.expected(value.project); this.expected(value.host_setup); this.expected(value.repository); this.text(value.checkout_kind); this.text(value.registry); break;
+      case "create_user_workspace": this.text(value.label); this.expected(value.project); this.expected(value.checkout); break;
+      case "create_attempt_workspace": this.text(value.label); this.expected(value.user_workspace); this.authority(value.requested_authority); break;
+      case "resume_attempt_workspace": case "resume_session": this.expected(value.target); this.authority(value.requested_authority); break;
+      default: this.expected(value.target);
+    }
+  }
+}
+export function lifecycleRequestDigest(value: Omit<WorkContextMutationProposal,"request_digest"|"schema">): WorkContextRequestDigest {
+  const material = new LifecycleMaterial(); material.text("automonique.platform/v2/work-context-mutation-request/v1"); material.text(value.actor.tenant); material.text(value.actor.id); material.text(value.authority); material.authority(value.actor_authority); material.text(value.idempotency_key); material.intent(value.intent);
+  return WorkContextRequestDigest(`sha256:${lifecycleSha256(Uint8Array.from(material.bytes))}`);
+}
+
+function actorJson(value: LifecycleActor): JsonValue { const actor = validateLifecycleActor(value); return object([["id",{kind:"string",value:actor.id}],["tenant",{kind:"string",value:actor.tenant}]]); }
+function decodeActorValue(value: JsonValue): LifecycleActor { const fields=exactFields(value,["id","tenant"],WORK_CONTEXT_INVALID_BODY); return validateLifecycleActor({id:bodyString(fields,"id",WORK_CONTEXT_INVALID_BODY),tenant:bodyString(fields,"tenant",WORK_CONTEXT_INVALID_BODY)}); }
+function previewRefJson(value: MutationPreviewRef): JsonValue { return object([["id",{kind:"string",value:MutationPreviewId(value.id)}],["revision",{kind:"integer",value:WorkContextRevision(value.revision)}]]); }
+function decodePreviewRefValue(value: JsonValue): MutationPreviewRef { const fields=exactFields(value,["id","revision"],WORK_CONTEXT_INVALID_BODY); return {id:MutationPreviewId(bodyString(fields,"id",WORK_CONTEXT_INVALID_BODY)),revision:WorkContextRevision(bodyInteger(fields,"revision",WORK_CONTEXT_INVALID_BODY))}; }
+
+export function validateWorkContextMutationProposal(value: WorkContextMutationProposal): WorkContextMutationProposal {
+  exactInput(value, PROPOSAL_FIELDS); if(value.schema!==PLATFORM_SCHEMA_V2) workContextRefusal("lifecycle schema is incompatible");
+  const proposal: WorkContextMutationProposal={actor:validateLifecycleActor(value.actor),actor_authority:validateAuthority(value.actor_authority),authority:decodeResourceAuthority(value.authority),idempotency_key:IdempotencyKey(value.idempotency_key),intent:validateIntent(value.intent),request_digest:WorkContextRequestDigest(value.request_digest),schema:PLATFORM_SCHEMA_V2};
+  if(lifecycleRequestDigest(proposal)!==proposal.request_digest) workContextRefusal("request digest does not bind proposal"); return proposal;
+}
+function proposalJson(value: WorkContextMutationProposal): JsonValue { const proposal=validateWorkContextMutationProposal(value); return object([["actor",actorJson(proposal.actor)],["actor_authority",authorityJson(proposal.actor_authority)],["authority",{kind:"string",value:proposal.authority}],["idempotency_key",{kind:"string",value:proposal.idempotency_key}],["intent",intentJson(proposal.intent)],["request_digest",{kind:"string",value:proposal.request_digest}],["schema",{kind:"string",value:proposal.schema}]]); }
+function decodeProposalValue(value: JsonValue): WorkContextMutationProposal { const fields=exactFields(value,PROPOSAL_FIELDS,WORK_CONTEXT_INVALID_BODY); const partial={actor:decodeActorValue(bodyValue(fields,"actor",WORK_CONTEXT_INVALID_BODY)),actor_authority:decodeAuthorityValue(bodyValue(fields,"actor_authority",WORK_CONTEXT_INVALID_BODY)),authority:decodeResourceAuthority(bodyString(fields,"authority",WORK_CONTEXT_INVALID_BODY)),idempotency_key:IdempotencyKey(bodyString(fields,"idempotency_key",WORK_CONTEXT_INVALID_BODY)),intent:decodeIntentValue(bodyValue(fields,"intent",WORK_CONTEXT_INVALID_BODY)),request_digest:WorkContextRequestDigest(bodyString(fields,"request_digest",WORK_CONTEXT_INVALID_BODY)),schema:bodyString(fields,"schema",WORK_CONTEXT_INVALID_BODY) as typeof PLATFORM_SCHEMA_V2}; return validateWorkContextMutationProposal(partial); }
+export function encodeWorkContextMutationProposal(value: WorkContextMutationProposal): Uint8Array { return lifecycleBytes(proposalJson(value)); }
+export function decodeWorkContextMutationProposal(payload: Uint8Array): WorkContextMutationProposal { return refuse(WORK_CONTEXT_VALUE_INVALID,()=>decodeProposalValue(parseDocument(payload,MAX_MUTATION_CANONICAL_BYTES))); }
+
+function requestedAuthority(intent: WorkContextMutationIntent): WorkContextAuthority|null { return intent.kind==="create_attempt_workspace"||intent.kind==="resume_attempt_workspace"||intent.kind==="resume_session"?intent.requested_authority:null; }
+function canonicalEqual(left: JsonValue, right: JsonValue): boolean { const a=toCanonicalBytes(left);const b=toCanonicalBytes(right);return a.length===b.length&&a.every((byte,index)=>byte===b[index]); }
+function expectedResult(intent: WorkContextMutationIntent, current: WorkContextRecord|null, issued: WorkContextIdentity): WorkContextRecord {
+  const emptyAttributes: WorkContextAttributes={checkout:null,host_setup:null};
+  const created=(kind:WorkContextKind,lifecycle:WorkContextLifecycle,label:WorkContextLabel,attributes:WorkContextAttributes,relations:readonly WorkContextRelation[]):WorkContextRecord=>{if(issued.kind!==kind)workContextRefusal("issued identity has the wrong kind");return validateWorkContextRecord({attributes,identity:issued,label,lifecycle,relations,revision:WorkContextRevision(1n)});};
+  switch(intent.kind){
+    case "create_project": return created("project","active",intent.label,emptyAttributes,intent.repositories.map((item)=>({kind:"project_repository",target:item.identity})));
+    case "create_host_setup": return created("host_setup","active",intent.label,{checkout:null,host_setup:intent.setup_kind},[{kind:"host_setup_project",target:intent.project.identity}]);
+    case "create_checkout": return created("checkout","active",intent.label,{checkout:intent.checkout_kind,host_setup:null},[{kind:"checkout_project",target:intent.project.identity},{kind:"checkout_host_setup",target:intent.host_setup.identity},{kind:"checkout_repository",target:intent.repository.identity}]);
+    case "create_user_workspace": return created("user_workspace","active",intent.label,emptyAttributes,[{kind:"user_workspace_project",target:intent.project.identity},{kind:"user_workspace_checkout",target:intent.checkout.identity}]);
+    case "create_attempt_workspace": return created("attempt_workspace","preparing",intent.label,emptyAttributes,[{kind:"attempt_user_workspace",target:intent.user_workspace.identity}]);
+    default: {
+      if(current===null)workContextRefusal("mutation preview requires the current record");const target=intent.target;
+      if(!canonicalEqual(workContextIdentityJson(current.identity),workContextIdentityJson(target.identity))||current.revision!==target.revision)workContextRefusal("current record does not match the expected target");
+      const resumeAttempt=intent.kind==="resume_attempt_workspace";const resumeSession=intent.kind==="resume_session";const from=resumeAttempt||resumeSession?"hibernated":"active";const to=resumeAttempt?"running":resumeSession?"active":"archived";
+      if(current.lifecycle!==from)workContextRefusal("lifecycle transition is invalid");return validateWorkContextRecord({...current,lifecycle:to,revision:WorkContextRevision(current.revision+1n)});
+    }
+  }
+}
+export function validateMutationPreview(value: MutationPreview): MutationPreview {
+  exactInput(value,PREVIEW_FIELDS); if(value.schema!==PLATFORM_SCHEMA_V2) workContextRefusal("lifecycle schema is incompatible");
+  const proposal=validateWorkContextMutationProposal(value.proposal); const current=value.current===null?null:validateWorkContextRecord(value.current); const resolved=validateResolvedParents(proposal.intent,value.resolved_parents); const resulting=validateWorkContextRecord(value.resulting); const inherited=validateAuthority(value.inherited_authority); const effective=validateAuthority(value.effective_authority); const requested=requestedAuthority(proposal.intent);
+  if(value.approval!=="not_required"&&value.approval!=="required") workContextRefusal("approval requirement is invalid");
+  if(value.issued_at_ms<0n||value.expires_at_ms<=value.issued_at_ms||value.expires_at_ms>LIFECYCLE_EPOCH_MAX) workContextRefusal("preview expiry is invalid");
+  if(requested===null ? AUTHORITY_FIELDS.some((field)=>effective[field].length>0||inherited[field].length>0) : !authorityEqual(requested,effective)||!authoritySubset(effective,inherited)||!authoritySubset(effective,proposal.actor_authority)) workContextRefusal("effective authority widens its ceiling");
+  if((proposal.intent.kind.startsWith("create_")&&current!==null)||(!proposal.intent.kind.startsWith("create_")&&current===null)) workContextRefusal("preview current record is incoherent");
+  if(!canonicalEqual(recordJson(resulting),recordJson(expectedResult(proposal.intent,current,resulting.identity))))workContextRefusal("preview resulting record is incoherent");
+  return {approval:value.approval,current,effective_authority:effective,expires_at_ms:value.expires_at_ms,inherited_authority:inherited,issued_at_ms:value.issued_at_ms,preview:value.preview,proposal,resolved_parents:resolved,resulting,schema:PLATFORM_SCHEMA_V2};
+}
+function previewJson(value: MutationPreview): JsonValue { const preview=validateMutationPreview(value); return object([["approval",{kind:"string",value:preview.approval}],["current",preview.current===null?{kind:"null"}:recordJson(preview.current)],["effective_authority",authorityJson(preview.effective_authority)],["expires_at_ms",{kind:"integer",value:preview.expires_at_ms}],["inherited_authority",authorityJson(preview.inherited_authority)],["issued_at_ms",{kind:"integer",value:preview.issued_at_ms}],["preview",previewRefJson(preview.preview)],["proposal",proposalJson(preview.proposal)],["resolved_parents",{kind:"array",items:preview.resolved_parents.map(resolvedParentJson)}],["resulting",recordJson(preview.resulting)],["schema",{kind:"string",value:preview.schema}]]); }
+function decodePreviewValue(value: JsonValue): MutationPreview { const fields=exactFields(value,PREVIEW_FIELDS,WORK_CONTEXT_INVALID_BODY); const current=bodyValueOrNull(fields,"current",WORK_CONTEXT_INVALID_BODY); return validateMutationPreview({approval:bodyString(fields,"approval",WORK_CONTEXT_INVALID_BODY) as MutationApprovalRequirement,current:current===null?null:decodeWorkContextRecordValue(current),effective_authority:decodeAuthorityValue(bodyValue(fields,"effective_authority",WORK_CONTEXT_INVALID_BODY)),expires_at_ms:bodyInteger(fields,"expires_at_ms",WORK_CONTEXT_INVALID_BODY),inherited_authority:decodeAuthorityValue(bodyValue(fields,"inherited_authority",WORK_CONTEXT_INVALID_BODY)),issued_at_ms:bodyInteger(fields,"issued_at_ms",WORK_CONTEXT_INVALID_BODY),preview:decodePreviewRefValue(bodyValue(fields,"preview",WORK_CONTEXT_INVALID_BODY)),proposal:decodeProposalValue(bodyValue(fields,"proposal",WORK_CONTEXT_INVALID_BODY)),resolved_parents:bodyArray(fields,"resolved_parents",WORK_CONTEXT_INVALID_BODY,MAX_WORK_CONTEXT_RELATIONS,WORK_CONTEXT_VALUE_INVALID).map(decodeResolvedParentValue),resulting:decodeWorkContextRecordValue(bodyValue(fields,"resulting",WORK_CONTEXT_INVALID_BODY)),schema:bodyString(fields,"schema",WORK_CONTEXT_INVALID_BODY) as typeof PLATFORM_SCHEMA_V2}); }
+export function mutationPreviewDigest(value: MutationPreview): MutationPreviewDigest { return MutationPreviewDigest(`sha256:${lifecycleSha256(toCanonicalBytes(previewJson(value)))}`); }
+function lifecycleBytes(value: JsonValue): Uint8Array { const bytes=toCanonicalBytes(value);if(bytes.length>MAX_MUTATION_CANONICAL_BYTES)throw new RefusalError("frame_too_large","mutation document exceeds its ceiling");return bytes; }
+export function encodeWorkContextMutationPreview(value: MutationPreview): Uint8Array { return lifecycleBytes(previewJson(value)); }
+export function decodeWorkContextMutationPreview(payload: Uint8Array): MutationPreview { return refuse(WORK_CONTEXT_VALUE_INVALID,()=>decodePreviewValue(parseDocument(payload,MAX_MUTATION_CANONICAL_BYTES))); }
+
+function validateMutationApproval(value: MutationApproval, preview: MutationPreview): MutationApproval { exactInput(value,APPROVAL_FIELDS);if(value.decision!=="denied"&&value.decision!=="granted")workContextRefusal("approval decision is invalid");const approval={decided_at_ms:value.decided_at_ms,decided_by:validateLifecycleActor(value.decided_by),decision:value.decision,expires_at_ms:value.expires_at_ms,id:MutationApprovalId(value.id),idempotency_key:IdempotencyKey(value.idempotency_key),preview:value.preview,preview_digest:MutationPreviewDigest(value.preview_digest),request_digest:WorkContextRequestDigest(value.request_digest)};if(approval.preview.id!==preview.preview.id||approval.preview.revision!==preview.preview.revision||approval.preview_digest!==mutationPreviewDigest(preview)||approval.request_digest!==preview.proposal.request_digest||approval.idempotency_key!==preview.proposal.idempotency_key||approval.decided_at_ms<preview.issued_at_ms||approval.expires_at_ms<=approval.decided_at_ms||approval.expires_at_ms>preview.expires_at_ms||approval.expires_at_ms>LIFECYCLE_EPOCH_MAX) workContextRefusal("approval does not bind preview");return approval; }
+function approvalJson(value: MutationApproval): JsonValue { return object([["decided_at_ms",{kind:"integer",value:value.decided_at_ms}],["decided_by",actorJson(value.decided_by)],["decision",{kind:"string",value:value.decision}],["expires_at_ms",{kind:"integer",value:value.expires_at_ms}],["id",{kind:"string",value:MutationApprovalId(value.id)}],["idempotency_key",{kind:"string",value:IdempotencyKey(value.idempotency_key)}],["preview",previewRefJson(value.preview)],["preview_digest",{kind:"string",value:MutationPreviewDigest(value.preview_digest)}],["request_digest",{kind:"string",value:WorkContextRequestDigest(value.request_digest)}]]); }
+function decodeApprovalValue(value: JsonValue, preview: MutationPreview): MutationApproval { const fields=exactFields(value,APPROVAL_FIELDS,WORK_CONTEXT_INVALID_BODY);return validateMutationApproval({decided_at_ms:bodyInteger(fields,"decided_at_ms",WORK_CONTEXT_INVALID_BODY),decided_by:decodeActorValue(bodyValue(fields,"decided_by",WORK_CONTEXT_INVALID_BODY)),decision:bodyString(fields,"decision",WORK_CONTEXT_INVALID_BODY) as MutationApprovalDecision,expires_at_ms:bodyInteger(fields,"expires_at_ms",WORK_CONTEXT_INVALID_BODY),id:MutationApprovalId(bodyString(fields,"id",WORK_CONTEXT_INVALID_BODY)),idempotency_key:IdempotencyKey(bodyString(fields,"idempotency_key",WORK_CONTEXT_INVALID_BODY)),preview:decodePreviewRefValue(bodyValue(fields,"preview",WORK_CONTEXT_INVALID_BODY)),preview_digest:MutationPreviewDigest(bodyString(fields,"preview_digest",WORK_CONTEXT_INVALID_BODY)),request_digest:WorkContextRequestDigest(bodyString(fields,"request_digest",WORK_CONTEXT_INVALID_BODY))},preview); }
+export function encodeWorkContextMutationApproval(value: MutationApproval, preview: MutationPreview): Uint8Array { return lifecycleBytes(object([["approval",approvalJson(validateMutationApproval(value,preview))],["schema",{kind:"string",value:PLATFORM_SCHEMA_V2}]])); }
+export function decodeWorkContextMutationApproval(payload: Uint8Array, preview: MutationPreview): MutationApproval { return refuse(WORK_CONTEXT_VALUE_INVALID,()=>{const fields=exactFields(parseDocument(payload,MAX_MUTATION_CANONICAL_BYTES),["approval","schema"],WORK_CONTEXT_INVALID_BODY);if(bodyString(fields,"schema",WORK_CONTEXT_INVALID_BODY)!==PLATFORM_SCHEMA_V2)workContextRefusal("lifecycle schema is incompatible");return decodeApprovalValue(bodyValue(fields,"approval",WORK_CONTEXT_INVALID_BODY),preview);}); }
+
+export function validateMutationSubmission(value: MutationSubmission, preview: MutationPreview): MutationSubmission { exactInput(value,SUBMISSION_FIELDS);if(value.schema!==PLATFORM_SCHEMA_V2||value.preview.id!==preview.preview.id||value.preview.revision!==preview.preview.revision||value.preview_digest!==mutationPreviewDigest(preview)||value.request_digest!==preview.proposal.request_digest||value.idempotency_key!==preview.proposal.idempotency_key||value.submitted_at_ms<preview.issued_at_ms||value.submitted_at_ms>=preview.expires_at_ms||value.submitted_at_ms>LIFECYCLE_EPOCH_MAX)workContextRefusal("submission does not bind preview");const approval=value.approval===null?null:validateMutationApproval(value.approval,preview);if(preview.approval==="required"&&(approval===null||approval.decision!=="granted"||value.submitted_at_ms>=approval.expires_at_ms))workContextRefusal("approval is absent, denied, or expired");if(preview.approval==="not_required"&&approval!==null)workContextRefusal("approval is unexpected");return {...value,approval,preview_digest:MutationPreviewDigest(value.preview_digest)}; }
+export function encodeWorkContextMutationSubmission(value: MutationSubmission, preview: MutationPreview): Uint8Array { const submission=validateMutationSubmission(value,preview);return lifecycleBytes(object([["approval",submission.approval===null?{kind:"null"}:approvalJson(submission.approval)],["idempotency_key",{kind:"string",value:submission.idempotency_key}],["preview",previewRefJson(submission.preview)],["preview_digest",{kind:"string",value:submission.preview_digest}],["request_digest",{kind:"string",value:submission.request_digest}],["schema",{kind:"string",value:submission.schema}],["submitted_at_ms",{kind:"integer",value:submission.submitted_at_ms}]])); }
+export function decodeWorkContextMutationSubmission(payload: Uint8Array, preview: MutationPreview): MutationSubmission { return refuse(WORK_CONTEXT_VALUE_INVALID,()=>{const fields=exactFields(parseDocument(payload,MAX_MUTATION_CANONICAL_BYTES),SUBMISSION_FIELDS,WORK_CONTEXT_INVALID_BODY);const item=bodyValueOrNull(fields,"approval",WORK_CONTEXT_INVALID_BODY);return validateMutationSubmission({approval:item===null?null:decodeApprovalValue(item,preview),idempotency_key:IdempotencyKey(bodyString(fields,"idempotency_key",WORK_CONTEXT_INVALID_BODY)),preview:decodePreviewRefValue(bodyValue(fields,"preview",WORK_CONTEXT_INVALID_BODY)),preview_digest:MutationPreviewDigest(bodyString(fields,"preview_digest",WORK_CONTEXT_INVALID_BODY)),request_digest:WorkContextRequestDigest(bodyString(fields,"request_digest",WORK_CONTEXT_INVALID_BODY)),schema:bodyString(fields,"schema",WORK_CONTEXT_INVALID_BODY) as typeof PLATFORM_SCHEMA_V2,submitted_at_ms:bodyInteger(fields,"submitted_at_ms",WORK_CONTEXT_INVALID_BODY)},preview);}); }
+
+function validateMutationReceipt(value: MutationReceipt, submission: MutationSubmission, preview: MutationPreview): MutationReceipt {exactInput(value,RECEIPT_FIELDS);if(value.schema!==PLATFORM_SCHEMA_V2||!(value.outcome==="accepted"||value.outcome==="completed"||value.outcome==="conflict"||value.outcome==="rejected"))workContextRefusal("receipt outcome or schema is invalid");if(value.preview.id!==submission.preview.id||value.preview.revision!==submission.preview.revision||value.preview_digest!==submission.preview_digest||value.preview_digest!==mutationPreviewDigest(preview)||value.request_digest!==submission.request_digest||value.idempotency_key!==submission.idempotency_key||value.approval_id!==(submission.approval?.id??null)||value.recorded_at_ms<submission.submitted_at_ms||value.recorded_at_ms>LIFECYCLE_EPOCH_MAX)workContextRefusal("receipt does not bind submission");const expectedRevision=value.outcome==="completed"?preview.resulting.revision:null;if(value.resulting_revision!==expectedRevision)workContextRefusal("receipt resulting revision is incoherent");return {...value,preview_digest:MutationPreviewDigest(value.preview_digest)};}
+export function encodeWorkContextMutationReceipt(value: MutationReceipt, submission: MutationSubmission, preview: MutationPreview): Uint8Array { const receipt=validateMutationReceipt(value,submission,preview);return lifecycleBytes(object([["approval_id",receipt.approval_id===null?{kind:"null"}:{kind:"string",value:MutationApprovalId(receipt.approval_id)}],["id",{kind:"string",value:ReceiptId(receipt.id)}],["idempotency_key",{kind:"string",value:IdempotencyKey(receipt.idempotency_key)}],["outcome",{kind:"string",value:receipt.outcome}],["preview",previewRefJson(receipt.preview)],["preview_digest",{kind:"string",value:receipt.preview_digest}],["recorded_at_ms",{kind:"integer",value:receipt.recorded_at_ms}],["request_digest",{kind:"string",value:WorkContextRequestDigest(receipt.request_digest)}],["resulting_revision",receipt.resulting_revision===null?{kind:"null"}:{kind:"integer",value:WorkContextRevision(receipt.resulting_revision)}],["schema",{kind:"string",value:PLATFORM_SCHEMA_V2}]])); }
+export function decodeWorkContextMutationReceipt(payload: Uint8Array, submission: MutationSubmission, preview: MutationPreview): MutationReceipt { return refuse(WORK_CONTEXT_VALUE_INVALID,()=>{const fields=exactFields(parseDocument(payload,MAX_MUTATION_CANONICAL_BYTES),RECEIPT_FIELDS,WORK_CONTEXT_INVALID_BODY);const approval=bodyStringOrNull(fields,"approval_id",WORK_CONTEXT_INVALID_BODY);const revision=bodyValueOrNull(fields,"resulting_revision",WORK_CONTEXT_INVALID_BODY);const outcome=bodyString(fields,"outcome",WORK_CONTEXT_INVALID_BODY) as MutationReceipt["outcome"];const receipt={approval_id:approval===null?null:MutationApprovalId(approval),id:ReceiptId(bodyString(fields,"id",WORK_CONTEXT_INVALID_BODY)),idempotency_key:IdempotencyKey(bodyString(fields,"idempotency_key",WORK_CONTEXT_INVALID_BODY)),outcome,preview:decodePreviewRefValue(bodyValue(fields,"preview",WORK_CONTEXT_INVALID_BODY)),preview_digest:MutationPreviewDigest(bodyString(fields,"preview_digest",WORK_CONTEXT_INVALID_BODY)),recorded_at_ms:bodyInteger(fields,"recorded_at_ms",WORK_CONTEXT_INVALID_BODY),request_digest:WorkContextRequestDigest(bodyString(fields,"request_digest",WORK_CONTEXT_INVALID_BODY)),resulting_revision:revision===null?null:(revision.kind==="integer"?WorkContextRevision(revision.value):workContextRefusal("resulting revision is not an integer")),schema:bodyString(fields,"schema",WORK_CONTEXT_INVALID_BODY) as typeof PLATFORM_SCHEMA_V2};return validateMutationReceipt(receipt,submission,preview);}); }
+
+const REFUSAL_CATEGORIES: readonly MutationRefusalCategory[]=["invalid_request","unauthorized","authority_widening","stale_revision","conflict","preview_expired","approval_required","approval_unexpected","approval_mismatch","approval_denied","approval_expired","unknown","resync_required","unavailable"];
+export function encodeWorkContextMutationRefusal(value: MutationRefusal): Uint8Array { exactInput(value,REFUSAL_FIELDS);if(!REFUSAL_CATEGORIES.includes(value.category)||value.schema!==PLATFORM_SCHEMA_V2)workContextRefusal("refusal is invalid");return lifecycleBytes(object([["category",{kind:"string",value:value.category}],["explanation",{kind:"string",value:WorkContextLabel(value.explanation)}],["request_digest",value.request_digest===null?{kind:"null"}:{kind:"string",value:WorkContextRequestDigest(value.request_digest)}],["schema",{kind:"string",value:value.schema}]])); }
+export function decodeWorkContextMutationRefusal(payload: Uint8Array): MutationRefusal { return refuse(WORK_CONTEXT_VALUE_INVALID,()=>{const fields=exactFields(parseDocument(payload,MAX_MUTATION_CANONICAL_BYTES),REFUSAL_FIELDS,WORK_CONTEXT_INVALID_BODY);const category=bodyString(fields,"category",WORK_CONTEXT_INVALID_BODY) as MutationRefusalCategory;if(!REFUSAL_CATEGORIES.includes(category))workContextRefusal("unknown refusal category");const digest=bodyStringOrNull(fields,"request_digest",WORK_CONTEXT_INVALID_BODY);const schema=bodyString(fields,"schema",WORK_CONTEXT_INVALID_BODY);if(schema!==PLATFORM_SCHEMA_V2)workContextRefusal("lifecycle schema is incompatible");return {category,explanation:WorkContextLabel(bodyString(fields,"explanation",WORK_CONTEXT_INVALID_BODY)),request_digest:digest===null?null:WorkContextRequestDigest(digest),schema:PLATFORM_SCHEMA_V2};}); }
 "#,
     );
 }
