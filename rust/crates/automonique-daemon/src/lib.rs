@@ -223,6 +223,7 @@ pub mod mcp_client;
 pub mod memory_config;
 pub mod model_inventory;
 pub mod parity_trace;
+pub mod platform_v2_bootstrap;
 pub mod platform_v2_host;
 pub use platform_v2_host::{
     POLICY_FILE_NAME as PLATFORM_V2_POLICY_FILE_NAME, resolve_web_mobile_request_project,
