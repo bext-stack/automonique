@@ -163,6 +163,7 @@ jobs:
           second_package_dir="$(mktemp -d)"
           consumer_dir="$(mktemp -d)"
           browser_dir="$(mktemp -d)"
+          extracted_dir="$(mktemp -d)"
           test -d dist
           mv dist "$package_dir/prebuilt-dist"
           npm pack --pack-destination "$package_dir"
@@ -176,6 +177,8 @@ jobs:
           tar -tzf "$archive" > "$archive_listing"
           grep -Fxq 'package/LICENSE' "$archive_listing"
           grep -Fxq 'package/README.md' "$archive_listing"
+          tar -xzf "$archive" -C "$extracted_dir"
+          node ./test/packed-boundary.mjs "$extracted_dir/package"
           npm install --prefix "$consumer_dir" "$archive"
           (cd "$consumer_dir" && node --input-type=module -e \
             'Promise.all([
@@ -184,7 +187,9 @@ jobs:
               import("node:fs/promises").then(({readFile}) => readFile("./node_modules/@automonique/sdk/package.json", "utf8").then(JSON.parse)),
             ]).then(([sdk, testing, sdkPackage]) => {
               if (typeof sdk.PlatformClient !== "function") process.exit(1);
+              if (typeof sdk.PlatformV2Client !== "function") process.exit(1);
               if (typeof testing.createDeterministicSdkFixture !== "function") process.exit(1);
+              if (typeof testing.DeterministicPlatformV2Adapter !== "function") process.exit(1);
               if (`sha256:${sdk.PLATFORM_V1_SCHEMA_DIGEST}` !== sdkPackage.automonique.schemaDigest) process.exit(1);
             })')
           bun build "$consumer_dir/node_modules/@automonique/sdk/dist/sdk/src/index.js" \
