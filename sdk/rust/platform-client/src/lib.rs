@@ -32,10 +32,13 @@ use automonique_protocol::platform::{
 use automonique_protocol::platform_api::{
     MAX_PLATFORM_CANONICAL_BYTES, PlatformRequestMessage, PlatformResponseMessage,
 };
-use zeroize::Zeroizing;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const PLATFORM_CONTENT_TYPE: &str = "application/vnd.automonique.platform.v1+json";
 const MAX_BEARER_BYTES: usize = 4096;
+const MAX_BASIC_DECODED_BYTES: usize = 512;
 
 /// Stable client refusal categories. Payload bytes are never retained.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +103,73 @@ impl BearerToken {
 impl fmt::Debug for BearerToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("BearerToken(<redacted>)")
+    }
+}
+
+/// Bounded HTTP Basic credential retained only as a zeroizing encoded value.
+///
+/// The username grammar matches the web-entry auth configuration. Neither the
+/// password nor the encoded credential is available through accessors or
+/// diagnostics.
+pub struct BasicCredential(Zeroizing<String>);
+
+impl BasicCredential {
+    pub fn new(
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Result<Self, ClientError> {
+        let mut username = username.into();
+        let mut password = password.into();
+        let username_valid = !username.is_empty()
+            && username.len() <= 64
+            && username
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+        let decoded_length = username
+            .len()
+            .checked_add(1)
+            .and_then(|value| value.checked_add(password.len()));
+        if !username_valid
+            || password.is_empty()
+            || decoded_length.is_none_or(|length| length > MAX_BASIC_DECODED_BYTES)
+        {
+            username.zeroize();
+            password.zeroize();
+            return Err(ClientError::Unauthorized);
+        }
+        let mut decoded = Zeroizing::new(Vec::with_capacity(decoded_length.unwrap_or(0)));
+        decoded.extend_from_slice(username.as_bytes());
+        decoded.push(b':');
+        decoded.extend_from_slice(password.as_bytes());
+        username.zeroize();
+        password.zeroize();
+        Ok(Self(Zeroizing::new(
+            BASE64_STANDARD.encode(decoded.as_slice()),
+        )))
+    }
+
+    fn authorization(&self) -> Zeroizing<String> {
+        Zeroizing::new(format!("Basic {}", self.0.as_str()))
+    }
+}
+
+impl fmt::Debug for BasicCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BasicCredential(<redacted>)")
+    }
+}
+
+enum HttpsCredential {
+    Bearer(BearerToken),
+    Basic(BasicCredential),
+}
+
+impl HttpsCredential {
+    fn authorization(&self) -> Zeroizing<String> {
+        match self {
+            Self::Bearer(value) => value.authorization(),
+            Self::Basic(value) => value.authorization(),
+        }
     }
 }
 
@@ -204,7 +274,7 @@ impl PlatformTransport for UnixTransport {
 /// types or retry policy are introduced here.
 pub struct HttpsTransport {
     endpoint: String,
-    token: BearerToken,
+    credential: HttpsCredential,
     timeout: Duration,
     agent: ureq::Agent,
     v2_agent: ureq::Agent,
@@ -216,7 +286,25 @@ impl HttpsTransport {
         validate_endpoint(&endpoint)?;
         Ok(Self {
             endpoint,
-            token,
+            credential: HttpsCredential::Bearer(token),
+            timeout: Duration::from_secs(10),
+            agent: ureq::Agent::config_builder().build().new_agent(),
+            v2_agent: ureq::Agent::config_builder()
+                .max_redirects(0)
+                .build()
+                .new_agent(),
+        })
+    }
+
+    pub fn new_basic(
+        endpoint: impl Into<String>,
+        credential: BasicCredential,
+    ) -> Result<Self, ClientError> {
+        let endpoint = endpoint.into();
+        validate_endpoint(&endpoint)?;
+        Ok(Self {
+            endpoint,
+            credential: HttpsCredential::Basic(credential),
             timeout: Duration::from_secs(10),
             agent: ureq::Agent::config_builder().build().new_agent(),
             v2_agent: ureq::Agent::config_builder()
@@ -243,7 +331,7 @@ impl fmt::Debug for HttpsTransport {
         formatter
             .debug_struct("HttpsTransport")
             .field("endpoint", &self.endpoint)
-            .field("token", &"<redacted>")
+            .field("credential", &"<redacted>")
             .field("timeout", &self.timeout)
             .finish_non_exhaustive()
     }
@@ -275,7 +363,7 @@ impl PlatformTransport for HttpsTransport {
             .to_message()
             .map_err(|_| ClientError::Protocol)?
             .to_canonical_bytes();
-        let authorization = self.token.authorization();
+        let authorization = self.credential.authorization();
         let mut response = self
             .agent
             .post(&self.endpoint)

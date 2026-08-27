@@ -34,6 +34,11 @@
       "types": "./dist/sdk/src/testing.d.ts",
       "import": "./dist/sdk/src/testing.js",
       "default": "./dist/sdk/src/testing.js"
+    },
+    "./testing/internal": {
+      "types": "./dist/sdk/src/testing/internal.d.ts",
+      "import": "./dist/sdk/src/testing/internal.js",
+      "default": "./dist/sdk/src/testing/internal.js"
     }
   },
   "scripts": {

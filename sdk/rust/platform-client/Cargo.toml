@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 automonique-protocol = { path = "../../../rust/crates/automonique-protocol" }
+base64 = "=0.22.1"
 ureq = { version = "=3.3.0", default-features = false, features = ["rustls"] }
 zeroize = "=1.9.0"
 
