@@ -4,6 +4,7 @@
 
 mod agent_auth;
 mod mobile_auth;
+mod platform_v2_bridge;
 
 pub use agent_auth::AgentAuthConfig;
 
@@ -75,6 +76,7 @@ use crate::mobile_auth::{
     MobileRefreshRequest, MobileRevocation, authorize_platform_request, filter_command_state,
     filter_sessions,
 };
+use crate::platform_v2_bridge::{PlatformV2Bridge, PlatformV2Lane};
 
 const DASHBOARD_HTML: &str = include_str!("../assets/dashboard.html");
 const DASHBOARD_CSS: &str = include_str!("../assets/dashboard.css");
@@ -103,7 +105,7 @@ const INTEGRATION_CONFIG_LIMIT: u64 = 4 * 1024;
 const PROVIDER_AUTH_HEALTH_LIMIT: u64 = 4 * 1024;
 const PROCESS_SNAPSHOT_LIMIT: u64 = 256 * 1024;
 const BODY_LIMIT: usize = MAX_PLATFORM_REQUEST_CANONICAL_BYTES;
-const REQUEST_LIMIT: usize = HEADER_LIMIT + BODY_LIMIT;
+const REQUEST_LIMIT: usize = HEADER_LIMIT + PlatformV2Lane::V2.request_limit();
 const MANAGE_PLATFORM_RESPONSE_LIMIT: u64 = 64 * 1024;
 const MAX_MANAGE_RESULT_CONTEXT_BYTES: usize = 8 * 1024;
 const MAX_PENDING_MANAGE_ACTIONS: usize = 32;
@@ -137,6 +139,7 @@ pub enum Route {
     ApiPlatform,
     ApiPlatformSession,
     ApiPlatformRemote,
+    ApiPlatformV2Remote,
     MobileDiscovery,
     MobileOperatorProvision,
     MobilePairingCreate,
@@ -179,6 +182,7 @@ pub struct Request<'a> {
     cookie: Option<&'a str>,
     forwarded_proto: Option<&'a str>,
     content_type: Option<&'a str>,
+    accept: Option<&'a str>,
     content_length: usize,
     header_length: usize,
 }
@@ -194,6 +198,7 @@ impl fmt::Debug for Request<'_> {
             .field("cookie", &self.cookie.map(|_| "<redacted>"))
             .field("forwarded_proto", &self.forwarded_proto)
             .field("content_type", &self.content_type)
+            .field("accept", &self.accept)
             .field("content_length", &self.content_length)
             .finish()
     }
@@ -693,6 +698,7 @@ pub struct WebIntegration {
     memory_path: PathBuf,
     lane: Mutex<SocketRunLane>,
     platform: Mutex<PlatformClient<UnixTransport>>,
+    platform_v2: PlatformV2Bridge,
     mobile_auth: Mutex<MobileCredentialAuthority>,
     slack: Mutex<Option<Box<dyn SlackSurface + Send>>>,
     github: Mutex<Option<Box<dyn GitHubSurface + Send>>>,
@@ -2042,12 +2048,21 @@ impl WebIntegration {
             &config.actor,
         )
         .map_err(|_| "dashboard mobile credential authority unavailable")?;
+        let platform_v2 = PlatformV2Bridge::new(
+            state_dir,
+            admin_socket.clone(),
+            geteuid().as_raw(),
+            config.tenant.clone(),
+            config.actor.clone(),
+            IO_TIMEOUT,
+        );
         Ok(Self {
             config,
             state_dir: state_dir.to_path_buf(),
             memory_path: state_dir.join("agent-memory.sqlite3"),
             lane: Mutex::new(lane),
             platform: Mutex::new(PlatformClient::new(UnixTransport::new(admin_socket))),
+            platform_v2,
             mobile_auth: Mutex::new(mobile_auth),
             slack: Mutex::new(slack),
             github: Mutex::new(github),
@@ -2400,6 +2415,14 @@ impl WebIntegration {
             .to_message()
             .map(|message| message.to_canonical_bytes())
             .map_err(|_| "platform_response_invalid")
+    }
+
+    fn platform_v2_remote(
+        &self,
+        lane: PlatformV2Lane,
+        body: &[u8],
+    ) -> Result<Vec<u8>, &'static str> {
+        self.platform_v2.exchange(lane, body)
     }
 
     fn mobile_discovery(&self) -> Result<mobile_auth::MobileDiscovery, &'static str> {
@@ -5170,12 +5193,14 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request<'_>, Route> {
     if !path.starts_with('/') || path.bytes().any(|byte| byte.is_ascii_control()) {
         return Err(Route::BadRequest);
     }
+    let platform_v2_path = path.split('?').next() == Some("/api/platform/v2");
 
     let mut host = None;
     let mut authorization = None;
     let mut cookie = None;
     let mut forwarded_proto = None;
     let mut content_type = None;
+    let mut accept = None;
     let mut content_length = None;
     for header in parsed.headers.iter() {
         if header.name.eq_ignore_ascii_case("host") {
@@ -5215,6 +5240,17 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request<'_>, Route> {
                     .map_err(|_| Route::BadRequest)?
                     .trim(),
             );
+        } else if header.name.eq_ignore_ascii_case("accept") {
+            if platform_v2_path {
+                if accept.is_some() {
+                    return Err(Route::BadRequest);
+                }
+                accept = Some(
+                    std::str::from_utf8(header.value)
+                        .map_err(|_| Route::BadRequest)?
+                        .trim(),
+                );
+            }
         } else if header.name.eq_ignore_ascii_case("content-length") {
             if content_length.is_some() {
                 return Err(Route::BadRequest);
@@ -5224,11 +5260,21 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request<'_>, Route> {
                 .trim()
                 .parse::<usize>()
                 .map_err(|_| Route::BadRequest)?;
-            if value > BODY_LIMIT {
-                return Err(Route::BadRequest);
-            }
             content_length = Some(value);
         }
+    }
+    let body_limit = if platform_v2_path {
+        content_type
+            .and_then(PlatformV2Lane::from_media_type)
+            .map_or(
+                PlatformV2Lane::V2.request_limit(),
+                PlatformV2Lane::request_limit,
+            )
+    } else {
+        BODY_LIMIT
+    };
+    if content_length.unwrap_or(0) > body_limit {
+        return Err(Route::BadRequest);
     }
     let host = host.ok_or(Route::BadRequest)?.trim();
     if normalize_host(host).is_none() {
@@ -5242,6 +5288,7 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request<'_>, Route> {
         cookie,
         forwarded_proto,
         content_type,
+        accept,
         content_length: content_length.unwrap_or(0),
         header_length,
     })
@@ -5278,6 +5325,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                     }
                 }
                 "/api/platform/session" => Route::ApiPlatformSession,
+                "/api/platform/v2" => Route::ApiPlatformV2Remote,
                 "/api/mobile/operator-provision" => Route::MobileOperatorProvision,
                 "/api/mobile/pairings" => Route::MobilePairingCreate,
                 "/api/mobile/pairing-sessions" => Route::MobilePairingSessions,
@@ -5305,6 +5353,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                     | Route::ApiAgentAccountsAction
                     | Route::ApiPlatformSession
                     | Route::ApiPlatformRemote
+                    | Route::ApiPlatformV2Remote
                     | Route::MobileOperatorProvision
                     | Route::MobilePairingCreate
                     | Route::MobilePairingExchange
@@ -5748,6 +5797,7 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         | Route::ApiPlatform
         | Route::ApiPlatformSession
         | Route::ApiPlatformRemote
+        | Route::ApiPlatformV2Remote
         | Route::ApiProcesses
         | Route::ApiChat
         | Route::ApiChatAction
@@ -5825,6 +5875,7 @@ fn api_response(
     integration: &WebIntegration,
     state: &AppState,
     mobile_authorization: Option<&MobileAuthorization>,
+    platform_v2_lane: Option<PlatformV2Lane>,
 ) -> Response {
     match route {
         Route::ApiMemory => match integration.memory(None) {
@@ -5885,6 +5936,25 @@ fn api_response(
             }
             Err(category) => json_error("503 Service Unavailable", category),
         },
+        Route::ApiPlatformV2Remote => {
+            let Some(lane) = platform_v2_lane else {
+                return json_error("400 Bad Request", "platform_v2_media_type_invalid");
+            };
+            match integration.platform_v2_remote(lane, body) {
+                Ok(body) => Response {
+                    status: "200 OK",
+                    content_type: Some(lane.content_type()),
+                    cache_control: "no-store",
+                    location: None,
+                    retry_after: None,
+                    body,
+                },
+                Err("platform_v2_request_invalid") => {
+                    json_error("400 Bad Request", "platform_v2_request_invalid")
+                }
+                Err(category) => json_error("503 Service Unavailable", category),
+            }
+        }
         Route::MobileDiscovery => match integration.mobile_discovery() {
             Ok(discovery) => mobile_response("200 OK", &discovery),
             Err(category) => mobile_error("503 Service Unavailable", category),
@@ -6198,6 +6268,14 @@ fn handle(
                 let local_health = normalize_host(request.host) == Some("localhost")
                     && requested_route == Route::Health;
                 let remote_platform = requested_route == Route::ApiPlatformRemote;
+                let platform_v2 = requested_route == Route::ApiPlatformV2Remote;
+                let platform_v2_lane = platform_v2
+                    .then(|| {
+                        request
+                            .content_type
+                            .and_then(PlatformV2Lane::from_media_type)
+                    })
+                    .flatten();
                 let operator_mobile = matches!(
                     requested_route,
                     Route::MobileOperatorProvision
@@ -6275,6 +6353,8 @@ fn handle(
                     Route::ManageUnauthorized
                 } else if operator_mobile && !basic_authorized {
                     Route::MobileUnauthorized
+                } else if platform_v2 && !basic_authorized {
+                    Route::Unauthorized
                 } else if needs_auth && !manage_chat_route && !credentials_authorized {
                     if mobile_access_presented {
                         Route::MobileAccessUnauthorized
@@ -6285,13 +6365,17 @@ fn handle(
                     && request.method == Method::Post
                     && (request.content_length == 0
                         || !request.content_type.is_some_and(|value| {
-                            value.eq_ignore_ascii_case(if remote_platform {
-                                PLATFORM_CONTENT_TYPE
-                            } else if mobile_lifecycle {
-                                MOBILE_AUTH_MEDIA_TYPE
+                            if platform_v2 {
+                                platform_v2_lane.is_some() && request.accept == request.content_type
                             } else {
-                                "application/json"
-                            })
+                                value.eq_ignore_ascii_case(if remote_platform {
+                                    PLATFORM_CONTENT_TYPE
+                                } else if mobile_lifecycle {
+                                    MOBILE_AUTH_MEDIA_TYPE
+                                } else {
+                                    "application/json"
+                                })
+                            }
                         }))
                 {
                     Route::BadRequest
@@ -6305,6 +6389,7 @@ fn handle(
                 };
                 let issue_session = needs_auth
                     && !remote_platform
+                    && !platform_v2
                     && !mobile_lifecycle
                     && basic_authorized
                     && !session_authorized;
@@ -6314,6 +6399,7 @@ fn handle(
                     body,
                     issue_session,
                     mobile_authorization,
+                    platform_v2_lane,
                 ));
             }
             Err(Route::BadRequest) if !bytes.windows(4).any(|part| part == b"\r\n\r\n") => {
@@ -6323,10 +6409,11 @@ fn handle(
         }
     };
     bytes.zeroize();
-    let (route, head_only, mut body, issue_session, mobile_authorization) = match parsed {
-        Ok(value) => value,
-        Err(route) => (route, false, Vec::new(), false, None),
-    };
+    let (route, head_only, mut body, issue_session, mobile_authorization, platform_v2_lane) =
+        match parsed {
+            Ok(value) => value,
+            Err(route) => (route, false, Vec::new(), false, None, None),
+        };
     let response = if matches!(
         route,
         Route::ApiMemory
@@ -6338,6 +6425,7 @@ fn handle(
             | Route::ApiPlatform
             | Route::ApiPlatformSession
             | Route::ApiPlatformRemote
+            | Route::ApiPlatformV2Remote
             | Route::ApiProcesses
             | Route::ApiChat
             | Route::ApiChatAction
@@ -6367,6 +6455,7 @@ fn handle(
                     integration,
                     state,
                     mobile_authorization.as_ref(),
+                    platform_v2_lane,
                 )
             },
         )
@@ -6705,6 +6794,15 @@ mod tests {
             route(&parse_request(&bytes).unwrap(), &fixture_hosts())
         );
         let bytes = format!(
+            "POST /api/platform/v2 HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nContent-Length: 2\r\nContent-Type: {}\r\nAccept: {}\r\n\r\n{{}}",
+            crate::platform_v2_bridge::PLATFORM_V2_CONTENT_TYPE,
+            crate::platform_v2_bridge::PLATFORM_V2_CONTENT_TYPE,
+        );
+        assert_eq!(
+            Route::ApiPlatformV2Remote,
+            route(&parse_request(bytes.as_bytes()).unwrap(), &fixture_hosts())
+        );
+        let bytes = format!(
             "POST /api/platform/session HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nContent-Length: 2\r\nContent-Type: application/json\r\n\r\n{{}}"
         );
         assert_eq!(
@@ -6832,6 +6930,7 @@ mod tests {
                     &[],
                     &worker_integration,
                     &AppState::new(fixture_status()),
+                    None,
                     None,
                 ))
                 .expect("send platform projection");
@@ -7060,6 +7159,7 @@ mod tests {
                 &serde_json::to_vec(&body).unwrap(),
                 &integration,
                 &state,
+                None,
                 None,
             )
         };
@@ -9017,6 +9117,398 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
         assert!(response.contains("WWW-Authenticate: Basic"));
         assert!(!response.contains("Operations overview"));
+    }
+
+    #[test]
+    fn platform_v2_http_route_accepts_only_exact_basic_principal_and_media_lane() {
+        let body = r#"{"fixture":"body"}"#;
+        let media = crate::platform_v2_bridge::PLATFORM_V2_CONTENT_TYPE;
+        let basic = format!("Basic {}", BASE64_STANDARD.encode("ops:fixture-password"));
+        let request_with = |credential_header: &str, accept: &str, content_type: &str| {
+            format!(
+                "POST /api/platform/v2 HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nX-Forwarded-Proto: https\r\n{credential_header}Accept: {accept}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+
+        let basic_response = exchange_without_integration(
+            request_with(&format!("Authorization: {basic}\r\n"), media, media).as_bytes(),
+        );
+        assert!(basic_response.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"));
+
+        let wrong_basic = format!("Basic {}", BASE64_STANDARD.encode("ops:wrong"));
+        let wrong_basic_response = exchange_without_integration(
+            request_with(&format!("Authorization: {wrong_basic}\r\n"), media, media).as_bytes(),
+        );
+        assert!(wrong_basic_response.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
+
+        let bearer_response = exchange_without_integration(
+            request_with(
+                "Authorization: Bearer fixture-manage-chat-token-0123456789\r\n",
+                media,
+                media,
+            )
+            .as_bytes(),
+        );
+        assert!(bearer_response.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
+        assert!(
+            bearer_response
+                .windows(b"WWW-Authenticate: Basic".len())
+                .any(|window| window == b"WWW-Authenticate: Basic")
+        );
+
+        let cookie = fixture_auth().session_cookie();
+        let cookie = cookie.split(';').next().unwrap();
+        let cookie_response = exchange_without_integration(
+            request_with(&format!("Cookie: {cookie}\r\n"), media, media).as_bytes(),
+        );
+        assert!(cookie_response.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
+
+        let wrong_lane = exchange_without_integration(
+            request_with(
+                &format!("Authorization: {basic}\r\n"),
+                "application/json",
+                media,
+            )
+            .as_bytes(),
+        );
+        assert!(wrong_lane.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+    }
+
+    #[test]
+    fn platform_v2_http_route_relays_a_correlated_typed_response() {
+        use automonique_protocol::platform_v2::{ProjectId, WorkContextIdentity};
+        use automonique_protocol::platform_v2_transport::{
+            PlatformV2Refusal, PlatformV2Request, PlatformV2RequestMessage, PlatformV2Response,
+            PlatformV2ResponseMessage,
+        };
+
+        let state_dir = tempfile::tempdir().expect("temporary state");
+        let runtime_dir = tempfile::tempdir().expect("temporary runtime");
+        std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private state");
+        std::fs::set_permissions(runtime_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private runtime");
+        let uid = geteuid().as_raw();
+        let policy = serde_json::json!({
+            "version": 1,
+            "principals": [{
+                "uid": uid, "tenant": "operator", "actor": "operator:v2-http",
+                "serving_authority": "automonique", "projects": ["project-test"],
+                "workspaces": [{
+                    "project": "project-test", "kind": "project", "id": "project-test",
+                    "inherited_authority": {
+                        "filesystem": [], "credentials": [], "network": [],
+                        "tools": [], "providers": [], "models": []
+                    }
+                }],
+                "authority": {
+                    "filesystem": [], "credentials": [], "network": [],
+                    "tools": [], "providers": [], "models": []
+                },
+                "review_authorities": {}
+            }]
+        });
+        let policy_path = state_dir
+            .path()
+            .join(automonique_daemon::PLATFORM_V2_POLICY_FILE_NAME);
+        std::fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
+        std::fs::set_permissions(&policy_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let platform_listener = UnixListener::bind(runtime_dir.path().join("admin.sock"))
+            .expect("fixture platform socket");
+        let platform_server = thread::spawn(move || {
+            let (mut stream, _) = platform_listener.accept().unwrap();
+            let mut prefix = [0_u8; 4];
+            stream.read_exact(&mut prefix).unwrap();
+            let mut payload = vec![0_u8; u32::from_be_bytes(prefix) as usize];
+            stream.read_exact(&mut payload).unwrap();
+            let request = PlatformV2RequestMessage::from_canonical_bytes(&payload).unwrap();
+            let response = PlatformV2ResponseMessage::for_request(
+                &request,
+                PlatformV2Response::Refused(
+                    PlatformV2Refusal::new("fixture_http_refusal", "fixture HTTP refusal").unwrap(),
+                ),
+            )
+            .unwrap()
+            .to_canonical_bytes()
+            .unwrap();
+            stream
+                .write_all(&u32::try_from(response.len()).unwrap().to_be_bytes())
+                .unwrap();
+            stream.write_all(&response).unwrap();
+        });
+
+        let request = PlatformV2RequestMessage::new(
+            RequestId::new("http-v2-correlation").unwrap(),
+            PlatformV2Request::GetWorkContext(WorkContextIdentity::Project(
+                ProjectId::new("project-test").unwrap(),
+            )),
+        );
+        let body = request.to_canonical_bytes().unwrap();
+        let media = crate::platform_v2_bridge::PLATFORM_V2_CONTENT_TYPE;
+        let credential = BASE64_STANDARD.encode("ops:fixture-password");
+        let wire_request = format!(
+            "POST /api/platform/v2 HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nX-Forwarded-Proto: https\r\nAuthorization: Basic {credential}\r\nAccept: {media}\r\nContent-Type: {media}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let integration = WebIntegration::open(
+            IntegrationConfig {
+                tenant: String::from("operator"),
+                actor: String::from("operator:v2-http"),
+                hosts: fixture_hosts(),
+            },
+            state_dir.path(),
+            runtime_dir.path(),
+        )
+        .unwrap();
+        let web_server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle(
+                stream,
+                &AppState::new(fixture_status()),
+                &fixture_auth(),
+                &fixture_manage_chat_auth(),
+                Some(&integration),
+                &fixture_hosts(),
+            )
+            .unwrap();
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client.write_all(wire_request.as_bytes()).unwrap();
+        client.write_all(&body).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        web_server.join().unwrap();
+        platform_server.join().unwrap();
+
+        let boundary = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap();
+        let headers = std::str::from_utf8(&response[..boundary]).unwrap();
+        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(headers.contains(&format!("Content-Type: {media}")));
+        assert!(headers.contains("Cache-Control: no-store"));
+        let response =
+            PlatformV2ResponseMessage::from_canonical_bytes(&response[boundary + 4..], &request)
+                .unwrap();
+        assert!(matches!(
+            response.response(),
+            PlatformV2Response::Refused(value)
+                if value.category().as_str() == "fixture_http_refusal"
+        ));
+    }
+
+    #[test]
+    fn production_rust_and_typescript_v2_clients_cross_the_basic_web_bridge() {
+        use automonique_platform_client::platform_v2_client::{
+            NegotiationResult, PlatformV2Client, WorkContextGetResult,
+        };
+        use automonique_platform_client::{BasicCredential, HttpsTransport};
+        use automonique_protocol::platform_v2::{
+            NegotiatedPlatform, PLATFORM_SCHEMA_V2, PlatformVersion, PlatformVersionOffer,
+            ProjectId, WorkContextAvailability, WorkContextIdentity,
+        };
+        use automonique_protocol::platform_v2_transport::{
+            PlatformNegotiationRequestMessage, PlatformNegotiationResponse,
+            PlatformNegotiationResponseMessage, PlatformV2Refusal, PlatformV2RequestMessage,
+            PlatformV2Response, PlatformV2ResponseMessage,
+        };
+
+        const EXCHANGES: usize = 4;
+        let state_dir = tempfile::tempdir().expect("temporary state");
+        let runtime_dir = tempfile::tempdir().expect("temporary runtime");
+        std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private state");
+        std::fs::set_permissions(runtime_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private runtime");
+        let uid = geteuid().as_raw();
+        let policy = serde_json::json!({
+            "version": 1,
+            "principals": [{
+                "uid": uid, "tenant": "operator", "actor": "operator:v2-production",
+                "serving_authority": "automonique", "projects": ["project-test"],
+                "workspaces": [{
+                    "project": "project-test", "kind": "project", "id": "project-test",
+                    "inherited_authority": {
+                        "filesystem": [], "credentials": [], "network": [],
+                        "tools": [], "providers": [], "models": []
+                    }
+                }],
+                "authority": {
+                    "filesystem": [], "credentials": [], "network": [],
+                    "tools": [], "providers": [], "models": []
+                },
+                "review_authorities": {}
+            }]
+        });
+        let policy_path = state_dir
+            .path()
+            .join(automonique_daemon::PLATFORM_V2_POLICY_FILE_NAME);
+        std::fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
+        std::fs::set_permissions(&policy_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let platform_listener = UnixListener::bind(runtime_dir.path().join("admin.sock"))
+            .expect("fixture platform socket");
+        let platform_server = thread::spawn(move || {
+            for index in 0..EXCHANGES {
+                let (mut stream, _) = platform_listener.accept().expect("platform connection");
+                let mut prefix = [0_u8; 4];
+                stream.read_exact(&mut prefix).expect("platform prefix");
+                let mut payload = vec![0_u8; u32::from_be_bytes(prefix) as usize];
+                stream.read_exact(&mut payload).expect("platform request");
+                let response = if index % 2 == 0 {
+                    let request = PlatformNegotiationRequestMessage::from_canonical_bytes(&payload)
+                        .expect("canonical negotiation");
+                    let negotiated = NegotiatedPlatform::new(
+                        PlatformVersion::V2,
+                        PLATFORM_SCHEMA_V2,
+                        WorkContextAvailability::V2Structured,
+                    )
+                    .unwrap();
+                    PlatformNegotiationResponseMessage::for_request(
+                        &request,
+                        PlatformNegotiationResponse::Negotiated(negotiated),
+                    )
+                    .unwrap()
+                    .to_canonical_bytes()
+                    .unwrap()
+                } else {
+                    let request = PlatformV2RequestMessage::from_canonical_bytes(&payload)
+                        .expect("canonical v2 request");
+                    PlatformV2ResponseMessage::for_request(
+                        &request,
+                        PlatformV2Response::Refused(
+                            PlatformV2Refusal::new("fixture_http_refusal", "fixture HTTP refusal")
+                                .unwrap(),
+                        ),
+                    )
+                    .unwrap()
+                    .to_canonical_bytes()
+                    .unwrap()
+                };
+                stream
+                    .write_all(&u32::try_from(response.len()).unwrap().to_be_bytes())
+                    .unwrap();
+                stream.write_all(&response).unwrap();
+            }
+        });
+
+        let integration = Arc::new(
+            WebIntegration::open(
+                IntegrationConfig {
+                    tenant: String::from("operator"),
+                    actor: String::from("operator:v2-production"),
+                    hosts: fixture_hosts(),
+                },
+                state_dir.path(),
+                runtime_dir.path(),
+            )
+            .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let web_server = thread::spawn(move || {
+            for _ in 0..EXCHANGES {
+                let (stream, _) = listener.accept().expect("HTTP connection");
+                handle(
+                    stream,
+                    &AppState::new(fixture_status()),
+                    &fixture_auth(),
+                    &fixture_manage_chat_auth(),
+                    Some(&integration),
+                    &fixture_hosts(),
+                )
+                .expect("Platform v2 HTTP route");
+            }
+        });
+
+        let endpoint = format!("http://localhost:{}/api/platform/v2", address.port());
+        let credential = BasicCredential::new("ops", "fixture-password").unwrap();
+        let transport = HttpsTransport::new_basic(&endpoint, credential).unwrap();
+        let mut rust_client = PlatformV2Client::new_https(transport);
+        assert!(matches!(
+            rust_client
+                .negotiate(PlatformVersionOffer::new(vec![2]).unwrap())
+                .unwrap(),
+            NegotiationResult::V2(_)
+        ));
+        assert!(matches!(
+            rust_client
+                .get_work_context(WorkContextIdentity::Project(
+                    ProjectId::new("project-test").unwrap()
+                ))
+                .unwrap(),
+            WorkContextGetResult::Refused(refusal)
+                if refusal.category().as_str() == "fixture_http_refusal"
+        ));
+
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let script =
+            repository.join("sdk/typescript/packages/sdk/conformance/rust-http-v2-contract.ts");
+        let status = Command::new("bun")
+            .arg("run")
+            .arg(script)
+            .arg(endpoint)
+            .current_dir(repository)
+            .status()
+            .expect("run TypeScript Platform v2 contract client");
+        assert!(
+            status.success(),
+            "TypeScript Platform v2 contract client failed"
+        );
+
+        web_server.join().expect("web server");
+        platform_server.join().expect("platform server");
+    }
+
+    #[test]
+    fn platform_v2_body_limit_is_additive_and_v1_limit_is_unchanged() {
+        let v1 = format!(
+            "POST /api/platform HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nContent-Type: {PLATFORM_CONTENT_TYPE}\r\nContent-Length: {}\r\n\r\n",
+            BODY_LIMIT + 1
+        );
+        assert_eq!(Err(Route::BadRequest), parse_request(v1.as_bytes()));
+
+        let v2_size = BODY_LIMIT + 1;
+        assert!(v2_size <= PlatformV2Lane::V2.request_limit());
+        let v2 = format!(
+            "POST /api/platform/v2 HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nContent-Type: {}\r\nAccept: {}\r\nContent-Length: {v2_size}\r\n\r\n",
+            crate::platform_v2_bridge::PLATFORM_V2_CONTENT_TYPE,
+            crate::platform_v2_bridge::PLATFORM_V2_CONTENT_TYPE,
+        );
+        assert_eq!(
+            parse_request(v2.as_bytes()).unwrap().content_length,
+            v2_size
+        );
+
+        let negotiation = format!(
+            "POST /api/platform/v2 HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nContent-Type: {}\r\nAccept: {}\r\nContent-Length: {}\r\n\r\n",
+            crate::platform_v2_bridge::PLATFORM_NEGOTIATION_CONTENT_TYPE,
+            crate::platform_v2_bridge::PLATFORM_NEGOTIATION_CONTENT_TYPE,
+            PlatformV2Lane::Negotiation.request_limit() + 1,
+        );
+        assert_eq!(
+            Err(Route::BadRequest),
+            parse_request(negotiation.as_bytes())
+        );
+
+        let v2_duplicate_accept = format!(
+            "POST /api/platform/v2 HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nContent-Type: {0}\r\nAccept: {0}\r\nAccept: {0}\r\nContent-Length: 2\r\n\r\n{{}}",
+            crate::platform_v2_bridge::PLATFORM_V2_CONTENT_TYPE,
+        );
+        assert_eq!(
+            Err(Route::BadRequest),
+            parse_request(v2_duplicate_accept.as_bytes())
+        );
+        let v1_duplicate_accept = format!(
+            "POST /api/platform HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nContent-Type: {PLATFORM_CONTENT_TYPE}\r\nAccept: first\r\nAccept: second\r\nContent-Length: 2\r\n\r\n{{}}"
+        );
+        assert!(parse_request(v1_duplicate_accept.as_bytes()).is_ok());
     }
 
     #[test]
