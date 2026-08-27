@@ -12,6 +12,9 @@
 import {PLATFORM_SCHEMA_V1, ResourceId, decodeResourceAuthority, decodeResourceKind, type ResourceCoordinate} from "./platform.js";
 import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyString, bodyStringOrNull, bodyValue, bodyValueOrNull, byteLength, exactFields, exactInputFields, isWellFormedUnicode, parseCanonical, refuse, toCanonicalBytes, type JsonValue} from "./runtime.js";
 
+/** Maximum lineage records carried by one bounded projection. */
+export const MAX_LINEAGE_RECORDS = 128;
+
 /** Maximum canonical version-negotiation document bytes. */
 export const MAX_PLATFORM_NEGOTIATION_CANONICAL_BYTES = 4096;
 
@@ -76,6 +79,30 @@ export function AttemptWorkspaceId(value: string): AttemptWorkspaceId {
 }
 
 /** Branded identifier, at most 256 UTF-8 bytes. */
+export type BaseSelectorId = string & {readonly __brand: "BaseSelectorId"};
+export const BaseSelectorId_MAX_BYTES = 256;
+export const BaseSelectorId_PATTERN = /^[^\p{Cc}]+$/u;
+export function BaseSelectorId(value: string): BaseSelectorId {
+  if (value.length === 0) throw new ValidationError("BaseSelectorId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("BaseSelectorId", "invalid_character");
+  if (byteLength(value) > 256) throw new ValidationError("BaseSelectorId", "too_long");
+  if (!BaseSelectorId_PATTERN.test(value)) throw new ValidationError("BaseSelectorId", "invalid_character");
+  return value as BaseSelectorId;
+}
+
+/** Branded identifier, at most 256 UTF-8 bytes. */
+export type BranchSelectorId = string & {readonly __brand: "BranchSelectorId"};
+export const BranchSelectorId_MAX_BYTES = 256;
+export const BranchSelectorId_PATTERN = /^[^\p{Cc}]+$/u;
+export function BranchSelectorId(value: string): BranchSelectorId {
+  if (value.length === 0) throw new ValidationError("BranchSelectorId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("BranchSelectorId", "invalid_character");
+  if (byteLength(value) > 256) throw new ValidationError("BranchSelectorId", "too_long");
+  if (!BranchSelectorId_PATTERN.test(value)) throw new ValidationError("BranchSelectorId", "invalid_character");
+  return value as BranchSelectorId;
+}
+
+/** Branded identifier, at most 256 UTF-8 bytes. */
 export type CheckoutId = string & {readonly __brand: "CheckoutId"};
 export const CheckoutId_MAX_BYTES = 256;
 export const CheckoutId_PATTERN = /^[^\p{Cc}]+$/u;
@@ -88,6 +115,30 @@ export function CheckoutId(value: string): CheckoutId {
 }
 
 /** Branded identifier, at most 256 UTF-8 bytes. */
+export type ExternalWorkKey = string & {readonly __brand: "ExternalWorkKey"};
+export const ExternalWorkKey_MAX_BYTES = 256;
+export const ExternalWorkKey_PATTERN = /^[^\p{Cc}]+$/u;
+export function ExternalWorkKey(value: string): ExternalWorkKey {
+  if (value.length === 0) throw new ValidationError("ExternalWorkKey", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("ExternalWorkKey", "invalid_character");
+  if (byteLength(value) > 256) throw new ValidationError("ExternalWorkKey", "too_long");
+  if (!ExternalWorkKey_PATTERN.test(value)) throw new ValidationError("ExternalWorkKey", "invalid_character");
+  return value as ExternalWorkKey;
+}
+
+/** Branded identifier, at most 256 UTF-8 bytes. */
+export type ExternalWorkScope = string & {readonly __brand: "ExternalWorkScope"};
+export const ExternalWorkScope_MAX_BYTES = 256;
+export const ExternalWorkScope_PATTERN = /^[^\p{Cc}]+$/u;
+export function ExternalWorkScope(value: string): ExternalWorkScope {
+  if (value.length === 0) throw new ValidationError("ExternalWorkScope", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("ExternalWorkScope", "invalid_character");
+  if (byteLength(value) > 256) throw new ValidationError("ExternalWorkScope", "too_long");
+  if (!ExternalWorkScope_PATTERN.test(value)) throw new ValidationError("ExternalWorkScope", "invalid_character");
+  return value as ExternalWorkScope;
+}
+
+/** Branded identifier, at most 256 UTF-8 bytes. */
 export type HostSetupId = string & {readonly __brand: "HostSetupId"};
 export const HostSetupId_MAX_BYTES = 256;
 export const HostSetupId_PATTERN = /^[^\p{Cc}]+$/u;
@@ -97,6 +148,90 @@ export function HostSetupId(value: string): HostSetupId {
   if (byteLength(value) > 256) throw new ValidationError("HostSetupId", "too_long");
   if (!HostSetupId_PATTERN.test(value)) throw new ValidationError("HostSetupId", "invalid_character");
   return value as HostSetupId;
+}
+
+/** Branded identifier, at most 256 UTF-8 bytes. */
+export type OrchestrationDecisionGateId = string & {readonly __brand: "OrchestrationDecisionGateId"};
+export const OrchestrationDecisionGateId_MAX_BYTES = 256;
+export const OrchestrationDecisionGateId_PATTERN = /^[^\p{Cc}]+$/u;
+export function OrchestrationDecisionGateId(value: string): OrchestrationDecisionGateId {
+  if (value.length === 0) throw new ValidationError("OrchestrationDecisionGateId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("OrchestrationDecisionGateId", "invalid_character");
+  if (byteLength(value) > 256) throw new ValidationError("OrchestrationDecisionGateId", "too_long");
+  if (!OrchestrationDecisionGateId_PATTERN.test(value)) throw new ValidationError("OrchestrationDecisionGateId", "invalid_character");
+  return value as OrchestrationDecisionGateId;
+}
+
+/** Branded identifier, at most 256 UTF-8 bytes. */
+export type OrchestrationDispatchId = string & {readonly __brand: "OrchestrationDispatchId"};
+export const OrchestrationDispatchId_MAX_BYTES = 256;
+export const OrchestrationDispatchId_PATTERN = /^[^\p{Cc}]+$/u;
+export function OrchestrationDispatchId(value: string): OrchestrationDispatchId {
+  if (value.length === 0) throw new ValidationError("OrchestrationDispatchId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("OrchestrationDispatchId", "invalid_character");
+  if (byteLength(value) > 256) throw new ValidationError("OrchestrationDispatchId", "too_long");
+  if (!OrchestrationDispatchId_PATTERN.test(value)) throw new ValidationError("OrchestrationDispatchId", "invalid_character");
+  return value as OrchestrationDispatchId;
+}
+
+/** Branded identifier, at most 256 UTF-8 bytes. */
+export type OrchestrationHeartbeatId = string & {readonly __brand: "OrchestrationHeartbeatId"};
+export const OrchestrationHeartbeatId_MAX_BYTES = 256;
+export const OrchestrationHeartbeatId_PATTERN = /^[^\p{Cc}]+$/u;
+export function OrchestrationHeartbeatId(value: string): OrchestrationHeartbeatId {
+  if (value.length === 0) throw new ValidationError("OrchestrationHeartbeatId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("OrchestrationHeartbeatId", "invalid_character");
+  if (byteLength(value) > 256) throw new ValidationError("OrchestrationHeartbeatId", "too_long");
+  if (!OrchestrationHeartbeatId_PATTERN.test(value)) throw new ValidationError("OrchestrationHeartbeatId", "invalid_character");
+  return value as OrchestrationHeartbeatId;
+}
+
+/** Branded identifier, at most 256 UTF-8 bytes. */
+export type OrchestrationQuestionId = string & {readonly __brand: "OrchestrationQuestionId"};
+export const OrchestrationQuestionId_MAX_BYTES = 256;
+export const OrchestrationQuestionId_PATTERN = /^[^\p{Cc}]+$/u;
+export function OrchestrationQuestionId(value: string): OrchestrationQuestionId {
+  if (value.length === 0) throw new ValidationError("OrchestrationQuestionId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("OrchestrationQuestionId", "invalid_character");
+  if (byteLength(value) > 256) throw new ValidationError("OrchestrationQuestionId", "too_long");
+  if (!OrchestrationQuestionId_PATTERN.test(value)) throw new ValidationError("OrchestrationQuestionId", "invalid_character");
+  return value as OrchestrationQuestionId;
+}
+
+/** Branded identifier, at most 256 UTF-8 bytes. */
+export type OrchestrationRunId = string & {readonly __brand: "OrchestrationRunId"};
+export const OrchestrationRunId_MAX_BYTES = 256;
+export const OrchestrationRunId_PATTERN = /^[^\p{Cc}]+$/u;
+export function OrchestrationRunId(value: string): OrchestrationRunId {
+  if (value.length === 0) throw new ValidationError("OrchestrationRunId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("OrchestrationRunId", "invalid_character");
+  if (byteLength(value) > 256) throw new ValidationError("OrchestrationRunId", "too_long");
+  if (!OrchestrationRunId_PATTERN.test(value)) throw new ValidationError("OrchestrationRunId", "invalid_character");
+  return value as OrchestrationRunId;
+}
+
+/** Branded identifier, at most 256 UTF-8 bytes. */
+export type OrchestrationTaskId = string & {readonly __brand: "OrchestrationTaskId"};
+export const OrchestrationTaskId_MAX_BYTES = 256;
+export const OrchestrationTaskId_PATTERN = /^[^\p{Cc}]+$/u;
+export function OrchestrationTaskId(value: string): OrchestrationTaskId {
+  if (value.length === 0) throw new ValidationError("OrchestrationTaskId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("OrchestrationTaskId", "invalid_character");
+  if (byteLength(value) > 256) throw new ValidationError("OrchestrationTaskId", "too_long");
+  if (!OrchestrationTaskId_PATTERN.test(value)) throw new ValidationError("OrchestrationTaskId", "invalid_character");
+  return value as OrchestrationTaskId;
+}
+
+/** Branded identifier, at most 256 UTF-8 bytes. */
+export type OrchestrationWorkerId = string & {readonly __brand: "OrchestrationWorkerId"};
+export const OrchestrationWorkerId_MAX_BYTES = 256;
+export const OrchestrationWorkerId_PATTERN = /^[^\p{Cc}]+$/u;
+export function OrchestrationWorkerId(value: string): OrchestrationWorkerId {
+  if (value.length === 0) throw new ValidationError("OrchestrationWorkerId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("OrchestrationWorkerId", "invalid_character");
+  if (byteLength(value) > 256) throw new ValidationError("OrchestrationWorkerId", "too_long");
+  if (!OrchestrationWorkerId_PATTERN.test(value)) throw new ValidationError("OrchestrationWorkerId", "invalid_character");
+  return value as OrchestrationWorkerId;
 }
 
 /** Branded identifier, at most 256 UTF-8 bytes. */
@@ -159,6 +294,30 @@ export function WorkSessionId(value: string): WorkSessionId {
   return value as WorkSessionId;
 }
 
+/** Branded identifier, at most 256 UTF-8 bytes. */
+export type WorkspaceIntentId = string & {readonly __brand: "WorkspaceIntentId"};
+export const WorkspaceIntentId_MAX_BYTES = 256;
+export const WorkspaceIntentId_PATTERN = /^[^\p{Cc}]+$/u;
+export function WorkspaceIntentId(value: string): WorkspaceIntentId {
+  if (value.length === 0) throw new ValidationError("WorkspaceIntentId", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("WorkspaceIntentId", "invalid_character");
+  if (byteLength(value) > 256) throw new ValidationError("WorkspaceIntentId", "too_long");
+  if (!WorkspaceIntentId_PATTERN.test(value)) throw new ValidationError("WorkspaceIntentId", "invalid_character");
+  return value as WorkspaceIntentId;
+}
+
+/** Bounded string, at most 1024 UTF-8 bytes. */
+export type LineageMessage = string & {readonly __brand: "LineageMessage"};
+export const LineageMessage_MAX_BYTES = 1024;
+export const LineageMessage_PATTERN = /^[^\p{Cc}]+$/u;
+export function LineageMessage(value: string): LineageMessage {
+  if (value.length === 0) throw new ValidationError("LineageMessage", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("LineageMessage", "invalid_character");
+  if (byteLength(value) > 1024) throw new ValidationError("LineageMessage", "too_long");
+  if (!LineageMessage_PATTERN.test(value)) throw new ValidationError("LineageMessage", "invalid_character");
+  return value as LineageMessage;
+}
+
 /** Bounded string, at most 512 UTF-8 bytes. */
 export type WorkContextLabel = string & {readonly __brand: "WorkContextLabel"};
 export const WorkContextLabel_MAX_BYTES = 512;
@@ -169,6 +328,24 @@ export function WorkContextLabel(value: string): WorkContextLabel {
   if (byteLength(value) > 512) throw new ValidationError("WorkContextLabel", "too_long");
   if (!WorkContextLabel_PATTERN.test(value)) throw new ValidationError("WorkContextLabel", "invalid_character");
   return value as WorkContextLabel;
+}
+
+/** Bounded integer in [1, 9223372036854775807]. */
+export type LineageObservedAtMs = bigint & {readonly __brand: "LineageObservedAtMs"};
+export const LineageObservedAtMs_MIN = 1n;
+export const LineageObservedAtMs_MAX = 9223372036854775807n;
+export function LineageObservedAtMs(value: bigint): LineageObservedAtMs {
+  if (typeof value !== "bigint" || value < 1n || value > 9223372036854775807n) throw new ValidationError("LineageObservedAtMs", "out_of_range");
+  return value as LineageObservedAtMs;
+}
+
+/** Bounded integer in [1, 9223372036854775807]. */
+export type LineageStaleAfterMs = bigint & {readonly __brand: "LineageStaleAfterMs"};
+export const LineageStaleAfterMs_MIN = 1n;
+export const LineageStaleAfterMs_MAX = 9223372036854775807n;
+export function LineageStaleAfterMs(value: bigint): LineageStaleAfterMs {
+  if (typeof value !== "bigint" || value < 1n || value > 9223372036854775807n) throw new ValidationError("LineageStaleAfterMs", "out_of_range");
+  return value as LineageStaleAfterMs;
 }
 
 /** Bounded integer in [1, 65535]. */
@@ -217,6 +394,26 @@ export function decodeCheckoutKind(value: string): CheckoutKind {
   return value as CheckoutKind;
 }
 
+export type ExternalWorkProvider = "github" | "gitlab" | "jira_compatible" | "linear";
+export const ExternalWorkProvider_VALUES: readonly ExternalWorkProvider[] = ["github", "gitlab", "jira_compatible", "linear"];
+/** Security-sensitive: an undefined value is refused. */
+export function decodeExternalWorkProvider(value: string): ExternalWorkProvider {
+  if (!(ExternalWorkProvider_VALUES as readonly string[]).includes(value)) {
+    throw new ValidationError("ExternalWorkProvider", "unknown_enum_value");
+  }
+  return value as ExternalWorkProvider;
+}
+
+export type ExternalWorkState = "closed" | "moved" | "open";
+export const ExternalWorkState_VALUES: readonly ExternalWorkState[] = ["closed", "moved", "open"];
+/** Security-sensitive: an undefined value is refused. */
+export function decodeExternalWorkState(value: string): ExternalWorkState {
+  if (!(ExternalWorkState_VALUES as readonly string[]).includes(value)) {
+    throw new ValidationError("ExternalWorkState", "unknown_enum_value");
+  }
+  return value as ExternalWorkState;
+}
+
 export type HostSetupKind = "local" | "remote_runtime" | "ssh";
 export const HostSetupKind_VALUES: readonly HostSetupKind[] = ["local", "remote_runtime", "ssh"];
 /** Security-sensitive: an undefined value is refused. */
@@ -225,6 +422,26 @@ export function decodeHostSetupKind(value: string): HostSetupKind {
     throw new ValidationError("HostSetupKind", "unknown_enum_value");
   }
   return value as HostSetupKind;
+}
+
+export type LineageFreshnessState = "fresh" | "stale";
+export const LineageFreshnessState_VALUES: readonly LineageFreshnessState[] = ["fresh", "stale"];
+/** Security-sensitive: an undefined value is refused. */
+export function decodeLineageFreshnessState(value: string): LineageFreshnessState {
+  if (!(LineageFreshnessState_VALUES as readonly string[]).includes(value)) {
+    throw new ValidationError("LineageFreshnessState", "unknown_enum_value");
+  }
+  return value as LineageFreshnessState;
+}
+
+export type OrchestrationKind = "decision_gate" | "dispatch" | "heartbeat" | "question" | "run" | "task" | "worker";
+export const OrchestrationKind_VALUES: readonly OrchestrationKind[] = ["decision_gate", "dispatch", "heartbeat", "question", "run", "task", "worker"];
+/** Security-sensitive: an undefined value is refused. */
+export function decodeOrchestrationKind(value: string): OrchestrationKind {
+  if (!(OrchestrationKind_VALUES as readonly string[]).includes(value)) {
+    throw new ValidationError("OrchestrationKind", "unknown_enum_value");
+  }
+  return value as OrchestrationKind;
 }
 
 export type WorkContextAvailability = "v1_existing_resources_only" | "v2_structured";
@@ -277,6 +494,39 @@ export function decodeWorkContextTargetKind(value: string): WorkContextTargetKin
   return value as WorkContextTargetKind;
 }
 
+export type WorkspaceIntentConflict = "creation_cancelled" | "duplicate_intake" | "external_work_closed" | "external_work_moved" | "orphan_dispatch" | "question_pending" | "revision_mismatch" | "stale_heartbeat" | "task_already_bound" | "workspace_not_found";
+export const WorkspaceIntentConflict_VALUES: readonly WorkspaceIntentConflict[] = ["creation_cancelled", "duplicate_intake", "external_work_closed", "external_work_moved", "orphan_dispatch", "question_pending", "revision_mismatch", "stale_heartbeat", "task_already_bound", "workspace_not_found"];
+/** Security-sensitive: an undefined value is refused. */
+export function decodeWorkspaceIntentConflict(value: string): WorkspaceIntentConflict {
+  if (!(WorkspaceIntentConflict_VALUES as readonly string[]).includes(value)) {
+    throw new ValidationError("WorkspaceIntentConflict", "unknown_enum_value");
+  }
+  return value as WorkspaceIntentConflict;
+}
+
+export type LineageStatus =
+  | {readonly kind: "blocked"; readonly reason: LineageMessage}
+  | {readonly kind: "done"; readonly outcome: LineageMessage}
+  | {readonly kind: "waiting"; readonly reason: LineageMessage}
+  | {readonly kind: "working"};
+
+export function assertNeverLineageStatus(value: never): never {
+  throw new ValidationError("LineageStatus", `unhandled variant: ${JSON.stringify(value)}`);
+}
+
+export type OrchestrationIdentity =
+  | {readonly kind: "decision_gate"; readonly id: OrchestrationDecisionGateId}
+  | {readonly kind: "dispatch"; readonly id: OrchestrationDispatchId}
+  | {readonly kind: "heartbeat"; readonly id: OrchestrationHeartbeatId}
+  | {readonly kind: "question"; readonly id: OrchestrationQuestionId}
+  | {readonly kind: "run"; readonly id: OrchestrationRunId}
+  | {readonly kind: "task"; readonly id: OrchestrationTaskId}
+  | {readonly kind: "worker"; readonly id: OrchestrationWorkerId};
+
+export function assertNeverOrchestrationIdentity(value: never): never {
+  throw new ValidationError("OrchestrationIdentity", `unhandled variant: ${JSON.stringify(value)}`);
+}
+
 export type WorkContextIdentity =
   | {readonly kind: "attempt_workspace"; readonly id: AttemptWorkspaceId}
   | {readonly kind: "checkout"; readonly id: CheckoutId}
@@ -292,6 +542,91 @@ export function assertNeverWorkContextIdentity(value: never): never {
   throw new ValidationError("WorkContextIdentity", `unhandled variant: ${JSON.stringify(value)}`);
 }
 
+export type WorkspaceIntent =
+  | {readonly kind: "create"; readonly request: WorkspaceCreateIntent}
+  | {readonly kind: "resume"; readonly request: WorkspaceResumeIntent};
+
+export function assertNeverWorkspaceIntent(value: never): never {
+  throw new ValidationError("WorkspaceIntent", `unhandled variant: ${JSON.stringify(value)}`);
+}
+
+export type WorkspaceIntentOutcome =
+  | {readonly kind: "conflict"; readonly conflict: WorkspaceIntentConflict}
+  | {readonly kind: "created"; readonly workspace: UserWorkspaceId}
+  | {readonly kind: "resumed"; readonly workspace: UserWorkspaceId};
+
+export function assertNeverWorkspaceIntentOutcome(value: never): never {
+  throw new ValidationError("WorkspaceIntentOutcome", `unhandled variant: ${JSON.stringify(value)}`);
+}
+
+/** Provider-qualified external identity; provider, scope, and key are one indivisible identity. */
+export interface ExternalWorkIdentity {
+  readonly key: ExternalWorkKey;
+  readonly provider: ExternalWorkProvider;
+  readonly scope: ExternalWorkScope;
+}
+export const ExternalWorkIdentity_FIELDS: readonly string[] = [
+  "key",
+  "provider",
+  "scope",
+];
+
+/** External work projection bound to, but never identified as, a user workspace. */
+export interface ExternalWorkItem {
+  readonly freshness: LineageFreshness;
+  readonly identity: ExternalWorkIdentity;
+  readonly latest_useful_message: LatestUsefulMessage | null;
+  readonly moved_to: ExternalWorkIdentity | null;
+  readonly revision: WorkContextRevision;
+  readonly state: ExternalWorkState;
+  readonly workspace: UserWorkspaceId;
+}
+export const ExternalWorkItem_FIELDS: readonly string[] = [
+  "freshness",
+  "identity",
+  "latest_useful_message",
+  "moved_to",
+  "revision",
+  "state",
+  "workspace",
+];
+
+/** Latest bounded operator-useful text, separate from identity and authority. */
+export interface LatestUsefulMessage {
+  readonly observed_at_ms: LineageObservedAtMs;
+  readonly text: LineageMessage;
+}
+export const LatestUsefulMessage_FIELDS: readonly string[] = [
+  "observed_at_ms",
+  "text",
+];
+
+/** Explicit source observation and staleness declaration; clients do not infer freshness from status. */
+export interface LineageFreshness {
+  readonly observed_at_ms: LineageObservedAtMs;
+  readonly stale_after_ms: LineageStaleAfterMs;
+  readonly state: LineageFreshnessState;
+}
+export const LineageFreshness_FIELDS: readonly string[] = [
+  "observed_at_ms",
+  "stale_after_ms",
+  "state",
+];
+
+/** Bounded records for one exact user workspace; identities remain in separate domains. */
+export interface LineageProjection {
+  readonly external_work_items: readonly ExternalWorkItem[];
+  readonly orchestration: readonly OrchestrationRecord[];
+  readonly schema: typeof PLATFORM_SCHEMA_V2;
+  readonly workspace: UserWorkspaceId;
+}
+export const LineageProjection_FIELDS: readonly string[] = [
+  "external_work_items",
+  "orchestration",
+  "schema",
+  "workspace",
+];
+
 /** Highest shared Platform version and truthful work-context availability. */
 export interface NegotiatedPlatform {
   readonly schema: typeof PLATFORM_SCHEMA_V1 | typeof PLATFORM_SCHEMA_V2;
@@ -302,6 +637,26 @@ export const NegotiatedPlatform_FIELDS: readonly string[] = [
   "schema",
   "version",
   "work_context",
+];
+
+/** Internal lineage node with a typed parent and explicit workspace binding. */
+export interface OrchestrationRecord {
+  readonly external_work: ExternalWorkIdentity | null;
+  readonly freshness: LineageFreshness;
+  readonly identity: OrchestrationIdentity;
+  readonly latest_useful_message: LatestUsefulMessage | null;
+  readonly parent: OrchestrationIdentity | null;
+  readonly status: LineageStatus;
+  readonly workspace: UserWorkspaceId;
+}
+export const OrchestrationRecord_FIELDS: readonly string[] = [
+  "external_work",
+  "freshness",
+  "identity",
+  "latest_useful_message",
+  "parent",
+  "status",
+  "workspace",
 ];
 
 /** Bounded set of Platform versions supported by one peer. */
@@ -400,6 +755,36 @@ export const WorkContextResync_FIELDS: readonly string[] = [
   "expired_after",
   "outcome",
   "schema",
+];
+
+/** Create intent using opaque registry selectors rather than host paths or branch names. */
+export interface WorkspaceCreateIntent {
+  readonly base_selector: BaseSelectorId;
+  readonly branch_selector: BranchSelectorId;
+  readonly external_work: ExternalWorkIdentity;
+  readonly intent_id: WorkspaceIntentId;
+  readonly task: OrchestrationTaskId;
+}
+export const WorkspaceCreateIntent_FIELDS: readonly string[] = [
+  "base_selector",
+  "branch_selector",
+  "external_work",
+  "intent_id",
+  "task",
+];
+
+/** Resume intent fenced by exact workspace revision. */
+export interface WorkspaceResumeIntent {
+  readonly expected_revision: WorkContextRevision;
+  readonly intent_id: WorkspaceIntentId;
+  readonly task: OrchestrationTaskId;
+  readonly workspace: UserWorkspaceId;
+}
+export const WorkspaceResumeIntent_FIELDS: readonly string[] = [
+  "expected_revision",
+  "intent_id",
+  "task",
+  "workspace",
 ];
 
 
@@ -948,4 +1333,179 @@ export function decodeWorkContextResync(payload: Uint8Array): WorkContextResync 
       schema: bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY) as typeof PLATFORM_SCHEMA_V2,
     });
   });
+}
+
+function sameExternalWorkIdentity(left: ExternalWorkIdentity, right: ExternalWorkIdentity): boolean {
+  return left.provider === right.provider && left.scope === right.scope && left.key === right.key;
+}
+
+function sameOrchestrationIdentity(left: OrchestrationIdentity, right: OrchestrationIdentity): boolean {
+  return left.kind === right.kind && left.id === right.id;
+}
+
+function compareText(left: string, right: string): number {
+  return compareUtf8(left, right);
+}
+
+function compareExternalWorkIdentity(left: ExternalWorkIdentity, right: ExternalWorkIdentity): number {
+  return compareText(left.provider, right.provider)
+    || compareText(left.scope, right.scope)
+    || compareText(left.key, right.key);
+}
+
+function compareOrchestrationIdentity(left: OrchestrationIdentity, right: OrchestrationIdentity): number {
+  return compareText(left.kind, right.kind) || compareText(left.id, right.id);
+}
+
+export function validateExternalWorkIdentity(value: ExternalWorkIdentity): ExternalWorkIdentity {
+  exactInput(value, ExternalWorkIdentity_FIELDS);
+  return {
+    key: ExternalWorkKey(value.key),
+    provider: decodeExternalWorkProvider(value.provider),
+    scope: ExternalWorkScope(value.scope),
+  };
+}
+
+export function validateLatestUsefulMessage(value: LatestUsefulMessage): LatestUsefulMessage {
+  exactInput(value, LatestUsefulMessage_FIELDS);
+  return {observed_at_ms: LineageObservedAtMs(value.observed_at_ms), text: LineageMessage(value.text)};
+}
+
+export function validateLineageFreshness(value: LineageFreshness): LineageFreshness {
+  exactInput(value, LineageFreshness_FIELDS);
+  return {
+    observed_at_ms: LineageObservedAtMs(value.observed_at_ms),
+    stale_after_ms: LineageStaleAfterMs(value.stale_after_ms),
+    state: decodeLineageFreshnessState(value.state),
+  };
+}
+
+export function validateLineageStatus(value: LineageStatus): LineageStatus {
+  switch (value.kind) {
+    case "blocked": exactInput(value, ["kind", "reason"]); return {kind: value.kind, reason: LineageMessage(value.reason)};
+    case "done": exactInput(value, ["kind", "outcome"]); return {kind: value.kind, outcome: LineageMessage(value.outcome)};
+    case "waiting": exactInput(value, ["kind", "reason"]); return {kind: value.kind, reason: LineageMessage(value.reason)};
+    case "working": exactInput(value, ["kind"]); return {kind: value.kind};
+    default: return assertNeverLineageStatus(value);
+  }
+}
+
+export function validateOrchestrationIdentity(value: OrchestrationIdentity): OrchestrationIdentity {
+  switch (value.kind) {
+    case "decision_gate": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: OrchestrationDecisionGateId(value.id)};
+    case "dispatch": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: OrchestrationDispatchId(value.id)};
+    case "heartbeat": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: OrchestrationHeartbeatId(value.id)};
+    case "question": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: OrchestrationQuestionId(value.id)};
+    case "run": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: OrchestrationRunId(value.id)};
+    case "task": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: OrchestrationTaskId(value.id)};
+    case "worker": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: OrchestrationWorkerId(value.id)};
+    default: return assertNeverOrchestrationIdentity(value);
+  }
+}
+
+function orchestrationParentAllowed(identity: OrchestrationIdentity, parent: OrchestrationIdentity | null): boolean {
+  switch (identity.kind) {
+    case "run": return parent === null;
+    case "task": return parent?.kind === "run" || parent?.kind === "task";
+    case "dispatch": return parent?.kind === "task";
+    case "worker": return parent?.kind === "dispatch";
+    case "heartbeat": return parent?.kind === "worker";
+    case "question": return parent?.kind === "task";
+    case "decision_gate": return parent?.kind === "question" || parent?.kind === "task";
+    default: return assertNeverOrchestrationIdentity(identity);
+  }
+}
+
+export function validateExternalWorkItem(value: ExternalWorkItem): ExternalWorkItem {
+  exactInput(value, ExternalWorkItem_FIELDS);
+  const identity = validateExternalWorkIdentity(value.identity);
+  const moved_to = value.moved_to === null ? null : validateExternalWorkIdentity(value.moved_to);
+  const state = decodeExternalWorkState(value.state);
+  if ((state === "moved") !== (moved_to !== null) || (moved_to !== null && sameExternalWorkIdentity(identity, moved_to))) {
+    workContextRefusal("external work transition is invalid");
+  }
+  return {
+    freshness: validateLineageFreshness(value.freshness),
+    identity,
+    latest_useful_message: value.latest_useful_message === null ? null : validateLatestUsefulMessage(value.latest_useful_message),
+    moved_to,
+    revision: WorkContextRevision(value.revision),
+    state,
+    workspace: UserWorkspaceId(value.workspace),
+  };
+}
+
+export function validateOrchestrationRecord(value: OrchestrationRecord): OrchestrationRecord {
+  exactInput(value, OrchestrationRecord_FIELDS);
+  const identity = validateOrchestrationIdentity(value.identity);
+  const parent = value.parent === null ? null : validateOrchestrationIdentity(value.parent);
+  if (!orchestrationParentAllowed(identity, parent)) workContextRefusal("orchestration parent is invalid");
+  return {
+    external_work: value.external_work === null ? null : validateExternalWorkIdentity(value.external_work),
+    freshness: validateLineageFreshness(value.freshness),
+    identity,
+    latest_useful_message: value.latest_useful_message === null ? null : validateLatestUsefulMessage(value.latest_useful_message),
+    parent,
+    status: validateLineageStatus(value.status),
+    workspace: UserWorkspaceId(value.workspace),
+  };
+}
+
+export function validateLineageProjection(value: LineageProjection): LineageProjection {
+  exactInput(value, LineageProjection_FIELDS);
+  if (value.schema !== PLATFORM_SCHEMA_V2) workContextRefusal("lineage projection schema is incompatible");
+  if (!Array.isArray(value.external_work_items) || !Array.isArray(value.orchestration)
+      || value.external_work_items.length + value.orchestration.length > MAX_LINEAGE_RECORDS) {
+    workContextRefusal("lineage projection exceeds its record limit");
+  }
+  const workspace = UserWorkspaceId(value.workspace);
+  const external_work_items = value.external_work_items.map(validateExternalWorkItem)
+    .sort((left, right) => compareExternalWorkIdentity(left.identity, right.identity));
+  const orchestration = value.orchestration.map(validateOrchestrationRecord)
+    .sort((left, right) => compareOrchestrationIdentity(left.identity, right.identity));
+  if (external_work_items.some((item) => item.workspace !== workspace)
+      || orchestration.some((item) => item.workspace !== workspace)
+      || external_work_items.some((item, index) => index > 0 && sameExternalWorkIdentity(external_work_items[index - 1]!.identity, item.identity))
+      || orchestration.some((item, index) => index > 0 && sameOrchestrationIdentity(orchestration[index - 1]!.identity, item.identity))) {
+    workContextRefusal("lineage projection is duplicated or crosses workspaces");
+  }
+  return {external_work_items, orchestration, schema: PLATFORM_SCHEMA_V2, workspace};
+}
+
+export function validateWorkspaceCreateIntent(value: WorkspaceCreateIntent): WorkspaceCreateIntent {
+  exactInput(value, WorkspaceCreateIntent_FIELDS);
+  return {
+    base_selector: BaseSelectorId(value.base_selector),
+    branch_selector: BranchSelectorId(value.branch_selector),
+    external_work: validateExternalWorkIdentity(value.external_work),
+    intent_id: WorkspaceIntentId(value.intent_id),
+    task: OrchestrationTaskId(value.task),
+  };
+}
+
+export function validateWorkspaceResumeIntent(value: WorkspaceResumeIntent): WorkspaceResumeIntent {
+  exactInput(value, WorkspaceResumeIntent_FIELDS);
+  return {
+    expected_revision: WorkContextRevision(value.expected_revision),
+    intent_id: WorkspaceIntentId(value.intent_id),
+    task: OrchestrationTaskId(value.task),
+    workspace: UserWorkspaceId(value.workspace),
+  };
+}
+
+export function validateWorkspaceIntent(value: WorkspaceIntent): WorkspaceIntent {
+  switch (value.kind) {
+    case "create": exactInput(value, ["kind", "request"]); return {kind: value.kind, request: validateWorkspaceCreateIntent(value.request)};
+    case "resume": exactInput(value, ["kind", "request"]); return {kind: value.kind, request: validateWorkspaceResumeIntent(value.request)};
+    default: return assertNeverWorkspaceIntent(value);
+  }
+}
+
+export function validateWorkspaceIntentOutcome(value: WorkspaceIntentOutcome): WorkspaceIntentOutcome {
+  switch (value.kind) {
+    case "conflict": exactInput(value, ["conflict", "kind"]); return {kind: value.kind, conflict: decodeWorkspaceIntentConflict(value.conflict)};
+    case "created": exactInput(value, ["kind", "workspace"]); return {kind: value.kind, workspace: UserWorkspaceId(value.workspace)};
+    case "resumed": exactInput(value, ["kind", "workspace"]); return {kind: value.kind, workspace: UserWorkspaceId(value.workspace)};
+    default: return assertNeverWorkspaceIntentOutcome(value);
+  }
 }

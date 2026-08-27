@@ -133,6 +133,71 @@ snapshot ceiling: for example, 640 records remain five ordinary 128-item pages.
 The helper is deterministic protocol behavior, not a persistence, indexing, or
 authorization implementation.
 
+## External work and orchestration lineage
+
+Platform v2 keeps three identities separate even when one operator experience
+shows them together:
+
+- `ExternalWorkIdentity` is the indivisible tuple `provider + opaque scope +
+  opaque key`. Providers are the closed set `github`, `gitlab`, `linear`, and
+  `jira_compatible`. The same scope/key bytes at two providers are different
+  identities. A moved item carries its complete replacement identity; a closed
+  item has no replacement.
+- `UserWorkspaceId` is the durable human workspace to which work is bound. It
+  is neither an issue key nor an execution identity, and observing the binding
+  grants no provider, repository, filesystem, or execution authority.
+- `OrchestrationIdentity` has distinct branded domains for `run`, `task`,
+  `dispatch`, `worker`, `heartbeat`, `question`, and `decision_gate`. No generic
+  orchestration ID or generic authority string exists.
+
+Internal parentage is closed and typed:
+
+```text
+Run ─► Task ─► Dispatch ─► Worker ─► Heartbeat
+       ├─► Task (bounded child-task lineage)
+       └─► Question ─► DecisionGate
+       └────────────────► DecisionGate
+```
+
+A run has no parent. Dispatch without a task, worker without a dispatch,
+heartbeat without a worker, or question without a task is an orphan and is
+refused. A decision gate binds to the exact question or task whose decision it
+guards. External work and every internal record independently name the same
+`UserWorkspaceId`; their identities are never synthesized from one another.
+
+Every projected record carries explicit freshness (`observed_at_ms`, a positive
+staleness interval, and `fresh|stale`) and may carry one latest useful message
+bounded to 1,024 UTF-8 bytes. Status is a discriminated value: `working` has no
+invented explanation, `blocked` and `waiting` carry a bounded reason, and
+`done` carries a bounded outcome. A stale heartbeat cannot prove a worker is
+running. Messages are presentation evidence, never IDs, authority, or implicit
+state transitions.
+
+## Task-to-workspace create and resume intent
+
+A create intent binds an exact orchestration task and external work identity to
+an idempotent intent ID plus distinct opaque base and branch selector IDs. The
+selectors are issued by an authorized registry; they do not contain and cannot
+be replaced by a host path, repository slug, ref name, provider URL, or command
+fragment. A resume intent names the exact task, `UserWorkspaceId`, and non-zero
+expected revision. Neither request accepts a generic string selector.
+
+Outcomes are `created`, `resumed`, or a closed typed conflict. Stable conflicts
+cover duplicate intake, task already bound, workspace absent, revision
+mismatch, moved/closed external work, orphan dispatch, stale heartbeat,
+pending question, and cancelled creation. Duplicate intake returns the prior
+binding or a conflict; it never creates a second workspace. Moved and closed
+sources do not silently retarget. Cancellation is terminal for that exact
+create intent, while a new authorized intent requires a new identity.
+
+The shared synthetic corpus
+`rust/crates/automonique-protocol/fixtures/platform-v2-lineage-v1.json` covers
+those boundaries and mixed-version behavior. Offers such as `[1,2,3]` still
+downgrade truthfully to a v1-only peer with lineage unavailable; when a peer
+later offers v2, negotiation recovers v2 and the structured lineage surface.
+The corpus contains opaque test values only and no host paths or live provider
+identifiers.
+
 ## Mutation contract for the next slice
 
 Create project/setup/checkout/workspace, resume workspace/attempt/session, and
@@ -148,15 +213,19 @@ policy requires it, targets that exact preview revision. Ambiguous outcomes are
 reconciled by receipt identity or idempotency key and never replayed blindly.
 Archive is non-destructive and does not cancel an active attempt implicitly.
 
-This first contract slice supplies the identities, graph, strict negotiation,
+This contract slice supplies the identities, graph, strict negotiation,
 exact query/page/resynchronization codecs, a deterministic pager over already
-authorized input, generated TypeScript validators/codecs, and bidirectional
-Rust/TypeScript conformance fixtures. `SCHEMA_DIGEST` identifies the complete
+authorized input, external-work/orchestration lineage values, generated
+TypeScript declarations and fail-closed composite validators, and shared
+bidirectional Rust/TypeScript conformance fixtures.
+`SCHEMA_DIGEST` identifies the complete
 additive generated surface and therefore moves when the v2 module changes. The
 SDK still advertises `protocolRange: 1` and `automonique.platform/v1`, so its
 manifest pins the separately generated `PLATFORM_V1_SCHEMA_DIGEST`; the
 checked-in Platform v1 module remains byte-identical.
 
-The mutation methods, durable persistence/index and authorization integration,
-SDK client ergonomics, daemon routes, and internal terminology cleanup remain
-separate implementation work.
+The durable lineage store/index, external-provider ingestion, workspace
+create/resume execution, authorization and selector registries, daemon routes,
+SDK client ergonomics, and UI projection remain separate runtime work. The
+contract does not claim that a provider item was fetched, a worker is live, or
+a workspace was created.

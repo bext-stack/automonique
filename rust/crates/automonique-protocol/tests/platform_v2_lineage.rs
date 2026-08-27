@@ -1,0 +1,341 @@
+// SPDX-License-Identifier: Elastic-2.0
+
+use automonique_protocol::codegen::generated_platform_v1_schema_digest;
+use automonique_protocol::digest::Sha256;
+use automonique_protocol::platform_v2::{
+    PlatformVersionOffer, UserWorkspaceId, negotiate_platform_version,
+};
+use automonique_protocol::platform_v2_lineage::*;
+use automonique_protocol::primitives::Revision;
+
+fn opaque<T>(
+    build: impl FnOnce(String) -> Result<T, automonique_protocol::primitives::ValueError>,
+    value: &str,
+) -> T {
+    build(value.to_owned()).unwrap()
+}
+
+fn external(provider: ExternalWorkProvider, scope: &str, key: &str) -> ExternalWorkIdentity {
+    ExternalWorkIdentity::new(
+        provider,
+        opaque(ExternalWorkScope::new, scope),
+        opaque(ExternalWorkKey::new, key),
+    )
+}
+
+fn fresh() -> LineageFreshness {
+    LineageFreshness::new(1_700_000_000_000, 30_000, LineageFreshnessState::Fresh).unwrap()
+}
+
+#[test]
+fn freshness_counters_share_the_generated_signed_wire_ceiling() {
+    assert!(
+        LineageFreshness::new(
+            MAX_LINEAGE_COUNTER,
+            MAX_LINEAGE_COUNTER,
+            LineageFreshnessState::Fresh
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        LineageFreshness::new(MAX_LINEAGE_COUNTER + 1, 1, LineageFreshnessState::Fresh),
+        Err(LineageError::FreshnessInvalid)
+    );
+    assert_eq!(
+        LatestUsefulMessage::new(
+            LineageMessage::new("bounded").unwrap(),
+            MAX_LINEAGE_COUNTER + 1
+        ),
+        Err(LineageError::FreshnessInvalid)
+    );
+}
+
+#[test]
+fn provider_qualified_work_identity_never_collapses_into_workspace_or_other_providers() {
+    let github = external(ExternalWorkProvider::GitHub, "scope-01", "item-42");
+    let gitlab = external(ExternalWorkProvider::GitLab, "scope-01", "item-42");
+    assert_ne!(github, gitlab);
+
+    let workspace = opaque(UserWorkspaceId::new, "workspace-01");
+    let item = ExternalWorkItem::new(
+        github.clone(),
+        workspace.clone(),
+        Revision::FIRST,
+        ExternalWorkState::Open,
+        None,
+        fresh(),
+        Some(
+            LatestUsefulMessage::new(
+                LineageMessage::new("Ready for an exact task decision.").unwrap(),
+                1_700_000_000_000,
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(item.identity(), &github);
+    assert_eq!(item.workspace(), &workspace);
+    assert_ne!(item.identity().key().as_str(), item.workspace().as_str());
+    let projection =
+        LineageProjection::new(workspace.clone(), vec![item.clone()], Vec::new()).unwrap();
+    assert_eq!(projection.workspace(), &workspace);
+    assert_eq!(projection.external_work_items().len(), 1);
+    assert_eq!(
+        LineageProjection::new(workspace.clone(), vec![item.clone(), item], Vec::new()),
+        Err(LineageError::InventoryInvalid)
+    );
+
+    assert!(
+        ExternalWorkItem::new(
+            github.clone(),
+            workspace.clone(),
+            Revision::FIRST,
+            ExternalWorkState::Moved,
+            None,
+            fresh(),
+            None,
+        )
+        .is_err()
+    );
+    assert!(
+        ExternalWorkItem::new(
+            github.clone(),
+            workspace,
+            Revision::FIRST,
+            ExternalWorkState::Open,
+            Some(gitlab),
+            fresh(),
+            None,
+        )
+        .is_err()
+    );
+
+    let jira = ExternalWorkItem::new(
+        external(ExternalWorkProvider::JiraCompatible, "scope-01", "item-42"),
+        projection.workspace().clone(),
+        Revision::FIRST,
+        ExternalWorkState::Open,
+        None,
+        fresh(),
+        None,
+    )
+    .unwrap();
+    let linear = ExternalWorkItem::new(
+        external(ExternalWorkProvider::Linear, "scope-01", "item-42"),
+        projection.workspace().clone(),
+        Revision::FIRST,
+        ExternalWorkState::Open,
+        None,
+        fresh(),
+        None,
+    )
+    .unwrap();
+    let ordered = LineageProjection::new(
+        projection.workspace().clone(),
+        vec![linear, jira],
+        Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        ordered.external_work_items()[0].identity().provider(),
+        ExternalWorkProvider::JiraCompatible
+    );
+}
+
+#[test]
+fn orchestration_parentage_is_typed_and_orphans_are_refused() {
+    let workspace = opaque(UserWorkspaceId::new, "workspace-02");
+    let run = OrchestrationIdentity::Run(opaque(OrchestrationRunId::new, "run-01"));
+    let task = OrchestrationIdentity::Task(opaque(OrchestrationTaskId::new, "task-01"));
+    let dispatch =
+        OrchestrationIdentity::Dispatch(opaque(OrchestrationDispatchId::new, "dispatch-01"));
+    let worker = OrchestrationIdentity::Worker(opaque(OrchestrationWorkerId::new, "worker-01"));
+    let heartbeat =
+        OrchestrationIdentity::Heartbeat(opaque(OrchestrationHeartbeatId::new, "heartbeat-01"));
+    let question =
+        OrchestrationIdentity::Question(opaque(OrchestrationQuestionId::new, "question-01"));
+    let gate =
+        OrchestrationIdentity::DecisionGate(opaque(OrchestrationDecisionGateId::new, "gate-01"));
+
+    let record = |identity, parent, status, freshness| {
+        OrchestrationRecord::new(
+            identity,
+            workspace.clone(),
+            None,
+            parent,
+            status,
+            freshness,
+            None,
+        )
+    };
+    assert!(record(run.clone(), None, LineageStatus::Working, fresh()).is_ok());
+    assert!(record(task.clone(), Some(run), LineageStatus::Working, fresh()).is_ok());
+    assert!(
+        record(
+            dispatch.clone(),
+            Some(task.clone()),
+            LineageStatus::Working,
+            fresh()
+        )
+        .is_ok()
+    );
+    assert!(
+        record(
+            worker.clone(),
+            Some(dispatch.clone()),
+            LineageStatus::Working,
+            fresh()
+        )
+        .is_ok()
+    );
+    assert!(
+        record(
+            heartbeat,
+            Some(worker),
+            LineageStatus::Waiting(LineageMessage::new("Worker observation expired.").unwrap()),
+            LineageFreshness::new(1_700_000_000_100, 15_000, LineageFreshnessState::Stale).unwrap()
+        )
+        .is_ok()
+    );
+    assert!(
+        record(
+            question.clone(),
+            Some(task.clone()),
+            LineageStatus::Waiting(LineageMessage::new("User answer required.").unwrap()),
+            fresh()
+        )
+        .is_ok()
+    );
+    assert!(
+        record(
+            gate,
+            Some(question),
+            LineageStatus::Blocked(
+                LineageMessage::new("Exact question decision required.").unwrap()
+            ),
+            fresh()
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        record(
+            dispatch.clone(),
+            None,
+            LineageStatus::Blocked(LineageMessage::new("Missing task.").unwrap()),
+            fresh()
+        ),
+        Err(LineageError::OrchestrationParentInvalid)
+    );
+    assert_eq!(
+        record(
+            dispatch,
+            Some(task),
+            LineageStatus::Done(LineageMessage::new("Dispatch settled.").unwrap()),
+            fresh()
+        )
+        .unwrap()
+        .status()
+        .kind(),
+        "done"
+    );
+}
+
+#[test]
+fn create_and_resume_intents_use_opaque_selectors_exact_revisions_and_typed_conflicts() {
+    let task = opaque(OrchestrationTaskId::new, "task-03");
+    let workspace = opaque(UserWorkspaceId::new, "workspace-03");
+    let create = WorkspaceCreateIntent::new(
+        opaque(WorkspaceIntentId::new, "intent-create-01"),
+        task.clone(),
+        external(ExternalWorkProvider::Linear, "scope-linear-01", "lin-7"),
+        opaque(BaseSelectorId::new, "base-opaque-01"),
+        opaque(BranchSelectorId::new, "branch-opaque-01"),
+    );
+    assert_eq!(create.task(), &task);
+    assert_eq!(create.base_selector().as_str(), "base-opaque-01");
+    assert_eq!(create.branch_selector().as_str(), "branch-opaque-01");
+
+    let resume = WorkspaceResumeIntent::new(
+        opaque(WorkspaceIntentId::new, "intent-resume-01"),
+        task,
+        workspace.clone(),
+        Revision::new(4).unwrap(),
+    );
+    assert_eq!(resume.expected_revision().get(), 4);
+    assert_eq!(
+        WorkspaceIntentConflict::DuplicateIntake.as_str(),
+        "duplicate_intake"
+    );
+    assert_eq!(
+        WorkspaceIntentConflict::ExternalWorkMoved.as_str(),
+        "external_work_moved"
+    );
+    assert_eq!(
+        WorkspaceIntentConflict::ExternalWorkClosed.as_str(),
+        "external_work_closed"
+    );
+    assert_eq!(
+        WorkspaceIntentConflict::CreationCancelled.as_str(),
+        "creation_cancelled"
+    );
+    assert_eq!(
+        WorkspaceIntentOutcome::Resumed(workspace),
+        WorkspaceIntentOutcome::Resumed(resume.workspace().clone())
+    );
+}
+
+#[test]
+fn shared_fixture_names_every_required_boundary_and_mixed_version_recovery() {
+    assert_eq!(
+        generated_platform_v1_schema_digest(),
+        (
+            "sha256",
+            "1c3f561d137a14321cee480b8035341dd70b526ca501f2d5efd7f817a6e4b845".to_owned()
+        )
+    );
+    let fixture = include_str!("../fixtures/platform-v2-lineage-v1.json");
+    assert_eq!(
+        Sha256::digest(fixture.as_bytes()).to_hex(),
+        "130be5da4a7eff9fb656f1e8506b1ce9fb37f64f812548e2a8009b5f1f902714"
+    );
+    for name in [
+        "duplicate_intake",
+        "moved_source",
+        "closed_source",
+        "orphan_dispatch",
+        "stale_heartbeat",
+        "question_and_gate",
+        "cancelled_creation",
+        "mixed_version_downgrade",
+        "mixed_version_recovery",
+    ] {
+        assert!(
+            fixture.contains(&format!("\"name\": \"{name}\"")),
+            "missing {name}"
+        );
+    }
+    for provider in ["github", "gitlab", "linear", "jira_compatible"] {
+        assert!(fixture.contains(&format!("\"provider\":\"{provider}\"")));
+    }
+    for forbidden in ["/home/", "/Users/", "refs/heads/", "generic_authority"] {
+        assert!(!fixture.contains(forbidden));
+    }
+
+    let future = PlatformVersionOffer::new(vec![1, 2, 3]).unwrap();
+    let v1 = PlatformVersionOffer::new(vec![1]).unwrap();
+    let recovered = PlatformVersionOffer::new(vec![1, 2, 4]).unwrap();
+    assert_eq!(
+        negotiate_platform_version(&future, &v1)
+            .unwrap()
+            .version()
+            .number(),
+        1
+    );
+    assert_eq!(
+        negotiate_platform_version(&future, &recovered)
+            .unwrap()
+            .version()
+            .number(),
+        2
+    );
+}
