@@ -85,10 +85,26 @@ CREATE TABLE review_authority_grants (
     authentication TEXT NOT NULL CHECK (authentication IN ('user_session', 'service_identity')),
     authority_kind TEXT NOT NULL CHECK (authority_kind IN ('filesystem', 'git', 'ci', 'pull_request', 'review', 'delivery')),
     authority_id TEXT NOT NULL,
+    authorization_id TEXT NOT NULL,
+    grant_revision INTEGER NOT NULL CHECK (grant_revision >= 1),
     granted_at_ms INTEGER NOT NULL CHECK (granted_at_ms >= 0),
     expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms > granted_at_ms),
     revoked_at_ms INTEGER CHECK (revoked_at_ms IS NULL OR revoked_at_ms >= granted_at_ms),
     PRIMARY KEY (workspace_kind, workspace_id, actor_id, authentication, authority_kind, authority_id)
+) STRICT;
+
+CREATE TABLE review_authority_grant_events (
+    authorization_id TEXT PRIMARY KEY,
+    workspace_kind TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    authentication TEXT NOT NULL CHECK (authentication IN ('user_session', 'service_identity')),
+    authority_kind TEXT NOT NULL,
+    authority_id TEXT NOT NULL,
+    grant_revision INTEGER NOT NULL CHECK (grant_revision >= 1),
+    granted_at_ms INTEGER NOT NULL CHECK (granted_at_ms >= 0),
+    expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms > granted_at_ms),
+    UNIQUE (workspace_kind, workspace_id, actor_id, authentication, authority_kind, authority_id, grant_revision)
 ) STRICT;
 
 CREATE TABLE review_action_previews (
@@ -110,7 +126,9 @@ CREATE TABLE review_action_previews (
     approval_policy TEXT NOT NULL CHECK (approval_policy IN ('not_required', 'required')),
     approval_required INTEGER NOT NULL CHECK (approval_required IN (0, 1)),
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
-    write_started_at_ms INTEGER CHECK (write_started_at_ms IS NULL OR write_started_at_ms >= created_at_ms),
+    write_admission_id TEXT,
+    write_admitted_at_ms INTEGER CHECK (write_admitted_at_ms IS NULL OR write_admitted_at_ms >= created_at_ms),
+    write_admission_document BLOB,
     write_admission_digest BLOB CHECK (write_admission_digest IS NULL OR length(write_admission_digest) = 32),
     UNIQUE (workspace_kind, workspace_id, actor_id, idempotency_key)
 ) STRICT;
@@ -150,9 +168,12 @@ CREATE TABLE review_action_receipts (
     receipt_id TEXT PRIMARY KEY,
     preview_id TEXT NOT NULL UNIQUE REFERENCES review_action_previews(preview_id),
     receipt_document BLOB NOT NULL,
+    receipt_digest BLOB NOT NULL CHECK (length(receipt_digest) = 32),
     request_digest BLOB NOT NULL CHECK (length(request_digest) = 32),
     approval_digest BLOB CHECK (approval_digest IS NULL OR length(approval_digest) = 32),
     outcome TEXT NOT NULL CHECK (outcome IN ('accepted', 'completed', 'refused', 'conflict', 'unknown')),
+    result_revision INTEGER CHECK (result_revision IS NULL OR result_revision >= 1),
+    current_revision INTEGER CHECK (current_revision IS NULL OR current_revision >= 1),
     updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0)
 ) STRICT;
 
@@ -375,7 +396,8 @@ pub struct StoredReviewAction {
     pub approval_policy: ApprovalPolicy,
     pub approved: bool,
     pub approval: Option<StoredReviewApproval>,
-    pub write_started_at_ms: Option<i64>,
+    pub write_admission_id: Option<String>,
+    pub write_admitted_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -421,8 +443,8 @@ impl ReviewStore {
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
         let mut connection = Connection::open_with_flags(path, flags)?;
         crate::sqlite_policy::configure_authoritative(&connection)?;
-        initialize(&mut connection)?;
-        bind_authority_namespace(&connection, authority_namespace)?;
+        let schema_fresh = initialize(&mut connection)?;
+        bind_authority_namespace(&connection, authority_namespace, schema_fresh)?;
         Ok(Self {
             connection,
             path: path.to_path_buf(),
@@ -541,9 +563,103 @@ impl ReviewStore {
             return Err(ReviewStoreError::Unauthorized);
         }
         let (kind, id) = workspace_parts(workspace);
-        self.connection.execute(
-            "INSERT INTO review_authority_grants(workspace_kind,workspace_id,actor_id,authentication,authority_kind,authority_id,granted_at_ms,expires_at_ms,revoked_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,NULL) ON CONFLICT(workspace_kind,workspace_id,actor_id,authentication,authority_kind,authority_id) DO UPDATE SET granted_at_ms=excluded.granted_at_ms,expires_at_ms=excluded.expires_at_ms,revoked_at_ms=NULL",
-            params![kind, id, actor.as_str(), authentication.as_str(), authority.kind().as_str(), authority.id().as_str(), granted_at_ms, expires_at_ms])?;
+        let authorization_id =
+            initial_authorization_id(workspace, actor, authentication, authority);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        type RawGrant = (String, i64, i64, i64, Option<i64>);
+        let existing: Option<RawGrant> = transaction.query_row(
+            "SELECT authorization_id,grant_revision,granted_at_ms,expires_at_ms,revoked_at_ms FROM review_authority_grants WHERE workspace_kind=?1 AND workspace_id=?2 AND actor_id=?3 AND authentication=?4 AND authority_kind=?5 AND authority_id=?6",
+            params![kind, id, actor.as_str(), authentication.as_str(), authority.kind().as_str(), authority.id().as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).optional()?;
+        if let Some((stored_id, revision, stored_granted, stored_expires, revoked)) = existing {
+            if stored_id == authorization_id
+                && revision == 1
+                && stored_granted == granted_at_ms
+                && stored_expires == expires_at_ms
+                && revoked.is_none()
+            {
+                transaction.commit()?;
+                return Ok(());
+            }
+            return Err(ReviewStoreError::Conflict("authority_grant"));
+        }
+        transaction.execute(
+            "INSERT INTO review_authority_grants(workspace_kind,workspace_id,actor_id,authentication,authority_kind,authority_id,authorization_id,grant_revision,granted_at_ms,expires_at_ms,revoked_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8,?9,NULL)",
+            params![kind, id, actor.as_str(), authentication.as_str(), authority.kind().as_str(), authority.id().as_str(), authorization_id, granted_at_ms, expires_at_ms])?;
+        transaction.execute(
+            "INSERT INTO review_authority_grant_events(authorization_id,workspace_kind,workspace_id,actor_id,authentication,authority_kind,authority_id,grant_revision,granted_at_ms,expires_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8,?9)",
+            params![authorization_id, kind, id, actor.as_str(), authentication.as_str(), authority.kind().as_str(), authority.id().as_str(), granted_at_ms, expires_at_ms],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn reauthorize_authority_until(
+        &mut self,
+        workspace: &WorkContextIdentity,
+        actor: &ReviewActorId,
+        authentication: ReviewAuthentication,
+        authority: &ReviewAuthority,
+        authorization_id: &str,
+        expected_grant_revision: Revision,
+        granted_at_ms: i64,
+        expires_at_ms: i64,
+    ) -> Stored<()> {
+        validate_time(granted_at_ms)?;
+        if authentication == ReviewAuthentication::ProviderSession
+            || ReviewField::new(authorization_id).is_err()
+            || expires_at_ms <= granted_at_ms
+        {
+            return Err(ReviewStoreError::Unauthorized);
+        }
+        let (kind, id) = workspace_parts(workspace);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        type RawGrant = (String, i64, i64, i64, Option<i64>);
+        let (stored_id, stored_revision, stored_granted, stored_expires, revoked): RawGrant = transaction.query_row(
+            "SELECT authorization_id,grant_revision,granted_at_ms,expires_at_ms,revoked_at_ms FROM review_authority_grants WHERE workspace_kind=?1 AND workspace_id=?2 AND actor_id=?3 AND authentication=?4 AND authority_kind=?5 AND authority_id=?6",
+            params![kind, id, actor.as_str(), authentication.as_str(), authority.kind().as_str(), authority.id().as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).optional()?.ok_or(ReviewStoreError::NotFound)?;
+        if stored_id == authorization_id
+            && stored_granted == granted_at_ms
+            && stored_expires == expires_at_ms
+            && revoked.is_none()
+        {
+            transaction.commit()?;
+            return Ok(());
+        }
+        if stored_revision != db_revision(expected_grant_revision)?
+            || authorization_id == stored_id
+            || granted_at_ms <= revoked.unwrap_or(stored_granted).max(stored_granted)
+        {
+            return Err(ReviewStoreError::Conflict("authority_grant"));
+        }
+        let reused: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM review_authority_grant_events WHERE authorization_id=?1)",
+            [authorization_id],
+            |row| row.get(0),
+        )?;
+        if reused {
+            return Err(ReviewStoreError::Conflict("authority_grant"));
+        }
+        let next_revision = stored_revision
+            .checked_add(1)
+            .ok_or(ReviewStoreError::Conflict("authority_grant"))?;
+        transaction.execute(
+            "UPDATE review_authority_grants SET authorization_id=?1,grant_revision=?2,granted_at_ms=?3,expires_at_ms=?4,revoked_at_ms=NULL WHERE workspace_kind=?5 AND workspace_id=?6 AND actor_id=?7 AND authentication=?8 AND authority_kind=?9 AND authority_id=?10 AND grant_revision=?11",
+            params![authorization_id, next_revision, granted_at_ms, expires_at_ms, kind, id, actor.as_str(), authentication.as_str(), authority.kind().as_str(), authority.id().as_str(), stored_revision],
+        )?;
+        transaction.execute(
+            "INSERT INTO review_authority_grant_events(authorization_id,workspace_kind,workspace_id,actor_id,authentication,authority_kind,authority_id,grant_revision,granted_at_ms,expires_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![authorization_id, kind, id, actor.as_str(), authentication.as_str(), authority.kind().as_str(), authority.id().as_str(), next_revision, granted_at_ms, expires_at_ms],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -557,13 +673,29 @@ impl ReviewStore {
     ) -> Stored<()> {
         validate_time(revoked_at_ms)?;
         let (kind, id) = workspace_parts(workspace);
-        let changed = self.connection.execute(
-            "UPDATE review_authority_grants SET revoked_at_ms=?1 WHERE workspace_kind=?2 AND workspace_id=?3 AND actor_id=?4 AND authentication=?5 AND authority_kind=?6 AND authority_id=?7 AND granted_at_ms<=?1",
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (granted_at, current): (i64, Option<i64>) = transaction.query_row(
+            "SELECT granted_at_ms,revoked_at_ms FROM review_authority_grants WHERE workspace_kind=?1 AND workspace_id=?2 AND actor_id=?3 AND authentication=?4 AND authority_kind=?5 AND authority_id=?6",
+            params![kind, id, actor.as_str(), authentication.as_str(), authority.kind().as_str(), authority.id().as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?.ok_or(ReviewStoreError::NotFound)?;
+        if let Some(current) = current {
+            if current == revoked_at_ms {
+                transaction.commit()?;
+                return Ok(());
+            }
+            return Err(ReviewStoreError::Conflict("authority_revocation"));
+        }
+        if revoked_at_ms < granted_at {
+            return Err(ReviewStoreError::Conflict("authority_revocation"));
+        }
+        transaction.execute(
+            "UPDATE review_authority_grants SET revoked_at_ms=?1 WHERE workspace_kind=?2 AND workspace_id=?3 AND actor_id=?4 AND authentication=?5 AND authority_kind=?6 AND authority_id=?7 AND revoked_at_ms IS NULL",
             params![revoked_at_ms, kind, id, actor.as_str(), authentication.as_str(), authority.kind().as_str(), authority.id().as_str()],
         )?;
-        if changed == 0 {
-            return Err(ReviewStoreError::NotFound);
-        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -624,12 +756,13 @@ impl ReviewStore {
         )
         .map_err(protocol)?;
         let receipt_document = encode_review_action_receipt(&receipt).map_err(protocol)?;
+        let receipt_digest = digest(&receipt_document);
         transaction.execute(
-            "INSERT INTO review_action_previews(preview_id,workspace_kind,workspace_id,expected_revision,actor_id,authentication,authority_kind,authority_id,idempotency_key,action_kind,action_id,request_document,protocol_request_digest,preview_document,request_digest,approval_policy,approval_required,created_at_ms,write_started_at_ms,write_admission_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,NULL,NULL)",
+            "INSERT INTO review_action_previews(preview_id,workspace_kind,workspace_id,expected_revision,actor_id,authentication,authority_kind,authority_id,idempotency_key,action_kind,action_id,request_document,protocol_request_digest,preview_document,request_digest,approval_policy,approval_required,created_at_ms,write_admission_id,write_admitted_at_ms,write_admission_document,write_admission_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,NULL,NULL,NULL,NULL)",
             params![preview_id, kind, id, db_revision(request.expected_revision())?, request.actor().as_str(), request.authentication().as_str(), request.authority().kind().as_str(), request.authority().id().as_str(), request.idempotency_key().as_str(), request.action().kind().as_str(), action_id.as_str(), document, protocol_request_digest.as_slice(), preview_document, request_digest.as_slice(), approval.as_str(), i64::from(approval == ApprovalPolicy::Required), created_at_ms])?;
         transaction.execute(
-            "INSERT INTO review_action_receipts(receipt_id,preview_id,receipt_document,request_digest,approval_digest,outcome,updated_at_ms) VALUES(?1,?2,?3,?4,NULL,?5,?6)",
-            params![receipt.receipt_id().as_str(), preview_id, receipt_document, request_digest.as_slice(), receipt.outcome().as_str(), created_at_ms])?;
+            "INSERT INTO review_action_receipts(receipt_id,preview_id,receipt_document,receipt_digest,request_digest,approval_digest,outcome,result_revision,current_revision,updated_at_ms) VALUES(?1,?2,?3,?4,?5,NULL,?6,NULL,NULL,?7)",
+            params![receipt.receipt_id().as_str(), preview_id, receipt_document, receipt_digest.as_slice(), request_digest.as_slice(), receipt.outcome().as_str(), created_at_ms])?;
         let stored = read_action_by_preview(&transaction, &preview_id)?
             .ok_or(ReviewStoreError::Corrupt("preview"))?;
         transaction.commit()?;
@@ -740,7 +873,7 @@ impl ReviewStore {
             return Err(ReviewStoreError::Conflict("request_digest"));
         }
         require_active_authority(&transaction, &action.request, now_ms)?;
-        if action.write_started_at_ms.is_some() {
+        if action.write_admitted_at_ms.is_some() {
             transaction.commit()?;
             return Ok(ReviewWriteAdmission::Replay(action));
         }
@@ -749,9 +882,14 @@ impl ReviewStore {
         }
         validate_live_approval(&action, now_ms)?;
         validate_current_action(&transaction, &action.request)?;
+        let approval_digest = action.approval.as_ref().map(|value| value.digest);
+        let admission_id = write_admission_id(&action, approval_digest.as_ref(), now_ms)?;
+        let admission_document =
+            encode_write_admission(&action, approval_digest.as_ref(), now_ms, &admission_id)?;
+        let admission_digest = digest(&admission_document);
         let changed = transaction.execute(
-            "UPDATE review_action_previews SET write_started_at_ms=?1,write_admission_digest=?2 WHERE preview_id=?3 AND write_started_at_ms IS NULL",
-            params![now_ms, request_digest.as_slice(), preview_id],
+            "UPDATE review_action_previews SET write_admission_id=?1,write_admitted_at_ms=?2,write_admission_document=?3,write_admission_digest=?4 WHERE preview_id=?5 AND write_admitted_at_ms IS NULL",
+            params![admission_id, now_ms, admission_document, admission_digest.as_slice(), preview_id],
         )?;
         if changed != 1 {
             return Err(ReviewStoreError::Conflict("write_admission"));
@@ -782,7 +920,7 @@ impl ReviewStore {
         if action.approval_required && !action.approved {
             return Err(ReviewStoreError::ApprovalRequired);
         }
-        if action.write_started_at_ms.is_none() {
+        if action.write_admitted_at_ms.is_none() {
             return Err(ReviewStoreError::Conflict("write_not_started"));
         }
         if action.receipt.outcome() != ReviewReceiptOutcome::Accepted {
@@ -845,7 +983,7 @@ impl ReviewStore {
             }
             return Err(ReviewStoreError::Conflict("terminal_receipt"));
         }
-        if action.write_started_at_ms.is_none() {
+        if action.write_admitted_at_ms.is_none() {
             return Err(ReviewStoreError::Conflict("write_not_started"));
         }
         if action.approval_required && !action.approved {
@@ -915,7 +1053,7 @@ impl ReviewStore {
             read_action_by_preview(&transaction, preview_id)?.ok_or(ReviewStoreError::NotFound)?;
         if action.request_digest != request_digest
             || action.request.authority() != authority
-            || action.write_started_at_ms.is_none()
+            || action.write_admitted_at_ms.is_none()
         {
             return Err(ReviewStoreError::Conflict("completion_evidence_binding"));
         }
@@ -974,11 +1112,29 @@ impl ReviewStore {
         &self,
         workspace: &WorkContextIdentity,
         actor: &ReviewActorId,
+        authentication: ReviewAuthentication,
+        authority: &ReviewAuthority,
         key: &IdempotencyKey,
+        now_ms: i64,
     ) -> Stored<Option<ReviewActionReceipt>> {
+        validate_time(now_ms)?;
+        require_active_grant(
+            &self.connection,
+            workspace,
+            actor,
+            authentication,
+            authority,
+            now_ms,
+        )?;
         let (kind, id) = workspace_parts(workspace);
-        read_action_by_key(&self.connection, kind, id, actor.as_str(), key.as_str())
-            .map(|value| value.map(|action| action.receipt))
+        let action = read_action_by_key(&self.connection, kind, id, actor.as_str(), key.as_str())?;
+        if let Some(action) = &action
+            && (action.request.authentication() != authentication
+                || action.request.authority() != authority)
+        {
+            return Err(ReviewStoreError::Unauthorized);
+        }
+        Ok(action.map(|action| action.receipt))
     }
 
     pub fn comment(
@@ -1098,10 +1254,10 @@ impl ReviewStore {
     }
 }
 
-fn initialize(connection: &mut Connection) -> Stored<()> {
+fn initialize(connection: &mut Connection) -> Stored<bool> {
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version == REVIEW_STORE_SCHEMA_VERSION {
-        return Ok(());
+        return Ok(false);
     }
     if version != 0 {
         return Err(ReviewStoreError::SchemaVersion {
@@ -1113,9 +1269,13 @@ fn initialize(connection: &mut Connection) -> Stored<()> {
     transaction.execute_batch(SCHEMA_V1)?;
     transaction.pragma_update(None, "user_version", REVIEW_STORE_SCHEMA_VERSION)?;
     transaction.commit()?;
-    Ok(())
+    Ok(true)
 }
-fn bind_authority_namespace(connection: &Connection, namespace: &str) -> Stored<()> {
+fn bind_authority_namespace(
+    connection: &Connection,
+    namespace: &str,
+    schema_fresh: bool,
+) -> Stored<()> {
     let current: Option<String> = connection
         .query_row(
             "SELECT authority_namespace FROM review_store_metadata WHERE singleton=1",
@@ -1129,6 +1289,14 @@ fn bind_authority_namespace(connection: &Connection, namespace: &str) -> Stored<
         }
         Some(_) => Ok(()),
         None => {
+            let populated: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM review_current UNION ALL SELECT 1 FROM review_snapshots UNION ALL SELECT 1 FROM review_comments UNION ALL SELECT 1 FROM review_authority_grants UNION ALL SELECT 1 FROM review_authority_grant_events UNION ALL SELECT 1 FROM review_action_previews UNION ALL SELECT 1 FROM review_action_approvals UNION ALL SELECT 1 FROM review_action_receipts UNION ALL SELECT 1 FROM review_completion_evidence UNION ALL SELECT 1 FROM review_provider_observations)",
+                [],
+                |row| row.get(0),
+            )?;
+            if populated || !schema_fresh {
+                return Err(ReviewStoreError::Corrupt("authority_namespace"));
+            }
             connection.execute(
                 "INSERT OR IGNORE INTO review_store_metadata(singleton,authority_namespace) VALUES(1,?1)",
                 [namespace],
@@ -1203,6 +1371,126 @@ fn encode_preview_document(protocol_request_digest: &[u8; 32], policy: ApprovalP
     .to_canonical_bytes()
 }
 
+fn initial_authorization_id(
+    workspace: &WorkContextIdentity,
+    actor: &ReviewActorId,
+    authentication: ReviewAuthentication,
+    authority: &ReviewAuthority,
+) -> String {
+    let (workspace_kind, workspace_id) = workspace_parts(workspace);
+    let material = JsonValue::Object(vec![
+        (
+            "actor".to_owned(),
+            JsonValue::String(actor.as_str().to_owned()),
+        ),
+        (
+            "authentication".to_owned(),
+            JsonValue::String(authentication.as_str().to_owned()),
+        ),
+        (
+            "authority_id".to_owned(),
+            JsonValue::String(authority.id().as_str().to_owned()),
+        ),
+        (
+            "authority_kind".to_owned(),
+            JsonValue::String(authority.kind().as_str().to_owned()),
+        ),
+        (
+            "workspace_id".to_owned(),
+            JsonValue::String(workspace_id.to_owned()),
+        ),
+        (
+            "workspace_kind".to_owned(),
+            JsonValue::String(workspace_kind.to_owned()),
+        ),
+    ])
+    .to_canonical_bytes();
+    format!("grant_{}", digest_token(&digest(&material)))
+}
+
+fn write_admission_id(
+    action: &StoredReviewAction,
+    approval_digest: Option<&[u8; 32]>,
+    admitted_at_ms: i64,
+) -> Stored<String> {
+    let material = encode_write_admission(action, approval_digest, admitted_at_ms, "pending")?;
+    Ok(format!("write_{}", digest_token(&digest(&material))))
+}
+
+fn encode_write_admission(
+    action: &StoredReviewAction,
+    approval_digest: Option<&[u8; 32]>,
+    admitted_at_ms: i64,
+    admission_id: &str,
+) -> Stored<Vec<u8>> {
+    let (workspace_kind, workspace_id) = workspace_parts(action.request.workspace());
+    Ok(JsonValue::Object(vec![
+        (
+            "action_id".to_owned(),
+            JsonValue::String(action.receipt.action_id().as_str().to_owned()),
+        ),
+        (
+            "action_kind".to_owned(),
+            JsonValue::String(action.request.action().kind().as_str().to_owned()),
+        ),
+        (
+            "actor".to_owned(),
+            JsonValue::String(action.request.actor().as_str().to_owned()),
+        ),
+        (
+            "admission_id".to_owned(),
+            JsonValue::String(admission_id.to_owned()),
+        ),
+        (
+            "admitted_at_ms".to_owned(),
+            JsonValue::Integer(admitted_at_ms),
+        ),
+        (
+            "approval_digest".to_owned(),
+            approval_digest.map_or(JsonValue::Null, |value| {
+                JsonValue::String(digest_token(value))
+            }),
+        ),
+        (
+            "approval_policy".to_owned(),
+            JsonValue::String(action.approval_policy.as_str().to_owned()),
+        ),
+        (
+            "authentication".to_owned(),
+            JsonValue::String(action.request.authentication().as_str().to_owned()),
+        ),
+        (
+            "authority_id".to_owned(),
+            JsonValue::String(action.request.authority().id().as_str().to_owned()),
+        ),
+        (
+            "authority_kind".to_owned(),
+            JsonValue::String(action.request.authority().kind().as_str().to_owned()),
+        ),
+        (
+            "expected_revision".to_owned(),
+            JsonValue::Integer(db_revision(action.request.expected_revision())?),
+        ),
+        (
+            "request_digest".to_owned(),
+            JsonValue::String(digest_token(&action.request_digest)),
+        ),
+        (
+            "schema".to_owned(),
+            JsonValue::String("automonique.store/review-write-admission/v1".to_owned()),
+        ),
+        (
+            "workspace_id".to_owned(),
+            JsonValue::String(workspace_id.to_owned()),
+        ),
+        (
+            "workspace_kind".to_owned(),
+            JsonValue::String(workspace_kind.to_owned()),
+        ),
+    ])
+    .to_canonical_bytes())
+}
+
 fn is_terminal(outcome: ReviewReceiptOutcome) -> bool {
     !matches!(
         outcome,
@@ -1238,7 +1526,7 @@ fn require_active_grant(
     }
     let (kind, id) = workspace_parts(workspace);
     let authorized: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM review_authority_grants WHERE workspace_kind=?1 AND workspace_id=?2 AND actor_id=?3 AND authentication=?4 AND authority_kind=?5 AND authority_id=?6 AND granted_at_ms<=?7 AND expires_at_ms>?7 AND revoked_at_ms IS NULL)",
+        "SELECT EXISTS(SELECT 1 FROM review_authority_grants g JOIN review_authority_grant_events e ON e.authorization_id=g.authorization_id AND e.workspace_kind=g.workspace_kind AND e.workspace_id=g.workspace_id AND e.actor_id=g.actor_id AND e.authentication=g.authentication AND e.authority_kind=g.authority_kind AND e.authority_id=g.authority_id AND e.grant_revision=g.grant_revision AND e.granted_at_ms=g.granted_at_ms AND e.expires_at_ms=g.expires_at_ms WHERE g.workspace_kind=?1 AND g.workspace_id=?2 AND g.actor_id=?3 AND g.authentication=?4 AND g.authority_kind=?5 AND g.authority_id=?6 AND g.granted_at_ms<=?7 AND g.expires_at_ms>?7 AND g.revoked_at_ms IS NULL)",
         params![kind, id, actor.as_str(), authentication.as_str(), authority.kind().as_str(), authority.id().as_str(), now_ms],
         |row| row.get(0),
     )?;
@@ -1709,17 +1997,22 @@ fn read_action_by_preview(
         request_digest: Vec<u8>,
         approval_policy: String,
         approval_required: i64,
-        write_started_at_ms: Option<i64>,
+        write_admission_id: Option<String>,
+        write_admitted_at_ms: Option<i64>,
+        write_admission_document: Option<Vec<u8>>,
         write_admission_digest: Option<Vec<u8>>,
         receipt_id: String,
         receipt_document: Vec<u8>,
+        receipt_digest: Vec<u8>,
         receipt_request_digest: Vec<u8>,
         receipt_approval_digest: Option<Vec<u8>>,
         receipt_outcome: String,
+        receipt_result_revision: Option<i64>,
+        receipt_current_revision: Option<i64>,
     }
     let raw: Option<RawAction> = connection
         .query_row(
-            "SELECT p.workspace_kind,p.workspace_id,p.expected_revision,p.actor_id,p.authentication,p.authority_kind,p.authority_id,p.idempotency_key,p.action_kind,p.action_id,p.request_document,p.protocol_request_digest,p.preview_document,p.request_digest,p.approval_policy,p.approval_required,p.write_started_at_ms,p.write_admission_digest,r.receipt_id,r.receipt_document,r.request_digest,r.approval_digest,r.outcome FROM review_action_previews p JOIN review_action_receipts r USING(preview_id) WHERE p.preview_id=?1",
+            "SELECT p.workspace_kind,p.workspace_id,p.expected_revision,p.actor_id,p.authentication,p.authority_kind,p.authority_id,p.idempotency_key,p.action_kind,p.action_id,p.request_document,p.protocol_request_digest,p.preview_document,p.request_digest,p.approval_policy,p.approval_required,p.write_admission_id,p.write_admitted_at_ms,p.write_admission_document,p.write_admission_digest,r.receipt_id,r.receipt_document,r.receipt_digest,r.request_digest,r.approval_digest,r.outcome,r.result_revision,r.current_revision FROM review_action_previews p JOIN review_action_receipts r USING(preview_id) WHERE p.preview_id=?1",
             [preview_id],
             |row| {
                 Ok(RawAction {
@@ -1739,13 +2032,18 @@ fn read_action_by_preview(
                     request_digest: row.get(13)?,
                     approval_policy: row.get(14)?,
                     approval_required: row.get(15)?,
-                    write_started_at_ms: row.get(16)?,
-                    write_admission_digest: row.get(17)?,
-                    receipt_id: row.get(18)?,
-                    receipt_document: row.get(19)?,
-                    receipt_request_digest: row.get(20)?,
-                    receipt_approval_digest: row.get(21)?,
-                    receipt_outcome: row.get(22)?,
+                    write_admission_id: row.get(16)?,
+                    write_admitted_at_ms: row.get(17)?,
+                    write_admission_document: row.get(18)?,
+                    write_admission_digest: row.get(19)?,
+                    receipt_id: row.get(20)?,
+                    receipt_document: row.get(21)?,
+                    receipt_digest: row.get(22)?,
+                    receipt_request_digest: row.get(23)?,
+                    receipt_approval_digest: row.get(24)?,
+                    receipt_outcome: row.get(25)?,
+                    receipt_result_revision: row.get(26)?,
+                    receipt_current_revision: row.get(27)?,
                 })
             },
         )
@@ -1789,26 +2087,22 @@ fn read_action_by_preview(
     if (approval_policy == ApprovalPolicy::Required) != (raw.approval_required != 0) {
         return Err(ReviewStoreError::Corrupt("approval_requirement"));
     }
-    let write_admission_digest: Option<[u8; 32]> = raw
-        .write_admission_digest
-        .map(|value| {
-            value
-                .try_into()
-                .map_err(|_| ReviewStoreError::Corrupt("write_admission"))
-        })
-        .transpose()?;
-    if raw.write_started_at_ms.is_some() != write_admission_digest.is_some()
-        || write_admission_digest.is_some_and(|value| value != request_digest)
-    {
-        return Err(ReviewStoreError::Corrupt("write_admission"));
-    }
+    let receipt_digest: [u8; 32] = raw
+        .receipt_digest
+        .try_into()
+        .map_err(|_| ReviewStoreError::Corrupt("receipt_digest"))?;
     let receipt = decode_review_action_receipt(&raw.receipt_document)
         .map_err(|_| ReviewStoreError::Corrupt("receipt"))?;
+    if digest(&raw.receipt_document) != receipt_digest {
+        return Err(ReviewStoreError::Corrupt("receipt_digest"));
+    }
     if receipt.receipt_id().as_str() != raw.receipt_id
         || receipt.action_id().as_str() != raw.action_id
         || receipt.idempotency_key() != request.idempotency_key()
         || receipt.actor() != request.actor()
         || receipt.outcome().as_str() != raw.receipt_outcome
+        || receipt.revision().map(db_revision).transpose()? != raw.receipt_result_revision
+        || receipt.current_revision().map(db_revision).transpose()? != raw.receipt_current_revision
     {
         return Err(ReviewStoreError::Corrupt("receipt_projection"));
     }
@@ -1845,6 +2139,46 @@ fn read_action_by_preview(
     let approved = approval
         .as_ref()
         .is_some_and(|value| value.document.decision() == ReviewApprovalDecision::Approved);
+    let admission_fields = [
+        raw.write_admission_id.is_some(),
+        raw.write_admitted_at_ms.is_some(),
+        raw.write_admission_document.is_some(),
+        raw.write_admission_digest.is_some(),
+    ];
+    if admission_fields.iter().any(|value| *value) && !admission_fields.iter().all(|value| *value) {
+        return Err(ReviewStoreError::Corrupt("write_admission"));
+    }
+    if let (Some(admission_id), Some(admitted_at), Some(document), Some(raw_digest)) = (
+        raw.write_admission_id.as_deref(),
+        raw.write_admitted_at_ms,
+        raw.write_admission_document.as_deref(),
+        raw.write_admission_digest.as_deref(),
+    ) {
+        let stored_digest: [u8; 32] = raw_digest
+            .try_into()
+            .map_err(|_| ReviewStoreError::Corrupt("write_admission"))?;
+        let partial = StoredReviewAction {
+            preview_id: preview_id.to_owned(),
+            request_digest,
+            request: request.clone(),
+            receipt: receipt.clone(),
+            approval_required: raw.approval_required != 0,
+            approval_policy,
+            approved,
+            approval: approval.clone(),
+            write_admission_id: None,
+            write_admitted_at_ms: None,
+        };
+        let expected = encode_write_admission(
+            &partial,
+            approval.as_ref().map(|value| &value.digest),
+            admitted_at,
+            admission_id,
+        )?;
+        if digest(document) != stored_digest || document != expected {
+            return Err(ReviewStoreError::Corrupt("write_admission"));
+        }
+    }
     Ok(Some(StoredReviewAction {
         preview_id: preview_id.to_owned(),
         request_digest,
@@ -1854,7 +2188,8 @@ fn read_action_by_preview(
         approval_policy,
         approved,
         approval,
-        write_started_at_ms: raw.write_started_at_ms,
+        write_admission_id: raw.write_admission_id,
+        write_admitted_at_ms: raw.write_admitted_at_ms,
     }))
 }
 fn update_receipt(
@@ -1864,6 +2199,7 @@ fn update_receipt(
     now_ms: i64,
 ) -> Stored<()> {
     let document = encode_review_action_receipt(receipt).map_err(protocol)?;
-    connection.execute("UPDATE review_action_receipts SET receipt_document=?1,outcome=?2,updated_at_ms=?3 WHERE preview_id=?4", params![document, receipt.outcome().as_str(), now_ms, preview_id])?;
+    let receipt_digest = digest(&document);
+    connection.execute("UPDATE review_action_receipts SET receipt_document=?1,receipt_digest=?2,outcome=?3,result_revision=?4,current_revision=?5,updated_at_ms=?6 WHERE preview_id=?7", params![document, receipt_digest.as_slice(), receipt.outcome().as_str(), receipt.revision().map(db_revision).transpose()?, receipt.current_revision().map(db_revision).transpose()?, now_ms, preview_id])?;
     Ok(())
 }

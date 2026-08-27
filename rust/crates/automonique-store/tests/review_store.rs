@@ -19,6 +19,7 @@ use automonique_store::review_store::{
     ReviewStore, ReviewStoreError, ReviewWriteAdmission,
 };
 use rusqlite::{Connection, params};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 const SNAPSHOT: &[u8] =
@@ -198,16 +199,17 @@ fn stale_revision_actor_isolation_and_authorization_are_closed() {
     store
         .prepare_action(&request, ApprovalPolicy::NotRequired, 22)
         .expect("authorized");
-    assert!(
-        store
-            .receipt(
-                request.workspace(),
-                unauthorized.actor(),
-                request.idempotency_key()
-            )
-            .expect("isolated lookup")
-            .is_none()
-    );
+    assert!(matches!(
+        store.receipt(
+            request.workspace(),
+            unauthorized.actor(),
+            unauthorized.authentication(),
+            unauthorized.authority(),
+            request.idempotency_key(),
+            23,
+        ),
+        Err(ReviewStoreError::Unauthorized)
+    ));
 }
 
 #[test]
@@ -264,7 +266,7 @@ fn provider_observation_never_becomes_local_mutation_authority() {
 #[test]
 fn approval_and_ambiguous_receipt_reconcile_after_restart_without_replay() {
     let private = PrivateStore::new();
-    let (workspace, actor, key, preview_id, digest, accepted) = {
+    let (workspace, actor, authentication, authority, key, preview_id, digest, accepted) = {
         let mut store = ReviewStore::open(private.path()).expect("open");
         let request = seed(&mut store);
         let ReviewActionAdmission::New(action) = store
@@ -307,7 +309,7 @@ fn approval_and_ambiguous_receipt_reconcile_after_restart_without_replay() {
         else {
             panic!("first admission must be new");
         };
-        assert_eq!(started.write_started_at_ms, Some(23));
+        assert_eq!(started.write_admitted_at_ms, Some(23));
         let unknown = store
             .mark_ambiguous(&action.preview_id, action.request_digest, 24)
             .expect("persist unknown");
@@ -315,6 +317,8 @@ fn approval_and_ambiguous_receipt_reconcile_after_restart_without_replay() {
         (
             request.workspace().clone(),
             request.actor().clone(),
+            request.authentication(),
+            request.authority().clone(),
             request.idempotency_key().clone(),
             action.preview_id,
             action.request_digest,
@@ -323,7 +327,7 @@ fn approval_and_ambiguous_receipt_reconcile_after_restart_without_replay() {
     };
     let mut reopened = ReviewStore::open(private.path()).expect("reopen");
     let reconciled = reopened
-        .receipt(&workspace, &actor, &key)
+        .receipt(&workspace, &actor, authentication, &authority, &key, 25)
         .expect("lookup")
         .expect("receipt");
     assert_eq!(reconciled.outcome().as_str(), "unknown");
@@ -620,7 +624,10 @@ fn snapshot_and_normalized_action_corruption_fail_after_reopen() {
         reopened.receipt(
             request.workspace(),
             request.actor(),
-            request.idempotency_key()
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            21,
         ),
         Err(ReviewStoreError::Corrupt("request_digest"))
     ));
@@ -676,7 +683,10 @@ fn approval_projection_corruption_cannot_authorize_after_reopen() {
         reopened.receipt(
             request.workspace(),
             request.actor(),
-            request.idempotency_key()
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            23,
         ),
         Err(ReviewStoreError::Corrupt("approval_projection"))
     ));
@@ -873,7 +883,10 @@ fn policy_is_digest_bound_and_normalized_corruption_fails_closed() {
         reopened.receipt(
             request.workspace(),
             request.actor(),
-            request.idempotency_key()
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            22,
         ),
         Err(ReviewStoreError::Corrupt("approval_requirement"))
     ));
@@ -1063,14 +1076,15 @@ fn write_admission_expires_before_start_but_reconciliation_survives_after_start(
 fn expired_or_revoked_grants_refuse_replay_and_new_write_admission() {
     let private = PrivateStore::new();
     let mut store = ReviewStore::open(private.path()).expect("open");
-    let request = seed(&mut store);
+    let request = request();
+    store.put_snapshot(&snapshot(), 10).expect("snapshot");
     store
         .grant_authority_until(
             request.workspace(),
             request.actor(),
             request.authentication(),
             request.authority(),
-            12,
+            11,
             25,
         )
         .expect("bounded grant");
@@ -1089,11 +1103,13 @@ fn expired_or_revoked_grants_refuse_replay_and_new_write_admission() {
         Err(ReviewStoreError::Unauthorized)
     ));
     store
-        .grant_authority_until(
+        .reauthorize_authority_until(
             request.workspace(),
             request.actor(),
             request.authentication(),
             request.authority(),
+            "reauthorization-2",
+            revision(1),
             26,
             40,
         )
@@ -1108,8 +1124,61 @@ fn expired_or_revoked_grants_refuse_replay_and_new_write_admission() {
         )
         .expect("revoke");
     assert!(matches!(
+        store.grant_authority_until(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            11,
+            25,
+        ),
+        Err(ReviewStoreError::Conflict("authority_grant"))
+    ));
+    assert!(matches!(
+        store.reauthorize_authority_until(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            "stale-reauthorization",
+            revision(1),
+            28,
+            50,
+        ),
+        Err(ReviewStoreError::Conflict("authority_grant"))
+    ));
+    assert!(matches!(
         store.prepare_action(&request, ApprovalPolicy::NotRequired, 28),
         Err(ReviewStoreError::Unauthorized)
+    ));
+    store
+        .reauthorize_authority_until(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            "reauthorization-3",
+            revision(2),
+            29,
+            50,
+        )
+        .expect("explicit later reauthorization");
+    assert!(matches!(
+        store.prepare_action(&request, ApprovalPolicy::NotRequired, 30),
+        Ok(ReviewActionAdmission::Replay(_))
+    ));
+    assert!(matches!(
+        store.reauthorize_authority_until(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            "reauthorization-2",
+            revision(3),
+            31,
+            60,
+        ),
+        Err(ReviewStoreError::Conflict("authority_grant"))
     ));
 }
 
@@ -1144,10 +1213,175 @@ fn comment_history_and_authority_namespace_are_durable_invariants() {
         ReviewStore::open_scoped(private.path(), "tenant-b"),
         Err(ReviewStoreError::Conflict("authority_namespace"))
     ));
-    assert_eq!(
-        ReviewStore::open_scoped(private.path(), "tenant-a")
-            .expect("same tenant reopen")
-            .authority_namespace(),
-        "tenant-a"
+    let same = ReviewStore::open_scoped(private.path(), "tenant-a").expect("same tenant reopen");
+    assert_eq!(same.authority_namespace(), "tenant-a");
+    drop(same);
+    let raw = Connection::open(private.path()).expect("raw open");
+    raw.execute("DELETE FROM review_store_metadata", [])
+        .expect("remove namespace custody");
+    drop(raw);
+    assert!(matches!(
+        ReviewStore::open_scoped(private.path(), "tenant-a"),
+        Err(ReviewStoreError::Corrupt("authority_namespace"))
+    ));
+}
+
+#[test]
+fn terminal_receipt_document_and_normalized_revisions_are_verified_before_replay() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).expect("open");
+    let request = seed(&mut store);
+    let ReviewActionAdmission::New(action) = store
+        .prepare_action(&request, ApprovalPolicy::NotRequired, 20)
+        .expect("preview")
+    else {
+        panic!("new");
+    };
+    store
+        .start_write(&action.preview_id, action.request_digest, 21)
+        .expect("write admission");
+    let next_document = String::from_utf8(SNAPSHOT.to_vec())
+        .expect("fixture")
+        .replace("\"revision\":9,\"schema\"", "\"revision\":10,\"schema\"");
+    store
+        .put_snapshot(
+            &decode_review_snapshot(next_document.as_bytes()).expect("next snapshot"),
+            22,
+        )
+        .expect("advance snapshot");
+    let completed = ReviewActionReceipt::new(
+        action.receipt.receipt_id().clone(),
+        action.receipt.idempotency_key().clone(),
+        action.receipt.action_id().clone(),
+        action.receipt.actor().clone(),
+        ReviewReceiptOutcome::Completed,
+        Some(revision(10)),
+        None,
+        ReviewReconciliation::Final,
+    )
+    .expect("completed");
+    store
+        .reconcile_receipt(&action.preview_id, action.request_digest, &completed, 23)
+        .expect("terminal receipt");
+
+    let raw = Connection::open(private.path()).expect("raw open");
+    let document: Vec<u8> = raw
+        .query_row(
+            "SELECT receipt_document FROM review_action_receipts WHERE preview_id=?1",
+            [&action.preview_id],
+            |row| row.get(0),
+        )
+        .expect("receipt document");
+    let forged = String::from_utf8(document)
+        .expect("canonical receipt")
+        .replace("\"revision\":10", "\"revision\":11")
+        .into_bytes();
+    raw.execute(
+        "UPDATE review_action_receipts SET receipt_document=?1 WHERE preview_id=?2",
+        params![forged, action.preview_id],
+    )
+    .expect("forge completed revision");
+    drop(raw);
+    match store.prepare_action(&request, ApprovalPolicy::NotRequired, 24) {
+        Err(ReviewStoreError::Corrupt("receipt_digest")) => {}
+        other => panic!("forged terminal receipt returned {other:?}"),
+    }
+
+    let forged = String::from_utf8(
+        Connection::open(private.path())
+            .expect("raw reopen")
+            .query_row(
+                "SELECT receipt_document FROM review_action_receipts WHERE preview_id=?1",
+                [&action.preview_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .expect("forged receipt"),
+    )
+    .expect("receipt text")
+    .into_bytes();
+    let forged_digest: [u8; 32] = Sha256::digest(&forged).into();
+    let raw = Connection::open(private.path()).expect("raw reopen");
+    raw.execute(
+        "UPDATE review_action_receipts SET receipt_digest=?1 WHERE preview_id=?2",
+        params![forged_digest.as_slice(), action.preview_id],
+    )
+    .expect("forge matching digest");
+    drop(raw);
+    assert!(matches!(
+        store.prepare_action(&request, ApprovalPolicy::NotRequired, 25),
+        Err(ReviewStoreError::Corrupt("receipt_projection"))
+    ));
+}
+
+#[test]
+fn receipt_polling_and_write_admission_require_live_integrity_bound_authority() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).expect("open");
+    let request = seed(&mut store);
+    let ReviewActionAdmission::New(action) = store
+        .prepare_action(&request, ApprovalPolicy::NotRequired, 20)
+        .expect("preview")
+    else {
+        panic!("new");
+    };
+    let ReviewWriteAdmission::New(started) = store
+        .start_write(&action.preview_id, action.request_digest, 21)
+        .expect("write admission")
+    else {
+        panic!("new write admission");
+    };
+    assert!(started.write_admission_id.is_some());
+    assert!(
+        store
+            .receipt(
+                request.workspace(),
+                request.actor(),
+                request.authentication(),
+                request.authority(),
+                request.idempotency_key(),
+                22,
+            )
+            .expect("authorized poll")
+            .is_some()
     );
+
+    let raw = Connection::open(private.path()).expect("raw open");
+    raw.execute(
+        "UPDATE review_action_previews SET write_admission_digest=request_digest WHERE preview_id=?1",
+        [&action.preview_id],
+    )
+    .expect("copy unrelated digest into admission");
+    drop(raw);
+    assert!(matches!(
+        store.receipt(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            23,
+        ),
+        Err(ReviewStoreError::Corrupt("write_admission"))
+    ));
+
+    store
+        .revoke_authority(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            24,
+        )
+        .expect("revoke polling authority");
+    assert!(matches!(
+        store.receipt(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            25,
+        ),
+        Err(ReviewStoreError::Unauthorized)
+    ));
 }

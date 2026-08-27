@@ -109,23 +109,38 @@ in every outcome. The custody row integrity-binds the canonical request, full
 approval policy, duplicated `approval_required` decision, and, when required,
 the exact authenticated approval. A separate transactional `start-write`
 admission is recorded only while the grant, revision, target, and approval are
-current; its explicit replay outcome never licenses a second external write.
+current. The admission is its own canonical document and digest, with a unique
+admission identity, trusted admission time, workspace, actor, authentication,
+exact authority, action identity and kind, expected revision, request and
+approval-policy digests. Its explicit replay outcome never licenses a second
+external write.
 Once admitted, an unknown result can still be recorded and reconciled after the
 approval expires. A completed result is final only when its revision is the
 authoritative snapshot revision or separately stored evidence from an
 authenticated exact-authority service adapter proves that revision. Exact
 terminal replays are returned only after current actor authorization is checked.
-Grant expiry and revocation fail closed.
+Receipt polling likewise requires the current authenticated actor, exact
+authority scope, trusted time, and an active grant; an opaque receipt or
+idempotency key is never authority. Receipt canonical bytes, digest, outcome,
+result revision, and current revision are revalidated before the terminal fast
+path. Grant events have a monotonic revision and authorization identity. An
+initial-grant replay cannot change its lifetime, and neither a stale grant nor
+a differently timed revocation can resurrect authority. Reauthorization after
+expiry or revocation requires a distinct identity, the exact preceding grant
+revision, and a later trusted instant. Authorization identities are retained
+and cannot be reused by a later grant revision.
 
 On every read, snapshot, preview, approval, receipt, completion-evidence and
 duplicated normalized fields are re-derived; corruption fails closed across
 process restarts. Comment identity, actor and anchor cannot be rewritten across
 snapshots; same-revision values are immutable, edits advance exactly one
 revision, and sent-to-agent state is monotonic. Each review-store database is
-bound at creation to one explicit authority namespace. Hosted deployments must
-use a different database for every tenant/authority domain until a later schema
-introduces row-level tenancy. The store still has no daemon route or real git,
-CI, provider, or pull-request adapter.
+bound at fresh-schema creation to one explicit authority namespace. A missing
+namespace singleton in any previously opened or populated database is
+corruption, not an invitation to infer or replace the tenant. Hosted
+deployments must use a different database for every tenant/authority domain
+until a later schema introduces row-level tenancy. The store still has no
+daemon route or real git, CI, provider, or pull-request adapter.
 
 ## Shared conformance
 
