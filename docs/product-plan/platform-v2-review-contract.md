@@ -18,6 +18,13 @@ approvals, receipts, actor, workspace, expected revision, authority, request
 digest, and idempotency key. External provider observations are kept in a
 separate table and cannot create local authority grants.
 
+Approval is a checked document rather than an unauthenticated flag. It binds
+the preview, workspace, request digest and revision, authenticated approver,
+exact authority identity, approved/refused decision, and expiry. The approver's
+grant, current snapshot revision, and action target are rechecked in the same
+transaction that records the decision. A refusal closes the receipt without
+executing the proposal; an expired approval cannot authorize a later write.
+
 There is still no daemon route, git adapter, shell adapter, CI adapter,
 pull-request adapter, provider adapter, or client UI. A future daemon must
 obtain authority decisions from its local policy registry before installing a
@@ -93,7 +100,11 @@ the resulting revision. Conflicts carry the current revision. Refusals are
 final. Accepted and unknown outcomes carry no claimed revision and explicitly
 say `poll_receipt`; clients reconcile that receipt and never blindly replay the
 mutation. Actor, action, receipt, and idempotency identities remain attributable
-in every outcome.
+in every outcome. The custody row also binds the receipt to the full request
+digest and, when required, the exact approval digest. Reconciliation verifies
+completed and conflict revisions against the authoritative workspace revision.
+On every read, snapshot and approval digests plus their duplicated normalized
+columns are re-derived; corruption fails closed across process restarts.
 
 ## Shared conformance
 

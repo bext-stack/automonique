@@ -15,8 +15,10 @@ use automonique_protocol::platform_v2_review_api::{
 };
 use automonique_protocol::primitives::Revision;
 use automonique_store::review_store::{
-    ApprovalPolicy, ReviewActionAdmission, ReviewStore, ReviewStoreError,
+    ApprovalPolicy, ReviewActionAdmission, ReviewApprovalDecision, ReviewApprovalDocument,
+    ReviewStore, ReviewStoreError,
 };
+use rusqlite::{Connection, params};
 use tempfile::TempDir;
 
 const SNAPSHOT: &[u8] =
@@ -154,6 +156,24 @@ fn exact_request_replays_and_different_body_under_same_key_conflicts() {
 }
 
 #[test]
+fn action_target_is_resolved_against_the_authoritative_snapshot() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).expect("open");
+    let request = seed(&mut store);
+    let wrong_target_revision = request_variant(
+        &request,
+        "wrong-target-revision",
+        request.actor().as_str(),
+        request.expected_revision(),
+        revision(8),
+    );
+    assert!(matches!(
+        store.prepare_action(&wrong_target_revision, ApprovalPolicy::NotRequired, 20),
+        Err(ReviewStoreError::Protocol(_))
+    ));
+}
+
+#[test]
 fn stale_revision_actor_isolation_and_authorization_are_closed() {
     let private = PrivateStore::new();
     let mut store = ReviewStore::open(private.path()).expect("open");
@@ -258,15 +278,28 @@ fn approval_and_ambiguous_receipt_reconcile_after_restart_without_replay() {
             Err(ReviewStoreError::ApprovalRequired)
         ));
         let approver = ReviewActorId::new("reviewer-1").expect("approver");
-        let approved = store
-            .approve_action(
-                &action.preview_id,
-                action.request_digest,
-                request.expected_revision(),
+        store
+            .grant_authority(
+                request.workspace(),
                 &approver,
-                22,
+                ReviewAuthentication::UserSession,
+                request.authority(),
+                21,
             )
-            .expect("approve");
+            .expect("approver authority");
+        let approval = ReviewApprovalDocument::new(
+            &action.preview_id,
+            request.workspace().clone(),
+            approver,
+            ReviewAuthentication::UserSession,
+            request.authority().clone(),
+            action.request_digest,
+            request.expected_revision(),
+            ReviewApprovalDecision::Approved,
+            100,
+        )
+        .expect("approval document");
+        let approved = store.decide_action(&approval, 22).expect("approve");
         assert!(approved.approved);
         let unknown = store
             .mark_ambiguous(&action.preview_id, action.request_digest, 23)
@@ -335,6 +368,282 @@ fn approval_and_ambiguous_receipt_reconcile_after_restart_without_replay() {
 }
 
 #[test]
+fn approval_is_authenticated_exact_bounded_and_expiring() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).expect("open");
+    let request = seed(&mut store);
+    let ReviewActionAdmission::New(action) = store
+        .prepare_action(&request, ApprovalPolicy::Required, 20)
+        .expect("preview")
+    else {
+        panic!("new");
+    };
+    let approver = ReviewActorId::new("reviewer-ungranted").expect("approver");
+    let approval = ReviewApprovalDocument::new(
+        &action.preview_id,
+        request.workspace().clone(),
+        approver.clone(),
+        ReviewAuthentication::UserSession,
+        request.authority().clone(),
+        action.request_digest,
+        request.expected_revision(),
+        ReviewApprovalDecision::Approved,
+        30,
+    )
+    .expect("approval");
+    assert!(matches!(
+        store.decide_action(&approval, 21),
+        Err(ReviewStoreError::Unauthorized)
+    ));
+    store
+        .grant_authority(
+            request.workspace(),
+            &approver,
+            ReviewAuthentication::UserSession,
+            request.authority(),
+            22,
+        )
+        .expect("grant");
+    assert!(matches!(
+        store.decide_action(&approval, 30),
+        Err(ReviewStoreError::InvalidField("approval_expired"))
+    ));
+    let wrong_digest = ReviewApprovalDocument::new(
+        &action.preview_id,
+        request.workspace().clone(),
+        approver.clone(),
+        ReviewAuthentication::UserSession,
+        request.authority().clone(),
+        [7; 32],
+        request.expected_revision(),
+        ReviewApprovalDecision::Approved,
+        40,
+    )
+    .expect("wrong digest document");
+    assert!(matches!(
+        store.decide_action(&wrong_digest, 23),
+        Err(ReviewStoreError::Conflict("approval_binding"))
+    ));
+    assert!(
+        ReviewApprovalDocument::new(
+            &action.preview_id,
+            request.workspace().clone(),
+            ReviewActorId::new("provider").expect("actor"),
+            ReviewAuthentication::ProviderSession,
+            request.authority().clone(),
+            action.request_digest,
+            request.expected_revision(),
+            ReviewApprovalDecision::Approved,
+            40,
+        )
+        .is_err()
+    );
+    let refusal = ReviewApprovalDocument::new(
+        &action.preview_id,
+        request.workspace().clone(),
+        approver,
+        ReviewAuthentication::UserSession,
+        request.authority().clone(),
+        action.request_digest,
+        request.expected_revision(),
+        ReviewApprovalDecision::Refused,
+        40,
+    )
+    .expect("refusal document");
+    let refused = store.decide_action(&refusal, 24).expect("refusal");
+    assert!(!refused.approved);
+    assert_eq!(refused.receipt.outcome(), ReviewReceiptOutcome::Refused);
+}
+
+#[test]
+fn approval_rechecks_the_current_snapshot_revision_transactionally() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).expect("open");
+    let request = seed(&mut store);
+    let ReviewActionAdmission::New(action) = store
+        .prepare_action(&request, ApprovalPolicy::Required, 20)
+        .expect("preview")
+    else {
+        panic!("new");
+    };
+    let approver = ReviewActorId::new("reviewer-1").expect("approver");
+    store
+        .grant_authority(
+            request.workspace(),
+            &approver,
+            ReviewAuthentication::UserSession,
+            request.authority(),
+            21,
+        )
+        .expect("grant");
+    let approval = ReviewApprovalDocument::new(
+        &action.preview_id,
+        request.workspace().clone(),
+        approver,
+        ReviewAuthentication::UserSession,
+        request.authority().clone(),
+        action.request_digest,
+        request.expected_revision(),
+        ReviewApprovalDecision::Approved,
+        100,
+    )
+    .expect("approval");
+    let next_document = String::from_utf8(SNAPSHOT.to_vec())
+        .expect("fixture text")
+        .replace("\"revision\":9,\"schema\"", "\"revision\":10,\"schema\"");
+    let next = decode_review_snapshot(next_document.as_bytes()).expect("next snapshot");
+    store.put_snapshot(&next, 22).expect("advance snapshot");
+    assert!(matches!(
+        store.decide_action(&approval, 23),
+        Err(ReviewStoreError::StaleRevision { current }) if current == revision(10)
+    ));
+}
+
+#[test]
+fn reconciled_revisions_match_authoritative_state() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).expect("open");
+    let request = seed(&mut store);
+    let ReviewActionAdmission::New(action) = store
+        .prepare_action(&request, ApprovalPolicy::NotRequired, 20)
+        .expect("preview")
+    else {
+        panic!("new");
+    };
+    let conflict = |current| {
+        ReviewActionReceipt::new(
+            action.receipt.receipt_id().clone(),
+            action.receipt.idempotency_key().clone(),
+            action.receipt.action_id().clone(),
+            action.receipt.actor().clone(),
+            ReviewReceiptOutcome::Conflict,
+            None,
+            Some(revision(current)),
+            ReviewReconciliation::Final,
+        )
+        .expect("conflict")
+    };
+    assert!(matches!(
+        store.reconcile_receipt(&action.preview_id, action.request_digest, &conflict(8), 21),
+        Err(ReviewStoreError::Conflict("current_revision"))
+    ));
+    assert_eq!(
+        store
+            .reconcile_receipt(&action.preview_id, action.request_digest, &conflict(9), 22)
+            .expect("current conflict")
+            .current_revision(),
+        Some(revision(9))
+    );
+}
+
+#[test]
+fn snapshot_and_normalized_action_corruption_fail_after_reopen() {
+    let snapshot_private = PrivateStore::new();
+    let workspace = {
+        let mut store = ReviewStore::open(snapshot_private.path()).expect("open");
+        let snapshot = snapshot();
+        store.put_snapshot(&snapshot, 10).expect("snapshot");
+        snapshot.workspace().clone()
+    };
+    let connection = Connection::open(snapshot_private.path()).expect("raw open");
+    connection
+        .execute(
+            "UPDATE review_snapshots SET document_digest=zeroblob(32)",
+            [],
+        )
+        .expect("corrupt digest");
+    drop(connection);
+    let reopened = ReviewStore::open(snapshot_private.path()).expect("reopen");
+    assert!(matches!(
+        reopened.snapshot(&workspace),
+        Err(ReviewStoreError::Corrupt("snapshot_digest"))
+    ));
+
+    let action_private = PrivateStore::new();
+    let request = {
+        let mut store = ReviewStore::open(action_private.path()).expect("open");
+        let request = seed(&mut store);
+        store
+            .prepare_action(&request, ApprovalPolicy::NotRequired, 20)
+            .expect("action");
+        request
+    };
+    let connection = Connection::open(action_private.path()).expect("raw open");
+    connection
+        .execute(
+            "UPDATE review_action_previews SET action_kind='approve_review'",
+            [],
+        )
+        .expect("corrupt projection");
+    drop(connection);
+    let reopened = ReviewStore::open(action_private.path()).expect("reopen");
+    assert!(matches!(
+        reopened.receipt(
+            request.workspace(),
+            request.actor(),
+            request.idempotency_key()
+        ),
+        Err(ReviewStoreError::Corrupt("request_digest"))
+    ));
+}
+
+#[test]
+fn approval_projection_corruption_cannot_authorize_after_reopen() {
+    let private = PrivateStore::new();
+    let (request, preview_id) = {
+        let mut store = ReviewStore::open(private.path()).expect("open");
+        let request = seed(&mut store);
+        let ReviewActionAdmission::New(action) = store
+            .prepare_action(&request, ApprovalPolicy::Required, 20)
+            .expect("preview")
+        else {
+            panic!("new");
+        };
+        let approver = ReviewActorId::new("reviewer-1").expect("approver");
+        store
+            .grant_authority(
+                request.workspace(),
+                &approver,
+                ReviewAuthentication::UserSession,
+                request.authority(),
+                21,
+            )
+            .expect("grant");
+        let approval = ReviewApprovalDocument::new(
+            &action.preview_id,
+            request.workspace().clone(),
+            approver,
+            ReviewAuthentication::UserSession,
+            request.authority().clone(),
+            action.request_digest,
+            request.expected_revision(),
+            ReviewApprovalDecision::Approved,
+            100,
+        )
+        .expect("approval");
+        store.decide_action(&approval, 22).expect("decide");
+        (request, action.preview_id)
+    };
+    let connection = Connection::open(private.path()).expect("raw open");
+    connection
+        .execute(
+            "UPDATE review_action_approvals SET authority_id=?1 WHERE preview_id=?2",
+            params!["forged-authority", preview_id],
+        )
+        .expect("corrupt approval projection");
+    drop(connection);
+    let reopened = ReviewStore::open(private.path()).expect("reopen");
+    assert!(matches!(
+        reopened.receipt(
+            request.workspace(),
+            request.actor(),
+            request.idempotency_key()
+        ),
+        Err(ReviewStoreError::Corrupt("approval_projection"))
+    ));
+}
+
+#[test]
 fn concurrent_identical_key_has_one_new_admission_and_one_replay() {
     let private = PrivateStore::new();
     let request = {
@@ -383,4 +692,63 @@ fn concurrent_identical_key_has_one_new_admission_and_one_replay() {
         })
         .collect();
     assert_eq!(receipts[0], receipts[1]);
+}
+
+#[test]
+fn concurrent_same_key_with_different_body_has_one_admission_and_one_conflict() {
+    let private = PrivateStore::new();
+    let (user_request, service_request) = {
+        let mut store = ReviewStore::open(private.path()).expect("open");
+        let user_request = seed(&mut store);
+        store
+            .grant_authority(
+                user_request.workspace(),
+                user_request.actor(),
+                ReviewAuthentication::ServiceIdentity,
+                user_request.authority(),
+                12,
+            )
+            .expect("service grant");
+        let service_request = ReviewActionRequest::new(
+            user_request.workspace().clone(),
+            user_request.expected_revision(),
+            user_request.actor().clone(),
+            ReviewAuthentication::ServiceIdentity,
+            user_request.authority().clone(),
+            user_request.idempotency_key().clone(),
+            user_request.action().clone(),
+        )
+        .expect("service request");
+        (user_request, service_request)
+    };
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = [user_request, service_request]
+        .into_iter()
+        .enumerate()
+        .map(|(index, request)| {
+            let path = private.path().to_path_buf();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let mut store = ReviewStore::open(path).expect("thread open");
+                barrier.wait();
+                store.prepare_action(
+                    &request,
+                    ApprovalPolicy::NotRequired,
+                    40 + i64::try_from(index).expect("index"),
+                )
+            })
+        })
+        .collect();
+    let outcomes: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("thread"))
+        .collect();
+    assert_eq!(outcomes.iter().filter(|value| value.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|value| matches!(value, Err(ReviewStoreError::Conflict("idempotency_key"))))
+            .count(),
+        1
+    );
 }
