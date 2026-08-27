@@ -29,17 +29,23 @@ fn project(index: usize) -> WorkContextRecord {
     .unwrap()
 }
 
-fn project_with_repository(index: usize) -> WorkContextRecord {
+fn corpus_project() -> WorkContextRecord {
     WorkContextRecord::new(
-        WorkContextIdentity::Project(ProjectId::new(format!("project-{index}")).unwrap()),
+        WorkContextIdentity::Project(ProjectId::new("project-0000").unwrap()),
         Revision::FIRST,
         WorkContextLifecycle::Active,
         label("Project"),
         WorkContextAttributes::EMPTY,
-        vec![relation(
-            WorkContextRelationKind::ProjectRepository,
-            repository("repository-1", ResourceAuthority::GitHub),
-        )],
+        vec![
+            relation(
+                WorkContextRelationKind::ProjectRepository,
+                repository("\u{e000}", ResourceAuthority::GitHub),
+            ),
+            relation(
+                WorkContextRelationKind::ProjectRepository,
+                repository("😀", ResourceAuthority::GitHub),
+            ),
+        ],
     )
     .unwrap()
 }
@@ -117,6 +123,40 @@ fn version_negotiation_prefers_v2_and_downgrades_truthfully() {
         Err(WorkContextApiError::Context(
             WorkContextError::VersionOfferInvalid
         ))
+    );
+}
+
+#[test]
+fn authoritative_identity_issuance_uses_only_random_nonce_bytes() {
+    let sensitive_inputs = [
+        "/home/operator/repository",
+        "owner/repository",
+        "builder.internal.example",
+        "provider-session-token",
+        "Developer tools",
+    ];
+    let mut issued = std::collections::BTreeSet::new();
+    for (index, kind) in WorkContextKind::ALL.into_iter().enumerate() {
+        let mut nonce = [0xa5; 16];
+        nonce[0] = u8::try_from(index).unwrap();
+        let identity = issue_work_context_identity_from_random_nonce(kind, nonce);
+        assert_eq!(identity.kind(), WorkContextTargetKind::from(kind));
+        assert!(identity.id().starts_with("wc2_"));
+        assert!(
+            sensitive_inputs
+                .iter()
+                .all(|sensitive| !identity.id().contains(sensitive))
+        );
+        assert!(issued.insert(identity.id().to_owned()));
+    }
+    assert_eq!(issued.len(), WorkContextKind::ALL.len());
+
+    // Admission is intentionally not issuance: rejecting slash-shaped opaque
+    // values here would break legitimate upstream/client-selected IDs without
+    // proving that an authoritative issuer kept sensitive inputs out.
+    assert!(
+        WorkContextIdentity::parse_local(WorkContextTargetKind::Project, "owner/repository")
+            .is_ok()
     );
 }
 
@@ -285,27 +325,21 @@ fn structured_relations_admit_multiple_repositories_without_summary_identity() {
         authorized_folder.attributes().checkout_kind(),
         Some(CheckoutKind::AuthorizedFolder)
     );
-    let encoded = encode_work_context_page(
-        &WorkContextPage::new(
-            9,
-            None,
-            None,
-            false,
-            vec![
-                project,
-                host,
-                checkout,
-                local_host,
-                authorized_folder,
-                user_workspace,
-                attempt,
-                session,
-                pane,
-            ],
-        )
-        .unwrap(),
-    )
-    .unwrap();
+    let mut records = vec![
+        project,
+        host,
+        checkout,
+        local_host,
+        authorized_folder,
+        user_workspace,
+        attempt,
+        session,
+        pane,
+    ];
+    records.sort_by(|left, right| left.identity().cmp(right.identity()));
+    let encoded =
+        encode_work_context_page(&WorkContextPage::new(9, None, None, false, records).unwrap())
+            .unwrap();
     assert!(!encoded.windows(5).any(|bytes| bytes == b"/home"));
     let encoded = String::from_utf8(encoded).unwrap();
     assert!(
@@ -376,7 +410,7 @@ fn exact_query_and_page_codecs_refuse_shape_and_semantic_drift() {
         Some(WorkContextCursor::new("cursor-1").unwrap()),
         Some(WorkContextCursor::new("cursor-2").unwrap()),
         true,
-        vec![project_with_repository(1)],
+        vec![corpus_project()],
     )
     .unwrap();
     let page_bytes = encode_work_context_page(&page).unwrap();
@@ -419,6 +453,14 @@ fn exact_query_and_page_codecs_refuse_shape_and_semantic_drift() {
     assert_eq!(
         WorkContextPage::new(1, None, None, true, vec![project(2)]),
         Err(WorkContextError::PageCursorInvalid)
+    );
+    assert_eq!(
+        WorkContextPage::new(2, None, None, false, vec![project(2), project(1)]),
+        Err(WorkContextError::PageOrderInvalid)
+    );
+    assert_eq!(
+        WorkContextPage::new(2, None, None, false, vec![project(1), project(1)]),
+        Err(WorkContextError::PageOrderInvalid)
     );
 }
 
@@ -530,11 +572,6 @@ fn rust_and_typescript_exchange_the_same_valid_corpus() {
         .map(decode_hex)
         .collect();
     assert_eq!(documents.len(), 4);
-    decode_platform_version_offer(&documents[0]).unwrap();
-    decode_negotiated_platform(&documents[1]).unwrap();
-    decode_work_context_query(&documents[2]).unwrap();
-    decode_work_context_page(&documents[3]).unwrap();
-
     let offer = PlatformVersionOffer::new(vec![PlatformVersion::V1, PlatformVersion::V2]).unwrap();
     let negotiated = negotiate_platform_version(&offer, &offer).unwrap();
     let query = WorkContextQuery::new(
@@ -546,23 +583,26 @@ fn rust_and_typescript_exchange_the_same_valid_corpus() {
         128,
     )
     .unwrap();
-    let page = WorkContextPage::new(
-        128,
-        None,
-        Some(WorkContextCursor::new("next").unwrap()),
-        true,
-        vec![project(1)],
-    )
-    .unwrap();
+    let page = WorkContextPage::new(128, None, None, false, vec![corpus_project()]).unwrap();
+    let expected_documents = vec![
+        encode_platform_version_offer(&offer).unwrap(),
+        encode_negotiated_platform(&negotiated).unwrap(),
+        encode_work_context_query(&query).unwrap(),
+        encode_work_context_page(&page).unwrap(),
+    ];
+    assert_eq!(documents, expected_documents);
+    assert_eq!(decode_platform_version_offer(&documents[0]).unwrap(), offer);
+    assert_eq!(
+        decode_negotiated_platform(&documents[1]).unwrap(),
+        negotiated
+    );
+    assert_eq!(decode_work_context_query(&documents[2]).unwrap(), query);
+    assert_eq!(decode_work_context_page(&documents[3]).unwrap(), page);
+
     let decoded = Command::new("bun")
         .arg(&fixture)
         .arg("decode-corpus")
-        .arg(encode_hex(&encode_platform_version_offer(&offer).unwrap()))
-        .arg(encode_hex(
-            &encode_negotiated_platform(&negotiated).unwrap(),
-        ))
-        .arg(encode_hex(&encode_work_context_query(&query).unwrap()))
-        .arg(encode_hex(&encode_work_context_page(&page).unwrap()))
+        .args(expected_documents.iter().map(|bytes| encode_hex(bytes)))
         .current_dir(package)
         .output()
         .expect("TypeScript work-context fixture starts");
@@ -571,26 +611,64 @@ fn rust_and_typescript_exchange_the_same_valid_corpus() {
         "TypeScript corpus decode failed: {}",
         String::from_utf8_lossy(&decoded.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&decoded.stdout), "ok\n");
+    let expected_round_trip = expected_documents
+        .iter()
+        .map(|bytes| encode_hex(bytes))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert_eq!(
+        String::from_utf8_lossy(&decoded.stdout),
+        expected_round_trip
+    );
 
-    let refusals: [&[u8]; 6] = [
-        br#"{"schema":"automonique.platform/negotiation/v1","versions":[1,1]}"#,
-        br#"{"schema":"automonique.platform/v2","version":1,"work_context":"v2_structured"}"#,
-        br#"{"after":null,"kinds":["project","project"],"lifecycles":[],"limit":1,"parent":null,"project":null,"schema":"automonique.platform/v2"}"#,
-        br#"{"after":null,"has_more":true,"items":[],"next_cursor":null,"requested_limit":1,"schema":"automonique.platform/v2"}"#,
-        br#"{"after":null,"kinds":["project"],"lifecycles":[],"limit":129,"parent":null,"project":null,"schema":"automonique.platform/v2"}"#,
-        br#"{"after":null,"has_more":false,"items":[{"attributes":{"checkout":null,"host_setup":null},"identity":{"id":"project-1","kind":"project"},"label":"Project","lifecycle":"active","relations":[{"kind":"project_repository","target":{"kind":"repository","resource":{"authority":"github","id":"repo-a","kind":"session"}}}],"revision":1}],"next_cursor":null,"requested_limit":1,"schema":"automonique.platform/v2"}"#,
+    let mut refusals = vec![
+        br#"{"schema":"automonique.platform/negotiation/v1","versions":[1,1]}"#.to_vec(),
+        br#"{"schema":"automonique.platform/v2","version":1,"work_context":"v2_structured"}"#.to_vec(),
+        br#"{"after":null,"kinds":["project","project"],"lifecycles":[],"limit":1,"parent":null,"project":null,"schema":"automonique.platform/v2"}"#.to_vec(),
+        br#"{"after":null,"has_more":true,"items":[],"next_cursor":null,"requested_limit":1,"schema":"automonique.platform/v2"}"#.to_vec(),
+        br#"{"after":null,"kinds":["project"],"lifecycles":[],"limit":129,"parent":null,"project":null,"schema":"automonique.platform/v2"}"#.to_vec(),
+        br#"{"after":null,"has_more":false,"items":[{"attributes":{"checkout":null,"host_setup":null},"identity":{"id":"project-1","kind":"project"},"label":"Project","lifecycle":"active","relations":[{"kind":"project_repository","target":{"kind":"repository","resource":{"authority":"github","id":"repo-a","kind":"session"}}}],"revision":1}],"next_cursor":null,"requested_limit":1,"schema":"automonique.platform/v2"}"#.to_vec(),
     ];
-    assert!(decode_platform_version_offer(refusals[0]).is_err());
-    assert!(decode_negotiated_platform(refusals[1]).is_err());
-    assert!(decode_work_context_query(refusals[2]).is_err());
-    assert!(decode_work_context_page(refusals[3]).is_err());
-    assert!(decode_work_context_query(refusals[4]).is_err());
-    assert!(decode_work_context_page(refusals[5]).is_err());
+    let valid_page = String::from_utf8(encode_work_context_page(&page).unwrap()).unwrap();
+    let items_start = valid_page.find("\"items\":[").unwrap() + "\"items\":[".len();
+    let items_end = valid_page.find("],\"next_cursor\"").unwrap();
+    let item = &valid_page[items_start..items_end];
+    refusals.push(
+        format!(
+            "{}{item},{item}{}",
+            &valid_page[..items_start],
+            &valid_page[items_end..]
+        )
+        .into_bytes(),
+    );
+    let categories = [
+        decode_platform_version_offer(&refusals[0])
+            .unwrap_err()
+            .category(),
+        decode_negotiated_platform(&refusals[1])
+            .unwrap_err()
+            .category(),
+        decode_work_context_query(&refusals[2])
+            .unwrap_err()
+            .category(),
+        decode_work_context_page(&refusals[3])
+            .unwrap_err()
+            .category(),
+        decode_work_context_query(&refusals[4])
+            .unwrap_err()
+            .category(),
+        decode_work_context_page(&refusals[5])
+            .unwrap_err()
+            .category(),
+        decode_work_context_page(&refusals[6])
+            .unwrap_err()
+            .category(),
+    ];
     let refused = Command::new("bun")
         .arg(&fixture)
         .arg("decode-refusal-corpus")
-        .args(refusals.map(encode_hex))
+        .args(refusals.iter().map(|bytes| encode_hex(bytes)))
         .current_dir(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../../sdk/typescript/packages/protocol"),
@@ -602,7 +680,10 @@ fn rust_and_typescript_exchange_the_same_valid_corpus() {
         "TypeScript refusal corpus failed: {}",
         String::from_utf8_lossy(&refused.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&refused.stdout), "refused:6\n");
+    assert_eq!(
+        String::from_utf8_lossy(&refused.stdout),
+        categories.join(",") + "\n"
+    );
 }
 
 fn encode_hex(bytes: &[u8]) -> String {

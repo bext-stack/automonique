@@ -74,7 +74,7 @@ mod work_context_surface {
         );
         assert_eq!(
             String::from_utf8_lossy(&output.stdout),
-            "{\"identities\":9,\"items\":640,\"page_limit\":128,\"schema\":\"automonique.platform/v2\",\"refusals\":6,\"version\":2}\n"
+            "{\"identities\":9,\"items\":640,\"page_limit\":128,\"schema\":\"automonique.platform/v2\",\"refusals\":9,\"version\":2}\n"
         );
     }
 }

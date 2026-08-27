@@ -10,7 +10,7 @@
 // ergonomics; it may not redefine anything in this file.
 
 import {PLATFORM_SCHEMA_V1, ResourceId, decodeResourceAuthority, decodeResourceKind, type ResourceCoordinate} from "./platform.js";
-import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyString, bodyStringOrNull, bodyValue, bodyValueOrNull, byteLength, exactFields, exactInputFields, isWellFormedUnicode, parseCanonical, toCanonicalBytes, type JsonValue} from "./runtime.js";
+import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyString, bodyStringOrNull, bodyValue, bodyValueOrNull, byteLength, exactFields, exactInputFields, isWellFormedUnicode, parseCanonical, refuse, toCanonicalBytes, type JsonValue} from "./runtime.js";
 
 /** Maximum canonical version-negotiation document bytes. */
 export const MAX_PLATFORM_NEGOTIATION_CANONICAL_BYTES = 4096;
@@ -431,8 +431,23 @@ function orderIndex(order: readonly string[], value: string): number {
   return index;
 }
 
+// Rust String::cmp compares UTF-8 bytes. JavaScript's relational operators
+// compare UTF-16 code units, which disagrees for some BMP/non-BMP pairs.
+const WORK_CONTEXT_UTF8_ENCODER = new TextEncoder();
+
+function compareUtf8(left: string, right: string): number {
+  const leftBytes = WORK_CONTEXT_UTF8_ENCODER.encode(left);
+  const rightBytes = WORK_CONTEXT_UTF8_ENCODER.encode(right);
+  const shared = Math.min(leftBytes.length, rightBytes.length);
+  for (let index = 0; index < shared; index += 1) {
+    const difference = leftBytes[index]! - rightBytes[index]!;
+    if (difference !== 0) return difference;
+  }
+  return leftBytes.length - rightBytes.length;
+}
+
 function strictlyOrdered<T>(values: readonly T[], key: (value: T) => string): boolean {
-  return values.every((value, index) => index === 0 || key(values[index - 1]!) < key(value));
+  return values.every((value, index) => index === 0 || compareUtf8(key(values[index - 1]!), key(value)) < 0);
 }
 
 function validateV1Coordinate(value: ResourceCoordinate, expected: "repository" | "session"): ResourceCoordinate {
@@ -713,13 +728,15 @@ export function encodePlatformVersionOffer(value: PlatformVersionOffer): Uint8Ar
 }
 
 export function decodePlatformVersionOffer(payload: Uint8Array): PlatformVersionOffer {
-  const fields = exactFields(parseDocument(payload, MAX_PLATFORM_NEGOTIATION_CANONICAL_BYTES), PlatformVersionOffer_FIELDS, WORK_CONTEXT_INVALID_BODY);
-  const schema = bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY);
-  const versions = bodyArray(fields, "versions", WORK_CONTEXT_INVALID_BODY, MAX_PLATFORM_VERSION_OFFERS, WORK_CONTEXT_VALUE_INVALID).map((value) => {
-    if (value.kind !== "integer") throw new RefusalError(WORK_CONTEXT_INVALID_BODY, "version is not an integer");
-    return PlatformVersionNumber(value.value);
+  return refuse(WORK_CONTEXT_VALUE_INVALID, () => {
+    const fields = exactFields(parseDocument(payload, MAX_PLATFORM_NEGOTIATION_CANONICAL_BYTES), PlatformVersionOffer_FIELDS, WORK_CONTEXT_INVALID_BODY);
+    const schema = bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY);
+    const versions = bodyArray(fields, "versions", WORK_CONTEXT_INVALID_BODY, MAX_PLATFORM_VERSION_OFFERS, WORK_CONTEXT_VALUE_INVALID).map((value) => {
+      if (value.kind !== "integer") throw new RefusalError(WORK_CONTEXT_INVALID_BODY, "version is not an integer");
+      return PlatformVersionNumber(value.value);
+    });
+    return validatePlatformVersionOffer({schema: schema as typeof PLATFORM_NEGOTIATION_SCHEMA_V1, versions});
   });
-  return validatePlatformVersionOffer({schema: schema as typeof PLATFORM_NEGOTIATION_SCHEMA_V1, versions});
 }
 
 export function validateNegotiatedPlatform(value: NegotiatedPlatform): NegotiatedPlatform {
@@ -744,12 +761,37 @@ export function encodeNegotiatedPlatform(value: NegotiatedPlatform): Uint8Array 
 }
 
 export function decodeNegotiatedPlatform(payload: Uint8Array): NegotiatedPlatform {
-  const fields = exactFields(parseDocument(payload, MAX_PLATFORM_NEGOTIATION_CANONICAL_BYTES), NegotiatedPlatform_FIELDS, WORK_CONTEXT_INVALID_BODY);
-  return validateNegotiatedPlatform({
-    schema: bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY) as NegotiatedPlatform["schema"],
-    version: PlatformVersionNumber(bodyInteger(fields, "version", WORK_CONTEXT_INVALID_BODY)),
-    work_context: decodeWorkContextAvailability(bodyString(fields, "work_context", WORK_CONTEXT_INVALID_BODY)),
+  return refuse(WORK_CONTEXT_VALUE_INVALID, () => {
+    const fields = exactFields(parseDocument(payload, MAX_PLATFORM_NEGOTIATION_CANONICAL_BYTES), NegotiatedPlatform_FIELDS, WORK_CONTEXT_INVALID_BODY);
+    return validateNegotiatedPlatform({
+      schema: bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY) as NegotiatedPlatform["schema"],
+      version: PlatformVersionNumber(bodyInteger(fields, "version", WORK_CONTEXT_INVALID_BODY)),
+      work_context: decodeWorkContextAvailability(bodyString(fields, "work_context", WORK_CONTEXT_INVALID_BODY)),
+    });
   });
+}
+
+export function negotiatePlatformVersion(clientValue: PlatformVersionOffer, serverValue: PlatformVersionOffer): NegotiatedPlatform {
+  const client = validatePlatformVersionOffer(clientValue);
+  const server = validatePlatformVersionOffer(serverValue);
+  const version = [...client.versions].reverse().find((candidate) => server.versions.includes(candidate));
+  if (version === undefined) workContextRefusal("platform versions do not overlap");
+  return version === 2n
+    ? {schema: PLATFORM_SCHEMA_V2, version, work_context: "v2_structured"}
+    : {schema: PLATFORM_SCHEMA_V1, version, work_context: "v1_existing_resources_only"};
+}
+
+export function verifyPlatformNegotiationTranscript(
+  client: PlatformVersionOffer,
+  server: PlatformVersionOffer,
+  resultValue: NegotiatedPlatform,
+): NegotiatedPlatform {
+  const expected = negotiatePlatformVersion(client, server);
+  const result = validateNegotiatedPlatform(resultValue);
+  if (result.version !== expected.version || result.schema !== expected.schema || result.work_context !== expected.work_context) {
+    workContextRefusal("negotiation result is not the highest common platform version");
+  }
+  return result;
 }
 
 export function validateWorkContextQuery(value: WorkContextQuery): WorkContextQuery {
@@ -788,23 +830,25 @@ export function encodeWorkContextQuery(value: WorkContextQuery): Uint8Array {
 }
 
 export function decodeWorkContextQuery(payload: Uint8Array): WorkContextQuery {
-  const fields = exactFields(parseDocument(payload, MAX_WORK_CONTEXT_QUERY_CANONICAL_BYTES), WorkContextQuery_FIELDS, WORK_CONTEXT_INVALID_BODY);
-  const after = bodyStringOrNull(fields, "after", WORK_CONTEXT_INVALID_BODY);
-  const project = bodyStringOrNull(fields, "project", WORK_CONTEXT_INVALID_BODY);
-  return validateWorkContextQuery({
-    after: after === null ? null : WorkContextCursor(after),
-    kinds: bodyArray(fields, "kinds", WORK_CONTEXT_INVALID_BODY, WORK_CONTEXT_KIND_WIRE_ORDER.length, WORK_CONTEXT_VALUE_INVALID).map((value) => {
-      if (value.kind !== "string") throw new RefusalError(WORK_CONTEXT_INVALID_BODY, "kind filter is not a string");
-      return decodeWorkContextKind(value.value);
-    }),
-    lifecycles: bodyArray(fields, "lifecycles", WORK_CONTEXT_INVALID_BODY, WORK_CONTEXT_LIFECYCLE_WIRE_ORDER.length, WORK_CONTEXT_VALUE_INVALID).map((value) => {
-      if (value.kind !== "string") throw new RefusalError(WORK_CONTEXT_INVALID_BODY, "lifecycle filter is not a string");
-      return decodeWorkContextLifecycle(value.value);
-    }),
-    limit: WorkContextPageLimit(bodyInteger(fields, "limit", WORK_CONTEXT_INVALID_BODY)),
-    parent: bodyValueOrNull(fields, "parent", WORK_CONTEXT_INVALID_BODY) === null ? null : decodeWorkContextIdentityValue(bodyValue(fields, "parent", WORK_CONTEXT_INVALID_BODY)),
-    project: project === null ? null : ProjectId(project),
-    schema: bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY) as typeof PLATFORM_SCHEMA_V2,
+  return refuse(WORK_CONTEXT_VALUE_INVALID, () => {
+    const fields = exactFields(parseDocument(payload, MAX_WORK_CONTEXT_QUERY_CANONICAL_BYTES), WorkContextQuery_FIELDS, WORK_CONTEXT_INVALID_BODY);
+    const after = bodyStringOrNull(fields, "after", WORK_CONTEXT_INVALID_BODY);
+    const project = bodyStringOrNull(fields, "project", WORK_CONTEXT_INVALID_BODY);
+    return validateWorkContextQuery({
+      after: after === null ? null : WorkContextCursor(after),
+      kinds: bodyArray(fields, "kinds", WORK_CONTEXT_INVALID_BODY, WORK_CONTEXT_KIND_WIRE_ORDER.length, WORK_CONTEXT_VALUE_INVALID).map((value) => {
+        if (value.kind !== "string") throw new RefusalError(WORK_CONTEXT_INVALID_BODY, "kind filter is not a string");
+        return decodeWorkContextKind(value.value);
+      }),
+      lifecycles: bodyArray(fields, "lifecycles", WORK_CONTEXT_INVALID_BODY, WORK_CONTEXT_LIFECYCLE_WIRE_ORDER.length, WORK_CONTEXT_VALUE_INVALID).map((value) => {
+        if (value.kind !== "string") throw new RefusalError(WORK_CONTEXT_INVALID_BODY, "lifecycle filter is not a string");
+        return decodeWorkContextLifecycle(value.value);
+      }),
+      limit: WorkContextPageLimit(bodyInteger(fields, "limit", WORK_CONTEXT_INVALID_BODY)),
+      parent: bodyValueOrNull(fields, "parent", WORK_CONTEXT_INVALID_BODY) === null ? null : decodeWorkContextIdentityValue(bodyValue(fields, "parent", WORK_CONTEXT_INVALID_BODY)),
+      project: project === null ? null : ProjectId(project),
+      schema: bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY) as typeof PLATFORM_SCHEMA_V2,
+    });
   });
 }
 
@@ -814,6 +858,7 @@ export function validateWorkContextPage(value: WorkContextPage): WorkContextPage
   const requested_limit = WorkContextPageLimit(value.requested_limit);
   if (!Array.isArray(value.items) || BigInt(value.items.length) > requested_limit) workContextRefusal("work-context page exceeds its requested limit");
   const items = value.items.map(validateWorkContextRecord);
+  if (!strictlyOrdered(items, (record) => identityOrderKey(record.identity))) workContextRefusal("work-context page identities are repeated or unordered");
   const after = value.after === null ? null : WorkContextCursor(value.after);
   const next_cursor = value.next_cursor === null ? null : WorkContextCursor(value.next_cursor);
   if (typeof value.has_more !== "boolean") workContextRefusal("has_more is not boolean");
@@ -840,16 +885,18 @@ export function encodeWorkContextPage(value: WorkContextPage): Uint8Array {
 }
 
 export function decodeWorkContextPage(payload: Uint8Array): WorkContextPage {
-  const fields = exactFields(parseDocument(payload, MAX_WORK_CONTEXT_PAGE_CANONICAL_BYTES), WorkContextPage_FIELDS, WORK_CONTEXT_INVALID_BODY);
-  const after = bodyStringOrNull(fields, "after", WORK_CONTEXT_INVALID_BODY);
-  const next = bodyStringOrNull(fields, "next_cursor", WORK_CONTEXT_INVALID_BODY);
-  return validateWorkContextPage({
-    after: after === null ? null : WorkContextCursor(after),
-    has_more: bodyBool(fields, "has_more", WORK_CONTEXT_INVALID_BODY),
-    items: bodyArray(fields, "items", WORK_CONTEXT_INVALID_BODY, MAX_WORK_CONTEXT_PAGE_ITEMS, WORK_CONTEXT_VALUE_INVALID).map(decodeWorkContextRecordValue),
-    next_cursor: next === null ? null : WorkContextCursor(next),
-    requested_limit: WorkContextPageLimit(bodyInteger(fields, "requested_limit", WORK_CONTEXT_INVALID_BODY)),
-    schema: bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY) as typeof PLATFORM_SCHEMA_V2,
+  return refuse(WORK_CONTEXT_VALUE_INVALID, () => {
+    const fields = exactFields(parseDocument(payload, MAX_WORK_CONTEXT_PAGE_CANONICAL_BYTES), WorkContextPage_FIELDS, WORK_CONTEXT_INVALID_BODY);
+    const after = bodyStringOrNull(fields, "after", WORK_CONTEXT_INVALID_BODY);
+    const next = bodyStringOrNull(fields, "next_cursor", WORK_CONTEXT_INVALID_BODY);
+    return validateWorkContextPage({
+      after: after === null ? null : WorkContextCursor(after),
+      has_more: bodyBool(fields, "has_more", WORK_CONTEXT_INVALID_BODY),
+      items: bodyArray(fields, "items", WORK_CONTEXT_INVALID_BODY, MAX_WORK_CONTEXT_PAGE_ITEMS, WORK_CONTEXT_VALUE_INVALID).map(decodeWorkContextRecordValue),
+      next_cursor: next === null ? null : WorkContextCursor(next),
+      requested_limit: WorkContextPageLimit(bodyInteger(fields, "requested_limit", WORK_CONTEXT_INVALID_BODY)),
+      schema: bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY) as typeof PLATFORM_SCHEMA_V2,
+    });
   });
 }
 
@@ -869,10 +916,12 @@ export function encodeWorkContextResync(value: WorkContextResync): Uint8Array {
 }
 
 export function decodeWorkContextResync(payload: Uint8Array): WorkContextResync {
-  const fields = exactFields(parseDocument(payload, MAX_WORK_CONTEXT_QUERY_CANONICAL_BYTES), WorkContextResync_FIELDS, WORK_CONTEXT_INVALID_BODY);
-  return validateWorkContextResync({
-    expired_after: WorkContextCursor(bodyString(fields, "expired_after", WORK_CONTEXT_INVALID_BODY)),
-    outcome: bodyString(fields, "outcome", WORK_CONTEXT_INVALID_BODY) as "resync_required",
-    schema: bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY) as typeof PLATFORM_SCHEMA_V2,
+  return refuse(WORK_CONTEXT_VALUE_INVALID, () => {
+    const fields = exactFields(parseDocument(payload, MAX_WORK_CONTEXT_QUERY_CANONICAL_BYTES), WorkContextResync_FIELDS, WORK_CONTEXT_INVALID_BODY);
+    return validateWorkContextResync({
+      expired_after: WorkContextCursor(bodyString(fields, "expired_after", WORK_CONTEXT_INVALID_BODY)),
+      outcome: bodyString(fields, "outcome", WORK_CONTEXT_INVALID_BODY) as "resync_required",
+      schema: bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY) as typeof PLATFORM_SCHEMA_V2,
+    });
   });
 }

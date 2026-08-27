@@ -9,8 +9,11 @@ the rules later mutation/storage slices must preserve. Platform v1 remains an
 installed exact contract: its schema identifier, resource vocabulary, record
 shapes, request kinds, response kinds, and 512-resource ceilings are unchanged.
 
-A connection advertises a bounded set of supported major versions. Peers select
-the highest shared version. A v2 implementation that meets a v1-only client
+A connection advertises a bounded, strictly ordered set of supported major
+versions. Peers select the highest shared version. Generated TypeScript exposes
+the same negotiation function and a transcript verifier; a coherent v1 result
+is still refused as a suboptimal downgrade when both offers include v2. A v2
+implementation that meets a v1-only client
 continues to serve the existing v1 resources, session discovery, attachment,
 history, commands, and receipts. It does not encode a project or workspace ID
 inside `ResourceRecord.summary`, invent a new v1 `ResourceKind`, or imply that a
@@ -27,6 +30,18 @@ its complete `ResourceCoordinate` (`authority`, expected v1 `kind`, and opaque
 `id`); a bare ID would lose authority and is refused. Every record carries a
 non-zero monotonic revision; mutations must target the exact identity and
 expected revision. Observing a related record never grants authority over it.
+
+Wire decoding intentionally applies only the shared opaque-ID grammar. It
+cannot safely reject a string merely because it resembles a legitimate path,
+slug, host, or provider spelling: opaque upstream identifiers may contain the
+same Unicode. New authoritative work-context identities therefore have a
+separate issuance invariant. The authority must call
+`issue_work_context_identity_from_random_nonce` with 128 bits obtained directly
+from a cryptographically secure random generator; it must not accept a
+client-chosen ID or derive the nonce from filesystem, repository, host,
+provider/session, credential, or display data. Clients only receive and echo
+these identities. Existing Platform v1 coordinates are references and remain
+under their original issuer's policy.
 
 | Node | Identity and ownership | Lifecycle | Retention |
 | --- | --- | --- | --- |
@@ -100,7 +115,10 @@ contains:
 - a requested limit in `1..=128`.
 
 Each response carries at most the requested limit, the cursor it continued
-after, and a `next_cursor` exactly when `has_more` is true. The server applies
+after, and a `next_cursor` exactly when `has_more` is true. Record identities
+inside a page are unique and strictly increasing by their Rust canonical order;
+generated TypeScript compares UTF-8 bytes explicitly rather than JavaScript
+UTF-16 code units, including for BMP/non-BMP IDs. The server applies
 authorization before counting or paging and uses a deterministic stable order.
 The protocol helper accepts records that the caller has already authorized,
 uses stable identity ordering, and binds each cursor to both the complete

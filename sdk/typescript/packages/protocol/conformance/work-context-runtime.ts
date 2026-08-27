@@ -28,10 +28,12 @@ import {
   encodePlatformVersionOffer,
   encodeWorkContextPage,
   encodeWorkContextQuery,
+  negotiatePlatformVersion,
   validateWorkContextIdentity,
   validateWorkContextPage,
   validateWorkContextQuery,
   validateWorkContextRecord,
+  verifyPlatformNegotiationTranscript,
   type WorkContextPage,
   type WorkContextQuery,
   type WorkContextRecord,
@@ -40,16 +42,18 @@ import {ResourceId} from "../generated/platform.ts";
 
 const record = (index: number): WorkContextRecord => ({
   attributes: {checkout: null, host_setup: null},
-  identity: {id: ProjectId(`project-${index}`), kind: "project"},
+  identity: {id: ProjectId(`project-${index.toString().padStart(4, "0")}`), kind: "project"},
   label: WorkContextLabel("Project"),
   lifecycle: "active",
-  relations: index === 0 ? [{
-    kind: "project_repository",
+  // U+E000 sorts before U+1F600 by UTF-8 bytes (Rust String::cmp), while
+  // JavaScript's native UTF-16 comparison gives the opposite answer.
+  relations: index === 0 ? ["\u{e000}", "😀"].map((id) => ({
+    kind: "project_repository" as const,
     target: {
-      kind: "repository",
-      resource: {authority: "github", id: ResourceId("repository-1"), kind: "repository"},
+      kind: "repository" as const,
+      resource: {authority: "github" as const, id: ResourceId(id), kind: "repository" as const},
     },
-  }] : [],
+  })) : [],
   revision: WorkContextRevision(1n),
 });
 
@@ -100,9 +104,33 @@ const negotiated = {
   version: PlatformVersionNumber(2n),
   work_context: "v2_structured",
 } as const;
+const v1Offer = {
+  schema: PLATFORM_NEGOTIATION_SCHEMA_V1,
+  versions: [PlatformVersionNumber(1n)],
+} as const;
+const v2Offer = {
+  schema: PLATFORM_NEGOTIATION_SCHEMA_V1,
+  versions: [PlatformVersionNumber(2n)],
+} as const;
+const v1Negotiated = {
+  schema: "automonique.platform/v1",
+  version: PlatformVersionNumber(1n),
+  work_context: "v1_existing_resources_only",
+} as const;
+if (negotiatePlatformVersion(offer, offer).version !== 2n) throw new Error("v2 was not preferred");
+if (negotiatePlatformVersion(offer, v1Offer).version !== 1n) throw new Error("v1-only peer did not downgrade truthfully");
+verifyPlatformNegotiationTranscript(offer, offer, negotiated);
 decodePlatformVersionOffer(encodePlatformVersionOffer(offer));
 decodeNegotiatedPlatform(encodeNegotiatedPlatform(negotiated));
 const decodedPages = pages.map((page) => decodeWorkContextPage(encodeWorkContextPage(validateWorkContextPage(page))));
+const corpusPage: WorkContextPage = {
+  after: null,
+  has_more: false,
+  items: [record(0)],
+  next_cursor: null,
+  requested_limit: WorkContextPageLimit(128n),
+  schema: "automonique.platform/v2",
+};
 
 const hex = (bytes: Uint8Array): string => Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 const unhex = (value: string): Uint8Array => {
@@ -115,16 +143,29 @@ if (bunArgs[2] === "encode-corpus") {
     hex(encodePlatformVersionOffer(offer)),
     hex(encodeNegotiatedPlatform(negotiated)),
     hex(encodeWorkContextQuery(query)),
-    hex(encodeWorkContextPage(pages[0]!)),
+    hex(encodeWorkContextPage(corpusPage)),
   ].join("\n"));
   (globalThis as typeof globalThis & {process?: {exit(code: number): never}}).process?.exit(0);
 }
 if (bunArgs[2] === "decode-corpus") {
-  decodePlatformVersionOffer(unhex(bunArgs[3] ?? ""));
-  decodeNegotiatedPlatform(unhex(bunArgs[4] ?? ""));
-  decodeWorkContextQuery(unhex(bunArgs[5] ?? ""));
-  decodeWorkContextPage(unhex(bunArgs[6] ?? ""));
-  console.log("ok");
+  const documents = bunArgs.slice(3, 7).map(unhex);
+  const decodedOffer = decodePlatformVersionOffer(documents[0]!);
+  const decodedNegotiated = decodeNegotiatedPlatform(documents[1]!);
+  const decodedQuery = decodeWorkContextQuery(documents[2]!);
+  const decodedPage = decodeWorkContextPage(documents[3]!);
+  const decodedRelations = decodedPage.items[0]?.relations ?? [];
+  if (decodedOffer.versions.length !== 2 || decodedOffer.versions[0] !== 1n || decodedOffer.versions[1] !== 2n) throw new Error("offer value drifted");
+  if (decodedNegotiated.version !== 2n || decodedNegotiated.work_context !== "v2_structured") throw new Error("negotiated value drifted");
+  if (decodedQuery.kinds[0] !== "project" || decodedQuery.lifecycles[0] !== "active" || decodedQuery.limit !== 128n) throw new Error("query value drifted");
+  if (decodedPage.items.length !== 1 || decodedPage.items[0]?.identity.kind !== "project" || decodedRelations.length !== 2) throw new Error("page value drifted");
+  if (decodedRelations[0]?.target.kind !== "repository" || decodedRelations[0].target.resource.id !== "\u{e000}") throw new Error("BMP relation value drifted");
+  if (decodedRelations[1]?.target.kind !== "repository" || decodedRelations[1].target.resource.id !== "😀") throw new Error("non-BMP relation value drifted");
+  console.log([
+    hex(encodePlatformVersionOffer(decodedOffer)),
+    hex(encodeNegotiatedPlatform(decodedNegotiated)),
+    hex(encodeWorkContextQuery(decodedQuery)),
+    hex(encodeWorkContextPage(decodedPage)),
+  ].join("\n"));
   (globalThis as typeof globalThis & {process?: {exit(code: number): never}}).process?.exit(0);
 }
 if (bunArgs[2] === "decode-refusal-corpus") {
@@ -135,17 +176,20 @@ if (bunArgs[2] === "decode-refusal-corpus") {
     decodeWorkContextPage,
     decodeWorkContextQuery,
     decodeWorkContextPage,
+    decodeWorkContextPage,
   ] as const;
-  let refused = 0;
+  const categories: string[] = [];
   for (const [index, decode] of decoders.entries()) {
     try {
       (decode as (payload: Uint8Array) => unknown)(unhex(bunArgs[index + 3] ?? ""));
-    } catch {
-      refused += 1;
+    } catch (error) {
+      const category = (error as {category?: unknown}).category;
+      if (typeof category !== "string") throw error;
+      categories.push(category);
     }
   }
-  if (refused !== decoders.length) throw new Error("TypeScript admitted the Rust refusal corpus");
-  console.log(`refused:${refused}`);
+  if (categories.length !== decoders.length) throw new Error("TypeScript admitted the Rust refusal corpus");
+  console.log(categories.join(","));
   (globalThis as typeof globalThis & {process?: {exit(code: number): never}}).process?.exit(0);
 }
 
@@ -169,6 +213,9 @@ for (const refuse of [
       },
     }],
   }),
+  () => validateWorkContextPage({...corpusPage, items: [record(0), record(0)]}),
+  () => negotiatePlatformVersion(v1Offer, v2Offer),
+  () => verifyPlatformNegotiationTranscript(offer, offer, v1Negotiated),
 ]) {
   try {
     refuse();

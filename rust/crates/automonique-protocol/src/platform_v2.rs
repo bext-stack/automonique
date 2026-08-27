@@ -410,6 +410,34 @@ impl WorkContextIdentity {
     }
 }
 
+/// Issue one authority-owned work-context identity from an independently
+/// generated 128-bit nonce.
+///
+/// The authoritative issuer must obtain `random_nonce` directly from a
+/// cryptographically secure random generator. It must never derive these
+/// bytes from a path, repository slug, host address, provider/session token,
+/// display label, or other sensitive input. This narrow issuance signature is
+/// separate from wire decoding: [`OpaqueId`] deliberately accepts legitimate
+/// opaque Unicode spellings and cannot determine what semantic source an
+/// already-issued identifier came from.
+#[must_use]
+pub fn issue_work_context_identity_from_random_nonce(
+    kind: WorkContextKind,
+    random_nonce: [u8; 16],
+) -> WorkContextIdentity {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(4 + kind.as_str().len() + random_nonce.len() * 2);
+    value.push_str("wc2_");
+    value.push_str(kind.as_str());
+    value.push('_');
+    for byte in random_nonce {
+        value.push(char::from(HEX[usize::from(byte >> 4)]));
+        value.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    WorkContextIdentity::parse_local(kind.into(), &value)
+        .expect("fixed issuer rendering satisfies the opaque identifier bound")
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum WorkContextLifecycle {
     Active,
@@ -960,6 +988,12 @@ impl WorkContextPage {
         if after.is_some() && after == next_cursor {
             return Err(WorkContextError::PageCursorInvalid);
         }
+        if !items
+            .windows(2)
+            .all(|pair| pair[0].identity() < pair[1].identity())
+        {
+            return Err(WorkContextError::PageOrderInvalid);
+        }
         Ok(Self {
             requested_limit,
             after,
@@ -1283,6 +1317,7 @@ pub enum WorkContextError {
     QueryOrderInvalid,
     PageLimitInvalid,
     PageCursorInvalid,
+    PageOrderInvalid,
     InventoryInvalid,
 }
 
@@ -1319,6 +1354,7 @@ impl fmt::Display for WorkContextError {
             Self::QueryOrderInvalid => "work-context query filters are repeated or unordered",
             Self::PageLimitInvalid => "work-context page limit is invalid",
             Self::PageCursorInvalid => "work-context page cursor is incoherent",
+            Self::PageOrderInvalid => "work-context page identities are repeated or unordered",
             Self::InventoryInvalid => "authorized work-context inventory is invalid",
         })
     }
