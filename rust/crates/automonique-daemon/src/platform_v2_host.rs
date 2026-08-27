@@ -114,8 +114,25 @@ pub trait PlatformV2LifecycleEffectAdapter: Send {
         Ok(())
     }
 
+    fn preflight_submission(
+        &self,
+        intent: &WorkContextMutationIntent,
+        _resulting_identity: &WorkContextIdentity,
+    ) -> Result<(), &'static str> {
+        self.preflight(intent)
+    }
+
     fn workspace_intents_supported(&self) -> bool {
         false
+    }
+
+    fn preflight_workspace_intent(
+        &self,
+        _intent: &WorkspaceIntent,
+        _project: &ProjectId,
+        _workspace: &UserWorkspaceId,
+    ) -> Result<(), &'static str> {
+        Err("platform_v2_workspace_executor_unavailable")
     }
 
     fn execute_workspace_intent(
@@ -166,7 +183,13 @@ impl PlatformV2LifecycleEffectAdapter for UnavailableLifecycleEffectAdapter {
     }
 
     fn preflight(&self, _intent: &WorkContextMutationIntent) -> Result<(), &'static str> {
-        Err("platform_v2_selector_registry_unavailable")
+        match _intent {
+            WorkContextMutationIntent::CreateHostSetup(_)
+            | WorkContextMutationIntent::CreateCheckout(_) => {
+                Err("platform_v2_selector_registry_unavailable")
+            }
+            _ => Ok(()),
+        }
     }
 
     fn execute(
@@ -708,8 +731,10 @@ impl PlatformV2Runtime {
                         .map_err(|_| "platform_v2_submission_refused")?;
                 self.validate_intent_scope(&principal, candidate.proposal().intent())?;
                 if lifecycle_effect_kind(candidate.proposal().intent()).is_some() {
-                    self.lifecycle_effects
-                        .preflight(candidate.proposal().intent())?;
+                    self.lifecycle_effects.preflight_submission(
+                        candidate.proposal().intent(),
+                        candidate.resulting().identity(),
+                    )?;
                 }
                 let policy = principal.mutation_policy(
                     Some(project),
@@ -899,6 +924,11 @@ impl PlatformV2Runtime {
                         WorkspaceIntent::Cancel(_) => unreachable!("handled above"),
                     });
                 }
+                self.lifecycle_effects.preflight_workspace_intent(
+                    value.intent(),
+                    value.project(),
+                    &workspace,
+                )?;
                 self.lineage
                     .record_intent(
                         principal.actor.tenant(),
@@ -921,6 +951,7 @@ impl PlatformV2Runtime {
                 {
                     return Ok(PlatformV2Response::WorkspaceIntentResult(stored.outcome));
                 }
+                self.policy_fence.verify()?;
                 let outcome = match self.lifecycle_effects.execute_workspace_intent(
                     value.intent(),
                     value.project(),
@@ -957,7 +988,8 @@ impl PlatformV2Runtime {
                     return Err("platform_v2_scope_denied");
                 }
                 let allowed = user_workspaces_for_project(&principal, value.project());
-                self.lineage
+                let stored = self
+                    .lineage
                     .intent_authorized_in_workspaces(
                         &negotiated_v2()?,
                         principal.actor.tenant(),
@@ -965,8 +997,64 @@ impl PlatformV2Runtime {
                         &allowed,
                     )
                     .map_err(|_| "platform_v2_store_refused")?
-                    .map(|stored| PlatformV2Response::WorkspaceIntentResult(stored.outcome))
-                    .ok_or("platform_v2_not_found")
+                    .ok_or("platform_v2_not_found")?;
+                if stored.outcome.reconciliation()
+                    != automonique_protocol::platform_v2_lineage::WorkspaceIntentReconciliation::Final
+                    && self.lifecycle_effects.workspace_intents_supported()
+                {
+                    let workspace = match &stored.intent {
+                        WorkspaceIntent::Create(intent) => self
+                            .lineage
+                            .task_workspace_authorized(
+                                principal.actor.tenant(),
+                                intent.task(),
+                                &allowed,
+                            )
+                            .map_err(|_| "platform_v2_intent_refused")?
+                            .ok_or("platform_v2_intent_refused")?,
+                        WorkspaceIntent::Resume(intent) => intent.workspace().clone(),
+                        WorkspaceIntent::Cancel(_) => {
+                            return Ok(PlatformV2Response::WorkspaceIntentResult(stored.outcome));
+                        }
+                    };
+                    if self
+                        .lifecycle_effects
+                        .preflight_workspace_intent(&stored.intent, value.project(), &workspace)
+                        .is_ok()
+                    {
+                        self.policy_fence.verify()?;
+                        if let Ok(outcome) = self.lifecycle_effects.execute_workspace_intent(
+                            &stored.intent,
+                            value.project(),
+                            &workspace,
+                        )
+                        {
+                            self.policy_fence.verify()?;
+                            self.lineage
+                                .reconcile_intent(
+                                    principal.actor.tenant(),
+                                    &WorkspaceIntentExecutionReceipt {
+                                        intent_id: stored.intent.intent_id().clone(),
+                                        request_digest: stored.request_digest,
+                                        outcome,
+                                    },
+                                )
+                                .map_err(|_| "platform_v2_intent_refused")?;
+                        }
+                    }
+                    let refreshed = self
+                        .lineage
+                        .intent_authorized_in_workspaces(
+                            &negotiated_v2()?,
+                            principal.actor.tenant(),
+                            value.intent_id(),
+                            &allowed,
+                        )
+                        .map_err(|_| "platform_v2_store_refused")?
+                        .ok_or("platform_v2_not_found")?;
+                    return Ok(PlatformV2Response::WorkspaceIntentResult(refreshed.outcome));
+                }
+                Ok(PlatformV2Response::WorkspaceIntentResult(stored.outcome))
             }
             PlatformV2Request::GetReview(value) => {
                 authorize_identity(&principal, value.project(), value.workspace())?;
