@@ -1620,11 +1620,10 @@ fn safe_git_command(path: &Path) -> Result<Command, &'static str> {
             "--no-includes",
             "--null",
             "--name-only",
-            "--get-regexp",
-            r"^filter\..*\.(process|smudge|clean|required)$",
+            "--list",
         ]);
     let output = bounded_output(&mut query)?;
-    if !matches!(output.status.code(), Some(0 | 1)) {
+    if !output.status.success() {
         return Err("platform_v2_lifecycle_git_failed");
     }
     let mut filters = Vec::new();
@@ -1634,10 +1633,16 @@ fn safe_git_command(path: &Path) -> Result<Command, &'static str> {
         .filter(|value| !value.is_empty())
     {
         let key = std::str::from_utf8(key).map_err(|_| "platform_v2_lifecycle_git_failed")?;
-        let name = key
+        let normalized = key.to_ascii_lowercase();
+        if normalized.starts_with("include.") || normalized.starts_with("includeif.") {
+            return Err("platform_v2_lifecycle_git_include_unsafe");
+        }
+        let Some(name) = normalized
             .strip_prefix("filter.")
             .and_then(|value| value.rsplit_once('.').map(|value| value.0))
-            .ok_or("platform_v2_lifecycle_git_failed")?;
+        else {
+            continue;
+        };
         if !safe_filter_name(name) {
             return Err("platform_v2_lifecycle_filter_unsafe");
         }
@@ -2303,6 +2308,14 @@ mod tests {
         assert_eq!(
             validate_checkout_materialized(&forged_binding, uid),
             Err("platform_v2_lifecycle_checkout_mismatch")
+        );
+
+        let included = directory.path().join("included-git-config");
+        fs::write(&included, "[filter \"included\"]\n\tprocess = /bin/false\n").unwrap();
+        run(&["config", "include.path", included.to_str().unwrap()]);
+        assert_eq!(
+            git_text(&repository, &["rev-parse", "HEAD"]),
+            Err("platform_v2_lifecycle_git_include_unsafe")
         );
     }
 }
