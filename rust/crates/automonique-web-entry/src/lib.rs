@@ -1023,10 +1023,17 @@ struct PlatformProjectionView {
     schema: &'static str,
     health: &'static str,
     capabilities: PlatformCapabilitiesView,
-    cursor: PlatformCursorView,
+    inventory: PlatformInventoryView,
+    cursor: Option<PlatformCursorView>,
     sessions_cursor: PlatformCursorView,
     resources: Vec<PlatformResourceView>,
     sessions: Vec<PlatformSessionView>,
+}
+
+#[derive(Serialize)]
+struct PlatformInventoryView {
+    state: &'static str,
+    explanation: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1698,14 +1705,30 @@ impl WebIntegration {
             .try_lock()
             .map_err(|_| "platform_client_busy")?;
         let capabilities = client.capabilities().map_err(|_| "platform_unavailable")?;
-        let snapshot = match client
+        let (health, inventory, cursor, resources) = match client
             .request(PlatformRequest::Snapshot(
                 SnapshotRequest::new(Vec::new()).map_err(|_| "platform_request_invalid")?,
             ))
             .map_err(|_| "platform_unavailable")?
         {
-            PlatformResponse::Snapshot(snapshot) => snapshot,
-            PlatformResponse::Refused { .. } => return Err("platform_snapshot_refused"),
+            PlatformResponse::Snapshot(snapshot) => (
+                "operational",
+                PlatformInventoryView {
+                    state: "available",
+                    explanation: None,
+                },
+                Some(snapshot.cursor.into()),
+                snapshot.resources.into_iter().map(Into::into).collect(),
+            ),
+            PlatformResponse::Refused { explanation, .. } => (
+                "degraded",
+                PlatformInventoryView {
+                    state: "refused",
+                    explanation: Some(explanation.into_inner()),
+                },
+                None,
+                Vec::new(),
+            ),
             _ => return Err("platform_protocol_invalid"),
         };
         let sessions = match client
@@ -1721,11 +1744,12 @@ impl WebIntegration {
         };
         Ok(PlatformProjectionView {
             schema: "automonique.dashboard.platform/v1",
-            health: "operational",
+            health,
             capabilities: capabilities.into(),
-            cursor: snapshot.cursor.into(),
+            inventory,
+            cursor,
             sessions_cursor: sessions.cursor.into(),
-            resources: snapshot.resources.into_iter().map(Into::into).collect(),
+            resources,
             sessions: sessions.sessions.into_iter().map(Into::into).collect(),
         })
     }
@@ -6101,6 +6125,131 @@ mod tests {
     }
 
     #[test]
+    fn platform_projection_keeps_sessions_when_full_inventory_is_refused() {
+        let state_dir = tempfile::tempdir().expect("temporary state");
+        let runtime_dir = tempfile::tempdir().expect("temporary runtime");
+        std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private state");
+        std::fs::set_permissions(runtime_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private runtime");
+
+        let platform_listener = UnixListener::bind(runtime_dir.path().join("admin.sock"))
+            .expect("fixture platform socket");
+        let platform_server = thread::spawn(move || {
+            let session_coordinate = ResourceCoordinate::new(
+                ResourceAuthority::Automonique,
+                ResourceKind::Session,
+                ResourceId::new("session-visible-without-inventory").unwrap(),
+            );
+            let cursor = PlatformCursor {
+                authority: ResourceAuthority::Automonique,
+                topic: CursorTopic::new("sessions").unwrap(),
+                sequence: Revision::new(7).unwrap(),
+            };
+            for expected in ["capabilities", "snapshot", "list_sessions"] {
+                let (mut stream, _) = platform_listener.accept().expect("platform connection");
+                let mut prefix = [0_u8; 4];
+                stream.read_exact(&mut prefix).expect("platform prefix");
+                let length = usize::try_from(u32::from_be_bytes(prefix)).unwrap();
+                let mut payload = vec![0_u8; length];
+                stream.read_exact(&mut payload).expect("platform request");
+                let request = PlatformRequestMessage::from_canonical_bytes(&payload)
+                    .expect("canonical platform request");
+                let response = match (expected, request.request()) {
+                    ("capabilities", PlatformRequest::Capabilities) => {
+                        PlatformResponse::Capabilities(Capabilities::platform_v1())
+                    }
+                    ("snapshot", PlatformRequest::Snapshot(snapshot)) => {
+                        assert!(snapshot.resources.is_empty());
+                        PlatformResponse::Refused {
+                            outcome: ReceiptOutcome::Rejected,
+                            explanation: PlatformText::new("snapshot_too_large").unwrap(),
+                        }
+                    }
+                    ("list_sessions", PlatformRequest::ListSessions(list)) => {
+                        assert_eq!(list.authority, ResourceAuthority::Automonique);
+                        assert!(list.cursor.is_none());
+                        PlatformResponse::Sessions(
+                            SessionList::new(
+                                vec![SessionRecord {
+                                    session: ResourceRecord {
+                                        resource: session_coordinate.clone(),
+                                        freshness: Freshness {
+                                            state: FreshnessState::Fresh,
+                                            observed_at: EpochMillis::from_millis(6),
+                                            revision: Revision::new(6).unwrap(),
+                                        },
+                                        summary: PlatformText::new("waiting for operator").unwrap(),
+                                    },
+                                    run: None,
+                                    attachable: true,
+                                    controllable: false,
+                                }],
+                                cursor.clone(),
+                            )
+                            .unwrap(),
+                        )
+                    }
+                    _ => panic!("unexpected {expected} request: {:?}", request.request()),
+                };
+                let body = PlatformResponseMessage::new(request.request_id().clone(), response)
+                    .to_message()
+                    .unwrap()
+                    .to_canonical_bytes();
+                stream
+                    .write_all(&u32::try_from(body.len()).unwrap().to_be_bytes())
+                    .unwrap();
+                stream.write_all(&body).unwrap();
+            }
+        });
+
+        let integration = WebIntegration::open(
+            IntegrationConfig {
+                tenant: String::from("operator"),
+                actor: String::from("operator:platform-degraded"),
+                hosts: fixture_hosts(),
+            },
+            state_dir.path(),
+            runtime_dir.path(),
+        )
+        .expect("web integration");
+        let response = api_response(
+            Route::ApiPlatform,
+            &[],
+            &integration,
+            &AppState::new(fixture_status()),
+            None,
+        );
+        platform_server.join().expect("platform server");
+
+        assert_eq!(response.status, "200 OK");
+        let body: Value = serde_json::from_slice(&response.body).expect("platform projection JSON");
+        assert_eq!(body["health"], "degraded");
+        assert_eq!(body["cursor"], Value::Null);
+        assert_eq!(body["inventory"]["state"], "refused");
+        assert_eq!(
+            body["inventory"]["explanation"],
+            Value::String(String::from("snapshot_too_large"))
+        );
+        assert_eq!(body["resources"], Value::Array(Vec::new()));
+        assert_eq!(body["sessions"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            body["sessions"][0]["session"]["resource"]["id"],
+            "session-visible-without-inventory"
+        );
+        assert_eq!(
+            body["sessions"][0]["session"]["summary"],
+            "waiting for operator"
+        );
+        assert_eq!(body["sessions"][0]["attachable"], true);
+        assert!(
+            body["capabilities"]["methods"].as_array().is_some_and(
+                |methods| methods.contains(&Value::String(String::from("list_sessions")))
+            )
+        );
+    }
+
+    #[test]
     fn mobile_access_tokens_are_exclusively_identified_before_manage_authorization() {
         assert!(presents_mobile_access_token(Some(
             "Bearer ma_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -7318,6 +7467,8 @@ mod tests {
         assert!(DASHBOARD_JS.contains("processHierarchy(jobs)"));
         assert!(DASHBOARD_JS.contains("api(\"/api/platform\")"));
         assert!(DASHBOARD_JS.contains("renderPlatform"));
+        assert!(DASHBOARD_JS.contains("Full resource inventory unavailable:"));
+        assert!(DASHBOARD_JS.contains("Showing sessions from the paged session listing."));
         assert!(DASHBOARD_JS.contains("Manage control-plane state"));
         assert!(DASHBOARD_JS.contains("monique-text-scale"));
         assert!(DASHBOARD_JS.contains("monique-sidebar"));
