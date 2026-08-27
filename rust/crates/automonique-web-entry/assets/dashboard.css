@@ -1603,3 +1603,25 @@ html[data-health="unavailable"] .attention-bar { border-color: var(--danger-bord
 }
 
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }
+
+/* Pairing a phone. The same floating surface as the appearance panel, so it
+   inherits that panel's tokens rather than inventing any. */
+.pairing-panel { position: fixed; z-index: 70; top: 56px; right: 18px; width: min(430px, calc(100vw - 28px)); max-height: calc(100vh - 74px); padding: 20px; border: 1px solid var(--line-bright); border-radius: 18px; background: var(--panel); box-shadow: 0 24px 80px var(--shadow-color); overflow-y: auto; animation: appearance-in .16s ease-out; }
+.pairing-head { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 14px; }
+.pairing-head p { margin: 0 0 4px; color: var(--quiet); font-size: var(--font-xs); font-weight: 650; letter-spacing: .08em; text-transform: uppercase; }
+.pairing-head h2 { font-size: var(--font-title-lg); letter-spacing: -.025em; }
+.pairing-head button { display: grid; width: 32px; height: 32px; place-items: center; border: 0; border-radius: 9px; color: var(--muted); background: var(--panel-2); font-size: var(--font-title); cursor: pointer; }
+.pairing-lede, .pairing-note { margin: 0 0 12px; color: var(--muted); font-size: var(--font-sm); line-height: 1.5; }
+.pairing-note { margin: 6px 0 0; color: var(--quiet); font-size: var(--font-xs); }
+.pairing-scope > label > span { display: block; margin-bottom: 6px; color: var(--quiet); font-size: var(--font-xs); font-weight: 650; letter-spacing: .08em; text-transform: uppercase; }
+.pairing-scope select { width: 100%; padding: 6px; border: 1px solid var(--line); border-radius: 8px; color: var(--text); background: var(--field-surface); font-family: inherit; font-size: var(--font-xs); }
+.pairing-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.pairing-result { margin-top: 16px; text-align: center; }
+/* Inline SVG, not an image: the dashboard policy is `img-src 'self'`, which a
+   data: URI would violate. The white plate is the quiet zone a scanner needs. */
+.pairing-code { display: inline-block; padding: 12px; border-radius: 12px; background: #fff; line-height: 0; }
+.pairing-code svg { display: block; width: min(240px, 60vw); height: auto; }
+.pairing-expiry { margin: 10px 0 0; color: var(--text); font-size: var(--font-md); font-variant-numeric: tabular-nums; }
+.pairing-expiry.is-expired { color: var(--danger-text, #e0736b); }
+.pairing-status { margin: 12px 0 0; min-height: 1.2em; color: var(--muted); font-size: var(--font-sm); }
+.pairing-status[data-kind="error"] { color: var(--danger-text, #e0736b); }

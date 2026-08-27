@@ -9,7 +9,8 @@
     <title>Monique</title>
     <link rel="icon" href="/favicon.svg?v=3" type="image/svg+xml">
     <link rel="stylesheet" href="/assets/dashboard.css?v=13">
-    <script src="/assets/dashboard.js?v=13" defer></script>
+    <script src="/assets/qrcode.js?v=1" defer></script>
+    <script src="/assets/dashboard.js?v=14" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#workspace">Skip to workspace</a>
@@ -61,7 +62,7 @@
           <section class="view is-visible" data-panel="overview" aria-labelledby="overview-title">
             <div class="page-heading">
               <div><p class="kicker">CONTROL PLANE / LIVE</p><h1 id="overview-title">Operations overview</h1><p class="page-lede">A live, secret-safe view of Monique’s execution path and delivery certainty.</p></div>
-              <div class="heading-actions"><button class="button primary" type="button" data-open-chat="Explain Monique’s current operational health and name anything that needs attention.">Ask Monique</button><a class="button secondary" id="manage-link" data-manage-link rel="noreferrer" target="_blank" hidden>Open Manage ↗</a></div>
+              <div class="heading-actions"><button class="button primary" type="button" data-open-chat="Explain Monique’s current operational health and name anything that needs attention.">Ask Monique</button><button class="button secondary" id="pairing-open" type="button" aria-haspopup="dialog" aria-controls="pairing-panel">Pair a phone</button><a class="button secondary" id="manage-link" data-manage-link rel="noreferrer" target="_blank" hidden>Open Manage ↗</a></div>
             </div>
 
             <div class="attention-bar" id="attention-bar">
@@ -358,6 +359,30 @@
       </div>
     </div>
     <button class="sidebar-backdrop" id="sidebar-backdrop" type="button" aria-label="Close navigation" hidden></button>
+    <section class="pairing-panel" id="pairing-panel" role="dialog" aria-modal="true" aria-labelledby="pairing-title" hidden>
+      <div class="pairing-head">
+        <div><p>Mobile</p><h2 id="pairing-title">Pair a phone</h2></div>
+        <button id="pairing-close" type="button" aria-label="Close pairing">×</button>
+      </div>
+      <p class="pairing-lede">An invite is single use and lives five minutes. Create it with the phone already in your hand.</p>
+      <div class="pairing-scope">
+        <label for="pairing-sessions"><span>Sessions this phone may attach to</span>
+          <select id="pairing-sessions" multiple size="6" aria-describedby="pairing-scope-note"></select>
+        </label>
+        <p class="pairing-note" id="pairing-scope-note">Every listed session is selected. A phone can only reach the sessions named here.</p>
+      </div>
+      <div class="pairing-actions">
+        <button class="button primary" id="pairing-create" type="button">Create invite</button>
+        <button class="button secondary" id="pairing-copy" type="button" hidden>Copy invite</button>
+      </div>
+      <div class="pairing-result" id="pairing-result" hidden>
+        <div class="pairing-code" id="pairing-code" role="img" aria-label="Pairing QR code"></div>
+        <p class="pairing-expiry" id="pairing-expiry"></p>
+        <p class="pairing-note">Scan it in the app, or use Copy invite and paste it there instead.</p>
+      </div>
+      <p class="pairing-status" id="pairing-status" role="status"></p>
+    </section>
+
     <section class="appearance-panel" id="appearance-panel" aria-labelledby="appearance-title" hidden>
       <div class="appearance-panel-head"><div><p>Personalize</p><h2 id="appearance-title">Appearance</h2></div><button id="appearance-close" type="button" aria-label="Close appearance settings">×</button></div>
       <label class="theme-select-row" for="theme-select"><span>Color theme</span><select id="theme-select"><option value="system">System</option><option value="dark">Carbon</option><option value="light">Paper</option><option value="midnight">Midnight</option><option value="ocean">Ocean</option><option value="forest">Forest</option><option value="monokai">Monokai</option><option value="dracula">Dracula</option><option value="nord">Nord</option><option value="sand">Sand</option><option value="rose">Rose</option><option value="contrast">High contrast</option></select></label>
