@@ -1688,7 +1688,12 @@ impl ReviewAction {
         }
     }
 
-    fn validate_shape(&self) -> Result<(), ReviewContractError> {
+    /// Validate only the client-owned shape of an action.
+    ///
+    /// Authentication, actor identity, authority, workspace scope, and the
+    /// authoritative snapshot remain host-owned checks. Transport decoders may
+    /// use this narrower validation before those values have been injected.
+    pub fn validate_client_shape(&self) -> Result<(), ReviewContractError> {
         if let Self::BatchSendCommentsToAgent { comments } = self
             && (comments.is_empty()
                 || comments.len() > MAX_REVIEW_COMMENTS
@@ -1722,7 +1727,7 @@ impl ReviewActionRequest {
         action: ReviewAction,
     ) -> Result<Self, ReviewContractError> {
         validate_workspace(&workspace)?;
-        action.validate_shape()?;
+        action.validate_client_shape()?;
         if authentication == ReviewAuthentication::ProviderSession
             || authority.kind() != action.required_authority()
         {

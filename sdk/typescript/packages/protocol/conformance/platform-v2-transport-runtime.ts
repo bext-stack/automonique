@@ -18,7 +18,7 @@ import {
   encodePlatformV2Request,
   encodePlatformV2RequestFrame,
 } from "../generated/platform-v2-transport.ts";
-import {PLATFORM_PROTOCOL, PlatformRequestId} from "../generated/platform.ts";
+import {IdempotencyKey, PLATFORM_PROTOCOL, PlatformRequestId} from "../generated/platform.ts";
 import {
   PLATFORM_NEGOTIATION_SCHEMA_V1,
   PLATFORM_SCHEMA_V2,
@@ -26,10 +26,12 @@ import {
   PlatformVersionNumber,
   SupportedPlatformVersionNumber,
   UserWorkspaceId,
+  WorkContextRevision,
   encodeNegotiatedPlatform,
   type PlatformVersionOffer,
 } from "../generated/work-context.ts";
 import {
+  RefusalError,
   WireError,
   encodeFrameWithLimit,
   encodeMessage,
@@ -44,6 +46,16 @@ function expectWireRefusal(label: string, action: () => unknown): void {
     action();
   } catch (error) {
     if (error instanceof WireError) return;
+    throw error;
+  }
+  throw new Error(`${label} was accepted`);
+}
+
+function expectReviewRefusal(label: string, action: () => unknown): void {
+  try {
+    action();
+  } catch (error) {
+    if (error instanceof RefusalError) return;
     throw error;
   }
   throw new Error(`${label} was accepted`);
@@ -84,6 +96,39 @@ const v2Frame = encodePlatformV2RequestFrame(v2Id, {
   identity: {kind: "user_workspace", id: UserWorkspaceId("workspace-1")},
 });
 if (v2Frame.length !== v2.length + 4) throw new Error("v2 frame bound");
+
+for (const [label, comments] of [
+  ["empty review comment batch", []],
+  [
+    "duplicate review comment batch",
+    [
+      {comment_id: "comment-1", expected_comment_revision: 1n},
+      {comment_id: "comment-1", expected_comment_revision: 1n},
+    ],
+  ],
+] as const) {
+  expectReviewRefusal(label, () => encodePlatformV2Request(v2Id, {
+    kind: "execute_review_action",
+    request: {
+      action: {kind: "batch_send_comments_to_agent", payload: {comments}},
+      expected_revision: WorkContextRevision(1n),
+      idempotency_key: IdempotencyKey("review-action-batch"),
+      workspace: {kind: "user_workspace", id: UserWorkspaceId("workspace-1")},
+    },
+  }));
+}
+encodePlatformV2Request(v2Id, {
+  kind: "execute_review_action",
+  request: {
+    action: {
+      kind: "batch_send_comments_to_agent",
+      payload: {comments: [{comment_id: "comment-1", expected_comment_revision: 1n}]},
+    },
+    expected_revision: WorkContextRevision(1n),
+    idempotency_key: IdempotencyKey("review-action-batch"),
+    workspace: {kind: "user_workspace", id: UserWorkspaceId("workspace-1")},
+  },
+});
 
 const negotiatedBody = parseCanonical(encodeNegotiatedPlatform({
   schema: PLATFORM_SCHEMA_V2,

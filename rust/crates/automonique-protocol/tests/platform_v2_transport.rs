@@ -63,6 +63,97 @@ fn review_action() -> ReviewActionTransportRequest {
 }
 
 #[test]
+fn review_action_transport_rejects_the_same_invalid_batch_shapes_as_typescript() {
+    let request = |action| {
+        ReviewActionTransportRequest::new(
+            workspace(),
+            Revision::FIRST,
+            action,
+            IdempotencyKey::new("review-action-batch").unwrap(),
+        )
+    };
+    assert_eq!(
+        request(ReviewAction::BatchSendCommentsToAgent { comments: vec![] }),
+        Err(PlatformV2TransportError::InvalidBody)
+    );
+
+    let target = ReviewCommentTarget::new(OpaqueId::new("comment-1").unwrap(), Revision::FIRST);
+    assert_eq!(
+        request(ReviewAction::BatchSendCommentsToAgent {
+            comments: vec![target.clone(), target],
+        }),
+        Err(PlatformV2TransportError::InvalidBody)
+    );
+
+    assert!(
+        request(ReviewAction::BatchSendCommentsToAgent {
+            comments: vec![ReviewCommentTarget::new(
+                OpaqueId::new("comment-1").unwrap(),
+                Revision::FIRST,
+            )],
+        })
+        .is_ok()
+    );
+
+    let valid = PlatformV2RequestMessage::new(
+        request_id("review-action-batch-wire"),
+        PlatformV2Request::ExecuteReviewAction(
+            request(ReviewAction::BatchSendCommentsToAgent {
+                comments: vec![ReviewCommentTarget::new(
+                    OpaqueId::new("comment-1").unwrap(),
+                    Revision::FIRST,
+                )],
+            })
+            .unwrap(),
+        ),
+    )
+    .to_canonical_bytes()
+    .unwrap();
+    let valid = Message::from_canonical_bytes(&valid).unwrap();
+    let first_target = valid
+        .body()
+        .get("action")
+        .and_then(|value| value.get("payload"))
+        .and_then(|value| value.get("comments"))
+        .and_then(JsonValue::as_array)
+        .and_then(|values| values.first())
+        .unwrap()
+        .clone();
+    for comments in [vec![], vec![first_target.clone(), first_target]] {
+        let mut body = valid.body().clone();
+        let JsonValue::Object(fields) = &mut body else {
+            panic!("review action body is an object");
+        };
+        let JsonValue::Object(action) = fields
+            .iter_mut()
+            .find(|(name, _)| name == "action")
+            .map(|(_, value)| value)
+            .unwrap()
+        else {
+            panic!("review action is an object");
+        };
+        let JsonValue::Object(payload) = action
+            .iter_mut()
+            .find(|(name, _)| name == "payload")
+            .map(|(_, value)| value)
+            .unwrap()
+        else {
+            panic!("review action payload is an object");
+        };
+        *payload
+            .iter_mut()
+            .find(|(name, _)| name == "comments")
+            .map(|(_, value)| value)
+            .unwrap() = JsonValue::Array(comments);
+        let hostile = Message::new(valid.envelope().clone(), body).to_canonical_bytes();
+        assert_eq!(
+            PlatformV2RequestMessage::from_canonical_bytes(&hostile),
+            Err(PlatformV2TransportError::InvalidBody)
+        );
+    }
+}
+
+#[test]
 fn rust_transport_encoding_matches_the_shared_typescript_corpus() {
     let fixture = include_str!("../fixtures/platform-v2-transport-v1.txt")
         .trim_end()

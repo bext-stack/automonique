@@ -487,7 +487,7 @@ impl ReviewActionTransportRequest {
         action: ReviewAction,
         idempotency_key: IdempotencyKey,
     ) -> Result<Self, PlatformV2TransportError> {
-        if !is_review_workspace(&workspace) {
+        if !is_review_workspace(&workspace) || action.validate_client_shape().is_err() {
             return Err(PlatformV2TransportError::InvalidBody);
         }
         Ok(Self {
