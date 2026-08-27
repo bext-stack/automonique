@@ -10,7 +10,8 @@
     <link rel="icon" href="/favicon.svg?v=3" type="image/svg+xml">
     <link rel="stylesheet" href="/assets/dashboard.css?v=13">
     <script src="/assets/qrcode.js?v=1" defer></script>
-    <script src="/assets/dashboard.js?v=14" defer></script>
+    <script src="/assets/platform-cockpit-core.js?v=1" defer></script>
+    <script src="/assets/dashboard.js?v=15" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#workspace">Skip to workspace</a>
@@ -188,15 +189,25 @@
               <article><span>PENDING</span><strong id="operations-pending">—</strong><small>awaiting your decision</small></article>
             </div>
             <article class="panel platform-monitor" aria-labelledby="platform-monitor-title">
-              <div class="panel-head process-monitor-head"><div><p class="kicker">AUTOMONIQUE.PLATFORM / V1</p><h2 id="platform-monitor-title">Shared platform projection</h2></div><div class="process-monitor-actions"><small id="platform-cursor">Waiting for a gap-free cursor</small><button class="button secondary" id="platform-refresh" type="button">Refresh</button><span class="tag" id="platform-health">LOADING</span></div></div>
-              <div class="operations-metrics platform-metrics" aria-label="Shared platform counts">
-                <article><span>RESOURCES</span><strong id="platform-resources">—</strong><small>authority-qualified</small></article>
-                <article><span>SESSIONS</span><strong id="platform-sessions">—</strong><small>provider-neutral</small></article>
-                <article><span>METHODS</span><strong id="platform-methods">—</strong><small>advertised by endpoint</small></article>
-                <article><span>TRANSPORTS</span><strong id="platform-transports">—</strong><small>same semantic contract</small></article>
+              <div class="panel-head process-monitor-head"><div><p class="kicker">AUTOMONIQUE.PLATFORM / RETAINED SESSION</p><h2 id="platform-monitor-title">Hosted session cockpit</h2></div><div class="process-monitor-actions"><small id="platform-cursor">Waiting for session inventory</small><button class="button secondary" id="platform-refresh" type="button">Refresh</button><span class="tag" id="platform-health">LOADING</span></div></div>
+              <p class="process-semantics">Select an authority-qualified session to attach as an observer. Observation never grants control; follow-ups use the session’s exact revision and reconcile uncertain receipts without replay.</p>
+              <div class="platform-cockpit">
+                <aside class="platform-session-rail" aria-label="Retained sessions">
+                  <div class="platform-session-rail-head"><strong>Sessions</strong><span id="platform-sessions">—</span></div>
+                  <div id="platform-session-list"><div class="integration-empty">Loading retained sessions…</div></div>
+                </aside>
+                <section class="platform-session-workspace" aria-live="polite">
+                  <div class="platform-session-empty" id="platform-session-empty"><strong>Select a retained session</strong><p>History, run state, approvals, and receipt certainty stay scoped to the selected authority-qualified session.</p></div>
+                  <div id="platform-session-detail" hidden>
+                    <header class="platform-session-head"><div><span id="platform-session-coordinate">—</span><strong id="platform-session-summary">—</strong><small id="platform-session-posture">Observer · control not claimed</small></div><button class="button secondary" id="platform-session-detach" type="button">Disconnect</button></header>
+                    <div class="platform-session-status" id="platform-session-status">Attaching…</div>
+                    <div class="platform-history" id="platform-history" role="log" aria-label="Sanitized retained session history"></div>
+                    <button class="button secondary platform-history-more" id="platform-history-more" type="button" hidden>Load new events</button>
+                    <div class="platform-receipt" id="platform-receipt" hidden></div>
+                    <form class="platform-composer" id="platform-composer"><label for="platform-follow-up">Continue this retained session</label><div><textarea id="platform-follow-up" rows="2" maxlength="8192" placeholder="Add a follow-up…"></textarea><button class="button primary" id="platform-send" type="submit">Send</button></div><small id="platform-composer-note">A fresh exact revision is required before every follow-up.</small></form>
+                  </div>
+                </section>
               </div>
-              <p class="process-semantics">This browser reads the same typed platform contract as JCode. Resources name their owning authority; queued work is never presented as local execution.</p>
-              <div class="tool-grid" id="platform-resource-grid"><div class="integration-empty">Loading the shared projection…</div></div>
             </article>
             <article class="panel process-monitor" aria-labelledby="process-monitor-title">
               <div class="panel-head process-monitor-head"><div><p class="kicker">EXECUTION MONITOR</p><h2 id="process-monitor-title">Agent processes</h2></div><div class="process-monitor-actions"><small id="process-observed">Waiting for worker snapshot</small><button class="button secondary" id="processes-refresh" type="button">Refresh</button><span class="tag" id="processes-health">LOADING</span></div></div>

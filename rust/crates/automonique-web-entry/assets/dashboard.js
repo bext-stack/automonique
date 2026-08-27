@@ -21,6 +21,12 @@ let selectedMemoryReference = null;
 let memoryQuery = null;
 let operationsSnapshot = null;
 let processesSnapshot = null;
+let platformSnapshot = null;
+let platformSelectedSession = null;
+let platformHistoryCursor = null;
+let platformMutation = null;
+let platformBusy = false;
+let platformExactRevision = null;
 let processFilter = "all";
 const expandedProcesses = new Set();
 let ticketFilter = "all";
@@ -2083,74 +2089,309 @@ async function loadProcesses({ announce = false } = {}) {
 }
 
 function renderPlatform(view) {
-  const resources = Array.isArray(view.resources) ? view.resources : [];
   const sessions = Array.isArray(view.sessions) ? view.sessions : [];
   const inventory = view.inventory || {};
-  const methods = Array.isArray(view.capabilities?.methods) ? view.capabilities.methods : [];
-  const transports = Array.isArray(view.capabilities?.transports) ? view.capabilities.transports : [];
-  byId("platform-resources").textContent = count(resources.length);
+  platformSnapshot = view;
   byId("platform-sessions").textContent = count(sessions.length);
-  byId("platform-methods").textContent = count(methods.length);
-  byId("platform-transports").textContent = count(transports.length);
   byId("platform-health").textContent = words(view.health || "unavailable").toUpperCase();
-  byId("platform-cursor").textContent = view.cursor
-    ? `${words(view.cursor.authority)} / ${view.cursor.topic} / seq ${count(view.cursor.sequence)}`
+  byId("platform-health").dataset.state = view.health || "unavailable";
+  byId("platform-cursor").textContent = view.sessions_cursor
+    ? `${words(view.sessions_cursor.authority)} / ${view.sessions_cursor.topic} / seq ${String(view.sessions_cursor.sequence)}`
     : inventory.state === "refused"
-      ? "Inventory snapshot refused"
-      : "No cursor";
-  const sessionById = new Map(sessions.map((session) => [session.session?.resource?.id, session]));
-  const root = byId("platform-resource-grid");
+      ? "Session inventory refused"
+      : "No session cursor";
+  const root = byId("platform-session-list");
   root.replaceChildren();
-  if (inventory.state === "refused") {
+  if (sessions.length === 0) {
     const empty = document.createElement("div");
     empty.className = "integration-empty";
-    empty.setAttribute("data-i18n-skip", "");
-    empty.textContent = `Full resource inventory unavailable: ${inventory.explanation || "the platform authority refused the snapshot without an explanation"}. Showing sessions from the paged session listing.`;
+    empty.textContent = inventory.state === "refused"
+      ? `Session listing unavailable: ${inventory.explanation || "refused by the platform authority"}.`
+      : "No retained sessions are currently visible.";
     root.append(empty);
-  }
-  const visibleResources = resources.length > 0
-    ? resources
-    : sessions.map((session) => session.session).filter((record) => record?.resource);
-  if (visibleResources.length === 0) {
-    if (inventory.state !== "refused") {
-      const empty = document.createElement("div");
-      empty.className = "integration-empty";
-      empty.textContent = "The platform endpoint returned no visible resources.";
-      root.append(empty);
-    }
     return;
   }
-  visibleResources.forEach((record) => {
+  sessions.forEach((session) => {
+    const record = session.session || {};
     const coordinate = record.resource || {};
-    const session = sessionById.get(coordinate.id);
-    const card = document.createElement("article");
-    card.className = "tool-card";
-    const head = document.createElement("div");
-    const authority = document.createElement("span");
-    authority.textContent = words(coordinate.authority || "unknown");
-    const freshness = document.createElement("i");
-    freshness.className = record.freshness === "fresh" ? "safe" : "approval";
-    freshness.textContent = words(record.freshness || "unknown").toUpperCase();
-    head.append(authority, freshness);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "platform-session-option";
+    button.classList.toggle("is-selected", coordinate.id === platformSelectedSession);
+    button.disabled = session.attachable !== true;
+    button.dataset.sessionId = coordinate.id || "";
     const title = document.createElement("strong");
     title.setAttribute("data-i18n-skip", "");
-    title.textContent = `${words(coordinate.kind || "resource")} · ${coordinate.id || "—"}`;
-    const summary = document.createElement("p");
+    title.textContent = coordinate.id || "Unnamed session";
+    const summary = document.createElement("span");
     summary.setAttribute("data-i18n-skip", "");
-    summary.textContent = record.summary || "No bounded summary.";
-    const footer = document.createElement("div");
-    const revision = document.createElement("small");
-    revision.textContent = `Revision ${count(record.revision)}`;
-    const detail = document.createElement("small");
-    detail.textContent = session
-      ? `${session.attachable ? "Attachable" : "Observe only"} · ${session.controllable ? "Control available" : "No control"}`
-      : Number.isSafeInteger(record.observed_at_ms)
-        ? ticketDateLabel(new Date(record.observed_at_ms).toISOString())
-        : "Observation time unknown";
-    footer.append(revision, detail);
-    card.append(head, title, summary, footer);
-    root.append(card);
+    summary.textContent = record.summary || "No bounded summary";
+    const posture = document.createElement("small");
+    posture.textContent = `${words(record.freshness || "unknown")} · ${session.run ? "run present" : "idle"} · ${session.controllable ? "control available" : "observe only"}`;
+    button.append(title, summary, posture);
+    button.addEventListener("click", () => selectPlatformSession(coordinate.id));
+    root.append(button);
   });
+  if (platformSelectedSession && !sessions.some((session) => session.session?.resource?.id === platformSelectedSession)) {
+    platformExactRevision = null;
+    byId("platform-session-empty").hidden = true;
+    byId("platform-session-detail").hidden = false;
+    byId("platform-session-status").textContent = "Selected session is no longer visible in the fresh authority listing.";
+    settlePlatformFence(null);
+  }
+}
+
+function platformSelectedSessionVisible() {
+  const sessions = Array.isArray(platformSnapshot?.sessions) ? platformSnapshot.sessions : [];
+  return sessions.some((session) => session.session?.resource?.id === platformSelectedSession);
+}
+
+function platformPost(payload) {
+  return api("/api/platform/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+function validPlatformDecimal(value, allowZero = true) {
+  return globalThis.AutomoniquePlatformCockpit.validDecimal(value, allowZero);
+}
+
+function platformDecimalGreater(left, right) {
+  return globalThis.AutomoniquePlatformCockpit.decimalGreater(left, right);
+}
+
+function readPlatformMutation() {
+  try {
+    const value = JSON.parse(sessionStorage.getItem("monique-platform-reconciliation") || "null");
+    if (!value || typeof value.sessionId !== "string" || typeof value.idempotencyKey !== "string") return null;
+    if (value.expectedRevision !== null && !validPlatformDecimal(value.expectedRevision, false)) return null;
+    return value;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function storePlatformMutation(value) {
+  platformMutation = value;
+  try {
+    if (value) sessionStorage.setItem("monique-platform-reconciliation", JSON.stringify(value));
+    else sessionStorage.removeItem("monique-platform-reconciliation");
+  } catch (_error) {
+    // Private browsing may disable storage. The in-memory fence still applies.
+  }
+}
+
+function platformCommandRevision(command) {
+  return command?.state === "ready" && validPlatformDecimal(command.session?.revision, false)
+    ? command.session.revision
+    : null;
+}
+
+function renderPlatformHistory(history, replace = false) {
+  const root = byId("platform-history");
+  if (replace) root.replaceChildren();
+  if (!history || history.state === "refused") {
+    if (replace) {
+      const item = document.createElement("div");
+      item.className = "platform-history-notice";
+      item.textContent = `History refused: ${history?.explanation || "no explanation"}.`;
+      root.append(item);
+    }
+    byId("platform-history-more").hidden = true;
+    return;
+  }
+  if (history.state === "resync_required") {
+    root.replaceChildren();
+    const item = document.createElement("div");
+    item.className = "platform-history-notice";
+    item.textContent = `History retention changed (${history.snapshot_from}–${history.snapshot_to}). Replacing with a fresh snapshot…`;
+    root.append(item);
+    byId("platform-history-more").hidden = true;
+    window.setTimeout(() => openPlatformSession(platformSelectedSession), 0);
+    return;
+  }
+  if (history.state !== "page") return;
+  platformHistoryCursor = history.terminal_cursor;
+  const events = Array.isArray(history.events) ? history.events : [];
+  events.forEach((event) => {
+    const item = document.createElement("article");
+    item.className = `platform-history-event is-${event.kind || "unknown"}`;
+    item.dataset.cursor = event.cursor || "";
+    const head = document.createElement("div");
+    const kind = document.createElement("strong");
+    kind.textContent = event.kind === "message" ? words(event.role || "message") : words(event.kind || "event");
+    const cursor = document.createElement("small");
+    cursor.textContent = `#${event.cursor || "—"}`;
+    head.append(kind, cursor);
+    const content = document.createElement("p");
+    content.setAttribute("data-i18n-skip", "");
+    if (event.kind === "message") content.textContent = event.text || "";
+    else if (event.kind === "tool_state") content.textContent = `${event.label || "Tool step"}: ${words(event.state)}`;
+    else if (event.kind === "run_state") content.textContent = `Run ${words(event.state)}`;
+    else content.textContent = `Sanitized ${words(event.source || "unknown event")}`;
+    item.append(head, content);
+    root.append(item);
+  });
+  byId("platform-history-more").hidden = history.has_more !== true;
+  root.scrollTop = root.scrollHeight;
+}
+
+function renderPlatformReceipt(view) {
+  const root = byId("platform-receipt");
+  root.hidden = false;
+  root.dataset.state = view.state;
+  if (view.state === "ambiguous") {
+    root.textContent = "Outcome uncertain. Reconciling this idempotency key without replaying the follow-up.";
+    return;
+  }
+  if (view.state === "refused") {
+    root.textContent = `Refused (${words(view.outcome)}): ${view.explanation}`;
+    return;
+  }
+  const receipt = view.receipt || {};
+  root.textContent = `Receipt ${receipt.id || "—"}: ${words(receipt.outcome || "unknown")} · ${words(receipt.lifecycle || "unknown")}.`;
+}
+
+function settlePlatformFence(command) {
+  if (command !== undefined && command !== null) platformExactRevision = platformCommandRevision(command);
+  const revision = platformExactRevision;
+  if (platformMutation?.expectedRevision && revision && platformDecimalGreater(revision, platformMutation.expectedRevision)) {
+    storePlatformMutation(null);
+    byId("platform-receipt").hidden = true;
+  }
+  const blocked = platformBusy || platformMutation !== null || revision === null;
+  byId("platform-follow-up").disabled = blocked;
+  byId("platform-send").disabled = blocked;
+  byId("platform-composer-note").textContent = platformMutation
+    ? "This mutation is fenced until its receipt is reconciled and a newer session revision is observed."
+    : revision
+      ? `Exact session revision ${revision}.`
+      : "Follow-up unavailable until command state supplies an exact revision.";
+}
+
+async function openPlatformSession(sessionId) {
+  if (!sessionId || platformBusy) return;
+  platformBusy = true;
+  byId("platform-session-empty").hidden = true;
+  byId("platform-session-detail").hidden = false;
+  byId("platform-session-status").textContent = "Attaching as observer…";
+  settlePlatformFence(null);
+  try {
+    const view = await platformPost({ action: "open", session_id: sessionId });
+    if (view.state === "refused") {
+      renderPlatformReceipt(view);
+      byId("platform-session-status").textContent = `Attach refused · ${words(view.outcome)}`;
+      return;
+    }
+    if (view.state !== "open") throw new Error("Unexpected retained-session response");
+    const record = view.session?.session || {};
+    const coordinate = record.resource || {};
+    byId("platform-session-coordinate").textContent = `${coordinate.authority || "automonique"} / ${coordinate.kind || "session"} / ${coordinate.id || sessionId}`;
+    byId("platform-session-summary").textContent = record.summary || "No bounded summary";
+    byId("platform-session-posture").textContent = `${words(record.freshness || "unknown")} · Observer · control not claimed${view.control?.available ? " · control available to claim elsewhere" : ""}`;
+    const approvals = view.command?.state === "ready" && Array.isArray(view.command.pending_approvals) ? view.command.pending_approvals.length : 0;
+    const run = view.command?.state === "ready" && view.command.run ? "run present" : "no active run target";
+    byId("platform-session-status").textContent = `Attached · ${run} · ${approvals} pending approval${approvals === 1 ? "" : "s"}`;
+    renderPlatformHistory(view.history, true);
+    settlePlatformFence(view.command);
+  } catch (error) {
+    byId("platform-session-status").textContent = `Session unavailable: ${error.message}`;
+  } finally {
+    platformBusy = false;
+    settlePlatformFence(null);
+  }
+}
+
+async function selectPlatformSession(sessionId) {
+  if (!sessionId || sessionId === platformSelectedSession) return openPlatformSession(sessionId);
+  const previous = platformSelectedSession;
+  platformSelectedSession = sessionId;
+  platformHistoryCursor = null;
+  platformExactRevision = null;
+  try { sessionStorage.setItem("monique-platform-session", sessionId); } catch (_error) { /* memory-only fallback */ }
+  renderPlatform(platformSnapshot || {});
+  if (previous) platformPost({ action: "detach", session_id: previous }).catch(() => {});
+  await openPlatformSession(sessionId);
+}
+
+async function pagePlatformHistory() {
+  if (!platformSelectedSession || !validPlatformDecimal(platformHistoryCursor)) return;
+  const view = await platformPost({ action: "page", session_id: platformSelectedSession, after: platformHistoryCursor });
+  if (view.state === "page") renderPlatformHistory(view.history, false);
+  else if (view.state === "refused") renderPlatformReceipt(view);
+}
+
+async function reconcilePlatformMutation() {
+  if (!platformMutation || platformBusy) return;
+  platformBusy = true;
+  settlePlatformFence(null);
+  let refreshSession = false;
+  try {
+    const view = await platformPost({
+      action: "reconcile",
+      session_id: platformMutation.sessionId,
+      idempotency_key: platformMutation.idempotencyKey,
+    });
+    renderPlatformReceipt(view);
+    if (view.state === "receipt") {
+      const directive = globalThis.AutomoniquePlatformCockpit.receiptDirective(view);
+      if (directive === "reconcile") return;
+      if (directive === "settled") {
+        storePlatformMutation(null);
+      } else {
+        platformMutation.expectedRevision = platformMutation.expectedRevision || "0";
+        storePlatformMutation(platformMutation);
+        refreshSession = true;
+      }
+    }
+  } catch (_error) {
+    renderPlatformReceipt({ state: "ambiguous" });
+  } finally {
+    platformBusy = false;
+    settlePlatformFence(null);
+    if (refreshSession && platformSelectedSession) await openPlatformSession(platformSelectedSession);
+  }
+}
+
+async function sendPlatformFollowUp(event) {
+  event.preventDefault();
+  if (platformBusy || platformMutation || !platformSelectedSession) return;
+  const text = byId("platform-follow-up").value.trim();
+  const revisionText = byId("platform-composer-note").textContent.match(/[0-9]+/)?.[0];
+  if (!text || !validPlatformDecimal(revisionText, false)) return;
+  const idempotencyKey = crypto.randomUUID();
+  storePlatformMutation({ sessionId: platformSelectedSession, idempotencyKey, expectedRevision: revisionText });
+  platformBusy = true;
+  settlePlatformFence(null);
+  try {
+    const view = await platformPost({ action: "follow_up", session_id: platformSelectedSession, expected_revision: revisionText, idempotency_key: idempotencyKey, text });
+    renderPlatformReceipt(view);
+    if (view.state === "refused") storePlatformMutation(null);
+    else if (view.state === "receipt") {
+      byId("platform-follow-up").value = "";
+      if (globalThis.AutomoniquePlatformCockpit.receiptDirective(view) === "settled") storePlatformMutation(null);
+    }
+  } catch (_error) {
+    renderPlatformReceipt({ state: "ambiguous" });
+  } finally {
+    platformBusy = false;
+    settlePlatformFence(null);
+  }
+}
+
+async function detachPlatformSession() {
+  if (!platformSelectedSession) return;
+  const sessionId = platformSelectedSession;
+  try { await platformPost({ action: "detach", session_id: sessionId }); } catch (_error) { /* selection can still close locally */ }
+  platformSelectedSession = null;
+  platformHistoryCursor = null;
+  platformExactRevision = null;
+  try { sessionStorage.removeItem("monique-platform-session"); } catch (_error) { /* memory-only fallback */ }
+  byId("platform-session-detail").hidden = true;
+  byId("platform-session-empty").hidden = false;
+  renderPlatform(platformSnapshot || {});
 }
 
 async function loadPlatform({ announce = false } = {}) {
@@ -2158,6 +2399,9 @@ async function loadPlatform({ announce = false } = {}) {
   button.disabled = true;
   try {
     renderPlatform(await api("/api/platform"));
+    if (platformMutation) await reconcilePlatformMutation();
+    else if (platformSelectedSession && platformSelectedSessionVisible() && byId("platform-session-detail").hidden) await openPlatformSession(platformSelectedSession);
+    else if (platformSelectedSession && platformSelectedSessionVisible() && !platformBusy) await pagePlatformHistory();
     if (announce) toast("Shared platform projection refreshed.");
   } catch (_error) {
     renderPlatform({ health: "unavailable", capabilities: {}, resources: [], sessions: [] });
@@ -2539,6 +2783,9 @@ byId("operations-refresh").addEventListener("click", () => {
 });
 byId("processes-refresh").addEventListener("click", () => loadProcesses({ announce: true }));
 byId("platform-refresh").addEventListener("click", () => loadPlatform({ announce: true }));
+byId("platform-history-more").addEventListener("click", () => pagePlatformHistory());
+byId("platform-session-detach").addEventListener("click", () => detachPlatformSession());
+byId("platform-composer").addEventListener("submit", sendPlatformFollowUp);
 byId("attention-toggle").addEventListener("click", () => {
   const button = byId("attention-toggle");
   const expanded = button.getAttribute("aria-expanded") === "true";
@@ -3908,6 +4155,9 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
+platformMutation = readPlatformMutation();
+try { platformSelectedSession = sessionStorage.getItem("monique-platform-session"); } catch (_error) { platformSelectedSession = null; }
+if (platformMutation) platformSelectedSession = platformMutation.sessionId;
 refreshStatus();
 loadPlatform();
 loadProcesses();
