@@ -18,6 +18,7 @@ export * from "./doctor.js";
 export * from "./mobile-auth.js";
 export * from "./platform.js";
 export * from "./progress.js";
+export * from "./review-context.js";
 export * from "./runs.js";
 export * from "./runtime.js";
 export * from "./work-context.js";
@@ -25,7 +26,7 @@ export * from "./work-context.js";
 // The digest of the surface re-exported above. It identifies the schema
 // these files were generated from; it is not a checksum of this file.
 export const SCHEMA_DIGEST_ALGORITHM = "sha256";
-export const SCHEMA_DIGEST = "6c8037cfa6e081fbc70b76bf3283bc87804baa2447897637934b432f67cd7380";
+export const SCHEMA_DIGEST = "8172b6d8aa95fc18c9376361a740e92a1501e65f6645154f29ba46c5c0be35d4";
 
 // The exact generated Platform v1 module digest. A package that advertises
 // protocolRange/schema v1 uses this pin, not the aggregate surface digest.

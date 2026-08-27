@@ -1,0 +1,1 @@
+{"action_id":"action-1","actor":"actor-1","current_revision":null,"idempotency_key":"idem-1","outcome":"unknown","platform_version":2,"receipt_id":"receipt-1","reconciliation":"poll_receipt","revision":null,"schema":"automonique.platform/review/v1"}

@@ -318,6 +318,13 @@ use crate::platform_v2_lineage::{
     ExternalWorkProvider, ExternalWorkState, LineageFreshnessState, OrchestrationKind,
     WorkspaceIntentConflict,
 };
+use crate::platform_v2_review::{
+    AttentionOriginKind, AttentionReason, AttentionState, CheckState, CommentAgentState,
+    ConflictState, DeliveryState, DiffChangeKind, DiffSide, MergeReadiness, PreviewKind,
+    PullRequestState, ReviewActionKind, ReviewAuthentication, ReviewAuthorityKind, ReviewDecision,
+    ReviewFreshnessState, ReviewProposalKind, ReviewReceiptOutcome, ReviewReconciliation,
+    WorktreeFileState,
+};
 use crate::primitives::ValueError;
 use crate::progress_api::{StreamMessageKind, StreamRefusal};
 use crate::provenance::MAX_PROVENANCE_ID_BYTES;
@@ -838,6 +845,8 @@ pub const PROGRESS_MODULE: &str = "progress";
 pub const PLATFORM_MODULE: &str = "platform";
 /// Negotiated `automonique.platform/v2` work-context read contract.
 pub const WORK_CONTEXT_MODULE: &str = "work-context";
+/// Platform v2 typed review and attention sub-contract.
+pub const REVIEW_CONTEXT_MODULE: &str = "review-context";
 /// Generated mobile authentication and authorization module stem.
 pub const MOBILE_AUTH_MODULE: &str = "mobile-auth";
 
@@ -1440,6 +1449,7 @@ pub struct JsonSurface {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GeneratedImplementation {
     WorkContext,
+    ReviewContext,
 }
 
 /// A nested wire body whose discriminant decides its payload.
@@ -8889,6 +8899,224 @@ fn work_context_module() -> GeneratedModule {
     }
 }
 
+/// Platform v2 review/attention/check/PR projections and scoped actions.
+fn review_context_module() -> GeneratedModule {
+    let security_enum = |name: &str, values: Vec<String>| GeneratedEnum {
+        name: name.to_owned(),
+        sensitivity: EnumSensitivity::SecuritySensitive,
+        values,
+        wire_order: None,
+    };
+    GeneratedModule {
+        file_name: module_file_name(REVIEW_CONTEXT_MODULE),
+        doc: "Bounded Platform v2 review, attention, check, and pull-request contract.".to_owned(),
+        source: "automonique_protocol::platform_v2_review".to_owned(),
+        constants: vec![
+            Constant {
+                name: "PLATFORM_REVIEW_SCHEMA_V1".to_owned(),
+                doc: "Stable Platform v2 review sub-contract schema.".to_owned(),
+                value: ConstantValue::Text(
+                    crate::platform_v2_review::PLATFORM_REVIEW_SCHEMA_V1.to_owned(),
+                ),
+            },
+            Constant {
+                name: "MAX_REVIEW_FIELD_BYTES".to_owned(),
+                doc: "Maximum opaque identifier or short field bytes.".to_owned(),
+                value: ConstantValue::Count(crate::platform_v2_review::MAX_REVIEW_FIELD_BYTES),
+            },
+            Constant {
+                name: "MAX_REVIEW_PATH_BYTES".to_owned(),
+                doc: "Maximum repository-relative display path bytes.".to_owned(),
+                value: ConstantValue::Count(crate::platform_v2_review::MAX_REVIEW_PATH_BYTES),
+            },
+            Constant {
+                name: "MAX_REVIEW_TEXT_BYTES".to_owned(),
+                doc: "Maximum persisted comment text bytes.".to_owned(),
+                value: ConstantValue::Count(crate::platform_v2_review::MAX_REVIEW_TEXT_BYTES),
+            },
+            Constant {
+                name: "MAX_REVIEW_HUNK_PREVIEW_BYTES".to_owned(),
+                doc: "Maximum sanitized hunk preview bytes.".to_owned(),
+                value: ConstantValue::Count(
+                    crate::platform_v2_review::MAX_REVIEW_HUNK_PREVIEW_BYTES,
+                ),
+            },
+            Constant {
+                name: "MAX_REVIEW_FILES".to_owned(),
+                doc: "Maximum files in one review snapshot.".to_owned(),
+                value: ConstantValue::Count(crate::platform_v2_review::MAX_REVIEW_FILES),
+            },
+            Constant {
+                name: "MAX_REVIEW_HUNKS_PER_FILE".to_owned(),
+                doc: "Maximum hunks retained for one file.".to_owned(),
+                value: ConstantValue::Count(crate::platform_v2_review::MAX_REVIEW_HUNKS_PER_FILE),
+            },
+            Constant {
+                name: "MAX_REVIEW_HUNKS".to_owned(),
+                doc: "Maximum hunks across one review snapshot.".to_owned(),
+                value: ConstantValue::Count(crate::platform_v2_review::MAX_REVIEW_HUNKS),
+            },
+            Constant {
+                name: "MAX_REVIEW_COMMENTS".to_owned(),
+                doc: "Maximum anchored comments in one review snapshot.".to_owned(),
+                value: ConstantValue::Count(crate::platform_v2_review::MAX_REVIEW_COMMENTS),
+            },
+            Constant {
+                name: "MAX_REVIEW_CHECKS".to_owned(),
+                doc: "Maximum check projections in one review snapshot.".to_owned(),
+                value: ConstantValue::Count(crate::platform_v2_review::MAX_REVIEW_CHECKS),
+            },
+            Constant {
+                name: "MAX_REVIEW_PROPOSALS".to_owned(),
+                doc: "Maximum typed proposals in one review snapshot.".to_owned(),
+                value: ConstantValue::Count(crate::platform_v2_review::MAX_REVIEW_PROPOSALS),
+            },
+            Constant {
+                name: "MAX_REVIEW_PROPOSAL_FILES".to_owned(),
+                doc: "Maximum file identities in one typed proposal.".to_owned(),
+                value: ConstantValue::Count(crate::platform_v2_review::MAX_REVIEW_PROPOSAL_FILES),
+            },
+            Constant {
+                name: "MAX_REVIEW_ATTENTION_EVENTS".to_owned(),
+                doc: "Maximum source attention events in one review snapshot.".to_owned(),
+                value: ConstantValue::Count(crate::platform_v2_review::MAX_REVIEW_ATTENTION_EVENTS),
+            },
+            Constant {
+                name: "MAX_REVIEW_UNREAD".to_owned(),
+                doc: "Maximum authoritative unread count.".to_owned(),
+                value: ConstantValue::Count(crate::platform_v2_review::MAX_REVIEW_UNREAD as usize),
+            },
+            Constant {
+                name: "MAX_REVIEW_SNAPSHOT_CANONICAL_BYTES".to_owned(),
+                doc: "Maximum canonical review snapshot bytes.".to_owned(),
+                value: ConstantValue::Count(
+                    crate::platform_v2_review_api::MAX_REVIEW_SNAPSHOT_CANONICAL_BYTES,
+                ),
+            },
+            Constant {
+                name: "MAX_REVIEW_ACTION_CANONICAL_BYTES".to_owned(),
+                doc: "Maximum canonical scoped review action bytes.".to_owned(),
+                value: ConstantValue::Count(
+                    crate::platform_v2_review_api::MAX_REVIEW_ACTION_CANONICAL_BYTES,
+                ),
+            },
+            Constant {
+                name: "MAX_REVIEW_RECEIPT_CANONICAL_BYTES".to_owned(),
+                doc: "Maximum canonical review receipt bytes.".to_owned(),
+                value: ConstantValue::Count(
+                    crate::platform_v2_review_api::MAX_REVIEW_RECEIPT_CANONICAL_BYTES,
+                ),
+            },
+        ],
+        enums: vec![
+            security_enum(
+                "AttentionOriginKind",
+                platform_values(&AttentionOriginKind::ALL, AttentionOriginKind::as_str),
+            ),
+            security_enum(
+                "AttentionReason",
+                platform_values(&AttentionReason::ALL, AttentionReason::as_str),
+            ),
+            security_enum(
+                "AttentionState",
+                platform_values(&AttentionState::ALL, AttentionState::as_str),
+            ),
+            security_enum(
+                "CheckState",
+                platform_values(&CheckState::ALL, CheckState::as_str),
+            ),
+            security_enum(
+                "CommentAgentState",
+                platform_values(&CommentAgentState::ALL, CommentAgentState::as_str),
+            ),
+            security_enum(
+                "ConflictState",
+                platform_values(&ConflictState::ALL, ConflictState::as_str),
+            ),
+            security_enum(
+                "DeliveryState",
+                platform_values(&DeliveryState::ALL, DeliveryState::as_str),
+            ),
+            security_enum(
+                "DiffChangeKind",
+                platform_values(&DiffChangeKind::ALL, DiffChangeKind::as_str),
+            ),
+            security_enum(
+                "DiffSide",
+                platform_values(&DiffSide::ALL, DiffSide::as_str),
+            ),
+            security_enum(
+                "MergeReadiness",
+                platform_values(&MergeReadiness::ALL, MergeReadiness::as_str),
+            ),
+            security_enum(
+                "PreviewKind",
+                platform_values(&PreviewKind::ALL, PreviewKind::as_str),
+            ),
+            security_enum(
+                "PullRequestState",
+                platform_values(&PullRequestState::ALL, PullRequestState::as_str),
+            ),
+            security_enum(
+                "ReviewActionKind",
+                platform_values(&ReviewActionKind::ALL, ReviewActionKind::as_str),
+            ),
+            security_enum(
+                "ReviewAuthentication",
+                platform_values(&ReviewAuthentication::ALL, ReviewAuthentication::as_str),
+            ),
+            security_enum(
+                "ReviewAuthorityKind",
+                platform_values(&ReviewAuthorityKind::ALL, ReviewAuthorityKind::as_str),
+            ),
+            security_enum(
+                "ReviewDecision",
+                platform_values(&ReviewDecision::ALL, ReviewDecision::as_str),
+            ),
+            security_enum(
+                "ReviewFreshnessState",
+                platform_values(&ReviewFreshnessState::ALL, ReviewFreshnessState::as_str),
+            ),
+            security_enum(
+                "ReviewProposalKind",
+                platform_values(&ReviewProposalKind::ALL, ReviewProposalKind::as_str),
+            ),
+            security_enum(
+                "ReviewReceiptOutcome",
+                platform_values(&ReviewReceiptOutcome::ALL, ReviewReceiptOutcome::as_str),
+            ),
+            security_enum(
+                "ReviewReconciliation",
+                platform_values(&ReviewReconciliation::ALL, ReviewReconciliation::as_str),
+            ),
+            security_enum(
+                "WorktreeFileState",
+                platform_values(&WorktreeFileState::ALL, WorktreeFileState::as_str),
+            ),
+        ],
+        imports: vec![
+            ModuleImport {
+                module: RUNTIME_MODULE.to_owned(),
+                values: vec![
+                    "RefusalError".to_owned(),
+                    "byteLength".to_owned(),
+                    "isWellFormedUnicode".to_owned(),
+                    "parseCanonical".to_owned(),
+                    "toCanonicalBytes".to_owned(),
+                ],
+                types: vec!["JsonValue".to_owned()],
+            },
+            ModuleImport {
+                module: WORK_CONTEXT_MODULE.to_owned(),
+                values: vec!["validateWorkContextIdentity".to_owned()],
+                types: vec!["WorkContextIdentity".to_owned()],
+            },
+        ],
+        implementation: Some(GeneratedImplementation::ReviewContext),
+        ..GeneratedModule::default()
+    }
+}
+
 /// The stream message arms, each carrying its body under one shared key.
 ///
 /// Written as a match over the closed kind set rather than a list, so a kind
@@ -8931,6 +9159,7 @@ pub fn maintained_modules() -> Vec<GeneratedModule> {
         mobile_auth_module(),
         platform_module(),
         work_context_module(),
+        review_context_module(),
         progress_module(),
     ];
     modules.sort_by(|left, right| left.file_name.cmp(&right.file_name));
@@ -11719,6 +11948,19 @@ export function decodeWorkContextMutationRefusal(payload: Uint8Array): MutationR
     );
 }
 
+/// Emit the strict validator/codec implementation for the generated review
+/// sub-contract. Its declarations are driven by the Rust model and the
+/// cross-language canonical corpus holds this implementation to the Rust
+/// encoders and refusal categories.
+fn emit_review_context_implementation(out: &mut String) {
+    out.push('\n');
+    let template = include_str!("platform_v2_review.typescript");
+    let implementation = template
+        .strip_prefix("// SPDX-License-Identifier: Elastic-2.0\n\n")
+        .expect("review TypeScript template carries the product license marker");
+    out.push_str(implementation);
+}
+
 /// Emit one generated file.
 ///
 /// Output is a pure function of the input: every collection is sorted and no
@@ -11779,6 +12021,9 @@ pub fn emit_module(module: &GeneratedModule) -> String {
 
     if module.implementation == Some(GeneratedImplementation::WorkContext) {
         emit_work_context_implementation(&mut out);
+    }
+    if module.implementation == Some(GeneratedImplementation::ReviewContext) {
+        emit_review_context_implementation(&mut out);
     }
 
     if let Some(surface) = &module.json_surface {

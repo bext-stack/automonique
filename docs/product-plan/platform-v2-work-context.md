@@ -243,6 +243,9 @@ SDK still advertises `protocolRange: 1` and `automonique.platform/v1`, so its
 manifest pins the separately generated `PLATFORM_V1_SCHEMA_DIGEST`; the
 checked-in Platform v1 module remains byte-identical.
 
+The additive typed review/attention sub-contract built on these identities is
+specified in [Platform v2 review, attention, checks, and pull requests](platform-v2-review-contract.md).
+
 `automonique-store::lineage_index` is the authoritative normalized SQLite
 index for this slice. It validates current-version tables, indexes, required
 columns, foreign keys, and SQLite integrity on open. It keeps external work, internal orchestration, and
