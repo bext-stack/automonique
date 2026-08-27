@@ -3,6 +3,7 @@
 //! Bounded, server-owned browser projection over the authenticated Platform v2 bridge.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use automonique_protocol::platform::IdempotencyKey;
 use automonique_protocol::platform_v2::{
@@ -27,6 +28,14 @@ use crate::platform_v2_bridge::PlatformV2Bridge;
 const SCHEMA: &str = "automonique.dashboard.cockpit/v2";
 const ADAPTER_PENDING: &str = "platform_v2_lifecycle_adapter_pending";
 const REVIEW_ADAPTER_PENDING: &str = "platform_v2_review_adapter_pending";
+const MAX_ATTENTION_WORKSPACES: usize = 16;
+const ATTENTION_READ_TIMEOUT: Duration = Duration::from_millis(100);
+
+#[derive(Debug)]
+struct AttentionInventory {
+    coverage: Value,
+    observations: BTreeMap<String, Value>,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -145,6 +154,7 @@ fn read(
         }
         _ => unavailable("no_selected_workspace"),
     };
+    let attention = attention_inventory(bridge, records, selected_identity.as_ref(), &review);
     Ok(json!({
         "schema": SCHEMA,
         "mode": "v2",
@@ -152,10 +162,11 @@ fn read(
         "retained_v1": retained_v1,
         "projects": named_records(records, WorkContextKind::Project),
         "hosts": host_records(records),
-        "workspaces": workspace_records(records, selected_identity.as_ref(), &review),
+        "workspaces": workspace_records(records, &attention.observations),
         "selected": { "workspace": selected_identity.as_ref().map(WorkContextIdentity::id) },
         "lineage": lineage,
         "review": review,
+        "attention": attention.coverage,
         "actions": {
             "lifecycle": { "available": false, "category": ADAPTER_PENDING },
             "review": { "available": false, "category": REVIEW_ADAPTER_PENDING }
@@ -265,10 +276,123 @@ fn host_records(records: &[WorkContextRecord]) -> Vec<Value> {
         .collect()
 }
 
-fn workspace_records(
+fn attention_inventory(
+    bridge: &PlatformV2Bridge,
     records: &[WorkContextRecord],
     selected: Option<&WorkContextIdentity>,
-    review: &Value,
+    selected_review: &Value,
+) -> AttentionInventory {
+    let workspaces: Vec<_> = records
+        .iter()
+        .filter(|record| record.kind() == WorkContextKind::UserWorkspace)
+        .collect();
+    let total = workspaces.len();
+    if total > MAX_ATTENTION_WORKSPACES {
+        return AttentionInventory {
+            coverage: attention_coverage(
+                "unavailable",
+                Some("platform_v2_attention_inventory_exceeds_bound"),
+                0,
+                total,
+            ),
+            observations: BTreeMap::new(),
+        };
+    }
+
+    let observations = workspaces
+        .into_iter()
+        .map(|record| {
+            let review = if selected == Some(record.identity()) {
+                selected_review.clone()
+            } else {
+                bounded_review(bridge, record)
+            };
+            (
+                record.identity().id().to_owned(),
+                attention_observation(&review),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let coverage = summarize_attention(&observations, total);
+    AttentionInventory {
+        coverage,
+        observations,
+    }
+}
+
+fn summarize_attention(observations: &BTreeMap<String, Value>, total: usize) -> Value {
+    let known = observations
+        .values()
+        .filter(|value| value["state"] == "available")
+        .count();
+    let (state, category) = if known == total {
+        ("available", None)
+    } else if known == 0 {
+        ("unavailable", Some("platform_v2_attention_unavailable"))
+    } else {
+        ("partial", Some("platform_v2_attention_partial"))
+    };
+    attention_coverage(state, category, known, total)
+}
+
+fn bounded_review(bridge: &PlatformV2Bridge, record: &WorkContextRecord) -> Value {
+    let Some(WorkContextIdentity::Project(project)) =
+        relation(record, WorkContextRelationKind::UserWorkspaceProject)
+    else {
+        return unavailable("platform_v2_workspace_project_unavailable");
+    };
+    let Ok(request) = ReviewReadRequest::new(project, record.identity().clone()) else {
+        return unavailable("platform_cockpit_selection_invalid");
+    };
+    match bridge.request_with_timeout(
+        PlatformV2Request::GetReview(request),
+        ATTENTION_READ_TIMEOUT,
+    ) {
+        Ok(PlatformV2Response::ReviewResult(value)) => encode_review_snapshot(&value)
+            .map_err(|_| "platform_cockpit_projection_invalid")
+            .and_then(available_document)
+            .unwrap_or_else(unavailable),
+        Ok(PlatformV2Response::Refused(value)) => {
+            refused(value.category().as_str(), value.explanation().as_str())
+        }
+        Ok(_) => unavailable("platform_v2_response_invalid"),
+        Err(category) => unavailable(category),
+    }
+}
+
+fn attention_observation(review: &Value) -> Value {
+    let attention = review
+        .pointer("/document/attention/state")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            matches!(
+                *value,
+                "idle" | "needs_you" | "working" | "blocked" | "done"
+            )
+        });
+    if let Some(attention) = attention {
+        json!({ "state": "available", "value": attention, "category": Value::Null })
+    } else {
+        let category = review
+            .get("category")
+            .and_then(Value::as_str)
+            .unwrap_or("platform_v2_attention_unavailable");
+        json!({ "state": "unavailable", "value": Value::Null, "category": category })
+    }
+}
+
+fn attention_coverage(state: &str, category: Option<&str>, known: usize, total: usize) -> Value {
+    json!({
+        "state": state,
+        "category": category,
+        "known_workspaces": known.to_string(),
+        "total_workspaces": total.to_string()
+    })
+}
+
+fn workspace_records(
+    records: &[WorkContextRecord],
+    attention: &BTreeMap<String, Value>,
 ) -> Vec<Value> {
     let checkouts: BTreeMap<_, _> = records
         .iter()
@@ -305,11 +429,7 @@ fn workspace_records(
         .map(|record| {
             let project = relation(record, WorkContextRelationKind::UserWorkspaceProject);
             let checkout = relation(record, WorkContextRelationKind::UserWorkspaceCheckout);
-            let selected_record = selected == Some(record.identity());
-            let attention = selected_record
-                .then(|| review.pointer("/document/attention/state").cloned())
-                .flatten()
-                .unwrap_or(Value::Null);
+            let observation = attention.get(record.identity().id());
             json!({
                 "id": record.identity().id(),
                 "label": record.label().as_str(),
@@ -319,7 +439,18 @@ fn workspace_records(
                 "checkout_id": checkout.as_ref().map(WorkContextIdentity::id),
                 "host_id": checkout.as_ref().and_then(|value| checkouts.get(value.id())).cloned().flatten(),
                 "session_id": sessions.get(record.identity().id()),
-                "attention": attention
+                "attention": observation
+                    .and_then(|value| value.get("value"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "attention_availability": observation
+                    .and_then(|value| value.get("state"))
+                    .cloned()
+                    .unwrap_or_else(|| json!("unavailable")),
+                "attention_category": observation
+                    .and_then(|value| value.get("category"))
+                    .cloned()
+                    .unwrap_or_else(|| json!("platform_v2_attention_inventory_exceeds_bound"))
             })
         })
         .collect()
@@ -376,6 +507,12 @@ fn fallback(retained_v1: Value, category: &str) -> Value {
         "selected": { "workspace": Value::Null },
         "lineage": unavailable("platform_v2_unavailable"),
         "review": unavailable("platform_v2_unavailable"),
+        "attention": {
+            "state": "unavailable",
+            "category": "platform_v2_unavailable",
+            "known_workspaces": "0",
+            "total_workspaces": "0"
+        },
         "actions": {
             "lifecycle": { "available": false, "category": ADAPTER_PENDING },
             "review": { "available": false, "category": REVIEW_ADAPTER_PENDING }
@@ -412,5 +549,53 @@ mod tests {
         assert_eq!(value["mode"], "v1");
         assert_eq!(value["workspaces"], json!([]));
         assert_eq!(value["actions"]["lifecycle"]["available"], false);
+    }
+
+    #[test]
+    fn attention_inventory_is_complete_only_when_every_workspace_is_known() {
+        let observations = BTreeMap::from([
+            (
+                String::from("workspace-a"),
+                attention_observation(&json!({
+                    "state": "available",
+                    "document": { "attention": { "state": "needs_you" } }
+                })),
+            ),
+            (
+                String::from("workspace-b"),
+                attention_observation(&json!({
+                    "state": "available",
+                    "document": { "attention": { "state": "blocked" } }
+                })),
+            ),
+        ]);
+        let complete = summarize_attention(&observations, 2);
+        assert_eq!(complete["state"], "available");
+        assert_eq!(complete["known_workspaces"], "2");
+        assert_eq!(observations["workspace-a"]["value"], "needs_you");
+        assert_eq!(observations["workspace-b"]["value"], "blocked");
+
+        let mut partial = observations;
+        partial.insert(
+            String::from("workspace-b"),
+            attention_observation(&unavailable("review_adapter_unavailable")),
+        );
+        let partial = summarize_attention(&partial, 2);
+        assert_eq!(partial["state"], "partial");
+        assert_eq!(partial["known_workspaces"], "1");
+        assert_eq!(partial["total_workspaces"], "2");
+    }
+
+    #[test]
+    fn bounded_attention_overflow_is_explicit_and_non_inferential() {
+        let value = attention_coverage(
+            "unavailable",
+            Some("platform_v2_attention_inventory_exceeds_bound"),
+            0,
+            MAX_ATTENTION_WORKSPACES + 1,
+        );
+        assert_eq!(value["state"], "unavailable");
+        assert_eq!(value["known_workspaces"], "0");
+        assert_eq!(value["total_workspaces"], "17");
     }
 }

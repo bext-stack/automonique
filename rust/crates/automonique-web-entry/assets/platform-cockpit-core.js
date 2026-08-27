@@ -109,6 +109,37 @@
     });
   }
 
+  function freshnessStates(document) {
+    const lineage = document?.lineage?.document?.value || document?.lineage?.document || {};
+    const review = document?.review?.document || {};
+    return [
+      ...(Array.isArray(lineage.external_work_items) ? lineage.external_work_items : []),
+      ...(Array.isArray(lineage.orchestration) ? lineage.orchestration : []),
+      ...(Array.isArray(review.checks) ? review.checks : []),
+      review.review,
+      review.pull_request,
+      review.delivery,
+    ].map((value) => value?.freshness?.state).filter((value) => typeof value === "string");
+  }
+
+  function partialReasons(document, selectedWorkspace) {
+    if (document?.mode !== "v2") return [];
+    const reasons = [];
+    if (selectedWorkspace) {
+      ["lineage", "review"].forEach((name) => {
+        const projection = document?.[name];
+        if (projection?.state !== "available") {
+          reasons.push(boundedText(projection?.category, 128) || `${name}_unavailable`);
+        }
+      });
+    }
+    if (document?.attention?.state !== "available") {
+      reasons.push(boundedText(document?.attention?.category, 128) || "attention_inventory_unavailable");
+    }
+    if (freshnessStates(document).includes("unknown")) reasons.push("freshness_unknown");
+    return [...new Set(reasons)];
+  }
+
   function derivePresentation(document, selection = {}) {
     // Only the authenticated server-owned cockpit projection is accepted.
     // Raw Platform v2 documents and retained-session summaries never become
@@ -123,22 +154,28 @@
       || workspaces.find((item) => item.session_id === sessionId)
       || workspaces[0]
       || null;
-    const mode = structured && document.mode === "v2" ? "v2" : "v1";
-    const degradation = mode === "v2"
-      ? null
-      : `Platform v1: workspace context is unavailable (${boundedText(document?.degradation?.category, 128) || "Platform v2 unavailable"}). Retained sessions remain available.`;
+    const reasons = partialReasons(document, selectedWorkspace);
+    const v2 = structured && document.mode === "v2";
+    const attentionAvailable = v2 && document?.attention?.state === "available";
+    const mode = v2 ? (reasons.length === 0 ? "v2" : "partial") : "v1";
+    const degradation = mode === "v1"
+      ? `Platform v1: workspace context is unavailable (${boundedText(document?.degradation?.category, 128) || "Platform v2 unavailable"}). Retained sessions remain available.`
+      : mode === "partial"
+        ? `Platform v2 is partial (${reasons.join(", ")}). Unavailable context is not inferred and workspace actions remain read-only.`
+        : null;
     const activities = structured && Array.isArray(document.activities)
       ? document.activities.map(normalizeActivity).filter(Boolean).sort((left, right) => left.at.localeCompare(right.at) || left.id.localeCompare(right.id))
       : [];
     return Object.freeze({
       mode,
       degradation,
-      stale: false,
+      stale: v2 && freshnessStates(document).includes("stale"),
       projects: Object.freeze(projects),
       hosts: Object.freeze(hosts),
       workspaces: Object.freeze(workspaces),
       selectedWorkspace,
-      attention: Object.freeze(Object.fromEntries(ATTENTION_STATES.map((state) => [state, workspaces.filter((item) => item.attention === state).length]))),
+      attentionAvailable,
+      attention: Object.freeze(Object.fromEntries(ATTENTION_STATES.map((state) => [state, attentionAvailable ? workspaces.filter((item) => item.attention === state).length : null]))),
       activities: Object.freeze(activities),
       receipt: normalizeReceipt(document?.receipt),
       create: mutationCapability(document),

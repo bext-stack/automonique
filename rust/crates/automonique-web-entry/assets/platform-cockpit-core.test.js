@@ -23,7 +23,9 @@ const fixture = {
     attention: "needs_you",
     revision: "9007199254740995",
   }],
-  review: { state: "available", document: { files: [], checks: [], review: { decision: "pending" }, delivery: { state: "pending" } } },
+  lineage: { state: "available", document: { value: { external_work_items: [], orchestration: [] } } },
+  review: { state: "available", document: { files: [], checks: [], review: { decision: "pending", freshness: { state: "fresh" } }, delivery: { state: "pending", freshness: { state: "fresh" } } } },
+  attention: { state: "available", known_workspaces: "1", total_workspaces: "1" },
 };
 
 test("decimal fences stay exact beyond Number.MAX_SAFE_INTEGER", () => {
@@ -47,7 +49,7 @@ test("v1 degrades explicitly and never infers workspace state from summaries", (
   expect(view.mode).toBe("v1");
   expect(view.degradation).toContain("Platform v1");
   expect(view.workspaces).toEqual([]);
-  expect(view.attention.working).toBe(0);
+  expect(view.attention.working).toBe(null);
   expect(view.resume.available).toBe(false);
 });
 
@@ -73,7 +75,58 @@ test("server-owned structured fixture exposes exact selected workspace and revie
   expect(view.selectedWorkspace.revision).toBe("9007199254740995");
   expect(view.attention.needs_you).toBe(1);
   expect(view.readModels.files).toEqual([]);
-  expect(view.readModels.review).toEqual({ decision: "pending" });
+  expect(view.readModels.review.decision).toBe("pending");
+});
+
+test("attention counts remain inventory-wide across several structured workspaces", () => {
+  const view = cockpit.derivePresentation({
+    ...fixture,
+    workspaces: [
+      ...fixture.workspaces,
+      { id: "workspace-2", label: "Blocked work", revision: "2", attention: "blocked" },
+      { id: "workspace-3", label: "Background work", revision: "3", attention: "working" },
+    ],
+    attention: { state: "available", known_workspaces: "3", total_workspaces: "3" },
+  });
+  expect(view.mode).toBe("v2");
+  expect(view.attention).toEqual({ needs_you: 1, working: 1, blocked: 1, done: 0 });
+});
+
+test("partial lineage or review refusal never claims complete v2 capability", () => {
+  const lineageRefused = cockpit.derivePresentation({
+    ...fixture,
+    lineage: { state: "refused", category: "lineage_authority_refused" },
+  });
+  expect(lineageRefused.mode).toBe("partial");
+  expect(lineageRefused.degradation).toContain("lineage_authority_refused");
+
+  const reviewRefused = cockpit.derivePresentation({
+    ...fixture,
+    review: { state: "refused", category: "review_authority_refused" },
+    attention: { state: "partial", category: "platform_v2_attention_partial" },
+  });
+  expect(reviewRefused.mode).toBe("partial");
+  expect(reviewRefused.degradation).toContain("review_authority_refused");
+  expect(reviewRefused.degradation).toContain("platform_v2_attention_partial");
+  expect(reviewRefused.attentionAvailable).toBe(false);
+  expect(reviewRefused.attention.needs_you).toBe(null);
+});
+
+test("stale canonical subprojections make the cockpit explicitly stale and read-only", () => {
+  const view = cockpit.derivePresentation({
+    ...fixture,
+    review: {
+      state: "available",
+      document: {
+        ...fixture.review.document,
+        review: { decision: "pending", freshness: { state: "stale" } },
+      },
+    },
+  });
+  expect(view.mode).toBe("v2");
+  expect(view.stale).toBe(true);
+  expect(view.create.available).toBe(false);
+  expect(view.resume.available).toBe(false);
 });
 
 test("lifecycle actions remain honestly disabled at the missing host adapter seam", () => {

@@ -411,6 +411,26 @@ impl PlatformV2Bridge {
             .map_err(|_| "platform_v2_response_invalid")
     }
 
+    /// Issue one internal Platform v2 read with a caller-owned wall-clock
+    /// bound. The ordinary bridge path retains its configured timeout; this
+    /// narrower path is used only for best-effort inventory enrichment where
+    /// one slow workspace must not stall the entire hosted cockpit.
+    pub(crate) fn request_with_timeout(
+        &self,
+        request: PlatformV2Request,
+        timeout: Duration,
+    ) -> Result<PlatformV2Response, &'static str> {
+        let request = PlatformV2RequestMessage::new(self.request_id("cockpit-bounded")?, request);
+        let bytes = request
+            .to_canonical_bytes()
+            .map_err(|_| "platform_v2_request_invalid")?;
+        self.verify_binding()?;
+        let response = self.exchange_local_with_timeout(PlatformV2Lane::V2, &bytes, timeout)?;
+        PlatformV2ResponseMessage::from_canonical_bytes(&response, &request)
+            .map(|message| message.response().clone())
+            .map_err(|_| "platform_v2_response_invalid")
+    }
+
     fn request_id(&self, lane: &str) -> Result<RequestId, &'static str> {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
         RequestId::new(format!("web-{lane}-{sequence}")).map_err(|_| "platform_v2_request_invalid")

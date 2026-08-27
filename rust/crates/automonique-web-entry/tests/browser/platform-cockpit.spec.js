@@ -15,14 +15,28 @@ const cockpit = {
     health: "operational",
     inventory: { state: "available" },
     sessions_cursor: { authority: "automonique", topic: "sessions", sequence: "4" },
-    sessions: [],
+    sessions: [{
+      session: {
+        resource: { authority: "automonique", kind: "session", id: "session-1" },
+        summary: "Retained cockpit work",
+        freshness: "fresh",
+        revision: "4",
+      },
+      attachable: true,
+      controllable: false,
+      run: null,
+    }],
   },
   projects: [{ id: "project-1", label: "Automonique", revision: "1", lifecycle: "active" }],
   hosts: [{ id: "host-1", label: "Local host", revision: "1", lifecycle: "active", project_id: "project-1", kind: "local" }],
-  workspaces: [{ id: "workspace-1", label: "Cockpit", revision: "9007199254740995", lifecycle: "active", project_id: "project-1", host_id: "host-1", session_id: null, attention: "needs_you" }],
+  workspaces: [
+    { id: "workspace-1", label: "Cockpit", revision: "9007199254740995", lifecycle: "active", project_id: "project-1", host_id: "host-1", session_id: "session-1", attention: "needs_you" },
+    { id: "workspace-2", label: "Blocked workspace", revision: "7", lifecycle: "active", project_id: "project-1", host_id: "host-1", session_id: null, attention: "blocked" },
+  ],
   selected: { workspace: "workspace-1" },
   lineage: { state: "available", document: { workspace: "workspace-1", external_work_items: [], orchestration: [] } },
-  review: { state: "available", document: { files: [], checks: [], review: {}, delivery: {} } },
+  review: { state: "available", document: { files: [], checks: [], review: { freshness: { state: "fresh" } }, delivery: { freshness: { state: "fresh" } } } },
+  attention: { state: "available", known_workspaces: "2", total_workspaces: "2" },
   actions: {
     lifecycle: { available: false, category: "platform_v2_lifecycle_adapter_pending" },
     review: { available: false, category: "platform_v2_review_adapter_pending" },
@@ -41,6 +55,7 @@ test.beforeEach(async ({ page }) => {
     if (url.pathname === "/assets/platform-cockpit-core.js") return route.fulfill({ contentType: "text/javascript", body: core });
     if (url.pathname === "/assets/qrcode.js") return route.fulfill({ contentType: "text/javascript", body: "" });
     if (url.pathname === "/api/platform/cockpit") return route.fulfill({ contentType: "application/json", body: JSON.stringify(cockpit) });
+    if (url.pathname === "/api/platform/session") return route.fulfill({ contentType: "application/json", body: JSON.stringify({ state: "refused", outcome: "unavailable", explanation: "Fixture has no session host" }) });
     return route.fulfill({ contentType: "application/json", body: "{}" });
   });
   await page.goto("https://cockpit.test/#sessions");
@@ -65,4 +80,52 @@ test("workspace-first layout does not overflow the active viewport", async ({ pa
   await expect(page.locator("#cockpit-workspace-navigation")).toBeVisible();
   await expect(page.locator("#cockpit-workspace-summary")).toBeVisible();
   await expect(page.locator("#cockpit-workspace-inspector")).toBeVisible();
+});
+
+test("attention filtering preserves structured workspaces and retained sessions", async ({ page }) => {
+  await expect(page.locator("#cockpit-needs-you-count")).toHaveText("1");
+  await expect(page.locator("#cockpit-blocked-count")).toHaveText("1");
+  await expect(page.locator(".platform-session-option")).toContainText("Retained cockpit work");
+
+  await page.locator('[data-cockpit-attention="needs_you"]').click();
+  await expect(page.getByRole("option", { name: /Cockpit/ })).toBeVisible();
+  await expect(page.getByRole("option", { name: /Blocked workspace/ })).toHaveCount(0);
+  await expect(page.locator(".platform-session-option")).toContainText("Retained cockpit work");
+  await expect(page.locator("#cockpit-capability-state")).toHaveAttribute("data-mode", "v2");
+
+  await page.locator('[data-cockpit-attention="blocked"]').click();
+  await expect(page.getByRole("option", { name: /Blocked workspace/ })).toBeVisible();
+  await expect(page.getByRole("option", { name: /Cockpit/ })).toHaveCount(0);
+  await expect(page.locator(".platform-session-option")).toContainText("Retained cockpit work");
+});
+
+test("retained session selection and detach never discard the cockpit snapshot", async ({ page }) => {
+  await page.locator(".platform-session-option").click();
+  await expect(page.locator(".platform-session-option")).toContainText("Retained cockpit work");
+  await expect(page.getByRole("option", { name: /Cockpit/ })).toBeVisible();
+  await expect(page.locator("#cockpit-capability-state")).toHaveAttribute("data-mode", "v2");
+
+  await page.locator("#platform-session-detach").click();
+  await expect(page.locator(".platform-session-option")).toContainText("Retained cockpit work");
+  await expect(page.getByRole("option", { name: /Cockpit/ })).toBeVisible();
+  await expect(page.locator("#cockpit-capability-state")).toHaveAttribute("data-mode", "v2");
+});
+
+test("partial lineage and review refusals disable attention filtering without inference", async ({ page }) => {
+  const partial = {
+    ...cockpit,
+    lineage: { state: "refused", category: "lineage_authority_refused", explanation: "Fixture refusal" },
+    review: { state: "refused", category: "review_authority_refused", explanation: "Fixture refusal" },
+    attention: { state: "partial", category: "platform_v2_attention_partial", known_workspaces: "1", total_workspaces: "2" },
+  };
+  await page.evaluate((view) => globalThis.renderPlatform(view), partial);
+  await expect(page.locator("#cockpit-capability-state")).toHaveAttribute("data-mode", "partial");
+  await expect(page.locator("#cockpit-capability-state")).toContainText("lineage_authority_refused");
+  await expect(page.locator("#cockpit-capability-state")).toContainText("review_authority_refused");
+  await expect(page.locator('[data-cockpit-attention="needs_you"]')).toBeDisabled();
+  await expect(page.locator('[data-cockpit-attention="blocked"]')).toBeDisabled();
+  await expect(page.locator("#cockpit-needs-you-count")).toHaveText("—");
+  await expect(page.getByRole("option", { name: /Cockpit/ })).toBeVisible();
+  await expect(page.getByRole("option", { name: /Blocked workspace/ })).toBeVisible();
+  await expect(page.locator(".platform-session-option")).toContainText("Retained cockpit work");
 });

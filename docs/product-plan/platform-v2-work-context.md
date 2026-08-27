@@ -347,6 +347,15 @@ exact project-qualified lineage and review operations. Canonical integer
 fields are rendered as decimal strings before they cross the browser boundary,
 so JavaScript never parses authoritative revisions through `Number`.
 
+Attention filters are advertised as complete only when every workspace in the
+bounded inventory has an authority-qualified review projection. The web entry
+enriches at most 16 workspaces and gives each non-selected enrichment read a
+100 ms local-socket deadline. A larger inventory, a refusal, or a timed-out
+workspace produces explicit `partial` or `unavailable` attention coverage;
+unknown workspaces receive no inferred attention state. The browser keeps the
+structured cockpit snapshot separate from the retained Platform v1 snapshot,
+so filtering, selecting, and detaching cannot discard either surface.
+
 If v2 is refused, unavailable, downgraded, or exceeds the cockpit bound, the
 response carries the retained Platform v1 session projection separately and
 an explicit degradation category. It returns no projects, hosts, or workspaces
@@ -357,3 +366,9 @@ the exact selected workspace, expected snapshot/review revisions, and
 idempotency key on the typed v2 request, but remain visibly unavailable while
 the daemon returns `platform_v2_review_adapter_pending`. These are integration
 gaps, not browser capabilities.
+
+Within a negotiated v2 response, lineage, review, and attention availability
+remain independent. Any selected-workspace refusal, incomplete attention
+coverage, or unknown freshness is rendered as partial rather than fully
+capable. Canonical stale freshness is called out explicitly and the cockpit
+remains read-only.

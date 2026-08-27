@@ -22,6 +22,7 @@ let memoryQuery = null;
 let operationsSnapshot = null;
 let processesSnapshot = null;
 let platformSnapshot = null;
+let cockpitSnapshot = null;
 let platformSelectedSession = null;
 let platformHistoryCursor = null;
 let platformMutation = null;
@@ -2231,7 +2232,7 @@ function renderHostedCockpit(view) {
 
   const workspaceRoot = byId("cockpit-workspace-list");
   workspaceRoot.replaceChildren();
-  const filtered = cockpitPresentation.workspaces.filter((workspace) => cockpitState.attentionFilter === "all" || workspace.attention === cockpitState.attentionFilter);
+  const filtered = cockpitPresentation.workspaces.filter((workspace) => !cockpitPresentation.attentionAvailable || cockpitState.attentionFilter === "all" || workspace.attention === cockpitState.attentionFilter);
   if (filtered.length === 0) {
     const empty = document.createElement("div");
     empty.className = "cockpit-unavailable";
@@ -2256,6 +2257,14 @@ function renderHostedCockpit(view) {
 
   Object.entries({ needs_you: "cockpit-needs-you-count", working: "cockpit-working-count", blocked: "cockpit-blocked-count", done: "cockpit-done-count" })
     .forEach(([state, id]) => { byId(id).textContent = count(cockpitPresentation.attention[state]); });
+  document.querySelectorAll("[data-cockpit-attention]").forEach((button) => {
+    button.disabled = button.dataset.cockpitAttention !== "all" && !cockpitPresentation.attentionAvailable;
+    const active = cockpitPresentation.attentionAvailable
+      ? button.dataset.cockpitAttention === cockpitState.attentionFilter
+      : button.dataset.cockpitAttention === "all";
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
 
   const workspace = cockpitPresentation.selectedWorkspace;
   byId("cockpit-workspace-coordinate").textContent = workspace ? workspace.id : "NO STRUCTURED WORKSPACE";
@@ -2315,10 +2324,15 @@ function renderHostedCockpit(view) {
 
 function renderPlatform(view) {
   const retained = view?.retained_v1 && typeof view.retained_v1 === "object" ? view.retained_v1 : {};
+  cockpitSnapshot = view?.schema === "automonique.dashboard.cockpit/v2" ? view : null;
+  renderHostedCockpit(view);
+  renderRetainedPlatform(retained);
+}
+
+function renderRetainedPlatform(retained) {
   const sessions = Array.isArray(retained.sessions) ? retained.sessions : [];
   const inventory = retained.inventory || {};
   platformSnapshot = retained;
-  renderHostedCockpit(view);
   byId("platform-sessions").textContent = count(sessions.length);
   byId("platform-health").textContent = words(retained.health || "unavailable").toUpperCase();
   byId("platform-health").dataset.state = retained.health || "unavailable";
@@ -2543,7 +2557,7 @@ async function selectPlatformSession(sessionId) {
   platformHistoryCursor = null;
   platformExactRevision = null;
   try { sessionStorage.setItem("monique-platform-session", sessionId); } catch (_error) { /* memory-only fallback */ }
-  renderPlatform(platformSnapshot || {});
+  renderRetainedPlatform(platformSnapshot || {});
   updateCockpitLink(matchingWorkspace || cockpitPresentation?.selectedWorkspace, sessionId);
   if (previous) platformPost({ action: "detach", session_id: previous }).catch(() => {});
   await openPlatformSession(sessionId);
@@ -2628,7 +2642,7 @@ async function detachPlatformSession() {
   }));
   byId("platform-session-detail").hidden = true;
   byId("platform-session-empty").hidden = false;
-  renderPlatform(platformSnapshot || {});
+  renderRetainedPlatform(platformSnapshot || {});
 }
 
 async function loadPlatform({ announce = false } = {}) {
@@ -3041,7 +3055,7 @@ document.querySelectorAll("[data-cockpit-attention]").forEach((button) => button
     item.classList.toggle("is-active", item === button);
     item.setAttribute("aria-pressed", String(item === button));
   });
-  renderHostedCockpit(platformSnapshot || {});
+  renderHostedCockpit(cockpitSnapshot || {});
 }));
 byId("cockpit-workspace-list").addEventListener("keydown", (event) => {
   if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
