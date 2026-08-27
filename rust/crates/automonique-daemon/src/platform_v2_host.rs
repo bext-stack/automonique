@@ -221,6 +221,87 @@ pub fn verify_web_principal_binding(
     tenant: &str,
     actor: &str,
 ) -> Result<(), &'static str> {
+    load_web_principal(policy_path, expected_uid, tenant, actor).map(|_| ())
+}
+
+/// Verify that an operator-provisioned mobile project set is a non-empty
+/// subset of the current server-owned principal policy.
+pub fn verify_web_project_roots(
+    policy_path: &Path,
+    expected_uid: u32,
+    tenant: &str,
+    actor: &str,
+    roots: &BTreeSet<ProjectId>,
+) -> Result<(), &'static str> {
+    let principal = load_web_principal(policy_path, expected_uid, tenant, actor)?;
+    if roots.is_empty() || !roots.is_subset(&principal.projects) {
+        return Err("platform_v2_mobile_project_denied");
+    }
+    Ok(())
+}
+
+/// Resolve only the project coordinate required to authorize one mobile
+/// Platform v2 request. No authority grant or unrelated policy entry leaves
+/// this boundary.
+pub fn resolve_web_mobile_request_project(
+    policy_path: &Path,
+    expected_uid: u32,
+    tenant: &str,
+    actor: &str,
+    roots: &BTreeSet<ProjectId>,
+    request: &PlatformV2Request,
+) -> Result<ProjectId, &'static str> {
+    let principal = load_web_principal(policy_path, expected_uid, tenant, actor)?;
+    let project = match request {
+        PlatformV2Request::QueryWorkContexts(query) => {
+            let project = query
+                .project()
+                .ok_or("platform_v2_mobile_project_required")?;
+            if query.parent().is_some_and(|parent| {
+                principal
+                    .workspaces
+                    .get(parent)
+                    .is_none_or(|scope| &scope.project != project)
+            }) {
+                return Err("platform_v2_mobile_project_denied");
+            }
+            project.clone()
+        }
+        PlatformV2Request::GetWorkContext(identity) => principal
+            .workspaces
+            .get(identity)
+            .map(|scope| scope.project.clone())
+            .ok_or("platform_v2_mobile_project_denied")?,
+        PlatformV2Request::PrepareMutation(value) => {
+            scope_for_intent(value.intent(), &principal)?.0
+        }
+        PlatformV2Request::DecideMutation(_) | PlatformV2Request::SubmitMutation(_) => {
+            return Err("platform_v2_mobile_preview_scope_required");
+        }
+        PlatformV2Request::GetMutationReceipt(value) => value.project().clone(),
+        PlatformV2Request::GetLineage(value) => value.project().clone(),
+        PlatformV2Request::SubmitWorkspaceIntent(value) => value.project().clone(),
+        PlatformV2Request::GetWorkspaceIntent(value) => value.project().clone(),
+        PlatformV2Request::GetReview(value) => value.project().clone(),
+        PlatformV2Request::ExecuteReviewAction(value) => principal
+            .workspaces
+            .get(value.workspace())
+            .map(|scope| scope.project.clone())
+            .ok_or("platform_v2_mobile_project_denied")?,
+        PlatformV2Request::GetReviewReceipt(value) => value.project().clone(),
+    };
+    if !principal.projects.contains(&project) || !roots.contains(&project) {
+        return Err("platform_v2_mobile_project_denied");
+    }
+    Ok(project)
+}
+
+fn load_web_principal(
+    policy_path: &Path,
+    expected_uid: u32,
+    tenant: &str,
+    actor: &str,
+) -> Result<PrincipalPolicy, &'static str> {
     let snapshot = read_policy_snapshot(policy_path, expected_uid)?
         .ok_or("platform_v2_web_binding_unavailable")?;
     let document: PolicyDocument =
@@ -235,7 +316,7 @@ pub fn verify_web_principal_binding(
     if principal.actor.tenant() != tenant || principal.actor.id() != actor {
         return Err("platform_v2_web_binding_mismatch");
     }
-    Ok(())
+    Ok(principal.clone())
 }
 
 impl PlatformV2Runtime {

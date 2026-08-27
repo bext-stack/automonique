@@ -8,12 +8,15 @@
 //! Platform v2 principal mapped to the web process uid. The public request
 //! carries no actor, tenant, grant, or review-authority assertion.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use automonique_protocol::codec::{LENGTH_PREFIX_BYTES, encode_frame_with_limit};
+use automonique_protocol::platform_v2::ProjectId;
 use automonique_protocol::platform_v2_transport::{
     MAX_PLATFORM_NEGOTIATION_REQUEST_CANONICAL_BYTES,
     MAX_PLATFORM_NEGOTIATION_RESPONSE_CANONICAL_BYTES, MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES,
@@ -22,9 +25,12 @@ use automonique_protocol::platform_v2_transport::{
     PlatformV2RequestMessage, PlatformV2Response, PlatformV2ResponseMessage,
 };
 
+use crate::mobile_auth::{MobilePlatformV2Action, MobilePlatformV2Authorization};
+
 pub(crate) const PLATFORM_NEGOTIATION_CONTENT_TYPE: &str =
     "application/vnd.automonique.platform.negotiation.v1+json";
 pub(crate) const PLATFORM_V2_CONTENT_TYPE: &str = "application/vnd.automonique.platform.v2+json";
+const MAX_MOBILE_PREVIEW_SCOPES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PlatformV2Lane {
@@ -71,6 +77,7 @@ pub(crate) struct PlatformV2Bridge {
     tenant: String,
     actor: String,
     timeout: Duration,
+    preview_scopes: Mutex<BTreeMap<String, (ProjectId, i64, String, u64)>>,
 }
 
 impl PlatformV2Bridge {
@@ -89,7 +96,209 @@ impl PlatformV2Bridge {
             tenant,
             actor,
             timeout,
+            preview_scopes: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    pub(crate) fn verify_project_roots(&self, roots: &[String]) -> Result<(), &'static str> {
+        let roots = roots
+            .iter()
+            .cloned()
+            .map(ProjectId::new)
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(|_| "platform_v2_mobile_project_denied")?;
+        automonique_daemon::verify_web_project_roots(
+            &self.policy,
+            self.uid,
+            &self.tenant,
+            &self.actor,
+            &roots,
+        )
+    }
+
+    pub(crate) fn exchange_mobile(
+        &self,
+        lane: PlatformV2Lane,
+        request: &[u8],
+        authorization: &MobilePlatformV2Authorization,
+        now_ms: i64,
+    ) -> Result<Vec<u8>, &'static str> {
+        if request.is_empty() || request.len() > lane.request_limit() {
+            return Err("platform_v2_request_invalid");
+        }
+        match lane {
+            PlatformV2Lane::Negotiation => {
+                let request = PlatformNegotiationRequestMessage::from_canonical_bytes(request)
+                    .map_err(|_| "platform_v2_request_invalid")?;
+                if authorization.tenant_id != self.tenant
+                    || authorization.actor_id != self.actor
+                    || authorization.expires_at_ms <= now_ms
+                {
+                    return typed_negotiation_refusal(
+                        &request,
+                        "platform_v2_mobile_authorization_invalid",
+                    );
+                }
+                if let Err(category) = self.verify_binding() {
+                    return typed_negotiation_refusal(&request, category);
+                }
+                let response = self.exchange_local(
+                    lane,
+                    &request
+                        .to_canonical_bytes()
+                        .map_err(|_| "platform_v2_request_invalid")?,
+                )?;
+                PlatformNegotiationResponseMessage::from_canonical_bytes(&response, &request)
+                    .and_then(|message| message.to_canonical_bytes())
+                    .map_err(|_| "platform_v2_response_invalid")
+            }
+            PlatformV2Lane::V2 => {
+                let request = PlatformV2RequestMessage::from_canonical_bytes(request)
+                    .map_err(|_| "platform_v2_request_invalid")?;
+                if authorization.tenant_id != self.tenant
+                    || authorization.actor_id != self.actor
+                    || authorization.expires_at_ms <= now_ms
+                {
+                    return typed_v2_refusal(&request, "platform_v2_mobile_authorization_invalid");
+                }
+                let project =
+                    match self.authorize_mobile_request(authorization, request.request(), now_ms) {
+                        Ok(project) => project,
+                        Err(category) => return typed_v2_refusal(&request, category),
+                    };
+                let response = self.exchange_local(
+                    lane,
+                    &request
+                        .to_canonical_bytes()
+                        .map_err(|_| "platform_v2_request_invalid")?,
+                )?;
+                let response = PlatformV2ResponseMessage::from_canonical_bytes(&response, &request)
+                    .map_err(|_| "platform_v2_response_invalid")?;
+                if let PlatformV2Response::MutationPreview(preview) = response.response() {
+                    let mut scopes = self
+                        .preview_scopes
+                        .lock()
+                        .map_err(|_| "platform_v2_bridge_unavailable")?;
+                    scopes.retain(|_, (_, expiry, _, _)| *expiry > now_ms);
+                    if scopes.len() >= MAX_MOBILE_PREVIEW_SCOPES
+                        && !scopes.contains_key(preview.preview().id().as_str())
+                    {
+                        return typed_v2_refusal(&request, "platform_v2_mobile_preview_limit");
+                    }
+                    scopes.insert(
+                        preview.preview().id().as_str().to_owned(),
+                        (
+                            project,
+                            preview.expires_at().as_millis(),
+                            authorization.credential_id.clone(),
+                            authorization.principal_generation,
+                        ),
+                    );
+                }
+                response
+                    .to_canonical_bytes()
+                    .map_err(|_| "platform_v2_response_invalid")
+            }
+        }
+    }
+
+    pub(crate) fn refuse(
+        &self,
+        lane: PlatformV2Lane,
+        request: &[u8],
+        category: &'static str,
+    ) -> Result<Vec<u8>, &'static str> {
+        match lane {
+            PlatformV2Lane::Negotiation => {
+                let request = PlatformNegotiationRequestMessage::from_canonical_bytes(request)
+                    .map_err(|_| "platform_v2_request_invalid")?;
+                typed_negotiation_refusal(&request, category)
+            }
+            PlatformV2Lane::V2 => {
+                let request = PlatformV2RequestMessage::from_canonical_bytes(request)
+                    .map_err(|_| "platform_v2_request_invalid")?;
+                typed_v2_refusal(&request, category)
+            }
+        }
+    }
+
+    fn authorize_mobile_request(
+        &self,
+        authorization: &MobilePlatformV2Authorization,
+        request: &automonique_protocol::platform_v2_transport::PlatformV2Request,
+        now_ms: i64,
+    ) -> Result<ProjectId, &'static str> {
+        use automonique_protocol::platform_v2_transport::PlatformV2Request;
+
+        let action = match request {
+            PlatformV2Request::QueryWorkContexts(_) => MobilePlatformV2Action::QueryWorkContexts,
+            PlatformV2Request::GetLineage(_) => MobilePlatformV2Action::GetLineage,
+            PlatformV2Request::PrepareMutation(_) => MobilePlatformV2Action::PrepareMutation,
+            PlatformV2Request::DecideMutation(_) => MobilePlatformV2Action::DecideMutation,
+            PlatformV2Request::SubmitMutation(_) => MobilePlatformV2Action::SubmitMutation,
+            PlatformV2Request::GetMutationReceipt(_) => MobilePlatformV2Action::GetMutationReceipt,
+            PlatformV2Request::SubmitWorkspaceIntent(_) => {
+                MobilePlatformV2Action::SubmitWorkspaceIntent
+            }
+            PlatformV2Request::GetWorkspaceIntent(_) => MobilePlatformV2Action::GetWorkspaceIntent,
+            PlatformV2Request::GetReview(_) => MobilePlatformV2Action::GetReview,
+            PlatformV2Request::GetWorkContext(_)
+            | PlatformV2Request::ExecuteReviewAction(_)
+            | PlatformV2Request::GetReviewReceipt(_) => {
+                return Err("platform_v2_mobile_action_denied");
+            }
+        };
+        if !authorization.allows(action) {
+            return Err("platform_v2_mobile_action_denied");
+        }
+        let roots = authorization
+            .project_roots
+            .iter()
+            .cloned()
+            .map(ProjectId::new)
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(|_| "platform_v2_mobile_project_denied")?;
+        let project = match request {
+            PlatformV2Request::DecideMutation(value) => {
+                self.preview_project(value.preview().id().as_str(), authorization, now_ms)?
+            }
+            PlatformV2Request::SubmitMutation(value) => {
+                self.preview_project(value.preview().id().as_str(), authorization, now_ms)?
+            }
+            _ => automonique_daemon::resolve_web_mobile_request_project(
+                &self.policy,
+                self.uid,
+                &self.tenant,
+                &self.actor,
+                &roots,
+                request,
+            )?,
+        };
+        if !authorization.allows_project(&project) {
+            return Err("platform_v2_mobile_project_denied");
+        }
+        Ok(project)
+    }
+
+    fn preview_project(
+        &self,
+        preview_id: &str,
+        authorization: &MobilePlatformV2Authorization,
+        now_ms: i64,
+    ) -> Result<ProjectId, &'static str> {
+        let mut scopes = self
+            .preview_scopes
+            .lock()
+            .map_err(|_| "platform_v2_bridge_unavailable")?;
+        scopes.retain(|_, (_, expiry, _, _)| *expiry > now_ms);
+        scopes
+            .get(preview_id)
+            .filter(|(_, _, credential_id, generation)| {
+                credential_id == &authorization.credential_id
+                    && *generation == authorization.principal_generation
+            })
+            .map(|(project, _, _, _)| project.clone())
+            .ok_or("platform_v2_mobile_preview_scope_required")
     }
 
     pub(crate) fn exchange(
@@ -277,6 +486,92 @@ mod tests {
             actor.to_owned(),
             Duration::from_secs(1),
         )
+    }
+
+    fn mobile(
+        actions: Vec<MobilePlatformV2Action>,
+        roots: Vec<&str>,
+    ) -> MobilePlatformV2Authorization {
+        MobilePlatformV2Authorization {
+            actions,
+            actor_id: "actor-test".to_owned(),
+            authorization_revision: 1,
+            credential_id: format!("mc_{}", "A".repeat(43)),
+            credential_revision: 1,
+            delegation_id: format!("md_{}", "B".repeat(43)),
+            expires_at_ms: 2_000,
+            issued_at_ms: 1,
+            principal_generation: 1,
+            project_roots: roots.into_iter().map(str::to_owned).collect(),
+            schema: crate::mobile_auth::MOBILE_PLATFORM_V2_AUTH_SCHEMA,
+            server_identity: format!("sha256:{}", "c".repeat(64)),
+            tenant_id: "tenant-test".to_owned(),
+        }
+    }
+
+    #[test]
+    fn mobile_action_and_project_scope_refuse_before_opening_the_socket() {
+        let root = tempfile::tempdir().unwrap();
+        let uid = nix::unistd::geteuid().as_raw();
+        write_policy(root.path(), uid, "tenant-test", "actor-test");
+        let bridge = bridge(
+            root.path(),
+            root.path().join("absent.sock"),
+            "tenant-test",
+            "actor-test",
+        );
+        let request = v2_request();
+        let wrong_action = bridge
+            .exchange_mobile(
+                PlatformV2Lane::V2,
+                &request.to_canonical_bytes().unwrap(),
+                &mobile(
+                    vec![MobilePlatformV2Action::GetLineage],
+                    vec!["project-test"],
+                ),
+                1_000,
+            )
+            .unwrap();
+        let response =
+            PlatformV2ResponseMessage::from_canonical_bytes(&wrong_action, &request).unwrap();
+        assert!(matches!(
+            response.response(),
+            PlatformV2Response::Refused(value)
+                if value.category().as_str() == "platform_v2_mobile_action_denied"
+        ));
+
+        let query = PlatformV2RequestMessage::new(
+            RequestId::new("mobile-wrong-root").unwrap(),
+            PlatformV2Request::QueryWorkContexts(
+                automonique_protocol::platform_v2::WorkContextQuery::new(
+                    vec![automonique_protocol::platform_v2::WorkContextKind::Project],
+                    vec![],
+                    Some(ProjectId::new("project-test").unwrap()),
+                    None,
+                    None,
+                    1,
+                )
+                .unwrap(),
+            ),
+        );
+        let wrong_root = bridge
+            .exchange_mobile(
+                PlatformV2Lane::V2,
+                &query.to_canonical_bytes().unwrap(),
+                &mobile(
+                    vec![MobilePlatformV2Action::QueryWorkContexts],
+                    vec!["project-other"],
+                ),
+                1_000,
+            )
+            .unwrap();
+        let response =
+            PlatformV2ResponseMessage::from_canonical_bytes(&wrong_root, &query).unwrap();
+        assert!(matches!(
+            response.response(),
+            PlatformV2Response::Refused(value)
+                if value.category().as_str() == "platform_v2_mobile_project_denied"
+        ));
     }
 
     #[test]

@@ -168,17 +168,42 @@ v2 canonical limit. Local responses are length-prefixed and bounded before
 allocation by the corresponding response limit, then decoded against the
 original typed request to enforce correlation and response shape.
 
-This first bridge is deliberately single-principal. It accepts an HTTP
-Basic credential for the dashboard's one configured username; dashboard
-session cookies, mobile credentials, Manage service bearers, and other bearer
-credentials cannot enter this route. Before every local exchange, web-entry
+The bridge remains single-principal at the daemon socket. It accepts either
+the dashboard's one configured HTTP Basic credential or an `ma_` mobile access
+token with a live, separately persisted Platform v2 delegation. Dashboard
+session cookies, Manage service bearers, ungranted mobile credentials, and
+other bearer credentials cannot enter this route. An `ma_` token never falls
+back to Basic, a session cookie, or Manage authority. Before every local exchange, web-entry
 opens the private policy with the same descriptor checks as the daemon and
 requires that its server-owned integration tenant and actor exactly equal the
 sole principal mapped to its Unix uid. The HTTP authorization header is never
 forwarded to the daemon. A missing, changed, multi-principal, or mismatched
 policy produces a correlated typed refusal without opening the admin socket.
 
-The current local protocol cannot safely represent multiple HTTP principals
+Mobile Platform v2 authorization is additive to the unchanged
+`automonique.mobile-auth/v1` wire. An operator first issues or pairs a normal
+v1 mobile credential, then posts the exact credential ID, bounded Platform v2
+action set, and at most 32 canonical project IDs to
+`POST /api/mobile/platform-v2/grants` using
+`application/vnd.automonique.mobile-platform-v2-authorization.v1+json` and
+the dashboard Basic credential. This is the bootstrap source of truth:
+project roots must already exist in the daemon's server-owned principal policy.
+The request never accepts filesystem paths, repository paths, tenant IDs,
+actor IDs, expiry, revisions, or authority grants from the mobile client.
+
+The mobile client reads its exact delegation at
+`GET /api/mobile/platform-v2/authorization` with the same media type and its
+mobile bearer. The response binds the origin identity, credential and
+authorization revisions, delegation ID, principal generation, tenant, actor,
+access-token issuance/expiry, sorted project roots, and sorted per-operation
+grants. Refresh rotation advances both the credential revision and principal
+generation; regrant changes the delegation ID and generation; credential
+revocation revokes the delegation in the same transaction. Old generations
+cannot reuse cached mutation previews. Every request is action-checked and
+resolved to one admitted project before the local socket is opened; the daemon
+then independently applies its current policy fence and ownership checks.
+
+The current local protocol cannot safely represent multiple daemon principals
 behind one web-entry uid. Such a configuration stays blocked; adding more
 Basic users must first add a daemon-authenticated delegated-principal protocol
 instead of mapping them all to the process uid. Operators must restart the
