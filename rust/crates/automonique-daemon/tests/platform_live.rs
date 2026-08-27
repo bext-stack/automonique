@@ -7,8 +7,8 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use automonique_daemon::{Daemon, DaemonConfig};
@@ -69,6 +69,18 @@ const REVIEW_SNAPSHOT: &[u8] =
     include_bytes!("../../automonique-protocol/fixtures/platform-v2-review-v2.json");
 const REVIEW_ACTION: &[u8] =
     include_bytes!("../../automonique-protocol/fixtures/platform-v2-review-action-v1.json");
+
+static FULL_DAEMON_TEST_GUARD: Mutex<()> = Mutex::new(());
+
+fn full_daemon_test_guard() -> MutexGuard<'static, ()> {
+    match FULL_DAEMON_TEST_GUARD.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            FULL_DAEMON_TEST_GUARD.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
 
 fn fixture() -> (tempfile::TempDir, DaemonConfig) {
     let root = tempfile::tempdir().expect("temporary root");
@@ -524,6 +536,7 @@ fn set_scope_tools(config: &DaemonConfig, kind: &str, id: &str, tools: &[&str]) 
 
 #[test]
 fn negotiation_advertises_only_v1_and_v2_fails_closed_until_host_wiring() {
+    let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     let serving = serve(&config);
 
@@ -579,6 +592,7 @@ fn negotiation_advertises_only_v1_and_v2_fails_closed_until_host_wiring() {
 
 #[test]
 fn multi_tenant_policy_fails_closed_without_changing_v1() {
+    let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     std::fs::create_dir(config.state_dir()).unwrap();
     std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -693,6 +707,7 @@ fn multi_tenant_policy_fails_closed_without_changing_v1() {
 
 #[test]
 fn configured_v2_uses_kernel_principal_scope_and_durable_idempotency() {
+    let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     configure_v2(&config);
     let serving = serve(&config);
@@ -934,6 +949,7 @@ fn configured_v2_uses_kernel_principal_scope_and_durable_idempotency() {
 
 #[test]
 fn resume_requires_live_durable_workspace_and_never_admits_without_adapter() {
+    let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     configure_v2(&config);
     let mut store = WorkContextStore::open(config.platform_v2_work_context_path()).unwrap();
@@ -984,6 +1000,7 @@ fn resume_requires_live_durable_workspace_and_never_admits_without_adapter() {
 
 #[test]
 fn durable_mapping_drift_disables_v2_actions_fail_closed() {
+    let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     configure_v2(&config);
     let serving = serve(&config);
@@ -1031,6 +1048,7 @@ fn durable_mapping_drift_disables_v2_actions_fail_closed() {
 
 #[test]
 fn policy_requires_the_complete_durable_inheritance_chain() {
+    let _guard = full_daemon_test_guard();
     for (kind, id, label) in [
         ("host_setup", "host-live", "v2-missing-host-parent"),
         ("checkout", "checkout-live", "v2-missing-checkout-parent"),
@@ -1067,6 +1085,7 @@ fn policy_requires_the_complete_durable_inheritance_chain() {
 
 #[test]
 fn complete_durable_inheritance_chain_enables_v2_reads() {
+    let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     configure_v2(&config);
     let serving = serve(&config);
@@ -1086,6 +1105,7 @@ fn complete_durable_inheritance_chain_enables_v2_reads() {
 
 #[test]
 fn session_and_pane_ceilings_cannot_exceed_their_direct_parents() {
+    let _guard = full_daemon_test_guard();
     for (parent_kind, parent_id, label) in [
         (
             "attempt_workspace",
@@ -1116,6 +1136,7 @@ fn session_and_pane_ceilings_cannot_exceed_their_direct_parents() {
 
 #[test]
 fn create_checkout_authorizes_only_the_intents_durable_project_repository() {
+    let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     configure_v2(&config);
     let serving = serve(&config);
@@ -1197,6 +1218,7 @@ fn create_checkout_authorizes_only_the_intents_durable_project_repository() {
 
 #[test]
 fn restart_narrowing_revokes_old_preview_decision_and_receipt_reads() {
+    let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     configure_v2(&config);
     set_tool_authority(&config, false);
@@ -1427,6 +1449,7 @@ fn approval_proposal<'a>(key: &'a str, run_id: &'a str) -> ApprovalProposal<'a> 
 
 #[test]
 fn session_commands_are_fenced_to_the_managed_owner_before_receipt_admission() {
+    let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     std::fs::create_dir(config.state_dir()).expect("product state");
     std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
@@ -1735,6 +1758,7 @@ fn command_state(
 /// and neither is what this file proves.
 #[test]
 fn a_live_turns_approval_is_projected_and_decidable_by_its_own_session() {
+    let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     std::fs::create_dir(config.state_dir()).expect("product state");
     std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
@@ -1861,6 +1885,7 @@ fn a_live_turns_approval_is_projected_and_decidable_by_its_own_session() {
 /// so is an approval owned by it, with no receipt written for either.
 #[test]
 fn a_foreign_sessions_live_run_and_approval_are_refused() {
+    let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     std::fs::create_dir(config.state_dir()).expect("product state");
     std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
@@ -1971,6 +1996,7 @@ fn a_foreign_sessions_live_run_and_approval_are_refused() {
 /// read model did.
 #[test]
 fn a_settled_turn_projects_as_before_and_an_abandoned_binding_heals_on_read() {
+    let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     std::fs::create_dir(config.state_dir()).expect("product state");
     std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
@@ -2070,6 +2096,7 @@ fn a_settled_turn_projects_as_before_and_an_abandoned_binding_heals_on_read() {
 /// carrying the request id, never a bare EOF.
 #[test]
 fn platform_decode_failures_are_typed_refusals_and_absent_client_is_accepted() {
+    let _guard = full_daemon_test_guard();
     use automonique_protocol::wire::{JsonValue, Message};
 
     let (_root, config) = fixture();
@@ -2182,6 +2209,7 @@ fn platform_decode_failures_are_typed_refusals_and_absent_client_is_accepted() {
 
 #[test]
 fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
+    let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     std::fs::create_dir(config.state_dir()).expect("product state");
     std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
@@ -2492,6 +2520,7 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
 
 #[test]
 fn managed_request_worker_reconciles_a_typed_provider_refusal() {
+    let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     std::fs::create_dir(config.state_dir()).expect("product state");
     std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
