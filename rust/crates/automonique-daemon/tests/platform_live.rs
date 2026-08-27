@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -29,17 +29,20 @@ use automonique_protocol::platform_v2::{
     WorkContextRelation, WorkContextRelationKind, WorkContextTargetKind, WorkSessionId,
 };
 use automonique_protocol::platform_v2_lifecycle::{
-    ArchiveIntent, AuthorityGrantId, CreateAttemptWorkspaceIntent, CreateCheckoutIntent,
-    ExpectedWorkContext, ExternalParentResolution, MutationApprovalDecision,
-    MutationApprovalRequirement, WorkContextAuthority, WorkContextMutationIntent,
-    WorkContextRegistrySelector,
+    AuthorityGrantId, CreateAttemptWorkspaceIntent, CreateCheckoutIntent,
+    CreateUserWorkspaceIntent, ExpectedWorkContext, ExternalParentResolution,
+    MutationApprovalDecision, MutationApprovalRequirement, MutationPreviewDigest,
+    WorkContextAuthority, WorkContextMutationIntent, WorkContextRegistrySelector,
 };
 use automonique_protocol::platform_v2_lifecycle_api::{
-    encode_work_context_mutation_submission, work_context_mutation_preview_digest,
+    decode_work_context_mutation_submission, encode_work_context_mutation_submission,
+    work_context_mutation_preview_digest,
 };
 use automonique_protocol::platform_v2_lineage::{
-    LineageFreshness, LineageFreshnessState, LineageStatus, OrchestrationIdentity,
-    OrchestrationRecord, OrchestrationRunId, OrchestrationTaskId, WorkspaceIntent,
+    BaseSelectorId, BranchSelectorId, ExternalWorkAuthorityId, ExternalWorkIdentity,
+    ExternalWorkKey, ExternalWorkProvider, ExternalWorkScope, LineageFreshness,
+    LineageFreshnessState, LineageStatus, OrchestrationIdentity, OrchestrationRecord,
+    OrchestrationRunId, OrchestrationTaskId, WorkspaceCreateIntent, WorkspaceIntent,
     WorkspaceIntentId, WorkspaceResumeIntent,
 };
 use automonique_protocol::platform_v2_review_api::{
@@ -47,10 +50,11 @@ use automonique_protocol::platform_v2_review_api::{
 };
 use automonique_protocol::platform_v2_transport::{
     LineageReadRequest, MutationDecisionRequest, MutationPrepareRequest, MutationReceiptLookup,
-    PlatformNegotiationRequest, PlatformNegotiationRequestMessage, PlatformNegotiationResponse,
-    PlatformNegotiationResponseMessage, PlatformV2Request, PlatformV2RequestMessage,
-    PlatformV2Response, PlatformV2ResponseMessage, ReceiptLookupKey, ReviewActionTransportRequest,
-    ReviewReceiptLookup, WorkspaceIntentLookup, WorkspaceIntentRequest,
+    MutationSubmitRequest, PlatformNegotiationRequest, PlatformNegotiationRequestMessage,
+    PlatformNegotiationResponse, PlatformNegotiationResponseMessage, PlatformV2Request,
+    PlatformV2RequestMessage, PlatformV2Response, PlatformV2ResponseMessage, ReceiptLookupKey,
+    ReviewActionTransportRequest, ReviewReceiptLookup, WorkspaceIntentLookup,
+    WorkspaceIntentRequest,
 };
 use automonique_protocol::primitives::{EpochMillis, Revision};
 use automonique_store::approval_requests::{
@@ -297,7 +301,7 @@ fn configure_v2(config: &DaemonConfig) {
         Revision::FIRST,
         WorkContextLifecycle::Active,
         WorkContextLabel::new("Live checkout").unwrap(),
-        WorkContextAttributes::checkout(CheckoutKind::GitWorktree),
+        WorkContextAttributes::checkout(CheckoutKind::AuthorizedFolder),
         vec![
             WorkContextRelation::new(
                 WorkContextRelationKind::CheckoutProject,
@@ -790,16 +794,71 @@ fn configured_v2_uses_kernel_principal_scope_and_durable_idempotency() {
     assert!(matches!(
         platform_v2(
             &config,
-            "v2-resume-no-adapter",
+            "v2-resume-refuses-without-adapter",
             PlatformV2Request::SubmitWorkspaceIntent(resume_request)
         ),
         PlatformV2Response::Refused(refusal)
             if refusal.category().as_str() == "platform_v2_resume_adapter_pending"
     ));
+    let wrong_workspace = WorkspaceIntent::Resume(WorkspaceResumeIntent::new(
+        WorkspaceIntentId::new("intent-resume-wrong-workspace").unwrap(),
+        OrchestrationTaskId::new("task-live").unwrap(),
+        UserWorkspaceId::new("wc_user_1").unwrap(),
+        Revision::FIRST,
+    ));
     assert!(matches!(
         platform_v2(
             &config,
-            "v2-resume-not-admitted",
+            "v2-resume-task-workspace-mismatch",
+            PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(
+                ProjectId::new("project-live").unwrap(),
+                wrong_workspace,
+            )),
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_resume_scope_denied"
+    ));
+    let create = WorkspaceIntent::Create(WorkspaceCreateIntent::new(
+        WorkspaceIntentId::new("intent-create-without-private-registry").unwrap(),
+        OrchestrationTaskId::new("task-live").unwrap(),
+        ExternalWorkIdentity::new(
+            ExternalWorkProvider::GitHub,
+            ExternalWorkAuthorityId::new("authority-live").unwrap(),
+            ExternalWorkScope::new("scope-live").unwrap(),
+            ExternalWorkKey::new("work-live").unwrap(),
+        ),
+        BaseSelectorId::new("base-live").unwrap(),
+        BranchSelectorId::new("branch-live").unwrap(),
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-create-needs-private-selector-registry",
+            PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(
+                ProjectId::new("project-live").unwrap(),
+                create.clone(),
+            )),
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str()
+                == "platform_v2_create_selector_registry_unavailable"
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-create-without-registry-not-stored",
+            PlatformV2Request::GetWorkspaceIntent(WorkspaceIntentLookup::new(
+                ProjectId::new("project-live").unwrap(),
+                create.intent_id().clone(),
+            )),
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_not_found"
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-resume-without-adapter-not-stored",
             PlatformV2Request::GetWorkspaceIntent(WorkspaceIntentLookup::new(
                 ProjectId::new("project-live").unwrap(),
                 resume.intent_id().clone(),
@@ -810,12 +869,23 @@ fn configured_v2_uses_kernel_principal_scope_and_durable_idempotency() {
     ));
 
     let prepare = MutationPrepareRequest::new(
-        IdempotencyKey::new("archive-project-once").unwrap(),
-        WorkContextMutationIntent::ArchiveProject(
-            ArchiveIntent::new(ExpectedWorkContext::new(
-                WorkContextIdentity::Project(ProjectId::new("project-live").unwrap()),
-                Revision::FIRST,
-            ))
+        IdempotencyKey::new("create-manual-workspace-once").unwrap(),
+        WorkContextMutationIntent::CreateUserWorkspace(
+            CreateUserWorkspaceIntent::new(
+                WorkContextLabel::new("Manual existing-folder workspace").unwrap(),
+                ExpectedWorkContext::new(
+                    WorkContextIdentity::Project(ProjectId::new("project-live").unwrap()),
+                    Revision::FIRST,
+                ),
+                ExpectedWorkContext::new(
+                    WorkContextIdentity::parse_local(
+                        WorkContextTargetKind::Checkout,
+                        "checkout-live",
+                    )
+                    .unwrap(),
+                    Revision::FIRST,
+                ),
+            )
             .unwrap(),
         ),
     );
@@ -855,6 +925,58 @@ fn configured_v2_uses_kernel_principal_scope_and_durable_idempotency() {
         panic!("decision replay")
     };
     assert_eq!(approval_replay, approval);
+
+    let decoded_approval = approval.decode(&first).unwrap();
+    let wrong_digest = MutationPreviewDigest::from_digest(
+        automonique_protocol::digest::Sha256::digest(b"not-the-preview"),
+    );
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-submit-wrong-preview-digest",
+            PlatformV2Request::SubmitMutation(MutationSubmitRequest::new(
+                first.preview().clone(),
+                wrong_digest,
+                Some(decoded_approval.id().clone()),
+            )),
+        ),
+        PlatformV2Response::MutationRefused(refusal)
+            if refusal.category()
+                == automonique_protocol::platform_v2_lifecycle::MutationRefusalCategory::ApprovalMismatch
+    ));
+    let submit = MutationSubmitRequest::new(
+        first.preview().clone(),
+        work_context_mutation_preview_digest(&first).unwrap(),
+        Some(decoded_approval.id().clone()),
+    );
+    let PlatformV2Response::MutationReceipt(raw_receipt) = platform_v2(
+        &config,
+        "v2-submit-logical-lifecycle",
+        PlatformV2Request::SubmitMutation(submit.clone()),
+    ) else {
+        panic!("approved logical lifecycle mutation must be durably completed")
+    };
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-submit-logical-lifecycle-replay",
+            PlatformV2Request::SubmitMutation(submit),
+        ),
+        PlatformV2Response::MutationReceipt(replay) if replay == raw_receipt
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-submit-logical-lifecycle-lookup",
+            PlatformV2Request::GetMutationReceipt(MutationReceiptLookup::new(
+                ProjectId::new("project-live").unwrap(),
+                ReceiptLookupKey::IdempotencyKey(
+                    IdempotencyKey::new("create-manual-workspace-once").unwrap(),
+                ),
+            )),
+        ),
+        PlatformV2Response::MutationReceipt(found) if found == raw_receipt
+    ));
 
     let fixture_action = decode_review_action_request(REVIEW_ACTION).unwrap();
     let action = ReviewActionTransportRequest::new(
@@ -919,7 +1041,7 @@ fn configured_v2_uses_kernel_principal_scope_and_durable_idempotency() {
     assert!(matches!(
         platform_v2(
             &config,
-            "v2-resume-still-not-admitted-after-restart",
+            "v2-resume-remains-absent-after-restart",
             PlatformV2Request::GetWorkspaceIntent(WorkspaceIntentLookup::new(
                 ProjectId::new("project-live").unwrap(),
                 resume.intent_id().clone(),
@@ -945,6 +1067,299 @@ fn configured_v2_uses_kernel_principal_scope_and_durable_idempotency() {
             if refusal.category().as_str() == "platform_v2_not_found"
     ));
     serving.shutdown(&config);
+}
+
+struct RecoveringLifecycleAdapter {
+    executions: Arc<AtomicUsize>,
+    reconciliations: Arc<AtomicUsize>,
+    scenario: LifecycleRecoveryScenario,
+}
+
+#[derive(Clone, Copy)]
+enum LifecycleRecoveryScenario {
+    CrashBefore,
+    CrashAfter,
+    ExpiredLease,
+}
+
+impl automonique_daemon::platform_v2_host::PlatformV2LifecycleEffectAdapter
+    for RecoveringLifecycleAdapter
+{
+    fn supported_effect_kinds(&self) -> BTreeSet<String> {
+        BTreeSet::from(["create_attempt_workspace".to_owned()])
+    }
+
+    fn execute(
+        &mut self,
+        _intent: &WorkContextMutationIntent,
+        _resulting_identity: &WorkContextIdentity,
+        _idempotency_key: &IdempotencyKey,
+    ) -> automonique_daemon::platform_v2_host::PlatformV2EffectExecution {
+        let execution = self.executions.fetch_add(1, Ordering::SeqCst);
+        match (self.scenario, execution) {
+            (LifecycleRecoveryScenario::CrashBefore, 0) => {
+                automonique_daemon::platform_v2_host::PlatformV2EffectExecution::NotStarted
+            }
+            (LifecycleRecoveryScenario::CrashBefore, _) => {
+                automonique_daemon::platform_v2_host::PlatformV2EffectExecution::Completed
+            }
+            (LifecycleRecoveryScenario::CrashAfter, _) => {
+                automonique_daemon::platform_v2_host::PlatformV2EffectExecution::Unknown
+            }
+            (LifecycleRecoveryScenario::ExpiredLease, _) => {
+                automonique_daemon::platform_v2_host::PlatformV2EffectExecution::Completed
+            }
+        }
+    }
+
+    fn reconcile(
+        &mut self,
+        _intent: &WorkContextMutationIntent,
+        _resulting_identity: &WorkContextIdentity,
+        _idempotency_key: &IdempotencyKey,
+    ) -> automonique_daemon::platform_v2_host::PlatformV2EffectReconciliation {
+        self.reconciliations.fetch_add(1, Ordering::SeqCst);
+        match self.scenario {
+            LifecycleRecoveryScenario::CrashBefore => automonique_daemon::platform_v2_host::PlatformV2EffectReconciliation::VerifiedNotStarted(
+                b"typed provider verified the original effect did not start".to_vec(),
+            ),
+            LifecycleRecoveryScenario::CrashAfter => automonique_daemon::platform_v2_host::PlatformV2EffectReconciliation::Completed(
+                b"typed provider proved the original effect completed".to_vec(),
+            ),
+            LifecycleRecoveryScenario::ExpiredLease => automonique_daemon::platform_v2_host::PlatformV2EffectReconciliation::Completed(
+                b"typed provider proved the over-lease effect completed".to_vec(),
+            ),
+        }
+    }
+}
+
+struct FixedPlatformV2Clock(i64);
+
+impl automonique_daemon::platform_v2_host::PlatformV2Clock for FixedPlatformV2Clock {
+    fn now_ms(&mut self) -> Result<i64, &'static str> {
+        Ok(self.0)
+    }
+}
+
+#[test]
+fn lifecycle_effect_claim_recovers_crash_boundaries_without_blind_replay() {
+    run_lifecycle_recovery_scenario(LifecycleRecoveryScenario::CrashBefore);
+    run_lifecycle_recovery_scenario(LifecycleRecoveryScenario::CrashAfter);
+    run_lifecycle_recovery_scenario(LifecycleRecoveryScenario::ExpiredLease);
+}
+
+fn run_lifecycle_recovery_scenario(scenario: LifecycleRecoveryScenario) {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let executions = Arc::new(AtomicUsize::new(0));
+    let reconciliations = Arc::new(AtomicUsize::new(0));
+    let adapter = RecoveringLifecycleAdapter {
+        executions: Arc::clone(&executions),
+        reconciliations: Arc::clone(&reconciliations),
+        scenario,
+    };
+    let uid = nix::unistd::geteuid().as_raw();
+    let issued_at = 1_800_000_000_000_i64;
+    let adapter: Box<dyn automonique_daemon::platform_v2_host::PlatformV2LifecycleEffectAdapter> =
+        Box::new(adapter);
+    let mut host = if matches!(scenario, LifecycleRecoveryScenario::ExpiredLease) {
+        automonique_daemon::platform_v2_host::PlatformV2Host::open_with_lifecycle_adapter_and_clock(
+            &config.platform_v2_policy_path(),
+            &config.platform_v2_work_context_path(),
+            &config.platform_v2_lineage_path(),
+            &config.platform_v2_review_path(),
+            uid,
+            adapter,
+            Box::new(FixedPlatformV2Clock(issued_at + 30_004)),
+        )
+    } else {
+        automonique_daemon::platform_v2_host::PlatformV2Host::open_with_lifecycle_adapter(
+            &config.platform_v2_policy_path(),
+            &config.platform_v2_work_context_path(),
+            &config.platform_v2_lineage_path(),
+            &config.platform_v2_review_path(),
+            uid,
+            adapter,
+        )
+    };
+    let key = IdempotencyKey::new(match scenario {
+        LifecycleRecoveryScenario::CrashBefore => "attempt-recover-not-started",
+        LifecycleRecoveryScenario::CrashAfter => "attempt-recover-completed",
+        LifecycleRecoveryScenario::ExpiredLease => "attempt-recover-expired-lease",
+    })
+    .unwrap();
+    let prepare = MutationPrepareRequest::new(
+        key.clone(),
+        WorkContextMutationIntent::CreateAttemptWorkspace(
+            CreateAttemptWorkspaceIntent::new(
+                WorkContextLabel::new("Recoverable attempt").unwrap(),
+                ExpectedWorkContext::new(
+                    WorkContextIdentity::UserWorkspace(
+                        UserWorkspaceId::new("workspace-live").unwrap(),
+                    ),
+                    Revision::FIRST,
+                ),
+                WorkContextAuthority::EMPTY,
+            )
+            .unwrap(),
+        ),
+    );
+    let PlatformV2Response::MutationPreview(preview) =
+        host.handle(uid, &PlatformV2Request::PrepareMutation(prepare), issued_at)
+    else {
+        panic!("attempt preview")
+    };
+    let PlatformV2Response::MutationApproval(raw_approval) = host.handle(
+        uid,
+        &PlatformV2Request::DecideMutation(MutationDecisionRequest::new(
+            preview.preview().clone(),
+            work_context_mutation_preview_digest(&preview).unwrap(),
+            MutationApprovalDecision::Granted,
+        )),
+        issued_at + 1,
+    ) else {
+        panic!("attempt approval")
+    };
+    let approval = raw_approval.decode(&preview).unwrap();
+    let submitted_at = issued_at + 2;
+    let submission_document = encode_work_context_mutation_submission(
+        &preview,
+        Some(&approval),
+        EpochMillis::from_millis(submitted_at),
+    )
+    .unwrap();
+    let submission =
+        decode_work_context_mutation_submission(&submission_document, &preview).unwrap();
+    let submit = MutationSubmitRequest::new(
+        preview.preview().clone(),
+        work_context_mutation_preview_digest(&preview).unwrap(),
+        Some(approval.id().clone()),
+    );
+    let PlatformV2Response::MutationReceipt(accepted) = host.handle(
+        uid,
+        &PlatformV2Request::SubmitMutation(submit),
+        submitted_at,
+    ) else {
+        panic!("attempt accepted")
+    };
+    assert_eq!(
+        accepted.decode(&submission, &preview).unwrap().outcome(),
+        ReceiptOutcome::Accepted
+    );
+
+    let lookup = PlatformV2Request::GetMutationReceipt(MutationReceiptLookup::new(
+        ProjectId::new("project-live").unwrap(),
+        ReceiptLookupKey::IdempotencyKey(key),
+    ));
+    let first_claim_at = submitted_at + 1;
+    let PlatformV2Response::MutationReceipt(still_accepted) =
+        host.handle(uid, &lookup, first_claim_at)
+    else {
+        panic!("claimed receipt")
+    };
+    assert_eq!(
+        still_accepted
+            .decode(&submission, &preview)
+            .unwrap()
+            .outcome(),
+        ReceiptOutcome::Accepted
+    );
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+    assert_eq!(reconciliations.load(Ordering::SeqCst), 0);
+
+    let PlatformV2Response::MutationReceipt(completed) =
+        host.handle(uid, &lookup, first_claim_at + 30_000)
+    else {
+        panic!("reconciled receipt")
+    };
+    assert_eq!(
+        completed.decode(&submission, &preview).unwrap().outcome(),
+        ReceiptOutcome::Completed
+    );
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        match scenario {
+            LifecycleRecoveryScenario::CrashBefore => 2,
+            LifecycleRecoveryScenario::CrashAfter | LifecycleRecoveryScenario::ExpiredLease => 1,
+        }
+    );
+    assert_eq!(reconciliations.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn production_default_adapter_refuses_before_external_effect_custody() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let uid = nix::unistd::geteuid().as_raw();
+    let mut host = automonique_daemon::platform_v2_host::PlatformV2Host::open(
+        &config.platform_v2_policy_path(),
+        &config.platform_v2_work_context_path(),
+        &config.platform_v2_lineage_path(),
+        &config.platform_v2_review_path(),
+        uid,
+    );
+    let issued_at = 1_800_000_000_000_i64;
+    let prepare = MutationPrepareRequest::new(
+        IdempotencyKey::new("attempt-no-production-adapter").unwrap(),
+        WorkContextMutationIntent::CreateAttemptWorkspace(
+            CreateAttemptWorkspaceIntent::new(
+                WorkContextLabel::new("Unavailable attempt").unwrap(),
+                ExpectedWorkContext::new(
+                    WorkContextIdentity::UserWorkspace(
+                        UserWorkspaceId::new("workspace-live").unwrap(),
+                    ),
+                    Revision::FIRST,
+                ),
+                WorkContextAuthority::EMPTY,
+            )
+            .unwrap(),
+        ),
+    );
+    let PlatformV2Response::MutationPreview(preview) =
+        host.handle(uid, &PlatformV2Request::PrepareMutation(prepare), issued_at)
+    else {
+        panic!("preview")
+    };
+    let PlatformV2Response::MutationApproval(raw_approval) = host.handle(
+        uid,
+        &PlatformV2Request::DecideMutation(MutationDecisionRequest::new(
+            preview.preview().clone(),
+            work_context_mutation_preview_digest(&preview).unwrap(),
+            MutationApprovalDecision::Granted,
+        )),
+        issued_at + 1,
+    ) else {
+        panic!("approval")
+    };
+    let approval = raw_approval.decode(&preview).unwrap();
+    assert!(matches!(
+        host.handle(
+            uid,
+            &PlatformV2Request::SubmitMutation(MutationSubmitRequest::new(
+                preview.preview().clone(),
+                work_context_mutation_preview_digest(&preview).unwrap(),
+                Some(approval.id().clone()),
+            )),
+            issued_at + 2,
+        ),
+        PlatformV2Response::MutationRefused(refusal)
+            if refusal.category()
+                == automonique_protocol::platform_v2_lifecycle::MutationRefusalCategory::Unavailable
+    ));
+    let connection = rusqlite::Connection::open(config.platform_v2_work_context_path()).unwrap();
+    let receipts: i64 = connection
+        .query_row("SELECT count(*) FROM work_context_receipts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let outbox: i64 = connection
+        .query_row("SELECT count(*) FROM work_context_outbox", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!((receipts, outbox), (0, 0));
 }
 
 #[test]
@@ -998,7 +1413,7 @@ fn changed_policy_refuses_negotiation_and_requests_until_restart() {
 }
 
 #[test]
-fn resume_requires_live_durable_workspace_and_never_admits_without_adapter() {
+fn resume_requires_live_durable_workspace_before_intent_custody() {
     let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     configure_v2(&config);
@@ -1185,12 +1600,12 @@ fn session_and_pane_ceilings_cannot_exceed_their_direct_parents() {
 }
 
 #[test]
-fn create_checkout_authorizes_only_the_intents_durable_project_repository() {
+fn checkout_creation_refuses_until_a_typed_private_selector_registry_exists() {
     let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     configure_v2(&config);
     let serving = serve(&config);
-    let create_checkout = |repository, repository_revision, key: &str| {
+    let create_checkout = |checkout_kind, key: &str| {
         MutationPrepareRequest::new(
             IdempotencyKey::new(key).unwrap(),
             WorkContextMutationIntent::CreateCheckout(
@@ -1208,61 +1623,31 @@ fn create_checkout_authorizes_only_the_intents_durable_project_repository() {
                         .unwrap(),
                         Revision::FIRST,
                     ),
-                    ExpectedWorkContext::new(repository, repository_revision),
-                    CheckoutKind::GitWorktree,
+                    ExpectedWorkContext::new(live_repository("repo-live"), Revision::FIRST),
+                    checkout_kind,
                     WorkContextRegistrySelector::new("checkout-live-selector").unwrap(),
                 )
                 .unwrap(),
             ),
         )
     };
-    let prepare = create_checkout(
-        live_repository("repo-live"),
-        Revision::FIRST,
-        "checkout-authorized-once",
-    );
-    let PlatformV2Response::MutationPreview(first) = platform_v2(
-        &config,
-        "v2-checkout-authorized",
-        PlatformV2Request::PrepareMutation(prepare.clone()),
-    ) else {
-        panic!("authorized repository must produce a preview")
-    };
-    let PlatformV2Response::MutationPreview(replay) = platform_v2(
-        &config,
-        "v2-checkout-authorized-replay",
-        PlatformV2Request::PrepareMutation(prepare),
-    ) else {
-        panic!("authorized repository replay must produce the same preview")
-    };
-    assert_eq!(replay, first);
-
-    assert!(matches!(
-        platform_v2(
-            &config,
-            "v2-checkout-wrong-repository-revision",
-            PlatformV2Request::PrepareMutation(create_checkout(
-                live_repository("repo-live"),
-                Revision::new(2).unwrap(),
-                "checkout-wrong-repository-revision",
-            )),
+    for (kind, key) in [
+        (CheckoutKind::GitWorktree, "checkout-git-unavailable"),
+        (
+            CheckoutKind::AuthorizedFolder,
+            "checkout-folder-unavailable",
         ),
-        PlatformV2Response::Refused(refusal)
-            if refusal.category().as_str() == "platform_v2_mutation_refused"
-    ));
-    assert!(matches!(
-        platform_v2(
-            &config,
-            "v2-checkout-unrelated-repository",
-            PlatformV2Request::PrepareMutation(create_checkout(
-                live_repository("repo-unrelated"),
-                Revision::FIRST,
-                "checkout-unrelated-repository",
-            )),
-        ),
-        PlatformV2Response::Refused(refusal)
-            if refusal.category().as_str() == "platform_v2_mutation_refused"
-    ));
+    ] {
+        assert!(matches!(
+            platform_v2(
+                &config,
+                key,
+                PlatformV2Request::PrepareMutation(create_checkout(kind, key)),
+            ),
+            PlatformV2Response::Refused(refusal)
+                if refusal.category().as_str() == "platform_v2_selector_registry_unavailable"
+        ));
+    }
     serving.shutdown(&config);
 }
 
@@ -1353,6 +1738,36 @@ fn restart_narrowing_revokes_old_preview_decision_and_receipt_reads() {
         .unwrap();
     drop(store);
 
+    let prior_executions = Arc::new(AtomicUsize::new(0));
+    let prior_reconciliations = Arc::new(AtomicUsize::new(0));
+    let uid = nix::unistd::geteuid().as_raw();
+    let mut prior_host =
+        automonique_daemon::platform_v2_host::PlatformV2Host::open_with_lifecycle_adapter(
+            &config.platform_v2_policy_path(),
+            &config.platform_v2_work_context_path(),
+            &config.platform_v2_lineage_path(),
+            &config.platform_v2_review_path(),
+            uid,
+            Box::new(RecoveringLifecycleAdapter {
+                executions: Arc::clone(&prior_executions),
+                reconciliations: Arc::clone(&prior_reconciliations),
+                scenario: LifecycleRecoveryScenario::CrashAfter,
+            }),
+        );
+    assert!(matches!(
+        prior_host.handle(
+            uid,
+            &PlatformV2Request::GetWorkContext(WorkContextIdentity::Project(
+                ProjectId::new("project-live").unwrap(),
+            )),
+            now_ms.saturating_add(2),
+        ),
+        PlatformV2Response::WorkContextRecord(_)
+    ));
+    assert_eq!(prior_executions.load(Ordering::SeqCst), 1);
+    assert_eq!(prior_reconciliations.load(Ordering::SeqCst), 0);
+    drop(prior_host);
+
     let serving = serve(&config);
     assert!(matches!(
         platform_v2(
@@ -1410,6 +1825,60 @@ fn restart_narrowing_revokes_old_preview_decision_and_receipt_reads() {
         ));
     }
     serving.shutdown(&config);
+
+    let executions = Arc::new(AtomicUsize::new(0));
+    let reconciliations = Arc::new(AtomicUsize::new(0));
+    let adapter = RecoveringLifecycleAdapter {
+        executions: Arc::clone(&executions),
+        reconciliations: Arc::clone(&reconciliations),
+        scenario: LifecycleRecoveryScenario::CrashAfter,
+    };
+    let mut host =
+        automonique_daemon::platform_v2_host::PlatformV2Host::open_with_lifecycle_adapter(
+            &config.platform_v2_policy_path(),
+            &config.platform_v2_work_context_path(),
+            &config.platform_v2_lineage_path(),
+            &config.platform_v2_review_path(),
+            uid,
+            Box::new(adapter),
+        );
+    assert!(matches!(
+        host.handle(
+            uid,
+            &PlatformV2Request::GetWorkContext(WorkContextIdentity::Project(
+                ProjectId::new("project-live").unwrap(),
+            )),
+            now_ms.saturating_add(30_003),
+        ),
+        PlatformV2Response::WorkContextRecord(_)
+    ));
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    assert_eq!(reconciliations.load(Ordering::SeqCst), 0);
+    let connection = rusqlite::Connection::open(config.platform_v2_work_context_path()).unwrap();
+    let outbox_state: String = connection
+        .query_row(
+            "SELECT state FROM work_context_outbox WHERE preview_id=?1",
+            [preview.preview().id().as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let leases: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM work_context_effect_leases",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let recovery_audits: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM work_context_effect_recovery_audit",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(outbox_state, "ambiguous");
+    assert_eq!(leases, 1);
+    assert_eq!(recovery_audits, 0);
 }
 
 struct Serving {
