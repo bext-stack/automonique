@@ -40,10 +40,10 @@ use automonique_protocol::platform_v2_lifecycle_api::{
 };
 use automonique_protocol::platform_v2_lineage::{
     BaseSelectorId, BranchSelectorId, ExternalWorkAuthorityId, ExternalWorkIdentity,
-    ExternalWorkKey, ExternalWorkProvider, ExternalWorkScope, LineageFreshness,
-    LineageFreshnessState, LineageStatus, OrchestrationIdentity, OrchestrationRecord,
-    OrchestrationRunId, OrchestrationTaskId, WorkspaceCreateIntent, WorkspaceIntent,
-    WorkspaceIntentId, WorkspaceResumeIntent,
+    ExternalWorkItem, ExternalWorkKey, ExternalWorkProvider, ExternalWorkScope, ExternalWorkState,
+    LineageFreshness, LineageFreshnessState, LineageStatus, OrchestrationIdentity,
+    OrchestrationRecord, OrchestrationRunId, OrchestrationTaskId, WorkspaceCreateIntent,
+    WorkspaceIntent, WorkspaceIntentId, WorkspaceIntentOutcome, WorkspaceResumeIntent,
 };
 use automonique_protocol::platform_v2_review_api::{
     decode_review_action_request, decode_review_snapshot,
@@ -1065,6 +1065,166 @@ fn configured_v2_uses_kernel_principal_scope_and_durable_idempotency() {
         ),
         PlatformV2Response::Refused(refusal)
             if refusal.category().as_str() == "platform_v2_not_found"
+    ));
+    serving.shutdown(&config);
+}
+
+#[test]
+fn production_workspace_effect_adopts_resumes_and_reopens_exact_local_binding() {
+    let _guard = full_daemon_test_guard();
+    let (root, config) = fixture();
+    configure_v2(&config);
+    let workspace_root = root.path().join("workspace-effect");
+    std::fs::create_dir(&workspace_root).unwrap();
+    std::fs::set_permissions(&workspace_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let external = ExternalWorkIdentity::new(
+        ExternalWorkProvider::GitHub,
+        ExternalWorkAuthorityId::new("authority-workspace-live").unwrap(),
+        ExternalWorkScope::new("scope-workspace-live").unwrap(),
+        ExternalWorkKey::new("work-workspace-live").unwrap(),
+    );
+    let freshness =
+        LineageFreshness::new(1_800_000_000_100, 30_000, LineageFreshnessState::Fresh).unwrap();
+    let workspace = UserWorkspaceId::new("workspace-live").unwrap();
+    let mut lineage = LineageIndex::open(config.platform_v2_lineage_path()).unwrap();
+    lineage
+        .intake_external(
+            "tenant-live",
+            &ExternalWorkItem::new(
+                external.clone(),
+                workspace.clone(),
+                Revision::FIRST,
+                ExternalWorkState::Open,
+                None,
+                freshness,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    lineage
+        .record_orchestration(
+            "tenant-live",
+            &OrchestrationRecord::new(
+                OrchestrationIdentity::Task(
+                    OrchestrationTaskId::new("task-workspace-live").unwrap(),
+                ),
+                workspace.clone(),
+                Some(external.clone()),
+                Some(OrchestrationIdentity::Run(
+                    OrchestrationRunId::new("run-live").unwrap(),
+                )),
+                LineageStatus::Working,
+                freshness,
+                None,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+    drop(lineage);
+
+    let registry = serde_json::json!({
+        "version": 1,
+        "generation": "workspace-live-generation-one",
+        "host_setups": [{
+            "selector": "host-live-selector", "host_setup": "host-live",
+            "project": "project-live", "setup_kind": "local",
+            "canonical_root": workspace_root
+        }],
+        "checkouts": [{
+            "selector": "checkout-live-selector", "checkout": "checkout-live",
+            "project": "project-live", "host_setup": "host-live",
+            "repository_authority": "github", "repository": "repo-live",
+            "checkout_kind": "authorized_folder", "canonical_root": workspace_root,
+            "repository_root": null, "base_commit": null, "branch_ref": null
+        }],
+        "workspaces": [{
+            "workspace": "workspace-live", "project": "project-live",
+            "checkout": "checkout-live", "canonical_root": workspace_root
+        }],
+        "task_selectors": [{
+            "base_selector": "base-workspace-live",
+            "branch_selector": "branch-workspace-live",
+            "project": "project-live", "workspace": "workspace-live",
+            "checkout": "checkout-live", "task": "task-workspace-live",
+            "external_provider": "github",
+            "external_authority": "authority-workspace-live",
+            "external_scope": "scope-workspace-live",
+            "external_key": "work-workspace-live"
+        }]
+    });
+    let registry_path = config
+        .state_dir()
+        .join(automonique_daemon::platform_v2_lifecycle_adapter::LIFECYCLE_REGISTRY_FILE_NAME);
+    std::fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
+    std::fs::set_permissions(&registry_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let create = WorkspaceIntent::Create(WorkspaceCreateIntent::new(
+        WorkspaceIntentId::new("intent-workspace-live-create").unwrap(),
+        OrchestrationTaskId::new("task-workspace-live").unwrap(),
+        external,
+        BaseSelectorId::new("base-workspace-live").unwrap(),
+        BranchSelectorId::new("branch-workspace-live").unwrap(),
+    ));
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-production-workspace-create",
+            PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(
+                ProjectId::new("project-live").unwrap(),
+                create.clone(),
+            )),
+        ),
+        PlatformV2Response::WorkspaceIntentResult(WorkspaceIntentOutcome::Created(value))
+            if value == workspace
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-production-workspace-create-replay",
+            PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(
+                ProjectId::new("project-live").unwrap(),
+                create.clone(),
+            )),
+        ),
+        PlatformV2Response::WorkspaceIntentResult(WorkspaceIntentOutcome::Created(value))
+            if value == workspace
+    ));
+    let resume = WorkspaceIntent::Resume(WorkspaceResumeIntent::new(
+        WorkspaceIntentId::new("intent-workspace-live-resume").unwrap(),
+        OrchestrationTaskId::new("task-workspace-live").unwrap(),
+        workspace.clone(),
+        Revision::FIRST,
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-production-workspace-resume",
+            PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(
+                ProjectId::new("project-live").unwrap(),
+                resume.clone(),
+            )),
+        ),
+        PlatformV2Response::WorkspaceIntentResult(WorkspaceIntentOutcome::Resumed(value))
+            if value == workspace
+    ));
+    serving.shutdown(&config);
+
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-production-workspace-resume-after-restart",
+            PlatformV2Request::GetWorkspaceIntent(WorkspaceIntentLookup::new(
+                ProjectId::new("project-live").unwrap(),
+                resume.intent_id().clone(),
+            )),
+        ),
+        PlatformV2Response::WorkspaceIntentResult(WorkspaceIntentOutcome::Resumed(value))
+            if value == workspace
     ));
     serving.shutdown(&config);
 }

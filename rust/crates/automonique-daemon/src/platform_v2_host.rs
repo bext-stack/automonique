@@ -35,7 +35,7 @@ use automonique_protocol::platform_v2_transport::{
     PlatformV2Refusal, PlatformV2Request, PlatformV2Response, RawMutationApprovalDocument,
     RawMutationReceiptDocument, ReceiptLookupKey,
 };
-use automonique_protocol::primitives::EpochMillis;
+use automonique_protocol::primitives::{EpochMillis, Revision};
 use automonique_store::lineage_index::WorkspaceIntentExecutionReceipt;
 use automonique_store::lineage_index::{IntentAuthorizationScope, LineageIndex};
 use automonique_store::review_store::{ReviewStore, ReviewStoreError};
@@ -135,6 +135,8 @@ pub trait PlatformV2LifecycleEffectAdapter: Send {
         _intent: &WorkspaceIntent,
         _project: &ProjectId,
         _workspace: &UserWorkspaceId,
+        _workspace_revision: Revision,
+        _policy_generation: Sha256Digest,
     ) -> Result<(), &'static str> {
         Err("platform_v2_workspace_executor_unavailable")
     }
@@ -144,7 +146,20 @@ pub trait PlatformV2LifecycleEffectAdapter: Send {
         _intent: &WorkspaceIntent,
         _project: &ProjectId,
         _workspace: &UserWorkspaceId,
+        _workspace_revision: Revision,
+        _policy_generation: Sha256Digest,
     ) -> Result<WorkspaceIntentOutcome, &'static str> {
+        Err("platform_v2_workspace_executor_unavailable")
+    }
+
+    fn cancel_workspace_intent(
+        &mut self,
+        _target: &WorkspaceIntent,
+        _project: &ProjectId,
+        _workspace: &UserWorkspaceId,
+        _workspace_revision: Revision,
+        _policy_generation: Sha256Digest,
+    ) -> Result<(), &'static str> {
         Err("platform_v2_workspace_executor_unavailable")
     }
 
@@ -230,6 +245,20 @@ pub(crate) struct PolicyGeneration {
 impl PolicyGeneration {
     pub(crate) const fn digest(&self) -> Sha256Digest {
         self.digest
+    }
+
+    fn binding_digest(&self) -> Sha256Digest {
+        let mut hasher = Sha256::new();
+        hasher.update(b"automonique.platform/v2/policy-file-generation/v1\0");
+        hasher.update(&self.device.to_be_bytes());
+        hasher.update(&self.inode.to_be_bytes());
+        hasher.update(&self.changed_seconds.to_be_bytes());
+        hasher.update(&self.changed_nanoseconds.to_be_bytes());
+        hasher.update(&self.modified_seconds.to_be_bytes());
+        hasher.update(&self.modified_nanoseconds.to_be_bytes());
+        hasher.update(&self.length.to_be_bytes());
+        hasher.update(self.digest.as_bytes());
+        hasher.finish()
     }
 }
 
@@ -1011,6 +1040,56 @@ impl PlatformV2Runtime {
                     }
                     WorkspaceIntent::Cancel(intent) => {
                         authorize_workspace(&principal, value.project(), intent.workspace())?;
+                        if let Some(existing) = self
+                            .lineage
+                            .intent_authorized_in_workspaces(
+                                &negotiated_v2()?,
+                                principal.actor.tenant(),
+                                intent.intent_id(),
+                                &allowed,
+                            )
+                            .map_err(|_| "platform_v2_intent_refused")?
+                        {
+                            if existing.intent != *value.intent() {
+                                return Err("platform_v2_intent_refused");
+                            }
+                            return Ok(PlatformV2Response::WorkspaceIntentResult(existing.outcome));
+                        }
+                        let target = self
+                            .lineage
+                            .intent_authorized_in_workspaces(
+                                &negotiated_v2()?,
+                                principal.actor.tenant(),
+                                intent.target_intent_id(),
+                                &allowed,
+                            )
+                            .map_err(|_| "platform_v2_intent_refused")?
+                            .ok_or("platform_v2_intent_refused")?;
+                        if target.revision != intent.expected_revision()
+                            || target.outcome.reconciliation()
+                                == automonique_protocol::platform_v2_lineage::WorkspaceIntentReconciliation::Final
+                        {
+                            return Err("platform_v2_intent_refused");
+                        }
+                        if self.lifecycle_effects.workspace_intents_supported() {
+                            let workspace_revision = self
+                                .work_contexts
+                                .validate_policy_mapping(
+                                    principal.actor.tenant(),
+                                    value.project(),
+                                    &WorkContextIdentity::UserWorkspace(intent.workspace().clone()),
+                                )
+                                .map_err(|_| "platform_v2_policy_incoherent")?
+                                .revision();
+                            self.lifecycle_effects.cancel_workspace_intent(
+                                &target.intent,
+                                value.project(),
+                                intent.workspace(),
+                                workspace_revision,
+                                self.policy_fence.generation.binding_digest(),
+                            )?;
+                            self.policy_fence.verify()?;
+                        }
                         let outcome =
                             WorkspaceIntentOutcome::Cancelled(intent.target_intent_id().clone());
                         self.lineage
@@ -1019,6 +1098,15 @@ impl PlatformV2Runtime {
                         return Ok(PlatformV2Response::WorkspaceIntentResult(outcome));
                     }
                 };
+                let workspace_revision = self
+                    .work_contexts
+                    .validate_policy_mapping(
+                        principal.actor.tenant(),
+                        value.project(),
+                        &WorkContextIdentity::UserWorkspace(workspace.clone()),
+                    )
+                    .map_err(|_| "platform_v2_policy_incoherent")?
+                    .revision();
                 if !self.lifecycle_effects.workspace_intents_supported() {
                     return Err(match value.intent() {
                         WorkspaceIntent::Create(_) => {
@@ -1032,6 +1120,8 @@ impl PlatformV2Runtime {
                     value.intent(),
                     value.project(),
                     &workspace,
+                    workspace_revision,
+                    self.policy_fence.generation.binding_digest(),
                 )?;
                 self.lineage
                     .record_intent(
@@ -1060,6 +1150,8 @@ impl PlatformV2Runtime {
                     value.intent(),
                     value.project(),
                     &workspace,
+                    workspace_revision,
+                    self.policy_fence.generation.binding_digest(),
                 )?;
                 self.policy_fence.verify()?;
                 self.lineage
@@ -1120,16 +1212,29 @@ impl PlatformV2Runtime {
                             return Ok(PlatformV2Response::WorkspaceIntentResult(stored.outcome));
                         }
                     };
+                    let workspace_revision = self
+                        .work_contexts
+                        .validate_policy_mapping(
+                            principal.actor.tenant(),
+                            value.project(),
+                            &WorkContextIdentity::UserWorkspace(workspace.clone()),
+                        )
+                        .map_err(|_| "platform_v2_policy_incoherent")?
+                        .revision();
                     self.lifecycle_effects.preflight_workspace_intent(
                         &stored.intent,
                         value.project(),
                         &workspace,
+                        workspace_revision,
+                        self.policy_fence.generation.binding_digest(),
                     )?;
                     self.policy_fence.verify()?;
                     let outcome = self.lifecycle_effects.execute_workspace_intent(
                         &stored.intent,
                         value.project(),
                         &workspace,
+                        workspace_revision,
+                        self.policy_fence.generation.binding_digest(),
                     )?;
                     self.policy_fence.verify()?;
                     self.lineage
