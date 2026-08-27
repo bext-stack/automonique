@@ -380,7 +380,7 @@ impl ProductionLifecycleEffectAdapter {
                 if value.setup_kind() != HostSetupKind::Local {
                     return Err("platform_v2_remote_host_unsupported");
                 }
-                validate_existing_private_root(
+                validate_private_root_and_parent(
                     binding
                         .canonical_root
                         .as_deref()
@@ -780,6 +780,13 @@ impl PlatformV2LifecycleEffectAdapter for ProductionLifecycleEffectAdapter {
             return PlatformV2EffectExecution::NotStarted;
         }
         if self.apply_lifecycle(intent, resulting_identity).is_err() {
+            if self.definitely_not_started(intent, resulting_identity)
+                && self
+                    .tombstone_not_started(&key, intent, resulting_identity)
+                    .is_ok()
+            {
+                return PlatformV2EffectExecution::NotStarted;
+            }
             return PlatformV2EffectExecution::Unknown;
         }
         if self.mark_completed(&key).is_err() {
@@ -840,7 +847,7 @@ impl ProductionLifecycleEffectAdapter {
                     .canonical_root
                     .as_deref()
                     .ok_or("platform_v2_lifecycle_registry_invalid")?;
-                validate_existing_private_root(root, self.expected_uid)?;
+                validate_private_root_and_parent(root, self.expected_uid)?;
                 Ok(())
             }
             WorkContextMutationIntent::CreateCheckout(value) => {
@@ -861,7 +868,7 @@ impl ProductionLifecycleEffectAdapter {
                 .host_setup(value.registry().as_str())
                 .is_ok_and(|binding| {
                     binding.canonical_root.as_deref().is_some_and(|root| {
-                        validate_existing_private_root(root, self.expected_uid).is_ok()
+                        validate_private_root_and_parent(root, self.expected_uid).is_ok()
                     })
                 }),
             WorkContextMutationIntent::CreateCheckout(value) => self
@@ -879,25 +886,28 @@ impl ProductionLifecycleEffectAdapter {
         _resulting_identity: &WorkContextIdentity,
     ) -> bool {
         match intent {
+            WorkContextMutationIntent::CreateHostSetup(_) => true,
             WorkContextMutationIntent::CreateCheckout(value) => self
                 .checkout(value.registry().as_str())
-                .is_ok_and(|binding| {
-                    if binding.canonical_root.exists() {
-                        return false;
-                    }
-                    match CheckoutKind::parse(&binding.checkout_kind) {
+                .is_ok_and(
+                    |binding| match CheckoutKind::parse(&binding.checkout_kind) {
                         Ok(CheckoutKind::AuthorizedFolder) => true,
-                        Ok(CheckoutKind::GitWorktree) => binding
-                            .repository_root
-                            .as_deref()
-                            .zip(binding.branch_ref.as_deref())
-                            .is_some_and(|(repository, branch)| {
-                                git_status(repository, &["show-ref", "--verify", "--quiet", branch])
-                                    == Ok(false)
-                            }),
+                        Ok(CheckoutKind::GitWorktree) => {
+                            !binding.canonical_root.exists()
+                                && binding
+                                    .repository_root
+                                    .as_deref()
+                                    .zip(binding.branch_ref.as_deref())
+                                    .is_some_and(|(repository, branch)| {
+                                        git_status(
+                                            repository,
+                                            &["show-ref", "--verify", "--quiet", branch],
+                                        ) == Ok(false)
+                                    })
+                        }
                         Err(_) => false,
-                    }
-                }),
+                    },
+                ),
             _ => false,
         }
     }
@@ -973,7 +983,7 @@ fn validate_registry(document: &RegistryDocument, expected_uid: u32) -> Result<(
             return Err("platform_v2_lifecycle_registry_invalid");
         }
         if let Some(root) = &host.canonical_root {
-            validate_existing_private_root(root, expected_uid)?;
+            validate_private_root_and_parent(root, expected_uid)?;
         }
     }
     for checkout in &document.checkouts {
@@ -1037,7 +1047,7 @@ fn validate_checkout_binding(
             {
                 return Err("platform_v2_lifecycle_registry_invalid");
             }
-            validate_existing_private_root(&binding.canonical_root, expected_uid)
+            validate_private_root_and_parent(&binding.canonical_root, expected_uid)
         }
         CheckoutKind::GitWorktree => {
             let repository = binding
@@ -1090,7 +1100,7 @@ fn materialize_checkout(binding: &CheckoutBinding, expected_uid: u32) -> Result<
         .map_err(|_| "platform_v2_lifecycle_registry_invalid")?
     {
         CheckoutKind::AuthorizedFolder => {
-            validate_existing_private_root(&binding.canonical_root, expected_uid)
+            validate_private_root_and_parent(&binding.canonical_root, expected_uid)
         }
         CheckoutKind::GitWorktree => {
             if validate_checkout_materialized(binding, expected_uid).is_ok() {
@@ -1128,6 +1138,11 @@ fn materialize_checkout(binding: &CheckoutBinding, expected_uid: u32) -> Result<
             }
             fs::set_permissions(&binding.canonical_root, fs::Permissions::from_mode(0o700))
                 .map_err(|_| "platform_v2_lifecycle_path_insecure")?;
+            fs::set_permissions(
+                binding.canonical_root.join(".git"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .map_err(|_| "platform_v2_lifecycle_path_insecure")?;
             validate_checkout_materialized(binding, expected_uid)
         }
     }
@@ -1164,7 +1179,7 @@ fn validate_checkout_materialized(
     binding: &CheckoutBinding,
     expected_uid: u32,
 ) -> Result<(), &'static str> {
-    validate_existing_private_root(&binding.canonical_root, expected_uid)?;
+    validate_private_root_and_parent(&binding.canonical_root, expected_uid)?;
     if CheckoutKind::parse(&binding.checkout_kind).ok() == Some(CheckoutKind::GitWorktree) {
         let repository = binding.repository_root.as_ref().unwrap();
         validate_repository_root(repository, expected_uid)?;
@@ -1196,13 +1211,14 @@ fn validate_checkout_materialized(
 }
 
 fn validate_repository_root(path: &Path, expected_uid: u32) -> Result<(), &'static str> {
-    validate_existing_private_root(path, expected_uid)?;
+    validate_private_root_and_parent(path, expected_uid)?;
     let git = path.join(".git");
     let metadata =
         fs::symlink_metadata(&git).map_err(|_| "platform_v2_lifecycle_repository_mismatch")?;
     if metadata.file_type().is_symlink()
         || !metadata.is_dir()
         || metadata.uid() != expected_uid
+        || metadata.mode() & 0o022 != 0
         || fs::canonicalize(&git).ok().as_deref() != Some(git.as_path())
     {
         return Err("platform_v2_lifecycle_repository_mismatch");
@@ -1231,6 +1247,7 @@ fn validate_worktree_git_file(
         .map_err(|_| "platform_v2_lifecycle_checkout_mismatch")?;
     if !metadata.is_file()
         || metadata.uid() != expected_uid
+        || metadata.mode() & 0o022 != 0
         || metadata.nlink() != 1
         || metadata.len() > 4096
     {
@@ -1345,6 +1362,15 @@ fn validate_existing_private_root(path: &Path, expected_uid: u32) -> Result<(), 
         return Err("platform_v2_lifecycle_path_insecure");
     }
     Ok(())
+}
+
+fn validate_private_root_and_parent(path: &Path, expected_uid: u32) -> Result<(), &'static str> {
+    validate_existing_private_root(path, expected_uid)?;
+    let parent = path
+        .parent()
+        .filter(|parent| *parent != path)
+        .ok_or("platform_v2_lifecycle_path_insecure")?;
+    validate_existing_private_root(parent, expected_uid)
 }
 
 fn read_private_file(
@@ -1498,6 +1524,8 @@ fn bounded_output_with_timeout(
     let total = Arc::new(AtomicUsize::new(0));
     let exceeded = Arc::new(AtomicBool::new(false));
     let stdout = Arc::new(Mutex::new(Vec::new()));
+    let stdout_done = Arc::new(AtomicBool::new(false));
+    let stderr_done = Arc::new(AtomicBool::new(false));
     let stdout_reader = spawn_bounded_reader(
         child
             .stdout
@@ -1506,6 +1534,7 @@ fn bounded_output_with_timeout(
         Arc::clone(&total),
         Arc::clone(&exceeded),
         Some(Arc::clone(&stdout)),
+        Arc::clone(&stdout_done),
     );
     let stderr_reader = spawn_bounded_reader(
         child
@@ -1515,9 +1544,11 @@ fn bounded_output_with_timeout(
         Arc::clone(&total),
         Arc::clone(&exceeded),
         None,
+        Arc::clone(&stderr_done),
     );
     let started = Instant::now();
-    let status = loop {
+    let mut status = None;
+    loop {
         if exceeded.load(Ordering::Acquire) {
             kill_process_group(&mut child);
             let _ = stdout_reader.join();
@@ -1530,17 +1561,26 @@ fn bounded_output_with_timeout(
             let _ = stderr_reader.join();
             return Err("platform_v2_lifecycle_git_timeout");
         }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => thread::sleep(Duration::from_millis(5)),
-            Err(_) => {
-                kill_process_group(&mut child);
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err("platform_v2_lifecycle_git_failed");
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(value)) => status = Some(value),
+                Ok(None) => {}
+                Err(_) => {
+                    kill_process_group(&mut child);
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    return Err("platform_v2_lifecycle_git_failed");
+                }
             }
         }
-    };
+        if status.is_some()
+            && stdout_done.load(Ordering::Acquire)
+            && stderr_done.load(Ordering::Acquire)
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
     stdout_reader
         .join()
         .map_err(|_| "platform_v2_lifecycle_git_failed")??;
@@ -1554,7 +1594,10 @@ fn bounded_output_with_timeout(
         .map_err(|_| "platform_v2_lifecycle_git_failed")?
         .into_inner()
         .map_err(|_| "platform_v2_lifecycle_git_failed")?;
-    Ok(BoundedOutput { status, stdout })
+    Ok(BoundedOutput {
+        status: status.ok_or("platform_v2_lifecycle_git_failed")?,
+        stdout,
+    })
 }
 
 fn spawn_bounded_reader<R>(
@@ -1562,31 +1605,36 @@ fn spawn_bounded_reader<R>(
     total: Arc<AtomicUsize>,
     exceeded: Arc<AtomicBool>,
     capture: Option<Arc<Mutex<Vec<u8>>>>,
+    done: Arc<AtomicBool>,
 ) -> thread::JoinHandle<Result<(), &'static str>>
 where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
-        let mut buffer = [0_u8; 8192];
-        loop {
-            let count = reader
-                .read(&mut buffer)
-                .map_err(|_| "platform_v2_lifecycle_git_failed")?;
-            if count == 0 {
-                return Ok(());
+        let result = (|| {
+            let mut buffer = [0_u8; 8192];
+            loop {
+                let count = reader
+                    .read(&mut buffer)
+                    .map_err(|_| "platform_v2_lifecycle_git_failed")?;
+                if count == 0 {
+                    return Ok(());
+                }
+                let prior = total.fetch_add(count, Ordering::AcqRel);
+                if prior.saturating_add(count) > MAX_GIT_OUTPUT_BYTES {
+                    exceeded.store(true, Ordering::Release);
+                    continue;
+                }
+                if let Some(capture) = &capture {
+                    capture
+                        .lock()
+                        .map_err(|_| "platform_v2_lifecycle_git_failed")?
+                        .extend_from_slice(&buffer[..count]);
+                }
             }
-            let prior = total.fetch_add(count, Ordering::AcqRel);
-            if prior.saturating_add(count) > MAX_GIT_OUTPUT_BYTES {
-                exceeded.store(true, Ordering::Release);
-                continue;
-            }
-            if let Some(capture) = &capture {
-                capture
-                    .lock()
-                    .map_err(|_| "platform_v2_lifecycle_git_failed")?
-                    .extend_from_slice(&buffer[..count]);
-            }
-        }
+        })();
+        done.store(true, Ordering::Release);
+        result
     })
 }
 
@@ -1637,10 +1685,19 @@ fn safe_git_command(path: &Path) -> Result<Command, &'static str> {
         if normalized.starts_with("include.") || normalized.starts_with("includeif.") {
             return Err("platform_v2_lifecycle_git_include_unsafe");
         }
-        let Some(name) = normalized
-            .strip_prefix("filter.")
-            .and_then(|value| value.rsplit_once('.').map(|value| value.0))
-        else {
+        let Some(normalized_tail) = normalized.strip_prefix("filter.") else {
+            continue;
+        };
+        let Some((_, property)) = normalized_tail.rsplit_once('.') else {
+            continue;
+        };
+        if !matches!(property, "process" | "smudge" | "clean" | "required") {
+            continue;
+        }
+        // Git's section and variable names are case-insensitive, but subsection
+        // names are case-sensitive. Preserve the exact subsection spelling so
+        // the command-line override applies to the configured filter.
+        let Some((name, _)) = key["filter.".len()..].rsplit_once('.') else {
             continue;
         };
         if !safe_filter_name(name) {
@@ -1800,6 +1857,7 @@ mod tests {
     use automonique_protocol::primitives::Revision;
 
     fn private_directory(path: &Path) {
+        fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(path).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
@@ -1881,6 +1939,17 @@ mod tests {
         assert_eq!(
             bounded_output_with_timeout(
                 Command::new("/bin/sh").args(["-c", "sleep 30"]),
+                Duration::from_millis(50),
+            )
+            .err(),
+            Some("platform_v2_lifecycle_git_timeout")
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let started = Instant::now();
+        assert_eq!(
+            bounded_output_with_timeout(
+                Command::new("/bin/sh").args(["-c", "sleep 30 & exit 0"]),
                 Duration::from_millis(50),
             )
             .err(),
@@ -1984,6 +2053,28 @@ mod tests {
     }
 
     #[test]
+    fn selector_registry_refuses_a_permissive_authorized_root_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("state");
+        let permissive_parent = directory.path().join("permissive");
+        let root = permissive_parent.join("authorized");
+        private_directory(&state);
+        private_directory(&permissive_parent);
+        private_directory(&root);
+        fs::set_permissions(&permissive_parent, fs::Permissions::from_mode(0o770)).unwrap();
+        let registry_path = state.join(LIFECYCLE_REGISTRY_FILE_NAME);
+        write_registry(&registry_path, &authorized_registry(&root));
+        assert!(matches!(
+            ProductionLifecycleEffectAdapter::open(
+                &registry_path,
+                &state.join(LIFECYCLE_JOURNAL_FILE_NAME),
+                nix::unistd::geteuid().as_raw(),
+            ),
+            Err("platform_v2_lifecycle_path_insecure")
+        ));
+    }
+
+    #[test]
     fn completed_effect_survives_restart_and_live_registry_swap_refuses() {
         let directory = tempfile::tempdir().unwrap();
         let state = directory.path().join("state");
@@ -2043,6 +2134,106 @@ mod tests {
             restarted.reconcile(&intent, &resulting, &key),
             PlatformV2EffectReconciliation::Unknown(_)
         ));
+    }
+
+    #[test]
+    fn validation_only_prepared_effects_are_tombstoned_and_do_not_block_rotation() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("state");
+        let root = directory.path().join("authorized");
+        private_directory(&state);
+        private_directory(&root);
+        let registry_path = state.join(LIFECYCLE_REGISTRY_FILE_NAME);
+        let journal_path = state.join(LIFECYCLE_JOURNAL_FILE_NAME);
+        let mut document = authorized_registry(&root);
+        write_registry(&registry_path, &document);
+        let uid = nix::unistd::geteuid().as_raw();
+        let mut adapter =
+            ProductionLifecycleEffectAdapter::open(&registry_path, &journal_path, uid)
+                .unwrap()
+                .unwrap();
+        let project = ExpectedWorkContext::new(
+            WorkContextIdentity::Project(ProjectId::new("project-test").unwrap()),
+            Revision::FIRST,
+        );
+        let host_intent = WorkContextMutationIntent::CreateHostSetup(
+            CreateHostSetupIntent::new(
+                WorkContextLabel::new("Local host").unwrap(),
+                project.clone(),
+                HostSetupKind::Local,
+                WorkContextRegistrySelector::new("host-local").unwrap(),
+            )
+            .unwrap(),
+        );
+        let host_result = WorkContextIdentity::HostSetup(HostSetupId::new("host-one").unwrap());
+        let host_key = IdempotencyKey::new("host-validation-only").unwrap();
+        adapter
+            .insert_lifecycle_prepared(
+                format!("lifecycle:{}", host_key.as_str()),
+                lifecycle_digest(&host_intent, &host_result),
+                &host_intent,
+                &host_result,
+            )
+            .unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(matches!(
+            adapter.reconcile(&host_intent, &host_result, &host_key),
+            PlatformV2EffectReconciliation::VerifiedNotStarted(_)
+        ));
+        assert!(adapter.journal.entries.is_empty());
+        assert!(adapter.journal.host_setups.is_empty());
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let repository = WorkContextIdentity::Repository(
+            V1RepositoryRef::new(ResourceCoordinate::new(
+                ResourceAuthority::GitHub,
+                ResourceKind::Repository,
+                ResourceId::new("owner/repository").unwrap(),
+            ))
+            .unwrap(),
+        );
+        let checkout_intent = WorkContextMutationIntent::CreateCheckout(
+            CreateCheckoutIntent::new(
+                WorkContextLabel::new("Authorized checkout").unwrap(),
+                project,
+                ExpectedWorkContext::new(host_result.clone(), Revision::FIRST),
+                ExpectedWorkContext::new(repository, Revision::FIRST),
+                CheckoutKind::AuthorizedFolder,
+                WorkContextRegistrySelector::new("checkout-one").unwrap(),
+            )
+            .unwrap(),
+        );
+        let checkout_result = WorkContextIdentity::Checkout(
+            automonique_protocol::platform_v2::CheckoutId::new("checkout-one").unwrap(),
+        );
+        let checkout_key = IdempotencyKey::new("checkout-validation-only").unwrap();
+        adapter
+            .insert_lifecycle_prepared(
+                format!("lifecycle:{}", checkout_key.as_str()),
+                lifecycle_digest(&checkout_intent, &checkout_result),
+                &checkout_intent,
+                &checkout_result,
+            )
+            .unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(matches!(
+            adapter.reconcile(&checkout_intent, &checkout_result, &checkout_key),
+            PlatformV2EffectReconciliation::VerifiedNotStarted(_)
+        ));
+        assert!(adapter.journal.entries.is_empty());
+        assert!(adapter.journal.checkouts.is_empty());
+        drop(adapter);
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        document["generation"] = serde_json::Value::String("generation-two".to_owned());
+        let replacement = state.join("replacement.json");
+        write_registry(&replacement, &document);
+        fs::rename(&replacement, &registry_path).unwrap();
+        assert!(
+            ProductionLifecycleEffectAdapter::open(&registry_path, &journal_path, uid)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -2138,12 +2329,13 @@ mod tests {
             assert!(output.status.success(), "{:?}", output.stderr);
         };
         run(&["init", "--quiet"]);
+        fs::set_permissions(repository.join(".git"), fs::Permissions::from_mode(0o700)).unwrap();
         run(&["config", "user.name", "Fixture"]);
         run(&["config", "user.email", "fixture@example.invalid"]);
         fs::write(repository.join("README"), b"fixture\n").unwrap();
         fs::write(
             repository.join(".gitattributes"),
-            b"*.payload filter=evil\n",
+            b"*.payload filter=MiXeD\n",
         )
         .unwrap();
         fs::write(repository.join("fixture.payload"), b"payload\n").unwrap();
@@ -2168,8 +2360,8 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&filter, fs::Permissions::from_mode(0o700)).unwrap();
-        run(&["config", "filter.evil.process", filter.to_str().unwrap()]);
-        run(&["config", "filter.evil.required", "true"]);
+        run(&["config", "filter.MiXeD.smudge", filter.to_str().unwrap()]);
+        run(&["config", "filter.MiXeD.required", "true"]);
         let base = git_text(&repository, &["rev-parse", "HEAD"]).unwrap();
         let target = worktrees.join("issue-166");
         let registry_path = state.join(LIFECYCLE_REGISTRY_FILE_NAME);
@@ -2266,6 +2458,10 @@ mod tests {
             adapter.execute(&checkout, &resulting, &key),
             PlatformV2EffectExecution::Completed
         );
+        assert_eq!(
+            fs::symlink_metadata(target.join(".git")).unwrap().mode() & 0o777,
+            0o600
+        );
         assert_eq!(git_text(&target, &["rev-parse", "HEAD"]).unwrap(), base);
         assert_eq!(
             git_text(&target, &["symbolic-ref", "-q", "HEAD"]).unwrap(),
@@ -2290,6 +2486,7 @@ mod tests {
             .unwrap();
         assert!(output.status.success(), "{:?}", output.stderr);
         fs::set_permissions(&independent, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(independent.join(".git"), fs::Permissions::from_mode(0o700)).unwrap();
         let output = Command::new("git")
             .arg("-C")
             .arg(&independent)
@@ -2302,6 +2499,7 @@ mod tests {
             .unwrap();
         assert!(output.status.success(), "{:?}", output.stderr);
         fs::set_permissions(&forged, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(forged.join(".git"), fs::Permissions::from_mode(0o600)).unwrap();
         let mut forged_binding = adapter.checkout("checkout-git").unwrap().clone();
         forged_binding.canonical_root = forged;
         forged_binding.branch_ref = Some("refs/heads/work/forged".to_owned());
@@ -2309,6 +2507,19 @@ mod tests {
             validate_checkout_materialized(&forged_binding, uid),
             Err("platform_v2_lifecycle_checkout_mismatch")
         );
+
+        fs::set_permissions(target.join(".git"), fs::Permissions::from_mode(0o660)).unwrap();
+        assert_eq!(
+            validate_checkout_materialized(adapter.checkout("checkout-git").unwrap(), uid),
+            Err("platform_v2_lifecycle_checkout_mismatch")
+        );
+        fs::set_permissions(target.join(".git"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(repository.join(".git"), fs::Permissions::from_mode(0o770)).unwrap();
+        assert_eq!(
+            validate_repository_root(&repository, uid),
+            Err("platform_v2_lifecycle_repository_mismatch")
+        );
+        fs::set_permissions(repository.join(".git"), fs::Permissions::from_mode(0o700)).unwrap();
 
         let included = directory.path().join("included-git-config");
         fs::write(&included, "[filter \"included\"]\n\tprocess = /bin/false\n").unwrap();

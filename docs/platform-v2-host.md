@@ -209,10 +209,11 @@ free-disk headroom and refusal of symlink/submodule entries bound checkout
 materialization. System/global Git configuration, interactive prompting,
 repository hooks, repository-local clean/smudge/process filters and
 file-protocol transport are disabled. An existing worktree must also prove an
-owned, single-linked regular `.git` file whose canonical target and reported
-common directory are exactly under the configured repository's
+uid-owned, non-group/world-writable, single-linked regular `.git` file whose
+canonical target and reported common directory are exactly under the configured repository's
 `.git/worktrees`; matching commit/ref values from an independent repository do
-not suffice.
+not suffice. The configured repository's canonical `.git` directory is likewise
+required to be uid-owned and non-group/world-writable.
 
 ```json
 {
@@ -262,7 +263,9 @@ new generation but the following directory fsync fails, memory retains the
 installed generation rather than restoring stale state. A prepared record is durable before an external
 effect. Restart reconciliation proves an exact completed worktree, proves it
 was not started, or leaves it ambiguous; it never guesses and replays a partial
-effect. Completed host/checkout mappings retain only opaque identities and path
+effect. A prepared validation-only local-host or authorized-folder operation
+whose binding becomes invalid is durably tombstoned as not started, releasing
+its selector custody. Completed host/checkout mappings retain only opaque identities and path
 digests. Logical archive changes do not delete operator files or git
 worktrees.
 
