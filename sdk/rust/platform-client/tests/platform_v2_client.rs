@@ -20,6 +20,7 @@ use automonique_protocol::platform_v2_lifecycle::{
     WorkContextAuthority, WorkContextMutationIntent, WorkContextMutationProposal,
 };
 use automonique_protocol::platform_v2_lifecycle_api::work_context_mutation_preview_digest;
+use automonique_protocol::platform_v2_lineage::LineageProjection;
 use automonique_protocol::platform_v2_transport::{
     PlatformNegotiationResponse, PlatformV2Refusal, PlatformV2Response, RawMutationApprovalDocument,
 };
@@ -168,6 +169,28 @@ fn rejects_a_valid_record_for_the_wrong_coordinate() {
         .unwrap();
     assert_eq!(
         client.get_work_context(project("project-a")),
+        Err(ClientError::Protocol)
+    );
+}
+
+#[test]
+fn rejects_lineage_projected_for_another_workspace_coordinate() {
+    use automonique_protocol::platform_v2::UserWorkspaceId;
+
+    let requested = UserWorkspaceId::new("workspace-a").unwrap();
+    let projection =
+        LineageProjection::new(UserWorkspaceId::new("workspace-b").unwrap(), vec![], vec![])
+            .unwrap();
+    let transport = DeterministicPlatformV2Transport::new([
+        v2_negotiation(),
+        DeterministicPlatformV2Step::V2(Box::new(PlatformV2Response::LineageResult(projection))),
+    ]);
+    let mut client = PlatformV2Client::new_testing(transport);
+    client
+        .negotiate(PlatformVersionOffer::new(vec![2]).unwrap())
+        .unwrap();
+    assert_eq!(
+        client.get_lineage(ProjectId::new("project-a").unwrap(), requested),
         Err(ClientError::Protocol)
     );
 }

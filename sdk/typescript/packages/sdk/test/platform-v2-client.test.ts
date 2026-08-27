@@ -387,6 +387,27 @@ describe("canonical HTTPS Platform v2 client", () => {
     await expect(client.getWorkContext(projectA)).rejects.toMatchObject({category: "response_coordinate_mismatch"});
   });
 
+  test("rejects lineage projected for another workspace coordinate", async () => {
+    const requested = UserWorkspaceId("workspace-a");
+    const adapter = new DeterministicPlatformV2Adapter([
+      {lane: "negotiation", result: {kind: "negotiated", negotiated: negotiatedBody(2n)}},
+      {
+        lane: "v2",
+        request: {kind: "get_lineage", request: {project: ProjectId("project-a"), workspace: requested}},
+        result: {kind: "lineage_result", lineage: {
+          external_work_items: [],
+          orchestration: [],
+          schema: PLATFORM_SCHEMA_V2,
+          workspace: UserWorkspaceId("workspace-b"),
+        }},
+      },
+    ]);
+    const client = new PlatformV2Client(adapter);
+    await client.negotiate(offer);
+    await expect(client.getLineage(ProjectId("project-a"), requested))
+      .rejects.toMatchObject({category: "response_coordinate_mismatch"});
+  });
+
   test("preserves the exact idempotency lookup and supports AbortSignal", async () => {
     const key = IdempotencyKey("mutation-1");
     const adapter = new DeterministicPlatformV2Adapter([
