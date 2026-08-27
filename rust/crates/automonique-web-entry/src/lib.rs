@@ -2064,8 +2064,8 @@ impl WebIntegration {
     fn platform(&self) -> Result<PlatformProjectionView, &'static str> {
         let mut client = self
             .platform
-            .try_lock()
-            .map_err(|_| "platform_client_busy")?;
+            .lock()
+            .map_err(|_| "platform_client_unavailable")?;
         let capabilities = client.capabilities().map_err(|_| "platform_unavailable")?;
         let (health, inventory, cursor, resources) = match client
             .request(PlatformRequest::Snapshot(
@@ -2122,8 +2122,8 @@ impl WebIntegration {
     ) -> Result<PlatformSessionActionView, &'static str> {
         let mut client = self
             .platform
-            .try_lock()
-            .map_err(|_| "platform_client_busy")?;
+            .lock()
+            .map_err(|_| "platform_client_unavailable")?;
         let dashboard_client = ClientId::new(DASHBOARD_PLATFORM_CLIENT)
             .map_err(|_| "platform_session_request_invalid")?;
         let schema = "automonique.dashboard.retained-session/v1";
@@ -2341,8 +2341,8 @@ impl WebIntegration {
     fn platform_sessions(&self) -> Result<PlatformSessionsView, &'static str> {
         let mut client = self
             .platform
-            .try_lock()
-            .map_err(|_| "platform_client_busy")?;
+            .lock()
+            .map_err(|_| "platform_client_unavailable")?;
         let sessions = match client
             .request(PlatformRequest::ListSessions(ListSessionsRequest {
                 authority: ResourceAuthority::Automonique,
@@ -6807,23 +6807,44 @@ mod tests {
             }
         });
 
-        let integration = WebIntegration::open(
-            IntegrationConfig {
-                tenant: String::from("operator"),
-                actor: String::from("operator:platform-degraded"),
-                hosts: fixture_hosts(),
-            },
-            state_dir.path(),
-            runtime_dir.path(),
-        )
-        .expect("web integration");
-        let response = api_response(
-            Route::ApiPlatform,
-            &[],
-            &integration,
-            &AppState::new(fixture_status()),
-            None,
+        let integration = Arc::new(
+            WebIntegration::open(
+                IntegrationConfig {
+                    tenant: String::from("operator"),
+                    actor: String::from("operator:platform-degraded"),
+                    hosts: fixture_hosts(),
+                },
+                state_dir.path(),
+                runtime_dir.path(),
+            )
+            .expect("web integration"),
         );
+        let guard = integration.platform.lock().expect("platform client");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker_integration = Arc::clone(&integration);
+        let worker = thread::spawn(move || {
+            started_tx.send(()).expect("signal worker start");
+            result_tx
+                .send(api_response(
+                    Route::ApiPlatform,
+                    &[],
+                    &worker_integration,
+                    &AppState::new(fixture_status()),
+                    None,
+                ))
+                .expect("send platform projection");
+        });
+        started_rx.recv().expect("worker started");
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(guard);
+        let response = result_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("contended platform projection completed");
+        worker.join().expect("platform projection worker");
         platform_server.join().expect("platform server");
 
         assert_eq!(response.status, "200 OK");
