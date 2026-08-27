@@ -50,6 +50,35 @@ mod platform_surface {
     }
 }
 
+mod work_context_surface {
+    use super::*;
+
+    #[test]
+    fn generated_typescript_keeps_distinct_identities_and_pages_past_512() {
+        let runtime = javascript_runtime().unwrap_or_else(|| {
+            record_js_gap("the work-context cross-language fixture did not run");
+            "bun"
+        });
+        if javascript_runtime().is_none() {
+            return;
+        }
+        let output = Command::new(runtime)
+            .arg(package_root().join("conformance/work-context-runtime.ts"))
+            .current_dir(package_root())
+            .output()
+            .expect("the TypeScript runtime starts");
+        assert!(
+            output.status.success(),
+            "work-context fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "{\"identities\":9,\"items\":640,\"page_limit\":128,\"schema\":\"automonique.platform/v2\",\"refusals\":9,\"version\":2}\n"
+        );
+    }
+}
+
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -992,8 +1021,8 @@ mod maintained_surface {
 
     use automonique_protocol::codegen::{
         ADMIN_STATUS_MODULE, BARREL_MODULE, DOCTOR_MODULE, GENERATED_DIRECTORY, REGENERATE_COMMAND,
-        REGENERATE_ENV, RUNTIME_MODULE, generated_files, generated_schema_digest,
-        maintained_modules, module_file_name,
+        REGENERATE_ENV, RUNTIME_MODULE, generated_files, generated_platform_v1_schema_digest,
+        generated_schema_digest, maintained_modules, module_file_name,
     };
     use automonique_protocol::{
         MAX_DOCTOR_CHECKS, MAX_FINDING_CODE_BYTES, MAX_FINDING_MESSAGE_BYTES,
@@ -1470,7 +1499,8 @@ mod maintained_surface {
                 line.is_empty()
                     || line.starts_with("//")
                     || line.starts_with("export * from ")
-                    || line.starts_with("export const SCHEMA_DIGEST"),
+                    || line.starts_with("export const SCHEMA_DIGEST")
+                    || line.starts_with("export const PLATFORM_V1_SCHEMA_DIGEST"),
                 "{name} carries something other than a re-export or the schema digest: {line:?}"
             );
         }
@@ -1520,6 +1550,19 @@ mod maintained_surface {
             hex.bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
             "the digest is not lowercase hexadecimal: {hex}"
+        );
+
+        let (_, platform_v1_hex) = generated_platform_v1_schema_digest();
+        assert!(
+            barrel.contains(&format!(
+                "export const PLATFORM_V1_SCHEMA_DIGEST = \"{platform_v1_hex}\";"
+            )),
+            "the barrel's Platform v1 digest does not identify the exact v1 module; \
+             regenerate with: {REGENERATE_COMMAND}"
+        );
+        assert_ne!(
+            platform_v1_hex, hex,
+            "the Platform v1 package pin must be distinct from the additive aggregate surface"
         );
     }
 
