@@ -1,0 +1,1 @@
+{"action":{"kind":"rerun_check","payload":{"check_id":"check-1","expected_check_revision":7}},"actor":"actor-1","authentication":"user_session","authority":{"id":"authority-1","kind":"ci"},"expected_revision":9,"idempotency_key":"idem-1","platform_version":2,"schema":"automonique.platform/review/v1","workspace":{"id":"wc_user_1","kind":"user_workspace"}}

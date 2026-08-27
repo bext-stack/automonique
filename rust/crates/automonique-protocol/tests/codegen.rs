@@ -79,6 +79,35 @@ mod work_context_surface {
     }
 }
 
+mod review_context_surface {
+    use super::*;
+
+    #[test]
+    fn generated_typescript_preserves_review_fixture_and_authority_refusals() {
+        let runtime = javascript_runtime().unwrap_or_else(|| {
+            record_js_gap("the review-context cross-language fixture did not run");
+            "bun"
+        });
+        if javascript_runtime().is_none() {
+            return;
+        }
+        let output = Command::new(runtime)
+            .arg(package_root().join("conformance/review-context-runtime.ts"))
+            .current_dir(package_root())
+            .output()
+            .expect("the TypeScript runtime starts");
+        assert!(
+            output.status.success(),
+            "review-context fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "{\"action\":\"rerun_check\",\"attention\":\"needs_you\",\"bytes\":1633,\"receipt\":\"poll_receipt\",\"refusals\":3,\"schema\":\"automonique.platform/review/v1\"}\n"
+        );
+    }
+}
+
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }

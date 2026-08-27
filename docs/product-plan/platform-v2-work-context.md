@@ -160,3 +160,6 @@ checked-in Platform v1 module remains byte-identical.
 The mutation methods, durable persistence/index and authorization integration,
 SDK client ergonomics, daemon routes, and internal terminology cleanup remain
 separate implementation work.
+
+The additive typed review/attention sub-contract built on these identities is
+specified in [Platform v2 review, attention, checks, and pull requests](platform-v2-review-contract.md).

@@ -1,0 +1,1173 @@
+// SPDX-License-Identifier: Elastic-2.0
+
+//! Shared Platform v2 review, attention, check, and pull-request contract.
+//!
+//! Values in this module are projections and narrowly scoped proposals. They
+//! contain no host paths, credentials, provider payloads, generic executable
+//! input, or ambient authority. A provider session is an observed relation,
+//! never authorization for git, filesystem, CI, review, or pull-request
+//! mutation.
+
+use core::fmt;
+
+use crate::platform::{IdempotencyKey, ReceiptId};
+use crate::platform_v2::{WorkContextIdentity, WorkContextTargetKind};
+use crate::primitives::{BoundedString, IdDomain, OpaqueId, Revision, ValueError};
+
+pub const PLATFORM_REVIEW_SCHEMA_V1: &str = "automonique.platform/review/v1";
+pub const PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR: u16 = 2;
+pub const MAX_REVIEW_FIELD_BYTES: usize = 256;
+pub const MAX_REVIEW_PATH_BYTES: usize = 1024;
+pub const MAX_REVIEW_TEXT_BYTES: usize = 4096;
+pub const MAX_REVIEW_HUNK_PREVIEW_BYTES: usize = 512;
+pub const MAX_REVIEW_FILES: usize = 128;
+pub const MAX_REVIEW_HUNKS_PER_FILE: usize = 128;
+pub const MAX_REVIEW_HUNKS: usize = 512;
+pub const MAX_REVIEW_COMMENTS: usize = 256;
+pub const MAX_REVIEW_CHECKS: usize = 128;
+pub const MAX_REVIEW_PROPOSALS: usize = 32;
+pub const MAX_REVIEW_PROPOSAL_FILES: usize = 128;
+pub const MAX_REVIEW_UNREAD: u32 = 1_000_000;
+
+macro_rules! id_domain {
+    ($domain:ident, $name:ident) => {
+        #[derive(Clone, Copy, Debug)]
+        pub struct $domain;
+        impl IdDomain for $domain {}
+        pub type $name = OpaqueId<$domain, MAX_REVIEW_FIELD_BYTES>;
+    };
+}
+
+id_domain!(ReviewFileIdDomain, ReviewFileId);
+id_domain!(ReviewHunkIdDomain, ReviewHunkId);
+id_domain!(ReviewCommentIdDomain, ReviewCommentId);
+id_domain!(ReviewCheckIdDomain, ReviewCheckId);
+id_domain!(ReviewProposalIdDomain, ReviewProposalId);
+id_domain!(ReviewActorIdDomain, ReviewActorId);
+id_domain!(ReviewAuthorityIdDomain, ReviewAuthorityId);
+id_domain!(ReviewActionIdDomain, ReviewActionId);
+id_domain!(PullRequestIdDomain, PullRequestId);
+id_domain!(DeliveryIdDomain, DeliveryId);
+
+pub type ReviewText = BoundedString<MAX_REVIEW_TEXT_BYTES>;
+pub type ReviewHunkPreview = BoundedString<MAX_REVIEW_HUNK_PREVIEW_BYTES>;
+pub type ReviewField = BoundedString<MAX_REVIEW_FIELD_BYTES>;
+
+/// Repository-relative display path. It cannot name an absolute or parent path.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RepositoryRelativePath(String);
+
+impl RepositoryRelativePath {
+    pub fn new(value: impl Into<String>) -> Result<Self, ReviewContractError> {
+        let value = value.into();
+        if value.is_empty() || value.len() > MAX_REVIEW_PATH_BYTES {
+            return Err(ReviewContractError::PathInvalid);
+        }
+        if value.starts_with('/')
+            || value.starts_with('\\')
+            || value.contains('\\')
+            || value.contains('\0')
+            || value
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            return Err(ReviewContractError::PathInvalid);
+        }
+        if value.chars().any(char::is_control) {
+            return Err(ReviewContractError::PathInvalid);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+macro_rules! wire_enum {
+    ($name:ident { $($variant:ident => $wire:literal),+ $(,)? }) => {
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub enum $name { $($variant),+ }
+        impl $name {
+            pub const ALL: [Self; wire_enum!(@count $($variant),+)] = [$(Self::$variant),+];
+            #[must_use]
+            pub const fn as_str(self) -> &'static str {
+                match self { $(Self::$variant => $wire),+ }
+            }
+            pub fn parse(value: &str) -> Result<Self, ReviewContractError> {
+                Self::ALL.into_iter().find(|candidate| candidate.as_str() == value)
+                    .ok_or(ReviewContractError::UnknownEnum)
+            }
+        }
+    };
+    (@count $($item:ident),+) => { <[()]>::len(&[$(wire_enum!(@unit $item)),+]) };
+    (@unit $item:ident) => { () };
+}
+
+wire_enum!(DiffChangeKind { Added => "added", Modified => "modified", Deleted => "deleted", Renamed => "renamed" });
+wire_enum!(PreviewKind { None => "none", Text => "text", Binary => "binary", Image => "image", Html => "html" });
+wire_enum!(ConflictState { None => "none", Unresolved => "unresolved", Resolved => "resolved" });
+wire_enum!(DiffSide { Old => "old", New => "new" });
+wire_enum!(CommentAgentState { NotSent => "not_sent", Pending => "pending", Sent => "sent", Refused => "refused" });
+wire_enum!(WorktreeFileState { Staged => "staged", Unstaged => "unstaged", PartiallyStaged => "partially_staged", Untracked => "untracked" });
+wire_enum!(ReviewProposalKind { Stage => "stage", Unstage => "unstage", Commit => "commit" });
+wire_enum!(CheckState { Queued => "queued", Running => "running", Passed => "passed", Failed => "failed", Cancelled => "cancelled", Unavailable => "unavailable" });
+wire_enum!(ReviewDecision { Pending => "pending", Approved => "approved", ChangesRequested => "changes_requested", Dismissed => "dismissed" });
+wire_enum!(PullRequestState { Absent => "absent", Draft => "draft", Open => "open", Closed => "closed", Merged => "merged" });
+wire_enum!(MergeReadiness { Unknown => "unknown", Blocked => "blocked", Ready => "ready", Stale => "stale" });
+wire_enum!(DeliveryState { NotDelivered => "not_delivered", Pending => "pending", Delivered => "delivered", Failed => "failed" });
+wire_enum!(AttentionState { NeedsYou => "needs_you", Working => "working", Done => "done", Blocked => "blocked" });
+wire_enum!(AttentionReason { ReviewRequested => "review_requested", CommentReply => "comment_reply", ApprovalRequired => "approval_required", CheckRunning => "check_running", CheckFailed => "check_failed", Conflict => "conflict", DeliveryPending => "delivery_pending", Complete => "complete", ExternalBlocker => "external_blocker" });
+wire_enum!(ReviewAuthorityKind { Filesystem => "filesystem", Git => "git", Ci => "ci", PullRequest => "pull_request", Review => "review", Delivery => "delivery" });
+wire_enum!(ReviewFreshnessState { Fresh => "fresh", Stale => "stale", Unknown => "unknown" });
+wire_enum!(ReviewAuthentication { UserSession => "user_session", ServiceIdentity => "service_identity", ProviderSession => "provider_session" });
+wire_enum!(ReviewActionKind { AddComment => "add_comment", SendCommentToAgent => "send_comment_to_agent", ApproveReview => "approve_review", RerunCheck => "rerun_check", OpenPullRequest => "open_pull_request", UpdatePullRequest => "update_pull_request", MergePullRequest => "merge_pull_request" });
+wire_enum!(ReviewReceiptOutcome { Accepted => "accepted", Completed => "completed", Refused => "refused", Conflict => "conflict", Unknown => "unknown" });
+wire_enum!(ReviewReconciliation { Final => "final", PollReceipt => "poll_receipt" });
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewAuthority {
+    kind: ReviewAuthorityKind,
+    id: ReviewAuthorityId,
+}
+impl ReviewAuthority {
+    pub fn new(kind: ReviewAuthorityKind, id: ReviewAuthorityId) -> Self {
+        Self { kind, id }
+    }
+    #[must_use]
+    pub const fn kind(&self) -> ReviewAuthorityKind {
+        self.kind
+    }
+    #[must_use]
+    pub fn id(&self) -> &ReviewAuthorityId {
+        &self.id
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReviewFreshness {
+    state: ReviewFreshnessState,
+    observed_revision: Revision,
+    observed_at_ms: u64,
+}
+impl ReviewFreshness {
+    pub fn new(
+        state: ReviewFreshnessState,
+        observed_revision: Revision,
+        observed_at_ms: u64,
+    ) -> Result<Self, ReviewContractError> {
+        if observed_at_ms > i64::MAX as u64 {
+            return Err(ReviewContractError::CounterOutOfRange);
+        }
+        Ok(Self {
+            state,
+            observed_revision,
+            observed_at_ms,
+        })
+    }
+    #[must_use]
+    pub const fn state(&self) -> ReviewFreshnessState {
+        self.state
+    }
+    #[must_use]
+    pub const fn observed_revision(&self) -> Revision {
+        self.observed_revision
+    }
+    #[must_use]
+    pub const fn observed_at_ms(&self) -> u64 {
+        self.observed_at_ms
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreviewMetadata {
+    kind: PreviewKind,
+    media_type: Option<ReviewField>,
+    byte_size: Option<u64>,
+    width: Option<u32>,
+    height: Option<u32>,
+    sanitized: bool,
+}
+impl PreviewMetadata {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        kind: PreviewKind,
+        media_type: Option<ReviewField>,
+        byte_size: Option<u64>,
+        width: Option<u32>,
+        height: Option<u32>,
+        sanitized: bool,
+    ) -> Result<Self, ReviewContractError> {
+        let coherent = match kind {
+            PreviewKind::None => {
+                media_type.is_none()
+                    && byte_size.is_none()
+                    && width.is_none()
+                    && height.is_none()
+                    && !sanitized
+            }
+            PreviewKind::Text => width.is_none() && height.is_none() && sanitized,
+            PreviewKind::Binary => {
+                media_type.is_some()
+                    && byte_size.is_some()
+                    && width.is_none()
+                    && height.is_none()
+                    && !sanitized
+            }
+            PreviewKind::Image => {
+                media_type
+                    .as_ref()
+                    .is_some_and(|value| value.as_str().starts_with("image/"))
+                    && byte_size.is_some()
+                    && width.is_some_and(|v| v > 0)
+                    && height.is_some_and(|v| v > 0)
+                    && sanitized
+            }
+            PreviewKind::Html => {
+                media_type
+                    .as_ref()
+                    .is_some_and(|value| value.as_str() == "text/html")
+                    && byte_size.is_some()
+                    && width.is_none()
+                    && height.is_none()
+                    && sanitized
+            }
+        };
+        if !coherent || byte_size.is_some_and(|value| value > i64::MAX as u64) {
+            return Err(ReviewContractError::PreviewInvalid);
+        }
+        Ok(Self {
+            kind,
+            media_type,
+            byte_size,
+            width,
+            height,
+            sanitized,
+        })
+    }
+    #[must_use]
+    pub const fn kind(&self) -> PreviewKind {
+        self.kind
+    }
+    #[must_use]
+    pub fn media_type(&self) -> Option<&ReviewField> {
+        self.media_type.as_ref()
+    }
+    #[must_use]
+    pub const fn byte_size(&self) -> Option<u64> {
+        self.byte_size
+    }
+    #[must_use]
+    pub const fn width(&self) -> Option<u32> {
+        self.width
+    }
+    #[must_use]
+    pub const fn height(&self) -> Option<u32> {
+        self.height
+    }
+    #[must_use]
+    pub const fn sanitized(&self) -> bool {
+        self.sanitized
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiffHunk {
+    id: ReviewHunkId,
+    old_start: u32,
+    old_lines: u32,
+    new_start: u32,
+    new_lines: u32,
+    preview: ReviewHunkPreview,
+}
+impl DiffHunk {
+    pub fn new(
+        id: ReviewHunkId,
+        old_start: u32,
+        old_lines: u32,
+        new_start: u32,
+        new_lines: u32,
+        preview: ReviewHunkPreview,
+    ) -> Result<Self, ReviewContractError> {
+        if old_start == 0 || new_start == 0 || old_lines.saturating_add(new_lines) == 0 {
+            return Err(ReviewContractError::HunkInvalid);
+        }
+        Ok(Self {
+            id,
+            old_start,
+            old_lines,
+            new_start,
+            new_lines,
+            preview,
+        })
+    }
+    #[must_use]
+    pub fn id(&self) -> &ReviewHunkId {
+        &self.id
+    }
+    #[must_use]
+    pub const fn old_start(&self) -> u32 {
+        self.old_start
+    }
+    #[must_use]
+    pub const fn old_lines(&self) -> u32 {
+        self.old_lines
+    }
+    #[must_use]
+    pub const fn new_start(&self) -> u32 {
+        self.new_start
+    }
+    #[must_use]
+    pub const fn new_lines(&self) -> u32 {
+        self.new_lines
+    }
+    #[must_use]
+    pub fn preview(&self) -> &ReviewHunkPreview {
+        &self.preview
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewFile {
+    id: ReviewFileId,
+    path: RepositoryRelativePath,
+    change: DiffChangeKind,
+    worktree: WorktreeFileState,
+    preview: PreviewMetadata,
+    conflict: ConflictState,
+    hunks: Vec<DiffHunk>,
+}
+impl ReviewFile {
+    pub fn new(
+        id: ReviewFileId,
+        path: RepositoryRelativePath,
+        change: DiffChangeKind,
+        worktree: WorktreeFileState,
+        preview: PreviewMetadata,
+        conflict: ConflictState,
+        hunks: Vec<DiffHunk>,
+    ) -> Result<Self, ReviewContractError> {
+        if hunks.len() > MAX_REVIEW_HUNKS_PER_FILE || !strict_by(&hunks, |hunk| hunk.id().as_str())
+        {
+            return Err(ReviewContractError::CollectionInvalid);
+        }
+        if preview.kind() != PreviewKind::Text && !hunks.is_empty() {
+            return Err(ReviewContractError::PreviewInvalid);
+        }
+        Ok(Self {
+            id,
+            path,
+            change,
+            worktree,
+            preview,
+            conflict,
+            hunks,
+        })
+    }
+    #[must_use]
+    pub fn id(&self) -> &ReviewFileId {
+        &self.id
+    }
+    #[must_use]
+    pub fn path(&self) -> &RepositoryRelativePath {
+        &self.path
+    }
+    #[must_use]
+    pub const fn change(&self) -> DiffChangeKind {
+        self.change
+    }
+    #[must_use]
+    pub const fn worktree(&self) -> WorktreeFileState {
+        self.worktree
+    }
+    #[must_use]
+    pub fn preview(&self) -> &PreviewMetadata {
+        &self.preview
+    }
+    #[must_use]
+    pub const fn conflict(&self) -> ConflictState {
+        self.conflict
+    }
+    #[must_use]
+    pub fn hunks(&self) -> &[DiffHunk] {
+        &self.hunks
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewAnchor {
+    file_id: ReviewFileId,
+    hunk_id: ReviewHunkId,
+    side: DiffSide,
+    line: u32,
+}
+impl ReviewAnchor {
+    pub fn new(
+        file_id: ReviewFileId,
+        hunk_id: ReviewHunkId,
+        side: DiffSide,
+        line: u32,
+    ) -> Result<Self, ReviewContractError> {
+        if line == 0 {
+            return Err(ReviewContractError::AnchorInvalid);
+        }
+        Ok(Self {
+            file_id,
+            hunk_id,
+            side,
+            line,
+        })
+    }
+    #[must_use]
+    pub fn file_id(&self) -> &ReviewFileId {
+        &self.file_id
+    }
+    #[must_use]
+    pub fn hunk_id(&self) -> &ReviewHunkId {
+        &self.hunk_id
+    }
+    #[must_use]
+    pub const fn side(&self) -> DiffSide {
+        self.side
+    }
+    #[must_use]
+    pub const fn line(&self) -> u32 {
+        self.line
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewComment {
+    id: ReviewCommentId,
+    revision: Revision,
+    actor: ReviewActorId,
+    body: ReviewText,
+    anchor: ReviewAnchor,
+    agent_state: CommentAgentState,
+    unread: bool,
+}
+impl ReviewComment {
+    pub fn new(
+        id: ReviewCommentId,
+        revision: Revision,
+        actor: ReviewActorId,
+        body: ReviewText,
+        anchor: ReviewAnchor,
+        agent_state: CommentAgentState,
+        unread: bool,
+    ) -> Self {
+        Self {
+            id,
+            revision,
+            actor,
+            body,
+            anchor,
+            agent_state,
+            unread,
+        }
+    }
+    #[must_use]
+    pub fn id(&self) -> &ReviewCommentId {
+        &self.id
+    }
+    #[must_use]
+    pub const fn revision(&self) -> Revision {
+        self.revision
+    }
+    #[must_use]
+    pub fn actor(&self) -> &ReviewActorId {
+        &self.actor
+    }
+    #[must_use]
+    pub fn body(&self) -> &ReviewText {
+        &self.body
+    }
+    #[must_use]
+    pub fn anchor(&self) -> &ReviewAnchor {
+        &self.anchor
+    }
+    #[must_use]
+    pub const fn agent_state(&self) -> CommentAgentState {
+        self.agent_state
+    }
+    #[must_use]
+    pub const fn unread(&self) -> bool {
+        self.unread
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewProposal {
+    id: ReviewProposalId,
+    kind: ReviewProposalKind,
+    files: Vec<ReviewFileId>,
+    subject: Option<ReviewField>,
+}
+impl ReviewProposal {
+    pub fn new(
+        id: ReviewProposalId,
+        kind: ReviewProposalKind,
+        files: Vec<ReviewFileId>,
+        subject: Option<ReviewField>,
+    ) -> Result<Self, ReviewContractError> {
+        if files.is_empty()
+            || files.len() > MAX_REVIEW_PROPOSAL_FILES
+            || !strict_by(&files, OpaqueId::as_str)
+        {
+            return Err(ReviewContractError::CollectionInvalid);
+        }
+        if (kind == ReviewProposalKind::Commit) != subject.is_some() {
+            return Err(ReviewContractError::ProposalInvalid);
+        }
+        Ok(Self {
+            id,
+            kind,
+            files,
+            subject,
+        })
+    }
+    #[must_use]
+    pub fn id(&self) -> &ReviewProposalId {
+        &self.id
+    }
+    #[must_use]
+    pub const fn kind(&self) -> ReviewProposalKind {
+        self.kind
+    }
+    #[must_use]
+    pub fn files(&self) -> &[ReviewFileId] {
+        &self.files
+    }
+    #[must_use]
+    pub fn subject(&self) -> Option<&ReviewField> {
+        self.subject.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckProjection {
+    id: ReviewCheckId,
+    state: CheckState,
+    authority: ReviewAuthority,
+    freshness: ReviewFreshness,
+    required: bool,
+}
+impl CheckProjection {
+    pub fn new(
+        id: ReviewCheckId,
+        state: CheckState,
+        authority: ReviewAuthority,
+        freshness: ReviewFreshness,
+        required: bool,
+    ) -> Result<Self, ReviewContractError> {
+        if authority.kind() != ReviewAuthorityKind::Ci {
+            return Err(ReviewContractError::AuthorityInvalid);
+        }
+        Ok(Self {
+            id,
+            state,
+            authority,
+            freshness,
+            required,
+        })
+    }
+    #[must_use]
+    pub fn id(&self) -> &ReviewCheckId {
+        &self.id
+    }
+    #[must_use]
+    pub const fn state(&self) -> CheckState {
+        self.state
+    }
+    #[must_use]
+    pub fn authority(&self) -> &ReviewAuthority {
+        &self.authority
+    }
+    #[must_use]
+    pub const fn freshness(&self) -> ReviewFreshness {
+        self.freshness
+    }
+    #[must_use]
+    pub const fn required(&self) -> bool {
+        self.required
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewStatusProjection {
+    decision: ReviewDecision,
+    authority: ReviewAuthority,
+    freshness: ReviewFreshness,
+}
+impl ReviewStatusProjection {
+    pub fn new(
+        decision: ReviewDecision,
+        authority: ReviewAuthority,
+        freshness: ReviewFreshness,
+    ) -> Result<Self, ReviewContractError> {
+        if authority.kind() != ReviewAuthorityKind::Review {
+            return Err(ReviewContractError::AuthorityInvalid);
+        }
+        Ok(Self {
+            decision,
+            authority,
+            freshness,
+        })
+    }
+    #[must_use]
+    pub const fn decision(&self) -> ReviewDecision {
+        self.decision
+    }
+    #[must_use]
+    pub fn authority(&self) -> &ReviewAuthority {
+        &self.authority
+    }
+    #[must_use]
+    pub const fn freshness(&self) -> ReviewFreshness {
+        self.freshness
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PullRequestProjection {
+    id: Option<PullRequestId>,
+    state: PullRequestState,
+    readiness: MergeReadiness,
+    authority: ReviewAuthority,
+    freshness: ReviewFreshness,
+}
+impl PullRequestProjection {
+    pub fn new(
+        id: Option<PullRequestId>,
+        state: PullRequestState,
+        readiness: MergeReadiness,
+        authority: ReviewAuthority,
+        freshness: ReviewFreshness,
+    ) -> Result<Self, ReviewContractError> {
+        if authority.kind() != ReviewAuthorityKind::PullRequest
+            || (state == PullRequestState::Absent) != id.is_none()
+        {
+            return Err(ReviewContractError::AuthorityInvalid);
+        }
+        Ok(Self {
+            id,
+            state,
+            readiness,
+            authority,
+            freshness,
+        })
+    }
+    #[must_use]
+    pub fn id(&self) -> Option<&PullRequestId> {
+        self.id.as_ref()
+    }
+    #[must_use]
+    pub const fn state(&self) -> PullRequestState {
+        self.state
+    }
+    #[must_use]
+    pub const fn readiness(&self) -> MergeReadiness {
+        self.readiness
+    }
+    #[must_use]
+    pub fn authority(&self) -> &ReviewAuthority {
+        &self.authority
+    }
+    #[must_use]
+    pub const fn freshness(&self) -> ReviewFreshness {
+        self.freshness
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeliveryProjection {
+    id: Option<DeliveryId>,
+    state: DeliveryState,
+    authority: ReviewAuthority,
+    freshness: ReviewFreshness,
+}
+impl DeliveryProjection {
+    pub fn new(
+        id: Option<DeliveryId>,
+        state: DeliveryState,
+        authority: ReviewAuthority,
+        freshness: ReviewFreshness,
+    ) -> Result<Self, ReviewContractError> {
+        if authority.kind() != ReviewAuthorityKind::Delivery
+            || ((state == DeliveryState::NotDelivered) != id.is_none())
+        {
+            return Err(ReviewContractError::AuthorityInvalid);
+        }
+        Ok(Self {
+            id,
+            state,
+            authority,
+            freshness,
+        })
+    }
+    #[must_use]
+    pub fn id(&self) -> Option<&DeliveryId> {
+        self.id.as_ref()
+    }
+    #[must_use]
+    pub const fn state(&self) -> DeliveryState {
+        self.state
+    }
+    #[must_use]
+    pub fn authority(&self) -> &ReviewAuthority {
+        &self.authority
+    }
+    #[must_use]
+    pub const fn freshness(&self) -> ReviewFreshness {
+        self.freshness
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttentionProjection {
+    state: AttentionState,
+    reason: AttentionReason,
+    unread: u32,
+    source_revision: Revision,
+}
+impl AttentionProjection {
+    pub fn new(
+        state: AttentionState,
+        reason: AttentionReason,
+        unread: u32,
+        source_revision: Revision,
+    ) -> Result<Self, ReviewContractError> {
+        if unread > MAX_REVIEW_UNREAD {
+            return Err(ReviewContractError::CounterOutOfRange);
+        }
+        let compatible = match state {
+            AttentionState::NeedsYou => matches!(
+                reason,
+                AttentionReason::ReviewRequested
+                    | AttentionReason::CommentReply
+                    | AttentionReason::ApprovalRequired
+            ),
+            AttentionState::Working => matches!(
+                reason,
+                AttentionReason::CheckRunning | AttentionReason::DeliveryPending
+            ),
+            AttentionState::Done => reason == AttentionReason::Complete,
+            AttentionState::Blocked => matches!(
+                reason,
+                AttentionReason::CheckFailed
+                    | AttentionReason::Conflict
+                    | AttentionReason::ExternalBlocker
+            ),
+        };
+        if !compatible {
+            return Err(ReviewContractError::AttentionInvalid);
+        }
+        Ok(Self {
+            state,
+            reason,
+            unread,
+            source_revision,
+        })
+    }
+    #[must_use]
+    pub const fn state(&self) -> AttentionState {
+        self.state
+    }
+    #[must_use]
+    pub const fn reason(&self) -> AttentionReason {
+        self.reason
+    }
+    #[must_use]
+    pub const fn unread(&self) -> u32 {
+        self.unread
+    }
+    #[must_use]
+    pub const fn source_revision(&self) -> Revision {
+        self.source_revision
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewSnapshot {
+    workspace: WorkContextIdentity,
+    revision: Revision,
+    files: Vec<ReviewFile>,
+    comments: Vec<ReviewComment>,
+    proposals: Vec<ReviewProposal>,
+    checks: Vec<CheckProjection>,
+    review: ReviewStatusProjection,
+    pull_request: PullRequestProjection,
+    delivery: DeliveryProjection,
+    attention: AttentionProjection,
+}
+impl ReviewSnapshot {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        workspace: WorkContextIdentity,
+        revision: Revision,
+        files: Vec<ReviewFile>,
+        comments: Vec<ReviewComment>,
+        proposals: Vec<ReviewProposal>,
+        checks: Vec<CheckProjection>,
+        review: ReviewStatusProjection,
+        pull_request: PullRequestProjection,
+        delivery: DeliveryProjection,
+        attention: AttentionProjection,
+    ) -> Result<Self, ReviewContractError> {
+        validate_workspace(&workspace)?;
+        if files.len() > MAX_REVIEW_FILES
+            || files.iter().map(|file| file.hunks().len()).sum::<usize>() > MAX_REVIEW_HUNKS
+            || comments.len() > MAX_REVIEW_COMMENTS
+            || proposals.len() > MAX_REVIEW_PROPOSALS
+            || checks.len() > MAX_REVIEW_CHECKS
+            || !strict_by(&files, |v| v.id().as_str())
+            || !strict_by(&comments, |v| v.id().as_str())
+            || !strict_by(&proposals, |v| v.id().as_str())
+            || !strict_by(&checks, |v| v.id().as_str())
+        {
+            return Err(ReviewContractError::CollectionInvalid);
+        }
+        for comment in &comments {
+            let Some(file) = files
+                .iter()
+                .find(|file| file.id() == comment.anchor().file_id())
+            else {
+                return Err(ReviewContractError::AnchorInvalid);
+            };
+            if !file
+                .hunks()
+                .iter()
+                .any(|hunk| hunk.id() == comment.anchor().hunk_id())
+            {
+                return Err(ReviewContractError::AnchorInvalid);
+            }
+        }
+        if attention.source_revision() > revision {
+            return Err(ReviewContractError::AttentionInvalid);
+        }
+        Ok(Self {
+            workspace,
+            revision,
+            files,
+            comments,
+            proposals,
+            checks,
+            review,
+            pull_request,
+            delivery,
+            attention,
+        })
+    }
+    #[must_use]
+    pub fn workspace(&self) -> &WorkContextIdentity {
+        &self.workspace
+    }
+    #[must_use]
+    pub const fn revision(&self) -> Revision {
+        self.revision
+    }
+    #[must_use]
+    pub fn files(&self) -> &[ReviewFile] {
+        &self.files
+    }
+    #[must_use]
+    pub fn comments(&self) -> &[ReviewComment] {
+        &self.comments
+    }
+    #[must_use]
+    pub fn proposals(&self) -> &[ReviewProposal] {
+        &self.proposals
+    }
+    #[must_use]
+    pub fn checks(&self) -> &[CheckProjection] {
+        &self.checks
+    }
+    #[must_use]
+    pub fn review(&self) -> &ReviewStatusProjection {
+        &self.review
+    }
+    #[must_use]
+    pub fn pull_request(&self) -> &PullRequestProjection {
+        &self.pull_request
+    }
+    #[must_use]
+    pub fn delivery(&self) -> &DeliveryProjection {
+        &self.delivery
+    }
+    #[must_use]
+    pub const fn attention(&self) -> AttentionProjection {
+        self.attention
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReviewAction {
+    AddComment {
+        comment_id: ReviewCommentId,
+        anchor: ReviewAnchor,
+        body: ReviewText,
+    },
+    SendCommentToAgent {
+        comment_id: ReviewCommentId,
+        expected_comment_revision: Revision,
+    },
+    ApproveReview {
+        expected_review_revision: Revision,
+    },
+    RerunCheck {
+        check_id: ReviewCheckId,
+        expected_check_revision: Revision,
+    },
+    OpenPullRequest {
+        title: ReviewField,
+    },
+    UpdatePullRequest {
+        pull_request_id: PullRequestId,
+        expected_pull_request_revision: Revision,
+        title: ReviewField,
+    },
+    MergePullRequest {
+        pull_request_id: PullRequestId,
+        expected_pull_request_revision: Revision,
+        expected_head_revision: ReviewField,
+    },
+}
+impl ReviewAction {
+    #[must_use]
+    pub const fn kind(&self) -> ReviewActionKind {
+        match self {
+            Self::AddComment { .. } => ReviewActionKind::AddComment,
+            Self::SendCommentToAgent { .. } => ReviewActionKind::SendCommentToAgent,
+            Self::ApproveReview { .. } => ReviewActionKind::ApproveReview,
+            Self::RerunCheck { .. } => ReviewActionKind::RerunCheck,
+            Self::OpenPullRequest { .. } => ReviewActionKind::OpenPullRequest,
+            Self::UpdatePullRequest { .. } => ReviewActionKind::UpdatePullRequest,
+            Self::MergePullRequest { .. } => ReviewActionKind::MergePullRequest,
+        }
+    }
+    #[must_use]
+    pub const fn required_authority(&self) -> ReviewAuthorityKind {
+        match self {
+            Self::AddComment { .. }
+            | Self::SendCommentToAgent { .. }
+            | Self::ApproveReview { .. } => ReviewAuthorityKind::Review,
+            Self::RerunCheck { .. } => ReviewAuthorityKind::Ci,
+            Self::OpenPullRequest { .. }
+            | Self::UpdatePullRequest { .. }
+            | Self::MergePullRequest { .. } => ReviewAuthorityKind::PullRequest,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewActionRequest {
+    workspace: WorkContextIdentity,
+    expected_revision: Revision,
+    actor: ReviewActorId,
+    authentication: ReviewAuthentication,
+    authority: ReviewAuthority,
+    idempotency_key: IdempotencyKey,
+    action: ReviewAction,
+}
+impl ReviewActionRequest {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        workspace: WorkContextIdentity,
+        expected_revision: Revision,
+        actor: ReviewActorId,
+        authentication: ReviewAuthentication,
+        authority: ReviewAuthority,
+        idempotency_key: IdempotencyKey,
+        action: ReviewAction,
+    ) -> Result<Self, ReviewContractError> {
+        validate_workspace(&workspace)?;
+        if authentication == ReviewAuthentication::ProviderSession
+            || authority.kind() != action.required_authority()
+        {
+            return Err(ReviewContractError::AuthorityInvalid);
+        }
+        Ok(Self {
+            workspace,
+            expected_revision,
+            actor,
+            authentication,
+            authority,
+            idempotency_key,
+            action,
+        })
+    }
+    #[must_use]
+    pub fn workspace(&self) -> &WorkContextIdentity {
+        &self.workspace
+    }
+    #[must_use]
+    pub const fn expected_revision(&self) -> Revision {
+        self.expected_revision
+    }
+    #[must_use]
+    pub fn actor(&self) -> &ReviewActorId {
+        &self.actor
+    }
+    #[must_use]
+    pub const fn authentication(&self) -> ReviewAuthentication {
+        self.authentication
+    }
+    #[must_use]
+    pub fn authority(&self) -> &ReviewAuthority {
+        &self.authority
+    }
+    #[must_use]
+    pub fn idempotency_key(&self) -> &IdempotencyKey {
+        &self.idempotency_key
+    }
+    #[must_use]
+    pub fn action(&self) -> &ReviewAction {
+        &self.action
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewActionReceipt {
+    receipt_id: ReceiptId,
+    idempotency_key: IdempotencyKey,
+    action_id: ReviewActionId,
+    actor: ReviewActorId,
+    outcome: ReviewReceiptOutcome,
+    revision: Option<Revision>,
+    current_revision: Option<Revision>,
+    reconciliation: ReviewReconciliation,
+}
+impl ReviewActionReceipt {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        receipt_id: ReceiptId,
+        idempotency_key: IdempotencyKey,
+        action_id: ReviewActionId,
+        actor: ReviewActorId,
+        outcome: ReviewReceiptOutcome,
+        revision: Option<Revision>,
+        current_revision: Option<Revision>,
+        reconciliation: ReviewReconciliation,
+    ) -> Result<Self, ReviewContractError> {
+        let valid = match outcome {
+            ReviewReceiptOutcome::Accepted => {
+                revision.is_none()
+                    && current_revision.is_none()
+                    && reconciliation == ReviewReconciliation::PollReceipt
+            }
+            ReviewReceiptOutcome::Completed => {
+                revision.is_some()
+                    && current_revision.is_none()
+                    && reconciliation == ReviewReconciliation::Final
+            }
+            ReviewReceiptOutcome::Refused => {
+                revision.is_none()
+                    && current_revision.is_none()
+                    && reconciliation == ReviewReconciliation::Final
+            }
+            ReviewReceiptOutcome::Conflict => {
+                revision.is_none()
+                    && current_revision.is_some()
+                    && reconciliation == ReviewReconciliation::Final
+            }
+            ReviewReceiptOutcome::Unknown => {
+                revision.is_none()
+                    && current_revision.is_none()
+                    && reconciliation == ReviewReconciliation::PollReceipt
+            }
+        };
+        if !valid {
+            return Err(ReviewContractError::ReceiptInvalid);
+        }
+        Ok(Self {
+            receipt_id,
+            idempotency_key,
+            action_id,
+            actor,
+            outcome,
+            revision,
+            current_revision,
+            reconciliation,
+        })
+    }
+    #[must_use]
+    pub fn receipt_id(&self) -> &ReceiptId {
+        &self.receipt_id
+    }
+    #[must_use]
+    pub fn idempotency_key(&self) -> &IdempotencyKey {
+        &self.idempotency_key
+    }
+    #[must_use]
+    pub fn action_id(&self) -> &ReviewActionId {
+        &self.action_id
+    }
+    #[must_use]
+    pub fn actor(&self) -> &ReviewActorId {
+        &self.actor
+    }
+    #[must_use]
+    pub const fn outcome(&self) -> ReviewReceiptOutcome {
+        self.outcome
+    }
+    #[must_use]
+    pub const fn revision(&self) -> Option<Revision> {
+        self.revision
+    }
+    #[must_use]
+    pub const fn current_revision(&self) -> Option<Revision> {
+        self.current_revision
+    }
+    #[must_use]
+    pub const fn reconciliation(&self) -> ReviewReconciliation {
+        self.reconciliation
+    }
+}
+
+fn validate_workspace(value: &WorkContextIdentity) -> Result<(), ReviewContractError> {
+    if matches!(
+        value.kind(),
+        WorkContextTargetKind::UserWorkspace
+            | WorkContextTargetKind::AttemptWorkspace
+            | WorkContextTargetKind::Session
+    ) {
+        Ok(())
+    } else {
+        Err(ReviewContractError::WorkspaceInvalid)
+    }
+}
+
+fn strict_by<T>(values: &[T], key: impl Fn(&T) -> &str) -> bool {
+    values
+        .windows(2)
+        .all(|pair| key(&pair[0]).as_bytes() < key(&pair[1]).as_bytes())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReviewContractError {
+    Field(ValueError),
+    UnknownEnum,
+    PathInvalid,
+    CounterOutOfRange,
+    PreviewInvalid,
+    HunkInvalid,
+    AnchorInvalid,
+    ProposalInvalid,
+    AttentionInvalid,
+    AuthorityInvalid,
+    WorkspaceInvalid,
+    CollectionInvalid,
+    ReceiptInvalid,
+}
+impl From<ValueError> for ReviewContractError {
+    fn from(value: ValueError) -> Self {
+        Self::Field(value)
+    }
+}
+impl fmt::Display for ReviewContractError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "review contract refused value: {self:?}")
+    }
+}
+impl std::error::Error for ReviewContractError {}
