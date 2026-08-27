@@ -376,6 +376,54 @@ pub fn verify_web_principal_binding(
     Ok(())
 }
 
+pub(crate) fn verify_bootstrap_policy(
+    policy_path: &Path,
+    expected_uid: u32,
+    tenant: &str,
+    projects: &BTreeSet<ProjectId>,
+    identities: &BTreeSet<WorkContextIdentity>,
+) -> Result<Sha256Digest, &'static str> {
+    let snapshot = read_policy_snapshot(policy_path, expected_uid)?
+        .ok_or("platform_v2_bootstrap_policy_missing")?;
+    let document: PolicyDocument =
+        serde_json::from_slice(&snapshot.bytes).map_err(|_| "platform_v2_policy_invalid")?;
+    let principals = parse_policy(document)?;
+    let principal = if principals.len() == 1 {
+        principals.get(&expected_uid)
+    } else {
+        None
+    }
+    .ok_or("platform_v2_bootstrap_policy_ambiguous")?;
+    if principal.actor.tenant() != tenant
+        || &principal.projects != projects
+        || principal.workspaces.keys().collect::<BTreeSet<_>>()
+            != identities.iter().collect::<BTreeSet<_>>()
+    {
+        return Err("platform_v2_bootstrap_policy_mismatch");
+    }
+    Ok(snapshot.generation.digest)
+}
+
+pub(crate) fn verify_bootstrap_store(
+    policy_path: &Path,
+    expected_uid: u32,
+    store: &WorkContextStore,
+) -> Result<Sha256Digest, &'static str> {
+    let snapshot = read_policy_snapshot(policy_path, expected_uid)?
+        .ok_or("platform_v2_bootstrap_policy_missing")?;
+    let document: PolicyDocument =
+        serde_json::from_slice(&snapshot.bytes).map_err(|_| "platform_v2_policy_invalid")?;
+    let principals = parse_policy(document)?;
+    let principal = if principals.len() == 1 {
+        principals.get(&expected_uid)
+    } else {
+        None
+    }
+    .ok_or("platform_v2_bootstrap_policy_ambiguous")?;
+    validate_principal_mappings(store, principal)?;
+    Ok(snapshot.generation.digest)
+}
+
 impl PlatformV2Runtime {
     fn open(
         policy_path: &Path,
