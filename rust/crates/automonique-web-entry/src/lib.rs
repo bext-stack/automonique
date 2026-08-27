@@ -6460,6 +6460,7 @@ fn handle(
             | Route::ApiAgentAccountsAction
             | Route::ApiOperations
             | Route::ApiPlatform
+            | Route::ApiPlatformCockpit
             | Route::ApiPlatformSession
             | Route::ApiPlatformRemote
             | Route::ApiPlatformV2Remote
@@ -9259,27 +9260,91 @@ mod tests {
     fn platform_cockpit_http_route_is_basic_only_json() {
         let body = r#"{"action":"read"}"#;
         let basic = format!("Basic {}", BASE64_STANDARD.encode("ops:fixture-password"));
-        let request_with = |authorization: &str| {
+        let request_with = |authorization: &str, content_type: &str| {
             format!(
-                "POST /api/platform/cockpit HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nX-Forwarded-Proto: https\r\n{authorization}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "POST /api/platform/cockpit HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nX-Forwarded-Proto: https\r\n{authorization}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             )
         };
-        let basic_response = exchange_without_integration(
-            request_with(&format!("Authorization: {basic}\r\n")).as_bytes(),
+
+        let state_dir = tempfile::tempdir().expect("temporary state");
+        let runtime_dir = tempfile::tempdir().expect("temporary runtime");
+        std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private state");
+        std::fs::set_permissions(runtime_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private runtime");
+        let integration = WebIntegration::open(
+            IntegrationConfig {
+                tenant: String::from("operator"),
+                actor: String::from("operator:cockpit-http"),
+                hosts: fixture_hosts(),
+            },
+            state_dir.path(),
+            runtime_dir.path(),
         );
-        assert!(basic_response.starts_with(b"HTTP/1.1 500 Internal Server Error\r\n"));
+        let integration = integration.expect("web integration");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let web_server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle(
+                stream,
+                &AppState::new(fixture_status()),
+                &fixture_auth(),
+                &fixture_manage_chat_auth(),
+                Some(&integration),
+                &fixture_hosts(),
+            )
+            .unwrap();
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .write_all(
+                request_with(&format!("Authorization: {basic}\r\n"), "application/json").as_bytes(),
+            )
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut basic_response = Vec::new();
+        client.read_to_end(&mut basic_response).unwrap();
+        web_server.join().unwrap();
+
+        let boundary = basic_response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("HTTP boundary");
+        let headers = std::str::from_utf8(&basic_response[..boundary]).unwrap();
+        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(headers.contains("Content-Type: application/json"));
+        assert!(headers.contains("Cache-Control: no-store"));
+        let projection: Value =
+            serde_json::from_slice(&basic_response[boundary + 4..]).expect("typed cockpit JSON");
+        assert_eq!(projection["schema"], "automonique.dashboard.cockpit/v2");
+        assert_eq!(projection["mode"], "v1");
+        assert_eq!(
+            projection["degradation"]["category"],
+            "platform_v2_web_binding_unavailable"
+        );
 
         let bearer_response = exchange_without_integration(
-            request_with("Authorization: Bearer fixture-token\r\n").as_bytes(),
+            request_with(
+                "Authorization: Bearer fixture-token\r\n",
+                "application/json",
+            )
+            .as_bytes(),
         );
         assert!(bearer_response.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
 
         let cookie = fixture_auth().session_cookie();
         let cookie = cookie.split(';').next().unwrap();
-        let cookie_response =
-            exchange_without_integration(request_with(&format!("Cookie: {cookie}\r\n")).as_bytes());
+        let cookie_response = exchange_without_integration(
+            request_with(&format!("Cookie: {cookie}\r\n"), "application/json").as_bytes(),
+        );
         assert!(cookie_response.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
+
+        let simple_content_type = exchange_without_integration(
+            request_with(&format!("Authorization: {basic}\r\n"), "text/plain").as_bytes(),
+        );
+        assert!(simple_content_type.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
     }
 
     #[test]
