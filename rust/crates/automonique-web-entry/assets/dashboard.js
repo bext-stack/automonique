@@ -774,6 +774,26 @@ const frenchUi = Object.freeze({
   "Complete the native provider sign-in in your browser.": "Terminez l’authentification native du fournisseur dans votre navigateur.",
   "Reauthenticate the selected provider account, then relaunch blocked work.": "Réauthentifiez le compte fournisseur sélectionné, puis relancez le travail bloqué.",
   "Add a native Codex or Claude account and explicitly select it for the worker.": "Ajoutez un compte Codex ou Claude natif et sélectionnez-le explicitement pour le worker.",
+  "Pair a phone": "Associer un téléphone",
+  "Close pairing": "Fermer l’association",
+  "An invite is single use and lives five minutes. Create it with the phone already in your hand.": "Une invitation est à usage unique et vit cinq minutes. Créez-la avec le téléphone déjà en main.",
+  "Sessions this phone may attach to": "Sessions auxquelles ce téléphone peut se rattacher",
+  "Every listed session is selected. A phone can only reach the sessions named here.": "Toutes les sessions listées sont sélectionnées. Un téléphone n’atteint que les sessions nommées ici.",
+  "Create invite": "Créer l’invitation",
+  "Copy invite": "Copier l’invitation",
+  "Pairing QR code": "QR code d’association",
+  "Scan it in the app, or use Copy invite and paste it there instead.": "Scannez-le dans l’application, ou utilisez Copier l’invitation et collez-la à la place.",
+  "This invite has expired. Create another.": "Cette invitation a expiré. Créez-en une autre.",
+  "Creating the invite…": "Création de l’invitation…",
+  "Invite copied. Paste it in the app.": "Invitation copiée. Collez-la dans l’application.",
+  "The invite could not be copied.": "L’invitation n’a pas pu être copiée.",
+  "The invite could not be created.": "L’invitation n’a pas pu être créée.",
+  "The invite could not be read.": "L’invitation n’a pas pu être lue.",
+  "The invite was refused. Check the operator credential and try again.": "L’invitation a été refusée. Vérifiez l’identifiant opérateur et réessayez.",
+  "No session exists yet, so an invite would reach nothing. Run a task first.": "Aucune session n’existe encore : une invitation n’atteindrait rien. Lancez d’abord une tâche.",
+  "The session list is unavailable, so the invite could not be scoped.": "La liste des sessions est indisponible : l’invitation n’a pas pu être cadrée.",
+  "Select at least one session. A phone can only reach the sessions named here.": "Sélectionnez au moins une session. Un téléphone n’atteint que les sessions nommées ici.",
+  "The QR encoder did not load. Use Copy invite instead.": "L’encodeur QR n’a pas été chargé. Utilisez plutôt Copier l’invitation.",
 });
 const localizedTextSources = new WeakMap();
 const localizedAttributeSources = new WeakMap();
@@ -789,6 +809,7 @@ function translatePhraseForFrench(value) {
     [/^Text size: (.+)\. Increase text size$/, (match) => `Taille du texte : ${translatePhraseForFrench(match[1])}. Augmenter la taille du texte`],
     [/^Updated (.+)$/, (match) => `Mis à jour ${match[1]}`],
     [/^(\d+) seconds$/, (match) => `${match[1]} secondes`],
+    [/^Expires in (\d+) seconds$/, (match) => `Expire dans ${match[1]} secondes`],
     [/^(\d+)s ago$/, (match) => `il y a ${match[1]} s`],
     [/^(\d+)m ago$/, (match) => `il y a ${match[1]} min`],
     [/^(\d+)h ago$/, (match) => `il y a ${match[1]} h`],
@@ -3894,3 +3915,213 @@ window.setInterval(() => {
   }
 }, 5_000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshStatus(); });
+
+// ---------------------------------------------------------------------------
+// Pairing a phone.
+//
+// The operator mints a single-use invite and the phone reads it. Everything
+// here is deliberately local: the symbol is drawn from the vendored encoder in
+// `/assets/qrcode.js` and rendered as inline SVG, because the dashboard's own
+// policy is `default-src 'none'` with `img-src 'self'` — a data: image would be
+// refused and a remote generator is both blocked and a place a live credential
+// must never go.
+// ---------------------------------------------------------------------------
+
+const PAIRING_QUIET_MODULES = 4;
+let pairingOfferText = null;
+let pairingExpiresAtMs = 0;
+let pairingCountdown = 0;
+
+/// The offer must reach the phone as the exact bytes the endpoint returned:
+/// the app parses it as canonical JSON, so a re-serialised object is a
+/// different document and pairing fails. `api()` hands back parsed JSON, so
+/// this path reads the response as text and never rebuilds it.
+async function pairingRequestText(path, options = {}) {
+  const response = await fetch(path, {
+    cache: "no-store",
+    credentials: "same-origin",
+    ...options,
+    headers: { Accept: "application/vnd.automonique.mobile-auth.v1+json", ...(options.headers || {}) },
+  });
+  const text = await response.text();
+  return { ok: response.ok, status: response.status, text };
+}
+
+function pairingSetStatus(message, kind = "info") {
+  const node = byId("pairing-status");
+  node.textContent = message ? translatePhrase(message) : "";
+  node.dataset.kind = kind;
+}
+
+function pairingClearResult() {
+  window.clearInterval(pairingCountdown);
+  pairingCountdown = 0;
+  pairingOfferText = null;
+  pairingExpiresAtMs = 0;
+  byId("pairing-result").hidden = true;
+  byId("pairing-copy").hidden = true;
+  byId("pairing-code").replaceChildren();
+  byId("pairing-expiry").textContent = "";
+  byId("pairing-expiry").classList.remove("is-expired");
+}
+
+/// Draw one QR symbol as inline SVG. One path, one rect per dark module, so the
+/// whole symbol is a single node the browser scales without resampling.
+function pairingDrawCode(value) {
+  const host = byId("pairing-code");
+  host.replaceChildren();
+  const encoder = window.moniqueQrCode;
+  if (!encoder?.create) {
+    pairingSetStatus("The QR encoder did not load. Use Copy invite instead.", "error");
+    return false;
+  }
+  const symbol = encoder.create(value, { errorCorrectionLevel: "M" });
+  const size = symbol.modules.size;
+  const span = size + PAIRING_QUIET_MODULES * 2;
+  let path = "";
+  for (let row = 0; row < size; row += 1) {
+    for (let column = 0; column < size; column += 1) {
+      if (!symbol.modules.get(row, column)) continue;
+      path += `M${column + PAIRING_QUIET_MODULES} ${row + PAIRING_QUIET_MODULES}h1v1h-1z`;
+    }
+  }
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", `0 0 ${span} ${span}`);
+  svg.setAttribute("shape-rendering", "crispEdges");
+  const background = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+  background.setAttribute("width", String(span));
+  background.setAttribute("height", String(span));
+  background.setAttribute("fill", "#ffffff");
+  const modules = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  modules.setAttribute("d", path);
+  modules.setAttribute("fill", "#000000");
+  svg.append(background, modules);
+  host.append(svg);
+  return true;
+}
+
+function pairingTick() {
+  const node = byId("pairing-expiry");
+  const remaining = Math.round((pairingExpiresAtMs - Date.now()) / 1000);
+  if (remaining <= 0) {
+    node.textContent = translatePhrase("This invite has expired. Create another.");
+    node.classList.add("is-expired");
+    window.clearInterval(pairingCountdown);
+    pairingCountdown = 0;
+    return;
+  }
+  node.classList.remove("is-expired");
+  node.textContent = translatePhrase(`Expires in ${remaining} seconds`);
+}
+
+async function pairingLoadSessions() {
+  const select = byId("pairing-sessions");
+  select.replaceChildren();
+  try {
+    const view = await api("/api/mobile/pairing-sessions");
+    const sessions = Array.isArray(view.sessions) ? view.sessions : [];
+    if (sessions.length === 0) {
+      pairingSetStatus("No session exists yet, so an invite would reach nothing. Run a task first.", "error");
+      byId("pairing-create").disabled = true;
+      return;
+    }
+    for (const entry of sessions) {
+      const id = entry.session?.resource?.id;
+      if (!id) continue;
+      const option = document.createElement("option");
+      option.value = id;
+      option.selected = true;
+      option.textContent = entry.session?.summary ? `${id} — ${entry.session.summary}` : id;
+      option.setAttribute("data-i18n-skip", "");
+      select.append(option);
+    }
+    byId("pairing-create").disabled = select.options.length === 0;
+    pairingSetStatus("");
+  } catch (error) {
+    byId("pairing-create").disabled = true;
+    pairingSetStatus("The session list is unavailable, so the invite could not be scoped.", "error");
+  }
+}
+
+async function pairingCreate() {
+  const button = byId("pairing-create");
+  const scope = Array.from(byId("pairing-sessions").selectedOptions, (option) => option.value);
+  if (scope.length === 0) {
+    // session_scope is an allowlist, not a filter: an empty one reaches nothing.
+    pairingSetStatus("Select at least one session. A phone can only reach the sessions named here.", "error");
+    return;
+  }
+  button.disabled = true;
+  pairingClearResult();
+  pairingSetStatus("Creating the invite…");
+  try {
+    const result = await pairingRequestText("/api/mobile/pairings", {
+      method: "POST",
+      headers: { "Content-Type": "application/vnd.automonique.mobile-auth.v1+json" },
+      body: JSON.stringify({
+        actions: ["attach", "follow_up", "decide_approval", "stop_run"],
+        session_scope: scope,
+        limits: { max_follow_up_bytes: 65536, max_page_events: 100 },
+      }),
+    });
+    if (!result.ok) {
+      pairingSetStatus("The invite was refused. Check the operator credential and try again.", "error");
+      return;
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(result.text);
+    } catch (_error) {
+      pairingSetStatus("The invite could not be read.", "error");
+      return;
+    }
+    pairingOfferText = result.text.trim();
+    pairingExpiresAtMs = Number(parsed.expires_at_ms) || 0;
+    byId("pairing-result").hidden = false;
+    byId("pairing-copy").hidden = false;
+    pairingDrawCode(pairingOfferText);
+    pairingTick();
+    pairingCountdown = window.setInterval(pairingTick, 1000);
+    pairingSetStatus("");
+  } catch (_error) {
+    pairingSetStatus("The invite could not be created.", "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function pairingOpen(open) {
+  byId("pairing-panel").hidden = !open;
+  byId("pairing-open").setAttribute("aria-expanded", open ? "true" : "false");
+  if (open) {
+    byId("pairing-create").disabled = false;
+    pairingClearResult();
+    pairingSetStatus("");
+    void pairingLoadSessions();
+    byId("pairing-close").focus();
+  } else {
+    pairingClearResult();
+    byId("pairing-open").focus();
+  }
+}
+
+byId("pairing-open").addEventListener("click", () => pairingOpen(byId("pairing-panel").hidden));
+byId("pairing-close").addEventListener("click", () => pairingOpen(false));
+byId("pairing-create").addEventListener("click", () => void pairingCreate());
+byId("pairing-copy").addEventListener("click", async () => {
+  if (!pairingOfferText) return;
+  try {
+    await navigator.clipboard.writeText(pairingOfferText);
+    pairingSetStatus("Invite copied. Paste it in the app.");
+  } catch (_error) {
+    pairingSetStatus("The invite could not be copied.", "error");
+  }
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !byId("pairing-panel").hidden) pairingOpen(false);
+});
+document.addEventListener("click", (event) => {
+  if (byId("pairing-panel").hidden) return;
+  if (event.target.closest("#pairing-panel, #pairing-open")) return;
+  pairingOpen(false);
+});

@@ -73,6 +73,13 @@ use crate::mobile_auth::{
 const DASHBOARD_HTML: &str = include_str!("../assets/dashboard.html");
 const DASHBOARD_CSS: &str = include_str!("../assets/dashboard.css");
 const DASHBOARD_JS: &str = include_str!("../assets/dashboard.js");
+/// The vendored QR encoder the pairing panel draws its symbol from.
+///
+/// Embedded rather than fetched because the dashboard's own policy is
+/// `script-src 'self'`, and separate from `DASHBOARD_JS` so third-party
+/// bytes stay identifiable. Provenance and the regeneration command are in
+/// `third_party/qrcode/README.md`.
+const QRCODE_JS: &str = include_str!("../../../../third_party/qrcode/qrcode-core.js");
 const FAVICON_SVG: &str = include_str!("../assets/favicon.svg");
 const ROBOTS_TXT: &str = "User-agent: *\nDisallow: /\n";
 
@@ -109,6 +116,7 @@ pub enum Route {
     Dashboard,
     Styles,
     Script,
+    QrCodeScript,
     Favicon,
     Robots,
     ApiStatus,
@@ -123,6 +131,7 @@ pub enum Route {
     MobileDiscovery,
     MobileOperatorProvision,
     MobilePairingCreate,
+    MobilePairingSessions,
     MobilePairingExchange,
     MobileCredentialInventory,
     MobileCredentialRevoke,
@@ -1052,6 +1061,13 @@ struct PlatformResourceView {
 }
 
 #[derive(Serialize)]
+struct PlatformSessionsView {
+    schema: &'static str,
+    sessions_cursor: PlatformCursorView,
+    sessions: Vec<PlatformSessionView>,
+}
+
+#[derive(Serialize)]
 struct PlatformSessionView {
     session: PlatformResourceView,
     run: Option<PlatformCoordinateView>,
@@ -1710,6 +1726,38 @@ impl WebIntegration {
             cursor: snapshot.cursor.into(),
             sessions_cursor: sessions.cursor.into(),
             resources: snapshot.resources.into_iter().map(Into::into).collect(),
+            sessions: sessions.sessions.into_iter().map(Into::into).collect(),
+        })
+    }
+
+    /// The sessions a pairing offer can be scoped to, and nothing else.
+    ///
+    /// Separate from [`Self::platform`] on purpose. That projection opens with a
+    /// snapshot of *everything*, and `SnapshotRequest` carries no cursor, so a
+    /// deployment whose resource inventory has grown past
+    /// `MAX_SNAPSHOT_RESOURCES` has its whole platform view refused —
+    /// permanently, since the inventory only grows. Listing sessions is its own
+    /// request with its own cursor, so the pairing panel stays usable on a
+    /// deployment where the projection is not.
+    fn platform_sessions(&self) -> Result<PlatformSessionsView, &'static str> {
+        let mut client = self
+            .platform
+            .try_lock()
+            .map_err(|_| "platform_client_busy")?;
+        let sessions = match client
+            .request(PlatformRequest::ListSessions(ListSessionsRequest {
+                authority: ResourceAuthority::Automonique,
+                cursor: None,
+            }))
+            .map_err(|_| "platform_unavailable")?
+        {
+            PlatformResponse::Sessions(sessions) => sessions,
+            PlatformResponse::Refused { .. } => return Err("platform_sessions_refused"),
+            _ => return Err("platform_protocol_invalid"),
+        };
+        Ok(PlatformSessionsView {
+            schema: "automonique.dashboard.pairing-sessions/v1",
+            sessions_cursor: sessions.cursor.into(),
             sessions: sessions.sessions.into_iter().map(Into::into).collect(),
         })
     }
@@ -4611,6 +4659,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 "/" => Route::Dashboard,
                 "/assets/dashboard.css" => Route::Styles,
                 "/assets/dashboard.js" => Route::Script,
+                "/assets/qrcode.js" => Route::QrCodeScript,
                 "/favicon.svg" => Route::Favicon,
                 "/robots.txt" => Route::Robots,
                 "/.well-known/automonique-mobile" => Route::MobileDiscovery,
@@ -4630,6 +4679,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 }
                 "/api/mobile/operator-provision" => Route::MobileOperatorProvision,
                 "/api/mobile/pairings" => Route::MobilePairingCreate,
+                "/api/mobile/pairing-sessions" => Route::MobilePairingSessions,
                 "/api/mobile/pairings/exchange" => Route::MobilePairingExchange,
                 "/api/mobile/credentials/list" => Route::MobileCredentialInventory,
                 "/api/mobile/credentials/revoke" => Route::MobileCredentialRevoke,
@@ -5073,6 +5123,7 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         },
         Route::Styles => Response::static_asset("text/css; charset=utf-8", DASHBOARD_CSS),
         Route::Script => Response::static_asset("text/javascript; charset=utf-8", DASHBOARD_JS),
+        Route::QrCodeScript => Response::static_asset("text/javascript; charset=utf-8", QRCODE_JS),
         Route::Favicon => Response::static_asset("image/svg+xml", FAVICON_SVG),
         Route::Robots => Response::static_asset("text/plain; charset=utf-8", ROBOTS_TXT),
         Route::ApiStatus => Response {
@@ -5103,6 +5154,7 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         | Route::MobileDiscovery
         | Route::MobileOperatorProvision
         | Route::MobilePairingCreate
+        | Route::MobilePairingSessions
         | Route::MobilePairingExchange
         | Route::MobileCredentialInventory
         | Route::MobileCredentialRevoke
@@ -5230,6 +5282,10 @@ fn api_response(
                 Err(_) => mobile_error("400 Bad Request", "mobile_request_invalid"),
             }
         }
+        Route::MobilePairingSessions => match integration.platform_sessions() {
+            Ok(view) => json_response("200 OK", &view),
+            Err(category) => json_error("503 Service Unavailable", category),
+        },
         Route::MobilePairingCreate => {
             match serde_json::from_slice::<MobileOperatorProvisionRequest>(body) {
                 Ok(request) => match integration.mobile_pairing_create(request) {
@@ -5530,6 +5586,7 @@ fn handle(
                     requested_route,
                     Route::MobileOperatorProvision
                         | Route::MobilePairingCreate
+                        | Route::MobilePairingSessions
                         | Route::MobileCredentialInventory
                         | Route::MobileCredentialRevoke
                 );
@@ -5676,6 +5733,7 @@ fn handle(
             | Route::MobileDiscovery
             | Route::MobileOperatorProvision
             | Route::MobilePairingCreate
+            | Route::MobilePairingSessions
             | Route::MobilePairingExchange
             | Route::MobileCredentialInventory
             | Route::MobileCredentialRevoke
@@ -6001,10 +6059,12 @@ mod tests {
             ("/", Route::Dashboard),
             ("/assets/dashboard.css", Route::Styles),
             ("/assets/dashboard.js", Route::Script),
+            ("/assets/qrcode.js", Route::QrCodeScript),
             ("/api/status?fresh=1", Route::ApiStatus),
             ("/api/operations", Route::ApiOperations),
             ("/api/platform", Route::ApiPlatform),
             ("/.well-known/automonique-mobile", Route::MobileDiscovery),
+            ("/api/mobile/pairing-sessions", Route::MobilePairingSessions),
             ("/api/mobile/authorization", Route::MobileAuthorization),
             ("/api/processes", Route::ApiProcesses),
             ("/api/agent-accounts", Route::ApiAgentAccounts),
