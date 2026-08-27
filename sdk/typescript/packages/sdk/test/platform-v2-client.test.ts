@@ -143,7 +143,7 @@ describe("canonical HTTPS Platform v2 client", () => {
     expect(Reflect.ownKeys(Object.getPrototypeOf(transport))).toEqual(["constructor"]);
     expect(Object.getOwnPropertySymbols(transport)).toEqual([]);
     expect(Object.getOwnPropertySymbols(Object.getPrototypeOf(transport))).toEqual([]);
-    expect(Reflect.ownKeys(Object.getPrototypeOf(Object.getPrototypeOf(transport)))).toEqual(["constructor"]);
+    expect(Object.getPrototypeOf(Object.getPrototypeOf(transport))).toBe(Object.prototype);
     expect(Reflect.ownKeys(client)).toEqual([]);
   });
 

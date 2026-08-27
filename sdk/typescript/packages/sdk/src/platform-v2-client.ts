@@ -35,12 +35,44 @@ import {
   type WorkContextRevision,
 } from "../../protocol/src/index.js";
 import {PlatformTransportError} from "./platform-client.js";
-import {
-  claimPlatformV2Exchange,
-  RegisteredPlatformV2Transport,
-  type PlatformV2Exchange,
-  type PlatformV2Lane,
-} from "./platform-v2-internal.js";
+
+type PlatformV2Lane = "negotiation" | "v2";
+type PlatformV2Exchange = (
+  lane: PlatformV2Lane,
+  payload: Uint8Array,
+  signal?: AbortSignal,
+) => Promise<{readonly payload: Uint8Array; readonly status: number}>;
+
+interface PlatformV2CanonicalTestingHandlers {
+  readonly negotiate: (
+    requestId: ReturnType<typeof PlatformRequestId>,
+    offer: PlatformVersionOffer,
+    signal?: AbortSignal,
+  ) => Promise<PlatformNegotiationResponse>;
+  readonly request: (
+    requestId: ReturnType<typeof PlatformRequestId>,
+    request: PlatformV2Request,
+    signal?: AbortSignal,
+  ) => Promise<PlatformV2Response>;
+}
+
+const canonicalTestingTransports = new WeakMap<
+  PlatformV2CanonicalTestingTransport,
+  PlatformV2CanonicalTestingHandlers
+>();
+
+/**
+ * Testing-only typed registration. Instances expose no request method and
+ * cannot receive or recover the authenticated HTTPS bearer capability.
+ */
+export class PlatformV2CanonicalTestingTransport {
+  constructor(
+    negotiate: PlatformV2CanonicalTestingHandlers["negotiate"],
+    request: PlatformV2CanonicalTestingHandlers["request"],
+  ) {
+    canonicalTestingTransports.set(this, {negotiate, request});
+  }
+}
 
 export const PLATFORM_NEGOTIATION_MEDIA_TYPE = "application/vnd.automonique.platform.negotiation.v1+json";
 export const PLATFORM_V2_MEDIA_TYPE = "application/vnd.automonique.platform.v2+json";
@@ -181,8 +213,10 @@ async function exchangeHttps(
   return {payload: await readBoundedResponse(response, maximumResponseBytes), status: response.status};
 }
 
+const httpsExchanges = new WeakMap<HttpsPlatformV2Transport, PlatformV2Exchange>();
+
 /** Authenticated HTTPS transport with an exact endpoint and no redirect forwarding. */
-export class HttpsPlatformV2Transport extends RegisteredPlatformV2Transport {
+export class HttpsPlatformV2Transport {
   readonly #endpoint: string;
   readonly #credentialProvider: () => string | Promise<string>;
   readonly #fetcher: typeof fetch;
@@ -193,22 +227,17 @@ export class HttpsPlatformV2Transport extends RegisteredPlatformV2Transport {
     fetcher: typeof fetch = fetch,
   ) {
     const pinnedEndpoint = endpoint(endpointValue);
-    let invoke: PlatformV2Exchange | undefined;
-    super((lane, payload, signal) => {
-      if (invoke === undefined) return Promise.reject(new TypeError("platform v2 transport is not initialized"));
-      return invoke(lane, payload, signal);
-    });
     this.#endpoint = pinnedEndpoint;
     this.#credentialProvider = credentialProvider;
     this.#fetcher = fetcher;
-    invoke = (lane, payload, signal) => exchangeHttps(
+    httpsExchanges.set(this, (lane, payload, signal) => exchangeHttps(
       this.#endpoint,
       this.#credentialProvider,
       this.#fetcher,
       lane,
       payload,
       signal,
-    );
+    ));
   }
 }
 
@@ -284,12 +313,26 @@ function requireResponse<K extends PlatformV2Response["kind"]>(
 
 /** Operation-specific facade. V2 calls fail closed until major two is negotiated. */
 export class PlatformV2Client {
-  readonly #exchange: PlatformV2Exchange;
+  readonly #exchange: PlatformV2Exchange | null;
+  readonly #testingTransport: PlatformV2CanonicalTestingHandlers | null;
   #negotiationGeneration = 0n;
   #negotiated: {readonly generation: bigint; readonly value: NegotiatedPlatform} | null = null;
 
-  constructor(transport: RegisteredPlatformV2Transport) {
-    this.#exchange = claimPlatformV2Exchange(transport);
+  constructor(transport: HttpsPlatformV2Transport | PlatformV2CanonicalTestingTransport) {
+    const exchange = transport instanceof HttpsPlatformV2Transport
+      ? httpsExchanges.get(transport)
+      : undefined;
+    if (transport instanceof HttpsPlatformV2Transport && exchange === undefined) {
+      throw new TypeError("platform v2 transport capability is unavailable");
+    }
+    const testingTransport = transport instanceof PlatformV2CanonicalTestingTransport
+      ? canonicalTestingTransports.get(transport)
+      : undefined;
+    if (exchange === undefined && testingTransport === undefined) {
+      throw new TypeError("platform v2 transport capability is unavailable");
+    }
+    this.#exchange = exchange ?? null;
+    this.#testingTransport = testingTransport ?? null;
   }
 
   get negotiated(): NegotiatedPlatform | null {
@@ -307,12 +350,16 @@ export class PlatformV2Client {
     } catch (error) {
       throw protocolError(error);
     }
-    const exchanged = await this.#exchange("negotiation", payload, signal);
     let response: PlatformNegotiationResponse;
-    try {
-      response = decodePlatformNegotiationResponse(exchanged.payload, requestId, offer);
-    } catch (error) {
-      throw protocolError(error, exchanged.status);
+    if (this.#exchange !== null) {
+      const exchanged = await this.#exchange("negotiation", payload, signal);
+      try {
+        response = decodePlatformNegotiationResponse(exchanged.payload, requestId, offer);
+      } catch (error) {
+        throw protocolError(error, exchanged.status);
+      }
+    } else {
+      response = await this.#testingTransport!.negotiate(requestId, offer, signal);
     }
     if (generation !== this.#negotiationGeneration) {
       throw new PlatformTransportError(0, "negotiation_superseded");
@@ -341,18 +388,23 @@ export class PlatformV2Client {
     } catch (error) {
       return Promise.reject(protocolError(error));
     }
-    return this.#exchange("v2", payload, signal).then((response) => {
+    const response = this.#exchange !== null
+      ? this.#exchange("v2", payload, signal).then((exchanged) => {
+        try {
+          return decodePlatformV2Response(exchanged.payload, requestId, request.kind);
+        } catch (error) {
+          throw protocolError(error, exchanged.status);
+        }
+      })
+      : this.#testingTransport!.request(requestId, request, signal);
+    return response.then((decoded) => {
       if (
         negotiated.generation !== this.#negotiationGeneration
         || this.#negotiated?.generation !== negotiated.generation
       ) {
         throw new PlatformTransportError(0, "negotiation_invalidated");
       }
-      try {
-        return decodePlatformV2Response(response.payload, requestId, request.kind);
-      } catch (error) {
-        throw protocolError(error, response.status);
-      }
+      return decoded;
     });
   }
 
