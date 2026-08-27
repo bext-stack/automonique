@@ -311,8 +311,8 @@ use crate::platform::{
     ResourceAuthority, ResourceKind,
 };
 use crate::platform_v2::{
-    CheckoutKind, HostSetupKind, WorkContextKind, WorkContextLifecycle, WorkContextRelationKind,
-    WorkContextTargetKind,
+    CheckoutKind, HostSetupKind, WorkContextAvailability, WorkContextKind, WorkContextLifecycle,
+    WorkContextRelationKind, WorkContextTargetKind,
 };
 use crate::primitives::ValueError;
 use crate::progress_api::{StreamMessageKind, StreamRefusal};
@@ -1432,6 +1432,12 @@ pub struct JsonSurface {
     pub documents: Vec<JsonDocument>,
 }
 
+/// Schema-specific generated validator/codec implementation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeneratedImplementation {
+    WorkContext,
+}
+
 /// A nested wire body whose discriminant decides its payload.
 ///
 /// One object with two keys — a closed word and a value that is present for
@@ -1598,6 +1604,9 @@ pub struct GeneratedModule {
     pub json_surface: Option<JsonSurface>,
     /// The request builders and response decoders this module carries.
     pub command_surface: Option<CommandSurface>,
+    /// Validator/codecs whose cross-field invariants exceed declarative field
+    /// shapes while remaining generated from the Rust contract.
+    pub implementation: Option<GeneratedImplementation>,
 }
 
 /// A required field.
@@ -1794,6 +1803,7 @@ export {
   decodeMessageAdmitted,
   encodeMessage,
   isWellFormedUnicode,
+  parseCanonical,
   toCanonicalBytes,
   type JsonValue,
 } from "../src/canonical.js";
@@ -8342,17 +8352,91 @@ fn work_context_module() -> GeneratedModule {
                 doc: "Stable version-two work-context schema identifier.".to_owned(),
                 value: ConstantValue::Text(crate::platform_v2::PLATFORM_SCHEMA_V2.to_owned()),
             },
+            Constant {
+                name: "PLATFORM_NEGOTIATION_SCHEMA_V1".to_owned(),
+                doc: "Stable version-negotiation document schema identifier.".to_owned(),
+                value: ConstantValue::Text(
+                    crate::platform_v2_api::PLATFORM_NEGOTIATION_SCHEMA_V1.to_owned(),
+                ),
+            },
+            Constant {
+                name: "MAX_PLATFORM_NEGOTIATION_CANONICAL_BYTES".to_owned(),
+                doc: "Maximum canonical version-negotiation document bytes.".to_owned(),
+                value: ConstantValue::Count(
+                    crate::platform_v2_api::MAX_PLATFORM_NEGOTIATION_CANONICAL_BYTES,
+                ),
+            },
+            Constant {
+                name: "MAX_WORK_CONTEXT_QUERY_CANONICAL_BYTES".to_owned(),
+                doc: "Maximum canonical work-context query bytes.".to_owned(),
+                value: ConstantValue::Count(
+                    crate::platform_v2_api::MAX_WORK_CONTEXT_QUERY_CANONICAL_BYTES,
+                ),
+            },
+            Constant {
+                name: "MAX_WORK_CONTEXT_PAGE_CANONICAL_BYTES".to_owned(),
+                doc: "Maximum canonical work-context page bytes.".to_owned(),
+                value: ConstantValue::Count(
+                    crate::platform_v2_api::MAX_WORK_CONTEXT_PAGE_CANONICAL_BYTES,
+                ),
+            },
+            Constant {
+                name: "WORK_CONTEXT_KIND_WIRE_ORDER".to_owned(),
+                doc: "Canonical work-context kind set order.".to_owned(),
+                value: ConstantValue::Words(platform_values(
+                    &WorkContextKind::ALL,
+                    WorkContextKind::as_str,
+                )),
+            },
+            Constant {
+                name: "WORK_CONTEXT_LIFECYCLE_WIRE_ORDER".to_owned(),
+                doc: "Canonical lifecycle filter order.".to_owned(),
+                value: ConstantValue::Words(platform_values(
+                    &WorkContextLifecycle::ALL,
+                    WorkContextLifecycle::as_str,
+                )),
+            },
+            Constant {
+                name: "WORK_CONTEXT_RELATION_KIND_WIRE_ORDER".to_owned(),
+                doc: "Canonical structured relation order.".to_owned(),
+                value: ConstantValue::Words(platform_values(
+                    &WorkContextRelationKind::ALL,
+                    WorkContextRelationKind::as_str,
+                )),
+            },
+            Constant {
+                name: "WORK_CONTEXT_TARGET_KIND_WIRE_ORDER".to_owned(),
+                doc: "Canonical relation target identity order.".to_owned(),
+                value: ConstantValue::Words(platform_values(
+                    &WorkContextTargetKind::ALL,
+                    WorkContextTargetKind::as_str,
+                )),
+            },
+            Constant {
+                name: "V1_RESOURCE_AUTHORITY_WIRE_ORDER".to_owned(),
+                doc: "Platform v1 resource-authority declaration order.".to_owned(),
+                value: ConstantValue::Words(platform_values(
+                    &ResourceAuthority::ALL,
+                    ResourceAuthority::as_str,
+                )),
+            },
+            Constant {
+                name: "V1_RESOURCE_KIND_WIRE_ORDER".to_owned(),
+                doc: "Platform v1 resource-kind declaration order.".to_owned(),
+                value: ConstantValue::Words(platform_values(
+                    &ResourceKind::ALL,
+                    ResourceKind::as_str,
+                )),
+            },
         ],
         branded_ids: [
             "AttemptWorkspaceId",
             "CheckoutId",
             "HostSetupId",
             "PaneId",
-            "PlatformSessionId",
             "ProjectId",
             "UserWorkspaceId",
             "WorkContextCursor",
-            "WorkContextRepositoryId",
             "WorkSessionId",
         ]
         .into_iter()
@@ -8399,6 +8483,13 @@ fn work_context_module() -> GeneratedModule {
                 platform_values(&WorkContextKind::ALL, WorkContextKind::as_str),
             ),
             security_enum(
+                "WorkContextAvailability",
+                platform_values(
+                    &WorkContextAvailability::ALL,
+                    WorkContextAvailability::as_str,
+                ),
+            ),
+            security_enum(
                 "WorkContextLifecycle",
                 platform_values(&WorkContextLifecycle::ALL, WorkContextLifecycle::as_str),
             ),
@@ -8436,7 +8527,7 @@ fn work_context_module() -> GeneratedModule {
                 },
                 UnionVariant {
                     tag: "platform_session".to_owned(),
-                    payload: Some(("id".to_owned(), "PlatformSessionId".to_owned())),
+                    payload: Some(("resource".to_owned(), "ResourceCoordinate".to_owned())),
                 },
                 UnionVariant {
                     tag: "project".to_owned(),
@@ -8444,7 +8535,7 @@ fn work_context_module() -> GeneratedModule {
                 },
                 UnionVariant {
                     tag: "repository".to_owned(),
-                    payload: Some(("id".to_owned(), "WorkContextRepositoryId".to_owned())),
+                    payload: Some(("resource".to_owned(), "ResourceCoordinate".to_owned())),
                 },
                 UnionVariant {
                     tag: "session".to_owned(),
@@ -8467,13 +8558,16 @@ fn work_context_module() -> GeneratedModule {
                         "typeof PLATFORM_SCHEMA_V1 | typeof PLATFORM_SCHEMA_V2",
                     ),
                     required("version", "PlatformVersionNumber"),
-                    required("work_context", "boolean"),
+                    required("work_context", "WorkContextAvailability"),
                 ],
             },
             Interface {
                 name: "PlatformVersionOffer".to_owned(),
                 doc: "Bounded set of Platform versions supported by one peer.".to_owned(),
-                fields: vec![required("versions", "readonly PlatformVersionNumber[]")],
+                fields: vec![
+                    required("schema", "typeof PLATFORM_NEGOTIATION_SCHEMA_V1"),
+                    required("versions", "readonly PlatformVersionNumber[]"),
+                ],
             },
             Interface {
                 name: "WorkContextAttributes".to_owned(),
@@ -8531,12 +8625,28 @@ fn work_context_module() -> GeneratedModule {
                     required("schema", "typeof PLATFORM_SCHEMA_V2"),
                 ],
             },
+            Interface {
+                name: "WorkContextResync".to_owned(),
+                doc: "Explicit replacement outcome for an expired or filter-mismatched cursor."
+                    .to_owned(),
+                fields: vec![
+                    required("expired_after", "WorkContextCursor"),
+                    required("outcome", "\"resync_required\""),
+                    required("schema", "typeof PLATFORM_SCHEMA_V2"),
+                ],
+            },
         ],
         imports: vec![ModuleImport {
             module: PLATFORM_MODULE.to_owned(),
-            values: vec!["PLATFORM_SCHEMA_V1".to_owned()],
-            types: Vec::new(),
+            values: vec![
+                "PLATFORM_SCHEMA_V1".to_owned(),
+                "ResourceId".to_owned(),
+                "decodeResourceAuthority".to_owned(),
+                "decodeResourceKind".to_owned(),
+            ],
+            types: vec!["ResourceCoordinate".to_owned()],
         }],
+        implementation: Some(GeneratedImplementation::WorkContext),
         ..GeneratedModule::default()
     }
 }
@@ -8656,6 +8766,25 @@ fn runtime_imports(module: &GeneratedModule) -> (Vec<&'static str>, Vec<&'static
         || !module.unions.is_empty();
     let mut names = Vec::new();
     let mut types = Vec::new();
+
+    if module.implementation == Some(GeneratedImplementation::WorkContext) {
+        names.extend([
+            "RefusalError",
+            "bodyArray",
+            "bodyBool",
+            "bodyInteger",
+            "bodyString",
+            "bodyStringOrNull",
+            "bodyValue",
+            "bodyValueOrNull",
+            "exactFields",
+            "exactInputFields",
+            "parseCanonical",
+            "toCanonicalBytes",
+        ]);
+        types.push("JsonValue");
+        refuses_values = true;
+    }
 
     if let Some(surface) = &module.command_surface {
         // A surface always refuses something: an oversized payload on the way
@@ -8850,7 +8979,7 @@ fn schema_digest(modules: &[(String, String)]) -> String {
 /// The barrel also carries the schema digest, split into algorithm and hex the
 /// way [`crate::release::ArtifactDigest`] takes them, so a released SDK can
 /// declare the surface it was generated against without a second computation.
-fn emit_barrel(modules: &[GeneratedModule], digest: &str) -> String {
+fn emit_barrel(modules: &[GeneratedModule], digest: &str, platform_v1_digest: &str) -> String {
     let mut out = String::new();
     emit_banner(
         &mut out,
@@ -8875,6 +9004,12 @@ fn emit_barrel(modules: &[GeneratedModule], digest: &str) -> String {
         algorithm = crate::digest::ALGORITHM
     );
     let _ = writeln!(out, "export const SCHEMA_DIGEST = \"{digest}\";");
+    out.push_str("\n// The exact generated Platform v1 module digest. A package that advertises\n");
+    out.push_str("// protocolRange/schema v1 uses this pin, not the aggregate surface digest.\n");
+    let _ = writeln!(
+        out,
+        "export const PLATFORM_V1_SCHEMA_DIGEST = \"{platform_v1_digest}\";"
+    );
     out
 }
 
@@ -10183,6 +10318,503 @@ fn emit_command_surface(out: &mut String, surface: &CommandSurface) {
     }
 }
 
+/// Emit the cross-field validators and standalone canonical codecs for the
+/// Platform v2 work-context contract. These are generator-owned code, not an
+/// SDK redefinition: the vocabularies and bounds above come from Rust and the
+/// emitted implementation re-applies the same constructors and relations.
+fn emit_work_context_implementation(out: &mut String) {
+    out.push_str(
+        r#"
+
+const WORK_CONTEXT_INVALID_BODY = "work_context_invalid_body";
+const WORK_CONTEXT_VALUE_INVALID = "work_context_value_invalid";
+
+function workContextRefusal(detail: string): never {
+  throw new RefusalError(WORK_CONTEXT_VALUE_INVALID, detail);
+}
+
+function object(entries: readonly (readonly [string, JsonValue])[]): JsonValue {
+  return {kind: "object", entries};
+}
+
+function exactInput(value: object, fields: readonly string[]): void {
+  exactInputFields(value as Readonly<Record<string, unknown>>, fields, WORK_CONTEXT_INVALID_BODY);
+}
+
+function parseDocument(payload: Uint8Array, maximum: number): JsonValue {
+  if (payload.length > maximum) {
+    throw new RefusalError("frame_too_large", `canonical document is ${payload.length} bytes; maximum is ${maximum}`);
+  }
+  return parseCanonical(payload);
+}
+
+function objectKind(value: JsonValue): string {
+  if (value.kind !== "object") throw new RefusalError(WORK_CONTEXT_INVALID_BODY, "identity is not an object");
+  const fields = new Map<string, JsonValue>();
+  for (const [key, entry] of value.entries) {
+    if (fields.has(key)) throw new RefusalError(WORK_CONTEXT_INVALID_BODY, `duplicate field ${key}`);
+    fields.set(key, entry);
+  }
+  const kind = fields.get("kind");
+  if (kind?.kind !== "string") throw new RefusalError(WORK_CONTEXT_INVALID_BODY, "kind is not a string");
+  return kind.value;
+}
+
+function orderIndex(order: readonly string[], value: string): number {
+  const index = order.indexOf(value);
+  if (index < 0) workContextRefusal(`undefined ordering value ${value}`);
+  return index;
+}
+
+function strictlyOrdered<T>(values: readonly T[], key: (value: T) => string): boolean {
+  return values.every((value, index) => index === 0 || key(values[index - 1]!) < key(value));
+}
+
+function validateV1Coordinate(value: ResourceCoordinate, expected: "repository" | "session"): ResourceCoordinate {
+  exactInput(value, ["authority", "id", "kind"]);
+  const authority = decodeResourceAuthority(value.authority);
+  const kind = decodeResourceKind(value.kind);
+  const id = ResourceId(value.id);
+  if (kind !== expected) workContextRefusal(`v1 relation target must be ${expected}`);
+  return {authority, id, kind};
+}
+
+function decodeV1Coordinate(value: JsonValue, expected: "repository" | "session"): ResourceCoordinate {
+  const fields = exactFields(value, ["authority", "id", "kind"], WORK_CONTEXT_INVALID_BODY);
+  return validateV1Coordinate({
+    authority: decodeResourceAuthority(bodyString(fields, "authority", WORK_CONTEXT_INVALID_BODY)),
+    id: ResourceId(bodyString(fields, "id", WORK_CONTEXT_INVALID_BODY)),
+    kind: decodeResourceKind(bodyString(fields, "kind", WORK_CONTEXT_INVALID_BODY)),
+  }, expected);
+}
+
+function v1CoordinateJson(value: ResourceCoordinate): JsonValue {
+  return object([
+    ["authority", {kind: "string", value: value.authority}],
+    ["id", {kind: "string", value: value.id}],
+    ["kind", {kind: "string", value: value.kind}],
+  ]);
+}
+
+export function validateWorkContextIdentity(value: WorkContextIdentity): WorkContextIdentity {
+  switch (value.kind) {
+    case "attempt_workspace": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: AttemptWorkspaceId(value.id)};
+    case "checkout": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: CheckoutId(value.id)};
+    case "host_setup": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: HostSetupId(value.id)};
+    case "pane": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: PaneId(value.id)};
+    case "project": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: ProjectId(value.id)};
+    case "session": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: WorkSessionId(value.id)};
+    case "user_workspace": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: UserWorkspaceId(value.id)};
+    case "repository": exactInput(value, ["kind", "resource"]); return {kind: value.kind, resource: validateV1Coordinate(value.resource, "repository")};
+    case "platform_session": exactInput(value, ["kind", "resource"]); return {kind: value.kind, resource: validateV1Coordinate(value.resource, "session")};
+    default: return assertNeverWorkContextIdentity(value);
+  }
+}
+
+function decodeWorkContextIdentityValue(value: JsonValue): WorkContextIdentity {
+  const kind = decodeWorkContextTargetKind(objectKind(value));
+  if (kind === "repository" || kind === "platform_session") {
+    const fields = exactFields(value, ["kind", "resource"], WORK_CONTEXT_INVALID_BODY);
+    return validateWorkContextIdentity({
+      kind,
+      resource: decodeV1Coordinate(bodyValue(fields, "resource", WORK_CONTEXT_INVALID_BODY), kind === "repository" ? "repository" : "session"),
+    });
+  }
+  const fields = exactFields(value, ["id", "kind"], WORK_CONTEXT_INVALID_BODY);
+  const id = bodyString(fields, "id", WORK_CONTEXT_INVALID_BODY);
+  switch (kind) {
+    case "attempt_workspace": return {kind, id: AttemptWorkspaceId(id)};
+    case "checkout": return {kind, id: CheckoutId(id)};
+    case "host_setup": return {kind, id: HostSetupId(id)};
+    case "pane": return {kind, id: PaneId(id)};
+    case "project": return {kind, id: ProjectId(id)};
+    case "session": return {kind, id: WorkSessionId(id)};
+    case "user_workspace": return {kind, id: UserWorkspaceId(id)};
+    default: workContextRefusal(`relation-only identity ${kind} was decoded without a coordinate`);
+  }
+}
+
+function workContextIdentityJson(value: WorkContextIdentity): JsonValue {
+  const identity = validateWorkContextIdentity(value);
+  if (identity.kind === "repository" || identity.kind === "platform_session") {
+    return object([
+      ["kind", {kind: "string", value: identity.kind}],
+      ["resource", v1CoordinateJson(identity.resource)],
+    ]);
+  }
+  return object([
+    ["id", {kind: "string", value: identity.id}],
+    ["kind", {kind: "string", value: identity.kind}],
+  ]);
+}
+
+function identityOrderKey(identity: WorkContextIdentity): string {
+  const target = orderIndex(WORK_CONTEXT_TARGET_KIND_WIRE_ORDER, identity.kind).toString().padStart(2, "0");
+  if (identity.kind === "repository" || identity.kind === "platform_session") {
+    return `${target}\0${orderIndex(V1_RESOURCE_AUTHORITY_WIRE_ORDER, identity.resource.authority).toString().padStart(2, "0")}\0${orderIndex(V1_RESOURCE_KIND_WIRE_ORDER, identity.resource.kind).toString().padStart(2, "0")}\0${identity.resource.id}`;
+  }
+  return `${target}\0${identity.id}`;
+}
+
+function relationSource(kind: WorkContextRelationKind): WorkContextKind {
+  switch (kind) {
+    case "project_repository": return "project";
+    case "host_setup_project": return "host_setup";
+    case "checkout_project":
+    case "checkout_host_setup":
+    case "checkout_repository": return "checkout";
+    case "user_workspace_project":
+    case "user_workspace_checkout": return "user_workspace";
+    case "attempt_user_workspace": return "attempt_workspace";
+    case "session_attempt_workspace":
+    case "session_platform_session": return "session";
+    case "pane_session": return "pane";
+  }
+}
+
+function relationTarget(kind: WorkContextRelationKind): WorkContextTargetKind {
+  switch (kind) {
+    case "project_repository":
+    case "checkout_repository": return "repository";
+    case "host_setup_project":
+    case "checkout_project":
+    case "user_workspace_project": return "project";
+    case "checkout_host_setup": return "host_setup";
+    case "user_workspace_checkout": return "checkout";
+    case "attempt_user_workspace": return "user_workspace";
+    case "session_attempt_workspace": return "attempt_workspace";
+    case "session_platform_session": return "platform_session";
+    case "pane_session": return "session";
+  }
+}
+
+export function validateWorkContextRelation(value: WorkContextRelation): WorkContextRelation {
+  exactInput(value, ["kind", "target"]);
+  const kind = decodeWorkContextRelationKind(value.kind);
+  const target = validateWorkContextIdentity(value.target);
+  if (target.kind !== relationTarget(kind)) workContextRefusal("relation target kind is invalid");
+  return {kind, target};
+}
+
+function decodeWorkContextRelationValue(value: JsonValue): WorkContextRelation {
+  const fields = exactFields(value, ["kind", "target"], WORK_CONTEXT_INVALID_BODY);
+  return validateWorkContextRelation({
+    kind: decodeWorkContextRelationKind(bodyString(fields, "kind", WORK_CONTEXT_INVALID_BODY)),
+    target: decodeWorkContextIdentityValue(bodyValue(fields, "target", WORK_CONTEXT_INVALID_BODY)),
+  });
+}
+
+function relationJson(value: WorkContextRelation): JsonValue {
+  const relation = validateWorkContextRelation(value);
+  return object([
+    ["kind", {kind: "string", value: relation.kind}],
+    ["target", workContextIdentityJson(relation.target)],
+  ]);
+}
+
+function relationOrderKey(value: WorkContextRelation): string {
+  return `${orderIndex(WORK_CONTEXT_RELATION_KIND_WIRE_ORDER, value.kind).toString().padStart(2, "0")}\0${identityOrderKey(value.target)}`;
+}
+
+function validateWorkContextAttributes(value: WorkContextAttributes): WorkContextAttributes {
+  exactInput(value, ["checkout", "host_setup"]);
+  const checkout = value.checkout === null ? null : decodeCheckoutKind(value.checkout);
+  const host_setup = value.host_setup === null ? null : decodeHostSetupKind(value.host_setup);
+  if (checkout !== null && host_setup !== null) workContextRefusal("work-context attributes name two kinds");
+  return {checkout, host_setup};
+}
+
+function decodeWorkContextAttributes(value: JsonValue): WorkContextAttributes {
+  const fields = exactFields(value, ["checkout", "host_setup"], WORK_CONTEXT_INVALID_BODY);
+  const checkout = bodyStringOrNull(fields, "checkout", WORK_CONTEXT_INVALID_BODY);
+  const host_setup = bodyStringOrNull(fields, "host_setup", WORK_CONTEXT_INVALID_BODY);
+  return validateWorkContextAttributes({
+    checkout: checkout === null ? null : decodeCheckoutKind(checkout),
+    host_setup: host_setup === null ? null : decodeHostSetupKind(host_setup),
+  });
+}
+
+function attributesJson(value: WorkContextAttributes): JsonValue {
+  const attributes = validateWorkContextAttributes(value);
+  return object([
+    ["checkout", attributes.checkout === null ? {kind: "null"} : {kind: "string", value: attributes.checkout}],
+    ["host_setup", attributes.host_setup === null ? {kind: "null"} : {kind: "string", value: attributes.host_setup}],
+  ]);
+}
+
+function lifecycleAllowed(kind: WorkContextKind, lifecycle: WorkContextLifecycle): boolean {
+  switch (kind) {
+    case "project":
+    case "host_setup":
+    case "checkout":
+    case "user_workspace": return lifecycle === "active" || lifecycle === "archived";
+    case "attempt_workspace": return ["preparing", "running", "hibernated", "completed", "failed", "cancelled"].includes(lifecycle);
+    case "session": return ["active", "hibernated", "completed", "failed", "cancelled"].includes(lifecycle);
+    case "pane": return lifecycle === "active" || lifecycle === "closed";
+  }
+}
+
+function requiredRelations(kind: WorkContextKind): readonly WorkContextRelationKind[] {
+  switch (kind) {
+    case "project": return [];
+    case "host_setup": return ["host_setup_project"];
+    case "checkout": return ["checkout_project", "checkout_host_setup", "checkout_repository"];
+    case "user_workspace": return ["user_workspace_project", "user_workspace_checkout"];
+    case "attempt_workspace": return ["attempt_user_workspace"];
+    case "session": return ["session_attempt_workspace", "session_platform_session"];
+    case "pane": return ["pane_session"];
+  }
+}
+
+export function validateWorkContextRecord(value: WorkContextRecord): WorkContextRecord {
+  exactInput(value, ["attributes", "identity", "label", "lifecycle", "relations", "revision"]);
+  const identity = validateWorkContextIdentity(value.identity);
+  if (identity.kind === "repository" || identity.kind === "platform_session") workContextRefusal("relation-only identity cannot be a record");
+  const kind = decodeWorkContextKind(identity.kind);
+  const lifecycle = decodeWorkContextLifecycle(value.lifecycle);
+  if (!lifecycleAllowed(kind, lifecycle)) workContextRefusal("lifecycle is invalid for work-context kind");
+  const label = WorkContextLabel(value.label);
+  const revision = WorkContextRevision(value.revision);
+  const attributes = validateWorkContextAttributes(value.attributes);
+  if (kind === "host_setup") {
+    if (attributes.host_setup === null || attributes.checkout !== null) workContextRefusal("host setup attributes are invalid");
+  } else if (kind === "checkout") {
+    if (attributes.checkout === null || attributes.host_setup !== null) workContextRefusal("checkout attributes are invalid");
+  } else if (attributes.checkout !== null || attributes.host_setup !== null) {
+    workContextRefusal("attributes are invalid for work-context kind");
+  }
+  if (!Array.isArray(value.relations) || value.relations.length > MAX_WORK_CONTEXT_RELATIONS) workContextRefusal("work-context relation limit exceeded");
+  const relations = value.relations.map(validateWorkContextRelation);
+  if (!strictlyOrdered(relations, relationOrderKey)) workContextRefusal("work-context relations are duplicated or unordered");
+  if (relations.some((relation) => relationSource(relation.kind) !== kind)) workContextRefusal("relation source kind is invalid");
+  const required = requiredRelations(kind);
+  for (const relationKind of WORK_CONTEXT_RELATION_KIND_WIRE_ORDER) {
+    const count = relations.filter((relation) => relation.kind === relationKind).length;
+    if (kind === "project" && relationKind === "project_repository") continue;
+    if (required.includes(relationKind as WorkContextRelationKind)) {
+      if (count !== 1) workContextRefusal("required relation is missing or repeated");
+    } else if (count !== 0) {
+      workContextRefusal("relation is invalid for source kind");
+    }
+  }
+  return {attributes, identity, label, lifecycle, relations, revision};
+}
+
+function decodeWorkContextRecordValue(value: JsonValue): WorkContextRecord {
+  const fields = exactFields(value, WorkContextRecord_FIELDS, WORK_CONTEXT_INVALID_BODY);
+  return validateWorkContextRecord({
+    attributes: decodeWorkContextAttributes(bodyValue(fields, "attributes", WORK_CONTEXT_INVALID_BODY)),
+    identity: decodeWorkContextIdentityValue(bodyValue(fields, "identity", WORK_CONTEXT_INVALID_BODY)),
+    label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)),
+    lifecycle: decodeWorkContextLifecycle(bodyString(fields, "lifecycle", WORK_CONTEXT_INVALID_BODY)),
+    relations: bodyArray(fields, "relations", WORK_CONTEXT_INVALID_BODY, MAX_WORK_CONTEXT_RELATIONS, WORK_CONTEXT_VALUE_INVALID).map(decodeWorkContextRelationValue),
+    revision: WorkContextRevision(bodyInteger(fields, "revision", WORK_CONTEXT_INVALID_BODY)),
+  });
+}
+
+function recordJson(value: WorkContextRecord): JsonValue {
+  const record = validateWorkContextRecord(value);
+  return object([
+    ["attributes", attributesJson(record.attributes)],
+    ["identity", workContextIdentityJson(record.identity)],
+    ["label", {kind: "string", value: record.label}],
+    ["lifecycle", {kind: "string", value: record.lifecycle}],
+    ["relations", {kind: "array", items: record.relations.map(relationJson)}],
+    ["revision", {kind: "integer", value: record.revision}],
+  ]);
+}
+
+function strictEnumOrder(values: readonly string[], order: readonly string[]): boolean {
+  return strictlyOrdered(values, (value) => orderIndex(order, value).toString().padStart(2, "0"));
+}
+
+export function validatePlatformVersionOffer(value: PlatformVersionOffer): PlatformVersionOffer {
+  exactInput(value, PlatformVersionOffer_FIELDS);
+  if (value.schema !== PLATFORM_NEGOTIATION_SCHEMA_V1) workContextRefusal("negotiation schema is incompatible");
+  if (!Array.isArray(value.versions) || value.versions.length === 0 || value.versions.length > MAX_PLATFORM_VERSION_OFFERS) workContextRefusal("platform version offer is invalid");
+  const versions = value.versions.map(PlatformVersionNumber);
+  if (!versions.every((version, index) => index === 0 || versions[index - 1]! < version)) workContextRefusal("platform versions are repeated or unordered");
+  return {schema: PLATFORM_NEGOTIATION_SCHEMA_V1, versions};
+}
+
+export function encodePlatformVersionOffer(value: PlatformVersionOffer): Uint8Array {
+  const offer = validatePlatformVersionOffer(value);
+  const bytes = toCanonicalBytes(object([
+    ["schema", {kind: "string", value: offer.schema}],
+    ["versions", {kind: "array", items: offer.versions.map((version) => ({kind: "integer", value: version}))}],
+  ]));
+  if (bytes.length > MAX_PLATFORM_NEGOTIATION_CANONICAL_BYTES) throw new RefusalError("frame_too_large", "negotiation document exceeds its ceiling");
+  return bytes;
+}
+
+export function decodePlatformVersionOffer(payload: Uint8Array): PlatformVersionOffer {
+  const fields = exactFields(parseDocument(payload, MAX_PLATFORM_NEGOTIATION_CANONICAL_BYTES), PlatformVersionOffer_FIELDS, WORK_CONTEXT_INVALID_BODY);
+  const schema = bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY);
+  const versions = bodyArray(fields, "versions", WORK_CONTEXT_INVALID_BODY, MAX_PLATFORM_VERSION_OFFERS, WORK_CONTEXT_VALUE_INVALID).map((value) => {
+    if (value.kind !== "integer") throw new RefusalError(WORK_CONTEXT_INVALID_BODY, "version is not an integer");
+    return PlatformVersionNumber(value.value);
+  });
+  return validatePlatformVersionOffer({schema: schema as typeof PLATFORM_NEGOTIATION_SCHEMA_V1, versions});
+}
+
+export function validateNegotiatedPlatform(value: NegotiatedPlatform): NegotiatedPlatform {
+  exactInput(value, NegotiatedPlatform_FIELDS);
+  const version = PlatformVersionNumber(value.version);
+  const work_context = decodeWorkContextAvailability(value.work_context);
+  if (version === 1n) {
+    if (value.schema !== PLATFORM_SCHEMA_V1 || work_context !== "v1_existing_resources_only") workContextRefusal("v1 negotiation result is incoherent");
+    return {schema: PLATFORM_SCHEMA_V1, version, work_context};
+  }
+  if (value.schema !== PLATFORM_SCHEMA_V2 || work_context !== "v2_structured") workContextRefusal("v2 negotiation result is incoherent");
+  return {schema: PLATFORM_SCHEMA_V2, version, work_context};
+}
+
+export function encodeNegotiatedPlatform(value: NegotiatedPlatform): Uint8Array {
+  const negotiated = validateNegotiatedPlatform(value);
+  return toCanonicalBytes(object([
+    ["schema", {kind: "string", value: negotiated.schema}],
+    ["version", {kind: "integer", value: negotiated.version}],
+    ["work_context", {kind: "string", value: negotiated.work_context}],
+  ]));
+}
+
+export function decodeNegotiatedPlatform(payload: Uint8Array): NegotiatedPlatform {
+  const fields = exactFields(parseDocument(payload, MAX_PLATFORM_NEGOTIATION_CANONICAL_BYTES), NegotiatedPlatform_FIELDS, WORK_CONTEXT_INVALID_BODY);
+  return validateNegotiatedPlatform({
+    schema: bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY) as NegotiatedPlatform["schema"],
+    version: PlatformVersionNumber(bodyInteger(fields, "version", WORK_CONTEXT_INVALID_BODY)),
+    work_context: decodeWorkContextAvailability(bodyString(fields, "work_context", WORK_CONTEXT_INVALID_BODY)),
+  });
+}
+
+export function validateWorkContextQuery(value: WorkContextQuery): WorkContextQuery {
+  exactInput(value, WorkContextQuery_FIELDS);
+  if (value.schema !== PLATFORM_SCHEMA_V2) workContextRefusal("work-context query schema is incompatible");
+  if (!Array.isArray(value.kinds) || value.kinds.length === 0 || value.kinds.length > WORK_CONTEXT_KIND_WIRE_ORDER.length) workContextRefusal("work-context query kinds are invalid");
+  const kinds = value.kinds.map(decodeWorkContextKind);
+  if (!strictEnumOrder(kinds, WORK_CONTEXT_KIND_WIRE_ORDER)) workContextRefusal("work-context query kinds are repeated or unordered");
+  if (!Array.isArray(value.lifecycles) || value.lifecycles.length > WORK_CONTEXT_LIFECYCLE_WIRE_ORDER.length) workContextRefusal("work-context lifecycle filters are invalid");
+  const lifecycles = value.lifecycles.map(decodeWorkContextLifecycle);
+  if (lifecycles.length > 0 && !strictEnumOrder(lifecycles, WORK_CONTEXT_LIFECYCLE_WIRE_ORDER)) workContextRefusal("work-context lifecycle filters are repeated or unordered");
+  const after = value.after === null ? null : WorkContextCursor(value.after);
+  const parent = value.parent === null ? null : validateWorkContextIdentity(value.parent);
+  const project = value.project === null ? null : ProjectId(value.project);
+  const limit = WorkContextPageLimit(value.limit);
+  return {after, kinds, lifecycles, limit, parent, project, schema: PLATFORM_SCHEMA_V2};
+}
+
+function queryJson(value: WorkContextQuery): JsonValue {
+  const query = validateWorkContextQuery(value);
+  return object([
+    ["after", query.after === null ? {kind: "null"} : {kind: "string", value: query.after}],
+    ["kinds", {kind: "array", items: query.kinds.map((kind) => ({kind: "string", value: kind}))}],
+    ["lifecycles", {kind: "array", items: query.lifecycles.map((lifecycle) => ({kind: "string", value: lifecycle}))}],
+    ["limit", {kind: "integer", value: query.limit}],
+    ["parent", query.parent === null ? {kind: "null"} : workContextIdentityJson(query.parent)],
+    ["project", query.project === null ? {kind: "null"} : {kind: "string", value: query.project}],
+    ["schema", {kind: "string", value: query.schema}],
+  ]);
+}
+
+export function encodeWorkContextQuery(value: WorkContextQuery): Uint8Array {
+  const bytes = toCanonicalBytes(queryJson(value));
+  if (bytes.length > MAX_WORK_CONTEXT_QUERY_CANONICAL_BYTES) throw new RefusalError("frame_too_large", "work-context query exceeds its ceiling");
+  return bytes;
+}
+
+export function decodeWorkContextQuery(payload: Uint8Array): WorkContextQuery {
+  const fields = exactFields(parseDocument(payload, MAX_WORK_CONTEXT_QUERY_CANONICAL_BYTES), WorkContextQuery_FIELDS, WORK_CONTEXT_INVALID_BODY);
+  const after = bodyStringOrNull(fields, "after", WORK_CONTEXT_INVALID_BODY);
+  const project = bodyStringOrNull(fields, "project", WORK_CONTEXT_INVALID_BODY);
+  return validateWorkContextQuery({
+    after: after === null ? null : WorkContextCursor(after),
+    kinds: bodyArray(fields, "kinds", WORK_CONTEXT_INVALID_BODY, WORK_CONTEXT_KIND_WIRE_ORDER.length, WORK_CONTEXT_VALUE_INVALID).map((value) => {
+      if (value.kind !== "string") throw new RefusalError(WORK_CONTEXT_INVALID_BODY, "kind filter is not a string");
+      return decodeWorkContextKind(value.value);
+    }),
+    lifecycles: bodyArray(fields, "lifecycles", WORK_CONTEXT_INVALID_BODY, WORK_CONTEXT_LIFECYCLE_WIRE_ORDER.length, WORK_CONTEXT_VALUE_INVALID).map((value) => {
+      if (value.kind !== "string") throw new RefusalError(WORK_CONTEXT_INVALID_BODY, "lifecycle filter is not a string");
+      return decodeWorkContextLifecycle(value.value);
+    }),
+    limit: WorkContextPageLimit(bodyInteger(fields, "limit", WORK_CONTEXT_INVALID_BODY)),
+    parent: bodyValueOrNull(fields, "parent", WORK_CONTEXT_INVALID_BODY) === null ? null : decodeWorkContextIdentityValue(bodyValue(fields, "parent", WORK_CONTEXT_INVALID_BODY)),
+    project: project === null ? null : ProjectId(project),
+    schema: bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY) as typeof PLATFORM_SCHEMA_V2,
+  });
+}
+
+export function validateWorkContextPage(value: WorkContextPage): WorkContextPage {
+  exactInput(value, WorkContextPage_FIELDS);
+  if (value.schema !== PLATFORM_SCHEMA_V2) workContextRefusal("work-context page schema is incompatible");
+  const requested_limit = WorkContextPageLimit(value.requested_limit);
+  if (!Array.isArray(value.items) || BigInt(value.items.length) > requested_limit) workContextRefusal("work-context page exceeds its requested limit");
+  const items = value.items.map(validateWorkContextRecord);
+  const after = value.after === null ? null : WorkContextCursor(value.after);
+  const next_cursor = value.next_cursor === null ? null : WorkContextCursor(value.next_cursor);
+  if (typeof value.has_more !== "boolean") workContextRefusal("has_more is not boolean");
+  if (value.has_more !== (next_cursor !== null) || (value.has_more && items.length === 0) || (after !== null && after === next_cursor)) workContextRefusal("work-context page cursor is incoherent");
+  return {after, has_more: value.has_more, items, next_cursor, requested_limit, schema: PLATFORM_SCHEMA_V2};
+}
+
+function pageJson(value: WorkContextPage): JsonValue {
+  const page = validateWorkContextPage(value);
+  return object([
+    ["after", page.after === null ? {kind: "null"} : {kind: "string", value: page.after}],
+    ["has_more", {kind: "bool", value: page.has_more}],
+    ["items", {kind: "array", items: page.items.map(recordJson)}],
+    ["next_cursor", page.next_cursor === null ? {kind: "null"} : {kind: "string", value: page.next_cursor}],
+    ["requested_limit", {kind: "integer", value: page.requested_limit}],
+    ["schema", {kind: "string", value: page.schema}],
+  ]);
+}
+
+export function encodeWorkContextPage(value: WorkContextPage): Uint8Array {
+  const bytes = toCanonicalBytes(pageJson(value));
+  if (bytes.length > MAX_WORK_CONTEXT_PAGE_CANONICAL_BYTES) throw new RefusalError("frame_too_large", "work-context page exceeds its ceiling");
+  return bytes;
+}
+
+export function decodeWorkContextPage(payload: Uint8Array): WorkContextPage {
+  const fields = exactFields(parseDocument(payload, MAX_WORK_CONTEXT_PAGE_CANONICAL_BYTES), WorkContextPage_FIELDS, WORK_CONTEXT_INVALID_BODY);
+  const after = bodyStringOrNull(fields, "after", WORK_CONTEXT_INVALID_BODY);
+  const next = bodyStringOrNull(fields, "next_cursor", WORK_CONTEXT_INVALID_BODY);
+  return validateWorkContextPage({
+    after: after === null ? null : WorkContextCursor(after),
+    has_more: bodyBool(fields, "has_more", WORK_CONTEXT_INVALID_BODY),
+    items: bodyArray(fields, "items", WORK_CONTEXT_INVALID_BODY, MAX_WORK_CONTEXT_PAGE_ITEMS, WORK_CONTEXT_VALUE_INVALID).map(decodeWorkContextRecordValue),
+    next_cursor: next === null ? null : WorkContextCursor(next),
+    requested_limit: WorkContextPageLimit(bodyInteger(fields, "requested_limit", WORK_CONTEXT_INVALID_BODY)),
+    schema: bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY) as typeof PLATFORM_SCHEMA_V2,
+  });
+}
+
+export function validateWorkContextResync(value: WorkContextResync): WorkContextResync {
+  exactInput(value, WorkContextResync_FIELDS);
+  if (value.outcome !== "resync_required" || value.schema !== PLATFORM_SCHEMA_V2) workContextRefusal("work-context resync outcome is incompatible");
+  return {expired_after: WorkContextCursor(value.expired_after), outcome: "resync_required", schema: PLATFORM_SCHEMA_V2};
+}
+
+export function encodeWorkContextResync(value: WorkContextResync): Uint8Array {
+  const resync = validateWorkContextResync(value);
+  return toCanonicalBytes(object([
+    ["expired_after", {kind: "string", value: resync.expired_after}],
+    ["outcome", {kind: "string", value: resync.outcome}],
+    ["schema", {kind: "string", value: resync.schema}],
+  ]));
+}
+
+export function decodeWorkContextResync(payload: Uint8Array): WorkContextResync {
+  const fields = exactFields(parseDocument(payload, MAX_WORK_CONTEXT_QUERY_CANONICAL_BYTES), WorkContextResync_FIELDS, WORK_CONTEXT_INVALID_BODY);
+  return validateWorkContextResync({
+    expired_after: WorkContextCursor(bodyString(fields, "expired_after", WORK_CONTEXT_INVALID_BODY)),
+    outcome: bodyString(fields, "outcome", WORK_CONTEXT_INVALID_BODY) as "resync_required",
+    schema: bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY) as typeof PLATFORM_SCHEMA_V2,
+  });
+}
+"#,
+    );
+}
+
 /// Emit one generated file.
 ///
 /// Output is a pure function of the input: every collection is sorted and no
@@ -10241,6 +10873,10 @@ pub fn emit_module(module: &GeneratedModule) -> String {
         emit_interface(&mut out, interface);
     }
 
+    if module.implementation == Some(GeneratedImplementation::WorkContext) {
+        emit_work_context_implementation(&mut out);
+    }
+
     if let Some(surface) = &module.json_surface {
         let mut documents = surface.documents.clone();
         documents.sort_by(|left, right| left.body.name.cmp(&right.body.name));
@@ -10271,9 +10907,10 @@ pub fn generated_files() -> Vec<(String, String)> {
     let modules = maintained_modules();
     let mut files = maintained_files();
     let digest = schema_digest(&files);
+    let (_, platform_v1_digest) = generated_platform_v1_schema_digest();
     files.push((
         module_file_name(BARREL_MODULE),
-        emit_barrel(&modules, &digest),
+        emit_barrel(&modules, &digest, &platform_v1_digest),
     ));
     files.sort_by(|left, right| left.0.cmp(&right.0));
     files
@@ -10300,4 +10937,23 @@ fn maintained_files() -> Vec<(String, String)> {
 #[must_use]
 pub fn generated_schema_digest() -> (&'static str, String) {
     (crate::digest::ALGORITHM, schema_digest(&maintained_files()))
+}
+
+/// The digest of the exact generated Platform v1 module, excluding additive
+/// modules from newer negotiated protocol versions.
+///
+/// SDK distributions that still advertise only Platform v1 use this pin. The
+/// aggregate [`generated_schema_digest`] deliberately moves whenever any
+/// generated module moves, including the separately negotiated v2 surface.
+#[must_use]
+pub fn generated_platform_v1_schema_digest() -> (&'static str, String) {
+    let files = maintained_files();
+    let platform_v1 = files
+        .iter()
+        .find(|(name, _)| name == &module_file_name(PLATFORM_MODULE))
+        .expect("maintained surface carries Platform v1");
+    (
+        crate::digest::ALGORITHM,
+        schema_digest(std::slice::from_ref(platform_v1)),
+    )
 }

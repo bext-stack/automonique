@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: Elastic-2.0
 
+use automonique_protocol::platform::{
+    ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
+};
 use automonique_protocol::platform_v2::*;
 use automonique_protocol::platform_v2_api::*;
 use automonique_protocol::primitives::Revision;
+use std::path::PathBuf;
+use std::process::Command;
 
 fn label(value: &str) -> WorkContextLabel {
     WorkContextLabel::new(value).unwrap()
@@ -24,31 +29,94 @@ fn project(index: usize) -> WorkContextRecord {
     .unwrap()
 }
 
+fn project_with_repository(index: usize) -> WorkContextRecord {
+    WorkContextRecord::new(
+        WorkContextIdentity::Project(ProjectId::new(format!("project-{index}")).unwrap()),
+        Revision::FIRST,
+        WorkContextLifecycle::Active,
+        label("Project"),
+        WorkContextAttributes::EMPTY,
+        vec![relation(
+            WorkContextRelationKind::ProjectRepository,
+            repository("repository-1", ResourceAuthority::GitHub),
+        )],
+    )
+    .unwrap()
+}
+
+fn repository(id: &str, authority: ResourceAuthority) -> WorkContextIdentity {
+    WorkContextIdentity::Repository(
+        V1RepositoryRef::new(ResourceCoordinate::new(
+            authority,
+            ResourceKind::Repository,
+            ResourceId::new(id).unwrap(),
+        ))
+        .unwrap(),
+    )
+}
+
+fn platform_session(id: &str, authority: ResourceAuthority) -> WorkContextIdentity {
+    WorkContextIdentity::PlatformSession(
+        V1SessionRef::new(ResourceCoordinate::new(
+            authority,
+            ResourceKind::Session,
+            ResourceId::new(id).unwrap(),
+        ))
+        .unwrap(),
+    )
+}
+
 #[test]
 fn version_negotiation_prefers_v2_and_downgrades_truthfully() {
-    let both = PlatformVersionOffer::new(vec![PlatformVersion::V2, PlatformVersion::V1]).unwrap();
+    let both = PlatformVersionOffer::new(vec![PlatformVersion::V1, PlatformVersion::V2]).unwrap();
     let v1 = PlatformVersionOffer::new(vec![PlatformVersion::V1]).unwrap();
     let v2 = PlatformVersionOffer::new(vec![PlatformVersion::V2]).unwrap();
 
     assert_eq!(
         negotiate_platform_version(&both, &both).unwrap(),
-        NegotiatedPlatform {
-            version: PlatformVersion::V2,
-            schema: PLATFORM_SCHEMA_V2,
-            work_context: WorkContextAvailability::V2Structured,
-        }
+        NegotiatedPlatform::new(
+            PlatformVersion::V2,
+            PLATFORM_SCHEMA_V2,
+            WorkContextAvailability::V2Structured,
+        )
+        .unwrap()
     );
     assert_eq!(
         negotiate_platform_version(&both, &v1).unwrap(),
-        NegotiatedPlatform {
-            version: PlatformVersion::V1,
-            schema: automonique_protocol::platform::PLATFORM_SCHEMA_V1,
-            work_context: WorkContextAvailability::V1ExistingResourcesOnly,
-        }
+        NegotiatedPlatform::new(
+            PlatformVersion::V1,
+            automonique_protocol::platform::PLATFORM_SCHEMA_V1,
+            WorkContextAvailability::V1ExistingResourcesOnly,
+        )
+        .unwrap()
     );
     assert_eq!(
         negotiate_platform_version(&v1, &v2),
         Err(WorkContextError::VersionOverlapMissing)
+    );
+
+    let offer_bytes = encode_platform_version_offer(&both).unwrap();
+    assert_eq!(decode_platform_version_offer(&offer_bytes).unwrap(), both);
+    let negotiated = negotiate_platform_version(&both, &both).unwrap();
+    let negotiated_bytes = encode_negotiated_platform(&negotiated).unwrap();
+    assert_eq!(
+        decode_negotiated_platform(&negotiated_bytes).unwrap(),
+        negotiated
+    );
+    let incoherent =
+        br#"{"schema":"automonique.platform/v2","version":1,"work_context":"v2_structured"}"#;
+    assert_eq!(
+        decode_negotiated_platform(incoherent),
+        Err(WorkContextApiError::Context(
+            WorkContextError::NegotiatedPlatformInvalid
+        ))
+    );
+    let repeated = br#"{"schema":"automonique.platform/negotiation/v1","versions":[1,1]}"#;
+    assert_eq!(
+        decode_platform_version_offer(repeated),
+        Err(WorkContextApiError::Context(
+            WorkContextError::VersionOfferInvalid
+        ))
     );
 }
 
@@ -64,11 +132,11 @@ fn structured_relations_admit_multiple_repositories_without_summary_identity() {
         vec![
             relation(
                 WorkContextRelationKind::ProjectRepository,
-                WorkContextIdentity::Repository(WorkContextRepositoryId::new("repo-a").unwrap()),
+                repository("repo-a", ResourceAuthority::GitHub),
             ),
             relation(
                 WorkContextRelationKind::ProjectRepository,
-                WorkContextIdentity::Repository(WorkContextRepositoryId::new("repo-b").unwrap()),
+                repository("repo-b", ResourceAuthority::Automonique),
             ),
         ],
     )
@@ -78,10 +146,7 @@ fn structured_relations_admit_multiple_repositories_without_summary_identity() {
         Revision::FIRST,
         WorkContextLifecycle::Active,
         label("Remote builder"),
-        WorkContextAttributes {
-            host_setup: Some(HostSetupKind::Ssh),
-            checkout: None,
-        },
+        WorkContextAttributes::host_setup(HostSetupKind::Ssh),
         vec![relation(
             WorkContextRelationKind::HostSetupProject,
             WorkContextIdentity::Project(project_id.clone()),
@@ -93,10 +158,7 @@ fn structured_relations_admit_multiple_repositories_without_summary_identity() {
         Revision::FIRST,
         WorkContextLifecycle::Active,
         label("Issue 166 checkout"),
-        WorkContextAttributes {
-            host_setup: None,
-            checkout: Some(CheckoutKind::GitWorktree),
-        },
+        WorkContextAttributes::checkout(CheckoutKind::GitWorktree),
         vec![
             relation(
                 WorkContextRelationKind::CheckoutProject,
@@ -104,11 +166,11 @@ fn structured_relations_admit_multiple_repositories_without_summary_identity() {
             ),
             relation(
                 WorkContextRelationKind::CheckoutHostSetup,
-                host.identity.clone(),
+                host.identity().clone(),
             ),
             relation(
                 WorkContextRelationKind::CheckoutRepository,
-                WorkContextIdentity::Repository(WorkContextRepositoryId::new("repo-a").unwrap()),
+                repository("repo-a", ResourceAuthority::GitHub),
             ),
         ],
     )
@@ -118,10 +180,7 @@ fn structured_relations_admit_multiple_repositories_without_summary_identity() {
         Revision::FIRST,
         WorkContextLifecycle::Active,
         label("Local registry"),
-        WorkContextAttributes {
-            host_setup: Some(HostSetupKind::Local),
-            checkout: None,
-        },
+        WorkContextAttributes::host_setup(HostSetupKind::Local),
         vec![relation(
             WorkContextRelationKind::HostSetupProject,
             WorkContextIdentity::Project(project_id.clone()),
@@ -133,10 +192,7 @@ fn structured_relations_admit_multiple_repositories_without_summary_identity() {
         Revision::FIRST,
         WorkContextLifecycle::Active,
         label("Authorized folder"),
-        WorkContextAttributes {
-            host_setup: None,
-            checkout: Some(CheckoutKind::AuthorizedFolder),
-        },
+        WorkContextAttributes::checkout(CheckoutKind::AuthorizedFolder),
         vec![
             relation(
                 WorkContextRelationKind::CheckoutProject,
@@ -144,11 +200,11 @@ fn structured_relations_admit_multiple_repositories_without_summary_identity() {
             ),
             relation(
                 WorkContextRelationKind::CheckoutHostSetup,
-                local_host.identity.clone(),
+                local_host.identity().clone(),
             ),
             relation(
                 WorkContextRelationKind::CheckoutRepository,
-                WorkContextIdentity::Repository(WorkContextRepositoryId::new("repo-b").unwrap()),
+                repository("repo-b", ResourceAuthority::Automonique),
             ),
         ],
     )
@@ -166,7 +222,7 @@ fn structured_relations_admit_multiple_repositories_without_summary_identity() {
             ),
             relation(
                 WorkContextRelationKind::UserWorkspaceCheckout,
-                checkout.identity.clone(),
+                checkout.identity().clone(),
             ),
         ],
     )
@@ -181,7 +237,7 @@ fn structured_relations_admit_multiple_repositories_without_summary_identity() {
         WorkContextAttributes::EMPTY,
         vec![relation(
             WorkContextRelationKind::AttemptUserWorkspace,
-            user_workspace.identity.clone(),
+            user_workspace.identity().clone(),
         )],
     )
     .unwrap();
@@ -194,13 +250,11 @@ fn structured_relations_admit_multiple_repositories_without_summary_identity() {
         vec![
             relation(
                 WorkContextRelationKind::SessionAttemptWorkspace,
-                attempt.identity.clone(),
+                attempt.identity().clone(),
             ),
             relation(
                 WorkContextRelationKind::SessionPlatformSession,
-                WorkContextIdentity::PlatformSession(
-                    PlatformSessionId::new("platform-session-1").unwrap(),
-                ),
+                platform_session("platform-session-1", ResourceAuthority::Automonique),
             ),
         ],
     )
@@ -213,45 +267,61 @@ fn structured_relations_admit_multiple_repositories_without_summary_identity() {
         WorkContextAttributes::EMPTY,
         vec![relation(
             WorkContextRelationKind::PaneSession,
-            session.identity.clone(),
+            session.identity().clone(),
         )],
     )
     .unwrap();
 
-    assert_eq!(project.relations.len(), 2);
-    assert_eq!(host.attributes.host_setup, Some(HostSetupKind::Ssh));
+    assert_eq!(project.relations().len(), 2);
     assert_eq!(
-        checkout.attributes.checkout,
+        host.attributes().host_setup_kind(),
+        Some(HostSetupKind::Ssh)
+    );
+    assert_eq!(
+        checkout.attributes().checkout_kind(),
         Some(CheckoutKind::GitWorktree)
     );
     assert_eq!(
-        authorized_folder.attributes.checkout,
+        authorized_folder.attributes().checkout_kind(),
         Some(CheckoutKind::AuthorizedFolder)
     );
-    assert!(
-        !encode_work_context_page(
-            &WorkContextPage::new(
-                9,
-                None,
-                None,
-                false,
-                vec![
-                    project,
-                    host,
-                    checkout,
-                    local_host,
-                    authorized_folder,
-                    user_workspace,
-                    attempt,
-                    session,
-                    pane,
-                ],
-            )
-            .unwrap()
+    let encoded = encode_work_context_page(
+        &WorkContextPage::new(
+            9,
+            None,
+            None,
+            false,
+            vec![
+                project,
+                host,
+                checkout,
+                local_host,
+                authorized_folder,
+                user_workspace,
+                attempt,
+                session,
+                pane,
+            ],
         )
-        .unwrap()
-        .windows(5)
-        .any(|bytes| bytes == b"/home")
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(!encoded.windows(5).any(|bytes| bytes == b"/home"));
+    let encoded = String::from_utf8(encoded).unwrap();
+    assert!(
+        encoded.contains(r#""resource":{"authority":"github","id":"repo-a","kind":"repository"}"#)
+    );
+    assert!(encoded.contains(
+        r#""resource":{"authority":"automonique","id":"platform-session-1","kind":"session"}"#
+    ));
+
+    assert_eq!(
+        V1RepositoryRef::new(ResourceCoordinate::new(
+            ResourceAuthority::GitHub,
+            ResourceKind::Session,
+            ResourceId::new("wrong-kind").unwrap(),
+        )),
+        Err(WorkContextError::V1CoordinateKindInvalid)
     );
 }
 
@@ -276,12 +346,12 @@ fn attempt_workspace_and_user_workspace_cannot_be_confused() {
     assert_eq!(attempt.kind(), WorkContextKind::AttemptWorkspace);
     assert_eq!(
         WorkContextRecord::new(
-            attempt.identity,
+            attempt.identity().clone(),
             Revision::FIRST,
             WorkContextLifecycle::Archived,
             label("invalid"),
             WorkContextAttributes::EMPTY,
-            attempt.relations,
+            attempt.relations().to_vec(),
         ),
         Err(WorkContextError::LifecycleInvalid)
     );
@@ -290,7 +360,7 @@ fn attempt_workspace_and_user_workspace_cannot_be_confused() {
 #[test]
 fn exact_query_and_page_codecs_refuse_shape_and_semantic_drift() {
     let query = WorkContextQuery::new(
-        vec![WorkContextKind::Session, WorkContextKind::Project],
+        vec![WorkContextKind::Project, WorkContextKind::Session],
         vec![WorkContextLifecycle::Active],
         Some(ProjectId::new("project-1").unwrap()),
         None,
@@ -306,7 +376,7 @@ fn exact_query_and_page_codecs_refuse_shape_and_semantic_drift() {
         Some(WorkContextCursor::new("cursor-1").unwrap()),
         Some(WorkContextCursor::new("cursor-2").unwrap()),
         true,
-        vec![project(1)],
+        vec![project_with_repository(1)],
     )
     .unwrap();
     let page_bytes = encode_work_context_page(&page).unwrap();
@@ -322,6 +392,30 @@ fn exact_query_and_page_codecs_refuse_shape_and_semantic_drift() {
         decode_work_context_query(with_extra.as_bytes()),
         Err(WorkContextApiError::InvalidBody)
     );
+    let duplicate = String::from_utf8(encode_work_context_query(&query).unwrap())
+        .unwrap()
+        .replace(
+            "\"kinds\":[\"project\",\"session\"]",
+            "\"kinds\":[\"project\",\"project\"]",
+        );
+    assert_eq!(
+        decode_work_context_query(duplicate.as_bytes()),
+        Err(WorkContextApiError::Context(
+            WorkContextError::QueryOrderInvalid
+        ))
+    );
+    let unordered = String::from_utf8(encode_work_context_query(&query).unwrap())
+        .unwrap()
+        .replace(
+            "\"kinds\":[\"project\",\"session\"]",
+            "\"kinds\":[\"session\",\"project\"]",
+        );
+    assert_eq!(
+        decode_work_context_query(unordered.as_bytes()),
+        Err(WorkContextApiError::Context(
+            WorkContextError::QueryOrderInvalid
+        ))
+    );
     assert_eq!(
         WorkContextPage::new(1, None, None, true, vec![project(2)]),
         Err(WorkContextError::PageCursorInvalid)
@@ -330,29 +424,209 @@ fn exact_query_and_page_codecs_refuse_shape_and_semantic_drift() {
 
 #[test]
 fn inventory_above_512_remains_available_through_bounded_pages() {
-    let inventory: Vec<WorkContextRecord> = (0..640).map(project).collect();
+    let inventory: Vec<AuthorizedWorkContextRecord> = (0..640)
+        .map(|index| {
+            AuthorizedWorkContextRecord::new(
+                project(index),
+                ProjectId::new(format!("project-{index}")).unwrap(),
+                Vec::new(),
+            )
+            .unwrap()
+        })
+        .collect();
     let mut decoded = Vec::new();
     let mut after = None;
-    for page_index in 0..5 {
-        let has_more = page_index < 4;
-        let next_cursor =
-            has_more.then(|| WorkContextCursor::new(format!("page-{}", page_index + 1)).unwrap());
-        let page = WorkContextPage::new(
-            128,
+    let mut pages = 0;
+    let first_cursor = loop {
+        let query = WorkContextQuery::new(
+            vec![WorkContextKind::Project],
+            Vec::new(),
+            None,
+            None,
             after.clone(),
-            next_cursor.clone(),
-            has_more,
-            inventory[page_index * 128..(page_index + 1) * 128].to_vec(),
+            128,
         )
         .unwrap();
+        let WorkContextQueryResult::Page(page) =
+            page_authorized_work_context(&query, &inventory).unwrap()
+        else {
+            panic!("unchanged authorized inventory must not expire its cursor");
+        };
+        pages += 1;
+        let next = page.next_cursor().cloned();
+        let has_more = page.has_more();
         let round_trip =
             decode_work_context_page(&encode_work_context_page(&page).unwrap()).unwrap();
-        assert!(round_trip.items.len() <= MAX_WORK_CONTEXT_PAGE_ITEMS);
-        decoded.extend(round_trip.items);
-        after = next_cursor;
-    }
+        assert!(round_trip.items().len() <= MAX_WORK_CONTEXT_PAGE_ITEMS);
+        decoded.extend(round_trip.into_items());
+        if !has_more {
+            break after.expect("a five-page inventory has a continuation");
+        }
+        after = next;
+    };
 
+    assert_eq!(pages, 5);
     assert_eq!(decoded.len(), 640);
-    assert_eq!(decoded.first().unwrap().identity.id(), "project-0");
-    assert_eq!(decoded.last().unwrap().identity.id(), "project-639");
+    let unique: std::collections::BTreeSet<&str> = decoded
+        .iter()
+        .map(|record| record.identity().id())
+        .collect();
+    assert_eq!(unique.len(), 640);
+
+    let mut changed_inventory = inventory;
+    changed_inventory.push(
+        AuthorizedWorkContextRecord::new(
+            project(640),
+            ProjectId::new("project-640").unwrap(),
+            Vec::new(),
+        )
+        .unwrap(),
+    );
+    let resumed_query = WorkContextQuery::new(
+        vec![WorkContextKind::Project],
+        Vec::new(),
+        None,
+        None,
+        Some(first_cursor.clone()),
+        128,
+    )
+    .unwrap();
+    let WorkContextQueryResult::Resync(resync) =
+        page_authorized_work_context(&resumed_query, &changed_inventory).unwrap()
+    else {
+        panic!("a cursor bound to a changed inventory must require replacement");
+    };
+    assert_eq!(resync.expired_after(), &first_cursor);
+    let encoded = encode_work_context_resync(&resync).unwrap();
+    assert_eq!(decode_work_context_resync(&encoded).unwrap(), resync);
+}
+
+#[test]
+fn rust_and_typescript_exchange_the_same_valid_corpus() {
+    if !Command::new("bun")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        return;
+    }
+    let package =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../sdk/typescript/packages/protocol");
+    let fixture = package.join("conformance/work-context-runtime.ts");
+    let typescript = Command::new("bun")
+        .arg(&fixture)
+        .arg("encode-corpus")
+        .current_dir(&package)
+        .output()
+        .expect("TypeScript work-context fixture starts");
+    assert!(
+        typescript.status.success(),
+        "TypeScript corpus encode failed: {}",
+        String::from_utf8_lossy(&typescript.stderr)
+    );
+    let documents: Vec<Vec<u8>> = String::from_utf8(typescript.stdout)
+        .unwrap()
+        .lines()
+        .map(decode_hex)
+        .collect();
+    assert_eq!(documents.len(), 4);
+    decode_platform_version_offer(&documents[0]).unwrap();
+    decode_negotiated_platform(&documents[1]).unwrap();
+    decode_work_context_query(&documents[2]).unwrap();
+    decode_work_context_page(&documents[3]).unwrap();
+
+    let offer = PlatformVersionOffer::new(vec![PlatformVersion::V1, PlatformVersion::V2]).unwrap();
+    let negotiated = negotiate_platform_version(&offer, &offer).unwrap();
+    let query = WorkContextQuery::new(
+        vec![WorkContextKind::Project],
+        vec![WorkContextLifecycle::Active],
+        None,
+        None,
+        None,
+        128,
+    )
+    .unwrap();
+    let page = WorkContextPage::new(
+        128,
+        None,
+        Some(WorkContextCursor::new("next").unwrap()),
+        true,
+        vec![project(1)],
+    )
+    .unwrap();
+    let decoded = Command::new("bun")
+        .arg(&fixture)
+        .arg("decode-corpus")
+        .arg(encode_hex(&encode_platform_version_offer(&offer).unwrap()))
+        .arg(encode_hex(
+            &encode_negotiated_platform(&negotiated).unwrap(),
+        ))
+        .arg(encode_hex(&encode_work_context_query(&query).unwrap()))
+        .arg(encode_hex(&encode_work_context_page(&page).unwrap()))
+        .current_dir(package)
+        .output()
+        .expect("TypeScript work-context fixture starts");
+    assert!(
+        decoded.status.success(),
+        "TypeScript corpus decode failed: {}",
+        String::from_utf8_lossy(&decoded.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&decoded.stdout), "ok\n");
+
+    let refusals: [&[u8]; 6] = [
+        br#"{"schema":"automonique.platform/negotiation/v1","versions":[1,1]}"#,
+        br#"{"schema":"automonique.platform/v2","version":1,"work_context":"v2_structured"}"#,
+        br#"{"after":null,"kinds":["project","project"],"lifecycles":[],"limit":1,"parent":null,"project":null,"schema":"automonique.platform/v2"}"#,
+        br#"{"after":null,"has_more":true,"items":[],"next_cursor":null,"requested_limit":1,"schema":"automonique.platform/v2"}"#,
+        br#"{"after":null,"kinds":["project"],"lifecycles":[],"limit":129,"parent":null,"project":null,"schema":"automonique.platform/v2"}"#,
+        br#"{"after":null,"has_more":false,"items":[{"attributes":{"checkout":null,"host_setup":null},"identity":{"id":"project-1","kind":"project"},"label":"Project","lifecycle":"active","relations":[{"kind":"project_repository","target":{"kind":"repository","resource":{"authority":"github","id":"repo-a","kind":"session"}}}],"revision":1}],"next_cursor":null,"requested_limit":1,"schema":"automonique.platform/v2"}"#,
+    ];
+    assert!(decode_platform_version_offer(refusals[0]).is_err());
+    assert!(decode_negotiated_platform(refusals[1]).is_err());
+    assert!(decode_work_context_query(refusals[2]).is_err());
+    assert!(decode_work_context_page(refusals[3]).is_err());
+    assert!(decode_work_context_query(refusals[4]).is_err());
+    assert!(decode_work_context_page(refusals[5]).is_err());
+    let refused = Command::new("bun")
+        .arg(&fixture)
+        .arg("decode-refusal-corpus")
+        .args(refusals.map(encode_hex))
+        .current_dir(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../sdk/typescript/packages/protocol"),
+        )
+        .output()
+        .expect("TypeScript work-context fixture starts");
+    assert!(
+        refused.status.success(),
+        "TypeScript refusal corpus failed: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&refused.stdout), "refused:6\n");
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn decode_hex(value: &str) -> Vec<u8> {
+    assert_eq!(value.len() % 2, 0);
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let digit = |byte: u8| match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                _ => panic!("non-hex TypeScript corpus"),
+            };
+            digit(pair[0]) << 4 | digit(pair[1])
+        })
+        .collect()
 }

@@ -12,6 +12,8 @@
 
 use core::fmt;
 
+use crate::digest::Sha256;
+use crate::platform::{ResourceCoordinate, ResourceKind};
 use crate::primitives::{BoundedString, IdDomain, OpaqueId, Revision, ValueError};
 
 pub const PLATFORM_SCHEMA_V2: &str = "automonique.platform/v2";
@@ -41,8 +43,6 @@ id_domain!(UserWorkspaceIdDomain, UserWorkspaceId);
 id_domain!(AttemptWorkspaceIdDomain, AttemptWorkspaceId);
 id_domain!(WorkSessionIdDomain, WorkSessionId);
 id_domain!(PaneIdDomain, PaneId);
-id_domain!(RepositoryIdDomain, WorkContextRepositoryId);
-id_domain!(PlatformSessionIdDomain, PlatformSessionId);
 id_domain!(WorkContextCursorDomain, WorkContextCursor);
 
 pub type WorkContextLabel = BoundedString<MAX_WORK_CONTEXT_LABEL_BYTES>;
@@ -71,6 +71,14 @@ impl PlatformVersion {
             Self::V2 => PLATFORM_SCHEMA_V2,
         }
     }
+
+    pub const fn from_number(value: u16) -> Result<Self, WorkContextError> {
+        match value {
+            1 => Ok(Self::V1),
+            2 => Ok(Self::V2),
+            _ => Err(WorkContextError::VersionOfferInvalid),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -79,12 +87,13 @@ pub struct PlatformVersionOffer {
 }
 
 impl PlatformVersionOffer {
-    pub fn new(mut versions: Vec<PlatformVersion>) -> Result<Self, WorkContextError> {
+    pub fn new(versions: Vec<PlatformVersion>) -> Result<Self, WorkContextError> {
         if versions.is_empty() || versions.len() > MAX_PLATFORM_VERSION_OFFERS {
             return Err(WorkContextError::VersionOfferInvalid);
         }
-        versions.sort();
-        versions.dedup();
+        if !strictly_increasing(&versions) {
+            return Err(WorkContextError::VersionOfferInvalid);
+        }
         Ok(Self { versions })
     }
 
@@ -102,11 +111,66 @@ pub enum WorkContextAvailability {
     V2Structured,
 }
 
+impl WorkContextAvailability {
+    pub const ALL: [Self; 2] = [Self::V1ExistingResourcesOnly, Self::V2Structured];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::V1ExistingResourcesOnly => "v1_existing_resources_only",
+            Self::V2Structured => "v2_structured",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, WorkContextError> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == value)
+            .ok_or(WorkContextError::UnknownAvailability)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NegotiatedPlatform {
-    pub version: PlatformVersion,
-    pub schema: &'static str,
-    pub work_context: WorkContextAvailability,
+    version: PlatformVersion,
+    schema: &'static str,
+    work_context: WorkContextAvailability,
+}
+
+impl NegotiatedPlatform {
+    pub fn new(
+        version: PlatformVersion,
+        schema: &'static str,
+        work_context: WorkContextAvailability,
+    ) -> Result<Self, WorkContextError> {
+        let expected = match version {
+            PlatformVersion::V1 => WorkContextAvailability::V1ExistingResourcesOnly,
+            PlatformVersion::V2 => WorkContextAvailability::V2Structured,
+        };
+        if schema != version.schema() || work_context != expected {
+            return Err(WorkContextError::NegotiatedPlatformInvalid);
+        }
+        Ok(Self {
+            version,
+            schema,
+            work_context,
+        })
+    }
+
+    #[must_use]
+    pub const fn version(&self) -> PlatformVersion {
+        self.version
+    }
+
+    #[must_use]
+    pub const fn schema(&self) -> &'static str {
+        self.schema
+    }
+
+    #[must_use]
+    pub const fn work_context(&self) -> WorkContextAvailability {
+        self.work_context
+    }
 }
 
 pub fn negotiate_platform_version(
@@ -120,14 +184,14 @@ pub fn negotiate_platform_version(
         .find(|candidate| server.versions().contains(candidate))
         .copied()
         .ok_or(WorkContextError::VersionOverlapMissing)?;
-    Ok(NegotiatedPlatform {
+    NegotiatedPlatform::new(
         version,
-        schema: version.schema(),
-        work_context: match version {
+        version.schema(),
+        match version {
             PlatformVersion::V1 => WorkContextAvailability::V1ExistingResourcesOnly,
             PlatformVersion::V2 => WorkContextAvailability::V2Structured,
         },
-    })
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -237,6 +301,40 @@ impl From<WorkContextKind> for WorkContextTargetKind {
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct V1RepositoryRef(ResourceCoordinate);
+
+impl V1RepositoryRef {
+    pub fn new(coordinate: ResourceCoordinate) -> Result<Self, WorkContextError> {
+        if coordinate.kind != ResourceKind::Repository {
+            return Err(WorkContextError::V1CoordinateKindInvalid);
+        }
+        Ok(Self(coordinate))
+    }
+
+    #[must_use]
+    pub const fn coordinate(&self) -> &ResourceCoordinate {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct V1SessionRef(ResourceCoordinate);
+
+impl V1SessionRef {
+    pub fn new(coordinate: ResourceCoordinate) -> Result<Self, WorkContextError> {
+        if coordinate.kind != ResourceKind::Session {
+            return Err(WorkContextError::V1CoordinateKindInvalid);
+        }
+        Ok(Self(coordinate))
+    }
+
+    #[must_use]
+    pub const fn coordinate(&self) -> &ResourceCoordinate {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum WorkContextIdentity {
     Project(ProjectId),
     HostSetup(HostSetupId),
@@ -245,8 +343,8 @@ pub enum WorkContextIdentity {
     AttemptWorkspace(AttemptWorkspaceId),
     Session(WorkSessionId),
     Pane(PaneId),
-    Repository(WorkContextRepositoryId),
-    PlatformSession(PlatformSessionId),
+    Repository(V1RepositoryRef),
+    PlatformSession(V1SessionRef),
 }
 
 impl WorkContextIdentity {
@@ -275,12 +373,12 @@ impl WorkContextIdentity {
             Self::AttemptWorkspace(value) => value.as_str(),
             Self::Session(value) => value.as_str(),
             Self::Pane(value) => value.as_str(),
-            Self::Repository(value) => value.as_str(),
-            Self::PlatformSession(value) => value.as_str(),
+            Self::Repository(value) => value.coordinate().id.as_str(),
+            Self::PlatformSession(value) => value.coordinate().id.as_str(),
         }
     }
 
-    pub fn parse(kind: WorkContextTargetKind, id: &str) -> Result<Self, WorkContextError> {
+    pub fn parse_local(kind: WorkContextTargetKind, id: &str) -> Result<Self, WorkContextError> {
         macro_rules! build {
             ($variant:ident, $type:ident) => {
                 Self::$variant($type::new(id.to_owned()).map_err(WorkContextError::Field)?)
@@ -296,11 +394,19 @@ impl WorkContextIdentity {
             }
             WorkContextTargetKind::Session => build!(Session, WorkSessionId),
             WorkContextTargetKind::Pane => build!(Pane, PaneId),
-            WorkContextTargetKind::Repository => build!(Repository, WorkContextRepositoryId),
-            WorkContextTargetKind::PlatformSession => {
-                build!(PlatformSession, PlatformSessionId)
+            WorkContextTargetKind::Repository | WorkContextTargetKind::PlatformSession => {
+                return Err(WorkContextError::V1CoordinateRequired);
             }
         })
+    }
+
+    #[must_use]
+    pub const fn v1_coordinate(&self) -> Option<&ResourceCoordinate> {
+        match self {
+            Self::Repository(value) => Some(value.coordinate()),
+            Self::PlatformSession(value) => Some(value.coordinate()),
+            _ => None,
+        }
     }
 }
 
@@ -493,8 +599,8 @@ impl WorkContextRelationKind {
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct WorkContextRelation {
-    pub kind: WorkContextRelationKind,
-    pub target: WorkContextIdentity,
+    kind: WorkContextRelationKind,
+    target: WorkContextIdentity,
 }
 
 impl WorkContextRelation {
@@ -507,12 +613,22 @@ impl WorkContextRelation {
         }
         Ok(Self { kind, target })
     }
+
+    #[must_use]
+    pub const fn kind(&self) -> WorkContextRelationKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> &WorkContextIdentity {
+        &self.target
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WorkContextAttributes {
-    pub host_setup: Option<HostSetupKind>,
-    pub checkout: Option<CheckoutKind>,
+    host_setup: Option<HostSetupKind>,
+    checkout: Option<CheckoutKind>,
 }
 
 impl WorkContextAttributes {
@@ -520,16 +636,42 @@ impl WorkContextAttributes {
         host_setup: None,
         checkout: None,
     };
+
+    #[must_use]
+    pub const fn host_setup(kind: HostSetupKind) -> Self {
+        Self {
+            host_setup: Some(kind),
+            checkout: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn checkout(kind: CheckoutKind) -> Self {
+        Self {
+            host_setup: None,
+            checkout: Some(kind),
+        }
+    }
+
+    #[must_use]
+    pub const fn host_setup_kind(self) -> Option<HostSetupKind> {
+        self.host_setup
+    }
+
+    #[must_use]
+    pub const fn checkout_kind(self) -> Option<CheckoutKind> {
+        self.checkout
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkContextRecord {
-    pub identity: WorkContextIdentity,
-    pub revision: Revision,
-    pub lifecycle: WorkContextLifecycle,
-    pub label: WorkContextLabel,
-    pub attributes: WorkContextAttributes,
-    pub relations: Vec<WorkContextRelation>,
+    identity: WorkContextIdentity,
+    revision: Revision,
+    lifecycle: WorkContextLifecycle,
+    label: WorkContextLabel,
+    attributes: WorkContextAttributes,
+    relations: Vec<WorkContextRelation>,
 }
 
 impl WorkContextRecord {
@@ -585,6 +727,36 @@ impl WorkContextRecord {
     #[must_use]
     pub fn kind(&self) -> WorkContextKind {
         record_kind(&self.identity).expect("record constructors exclude relation-only identities")
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> &WorkContextIdentity {
+        &self.identity
+    }
+
+    #[must_use]
+    pub const fn revision(&self) -> Revision {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn lifecycle(&self) -> WorkContextLifecycle {
+        self.lifecycle
+    }
+
+    #[must_use]
+    pub const fn label(&self) -> &WorkContextLabel {
+        &self.label
+    }
+
+    #[must_use]
+    pub const fn attributes(&self) -> WorkContextAttributes {
+        self.attributes
+    }
+
+    #[must_use]
+    pub fn relations(&self) -> &[WorkContextRelation] {
+        &self.relations
     }
 }
 
@@ -689,32 +861,31 @@ fn validate_required_relations(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkContextQuery {
-    pub kinds: Vec<WorkContextKind>,
-    pub lifecycles: Vec<WorkContextLifecycle>,
-    pub project: Option<ProjectId>,
-    pub parent: Option<WorkContextIdentity>,
-    pub after: Option<WorkContextCursor>,
-    pub limit: u16,
+    kinds: Vec<WorkContextKind>,
+    lifecycles: Vec<WorkContextLifecycle>,
+    project: Option<ProjectId>,
+    parent: Option<WorkContextIdentity>,
+    after: Option<WorkContextCursor>,
+    limit: u16,
 }
 
 impl WorkContextQuery {
     pub fn new(
-        mut kinds: Vec<WorkContextKind>,
-        mut lifecycles: Vec<WorkContextLifecycle>,
+        kinds: Vec<WorkContextKind>,
+        lifecycles: Vec<WorkContextLifecycle>,
         project: Option<ProjectId>,
         parent: Option<WorkContextIdentity>,
         after: Option<WorkContextCursor>,
         limit: u16,
     ) -> Result<Self, WorkContextError> {
-        kinds.sort();
-        kinds.dedup();
-        lifecycles.sort();
-        lifecycles.dedup();
         if kinds.is_empty() || kinds.len() > MAX_WORK_CONTEXT_QUERY_KINDS {
             return Err(WorkContextError::QueryKindsInvalid);
         }
         if lifecycles.len() > MAX_WORK_CONTEXT_QUERY_LIFECYCLES {
             return Err(WorkContextError::QueryLifecyclesInvalid);
+        }
+        if !strictly_increasing(&kinds) || !strictly_increasing_or_empty(&lifecycles) {
+            return Err(WorkContextError::QueryOrderInvalid);
         }
         if limit == 0 || usize::from(limit) > MAX_WORK_CONTEXT_PAGE_ITEMS {
             return Err(WorkContextError::QueryLimitInvalid);
@@ -728,15 +899,45 @@ impl WorkContextQuery {
             limit,
         })
     }
+
+    #[must_use]
+    pub fn kinds(&self) -> &[WorkContextKind] {
+        &self.kinds
+    }
+
+    #[must_use]
+    pub fn lifecycles(&self) -> &[WorkContextLifecycle] {
+        &self.lifecycles
+    }
+
+    #[must_use]
+    pub const fn project(&self) -> Option<&ProjectId> {
+        self.project.as_ref()
+    }
+
+    #[must_use]
+    pub const fn parent(&self) -> Option<&WorkContextIdentity> {
+        self.parent.as_ref()
+    }
+
+    #[must_use]
+    pub const fn after(&self) -> Option<&WorkContextCursor> {
+        self.after.as_ref()
+    }
+
+    #[must_use]
+    pub const fn limit(&self) -> u16 {
+        self.limit
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkContextPage {
-    pub requested_limit: u16,
-    pub after: Option<WorkContextCursor>,
-    pub next_cursor: Option<WorkContextCursor>,
-    pub has_more: bool,
-    pub items: Vec<WorkContextRecord>,
+    requested_limit: u16,
+    after: Option<WorkContextCursor>,
+    next_cursor: Option<WorkContextCursor>,
+    has_more: bool,
+    items: Vec<WorkContextRecord>,
 }
 
 impl WorkContextPage {
@@ -767,6 +968,289 @@ impl WorkContextPage {
             items,
         })
     }
+
+    #[must_use]
+    pub const fn requested_limit(&self) -> u16 {
+        self.requested_limit
+    }
+
+    #[must_use]
+    pub const fn after(&self) -> Option<&WorkContextCursor> {
+        self.after.as_ref()
+    }
+
+    #[must_use]
+    pub const fn next_cursor(&self) -> Option<&WorkContextCursor> {
+        self.next_cursor.as_ref()
+    }
+
+    #[must_use]
+    pub const fn has_more(&self) -> bool {
+        self.has_more
+    }
+
+    #[must_use]
+    pub fn items(&self) -> &[WorkContextRecord] {
+        &self.items
+    }
+
+    #[must_use]
+    pub fn into_items(self) -> Vec<WorkContextRecord> {
+        self.items
+    }
+}
+
+/// One already-authorized record plus server-resolved ancestry used for
+/// deterministic filtering. This type does not decide authorization: callers
+/// must remove forbidden records before constructing it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizedWorkContextRecord {
+    record: WorkContextRecord,
+    project: ProjectId,
+    parents: Vec<WorkContextIdentity>,
+}
+
+impl AuthorizedWorkContextRecord {
+    pub fn new(
+        record: WorkContextRecord,
+        project: ProjectId,
+        mut parents: Vec<WorkContextIdentity>,
+    ) -> Result<Self, WorkContextError> {
+        if parents.len() > MAX_WORK_CONTEXT_RELATIONS {
+            return Err(WorkContextError::InventoryInvalid);
+        }
+        parents.sort();
+        if parents.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(WorkContextError::InventoryInvalid);
+        }
+        if let WorkContextIdentity::Project(identity) = record.identity()
+            && identity != &project
+        {
+            return Err(WorkContextError::InventoryInvalid);
+        }
+        let direct_projects: Vec<&WorkContextIdentity> = record
+            .relations()
+            .iter()
+            .filter(|relation| relation.target().kind() == WorkContextTargetKind::Project)
+            .map(WorkContextRelation::target)
+            .collect();
+        if direct_projects.iter().any(|identity| {
+            !matches!(identity, WorkContextIdentity::Project(value) if value == &project)
+        }) {
+            return Err(WorkContextError::InventoryInvalid);
+        }
+        Ok(Self {
+            record,
+            project,
+            parents,
+        })
+    }
+
+    #[must_use]
+    pub const fn record(&self) -> &WorkContextRecord {
+        &self.record
+    }
+
+    #[must_use]
+    pub const fn project(&self) -> &ProjectId {
+        &self.project
+    }
+
+    #[must_use]
+    pub fn parents(&self) -> &[WorkContextIdentity] {
+        &self.parents
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkContextResync {
+    expired_after: WorkContextCursor,
+}
+
+impl WorkContextResync {
+    #[must_use]
+    pub const fn new(expired_after: WorkContextCursor) -> Self {
+        Self { expired_after }
+    }
+
+    #[must_use]
+    pub const fn expired_after(&self) -> &WorkContextCursor {
+        &self.expired_after
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkContextQueryResult {
+    Page(WorkContextPage),
+    Resync(WorkContextResync),
+}
+
+/// Page a deterministic set of records the caller has already authorization-
+/// filtered. The cursor binds the filter and complete input revision set, so a
+/// changed filter or inventory returns `Resync` rather than skipping records.
+pub fn page_authorized_work_context(
+    query: &WorkContextQuery,
+    records: &[AuthorizedWorkContextRecord],
+) -> Result<WorkContextQueryResult, WorkContextError> {
+    let mut ordered: Vec<&AuthorizedWorkContextRecord> = records.iter().collect();
+    ordered.sort_by_key(|item| identity_order_key(item.record().identity()));
+    if ordered.windows(2).any(|pair| {
+        identity_order_key(pair[0].record().identity())
+            == identity_order_key(pair[1].record().identity())
+    }) {
+        return Err(WorkContextError::InventoryInvalid);
+    }
+    let inventory = inventory_fingerprint(&ordered);
+    let filter = query_filter_fingerprint(query);
+    let start = match query.after() {
+        None => 0,
+        Some(after) => match decode_bound_cursor(after) {
+            Some((cursor_filter, cursor_inventory, offset))
+                if cursor_filter == filter && cursor_inventory == inventory =>
+            {
+                offset
+            }
+            _ => {
+                return Ok(WorkContextQueryResult::Resync(WorkContextResync {
+                    expired_after: after.clone(),
+                }));
+            }
+        },
+    };
+    let filtered: Vec<&AuthorizedWorkContextRecord> = ordered
+        .into_iter()
+        .filter(|item| query.kinds().contains(&item.record().kind()))
+        .filter(|item| {
+            query.lifecycles().is_empty() || query.lifecycles().contains(&item.record().lifecycle())
+        })
+        .filter(|item| {
+            query
+                .project()
+                .is_none_or(|project| project == item.project())
+        })
+        .filter(|item| {
+            query
+                .parent()
+                .is_none_or(|parent| item.parents().contains(parent))
+        })
+        .collect();
+    if start > filtered.len() {
+        return Ok(WorkContextQueryResult::Resync(WorkContextResync {
+            expired_after: query
+                .after()
+                .expect("nonzero start comes from a cursor")
+                .clone(),
+        }));
+    }
+    let end = start
+        .saturating_add(usize::from(query.limit()))
+        .min(filtered.len());
+    let has_more = end < filtered.len();
+    let next_cursor = has_more
+        .then(|| encode_bound_cursor(&filter, &inventory, end))
+        .transpose()?;
+    Ok(WorkContextQueryResult::Page(WorkContextPage::new(
+        query.limit(),
+        query.after().cloned(),
+        next_cursor,
+        has_more,
+        filtered[start..end]
+            .iter()
+            .map(|item| item.record().clone())
+            .collect(),
+    )?))
+}
+
+fn identity_order_key(identity: &WorkContextIdentity) -> String {
+    let mut key = identity.kind().as_str().to_owned();
+    key.push('\0');
+    if let Some(coordinate) = identity.v1_coordinate() {
+        key.push_str(coordinate.authority.as_str());
+        key.push('\0');
+        key.push_str(coordinate.kind.as_str());
+        key.push('\0');
+    }
+    key.push_str(identity.id());
+    key
+}
+
+fn inventory_fingerprint(records: &[&AuthorizedWorkContextRecord]) -> String {
+    let mut bytes = Vec::new();
+    for item in records {
+        bytes.extend_from_slice(identity_order_key(item.record().identity()).as_bytes());
+        bytes.push(0xff);
+        bytes.extend_from_slice(item.record().revision().get().to_string().as_bytes());
+        bytes.push(0xfe);
+        bytes.extend_from_slice(item.project().as_str().as_bytes());
+        for parent in item.parents() {
+            bytes.push(0xfd);
+            bytes.extend_from_slice(identity_order_key(parent).as_bytes());
+        }
+        bytes.push(0xfc);
+    }
+    Sha256::digest(&bytes).to_hex()
+}
+
+fn query_filter_fingerprint(query: &WorkContextQuery) -> String {
+    let mut bytes = Vec::new();
+    for kind in query.kinds() {
+        bytes.extend_from_slice(kind.as_str().as_bytes());
+        bytes.push(0xff);
+    }
+    bytes.push(0xfe);
+    for lifecycle in query.lifecycles() {
+        bytes.extend_from_slice(lifecycle.as_str().as_bytes());
+        bytes.push(0xff);
+    }
+    if let Some(project) = query.project() {
+        bytes.push(0xfd);
+        bytes.extend_from_slice(project.as_str().as_bytes());
+    }
+    if let Some(parent) = query.parent() {
+        bytes.push(0xfc);
+        bytes.extend_from_slice(identity_order_key(parent).as_bytes());
+    }
+    Sha256::digest(&bytes).to_hex()
+}
+
+fn encode_bound_cursor(
+    filter: &str,
+    inventory: &str,
+    offset: usize,
+) -> Result<WorkContextCursor, WorkContextError> {
+    WorkContextCursor::new(format!("wc2.{filter}.{inventory}.{offset}"))
+        .map_err(WorkContextError::Field)
+}
+
+fn decode_bound_cursor(cursor: &WorkContextCursor) -> Option<(&str, &str, usize)> {
+    let mut parts = cursor.as_str().split('.');
+    let prefix = parts.next()?;
+    let filter = parts.next()?;
+    let inventory = parts.next()?;
+    let offset = parts.next()?;
+    if prefix != "wc2"
+        || filter.len() != 64
+        || inventory.len() != 64
+        || parts.next().is_some()
+        || offset.starts_with('0') && offset != "0"
+        || !filter
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || !inventory
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return None;
+    }
+    Some((filter, inventory, offset.parse().ok()?))
+}
+
+fn strictly_increasing<T: Ord>(values: &[T]) -> bool {
+    !values.is_empty() && values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn strictly_increasing_or_empty<T: Ord>(values: &[T]) -> bool {
+    values.is_empty() || strictly_increasing(values)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -774,9 +1258,11 @@ pub enum WorkContextError {
     Field(ValueError),
     VersionOfferInvalid,
     VersionOverlapMissing,
+    NegotiatedPlatformInvalid,
     UnknownKind,
     UnknownTargetKind,
     UnknownLifecycle,
+    UnknownAvailability,
     UnknownHostSetupKind,
     UnknownCheckoutKind,
     UnknownRelation,
@@ -786,13 +1272,18 @@ pub enum WorkContextError {
     TooManyRelations,
     RelationSourceInvalid,
     RelationTargetInvalid,
+    V1CoordinateRequired,
+    V1CoordinateKindInvalid,
     DuplicateRelation,
+    RelationOrderInvalid,
     RequiredRelationInvalid,
     QueryKindsInvalid,
     QueryLifecyclesInvalid,
     QueryLimitInvalid,
+    QueryOrderInvalid,
     PageLimitInvalid,
     PageCursorInvalid,
+    InventoryInvalid,
 }
 
 impl fmt::Display for WorkContextError {
@@ -801,9 +1292,11 @@ impl fmt::Display for WorkContextError {
             Self::Field(_) => "work-context field is invalid",
             Self::VersionOfferInvalid => "platform version offer is invalid",
             Self::VersionOverlapMissing => "platform versions do not overlap",
+            Self::NegotiatedPlatformInvalid => "negotiated platform result is incoherent",
             Self::UnknownKind => "work-context kind is unknown",
             Self::UnknownTargetKind => "work-context target kind is unknown",
             Self::UnknownLifecycle => "work-context lifecycle is unknown",
+            Self::UnknownAvailability => "work-context availability is unknown",
             Self::UnknownHostSetupKind => "host setup kind is unknown",
             Self::UnknownCheckoutKind => "checkout kind is unknown",
             Self::UnknownRelation => "work-context relation is unknown",
@@ -813,15 +1306,20 @@ impl fmt::Display for WorkContextError {
             Self::TooManyRelations => "work-context relation limit exceeded",
             Self::RelationSourceInvalid => "relation is invalid for source kind",
             Self::RelationTargetInvalid => "relation target kind is invalid",
+            Self::V1CoordinateRequired => "v1 relation target requires a full coordinate",
+            Self::V1CoordinateKindInvalid => "v1 relation coordinate kind is invalid",
             Self::DuplicateRelation => "work-context relation is duplicated",
+            Self::RelationOrderInvalid => "work-context relations are unordered",
             Self::RequiredRelationInvalid => {
                 "required work-context relation is missing or repeated"
             }
             Self::QueryKindsInvalid => "work-context query kinds are invalid",
             Self::QueryLifecyclesInvalid => "work-context lifecycle filter is invalid",
             Self::QueryLimitInvalid => "work-context query limit is invalid",
+            Self::QueryOrderInvalid => "work-context query filters are repeated or unordered",
             Self::PageLimitInvalid => "work-context page limit is invalid",
             Self::PageCursorInvalid => "work-context page cursor is incoherent",
+            Self::InventoryInvalid => "authorized work-context inventory is invalid",
         })
     }
 }

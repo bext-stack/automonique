@@ -19,9 +19,12 @@ compatibility refusal.
 
 ## Identity, authority, revision, and retention
 
-Every identity is opaque and meaningful only within the authority serving the
-projection. IDs never contain a filesystem path, repository slug, branch name,
-host address, provider session token, or display label. Every record carries a
+Every new work-context identity is opaque and meaningful only within the
+authority serving the projection. IDs never contain a filesystem path,
+repository slug, branch name, host address, provider session token, or display
+label. References to an existing Platform v1 repository or session preserve
+its complete `ResourceCoordinate` (`authority`, expected v1 `kind`, and opaque
+`id`); a bare ID would lose authority and is refused. Every record carries a
 non-zero monotonic revision; mutations must target the exact identity and
 expected revision. Observing a related record never grants authority over it.
 
@@ -46,16 +49,16 @@ credential, network, provider, or model authority.
 Relations are closed typed edges, bounded to 16 per record:
 
 ```text
-Project ──project_repository────────────► Repository (existing identity)
+Project ──project_repository────────────► Repository (v1 ResourceCoordinate)
 HostSetup ──host_setup_project──────────► Project
 Checkout ──checkout_project─────────────► Project
          ├─checkout_host_setup──────────► HostSetup
-         └─checkout_repository──────────► Repository (existing identity)
+         └─checkout_repository──────────► Repository (v1 ResourceCoordinate)
 UserWorkspace ──user_workspace_project──► Project
               └─user_workspace_checkout► Checkout
 AttemptWorkspace ──attempt_user_workspace► UserWorkspace
 Session ──session_attempt_workspace─────► AttemptWorkspace
-        └─session_platform_session──────► Platform v1 Session identity
+        └─session_platform_session──────► Session (v1 ResourceCoordinate)
 Pane ──pane_session─────────────────────► Session
 ```
 
@@ -99,10 +102,15 @@ contains:
 Each response carries at most the requested limit, the cursor it continued
 after, and a `next_cursor` exactly when `has_more` is true. The server applies
 authorization before counting or paging and uses a deterministic stable order.
-An expired cursor returns an explicit replacement/resynchronization outcome;
-it never silently starts at a new position. Total inventory is unbounded by the
-old 512-resource snapshot ceiling: for example, 640 records remain five
-ordinary 128-item pages.
+The protocol helper accepts records that the caller has already authorized,
+uses stable identity ordering, and binds each cursor to both the complete
+authorized inventory and the normalized filters. A changed inventory, changed
+filter, malformed cursor, or unavailable position returns the exact
+`resync_required` outcome carrying the expired cursor; it never silently starts
+at a new position. Total inventory is unbounded by the old 512-resource
+snapshot ceiling: for example, 640 records remain five ordinary 128-item pages.
+The helper is deterministic protocol behavior, not a persistence, indexing, or
+authorization implementation.
 
 ## Mutation contract for the next slice
 
@@ -119,8 +127,15 @@ policy requires it, targets that exact preview revision. Ambiguous outcomes are
 reconciled by receipt identity or idempotency key and never replayed blindly.
 Archive is non-destructive and does not cancel an active attempt implicitly.
 
-This first contract slice supplies the identities, graph, negotiation, exact
-query/page codecs, generated TypeScript, and conformance fixtures. The mutation
-methods, persistence/index implementation, retention-gap response type, SDK
-client ergonomics, daemon routes, and internal terminology cleanup remain
+This first contract slice supplies the identities, graph, strict negotiation,
+exact query/page/resynchronization codecs, a deterministic pager over already
+authorized input, generated TypeScript validators/codecs, and bidirectional
+Rust/TypeScript conformance fixtures. `SCHEMA_DIGEST` identifies the complete
+additive generated surface and therefore moves when the v2 module changes. The
+SDK still advertises `protocolRange: 1` and `automonique.platform/v1`, so its
+manifest pins the separately generated `PLATFORM_V1_SCHEMA_DIGEST`; the
+checked-in Platform v1 module remains byte-identical.
+
+The mutation methods, durable persistence/index and authorization integration,
+SDK client ergonomics, daemon routes, and internal terminology cleanup remain
 separate implementation work.

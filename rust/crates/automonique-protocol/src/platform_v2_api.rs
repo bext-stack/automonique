@@ -6,12 +6,15 @@ use core::fmt;
 use std::error::Error;
 
 use crate::codec::CodecError;
+use crate::platform::{ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind};
 use crate::platform_v2::*;
 use crate::primitives::Revision;
 use crate::wire::{JsonValue, parse_canonical};
 
 pub const MAX_WORK_CONTEXT_QUERY_CANONICAL_BYTES: usize = 16 * 1024;
 pub const MAX_WORK_CONTEXT_PAGE_CANONICAL_BYTES: usize = 512 * 1024;
+pub const MAX_PLATFORM_NEGOTIATION_CANONICAL_BYTES: usize = 4 * 1024;
+pub const PLATFORM_NEGOTIATION_SCHEMA_V1: &str = "automonique.platform/negotiation/v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkContextApiError {
@@ -146,37 +149,90 @@ fn optional_json<T>(value: Option<&T>, encode: impl FnOnce(&T) -> JsonValue) -> 
 }
 
 fn identity_json(identity: &WorkContextIdentity) -> JsonValue {
+    let kind = JsonValue::String(identity.kind().as_str().to_owned());
+    identity.v1_coordinate().map_or_else(
+        || {
+            object(vec![
+                ("id", JsonValue::String(identity.id().to_owned())),
+                ("kind", kind.clone()),
+            ])
+        },
+        |coordinate| {
+            object(vec![
+                ("kind", kind.clone()),
+                ("resource", coordinate_json(coordinate)),
+            ])
+        },
+    )
+}
+
+fn identity(value: &JsonValue) -> Result<WorkContextIdentity, WorkContextApiError> {
+    let kind = WorkContextTargetKind::parse(string(value, "kind")?)?;
+    match kind {
+        WorkContextTargetKind::Repository | WorkContextTargetKind::PlatformSession => {
+            exact_fields(value, &["kind", "resource"])?;
+            let coordinate = coordinate(
+                value
+                    .get("resource")
+                    .ok_or(WorkContextApiError::InvalidBody)?,
+            )?;
+            match kind {
+                WorkContextTargetKind::Repository => Ok(WorkContextIdentity::Repository(
+                    V1RepositoryRef::new(coordinate)?,
+                )),
+                WorkContextTargetKind::PlatformSession => Ok(WorkContextIdentity::PlatformSession(
+                    V1SessionRef::new(coordinate)?,
+                )),
+                _ => Err(WorkContextApiError::InvalidBody),
+            }
+        }
+        _ => {
+            exact_fields(value, &["id", "kind"])?;
+            WorkContextIdentity::parse_local(kind, string(value, "id")?).map_err(Into::into)
+        }
+    }
+}
+
+fn coordinate_json(coordinate: &ResourceCoordinate) -> JsonValue {
     object(vec![
-        ("id", JsonValue::String(identity.id().to_owned())),
+        (
+            "authority",
+            JsonValue::String(coordinate.authority.as_str().to_owned()),
+        ),
+        ("id", JsonValue::String(coordinate.id.as_str().to_owned())),
         (
             "kind",
-            JsonValue::String(identity.kind().as_str().to_owned()),
+            JsonValue::String(coordinate.kind.as_str().to_owned()),
         ),
     ])
 }
 
-fn identity(value: &JsonValue) -> Result<WorkContextIdentity, WorkContextApiError> {
-    exact_fields(value, &["id", "kind"])?;
-    WorkContextIdentity::parse(
-        WorkContextTargetKind::parse(string(value, "kind")?)?,
-        string(value, "id")?,
-    )
-    .map_err(Into::into)
+fn coordinate(value: &JsonValue) -> Result<ResourceCoordinate, WorkContextApiError> {
+    exact_fields(value, &["authority", "id", "kind"])?;
+    Ok(ResourceCoordinate::new(
+        ResourceAuthority::parse(string(value, "authority")?)
+            .map_err(|_| WorkContextApiError::InvalidBody)?,
+        ResourceKind::parse(string(value, "kind")?)
+            .map_err(|_| WorkContextApiError::InvalidBody)?,
+        ResourceId::new(string(value, "id")?.to_owned()).map_err(WorkContextError::Field)?,
+    ))
 }
 
 fn attributes_json(attributes: WorkContextAttributes) -> JsonValue {
     object(vec![
         (
             "checkout",
-            attributes.checkout.map_or(JsonValue::Null, |value| {
+            attributes.checkout_kind().map_or(JsonValue::Null, |value| {
                 JsonValue::String(value.as_str().to_owned())
             }),
         ),
         (
             "host_setup",
-            attributes.host_setup.map_or(JsonValue::Null, |value| {
-                JsonValue::String(value.as_str().to_owned())
-            }),
+            attributes
+                .host_setup_kind()
+                .map_or(JsonValue::Null, |value| {
+                    JsonValue::String(value.as_str().to_owned())
+                }),
         ),
     ])
 }
@@ -193,16 +249,21 @@ fn attributes(value: &JsonValue) -> Result<WorkContextAttributes, WorkContextApi
         Some(JsonValue::String(value)) => Some(HostSetupKind::parse(value)?),
         _ => return Err(WorkContextApiError::InvalidBody),
     };
-    Ok(WorkContextAttributes {
-        host_setup,
-        checkout,
-    })
+    match (host_setup, checkout) {
+        (None, None) => Ok(WorkContextAttributes::EMPTY),
+        (Some(kind), None) => Ok(WorkContextAttributes::host_setup(kind)),
+        (None, Some(kind)) => Ok(WorkContextAttributes::checkout(kind)),
+        (Some(_), Some(_)) => Err(WorkContextApiError::InvalidBody),
+    }
 }
 
 fn relation_json(relation: &WorkContextRelation) -> JsonValue {
     object(vec![
-        ("kind", JsonValue::String(relation.kind.as_str().to_owned())),
-        ("target", identity_json(&relation.target)),
+        (
+            "kind",
+            JsonValue::String(relation.kind().as_str().to_owned()),
+        ),
+        ("target", identity_json(relation.target())),
     ])
 }
 
@@ -221,18 +282,21 @@ fn relation(value: &JsonValue) -> Result<WorkContextRelation, WorkContextApiErro
 
 fn record_json(record: &WorkContextRecord) -> Result<JsonValue, WorkContextApiError> {
     Ok(object(vec![
-        ("attributes", attributes_json(record.attributes)),
-        ("identity", identity_json(&record.identity)),
-        ("label", JsonValue::String(record.label.as_str().to_owned())),
+        ("attributes", attributes_json(record.attributes())),
+        ("identity", identity_json(record.identity())),
+        (
+            "label",
+            JsonValue::String(record.label().as_str().to_owned()),
+        ),
         (
             "lifecycle",
-            JsonValue::String(record.lifecycle.as_str().to_owned()),
+            JsonValue::String(record.lifecycle().as_str().to_owned()),
         ),
         (
             "relations",
-            JsonValue::Array(record.relations.iter().map(relation_json).collect()),
+            JsonValue::Array(record.relations().iter().map(relation_json).collect()),
         ),
-        ("revision", integer(record.revision.get(), "revision")?),
+        ("revision", integer(record.revision().get(), "revision")?),
     ]))
 }
 
@@ -252,6 +316,9 @@ fn record(value: &JsonValue) -> Result<WorkContextRecord, WorkContextApiError> {
         .iter()
         .map(relation)
         .collect::<Result<Vec<_>, _>>()?;
+    if !relations.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err(WorkContextError::RelationOrderInvalid.into());
+    }
     WorkContextRecord::new(
         identity(
             value
@@ -280,11 +347,93 @@ fn admitted_document(bytes: &[u8], ceiling: usize) -> Result<JsonValue, WorkCont
     parse_canonical(bytes).map_err(Into::into)
 }
 
+pub fn encode_platform_version_offer(
+    offer: &PlatformVersionOffer,
+) -> Result<Vec<u8>, WorkContextApiError> {
+    let value = object(vec![
+        (
+            "schema",
+            JsonValue::String(PLATFORM_NEGOTIATION_SCHEMA_V1.to_owned()),
+        ),
+        (
+            "versions",
+            JsonValue::Array(
+                offer
+                    .versions()
+                    .iter()
+                    .map(|version| JsonValue::Integer(i64::from(version.number())))
+                    .collect(),
+            ),
+        ),
+    ]);
+    Ok(value.to_canonical_bytes())
+}
+
+pub fn decode_platform_version_offer(
+    bytes: &[u8],
+) -> Result<PlatformVersionOffer, WorkContextApiError> {
+    let value = admitted_document(bytes, MAX_PLATFORM_NEGOTIATION_CANONICAL_BYTES)?;
+    exact_fields(&value, &["schema", "versions"])?;
+    if string(&value, "schema")? != PLATFORM_NEGOTIATION_SCHEMA_V1 {
+        return Err(WorkContextApiError::InvalidBody);
+    }
+    PlatformVersionOffer::new(
+        array(&value, "versions")?
+            .iter()
+            .map(|value| {
+                let JsonValue::Integer(value) = value else {
+                    return Err(WorkContextApiError::InvalidBody);
+                };
+                let number = u16::try_from(*value)
+                    .map_err(|_| WorkContextApiError::CounterOutOfRange { field: "versions" })?;
+                PlatformVersion::from_number(number).map_err(Into::into)
+            })
+            .collect::<Result<Vec<_>, WorkContextApiError>>()?,
+    )
+    .map_err(Into::into)
+}
+
+pub fn encode_negotiated_platform(
+    negotiated: &NegotiatedPlatform,
+) -> Result<Vec<u8>, WorkContextApiError> {
+    let value = object(vec![
+        ("schema", JsonValue::String(negotiated.schema().to_owned())),
+        (
+            "version",
+            JsonValue::Integer(i64::from(negotiated.version().number())),
+        ),
+        (
+            "work_context",
+            JsonValue::String(negotiated.work_context().as_str().to_owned()),
+        ),
+    ]);
+    Ok(value.to_canonical_bytes())
+}
+
+pub fn decode_negotiated_platform(bytes: &[u8]) -> Result<NegotiatedPlatform, WorkContextApiError> {
+    let value = admitted_document(bytes, MAX_PLATFORM_NEGOTIATION_CANONICAL_BYTES)?;
+    exact_fields(&value, &["schema", "version", "work_context"])?;
+    let version = PlatformVersion::from_number(
+        u16::try_from(unsigned(&value, "version")?)
+            .map_err(|_| WorkContextApiError::CounterOutOfRange { field: "version" })?,
+    )?;
+    NegotiatedPlatform::new(
+        version,
+        match string(&value, "schema")? {
+            crate::platform::PLATFORM_SCHEMA_V1 => crate::platform::PLATFORM_SCHEMA_V1,
+            PLATFORM_SCHEMA_V2 => PLATFORM_SCHEMA_V2,
+            _ => return Err(WorkContextApiError::InvalidBody),
+        },
+        WorkContextAvailability::parse(string(&value, "work_context")?)?,
+    )
+    .map_err(Into::into)
+}
+
 pub fn encode_work_context_query(query: &WorkContextQuery) -> Result<Vec<u8>, WorkContextApiError> {
     let value = object(vec![
         (
             "after",
-            optional_json(query.after.as_ref(), |value| {
+            optional_json(query.after(), |value| {
                 JsonValue::String(value.as_str().to_owned())
             }),
         ),
@@ -292,7 +441,7 @@ pub fn encode_work_context_query(query: &WorkContextQuery) -> Result<Vec<u8>, Wo
             "kinds",
             JsonValue::Array(
                 query
-                    .kinds
+                    .kinds()
                     .iter()
                     .map(|value| JsonValue::String(value.as_str().to_owned()))
                     .collect(),
@@ -302,20 +451,17 @@ pub fn encode_work_context_query(query: &WorkContextQuery) -> Result<Vec<u8>, Wo
             "lifecycles",
             JsonValue::Array(
                 query
-                    .lifecycles
+                    .lifecycles()
                     .iter()
                     .map(|value| JsonValue::String(value.as_str().to_owned()))
                     .collect(),
             ),
         ),
-        ("limit", integer(u64::from(query.limit), "limit")?),
-        (
-            "parent",
-            optional_json(query.parent.as_ref(), identity_json),
-        ),
+        ("limit", integer(u64::from(query.limit()), "limit")?),
+        ("parent", optional_json(query.parent(), identity_json)),
         (
             "project",
-            optional_json(query.project.as_ref(), |value| {
+            optional_json(query.project(), |value| {
                 JsonValue::String(value.as_str().to_owned())
             }),
         ),
@@ -385,15 +531,15 @@ pub fn encode_work_context_page(page: &WorkContextPage) -> Result<Vec<u8>, WorkC
     let value = object(vec![
         (
             "after",
-            optional_json(page.after.as_ref(), |value| {
+            optional_json(page.after(), |value| {
                 JsonValue::String(value.as_str().to_owned())
             }),
         ),
-        ("has_more", JsonValue::Bool(page.has_more)),
+        ("has_more", JsonValue::Bool(page.has_more())),
         (
             "items",
             JsonValue::Array(
-                page.items
+                page.items()
                     .iter()
                     .map(record_json)
                     .collect::<Result<Vec<_>, _>>()?,
@@ -401,13 +547,13 @@ pub fn encode_work_context_page(page: &WorkContextPage) -> Result<Vec<u8>, WorkC
         ),
         (
             "next_cursor",
-            optional_json(page.next_cursor.as_ref(), |value| {
+            optional_json(page.next_cursor(), |value| {
                 JsonValue::String(value.as_str().to_owned())
             }),
         ),
         (
             "requested_limit",
-            integer(u64::from(page.requested_limit), "requested_limit")?,
+            integer(u64::from(page.requested_limit()), "requested_limit")?,
         ),
         ("schema", JsonValue::String(PLATFORM_SCHEMA_V2.to_owned())),
     ]);
@@ -450,4 +596,32 @@ pub fn decode_work_context_page(bytes: &[u8]) -> Result<WorkContextPage, WorkCon
             .collect::<Result<Vec<_>, _>>()?,
     )
     .map_err(Into::into)
+}
+
+pub fn encode_work_context_resync(
+    resync: &WorkContextResync,
+) -> Result<Vec<u8>, WorkContextApiError> {
+    Ok(object(vec![
+        (
+            "expired_after",
+            JsonValue::String(resync.expired_after().as_str().to_owned()),
+        ),
+        ("outcome", JsonValue::String("resync_required".to_owned())),
+        ("schema", JsonValue::String(PLATFORM_SCHEMA_V2.to_owned())),
+    ])
+    .to_canonical_bytes())
+}
+
+pub fn decode_work_context_resync(bytes: &[u8]) -> Result<WorkContextResync, WorkContextApiError> {
+    let value = admitted_document(bytes, MAX_WORK_CONTEXT_QUERY_CANONICAL_BYTES)?;
+    exact_fields(&value, &["expired_after", "outcome", "schema"])?;
+    if string(&value, "outcome")? != "resync_required"
+        || string(&value, "schema")? != PLATFORM_SCHEMA_V2
+    {
+        return Err(WorkContextApiError::InvalidBody);
+    }
+    Ok(WorkContextResync::new(
+        WorkContextCursor::new(string(&value, "expired_after")?.to_owned())
+            .map_err(WorkContextError::Field)?,
+    ))
 }

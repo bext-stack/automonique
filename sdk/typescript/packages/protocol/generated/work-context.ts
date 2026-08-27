@@ -9,8 +9,11 @@
 // Rust is the wire source of truth. Hand-written SDK code may add
 // ergonomics; it may not redefine anything in this file.
 
-import {PLATFORM_SCHEMA_V1} from "./platform.js";
-import {ValidationError, byteLength, isWellFormedUnicode} from "./runtime.js";
+import {PLATFORM_SCHEMA_V1, ResourceId, decodeResourceAuthority, decodeResourceKind, type ResourceCoordinate} from "./platform.js";
+import {RefusalError, ValidationError, bodyArray, bodyBool, bodyInteger, bodyString, bodyStringOrNull, bodyValue, bodyValueOrNull, byteLength, exactFields, exactInputFields, isWellFormedUnicode, parseCanonical, toCanonicalBytes, type JsonValue} from "./runtime.js";
+
+/** Maximum canonical version-negotiation document bytes. */
+export const MAX_PLATFORM_NEGOTIATION_CANONICAL_BYTES = 4096;
 
 /** Highest Platform major version this contract negotiates. */
 export const MAX_PLATFORM_VERSION = 2;
@@ -18,8 +21,14 @@ export const MAX_PLATFORM_VERSION = 2;
 /** Maximum advertised Platform protocol versions. */
 export const MAX_PLATFORM_VERSION_OFFERS = 8;
 
+/** Maximum canonical work-context page bytes. */
+export const MAX_WORK_CONTEXT_PAGE_CANONICAL_BYTES = 524288;
+
 /** Maximum records returned by one filtered page. */
 export const MAX_WORK_CONTEXT_PAGE_ITEMS = 128;
+
+/** Maximum canonical work-context query bytes. */
+export const MAX_WORK_CONTEXT_QUERY_CANONICAL_BYTES = 16384;
 
 /** Maximum structured relations carried by one record. */
 export const MAX_WORK_CONTEXT_RELATIONS = 16;
@@ -27,8 +36,29 @@ export const MAX_WORK_CONTEXT_RELATIONS = 16;
 /** Lowest Platform major version this contract negotiates. */
 export const MIN_PLATFORM_VERSION = 1;
 
+/** Stable version-negotiation document schema identifier. */
+export const PLATFORM_NEGOTIATION_SCHEMA_V1 = "automonique.platform/negotiation/v1";
+
 /** Stable version-two work-context schema identifier. */
 export const PLATFORM_SCHEMA_V2 = "automonique.platform/v2";
+
+/** Platform v1 resource-authority declaration order. */
+export const V1_RESOURCE_AUTHORITY_WIRE_ORDER: readonly string[] = ["ai_operations", "automonique", "github", "provider", "client"];
+
+/** Platform v1 resource-kind declaration order. */
+export const V1_RESOURCE_KIND_WIRE_ORDER: readonly string[] = ["job", "release", "node", "run", "session", "approval", "sandbox", "credential", "repository", "issue", "pull_request", "workflow", "provider_account", "model", "client", "control_lease", "receipt"];
+
+/** Canonical work-context kind set order. */
+export const WORK_CONTEXT_KIND_WIRE_ORDER: readonly string[] = ["project", "host_setup", "checkout", "user_workspace", "attempt_workspace", "session", "pane"];
+
+/** Canonical lifecycle filter order. */
+export const WORK_CONTEXT_LIFECYCLE_WIRE_ORDER: readonly string[] = ["active", "archived", "preparing", "running", "hibernated", "completed", "failed", "cancelled", "closed"];
+
+/** Canonical structured relation order. */
+export const WORK_CONTEXT_RELATION_KIND_WIRE_ORDER: readonly string[] = ["project_repository", "host_setup_project", "checkout_project", "checkout_host_setup", "checkout_repository", "user_workspace_project", "user_workspace_checkout", "attempt_user_workspace", "session_attempt_workspace", "session_platform_session", "pane_session"];
+
+/** Canonical relation target identity order. */
+export const WORK_CONTEXT_TARGET_KIND_WIRE_ORDER: readonly string[] = ["project", "host_setup", "checkout", "user_workspace", "attempt_workspace", "session", "pane", "repository", "platform_session"];
 
 /** Branded identifier, at most 256 UTF-8 bytes. */
 export type AttemptWorkspaceId = string & {readonly __brand: "AttemptWorkspaceId"};
@@ -79,18 +109,6 @@ export function PaneId(value: string): PaneId {
 }
 
 /** Branded identifier, at most 256 UTF-8 bytes. */
-export type PlatformSessionId = string & {readonly __brand: "PlatformSessionId"};
-export const PlatformSessionId_MAX_BYTES = 256;
-export const PlatformSessionId_PATTERN = /^[^\p{Cc}]+$/u;
-export function PlatformSessionId(value: string): PlatformSessionId {
-  if (value.length === 0) throw new ValidationError("PlatformSessionId", "empty");
-  if (!isWellFormedUnicode(value)) throw new ValidationError("PlatformSessionId", "invalid_character");
-  if (byteLength(value) > 256) throw new ValidationError("PlatformSessionId", "too_long");
-  if (!PlatformSessionId_PATTERN.test(value)) throw new ValidationError("PlatformSessionId", "invalid_character");
-  return value as PlatformSessionId;
-}
-
-/** Branded identifier, at most 256 UTF-8 bytes. */
 export type ProjectId = string & {readonly __brand: "ProjectId"};
 export const ProjectId_MAX_BYTES = 256;
 export const ProjectId_PATTERN = /^[^\p{Cc}]+$/u;
@@ -124,18 +142,6 @@ export function WorkContextCursor(value: string): WorkContextCursor {
   if (byteLength(value) > 256) throw new ValidationError("WorkContextCursor", "too_long");
   if (!WorkContextCursor_PATTERN.test(value)) throw new ValidationError("WorkContextCursor", "invalid_character");
   return value as WorkContextCursor;
-}
-
-/** Branded identifier, at most 256 UTF-8 bytes. */
-export type WorkContextRepositoryId = string & {readonly __brand: "WorkContextRepositoryId"};
-export const WorkContextRepositoryId_MAX_BYTES = 256;
-export const WorkContextRepositoryId_PATTERN = /^[^\p{Cc}]+$/u;
-export function WorkContextRepositoryId(value: string): WorkContextRepositoryId {
-  if (value.length === 0) throw new ValidationError("WorkContextRepositoryId", "empty");
-  if (!isWellFormedUnicode(value)) throw new ValidationError("WorkContextRepositoryId", "invalid_character");
-  if (byteLength(value) > 256) throw new ValidationError("WorkContextRepositoryId", "too_long");
-  if (!WorkContextRepositoryId_PATTERN.test(value)) throw new ValidationError("WorkContextRepositoryId", "invalid_character");
-  return value as WorkContextRepositoryId;
 }
 
 /** Branded identifier, at most 256 UTF-8 bytes. */
@@ -209,6 +215,16 @@ export function decodeHostSetupKind(value: string): HostSetupKind {
   return value as HostSetupKind;
 }
 
+export type WorkContextAvailability = "v1_existing_resources_only" | "v2_structured";
+export const WorkContextAvailability_VALUES: readonly WorkContextAvailability[] = ["v1_existing_resources_only", "v2_structured"];
+/** Security-sensitive: an undefined value is refused. */
+export function decodeWorkContextAvailability(value: string): WorkContextAvailability {
+  if (!(WorkContextAvailability_VALUES as readonly string[]).includes(value)) {
+    throw new ValidationError("WorkContextAvailability", "unknown_enum_value");
+  }
+  return value as WorkContextAvailability;
+}
+
 export type WorkContextKind = "attempt_workspace" | "checkout" | "host_setup" | "pane" | "project" | "session" | "user_workspace";
 export const WorkContextKind_VALUES: readonly WorkContextKind[] = ["attempt_workspace", "checkout", "host_setup", "pane", "project", "session", "user_workspace"];
 /** Security-sensitive: an undefined value is refused. */
@@ -254,9 +270,9 @@ export type WorkContextIdentity =
   | {readonly kind: "checkout"; readonly id: CheckoutId}
   | {readonly kind: "host_setup"; readonly id: HostSetupId}
   | {readonly kind: "pane"; readonly id: PaneId}
-  | {readonly kind: "platform_session"; readonly id: PlatformSessionId}
+  | {readonly kind: "platform_session"; readonly resource: ResourceCoordinate}
   | {readonly kind: "project"; readonly id: ProjectId}
-  | {readonly kind: "repository"; readonly id: WorkContextRepositoryId}
+  | {readonly kind: "repository"; readonly resource: ResourceCoordinate}
   | {readonly kind: "session"; readonly id: WorkSessionId}
   | {readonly kind: "user_workspace"; readonly id: UserWorkspaceId};
 
@@ -268,7 +284,7 @@ export function assertNeverWorkContextIdentity(value: never): never {
 export interface NegotiatedPlatform {
   readonly schema: typeof PLATFORM_SCHEMA_V1 | typeof PLATFORM_SCHEMA_V2;
   readonly version: PlatformVersionNumber;
-  readonly work_context: boolean;
+  readonly work_context: WorkContextAvailability;
 }
 export const NegotiatedPlatform_FIELDS: readonly string[] = [
   "schema",
@@ -278,9 +294,11 @@ export const NegotiatedPlatform_FIELDS: readonly string[] = [
 
 /** Bounded set of Platform versions supported by one peer. */
 export interface PlatformVersionOffer {
+  readonly schema: typeof PLATFORM_NEGOTIATION_SCHEMA_V1;
   readonly versions: readonly PlatformVersionNumber[];
 }
 export const PlatformVersionOffer_FIELDS: readonly string[] = [
+  "schema",
   "versions",
 ];
 
@@ -359,3 +377,502 @@ export const WorkContextRelation_FIELDS: readonly string[] = [
   "kind",
   "target",
 ];
+
+/** Explicit replacement outcome for an expired or filter-mismatched cursor. */
+export interface WorkContextResync {
+  readonly expired_after: WorkContextCursor;
+  readonly outcome: "resync_required";
+  readonly schema: typeof PLATFORM_SCHEMA_V2;
+}
+export const WorkContextResync_FIELDS: readonly string[] = [
+  "expired_after",
+  "outcome",
+  "schema",
+];
+
+
+const WORK_CONTEXT_INVALID_BODY = "work_context_invalid_body";
+const WORK_CONTEXT_VALUE_INVALID = "work_context_value_invalid";
+
+function workContextRefusal(detail: string): never {
+  throw new RefusalError(WORK_CONTEXT_VALUE_INVALID, detail);
+}
+
+function object(entries: readonly (readonly [string, JsonValue])[]): JsonValue {
+  return {kind: "object", entries};
+}
+
+function exactInput(value: object, fields: readonly string[]): void {
+  exactInputFields(value as Readonly<Record<string, unknown>>, fields, WORK_CONTEXT_INVALID_BODY);
+}
+
+function parseDocument(payload: Uint8Array, maximum: number): JsonValue {
+  if (payload.length > maximum) {
+    throw new RefusalError("frame_too_large", `canonical document is ${payload.length} bytes; maximum is ${maximum}`);
+  }
+  return parseCanonical(payload);
+}
+
+function objectKind(value: JsonValue): string {
+  if (value.kind !== "object") throw new RefusalError(WORK_CONTEXT_INVALID_BODY, "identity is not an object");
+  const fields = new Map<string, JsonValue>();
+  for (const [key, entry] of value.entries) {
+    if (fields.has(key)) throw new RefusalError(WORK_CONTEXT_INVALID_BODY, `duplicate field ${key}`);
+    fields.set(key, entry);
+  }
+  const kind = fields.get("kind");
+  if (kind?.kind !== "string") throw new RefusalError(WORK_CONTEXT_INVALID_BODY, "kind is not a string");
+  return kind.value;
+}
+
+function orderIndex(order: readonly string[], value: string): number {
+  const index = order.indexOf(value);
+  if (index < 0) workContextRefusal(`undefined ordering value ${value}`);
+  return index;
+}
+
+function strictlyOrdered<T>(values: readonly T[], key: (value: T) => string): boolean {
+  return values.every((value, index) => index === 0 || key(values[index - 1]!) < key(value));
+}
+
+function validateV1Coordinate(value: ResourceCoordinate, expected: "repository" | "session"): ResourceCoordinate {
+  exactInput(value, ["authority", "id", "kind"]);
+  const authority = decodeResourceAuthority(value.authority);
+  const kind = decodeResourceKind(value.kind);
+  const id = ResourceId(value.id);
+  if (kind !== expected) workContextRefusal(`v1 relation target must be ${expected}`);
+  return {authority, id, kind};
+}
+
+function decodeV1Coordinate(value: JsonValue, expected: "repository" | "session"): ResourceCoordinate {
+  const fields = exactFields(value, ["authority", "id", "kind"], WORK_CONTEXT_INVALID_BODY);
+  return validateV1Coordinate({
+    authority: decodeResourceAuthority(bodyString(fields, "authority", WORK_CONTEXT_INVALID_BODY)),
+    id: ResourceId(bodyString(fields, "id", WORK_CONTEXT_INVALID_BODY)),
+    kind: decodeResourceKind(bodyString(fields, "kind", WORK_CONTEXT_INVALID_BODY)),
+  }, expected);
+}
+
+function v1CoordinateJson(value: ResourceCoordinate): JsonValue {
+  return object([
+    ["authority", {kind: "string", value: value.authority}],
+    ["id", {kind: "string", value: value.id}],
+    ["kind", {kind: "string", value: value.kind}],
+  ]);
+}
+
+export function validateWorkContextIdentity(value: WorkContextIdentity): WorkContextIdentity {
+  switch (value.kind) {
+    case "attempt_workspace": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: AttemptWorkspaceId(value.id)};
+    case "checkout": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: CheckoutId(value.id)};
+    case "host_setup": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: HostSetupId(value.id)};
+    case "pane": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: PaneId(value.id)};
+    case "project": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: ProjectId(value.id)};
+    case "session": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: WorkSessionId(value.id)};
+    case "user_workspace": exactInput(value, ["id", "kind"]); return {kind: value.kind, id: UserWorkspaceId(value.id)};
+    case "repository": exactInput(value, ["kind", "resource"]); return {kind: value.kind, resource: validateV1Coordinate(value.resource, "repository")};
+    case "platform_session": exactInput(value, ["kind", "resource"]); return {kind: value.kind, resource: validateV1Coordinate(value.resource, "session")};
+    default: return assertNeverWorkContextIdentity(value);
+  }
+}
+
+function decodeWorkContextIdentityValue(value: JsonValue): WorkContextIdentity {
+  const kind = decodeWorkContextTargetKind(objectKind(value));
+  if (kind === "repository" || kind === "platform_session") {
+    const fields = exactFields(value, ["kind", "resource"], WORK_CONTEXT_INVALID_BODY);
+    return validateWorkContextIdentity({
+      kind,
+      resource: decodeV1Coordinate(bodyValue(fields, "resource", WORK_CONTEXT_INVALID_BODY), kind === "repository" ? "repository" : "session"),
+    });
+  }
+  const fields = exactFields(value, ["id", "kind"], WORK_CONTEXT_INVALID_BODY);
+  const id = bodyString(fields, "id", WORK_CONTEXT_INVALID_BODY);
+  switch (kind) {
+    case "attempt_workspace": return {kind, id: AttemptWorkspaceId(id)};
+    case "checkout": return {kind, id: CheckoutId(id)};
+    case "host_setup": return {kind, id: HostSetupId(id)};
+    case "pane": return {kind, id: PaneId(id)};
+    case "project": return {kind, id: ProjectId(id)};
+    case "session": return {kind, id: WorkSessionId(id)};
+    case "user_workspace": return {kind, id: UserWorkspaceId(id)};
+    default: workContextRefusal(`relation-only identity ${kind} was decoded without a coordinate`);
+  }
+}
+
+function workContextIdentityJson(value: WorkContextIdentity): JsonValue {
+  const identity = validateWorkContextIdentity(value);
+  if (identity.kind === "repository" || identity.kind === "platform_session") {
+    return object([
+      ["kind", {kind: "string", value: identity.kind}],
+      ["resource", v1CoordinateJson(identity.resource)],
+    ]);
+  }
+  return object([
+    ["id", {kind: "string", value: identity.id}],
+    ["kind", {kind: "string", value: identity.kind}],
+  ]);
+}
+
+function identityOrderKey(identity: WorkContextIdentity): string {
+  const target = orderIndex(WORK_CONTEXT_TARGET_KIND_WIRE_ORDER, identity.kind).toString().padStart(2, "0");
+  if (identity.kind === "repository" || identity.kind === "platform_session") {
+    return `${target}\0${orderIndex(V1_RESOURCE_AUTHORITY_WIRE_ORDER, identity.resource.authority).toString().padStart(2, "0")}\0${orderIndex(V1_RESOURCE_KIND_WIRE_ORDER, identity.resource.kind).toString().padStart(2, "0")}\0${identity.resource.id}`;
+  }
+  return `${target}\0${identity.id}`;
+}
+
+function relationSource(kind: WorkContextRelationKind): WorkContextKind {
+  switch (kind) {
+    case "project_repository": return "project";
+    case "host_setup_project": return "host_setup";
+    case "checkout_project":
+    case "checkout_host_setup":
+    case "checkout_repository": return "checkout";
+    case "user_workspace_project":
+    case "user_workspace_checkout": return "user_workspace";
+    case "attempt_user_workspace": return "attempt_workspace";
+    case "session_attempt_workspace":
+    case "session_platform_session": return "session";
+    case "pane_session": return "pane";
+  }
+}
+
+function relationTarget(kind: WorkContextRelationKind): WorkContextTargetKind {
+  switch (kind) {
+    case "project_repository":
+    case "checkout_repository": return "repository";
+    case "host_setup_project":
+    case "checkout_project":
+    case "user_workspace_project": return "project";
+    case "checkout_host_setup": return "host_setup";
+    case "user_workspace_checkout": return "checkout";
+    case "attempt_user_workspace": return "user_workspace";
+    case "session_attempt_workspace": return "attempt_workspace";
+    case "session_platform_session": return "platform_session";
+    case "pane_session": return "session";
+  }
+}
+
+export function validateWorkContextRelation(value: WorkContextRelation): WorkContextRelation {
+  exactInput(value, ["kind", "target"]);
+  const kind = decodeWorkContextRelationKind(value.kind);
+  const target = validateWorkContextIdentity(value.target);
+  if (target.kind !== relationTarget(kind)) workContextRefusal("relation target kind is invalid");
+  return {kind, target};
+}
+
+function decodeWorkContextRelationValue(value: JsonValue): WorkContextRelation {
+  const fields = exactFields(value, ["kind", "target"], WORK_CONTEXT_INVALID_BODY);
+  return validateWorkContextRelation({
+    kind: decodeWorkContextRelationKind(bodyString(fields, "kind", WORK_CONTEXT_INVALID_BODY)),
+    target: decodeWorkContextIdentityValue(bodyValue(fields, "target", WORK_CONTEXT_INVALID_BODY)),
+  });
+}
+
+function relationJson(value: WorkContextRelation): JsonValue {
+  const relation = validateWorkContextRelation(value);
+  return object([
+    ["kind", {kind: "string", value: relation.kind}],
+    ["target", workContextIdentityJson(relation.target)],
+  ]);
+}
+
+function relationOrderKey(value: WorkContextRelation): string {
+  return `${orderIndex(WORK_CONTEXT_RELATION_KIND_WIRE_ORDER, value.kind).toString().padStart(2, "0")}\0${identityOrderKey(value.target)}`;
+}
+
+function validateWorkContextAttributes(value: WorkContextAttributes): WorkContextAttributes {
+  exactInput(value, ["checkout", "host_setup"]);
+  const checkout = value.checkout === null ? null : decodeCheckoutKind(value.checkout);
+  const host_setup = value.host_setup === null ? null : decodeHostSetupKind(value.host_setup);
+  if (checkout !== null && host_setup !== null) workContextRefusal("work-context attributes name two kinds");
+  return {checkout, host_setup};
+}
+
+function decodeWorkContextAttributes(value: JsonValue): WorkContextAttributes {
+  const fields = exactFields(value, ["checkout", "host_setup"], WORK_CONTEXT_INVALID_BODY);
+  const checkout = bodyStringOrNull(fields, "checkout", WORK_CONTEXT_INVALID_BODY);
+  const host_setup = bodyStringOrNull(fields, "host_setup", WORK_CONTEXT_INVALID_BODY);
+  return validateWorkContextAttributes({
+    checkout: checkout === null ? null : decodeCheckoutKind(checkout),
+    host_setup: host_setup === null ? null : decodeHostSetupKind(host_setup),
+  });
+}
+
+function attributesJson(value: WorkContextAttributes): JsonValue {
+  const attributes = validateWorkContextAttributes(value);
+  return object([
+    ["checkout", attributes.checkout === null ? {kind: "null"} : {kind: "string", value: attributes.checkout}],
+    ["host_setup", attributes.host_setup === null ? {kind: "null"} : {kind: "string", value: attributes.host_setup}],
+  ]);
+}
+
+function lifecycleAllowed(kind: WorkContextKind, lifecycle: WorkContextLifecycle): boolean {
+  switch (kind) {
+    case "project":
+    case "host_setup":
+    case "checkout":
+    case "user_workspace": return lifecycle === "active" || lifecycle === "archived";
+    case "attempt_workspace": return ["preparing", "running", "hibernated", "completed", "failed", "cancelled"].includes(lifecycle);
+    case "session": return ["active", "hibernated", "completed", "failed", "cancelled"].includes(lifecycle);
+    case "pane": return lifecycle === "active" || lifecycle === "closed";
+  }
+}
+
+function requiredRelations(kind: WorkContextKind): readonly WorkContextRelationKind[] {
+  switch (kind) {
+    case "project": return [];
+    case "host_setup": return ["host_setup_project"];
+    case "checkout": return ["checkout_project", "checkout_host_setup", "checkout_repository"];
+    case "user_workspace": return ["user_workspace_project", "user_workspace_checkout"];
+    case "attempt_workspace": return ["attempt_user_workspace"];
+    case "session": return ["session_attempt_workspace", "session_platform_session"];
+    case "pane": return ["pane_session"];
+  }
+}
+
+export function validateWorkContextRecord(value: WorkContextRecord): WorkContextRecord {
+  exactInput(value, ["attributes", "identity", "label", "lifecycle", "relations", "revision"]);
+  const identity = validateWorkContextIdentity(value.identity);
+  if (identity.kind === "repository" || identity.kind === "platform_session") workContextRefusal("relation-only identity cannot be a record");
+  const kind = decodeWorkContextKind(identity.kind);
+  const lifecycle = decodeWorkContextLifecycle(value.lifecycle);
+  if (!lifecycleAllowed(kind, lifecycle)) workContextRefusal("lifecycle is invalid for work-context kind");
+  const label = WorkContextLabel(value.label);
+  const revision = WorkContextRevision(value.revision);
+  const attributes = validateWorkContextAttributes(value.attributes);
+  if (kind === "host_setup") {
+    if (attributes.host_setup === null || attributes.checkout !== null) workContextRefusal("host setup attributes are invalid");
+  } else if (kind === "checkout") {
+    if (attributes.checkout === null || attributes.host_setup !== null) workContextRefusal("checkout attributes are invalid");
+  } else if (attributes.checkout !== null || attributes.host_setup !== null) {
+    workContextRefusal("attributes are invalid for work-context kind");
+  }
+  if (!Array.isArray(value.relations) || value.relations.length > MAX_WORK_CONTEXT_RELATIONS) workContextRefusal("work-context relation limit exceeded");
+  const relations = value.relations.map(validateWorkContextRelation);
+  if (!strictlyOrdered(relations, relationOrderKey)) workContextRefusal("work-context relations are duplicated or unordered");
+  if (relations.some((relation) => relationSource(relation.kind) !== kind)) workContextRefusal("relation source kind is invalid");
+  const required = requiredRelations(kind);
+  for (const relationKind of WORK_CONTEXT_RELATION_KIND_WIRE_ORDER) {
+    const count = relations.filter((relation) => relation.kind === relationKind).length;
+    if (kind === "project" && relationKind === "project_repository") continue;
+    if (required.includes(relationKind as WorkContextRelationKind)) {
+      if (count !== 1) workContextRefusal("required relation is missing or repeated");
+    } else if (count !== 0) {
+      workContextRefusal("relation is invalid for source kind");
+    }
+  }
+  return {attributes, identity, label, lifecycle, relations, revision};
+}
+
+function decodeWorkContextRecordValue(value: JsonValue): WorkContextRecord {
+  const fields = exactFields(value, WorkContextRecord_FIELDS, WORK_CONTEXT_INVALID_BODY);
+  return validateWorkContextRecord({
+    attributes: decodeWorkContextAttributes(bodyValue(fields, "attributes", WORK_CONTEXT_INVALID_BODY)),
+    identity: decodeWorkContextIdentityValue(bodyValue(fields, "identity", WORK_CONTEXT_INVALID_BODY)),
+    label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)),
+    lifecycle: decodeWorkContextLifecycle(bodyString(fields, "lifecycle", WORK_CONTEXT_INVALID_BODY)),
+    relations: bodyArray(fields, "relations", WORK_CONTEXT_INVALID_BODY, MAX_WORK_CONTEXT_RELATIONS, WORK_CONTEXT_VALUE_INVALID).map(decodeWorkContextRelationValue),
+    revision: WorkContextRevision(bodyInteger(fields, "revision", WORK_CONTEXT_INVALID_BODY)),
+  });
+}
+
+function recordJson(value: WorkContextRecord): JsonValue {
+  const record = validateWorkContextRecord(value);
+  return object([
+    ["attributes", attributesJson(record.attributes)],
+    ["identity", workContextIdentityJson(record.identity)],
+    ["label", {kind: "string", value: record.label}],
+    ["lifecycle", {kind: "string", value: record.lifecycle}],
+    ["relations", {kind: "array", items: record.relations.map(relationJson)}],
+    ["revision", {kind: "integer", value: record.revision}],
+  ]);
+}
+
+function strictEnumOrder(values: readonly string[], order: readonly string[]): boolean {
+  return strictlyOrdered(values, (value) => orderIndex(order, value).toString().padStart(2, "0"));
+}
+
+export function validatePlatformVersionOffer(value: PlatformVersionOffer): PlatformVersionOffer {
+  exactInput(value, PlatformVersionOffer_FIELDS);
+  if (value.schema !== PLATFORM_NEGOTIATION_SCHEMA_V1) workContextRefusal("negotiation schema is incompatible");
+  if (!Array.isArray(value.versions) || value.versions.length === 0 || value.versions.length > MAX_PLATFORM_VERSION_OFFERS) workContextRefusal("platform version offer is invalid");
+  const versions = value.versions.map(PlatformVersionNumber);
+  if (!versions.every((version, index) => index === 0 || versions[index - 1]! < version)) workContextRefusal("platform versions are repeated or unordered");
+  return {schema: PLATFORM_NEGOTIATION_SCHEMA_V1, versions};
+}
+
+export function encodePlatformVersionOffer(value: PlatformVersionOffer): Uint8Array {
+  const offer = validatePlatformVersionOffer(value);
+  const bytes = toCanonicalBytes(object([
+    ["schema", {kind: "string", value: offer.schema}],
+    ["versions", {kind: "array", items: offer.versions.map((version) => ({kind: "integer", value: version}))}],
+  ]));
+  if (bytes.length > MAX_PLATFORM_NEGOTIATION_CANONICAL_BYTES) throw new RefusalError("frame_too_large", "negotiation document exceeds its ceiling");
+  return bytes;
+}
+
+export function decodePlatformVersionOffer(payload: Uint8Array): PlatformVersionOffer {
+  const fields = exactFields(parseDocument(payload, MAX_PLATFORM_NEGOTIATION_CANONICAL_BYTES), PlatformVersionOffer_FIELDS, WORK_CONTEXT_INVALID_BODY);
+  const schema = bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY);
+  const versions = bodyArray(fields, "versions", WORK_CONTEXT_INVALID_BODY, MAX_PLATFORM_VERSION_OFFERS, WORK_CONTEXT_VALUE_INVALID).map((value) => {
+    if (value.kind !== "integer") throw new RefusalError(WORK_CONTEXT_INVALID_BODY, "version is not an integer");
+    return PlatformVersionNumber(value.value);
+  });
+  return validatePlatformVersionOffer({schema: schema as typeof PLATFORM_NEGOTIATION_SCHEMA_V1, versions});
+}
+
+export function validateNegotiatedPlatform(value: NegotiatedPlatform): NegotiatedPlatform {
+  exactInput(value, NegotiatedPlatform_FIELDS);
+  const version = PlatformVersionNumber(value.version);
+  const work_context = decodeWorkContextAvailability(value.work_context);
+  if (version === 1n) {
+    if (value.schema !== PLATFORM_SCHEMA_V1 || work_context !== "v1_existing_resources_only") workContextRefusal("v1 negotiation result is incoherent");
+    return {schema: PLATFORM_SCHEMA_V1, version, work_context};
+  }
+  if (value.schema !== PLATFORM_SCHEMA_V2 || work_context !== "v2_structured") workContextRefusal("v2 negotiation result is incoherent");
+  return {schema: PLATFORM_SCHEMA_V2, version, work_context};
+}
+
+export function encodeNegotiatedPlatform(value: NegotiatedPlatform): Uint8Array {
+  const negotiated = validateNegotiatedPlatform(value);
+  return toCanonicalBytes(object([
+    ["schema", {kind: "string", value: negotiated.schema}],
+    ["version", {kind: "integer", value: negotiated.version}],
+    ["work_context", {kind: "string", value: negotiated.work_context}],
+  ]));
+}
+
+export function decodeNegotiatedPlatform(payload: Uint8Array): NegotiatedPlatform {
+  const fields = exactFields(parseDocument(payload, MAX_PLATFORM_NEGOTIATION_CANONICAL_BYTES), NegotiatedPlatform_FIELDS, WORK_CONTEXT_INVALID_BODY);
+  return validateNegotiatedPlatform({
+    schema: bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY) as NegotiatedPlatform["schema"],
+    version: PlatformVersionNumber(bodyInteger(fields, "version", WORK_CONTEXT_INVALID_BODY)),
+    work_context: decodeWorkContextAvailability(bodyString(fields, "work_context", WORK_CONTEXT_INVALID_BODY)),
+  });
+}
+
+export function validateWorkContextQuery(value: WorkContextQuery): WorkContextQuery {
+  exactInput(value, WorkContextQuery_FIELDS);
+  if (value.schema !== PLATFORM_SCHEMA_V2) workContextRefusal("work-context query schema is incompatible");
+  if (!Array.isArray(value.kinds) || value.kinds.length === 0 || value.kinds.length > WORK_CONTEXT_KIND_WIRE_ORDER.length) workContextRefusal("work-context query kinds are invalid");
+  const kinds = value.kinds.map(decodeWorkContextKind);
+  if (!strictEnumOrder(kinds, WORK_CONTEXT_KIND_WIRE_ORDER)) workContextRefusal("work-context query kinds are repeated or unordered");
+  if (!Array.isArray(value.lifecycles) || value.lifecycles.length > WORK_CONTEXT_LIFECYCLE_WIRE_ORDER.length) workContextRefusal("work-context lifecycle filters are invalid");
+  const lifecycles = value.lifecycles.map(decodeWorkContextLifecycle);
+  if (lifecycles.length > 0 && !strictEnumOrder(lifecycles, WORK_CONTEXT_LIFECYCLE_WIRE_ORDER)) workContextRefusal("work-context lifecycle filters are repeated or unordered");
+  const after = value.after === null ? null : WorkContextCursor(value.after);
+  const parent = value.parent === null ? null : validateWorkContextIdentity(value.parent);
+  const project = value.project === null ? null : ProjectId(value.project);
+  const limit = WorkContextPageLimit(value.limit);
+  return {after, kinds, lifecycles, limit, parent, project, schema: PLATFORM_SCHEMA_V2};
+}
+
+function queryJson(value: WorkContextQuery): JsonValue {
+  const query = validateWorkContextQuery(value);
+  return object([
+    ["after", query.after === null ? {kind: "null"} : {kind: "string", value: query.after}],
+    ["kinds", {kind: "array", items: query.kinds.map((kind) => ({kind: "string", value: kind}))}],
+    ["lifecycles", {kind: "array", items: query.lifecycles.map((lifecycle) => ({kind: "string", value: lifecycle}))}],
+    ["limit", {kind: "integer", value: query.limit}],
+    ["parent", query.parent === null ? {kind: "null"} : workContextIdentityJson(query.parent)],
+    ["project", query.project === null ? {kind: "null"} : {kind: "string", value: query.project}],
+    ["schema", {kind: "string", value: query.schema}],
+  ]);
+}
+
+export function encodeWorkContextQuery(value: WorkContextQuery): Uint8Array {
+  const bytes = toCanonicalBytes(queryJson(value));
+  if (bytes.length > MAX_WORK_CONTEXT_QUERY_CANONICAL_BYTES) throw new RefusalError("frame_too_large", "work-context query exceeds its ceiling");
+  return bytes;
+}
+
+export function decodeWorkContextQuery(payload: Uint8Array): WorkContextQuery {
+  const fields = exactFields(parseDocument(payload, MAX_WORK_CONTEXT_QUERY_CANONICAL_BYTES), WorkContextQuery_FIELDS, WORK_CONTEXT_INVALID_BODY);
+  const after = bodyStringOrNull(fields, "after", WORK_CONTEXT_INVALID_BODY);
+  const project = bodyStringOrNull(fields, "project", WORK_CONTEXT_INVALID_BODY);
+  return validateWorkContextQuery({
+    after: after === null ? null : WorkContextCursor(after),
+    kinds: bodyArray(fields, "kinds", WORK_CONTEXT_INVALID_BODY, WORK_CONTEXT_KIND_WIRE_ORDER.length, WORK_CONTEXT_VALUE_INVALID).map((value) => {
+      if (value.kind !== "string") throw new RefusalError(WORK_CONTEXT_INVALID_BODY, "kind filter is not a string");
+      return decodeWorkContextKind(value.value);
+    }),
+    lifecycles: bodyArray(fields, "lifecycles", WORK_CONTEXT_INVALID_BODY, WORK_CONTEXT_LIFECYCLE_WIRE_ORDER.length, WORK_CONTEXT_VALUE_INVALID).map((value) => {
+      if (value.kind !== "string") throw new RefusalError(WORK_CONTEXT_INVALID_BODY, "lifecycle filter is not a string");
+      return decodeWorkContextLifecycle(value.value);
+    }),
+    limit: WorkContextPageLimit(bodyInteger(fields, "limit", WORK_CONTEXT_INVALID_BODY)),
+    parent: bodyValueOrNull(fields, "parent", WORK_CONTEXT_INVALID_BODY) === null ? null : decodeWorkContextIdentityValue(bodyValue(fields, "parent", WORK_CONTEXT_INVALID_BODY)),
+    project: project === null ? null : ProjectId(project),
+    schema: bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY) as typeof PLATFORM_SCHEMA_V2,
+  });
+}
+
+export function validateWorkContextPage(value: WorkContextPage): WorkContextPage {
+  exactInput(value, WorkContextPage_FIELDS);
+  if (value.schema !== PLATFORM_SCHEMA_V2) workContextRefusal("work-context page schema is incompatible");
+  const requested_limit = WorkContextPageLimit(value.requested_limit);
+  if (!Array.isArray(value.items) || BigInt(value.items.length) > requested_limit) workContextRefusal("work-context page exceeds its requested limit");
+  const items = value.items.map(validateWorkContextRecord);
+  const after = value.after === null ? null : WorkContextCursor(value.after);
+  const next_cursor = value.next_cursor === null ? null : WorkContextCursor(value.next_cursor);
+  if (typeof value.has_more !== "boolean") workContextRefusal("has_more is not boolean");
+  if (value.has_more !== (next_cursor !== null) || (value.has_more && items.length === 0) || (after !== null && after === next_cursor)) workContextRefusal("work-context page cursor is incoherent");
+  return {after, has_more: value.has_more, items, next_cursor, requested_limit, schema: PLATFORM_SCHEMA_V2};
+}
+
+function pageJson(value: WorkContextPage): JsonValue {
+  const page = validateWorkContextPage(value);
+  return object([
+    ["after", page.after === null ? {kind: "null"} : {kind: "string", value: page.after}],
+    ["has_more", {kind: "bool", value: page.has_more}],
+    ["items", {kind: "array", items: page.items.map(recordJson)}],
+    ["next_cursor", page.next_cursor === null ? {kind: "null"} : {kind: "string", value: page.next_cursor}],
+    ["requested_limit", {kind: "integer", value: page.requested_limit}],
+    ["schema", {kind: "string", value: page.schema}],
+  ]);
+}
+
+export function encodeWorkContextPage(value: WorkContextPage): Uint8Array {
+  const bytes = toCanonicalBytes(pageJson(value));
+  if (bytes.length > MAX_WORK_CONTEXT_PAGE_CANONICAL_BYTES) throw new RefusalError("frame_too_large", "work-context page exceeds its ceiling");
+  return bytes;
+}
+
+export function decodeWorkContextPage(payload: Uint8Array): WorkContextPage {
+  const fields = exactFields(parseDocument(payload, MAX_WORK_CONTEXT_PAGE_CANONICAL_BYTES), WorkContextPage_FIELDS, WORK_CONTEXT_INVALID_BODY);
+  const after = bodyStringOrNull(fields, "after", WORK_CONTEXT_INVALID_BODY);
+  const next = bodyStringOrNull(fields, "next_cursor", WORK_CONTEXT_INVALID_BODY);
+  return validateWorkContextPage({
+    after: after === null ? null : WorkContextCursor(after),
+    has_more: bodyBool(fields, "has_more", WORK_CONTEXT_INVALID_BODY),
+    items: bodyArray(fields, "items", WORK_CONTEXT_INVALID_BODY, MAX_WORK_CONTEXT_PAGE_ITEMS, WORK_CONTEXT_VALUE_INVALID).map(decodeWorkContextRecordValue),
+    next_cursor: next === null ? null : WorkContextCursor(next),
+    requested_limit: WorkContextPageLimit(bodyInteger(fields, "requested_limit", WORK_CONTEXT_INVALID_BODY)),
+    schema: bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY) as typeof PLATFORM_SCHEMA_V2,
+  });
+}
+
+export function validateWorkContextResync(value: WorkContextResync): WorkContextResync {
+  exactInput(value, WorkContextResync_FIELDS);
+  if (value.outcome !== "resync_required" || value.schema !== PLATFORM_SCHEMA_V2) workContextRefusal("work-context resync outcome is incompatible");
+  return {expired_after: WorkContextCursor(value.expired_after), outcome: "resync_required", schema: PLATFORM_SCHEMA_V2};
+}
+
+export function encodeWorkContextResync(value: WorkContextResync): Uint8Array {
+  const resync = validateWorkContextResync(value);
+  return toCanonicalBytes(object([
+    ["expired_after", {kind: "string", value: resync.expired_after}],
+    ["outcome", {kind: "string", value: resync.outcome}],
+    ["schema", {kind: "string", value: resync.schema}],
+  ]));
+}
+
+export function decodeWorkContextResync(payload: Uint8Array): WorkContextResync {
+  const fields = exactFields(parseDocument(payload, MAX_WORK_CONTEXT_QUERY_CANONICAL_BYTES), WorkContextResync_FIELDS, WORK_CONTEXT_INVALID_BODY);
+  return validateWorkContextResync({
+    expired_after: WorkContextCursor(bodyString(fields, "expired_after", WORK_CONTEXT_INVALID_BODY)),
+    outcome: bodyString(fields, "outcome", WORK_CONTEXT_INVALID_BODY) as "resync_required",
+    schema: bodyString(fields, "schema", WORK_CONTEXT_INVALID_BODY) as typeof PLATFORM_SCHEMA_V2,
+  });
+}
