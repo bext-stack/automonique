@@ -13,9 +13,12 @@ use automonique_protocol::platform::{
 };
 use automonique_protocol::platform_v2::*;
 use automonique_protocol::platform_v2_lifecycle::*;
-use automonique_protocol::platform_v2_lifecycle_api::encode_work_context_mutation_submission;
+use automonique_protocol::platform_v2_lifecycle_api::{
+    encode_work_context_mutation_submission, work_context_mutation_preview_digest,
+};
 use automonique_protocol::primitives::{EpochMillis, Revision};
 use automonique_store::work_context_store::*;
+use rusqlite::Connection;
 use tempfile::TempDir;
 
 struct PrivateStore {
@@ -69,13 +72,80 @@ fn expected(kind: WorkContextKind, id: &str, rev: u64) -> ExpectedWorkContext {
 fn actor() -> Actor {
     Actor::new("tenant-1", "operator-1").unwrap()
 }
-fn empty_policy(requirement: MutationApprovalRequirement) -> MutationPolicyDecision {
+fn policy_for(
+    proposal: &WorkContextMutationProposal,
+    requirement: MutationApprovalRequirement,
+) -> MutationPolicyDecision {
+    let mut targets = BTreeSet::new();
+    let mut project = None;
+    let mut add = |expected: &ExpectedWorkContext| {
+        targets.insert(expected.identity().clone());
+        if let WorkContextIdentity::Project(value) = expected.identity() {
+            project = Some(value.clone());
+        }
+    };
+    match proposal.intent() {
+        WorkContextMutationIntent::CreateProject(value) => {
+            for expected in value.repositories() {
+                add(expected);
+            }
+        }
+        WorkContextMutationIntent::CreateHostSetup(value) => add(value.project()),
+        WorkContextMutationIntent::CreateCheckout(value) => {
+            add(value.project());
+            add(value.host_setup());
+            add(value.repository());
+        }
+        WorkContextMutationIntent::CreateUserWorkspace(value) => {
+            add(value.project());
+            add(value.checkout());
+        }
+        WorkContextMutationIntent::CreateAttemptWorkspace(value) => {
+            add(value.user_workspace());
+            project = Some(ProjectId::new("project-1").unwrap());
+        }
+        WorkContextMutationIntent::ResumeAttemptWorkspace(value) => {
+            add(value.target());
+            project = Some(ProjectId::new("project-1").unwrap());
+        }
+        WorkContextMutationIntent::ResumeSession(value) => {
+            add(value.target());
+            project = Some(ProjectId::new("project-1").unwrap());
+        }
+        WorkContextMutationIntent::ArchiveProject(value)
+        | WorkContextMutationIntent::ArchiveHostSetup(value)
+        | WorkContextMutationIntent::ArchiveCheckout(value)
+        | WorkContextMutationIntent::ArchiveUserWorkspace(value) => add(value.target()),
+    }
     MutationPolicyDecision::new(
         actor(),
         ResourceAuthority::Automonique,
         WorkContextAuthority::EMPTY,
         WorkContextAuthority::EMPTY,
+        project,
+        targets,
         requirement,
+    )
+}
+fn approval_policy(preview: &MutationPreview, expires_at_ms: i64) -> ApprovalPolicyDecision {
+    ApprovalPolicyDecision::new(
+        Actor::new("tenant-1", "approver-1").unwrap(),
+        ResourceAuthority::Automonique,
+        WorkContextApprovalAuthority::LifecycleMutation,
+        preview.preview().clone(),
+        work_context_mutation_preview_digest(preview).unwrap(),
+        EpochMillis::from_millis(expires_at_ms),
+    )
+}
+fn read_policy(identity: &WorkContextIdentity, project: Option<&str>) -> MutationPolicyDecision {
+    MutationPolicyDecision::new(
+        actor(),
+        ResourceAuthority::Automonique,
+        WorkContextAuthority::EMPTY,
+        WorkContextAuthority::EMPTY,
+        project.map(|value| ProjectId::new(value).unwrap()),
+        BTreeSet::from([identity.clone()]),
+        MutationApprovalRequirement::NotRequired,
     )
 }
 fn proposal(intent: WorkContextMutationIntent, key: &str) -> WorkContextMutationProposal {
@@ -144,7 +214,7 @@ fn create_reservation_reopens_replays_and_refuses_same_key_different_body() {
     let mut store = WorkContextStore::open(private.path()).unwrap();
     let repo = ExpectedWorkContext::new(repository("repo-1"), revision(4));
     store
-        .put_external_snapshot(&repo, ExternalParentResolution::Available, None)
+        .put_external_snapshot("tenant-1", &repo, ExternalParentResolution::Available, None)
         .unwrap();
     let request = proposal(
         WorkContextMutationIntent::CreateProject(
@@ -157,7 +227,7 @@ fn create_reservation_reopens_replays_and_refuses_same_key_different_body() {
         store
             .prepare_mutation(
                 &request,
-                &empty_policy(MutationApprovalRequirement::NotRequired),
+                &policy_for(&request, MutationApprovalRequirement::NotRequired),
                 100,
                 200,
                 &mut nonces,
@@ -170,7 +240,7 @@ fn create_reservation_reopens_replays_and_refuses_same_key_different_body() {
     let replay = reopened
         .prepare_mutation(
             &request,
-            &empty_policy(MutationApprovalRequirement::NotRequired),
+            &policy_for(&request, MutationApprovalRequirement::NotRequired),
             150,
             250,
             &mut nonces,
@@ -188,7 +258,7 @@ fn create_reservation_reopens_replays_and_refuses_same_key_different_body() {
         reopened
             .prepare_mutation(
                 &changed,
-                &empty_policy(MutationApprovalRequirement::NotRequired),
+                &policy_for(&changed, MutationApprovalRequirement::NotRequired),
                 150,
                 250,
                 &mut nonces
@@ -210,8 +280,11 @@ fn create_reservation_reopens_replays_and_refuses_same_key_different_body() {
 fn concurrent_replay_body_conflict_and_approval_consumption_are_serialized() {
     let private = PrivateStore::new();
     let mut seed = WorkContextStore::open(private.path()).unwrap();
-    seed.put_authoritative_record(&project("project-1", 1, WorkContextLifecycle::Active))
-        .unwrap();
+    seed.put_authoritative_record(
+        "tenant-1",
+        &project("project-1", 1, WorkContextLifecycle::Active),
+    )
+    .unwrap();
     drop(seed);
     let request = proposal(
         WorkContextMutationIntent::ArchiveProject(
@@ -232,7 +305,7 @@ fn concurrent_replay_body_conflict_and_approval_consumption_are_serialized() {
             store
                 .prepare_mutation(
                     &request,
-                    &empty_policy(MutationApprovalRequirement::Required),
+                    &policy_for(&request, MutationApprovalRequirement::Required),
                     100,
                     500,
                     &mut nonces,
@@ -268,9 +341,8 @@ fn concurrent_replay_body_conflict_and_approval_consumption_are_serialized() {
             preview.preview(),
             MutationApprovalId::new("approval-race").unwrap(),
             MutationApprovalDecision::Granted,
-            Actor::new("tenant-1", "approver-1").unwrap(),
+            &approval_policy(&preview, 400),
             150,
-            400,
         )
         .unwrap();
     let submission = encode_work_context_mutation_submission(
@@ -287,6 +359,7 @@ fn concurrent_replay_body_conflict_and_approval_consumption_are_serialized() {
         let preview_ref = preview.preview().clone();
         let submission = submission.clone();
         let barrier = barrier.clone();
+        let request = request.clone();
         submitters.push(thread::spawn(move || {
             let mut store = WorkContextStore::open(path).unwrap();
             barrier.wait();
@@ -294,7 +367,7 @@ fn concurrent_replay_body_conflict_and_approval_consumption_are_serialized() {
                 .submit_mutation(
                     &preview_ref,
                     &submission,
-                    &empty_policy(MutationApprovalRequirement::Required),
+                    &policy_for(&request, MutationApprovalRequirement::Required),
                     ReceiptId::new(receipt).unwrap(),
                     210,
                 )
@@ -342,7 +415,7 @@ fn concurrent_replay_body_conflict_and_approval_consumption_are_serialized() {
         reopened
             .prepare_mutation(
                 &changed,
-                &empty_policy(MutationApprovalRequirement::NotRequired),
+                &policy_for(&changed, MutationApprovalRequirement::NotRequired),
                 300,
                 400,
                 &mut nonces
@@ -358,7 +431,10 @@ fn stale_parent_graph_scope_and_authority_widening_fail_before_reservation() {
     let private = PrivateStore::new();
     let mut store = WorkContextStore::open(private.path()).unwrap();
     store
-        .put_authoritative_record(&project("project-1", 2, WorkContextLifecycle::Active))
+        .put_authoritative_record(
+            "tenant-1",
+            &project("project-1", 2, WorkContextLifecycle::Active),
+        )
         .unwrap();
     store
         .bind_private_selector(
@@ -384,7 +460,7 @@ fn stale_parent_graph_scope_and_authority_widening_fail_before_reservation() {
         store
             .prepare_mutation(
                 &stale,
-                &empty_policy(MutationApprovalRequirement::NotRequired),
+                &policy_for(&stale, MutationApprovalRequirement::NotRequired),
                 1,
                 10,
                 &mut nonces
@@ -411,6 +487,8 @@ fn stale_parent_graph_scope_and_authority_widening_fail_before_reservation() {
         ResourceAuthority::Automonique,
         WorkContextAuthority::EMPTY,
         WorkContextAuthority::EMPTY,
+        Some(ProjectId::new("project-1").unwrap()),
+        BTreeSet::from([identity(WorkContextKind::Project, "project-1")]),
         MutationApprovalRequirement::NotRequired,
     );
     assert_eq!(
@@ -438,7 +516,7 @@ fn stale_parent_graph_scope_and_authority_widening_fail_before_reservation() {
         store
             .prepare_mutation(
                 &attempt,
-                &empty_policy(MutationApprovalRequirement::NotRequired),
+                &policy_for(&attempt, MutationApprovalRequirement::NotRequired),
                 1,
                 10,
                 &mut nonces
@@ -455,6 +533,21 @@ fn checkout_repository_resolution_and_owner_are_rechecked_before_reservation() {
     let mut store = WorkContextStore::open(private.path()).unwrap();
     let repository = ExpectedWorkContext::new(repository("repo-checkout"), revision(5));
     let project_identity = identity(WorkContextKind::Project, "project-1");
+    let WorkContextIdentity::Project(selected_project) = &project_identity else {
+        unreachable!()
+    };
+    let other = match identity(WorkContextKind::Project, "project-2") {
+        WorkContextIdentity::Project(value) => value,
+        _ => unreachable!(),
+    };
+    store
+        .put_external_snapshot(
+            "tenant-1",
+            &repository,
+            ExternalParentResolution::Unavailable,
+            Some(selected_project),
+        )
+        .unwrap();
     let project = WorkContextRecord::new(
         project_identity.clone(),
         revision(1),
@@ -485,8 +578,10 @@ fn checkout_repository_resolution_and_owner_are_rechecked_before_reservation() {
         ],
     )
     .unwrap();
-    store.put_authoritative_record(&project).unwrap();
-    store.put_authoritative_record(&host).unwrap();
+    store
+        .put_authoritative_record("tenant-1", &project)
+        .unwrap();
+    store.put_authoritative_record("tenant-1", &host).unwrap();
     let selector = WorkContextRegistrySelector::new("checkout-selector").unwrap();
     store
         .bind_private_selector("tenant-1", &selector, b"private checkout binding")
@@ -499,24 +594,18 @@ fn checkout_repository_resolution_and_owner_are_rechecked_before_reservation() {
                 ExpectedWorkContext::new(host.identity().clone(), revision(1)),
                 repository.clone(),
                 CheckoutKind::GitWorktree,
-                selector,
+                selector.clone(),
             )
             .unwrap(),
         ),
         "checkout-resolution",
     );
-    let WorkContextIdentity::Project(selected_project) = &project_identity else {
-        unreachable!()
-    };
-    store
-        .put_external_snapshot(&repository, ExternalParentResolution::Unavailable, None)
-        .unwrap();
     let mut nonces = Nonces::new();
     assert_eq!(
         store
             .prepare_mutation(
                 &request,
-                &empty_policy(MutationApprovalRequirement::NotRequired),
+                &policy_for(&request, MutationApprovalRequirement::NotRequired),
                 1,
                 10,
                 &mut nonces,
@@ -525,43 +614,34 @@ fn checkout_repository_resolution_and_owner_are_rechecked_before_reservation() {
             .category(),
         "unavailable"
     );
-    let other = match identity(WorkContextKind::Project, "project-2") {
-        WorkContextIdentity::Project(value) => value,
-        _ => unreachable!(),
-    };
+    let available = ExpectedWorkContext::new(repository.identity().clone(), revision(6));
     store
         .put_external_snapshot(
-            &repository,
-            ExternalParentResolution::Available,
-            Some(&other),
-        )
-        .unwrap();
-    assert_eq!(
-        store
-            .prepare_mutation(
-                &request,
-                &empty_policy(MutationApprovalRequirement::NotRequired),
-                1,
-                10,
-                &mut nonces,
-            )
-            .unwrap_err()
-            .category(),
-        "conflict"
-    );
-    assert_eq!(nonces.calls, 0);
-    store
-        .put_external_snapshot(
-            &repository,
+            "tenant-1",
+            &available,
             ExternalParentResolution::Available,
             Some(selected_project),
         )
         .unwrap();
+    let available_request = proposal(
+        WorkContextMutationIntent::CreateCheckout(
+            CreateCheckoutIntent::new(
+                label("Checkout"),
+                ExpectedWorkContext::new(project_identity.clone(), revision(1)),
+                ExpectedWorkContext::new(host.identity().clone(), revision(1)),
+                available.clone(),
+                CheckoutKind::GitWorktree,
+                selector,
+            )
+            .unwrap(),
+        ),
+        "checkout-resolution",
+    );
     assert!(matches!(
         store
             .prepare_mutation(
-                &request,
-                &empty_policy(MutationApprovalRequirement::NotRequired),
+                &available_request,
+                &policy_for(&available_request, MutationApprovalRequirement::NotRequired),
                 1,
                 10,
                 &mut nonces,
@@ -569,15 +649,70 @@ fn checkout_repository_resolution_and_owner_are_rechecked_before_reservation() {
             .unwrap(),
         PreviewAdmission::New(_)
     ));
+    assert_eq!(nonces.calls, 2);
+    let reparented = ExpectedWorkContext::new(repository.identity().clone(), revision(7));
+    assert_eq!(
+        store
+            .put_external_snapshot(
+                "tenant-1",
+                &reparented,
+                ExternalParentResolution::Available,
+                Some(&other),
+            )
+            .unwrap_err()
+            .category(),
+        "stale_revision"
+    );
 }
 
 #[test]
 fn approval_is_exact_one_time_and_archive_is_one_way_after_restart() {
     let private = PrivateStore::new();
     let mut store = WorkContextStore::open(private.path()).unwrap();
+    let repo = ExpectedWorkContext::new(repository("repo-1"), revision(1));
+    let selected_project = ProjectId::new("project-1").unwrap();
     store
-        .put_authoritative_record(&project("project-1", 1, WorkContextLifecycle::Active))
+        .put_external_snapshot(
+            "tenant-1",
+            &repo,
+            ExternalParentResolution::Available,
+            Some(&selected_project),
+        )
         .unwrap();
+    let project = WorkContextRecord::new(
+        identity(WorkContextKind::Project, "project-1"),
+        revision(1),
+        WorkContextLifecycle::Active,
+        label("project-1"),
+        WorkContextAttributes::EMPTY,
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::ProjectRepository,
+                repo.identity().clone(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    store
+        .put_authoritative_record("tenant-1", &project)
+        .unwrap();
+    let host = WorkContextRecord::new(
+        identity(WorkContextKind::HostSetup, "setup-1"),
+        revision(1),
+        WorkContextLifecycle::Active,
+        label("setup-1"),
+        WorkContextAttributes::host_setup(HostSetupKind::Local),
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::HostSetupProject,
+                project.identity().clone(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    store.put_authoritative_record("tenant-1", &host).unwrap();
     let request = proposal(
         WorkContextMutationIntent::ArchiveProject(
             ArchiveIntent::new(expected(WorkContextKind::Project, "project-1", 1)).unwrap(),
@@ -589,7 +724,7 @@ fn approval_is_exact_one_time_and_archive_is_one_way_after_restart() {
         store
             .prepare_mutation(
                 &request,
-                &empty_policy(MutationApprovalRequirement::Required),
+                &policy_for(&request, MutationApprovalRequirement::Required),
                 100,
                 500,
                 &mut nonces,
@@ -601,9 +736,8 @@ fn approval_is_exact_one_time_and_archive_is_one_way_after_restart() {
             preview.preview(),
             MutationApprovalId::new("approval-1").unwrap(),
             MutationApprovalDecision::Granted,
-            Actor::new("tenant-1", "approver-1").unwrap(),
+            &approval_policy(&preview, 400),
             150,
-            400,
         )
         .unwrap();
     let submission = encode_work_context_mutation_submission(
@@ -616,7 +750,7 @@ fn approval_is_exact_one_time_and_archive_is_one_way_after_restart() {
         .submit_mutation(
             preview.preview(),
             &submission,
-            &empty_policy(MutationApprovalRequirement::Required),
+            &policy_for(&request, MutationApprovalRequirement::Required),
             ReceiptId::new("receipt-1").unwrap(),
             210,
         )
@@ -627,7 +761,7 @@ fn approval_is_exact_one_time_and_archive_is_one_way_after_restart() {
             .submit_mutation(
                 preview.preview(),
                 &submission,
-                &empty_policy(MutationApprovalRequirement::Required),
+                &policy_for(&request, MutationApprovalRequirement::Required),
                 ReceiptId::new("ignored-replay-id").unwrap(),
                 220
             )
@@ -641,7 +775,13 @@ fn approval_is_exact_one_time_and_archive_is_one_way_after_restart() {
     let mut reopened = WorkContextStore::open(private.path()).unwrap();
     assert_eq!(
         reopened
-            .record(&identity(WorkContextKind::Project, "project-1"))
+            .record(
+                &read_policy(
+                    &identity(WorkContextKind::Project, "project-1"),
+                    Some("project-1")
+                ),
+                &identity(WorkContextKind::Project, "project-1"),
+            )
             .unwrap()
             .unwrap()
             .lifecycle(),
@@ -657,7 +797,7 @@ fn approval_is_exact_one_time_and_archive_is_one_way_after_restart() {
         reopened
             .prepare_mutation(
                 &second,
-                &empty_policy(MutationApprovalRequirement::NotRequired),
+                &policy_for(&request, MutationApprovalRequirement::NotRequired),
                 300,
                 400,
                 &mut nonces
@@ -672,9 +812,50 @@ fn approval_is_exact_one_time_and_archive_is_one_way_after_restart() {
 fn external_effect_commits_outbox_then_result_and_completed_receipt_atomically() {
     let private = PrivateStore::new();
     let mut store = WorkContextStore::open(private.path()).unwrap();
+    let repo = ExpectedWorkContext::new(repository("repo-1"), revision(1));
+    let selected_project = ProjectId::new("project-1").unwrap();
     store
-        .put_authoritative_record(&project("project-1", 1, WorkContextLifecycle::Active))
+        .put_external_snapshot(
+            "tenant-1",
+            &repo,
+            ExternalParentResolution::Available,
+            Some(&selected_project),
+        )
         .unwrap();
+    let project = WorkContextRecord::new(
+        identity(WorkContextKind::Project, "project-1"),
+        revision(1),
+        WorkContextLifecycle::Active,
+        label("project-1"),
+        WorkContextAttributes::EMPTY,
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::ProjectRepository,
+                repo.identity().clone(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    store
+        .put_authoritative_record("tenant-1", &project)
+        .unwrap();
+    let host = WorkContextRecord::new(
+        identity(WorkContextKind::HostSetup, "setup-1"),
+        revision(1),
+        WorkContextLifecycle::Active,
+        label("setup-1"),
+        WorkContextAttributes::host_setup(HostSetupKind::Local),
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::HostSetupProject,
+                project.identity().clone(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    store.put_authoritative_record("tenant-1", &host).unwrap();
     let checkout = WorkContextRecord::new(
         identity(WorkContextKind::Checkout, "checkout-1"),
         revision(1),
@@ -700,9 +881,14 @@ fn external_effect_commits_outbox_then_result_and_completed_receipt_atomically()
         ],
     )
     .unwrap();
-    store.put_authoritative_record(&checkout).unwrap();
     store
-        .put_authoritative_record(&user_workspace("workspace-1", "project-1", "checkout-1", 1))
+        .put_authoritative_record("tenant-1", &checkout)
+        .unwrap();
+    store
+        .put_authoritative_record(
+            "tenant-1",
+            &user_workspace("workspace-1", "project-1", "checkout-1", 1),
+        )
         .unwrap();
     let request = proposal(
         WorkContextMutationIntent::CreateAttemptWorkspace(
@@ -720,7 +906,7 @@ fn external_effect_commits_outbox_then_result_and_completed_receipt_atomically()
         store
             .prepare_mutation(
                 &request,
-                &empty_policy(MutationApprovalRequirement::NotRequired),
+                &policy_for(&request, MutationApprovalRequirement::NotRequired),
                 10,
                 100,
                 &mut nonces,
@@ -734,7 +920,7 @@ fn external_effect_commits_outbox_then_result_and_completed_receipt_atomically()
         .submit_mutation(
             preview.preview(),
             &submission,
-            &empty_policy(MutationApprovalRequirement::NotRequired),
+            &policy_for(&request, MutationApprovalRequirement::NotRequired),
             ReceiptId::new("receipt-attempt").unwrap(),
             21,
         )
@@ -743,25 +929,152 @@ fn external_effect_commits_outbox_then_result_and_completed_receipt_atomically()
         matches!(accepted,ReceiptAdmission::New(ref value) if value.outcome()==automonique_protocol::platform::ReceiptOutcome::Accepted)
     );
     assert_eq!(store.ready_outbox_count().unwrap(), 1);
+    let mutation_policy = policy_for(&request, MutationApprovalRequirement::NotRequired);
+    assert!(matches!(
+        store
+            .receipt_by_id(&mutation_policy, &ReceiptId::new("receipt-attempt").unwrap())
+            .unwrap(),
+        ReceiptLookup::Found(ref receipt)
+            if receipt.outcome() == automonique_protocol::platform::ReceiptOutcome::Accepted
+    ));
+    assert!(matches!(
+        store
+            .receipt_by_idempotency_key(&mutation_policy, request.idempotency_key())
+            .unwrap(),
+        ReceiptLookup::Found(_)
+    ));
+    assert_eq!(
+        store
+            .receipt_by_id(
+                &mutation_policy,
+                &ReceiptId::new("receipt-unknown").unwrap()
+            )
+            .unwrap(),
+        ReceiptLookup::Unknown
+    );
+    let duplicate_request = proposal(request.intent().clone(), "attempt-distinct-key");
+    let duplicate_preview = unwrap_new(
+        store
+            .prepare_mutation(
+                &duplicate_request,
+                &policy_for(&duplicate_request, MutationApprovalRequirement::NotRequired),
+                22,
+                100,
+                &mut nonces,
+            )
+            .unwrap(),
+    );
+    let duplicate_submission = encode_work_context_mutation_submission(
+        &duplicate_preview,
+        None,
+        EpochMillis::from_millis(23),
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .submit_mutation(
+                duplicate_preview.preview(),
+                &duplicate_submission,
+                &policy_for(&duplicate_request, MutationApprovalRequirement::NotRequired),
+                ReceiptId::new("receipt-duplicate-effect").unwrap(),
+                24,
+            )
+            .unwrap_err()
+            .category(),
+        "conflict"
+    );
     assert!(
         store
-            .record(preview.resulting().identity())
+            .record(
+                &read_policy(preview.resulting().identity(), Some("project-1")),
+                preview.resulting().identity(),
+            )
             .unwrap()
             .is_none()
     );
     drop(store);
+    let mut unauthorized_store = WorkContextStore::open(private.path()).unwrap();
+    let mut unauthorized_nonces = Nonces { next: 80, calls: 0 };
+    assert_eq!(
+        unauthorized_store
+            .claim_external_effect(
+                preview.preview(),
+                &ExternalEffectExecutorPolicy::new(
+                    Actor::new("tenant-1", "executor-x").unwrap(),
+                    ResourceAuthority::GitHub,
+                    BTreeSet::from(["create_attempt_workspace".to_owned()]),
+                ),
+                25,
+                80,
+                &mut unauthorized_nonces,
+            )
+            .unwrap_err()
+            .category(),
+        "not_found"
+    );
+    drop(unauthorized_store);
+    let barrier = Arc::new(Barrier::new(2));
+    let mut claimers = Vec::new();
+    for (executor, next) in [("executor-1", 90), ("executor-2", 91)] {
+        let path = private.path().to_path_buf();
+        let preview_ref = preview.preview().clone();
+        let barrier = barrier.clone();
+        claimers.push(thread::spawn(move || {
+            let mut store = WorkContextStore::open(path).unwrap();
+            let mut nonces = Nonces { next, calls: 0 };
+            barrier.wait();
+            store.claim_external_effect(
+                &preview_ref,
+                &ExternalEffectExecutorPolicy::new(
+                    Actor::new("tenant-1", executor).unwrap(),
+                    ResourceAuthority::Automonique,
+                    BTreeSet::from(["create_attempt_workspace".to_owned()]),
+                ),
+                25,
+                80,
+                &mut nonces,
+            )
+        }));
+    }
+    let claims: Vec<_> = claimers
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    assert_eq!(claims.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        claims
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .next()
+            .unwrap()
+            .category(),
+        "unavailable"
+    );
+    let claim = claims.into_iter().find_map(Result::ok).unwrap();
     let mut reopened = WorkContextStore::open(private.path()).unwrap();
-    let completed = reopened
-        .complete_external_effect(preview.preview(), 30)
-        .unwrap();
+    let completed = reopened.complete_external_effect(&claim, 30).unwrap();
     assert_eq!(
         completed.outcome(),
         automonique_protocol::platform::ReceiptOutcome::Completed
     );
     assert_eq!(reopened.ready_outbox_count().unwrap(), 0);
     assert_eq!(
+        reopened.complete_external_effect(&claim, 31).unwrap(),
+        completed
+    );
+    assert!(matches!(
         reopened
-            .record(preview.resulting().identity())
+            .receipt_by_id(&mutation_policy, &ReceiptId::new("receipt-attempt").unwrap())
+            .unwrap(),
+        ReceiptLookup::Found(ref receipt)
+            if receipt.outcome() == automonique_protocol::platform::ReceiptOutcome::Completed
+    ));
+    assert_eq!(
+        reopened
+            .record(
+                &read_policy(preview.resulting().identity(), Some("project-1")),
+                preview.resulting().identity(),
+            )
             .unwrap()
             .unwrap(),
         *preview.resulting()
@@ -776,7 +1089,7 @@ fn authorized_inventory_pages_past_512_with_hidden_interleaving_and_resyncs_on_c
     for index in 0..720 {
         let id = format!("project-{index:04}");
         let record = project(&id, 1, WorkContextLifecycle::Active);
-        store.put_authoritative_record(&record).unwrap();
+        store.put_authoritative_record("tenant-1", &record).unwrap();
         if index % 9 != 0 {
             allowed.insert(record.identity().clone());
         }
@@ -819,13 +1132,40 @@ fn authorized_inventory_pages_past_512_with_hidden_interleaving_and_resyncs_on_c
         unreachable!()
     };
     let cursor = page.next_cursor().cloned().unwrap();
+    let second_actor = Actor::new("tenant-1", "operator-2").unwrap();
+    let WorkContextQueryResult::Page(second_page) =
+        store.inventory(&second_actor, &first, &allowed, 2).unwrap()
+    else {
+        unreachable!()
+    };
+    assert_eq!(second_page.next_cursor(), Some(&cursor));
+    let shared_continuation = WorkContextQuery::new(
+        vec![WorkContextKind::Project],
+        vec![],
+        None,
+        None,
+        Some(cursor.clone()),
+        128,
+    )
+    .unwrap();
+    assert!(matches!(
+        store
+            .inventory(&actor, &shared_continuation, &allowed, 2)
+            .unwrap(),
+        WorkContextQueryResult::Page(_)
+    ));
+    assert!(matches!(
+        store
+            .inventory(&second_actor, &shared_continuation, &allowed, 2)
+            .unwrap(),
+        WorkContextQueryResult::Page(_)
+    ));
     let changed_identity = allowed.iter().next().unwrap().clone();
     store
-        .put_authoritative_record(&project(
-            changed_identity.id(),
-            2,
-            WorkContextLifecycle::Active,
-        ))
+        .put_authoritative_record(
+            "tenant-1",
+            &project(changed_identity.id(), 2, WorkContextLifecycle::Archived),
+        )
         .unwrap();
     let continued = WorkContextQuery::new(
         vec![WorkContextKind::Project],
@@ -840,4 +1180,448 @@ fn authorized_inventory_pages_past_512_with_hidden_interleaving_and_resyncs_on_c
         store.inventory(&actor, &continued, &allowed, 3).unwrap(),
         WorkContextQueryResult::Resync(_)
     ));
+}
+
+#[test]
+fn tenant_scopes_records_targets_and_replay_authorization() {
+    let private = PrivateStore::new();
+    let mut store = WorkContextStore::open(private.path()).unwrap();
+    let target = identity(WorkContextKind::Project, "shared-project-id");
+    store
+        .put_authoritative_record(
+            "tenant-1",
+            &project("shared-project-id", 1, WorkContextLifecycle::Active),
+        )
+        .unwrap();
+    store
+        .put_authoritative_record(
+            "tenant-2",
+            &project("shared-project-id", 5, WorkContextLifecycle::Active),
+        )
+        .unwrap();
+    let tenant_two = Actor::new("tenant-2", "operator-2").unwrap();
+    let tenant_two_policy = MutationPolicyDecision::new(
+        tenant_two.clone(),
+        ResourceAuthority::Automonique,
+        WorkContextAuthority::EMPTY,
+        WorkContextAuthority::EMPTY,
+        Some(ProjectId::new("shared-project-id").unwrap()),
+        BTreeSet::from([target.clone()]),
+        MutationApprovalRequirement::NotRequired,
+    );
+    assert_eq!(
+        store
+            .record(&tenant_two_policy, &target)
+            .unwrap()
+            .unwrap()
+            .revision(),
+        revision(5)
+    );
+    assert_eq!(
+        store
+            .record(&read_policy(&target, Some("shared-project-id")), &target)
+            .unwrap()
+            .unwrap()
+            .revision(),
+        revision(1)
+    );
+
+    let tenant_one_request = proposal(
+        WorkContextMutationIntent::ArchiveProject(
+            ArchiveIntent::new(ExpectedWorkContext::new(target.clone(), revision(1))).unwrap(),
+        ),
+        "same-key-no-oracle",
+    );
+    let mut nonces = Nonces::new();
+    store
+        .prepare_mutation(
+            &tenant_one_request,
+            &policy_for(
+                &tenant_one_request,
+                MutationApprovalRequirement::NotRequired,
+            ),
+            10,
+            100,
+            &mut nonces,
+        )
+        .unwrap();
+    let absent = identity(WorkContextKind::Project, "tenant-one-only");
+    store
+        .put_authoritative_record(
+            "tenant-1",
+            &project("tenant-one-only", 1, WorkContextLifecycle::Active),
+        )
+        .unwrap();
+    let tenant_two_request = WorkContextMutationProposal::new(
+        tenant_two,
+        ResourceAuthority::Automonique,
+        WorkContextAuthority::EMPTY,
+        IdempotencyKey::new("same-key-no-oracle").unwrap(),
+        WorkContextMutationIntent::ArchiveProject(
+            ArchiveIntent::new(ExpectedWorkContext::new(absent.clone(), revision(1))).unwrap(),
+        ),
+    )
+    .unwrap();
+    let cross_tenant_policy = MutationPolicyDecision::new(
+        tenant_two_request.actor().clone(),
+        ResourceAuthority::Automonique,
+        WorkContextAuthority::EMPTY,
+        WorkContextAuthority::EMPTY,
+        Some(ProjectId::new("tenant-one-only").unwrap()),
+        BTreeSet::from([absent]),
+        MutationApprovalRequirement::NotRequired,
+    );
+    assert_eq!(
+        store
+            .prepare_mutation(
+                &tenant_two_request,
+                &cross_tenant_policy,
+                10,
+                100,
+                &mut nonces,
+            )
+            .unwrap_err()
+            .category(),
+        "stale_revision"
+    );
+}
+
+#[test]
+fn trusted_now_and_checked_approval_authority_fence_expiry() {
+    let private = PrivateStore::new();
+    let mut store = WorkContextStore::open(private.path()).unwrap();
+    store
+        .put_authoritative_record(
+            "tenant-1",
+            &project("project-1", 1, WorkContextLifecycle::Active),
+        )
+        .unwrap();
+    let request = proposal(
+        WorkContextMutationIntent::ArchiveProject(
+            ArchiveIntent::new(expected(WorkContextKind::Project, "project-1", 1)).unwrap(),
+        ),
+        "approval-expiry",
+    );
+    let mut nonces = Nonces::new();
+    let preview = unwrap_new(
+        store
+            .prepare_mutation(
+                &request,
+                &policy_for(&request, MutationApprovalRequirement::Required),
+                100,
+                200,
+                &mut nonces,
+            )
+            .unwrap(),
+    );
+    assert_eq!(
+        store
+            .record_approval(
+                preview.preview(),
+                MutationApprovalId::new("backdated-approval").unwrap(),
+                MutationApprovalDecision::Granted,
+                &approval_policy(&preview, 150),
+                150,
+            )
+            .unwrap_err()
+            .category(),
+        "unauthorized"
+    );
+    let approval = store
+        .record_approval(
+            preview.preview(),
+            MutationApprovalId::new("expiring-approval").unwrap(),
+            MutationApprovalDecision::Granted,
+            &approval_policy(&preview, 180),
+            150,
+        )
+        .unwrap();
+    let backdated_submission = encode_work_context_mutation_submission(
+        &preview,
+        Some(&approval),
+        EpochMillis::from_millis(160),
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .submit_mutation(
+                preview.preview(),
+                &backdated_submission,
+                &policy_for(&request, MutationApprovalRequirement::Required),
+                ReceiptId::new("expired-approval-receipt").unwrap(),
+                181,
+            )
+            .unwrap_err()
+            .category(),
+        "approval_expired"
+    );
+    assert_eq!(
+        store
+            .submit_mutation(
+                preview.preview(),
+                &backdated_submission,
+                &policy_for(&request, MutationApprovalRequirement::Required),
+                ReceiptId::new("expired-preview-receipt").unwrap(),
+                201,
+            )
+            .unwrap_err()
+            .category(),
+        "preview_expired"
+    );
+}
+
+#[test]
+fn authoritative_ingestion_refuses_terminal_rollback_reparent_and_external_regression() {
+    let private = PrivateStore::new();
+    let mut store = WorkContextStore::open(private.path()).unwrap();
+    store
+        .put_authoritative_record(
+            "tenant-1",
+            &project("project-1", 1, WorkContextLifecycle::Active),
+        )
+        .unwrap();
+    store
+        .put_authoritative_record(
+            "tenant-1",
+            &project("project-1", 2, WorkContextLifecycle::Archived),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .put_authoritative_record(
+                "tenant-1",
+                &project("project-1", 3, WorkContextLifecycle::Active),
+            )
+            .unwrap_err()
+            .category(),
+        "conflict"
+    );
+    store
+        .put_authoritative_record(
+            "tenant-1",
+            &project("project-2", 1, WorkContextLifecycle::Active),
+        )
+        .unwrap();
+    let host = |revision_value, project_id: &str| {
+        WorkContextRecord::new(
+            identity(WorkContextKind::HostSetup, "host-1"),
+            revision(revision_value),
+            WorkContextLifecycle::Active,
+            label("Host"),
+            WorkContextAttributes::host_setup(HostSetupKind::Local),
+            vec![
+                WorkContextRelation::new(
+                    WorkContextRelationKind::HostSetupProject,
+                    identity(WorkContextKind::Project, project_id),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap()
+    };
+    store
+        .put_authoritative_record("tenant-1", &host(1, "project-2"))
+        .unwrap();
+    assert_eq!(
+        store
+            .put_authoritative_record("tenant-1", &host(2, "project-1"))
+            .unwrap_err()
+            .category(),
+        "conflict"
+    );
+    let external = ExpectedWorkContext::new(repository("external-regression"), revision(5));
+    let owner = ProjectId::new("project-2").unwrap();
+    store
+        .put_external_snapshot(
+            "tenant-1",
+            &external,
+            ExternalParentResolution::Available,
+            Some(&owner),
+        )
+        .unwrap();
+    let regressed = ExpectedWorkContext::new(external.identity().clone(), revision(4));
+    assert_eq!(
+        store
+            .put_external_snapshot(
+                "tenant-1",
+                &regressed,
+                ExternalParentResolution::Available,
+                Some(&owner),
+            )
+            .unwrap_err()
+            .category(),
+        "stale_revision"
+    );
+    let reparented = ExpectedWorkContext::new(external.identity().clone(), revision(6));
+    assert_eq!(
+        store
+            .put_external_snapshot(
+                "tenant-1",
+                &reparented,
+                ExternalParentResolution::Available,
+                Some(&ProjectId::new("project-1").unwrap()),
+            )
+            .unwrap_err()
+            .category(),
+        "stale_revision"
+    );
+}
+
+#[test]
+fn durable_readers_reject_record_preview_and_receipt_projection_corruption() {
+    let record_private = PrivateStore::new();
+    let mut record_store = WorkContextStore::open(record_private.path()).unwrap();
+    let record_identity = identity(WorkContextKind::Project, "project-corrupt");
+    record_store
+        .put_authoritative_record(
+            "tenant-1",
+            &project("project-corrupt", 1, WorkContextLifecycle::Active),
+        )
+        .unwrap();
+    drop(record_store);
+    Connection::open(record_private.path())
+        .unwrap()
+        .execute(
+            "UPDATE work_context_records SET identity_id='substituted' WHERE tenant='tenant-1'",
+            [],
+        )
+        .unwrap();
+    let record_store = WorkContextStore::open(record_private.path()).unwrap();
+    assert_eq!(
+        record_store
+            .record(
+                &read_policy(&record_identity, Some("project-corrupt")),
+                &record_identity,
+            )
+            .unwrap_err()
+            .category(),
+        "corrupt"
+    );
+
+    let preview_private = PrivateStore::new();
+    let mut preview_store = WorkContextStore::open(preview_private.path()).unwrap();
+    preview_store
+        .put_authoritative_record(
+            "tenant-1",
+            &project("project-1", 1, WorkContextLifecycle::Active),
+        )
+        .unwrap();
+    let preview_request = proposal(
+        WorkContextMutationIntent::ArchiveProject(
+            ArchiveIntent::new(expected(WorkContextKind::Project, "project-1", 1)).unwrap(),
+        ),
+        "corrupt-preview",
+    );
+    let mut nonces = Nonces::new();
+    preview_store
+        .prepare_mutation(
+            &preview_request,
+            &policy_for(&preview_request, MutationApprovalRequirement::NotRequired),
+            10,
+            100,
+            &mut nonces,
+        )
+        .unwrap();
+    drop(preview_store);
+    Connection::open(preview_private.path())
+        .unwrap()
+        .execute(
+            "UPDATE work_context_previews SET request_digest='0000000000000000000000000000000000000000000000000000000000000000'",
+            [],
+        )
+        .unwrap();
+    let mut preview_store = WorkContextStore::open(preview_private.path()).unwrap();
+    assert_eq!(
+        preview_store
+            .prepare_mutation(
+                &preview_request,
+                &policy_for(&preview_request, MutationApprovalRequirement::NotRequired),
+                11,
+                101,
+                &mut nonces,
+            )
+            .unwrap_err()
+            .category(),
+        "corrupt"
+    );
+
+    let receipt_private = PrivateStore::new();
+    let mut receipt_store = WorkContextStore::open(receipt_private.path()).unwrap();
+    receipt_store
+        .put_authoritative_record(
+            "tenant-1",
+            &project("project-1", 1, WorkContextLifecycle::Active),
+        )
+        .unwrap();
+    let receipt_request = proposal(
+        WorkContextMutationIntent::ArchiveProject(
+            ArchiveIntent::new(expected(WorkContextKind::Project, "project-1", 1)).unwrap(),
+        ),
+        "corrupt-receipt",
+    );
+    let receipt_preview = unwrap_new(
+        receipt_store
+            .prepare_mutation(
+                &receipt_request,
+                &policy_for(&receipt_request, MutationApprovalRequirement::NotRequired),
+                10,
+                100,
+                &mut nonces,
+            )
+            .unwrap(),
+    );
+    let submission = encode_work_context_mutation_submission(
+        &receipt_preview,
+        None,
+        EpochMillis::from_millis(20),
+    )
+    .unwrap();
+    receipt_store
+        .submit_mutation(
+            receipt_preview.preview(),
+            &submission,
+            &policy_for(&receipt_request, MutationApprovalRequirement::NotRequired),
+            ReceiptId::new("receipt-corrupt").unwrap(),
+            21,
+        )
+        .unwrap();
+    drop(receipt_store);
+    Connection::open(receipt_private.path())
+        .unwrap()
+        .execute("UPDATE work_context_receipts SET outcome='accepted'", [])
+        .unwrap();
+    let receipt_store = WorkContextStore::open(receipt_private.path()).unwrap();
+    assert_eq!(
+        receipt_store
+            .receipt_by_id(
+                &policy_for(&receipt_request, MutationApprovalRequirement::NotRequired),
+                &ReceiptId::new("receipt-corrupt").unwrap(),
+            )
+            .unwrap_err()
+            .category(),
+        "corrupt"
+    );
+}
+
+#[test]
+fn empty_v1_database_migrates_to_tenant_scoped_schema() {
+    let private = PrivateStore::new();
+    drop(WorkContextStore::open(private.path()).unwrap());
+    let connection = Connection::open(private.path()).unwrap();
+    connection.pragma_update(None, "user_version", 1).unwrap();
+    drop(connection);
+    let store = WorkContextStore::open(private.path()).unwrap();
+    let connection = Connection::open(store.path()).unwrap();
+    let version: u32 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, WORK_CONTEXT_STORE_SCHEMA_VERSION);
+    let primary_key_columns: u32 = connection
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('work_context_cursor_state') WHERE pk>0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(primary_key_columns, 3);
 }
