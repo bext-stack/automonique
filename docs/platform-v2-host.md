@@ -150,8 +150,9 @@ operations remain unavailable in the production composition.
 The host exposes a typed lifecycle-effect adapter. An enabled adapter receives
 only the closed mutation intent, server-issued resulting identity and bound
 idempotency key. The host claims work under a bounded durable lease and records
-completion only after the adapter reports success and a freshly sampled
-trusted time remains inside the lease. A lost, over-lease, or uncertain claim
+completion only after the adapter reports success, policy and selector-registry
+generations are rechecked, and a freshly sampled trusted time remains inside
+the lease. A lost, over-lease, revoked, or uncertain claim
 becomes ambiguous after expiry. Claim and recovery reauthorize the retained
 preview against current server policy in the same transaction, so revoked
 work is skipped without changing custody or blocking unrelated reads. An
@@ -165,17 +166,19 @@ runtime setup kinds remain typed, explicit refusals.
 
 Workspace resume intents prove the task's server-stored workspace against the
 requested project's bounded policy set and recheck the active workspace and
-exact revision. With the registry installed, create/resume intent execution is
-recorded as `accepted` before the local effect and is reconciled on both retry
-and receipt polling. A cancellation can finalize a still-pending intent, and a
-cancelled intent cannot later reconcile as created or resumed.
+exact revision, then refuse before custody because this adapter cannot perform
+a truthful workspace lifecycle transition. Task create likewise remains
+unavailable. Cancellations of already-existing durable pending intents remain
+immediate and final. Polling an older non-final receipt for which no compatible
+adapter is installed returns a typed recovery refusal instead of repeating an
+`accepted` receipt indefinitely.
 
 The current lineage schema binds an orchestration task to an existing
-`UserWorkspace` before it can accept a workspace intent. Consequently the
-operation named `create` materializes and validates that already-authorized
-workspace from its task selectors; it does not issue a new workspace identity.
-Issuing a genuinely new task workspace still requires a future lineage schema
-that can hold an unbound task without weakening its foreign-key authority.
+`UserWorkspace` before it can accept a workspace intent. Treating validation of
+that existing directory as a successful `create` would fabricate a lifecycle
+effect, so this release does not do so. Issuing a genuinely new task workspace
+requires a future lineage schema that can hold an unbound task without
+weakening its foreign-key authority.
 Review actions
 still validate the server-selected role and current review revision, then
 refuse before custody because git/CI/pull-request workers are not configured.
@@ -185,8 +188,8 @@ final store operations.
 ## Private lifecycle selector registry
 
 The optional `platform-v2-lifecycle-registry.json` sibling is operator-owned,
-opened with `O_NOFOLLOW`, restricted to the daemon uid and exact mode `0600`,
-and bounded to 512 KiB. The daemon retains and rechecks the descriptor identity,
+opened with `O_NOFOLLOW`, restricted to the daemon uid, exact mode `0600` and
+one hard link, and bounded to 512 KiB. The daemon retains and rechecks the descriptor identity,
 timestamps, length and SHA-256 digest before every preflight, execution and
 reconciliation. A changed generation requires a restart; a previous generation
 with a prepared ambiguous effect refuses restart until it can be reconciled
@@ -199,9 +202,17 @@ bytes are never interpreted as paths, refs or command options. Local roots and
 their parent are uid-owned and not group/world writable; symlinks, path aliases,
 overlapping repository/worktree roots, moving bases, existing branches and
 non-canonical roots fail closed. `git` is invoked with a fixed executable and
-fixed argument layout after validation, never through a shell. System/global
-Git configuration, interactive prompting, repository hooks and file-protocol
-transport are disabled for these operations.
+fixed argument layout after validation, never through a shell. Each child runs
+in a killable process group with a deadline and one aggregate bounded output
+budget; timeout or overflow kills and reaps the group. Tree entry/byte limits,
+free-disk headroom and refusal of symlink/submodule entries bound checkout
+materialization. System/global Git configuration, interactive prompting,
+repository hooks, repository-local clean/smudge/process filters and
+file-protocol transport are disabled. An existing worktree must also prove an
+owned, single-linked regular `.git` file whose canonical target and reported
+common directory are exactly under the configured repository's
+`.git/worktrees`; matching commit/ref values from an independent repository do
+not suffice.
 
 ```json
 {
@@ -231,12 +242,7 @@ transport are disabled for these operations.
     "checkout": "wc2_checkout_00000000000000000000000000000003",
     "canonical_root": "/srv/automonique/worktrees/issue-166"
   }],
-  "task_selectors": [{
-    "base_selector": "base-main", "branch_selector": "branch-issue-166",
-    "project": "project-example",
-    "workspace": "wc2_user_workspace_00000000000000000000000000000004",
-    "checkout": "wc2_checkout_00000000000000000000000000000003"
-  }]
+  "task_selectors": []
 }
 ```
 
@@ -250,11 +256,14 @@ dependent checkout or workspace binding can use it; selectors and durable
 identities are never treated as interchangeable.
 
 The sibling `platform-v2-lifecycle-effects.json` is a daemon-owned, atomic,
-fsynced, mode-`0600` journal. A prepared record is durable before an external
+fsynced, mode-`0600`, single-linked and bounded journal. Its loaded full file
+generation is checked immediately before each overwrite. If rename installs a
+new generation but the following directory fsync fails, memory retains the
+installed generation rather than restoring stale state. A prepared record is durable before an external
 effect. Restart reconciliation proves an exact completed worktree, proves it
 was not started, or leaves it ambiguous; it never guesses and replays a partial
-effect. Completed workspace/checkout mappings retain only opaque identities and
-path digests. Logical archive changes do not delete operator files or git
+effect. Completed host/checkout mappings retain only opaque identities and path
+digests. Logical archive changes do not delete operator files or git
 worktrees.
 
 ## Offline production bootstrap

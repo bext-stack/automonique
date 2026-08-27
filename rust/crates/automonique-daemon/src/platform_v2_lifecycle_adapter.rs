@@ -12,16 +12,18 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use automonique_protocol::digest::{Sha256, Sha256Digest};
 use automonique_protocol::platform::IdempotencyKey;
-use automonique_protocol::platform_v2::{
-    CheckoutKind, HostSetupKind, ProjectId, UserWorkspaceId, WorkContextIdentity,
-};
+use automonique_protocol::platform_v2::{CheckoutKind, HostSetupKind, WorkContextIdentity};
 use automonique_protocol::platform_v2_lifecycle::WorkContextMutationIntent;
-use automonique_protocol::platform_v2_lineage::{WorkspaceIntent, WorkspaceIntentOutcome};
 use serde::{Deserialize, Serialize};
 
 use crate::platform_v2_host::{
@@ -35,6 +37,9 @@ const MAX_REGISTRY_BYTES: u64 = 512 * 1024;
 const MAX_JOURNAL_BYTES: u64 = 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
 const MAX_GIT_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_CHECKOUT_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_CHECKOUT_ENTRIES: usize = 20_000;
+const GIT_TIMEOUT: Duration = Duration::from_secs(15);
 const GIT_PROGRAM: &str = "/usr/bin/git";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,6 +58,18 @@ struct FileGeneration {
 struct PrivateSnapshot {
     bytes: Vec<u8>,
     generation: FileGeneration,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct JournalPersistError {
+    category: &'static str,
+    installed: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AtomicWriteError {
+    category: &'static str,
+    installed: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -205,6 +222,7 @@ pub struct ProductionLifecycleEffectAdapter {
     expected_uid: u32,
     registry: RegistryDocument,
     journal_path: PathBuf,
+    journal_generation: Option<FileGeneration>,
     journal: JournalDocument,
 }
 
@@ -221,7 +239,8 @@ impl ProductionLifecycleEffectAdapter {
         let registry: RegistryDocument = serde_json::from_slice(&snapshot.bytes)
             .map_err(|_| "platform_v2_lifecycle_registry_invalid")?;
         validate_registry(&registry, expected_uid)?;
-        let journal = match read_private_file(journal_path, expected_uid, MAX_JOURNAL_BYTES)? {
+        let journal_snapshot = read_private_file(journal_path, expected_uid, MAX_JOURNAL_BYTES)?;
+        let journal = match journal_snapshot.as_ref() {
             Some(value) => serde_json::from_slice(&value.bytes)
                 .map_err(|_| "platform_v2_lifecycle_journal_invalid")?,
             None => JournalDocument {
@@ -332,6 +351,7 @@ impl ProductionLifecycleEffectAdapter {
             expected_uid,
             registry,
             journal_path: journal_path.to_path_buf(),
+            journal_generation: journal_snapshot.map(|value| value.generation),
             journal,
         };
         Ok(Some(result))
@@ -384,7 +404,7 @@ impl ProductionLifecycleEffectAdapter {
                 {
                     return Err("platform_v2_lifecycle_selector_mismatch");
                 }
-                validate_checkout_binding(binding, self.expected_uid)
+                preflight_checkout_effect(binding, self.expected_uid)
             }
             WorkContextMutationIntent::CreateUserWorkspace(value) => self
                 .checkout_by_identity(value.checkout().identity().id())
@@ -442,167 +462,6 @@ impl ProductionLifecycleEffectAdapter {
             _ => {}
         }
         Ok(())
-    }
-
-    pub fn execute_workspace_intent(
-        &mut self,
-        intent: &WorkspaceIntent,
-        project: &ProjectId,
-        workspace: &UserWorkspaceId,
-    ) -> Result<WorkspaceIntentOutcome, &'static str> {
-        self.preflight_workspace_intent(intent, project, workspace)?;
-        let key = format!("lineage:{}", intent.intent_id().as_str());
-        let digest = workspace_intent_digest(intent, project, workspace);
-        match self.journal.entries.get(&key) {
-            Some(entry) if entry.digest != digest => {
-                return Err("platform_v2_lifecycle_idempotency_conflict");
-            }
-            Some(entry) if entry.state == "completed" => {
-                return Ok(workspace_final_outcome(intent, workspace));
-            }
-            Some(_) => return self.reconcile_workspace_intent(intent, project, workspace),
-            None => {}
-        }
-        self.insert_prepared(key.clone(), digest, "workspace_intent")?;
-        let result = match intent {
-            WorkspaceIntent::Create(value) => {
-                let selector = self
-                    .registry
-                    .task_selectors
-                    .iter()
-                    .find(|entry| {
-                        entry.base_selector == value.base_selector().as_str()
-                            && entry.branch_selector == value.branch_selector().as_str()
-                    })
-                    .ok_or("platform_v2_create_selector_unknown")?;
-                if selector.project != project.as_str() || selector.workspace != workspace.as_str()
-                {
-                    return Err("platform_v2_create_selector_mismatch");
-                }
-                let checkout = self.checkout_by_identity(&selector.checkout)?;
-                validate_checkout_materialized(checkout, self.expected_uid)?;
-                WorkspaceIntentOutcome::Created(workspace.clone())
-            }
-            WorkspaceIntent::Resume(_) => {
-                let root = self.workspace_root(workspace.as_str())?;
-                let project_matches = self
-                    .workspace(workspace.as_str())
-                    .map(|binding| binding.project == project.as_str())
-                    .or_else(|_| {
-                        self.journal
-                            .workspaces
-                            .get(workspace.as_str())
-                            .map(|binding| binding.project == project.as_str())
-                            .ok_or("platform_v2_lifecycle_workspace_unknown")
-                    })?;
-                if !project_matches {
-                    return Err("platform_v2_resume_scope_denied");
-                }
-                validate_existing_private_root(&root, self.expected_uid)?;
-                WorkspaceIntentOutcome::Resumed(workspace.clone())
-            }
-            WorkspaceIntent::Cancel(value) => {
-                WorkspaceIntentOutcome::Cancelled(value.target_intent_id().clone())
-            }
-        };
-        self.mark_completed(&key)?;
-        Ok(result)
-    }
-
-    pub fn preflight_workspace_intent(
-        &self,
-        intent: &WorkspaceIntent,
-        project: &ProjectId,
-        workspace: &UserWorkspaceId,
-    ) -> Result<(), &'static str> {
-        self.verify_registry()?;
-        match intent {
-            WorkspaceIntent::Create(value) => {
-                let selector = self
-                    .registry
-                    .task_selectors
-                    .iter()
-                    .find(|entry| {
-                        entry.base_selector == value.base_selector().as_str()
-                            && entry.branch_selector == value.branch_selector().as_str()
-                    })
-                    .ok_or("platform_v2_create_selector_unknown")?;
-                if selector.project != project.as_str() || selector.workspace != workspace.as_str()
-                {
-                    return Err("platform_v2_create_selector_mismatch");
-                }
-                let checkout = self.checkout_by_identity(&selector.checkout)?;
-                self.validate_checkout_scope(checkout, project.as_str())?;
-                validate_checkout_materialized(checkout, self.expected_uid)
-            }
-            WorkspaceIntent::Resume(_) => {
-                let root = self.workspace_root(workspace.as_str())?;
-                let checkout_id = if let Ok(binding) = self.workspace(workspace.as_str()) {
-                    if binding.project != project.as_str() {
-                        return Err("platform_v2_resume_scope_denied");
-                    }
-                    binding.checkout.as_str()
-                } else {
-                    self.journal
-                        .workspaces
-                        .get(workspace.as_str())
-                        .filter(|binding| binding.project == project.as_str())
-                        .map(|binding| binding.checkout.as_str())
-                        .ok_or("platform_v2_resume_scope_denied")?
-                };
-                let checkout = self.checkout_by_identity(checkout_id)?;
-                self.validate_checkout_scope(checkout, project.as_str())?;
-                validate_existing_private_root(&root, self.expected_uid)
-            }
-            WorkspaceIntent::Cancel(_) => Ok(()),
-        }
-    }
-
-    pub fn reconcile_workspace_intent(
-        &mut self,
-        intent: &WorkspaceIntent,
-        project: &ProjectId,
-        workspace: &UserWorkspaceId,
-    ) -> Result<WorkspaceIntentOutcome, &'static str> {
-        self.verify_registry()?;
-        let key = format!("lineage:{}", intent.intent_id().as_str());
-        let digest = workspace_intent_digest(intent, project, workspace);
-        let entry = self
-            .journal
-            .entries
-            .get(&key)
-            .ok_or("platform_v2_lifecycle_effect_not_started")?;
-        if entry.digest != digest {
-            return Err("platform_v2_lifecycle_idempotency_conflict");
-        }
-        if entry.state == "completed" {
-            return Ok(workspace_final_outcome(intent, workspace));
-        }
-        let complete = match intent {
-            WorkspaceIntent::Create(value) => self
-                .registry
-                .task_selectors
-                .iter()
-                .find(|binding| {
-                    binding.base_selector == value.base_selector().as_str()
-                        && binding.branch_selector == value.branch_selector().as_str()
-                        && binding.project == project.as_str()
-                        && binding.workspace == workspace.as_str()
-                })
-                .and_then(|binding| self.checkout_by_identity(&binding.checkout).ok())
-                .is_some_and(|binding| {
-                    validate_checkout_materialized(binding, self.expected_uid).is_ok()
-                }),
-            WorkspaceIntent::Resume(_) => self
-                .workspace_root(workspace.as_str())
-                .is_ok_and(|root| validate_existing_private_root(&root, self.expected_uid).is_ok()),
-            WorkspaceIntent::Cancel(_) => true,
-        };
-        if !complete {
-            return Err("platform_v2_lifecycle_effect_ambiguous");
-        }
-        self.mark_completed(&key)?;
-        Ok(workspace_final_outcome(intent, workspace))
     }
 
     fn host_setup(&self, selector: &str) -> Result<&HostSetupBinding, &'static str> {
@@ -679,31 +538,62 @@ impl ProductionLifecycleEffectAdapter {
         Ok(checkout.canonical_root.clone())
     }
 
-    fn validate_checkout_scope(
-        &self,
-        checkout: &CheckoutBinding,
-        project: &str,
-    ) -> Result<(), &'static str> {
-        let host = self.host_setup_by_identity(&checkout.host_setup)?;
-        if checkout.project != project
-            || host.project != project
-            || host.setup_kind != HostSetupKind::Local.as_str()
-        {
-            return Err("platform_v2_lifecycle_checkout_scope_mismatch");
+    fn verify_journal_generation(&self) -> Result<(), &'static str> {
+        let current = read_private_file(&self.journal_path, self.expected_uid, MAX_JOURNAL_BYTES)?;
+        if current.as_ref().map(|value| &value.generation) != self.journal_generation.as_ref() {
+            return Err("platform_v2_lifecycle_journal_changed");
         }
         Ok(())
     }
 
-    fn persist_journal(&mut self) -> Result<(), &'static str> {
+    fn persist_journal(&mut self) -> Result<(), JournalPersistError> {
+        self.verify_registry()
+            .map_err(|category| JournalPersistError {
+                category,
+                installed: false,
+            })?;
+        self.verify_journal_generation()
+            .map_err(|category| JournalPersistError {
+                category,
+                installed: false,
+            })?;
         self.journal.registry_generation = JournalGeneration::from(&self.registry_generation);
-        let bytes = serde_json::to_vec(&self.journal)
-            .map_err(|_| "platform_v2_lifecycle_journal_invalid")?;
+        let bytes = serde_json::to_vec(&self.journal).map_err(|_| JournalPersistError {
+            category: "platform_v2_lifecycle_journal_invalid",
+            installed: false,
+        })?;
         if bytes.len() as u64 > MAX_JOURNAL_BYTES {
-            return Err("platform_v2_lifecycle_journal_full");
+            return Err(JournalPersistError {
+                category: "platform_v2_lifecycle_journal_full",
+                installed: false,
+            });
         }
-        write_private_atomic(&self.journal_path, self.expected_uid, &bytes)
+        let write_result = write_private_atomic(&self.journal_path, self.expected_uid, &bytes);
+        match read_private_file(&self.journal_path, self.expected_uid, MAX_JOURNAL_BYTES) {
+            Ok(Some(snapshot)) if snapshot.generation.digest == Sha256::digest(&bytes) => {
+                self.journal_generation = Some(snapshot.generation);
+            }
+            Ok(_) if write_result.is_ok() => {
+                return Err(JournalPersistError {
+                    category: "platform_v2_lifecycle_journal_changed",
+                    installed: true,
+                });
+            }
+            Err(category) if write_result.is_ok() => {
+                return Err(JournalPersistError {
+                    category,
+                    installed: true,
+                });
+            }
+            _ => {}
+        }
+        write_result.map_err(|error| JournalPersistError {
+            category: error.category,
+            installed: error.installed,
+        })
     }
 
+    #[cfg(test)]
     fn insert_prepared(
         &mut self,
         key: String,
@@ -723,8 +613,10 @@ impl ProductionLifecycleEffectAdapter {
             },
         );
         if let Err(error) = self.persist_journal() {
-            self.journal = previous;
-            return Err(error);
+            if !error.installed {
+                self.journal = previous;
+            }
+            return Err(error.category);
         }
         Ok(())
     }
@@ -737,8 +629,36 @@ impl ProductionLifecycleEffectAdapter {
             .ok_or("platform_v2_lifecycle_journal_invalid")?
             .state = "completed".to_owned();
         if let Err(error) = self.persist_journal() {
-            self.journal = previous;
-            return Err(error);
+            if !error.installed {
+                self.journal = previous;
+            }
+            return Err(error.category);
+        }
+        Ok(())
+    }
+
+    fn tombstone_not_started(
+        &mut self,
+        key: &str,
+        intent: &WorkContextMutationIntent,
+        resulting_identity: &WorkContextIdentity,
+    ) -> Result<(), &'static str> {
+        let previous = self.journal.clone();
+        self.journal.entries.remove(key);
+        match intent {
+            WorkContextMutationIntent::CreateHostSetup(_) => {
+                self.journal.host_setups.remove(resulting_identity.id());
+            }
+            WorkContextMutationIntent::CreateCheckout(_) => {
+                self.journal.checkouts.remove(resulting_identity.id());
+            }
+            _ => {}
+        }
+        if let Err(error) = self.persist_journal() {
+            if !error.installed {
+                self.journal = previous;
+            }
+            return Err(error.category);
         }
         Ok(())
     }
@@ -798,8 +718,10 @@ impl ProductionLifecycleEffectAdapter {
             _ => {}
         }
         if let Err(error) = self.persist_journal() {
-            self.journal = previous;
-            return Err(error);
+            if !error.installed {
+                self.journal = previous;
+            }
+            return Err(error.category);
         }
         Ok(())
     }
@@ -825,26 +747,8 @@ impl PlatformV2LifecycleEffectAdapter for ProductionLifecycleEffectAdapter {
         Self::preflight_submission(self, intent, resulting_identity)
     }
 
-    fn workspace_intents_supported(&self) -> bool {
-        true
-    }
-
-    fn preflight_workspace_intent(
-        &self,
-        intent: &WorkspaceIntent,
-        project: &ProjectId,
-        workspace: &UserWorkspaceId,
-    ) -> Result<(), &'static str> {
-        Self::preflight_workspace_intent(self, intent, project, workspace)
-    }
-
-    fn execute_workspace_intent(
-        &mut self,
-        intent: &WorkspaceIntent,
-        project: &ProjectId,
-        workspace: &UserWorkspaceId,
-    ) -> Result<WorkspaceIntentOutcome, &'static str> {
-        Self::execute_workspace_intent(self, intent, project, workspace)
+    fn verify_generation(&self) -> Result<(), &'static str> {
+        self.verify_registry()
     }
 
     fn execute(
@@ -909,7 +813,14 @@ impl PlatformV2LifecycleEffectAdapter for ProductionLifecycleEffectAdapter {
             }
             PlatformV2EffectReconciliation::Completed(evidence())
         } else if self.definitely_not_started(intent, resulting_identity) {
-            PlatformV2EffectReconciliation::VerifiedNotStarted(evidence())
+            if self
+                .tombstone_not_started(&key, intent, resulting_identity)
+                .is_err()
+            {
+                PlatformV2EffectReconciliation::Unknown(evidence())
+            } else {
+                PlatformV2EffectReconciliation::VerifiedNotStarted(evidence())
+            }
         } else {
             PlatformV2EffectReconciliation::Unknown(evidence())
         }
@@ -920,7 +831,7 @@ impl ProductionLifecycleEffectAdapter {
     fn apply_lifecycle(
         &mut self,
         intent: &WorkContextMutationIntent,
-        resulting_identity: &WorkContextIdentity,
+        _resulting_identity: &WorkContextIdentity,
     ) -> Result<(), &'static str> {
         match intent {
             WorkContextMutationIntent::CreateHostSetup(value) => {
@@ -936,50 +847,6 @@ impl ProductionLifecycleEffectAdapter {
                 let binding = self.checkout(value.registry().as_str())?.clone();
                 materialize_checkout(&binding, self.expected_uid)
             }
-            WorkContextMutationIntent::CreateUserWorkspace(value) => {
-                let checkout = self.checkout_by_identity(value.checkout().identity().id())?;
-                validate_checkout_materialized(checkout, self.expected_uid)?;
-                if self.journal.workspaces.len() >= MAX_ENTRIES {
-                    return Err("platform_v2_lifecycle_journal_full");
-                }
-                self.journal.workspaces.insert(
-                    resulting_identity.id().to_owned(),
-                    JournalWorkspace {
-                        project: value.project().identity().id().to_owned(),
-                        checkout: value.checkout().identity().id().to_owned(),
-                        root_digest: path_digest(&checkout.canonical_root),
-                        archived: false,
-                    },
-                );
-                self.persist_journal()
-            }
-            WorkContextMutationIntent::ArchiveHostSetup(value) => {
-                let host = self
-                    .journal
-                    .host_setups
-                    .get_mut(value.target().identity().id())
-                    .ok_or("platform_v2_lifecycle_host_setup_unknown")?;
-                host.archived = true;
-                self.persist_journal()
-            }
-            WorkContextMutationIntent::ArchiveCheckout(value) => {
-                let checkout = self
-                    .journal
-                    .checkouts
-                    .get_mut(value.target().identity().id())
-                    .ok_or("platform_v2_lifecycle_checkout_unknown")?;
-                checkout.archived = true;
-                self.persist_journal()
-            }
-            WorkContextMutationIntent::ArchiveUserWorkspace(value) => {
-                let workspace = self
-                    .journal
-                    .workspaces
-                    .get_mut(value.target().identity().id())
-                    .ok_or("platform_v2_lifecycle_workspace_unknown")?;
-                workspace.archived = true;
-                self.persist_journal()
-            }
             _ => Err("platform_v2_execution_adapter_unavailable"),
         }
     }
@@ -987,7 +854,7 @@ impl ProductionLifecycleEffectAdapter {
     fn inspect_lifecycle(
         &self,
         intent: &WorkContextMutationIntent,
-        resulting_identity: &WorkContextIdentity,
+        _resulting_identity: &WorkContextIdentity,
     ) -> bool {
         match intent {
             WorkContextMutationIntent::CreateHostSetup(value) => self
@@ -1002,26 +869,6 @@ impl ProductionLifecycleEffectAdapter {
                 .is_ok_and(|binding| {
                     validate_checkout_materialized(binding, self.expected_uid).is_ok()
                 }),
-            WorkContextMutationIntent::CreateUserWorkspace(_) => self
-                .journal
-                .workspaces
-                .get(resulting_identity.id())
-                .is_some_and(|entry| !entry.archived),
-            WorkContextMutationIntent::ArchiveHostSetup(value) => self
-                .journal
-                .host_setups
-                .get(value.target().identity().id())
-                .is_some_and(|entry| entry.archived),
-            WorkContextMutationIntent::ArchiveCheckout(value) => self
-                .journal
-                .checkouts
-                .get(value.target().identity().id())
-                .is_some_and(|entry| entry.archived),
-            WorkContextMutationIntent::ArchiveUserWorkspace(value) => self
-                .journal
-                .workspaces
-                .get(value.target().identity().id())
-                .is_some_and(|entry| entry.archived),
             _ => false,
         }
     }
@@ -1029,7 +876,7 @@ impl ProductionLifecycleEffectAdapter {
     fn definitely_not_started(
         &self,
         intent: &WorkContextMutationIntent,
-        resulting_identity: &WorkContextIdentity,
+        _resulting_identity: &WorkContextIdentity,
     ) -> bool {
         match intent {
             WorkContextMutationIntent::CreateCheckout(value) => self
@@ -1051,10 +898,6 @@ impl ProductionLifecycleEffectAdapter {
                         Err(_) => false,
                     }
                 }),
-            WorkContextMutationIntent::CreateUserWorkspace(_) => !self
-                .journal
-                .workspaces
-                .contains_key(resulting_identity.id()),
             _ => false,
         }
     }
@@ -1209,9 +1052,8 @@ fn validate_checkout_binding(
                 .branch_ref
                 .as_deref()
                 .ok_or("platform_v2_lifecycle_registry_invalid")?;
-            validate_existing_private_root(repository, expected_uid)?;
-            if !repository.join(".git").exists()
-                || !valid_object_id(base)
+            validate_repository_root(repository, expected_uid)?;
+            if !valid_object_id(base)
                 || !valid_branch_ref(branch)
                 || !binding.canonical_root.is_absolute()
                 || binding
@@ -1270,24 +1112,17 @@ fn materialize_checkout(binding: &CheckoutBinding, expected_uid: u32) -> Result<
             if git_status(repository, &["show-ref", "--verify", "--quiet", branch_ref])? {
                 return Err("platform_v2_lifecycle_branch_conflict");
             }
+            validate_checkout_tree_bounds(repository, base, &binding.canonical_root)?;
             let branch = branch_ref
                 .strip_prefix("refs/heads/")
                 .ok_or("platform_v2_lifecycle_registry_invalid")?;
-            let output = bounded_output(
-                Command::new(GIT_PROGRAM)
-                    .args([
-                        "-c",
-                        "core.hooksPath=/dev/null",
-                        "-c",
-                        "protocol.file.allow=never",
-                    ])
-                    .arg("-C")
-                    .arg(repository)
-                    .args(["worktree", "add", "-b"])
-                    .arg(branch)
-                    .arg(&binding.canonical_root)
-                    .arg(base),
-            )?;
+            let mut command = safe_git_command(repository)?;
+            command
+                .args(["worktree", "add", "-b"])
+                .arg(branch)
+                .arg(&binding.canonical_root)
+                .arg(base);
+            let output = bounded_output(&mut command)?;
             if !output.status.success() {
                 return Err("platform_v2_lifecycle_git_failed");
             }
@@ -1298,19 +1133,196 @@ fn materialize_checkout(binding: &CheckoutBinding, expected_uid: u32) -> Result<
     }
 }
 
+fn preflight_checkout_effect(
+    binding: &CheckoutBinding,
+    expected_uid: u32,
+) -> Result<(), &'static str> {
+    validate_checkout_binding(binding, expected_uid)?;
+    if CheckoutKind::parse(&binding.checkout_kind).ok() != Some(CheckoutKind::GitWorktree) {
+        return Ok(());
+    }
+    if binding.canonical_root.exists() {
+        return validate_checkout_materialized(binding, expected_uid);
+    }
+    let repository = binding.repository_root.as_ref().unwrap();
+    let base = binding.base_commit.as_deref().unwrap();
+    let branch = binding.branch_ref.as_deref().unwrap();
+    if git_text(
+        repository,
+        &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
+    )? != base
+    {
+        return Err("platform_v2_lifecycle_base_mismatch");
+    }
+    if git_status(repository, &["show-ref", "--verify", "--quiet", branch])? {
+        return Err("platform_v2_lifecycle_branch_conflict");
+    }
+    validate_checkout_tree_bounds(repository, base, &binding.canonical_root)
+}
+
 fn validate_checkout_materialized(
     binding: &CheckoutBinding,
     expected_uid: u32,
 ) -> Result<(), &'static str> {
     validate_existing_private_root(&binding.canonical_root, expected_uid)?;
     if CheckoutKind::parse(&binding.checkout_kind).ok() == Some(CheckoutKind::GitWorktree) {
+        let repository = binding.repository_root.as_ref().unwrap();
+        validate_repository_root(repository, expected_uid)?;
+        validate_worktree_git_file(&binding.canonical_root, repository, expected_uid)?;
+        let expected_repository =
+            fs::canonicalize(repository).map_err(|_| "platform_v2_lifecycle_checkout_mismatch")?;
+        let expected_common = fs::canonicalize(repository.join(".git"))
+            .map_err(|_| "platform_v2_lifecycle_checkout_mismatch")?;
+        let actual_root = canonical_git_path(
+            &binding.canonical_root,
+            &git_text(&binding.canonical_root, &["rev-parse", "--show-toplevel"])?,
+        )?;
+        let actual_common = canonical_git_path(
+            &binding.canonical_root,
+            &git_text(&binding.canonical_root, &["rev-parse", "--git-common-dir"])?,
+        )?;
         let base = binding.base_commit.as_deref().unwrap();
         let branch = binding.branch_ref.as_deref().unwrap();
-        if git_text(&binding.canonical_root, &["rev-parse", "HEAD"])? != base
+        if actual_root != binding.canonical_root
+            || expected_repository != repository.as_path()
+            || actual_common != expected_common
+            || git_text(&binding.canonical_root, &["rev-parse", "HEAD"])? != base
             || git_text(&binding.canonical_root, &["symbolic-ref", "-q", "HEAD"])? != branch
         {
             return Err("platform_v2_lifecycle_checkout_mismatch");
         }
+    };
+    Ok(())
+}
+
+fn validate_repository_root(path: &Path, expected_uid: u32) -> Result<(), &'static str> {
+    validate_existing_private_root(path, expected_uid)?;
+    let git = path.join(".git");
+    let metadata =
+        fs::symlink_metadata(&git).map_err(|_| "platform_v2_lifecycle_repository_mismatch")?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != expected_uid
+        || fs::canonicalize(&git).ok().as_deref() != Some(git.as_path())
+    {
+        return Err("platform_v2_lifecycle_repository_mismatch");
+    }
+    let top = canonical_git_path(path, &git_text(path, &["rev-parse", "--show-toplevel"])?)?;
+    let common = canonical_git_path(path, &git_text(path, &["rev-parse", "--git-common-dir"])?)?;
+    if top != path || common != git {
+        return Err("platform_v2_lifecycle_repository_mismatch");
+    }
+    Ok(())
+}
+
+fn validate_worktree_git_file(
+    worktree: &Path,
+    repository: &Path,
+    expected_uid: u32,
+) -> Result<(), &'static str> {
+    let git_file = worktree.join(".git");
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
+        .open(&git_file)
+        .map_err(|_| "platform_v2_lifecycle_checkout_mismatch")?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "platform_v2_lifecycle_checkout_mismatch")?;
+    if !metadata.is_file()
+        || metadata.uid() != expected_uid
+        || metadata.nlink() != 1
+        || metadata.len() > 4096
+    {
+        return Err("platform_v2_lifecycle_checkout_mismatch");
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(4097)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "platform_v2_lifecycle_checkout_mismatch")?;
+    let value = std::str::from_utf8(&bytes)
+        .map_err(|_| "platform_v2_lifecycle_checkout_mismatch")?
+        .trim();
+    let target = value
+        .strip_prefix("gitdir: ")
+        .ok_or("platform_v2_lifecycle_checkout_mismatch")?;
+    let target = canonical_git_path(worktree, target)?;
+    let common = fs::canonicalize(repository.join(".git"))
+        .map_err(|_| "platform_v2_lifecycle_checkout_mismatch")?;
+    let worktree_records = common.join("worktrees");
+    if !target.starts_with(&worktree_records)
+        || target.parent() != Some(worktree_records.as_path())
+        || canonical_git_path(worktree, &git_text(worktree, &["rev-parse", "--git-dir"])?)?
+            != target
+    {
+        return Err("platform_v2_lifecycle_checkout_mismatch");
+    }
+    Ok(())
+}
+
+fn canonical_git_path(base: &Path, value: &str) -> Result<PathBuf, &'static str> {
+    let value = Path::new(value);
+    fs::canonicalize(if value.is_absolute() {
+        value.to_path_buf()
+    } else {
+        base.join(value)
+    })
+    .map_err(|_| "platform_v2_lifecycle_checkout_mismatch")
+}
+
+fn validate_checkout_tree_bounds(
+    repository: &Path,
+    base: &str,
+    target: &Path,
+) -> Result<(), &'static str> {
+    let mut command = safe_git_command(repository)?;
+    command.args(["ls-tree", "-rlz", "--full-tree", base]);
+    let output = bounded_output(&mut command)?;
+    if !output.status.success() {
+        return Err("platform_v2_lifecycle_git_failed");
+    }
+    let mut total = 0_u64;
+    let mut entries = 0_usize;
+    for record in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|value| !value.is_empty())
+    {
+        let header = record
+            .splitn(2, |byte| *byte == b'\t')
+            .next()
+            .ok_or("platform_v2_lifecycle_git_failed")?;
+        let header = std::str::from_utf8(header).map_err(|_| "platform_v2_lifecycle_git_failed")?;
+        let mut fields = header.split_ascii_whitespace();
+        let mode = fields.next().ok_or("platform_v2_lifecycle_git_failed")?;
+        let kind = fields.next().ok_or("platform_v2_lifecycle_git_failed")?;
+        let _object = fields.next().ok_or("platform_v2_lifecycle_git_failed")?;
+        let size = fields.next().ok_or("platform_v2_lifecycle_git_failed")?;
+        if mode == "120000" || mode == "160000" || kind != "blob" {
+            return Err("platform_v2_lifecycle_checkout_tree_unsafe");
+        }
+        total = total
+            .checked_add(
+                size.parse::<u64>()
+                    .map_err(|_| "platform_v2_lifecycle_git_failed")?,
+            )
+            .ok_or("platform_v2_lifecycle_checkout_too_large")?;
+        entries += 1;
+        if entries > MAX_CHECKOUT_ENTRIES || total > MAX_CHECKOUT_BYTES {
+            return Err("platform_v2_lifecycle_checkout_too_large");
+        }
+    }
+    let parent = target
+        .parent()
+        .ok_or("platform_v2_lifecycle_path_insecure")?;
+    let capacity =
+        nix::sys::statvfs::statvfs(parent).map_err(|_| "platform_v2_lifecycle_path_unavailable")?;
+    let available = capacity
+        .blocks_available()
+        .saturating_mul(capacity.fragment_size());
+    if total.saturating_add(64 * 1024 * 1024) > available {
+        return Err("platform_v2_lifecycle_checkout_disk_insufficient");
     }
     Ok(())
 }
@@ -1355,6 +1367,7 @@ fn read_private_file(
     if !metadata.file_type().is_file()
         || metadata.uid() != expected_uid
         || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
         || metadata.len() > limit
     {
         return Err("platform_v2_lifecycle_private_file_insecure");
@@ -1382,31 +1395,56 @@ fn read_private_file(
     }))
 }
 
-fn write_private_atomic(path: &Path, expected_uid: u32, bytes: &[u8]) -> Result<(), &'static str> {
+fn write_private_atomic(
+    path: &Path,
+    expected_uid: u32,
+    bytes: &[u8],
+) -> Result<(), AtomicWriteError> {
+    write_private_atomic_with(path, expected_uid, bytes, || Ok(()))
+}
+
+fn write_private_atomic_with<F>(
+    path: &Path,
+    expected_uid: u32,
+    bytes: &[u8],
+    after_rename: F,
+) -> Result<(), AtomicWriteError>
+where
+    F: FnOnce() -> Result<(), &'static str>,
+{
+    let before = |category| AtomicWriteError {
+        category,
+        installed: false,
+    };
+    let after = |category| AtomicWriteError {
+        category,
+        installed: true,
+    };
     let parent = path
         .parent()
-        .ok_or("platform_v2_lifecycle_journal_insecure")?;
-    let parent_metadata =
-        fs::symlink_metadata(parent).map_err(|_| "platform_v2_lifecycle_journal_insecure")?;
+        .ok_or_else(|| before("platform_v2_lifecycle_journal_insecure"))?;
+    let parent_metadata = fs::symlink_metadata(parent)
+        .map_err(|_| before("platform_v2_lifecycle_journal_insecure"))?;
     if parent_metadata.file_type().is_symlink()
         || !parent_metadata.is_dir()
         || parent_metadata.uid() != expected_uid
         || parent_metadata.mode() & 0o022 != 0
     {
-        return Err("platform_v2_lifecycle_journal_insecure");
+        return Err(before("platform_v2_lifecycle_journal_insecure"));
     }
     if let Ok(metadata) = fs::symlink_metadata(path)
         && (metadata.file_type().is_symlink()
             || !metadata.is_file()
             || metadata.uid() != expected_uid
-            || metadata.mode() & 0o7777 != 0o600)
+            || metadata.mode() & 0o7777 != 0o600
+            || metadata.nlink() != 1)
     {
-        return Err("platform_v2_lifecycle_journal_insecure");
+        return Err(before("platform_v2_lifecycle_journal_insecure"));
     }
     let mut nonce = [0_u8; 16];
     fs::File::open("/dev/urandom")
         .and_then(|mut source| source.read_exact(&mut nonce))
-        .map_err(|_| "platform_v2_lifecycle_journal_io")?;
+        .map_err(|_| before("platform_v2_lifecycle_journal_io"))?;
     let temporary = parent.join(format!(".platform-v2-lifecycle-{}.tmp", hex(&nonce)));
     let mut file = OpenOptions::new()
         .write(true)
@@ -1414,45 +1452,240 @@ fn write_private_atomic(path: &Path, expected_uid: u32, bytes: &[u8]) -> Result<
         .mode(0o600)
         .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
         .open(&temporary)
-        .map_err(|_| "platform_v2_lifecycle_journal_io")?;
-    file.write_all(bytes)
-        .and_then(|_| file.sync_all())
-        .map_err(|_| "platform_v2_lifecycle_journal_io")?;
-    fs::rename(&temporary, path).map_err(|_| "platform_v2_lifecycle_journal_io")?;
-    let directory = fs::File::open(parent).map_err(|_| "platform_v2_lifecycle_journal_io")?;
+        .map_err(|_| before("platform_v2_lifecycle_journal_io"))?;
+    if file.write_all(bytes).and_then(|_| file.sync_all()).is_err() {
+        let _ = fs::remove_file(&temporary);
+        return Err(before("platform_v2_lifecycle_journal_io"));
+    }
+    if fs::rename(&temporary, path).is_err() {
+        let _ = fs::remove_file(&temporary);
+        return Err(before("platform_v2_lifecycle_journal_io"));
+    }
+    after_rename().map_err(after)?;
+    let directory =
+        fs::File::open(parent).map_err(|_| after("platform_v2_lifecycle_journal_io"))?;
     directory
         .sync_all()
-        .map_err(|_| "platform_v2_lifecycle_journal_io")
+        .map_err(|_| after("platform_v2_lifecycle_journal_io"))
 }
 
-fn bounded_output(command: &mut Command) -> Result<std::process::Output, &'static str> {
-    let output = command
+struct BoundedOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+}
+
+fn bounded_output(command: &mut Command) -> Result<BoundedOutput, &'static str> {
+    bounded_output_with_timeout(command, GIT_TIMEOUT)
+}
+
+fn bounded_output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<BoundedOutput, &'static str> {
+    command
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .env_clear()
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
+        .env("GIT_TERMINAL_PROMPT", "0");
+    command.process_group(0);
+    let mut child = command
+        .spawn()
         .map_err(|_| "platform_v2_lifecycle_git_unavailable")?;
-    if output.stdout.len().saturating_add(output.stderr.len()) > MAX_GIT_OUTPUT_BYTES {
+
+    let total = Arc::new(AtomicUsize::new(0));
+    let exceeded = Arc::new(AtomicBool::new(false));
+    let stdout = Arc::new(Mutex::new(Vec::new()));
+    let stdout_reader = spawn_bounded_reader(
+        child
+            .stdout
+            .take()
+            .ok_or("platform_v2_lifecycle_git_unavailable")?,
+        Arc::clone(&total),
+        Arc::clone(&exceeded),
+        Some(Arc::clone(&stdout)),
+    );
+    let stderr_reader = spawn_bounded_reader(
+        child
+            .stderr
+            .take()
+            .ok_or("platform_v2_lifecycle_git_unavailable")?,
+        Arc::clone(&total),
+        Arc::clone(&exceeded),
+        None,
+    );
+    let started = Instant::now();
+    let status = loop {
+        if exceeded.load(Ordering::Acquire) {
+            kill_process_group(&mut child);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err("platform_v2_lifecycle_git_output_exceeded");
+        }
+        if started.elapsed() >= timeout {
+            kill_process_group(&mut child);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err("platform_v2_lifecycle_git_timeout");
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(Duration::from_millis(5)),
+            Err(_) => {
+                kill_process_group(&mut child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err("platform_v2_lifecycle_git_failed");
+            }
+        }
+    };
+    stdout_reader
+        .join()
+        .map_err(|_| "platform_v2_lifecycle_git_failed")??;
+    stderr_reader
+        .join()
+        .map_err(|_| "platform_v2_lifecycle_git_failed")??;
+    if exceeded.load(Ordering::Acquire) {
         return Err("platform_v2_lifecycle_git_output_exceeded");
     }
-    Ok(output)
+    let stdout = Arc::try_unwrap(stdout)
+        .map_err(|_| "platform_v2_lifecycle_git_failed")?
+        .into_inner()
+        .map_err(|_| "platform_v2_lifecycle_git_failed")?;
+    Ok(BoundedOutput { status, stdout })
+}
+
+fn spawn_bounded_reader<R>(
+    mut reader: R,
+    total: Arc<AtomicUsize>,
+    exceeded: Arc<AtomicBool>,
+    capture: Option<Arc<Mutex<Vec<u8>>>>,
+) -> thread::JoinHandle<Result<(), &'static str>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let count = reader
+                .read(&mut buffer)
+                .map_err(|_| "platform_v2_lifecycle_git_failed")?;
+            if count == 0 {
+                return Ok(());
+            }
+            let prior = total.fetch_add(count, Ordering::AcqRel);
+            if prior.saturating_add(count) > MAX_GIT_OUTPUT_BYTES {
+                exceeded.store(true, Ordering::Release);
+                continue;
+            }
+            if let Some(capture) = &capture {
+                capture
+                    .lock()
+                    .map_err(|_| "platform_v2_lifecycle_git_failed")?
+                    .extend_from_slice(&buffer[..count]);
+            }
+        }
+    })
+}
+
+fn kill_process_group(child: &mut std::process::Child) {
+    if let Ok(raw_pid) = i32::try_from(child.id()) {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(raw_pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn safe_git_command(path: &Path) -> Result<Command, &'static str> {
+    let mut query = Command::new(GIT_PROGRAM);
+    query
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "protocol.file.allow=never",
+        ])
+        .arg("-C")
+        .arg(path)
+        .args([
+            "config",
+            "--local",
+            "--no-includes",
+            "--null",
+            "--name-only",
+            "--get-regexp",
+            r"^filter\..*\.(process|smudge|clean|required)$",
+        ]);
+    let output = bounded_output(&mut query)?;
+    if !matches!(output.status.code(), Some(0 | 1)) {
+        return Err("platform_v2_lifecycle_git_failed");
+    }
+    let mut filters = Vec::new();
+    for key in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|value| !value.is_empty())
+    {
+        let key = std::str::from_utf8(key).map_err(|_| "platform_v2_lifecycle_git_failed")?;
+        let name = key
+            .strip_prefix("filter.")
+            .and_then(|value| value.rsplit_once('.').map(|value| value.0))
+            .ok_or("platform_v2_lifecycle_git_failed")?;
+        if !safe_filter_name(name) {
+            return Err("platform_v2_lifecycle_filter_unsafe");
+        }
+        if !filters.iter().any(|existing| existing == name) {
+            filters.push(name.to_owned());
+        }
+    }
+    if filters.len() > 64 {
+        return Err("platform_v2_lifecycle_filter_unsafe");
+    }
+    let mut command = Command::new(GIT_PROGRAM);
+    command.args([
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+        "-c",
+        "protocol.file.allow=never",
+    ]);
+    for filter in filters {
+        command
+            .arg("-c")
+            .arg(format!("filter.{filter}.process="))
+            .arg("-c")
+            .arg(format!("filter.{filter}.smudge=cat"))
+            .arg("-c")
+            .arg(format!("filter.{filter}.clean=cat"))
+            .arg("-c")
+            .arg(format!("filter.{filter}.required=false"));
+    }
+    command.arg("-C").arg(path);
+    Ok(command)
+}
+
+fn safe_filter_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn git_text(path: &Path, args: &[&str]) -> Result<String, &'static str> {
-    let output = bounded_output(
-        Command::new(GIT_PROGRAM)
-            .args([
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "protocol.file.allow=never",
-            ])
-            .arg("-C")
-            .arg(path)
-            .args(args),
-    )?;
+    let mut command = safe_git_command(path)?;
+    command.args(args);
+    let output = bounded_output(&mut command)?;
     if !output.status.success() {
         return Err("platform_v2_lifecycle_git_failed");
     }
@@ -1466,18 +1699,9 @@ fn git_text(path: &Path, args: &[&str]) -> Result<String, &'static str> {
 }
 
 fn git_status(path: &Path, args: &[&str]) -> Result<bool, &'static str> {
-    let output = bounded_output(
-        Command::new(GIT_PROGRAM)
-            .args([
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "protocol.file.allow=never",
-            ])
-            .arg("-C")
-            .arg(path)
-            .args(args),
-    )?;
+    let mut command = safe_git_command(path)?;
+    command.args(args);
+    let output = bounded_output(&mut command)?;
     match output.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
@@ -1550,33 +1774,6 @@ fn lifecycle_digest(intent: &WorkContextMutationIntent, identity: &WorkContextId
     hex(Sha256::digest(value.as_bytes()).as_bytes())
 }
 
-fn workspace_intent_digest(
-    intent: &WorkspaceIntent,
-    project: &ProjectId,
-    workspace: &UserWorkspaceId,
-) -> String {
-    let value = format!(
-        "v1\0{}\0{}\0{}",
-        intent.intent_id().as_str(),
-        project.as_str(),
-        workspace.as_str()
-    );
-    hex(Sha256::digest(value.as_bytes()).as_bytes())
-}
-
-fn workspace_final_outcome(
-    intent: &WorkspaceIntent,
-    workspace: &UserWorkspaceId,
-) -> WorkspaceIntentOutcome {
-    match intent {
-        WorkspaceIntent::Create(_) => WorkspaceIntentOutcome::Created(workspace.clone()),
-        WorkspaceIntent::Resume(_) => WorkspaceIntentOutcome::Resumed(workspace.clone()),
-        WorkspaceIntent::Cancel(value) => {
-            WorkspaceIntentOutcome::Cancelled(value.target_intent_id().clone())
-        }
-    }
-}
-
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -1588,13 +1785,12 @@ mod tests {
     use automonique_protocol::platform::{
         ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
     };
-    use automonique_protocol::platform_v2::{HostSetupId, V1RepositoryRef, WorkContextLabel};
+    use automonique_protocol::platform_v2::{
+        HostSetupId, ProjectId, V1RepositoryRef, WorkContextLabel,
+    };
     use automonique_protocol::platform_v2_lifecycle::{
         CreateCheckoutIntent, CreateHostSetupIntent, ExpectedWorkContext,
         WorkContextRegistrySelector,
-    };
-    use automonique_protocol::platform_v2_lineage::{
-        OrchestrationTaskId, WorkspaceIntentId, WorkspaceResumeIntent,
     };
     use automonique_protocol::primitives::Revision;
 
@@ -1666,6 +1862,56 @@ mod tests {
         assert!(read_private_file(&link, uid, 100).is_err());
         fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
         assert!(read_private_file(&target, uid, 100).is_err());
+
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let hardlink = root.path().join("hardlink");
+        fs::hard_link(&target, &hardlink).unwrap();
+        assert!(read_private_file(&target, uid, 100).is_err());
+        assert!(read_private_file(&hardlink, uid, 100).is_err());
+    }
+
+    #[test]
+    fn bounded_child_is_killed_on_timeout_and_output_limit() {
+        let started = Instant::now();
+        assert_eq!(
+            bounded_output_with_timeout(
+                Command::new("/bin/sh").args(["-c", "sleep 30"]),
+                Duration::from_millis(50),
+            )
+            .err(),
+            Some("platform_v2_lifecycle_git_timeout")
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        assert_eq!(
+            bounded_output_with_timeout(
+                Command::new("/bin/sh").args([
+                    "-c",
+                    "while :; do printf '012345678901234567890123456789'; done",
+                ]),
+                Duration::from_secs(2),
+            )
+            .err(),
+            Some("platform_v2_lifecycle_git_output_exceeded")
+        );
+    }
+
+    #[test]
+    fn atomic_write_reports_installed_after_post_rename_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("state");
+        private_directory(&state);
+        let journal = state.join("journal");
+        let error = write_private_atomic_with(
+            &journal,
+            nix::unistd::geteuid().as_raw(),
+            b"new-generation",
+            || Err("forced_post_rename_failure"),
+        )
+        .unwrap_err();
+        assert!(error.installed);
+        assert_eq!(error.category, "forced_post_rename_failure");
+        assert_eq!(fs::read(journal).unwrap(), b"new-generation");
     }
 
     #[test]
@@ -1795,39 +2041,6 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_workspace_scope_mismatch_writes_no_prepared_record() {
-        let directory = tempfile::tempdir().unwrap();
-        let state = directory.path().join("state");
-        let root = directory.path().join("authorized");
-        private_directory(&state);
-        private_directory(&root);
-        let registry_path = state.join(LIFECYCLE_REGISTRY_FILE_NAME);
-        let journal_path = state.join(LIFECYCLE_JOURNAL_FILE_NAME);
-        write_registry(&registry_path, &authorized_registry(&root));
-        let uid = nix::unistd::geteuid().as_raw();
-        let mut adapter =
-            ProductionLifecycleEffectAdapter::open(&registry_path, &journal_path, uid)
-                .unwrap()
-                .unwrap();
-        let workspace = UserWorkspaceId::new("workspace-one").unwrap();
-        let intent = WorkspaceIntent::Resume(WorkspaceResumeIntent::new(
-            WorkspaceIntentId::new("resume-one").unwrap(),
-            OrchestrationTaskId::new("task-one").unwrap(),
-            workspace.clone(),
-            Revision::FIRST,
-        ));
-        assert_eq!(
-            adapter.execute_workspace_intent(
-                &intent,
-                &ProjectId::new("project-other").unwrap(),
-                &workspace,
-            ),
-            Err("platform_v2_resume_scope_denied")
-        );
-        assert!(adapter.journal.entries.is_empty());
-    }
-
-    #[test]
     fn restart_refuses_to_reconcile_prepared_effect_under_replaced_registry_generation() {
         let directory = tempfile::tempdir().unwrap();
         let state = directory.path().join("state");
@@ -1862,6 +2075,44 @@ mod tests {
     }
 
     #[test]
+    fn journal_generation_is_fenced_before_overwrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("state");
+        let root = directory.path().join("authorized");
+        private_directory(&state);
+        private_directory(&root);
+        let registry_path = state.join(LIFECYCLE_REGISTRY_FILE_NAME);
+        let journal_path = state.join(LIFECYCLE_JOURNAL_FILE_NAME);
+        write_registry(&registry_path, &authorized_registry(&root));
+        let uid = nix::unistd::geteuid().as_raw();
+        let mut adapter =
+            ProductionLifecycleEffectAdapter::open(&registry_path, &journal_path, uid)
+                .unwrap()
+                .unwrap();
+        adapter
+            .insert_prepared(
+                "lifecycle:first".to_owned(),
+                "a".repeat(64),
+                "create_checkout",
+            )
+            .unwrap();
+        let replacement = state.join("replacement-journal");
+        fs::copy(&journal_path, &replacement).unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::rename(&replacement, &journal_path).unwrap();
+        let installed = fs::read(&journal_path).unwrap();
+        assert_eq!(
+            adapter.insert_prepared(
+                "lifecycle:second".to_owned(),
+                "b".repeat(64),
+                "create_checkout",
+            ),
+            Err("platform_v2_lifecycle_journal_changed")
+        );
+        assert_eq!(fs::read(&journal_path).unwrap(), installed);
+    }
+
+    #[test]
     fn git_worktree_uses_exact_commit_and_branch_and_replays_idempotently() {
         let directory = tempfile::tempdir().unwrap();
         let state = directory.path().join("state");
@@ -1885,7 +2136,13 @@ mod tests {
         run(&["config", "user.name", "Fixture"]);
         run(&["config", "user.email", "fixture@example.invalid"]);
         fs::write(repository.join("README"), b"fixture\n").unwrap();
-        run(&["add", "README"]);
+        fs::write(
+            repository.join(".gitattributes"),
+            b"*.payload filter=evil\n",
+        )
+        .unwrap();
+        fs::write(repository.join("fixture.payload"), b"payload\n").unwrap();
+        run(&["add", "README", ".gitattributes", "fixture.payload"]);
         run(&["commit", "--quiet", "-m", "fixture"]);
         let hook_marker = directory.path().join("hook-ran");
         let hook = repository.join(".git/hooks/post-checkout");
@@ -1895,6 +2152,19 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+        let filter_marker = directory.path().join("filter-ran");
+        let filter = directory.path().join("filter.sh");
+        fs::write(
+            &filter,
+            format!(
+                "#!/bin/sh\nprintf ran > '{}'\nexit 1\n",
+                filter_marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&filter, fs::Permissions::from_mode(0o700)).unwrap();
+        run(&["config", "filter.evil.process", filter.to_str().unwrap()]);
+        run(&["config", "filter.evil.required", "true"]);
         let base = git_text(&repository, &["rev-parse", "HEAD"]).unwrap();
         let target = worktrees.join("issue-166");
         let registry_path = state.join(LIFECYCLE_REGISTRY_FILE_NAME);
@@ -1954,6 +2224,18 @@ mod tests {
         let resulting = WorkContextIdentity::Checkout(
             automonique_protocol::platform_v2::CheckoutId::new("checkout-created").unwrap(),
         );
+        run(&["branch", "work/issue-166", &base]);
+        assert_eq!(
+            adapter.execute(
+                &checkout,
+                &resulting,
+                &IdempotencyKey::new("git-effect-conflict").unwrap(),
+            ),
+            PlatformV2EffectExecution::NotStarted
+        );
+        assert!(adapter.journal.entries.is_empty());
+        run(&["branch", "-D", "work/issue-166"]);
+
         let partial_key = IdempotencyKey::new("git-effect-partial").unwrap();
         adapter
             .insert_prepared(
@@ -1985,9 +2267,42 @@ mod tests {
             "refs/heads/work/issue-166"
         );
         assert!(!hook_marker.exists(), "repository hook was executed");
+        assert!(!filter_marker.exists(), "repository filter was executed");
         assert_eq!(
             adapter.execute(&checkout, &resulting, &key),
             PlatformV2EffectExecution::Completed
+        );
+
+        let independent = directory.path().join("independent");
+        let forged = worktrees.join("forged");
+        let output = Command::new("git")
+            .args(["clone", "--quiet", "--no-hardlinks"])
+            .arg(&repository)
+            .arg(&independent)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        fs::set_permissions(&independent, fs::Permissions::from_mode(0o700)).unwrap();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&independent)
+            .args(["worktree", "add", "--quiet", "-b", "work/forged"])
+            .arg(&forged)
+            .arg(&base)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        fs::set_permissions(&forged, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut forged_binding = adapter.checkout("checkout-git").unwrap().clone();
+        forged_binding.canonical_root = forged;
+        forged_binding.branch_ref = Some("refs/heads/work/forged".to_owned());
+        assert_eq!(
+            validate_checkout_materialized(&forged_binding, uid),
+            Err("platform_v2_lifecycle_checkout_mismatch")
         );
     }
 }

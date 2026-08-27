@@ -122,6 +122,10 @@ pub trait PlatformV2LifecycleEffectAdapter: Send {
         self.preflight(intent)
     }
 
+    fn verify_generation(&self) -> Result<(), &'static str> {
+        Ok(())
+    }
+
     fn workspace_intents_supported(&self) -> bool {
         false
     }
@@ -952,14 +956,11 @@ impl PlatformV2Runtime {
                     return Ok(PlatformV2Response::WorkspaceIntentResult(stored.outcome));
                 }
                 self.policy_fence.verify()?;
-                let outcome = match self.lifecycle_effects.execute_workspace_intent(
+                let outcome = self.lifecycle_effects.execute_workspace_intent(
                     value.intent(),
                     value.project(),
                     &workspace,
-                ) {
-                    Ok(outcome) => outcome,
-                    Err(_) => return Ok(PlatformV2Response::WorkspaceIntentResult(stored.outcome)),
-                };
+                )?;
                 self.policy_fence.verify()?;
                 self.lineage
                     .reconcile_intent(
@@ -1000,8 +1001,10 @@ impl PlatformV2Runtime {
                     .ok_or("platform_v2_not_found")?;
                 if stored.outcome.reconciliation()
                     != automonique_protocol::platform_v2_lineage::WorkspaceIntentReconciliation::Final
-                    && self.lifecycle_effects.workspace_intents_supported()
                 {
+                    if !self.lifecycle_effects.workspace_intents_supported() {
+                        return Err("platform_v2_workspace_intent_recovery_unavailable");
+                    }
                     let workspace = match &stored.intent {
                         WorkspaceIntent::Create(intent) => self
                             .lineage
@@ -1017,31 +1020,28 @@ impl PlatformV2Runtime {
                             return Ok(PlatformV2Response::WorkspaceIntentResult(stored.outcome));
                         }
                     };
-                    if self
-                        .lifecycle_effects
-                        .preflight_workspace_intent(&stored.intent, value.project(), &workspace)
-                        .is_ok()
-                    {
-                        self.policy_fence.verify()?;
-                        if let Ok(outcome) = self.lifecycle_effects.execute_workspace_intent(
-                            &stored.intent,
-                            value.project(),
-                            &workspace,
+                    self.lifecycle_effects.preflight_workspace_intent(
+                        &stored.intent,
+                        value.project(),
+                        &workspace,
+                    )?;
+                    self.policy_fence.verify()?;
+                    let outcome = self.lifecycle_effects.execute_workspace_intent(
+                        &stored.intent,
+                        value.project(),
+                        &workspace,
+                    )?;
+                    self.policy_fence.verify()?;
+                    self.lineage
+                        .reconcile_intent(
+                            principal.actor.tenant(),
+                            &WorkspaceIntentExecutionReceipt {
+                                intent_id: stored.intent.intent_id().clone(),
+                                request_digest: stored.request_digest,
+                                outcome,
+                            },
                         )
-                        {
-                            self.policy_fence.verify()?;
-                            self.lineage
-                                .reconcile_intent(
-                                    principal.actor.tenant(),
-                                    &WorkspaceIntentExecutionReceipt {
-                                        intent_id: stored.intent.intent_id().clone(),
-                                        request_digest: stored.request_digest,
-                                        outcome,
-                                    },
-                                )
-                                .map_err(|_| "platform_v2_intent_refused")?;
-                        }
-                    }
+                        .map_err(|_| "platform_v2_intent_refused")?;
                     let refreshed = self
                         .lineage
                         .intent_authorized_in_workspaces(
@@ -1190,6 +1190,9 @@ impl PlatformV2Runtime {
                 effect.resulting_identity(),
                 effect.idempotency_key(),
             );
+            self.policy_fence.verify()?;
+            self.lifecycle_effects.verify_generation()?;
+            self.authorize_lifecycle_effect(principal, &effect)?;
             let reconciliation = match reconciliation {
                 PlatformV2EffectReconciliation::VerifiedNotStarted(document) => {
                     ExternalEffectReconciliation::VerifiedNotStarted {
@@ -1251,6 +1254,9 @@ impl PlatformV2Runtime {
                 effect.idempotency_key(),
             ) == PlatformV2EffectExecution::Completed
             {
+                self.policy_fence.verify()?;
+                self.lifecycle_effects.verify_generation()?;
+                self.authorize_lifecycle_effect(principal, &effect)?;
                 let completion_now = self.clock.now_ms()?.max(now_ms);
                 match self
                     .work_contexts
