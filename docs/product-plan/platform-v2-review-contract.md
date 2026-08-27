@@ -61,12 +61,16 @@ UTF-8 bytes per sanitized hunk preview, 256 comments, 128 checks, 32 proposals,
 and 128 file identities per proposal. Comments must resolve to an exact line
 inside the selected side of a file and hunk in the same snapshot. Proposal
 files must exist and their staged/unstaged state must permit the proposed
-operation. At most 256 bounded attention events are retained. The projection
-is derived from those events with `Blocked` taking precedence over `NeedsYou`,
-then `Working`, then `Done`; unread counts are summed and the newest event
-revision is retained. Callers cannot author a different projection, and no
-event may cite a revision newer than the snapshot. Authority-bearing and
-invariant-bearing Rust fields are private;
+operation. At most 256 bounded attention events are retained. Every event has
+a unique identity and an exact typed origin coordinate: origin kind and
+identity where applicable, owning authority identity, and source revision.
+The reason must agree with the cited authoritative file, comment, check,
+review, pull-request, delivery, or complete-snapshot projection. Duplicate or
+unattributable events are refused. The projection is derived from those events
+with `Blocked` taking precedence over `NeedsYou`, then `Working`, then `Done`;
+unread counts are summed and the newest event revision is retained. Callers
+cannot author a different projection, and no event may cite a revision newer
+than the snapshot. Authority-bearing and invariant-bearing Rust fields are private;
 constructors and both codecs revalidate the same invariants.
 
 ## Scoped proposals and actions

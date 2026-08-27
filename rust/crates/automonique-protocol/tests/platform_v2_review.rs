@@ -125,8 +125,19 @@ fn snapshot() -> ReviewSnapshot {
         )
         .unwrap(),
         vec![
-            AttentionEvent::new(AttentionReason::Complete, 0, rev(8)).unwrap(),
-            AttentionEvent::new(AttentionReason::ReviewRequested, 1, rev(9)).unwrap(),
+            AttentionEvent::new(
+                id("attention-1"),
+                AttentionOrigin::new(
+                    AttentionOriginKind::Review,
+                    None,
+                    authority(ReviewAuthorityKind::Review),
+                    rev(8),
+                )
+                .unwrap(),
+                AttentionReason::ReviewRequested,
+                1,
+            )
+            .unwrap(),
         ],
     )
     .unwrap()
@@ -286,6 +297,49 @@ fn attention_ranges_proposals_and_u32_boundaries_are_authoritative() {
             ReviewContractError::ProposalInvalid
         ))
     ));
+
+    let base = snapshot();
+    let rebuild = |attention_events| {
+        ReviewSnapshot::new(
+            base.workspace().clone(),
+            base.revision(),
+            base.files().to_vec(),
+            base.comments().to_vec(),
+            base.proposals().to_vec(),
+            base.checks().to_vec(),
+            base.review().clone(),
+            base.pull_request().clone(),
+            base.delivery().clone(),
+            attention_events,
+        )
+    };
+    let duplicate_events = vec![
+        base.attention_events()[0].clone(),
+        base.attention_events()[0].clone(),
+    ];
+    assert_eq!(
+        rebuild(duplicate_events),
+        Err(ReviewContractError::CollectionInvalid)
+    );
+    let forged_origin = AttentionOrigin::new(
+        AttentionOriginKind::Review,
+        None,
+        ReviewAuthority::new(ReviewAuthorityKind::Review, id("forged-review")),
+        rev(8),
+    )
+    .unwrap();
+    assert_eq!(
+        rebuild(vec![
+            AttentionEvent::new(
+                id("attention-forged"),
+                forged_origin,
+                AttentionReason::ReviewRequested,
+                1,
+            )
+            .unwrap(),
+        ]),
+        Err(ReviewContractError::AttentionInvalid)
+    );
 }
 
 fn request(
@@ -572,6 +626,47 @@ fn ambiguous_writes_reconcile_by_receipt_without_replay() {
         decode_review_action_receipt(&encode_review_action_receipt(&conflict).unwrap()).unwrap(),
         conflict
     );
+}
+
+#[test]
+fn receipt_revisions_are_nonzero_on_both_runtimes() {
+    let completed = ReviewActionReceipt::new(
+        id("receipt-completed"),
+        IdempotencyKey::new("idem-completed").unwrap(),
+        id("action-completed"),
+        id("actor-1"),
+        ReviewReceiptOutcome::Completed,
+        Some(rev(10)),
+        None,
+        ReviewReconciliation::Final,
+    )
+    .unwrap();
+    let completed = String::from_utf8(encode_review_action_receipt(&completed).unwrap())
+        .unwrap()
+        .replace("\"revision\":10", "\"revision\":0");
+    assert!(matches!(
+        decode_review_action_receipt(completed.as_bytes()),
+        Err(ReviewApiError::InvalidBody)
+    ));
+
+    let conflict = ReviewActionReceipt::new(
+        id("receipt-conflict"),
+        IdempotencyKey::new("idem-conflict").unwrap(),
+        id("action-conflict"),
+        id("actor-1"),
+        ReviewReceiptOutcome::Conflict,
+        None,
+        Some(rev(10)),
+        ReviewReconciliation::Final,
+    )
+    .unwrap();
+    let conflict = String::from_utf8(encode_review_action_receipt(&conflict).unwrap())
+        .unwrap()
+        .replace("\"current_revision\":10", "\"current_revision\":0");
+    assert!(matches!(
+        decode_review_action_receipt(conflict.as_bytes()),
+        Err(ReviewApiError::InvalidBody)
+    ));
 }
 
 #[test]

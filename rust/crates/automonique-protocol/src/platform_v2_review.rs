@@ -47,6 +47,7 @@ id_domain!(ReviewProposalIdDomain, ReviewProposalId);
 id_domain!(ReviewActorIdDomain, ReviewActorId);
 id_domain!(ReviewAuthorityIdDomain, ReviewAuthorityId);
 id_domain!(ReviewActionIdDomain, ReviewActionId);
+id_domain!(ReviewAttentionEventIdDomain, ReviewAttentionEventId);
 id_domain!(PullRequestIdDomain, PullRequestId);
 id_domain!(DeliveryIdDomain, DeliveryId);
 
@@ -120,6 +121,7 @@ wire_enum!(MergeReadiness { Unknown => "unknown", Blocked => "blocked", Ready =>
 wire_enum!(DeliveryState { NotDelivered => "not_delivered", Pending => "pending", Delivered => "delivered", Failed => "failed" });
 wire_enum!(AttentionState { NeedsYou => "needs_you", Working => "working", Done => "done", Blocked => "blocked" });
 wire_enum!(AttentionReason { ReviewRequested => "review_requested", CommentReply => "comment_reply", ApprovalRequired => "approval_required", CheckRunning => "check_running", CheckFailed => "check_failed", Conflict => "conflict", DeliveryPending => "delivery_pending", Complete => "complete", ExternalBlocker => "external_blocker" });
+wire_enum!(AttentionOriginKind { File => "file", Comment => "comment", Check => "check", Review => "review", PullRequest => "pull_request", Delivery => "delivery", Snapshot => "snapshot" });
 wire_enum!(ReviewAuthorityKind { Filesystem => "filesystem", Git => "git", Ci => "ci", PullRequest => "pull_request", Review => "review", Delivery => "delivery" });
 wire_enum!(ReviewFreshnessState { Fresh => "fresh", Stale => "stale", Unknown => "unknown" });
 wire_enum!(ReviewAuthentication { UserSession => "user_session", ServiceIdentity => "service_identity", ProviderSession => "provider_session" });
@@ -736,26 +738,87 @@ impl DeliveryProjection {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttentionOrigin {
+    kind: AttentionOriginKind,
+    id: Option<ReviewField>,
+    authority: ReviewAuthority,
+    revision: Revision,
+}
+impl AttentionOrigin {
+    pub fn new(
+        kind: AttentionOriginKind,
+        id: Option<ReviewField>,
+        authority: ReviewAuthority,
+        revision: Revision,
+    ) -> Result<Self, ReviewContractError> {
+        let requires_id = matches!(
+            kind,
+            AttentionOriginKind::File
+                | AttentionOriginKind::Comment
+                | AttentionOriginKind::Check
+                | AttentionOriginKind::PullRequest
+                | AttentionOriginKind::Delivery
+        );
+        if requires_id != id.is_some() {
+            return Err(ReviewContractError::AttentionInvalid);
+        }
+        Ok(Self {
+            kind,
+            id,
+            authority,
+            revision,
+        })
+    }
+    #[must_use]
+    pub const fn kind(&self) -> AttentionOriginKind {
+        self.kind
+    }
+    #[must_use]
+    pub fn id(&self) -> Option<&ReviewField> {
+        self.id.as_ref()
+    }
+    #[must_use]
+    pub fn authority(&self) -> &ReviewAuthority {
+        &self.authority
+    }
+    #[must_use]
+    pub const fn revision(&self) -> Revision {
+        self.revision
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttentionEvent {
+    id: ReviewAttentionEventId,
+    origin: AttentionOrigin,
     reason: AttentionReason,
     unread: u32,
-    source_revision: Revision,
 }
 impl AttentionEvent {
     pub fn new(
+        id: ReviewAttentionEventId,
+        origin: AttentionOrigin,
         reason: AttentionReason,
         unread: u32,
-        source_revision: Revision,
     ) -> Result<Self, ReviewContractError> {
         if unread > MAX_REVIEW_UNREAD {
             return Err(ReviewContractError::CounterOutOfRange);
         }
         Ok(Self {
+            id,
+            origin,
             reason,
             unread,
-            source_revision,
         })
+    }
+    #[must_use]
+    pub fn id(&self) -> &ReviewAttentionEventId {
+        &self.id
+    }
+    #[must_use]
+    pub fn origin(&self) -> &AttentionOrigin {
+        &self.origin
     }
     #[must_use]
     pub const fn reason(&self) -> AttentionReason {
@@ -767,7 +830,7 @@ impl AttentionEvent {
     }
     #[must_use]
     pub const fn source_revision(&self) -> Revision {
-        self.source_revision
+        self.origin.revision()
     }
 }
 
@@ -791,7 +854,7 @@ impl AttentionProjection {
         {
             return Err(ReviewContractError::AttentionInvalid);
         }
-        let mut selected = events[0];
+        let mut selected = &events[0];
         let mut unread = 0_u32;
         for event in events {
             unread = unread
@@ -804,7 +867,7 @@ impl AttentionProjection {
                         || (event.source_revision() == selected.source_revision()
                             && event.reason() < selected.reason())))
             {
-                selected = *event;
+                selected = event;
             }
         }
         let state = attention_state(selected.reason());
@@ -859,6 +922,133 @@ const fn attention_precedence(reason: AttentionReason) -> u8 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_attention_event(
+    event: &AttentionEvent,
+    snapshot_revision: Revision,
+    files: &[ReviewFile],
+    comments: &[ReviewComment],
+    checks: &[CheckProjection],
+    review: &ReviewStatusProjection,
+    pull_request: &PullRequestProjection,
+    delivery: &DeliveryProjection,
+) -> Result<(), ReviewContractError> {
+    let origin = event.origin();
+    if origin.revision() > snapshot_revision {
+        return Err(ReviewContractError::AttentionInvalid);
+    }
+    let matches_authority_revision = |authority: &ReviewAuthority, revision: Revision| {
+        origin.authority() == authority && origin.revision() == revision
+    };
+    let valid = match event.reason() {
+        AttentionReason::ReviewRequested | AttentionReason::ApprovalRequired => {
+            origin.kind() == AttentionOriginKind::Review
+                && origin.id().is_none()
+                && matches_authority_revision(
+                    review.authority(),
+                    review.freshness().observed_revision(),
+                )
+                && matches!(
+                    review.decision(),
+                    ReviewDecision::Pending | ReviewDecision::ChangesRequested
+                )
+        }
+        AttentionReason::CommentReply => {
+            origin.kind() == AttentionOriginKind::Comment
+                && origin.authority() == review.authority()
+                && comments.iter().any(|comment| {
+                    origin_id_is(origin, comment.id().as_str())
+                        && origin.revision() == comment.revision()
+                        && comment.unread()
+                })
+        }
+        AttentionReason::CheckRunning => {
+            origin.kind() == AttentionOriginKind::Check
+                && checks.iter().any(|check| {
+                    origin_id_is(origin, check.id().as_str())
+                        && matches_authority_revision(
+                            check.authority(),
+                            check.freshness().observed_revision(),
+                        )
+                        && check.state() == CheckState::Running
+                })
+        }
+        AttentionReason::CheckFailed => {
+            origin.kind() == AttentionOriginKind::Check
+                && checks.iter().any(|check| {
+                    origin_id_is(origin, check.id().as_str())
+                        && matches_authority_revision(
+                            check.authority(),
+                            check.freshness().observed_revision(),
+                        )
+                        && check.state() == CheckState::Failed
+                })
+        }
+        AttentionReason::Conflict => {
+            origin.kind() == AttentionOriginKind::File
+                && origin.authority() == review.authority()
+                && origin.revision() == snapshot_revision
+                && files.iter().any(|file| {
+                    origin_id_is(origin, file.id().as_str())
+                        && file.conflict() == ConflictState::Unresolved
+                })
+        }
+        AttentionReason::DeliveryPending => {
+            origin.kind() == AttentionOriginKind::Delivery
+                && delivery
+                    .id()
+                    .is_some_and(|id| origin_id_is(origin, id.as_str()))
+                && matches_authority_revision(
+                    delivery.authority(),
+                    delivery.freshness().observed_revision(),
+                )
+                && delivery.state() == DeliveryState::Pending
+        }
+        AttentionReason::Complete => {
+            origin.kind() == AttentionOriginKind::Snapshot
+                && origin.id().is_none()
+                && origin.authority() == review.authority()
+                && origin.revision() == snapshot_revision
+                && review.decision() == ReviewDecision::Approved
+                && files
+                    .iter()
+                    .all(|file| file.conflict() != ConflictState::Unresolved)
+                && checks
+                    .iter()
+                    .filter(|check| check.required())
+                    .all(|check| check.state() == CheckState::Passed)
+                && matches!(
+                    pull_request.state(),
+                    PullRequestState::Absent | PullRequestState::Merged
+                )
+                && matches!(
+                    delivery.state(),
+                    DeliveryState::NotDelivered | DeliveryState::Delivered
+                )
+        }
+        AttentionReason::ExternalBlocker => {
+            origin.kind() == AttentionOriginKind::Delivery
+                && delivery
+                    .id()
+                    .is_some_and(|id| origin_id_is(origin, id.as_str()))
+                && matches_authority_revision(
+                    delivery.authority(),
+                    delivery.freshness().observed_revision(),
+                )
+                && delivery.state() == DeliveryState::Failed
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(ReviewContractError::AttentionInvalid)
+    }
+}
+
+fn origin_id_is(origin: &AttentionOrigin, expected: &str) -> bool {
+    origin.id().is_some_and(|id| id.as_str() == expected)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReviewSnapshot {
     workspace: WorkContextIdentity,
@@ -899,6 +1089,7 @@ impl ReviewSnapshot {
             || !strict_by(&comments, |v| v.id().as_str())
             || !strict_by(&proposals, |v| v.id().as_str())
             || !strict_by(&checks, |v| v.id().as_str())
+            || !strict_by(&attention_events, |v| v.id().as_str())
         {
             return Err(ReviewContractError::CollectionInvalid);
         }
@@ -931,6 +1122,18 @@ impl ReviewSnapshot {
                     return Err(ReviewContractError::ProposalInvalid);
                 }
             }
+        }
+        for event in &attention_events {
+            validate_attention_event(
+                event,
+                revision,
+                &files,
+                &comments,
+                &checks,
+                &review,
+                &pull_request,
+                &delivery,
+            )?;
         }
         let attention = AttentionProjection::derive(&attention_events, revision)?;
         Ok(Self {

@@ -315,10 +315,11 @@ use crate::platform_v2::{
     WorkContextRelationKind, WorkContextTargetKind,
 };
 use crate::platform_v2_review::{
-    AttentionReason, AttentionState, CheckState, CommentAgentState, ConflictState, DeliveryState,
-    DiffChangeKind, DiffSide, MergeReadiness, PreviewKind, PullRequestState, ReviewActionKind,
-    ReviewAuthentication, ReviewAuthorityKind, ReviewDecision, ReviewFreshnessState,
-    ReviewProposalKind, ReviewReceiptOutcome, ReviewReconciliation, WorktreeFileState,
+    AttentionOriginKind, AttentionReason, AttentionState, CheckState, CommentAgentState,
+    ConflictState, DeliveryState, DiffChangeKind, DiffSide, MergeReadiness, PreviewKind,
+    PullRequestState, ReviewActionKind, ReviewAuthentication, ReviewAuthorityKind, ReviewDecision,
+    ReviewFreshnessState, ReviewProposalKind, ReviewReceiptOutcome, ReviewReconciliation,
+    WorktreeFileState,
 };
 use crate::primitives::ValueError;
 use crate::progress_api::{StreamMessageKind, StreamRefusal};
@@ -8782,6 +8783,10 @@ fn review_context_module() -> GeneratedModule {
             },
         ],
         enums: vec![
+            security_enum(
+                "AttentionOriginKind",
+                platform_values(&AttentionOriginKind::ALL, AttentionOriginKind::as_str),
+            ),
             security_enum(
                 "AttentionReason",
                 platform_values(&AttentionReason::ALL, AttentionReason::as_str),

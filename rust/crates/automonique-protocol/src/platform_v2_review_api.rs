@@ -509,33 +509,51 @@ fn attention_json(value: AttentionProjection) -> Result<JsonValue, ReviewApiErro
         ("unread", integer(u64::from(value.unread()))?),
     ]))
 }
-fn attention(value: &JsonValue) -> Result<AttentionProjection, ReviewApiError> {
+fn attention(
+    value: &JsonValue,
+) -> Result<(AttentionState, AttentionReason, u32, Revision), ReviewApiError> {
     fields(value, &["reason", "source_revision", "state", "unread"])?;
-    let reason = AttentionReason::parse(string(value, "reason")?)?;
-    let event = AttentionEvent::new(
-        reason,
+    Ok((
+        AttentionState::parse(string(value, "state")?)?,
+        AttentionReason::parse(string(value, "reason")?)?,
         u32::try_from(unsigned(value, "unread")?).map_err(|_| ReviewApiError::InvalidBody)?,
         revision(unsigned(value, "source_revision")?)?,
-    )?;
-    let projection = AttentionProjection::derive(&[event], event.source_revision())?;
-    if projection.state() != AttentionState::parse(string(value, "state")?)? {
-        return Err(ReviewApiError::InvalidBody);
-    }
-    Ok(projection)
+    ))
 }
-fn attention_event_json(value: AttentionEvent) -> Result<JsonValue, ReviewApiError> {
+fn attention_origin_json(value: &AttentionOrigin) -> Result<JsonValue, ReviewApiError> {
     Ok(object(vec![
+        ("authority", authority_json(value.authority())),
+        ("id", nullable_text(value.id().map(ReviewField::as_str))),
+        ("kind", text(value.kind().as_str())),
+        ("revision", integer(value.revision().get())?),
+    ]))
+}
+fn attention_origin(value: &JsonValue) -> Result<AttentionOrigin, ReviewApiError> {
+    fields(value, &["authority", "id", "kind", "revision"])?;
+    Ok(AttentionOrigin::new(
+        AttentionOriginKind::parse(string(value, "kind")?)?,
+        maybe_string(value, "id")?
+            .map(ReviewField::new)
+            .transpose()?,
+        authority(get(value, "authority")?)?,
+        revision(unsigned(value, "revision")?)?,
+    )?)
+}
+fn attention_event_json(value: &AttentionEvent) -> Result<JsonValue, ReviewApiError> {
+    Ok(object(vec![
+        ("id", text(value.id().as_str())),
+        ("origin", attention_origin_json(value.origin())?),
         ("reason", text(value.reason().as_str())),
-        ("source_revision", integer(value.source_revision().get())?),
         ("unread", integer(u64::from(value.unread()))?),
     ]))
 }
 fn attention_event(value: &JsonValue) -> Result<AttentionEvent, ReviewApiError> {
-    fields(value, &["reason", "source_revision", "unread"])?;
+    fields(value, &["id", "origin", "reason", "unread"])?;
     Ok(AttentionEvent::new(
+        ReviewAttentionEventId::new(string(value, "id")?)?,
+        attention_origin(get(value, "origin")?)?,
         AttentionReason::parse(string(value, "reason")?)?,
         u32::try_from(unsigned(value, "unread")?).map_err(|_| ReviewApiError::InvalidBody)?,
-        revision(unsigned(value, "source_revision")?)?,
     )?)
 }
 
@@ -549,7 +567,6 @@ pub fn encode_review_snapshot(value: &ReviewSnapshot) -> Result<Vec<u8>, ReviewA
                     value
                         .attention_events()
                         .iter()
-                        .copied()
                         .map(attention_event_json)
                         .collect::<Result<Vec<_>, _>>()?,
                 ),
@@ -656,7 +673,15 @@ pub fn decode_review_snapshot(payload: &[u8]) -> Result<ReviewSnapshot, ReviewAp
             .map(attention_event)
             .collect::<Result<Vec<_>, _>>()?,
     )?;
-    if snapshot.attention() != carried_attention {
+    let derived = snapshot.attention();
+    if carried_attention
+        != (
+            derived.state(),
+            derived.reason(),
+            derived.unread(),
+            derived.source_revision(),
+        )
+    {
         return Err(ReviewApiError::InvalidBody);
     }
     Ok(snapshot)
