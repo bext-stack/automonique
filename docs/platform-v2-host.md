@@ -343,13 +343,20 @@ regrant or credential revocation. Thus another same-project credential and a
 new delegation cannot read an older mutation receipt.
 
 The final credential, delegation, generation, and receipt-custody check runs
-inside a SQLite `IMMEDIATE` transaction held through the mobile daemon socket
-exchange, whose read and write operations are capped at two seconds. Refresh,
-regrant, and revocation through another web-entry process therefore cannot
-commit between authorization and dispatch. Receipt custody is read or written
-inside that same transaction, eliminating a separate pre-transaction
-reauthorization window. A fence commit failure is returned as a correlated
-typed refusal rather than forwarding a response under uncertain custody.
+inside a SQLite `IMMEDIATE` transaction that also records a request-digest-bound
+ten-second dispatch lease. The transaction commits before the daemon socket is
+opened, so ambiguous or completed mutation dispatch can never precede durable
+mobile receipt custody. Submit custody also retains the exact canonical request
+digest: the same coordinate may be retried only by the identical request, while
+legacy custody without a digest remains readable but cannot admit a new submit.
+Refresh, regrant, and both revocation paths check the same lease table in their
+own write transactions and refuse while a dispatch lease is live; they
+therefore cannot commit between authorization and dispatch. Socket read and
+write operations are capped at two seconds, the lease is released after the
+correlated response is validated, and a crashed process leaves only a bounded
+lease that expires while its receipt custody remains recoverable. Receipt
+custody is read or written in the same transaction that installs the lease,
+eliminating a separate reauthorization window.
 
 The current local protocol cannot safely represent multiple daemon principals
 behind one web-entry uid. Such a configuration stays blocked; adding more
