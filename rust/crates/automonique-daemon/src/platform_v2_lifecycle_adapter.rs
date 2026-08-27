@@ -2013,6 +2013,13 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        assert_eq!(
+            adapter.supported_effect_kinds(),
+            std::collections::BTreeSet::from([
+                String::from("create_host_setup"),
+                String::from("create_checkout"),
+            ])
+        );
         let intent = WorkContextMutationIntent::CreateHostSetup(
             CreateHostSetupIntent::new(
                 WorkContextLabel::new("Remote host").unwrap(),

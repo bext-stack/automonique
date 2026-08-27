@@ -275,6 +275,7 @@ fn every_platform_v2_request_kind_round_trips_without_server_owned_inputs() {
     )
     .unwrap();
     let requests = vec![
+        PlatformV2Request::GetLifecycleCapabilities,
         PlatformV2Request::QueryWorkContexts(query),
         PlatformV2Request::GetWorkContext(workspace()),
         PlatformV2Request::PrepareMutation(MutationPrepareRequest::new(
@@ -396,6 +397,27 @@ fn mutation_commands_and_receipt_lookups_refuse_server_owned_or_ambiguous_fields
 
 #[test]
 fn response_documents_round_trip_and_review_envelope_fits_its_declared_ceiling() {
+    let capability_request = PlatformV2RequestMessage::new(
+        request_id("capabilities-response"),
+        PlatformV2Request::GetLifecycleCapabilities,
+    );
+    let capability_response = PlatformV2ResponseMessage::for_request(
+        &capability_request,
+        PlatformV2Response::LifecycleCapabilities(
+            LifecycleCapabilities::new(std::collections::BTreeSet::from([
+                String::from("create_checkout"),
+                String::from("create_host_setup"),
+            ]))
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let bytes = capability_response.to_canonical_bytes().unwrap();
+    assert_eq!(
+        PlatformV2ResponseMessage::from_canonical_bytes(&bytes, &capability_request).unwrap(),
+        capability_response
+    );
+
     let query = WorkContextQuery::new(
         vec![WorkContextKind::Project],
         vec![],

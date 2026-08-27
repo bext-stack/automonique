@@ -133,8 +133,40 @@ test("stale canonical subprojections make the cockpit explicitly stale and read-
 
 test("lifecycle actions remain honestly disabled at the missing host adapter seam", () => {
   const view = cockpit.derivePresentation(fixture);
-  expect(view.create).toEqual({ available: false, reason: "platform_v2_lifecycle_adapter_pending" });
-  expect(view.resume).toEqual({ available: false, reason: "platform_v2_lifecycle_adapter_pending" });
+  expect(view.create.available).toBe(false);
+  expect(view.create.reason).toBe("platform_v2_lifecycle_adapter_pending");
+  expect(view.resume.available).toBe(false);
+  expect(view.localLifecycle.createHostSetup.available).toBe(false);
+  expect(view.localLifecycle.createCheckout.available).toBe(false);
+});
+
+test("installed adapter exposes only local host and checkout preview/receipt operations", () => {
+  const view = cockpit.derivePresentation({
+    ...fixture,
+    actions: {
+      ...fixture.actions,
+      lifecycle: {
+        available: true,
+        operations: {
+          create_host_setup: { available: true, scope: "local", preview_operation: "prepare_mutation", receipt_operation: "get_mutation_receipt" },
+          create_checkout: { available: true, scope: "local", preview_operation: "prepare_mutation", receipt_operation: "get_mutation_receipt" },
+          create_attempt_workspace: { available: false, category: "platform_v2_lifecycle_adapter_pending" },
+          resume_attempt_workspace: { available: false, category: "platform_v2_lifecycle_adapter_pending" },
+          resume_session: { available: false, category: "platform_v2_lifecycle_adapter_pending" },
+        },
+      },
+    },
+  });
+  expect(view.localLifecycle.createHostSetup).toEqual({
+    available: true,
+    reason: null,
+    scope: "local",
+    preview_operation: "prepare_mutation",
+    receipt_operation: "get_mutation_receipt",
+  });
+  expect(view.localLifecycle.createCheckout.available).toBe(true);
+  expect(view.create.available).toBe(false);
+  expect(view.resume.available).toBe(false);
 });
 
 test("reducer cannot manufacture a preview from an unavailable server action", () => {

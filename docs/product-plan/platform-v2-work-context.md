@@ -365,9 +365,16 @@ anchors from the previous workspace are removed.
 If v2 is refused, unavailable, downgraded, or exceeds the cockpit bound, the
 response carries the retained Platform v1 session projection separately and
 an explicit degradation category. It returns no projects, hosts, or workspaces
-in that mode and never reconstructs them from summaries. Create and resume
-remain disabled with `platform_v2_lifecycle_adapter_pending`; the daemon does
-not yet install the lifecycle effect adapter. Review action requests preserve
+in that mode and never reconstructs them from summaries. Task/attempt create,
+attempt resume, and session resume remain disabled with
+`platform_v2_lifecycle_adapter_pending`. The daemon conditionally installs the
+private-registry-backed production lifecycle adapter; the cockpit reads its
+generation-verified, action-specific capability set from the daemon and exposes
+only local `create_host_setup` and `create_checkout` through the existing typed
+`prepare_mutation` preview and `get_mutation_receipt` reconciliation operations.
+An absent, changed, or refused registry leaves those operations unavailable,
+and the preview's exact parent revisions plus preview digest/approval and receipt
+lookup fences remain authoritative. Review action requests preserve
 the exact selected workspace, expected snapshot/review revisions, and
 idempotency key on the typed v2 request, but remain visibly unavailable while
 the daemon returns `platform_v2_review_adapter_pending`. These are integration

@@ -834,6 +834,7 @@ const frenchUi = Object.freeze({
   "Create unavailable": "Création indisponible",
   "Resume unavailable": "Reprise indisponible",
   "Unavailable: the Platform v2 lifecycle host adapter is not installed (platform_v2_lifecycle_adapter_pending).": "Indisponible : l’adaptateur hôte du cycle de vie Platform v2 n’est pas installé (platform_v2_lifecycle_adapter_pending).",
+  "Task create and resume remain unavailable. Local host setup and checkout support typed preview and receipt operations.": "La création et la reprise de tâche restent indisponibles. La configuration d’hôte local et le checkout prennent en charge des opérations typées d’aperçu et de reçu.",
 });
 const localizedTextSources = new WeakMap();
 const localizedAttributeSources = new WeakMap();
@@ -2277,7 +2278,13 @@ function renderHostedCockpit(view) {
   const resume = byId("cockpit-resume-preview");
   create.disabled = cockpitPresentation.create.available !== true;
   resume.disabled = cockpitPresentation.resume.available !== true;
-  byId("cockpit-action-reason").textContent = "Unavailable: the Platform v2 lifecycle host adapter is not installed (platform_v2_lifecycle_adapter_pending).";
+  const localLifecycleAvailable = cockpitPresentation.localLifecycle.createHostSetup.available === true
+    && cockpitPresentation.localLifecycle.createCheckout.available === true;
+  const lifecycleReason = byId("cockpit-action-reason");
+  lifecycleReason.dataset.localLifecycle = localLifecycleAvailable ? "available" : "unavailable";
+  lifecycleReason.textContent = localLifecycleAvailable
+    ? "Task create and resume remain unavailable. Local host setup and checkout support typed preview and receipt operations."
+    : `Unavailable: the Platform v2 lifecycle host adapter is not installed (${cockpitPresentation.create.reason || "platform_v2_lifecycle_adapter_pending"}).`;
   if (workspace?.id !== cockpitTaskWorkspaceId) {
     byId("cockpit-task-input").value = workspace?.task || "";
     cockpitTaskWorkspaceId = workspace?.id || null;

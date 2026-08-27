@@ -88,6 +88,16 @@ fn read(
         Ok(_) => return Ok(fallback(retained_v1, "platform_v2_not_negotiated")),
         Err(category) => return Ok(fallback(retained_v1, category)),
     };
+    let lifecycle = match bridge.request(PlatformV2Request::GetLifecycleCapabilities) {
+        Ok(PlatformV2Response::LifecycleCapabilities(value)) => {
+            lifecycle_actions(value.effect_kinds())
+        }
+        Ok(PlatformV2Response::Refused(value)) => {
+            lifecycle_actions_unavailable(value.category().as_str())
+        }
+        Ok(_) => return Err("platform_v2_response_invalid"),
+        Err(category) => lifecycle_actions_unavailable(category),
+    };
     let query = WorkContextQuery::new(
         WorkContextKind::ALL.to_vec(),
         Vec::new(),
@@ -168,10 +178,44 @@ fn read(
         "review": review,
         "attention": attention.coverage,
         "actions": {
-            "lifecycle": { "available": false, "category": ADAPTER_PENDING },
+            "lifecycle": lifecycle,
             "review": { "available": false, "category": REVIEW_ADAPTER_PENDING }
         }
     }))
+}
+
+fn lifecycle_actions(effect_kinds: &std::collections::BTreeSet<String>) -> Value {
+    let operation = |kind: &str, local: bool| {
+        let available = effect_kinds.contains(kind);
+        json!({
+            "available": available,
+            "category": if available { Value::Null } else { json!(ADAPTER_PENDING) },
+            "scope": if local { json!("local") } else { Value::Null },
+            "preview_operation": if available { json!("prepare_mutation") } else { Value::Null },
+            "receipt_operation": if available { json!("get_mutation_receipt") } else { Value::Null }
+        })
+    };
+    json!({
+        "available": !effect_kinds.is_empty(),
+        "operations": {
+            "create_host_setup": operation("create_host_setup", true),
+            "create_checkout": operation("create_checkout", true),
+            "create_attempt_workspace": operation("create_attempt_workspace", false),
+            "resume_attempt_workspace": operation("resume_attempt_workspace", false),
+            "resume_session": operation("resume_session", false)
+        }
+    })
+}
+
+fn lifecycle_actions_unavailable(category: &str) -> Value {
+    let mut value = lifecycle_actions(&std::collections::BTreeSet::new());
+    value["category"] = json!(category);
+    if let Some(operations) = value["operations"].as_object_mut() {
+        for operation in operations.values_mut() {
+            operation["category"] = json!(category);
+        }
+    }
+    value
 }
 
 fn approve_review(
@@ -549,6 +593,38 @@ mod tests {
         assert_eq!(value["mode"], "v1");
         assert_eq!(value["workspaces"], json!([]));
         assert_eq!(value["actions"]["lifecycle"]["available"], false);
+    }
+
+    #[test]
+    fn lifecycle_projection_exposes_only_installed_local_effects() {
+        let installed = lifecycle_actions(&std::collections::BTreeSet::from([
+            String::from("create_host_setup"),
+            String::from("create_checkout"),
+        ]));
+        assert_eq!(installed["available"], true);
+        assert_eq!(
+            installed["operations"]["create_host_setup"]["preview_operation"],
+            "prepare_mutation"
+        );
+        assert_eq!(
+            installed["operations"]["create_checkout"]["receipt_operation"],
+            "get_mutation_receipt"
+        );
+        assert_eq!(
+            installed["operations"]["create_attempt_workspace"]["available"],
+            false
+        );
+        assert_eq!(
+            installed["operations"]["resume_session"]["available"],
+            false
+        );
+
+        let absent = lifecycle_actions_unavailable("platform_v2_selector_registry_unavailable");
+        assert_eq!(absent["available"], false);
+        assert_eq!(
+            absent["operations"]["create_host_setup"]["category"],
+            "platform_v2_selector_registry_unavailable"
+        );
     }
 
     #[test]

@@ -306,6 +306,9 @@ impl PlatformV2Bridge {
         use automonique_protocol::platform_v2_transport::PlatformV2Request;
 
         let action = match request {
+            PlatformV2Request::GetLifecycleCapabilities => {
+                return Err("platform_v2_mobile_action_denied");
+            }
             PlatformV2Request::QueryWorkContexts(_) => MobilePlatformV2Action::QueryWorkContexts,
             PlatformV2Request::GetLineage(_) => MobilePlatformV2Action::GetLineage,
             PlatformV2Request::PrepareMutation(_) => MobilePlatformV2Action::PrepareMutation,

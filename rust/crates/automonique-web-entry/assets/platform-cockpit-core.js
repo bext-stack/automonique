@@ -102,11 +102,20 @@
     });
   }
 
-  function mutationCapability(document) {
+  function mutationCapability(document, operation) {
     const lifecycle = document?.actions?.lifecycle;
+    const capability = lifecycle?.operations?.[operation];
+    const available = capability?.available === true
+      && capability?.preview_operation === "prepare_mutation"
+      && capability?.receipt_operation === "get_mutation_receipt";
     return Object.freeze({
-      available: false,
-      reason: boundedText(lifecycle?.category, 128) || "platform_v2_lifecycle_adapter_pending",
+      available,
+      reason: available ? null : boundedText(capability?.category, 128)
+        || boundedText(lifecycle?.category, 128)
+        || "platform_v2_lifecycle_adapter_pending",
+      scope: available && capability?.scope === "local" ? "local" : null,
+      preview_operation: available ? "prepare_mutation" : null,
+      receipt_operation: available ? "get_mutation_receipt" : null,
     });
   }
 
@@ -179,8 +188,12 @@
       attention: Object.freeze(Object.fromEntries(ATTENTION_STATES.map((state) => [state, attentionAvailable ? workspaces.filter((item) => item.attention === state).length : null]))),
       activities: Object.freeze(activities),
       receipt: normalizeReceipt(document?.receipt),
-      create: mutationCapability(document),
-      resume: mutationCapability(document),
+      create: mutationCapability(document, "create_attempt_workspace"),
+      resume: mutationCapability(document, "resume_attempt_workspace"),
+      localLifecycle: Object.freeze({
+        createHostSetup: mutationCapability(document, "create_host_setup"),
+        createCheckout: mutationCapability(document, "create_checkout"),
+      }),
       readModels: Object.freeze({
         files: Array.isArray(document?.review?.document?.files) ? document.review.document.files : null,
         review: document?.review?.document?.review && typeof document.review.document.review === "object" ? document.review.document.review : null,

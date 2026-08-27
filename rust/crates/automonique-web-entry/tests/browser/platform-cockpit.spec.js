@@ -104,6 +104,29 @@ test("workspace projection is accessible and lifecycle controls fail closed", as
   await expect(page.getByRole("tab", { name: "Activity" })).toBeFocused();
 });
 
+test("installed local adapter is visible without enabling task or session actions", async ({ page }) => {
+  const previous = cockpit.actions.lifecycle;
+  cockpit.actions.lifecycle = {
+    available: true,
+    operations: {
+      create_host_setup: { available: true, scope: "local", preview_operation: "prepare_mutation", receipt_operation: "get_mutation_receipt" },
+      create_checkout: { available: true, scope: "local", preview_operation: "prepare_mutation", receipt_operation: "get_mutation_receipt" },
+      create_attempt_workspace: { available: false, category: "platform_v2_lifecycle_adapter_pending" },
+      resume_attempt_workspace: { available: false, category: "platform_v2_lifecycle_adapter_pending" },
+      resume_session: { available: false, category: "platform_v2_lifecycle_adapter_pending" },
+    },
+  };
+  try {
+    await page.reload();
+    await expect(page.locator("#cockpit-action-reason")).toHaveAttribute("data-local-lifecycle", "available");
+    await expect(page.locator("#cockpit-action-reason")).toContainText("Local host setup and checkout support typed preview and receipt operations");
+    await expect(page.getByRole("button", { name: "Create unavailable" })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Resume unavailable" })).toBeDisabled();
+  } finally {
+    cockpit.actions.lifecycle = previous;
+  }
+});
+
 test("workspace-first layout does not overflow the active viewport", async ({ page }) => {
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
   expect(overflow).toBe(false);

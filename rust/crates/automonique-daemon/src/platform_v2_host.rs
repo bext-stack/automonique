@@ -32,8 +32,8 @@ use automonique_protocol::platform_v2_review::{
     ReviewAuthorityKind,
 };
 use automonique_protocol::platform_v2_transport::{
-    PlatformV2Refusal, PlatformV2Request, PlatformV2Response, RawMutationApprovalDocument,
-    RawMutationReceiptDocument, ReceiptLookupKey,
+    LifecycleCapabilities, PlatformV2Refusal, PlatformV2Request, PlatformV2Response,
+    RawMutationApprovalDocument, RawMutationReceiptDocument, ReceiptLookupKey,
 };
 use automonique_protocol::primitives::EpochMillis;
 use automonique_store::lineage_index::WorkspaceIntentExecutionReceipt;
@@ -459,6 +459,9 @@ pub fn resolve_web_mobile_request_project(
 ) -> Result<ProjectId, &'static str> {
     let principal = load_web_principal(policy_path, expected_uid, tenant, actor)?;
     let project = match request {
+        PlatformV2Request::GetLifecycleCapabilities => {
+            return Err("platform_v2_mobile_action_denied");
+        }
         PlatformV2Request::QueryWorkContexts(query) => {
             let project = query
                 .project()
@@ -691,6 +694,13 @@ impl PlatformV2Runtime {
         self.validate_all_policy_mappings(&principal)?;
         self.drive_lifecycle_effects(&principal, now_ms)?;
         match request {
+            PlatformV2Request::GetLifecycleCapabilities => {
+                self.lifecycle_effects.verify_generation()?;
+                Ok(PlatformV2Response::LifecycleCapabilities(
+                    LifecycleCapabilities::new(self.lifecycle_effects.supported_effect_kinds())
+                        .map_err(|_| "platform_v2_response_invalid")?,
+                ))
+            }
             PlatformV2Request::QueryWorkContexts(query) => {
                 if query
                     .project()
@@ -2003,6 +2013,15 @@ mod tests {
             .unwrap();
         assert!(!principal.authority.is_empty());
         assert!(scope.inherited_authority.is_empty());
+    }
+
+    #[test]
+    fn unavailable_lifecycle_adapter_advertises_no_effects() {
+        assert!(
+            UnavailableLifecycleEffectAdapter
+                .supported_effect_kinds()
+                .is_empty()
+        );
     }
 
     #[test]
