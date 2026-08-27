@@ -133,30 +133,47 @@ snapshot ceiling: for example, 640 records remain five ordinary 128-item pages.
 The helper is deterministic protocol behavior, not a persistence, indexing, or
 authorization implementation.
 
-## Mutation contract for the next slice
+## Mutation contract
 
-Create project/setup/checkout/workspace, resume workspace/attempt/session, and
-archive project/setup/checkout/workspace operations must be dedicated typed v2
-methods. Each request will carry actor authority, exact parent identities,
-expected revisions where a record already exists, an idempotency key, and no
-host path. Responses use durable receipts with accepted, completed, rejected,
-conflict, unknown, and resynchronization-required outcomes.
+Create project, host setup, checkout, user workspace, and attempt workspace;
+resume attempt workspace and session; and archive project, host setup, checkout,
+and user workspace are distinct typed v2 intents. A caller never supplies a
+new record, authoritative lifecycle, revision, or ID. The issuer creates a new
+identity while producing the preview. Every existing target and parent carries
+its authority-qualified identity and exact expected revision.
 
-Before a create or resume is admitted, the server produces a bounded preview
-of resulting relations and the effective attempt authority. Approval, when
-policy requires it, targets that exact preview revision. Ambiguous outcomes are
-reconciled by receipt identity or idempotency key and never replayed blindly.
-Archive is non-destructive and does not cancel an active attempt implicitly.
+`UserWorkspace` archive is one-way. It has no resume or unarchive operation.
+Reopening human work under an active `UserWorkspace` means creating a new
+`AttemptWorkspace`. An archived `UserWorkspace` itself never reopens; returning
+after archive requires a new `UserWorkspace` and then a new attempt. Resume is
+reserved for a hibernated `AttemptWorkspace` or `Session`. Archive remains
+non-destructive and does not cancel an active attempt implicitly.
 
-This first contract slice supplies the identities, graph, strict negotiation,
-exact query/page/resynchronization codecs, a deterministic pager over already
-authorized input, generated TypeScript validators/codecs, and bidirectional
-Rust/TypeScript conformance fixtures. `SCHEMA_DIGEST` identifies the complete
-additive generated surface and therefore moves when the v2 module changes. The
-SDK still advertises `protocolRange: 1` and `automonique.platform/v1`, so its
-manifest pins the separately generated `PLATFORM_V1_SCHEMA_DIGEST`; the
-checked-in Platform v1 module remains byte-identical.
+Before submission, the server produces a bounded preview of the exact current
+record, resulting record, inherited authority, and effective authority. Actor,
+serving resource authority, idempotency key, all six authority axes
+(filesystem, credentials, network, tools, providers, and models), and the typed
+intent are bound by the canonical request digest. Effective authority must be
+a subset of both the authenticated actor ceiling and inherited ceiling.
+Approval, when policy requires it, targets the exact preview ID and revision,
+request digest, idempotency key, and expiry. Submission and receipt repeat
+those bindings. Ambiguous outcomes are reconciled by receipt identity or
+idempotency key and never replayed blindly; `unknown` and `resync_required` are
+lookup outcomes and cannot be persisted as mutation receipts.
 
-The mutation methods, durable persistence/index and authorization integration,
-SDK client ergonomics, daemon routes, and internal terminology cleanup remain
-separate implementation work.
+The contract slices now supply the identities and graph, strict negotiation,
+exact query/page/resynchronization codecs, deterministic pager over already
+authorized input, and lifecycle proposal/preview/approval/submission/receipt
+documents. Rust values keep authoritative and binding fields private;
+generated TypeScript validates the same canonical bytes and refusal corpus.
+`SCHEMA_DIGEST` identifies the complete additive generated surface and
+therefore moves when the v2 module changes. The SDK still advertises
+`protocolRange: 1` and `automonique.platform/v1`, so its manifest pins the
+separately generated `PLATFORM_V1_SCHEMA_DIGEST`; the checked-in Platform v1
+module remains byte-identical.
+
+Durable persistence/index transactions, authenticated actor and policy
+integration, server routes, receipt/idempotency lookup, retention workers, SDK
+client ergonomics, and runtime clock/random-ID providers remain separate
+implementation work. The protocol helpers do not claim to implement those
+authority or durability boundaries.
