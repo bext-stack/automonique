@@ -22,17 +22,19 @@ use automonique_protocol::platform::{
 };
 use automonique_protocol::platform_api::{PlatformRequestMessage, PlatformResponseMessage};
 use automonique_protocol::platform_v2::{
-    PlatformVersion, PlatformVersionOffer, ProjectId, UserWorkspaceId, WorkContextAttributes,
-    WorkContextIdentity, WorkContextLabel, WorkContextLifecycle, WorkContextRecord,
+    CheckoutKind, HostSetupKind, PlatformVersion, PlatformVersionOffer, ProjectId, UserWorkspaceId,
+    V1RepositoryRef, WorkContextAttributes, WorkContextIdentity, WorkContextLabel,
+    WorkContextLifecycle, WorkContextRecord, WorkContextRelation, WorkContextRelationKind,
 };
 use automonique_protocol::platform_v2_lifecycle::{
-    CreateProjectIntent, MutationApprovalDecision, WorkContextMutationIntent,
+    ArchiveIntent, ExpectedWorkContext, ExternalParentResolution, MutationApprovalDecision,
+    WorkContextMutationIntent,
 };
 use automonique_protocol::platform_v2_lifecycle_api::work_context_mutation_preview_digest;
 use automonique_protocol::platform_v2_lineage::{
     LineageFreshness, LineageFreshnessState, LineageStatus, OrchestrationIdentity,
-    OrchestrationRecord, OrchestrationRunId, OrchestrationTaskId, WorkspaceCancelIntent,
-    WorkspaceIntent, WorkspaceIntentId, WorkspaceIntentOutcome, WorkspaceResumeIntent,
+    OrchestrationRecord, OrchestrationRunId, OrchestrationTaskId, WorkspaceIntent,
+    WorkspaceIntentId, WorkspaceResumeIntent,
 };
 use automonique_protocol::platform_v2_review_api::{
     decode_review_action_request, decode_review_snapshot,
@@ -179,9 +181,12 @@ fn configure_v2(config: &DaemonConfig) {
             "serving_authority": "automonique",
             "projects": ["project-live"],
             "workspaces": [
-                {"project": "project-live", "kind": "project", "id": "project-live"},
-                {"project": "project-live", "kind": "user_workspace", "id": "workspace-live"},
-                {"project": "project-live", "kind": "user_workspace", "id": "wc_user_1"}
+                {"project": "project-live", "kind": "project", "id": "project-live",
+                 "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []}},
+                {"project": "project-live", "kind": "user_workspace", "id": "workspace-live",
+                 "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []}},
+                {"project": "project-live", "kind": "user_workspace", "id": "wc_user_1",
+                 "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []}}
             ],
             "authority": {
                 "filesystem": [], "credentials": [], "network": [],
@@ -209,6 +214,79 @@ fn configure_v2(config: &DaemonConfig) {
     store
         .put_authoritative_record("tenant-live", &project)
         .expect("seed project");
+    let repository = WorkContextIdentity::Repository(
+        V1RepositoryRef::new(ResourceCoordinate::new(
+            ResourceAuthority::GitHub,
+            ResourceKind::Repository,
+            ResourceId::new("repo-live").unwrap(),
+        ))
+        .unwrap(),
+    );
+    store
+        .put_external_snapshot(
+            "tenant-live",
+            &ExpectedWorkContext::new(repository.clone(), Revision::FIRST),
+            ExternalParentResolution::Available,
+            Some(&ProjectId::new("project-live").unwrap()),
+        )
+        .unwrap();
+    let host = WorkContextRecord::new(
+        WorkContextIdentity::parse_local(
+            automonique_protocol::platform_v2::WorkContextTargetKind::HostSetup,
+            "host-live",
+        )
+        .unwrap(),
+        Revision::FIRST,
+        WorkContextLifecycle::Active,
+        WorkContextLabel::new("Live host").unwrap(),
+        WorkContextAttributes::host_setup(HostSetupKind::Local),
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::HostSetupProject,
+                project.identity().clone(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    store
+        .put_authoritative_record("tenant-live", &host)
+        .unwrap();
+    let checkout = WorkContextRecord::new(
+        WorkContextIdentity::parse_local(
+            automonique_protocol::platform_v2::WorkContextTargetKind::Checkout,
+            "checkout-live",
+        )
+        .unwrap(),
+        Revision::FIRST,
+        WorkContextLifecycle::Active,
+        WorkContextLabel::new("Live checkout").unwrap(),
+        WorkContextAttributes::checkout(CheckoutKind::GitWorktree),
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::CheckoutProject,
+                project.identity().clone(),
+            )
+            .unwrap(),
+            WorkContextRelation::new(
+                WorkContextRelationKind::CheckoutHostSetup,
+                host.identity().clone(),
+            )
+            .unwrap(),
+            WorkContextRelation::new(WorkContextRelationKind::CheckoutRepository, repository)
+                .unwrap(),
+        ],
+    )
+    .unwrap();
+    store
+        .put_authoritative_record("tenant-live", &checkout)
+        .unwrap();
+    for id in ["workspace-live", "wc_user_1"] {
+        let workspace = live_workspace(id, Revision::FIRST, WorkContextLifecycle::Active);
+        store
+            .put_authoritative_record("tenant-live", &workspace)
+            .unwrap();
+    }
     drop(store);
 
     let mut reviews = ReviewStore::open_scoped(config.platform_v2_review_path(), "tenant-live")
@@ -256,6 +334,37 @@ fn configure_v2(config: &DaemonConfig) {
             None,
         )
         .unwrap();
+}
+
+fn live_workspace(
+    id: &str,
+    revision: Revision,
+    lifecycle: WorkContextLifecycle,
+) -> WorkContextRecord {
+    WorkContextRecord::new(
+        WorkContextIdentity::UserWorkspace(UserWorkspaceId::new(id).unwrap()),
+        revision,
+        lifecycle,
+        WorkContextLabel::new(id).unwrap(),
+        WorkContextAttributes::EMPTY,
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::UserWorkspaceProject,
+                WorkContextIdentity::Project(ProjectId::new("project-live").unwrap()),
+            )
+            .unwrap(),
+            WorkContextRelation::new(
+                WorkContextRelationKind::UserWorkspaceCheckout,
+                WorkContextIdentity::parse_local(
+                    automonique_protocol::platform_v2::WorkContextTargetKind::Checkout,
+                    "checkout-live",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap()
 }
 
 #[test]
@@ -388,6 +497,43 @@ fn multi_tenant_policy_fails_closed_without_changing_v1() {
             if refusal.category().as_str() == "platform_v2_policy_insecure"
     ));
     serving.shutdown(&config);
+
+    std::fs::set_permissions(
+        config.platform_v2_policy_path(),
+        std::fs::Permissions::from_mode(0o4600),
+    )
+    .unwrap();
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-special-mode-policy-refusal",
+            PlatformV2Request::GetWorkContext(WorkContextIdentity::Project(
+                ProjectId::new("project-live").unwrap()
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_policy_insecure"
+    ));
+    serving.shutdown(&config);
+
+    let target = config.state_dir().join("policy-target.json");
+    std::fs::rename(config.platform_v2_policy_path(), &target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::symlink(&target, config.platform_v2_policy_path()).unwrap();
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-symlink-policy-refusal",
+            PlatformV2Request::GetWorkContext(WorkContextIdentity::Project(
+                ProjectId::new("project-live").unwrap()
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_policy_insecure"
+    ));
+    serving.shutdown(&config);
 }
 
 #[test]
@@ -453,69 +599,54 @@ fn configured_v2_uses_kernel_principal_scope_and_durable_idempotency() {
     ));
     let resume_request =
         WorkspaceIntentRequest::new(ProjectId::new("project-live").unwrap(), resume.clone());
-    for label in ["v2-resume-intent", "v2-resume-intent-replay"] {
-        assert_eq!(
-            platform_v2(
-                &config,
-                label,
-                PlatformV2Request::SubmitWorkspaceIntent(resume_request.clone())
-            ),
-            PlatformV2Response::WorkspaceIntentResult(WorkspaceIntentOutcome::Accepted)
-        );
-    }
-    assert_eq!(
+    let stale_resume = WorkspaceIntent::Resume(WorkspaceResumeIntent::new(
+        WorkspaceIntentId::new("intent-resume-stale").unwrap(),
+        OrchestrationTaskId::new("task-live").unwrap(),
+        UserWorkspaceId::new("workspace-live").unwrap(),
+        Revision::new(2).unwrap(),
+    ));
+    assert!(matches!(
         platform_v2(
             &config,
-            "v2-resume-intent-lookup",
+            "v2-resume-stale",
+            PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(
+                ProjectId::new("project-live").unwrap(),
+                stale_resume,
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_resume_stale_revision"
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-resume-no-adapter",
+            PlatformV2Request::SubmitWorkspaceIntent(resume_request)
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_resume_adapter_pending"
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-resume-not-admitted",
             PlatformV2Request::GetWorkspaceIntent(WorkspaceIntentLookup::new(
                 ProjectId::new("project-live").unwrap(),
                 resume.intent_id().clone(),
             ))
         ),
-        PlatformV2Response::WorkspaceIntentResult(WorkspaceIntentOutcome::Accepted)
-    );
-    let cancel = WorkspaceIntent::Cancel(
-        WorkspaceCancelIntent::new(
-            WorkspaceIntentId::new("intent-cancel-live").unwrap(),
-            resume.intent_id().clone(),
-            UserWorkspaceId::new("workspace-live").unwrap(),
-            Revision::FIRST,
-        )
-        .unwrap(),
-    );
-    let cancel_request =
-        WorkspaceIntentRequest::new(ProjectId::new("project-live").unwrap(), cancel.clone());
-    for label in ["v2-cancel-intent", "v2-cancel-intent-replay"] {
-        assert_eq!(
-            platform_v2(
-                &config,
-                label,
-                PlatformV2Request::SubmitWorkspaceIntent(cancel_request.clone())
-            ),
-            PlatformV2Response::WorkspaceIntentResult(WorkspaceIntentOutcome::Cancelled(
-                resume.intent_id().clone()
-            ))
-        );
-    }
-    assert_eq!(
-        platform_v2(
-            &config,
-            "v2-cancel-intent-lookup",
-            PlatformV2Request::GetWorkspaceIntent(WorkspaceIntentLookup::new(
-                ProjectId::new("project-live").unwrap(),
-                cancel.intent_id().clone(),
-            ))
-        ),
-        PlatformV2Response::WorkspaceIntentResult(WorkspaceIntentOutcome::Cancelled(
-            resume.intent_id().clone()
-        ))
-    );
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_not_found"
+    ));
 
     let prepare = MutationPrepareRequest::new(
-        IdempotencyKey::new("create-project-once").unwrap(),
-        WorkContextMutationIntent::CreateProject(
-            CreateProjectIntent::new(WorkContextLabel::new("New project").unwrap(), vec![])
-                .unwrap(),
+        IdempotencyKey::new("archive-project-once").unwrap(),
+        WorkContextMutationIntent::ArchiveProject(
+            ArchiveIntent::new(ExpectedWorkContext::new(
+                WorkContextIdentity::Project(ProjectId::new("project-live").unwrap()),
+                Revision::FIRST,
+            ))
+            .unwrap(),
         ),
     );
     let PlatformV2Response::MutationPreview(first) = platform_v2(
@@ -574,27 +705,19 @@ fn configured_v2_uses_kernel_principal_scope_and_durable_idempotency() {
     assert!(!client_document.contains("\"tenant\""));
     assert!(!client_document.contains("\"authentication\""));
     assert!(!client_document.contains("\"authority\""));
-    let PlatformV2Response::ReviewReceipt(review_receipt) = platform_v2(
-        &config,
-        "v2-review-action-first",
-        PlatformV2Request::ExecuteReviewAction(action.clone()),
-    ) else {
-        panic!("review custody receipt")
-    };
-    let PlatformV2Response::ReviewReceipt(review_replay) = platform_v2(
-        &config,
-        "v2-review-action-replay",
-        PlatformV2Request::ExecuteReviewAction(action.clone()),
-    ) else {
-        panic!("review custody replay")
-    };
-    assert_eq!(review_replay, review_receipt);
-    assert_eq!(review_receipt.outcome().as_str(), "accepted");
-    assert_eq!(review_receipt.reconciliation().as_str(), "poll_receipt");
     assert!(matches!(
         platform_v2(
             &config,
-            "v2-review-receipt",
+            "v2-review-no-adapter",
+            PlatformV2Request::ExecuteReviewAction(action.clone()),
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_review_adapter_pending"
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-review-no-custody-receipt",
             PlatformV2Request::GetReviewReceipt(
                 ReviewReceiptLookup::new(
                     ProjectId::new("project-live").unwrap(),
@@ -604,7 +727,8 @@ fn configured_v2_uses_kernel_principal_scope_and_durable_idempotency() {
                 .unwrap()
             )
         ),
-        PlatformV2Response::ReviewReceipt(value) if value == review_receipt
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_not_found"
     ));
 
     serving.shutdown(&config);
@@ -621,6 +745,131 @@ fn configured_v2_uses_kernel_principal_scope_and_durable_idempotency() {
             ))
         ),
         PlatformV2Response::WorkContextRecord(_)
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-resume-still-not-admitted-after-restart",
+            PlatformV2Request::GetWorkspaceIntent(WorkspaceIntentLookup::new(
+                ProjectId::new("project-live").unwrap(),
+                resume.intent_id().clone(),
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_not_found"
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-review-still-no-custody-after-restart",
+            PlatformV2Request::GetReviewReceipt(
+                ReviewReceiptLookup::new(
+                    ProjectId::new("project-live").unwrap(),
+                    action.workspace().clone(),
+                    action.idempotency_key().clone(),
+                )
+                .unwrap(),
+            )
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_not_found"
+    ));
+    serving.shutdown(&config);
+}
+
+#[test]
+fn resume_requires_live_durable_workspace_and_never_admits_without_adapter() {
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let mut store = WorkContextStore::open(config.platform_v2_work_context_path()).unwrap();
+    store
+        .put_authoritative_record(
+            "tenant-live",
+            &live_workspace(
+                "workspace-live",
+                Revision::new(2).unwrap(),
+                WorkContextLifecycle::Archived,
+            ),
+        )
+        .unwrap();
+    drop(store);
+    let serving = serve(&config);
+    let intent = WorkspaceIntent::Resume(WorkspaceResumeIntent::new(
+        WorkspaceIntentId::new("intent-archived").unwrap(),
+        OrchestrationTaskId::new("task-live").unwrap(),
+        UserWorkspaceId::new("workspace-live").unwrap(),
+        Revision::new(2).unwrap(),
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-resume-archived",
+            PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(
+                ProjectId::new("project-live").unwrap(),
+                intent.clone(),
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_resume_not_resumable"
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-archived-resume-not-stored",
+            PlatformV2Request::GetWorkspaceIntent(WorkspaceIntentLookup::new(
+                ProjectId::new("project-live").unwrap(),
+                intent.intent_id().clone(),
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_not_found"
+    ));
+    serving.shutdown(&config);
+}
+
+#[test]
+fn durable_mapping_drift_disables_v2_actions_fail_closed() {
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let serving = serve(&config);
+    let connection = rusqlite::Connection::open(config.platform_v2_work_context_path()).unwrap();
+    connection
+        .execute(
+            "DELETE FROM work_context_records WHERE tenant='tenant-live' AND identity_id='workspace-live'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let intent = WorkspaceIntent::Resume(WorkspaceResumeIntent::new(
+        WorkspaceIntentId::new("intent-deleted-workspace").unwrap(),
+        OrchestrationTaskId::new("task-live").unwrap(),
+        UserWorkspaceId::new("workspace-live").unwrap(),
+        Revision::FIRST,
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-resume-deleted-workspace",
+            PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(
+                ProjectId::new("project-live").unwrap(),
+                intent,
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_policy_incoherent"
+    ));
+    serving.shutdown(&config);
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-startup-incoherent-mapping",
+            PlatformV2Request::GetWorkContext(WorkContextIdentity::Project(
+                ProjectId::new("project-live").unwrap(),
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_policy_incoherent"
     ));
     serving.shutdown(&config);
 }

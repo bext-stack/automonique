@@ -467,6 +467,48 @@ fn create_reservation_reopens_replays_and_refuses_same_key_different_body() {
         .unwrap();
     assert_eq!(replay, PreviewAdmission::Replay(first.clone()));
     assert_eq!(nonces.calls, 2, "replay reserves no IDs");
+    let submission =
+        encode_work_context_mutation_submission(&first, None, EpochMillis::from_millis(160))
+            .unwrap();
+    reopened
+        .submit_mutation(
+            first.preview(),
+            &submission,
+            &policy_for(&request, MutationApprovalRequirement::NotRequired),
+            ReceiptId::new("receipt-create-project").unwrap(),
+            161,
+        )
+        .unwrap();
+    let arbitrary_project = ProjectId::new("project-arbitrary").unwrap();
+    let arbitrary_targets = BTreeSet::from([first.resulting().identity().clone()]);
+    assert_eq!(
+        reopened
+            .receipt_by_id_authorized(
+                &actor(),
+                ResourceAuthority::Automonique,
+                &WorkContextAuthority::EMPTY,
+                &WorkContextAuthority::EMPTY,
+                &arbitrary_project,
+                &arbitrary_targets,
+                &ReceiptId::new("receipt-create-project").unwrap(),
+            )
+            .unwrap(),
+        ReceiptLookup::Unknown
+    );
+    assert_eq!(
+        reopened
+            .receipt_by_idempotency_key_authorized(
+                &actor(),
+                ResourceAuthority::Automonique,
+                &WorkContextAuthority::EMPTY,
+                &WorkContextAuthority::EMPTY,
+                &arbitrary_project,
+                &arbitrary_targets,
+                request.idempotency_key(),
+            )
+            .unwrap(),
+        ReceiptLookup::Unknown
+    );
     let changed = proposal(
         WorkContextMutationIntent::CreateProject(
             CreateProjectIntent::new(label("Changed"), vec![repo]).unwrap(),
@@ -1199,6 +1241,7 @@ fn external_effect_commits_outbox_then_result_and_completed_receipt_atomically()
                 &actor(),
                 ResourceAuthority::Automonique,
                 &WorkContextAuthority::EMPTY,
+                &WorkContextAuthority::EMPTY,
                 &ProjectId::new("project-1").unwrap(),
                 &authorized_targets,
                 &ReceiptId::new("receipt-attempt").unwrap(),
@@ -1211,6 +1254,7 @@ fn external_effect_commits_outbox_then_result_and_completed_receipt_atomically()
             .receipt_by_idempotency_key_authorized(
                 &actor(),
                 ResourceAuthority::Automonique,
+                &WorkContextAuthority::EMPTY,
                 &WorkContextAuthority::EMPTY,
                 &ProjectId::new("project-other").unwrap(),
                 &authorized_targets,
@@ -1731,6 +1775,16 @@ fn authorized_inventory_pages_past_512_with_hidden_interleaving_and_resyncs_on_c
             allowed.insert(record.identity().clone());
         }
     }
+    drop(store);
+    let connection = Connection::open(private.path()).unwrap();
+    connection
+        .execute(
+            "UPDATE work_context_records SET record_document=x'00' WHERE tenant='tenant-1' AND identity_id='project-0000'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let mut store = WorkContextStore::open(private.path()).unwrap();
     assert_eq!(allowed.len(), 640);
     let actor = actor();
     let mut after = None;

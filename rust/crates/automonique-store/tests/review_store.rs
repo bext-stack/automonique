@@ -188,6 +188,27 @@ fn seed(store: &mut ReviewStore) -> ReviewActionRequest {
 }
 
 #[test]
+fn validate_action_checks_authority_and_revision_without_admitting_custody() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let request = seed(&mut store);
+    store.validate_action(&request, 12).unwrap();
+    drop(store);
+    let connection = rusqlite::Connection::open(private.path()).unwrap();
+    let previews: i64 = connection
+        .query_row("SELECT count(*) FROM review_action_previews", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let receipts: i64 = connection
+        .query_row("SELECT count(*) FROM review_action_receipts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!((previews, receipts), (0, 0));
+}
+
+#[test]
 fn restart_preserves_sanitized_snapshot_comments_and_sent_state() {
     let private = PrivateStore::new();
     let workspace = {

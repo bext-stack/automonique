@@ -7,9 +7,9 @@
 //! actor, tenant, grant, or review authority is accepted from a request body.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 use automonique_protocol::identity::Actor;
@@ -33,9 +33,7 @@ use automonique_protocol::platform_v2_transport::{
 };
 use automonique_protocol::primitives::EpochMillis;
 use automonique_store::lineage_index::{IntentAuthorizationScope, LineageIndex};
-use automonique_store::review_store::{
-    ApprovalPolicy, ReviewActionAdmission, ReviewStore, ReviewStoreError,
-};
+use automonique_store::review_store::{ReviewStore, ReviewStoreError};
 use automonique_store::work_context_store::{
     ApprovalPolicyDecision, MutationPolicyDecision, PreviewAdmission, ReceiptLookup,
     WorkContextApprovalAuthority, WorkContextNonceSource, WorkContextStore,
@@ -71,9 +69,15 @@ struct PrincipalPolicy {
     actor: Actor,
     serving_authority: ResourceAuthority,
     projects: BTreeSet<ProjectId>,
-    workspaces: BTreeMap<WorkContextIdentity, ProjectId>,
+    workspaces: BTreeMap<WorkContextIdentity, ScopePolicy>,
     authority: WorkContextAuthority,
     review_authorities: BTreeMap<ReviewAuthorityKind, ReviewAuthority>,
+}
+
+#[derive(Clone, Debug)]
+struct ScopePolicy {
+    project: ProjectId,
+    inherited_authority: WorkContextAuthority,
 }
 
 #[derive(Deserialize)]
@@ -102,6 +106,7 @@ struct WorkspaceDocument {
     project: String,
     kind: String,
     id: String,
+    inherited_authority: AuthorityDocument,
 }
 
 #[derive(Deserialize)]
@@ -168,19 +173,9 @@ impl PlatformV2Runtime {
         review_path: &Path,
         expected_uid: u32,
     ) -> Result<Option<Self>, &'static str> {
-        if !policy_path.exists() {
+        let Some(bytes) = read_policy_file(policy_path, expected_uid)? else {
             return Ok(None);
-        }
-        let metadata = fs::symlink_metadata(policy_path).map_err(|_| "platform_v2_policy_io")?;
-        if !metadata.file_type().is_file()
-            || metadata.file_type().is_symlink()
-            || metadata.uid() != expected_uid
-            || metadata.permissions().mode() & 0o777 != 0o600
-            || metadata.len() > MAX_POLICY_BYTES
-        {
-            return Err("platform_v2_policy_insecure");
-        }
-        let bytes = fs::read(policy_path).map_err(|_| "platform_v2_policy_io")?;
+        };
         let document: PolicyDocument =
             serde_json::from_slice(&bytes).map_err(|_| "platform_v2_policy_invalid")?;
         let principals = parse_policy(document)?;
@@ -192,6 +187,9 @@ impl PlatformV2Runtime {
         }
         let work_contexts = WorkContextStore::open(work_context_path)
             .map_err(|_| "platform_v2_store_unavailable")?;
+        for principal in principals.values() {
+            validate_principal_mappings(&work_contexts, principal)?;
+        }
         let lineage =
             LineageIndex::open(lineage_path).map_err(|_| "platform_v2_store_unavailable")?;
         let tenant = principals
@@ -248,6 +246,9 @@ impl PlatformV2Runtime {
             .get(&uid)
             .cloned()
             .ok_or("platform_v2_principal_unmapped")?;
+        // Policy is a live server-owned authorization registry, not a cached
+        // substitute for durable identity and ownership truth.
+        self.validate_all_policy_mappings(&principal)?;
         match request {
             PlatformV2Request::QueryWorkContexts(query) => {
                 if query
@@ -259,6 +260,7 @@ impl PlatformV2Runtime {
                 {
                     return Err("platform_v2_scope_denied");
                 }
+                self.validate_all_policy_mappings(&principal)?;
                 match self
                     .work_contexts
                     .inventory(
@@ -278,11 +280,12 @@ impl PlatformV2Runtime {
                 }
             }
             PlatformV2Request::GetWorkContext(identity) => {
-                let project = principal
+                let scope = principal
                     .workspaces
                     .get(identity)
                     .ok_or("platform_v2_scope_denied")?;
-                let policy = principal.read_policy(Some(project.clone()), identity.clone());
+                self.validate_policy_mapping(&principal, identity)?;
+                let policy = principal.read_policy(Some(scope.project.clone()), identity.clone());
                 self.work_contexts
                     .record(&policy, identity)
                     .map_err(|_| "platform_v2_store_refused")?
@@ -290,6 +293,12 @@ impl PlatformV2Runtime {
                     .ok_or("platform_v2_not_found")
             }
             PlatformV2Request::PrepareMutation(value) => {
+                if matches!(
+                    value.intent(),
+                    automonique_protocol::platform_v2_lifecycle::WorkContextMutationIntent::CreateProject(_)
+                ) {
+                    return Err("platform_v2_create_project_adapter_pending");
+                }
                 let proposal = WorkContextMutationProposal::new(
                     principal.actor.clone(),
                     principal.serving_authority,
@@ -298,9 +307,11 @@ impl PlatformV2Runtime {
                     value.intent().clone(),
                 )
                 .map_err(|_| "platform_v2_request_invalid")?;
-                let project = project_for_intent(value.intent(), &principal)?;
+                let (project, inherited_authority) = scope_for_intent(value.intent(), &principal)?;
+                self.validate_intent_scope(&principal, value.intent())?;
                 let policy = principal.mutation_policy(
-                    project,
+                    Some(project),
+                    inherited_authority,
                     proposal.request_digest(),
                     MutationApprovalRequirement::Required,
                 );
@@ -318,9 +329,19 @@ impl PlatformV2Runtime {
                 }
             }
             PlatformV2Request::DecideMutation(value) => {
-                let expiry = now_ms
+                let requested_expiry = now_ms
                     .checked_add(APPROVAL_LIFETIME_MS)
                     .ok_or("platform_v2_clock_invalid")?;
+                let preview_expiry = self
+                    .work_contexts
+                    .preview_expiry_for_approval(
+                        value.preview(),
+                        &principal.actor,
+                        principal.serving_authority,
+                    )
+                    .map_err(|_| "platform_v2_decision_refused")?
+                    .as_millis();
+                let expiry = approval_expiry(requested_expiry, preview_expiry);
                 let id = MutationApprovalId::new(format!("approval_{}", self.nonces.token()))
                     .map_err(|_| "platform_v2_nonce_invalid")?;
                 let policy = ApprovalPolicyDecision::new(
@@ -357,13 +378,24 @@ impl PlatformV2Runtime {
                 if !principal.projects.contains(value.project()) {
                     return Err("platform_v2_scope_denied");
                 }
-                let targets: BTreeSet<WorkContextIdentity> =
-                    principal.workspaces.keys().cloned().collect();
+                let project_identity = WorkContextIdentity::Project(value.project().clone());
+                let scope = principal
+                    .workspaces
+                    .get(&project_identity)
+                    .ok_or("platform_v2_scope_denied")?;
+                self.validate_policy_mapping(&principal, &project_identity)?;
+                let targets: BTreeSet<WorkContextIdentity> = principal
+                    .workspaces
+                    .iter()
+                    .filter(|(_, scope)| &scope.project == value.project())
+                    .map(|(identity, _)| identity.clone())
+                    .collect();
                 let found = match value.key() {
                     ReceiptLookupKey::ReceiptId(id) => self.work_contexts.receipt_by_id_authorized(
                         &principal.actor,
                         principal.serving_authority,
                         &principal.authority,
+                        &scope.inherited_authority,
                         value.project(),
                         &targets,
                         id,
@@ -373,6 +405,7 @@ impl PlatformV2Runtime {
                             &principal.actor,
                             principal.serving_authority,
                             &principal.authority,
+                            &scope.inherited_authority,
                             value.project(),
                             &targets,
                             key,
@@ -390,6 +423,10 @@ impl PlatformV2Runtime {
             }
             PlatformV2Request::GetLineage(value) => {
                 authorize_workspace(&principal, value.project(), value.workspace())?;
+                self.validate_policy_mapping(
+                    &principal,
+                    &WorkContextIdentity::UserWorkspace(value.workspace().clone()),
+                )?;
                 let scope = IntentAuthorizationScope::new(
                     principal.actor.tenant().to_owned(),
                     value.project().clone(),
@@ -410,7 +447,20 @@ impl PlatformV2Runtime {
                     WorkspaceIntent::Create(_) => return Err("platform_v2_create_adapter_pending"),
                     WorkspaceIntent::Resume(intent) => {
                         authorize_workspace(&principal, value.project(), intent.workspace())?;
-                        WorkspaceIntentOutcome::Accepted
+                        self.work_contexts
+                            .validate_resumable_user_workspace(
+                                principal.actor.tenant(),
+                                value.project(),
+                                intent.workspace(),
+                                intent.expected_revision(),
+                            )
+                            .map_err(|error| match error.category() {
+                                "stale_revision" => "platform_v2_resume_stale_revision",
+                                "not_found" => "platform_v2_resume_not_found",
+                                "unavailable" => "platform_v2_resume_not_resumable",
+                                _ => "platform_v2_resume_refused",
+                            })?;
+                        return Err("platform_v2_resume_adapter_pending");
                     }
                     WorkspaceIntent::Cancel(intent) => {
                         authorize_workspace(&principal, value.project(), intent.workspace())?;
@@ -426,33 +476,29 @@ impl PlatformV2Runtime {
                 if !principal.projects.contains(value.project()) {
                     return Err("platform_v2_scope_denied");
                 }
-                // Intent ids are deliberately not global lookup keys. Search
-                // only the caller's explicitly visible workspaces.
-                for (workspace, project) in &principal.workspaces {
-                    if project != value.project() {
-                        continue;
-                    }
-                    let WorkContextIdentity::UserWorkspace(workspace) = workspace else {
-                        continue;
-                    };
-                    let scope = IntentAuthorizationScope::new(
-                        principal.actor.tenant().to_owned(),
-                        project.clone(),
-                        workspace.clone(),
+                let allowed: BTreeSet<UserWorkspaceId> = principal
+                    .workspaces
+                    .iter()
+                    .filter(|(_, scope)| &scope.project == value.project())
+                    .filter_map(|(identity, _)| match identity {
+                        WorkContextIdentity::UserWorkspace(workspace) => Some(workspace.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                self.lineage
+                    .intent_authorized_in_workspaces(
+                        &negotiated_v2()?,
+                        principal.actor.tenant(),
+                        value.intent_id(),
+                        &allowed,
                     )
-                    .map_err(|_| "platform_v2_scope_denied")?;
-                    if let Some(stored) = self
-                        .lineage
-                        .intent_authorized(&negotiated_v2()?, &scope, value.intent_id(), |_| true)
-                        .map_err(|_| "platform_v2_store_refused")?
-                    {
-                        return Ok(PlatformV2Response::WorkspaceIntentResult(stored.outcome));
-                    }
-                }
-                Err("platform_v2_not_found")
+                    .map_err(|_| "platform_v2_store_refused")?
+                    .map(|stored| PlatformV2Response::WorkspaceIntentResult(stored.outcome))
+                    .ok_or("platform_v2_not_found")
             }
             PlatformV2Request::GetReview(value) => {
                 authorize_identity(&principal, value.project(), value.workspace())?;
+                self.validate_policy_mapping(&principal, value.workspace())?;
                 self.reviews
                     .snapshot(value.workspace())
                     .map_err(|_| "platform_v2_store_refused")?
@@ -460,13 +506,14 @@ impl PlatformV2Runtime {
                     .ok_or("platform_v2_not_found")
             }
             PlatformV2Request::ExecuteReviewAction(value) => {
-                let project = principal
+                let scope = principal
                     .workspaces
                     .get(value.workspace())
                     .ok_or("platform_v2_scope_denied")?;
-                if !principal.projects.contains(project) {
+                if !principal.projects.contains(&scope.project) {
                     return Err("platform_v2_scope_denied");
                 }
+                self.validate_policy_mapping(&principal, value.workspace())?;
                 let authority = principal
                     .review_authorities
                     .get(&value.action().required_authority())
@@ -483,20 +530,14 @@ impl PlatformV2Runtime {
                     value.action().clone(),
                 )
                 .map_err(|_| "platform_v2_request_invalid")?;
-                let admission = self
-                    .reviews
-                    .prepare_action(&request, ApprovalPolicy::Required, now_ms)
+                self.reviews
+                    .validate_action(&request, now_ms)
                     .map_err(|_| "platform_v2_review_refused")?;
-                let stored = match admission {
-                    ReviewActionAdmission::New(value) | ReviewActionAdmission::Replay(value) => {
-                        value
-                    }
-                };
-                // Preparation is custody, not evidence that git/CI/PR ran.
-                Ok(PlatformV2Response::ReviewReceipt(stored.receipt))
+                Err("platform_v2_review_adapter_pending")
             }
             PlatformV2Request::GetReviewReceipt(value) => {
                 authorize_identity(&principal, value.project(), value.workspace())?;
+                self.validate_policy_mapping(&principal, value.workspace())?;
                 let actor = ReviewActorId::new(principal.actor.id().to_owned())
                     .map_err(|_| "platform_v2_policy_invalid")?;
                 for authority in principal.review_authorities.values() {
@@ -520,6 +561,132 @@ impl PlatformV2Runtime {
             }
         }
     }
+
+    fn validate_policy_mapping(
+        &self,
+        principal: &PrincipalPolicy,
+        identity: &WorkContextIdentity,
+    ) -> Result<(), &'static str> {
+        let scope = principal
+            .workspaces
+            .get(identity)
+            .ok_or("platform_v2_scope_denied")?;
+        self.work_contexts
+            .validate_policy_mapping(principal.actor.tenant(), &scope.project, identity)
+            .map(|_| ())
+            .map_err(|_| "platform_v2_policy_incoherent")
+    }
+
+    fn validate_all_policy_mappings(
+        &self,
+        principal: &PrincipalPolicy,
+    ) -> Result<(), &'static str> {
+        validate_principal_mappings(&self.work_contexts, principal)
+    }
+
+    fn validate_intent_scope(
+        &self,
+        principal: &PrincipalPolicy,
+        intent: &automonique_protocol::platform_v2_lifecycle::WorkContextMutationIntent,
+    ) -> Result<(), &'static str> {
+        let identity = primary_identity_for_intent(intent)
+            .ok_or("platform_v2_create_project_adapter_pending")?;
+        self.validate_policy_mapping(principal, identity)
+    }
+}
+
+fn read_policy_file(
+    policy_path: &Path,
+    expected_uid: u32,
+) -> Result<Option<Vec<u8>>, &'static str> {
+    read_policy_file_after_open(policy_path, expected_uid, || {})
+}
+
+fn read_policy_file_after_open(
+    policy_path: &Path,
+    expected_uid: u32,
+    after_open: impl FnOnce(),
+) -> Result<Option<Vec<u8>>, &'static str> {
+    let mut policy_file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
+        .open(policy_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.raw_os_error() == Some(nix::libc::ELOOP) => {
+            return Err("platform_v2_policy_insecure");
+        }
+        Err(_) => return Err("platform_v2_policy_io"),
+    };
+    let metadata = policy_file
+        .metadata()
+        .map_err(|_| "platform_v2_policy_io")?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != expected_uid
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.len() > MAX_POLICY_BYTES
+    {
+        return Err("platform_v2_policy_insecure");
+    }
+    after_open();
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    policy_file
+        .by_ref()
+        .take(MAX_POLICY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "platform_v2_policy_io")?;
+    if bytes.len() as u64 > MAX_POLICY_BYTES {
+        return Err("platform_v2_policy_insecure");
+    }
+    Ok(Some(bytes))
+}
+
+fn validate_principal_mappings(
+    work_contexts: &WorkContextStore,
+    principal: &PrincipalPolicy,
+) -> Result<(), &'static str> {
+    let mappings = principal
+        .workspaces
+        .iter()
+        .map(|(identity, scope)| (identity.clone(), scope.project.clone()))
+        .collect();
+    let records = work_contexts
+        .validate_policy_mappings(principal.actor.tenant(), &mappings)
+        .map_err(|_| "platform_v2_policy_incoherent")?;
+    for (identity, scope) in &principal.workspaces {
+        let record = records
+            .get(identity)
+            .ok_or("platform_v2_policy_incoherent")?;
+        for relation in record.relations() {
+            match principal.workspaces.get(relation.target()) {
+                Some(parent_scope)
+                    if parent_scope.project != scope.project
+                        || !scope
+                            .inherited_authority
+                            .is_subset_of(&parent_scope.inherited_authority) =>
+                {
+                    return Err("platform_v2_policy_incoherent");
+                }
+                None if matches!(
+                    identity,
+                    WorkContextIdentity::AttemptWorkspace(_)
+                        | WorkContextIdentity::Session(_)
+                        | WorkContextIdentity::Pane(_)
+                ) && matches!(
+                    relation.target(),
+                    WorkContextIdentity::UserWorkspace(_)
+                        | WorkContextIdentity::AttemptWorkspace(_)
+                        | WorkContextIdentity::Session(_)
+                ) =>
+                {
+                    return Err("platform_v2_policy_incoherent");
+                }
+                Some(_) | None => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 impl PrincipalPolicy {
@@ -539,16 +706,27 @@ impl PrincipalPolicy {
     fn mutation_policy(
         &self,
         project: Option<ProjectId>,
+        inherited_authority: WorkContextAuthority,
         digest: automonique_protocol::platform_v2_lifecycle::WorkContextRequestDigest,
         approval: MutationApprovalRequirement,
     ) -> MutationPolicyDecision {
+        let targets = self
+            .workspaces
+            .iter()
+            .filter(|(_, scope)| {
+                project
+                    .as_ref()
+                    .is_some_and(|value| &scope.project == value)
+            })
+            .map(|(identity, _)| identity.clone())
+            .collect();
         MutationPolicyDecision::new(
             self.actor.clone(),
             self.serving_authority,
             self.authority.clone(),
-            self.authority.clone(),
+            inherited_authority,
             project,
-            self.workspaces.keys().cloned().collect(),
+            targets,
             digest,
             approval,
         )
@@ -584,19 +762,45 @@ fn parse_policy(document: PolicyDocument) -> Result<BTreeMap<u32, PrincipalPolic
                 .map_err(|_| "platform_v2_policy_invalid")?;
             let identity = WorkContextIdentity::parse_local(kind, &raw_workspace.id)
                 .map_err(|_| "platform_v2_policy_invalid")?;
-            if workspaces.insert(identity, project).is_some() || workspaces.len() > 1024 {
+            let inherited_authority = authority(raw_workspace.inherited_authority)?;
+            if workspaces
+                .insert(
+                    identity,
+                    ScopePolicy {
+                        project,
+                        inherited_authority,
+                    },
+                )
+                .is_some()
+                || workspaces.len() > 1024
+            {
                 return Err("platform_v2_policy_invalid");
             }
         }
-        let authority = WorkContextAuthority::new(
-            grants(raw.authority.filesystem)?,
-            grants(raw.authority.credentials)?,
-            grants(raw.authority.network)?,
-            grants(raw.authority.tools)?,
-            grants(raw.authority.providers)?,
-            grants(raw.authority.models)?,
-        )
-        .map_err(|_| "platform_v2_policy_invalid")?;
+        let authority = authority(raw.authority)?;
+        if workspaces
+            .values()
+            .any(|scope| !scope.inherited_authority.is_subset_of(&authority))
+            || projects.iter().any(|project| {
+                !workspaces.contains_key(&WorkContextIdentity::Project(project.clone()))
+            })
+        {
+            return Err("platform_v2_policy_invalid");
+        }
+        for (identity, scope) in &workspaces {
+            if matches!(identity, WorkContextIdentity::Project(_)) {
+                continue;
+            }
+            let project_scope = workspaces
+                .get(&WorkContextIdentity::Project(scope.project.clone()))
+                .ok_or("platform_v2_policy_invalid")?;
+            if !scope
+                .inherited_authority
+                .is_subset_of(&project_scope.inherited_authority)
+            {
+                return Err("platform_v2_policy_invalid");
+            }
+        }
         let mut review_authorities = BTreeMap::new();
         for (kind, id) in raw.review_authorities {
             let kind =
@@ -639,6 +843,18 @@ fn grants(values: Vec<String>) -> Result<Vec<AuthorityGrantId>, &'static str> {
         .collect()
 }
 
+fn authority(raw: AuthorityDocument) -> Result<WorkContextAuthority, &'static str> {
+    WorkContextAuthority::new(
+        grants(raw.filesystem)?,
+        grants(raw.credentials)?,
+        grants(raw.network)?,
+        grants(raw.tools)?,
+        grants(raw.providers)?,
+        grants(raw.models)?,
+    )
+    .map_err(|_| "platform_v2_policy_invalid")
+}
+
 fn authorize_identity(
     principal: &PrincipalPolicy,
     project: &ProjectId,
@@ -648,7 +864,7 @@ fn authorize_identity(
         && principal
             .workspaces
             .get(identity)
-            .is_some_and(|owner| owner == project)
+            .is_some_and(|scope| &scope.project == project)
     {
         Ok(())
     } else {
@@ -668,13 +884,12 @@ fn authorize_workspace(
     )
 }
 
-fn project_for_intent(
+fn primary_identity_for_intent(
     intent: &automonique_protocol::platform_v2_lifecycle::WorkContextMutationIntent,
-    principal: &PrincipalPolicy,
-) -> Result<Option<ProjectId>, &'static str> {
+) -> Option<&WorkContextIdentity> {
     use automonique_protocol::platform_v2_lifecycle::WorkContextMutationIntent;
-    let identity = match intent {
-        WorkContextMutationIntent::CreateProject(_) => return Ok(None),
+    Some(match intent {
+        WorkContextMutationIntent::CreateProject(_) => return None,
         WorkContextMutationIntent::CreateHostSetup(value) => value.project().identity(),
         WorkContextMutationIntent::CreateCheckout(value) => value.project().identity(),
         WorkContextMutationIntent::CreateUserWorkspace(value) => value.project().identity(),
@@ -687,18 +902,27 @@ fn project_for_intent(
         WorkContextMutationIntent::ArchiveHostSetup(value) => value.target().identity(),
         WorkContextMutationIntent::ArchiveCheckout(value) => value.target().identity(),
         WorkContextMutationIntent::ArchiveUserWorkspace(value) => value.target().identity(),
-    };
-    match identity {
-        WorkContextIdentity::Project(project) if principal.projects.contains(project) => {
-            Ok(Some(project.clone()))
-        }
-        identity => principal
-            .workspaces
-            .get(identity)
-            .cloned()
-            .map(Some)
-            .ok_or("platform_v2_scope_denied"),
+    })
+}
+
+fn scope_for_intent(
+    intent: &automonique_protocol::platform_v2_lifecycle::WorkContextMutationIntent,
+    principal: &PrincipalPolicy,
+) -> Result<(ProjectId, WorkContextAuthority), &'static str> {
+    let identity =
+        primary_identity_for_intent(intent).ok_or("platform_v2_create_project_adapter_pending")?;
+    let scope = principal
+        .workspaces
+        .get(identity)
+        .ok_or("platform_v2_scope_denied")?;
+    if !principal.projects.contains(&scope.project) {
+        return Err("platform_v2_scope_denied");
     }
+    Ok((scope.project.clone(), scope.inherited_authority.clone()))
+}
+
+fn approval_expiry(requested_expiry: i64, preview_expiry: i64) -> i64 {
+    requested_expiry.min(preview_expiry)
 }
 
 fn negotiated_v2() -> Result<NegotiatedPlatform, &'static str> {
@@ -749,5 +973,103 @@ impl WorkContextNonceSource for HostNonces {
         let mut nonce = [0_u8; 16];
         nonce.copy_from_slice(&digest.as_bytes()[..16]);
         nonce
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn policy(inherited_tools: serde_json::Value) -> PolicyDocument {
+        serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "principals": [{
+                "uid": 7,
+                "tenant": "tenant-test",
+                "actor": "actor-test",
+                "serving_authority": "automonique",
+                "projects": ["project-test"],
+                "workspaces": [{
+                    "project": "project-test",
+                    "kind": "project",
+                    "id": "project-test",
+                    "inherited_authority": {
+                        "filesystem": [], "credentials": [], "network": [],
+                        "tools": inherited_tools, "providers": [], "models": []
+                    }
+                }],
+                "authority": {
+                    "filesystem": [], "credentials": [], "network": [],
+                    "tools": ["tool.actor"], "providers": [], "models": []
+                },
+                "review_authorities": {}
+            }]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn inherited_scope_ceiling_is_independent_and_narrower() {
+        let parsed = parse_policy(policy(serde_json::json!([]))).unwrap();
+        let principal = parsed.get(&7).unwrap();
+        let scope = principal
+            .workspaces
+            .get(&WorkContextIdentity::Project(
+                ProjectId::new("project-test").unwrap(),
+            ))
+            .unwrap();
+        assert!(!principal.authority.is_empty());
+        assert!(scope.inherited_authority.is_empty());
+    }
+
+    #[test]
+    fn inherited_scope_ceiling_cannot_exceed_actor_authority() {
+        assert!(parse_policy(policy(serde_json::json!(["tool.not-actor"]))).is_err());
+    }
+
+    #[test]
+    fn child_scope_ceiling_cannot_exceed_project_ceiling() {
+        let document: PolicyDocument = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "principals": [{
+                "uid": 7, "tenant": "tenant-test", "actor": "actor-test",
+                "serving_authority": "automonique", "projects": ["project-test"],
+                "workspaces": [
+                    {"project": "project-test", "kind": "project", "id": "project-test",
+                     "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []}},
+                    {"project": "project-test", "kind": "user_workspace", "id": "workspace-test",
+                     "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": ["tool.actor"], "providers": [], "models": []}}
+                ],
+                "authority": {"filesystem": [], "credentials": [], "network": [], "tools": ["tool.actor"], "providers": [], "models": []},
+                "review_authorities": {}
+            }]
+        }))
+        .unwrap();
+        assert!(parse_policy(document).is_err());
+    }
+
+    #[test]
+    fn last_minute_approval_is_capped_to_preview_expiry() {
+        assert_eq!(approval_expiry(10_060, 10_001), 10_001);
+        assert_eq!(approval_expiry(10_060, 20_000), 10_060);
+    }
+
+    #[test]
+    fn policy_path_swap_cannot_replace_the_open_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("policy.json");
+        let opened_inode = directory.path().join("opened-policy.json");
+        fs::write(&path, b"opened document").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let bytes = read_policy_file_after_open(&path, nix::unistd::geteuid().as_raw(), || {
+            fs::rename(&path, &opened_inode).unwrap();
+            fs::write(&path, b"replacement document").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(bytes, b"opened document");
+        assert_eq!(fs::read(path).unwrap(), b"replacement document");
     }
 }

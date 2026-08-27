@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Elastic-2.0
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -1453,6 +1454,28 @@ fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
         .intent_authorized(&lineage_v2(), &scope, create.intent_id(), |_| true)
         .unwrap()
         .unwrap();
+    assert!(
+        index
+            .intent_authorized_in_workspaces(
+                &lineage_v2(),
+                TENANT,
+                create.intent_id(),
+                &BTreeSet::from([workspace("workspace-other")]),
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        index
+            .intent_authorized_in_workspaces(
+                &lineage_v2(),
+                TENANT,
+                create.intent_id(),
+                &BTreeSet::from([ws.clone()]),
+            )
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(stored.intent, create);
     assert_eq!(stored.outcome, WorkspaceIntentOutcome::Accepted);
     assert_ne!(stored.request_digest, [0; 32]);
