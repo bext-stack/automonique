@@ -60,13 +60,21 @@ let lastNotifiedAttentionKey = null;
 const frenchUi = Object.freeze({
   "Skip to workspace": "Aller à l’espace de travail",
   "Primary navigation": "Navigation principale",
-  "Open Monique chat": "Ouvrir la discussion avec Monique",
+  "Open retained sessions": "Ouvrir les sessions conservées",
   "Collapse sidebar": "Réduire la barre latérale",
   "Expand sidebar": "Déployer la barre latérale",
   "Toggle sidebar": "Afficher ou masquer la barre latérale",
   "Close navigation": "Fermer la navigation",
   "New conversation": "Nouvelle conversation",
   "Confirm new conversation": "Confirmer la nouvelle conversation",
+  "Retained sessions": "Sessions conservées",
+  "RETAINED SESSIONS": "SESSIONS CONSERVÉES",
+  "Recovery": "Récupération",
+  "Recovery tools": "Outils de récupération",
+  "Generic chat": "Discussion générique",
+  "Generic recovery chat": "Discussion générique de récupération",
+  "GENERIC RECOVERY CHAT": "DISCUSSION GÉNÉRIQUE DE RÉCUPÉRATION",
+  "RECOVERY": "RÉCUPÉRATION",
   "Workspace": "Espace de travail",
   "Operations sections": "Sections opérationnelles",
   "Overview": "Vue d’ensemble",
@@ -180,6 +188,19 @@ const frenchUi = Object.freeze({
   "Waiting": "En attente",
   "Chat with Monique": "Discuter avec Monique",
   "Contained assistant": "Assistante cloisonnée",
+  "Generic recovery assistant": "Assistante générique de récupération",
+  "SECONDARY / RECOVERY": "SECONDAIRE / RÉCUPÉRATION",
+  "This assistant is not attached to an authority-qualified Platform session. Use it when retained session recovery is unavailable, then return to the retained cockpit for ongoing work.": "Cette assistante n’est pas rattachée à une session Platform qualifiée par une autorité. Utilisez-la lorsque la récupération d’une session conservée est indisponible, puis revenez au cockpit conservé pour poursuivre le travail.",
+  "Return to retained sessions": "Revenir aux sessions conservées",
+  "RECOVERY ASSISTANT": "ASSISTANTE DE RÉCUPÉRATION",
+  "Use recovery assistant": "Utiliser l’assistante de récupération",
+  "Generic help · no session context →": "Aide générique · sans contexte de session →",
+  "GENERIC RECOVERY ASSISTANT": "ASSISTANTE GÉNÉRIQUE DE RÉCUPÉRATION",
+  "Configuration recovery": "Récupération de configuration",
+  "Credentials remain outside this browser. This generic assistant is not attached to a retained session; any mutation still requires explicit approval.": "Les identifiants restent hors de ce navigateur. Cette assistante générique n’est pas rattachée à une session conservée ; toute modification exige toujours une approbation explicite.",
+  "AUTOMONIQUE.PLATFORM / AUTHORITY-QUALIFIED": "AUTOMONIQUE.PLATFORM / AUTORITÉ QUALIFIÉE",
+  "PRIMARY CONVERSATION SURFACE": "SURFACE DE CONVERSATION PRINCIPALE",
+  "Continue work in its durable Platform session, with exact authority, revision, approval, and receipt context preserved across every follow-up.": "Poursuivez le travail dans sa session Platform durable, en préservant le contexte exact d’autorité, de révision, d’approbation et de reçu à chaque suivi.",
   "Conversation context": "Contexte de conversation",
   "memory": "mémoire",
   "live": "temps réel",
@@ -996,7 +1017,7 @@ const sidebarStates = ["expanded", "collapsed"];
 const densityNames = { compact: "Compact", comfortable: "Comfortable", spacious: "Spacious" };
 const densities = Object.keys(densityNames);
 const motionModes = ["full", "reduce"];
-const startupViews = ["chat", "overview", "operations", "tickets"];
+const startupViews = ["sessions", "overview", "operations", "tickets", "chat"];
 
 function storedPreference(key, allowed, fallback) {
   try {
@@ -1083,7 +1104,7 @@ function applyMotion(mode, persist = true) {
 }
 
 function applyStartupView(view, persist = true) {
-  if (!startupViews.includes(view)) view = "chat";
+  if (!startupViews.includes(view)) view = "sessions";
   byId("startup-view").value = view;
   if (byId("configuration-startup")) byId("configuration-startup").value = view;
   if (persist) savePreference("monique-start-view", view);
@@ -1094,7 +1115,7 @@ applyTextScale(storedPreference("monique-text-scale", textScales, "comfortable")
 applySidebar(storedPreference("monique-sidebar", sidebarStates, "expanded"), false);
 applyDensity(storedPreference("monique-density", densities, "comfortable"), false);
 applyMotion(storedPreference("monique-motion", motionModes, "full"), false);
-applyStartupView(storedPreference("monique-start-view", startupViews, "chat"), false);
+applyStartupView(storedPreference("monique-start-view", startupViews, "sessions"), false);
 applyLanguage(currentLanguage, false);
 observeLocalization();
 
@@ -1375,8 +1396,8 @@ async function refreshStatus({ announce = false } = {}) {
 }
 
 function showView(name) {
-  const allowed = ["overview", "chat", "operations", "tickets", "memory", "configuration"];
-  if (!allowed.includes(name)) name = "overview";
+  const allowed = ["overview", "sessions", "chat", "operations", "tickets", "memory", "configuration"];
+  if (!allowed.includes(name)) name = "sessions";
   document.querySelectorAll("[data-panel]").forEach((node) => node.classList.toggle("is-visible", node.dataset.panel === name));
   document.querySelectorAll("[data-view]").forEach((node) => {
     const active = node.dataset.view === name;
@@ -1387,10 +1408,8 @@ function showView(name) {
   if (window.location.hash !== `#${name}`) history.replaceState(null, "", `#${name}`);
   if (name === "memory") loadMemory(memoryQuery);
   if (name === "operations" || name === "tickets") loadOperations();
-  if (name === "operations") {
-    loadPlatform();
-    loadProcesses();
-  }
+  if (name === "sessions") loadPlatform();
+  if (name === "operations") loadProcesses();
   if (name === "configuration") loadConfiguration();
   if (name === "chat") loadChatHistory();
   if (window.matchMedia("(max-width: 760px)").matches) mobileSidebarOpen(false);
@@ -1679,8 +1698,8 @@ function renderMemoryInspector(entry) {
   });
   const ask = document.createElement("button");
   ask.type = "button";
-  ask.className = "button primary";
-  ask.textContent = "Ask Monique";
+  ask.className = "button secondary";
+  ask.textContent = "Use recovery assistant";
   ask.dataset.openChat = `Review memory evidence ${entry.reference}. Explain what it establishes, its provenance and confidence, whether it needs review, and how it should influence current work.`;
   actions.append(copy, ask);
   root.append(head, content, confidence, facts, actions);
@@ -2631,7 +2650,7 @@ function renderTickets() {
         renderTickets();
       });
     } else {
-      action.textContent = "Ask Monique about work";
+      action.textContent = "Use recovery assistant";
       action.dataset.openChat = "Inspect the available Support and Manage capabilities and help me retrieve or review the right work queue.";
     }
     empty.append(title, action);
@@ -4071,8 +4090,6 @@ function resetNewChatButton() {
   newChatArmed = false;
   byId("new-chat").textContent = "New conversation";
   byId("new-chat").removeAttribute("data-armed");
-  byId("sidebar-new-chat-label").textContent = "New conversation";
-  byId("sidebar-new-chat").removeAttribute("data-armed");
 }
 
 byId("new-chat").addEventListener("click", async () => {
@@ -4084,8 +4101,6 @@ byId("new-chat").addEventListener("click", async () => {
     newChatArmed = true;
     byId("new-chat").textContent = "Confirm new conversation";
     byId("new-chat").dataset.armed = "true";
-    byId("sidebar-new-chat-label").textContent = "Confirm new conversation";
-    byId("sidebar-new-chat").dataset.armed = "true";
     newChatTimer = window.setTimeout(resetNewChatButton, 5000);
     return;
   }
@@ -4107,10 +4122,7 @@ byId("new-chat").addEventListener("click", async () => {
   }
 });
 
-byId("sidebar-new-chat").addEventListener("click", () => {
-  showView("chat");
-  byId("new-chat").click();
-});
+byId("sidebar-sessions").addEventListener("click", () => showView("sessions"));
 
 function seedChatPrompt(prompt) {
   showView("chat");
@@ -4125,6 +4137,7 @@ document.addEventListener("click", (event) => {
   if (prompt) seedChatPrompt(prompt);
   const overviewPrompt = event.target.closest("[data-open-chat]")?.dataset.openChat;
   if (overviewPrompt) seedChatPrompt(overviewPrompt);
+  if (event.target.closest("[data-open-sessions]")) showView("sessions");
 });
 
 document.addEventListener("keydown", (event) => {
@@ -4142,8 +4155,7 @@ document.addEventListener("keydown", (event) => {
     refreshStatus({ announce: true });
   } else if (!editing && event.key.toLowerCase() === "n") {
     event.preventDefault();
-    showView("chat");
-    byId("new-chat").click();
+    showView("sessions");
   } else if (event.key === "Escape" && newChatArmed) {
     resetNewChatButton();
   } else if (event.key === "Escape" && !byId("appearance-panel").hidden) {
@@ -4159,10 +4171,8 @@ platformMutation = readPlatformMutation();
 try { platformSelectedSession = sessionStorage.getItem("monique-platform-session"); } catch (_error) { platformSelectedSession = null; }
 if (platformMutation) platformSelectedSession = platformMutation.sessionId;
 refreshStatus();
-loadPlatform();
-loadProcesses();
 loadConfiguration();
-showView(window.location.hash.slice(1) || storedPreference("monique-start-view", startupViews, "chat"));
+showView(window.location.hash.slice(1) || storedPreference("monique-start-view", startupViews, "sessions"));
 function scheduleStatusRefresh(delay = 10000) {
   if (statusRefreshTimer !== null) window.clearTimeout(statusRefreshTimer);
   statusRefreshTimer = window.setTimeout(async () => {
@@ -4174,10 +4184,9 @@ scheduleStatusRefresh(Number(byId("configuration-refresh-rate").value));
 window.setInterval(updateObservedAge, 1_000);
 window.setInterval(renderPulse, 1_000);
 window.setInterval(() => {
-  if (!document.hidden && document.querySelector('[data-panel="operations"]')?.classList.contains("is-visible")) {
-    loadPlatform();
-    loadProcesses();
-  }
+  if (document.hidden) return;
+  if (document.querySelector('[data-panel="sessions"]')?.classList.contains("is-visible")) loadPlatform();
+  if (document.querySelector('[data-panel="operations"]')?.classList.contains("is-visible")) loadProcesses();
 }, 5_000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshStatus(); });
 
