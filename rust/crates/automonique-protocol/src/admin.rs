@@ -142,6 +142,9 @@ const _: () = assert!(
     "a maximally escaped metrics response must fit one admin frame"
 );
 
+/// Largest canonical request accepted by the local multi-protocol dispatch.
+pub const MAX_LOCAL_REQUEST_CANONICAL_BYTES: usize = MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES;
+
 /// Maximum UTF-8 byte length of the actor named on an intake pause or resume.
 ///
 /// The transport authenticates the Unix peer; this string is the operator's own
@@ -2141,6 +2144,12 @@ impl LocalRequest {
     /// well-formed envelope or that names a protocol this socket does not
     /// serve, and otherwise the owning lane's own refusal.
     pub fn from_canonical_bytes(payload: &[u8]) -> Result<Self, LocalRequestError> {
+        if payload.len() > MAX_LOCAL_REQUEST_CANONICAL_BYTES {
+            return Err(LocalRequestError::Envelope(CodecError::FrameTooLarge {
+                max_bytes: MAX_LOCAL_REQUEST_CANONICAL_BYTES,
+                declared_bytes: payload.len(),
+            }));
+        }
         let decoded =
             Message::from_canonical_bytes(payload).map_err(LocalRequestError::Envelope)?;
         let protocol = decoded.envelope().protocol().as_str().to_owned();

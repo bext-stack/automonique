@@ -178,7 +178,9 @@ fn registry(value: &JsonValue) -> Result<WorkContextRegistrySelector, LifecycleA
     WorkContextRegistrySelector::new(string(value, "registry")?.to_owned()).map_err(Into::into)
 }
 
-fn intent_json(intent: &WorkContextMutationIntent) -> Result<JsonValue, LifecycleApiError> {
+pub(crate) fn intent_json(
+    intent: &WorkContextMutationIntent,
+) -> Result<JsonValue, LifecycleApiError> {
     let kind = ("kind", JsonValue::String(intent.kind().to_owned()));
     Ok(match intent {
         WorkContextMutationIntent::CreateProject(value) => object(vec![
@@ -278,7 +280,7 @@ fn intent_json(intent: &WorkContextMutationIntent) -> Result<JsonValue, Lifecycl
     })
 }
 
-fn intent(value: &JsonValue) -> Result<WorkContextMutationIntent, LifecycleApiError> {
+pub(crate) fn intent(value: &JsonValue) -> Result<WorkContextMutationIntent, LifecycleApiError> {
     Ok(match string(value, "kind")? {
         "create_project" => {
             exact_fields(value, &["kind", "label", "repositories"])?;

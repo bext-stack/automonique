@@ -11,8 +11,8 @@ use core::fmt;
 use core::str::FromStr;
 
 use crate::codec::{
-    CodecError, Envelope, MajorVersion, MessageKind, ProtocolName, RequestId, SupportedProtocol,
-    VersionRange,
+    CodecError, Envelope, FrameDecode, MajorVersion, MessageKind, ProtocolName, RequestId,
+    SupportedProtocol, VersionRange, decode_frame_with_limit, encode_frame_with_limit,
 };
 use crate::platform::{IdempotencyKey, PLATFORM_PROTOCOL, ReceiptId};
 use crate::platform_v2::{
@@ -30,14 +30,14 @@ use crate::platform_v2_api::{
 use crate::platform_v2_lifecycle::{
     MAX_MUTATION_CANONICAL_BYTES, MutationApproval, MutationApprovalDecision, MutationApprovalId,
     MutationPreview, MutationPreviewDigest, MutationPreviewRef, MutationReceipt, MutationRefusal,
-    WorkContextMutationProposal,
+    WorkContextMutationIntent,
 };
 use crate::platform_v2_lifecycle_api::{
     LifecycleApiError, decode_work_context_mutation_approval, decode_work_context_mutation_preview,
-    decode_work_context_mutation_proposal, decode_work_context_mutation_receipt,
-    decode_work_context_mutation_refusal, encode_work_context_mutation_approval,
-    encode_work_context_mutation_preview, encode_work_context_mutation_proposal,
-    encode_work_context_mutation_receipt, encode_work_context_mutation_refusal,
+    decode_work_context_mutation_receipt, decode_work_context_mutation_refusal,
+    encode_work_context_mutation_approval, encode_work_context_mutation_preview,
+    encode_work_context_mutation_receipt, encode_work_context_mutation_refusal, intent,
+    intent_json,
 };
 use crate::platform_v2_lineage::{
     LineageProjection, WorkspaceIntent, WorkspaceIntentId, WorkspaceIntentOutcome,
@@ -47,11 +47,14 @@ use crate::platform_v2_lineage_api::{
     decode_workspace_intent_outcome, encode_lineage_projection, encode_workspace_intent,
     encode_workspace_intent_outcome,
 };
-use crate::platform_v2_review::{ReviewActionReceipt, ReviewActionRequest, ReviewSnapshot};
+use crate::platform_v2_review::{
+    PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR, PLATFORM_REVIEW_SCHEMA_V1, ReviewAction,
+    ReviewActionReceipt, ReviewSnapshot,
+};
 use crate::platform_v2_review_api::{
-    MAX_REVIEW_SNAPSHOT_CANONICAL_BYTES, ReviewApiError, decode_review_action_receipt,
-    decode_review_action_request, decode_review_snapshot, encode_review_action_receipt,
-    encode_review_action_request, encode_review_snapshot,
+    MAX_REVIEW_SNAPSHOT_CANONICAL_BYTES, ReviewApiError, action, action_json,
+    decode_review_action_receipt, decode_review_snapshot, encode_review_action_receipt,
+    encode_review_snapshot,
 };
 use crate::primitives::{BoundedString, Revision, ValueError};
 use crate::wire::{JsonValue, Message, parse_canonical};
@@ -78,7 +81,7 @@ const _: () = assert!(
     MAX_REVIEW_SNAPSHOT_CANONICAL_BYTES + PLATFORM_V2_ENVELOPE_OVERHEAD_BYTES
         <= MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES
 );
-const _: () = assert!(MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES <= crate::codec::MAX_FRAME_BYTES);
+const _: () = assert!(MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES <= u32::MAX as usize);
 
 pub type PlatformV2RefusalCategory = BoundedString<128>;
 pub type PlatformV2RefusalExplanation = BoundedString<512>;
@@ -116,6 +119,9 @@ pub enum PlatformV2TransportError {
     Lineage(LineageApiError),
     Review(ReviewApiError),
     InvalidBody,
+    CorrelationMismatch,
+    NegotiationMismatch,
+    ResponseMismatch,
     UnknownKind,
     FrameTooLarge {
         max_bytes: usize,
@@ -132,6 +138,9 @@ impl PlatformV2TransportError {
             Self::Lineage(value) => value.category(),
             Self::Review(value) => value.category(),
             Self::InvalidBody => "platform_v2_invalid_body",
+            Self::CorrelationMismatch => "platform_v2_correlation_mismatch",
+            Self::NegotiationMismatch => "platform_negotiation_mismatch",
+            Self::ResponseMismatch => "platform_v2_response_mismatch",
             Self::UnknownKind => "platform_v2_unknown_kind",
             Self::FrameTooLarge { .. } => "frame_too_large",
         }
@@ -225,6 +234,19 @@ fn document(bytes: Vec<u8>) -> Result<JsonValue, PlatformV2TransportError> {
 fn body_document(message: &Message) -> Vec<u8> {
     message.body().to_canonical_bytes()
 }
+fn framed_payload(input: &[u8], maximum: usize) -> Result<&[u8], PlatformV2TransportError> {
+    match decode_frame_with_limit(input, maximum)? {
+        FrameDecode::Frame { payload, consumed } if consumed == input.len() => Ok(payload),
+        FrameDecode::Frame { .. } | FrameDecode::NeedMore { .. } => {
+            Err(PlatformV2TransportError::InvalidBody)
+        }
+    }
+}
+fn framed(bytes: &[u8], maximum: usize) -> Result<Vec<u8>, PlatformV2TransportError> {
+    let mut frame = Vec::with_capacity(crate::codec::LENGTH_PREFIX_BYTES + bytes.len());
+    encode_frame_with_limit(bytes, &mut frame, maximum)?;
+    Ok(frame)
+}
 fn v2() -> NegotiatedPlatform {
     NegotiatedPlatform::new(
         PlatformVersion::V2,
@@ -232,6 +254,35 @@ fn v2() -> NegotiatedPlatform {
         crate::platform_v2::WorkContextAvailability::V2Structured,
     )
     .expect("coherent Platform v2 negotiation")
+}
+
+/// Client-owned inputs for preparing a mutation.
+///
+/// The authenticated actor, tenant, serving authority, authority ceiling,
+/// request digest, preview identity, and trusted times are deliberately absent.
+/// A host must inject those values when it constructs the authoritative
+/// [`crate::platform_v2_lifecycle::WorkContextMutationProposal`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MutationPrepareRequest {
+    idempotency_key: IdempotencyKey,
+    intent: WorkContextMutationIntent,
+}
+impl MutationPrepareRequest {
+    #[must_use]
+    pub const fn new(idempotency_key: IdempotencyKey, intent: WorkContextMutationIntent) -> Self {
+        Self {
+            idempotency_key,
+            intent,
+        }
+    }
+    #[must_use]
+    pub const fn idempotency_key(&self) -> &IdempotencyKey {
+        &self.idempotency_key
+    }
+    #[must_use]
+    pub const fn intent(&self) -> &WorkContextMutationIntent {
+        &self.intent
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -415,13 +466,59 @@ impl ReviewReadRequest {
 pub struct ReviewReceiptLookup {
     project: ProjectId,
     workspace: WorkContextIdentity,
-    key: ReceiptLookupKey,
+    idempotency_key: IdempotencyKey,
+}
+
+/// Client-owned inputs for one review action.
+///
+/// Authentication, actor identity, and action authority are resolved by the
+/// host after peer authentication and cannot be asserted on this wire.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewActionTransportRequest {
+    workspace: WorkContextIdentity,
+    expected_revision: Revision,
+    action: ReviewAction,
+    idempotency_key: IdempotencyKey,
+}
+impl ReviewActionTransportRequest {
+    pub fn new(
+        workspace: WorkContextIdentity,
+        expected_revision: Revision,
+        action: ReviewAction,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<Self, PlatformV2TransportError> {
+        if !is_review_workspace(&workspace) {
+            return Err(PlatformV2TransportError::InvalidBody);
+        }
+        Ok(Self {
+            workspace,
+            expected_revision,
+            action,
+            idempotency_key,
+        })
+    }
+    #[must_use]
+    pub const fn workspace(&self) -> &WorkContextIdentity {
+        &self.workspace
+    }
+    #[must_use]
+    pub const fn expected_revision(&self) -> Revision {
+        self.expected_revision
+    }
+    #[must_use]
+    pub const fn action(&self) -> &ReviewAction {
+        &self.action
+    }
+    #[must_use]
+    pub const fn idempotency_key(&self) -> &IdempotencyKey {
+        &self.idempotency_key
+    }
 }
 impl ReviewReceiptLookup {
     pub fn new(
         project: ProjectId,
         workspace: WorkContextIdentity,
-        key: ReceiptLookupKey,
+        idempotency_key: IdempotencyKey,
     ) -> Result<Self, PlatformV2TransportError> {
         if !is_review_workspace(&workspace) {
             return Err(PlatformV2TransportError::InvalidBody);
@@ -429,7 +526,7 @@ impl ReviewReceiptLookup {
         Ok(Self {
             project,
             workspace,
-            key,
+            idempotency_key,
         })
     }
     #[must_use]
@@ -441,8 +538,8 @@ impl ReviewReceiptLookup {
         &self.workspace
     }
     #[must_use]
-    pub const fn key(&self) -> &ReceiptLookupKey {
-        &self.key
+    pub const fn idempotency_key(&self) -> &IdempotencyKey {
+        &self.idempotency_key
     }
 }
 
@@ -455,10 +552,14 @@ fn is_review_workspace(workspace: &WorkContextIdentity) -> bool {
     )
 }
 
-/// Response-only canonical approval. It cannot be placed in a client request.
+/// Raw, response-only canonical approval document.
+///
+/// This is intentionally not a typed [`MutationApproval`]: that domain value
+/// cannot be validated without the exact preview. Call [`Self::decode`] with
+/// that context before treating these bytes as an approval.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MutationApprovalDocument(Vec<u8>);
-impl MutationApprovalDocument {
+pub struct RawMutationApprovalDocument(Vec<u8>);
+impl RawMutationApprovalDocument {
     pub fn from_approval(value: &MutationApproval) -> Result<Self, PlatformV2TransportError> {
         Ok(Self(encode_work_context_mutation_approval(value)?))
     }
@@ -476,11 +577,14 @@ impl MutationApprovalDocument {
     }
 }
 
-/// Response-only canonical receipt. Its contextual decode requires the exact
-/// preview and server-stamped submission retained by the caller.
+/// Raw, response-only canonical receipt document.
+///
+/// This is intentionally not a typed [`MutationReceipt`]. Its contextual
+/// decode requires the exact preview and server-stamped submission retained by
+/// the caller.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MutationReceiptDocument(Vec<u8>);
-impl MutationReceiptDocument {
+pub struct RawMutationReceiptDocument(Vec<u8>);
+impl RawMutationReceiptDocument {
     pub fn from_receipt(value: &MutationReceipt) -> Result<Self, PlatformV2TransportError> {
         Ok(Self(encode_work_context_mutation_receipt(value)?))
     }
@@ -562,6 +666,12 @@ impl PlatformNegotiationRequestMessage {
     pub const fn request(&self) -> &PlatformNegotiationRequest {
         &self.request
     }
+    #[must_use]
+    pub const fn offer(&self) -> &PlatformVersionOffer {
+        match &self.request {
+            PlatformNegotiationRequest::Negotiate(offer) => offer,
+        }
+    }
     pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, PlatformV2TransportError> {
         let PlatformNegotiationRequest::Negotiate(value) = &self.request;
         encoded(
@@ -594,6 +704,18 @@ impl PlatformNegotiationRequestMessage {
             ))?),
         ))
     }
+    pub fn to_frame(&self) -> Result<Vec<u8>, PlatformV2TransportError> {
+        framed(
+            &self.to_canonical_bytes()?,
+            MAX_PLATFORM_NEGOTIATION_REQUEST_CANONICAL_BYTES,
+        )
+    }
+    pub fn from_frame(frame: &[u8]) -> Result<Self, PlatformV2TransportError> {
+        Self::from_canonical_bytes(framed_payload(
+            frame,
+            MAX_PLATFORM_NEGOTIATION_REQUEST_CANONICAL_BYTES,
+        )?)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -602,19 +724,18 @@ pub struct PlatformNegotiationResponseMessage {
     response: PlatformNegotiationResponse,
 }
 impl PlatformNegotiationResponseMessage {
-    #[must_use]
-    pub const fn new(request_id: RequestId, response: PlatformNegotiationResponse) -> Self {
+    fn new(request_id: RequestId, response: PlatformNegotiationResponse) -> Self {
         Self {
             request_id,
             response,
         }
     }
-    #[must_use]
     pub fn for_request(
         request: &PlatformNegotiationRequestMessage,
         response: PlatformNegotiationResponse,
-    ) -> Self {
-        Self::new(request.request_id.clone(), response)
+    ) -> Result<Self, PlatformV2TransportError> {
+        validate_negotiation_response(request.offer(), &response)?;
+        Ok(Self::new(request.request_id.clone(), response))
     }
     #[must_use]
     pub const fn request_id(&self) -> &RequestId {
@@ -646,7 +767,10 @@ impl PlatformNegotiationResponseMessage {
             MAX_PLATFORM_NEGOTIATION_RESPONSE_CANONICAL_BYTES,
         )
     }
-    pub fn from_canonical_bytes(payload: &[u8]) -> Result<Self, PlatformV2TransportError> {
+    pub fn from_canonical_bytes(
+        payload: &[u8],
+        request: &PlatformNegotiationRequestMessage,
+    ) -> Result<Self, PlatformV2TransportError> {
         let message = admitted(
             payload,
             MAX_PLATFORM_NEGOTIATION_RESPONSE_CANONICAL_BYTES,
@@ -660,8 +784,39 @@ impl PlatformNegotiationResponseMessage {
             "platform_v2_refused" => PlatformNegotiationResponse::Refused(refusal(message.body())?),
             _ => return Err(PlatformV2TransportError::UnknownKind),
         };
+        if message.envelope().request_id() != request.request_id() {
+            return Err(PlatformV2TransportError::CorrelationMismatch);
+        }
+        validate_negotiation_response(request.offer(), &response)?;
         Ok(Self::new(message.envelope().request_id().clone(), response))
     }
+    pub fn to_frame(&self) -> Result<Vec<u8>, PlatformV2TransportError> {
+        framed(
+            &self.to_canonical_bytes()?,
+            MAX_PLATFORM_NEGOTIATION_RESPONSE_CANONICAL_BYTES,
+        )
+    }
+    pub fn from_frame(
+        frame: &[u8],
+        request: &PlatformNegotiationRequestMessage,
+    ) -> Result<Self, PlatformV2TransportError> {
+        Self::from_canonical_bytes(
+            framed_payload(frame, MAX_PLATFORM_NEGOTIATION_RESPONSE_CANONICAL_BYTES)?,
+            request,
+        )
+    }
+}
+
+fn validate_negotiation_response(
+    offer: &PlatformVersionOffer,
+    response: &PlatformNegotiationResponse,
+) -> Result<(), PlatformV2TransportError> {
+    if let PlatformNegotiationResponse::Negotiated(selected) = response
+        && !offer.versions().contains(&selected.version().number())
+    {
+        return Err(PlatformV2TransportError::NegotiationMismatch);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -669,7 +824,7 @@ impl PlatformNegotiationResponseMessage {
 pub enum PlatformV2Request {
     QueryWorkContexts(WorkContextQuery),
     GetWorkContext(WorkContextIdentity),
-    PrepareMutation(WorkContextMutationProposal),
+    PrepareMutation(MutationPrepareRequest),
     DecideMutation(MutationDecisionRequest),
     SubmitMutation(MutationSubmitRequest),
     GetMutationReceipt(MutationReceiptLookup),
@@ -677,7 +832,7 @@ pub enum PlatformV2Request {
     SubmitWorkspaceIntent(WorkspaceIntentRequest),
     GetWorkspaceIntent(WorkspaceIntentLookup),
     GetReview(ReviewReadRequest),
-    ExecuteReviewAction(ReviewActionRequest),
+    ExecuteReviewAction(ReviewActionTransportRequest),
     GetReviewReceipt(ReviewReceiptLookup),
 }
 
@@ -688,8 +843,8 @@ pub enum PlatformV2Response {
     WorkContextResync(WorkContextResync),
     WorkContextRecord(WorkContextRecord),
     MutationPreview(MutationPreview),
-    MutationApproval(MutationApprovalDocument),
-    MutationReceipt(MutationReceiptDocument),
+    MutationApproval(RawMutationApprovalDocument),
+    MutationReceipt(RawMutationReceiptDocument),
     MutationRefused(MutationRefusal),
     LineageResult(LineageProjection),
     WorkspaceIntentResult(WorkspaceIntentOutcome),
@@ -831,6 +986,21 @@ fn lookup(
     Ok((project, workspace, key))
 }
 
+fn review_lookup_json(value: &ReviewReceiptLookup) -> JsonValue {
+    object(vec![
+        (
+            "idempotency_key",
+            JsonValue::String(value.idempotency_key.as_str().to_owned()),
+        ),
+        (
+            "project",
+            JsonValue::String(value.project.as_str().to_owned()),
+        ),
+        ("schema", JsonValue::String(PLATFORM_SCHEMA_V2.to_owned())),
+        ("workspace", identity_json(&value.workspace)),
+    ])
+}
+
 fn request_kind(value: &PlatformV2Request) -> &'static str {
     match value {
         PlatformV2Request::QueryWorkContexts(_) => "query_work_contexts",
@@ -856,9 +1026,14 @@ fn request_body(value: &PlatformV2Request) -> Result<JsonValue, PlatformV2Transp
             document(encode_work_context_query(value)?)?
         }
         PlatformV2Request::GetWorkContext(value) => identity_json(value),
-        PlatformV2Request::PrepareMutation(value) => {
-            document(encode_work_context_mutation_proposal(value)?)?
-        }
+        PlatformV2Request::PrepareMutation(value) => object(vec![
+            (
+                "idempotency_key",
+                JsonValue::String(value.idempotency_key.as_str().to_owned()),
+            ),
+            ("intent", intent_json(&value.intent)?),
+            ("schema", JsonValue::String(PLATFORM_SCHEMA_V2.to_owned())),
+        ]),
         PlatformV2Request::DecideMutation(value) => object(vec![
             (
                 "decision",
@@ -922,12 +1097,30 @@ fn request_body(value: &PlatformV2Request) -> Result<JsonValue, PlatformV2Transp
             ("schema", JsonValue::String(PLATFORM_SCHEMA_V2.to_owned())),
         ]),
         PlatformV2Request::GetReview(value) => scope_json(&value.project, Some(&value.workspace)),
-        PlatformV2Request::ExecuteReviewAction(value) => {
-            document(encode_review_action_request(value)?)?
-        }
-        PlatformV2Request::GetReviewReceipt(value) => {
-            lookup_json(&value.project, Some(&value.workspace), &value.key)
-        }
+        PlatformV2Request::ExecuteReviewAction(value) => object(vec![
+            ("action", action_json(&value.action)?),
+            (
+                "expected_revision",
+                JsonValue::Integer(
+                    i64::try_from(value.expected_revision.get())
+                        .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+                ),
+            ),
+            (
+                "idempotency_key",
+                JsonValue::String(value.idempotency_key.as_str().to_owned()),
+            ),
+            (
+                "platform_version",
+                JsonValue::Integer(i64::from(PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR)),
+            ),
+            (
+                "schema",
+                JsonValue::String(PLATFORM_REVIEW_SCHEMA_V1.to_owned()),
+            ),
+            ("workspace", identity_json(&value.workspace)),
+        ]),
+        PlatformV2Request::GetReviewReceipt(value) => review_lookup_json(value),
     })
 }
 fn request_from_message(message: &Message) -> Result<PlatformV2Request, PlatformV2TransportError> {
@@ -942,7 +1135,20 @@ fn request_from_message(message: &Message) -> Result<PlatformV2Request, Platform
         }
         "get_work_context" => PlatformV2Request::GetWorkContext(identity(message.body())?),
         "prepare_mutation" => {
-            PlatformV2Request::PrepareMutation(decode_work_context_mutation_proposal(&bytes)?)
+            exact_fields(message.body(), &["idempotency_key", "intent", "schema"])?;
+            if string(message.body(), "schema")? != PLATFORM_SCHEMA_V2 {
+                return Err(PlatformV2TransportError::InvalidBody);
+            }
+            PlatformV2Request::PrepareMutation(MutationPrepareRequest::new(
+                IdempotencyKey::new(string(message.body(), "idempotency_key")?)
+                    .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+                intent(
+                    message
+                        .body()
+                        .get("intent")
+                        .ok_or(PlatformV2TransportError::InvalidBody)?,
+                )?,
+            ))
         }
         "decide_mutation" => {
             exact_fields(
@@ -1050,14 +1256,70 @@ fn request_from_message(message: &Message) -> Result<PlatformV2Request, Platform
             )?)
         }
         "execute_review_action" => {
-            PlatformV2Request::ExecuteReviewAction(decode_review_action_request(&bytes)?)
+            exact_fields(
+                message.body(),
+                &[
+                    "action",
+                    "expected_revision",
+                    "idempotency_key",
+                    "platform_version",
+                    "schema",
+                    "workspace",
+                ],
+            )?;
+            if string(message.body(), "schema")? != PLATFORM_REVIEW_SCHEMA_V1
+                || message
+                    .body()
+                    .get("platform_version")
+                    .and_then(JsonValue::as_integer)
+                    != Some(i64::from(PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR))
+            {
+                return Err(PlatformV2TransportError::InvalidBody);
+            }
+            let expected_revision = message
+                .body()
+                .get("expected_revision")
+                .and_then(JsonValue::as_integer)
+                .and_then(|value| u64::try_from(value).ok())
+                .and_then(|value| Revision::new(value).ok())
+                .ok_or(PlatformV2TransportError::InvalidBody)?;
+            PlatformV2Request::ExecuteReviewAction(ReviewActionTransportRequest::new(
+                identity(
+                    message
+                        .body()
+                        .get("workspace")
+                        .ok_or(PlatformV2TransportError::InvalidBody)?,
+                )?,
+                expected_revision,
+                action(
+                    message
+                        .body()
+                        .get("action")
+                        .ok_or(PlatformV2TransportError::InvalidBody)?,
+                )?,
+                IdempotencyKey::new(string(message.body(), "idempotency_key")?)
+                    .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+            )?)
         }
         "get_review_receipt" => {
-            let (project, workspace, key) = lookup(message.body())?;
+            exact_fields(
+                message.body(),
+                &["idempotency_key", "project", "schema", "workspace"],
+            )?;
+            if string(message.body(), "schema")? != PLATFORM_SCHEMA_V2 {
+                return Err(PlatformV2TransportError::InvalidBody);
+            }
             PlatformV2Request::GetReviewReceipt(ReviewReceiptLookup::new(
-                project,
-                workspace.ok_or(PlatformV2TransportError::InvalidBody)?,
-                key,
+                ProjectId::new(string(message.body(), "project")?)
+                    .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+                identity(
+                    message
+                        .body()
+                        .get("workspace")
+                        .ok_or(PlatformV2TransportError::InvalidBody)?,
+                )?,
+                IdempotencyKey::new(string(message.body(), "idempotency_key")?)
+                    .map_err(|_| PlatformV2TransportError::InvalidBody)?,
             )?)
         }
         _ => return Err(PlatformV2TransportError::UnknownKind),
@@ -1109,6 +1371,18 @@ impl PlatformV2RequestMessage {
         let request = request_from_message(&message)?;
         Ok(Self::new(message.envelope().request_id().clone(), request))
     }
+    pub fn to_frame(&self) -> Result<Vec<u8>, PlatformV2TransportError> {
+        framed(
+            &self.to_canonical_bytes()?,
+            MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES,
+        )
+    }
+    pub fn from_frame(frame: &[u8]) -> Result<Self, PlatformV2TransportError> {
+        Self::from_canonical_bytes(framed_payload(
+            frame,
+            MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES,
+        )?)
+    }
 }
 
 fn response_kind(value: &PlatformV2Response) -> &'static str {
@@ -1126,6 +1400,42 @@ fn response_kind(value: &PlatformV2Response) -> &'static str {
         PlatformV2Response::ReviewReceipt(_) => "review_receipt",
         PlatformV2Response::Refused(_) => "platform_v2_refused",
     }
+}
+fn response_answers_request(request: &PlatformV2Request, response: &PlatformV2Response) -> bool {
+    if matches!(response, PlatformV2Response::Refused(_)) {
+        return true;
+    }
+    matches!(
+        (request, response),
+        (
+            PlatformV2Request::QueryWorkContexts(_),
+            PlatformV2Response::WorkContextPage(_) | PlatformV2Response::WorkContextResync(_)
+        ) | (
+            PlatformV2Request::GetWorkContext(_),
+            PlatformV2Response::WorkContextRecord(_)
+        ) | (
+            PlatformV2Request::PrepareMutation(_),
+            PlatformV2Response::MutationPreview(_) | PlatformV2Response::MutationRefused(_)
+        ) | (
+            PlatformV2Request::DecideMutation(_),
+            PlatformV2Response::MutationApproval(_) | PlatformV2Response::MutationRefused(_)
+        ) | (
+            PlatformV2Request::SubmitMutation(_) | PlatformV2Request::GetMutationReceipt(_),
+            PlatformV2Response::MutationReceipt(_) | PlatformV2Response::MutationRefused(_)
+        ) | (
+            PlatformV2Request::GetLineage(_),
+            PlatformV2Response::LineageResult(_)
+        ) | (
+            PlatformV2Request::SubmitWorkspaceIntent(_) | PlatformV2Request::GetWorkspaceIntent(_),
+            PlatformV2Response::WorkspaceIntentResult(_)
+        ) | (
+            PlatformV2Request::GetReview(_),
+            PlatformV2Response::ReviewResult(_)
+        ) | (
+            PlatformV2Request::ExecuteReviewAction(_) | PlatformV2Request::GetReviewReceipt(_),
+            PlatformV2Response::ReviewReceipt(_)
+        )
+    )
 }
 fn response_body(value: &PlatformV2Response) -> Result<JsonValue, PlatformV2TransportError> {
     Ok(match value {
@@ -1169,11 +1479,11 @@ fn response_from_message(
             PlatformV2Response::MutationPreview(decode_work_context_mutation_preview(&bytes)?)
         }
         "mutation_approval" => PlatformV2Response::MutationApproval(
-            MutationApprovalDocument::from_body(message.body())?,
+            RawMutationApprovalDocument::from_body(message.body())?,
         ),
-        "mutation_receipt" => {
-            PlatformV2Response::MutationReceipt(MutationReceiptDocument::from_body(message.body())?)
-        }
+        "mutation_receipt" => PlatformV2Response::MutationReceipt(
+            RawMutationReceiptDocument::from_body(message.body())?,
+        ),
         "mutation_refused" => {
             PlatformV2Response::MutationRefused(decode_work_context_mutation_refusal(&bytes)?)
         }
@@ -1198,16 +1508,24 @@ pub struct PlatformV2ResponseMessage {
     response: PlatformV2Response,
 }
 impl PlatformV2ResponseMessage {
-    #[must_use]
-    pub const fn new(request_id: RequestId, response: PlatformV2Response) -> Self {
+    const fn new(request_id: RequestId, response: PlatformV2Response) -> Self {
         Self {
             request_id,
             response,
         }
     }
+    pub fn for_request(
+        request: &PlatformV2RequestMessage,
+        response: PlatformV2Response,
+    ) -> Result<Self, PlatformV2TransportError> {
+        if !response_answers_request(request.request(), &response) {
+            return Err(PlatformV2TransportError::ResponseMismatch);
+        }
+        Ok(Self::new(request.request_id.clone(), response))
+    }
     #[must_use]
-    pub fn for_request(request: &PlatformV2RequestMessage, response: PlatformV2Response) -> Self {
-        Self::new(request.request_id.clone(), response)
+    pub const fn refusal(request_id: RequestId, refusal: PlatformV2Refusal) -> Self {
+        Self::new(request_id, PlatformV2Response::Refused(refusal))
     }
     #[must_use]
     pub const fn request_id(&self) -> &RequestId {
@@ -1231,7 +1549,7 @@ impl PlatformV2ResponseMessage {
             MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES,
         )
     }
-    pub fn from_canonical_bytes(payload: &[u8]) -> Result<Self, PlatformV2TransportError> {
+    fn decode_uncorrelated(payload: &[u8]) -> Result<Self, PlatformV2TransportError> {
         let message = admitted(
             payload,
             MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES,
@@ -1240,5 +1558,33 @@ impl PlatformV2ResponseMessage {
         )?;
         let response = response_from_message(&message)?;
         Ok(Self::new(message.envelope().request_id().clone(), response))
+    }
+    pub fn from_canonical_bytes(
+        payload: &[u8],
+        request: &PlatformV2RequestMessage,
+    ) -> Result<Self, PlatformV2TransportError> {
+        let response = Self::decode_uncorrelated(payload)?;
+        if response.request_id() != request.request_id() {
+            return Err(PlatformV2TransportError::CorrelationMismatch);
+        }
+        if !response_answers_request(request.request(), response.response()) {
+            return Err(PlatformV2TransportError::ResponseMismatch);
+        }
+        Ok(response)
+    }
+    pub fn to_frame(&self) -> Result<Vec<u8>, PlatformV2TransportError> {
+        framed(
+            &self.to_canonical_bytes()?,
+            MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES,
+        )
+    }
+    pub fn from_frame(
+        frame: &[u8],
+        request: &PlatformV2RequestMessage,
+    ) -> Result<Self, PlatformV2TransportError> {
+        Self::from_canonical_bytes(
+            framed_payload(frame, MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES)?,
+            request,
+        )
     }
 }

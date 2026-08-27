@@ -21,6 +21,14 @@ use automonique_protocol::platform::{
     SessionFollowUpRequest, SessionRunStopRequest, SnapshotRequest,
 };
 use automonique_protocol::platform_api::{PlatformRequestMessage, PlatformResponseMessage};
+use automonique_protocol::platform_v2::{
+    PlatformVersion, PlatformVersionOffer, UserWorkspaceId, WorkContextIdentity,
+};
+use automonique_protocol::platform_v2_transport::{
+    PlatformNegotiationRequest, PlatformNegotiationRequestMessage, PlatformNegotiationResponse,
+    PlatformNegotiationResponseMessage, PlatformV2Request, PlatformV2RequestMessage,
+    PlatformV2Response, PlatformV2ResponseMessage,
+};
 use automonique_protocol::primitives::Revision;
 use automonique_store::approval_requests::{
     ApprovalContext, ApprovalProposal, ApprovalRequests, ApprovalState,
@@ -117,6 +125,61 @@ fn platform(config: &DaemonConfig, label: &str, request: PlatformRequest) -> Pla
         .expect("platform response");
     assert_eq!(response.request_id(), &request_id);
     response.response().clone()
+}
+
+#[test]
+fn negotiation_advertises_only_v1_and_v2_fails_closed_until_host_wiring() {
+    let (_root, config) = fixture();
+    let serving = serve(&config);
+
+    let negotiation = PlatformNegotiationRequestMessage::new(
+        RequestId::new("negotiate-v1").unwrap(),
+        PlatformNegotiationRequest::Negotiate(PlatformVersionOffer::new(vec![1, 2]).unwrap()),
+    );
+    let response = PlatformNegotiationResponseMessage::from_canonical_bytes(
+        &exchange(&config, &negotiation.to_canonical_bytes().unwrap()),
+        &negotiation,
+    )
+    .unwrap();
+    assert!(matches!(
+        response.response(),
+        PlatformNegotiationResponse::Negotiated(selected)
+            if selected.version() == PlatformVersion::V1
+    ));
+
+    let v2_only = PlatformNegotiationRequestMessage::new(
+        RequestId::new("negotiate-v2-only").unwrap(),
+        PlatformNegotiationRequest::Negotiate(PlatformVersionOffer::new(vec![2]).unwrap()),
+    );
+    let response = PlatformNegotiationResponseMessage::from_canonical_bytes(
+        &exchange(&config, &v2_only.to_canonical_bytes().unwrap()),
+        &v2_only,
+    )
+    .unwrap();
+    assert!(matches!(
+        response.response(),
+        PlatformNegotiationResponse::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_unavailable"
+    ));
+
+    let v2 = PlatformV2RequestMessage::new(
+        RequestId::new("v2-unavailable").unwrap(),
+        PlatformV2Request::GetWorkContext(WorkContextIdentity::UserWorkspace(
+            UserWorkspaceId::new("workspace-1").unwrap(),
+        )),
+    );
+    let response = PlatformV2ResponseMessage::from_canonical_bytes(
+        &exchange(&config, &v2.to_canonical_bytes().unwrap()),
+        &v2,
+    )
+    .unwrap();
+    assert!(matches!(
+        response.response(),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_unavailable"
+    ));
+
+    serving.shutdown(&config);
 }
 
 struct Serving {

@@ -5,7 +5,6 @@ use automonique_protocol::codec::{
     CodecError, Envelope, MajorVersion, MessageKind, ProtocolName, RequestId,
 };
 use automonique_protocol::digest::Sha256;
-use automonique_protocol::identity::Actor;
 use automonique_protocol::platform::{
     IdempotencyKey, PLATFORM_PROTOCOL, PlatformRequest, ReceiptId, ResourceAuthority,
     ResourceCoordinate, ResourceId, ResourceKind,
@@ -19,6 +18,10 @@ use automonique_protocol::platform_v2_review_api::decode_review_snapshot;
 use automonique_protocol::platform_v2_transport::*;
 use automonique_protocol::primitives::{OpaqueId, Revision};
 use automonique_protocol::wire::{JsonValue, Message};
+
+const _: () = assert!(
+    MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES > automonique_protocol::codec::MAX_FRAME_BYTES
+);
 
 fn request_id(value: &str) -> RequestId {
     RequestId::new(value).unwrap()
@@ -41,35 +44,46 @@ fn preview_ref() -> MutationPreviewRef {
         Revision::FIRST,
     )
 }
-fn proposal() -> WorkContextMutationProposal {
-    WorkContextMutationProposal::new(
-        Actor::new("tenant-1", "operator-1").unwrap(),
-        ResourceAuthority::Automonique,
-        WorkContextAuthority::EMPTY,
-        IdempotencyKey::new("mutation-1").unwrap(),
-        WorkContextMutationIntent::CreateProject(
-            CreateProjectIntent::new(WorkContextLabel::new("Project").unwrap(), vec![]).unwrap(),
-        ),
+fn mutation_intent() -> WorkContextMutationIntent {
+    WorkContextMutationIntent::CreateProject(
+        CreateProjectIntent::new(WorkContextLabel::new("Project").unwrap(), vec![]).unwrap(),
     )
-    .unwrap()
 }
-fn review_action() -> ReviewActionRequest {
-    ReviewActionRequest::new(
+fn review_action() -> ReviewActionTransportRequest {
+    ReviewActionTransportRequest::new(
         workspace(),
         Revision::FIRST,
-        OpaqueId::new("actor-1").unwrap(),
-        ReviewAuthentication::UserSession,
-        ReviewAuthority::new(
-            ReviewAuthorityKind::Ci,
-            OpaqueId::new("ci-authority-1").unwrap(),
-        ),
-        IdempotencyKey::new("review-action-1").unwrap(),
         ReviewAction::RerunCheck {
             check_id: OpaqueId::new("check-1").unwrap(),
             expected_check_revision: Revision::FIRST,
         },
+        IdempotencyKey::new("review-action-1").unwrap(),
     )
     .unwrap()
+}
+
+#[test]
+fn rust_transport_encoding_matches_the_shared_typescript_corpus() {
+    let fixture = include_str!("../fixtures/platform-v2-transport-v1.txt")
+        .trim_end()
+        .lines()
+        .collect::<Vec<_>>();
+    assert_eq!(fixture.len(), 2);
+
+    let negotiation = PlatformNegotiationRequestMessage::new(
+        request_id("transport-negotiate"),
+        PlatformNegotiationRequest::Negotiate(PlatformVersionOffer::new(vec![1, 2]).unwrap()),
+    );
+    assert_eq!(
+        negotiation.to_canonical_bytes().unwrap(),
+        fixture[0].as_bytes()
+    );
+
+    let v2 = PlatformV2RequestMessage::new(
+        request_id("transport-v2"),
+        PlatformV2Request::GetWorkContext(workspace()),
+    );
+    assert_eq!(v2.to_canonical_bytes().unwrap(), fixture[1].as_bytes());
 }
 
 #[test]
@@ -99,13 +113,55 @@ fn negotiation_is_a_separate_correlated_major_one_protocol() {
     let response = PlatformNegotiationResponseMessage::for_request(
         &request,
         PlatformNegotiationResponse::Negotiated(selected),
-    );
+    )
+    .unwrap();
     let bytes = response.to_canonical_bytes().unwrap();
     assert_eq!(
-        PlatformNegotiationResponseMessage::from_canonical_bytes(&bytes).unwrap(),
+        PlatformNegotiationResponseMessage::from_canonical_bytes(&bytes, &request).unwrap(),
         response
     );
     assert_eq!(response.request_id(), request.request_id());
+    assert_eq!(
+        PlatformNegotiationRequestMessage::from_frame(&request.to_frame().unwrap()).unwrap(),
+        request
+    );
+    assert_eq!(
+        PlatformNegotiationResponseMessage::from_frame(&response.to_frame().unwrap(), &request)
+            .unwrap(),
+        response
+    );
+
+    let v1_only = PlatformNegotiationRequestMessage::new(
+        request_id("same-correlation"),
+        PlatformNegotiationRequest::Negotiate(PlatformVersionOffer::new(vec![1]).unwrap()),
+    );
+    let selected_v2 = negotiate_platform_version(
+        &PlatformVersionOffer::new(vec![2]).unwrap(),
+        &PlatformVersionOffer::new(vec![2]).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        PlatformNegotiationResponseMessage::for_request(
+            &v1_only,
+            PlatformNegotiationResponse::Negotiated(selected_v2),
+        ),
+        Err(PlatformV2TransportError::NegotiationMismatch)
+    );
+    let v2_only = PlatformNegotiationRequestMessage::new(
+        request_id("same-correlation"),
+        PlatformNegotiationRequest::Negotiate(PlatformVersionOffer::new(vec![2]).unwrap()),
+    );
+    let hostile = PlatformNegotiationResponseMessage::for_request(
+        &v2_only,
+        PlatformNegotiationResponse::Negotiated(selected_v2),
+    )
+    .unwrap()
+    .to_canonical_bytes()
+    .unwrap();
+    assert_eq!(
+        PlatformNegotiationResponseMessage::from_canonical_bytes(&hostile, &v1_only),
+        Err(PlatformV2TransportError::NegotiationMismatch)
+    );
 }
 
 #[test]
@@ -130,7 +186,10 @@ fn every_platform_v2_request_kind_round_trips_without_server_owned_inputs() {
     let requests = vec![
         PlatformV2Request::QueryWorkContexts(query),
         PlatformV2Request::GetWorkContext(workspace()),
-        PlatformV2Request::PrepareMutation(proposal()),
+        PlatformV2Request::PrepareMutation(MutationPrepareRequest::new(
+            IdempotencyKey::new("mutation-1").unwrap(),
+            mutation_intent(),
+        )),
         PlatformV2Request::DecideMutation(MutationDecisionRequest::new(
             preview_ref(),
             digest(),
@@ -154,7 +213,7 @@ fn every_platform_v2_request_kind_round_trips_without_server_owned_inputs() {
             ReviewReceiptLookup::new(
                 project(),
                 workspace(),
-                ReceiptLookupKey::IdempotencyKey(IdempotencyKey::new("review-action-1").unwrap()),
+                IdempotencyKey::new("review-action-1").unwrap(),
             )
             .unwrap(),
         ),
@@ -165,8 +224,33 @@ fn every_platform_v2_request_kind_round_trips_without_server_owned_inputs() {
         let wire = Message::from_canonical_bytes(&bytes).unwrap();
         assert_eq!(wire.envelope().protocol().as_str(), PLATFORM_PROTOCOL);
         assert_eq!(wire.envelope().version().get(), 2);
+        if wire.envelope().kind().as_str() == "prepare_mutation" {
+            let encoded = wire.body().to_canonical_bytes();
+            let encoded = std::str::from_utf8(&encoded).unwrap();
+            for forbidden in [
+                "actor",
+                "actor_authority",
+                "authority",
+                "request_digest",
+                "issued_at_ms",
+                "preview",
+            ] {
+                assert!(!encoded.contains(&format!("\"{forbidden}\"")));
+            }
+        }
+        if wire.envelope().kind().as_str() == "execute_review_action" {
+            let encoded = wire.body().to_canonical_bytes();
+            let encoded = std::str::from_utf8(&encoded).unwrap();
+            for forbidden in ["actor", "authentication", "authority"] {
+                assert!(!encoded.contains(&format!("\"{forbidden}\"")));
+            }
+        }
         assert_eq!(
             PlatformV2RequestMessage::from_canonical_bytes(&bytes).unwrap(),
+            message
+        );
+        assert_eq!(
+            PlatformV2RequestMessage::from_frame(&message.to_frame().unwrap()).unwrap(),
             message
         );
     }
@@ -235,26 +319,56 @@ fn response_documents_round_trip_and_review_envelope_fits_its_declared_ceiling()
         PlatformV2Request::QueryWorkContexts(query),
     );
     let page = WorkContextPage::new(1, None, None, false, vec![]).unwrap();
+    assert_eq!(
+        PlatformV2ResponseMessage::for_request(
+            &PlatformV2RequestMessage::new(
+                request_id("response-1"),
+                PlatformV2Request::GetWorkContext(workspace()),
+            ),
+            PlatformV2Response::WorkContextPage(page.clone()),
+        ),
+        Err(PlatformV2TransportError::ResponseMismatch)
+    );
     let response =
-        PlatformV2ResponseMessage::for_request(&request, PlatformV2Response::WorkContextPage(page));
+        PlatformV2ResponseMessage::for_request(&request, PlatformV2Response::WorkContextPage(page))
+            .unwrap();
     let bytes = response.to_canonical_bytes().unwrap();
     assert_eq!(
-        PlatformV2ResponseMessage::from_canonical_bytes(&bytes).unwrap(),
+        PlatformV2ResponseMessage::from_canonical_bytes(&bytes, &request).unwrap(),
         response
     );
     assert_eq!(response.request_id(), request.request_id());
+    assert_eq!(
+        PlatformV2ResponseMessage::from_frame(&response.to_frame().unwrap(), &request).unwrap(),
+        response
+    );
 
     let snapshot =
         decode_review_snapshot(include_bytes!("../fixtures/platform-v2-review-v1.json")).unwrap();
-    let review = PlatformV2ResponseMessage::new(
+    let review_request = PlatformV2RequestMessage::new(
         request_id("review-response"),
-        PlatformV2Response::ReviewResult(snapshot),
+        PlatformV2Request::GetReview(ReviewReadRequest::new(project(), workspace()).unwrap()),
     );
+    let review = PlatformV2ResponseMessage::for_request(
+        &review_request,
+        PlatformV2Response::ReviewResult(snapshot),
+    )
+    .unwrap();
     let bytes = review.to_canonical_bytes().unwrap();
     assert!(bytes.len() <= MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES);
     assert_eq!(
-        PlatformV2ResponseMessage::from_canonical_bytes(&bytes).unwrap(),
+        PlatformV2ResponseMessage::from_canonical_bytes(&bytes, &review_request).unwrap(),
         review
+    );
+    assert_eq!(
+        PlatformV2ResponseMessage::from_canonical_bytes(
+            &bytes,
+            &PlatformV2RequestMessage::new(
+                request_id("review-response"),
+                PlatformV2Request::GetWorkContext(workspace()),
+            ),
+        ),
+        Err(PlatformV2TransportError::ResponseMismatch)
     );
     assert_eq!(
         MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES,
@@ -265,10 +379,6 @@ fn response_documents_round_trip_and_review_envelope_fits_its_declared_ceiling()
         MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES,
         512 * 1024 + PLATFORM_V2_ENVELOPE_OVERHEAD_BYTES
     );
-    assert_eq!(
-        MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES,
-        automonique_protocol::codec::MAX_FRAME_BYTES
-    );
     assert!(matches!(
         PlatformV2RequestMessage::from_canonical_bytes(&vec![
             b'x';
@@ -278,11 +388,10 @@ fn response_documents_round_trip_and_review_envelope_fits_its_declared_ceiling()
         Err(PlatformV2TransportError::FrameTooLarge { .. })
     ));
     assert!(matches!(
-        PlatformV2ResponseMessage::from_canonical_bytes(&vec![
-            b'x';
-            MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES
-                + 1
-        ]),
+        PlatformV2ResponseMessage::from_canonical_bytes(
+            &vec![b'x'; MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES + 1],
+            &request,
+        ),
         Err(PlatformV2TransportError::FrameTooLarge { .. })
     ));
 }
@@ -379,7 +488,7 @@ fn local_dispatch_routes_by_protocol_and_major_without_fallback() {
 #[test]
 fn review_reads_and_receipts_accept_only_review_workspace_kinds() {
     let project = project();
-    let key = ReceiptLookupKey::IdempotencyKey(IdempotencyKey::new("lookup-1").unwrap());
+    let key = IdempotencyKey::new("lookup-1").unwrap();
     for kind in [
         WorkContextTargetKind::UserWorkspace,
         WorkContextTargetKind::AttemptWorkspace,

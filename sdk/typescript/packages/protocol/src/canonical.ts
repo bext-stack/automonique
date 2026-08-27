@@ -18,7 +18,7 @@ export const MAX_REQUEST_ID_BYTES = 128;
 export const MAX_MESSAGE_KIND_BYTES = 64;
 export const MAX_ENUM_VALUE_BYTES = 64;
 export const LENGTH_PREFIX_BYTES = 4;
-export const MAX_FRAME_BYTES = 8 * 1024 * 1024 + 512;
+export const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 
 const I64_MIN = -(2n ** 63n);
 const I64_MAX = 2n ** 63n - 1n;
@@ -235,11 +235,19 @@ export type FrameDecode =
  * `MAX_FRAME_BYTES`.
  */
 export function encodeFrame(payload: Uint8Array): Uint8Array {
+  return encodeFrameWithLimit(payload, MAX_FRAME_BYTES);
+}
+
+/** Encode one frame under an explicit lane-owned payload ceiling. */
+export function encodeFrameWithLimit(payload: Uint8Array, maxBytes: number): Uint8Array {
   if (payload.length === 0) {
     throw new WireError("empty_frame", "frame declares a zero-length payload");
   }
-  if (payload.length > MAX_FRAME_BYTES) {
-    throw new WireError("frame_too_large", `maximum is ${MAX_FRAME_BYTES}`);
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 0xffffffff) {
+    throw new WireError("frame_too_large", "lane frame maximum is invalid");
+  }
+  if (payload.length > maxBytes) {
+    throw new WireError("frame_too_large", `maximum is ${maxBytes}`);
   }
   const out = new Uint8Array(LENGTH_PREFIX_BYTES + payload.length);
   const length = payload.length;
@@ -259,6 +267,14 @@ export function encodeFrame(payload: Uint8Array): Uint8Array {
  * prefix can never drive an allocation.
  */
 export function decodeFrame(input: Uint8Array): FrameDecode {
+  return decodeFrameWithLimit(input, MAX_FRAME_BYTES);
+}
+
+/** Decode one frame under an explicit lane-owned payload ceiling. */
+export function decodeFrameWithLimit(input: Uint8Array, maxBytes: number): FrameDecode {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 0xffffffff) {
+    throw new WireError("frame_too_large", "lane frame maximum is invalid");
+  }
   if (input.length < LENGTH_PREFIX_BYTES) {
     return {kind: "need_more", additional: LENGTH_PREFIX_BYTES - input.length};
   }
@@ -272,8 +288,8 @@ export function decodeFrame(input: Uint8Array): FrameDecode {
   if (declared === 0) {
     throw new WireError("empty_frame", "frame declares a zero-length payload");
   }
-  if (declared > MAX_FRAME_BYTES) {
-    throw new WireError("frame_too_large", `declared ${declared}, maximum ${MAX_FRAME_BYTES}`);
+  if (declared > maxBytes) {
+    throw new WireError("frame_too_large", `declared ${declared}, maximum ${maxBytes}`);
   }
   const total = LENGTH_PREFIX_BYTES + declared;
   if (input.length < total) {

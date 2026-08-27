@@ -548,15 +548,15 @@
     },
     {
       "decode": {
-        "consumed": 8389124,
+        "consumed": 8388612,
         "outcome": "frame",
-        "payload_bytes": 8389120
+        "payload_bytes": 8388608
       },
       "encode": {
         "outcome": "accept",
         "payload": [
           {
-            "count": 8389120,
+            "count": 8388608,
             "repeat_hex": "61"
           }
         ]
@@ -564,10 +564,10 @@
       "id": "frame-at-max-bytes",
       "input": [
         {
-          "literal_hex": "00800200"
+          "literal_hex": "00800000"
         },
         {
-          "count": 8389120,
+          "count": 8388608,
           "repeat_hex": "61"
         }
       ],
@@ -583,7 +583,7 @@
         "outcome": "reject",
         "payload": [
           {
-            "count": 8389121,
+            "count": 8388609,
             "repeat_hex": "61"
           }
         ]
@@ -591,7 +591,7 @@
       "id": "frame-one-past-max-bytes",
       "input": [
         {
-          "literal_hex": "00800201"
+          "literal_hex": "00800001"
         }
       ],
       "note": "one byte over the ceiling is refused from the prefix alone, before any allocation"

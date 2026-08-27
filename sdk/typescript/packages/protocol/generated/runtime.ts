@@ -19,7 +19,9 @@
 // every other generated module imports from this file and from nothing else.
 export {
   WireError,
+  decodeFrameWithLimit,
   decodeMessageAdmitted,
+  encodeFrameWithLimit,
   encodeMessage,
   isWellFormedUnicode,
   parseCanonical,

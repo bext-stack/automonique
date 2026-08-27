@@ -847,6 +847,8 @@ pub const PLATFORM_MODULE: &str = "platform";
 pub const WORK_CONTEXT_MODULE: &str = "work-context";
 /// Platform v2 typed review and attention sub-contract.
 pub const REVIEW_CONTEXT_MODULE: &str = "review-context";
+/// Platform negotiation and major-two envelope codecs.
+pub const PLATFORM_V2_TRANSPORT_MODULE: &str = "platform-v2-transport";
 /// Generated mobile authentication and authorization module stem.
 pub const MOBILE_AUTH_MODULE: &str = "mobile-auth";
 
@@ -1450,6 +1452,7 @@ pub struct JsonSurface {
 pub enum GeneratedImplementation {
     WorkContext,
     ReviewContext,
+    PlatformV2Transport,
 }
 
 /// A nested wire body whose discriminant decides its payload.
@@ -1814,7 +1817,9 @@ fn runtime_module() -> GeneratedModule {
 // every other generated module imports from this file and from nothing else.
 export {
   WireError,
+  decodeFrameWithLimit,
   decodeMessageAdmitted,
+  encodeFrameWithLimit,
   encodeMessage,
   isWellFormedUnicode,
   parseCanonical,
@@ -2344,6 +2349,67 @@ export function orderedEnumSet<T extends string>(
 }
 "#
         .to_owned(),
+        ..GeneratedModule::default()
+    }
+}
+
+fn platform_v2_transport_module() -> GeneratedModule {
+    GeneratedModule {
+        file_name: module_file_name(PLATFORM_V2_TRANSPORT_MODULE),
+        doc: "Strict Platform negotiation and major-two envelope codecs.".to_owned(),
+        source: "automonique_protocol::platform_v2_transport".to_owned(),
+        constants: vec![
+            Constant {
+                name: "PLATFORM_NEGOTIATION_PROTOCOL".to_owned(),
+                doc: "Protocol used only for Platform major negotiation.".to_owned(),
+                value: ConstantValue::Text(
+                    crate::platform_v2_transport::PLATFORM_NEGOTIATION_PROTOCOL.to_owned(),
+                ),
+            },
+            Constant {
+                name: "PLATFORM_NEGOTIATION_MAJOR".to_owned(),
+                doc: "Negotiation protocol major.".to_owned(),
+                value: ConstantValue::Count(
+                    crate::platform_v2_transport::PLATFORM_NEGOTIATION_MAJOR as usize,
+                ),
+            },
+            Constant {
+                name: "PLATFORM_V2_MAJOR".to_owned(),
+                doc: "Structured Platform protocol major.".to_owned(),
+                value: ConstantValue::Count(
+                    crate::platform_v2_transport::PLATFORM_V2_MAJOR as usize,
+                ),
+            },
+            Constant {
+                name: "MAX_PLATFORM_NEGOTIATION_REQUEST_CANONICAL_BYTES".to_owned(),
+                doc: "Maximum canonical negotiation request bytes.".to_owned(),
+                value: ConstantValue::Count(
+                    crate::platform_v2_transport::MAX_PLATFORM_NEGOTIATION_REQUEST_CANONICAL_BYTES,
+                ),
+            },
+            Constant {
+                name: "MAX_PLATFORM_NEGOTIATION_RESPONSE_CANONICAL_BYTES".to_owned(),
+                doc: "Maximum canonical negotiation response bytes.".to_owned(),
+                value: ConstantValue::Count(
+                    crate::platform_v2_transport::MAX_PLATFORM_NEGOTIATION_RESPONSE_CANONICAL_BYTES,
+                ),
+            },
+            Constant {
+                name: "MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES".to_owned(),
+                doc: "Maximum canonical Platform v2 request bytes.".to_owned(),
+                value: ConstantValue::Count(
+                    crate::platform_v2_transport::MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES,
+                ),
+            },
+            Constant {
+                name: "MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES".to_owned(),
+                doc: "Maximum canonical Platform v2 response bytes.".to_owned(),
+                value: ConstantValue::Count(
+                    crate::platform_v2_transport::MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES,
+                ),
+            },
+        ],
+        implementation: Some(GeneratedImplementation::PlatformV2Transport),
         ..GeneratedModule::default()
     }
 }
@@ -9158,6 +9224,7 @@ pub fn maintained_modules() -> Vec<GeneratedModule> {
         batch_module(),
         mobile_auth_module(),
         platform_module(),
+        platform_v2_transport_module(),
         work_context_module(),
         review_context_module(),
         progress_module(),
@@ -11784,7 +11851,7 @@ function validateResolvedParents(intent: WorkContextMutationIntent, values: read
   return checked;
 }
 
-function validateIntent(value: WorkContextMutationIntent): WorkContextMutationIntent {
+export function validateWorkContextMutationIntent(value: WorkContextMutationIntent): WorkContextMutationIntent {
   const expectedKind = (expected: ExpectedWorkContext, kind: WorkContextTargetKind): ExpectedWorkContext => {
     const identity = validateWorkContextIdentity(expected.identity); if (identity.kind !== kind) workContextRefusal("operation target kind is invalid"); return {identity, revision: WorkContextRevision(expected.revision)};
   };
@@ -11809,7 +11876,7 @@ function validateIntent(value: WorkContextMutationIntent): WorkContextMutationIn
 function assertNeverLifecycleIntent(value: never): never { throw new RefusalError(WORK_CONTEXT_VALUE_INVALID, `unknown lifecycle intent ${(value as {kind?: unknown}).kind}`); }
 
 function intentJson(value: WorkContextMutationIntent): JsonValue {
-  const intent = validateIntent(value); const word = {kind: "string", value: intent.kind} as const;
+  const intent = validateWorkContextMutationIntent(value); const word = {kind: "string", value: intent.kind} as const;
   switch (intent.kind) {
     case "create_project": return object([["kind", word], ["label", {kind: "string", value: intent.label}], ["repositories", {kind: "array", items: intent.repositories.map(expectedJson)}]]);
     case "create_host_setup": return object([["kind", word], ["label", {kind: "string", value: intent.label}], ["project", expectedJson(intent.project)], ["registry", {kind: "string", value: intent.registry}], ["setup_kind", {kind: "string", value: intent.setup_kind}]]);
@@ -11825,13 +11892,13 @@ function decodeIntentValue(value: JsonValue): WorkContextMutationIntent {
   const loose = new Map(value.entries); const kindValue = loose.get("kind"); if (kindValue?.kind !== "string") throw new RefusalError(WORK_CONTEXT_INVALID_BODY, "intent kind is not a string"); const kind = kindValue.value;
   const fieldsFor = (names: readonly string[]) => exactFields(value, names, WORK_CONTEXT_INVALID_BODY);
   switch (kind) {
-    case "create_project": { const fields = fieldsFor(["kind", "label", "repositories"]); return validateIntent({kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), repositories: bodyArray(fields, "repositories", WORK_CONTEXT_INVALID_BODY, MAX_WORK_CONTEXT_RELATIONS, WORK_CONTEXT_VALUE_INVALID).map(decodeExpectedValue)}); }
-    case "create_host_setup": { const fields = fieldsFor(["kind", "label", "project", "registry", "setup_kind"]); return validateIntent({kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), project: decodeExpectedValue(bodyValue(fields, "project", WORK_CONTEXT_INVALID_BODY)), registry: WorkContextRegistrySelector(bodyString(fields, "registry", WORK_CONTEXT_INVALID_BODY)), setup_kind: decodeHostSetupKind(bodyString(fields, "setup_kind", WORK_CONTEXT_INVALID_BODY))}); }
-    case "create_checkout": { const fields = fieldsFor(["checkout_kind", "host_setup", "kind", "label", "project", "registry", "repository"]); return validateIntent({checkout_kind: decodeCheckoutKind(bodyString(fields, "checkout_kind", WORK_CONTEXT_INVALID_BODY)), host_setup: decodeExpectedValue(bodyValue(fields, "host_setup", WORK_CONTEXT_INVALID_BODY)), kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), project: decodeExpectedValue(bodyValue(fields, "project", WORK_CONTEXT_INVALID_BODY)), registry: WorkContextRegistrySelector(bodyString(fields, "registry", WORK_CONTEXT_INVALID_BODY)), repository: decodeExpectedValue(bodyValue(fields, "repository", WORK_CONTEXT_INVALID_BODY))}); }
-    case "create_user_workspace": { const fields = fieldsFor(["checkout", "kind", "label", "project"]); return validateIntent({checkout: decodeExpectedValue(bodyValue(fields, "checkout", WORK_CONTEXT_INVALID_BODY)), kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), project: decodeExpectedValue(bodyValue(fields, "project", WORK_CONTEXT_INVALID_BODY))}); }
-    case "create_attempt_workspace": { const fields = fieldsFor(["kind", "label", "requested_authority", "user_workspace"]); return validateIntent({kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), requested_authority: decodeAuthorityValue(bodyValue(fields, "requested_authority", WORK_CONTEXT_INVALID_BODY)), user_workspace: decodeExpectedValue(bodyValue(fields, "user_workspace", WORK_CONTEXT_INVALID_BODY))}); }
-    case "resume_attempt_workspace": case "resume_session": { const fields = fieldsFor(["kind", "requested_authority", "target"]); return validateIntent({kind, requested_authority: decodeAuthorityValue(bodyValue(fields, "requested_authority", WORK_CONTEXT_INVALID_BODY)), target: decodeExpectedValue(bodyValue(fields, "target", WORK_CONTEXT_INVALID_BODY))}); }
-    case "archive_project": case "archive_host_setup": case "archive_checkout": case "archive_user_workspace": { const fields = fieldsFor(["kind", "target"]); return validateIntent({kind, target: decodeExpectedValue(bodyValue(fields, "target", WORK_CONTEXT_INVALID_BODY))}); }
+    case "create_project": { const fields = fieldsFor(["kind", "label", "repositories"]); return validateWorkContextMutationIntent({kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), repositories: bodyArray(fields, "repositories", WORK_CONTEXT_INVALID_BODY, MAX_WORK_CONTEXT_RELATIONS, WORK_CONTEXT_VALUE_INVALID).map(decodeExpectedValue)}); }
+    case "create_host_setup": { const fields = fieldsFor(["kind", "label", "project", "registry", "setup_kind"]); return validateWorkContextMutationIntent({kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), project: decodeExpectedValue(bodyValue(fields, "project", WORK_CONTEXT_INVALID_BODY)), registry: WorkContextRegistrySelector(bodyString(fields, "registry", WORK_CONTEXT_INVALID_BODY)), setup_kind: decodeHostSetupKind(bodyString(fields, "setup_kind", WORK_CONTEXT_INVALID_BODY))}); }
+    case "create_checkout": { const fields = fieldsFor(["checkout_kind", "host_setup", "kind", "label", "project", "registry", "repository"]); return validateWorkContextMutationIntent({checkout_kind: decodeCheckoutKind(bodyString(fields, "checkout_kind", WORK_CONTEXT_INVALID_BODY)), host_setup: decodeExpectedValue(bodyValue(fields, "host_setup", WORK_CONTEXT_INVALID_BODY)), kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), project: decodeExpectedValue(bodyValue(fields, "project", WORK_CONTEXT_INVALID_BODY)), registry: WorkContextRegistrySelector(bodyString(fields, "registry", WORK_CONTEXT_INVALID_BODY)), repository: decodeExpectedValue(bodyValue(fields, "repository", WORK_CONTEXT_INVALID_BODY))}); }
+    case "create_user_workspace": { const fields = fieldsFor(["checkout", "kind", "label", "project"]); return validateWorkContextMutationIntent({checkout: decodeExpectedValue(bodyValue(fields, "checkout", WORK_CONTEXT_INVALID_BODY)), kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), project: decodeExpectedValue(bodyValue(fields, "project", WORK_CONTEXT_INVALID_BODY))}); }
+    case "create_attempt_workspace": { const fields = fieldsFor(["kind", "label", "requested_authority", "user_workspace"]); return validateWorkContextMutationIntent({kind, label: WorkContextLabel(bodyString(fields, "label", WORK_CONTEXT_INVALID_BODY)), requested_authority: decodeAuthorityValue(bodyValue(fields, "requested_authority", WORK_CONTEXT_INVALID_BODY)), user_workspace: decodeExpectedValue(bodyValue(fields, "user_workspace", WORK_CONTEXT_INVALID_BODY))}); }
+    case "resume_attempt_workspace": case "resume_session": { const fields = fieldsFor(["kind", "requested_authority", "target"]); return validateWorkContextMutationIntent({kind, requested_authority: decodeAuthorityValue(bodyValue(fields, "requested_authority", WORK_CONTEXT_INVALID_BODY)), target: decodeExpectedValue(bodyValue(fields, "target", WORK_CONTEXT_INVALID_BODY))}); }
+    case "archive_project": case "archive_host_setup": case "archive_checkout": case "archive_user_workspace": { const fields = fieldsFor(["kind", "target"]); return validateWorkContextMutationIntent({kind, target: decodeExpectedValue(bodyValue(fields, "target", WORK_CONTEXT_INVALID_BODY))}); }
     default: workContextRefusal("unknown lifecycle operation");
   }
 }
@@ -11883,7 +11950,7 @@ function decodePreviewRefValue(value: JsonValue): MutationPreviewRef { const fie
 
 export function validateWorkContextMutationProposal(value: WorkContextMutationProposal): WorkContextMutationProposal {
   exactInput(value, PROPOSAL_FIELDS); if(value.schema!==PLATFORM_SCHEMA_V2) workContextRefusal("lifecycle schema is incompatible");
-  const proposal: WorkContextMutationProposal={actor:validateLifecycleActor(value.actor),actor_authority:validateAuthority(value.actor_authority),authority:decodeResourceAuthority(value.authority),idempotency_key:IdempotencyKey(value.idempotency_key),intent:validateIntent(value.intent),request_digest:WorkContextRequestDigest(value.request_digest),schema:PLATFORM_SCHEMA_V2};
+  const proposal: WorkContextMutationProposal={actor:validateLifecycleActor(value.actor),actor_authority:validateAuthority(value.actor_authority),authority:decodeResourceAuthority(value.authority),idempotency_key:IdempotencyKey(value.idempotency_key),intent:validateWorkContextMutationIntent(value.intent),request_digest:WorkContextRequestDigest(value.request_digest),schema:PLATFORM_SCHEMA_V2};
   if(lifecycleRequestDigest(proposal)!==proposal.request_digest) workContextRefusal("request digest does not bind proposal"); return proposal;
 }
 function proposalJson(value: WorkContextMutationProposal): JsonValue { const proposal=validateWorkContextMutationProposal(value); return object([["actor",actorJson(proposal.actor)],["actor_authority",authorityJson(proposal.actor_authority)],["authority",{kind:"string",value:proposal.authority}],["idempotency_key",{kind:"string",value:proposal.idempotency_key}],["intent",intentJson(proposal.intent)],["request_digest",{kind:"string",value:proposal.request_digest}],["schema",{kind:"string",value:proposal.schema}]]); }
@@ -12024,6 +12091,14 @@ pub fn emit_module(module: &GeneratedModule) -> String {
     }
     if module.implementation == Some(GeneratedImplementation::ReviewContext) {
         emit_review_context_implementation(&mut out);
+    }
+    if module.implementation == Some(GeneratedImplementation::PlatformV2Transport) {
+        out.push('\n');
+        let template = include_str!("platform_v2_transport.typescript");
+        let implementation = template
+            .strip_prefix("// SPDX-License-Identifier: Elastic-2.0\n\n")
+            .expect("Platform v2 transport TypeScript template carries the product license marker");
+        out.push_str(implementation);
     }
 
     if let Some(surface) = &module.json_surface {

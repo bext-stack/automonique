@@ -22,7 +22,7 @@ use crate::primitives::ValueError;
 pub const LENGTH_PREFIX_BYTES: usize = 4;
 
 /// Maximum payload bytes in one frame.
-pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024 + 512;
+pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 /// Maximum structural nesting depth accepted during decode.
 pub const MAX_NESTING_DEPTH: usize = 32;
@@ -285,18 +285,30 @@ pub enum FrameDecode<'a> {
 /// Returns [`CodecError::EmptyFrame`] for an empty payload and
 /// [`CodecError::FrameTooLarge`] above [`MAX_FRAME_BYTES`].
 pub fn encode_frame(payload: &[u8], out: &mut Vec<u8>) -> Result<(), CodecError> {
+    encode_frame_with_limit(payload, out, MAX_FRAME_BYTES)
+}
+
+/// Append a length-delimited frame using an explicit lane-owned payload limit.
+///
+/// This is for protocols whose audited envelope ceiling differs from the
+/// version-one shared default. The limit is checked before reserving output.
+pub fn encode_frame_with_limit(
+    payload: &[u8],
+    out: &mut Vec<u8>,
+    max_bytes: usize,
+) -> Result<(), CodecError> {
     if payload.is_empty() {
         return Err(CodecError::EmptyFrame);
     }
-    if payload.len() > MAX_FRAME_BYTES {
+    if payload.len() > max_bytes {
         return Err(CodecError::FrameTooLarge {
-            max_bytes: MAX_FRAME_BYTES,
+            max_bytes,
             declared_bytes: payload.len(),
         });
     }
     // The bound above keeps this conversion exact on every supported target.
     let length = u32::try_from(payload.len()).map_err(|_| CodecError::FrameTooLarge {
-        max_bytes: MAX_FRAME_BYTES,
+        max_bytes,
         declared_bytes: payload.len(),
     })?;
     out.reserve(LENGTH_PREFIX_BYTES + payload.len());
@@ -316,6 +328,16 @@ pub fn encode_frame(payload: &[u8], out: &mut Vec<u8>) -> Result<(), CodecError>
 /// Returns [`CodecError::EmptyFrame`] or [`CodecError::FrameTooLarge`] when the
 /// prefix declares a length outside the accepted range.
 pub fn decode_frame(input: &[u8]) -> Result<FrameDecode<'_>, CodecError> {
+    decode_frame_with_limit(input, MAX_FRAME_BYTES)
+}
+
+/// Decode the first frame using an explicit lane-owned payload limit.
+///
+/// The declared length is checked before any payload is borrowed or allocated.
+pub fn decode_frame_with_limit(
+    input: &[u8],
+    max_bytes: usize,
+) -> Result<FrameDecode<'_>, CodecError> {
     let Some(prefix) = input.get(..LENGTH_PREFIX_BYTES) else {
         return Ok(need_more(LENGTH_PREFIX_BYTES - input.len()));
     };
@@ -326,12 +348,12 @@ pub fn decode_frame(input: &[u8]) -> Result<FrameDecode<'_>, CodecError> {
         return Err(CodecError::EmptyFrame);
     }
     let declared = usize::try_from(declared).map_err(|_| CodecError::FrameTooLarge {
-        max_bytes: MAX_FRAME_BYTES,
-        declared_bytes: MAX_FRAME_BYTES.saturating_add(1),
+        max_bytes,
+        declared_bytes: max_bytes.saturating_add(1),
     })?;
-    if declared > MAX_FRAME_BYTES {
+    if declared > max_bytes {
         return Err(CodecError::FrameTooLarge {
-            max_bytes: MAX_FRAME_BYTES,
+            max_bytes,
             declared_bytes: declared,
         });
     }

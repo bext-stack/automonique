@@ -105,7 +105,9 @@ use automonique_protocol::batch_api::{
 use automonique_protocol::batch_runner::{
     BatchId, BatchLabel, BatchMemberKey, ConcurrencyPolicy, MemberProgress,
 };
-use automonique_protocol::codec::{LENGTH_PREFIX_BYTES, RequestId, decode_frame, encode_frame};
+use automonique_protocol::codec::{
+    LENGTH_PREFIX_BYTES, RequestId, decode_frame_with_limit, encode_frame,
+};
 use automonique_protocol::digest::{ALGORITHM, Sha256, Sha256Digest};
 use automonique_protocol::execute_api::ApprovalContextField;
 use automonique_protocol::execute_api::{
@@ -122,6 +124,12 @@ use automonique_protocol::platform::{
 use automonique_protocol::platform_api::{
     MAX_PLATFORM_REQUEST_CANONICAL_BYTES, PlatformApiError, PlatformRequestMessage,
     PlatformResponseMessage,
+};
+use automonique_protocol::platform_v2::{PlatformVersionOffer, negotiate_platform_version};
+use automonique_protocol::platform_v2_transport::{
+    MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES, PlatformNegotiationRequestMessage,
+    PlatformNegotiationResponse, PlatformNegotiationResponseMessage, PlatformV2Refusal,
+    PlatformV2RequestMessage, PlatformV2Response, PlatformV2ResponseMessage,
 };
 use automonique_protocol::primitives::Revision;
 use automonique_protocol::provenance::{CausationId, CorrelationId, Provenance, TraceId};
@@ -466,11 +474,14 @@ pub const EGRESS_DESTINATIONS_NAME: &str = "egress-destinations";
 
 /// Maximum administration payload accepted by the daemon.
 pub const MAX_ADMIN_PAYLOAD_BYTES: usize =
-    if MAX_PLATFORM_REQUEST_CANONICAL_BYTES > MAX_ADMIN_CANONICAL_BYTES {
+    if MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES > MAX_PLATFORM_REQUEST_CANONICAL_BYTES {
+        MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES
+    } else if MAX_PLATFORM_REQUEST_CANONICAL_BYTES > MAX_ADMIN_CANONICAL_BYTES {
         MAX_PLATFORM_REQUEST_CANONICAL_BYTES
     } else {
         MAX_ADMIN_CANONICAL_BYTES
     };
+const _: () = assert!(MAX_ADMIN_PAYLOAD_BYTES == MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES);
 
 /// Ceiling this daemon re-opens a finished run's spool under, to read its
 /// lifecycle.
@@ -3951,8 +3962,8 @@ impl Daemon {
     /// Authenticate the peer, read one bounded frame, and hand it to the lane
     /// its envelope names.
     ///
-    /// The socket serves seven protocols. Which one a frame belongs to is read
-    /// off its declared protocol name by
+    /// The socket serves eight protocols and two Platform majors. Which lane a
+    /// frame belongs to is read off its declared protocol name and major by
     /// [`LocalRequest::from_canonical_bytes`], never guessed and never tried in
     /// sequence, so an administration client, a Runs client, an Automation
     /// client, an Approval client, a Batch client and an Execute client receive
@@ -3978,6 +3989,10 @@ impl Daemon {
                     && let Some(frame) = platform_decode_refusal(&payload, platform_error)
                 {
                     let _ = stream.write_all(&frame).and_then(|()| stream.flush());
+                } else if let LocalRequestError::PlatformV2(platform_error) = &error
+                    && let Some(frame) = platform_v2_decode_refusal(&payload, platform_error)
+                {
+                    let _ = stream.write_all(&frame).and_then(|()| stream.flush());
                 }
                 return Err(DaemonError::ProtocolRefused(error.category()));
             }
@@ -3990,6 +4005,12 @@ impl Daemon {
             LocalRequest::Batch(request) => self.handle_batch(stream, &request),
             LocalRequest::Execute(request) => self.handle_execute(stream, &request),
             LocalRequest::Platform(request) => self.handle_platform(stream, &request),
+            LocalRequest::PlatformNegotiation(request) => {
+                self.handle_platform_negotiation(stream, &request)
+            }
+            LocalRequest::PlatformV2(request) => {
+                self.handle_platform_v2_unavailable(stream, &request)
+            }
         }
     }
 
@@ -5111,6 +5132,56 @@ impl Daemon {
         let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + payload.len());
         encode_frame(&payload, &mut frame)
             .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
+        stream.write_all(&frame)?;
+        stream.flush()?;
+        Ok(())
+    }
+
+    /// Negotiate only the Platform major this daemon actually serves.
+    ///
+    /// The transport types know v2 so clients can be implemented ahead of the
+    /// host, but this daemon does not advertise it until the domain handlers are
+    /// wired. An offer of `[2]` is therefore a typed refusal, never a fallback.
+    fn handle_platform_negotiation(
+        &self,
+        stream: &mut UnixStream,
+        message: &PlatformNegotiationRequestMessage,
+    ) -> Result<(), DaemonError> {
+        let supported = PlatformVersionOffer::new(vec![1])
+            .map_err(|_| DaemonError::ProtocolRefused("platform_negotiation"))?;
+        let response = match negotiate_platform_version(message.offer(), &supported) {
+            Ok(selected) => PlatformNegotiationResponse::Negotiated(selected),
+            Err(_) => PlatformNegotiationResponse::Refused(
+                PlatformV2Refusal::new(
+                    "platform_v2_unavailable",
+                    "this daemon currently serves Platform major 1 only",
+                )
+                .map_err(|_| DaemonError::ProtocolRefused("platform_negotiation"))?,
+            ),
+        };
+        let frame = PlatformNegotiationResponseMessage::for_request(message, response)
+            .and_then(|response| response.to_frame())
+            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
+        stream.write_all(&frame)?;
+        stream.flush()?;
+        Ok(())
+    }
+
+    /// Fail closed until Platform v2 domain handlers are wired into the host.
+    fn handle_platform_v2_unavailable(
+        &self,
+        stream: &mut UnixStream,
+        message: &PlatformV2RequestMessage,
+    ) -> Result<(), DaemonError> {
+        let refusal = PlatformV2Refusal::new(
+            "platform_v2_unavailable",
+            "Platform major 2 transport is recognized but not served by this daemon",
+        )
+        .map_err(|_| DaemonError::ProtocolRefused("platform_v2_unavailable"))?;
+        let frame =
+            PlatformV2ResponseMessage::for_request(message, PlatformV2Response::Refused(refusal))
+                .and_then(|response| response.to_frame())
+                .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
         stream.write_all(&frame)?;
         stream.flush()?;
         Ok(())
@@ -9098,6 +9169,27 @@ fn platform_decode_refusal(payload: &[u8], error: &PlatformApiError) -> Option<V
     Some(frame)
 }
 
+/// Correlated refusal for a syntactically enveloped Platform v2 request whose
+/// strict body decoder rejected it.
+fn platform_v2_decode_refusal(
+    payload: &[u8],
+    error: &automonique_protocol::platform_v2_transport::PlatformV2TransportError,
+) -> Option<Vec<u8>> {
+    let request_id = automonique_protocol::wire::Message::from_canonical_bytes(payload)
+        .ok()?
+        .envelope()
+        .request_id()
+        .clone();
+    let refusal = PlatformV2Refusal::new(
+        "invalid_request",
+        format!("Platform v2 request refused: {}", error.category()),
+    )
+    .ok()?;
+    PlatformV2ResponseMessage::refusal(request_id, refusal)
+        .to_frame()
+        .ok()
+}
+
 /// The node id a Platform client may name to mean "whichever daemon
 /// generation is live now". Resolved in the snapshot path only; an execute
 /// target still names the exact node the snapshot returned.
@@ -9587,7 +9679,9 @@ fn read_payload(stream: &mut UnixStream) -> Result<Vec<u8>, DaemonError> {
     framed.extend_from_slice(&prefix);
     framed.resize(LENGTH_PREFIX_BYTES + declared, 0);
     stream.read_exact(&mut framed[LENGTH_PREFIX_BYTES..])?;
-    match decode_frame(&framed).map_err(|error| DaemonError::ProtocolRefused(error.category()))? {
+    match decode_frame_with_limit(&framed, MAX_ADMIN_PAYLOAD_BYTES)
+        .map_err(|error| DaemonError::ProtocolRefused(error.category()))?
+    {
         automonique_protocol::codec::FrameDecode::Frame { payload, consumed }
             if consumed == framed.len() =>
         {
