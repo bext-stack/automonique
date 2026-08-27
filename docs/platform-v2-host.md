@@ -243,15 +243,35 @@ automonique platform-v2-bootstrap apply --manifest /operator/private/bootstrap.j
 automonique platform-v2-bootstrap verify --manifest /operator/private/bootstrap.json
 ```
 
-`plan` and `apply --dry-run` do not create the work-context database. Apply
-uses one immediate SQLite transaction for the complete external and local
-graph. It seeds only a tenant with no authoritative work-context state. A
-retry succeeds only when every record and external projection is identical;
-partial state, changed labels/attributes/relations/ownership, and a durable
-revision newer than the manifest are distinct refusals and leave the store
-unchanged. The JSON report includes only counts, tenant, and SHA-256 digests of
-the securely read manifest and policy. This command adds no Platform request
-or response shape and does not change Platform v1.
+`plan` and `apply --dry-run` do not create the work-context database. Every
+mode opens an existing database read-only first, requires the exact current
+schema, and inspects its complete state without migrations. Apply then reopens
+that same current-schema database read-write without migration and repeats the
+comparison in one immediate SQLite transaction. An older or newer schema is
+therefore refused byte-for-byte unchanged.
+
+Apply uses that transaction for the complete external and local graph. It
+seeds only a tenant with no authoritative work-context state. Immediately
+before commit, while the transaction still owns its write lock, it securely
+reopens and validates the policy and requires the exact generation admitted by
+preflight. A changed or invalid policy fails the guard and rolls back every
+graph row. A retry succeeds only when every record and external projection is
+identical; partial state, changed labels/attributes/relations/ownership, and a
+durable revision newer than the manifest are distinct refusals and leave the
+graph unchanged.
+
+The successful policy guard plus SQLite commit is the bootstrap operation's
+linearization boundary. The policy file and SQLite database are separate
+filesystem objects, so this is not a cross-filesystem atomic transaction and
+does not prevent an external operator from replacing the policy in the narrow
+interval after its guarded read. Operators must serialize policy replacement
+with bootstrap and run `verify` before daemon restart. On a first Apply,
+database schema creation necessarily precedes the guarded graph transaction;
+a failed guard may therefore leave an empty current-schema database container,
+but no external or local graph rows. The JSON report includes only counts,
+tenant, and SHA-256 digests of the securely read manifest and policy. This
+command adds no Platform request or response shape and does not change
+Platform v1.
 
 ## Authenticated web bridge
 

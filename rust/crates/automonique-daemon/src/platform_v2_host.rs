@@ -1566,7 +1566,8 @@ fn mutation_store_refusal(
         WorkContextStoreError::ReconcileRequired
         | WorkContextStoreError::BootstrapPartial
         | WorkContextStoreError::BootstrapMismatch
-        | WorkContextStoreError::BootstrapDowngrade => MutationRefusalCategory::Unknown,
+        | WorkContextStoreError::BootstrapDowngrade
+        | WorkContextStoreError::BootstrapGuard => MutationRefusalCategory::Unknown,
     };
     Ok(MutationRefusal::new(
         category,

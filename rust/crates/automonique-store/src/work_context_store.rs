@@ -221,6 +221,7 @@ pub enum WorkContextStoreError {
     BootstrapPartial,
     BootstrapMismatch,
     BootstrapDowngrade,
+    BootstrapGuard,
     ApprovalRequired,
     ApprovalMismatch,
     ApprovalDenied,
@@ -250,6 +251,7 @@ impl WorkContextStoreError {
             Self::BootstrapPartial => "bootstrap_partial",
             Self::BootstrapMismatch => "bootstrap_mismatch",
             Self::BootstrapDowngrade => "bootstrap_downgrade",
+            Self::BootstrapGuard => "bootstrap_guard",
             Self::ApprovalRequired => "approval_required",
             Self::ApprovalMismatch => "approval_mismatch",
             Self::ApprovalDenied => "approval_denied",
@@ -650,6 +652,32 @@ impl WorkContextStore {
         })
     }
 
+    /// Create and initialize a new current-schema store, refusing if any file
+    /// already occupies the path. This keeps callers that admitted an absent
+    /// store from accidentally migrating a concurrently introduced database.
+    pub fn create_new(path: impl AsRef<Path>) -> Stored<Self> {
+        let path = path.as_ref();
+        secure_path(path)?;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        secure_path(path)?;
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let mut connection = Connection::open_with_flags(path, flags)?;
+        crate::sqlite_policy::configure_authoritative(&connection)?;
+        initialize(&mut connection)?;
+        Ok(Self {
+            connection,
+            path: path.to_path_buf(),
+        })
+    }
+
     /// Open an existing current-schema store without migrations, journal-mode
     /// changes, file creation, or write authority.
     pub fn open_read_only(path: impl AsRef<Path>) -> Stored<Self> {
@@ -672,6 +700,36 @@ impl WorkContextStore {
                 supported: WORK_CONTEXT_STORE_SCHEMA_VERSION,
             });
         }
+        Ok(Self {
+            connection,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Open an existing current-schema store with write authority but without
+    /// creating the file or running any schema migration.
+    ///
+    /// The schema version is checked before authoritative write pragmas are
+    /// configured, so an older or newer store is refused without mutation.
+    pub fn open_existing_current(path: impl AsRef<Path>) -> Stored<Self> {
+        let path = path.as_ref();
+        secure_path(path)?;
+        if !path.exists() {
+            return Err(WorkContextStoreError::NotFound);
+        }
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let connection = Connection::open_with_flags(path, flags)?;
+        let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version != WORK_CONTEXT_STORE_SCHEMA_VERSION {
+            return Err(WorkContextStoreError::SchemaVersion {
+                found: version,
+                supported: WORK_CONTEXT_STORE_SCHEMA_VERSION,
+            });
+        }
+        crate::sqlite_policy::configure_authoritative(&connection)?;
         Ok(Self {
             connection,
             path: path.to_path_buf(),
@@ -738,12 +796,30 @@ impl WorkContextStore {
         externals: &[WorkContextBootstrapExternal],
         records: &[WorkContextRecord],
     ) -> Stored<WorkContextBootstrapState> {
+        self.apply_bootstrap_guarded(tenant, externals, records, || Ok(()))
+    }
+
+    /// Seed a complete operator-owned graph atomically, running `precommit`
+    /// inside the immediate SQLite transaction after the final state change
+    /// and immediately before commit. A failed guard rolls back every graph
+    /// write made by this call.
+    pub fn apply_bootstrap_guarded<F>(
+        &mut self,
+        tenant: &str,
+        externals: &[WorkContextBootstrapExternal],
+        records: &[WorkContextRecord],
+        precommit: F,
+    ) -> Stored<WorkContextBootstrapState>
+    where
+        F: FnOnce() -> Stored<()>,
+    {
         validate_bootstrap_input(tenant, externals, records)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let state = inspect_bootstrap_on(&tx, tenant, externals, records)?;
         if state == WorkContextBootstrapState::Identical {
+            precommit()?;
             tx.commit()?;
             return Ok(state);
         }
@@ -754,6 +830,7 @@ impl WorkContextStore {
             store_record(&tx, tenant, record)?;
         }
         bump_generation(&tx)?;
+        precommit()?;
         tx.commit()?;
         Ok(WorkContextBootstrapState::Absent)
     }

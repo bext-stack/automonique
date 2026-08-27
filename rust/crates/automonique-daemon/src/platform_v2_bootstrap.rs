@@ -8,7 +8,7 @@ use std::io::Read as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::Path;
 
-use automonique_protocol::digest::Sha256;
+use automonique_protocol::digest::{Sha256, Sha256Digest};
 use automonique_protocol::platform::{
     ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
 };
@@ -22,6 +22,7 @@ use automonique_protocol::platform_v2_lifecycle::{ExpectedWorkContext, ExternalP
 use automonique_protocol::primitives::Revision;
 use automonique_store::work_context_store::{
     WorkContextBootstrapExternal, WorkContextBootstrapState, WorkContextStore,
+    WorkContextStoreError,
 };
 use nix::unistd::geteuid;
 use serde::{Deserialize, Serialize};
@@ -121,6 +122,18 @@ pub fn run(
     manifest_path: &Path,
     mode: BootstrapMode,
 ) -> Result<BootstrapReport, &'static str> {
+    run_with_precommit_hook(config, manifest_path, mode, || {})
+}
+
+fn run_with_precommit_hook<F>(
+    config: &DaemonConfig,
+    manifest_path: &Path,
+    mode: BootstrapMode,
+    mut precommit_hook: F,
+) -> Result<BootstrapReport, &'static str>
+where
+    F: FnMut(),
+{
     ensure_private_dir(&config.state_root, "state root")
         .map_err(|_| "platform_v2_bootstrap_state_insecure")?;
     ensure_private_dir(&config.state_dir(), "state directory")
@@ -148,57 +161,53 @@ pub fn run(
 
     let store_path = config.platform_v2_work_context_path();
     let state = if store_path.exists() {
-        let (store, compared) = match mode {
+        let read_store = WorkContextStore::open_read_only(&store_path).map_err(map_open_error)?;
+        let compared = read_store
+            .inspect_bootstrap(&graph.tenant, &graph.externals, &graph.records)
+            .map_err(map_store_error)?;
+        match mode {
+            BootstrapMode::Plan => compared,
+            BootstrapMode::Verify => {
+                if compared == WorkContextBootstrapState::Absent {
+                    return Err("platform_v2_bootstrap_absent");
+                }
+                let verified_generation = platform_v2_host::verify_bootstrap_store(
+                    &config.platform_v2_policy_path(),
+                    geteuid().as_raw(),
+                    &read_store,
+                )?;
+                if verified_generation != policy_generation {
+                    return Err("platform_v2_bootstrap_policy_changed");
+                }
+                compared
+            }
             BootstrapMode::Apply => {
-                let mut store = WorkContextStore::open(&store_path)
-                    .map_err(|_| "platform_v2_bootstrap_store_unavailable")?;
-                let compared = store
-                    .apply_bootstrap(&graph.tenant, &graph.externals, &graph.records)
-                    .map_err(map_store_error)?;
-                (store, compared)
-            }
-            BootstrapMode::Plan | BootstrapMode::Verify => {
-                let store = WorkContextStore::open_read_only(&store_path)
-                    .map_err(|_| "platform_v2_bootstrap_store_unavailable")?;
-                let compared = store
-                    .inspect_bootstrap(&graph.tenant, &graph.externals, &graph.records)
-                    .map_err(map_store_error)?;
-                (store, compared)
-            }
-        };
-        if mode != BootstrapMode::Plan {
-            if compared == WorkContextBootstrapState::Absent && mode == BootstrapMode::Verify {
-                return Err("platform_v2_bootstrap_absent");
-            }
-            let verified_generation = platform_v2_host::verify_bootstrap_store(
-                &config.platform_v2_policy_path(),
-                geteuid().as_raw(),
-                &store,
-            )?;
-            if verified_generation != policy_generation {
-                return Err("platform_v2_bootstrap_policy_changed");
+                drop(read_store);
+                let mut store =
+                    WorkContextStore::open_existing_current(&store_path).map_err(map_open_error)?;
+                apply_with_policy_guard(
+                    &mut store,
+                    config,
+                    &graph,
+                    policy_generation,
+                    &mut precommit_hook,
+                )?
             }
         }
-        compared
     } else {
         match mode {
             BootstrapMode::Plan => WorkContextBootstrapState::Absent,
             BootstrapMode::Verify => return Err("platform_v2_bootstrap_absent"),
             BootstrapMode::Apply => {
-                let mut store = WorkContextStore::open(&store_path)
+                let mut store = WorkContextStore::create_new(&store_path)
                     .map_err(|_| "platform_v2_bootstrap_store_unavailable")?;
-                let state = store
-                    .apply_bootstrap(&graph.tenant, &graph.externals, &graph.records)
-                    .map_err(|_| "platform_v2_bootstrap_store_refused")?;
-                let verified_generation = platform_v2_host::verify_bootstrap_store(
-                    &config.platform_v2_policy_path(),
-                    geteuid().as_raw(),
-                    &store,
-                )?;
-                if verified_generation != policy_generation {
-                    return Err("platform_v2_bootstrap_policy_changed");
-                }
-                state
+                apply_with_policy_guard(
+                    &mut store,
+                    config,
+                    &graph,
+                    policy_generation,
+                    &mut precommit_hook,
+                )?
             }
         }
     };
@@ -222,6 +231,35 @@ pub fn run(
     })
 }
 
+fn apply_with_policy_guard<F>(
+    store: &mut WorkContextStore,
+    config: &DaemonConfig,
+    graph: &ValidatedBootstrap,
+    expected_generation: Sha256Digest,
+    precommit_hook: &mut F,
+) -> Result<WorkContextBootstrapState, &'static str>
+where
+    F: FnMut(),
+{
+    store
+        .apply_bootstrap_guarded(&graph.tenant, &graph.externals, &graph.records, || {
+            precommit_hook();
+            let current = platform_v2_host::verify_bootstrap_policy(
+                &config.platform_v2_policy_path(),
+                geteuid().as_raw(),
+                &graph.tenant,
+                &graph.projects,
+                &graph.ownership,
+            )
+            .map_err(|_| WorkContextStoreError::BootstrapGuard)?;
+            if current != expected_generation {
+                return Err(WorkContextStoreError::BootstrapGuard);
+            }
+            Ok(())
+        })
+        .map_err(map_store_error)
+}
+
 fn map_store_error(
     error: automonique_store::work_context_store::WorkContextStoreError,
 ) -> &'static str {
@@ -229,7 +267,15 @@ fn map_store_error(
         "bootstrap_partial" => "platform_v2_bootstrap_partial",
         "bootstrap_mismatch" => "platform_v2_bootstrap_mismatch",
         "bootstrap_downgrade" => "platform_v2_bootstrap_downgrade",
+        "bootstrap_guard" => "platform_v2_bootstrap_policy_changed",
         _ => "platform_v2_bootstrap_store_refused",
+    }
+}
+
+fn map_open_error(error: WorkContextStoreError) -> &'static str {
+    match error.category() {
+        "schema_version" => "platform_v2_bootstrap_schema_unsupported",
+        _ => "platform_v2_bootstrap_store_unavailable",
     }
 }
 
@@ -671,6 +717,104 @@ mod tests {
         assert_eq!(verified.state, "identical");
         assert_eq!(verified.records, 4);
         assert_eq!(verified.repositories, 1);
+    }
+
+    #[test]
+    fn every_mode_refuses_an_old_schema_without_changing_its_bytes_or_version() {
+        let (_temp, config, manifest_path) = fixture();
+        let store_path = config.platform_v2_work_context_path();
+        let connection = rusqlite::Connection::open(&store_path).unwrap();
+        connection
+            .execute("CREATE TABLE legacy_state(value TEXT NOT NULL)", [])
+            .unwrap();
+        connection
+            .execute("INSERT INTO legacy_state(value) VALUES('preserve-me')", [])
+            .unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        drop(connection);
+        fs::set_permissions(&store_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let before = fs::read(&store_path).unwrap();
+
+        for mode in [
+            BootstrapMode::Plan,
+            BootstrapMode::Verify,
+            BootstrapMode::Apply,
+        ] {
+            assert_eq!(
+                run(&config, &manifest_path, mode).unwrap_err(),
+                "platform_v2_bootstrap_schema_unsupported"
+            );
+            assert_eq!(fs::read(&store_path).unwrap(), before);
+        }
+
+        let connection = rusqlite::Connection::open_with_flags(
+            &store_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let value: String = connection
+            .query_row("SELECT value FROM legacy_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        assert_eq!(value, "preserve-me");
+    }
+
+    #[test]
+    fn policy_replacement_in_precommit_guard_rolls_back_new_and_existing_stores() {
+        for existing_store in [false, true] {
+            let (_temp, config, manifest_path) = fixture();
+            let store_path = config.platform_v2_work_context_path();
+            if existing_store {
+                drop(WorkContextStore::open(&store_path).unwrap());
+            }
+
+            let replacement = config.state_dir().join(if existing_store {
+                "invalid.next"
+            } else {
+                "changed.next"
+            });
+            if existing_store {
+                write_private(&replacement, b"{}");
+            } else {
+                let mut changed_policy = policy(geteuid().as_raw());
+                changed_policy.push(b'\n');
+                write_private(&replacement, &changed_policy);
+            }
+            let policy_path = config.platform_v2_policy_path();
+            let mut guard_ran = false;
+            assert_eq!(
+                run_with_precommit_hook(&config, &manifest_path, BootstrapMode::Apply, || {
+                    assert!(!guard_ran);
+                    guard_ran = true;
+                    fs::rename(&replacement, &policy_path).unwrap();
+                },)
+                .unwrap_err(),
+                "platform_v2_bootstrap_policy_changed"
+            );
+            assert!(guard_ran);
+            assert!(store_path.exists());
+
+            let connection = rusqlite::Connection::open_with_flags(
+                &store_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            for table in [
+                "work_context_records",
+                "work_context_expected_revisions",
+                "work_context_selector_bindings",
+            ] {
+                let count: i64 = connection
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 0, "{table} stayed empty");
+            }
+        }
     }
 
     #[test]
