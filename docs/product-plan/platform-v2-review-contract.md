@@ -104,11 +104,27 @@ the resulting revision. Conflicts carry the current revision. Refusals are
 final. Accepted and unknown outcomes carry no claimed revision and explicitly
 say `poll_receipt`; clients reconcile that receipt and never blindly replay the
 mutation. Actor, action, receipt, and idempotency identities remain attributable
-in every outcome. The custody row also binds the receipt to the full request
-digest and, when required, the exact approval digest. Reconciliation verifies
-completed and conflict revisions against the authoritative workspace revision.
-On every read, snapshot and approval digests plus their duplicated normalized
-columns are re-derived; corruption fails closed across process restarts.
+in every outcome. The custody row integrity-binds the canonical request, full
+approval policy, duplicated `approval_required` decision, and, when required,
+the exact authenticated approval. A separate transactional `start-write`
+admission is recorded only while the grant, revision, target, and approval are
+current; its explicit replay outcome never licenses a second external write.
+Once admitted, an unknown result can still be recorded and reconciled after the
+approval expires. A completed result is final only when its revision is the
+authoritative snapshot revision or separately stored evidence from an
+authenticated exact-authority service adapter proves that revision. Exact
+terminal replays are returned only after current actor authorization is checked.
+Grant expiry and revocation fail closed.
+
+On every read, snapshot, preview, approval, receipt, completion-evidence and
+duplicated normalized fields are re-derived; corruption fails closed across
+process restarts. Comment identity, actor and anchor cannot be rewritten across
+snapshots; same-revision values are immutable, edits advance exactly one
+revision, and sent-to-agent state is monotonic. Each review-store database is
+bound at creation to one explicit authority namespace. Hosted deployments must
+use a different database for every tenant/authority domain until a later schema
+introduces row-level tenancy. The store still has no daemon route or real git,
+CI, provider, or pull-request adapter.
 
 ## Shared conformance
 
