@@ -20,7 +20,8 @@ use automonique_protocol::platform_v2::{
 };
 use automonique_protocol::platform_v2_lifecycle::{
     AuthorityGrantId, MutationApprovalId, MutationApprovalRequirement, MutationExplanation,
-    MutationRefusal, MutationRefusalCategory, WorkContextAuthority, WorkContextMutationProposal,
+    MutationRefusal, MutationRefusalCategory, WorkContextAuthority, WorkContextMutationIntent,
+    WorkContextMutationProposal,
 };
 use automonique_protocol::platform_v2_lineage::{WorkspaceIntent, WorkspaceIntentOutcome};
 use automonique_protocol::platform_v2_review::{
@@ -312,6 +313,7 @@ impl PlatformV2Runtime {
                 let policy = principal.mutation_policy(
                     Some(project),
                     inherited_authority,
+                    value.intent(),
                     proposal.request_digest(),
                     MutationApprovalRequirement::Required,
                 );
@@ -343,6 +345,7 @@ impl PlatformV2Runtime {
                 let current_policy = principal.mutation_policy(
                     Some(project),
                     inherited_authority,
+                    candidate.proposal().intent(),
                     candidate.proposal().request_digest(),
                     candidate.approval(),
                 );
@@ -418,6 +421,7 @@ impl PlatformV2Runtime {
                 let policy = principal.mutation_policy(
                     Some(project),
                     inherited_authority,
+                    candidate.proposal().intent(),
                     candidate.proposal().request_digest(),
                     candidate.approval(),
                 );
@@ -743,10 +747,11 @@ impl PrincipalPolicy {
         &self,
         project: Option<ProjectId>,
         inherited_authority: WorkContextAuthority,
+        intent: &WorkContextMutationIntent,
         digest: automonique_protocol::platform_v2_lifecycle::WorkContextRequestDigest,
         approval: MutationApprovalRequirement,
     ) -> MutationPolicyDecision {
-        let targets = self
+        let mut targets: BTreeSet<_> = self
             .workspaces
             .iter()
             .filter(|(_, scope)| {
@@ -756,6 +761,14 @@ impl PrincipalPolicy {
             })
             .map(|(identity, _)| identity.clone())
             .collect();
+        // Repositories are external v1 coordinates, so they cannot appear in
+        // the durable workspace policy registry. A checkout preview needs its
+        // one immutable repository coordinate in the store authorization set;
+        // the store still proves that exact coordinate is a repository of the
+        // selected durable project and matches its external snapshot.
+        if let WorkContextMutationIntent::CreateCheckout(checkout) = intent {
+            targets.insert(checkout.repository().identity().clone());
+        }
         MutationPolicyDecision::new(
             self.actor.clone(),
             self.serving_authority,

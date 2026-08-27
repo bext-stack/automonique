@@ -33,7 +33,42 @@ The file has this bounded shape:
         }
       },
       {
+        "project": "project-example", "kind": "host_setup", "id": "host-example",
+        "inherited_authority": {
+          "filesystem": ["workspace-read"], "credentials": [], "network": [],
+          "tools": [], "providers": [], "models": []
+        }
+      },
+      {
+        "project": "project-example", "kind": "checkout", "id": "checkout-example",
+        "inherited_authority": {
+          "filesystem": ["workspace-read"], "credentials": [], "network": [],
+          "tools": [], "providers": [], "models": []
+        }
+      },
+      {
         "project": "project-example", "kind": "user_workspace", "id": "workspace-example",
+        "inherited_authority": {
+          "filesystem": ["workspace-read"], "credentials": [], "network": [],
+          "tools": [], "providers": [], "models": []
+        }
+      },
+      {
+        "project": "project-example", "kind": "attempt_workspace", "id": "attempt-example",
+        "inherited_authority": {
+          "filesystem": ["workspace-read"], "credentials": [], "network": [],
+          "tools": [], "providers": [], "models": []
+        }
+      },
+      {
+        "project": "project-example", "kind": "session", "id": "session-example",
+        "inherited_authority": {
+          "filesystem": ["workspace-read"], "credentials": [], "network": [],
+          "tools": [], "providers": [], "models": []
+        }
+      },
+      {
+        "project": "project-example", "kind": "pane", "id": "pane-example",
         "inherited_authority": {
           "filesystem": ["workspace-read"], "credentials": [], "network": [],
           "tools": [], "providers": [], "models": []
@@ -66,7 +101,8 @@ before every read or action, identities must exist in the authoritative work
 context store, project identities must equal their declared project, and child
 ownership must agree with the durable owner projection. The complete direct
 inheritance chain must be visible in policy (`project` → `host_setup` →
-`checkout` → `user_workspace` → `attempt_workspace` → `session`, as present);
+`checkout` → `user_workspace` → `attempt_workspace` → `session` → `pane`, as
+present);
 omitting an intermediate parent refuses v2 rather than falling back to the
 project or actor ceiling.
 Review authority keys use the six review axes (`filesystem`, `git`, `ci`,
@@ -87,6 +123,11 @@ Old previews and receipts are reauthorized after restart from their immutable
 actor, intent, project, and exact target coordinates. The current target's
 exact inherited ceiling must still equal the preview ceiling; narrowing or
 revoking a child makes decision and receipt reads opaque/refused.
+For `create_checkout`, the server adds only the intent's exact external
+repository coordinate to that preview's authorized targets. The authoritative
+store must also prove the coordinate and revision are a repository relation of
+the selected project; an unrelated repository is refused even when its
+external snapshot exists.
 
 The lifecycle filesystem adapter, workspace-create/resume adapter, and
 git/CI/pull-request workers are intentionally not wired in this slice.

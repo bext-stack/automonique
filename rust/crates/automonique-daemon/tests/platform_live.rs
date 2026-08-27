@@ -23,14 +23,16 @@ use automonique_protocol::platform::{
 };
 use automonique_protocol::platform_api::{PlatformRequestMessage, PlatformResponseMessage};
 use automonique_protocol::platform_v2::{
-    CheckoutKind, HostSetupKind, PlatformVersion, PlatformVersionOffer, ProjectId, UserWorkspaceId,
-    V1RepositoryRef, WorkContextAttributes, WorkContextIdentity, WorkContextLabel,
-    WorkContextLifecycle, WorkContextRecord, WorkContextRelation, WorkContextRelationKind,
+    AttemptWorkspaceId, CheckoutKind, HostSetupKind, PaneId, PlatformVersion, PlatformVersionOffer,
+    ProjectId, UserWorkspaceId, V1RepositoryRef, V1SessionRef, WorkContextAttributes,
+    WorkContextIdentity, WorkContextLabel, WorkContextLifecycle, WorkContextRecord,
+    WorkContextRelation, WorkContextRelationKind, WorkContextTargetKind, WorkSessionId,
 };
 use automonique_protocol::platform_v2_lifecycle::{
-    ArchiveIntent, AuthorityGrantId, CreateAttemptWorkspaceIntent, ExpectedWorkContext,
-    ExternalParentResolution, MutationApprovalDecision, MutationApprovalRequirement,
-    WorkContextAuthority, WorkContextMutationIntent,
+    ArchiveIntent, AuthorityGrantId, CreateAttemptWorkspaceIntent, CreateCheckoutIntent,
+    ExpectedWorkContext, ExternalParentResolution, MutationApprovalDecision,
+    MutationApprovalRequirement, WorkContextAuthority, WorkContextMutationIntent,
+    WorkContextRegistrySelector,
 };
 use automonique_protocol::platform_v2_lifecycle_api::{
     encode_work_context_mutation_submission, work_context_mutation_preview_digest,
@@ -194,6 +196,12 @@ fn configure_v2(config: &DaemonConfig) {
                 {"project": "project-live", "kind": "user_workspace", "id": "workspace-live",
                  "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []}},
                 {"project": "project-live", "kind": "user_workspace", "id": "wc_user_1",
+                 "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []}},
+                {"project": "project-live", "kind": "attempt_workspace", "id": "attempt-live",
+                 "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []}},
+                {"project": "project-live", "kind": "session", "id": "session-live",
+                 "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []}},
+                {"project": "project-live", "kind": "pane", "id": "pane-live",
                  "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []}}
             ],
             "authority": {
@@ -210,26 +218,7 @@ fn configure_v2(config: &DaemonConfig) {
 
     let mut store = WorkContextStore::open(config.platform_v2_work_context_path())
         .expect("v2 work context store");
-    let project = WorkContextRecord::new(
-        WorkContextIdentity::Project(ProjectId::new("project-live").unwrap()),
-        Revision::FIRST,
-        WorkContextLifecycle::Active,
-        WorkContextLabel::new("Live project").unwrap(),
-        WorkContextAttributes::EMPTY,
-        vec![],
-    )
-    .unwrap();
-    store
-        .put_authoritative_record("tenant-live", &project)
-        .expect("seed project");
-    let repository = WorkContextIdentity::Repository(
-        V1RepositoryRef::new(ResourceCoordinate::new(
-            ResourceAuthority::GitHub,
-            ResourceKind::Repository,
-            ResourceId::new("repo-live").unwrap(),
-        ))
-        .unwrap(),
-    );
+    let repository = live_repository("repo-live");
     store
         .put_external_snapshot(
             "tenant-live",
@@ -238,6 +227,33 @@ fn configure_v2(config: &DaemonConfig) {
             Some(&ProjectId::new("project-live").unwrap()),
         )
         .unwrap();
+    let unrelated_repository = live_repository("repo-unrelated");
+    store
+        .put_external_snapshot(
+            "tenant-live",
+            &ExpectedWorkContext::new(unrelated_repository, Revision::FIRST),
+            ExternalParentResolution::Available,
+            Some(&ProjectId::new("project-live").unwrap()),
+        )
+        .unwrap();
+    let project = WorkContextRecord::new(
+        WorkContextIdentity::Project(ProjectId::new("project-live").unwrap()),
+        Revision::FIRST,
+        WorkContextLifecycle::Active,
+        WorkContextLabel::new("Live project").unwrap(),
+        WorkContextAttributes::EMPTY,
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::ProjectRepository,
+                repository.clone(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    store
+        .put_authoritative_record("tenant-live", &project)
+        .expect("seed project");
     let host = WorkContextRecord::new(
         WorkContextIdentity::parse_local(
             automonique_protocol::platform_v2::WorkContextTargetKind::HostSetup,
@@ -295,6 +311,80 @@ fn configure_v2(config: &DaemonConfig) {
             .put_authoritative_record("tenant-live", &workspace)
             .unwrap();
     }
+    let attempt = WorkContextRecord::new(
+        WorkContextIdentity::AttemptWorkspace(AttemptWorkspaceId::new("attempt-live").unwrap()),
+        Revision::FIRST,
+        WorkContextLifecycle::Running,
+        WorkContextLabel::new("Live attempt").unwrap(),
+        WorkContextAttributes::EMPTY,
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::AttemptUserWorkspace,
+                WorkContextIdentity::UserWorkspace(UserWorkspaceId::new("workspace-live").unwrap()),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    store
+        .put_authoritative_record("tenant-live", &attempt)
+        .unwrap();
+    let platform_session = WorkContextIdentity::PlatformSession(
+        V1SessionRef::new(ResourceCoordinate::new(
+            ResourceAuthority::Automonique,
+            ResourceKind::Session,
+            ResourceId::new("platform-session-live").unwrap(),
+        ))
+        .unwrap(),
+    );
+    let session = WorkContextRecord::new(
+        WorkContextIdentity::Session(WorkSessionId::new("session-live").unwrap()),
+        Revision::FIRST,
+        WorkContextLifecycle::Active,
+        WorkContextLabel::new("Live session").unwrap(),
+        WorkContextAttributes::EMPTY,
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::SessionAttemptWorkspace,
+                attempt.identity().clone(),
+            )
+            .unwrap(),
+            WorkContextRelation::new(
+                WorkContextRelationKind::SessionPlatformSession,
+                platform_session,
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    store
+        .put_authoritative_record("tenant-live", &session)
+        .unwrap();
+    let pane = WorkContextRecord::new(
+        WorkContextIdentity::Pane(PaneId::new("pane-live").unwrap()),
+        Revision::FIRST,
+        WorkContextLifecycle::Active,
+        WorkContextLabel::new("Live pane").unwrap(),
+        WorkContextAttributes::EMPTY,
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::PaneSession,
+                session.identity().clone(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    store
+        .put_authoritative_record("tenant-live", &pane)
+        .unwrap();
+    store
+        .bind_private_selector(
+            "tenant-live",
+            &WorkContextRegistrySelector::new("checkout-live-selector").unwrap(),
+            b"live checkout binding",
+        )
+        .unwrap();
     drop(store);
 
     let mut reviews = ReviewStore::open_scoped(config.platform_v2_review_path(), "tenant-live")
@@ -344,6 +434,17 @@ fn configure_v2(config: &DaemonConfig) {
         .unwrap();
 }
 
+fn live_repository(id: &str) -> WorkContextIdentity {
+    WorkContextIdentity::Repository(
+        V1RepositoryRef::new(ResourceCoordinate::new(
+            ResourceAuthority::GitHub,
+            ResourceKind::Repository,
+            ResourceId::new(id).unwrap(),
+        ))
+        .unwrap(),
+    )
+}
+
 fn live_workspace(
     id: &str,
     revision: Revision,
@@ -382,10 +483,12 @@ fn set_tool_authority(config: &DaemonConfig, narrow_workspace_live: bool) {
     let principal = &mut policy["principals"][0];
     principal["authority"]["tools"] = serde_json::json!(["tool-live"]);
     for workspace in principal["workspaces"].as_array_mut().unwrap() {
-        workspace["inherited_authority"]["tools"] = if narrow_workspace_live
-            && workspace["kind"] == "user_workspace"
-            && workspace["id"] == "workspace-live"
-        {
+        let narrowed_subtree = (workspace["kind"] == "user_workspace"
+            && workspace["id"] == "workspace-live")
+            || workspace["kind"] == "attempt_workspace"
+            || workspace["kind"] == "session"
+            || workspace["kind"] == "pane";
+        workspace["inherited_authority"]["tools"] = if narrow_workspace_live && narrowed_subtree {
             serde_json::json!([])
         } else {
             serde_json::json!(["tool-live"])
@@ -402,6 +505,20 @@ fn remove_policy_scope(config: &DaemonConfig, kind: &str, id: &str) {
         .as_array_mut()
         .unwrap()
         .retain(|workspace| workspace["kind"] != kind || workspace["id"] != id);
+    std::fs::write(path, serde_json::to_vec(&policy).unwrap()).unwrap();
+}
+
+fn set_scope_tools(config: &DaemonConfig, kind: &str, id: &str, tools: &[&str]) {
+    let path = config.platform_v2_policy_path();
+    let mut policy: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let scope = policy["principals"][0]["workspaces"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|scope| scope["kind"] == kind && scope["id"] == id)
+        .unwrap();
+    scope["inherited_authority"]["tools"] = serde_json::json!(tools);
     std::fs::write(path, serde_json::to_vec(&policy).unwrap()).unwrap();
 }
 
@@ -917,6 +1034,17 @@ fn policy_requires_the_complete_durable_inheritance_chain() {
     for (kind, id, label) in [
         ("host_setup", "host-live", "v2-missing-host-parent"),
         ("checkout", "checkout-live", "v2-missing-checkout-parent"),
+        (
+            "user_workspace",
+            "workspace-live",
+            "v2-missing-attempt-parent",
+        ),
+        (
+            "attempt_workspace",
+            "attempt-live",
+            "v2-missing-session-parent",
+        ),
+        ("session", "session-live", "v2-missing-pane-parent"),
     ] {
         let (_root, config) = fixture();
         configure_v2(&config);
@@ -946,12 +1074,123 @@ fn complete_durable_inheritance_chain_enables_v2_reads() {
         platform_v2(
             &config,
             "v2-complete-policy-chain",
-            PlatformV2Request::GetWorkContext(WorkContextIdentity::UserWorkspace(
-                UserWorkspaceId::new("workspace-live").unwrap(),
+            PlatformV2Request::GetWorkContext(WorkContextIdentity::Pane(
+                PaneId::new("pane-live").unwrap(),
             ))
         ),
         PlatformV2Response::WorkContextRecord(record)
-            if record.identity().id() == "workspace-live"
+            if record.identity().id() == "pane-live"
+    ));
+    serving.shutdown(&config);
+}
+
+#[test]
+fn session_and_pane_ceilings_cannot_exceed_their_direct_parents() {
+    for (parent_kind, parent_id, label) in [
+        (
+            "attempt_workspace",
+            "attempt-live",
+            "v2-session-exceeds-attempt-ceiling",
+        ),
+        ("session", "session-live", "v2-pane-exceeds-session-ceiling"),
+    ] {
+        let (_root, config) = fixture();
+        configure_v2(&config);
+        set_tool_authority(&config, false);
+        set_scope_tools(&config, parent_kind, parent_id, &[]);
+        let serving = serve(&config);
+        assert!(matches!(
+            platform_v2(
+                &config,
+                label,
+                PlatformV2Request::GetWorkContext(WorkContextIdentity::Pane(
+                    PaneId::new("pane-live").unwrap(),
+                ))
+            ),
+            PlatformV2Response::Refused(refusal)
+                if refusal.category().as_str() == "platform_v2_policy_incoherent"
+        ));
+        serving.shutdown(&config);
+    }
+}
+
+#[test]
+fn create_checkout_authorizes_only_the_intents_durable_project_repository() {
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let serving = serve(&config);
+    let create_checkout = |repository, repository_revision, key: &str| {
+        MutationPrepareRequest::new(
+            IdempotencyKey::new(key).unwrap(),
+            WorkContextMutationIntent::CreateCheckout(
+                CreateCheckoutIntent::new(
+                    WorkContextLabel::new("New live checkout").unwrap(),
+                    ExpectedWorkContext::new(
+                        WorkContextIdentity::Project(ProjectId::new("project-live").unwrap()),
+                        Revision::FIRST,
+                    ),
+                    ExpectedWorkContext::new(
+                        WorkContextIdentity::parse_local(
+                            WorkContextTargetKind::HostSetup,
+                            "host-live",
+                        )
+                        .unwrap(),
+                        Revision::FIRST,
+                    ),
+                    ExpectedWorkContext::new(repository, repository_revision),
+                    CheckoutKind::GitWorktree,
+                    WorkContextRegistrySelector::new("checkout-live-selector").unwrap(),
+                )
+                .unwrap(),
+            ),
+        )
+    };
+    let prepare = create_checkout(
+        live_repository("repo-live"),
+        Revision::FIRST,
+        "checkout-authorized-once",
+    );
+    let PlatformV2Response::MutationPreview(first) = platform_v2(
+        &config,
+        "v2-checkout-authorized",
+        PlatformV2Request::PrepareMutation(prepare.clone()),
+    ) else {
+        panic!("authorized repository must produce a preview")
+    };
+    let PlatformV2Response::MutationPreview(replay) = platform_v2(
+        &config,
+        "v2-checkout-authorized-replay",
+        PlatformV2Request::PrepareMutation(prepare),
+    ) else {
+        panic!("authorized repository replay must produce the same preview")
+    };
+    assert_eq!(replay, first);
+
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-checkout-wrong-repository-revision",
+            PlatformV2Request::PrepareMutation(create_checkout(
+                live_repository("repo-live"),
+                Revision::new(2).unwrap(),
+                "checkout-wrong-repository-revision",
+            )),
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_mutation_refused"
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-checkout-unrelated-repository",
+            PlatformV2Request::PrepareMutation(create_checkout(
+                live_repository("repo-unrelated"),
+                Revision::FIRST,
+                "checkout-unrelated-repository",
+            )),
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_mutation_refused"
     ));
     serving.shutdown(&config);
 }
