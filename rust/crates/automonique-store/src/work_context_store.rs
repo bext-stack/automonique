@@ -49,6 +49,8 @@ use crate::{StoreError, validate_database_path};
 pub const WORK_CONTEXT_STORE_SCHEMA_VERSION: u32 = 4;
 pub const MAX_EXTERNAL_EFFECT_LEASE_MILLIS: i64 = 300_000;
 const MAX_RECONCILIATION_EVIDENCE_BYTES: usize = 16 * 1024;
+const CURSOR_RETENTION_MILLIS: i64 = 15 * 60 * 1_000;
+const MAX_CURSORS_PER_ACTOR: i64 = 256;
 
 const SCHEMA_V4: &str = r#"
 CREATE TABLE work_context_meta (
@@ -714,6 +716,173 @@ impl WorkContextStore {
         )
     }
 
+    /// Validate a server-owned policy mapping against the durable identity and
+    /// ownership projections. This is intentionally independent of a client
+    /// supplied read policy.
+    pub fn validate_policy_mapping(
+        &self,
+        tenant: &str,
+        project: &ProjectId,
+        identity: &WorkContextIdentity,
+    ) -> Stored<WorkContextRecord> {
+        validate_tenant(tenant)?;
+        let tx = self.connection.unchecked_transaction()?;
+        let record = validate_policy_mapping_on(&tx, tenant, project, identity)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    /// Validate the complete bounded policy registry in one SQLite snapshot.
+    pub fn validate_policy_mappings(
+        &self,
+        tenant: &str,
+        mappings: &BTreeMap<WorkContextIdentity, ProjectId>,
+    ) -> Stored<BTreeMap<WorkContextIdentity, WorkContextRecord>> {
+        validate_tenant(tenant)?;
+        let tx = self.connection.unchecked_transaction()?;
+        let mut records = BTreeMap::new();
+        for (identity, project) in mappings {
+            records.insert(
+                identity.clone(),
+                validate_policy_mapping_on(&tx, tenant, project, identity)?,
+            );
+        }
+        tx.commit()?;
+        Ok(records)
+    }
+
+    /// Require exact durable revision and an active user workspace before a
+    /// resume adapter may take custody of a lineage intent.
+    pub fn validate_resumable_user_workspace(
+        &self,
+        tenant: &str,
+        project: &ProjectId,
+        workspace: &automonique_protocol::platform_v2::UserWorkspaceId,
+        expected_revision: Revision,
+    ) -> Stored<WorkContextRecord> {
+        let identity = WorkContextIdentity::UserWorkspace(workspace.clone());
+        let record = self.validate_policy_mapping(tenant, project, &identity)?;
+        if record.revision() != expected_revision {
+            return Err(WorkContextStoreError::StaleRevision);
+        }
+        if record.lifecycle() != WorkContextLifecycle::Active {
+            return Err(WorkContextStoreError::Unavailable);
+        }
+        Ok(record)
+    }
+
+    /// Load an immutable preview only through its authenticated actor and
+    /// serving-authority coordinates. Callers must subsequently apply the
+    /// current policy with [`Self::authorize_existing_preview`].
+    pub fn preview_for_actor(
+        &self,
+        preview_ref: &MutationPreviewRef,
+        authenticated_actor: &Actor,
+        serving_authority: ResourceAuthority,
+    ) -> Stored<MutationPreview> {
+        let preview = load_preview_for_scope(
+            &self.connection,
+            preview_ref,
+            authenticated_actor.tenant(),
+            serving_authority,
+        )?;
+        if preview.proposal().actor() != authenticated_actor {
+            return Err(WorkContextStoreError::Unauthorized);
+        }
+        Ok(preview)
+    }
+
+    /// Reauthorize an old immutable preview against the current exact actor,
+    /// target set, project, inherited ceiling, and durable ownership truth.
+    pub fn authorize_existing_preview(
+        &self,
+        preview_ref: &MutationPreviewRef,
+        policy: &MutationPolicyDecision,
+    ) -> Stored<MutationPreview> {
+        let tx = self.connection.unchecked_transaction()?;
+        let preview = load_preview_for_scope(
+            &tx,
+            preview_ref,
+            policy.authenticated_actor.tenant(),
+            policy.serving_authority,
+        )?;
+        recheck_policy(&preview, policy)?;
+        authorize_transaction_scope(&tx, preview.proposal().intent(), policy)?;
+        tx.commit()?;
+        Ok(preview)
+    }
+
+    pub fn receipt_preview_by_id_for_actor(
+        &self,
+        authenticated_actor: &Actor,
+        serving_authority: ResourceAuthority,
+        receipt_id: &ReceiptId,
+    ) -> Stored<Option<MutationPreview>> {
+        self.receipt_preview_for_actor(
+            authenticated_actor,
+            serving_authority,
+            "r.receipt_id=?4",
+            receipt_id.as_str(),
+        )
+    }
+
+    pub fn receipt_preview_by_idempotency_key_for_actor(
+        &self,
+        authenticated_actor: &Actor,
+        serving_authority: ResourceAuthority,
+        key: &automonique_protocol::platform::IdempotencyKey,
+    ) -> Stored<Option<MutationPreview>> {
+        self.receipt_preview_for_actor(
+            authenticated_actor,
+            serving_authority,
+            "p.idempotency_key=?4",
+            key.as_str(),
+        )
+    }
+
+    fn receipt_preview_for_actor(
+        &self,
+        authenticated_actor: &Actor,
+        serving_authority: ResourceAuthority,
+        predicate: &'static str,
+        value: &str,
+    ) -> Stored<Option<MutationPreview>> {
+        let sql = match predicate {
+            "r.receipt_id=?4" => {
+                "SELECT p.preview_id,p.preview_revision FROM work_context_receipts r JOIN work_context_previews p ON p.preview_id=r.preview_id WHERE p.tenant=?1 AND p.actor_id=?2 AND p.serving_authority=?3 AND r.receipt_id=?4"
+            }
+            "p.idempotency_key=?4" => {
+                "SELECT p.preview_id,p.preview_revision FROM work_context_receipts r JOIN work_context_previews p ON p.preview_id=r.preview_id WHERE p.tenant=?1 AND p.actor_id=?2 AND p.serving_authority=?3 AND p.idempotency_key=?4"
+            }
+            _ => return Err(WorkContextStoreError::InvalidField("receipt_lookup")),
+        };
+        let row: Option<(String, i64)> = self
+            .connection
+            .query_row(
+                sql,
+                params![
+                    authenticated_actor.tenant(),
+                    authenticated_actor.id(),
+                    serving_authority.as_str(),
+                    value,
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((id, revision)) = row else {
+            return Ok(None);
+        };
+        let preview_ref = MutationPreviewRef::new(
+            MutationPreviewId::new(id).map_err(|_| WorkContextStoreError::Corrupt("preview_id"))?,
+            u64::try_from(revision)
+                .ok()
+                .and_then(|value| Revision::new(value).ok())
+                .ok_or(WorkContextStoreError::Corrupt("preview_revision"))?,
+        );
+        self.preview_for_actor(&preview_ref, authenticated_actor, serving_authority)
+            .map(Some)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_mutation(
         &mut self,
@@ -839,6 +1008,25 @@ impl WorkContextStore {
             || trusted_now_ms >= preview.expires_at().as_millis()
         {
             return Err(WorkContextStoreError::Unauthorized);
+        }
+        let existing: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT approval_document FROM work_context_approvals WHERE preview_id=?1 ORDER BY approval_id LIMIT 1",
+                [preview.preview().id().as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(document) = existing {
+            let approval =
+                decode_work_context_mutation_approval(&document, &preview).map_err(protocol)?;
+            if approval.decision() == decision
+                && approval.decided_by() == &policy.authenticated_approver
+                && approval.preview_digest() == digest
+            {
+                tx.commit()?;
+                return Ok(approval);
+            }
+            return Err(WorkContextStoreError::BodyConflict);
         }
         let approval = MutationApproval::new(
             id,
@@ -1929,6 +2117,133 @@ impl WorkContextStore {
         )
     }
 
+    /// Resolve a receipt from server-owned actor and scope inputs when the
+    /// request wire cannot know the proposal digest retained by this store.
+    /// A receipt in another authorized project is deliberately reported as
+    /// unknown, so an opaque receipt id is not a cross-project existence
+    /// oracle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn receipt_by_id_authorized(
+        &self,
+        authenticated_actor: &Actor,
+        serving_authority: ResourceAuthority,
+        actor_authority: &WorkContextAuthority,
+        inherited_authority: &WorkContextAuthority,
+        authorized_project: &ProjectId,
+        authorized_targets: &BTreeSet<WorkContextIdentity>,
+        receipt_id: &ReceiptId,
+    ) -> Stored<ReceiptLookup> {
+        self.receipt_authorized(
+            authenticated_actor,
+            serving_authority,
+            actor_authority,
+            inherited_authority,
+            authorized_project,
+            authorized_targets,
+            "r.receipt_id=?4",
+            receipt_id.as_str(),
+        )
+    }
+
+    /// Idempotency-key form of [`Self::receipt_by_id_authorized`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn receipt_by_idempotency_key_authorized(
+        &self,
+        authenticated_actor: &Actor,
+        serving_authority: ResourceAuthority,
+        actor_authority: &WorkContextAuthority,
+        inherited_authority: &WorkContextAuthority,
+        authorized_project: &ProjectId,
+        authorized_targets: &BTreeSet<WorkContextIdentity>,
+        key: &automonique_protocol::platform::IdempotencyKey,
+    ) -> Stored<ReceiptLookup> {
+        self.receipt_authorized(
+            authenticated_actor,
+            serving_authority,
+            actor_authority,
+            inherited_authority,
+            authorized_project,
+            authorized_targets,
+            "p.idempotency_key=?4",
+            key.as_str(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn receipt_authorized(
+        &self,
+        authenticated_actor: &Actor,
+        serving_authority: ResourceAuthority,
+        actor_authority: &WorkContextAuthority,
+        inherited_authority: &WorkContextAuthority,
+        authorized_project: &ProjectId,
+        authorized_targets: &BTreeSet<WorkContextIdentity>,
+        predicate: &'static str,
+        value: &str,
+    ) -> Stored<ReceiptLookup> {
+        let sql = match predicate {
+            "r.receipt_id=?4" => {
+                "SELECT p.preview_id,p.preview_revision FROM work_context_receipts r JOIN work_context_previews p ON p.preview_id=r.preview_id WHERE p.tenant=?1 AND p.actor_id=?2 AND p.serving_authority=?3 AND r.receipt_id=?4"
+            }
+            "p.idempotency_key=?4" => {
+                "SELECT p.preview_id,p.preview_revision FROM work_context_receipts r JOIN work_context_previews p ON p.preview_id=r.preview_id WHERE p.tenant=?1 AND p.actor_id=?2 AND p.serving_authority=?3 AND p.idempotency_key=?4"
+            }
+            _ => return Err(WorkContextStoreError::InvalidField("receipt_lookup")),
+        };
+        let row: Option<(String, i64)> = self
+            .connection
+            .query_row(
+                sql,
+                params![
+                    authenticated_actor.tenant(),
+                    authenticated_actor.id(),
+                    serving_authority.as_str(),
+                    value
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((preview_id, preview_revision)) = row else {
+            return Ok(ReceiptLookup::Unknown);
+        };
+        let preview = load_preview_for_scope(
+            &self.connection,
+            &MutationPreviewRef::new(
+                MutationPreviewId::new(preview_id)
+                    .map_err(|_| WorkContextStoreError::Corrupt("preview_id"))?,
+                u64::try_from(preview_revision)
+                    .ok()
+                    .and_then(|revision| Revision::new(revision).ok())
+                    .ok_or(WorkContextStoreError::Corrupt("preview_revision"))?,
+            ),
+            authenticated_actor.tenant(),
+            serving_authority,
+        )?;
+        if matches!(
+            preview.proposal().intent(),
+            WorkContextMutationIntent::CreateProject(_)
+        ) {
+            // A create-project preview has no pre-existing project scope. The
+            // v2 lookup wire carries only a caller-selected project, so it
+            // cannot soundly bind this receipt to its resulting project.
+            return Ok(ReceiptLookup::Unknown);
+        }
+        let policy = MutationPolicyDecision::new(
+            authenticated_actor.clone(),
+            serving_authority,
+            actor_authority.clone(),
+            inherited_authority.clone(),
+            Some(authorized_project.clone()),
+            authorized_targets.clone(),
+            preview.proposal().request_digest(),
+            preview.approval(),
+        );
+        match load_receipt_lookup(&self.connection, &policy, predicate, value) {
+            Err(WorkContextStoreError::Unauthorized) => Ok(ReceiptLookup::Unknown),
+            result => result,
+        }
+    }
+
     pub fn inventory(
         &mut self,
         actor: &Actor,
@@ -1936,6 +2251,14 @@ impl WorkContextStore {
         allowed: &BTreeSet<WorkContextIdentity>,
         now_ms: i64,
     ) -> Stored<WorkContextQueryResult> {
+        if now_ms < 0 {
+            return Err(WorkContextStoreError::InvalidField("cursor_time"));
+        }
+        let cutoff = now_ms.saturating_sub(CURSOR_RETENTION_MILLIS);
+        self.connection.execute(
+            "DELETE FROM work_context_cursor_state WHERE tenant=?1 AND actor_id=?2 AND created_at_ms<?3",
+            params![actor.tenant(), actor.id(), cutoff],
+        )?;
         if let Some(after) = query.after() {
             let owner: Option<(String, String)> = self
                 .connection
@@ -1954,11 +2277,15 @@ impl WorkContextStore {
                 ));
             }
         }
-        let all = load_all_records(&self.connection, actor.tenant())?;
-        let map: BTreeMap<WorkContextIdentity, WorkContextRecord> = all
-            .into_iter()
-            .map(|record| (record.identity().clone(), record))
-            .collect();
+        // Decode only the policy-bounded identity set. A tenant may hold an
+        // arbitrary number of unrelated records, none of which should affect
+        // this query's CPU or memory cost.
+        let mut map = BTreeMap::new();
+        for identity in allowed {
+            if let Some(record) = load_record(&self.connection, actor.tenant(), identity)? {
+                map.insert(identity.clone(), record);
+            }
+        }
         let mut authorized = Vec::new();
         for identity in allowed {
             if let Some(record) = map.get(identity) {
@@ -1979,6 +2306,10 @@ impl WorkContextStore {
                 |row| row.get(0),
             )?;
             self.connection.execute("INSERT INTO work_context_cursor_state(tenant,actor_id,cursor,inventory_generation,created_at_ms) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(tenant,actor_id,cursor) DO UPDATE SET inventory_generation=excluded.inventory_generation,created_at_ms=excluded.created_at_ms",params![actor.tenant(),actor.id(),cursor.as_str(),generation,now_ms])?;
+            self.connection.execute(
+                "DELETE FROM work_context_cursor_state WHERE tenant=?1 AND actor_id=?2 AND cursor NOT IN (SELECT cursor FROM work_context_cursor_state WHERE tenant=?1 AND actor_id=?2 ORDER BY created_at_ms DESC,cursor DESC LIMIT ?3)",
+                params![actor.tenant(), actor.id(), MAX_CURSORS_PER_ACTOR],
+            )?;
         }
         Ok(result)
     }
@@ -2475,28 +2806,33 @@ fn load_required_record(
 ) -> Stored<WorkContextRecord> {
     load_record(connection, tenant, identity)?.ok_or(WorkContextStoreError::NotFound)
 }
-fn load_all_records(connection: &Connection, tenant: &str) -> Stored<Vec<WorkContextRecord>> {
-    let mut statement = connection
-        .prepare("SELECT identity_key,record_document FROM work_context_records WHERE tenant=?1 ORDER BY identity_key")?;
-    let rows = statement.query_map([tenant], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-    })?;
-    let identities: Vec<WorkContextIdentity> = rows
-        .map(|row| {
-            let (key, bytes) = row?;
-            let record = decode_record_document(&bytes)?;
-            if identity_key(record.identity()) != key || record_document(&record)? != bytes {
-                return Err(WorkContextStoreError::Corrupt("record_projection"));
-            }
-            Ok(record.identity().clone())
-        })
-        .collect::<Stored<_>>()?;
-    drop(statement);
-    identities
-        .iter()
-        .map(|identity| load_required_record(connection, tenant, identity))
-        .collect()
+
+fn validate_policy_mapping_on(
+    connection: &Connection,
+    tenant: &str,
+    project: &ProjectId,
+    identity: &WorkContextIdentity,
+) -> Stored<WorkContextRecord> {
+    if let WorkContextIdentity::Project(identity_project) = identity
+        && identity_project != project
+    {
+        return Err(WorkContextStoreError::Unauthorized);
+    }
+    let record = load_required_record(connection, tenant, identity)?;
+    let owner: Option<String> = connection
+        .query_row(
+            "SELECT owning_project_id FROM work_context_expected_revisions WHERE tenant=?1 AND identity_key=?2 AND external_resolution IS NULL",
+            params![tenant, identity_key(identity)],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    if owner.as_deref() != Some(project.as_str()) {
+        return Err(WorkContextStoreError::Unauthorized);
+    }
+    Ok(record)
 }
+
 fn bump_generation(tx: &Transaction<'_>) -> Stored<()> {
     tx.execute("UPDATE work_context_meta SET inventory_generation=inventory_generation+1 WHERE singleton=1",[])?;
     Ok(())
@@ -2832,6 +3168,7 @@ fn recheck_policy(preview: &MutationPreview, policy: &MutationPolicyDecision) ->
         return Err(WorkContextStoreError::Unauthorized);
     }
     if proposal.actor_authority() != &policy.actor_authority
+        || preview.inherited_authority() != &policy.inherited_authority
         || preview.approval() != policy.approval
         || !preview
             .effective_authority()

@@ -2,12 +2,13 @@
 
 //! Platform-v1 framing and durable controller semantics over the real socket.
 
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use automonique_daemon::{Daemon, DaemonConfig};
@@ -16,28 +17,70 @@ use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_f
 use automonique_protocol::platform::{
     ClaimControlRequest, ClientId, ExecuteRequest, GetReceiptRequest, IdempotencyKey,
     ListSessionsRequest, PlatformAction, PlatformParameter, PlatformRequest, PlatformResponse,
-    PlatformText, ReceiptOutcome, ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
-    SessionApprovalDecision, SessionApprovalDecisionRequest, SessionCommandStateRequest,
-    SessionFollowUpRequest, SessionRunStopRequest, SnapshotRequest,
+    PlatformText, ReceiptId, ReceiptOutcome, ResourceAuthority, ResourceCoordinate, ResourceId,
+    ResourceKind, SessionApprovalDecision, SessionApprovalDecisionRequest,
+    SessionCommandStateRequest, SessionFollowUpRequest, SessionRunStopRequest, SnapshotRequest,
 };
 use automonique_protocol::platform_api::{PlatformRequestMessage, PlatformResponseMessage};
 use automonique_protocol::platform_v2::{
-    PlatformVersion, PlatformVersionOffer, UserWorkspaceId, WorkContextIdentity,
+    AttemptWorkspaceId, CheckoutKind, HostSetupKind, PaneId, PlatformVersion, PlatformVersionOffer,
+    ProjectId, UserWorkspaceId, V1RepositoryRef, V1SessionRef, WorkContextAttributes,
+    WorkContextIdentity, WorkContextLabel, WorkContextLifecycle, WorkContextRecord,
+    WorkContextRelation, WorkContextRelationKind, WorkContextTargetKind, WorkSessionId,
+};
+use automonique_protocol::platform_v2_lifecycle::{
+    ArchiveIntent, AuthorityGrantId, CreateAttemptWorkspaceIntent, CreateCheckoutIntent,
+    ExpectedWorkContext, ExternalParentResolution, MutationApprovalDecision,
+    MutationApprovalRequirement, WorkContextAuthority, WorkContextMutationIntent,
+    WorkContextRegistrySelector,
+};
+use automonique_protocol::platform_v2_lifecycle_api::{
+    encode_work_context_mutation_submission, work_context_mutation_preview_digest,
+};
+use automonique_protocol::platform_v2_lineage::{
+    LineageFreshness, LineageFreshnessState, LineageStatus, OrchestrationIdentity,
+    OrchestrationRecord, OrchestrationRunId, OrchestrationTaskId, WorkspaceIntent,
+    WorkspaceIntentId, WorkspaceResumeIntent,
+};
+use automonique_protocol::platform_v2_review_api::{
+    decode_review_action_request, decode_review_snapshot,
 };
 use automonique_protocol::platform_v2_transport::{
+    LineageReadRequest, MutationDecisionRequest, MutationPrepareRequest, MutationReceiptLookup,
     PlatformNegotiationRequest, PlatformNegotiationRequestMessage, PlatformNegotiationResponse,
     PlatformNegotiationResponseMessage, PlatformV2Request, PlatformV2RequestMessage,
-    PlatformV2Response, PlatformV2ResponseMessage,
+    PlatformV2Response, PlatformV2ResponseMessage, ReceiptLookupKey, ReviewActionTransportRequest,
+    ReviewReceiptLookup, WorkspaceIntentLookup, WorkspaceIntentRequest,
 };
-use automonique_protocol::primitives::Revision;
+use automonique_protocol::primitives::{EpochMillis, Revision};
 use automonique_store::approval_requests::{
     ApprovalContext, ApprovalProposal, ApprovalRequests, ApprovalState,
 };
+use automonique_store::lineage_index::LineageIndex;
 use automonique_store::provider_journal::{ProcessSpawn, ProviderJournal, SessionOpening};
+use automonique_store::review_store::ReviewStore;
 use automonique_store::run_index::{RunIndex, RunIndexEntry, RunSpoolState, StateAdvance};
+use automonique_store::work_context_store::{MutationPolicyDecision, WorkContextStore};
 
 #[path = "support/isolation.rs"]
 mod test_isolation;
+
+const REVIEW_SNAPSHOT: &[u8] =
+    include_bytes!("../../automonique-protocol/fixtures/platform-v2-review-v2.json");
+const REVIEW_ACTION: &[u8] =
+    include_bytes!("../../automonique-protocol/fixtures/platform-v2-review-action-v1.json");
+
+static FULL_DAEMON_TEST_GUARD: Mutex<()> = Mutex::new(());
+
+fn full_daemon_test_guard() -> MutexGuard<'static, ()> {
+    match FULL_DAEMON_TEST_GUARD.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            FULL_DAEMON_TEST_GUARD.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
 
 fn fixture() -> (tempfile::TempDir, DaemonConfig) {
     let root = tempfile::tempdir().expect("temporary root");
@@ -127,8 +170,373 @@ fn platform(config: &DaemonConfig, label: &str, request: PlatformRequest) -> Pla
     response.response().clone()
 }
 
+fn platform_v2(
+    config: &DaemonConfig,
+    label: &str,
+    request: PlatformV2Request,
+) -> PlatformV2Response {
+    let request = PlatformV2RequestMessage::new(RequestId::new(label).unwrap(), request);
+    PlatformV2ResponseMessage::from_canonical_bytes(
+        &exchange(config, &request.to_canonical_bytes().unwrap()),
+        &request,
+    )
+    .unwrap()
+    .response()
+    .clone()
+}
+
+fn configure_v2(config: &DaemonConfig) {
+    std::fs::create_dir(config.state_dir()).expect("product state");
+    std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
+        .expect("private product state");
+    let uid = nix::unistd::geteuid().as_raw();
+    let policy = serde_json::json!({
+        "version": 1,
+        "principals": [{
+            "uid": uid,
+            "tenant": "tenant-live",
+            "actor": "operator-live",
+            "serving_authority": "automonique",
+            "projects": ["project-live"],
+            "workspaces": [
+                {"project": "project-live", "kind": "project", "id": "project-live",
+                 "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []}},
+                {"project": "project-live", "kind": "host_setup", "id": "host-live",
+                 "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []}},
+                {"project": "project-live", "kind": "checkout", "id": "checkout-live",
+                 "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []}},
+                {"project": "project-live", "kind": "user_workspace", "id": "workspace-live",
+                 "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []}},
+                {"project": "project-live", "kind": "user_workspace", "id": "wc_user_1",
+                 "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []}},
+                {"project": "project-live", "kind": "attempt_workspace", "id": "attempt-live",
+                 "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []}},
+                {"project": "project-live", "kind": "session", "id": "session-live",
+                 "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []}},
+                {"project": "project-live", "kind": "pane", "id": "pane-live",
+                 "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []}}
+            ],
+            "authority": {
+                "filesystem": [], "credentials": [], "network": [],
+                "tools": [], "providers": [], "models": []
+            },
+            "review_authorities": {"ci": "authority-1"}
+        }]
+    });
+    let path = config.platform_v2_policy_path();
+    std::fs::write(&path, serde_json::to_vec(&policy).unwrap()).expect("v2 policy");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .expect("private v2 policy");
+
+    let mut store = WorkContextStore::open(config.platform_v2_work_context_path())
+        .expect("v2 work context store");
+    let repository = live_repository("repo-live");
+    store
+        .put_external_snapshot(
+            "tenant-live",
+            &ExpectedWorkContext::new(repository.clone(), Revision::FIRST),
+            ExternalParentResolution::Available,
+            Some(&ProjectId::new("project-live").unwrap()),
+        )
+        .unwrap();
+    let unrelated_repository = live_repository("repo-unrelated");
+    store
+        .put_external_snapshot(
+            "tenant-live",
+            &ExpectedWorkContext::new(unrelated_repository, Revision::FIRST),
+            ExternalParentResolution::Available,
+            Some(&ProjectId::new("project-live").unwrap()),
+        )
+        .unwrap();
+    let project = WorkContextRecord::new(
+        WorkContextIdentity::Project(ProjectId::new("project-live").unwrap()),
+        Revision::FIRST,
+        WorkContextLifecycle::Active,
+        WorkContextLabel::new("Live project").unwrap(),
+        WorkContextAttributes::EMPTY,
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::ProjectRepository,
+                repository.clone(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    store
+        .put_authoritative_record("tenant-live", &project)
+        .expect("seed project");
+    let host = WorkContextRecord::new(
+        WorkContextIdentity::parse_local(
+            automonique_protocol::platform_v2::WorkContextTargetKind::HostSetup,
+            "host-live",
+        )
+        .unwrap(),
+        Revision::FIRST,
+        WorkContextLifecycle::Active,
+        WorkContextLabel::new("Live host").unwrap(),
+        WorkContextAttributes::host_setup(HostSetupKind::Local),
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::HostSetupProject,
+                project.identity().clone(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    store
+        .put_authoritative_record("tenant-live", &host)
+        .unwrap();
+    let checkout = WorkContextRecord::new(
+        WorkContextIdentity::parse_local(
+            automonique_protocol::platform_v2::WorkContextTargetKind::Checkout,
+            "checkout-live",
+        )
+        .unwrap(),
+        Revision::FIRST,
+        WorkContextLifecycle::Active,
+        WorkContextLabel::new("Live checkout").unwrap(),
+        WorkContextAttributes::checkout(CheckoutKind::GitWorktree),
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::CheckoutProject,
+                project.identity().clone(),
+            )
+            .unwrap(),
+            WorkContextRelation::new(
+                WorkContextRelationKind::CheckoutHostSetup,
+                host.identity().clone(),
+            )
+            .unwrap(),
+            WorkContextRelation::new(WorkContextRelationKind::CheckoutRepository, repository)
+                .unwrap(),
+        ],
+    )
+    .unwrap();
+    store
+        .put_authoritative_record("tenant-live", &checkout)
+        .unwrap();
+    for id in ["workspace-live", "wc_user_1"] {
+        let workspace = live_workspace(id, Revision::FIRST, WorkContextLifecycle::Active);
+        store
+            .put_authoritative_record("tenant-live", &workspace)
+            .unwrap();
+    }
+    let attempt = WorkContextRecord::new(
+        WorkContextIdentity::AttemptWorkspace(AttemptWorkspaceId::new("attempt-live").unwrap()),
+        Revision::FIRST,
+        WorkContextLifecycle::Running,
+        WorkContextLabel::new("Live attempt").unwrap(),
+        WorkContextAttributes::EMPTY,
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::AttemptUserWorkspace,
+                WorkContextIdentity::UserWorkspace(UserWorkspaceId::new("workspace-live").unwrap()),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    store
+        .put_authoritative_record("tenant-live", &attempt)
+        .unwrap();
+    let platform_session = WorkContextIdentity::PlatformSession(
+        V1SessionRef::new(ResourceCoordinate::new(
+            ResourceAuthority::Automonique,
+            ResourceKind::Session,
+            ResourceId::new("platform-session-live").unwrap(),
+        ))
+        .unwrap(),
+    );
+    let session = WorkContextRecord::new(
+        WorkContextIdentity::Session(WorkSessionId::new("session-live").unwrap()),
+        Revision::FIRST,
+        WorkContextLifecycle::Active,
+        WorkContextLabel::new("Live session").unwrap(),
+        WorkContextAttributes::EMPTY,
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::SessionAttemptWorkspace,
+                attempt.identity().clone(),
+            )
+            .unwrap(),
+            WorkContextRelation::new(
+                WorkContextRelationKind::SessionPlatformSession,
+                platform_session,
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    store
+        .put_authoritative_record("tenant-live", &session)
+        .unwrap();
+    let pane = WorkContextRecord::new(
+        WorkContextIdentity::Pane(PaneId::new("pane-live").unwrap()),
+        Revision::FIRST,
+        WorkContextLifecycle::Active,
+        WorkContextLabel::new("Live pane").unwrap(),
+        WorkContextAttributes::EMPTY,
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::PaneSession,
+                session.identity().clone(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    store
+        .put_authoritative_record("tenant-live", &pane)
+        .unwrap();
+    store
+        .bind_private_selector(
+            "tenant-live",
+            &WorkContextRegistrySelector::new("checkout-live-selector").unwrap(),
+            b"live checkout binding",
+        )
+        .unwrap();
+    drop(store);
+
+    let mut reviews = ReviewStore::open_scoped(config.platform_v2_review_path(), "tenant-live")
+        .expect("v2 review store");
+    reviews
+        .put_snapshot(&decode_review_snapshot(REVIEW_SNAPSHOT).unwrap(), 10)
+        .expect("seed review snapshot");
+    drop(reviews);
+
+    let mut lineage =
+        LineageIndex::open(config.platform_v2_lineage_path()).expect("v2 lineage store");
+    let workspace = UserWorkspaceId::new("workspace-live").unwrap();
+    let freshness =
+        LineageFreshness::new(1_800_000_000_000, 30_000, LineageFreshnessState::Fresh).unwrap();
+    let run = OrchestrationIdentity::Run(OrchestrationRunId::new("run-live").unwrap());
+    lineage
+        .record_orchestration(
+            "tenant-live",
+            &OrchestrationRecord::new(
+                run.clone(),
+                workspace.clone(),
+                None,
+                None,
+                LineageStatus::Working,
+                freshness,
+                None,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+    lineage
+        .record_orchestration(
+            "tenant-live",
+            &OrchestrationRecord::new(
+                OrchestrationIdentity::Task(OrchestrationTaskId::new("task-live").unwrap()),
+                workspace,
+                None,
+                Some(run),
+                LineageStatus::Working,
+                freshness,
+                None,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+}
+
+fn live_repository(id: &str) -> WorkContextIdentity {
+    WorkContextIdentity::Repository(
+        V1RepositoryRef::new(ResourceCoordinate::new(
+            ResourceAuthority::GitHub,
+            ResourceKind::Repository,
+            ResourceId::new(id).unwrap(),
+        ))
+        .unwrap(),
+    )
+}
+
+fn live_workspace(
+    id: &str,
+    revision: Revision,
+    lifecycle: WorkContextLifecycle,
+) -> WorkContextRecord {
+    WorkContextRecord::new(
+        WorkContextIdentity::UserWorkspace(UserWorkspaceId::new(id).unwrap()),
+        revision,
+        lifecycle,
+        WorkContextLabel::new(id).unwrap(),
+        WorkContextAttributes::EMPTY,
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::UserWorkspaceProject,
+                WorkContextIdentity::Project(ProjectId::new("project-live").unwrap()),
+            )
+            .unwrap(),
+            WorkContextRelation::new(
+                WorkContextRelationKind::UserWorkspaceCheckout,
+                WorkContextIdentity::parse_local(
+                    automonique_protocol::platform_v2::WorkContextTargetKind::Checkout,
+                    "checkout-live",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap()
+}
+
+fn set_tool_authority(config: &DaemonConfig, narrow_workspace_live: bool) {
+    let path = config.platform_v2_policy_path();
+    let mut policy: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let principal = &mut policy["principals"][0];
+    principal["authority"]["tools"] = serde_json::json!(["tool-live"]);
+    for workspace in principal["workspaces"].as_array_mut().unwrap() {
+        let narrowed_subtree = (workspace["kind"] == "user_workspace"
+            && workspace["id"] == "workspace-live")
+            || workspace["kind"] == "attempt_workspace"
+            || workspace["kind"] == "session"
+            || workspace["kind"] == "pane";
+        workspace["inherited_authority"]["tools"] = if narrow_workspace_live && narrowed_subtree {
+            serde_json::json!([])
+        } else {
+            serde_json::json!(["tool-live"])
+        };
+    }
+    std::fs::write(path, serde_json::to_vec(&policy).unwrap()).unwrap();
+}
+
+fn remove_policy_scope(config: &DaemonConfig, kind: &str, id: &str) {
+    let path = config.platform_v2_policy_path();
+    let mut policy: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    policy["principals"][0]["workspaces"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|workspace| workspace["kind"] != kind || workspace["id"] != id);
+    std::fs::write(path, serde_json::to_vec(&policy).unwrap()).unwrap();
+}
+
+fn set_scope_tools(config: &DaemonConfig, kind: &str, id: &str, tools: &[&str]) {
+    let path = config.platform_v2_policy_path();
+    let mut policy: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let scope = policy["principals"][0]["workspaces"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|scope| scope["kind"] == kind && scope["id"] == id)
+        .unwrap();
+    scope["inherited_authority"]["tools"] = serde_json::json!(tools);
+    std::fs::write(path, serde_json::to_vec(&policy).unwrap()).unwrap();
+}
+
 #[test]
 fn negotiation_advertises_only_v1_and_v2_fails_closed_until_host_wiring() {
+    let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     let serving = serve(&config);
 
@@ -179,6 +587,828 @@ fn negotiation_advertises_only_v1_and_v2_fails_closed_until_host_wiring() {
             if refusal.category().as_str() == "platform_v2_unavailable"
     ));
 
+    serving.shutdown(&config);
+}
+
+#[test]
+fn multi_tenant_policy_fails_closed_without_changing_v1() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    std::fs::create_dir(config.state_dir()).unwrap();
+    std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let uid = nix::unistd::geteuid().as_raw();
+    let principal = |uid: u32, tenant: &str| {
+        serde_json::json!({
+            "uid": uid,
+            "tenant": tenant,
+            "actor": "operator",
+            "serving_authority": "automonique",
+            "projects": ["project-live"],
+            "workspaces": [],
+            "authority": {
+                "filesystem": [], "credentials": [], "network": [],
+                "tools": [], "providers": [], "models": []
+            },
+            "review_authorities": {}
+        })
+    };
+    let policy = serde_json::json!({
+        "version": 1,
+        "principals": [principal(uid, "tenant-one"), principal(uid.saturating_add(1), "tenant-two")]
+    });
+    let path = config.platform_v2_policy_path();
+    std::fs::write(&path, serde_json::to_vec(&policy).unwrap()).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let serving = serve(&config);
+    let negotiation = PlatformNegotiationRequestMessage::new(
+        RequestId::new("negotiate-invalid-v2-policy").unwrap(),
+        PlatformNegotiationRequest::Negotiate(PlatformVersionOffer::new(vec![1, 2]).unwrap()),
+    );
+    let response = PlatformNegotiationResponseMessage::from_canonical_bytes(
+        &exchange(&config, &negotiation.to_canonical_bytes().unwrap()),
+        &negotiation,
+    )
+    .unwrap();
+    assert!(matches!(
+        response.response(),
+        PlatformNegotiationResponse::Negotiated(selected)
+            if selected.version() == PlatformVersion::V1
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-invalid-policy-refusal",
+            PlatformV2Request::GetWorkContext(WorkContextIdentity::Project(
+                ProjectId::new("project-live").unwrap()
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_policy_invalid"
+    ));
+    serving.shutdown(&config);
+
+    std::fs::set_permissions(
+        config.platform_v2_policy_path(),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-insecure-policy-refusal",
+            PlatformV2Request::GetWorkContext(WorkContextIdentity::Project(
+                ProjectId::new("project-live").unwrap()
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_policy_insecure"
+    ));
+    serving.shutdown(&config);
+
+    std::fs::set_permissions(
+        config.platform_v2_policy_path(),
+        std::fs::Permissions::from_mode(0o4600),
+    )
+    .unwrap();
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-special-mode-policy-refusal",
+            PlatformV2Request::GetWorkContext(WorkContextIdentity::Project(
+                ProjectId::new("project-live").unwrap()
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_policy_insecure"
+    ));
+    serving.shutdown(&config);
+
+    let target = config.state_dir().join("policy-target.json");
+    std::fs::rename(config.platform_v2_policy_path(), &target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::symlink(&target, config.platform_v2_policy_path()).unwrap();
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-symlink-policy-refusal",
+            PlatformV2Request::GetWorkContext(WorkContextIdentity::Project(
+                ProjectId::new("project-live").unwrap()
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_policy_insecure"
+    ));
+    serving.shutdown(&config);
+}
+
+#[test]
+fn configured_v2_uses_kernel_principal_scope_and_durable_idempotency() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let serving = serve(&config);
+
+    let negotiation = PlatformNegotiationRequestMessage::new(
+        RequestId::new("negotiate-v2-live").unwrap(),
+        PlatformNegotiationRequest::Negotiate(PlatformVersionOffer::new(vec![1, 2]).unwrap()),
+    );
+    let response = PlatformNegotiationResponseMessage::from_canonical_bytes(
+        &exchange(&config, &negotiation.to_canonical_bytes().unwrap()),
+        &negotiation,
+    )
+    .unwrap();
+    assert!(matches!(
+        response.response(),
+        PlatformNegotiationResponse::Negotiated(selected)
+            if selected.version() == PlatformVersion::V2
+    ));
+
+    let project = WorkContextIdentity::Project(ProjectId::new("project-live").unwrap());
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-authorized-read",
+            PlatformV2Request::GetWorkContext(project)
+        ),
+        PlatformV2Response::WorkContextRecord(record)
+            if record.identity().id() == "project-live"
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-denied-read",
+            PlatformV2Request::GetWorkContext(WorkContextIdentity::Project(
+                ProjectId::new("project-other").unwrap()
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_scope_denied"
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-denied-cross-project-lineage",
+            PlatformV2Request::GetLineage(LineageReadRequest::new(
+                ProjectId::new("project-other").unwrap(),
+                UserWorkspaceId::new("workspace-live").unwrap(),
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_scope_denied"
+    ));
+
+    let resume = WorkspaceIntent::Resume(WorkspaceResumeIntent::new(
+        WorkspaceIntentId::new("intent-resume-live").unwrap(),
+        OrchestrationTaskId::new("task-live").unwrap(),
+        UserWorkspaceId::new("workspace-live").unwrap(),
+        Revision::FIRST,
+    ));
+    let resume_request =
+        WorkspaceIntentRequest::new(ProjectId::new("project-live").unwrap(), resume.clone());
+    let stale_resume = WorkspaceIntent::Resume(WorkspaceResumeIntent::new(
+        WorkspaceIntentId::new("intent-resume-stale").unwrap(),
+        OrchestrationTaskId::new("task-live").unwrap(),
+        UserWorkspaceId::new("workspace-live").unwrap(),
+        Revision::new(2).unwrap(),
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-resume-stale",
+            PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(
+                ProjectId::new("project-live").unwrap(),
+                stale_resume,
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_resume_stale_revision"
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-resume-no-adapter",
+            PlatformV2Request::SubmitWorkspaceIntent(resume_request)
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_resume_adapter_pending"
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-resume-not-admitted",
+            PlatformV2Request::GetWorkspaceIntent(WorkspaceIntentLookup::new(
+                ProjectId::new("project-live").unwrap(),
+                resume.intent_id().clone(),
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_not_found"
+    ));
+
+    let prepare = MutationPrepareRequest::new(
+        IdempotencyKey::new("archive-project-once").unwrap(),
+        WorkContextMutationIntent::ArchiveProject(
+            ArchiveIntent::new(ExpectedWorkContext::new(
+                WorkContextIdentity::Project(ProjectId::new("project-live").unwrap()),
+                Revision::FIRST,
+            ))
+            .unwrap(),
+        ),
+    );
+    let PlatformV2Response::MutationPreview(first) = platform_v2(
+        &config,
+        "v2-prepare-first",
+        PlatformV2Request::PrepareMutation(prepare.clone()),
+    ) else {
+        panic!("first preview")
+    };
+    let PlatformV2Response::MutationPreview(replay) = platform_v2(
+        &config,
+        "v2-prepare-replay",
+        PlatformV2Request::PrepareMutation(prepare),
+    ) else {
+        panic!("preview replay")
+    };
+    assert_eq!(replay, first);
+
+    let decision = MutationDecisionRequest::new(
+        first.preview().clone(),
+        work_context_mutation_preview_digest(&first).unwrap(),
+        MutationApprovalDecision::Granted,
+    );
+    let PlatformV2Response::MutationApproval(approval) = platform_v2(
+        &config,
+        "v2-decision-first",
+        PlatformV2Request::DecideMutation(decision.clone()),
+    ) else {
+        panic!("first decision")
+    };
+    let PlatformV2Response::MutationApproval(approval_replay) = platform_v2(
+        &config,
+        "v2-decision-replay",
+        PlatformV2Request::DecideMutation(decision),
+    ) else {
+        panic!("decision replay")
+    };
+    assert_eq!(approval_replay, approval);
+
+    let fixture_action = decode_review_action_request(REVIEW_ACTION).unwrap();
+    let action = ReviewActionTransportRequest::new(
+        fixture_action.workspace().clone(),
+        fixture_action.expected_revision(),
+        fixture_action.action().clone(),
+        fixture_action.idempotency_key().clone(),
+    )
+    .unwrap();
+    let client_document = PlatformV2RequestMessage::new(
+        RequestId::new("v2-review-client-shape").unwrap(),
+        PlatformV2Request::ExecuteReviewAction(action.clone()),
+    )
+    .to_canonical_bytes()
+    .unwrap();
+    let client_document = std::str::from_utf8(&client_document).unwrap();
+    assert!(!client_document.contains("\"actor\""));
+    assert!(!client_document.contains("\"tenant\""));
+    assert!(!client_document.contains("\"authentication\""));
+    assert!(!client_document.contains("\"authority\""));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-review-no-adapter",
+            PlatformV2Request::ExecuteReviewAction(action.clone()),
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_review_adapter_pending"
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-review-no-custody-receipt",
+            PlatformV2Request::GetReviewReceipt(
+                ReviewReceiptLookup::new(
+                    ProjectId::new("project-live").unwrap(),
+                    action.workspace().clone(),
+                    action.idempotency_key().clone(),
+                )
+                .unwrap()
+            )
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_not_found"
+    ));
+
+    serving.shutdown(&config);
+
+    // The v2 records are sibling durable stores and survive a daemon restart;
+    // Platform v1 startup and shutdown continue to use the same socket.
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-read-after-restart",
+            PlatformV2Request::GetWorkContext(WorkContextIdentity::Project(
+                ProjectId::new("project-live").unwrap()
+            ))
+        ),
+        PlatformV2Response::WorkContextRecord(_)
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-resume-still-not-admitted-after-restart",
+            PlatformV2Request::GetWorkspaceIntent(WorkspaceIntentLookup::new(
+                ProjectId::new("project-live").unwrap(),
+                resume.intent_id().clone(),
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_not_found"
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-review-still-no-custody-after-restart",
+            PlatformV2Request::GetReviewReceipt(
+                ReviewReceiptLookup::new(
+                    ProjectId::new("project-live").unwrap(),
+                    action.workspace().clone(),
+                    action.idempotency_key().clone(),
+                )
+                .unwrap(),
+            )
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_not_found"
+    ));
+    serving.shutdown(&config);
+}
+
+#[test]
+fn changed_policy_refuses_negotiation_and_requests_until_restart() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    set_tool_authority(&config, false);
+    let serving = serve(&config);
+
+    set_tool_authority(&config, true);
+    let negotiation = PlatformNegotiationRequestMessage::new(
+        RequestId::new("negotiate-stale-policy").unwrap(),
+        PlatformNegotiationRequest::Negotiate(PlatformVersionOffer::new(vec![2]).unwrap()),
+    );
+    let response = PlatformNegotiationResponseMessage::from_canonical_bytes(
+        &exchange(&config, &negotiation.to_canonical_bytes().unwrap()),
+        &negotiation,
+    )
+    .unwrap();
+    assert!(matches!(
+        response.response(),
+        PlatformNegotiationResponse::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_policy_changed"
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-stale-policy-refusal",
+            PlatformV2Request::GetWorkContext(WorkContextIdentity::Project(
+                ProjectId::new("project-live").unwrap()
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_policy_changed"
+    ));
+    serving.shutdown(&config);
+
+    let restarted = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-narrowed-policy-after-restart",
+            PlatformV2Request::GetWorkContext(WorkContextIdentity::Project(
+                ProjectId::new("project-live").unwrap()
+            ))
+        ),
+        PlatformV2Response::WorkContextRecord(_)
+    ));
+    restarted.shutdown(&config);
+}
+
+#[test]
+fn resume_requires_live_durable_workspace_and_never_admits_without_adapter() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let mut store = WorkContextStore::open(config.platform_v2_work_context_path()).unwrap();
+    store
+        .put_authoritative_record(
+            "tenant-live",
+            &live_workspace(
+                "workspace-live",
+                Revision::new(2).unwrap(),
+                WorkContextLifecycle::Archived,
+            ),
+        )
+        .unwrap();
+    drop(store);
+    let serving = serve(&config);
+    let intent = WorkspaceIntent::Resume(WorkspaceResumeIntent::new(
+        WorkspaceIntentId::new("intent-archived").unwrap(),
+        OrchestrationTaskId::new("task-live").unwrap(),
+        UserWorkspaceId::new("workspace-live").unwrap(),
+        Revision::new(2).unwrap(),
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-resume-archived",
+            PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(
+                ProjectId::new("project-live").unwrap(),
+                intent.clone(),
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_resume_not_resumable"
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-archived-resume-not-stored",
+            PlatformV2Request::GetWorkspaceIntent(WorkspaceIntentLookup::new(
+                ProjectId::new("project-live").unwrap(),
+                intent.intent_id().clone(),
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_not_found"
+    ));
+    serving.shutdown(&config);
+}
+
+#[test]
+fn durable_mapping_drift_disables_v2_actions_fail_closed() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let serving = serve(&config);
+    let connection = rusqlite::Connection::open(config.platform_v2_work_context_path()).unwrap();
+    connection
+        .execute(
+            "DELETE FROM work_context_records WHERE tenant='tenant-live' AND identity_id='workspace-live'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let intent = WorkspaceIntent::Resume(WorkspaceResumeIntent::new(
+        WorkspaceIntentId::new("intent-deleted-workspace").unwrap(),
+        OrchestrationTaskId::new("task-live").unwrap(),
+        UserWorkspaceId::new("workspace-live").unwrap(),
+        Revision::FIRST,
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-resume-deleted-workspace",
+            PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(
+                ProjectId::new("project-live").unwrap(),
+                intent,
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_policy_incoherent"
+    ));
+    serving.shutdown(&config);
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-startup-incoherent-mapping",
+            PlatformV2Request::GetWorkContext(WorkContextIdentity::Project(
+                ProjectId::new("project-live").unwrap(),
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_policy_incoherent"
+    ));
+    serving.shutdown(&config);
+}
+
+#[test]
+fn policy_requires_the_complete_durable_inheritance_chain() {
+    let _guard = full_daemon_test_guard();
+    for (kind, id, label) in [
+        ("host_setup", "host-live", "v2-missing-host-parent"),
+        ("checkout", "checkout-live", "v2-missing-checkout-parent"),
+        (
+            "user_workspace",
+            "workspace-live",
+            "v2-missing-attempt-parent",
+        ),
+        (
+            "attempt_workspace",
+            "attempt-live",
+            "v2-missing-session-parent",
+        ),
+        ("session", "session-live", "v2-missing-pane-parent"),
+    ] {
+        let (_root, config) = fixture();
+        configure_v2(&config);
+        remove_policy_scope(&config, kind, id);
+        let serving = serve(&config);
+        assert!(matches!(
+            platform_v2(
+                &config,
+                label,
+                PlatformV2Request::GetWorkContext(WorkContextIdentity::UserWorkspace(
+                    UserWorkspaceId::new("workspace-live").unwrap(),
+                ))
+            ),
+            PlatformV2Response::Refused(refusal)
+                if refusal.category().as_str() == "platform_v2_policy_incoherent"
+        ));
+        serving.shutdown(&config);
+    }
+}
+
+#[test]
+fn complete_durable_inheritance_chain_enables_v2_reads() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-complete-policy-chain",
+            PlatformV2Request::GetWorkContext(WorkContextIdentity::Pane(
+                PaneId::new("pane-live").unwrap(),
+            ))
+        ),
+        PlatformV2Response::WorkContextRecord(record)
+            if record.identity().id() == "pane-live"
+    ));
+    serving.shutdown(&config);
+}
+
+#[test]
+fn session_and_pane_ceilings_cannot_exceed_their_direct_parents() {
+    let _guard = full_daemon_test_guard();
+    for (parent_kind, parent_id, label) in [
+        (
+            "attempt_workspace",
+            "attempt-live",
+            "v2-session-exceeds-attempt-ceiling",
+        ),
+        ("session", "session-live", "v2-pane-exceeds-session-ceiling"),
+    ] {
+        let (_root, config) = fixture();
+        configure_v2(&config);
+        set_tool_authority(&config, false);
+        set_scope_tools(&config, parent_kind, parent_id, &[]);
+        let serving = serve(&config);
+        assert!(matches!(
+            platform_v2(
+                &config,
+                label,
+                PlatformV2Request::GetWorkContext(WorkContextIdentity::Pane(
+                    PaneId::new("pane-live").unwrap(),
+                ))
+            ),
+            PlatformV2Response::Refused(refusal)
+                if refusal.category().as_str() == "platform_v2_policy_incoherent"
+        ));
+        serving.shutdown(&config);
+    }
+}
+
+#[test]
+fn create_checkout_authorizes_only_the_intents_durable_project_repository() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let serving = serve(&config);
+    let create_checkout = |repository, repository_revision, key: &str| {
+        MutationPrepareRequest::new(
+            IdempotencyKey::new(key).unwrap(),
+            WorkContextMutationIntent::CreateCheckout(
+                CreateCheckoutIntent::new(
+                    WorkContextLabel::new("New live checkout").unwrap(),
+                    ExpectedWorkContext::new(
+                        WorkContextIdentity::Project(ProjectId::new("project-live").unwrap()),
+                        Revision::FIRST,
+                    ),
+                    ExpectedWorkContext::new(
+                        WorkContextIdentity::parse_local(
+                            WorkContextTargetKind::HostSetup,
+                            "host-live",
+                        )
+                        .unwrap(),
+                        Revision::FIRST,
+                    ),
+                    ExpectedWorkContext::new(repository, repository_revision),
+                    CheckoutKind::GitWorktree,
+                    WorkContextRegistrySelector::new("checkout-live-selector").unwrap(),
+                )
+                .unwrap(),
+            ),
+        )
+    };
+    let prepare = create_checkout(
+        live_repository("repo-live"),
+        Revision::FIRST,
+        "checkout-authorized-once",
+    );
+    let PlatformV2Response::MutationPreview(first) = platform_v2(
+        &config,
+        "v2-checkout-authorized",
+        PlatformV2Request::PrepareMutation(prepare.clone()),
+    ) else {
+        panic!("authorized repository must produce a preview")
+    };
+    let PlatformV2Response::MutationPreview(replay) = platform_v2(
+        &config,
+        "v2-checkout-authorized-replay",
+        PlatformV2Request::PrepareMutation(prepare),
+    ) else {
+        panic!("authorized repository replay must produce the same preview")
+    };
+    assert_eq!(replay, first);
+
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-checkout-wrong-repository-revision",
+            PlatformV2Request::PrepareMutation(create_checkout(
+                live_repository("repo-live"),
+                Revision::new(2).unwrap(),
+                "checkout-wrong-repository-revision",
+            )),
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_mutation_refused"
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-checkout-unrelated-repository",
+            PlatformV2Request::PrepareMutation(create_checkout(
+                live_repository("repo-unrelated"),
+                Revision::FIRST,
+                "checkout-unrelated-repository",
+            )),
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_mutation_refused"
+    ));
+    serving.shutdown(&config);
+}
+
+#[test]
+fn restart_narrowing_revokes_old_preview_decision_and_receipt_reads() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    set_tool_authority(&config, false);
+    let serving = serve(&config);
+    let grant = AuthorityGrantId::new("tool-live").unwrap();
+    let authority =
+        WorkContextAuthority::new(vec![], vec![], vec![], vec![grant], vec![], vec![]).unwrap();
+    let key = IdempotencyKey::new("attempt-before-narrowing").unwrap();
+    let prepare = MutationPrepareRequest::new(
+        key.clone(),
+        WorkContextMutationIntent::CreateAttemptWorkspace(
+            CreateAttemptWorkspaceIntent::new(
+                WorkContextLabel::new("Attempt before narrowing").unwrap(),
+                ExpectedWorkContext::new(
+                    WorkContextIdentity::UserWorkspace(
+                        UserWorkspaceId::new("workspace-live").unwrap(),
+                    ),
+                    Revision::FIRST,
+                ),
+                authority.clone(),
+            )
+            .unwrap(),
+        ),
+    );
+    let PlatformV2Response::MutationPreview(preview) = platform_v2(
+        &config,
+        "v2-preview-before-narrowing",
+        PlatformV2Request::PrepareMutation(prepare),
+    ) else {
+        panic!("preview before narrowing")
+    };
+    let decision = MutationDecisionRequest::new(
+        preview.preview().clone(),
+        work_context_mutation_preview_digest(&preview).unwrap(),
+        MutationApprovalDecision::Granted,
+    );
+    let PlatformV2Response::MutationApproval(raw_approval) = platform_v2(
+        &config,
+        "v2-approval-before-narrowing",
+        PlatformV2Request::DecideMutation(decision.clone()),
+    ) else {
+        panic!("approval before narrowing")
+    };
+    serving.shutdown(&config);
+
+    // Seed the kind of accepted pre-adapter receipt an upgraded deployment
+    // may already contain. The daemon itself never admits this effect today.
+    let approval = raw_approval.decode(&preview).unwrap();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let submission = encode_work_context_mutation_submission(
+        &preview,
+        Some(&approval),
+        EpochMillis::from_millis(now_ms),
+    )
+    .unwrap();
+    let targets = BTreeSet::from([WorkContextIdentity::UserWorkspace(
+        UserWorkspaceId::new("workspace-live").unwrap(),
+    )]);
+    let policy = MutationPolicyDecision::new(
+        preview.proposal().actor().clone(),
+        preview.proposal().authority(),
+        authority.clone(),
+        authority,
+        Some(ProjectId::new("project-live").unwrap()),
+        targets,
+        preview.proposal().request_digest(),
+        MutationApprovalRequirement::Required,
+    );
+    let receipt_id = ReceiptId::new("receipt-before-narrowing").unwrap();
+    let mut store = WorkContextStore::open(config.platform_v2_work_context_path()).unwrap();
+    store
+        .submit_mutation(
+            preview.preview(),
+            &submission,
+            &policy,
+            receipt_id.clone(),
+            now_ms.saturating_add(1),
+        )
+        .unwrap();
+    drop(store);
+
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-old-preview-same-policy-after-restart",
+            PlatformV2Request::DecideMutation(decision.clone()),
+        ),
+        PlatformV2Response::MutationApproval(value) if value == raw_approval
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-old-receipt-same-policy-after-restart",
+            PlatformV2Request::GetMutationReceipt(MutationReceiptLookup::new(
+                ProjectId::new("project-live").unwrap(),
+                ReceiptLookupKey::ReceiptId(receipt_id.clone()),
+            )),
+        ),
+        PlatformV2Response::MutationReceipt(_)
+    ));
+    serving.shutdown(&config);
+
+    set_tool_authority(&config, true);
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-old-preview-after-narrowing",
+            PlatformV2Request::DecideMutation(decision),
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_decision_refused"
+    ));
+    for (label, lookup) in [
+        (
+            "v2-old-receipt-id-after-narrowing",
+            ReceiptLookupKey::ReceiptId(receipt_id),
+        ),
+        (
+            "v2-old-receipt-key-after-narrowing",
+            ReceiptLookupKey::IdempotencyKey(key),
+        ),
+    ] {
+        assert!(matches!(
+            platform_v2(
+                &config,
+                label,
+                PlatformV2Request::GetMutationReceipt(MutationReceiptLookup::new(
+                    ProjectId::new("project-live").unwrap(),
+                    lookup,
+                )),
+            ),
+            PlatformV2Response::Refused(refusal)
+                if refusal.category().as_str() == "platform_v2_not_found"
+        ));
+    }
     serving.shutdown(&config);
 }
 
@@ -269,6 +1499,7 @@ fn approval_proposal<'a>(key: &'a str, run_id: &'a str) -> ApprovalProposal<'a> 
 
 #[test]
 fn session_commands_are_fenced_to_the_managed_owner_before_receipt_admission() {
+    let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     std::fs::create_dir(config.state_dir()).expect("product state");
     std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
@@ -577,6 +1808,7 @@ fn command_state(
 /// and neither is what this file proves.
 #[test]
 fn a_live_turns_approval_is_projected_and_decidable_by_its_own_session() {
+    let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     std::fs::create_dir(config.state_dir()).expect("product state");
     std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
@@ -703,6 +1935,7 @@ fn a_live_turns_approval_is_projected_and_decidable_by_its_own_session() {
 /// so is an approval owned by it, with no receipt written for either.
 #[test]
 fn a_foreign_sessions_live_run_and_approval_are_refused() {
+    let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     std::fs::create_dir(config.state_dir()).expect("product state");
     std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
@@ -813,6 +2046,7 @@ fn a_foreign_sessions_live_run_and_approval_are_refused() {
 /// read model did.
 #[test]
 fn a_settled_turn_projects_as_before_and_an_abandoned_binding_heals_on_read() {
+    let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     std::fs::create_dir(config.state_dir()).expect("product state");
     std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
@@ -912,6 +2146,7 @@ fn a_settled_turn_projects_as_before_and_an_abandoned_binding_heals_on_read() {
 /// carrying the request id, never a bare EOF.
 #[test]
 fn platform_decode_failures_are_typed_refusals_and_absent_client_is_accepted() {
+    let _guard = full_daemon_test_guard();
     use automonique_protocol::wire::{JsonValue, Message};
 
     let (_root, config) = fixture();
@@ -1024,6 +2259,7 @@ fn platform_decode_failures_are_typed_refusals_and_absent_client_is_accepted() {
 
 #[test]
 fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
+    let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     std::fs::create_dir(config.state_dir()).expect("product state");
     std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
@@ -1334,6 +2570,7 @@ fn platform_capabilities_snapshot_and_controller_are_live_and_durable() {
 
 #[test]
 fn managed_request_worker_reconciles_a_typed_provider_refusal() {
+    let _guard = full_daemon_test_guard();
     let (_root, config) = fixture();
     std::fs::create_dir(config.state_dir()).expect("product state");
     std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))

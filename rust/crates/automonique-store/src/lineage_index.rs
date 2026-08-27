@@ -14,6 +14,7 @@
 //! does not execute workspace intents or claim that a stored observation is
 //! fresh; those remain responsibilities of the caller and lifecycle runtime.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::fs::OpenOptions;
@@ -669,6 +670,29 @@ impl LineageIndex {
             return Ok(None);
         };
         if value.workspace != scope.workspace.as_str() {
+            return Ok(None);
+        }
+        value.into_stored().map(Some)
+    }
+
+    /// Resolve an opaque intent id with one indexed lookup, then authorize its
+    /// stored workspace against the server-owned bounded visibility set.
+    pub fn intent_authorized_in_workspaces(
+        &self,
+        negotiated: &NegotiatedPlatform,
+        tenant: &str,
+        id: &WorkspaceIntentId,
+        allowed: &BTreeSet<UserWorkspaceId>,
+    ) -> Indexed<Option<StoredWorkspaceIntent>> {
+        require_lineage_v2(negotiated)
+            .map_err(|_| LineageIndexError::InvalidField("negotiated_platform"))?;
+        validate_tenant(tenant)?;
+        let Some(value) = read_intent(&self.connection, tenant, id.as_str())? else {
+            return Ok(None);
+        };
+        let workspace = UserWorkspaceId::new(value.workspace.clone())
+            .map_err(|_| LineageIndexError::Corrupt("intent_workspace"))?;
+        if !allowed.contains(&workspace) {
             return Ok(None);
         }
         value.into_stored().map(Some)

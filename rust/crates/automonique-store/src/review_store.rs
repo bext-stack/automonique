@@ -782,6 +782,14 @@ impl ReviewStore {
         Ok(ReviewActionAdmission::New(stored))
     }
 
+    /// Validate the exact actor grant, workspace revision, and action against
+    /// current durable state without admitting custody or creating a receipt.
+    pub fn validate_action(&self, request: &ReviewActionRequest, now_ms: i64) -> Stored<()> {
+        validate_time(now_ms)?;
+        require_active_authority(&self.connection, request, now_ms)?;
+        validate_current_action(&self.connection, request)
+    }
+
     pub fn decide_action(
         &mut self,
         approval: &ReviewApprovalDocument,
