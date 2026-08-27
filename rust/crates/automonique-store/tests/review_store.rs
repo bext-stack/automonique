@@ -278,6 +278,72 @@ fn local_comment_effect_is_atomic_exactly_once_and_actor_attributed() {
 }
 
 #[test]
+fn completed_local_effect_without_its_write_admission_fails_after_reopen() {
+    let private = PrivateStore::new();
+    let request = {
+        let mut store = ReviewStore::open(private.path()).expect("open");
+        let initial = snapshot();
+        let actor = ReviewActorId::new("actor-local-admission").expect("actor");
+        let authority = initial.review().authority().clone();
+        store.put_snapshot(&initial, 10).expect("snapshot");
+        store
+            .grant_authority(
+                initial.workspace(),
+                &actor,
+                ReviewAuthentication::UserSession,
+                &authority,
+                11,
+            )
+            .expect("grant");
+        let request = ReviewActionRequest::new(
+            initial.workspace().clone(),
+            initial.revision(),
+            actor,
+            ReviewAuthentication::UserSession,
+            authority,
+            IdempotencyKey::new("local-comment-admission").expect("key"),
+            ReviewAction::AddComment {
+                comment_id: ReviewCommentId::new("comment-local-admission").expect("comment"),
+                anchor: initial.comments()[0].anchor().clone(),
+                body: ReviewText::new("A bounded attributed comment.").expect("body"),
+            },
+        )
+        .expect("request");
+        let receipt = store
+            .execute_local_action(&request, 12)
+            .expect("completed local action");
+        assert_eq!(receipt.outcome(), ReviewReceiptOutcome::Completed);
+        request
+    };
+
+    let connection = Connection::open(private.path()).expect("raw open");
+    connection
+        .execute(
+            "UPDATE review_action_previews SET write_admission_id=NULL,write_admitted_at_ms=NULL,write_admission_document=NULL,write_admission_digest=NULL",
+            [],
+        )
+        .expect("remove completed admission");
+    drop(connection);
+
+    let mut reopened = ReviewStore::open(private.path()).expect("reopen");
+    assert!(matches!(
+        reopened.receipt(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            13,
+        ),
+        Err(ReviewStoreError::Corrupt("write_admission"))
+    ));
+    assert!(matches!(
+        reopened.execute_local_action(&request, 14),
+        Err(ReviewStoreError::Corrupt("write_admission"))
+    ));
+}
+
+#[test]
 fn local_review_approval_advances_one_revision_and_replays_terminal_receipt() {
     let private = PrivateStore::new();
     let mut store = ReviewStore::open(private.path()).expect("open");

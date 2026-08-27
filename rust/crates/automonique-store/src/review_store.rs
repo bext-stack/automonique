@@ -2730,6 +2730,13 @@ fn read_action_by_preview(
     if admission_fields.iter().any(|value| *value) && !admission_fields.iter().all(|value| *value) {
         return Err(ReviewStoreError::Corrupt("write_admission"));
     }
+    if matches!(
+        receipt.outcome(),
+        ReviewReceiptOutcome::Completed | ReviewReceiptOutcome::Unknown
+    ) && !admission_fields.iter().all(|value| *value)
+    {
+        return Err(ReviewStoreError::Corrupt("write_admission"));
+    }
     if let (Some(admission_id), Some(admitted_at), Some(document), Some(raw_digest)) = (
         raw.write_admission_id.as_deref(),
         raw.write_admitted_at_ms,
