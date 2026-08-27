@@ -2,6 +2,7 @@
 
 //! Platform-v1 framing and durable controller semantics over the real socket.
 
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
@@ -16,9 +17,9 @@ use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_f
 use automonique_protocol::platform::{
     ClaimControlRequest, ClientId, ExecuteRequest, GetReceiptRequest, IdempotencyKey,
     ListSessionsRequest, PlatformAction, PlatformParameter, PlatformRequest, PlatformResponse,
-    PlatformText, ReceiptOutcome, ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
-    SessionApprovalDecision, SessionApprovalDecisionRequest, SessionCommandStateRequest,
-    SessionFollowUpRequest, SessionRunStopRequest, SnapshotRequest,
+    PlatformText, ReceiptId, ReceiptOutcome, ResourceAuthority, ResourceCoordinate, ResourceId,
+    ResourceKind, SessionApprovalDecision, SessionApprovalDecisionRequest,
+    SessionCommandStateRequest, SessionFollowUpRequest, SessionRunStopRequest, SnapshotRequest,
 };
 use automonique_protocol::platform_api::{PlatformRequestMessage, PlatformResponseMessage};
 use automonique_protocol::platform_v2::{
@@ -27,10 +28,13 @@ use automonique_protocol::platform_v2::{
     WorkContextLifecycle, WorkContextRecord, WorkContextRelation, WorkContextRelationKind,
 };
 use automonique_protocol::platform_v2_lifecycle::{
-    ArchiveIntent, ExpectedWorkContext, ExternalParentResolution, MutationApprovalDecision,
-    WorkContextMutationIntent,
+    ArchiveIntent, AuthorityGrantId, CreateAttemptWorkspaceIntent, ExpectedWorkContext,
+    ExternalParentResolution, MutationApprovalDecision, MutationApprovalRequirement,
+    WorkContextAuthority, WorkContextMutationIntent,
 };
-use automonique_protocol::platform_v2_lifecycle_api::work_context_mutation_preview_digest;
+use automonique_protocol::platform_v2_lifecycle_api::{
+    encode_work_context_mutation_submission, work_context_mutation_preview_digest,
+};
 use automonique_protocol::platform_v2_lineage::{
     LineageFreshness, LineageFreshnessState, LineageStatus, OrchestrationIdentity,
     OrchestrationRecord, OrchestrationRunId, OrchestrationTaskId, WorkspaceIntent,
@@ -40,13 +44,13 @@ use automonique_protocol::platform_v2_review_api::{
     decode_review_action_request, decode_review_snapshot,
 };
 use automonique_protocol::platform_v2_transport::{
-    LineageReadRequest, MutationDecisionRequest, MutationPrepareRequest,
+    LineageReadRequest, MutationDecisionRequest, MutationPrepareRequest, MutationReceiptLookup,
     PlatformNegotiationRequest, PlatformNegotiationRequestMessage, PlatformNegotiationResponse,
     PlatformNegotiationResponseMessage, PlatformV2Request, PlatformV2RequestMessage,
-    PlatformV2Response, PlatformV2ResponseMessage, ReviewActionTransportRequest,
+    PlatformV2Response, PlatformV2ResponseMessage, ReceiptLookupKey, ReviewActionTransportRequest,
     ReviewReceiptLookup, WorkspaceIntentLookup, WorkspaceIntentRequest,
 };
-use automonique_protocol::primitives::Revision;
+use automonique_protocol::primitives::{EpochMillis, Revision};
 use automonique_store::approval_requests::{
     ApprovalContext, ApprovalProposal, ApprovalRequests, ApprovalState,
 };
@@ -54,7 +58,7 @@ use automonique_store::lineage_index::LineageIndex;
 use automonique_store::provider_journal::{ProcessSpawn, ProviderJournal, SessionOpening};
 use automonique_store::review_store::ReviewStore;
 use automonique_store::run_index::{RunIndex, RunIndexEntry, RunSpoolState, StateAdvance};
-use automonique_store::work_context_store::WorkContextStore;
+use automonique_store::work_context_store::{MutationPolicyDecision, WorkContextStore};
 
 #[path = "support/isolation.rs"]
 mod test_isolation;
@@ -182,6 +186,10 @@ fn configure_v2(config: &DaemonConfig) {
             "projects": ["project-live"],
             "workspaces": [
                 {"project": "project-live", "kind": "project", "id": "project-live",
+                 "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []}},
+                {"project": "project-live", "kind": "host_setup", "id": "host-live",
+                 "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []}},
+                {"project": "project-live", "kind": "checkout", "id": "checkout-live",
                  "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []}},
                 {"project": "project-live", "kind": "user_workspace", "id": "workspace-live",
                  "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []}},
@@ -365,6 +373,36 @@ fn live_workspace(
         ],
     )
     .unwrap()
+}
+
+fn set_tool_authority(config: &DaemonConfig, narrow_workspace_live: bool) {
+    let path = config.platform_v2_policy_path();
+    let mut policy: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let principal = &mut policy["principals"][0];
+    principal["authority"]["tools"] = serde_json::json!(["tool-live"]);
+    for workspace in principal["workspaces"].as_array_mut().unwrap() {
+        workspace["inherited_authority"]["tools"] = if narrow_workspace_live
+            && workspace["kind"] == "user_workspace"
+            && workspace["id"] == "workspace-live"
+        {
+            serde_json::json!([])
+        } else {
+            serde_json::json!(["tool-live"])
+        };
+    }
+    std::fs::write(path, serde_json::to_vec(&policy).unwrap()).unwrap();
+}
+
+fn remove_policy_scope(config: &DaemonConfig, kind: &str, id: &str) {
+    let path = config.platform_v2_policy_path();
+    let mut policy: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    policy["principals"][0]["workspaces"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|workspace| workspace["kind"] != kind || workspace["id"] != id);
+    std::fs::write(path, serde_json::to_vec(&policy).unwrap()).unwrap();
 }
 
 #[test]
@@ -871,6 +909,195 @@ fn durable_mapping_drift_disables_v2_actions_fail_closed() {
         PlatformV2Response::Refused(refusal)
             if refusal.category().as_str() == "platform_v2_policy_incoherent"
     ));
+    serving.shutdown(&config);
+}
+
+#[test]
+fn policy_requires_the_complete_durable_inheritance_chain() {
+    for (kind, id, label) in [
+        ("host_setup", "host-live", "v2-missing-host-parent"),
+        ("checkout", "checkout-live", "v2-missing-checkout-parent"),
+    ] {
+        let (_root, config) = fixture();
+        configure_v2(&config);
+        remove_policy_scope(&config, kind, id);
+        let serving = serve(&config);
+        assert!(matches!(
+            platform_v2(
+                &config,
+                label,
+                PlatformV2Request::GetWorkContext(WorkContextIdentity::UserWorkspace(
+                    UserWorkspaceId::new("workspace-live").unwrap(),
+                ))
+            ),
+            PlatformV2Response::Refused(refusal)
+                if refusal.category().as_str() == "platform_v2_policy_incoherent"
+        ));
+        serving.shutdown(&config);
+    }
+}
+
+#[test]
+fn complete_durable_inheritance_chain_enables_v2_reads() {
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-complete-policy-chain",
+            PlatformV2Request::GetWorkContext(WorkContextIdentity::UserWorkspace(
+                UserWorkspaceId::new("workspace-live").unwrap(),
+            ))
+        ),
+        PlatformV2Response::WorkContextRecord(record)
+            if record.identity().id() == "workspace-live"
+    ));
+    serving.shutdown(&config);
+}
+
+#[test]
+fn restart_narrowing_revokes_old_preview_decision_and_receipt_reads() {
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    set_tool_authority(&config, false);
+    let serving = serve(&config);
+    let grant = AuthorityGrantId::new("tool-live").unwrap();
+    let authority =
+        WorkContextAuthority::new(vec![], vec![], vec![], vec![grant], vec![], vec![]).unwrap();
+    let key = IdempotencyKey::new("attempt-before-narrowing").unwrap();
+    let prepare = MutationPrepareRequest::new(
+        key.clone(),
+        WorkContextMutationIntent::CreateAttemptWorkspace(
+            CreateAttemptWorkspaceIntent::new(
+                WorkContextLabel::new("Attempt before narrowing").unwrap(),
+                ExpectedWorkContext::new(
+                    WorkContextIdentity::UserWorkspace(
+                        UserWorkspaceId::new("workspace-live").unwrap(),
+                    ),
+                    Revision::FIRST,
+                ),
+                authority.clone(),
+            )
+            .unwrap(),
+        ),
+    );
+    let PlatformV2Response::MutationPreview(preview) = platform_v2(
+        &config,
+        "v2-preview-before-narrowing",
+        PlatformV2Request::PrepareMutation(prepare),
+    ) else {
+        panic!("preview before narrowing")
+    };
+    let decision = MutationDecisionRequest::new(
+        preview.preview().clone(),
+        work_context_mutation_preview_digest(&preview).unwrap(),
+        MutationApprovalDecision::Granted,
+    );
+    let PlatformV2Response::MutationApproval(raw_approval) = platform_v2(
+        &config,
+        "v2-approval-before-narrowing",
+        PlatformV2Request::DecideMutation(decision.clone()),
+    ) else {
+        panic!("approval before narrowing")
+    };
+    serving.shutdown(&config);
+
+    // Seed the kind of accepted pre-adapter receipt an upgraded deployment
+    // may already contain. The daemon itself never admits this effect today.
+    let approval = raw_approval.decode(&preview).unwrap();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let submission = encode_work_context_mutation_submission(
+        &preview,
+        Some(&approval),
+        EpochMillis::from_millis(now_ms),
+    )
+    .unwrap();
+    let targets = BTreeSet::from([WorkContextIdentity::UserWorkspace(
+        UserWorkspaceId::new("workspace-live").unwrap(),
+    )]);
+    let policy = MutationPolicyDecision::new(
+        preview.proposal().actor().clone(),
+        preview.proposal().authority(),
+        authority.clone(),
+        authority,
+        Some(ProjectId::new("project-live").unwrap()),
+        targets,
+        preview.proposal().request_digest(),
+        MutationApprovalRequirement::Required,
+    );
+    let receipt_id = ReceiptId::new("receipt-before-narrowing").unwrap();
+    let mut store = WorkContextStore::open(config.platform_v2_work_context_path()).unwrap();
+    store
+        .submit_mutation(
+            preview.preview(),
+            &submission,
+            &policy,
+            receipt_id.clone(),
+            now_ms.saturating_add(1),
+        )
+        .unwrap();
+    drop(store);
+
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-old-preview-same-policy-after-restart",
+            PlatformV2Request::DecideMutation(decision.clone()),
+        ),
+        PlatformV2Response::MutationApproval(value) if value == raw_approval
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-old-receipt-same-policy-after-restart",
+            PlatformV2Request::GetMutationReceipt(MutationReceiptLookup::new(
+                ProjectId::new("project-live").unwrap(),
+                ReceiptLookupKey::ReceiptId(receipt_id.clone()),
+            )),
+        ),
+        PlatformV2Response::MutationReceipt(_)
+    ));
+    serving.shutdown(&config);
+
+    set_tool_authority(&config, true);
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-old-preview-after-narrowing",
+            PlatformV2Request::DecideMutation(decision),
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_decision_refused"
+    ));
+    for (label, lookup) in [
+        (
+            "v2-old-receipt-id-after-narrowing",
+            ReceiptLookupKey::ReceiptId(receipt_id),
+        ),
+        (
+            "v2-old-receipt-key-after-narrowing",
+            ReceiptLookupKey::IdempotencyKey(key),
+        ),
+    ] {
+        assert!(matches!(
+            platform_v2(
+                &config,
+                label,
+                PlatformV2Request::GetMutationReceipt(MutationReceiptLookup::new(
+                    ProjectId::new("project-live").unwrap(),
+                    lookup,
+                )),
+            ),
+            PlatformV2Response::Refused(refusal)
+                if refusal.category().as_str() == "platform_v2_not_found"
+        ));
+    }
     serving.shutdown(&config);
 }
 

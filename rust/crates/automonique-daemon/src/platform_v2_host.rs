@@ -329,18 +329,31 @@ impl PlatformV2Runtime {
                 }
             }
             PlatformV2Request::DecideMutation(value) => {
-                let requested_expiry = now_ms
-                    .checked_add(APPROVAL_LIFETIME_MS)
-                    .ok_or("platform_v2_clock_invalid")?;
-                let preview_expiry = self
+                let candidate = self
                     .work_contexts
-                    .preview_expiry_for_approval(
+                    .preview_for_actor(
                         value.preview(),
                         &principal.actor,
                         principal.serving_authority,
                     )
-                    .map_err(|_| "platform_v2_decision_refused")?
-                    .as_millis();
+                    .map_err(|_| "platform_v2_decision_refused")?;
+                let (project, inherited_authority) =
+                    scope_for_intent(candidate.proposal().intent(), &principal)
+                        .map_err(|_| "platform_v2_decision_refused")?;
+                let current_policy = principal.mutation_policy(
+                    Some(project),
+                    inherited_authority,
+                    candidate.proposal().request_digest(),
+                    candidate.approval(),
+                );
+                let preview = self
+                    .work_contexts
+                    .authorize_existing_preview(value.preview(), &current_policy)
+                    .map_err(|_| "platform_v2_decision_refused")?;
+                let requested_expiry = now_ms
+                    .checked_add(APPROVAL_LIFETIME_MS)
+                    .ok_or("platform_v2_clock_invalid")?;
+                let preview_expiry = preview.expires_at().as_millis();
                 let expiry = approval_expiry(requested_expiry, preview_expiry);
                 let id = MutationApprovalId::new(format!("approval_{}", self.nonces.token()))
                     .map_err(|_| "platform_v2_nonce_invalid")?;
@@ -378,41 +391,48 @@ impl PlatformV2Runtime {
                 if !principal.projects.contains(value.project()) {
                     return Err("platform_v2_scope_denied");
                 }
-                let project_identity = WorkContextIdentity::Project(value.project().clone());
-                let scope = principal
-                    .workspaces
-                    .get(&project_identity)
-                    .ok_or("platform_v2_scope_denied")?;
-                self.validate_policy_mapping(&principal, &project_identity)?;
-                let targets: BTreeSet<WorkContextIdentity> = principal
-                    .workspaces
-                    .iter()
-                    .filter(|(_, scope)| &scope.project == value.project())
-                    .map(|(identity, _)| identity.clone())
-                    .collect();
-                let found = match value.key() {
-                    ReceiptLookupKey::ReceiptId(id) => self.work_contexts.receipt_by_id_authorized(
-                        &principal.actor,
-                        principal.serving_authority,
-                        &principal.authority,
-                        &scope.inherited_authority,
-                        value.project(),
-                        &targets,
-                        id,
-                    ),
-                    ReceiptLookupKey::IdempotencyKey(key) => {
-                        self.work_contexts.receipt_by_idempotency_key_authorized(
+                let candidate = match value.key() {
+                    ReceiptLookupKey::ReceiptId(id) => {
+                        self.work_contexts.receipt_preview_by_id_for_actor(
                             &principal.actor,
                             principal.serving_authority,
-                            &principal.authority,
-                            &scope.inherited_authority,
-                            value.project(),
-                            &targets,
-                            key,
+                            id,
                         )
                     }
+                    ReceiptLookupKey::IdempotencyKey(key) => self
+                        .work_contexts
+                        .receipt_preview_by_idempotency_key_for_actor(
+                            &principal.actor,
+                            principal.serving_authority,
+                            key,
+                        ),
                 }
-                .map_err(|_| "platform_v2_receipt_refused")?;
+                .map_err(|_| "platform_v2_not_found")?
+                .ok_or("platform_v2_not_found")?;
+                let (project, inherited_authority) =
+                    scope_for_intent(candidate.proposal().intent(), &principal)
+                        .map_err(|_| "platform_v2_not_found")?;
+                if &project != value.project() {
+                    return Err("platform_v2_not_found");
+                }
+                let policy = principal.mutation_policy(
+                    Some(project),
+                    inherited_authority,
+                    candidate.proposal().request_digest(),
+                    candidate.approval(),
+                );
+                self.work_contexts
+                    .authorize_existing_preview(candidate.preview(), &policy)
+                    .map_err(|_| "platform_v2_not_found")?;
+                let found = match value.key() {
+                    ReceiptLookupKey::ReceiptId(id) => {
+                        self.work_contexts.receipt_by_id(&policy, id)
+                    }
+                    ReceiptLookupKey::IdempotencyKey(key) => {
+                        self.work_contexts.receipt_by_idempotency_key(&policy, key)
+                    }
+                }
+                .map_err(|_| "platform_v2_not_found")?;
                 match found {
                     ReceiptLookup::Found(receipt) => Ok(PlatformV2Response::MutationReceipt(
                         automonique_protocol::platform_v2_transport::RawMutationReceiptDocument::from_receipt(&receipt)
@@ -658,35 +678,51 @@ fn validate_principal_mappings(
         let record = records
             .get(identity)
             .ok_or("platform_v2_policy_incoherent")?;
+        if let Some(required_parent) = required_policy_parent(identity.kind()) {
+            let parent = record
+                .relations()
+                .iter()
+                .find(|relation| relation.target().kind() == required_parent)
+                .ok_or("platform_v2_policy_incoherent")?
+                .target();
+            let parent_scope = principal
+                .workspaces
+                .get(parent)
+                .ok_or("platform_v2_policy_incoherent")?;
+            if parent_scope.project != scope.project
+                || !scope
+                    .inherited_authority
+                    .is_subset_of(&parent_scope.inherited_authority)
+            {
+                return Err("platform_v2_policy_incoherent");
+            }
+        }
         for relation in record.relations() {
-            match principal.workspaces.get(relation.target()) {
-                Some(parent_scope)
-                    if parent_scope.project != scope.project
-                        || !scope
-                            .inherited_authority
-                            .is_subset_of(&parent_scope.inherited_authority) =>
-                {
-                    return Err("platform_v2_policy_incoherent");
-                }
-                None if matches!(
-                    identity,
-                    WorkContextIdentity::AttemptWorkspace(_)
-                        | WorkContextIdentity::Session(_)
-                        | WorkContextIdentity::Pane(_)
-                ) && matches!(
-                    relation.target(),
-                    WorkContextIdentity::UserWorkspace(_)
-                        | WorkContextIdentity::AttemptWorkspace(_)
-                        | WorkContextIdentity::Session(_)
-                ) =>
-                {
-                    return Err("platform_v2_policy_incoherent");
-                }
-                Some(_) | None => {}
+            if let Some(parent_scope) = principal.workspaces.get(relation.target())
+                && (parent_scope.project != scope.project
+                    || !scope
+                        .inherited_authority
+                        .is_subset_of(&parent_scope.inherited_authority))
+            {
+                return Err("platform_v2_policy_incoherent");
             }
         }
     }
     Ok(())
+}
+
+fn required_policy_parent(kind: WorkContextTargetKind) -> Option<WorkContextTargetKind> {
+    match kind {
+        WorkContextTargetKind::HostSetup => Some(WorkContextTargetKind::Project),
+        WorkContextTargetKind::Checkout => Some(WorkContextTargetKind::HostSetup),
+        WorkContextTargetKind::UserWorkspace => Some(WorkContextTargetKind::Checkout),
+        WorkContextTargetKind::AttemptWorkspace => Some(WorkContextTargetKind::UserWorkspace),
+        WorkContextTargetKind::Session => Some(WorkContextTargetKind::AttemptWorkspace),
+        WorkContextTargetKind::Pane => Some(WorkContextTargetKind::Session),
+        WorkContextTargetKind::Project
+        | WorkContextTargetKind::Repository
+        | WorkContextTargetKind::PlatformSession => None,
+    }
 }
 
 impl PrincipalPolicy {
@@ -891,8 +927,8 @@ fn primary_identity_for_intent(
     Some(match intent {
         WorkContextMutationIntent::CreateProject(_) => return None,
         WorkContextMutationIntent::CreateHostSetup(value) => value.project().identity(),
-        WorkContextMutationIntent::CreateCheckout(value) => value.project().identity(),
-        WorkContextMutationIntent::CreateUserWorkspace(value) => value.project().identity(),
+        WorkContextMutationIntent::CreateCheckout(value) => value.host_setup().identity(),
+        WorkContextMutationIntent::CreateUserWorkspace(value) => value.checkout().identity(),
         WorkContextMutationIntent::CreateAttemptWorkspace(value) => {
             value.user_workspace().identity()
         }

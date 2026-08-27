@@ -64,7 +64,11 @@ the daemon never substitutes the actor ceiling for a parent ceiling.
 Every listed project must have its own `project` identity entry. At startup and
 before every read or action, identities must exist in the authoritative work
 context store, project identities must equal their declared project, and child
-ownership must agree with the durable owner projection.
+ownership must agree with the durable owner projection. The complete direct
+inheritance chain must be visible in policy (`project` → `host_setup` →
+`checkout` → `user_workspace` → `attempt_workspace` → `session`, as present);
+omitting an intermediate parent refuses v2 rather than falling back to the
+project or actor ceiling.
 Review authority keys use the six review axes (`filesystem`, `git`, `ci`,
 `pull_request`, `review`, and `delivery`). Neither the v2 request envelope nor
 its domain documents can replace the actor, tenant, project bindings, six
@@ -79,6 +83,10 @@ and idempotent; approval expiry is capped to its preview expiry. Receipt reads
 are bound to the authenticated actor, tenant, intent targets, and project.
 Create-project receipt lookup is refused because the current lookup wire cannot
 soundly bind its newly issued project.
+Old previews and receipts are reauthorized after restart from their immutable
+actor, intent, project, and exact target coordinates. The current target's
+exact inherited ceiling must still equal the preview ceiling; narrowing or
+revoking a child makes decision and receipt reads opaque/refused.
 
 The lifecycle filesystem adapter, workspace-create/resume adapter, and
 git/CI/pull-request workers are intentionally not wired in this slice.

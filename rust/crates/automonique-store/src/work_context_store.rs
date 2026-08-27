@@ -771,14 +771,15 @@ impl WorkContextStore {
         Ok(record)
     }
 
-    /// Read the authoritative preview expiry only for the authenticated actor
-    /// and serving authority that created it.
-    pub fn preview_expiry_for_approval(
+    /// Load an immutable preview only through its authenticated actor and
+    /// serving-authority coordinates. Callers must subsequently apply the
+    /// current policy with [`Self::authorize_existing_preview`].
+    pub fn preview_for_actor(
         &self,
         preview_ref: &MutationPreviewRef,
         authenticated_actor: &Actor,
         serving_authority: ResourceAuthority,
-    ) -> Stored<EpochMillis> {
+    ) -> Stored<MutationPreview> {
         let preview = load_preview_for_scope(
             &self.connection,
             preview_ref,
@@ -788,7 +789,98 @@ impl WorkContextStore {
         if preview.proposal().actor() != authenticated_actor {
             return Err(WorkContextStoreError::Unauthorized);
         }
-        Ok(preview.expires_at())
+        Ok(preview)
+    }
+
+    /// Reauthorize an old immutable preview against the current exact actor,
+    /// target set, project, inherited ceiling, and durable ownership truth.
+    pub fn authorize_existing_preview(
+        &self,
+        preview_ref: &MutationPreviewRef,
+        policy: &MutationPolicyDecision,
+    ) -> Stored<MutationPreview> {
+        let tx = self.connection.unchecked_transaction()?;
+        let preview = load_preview_for_scope(
+            &tx,
+            preview_ref,
+            policy.authenticated_actor.tenant(),
+            policy.serving_authority,
+        )?;
+        recheck_policy(&preview, policy)?;
+        authorize_transaction_scope(&tx, preview.proposal().intent(), policy)?;
+        tx.commit()?;
+        Ok(preview)
+    }
+
+    pub fn receipt_preview_by_id_for_actor(
+        &self,
+        authenticated_actor: &Actor,
+        serving_authority: ResourceAuthority,
+        receipt_id: &ReceiptId,
+    ) -> Stored<Option<MutationPreview>> {
+        self.receipt_preview_for_actor(
+            authenticated_actor,
+            serving_authority,
+            "r.receipt_id=?4",
+            receipt_id.as_str(),
+        )
+    }
+
+    pub fn receipt_preview_by_idempotency_key_for_actor(
+        &self,
+        authenticated_actor: &Actor,
+        serving_authority: ResourceAuthority,
+        key: &automonique_protocol::platform::IdempotencyKey,
+    ) -> Stored<Option<MutationPreview>> {
+        self.receipt_preview_for_actor(
+            authenticated_actor,
+            serving_authority,
+            "p.idempotency_key=?4",
+            key.as_str(),
+        )
+    }
+
+    fn receipt_preview_for_actor(
+        &self,
+        authenticated_actor: &Actor,
+        serving_authority: ResourceAuthority,
+        predicate: &'static str,
+        value: &str,
+    ) -> Stored<Option<MutationPreview>> {
+        let sql = match predicate {
+            "r.receipt_id=?4" => {
+                "SELECT p.preview_id,p.preview_revision FROM work_context_receipts r JOIN work_context_previews p ON p.preview_id=r.preview_id WHERE p.tenant=?1 AND p.actor_id=?2 AND p.serving_authority=?3 AND r.receipt_id=?4"
+            }
+            "p.idempotency_key=?4" => {
+                "SELECT p.preview_id,p.preview_revision FROM work_context_receipts r JOIN work_context_previews p ON p.preview_id=r.preview_id WHERE p.tenant=?1 AND p.actor_id=?2 AND p.serving_authority=?3 AND p.idempotency_key=?4"
+            }
+            _ => return Err(WorkContextStoreError::InvalidField("receipt_lookup")),
+        };
+        let row: Option<(String, i64)> = self
+            .connection
+            .query_row(
+                sql,
+                params![
+                    authenticated_actor.tenant(),
+                    authenticated_actor.id(),
+                    serving_authority.as_str(),
+                    value,
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((id, revision)) = row else {
+            return Ok(None);
+        };
+        let preview_ref = MutationPreviewRef::new(
+            MutationPreviewId::new(id).map_err(|_| WorkContextStoreError::Corrupt("preview_id"))?,
+            u64::try_from(revision)
+                .ok()
+                .and_then(|value| Revision::new(value).ok())
+                .ok_or(WorkContextStoreError::Corrupt("preview_revision"))?,
+        );
+        self.preview_for_actor(&preview_ref, authenticated_actor, serving_authority)
+            .map(Some)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3076,6 +3168,7 @@ fn recheck_policy(preview: &MutationPreview, policy: &MutationPolicyDecision) ->
         return Err(WorkContextStoreError::Unauthorized);
     }
     if proposal.actor_authority() != &policy.actor_authority
+        || preview.inherited_authority() != &policy.inherited_authority
         || preview.approval() != policy.approval
         || !preview
             .effective_authority()
