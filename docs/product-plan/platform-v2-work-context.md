@@ -181,8 +181,28 @@ therefore moves when the v2 module changes. The SDK still advertises
 separately generated `PLATFORM_V1_SCHEMA_DIGEST`; the checked-in Platform v1
 module remains byte-identical.
 
-Durable persistence/index transactions, authenticated actor and policy
-integration, server routes, receipt/idempotency lookup, retention workers, SDK
-client ergonomics, and runtime clock/random-ID providers remain separate
-implementation work. The protocol helpers do not claim to implement those
+The authoritative SQLite slice stores records, relations, expected revisions,
+previews, approvals, receipts, inventory cursors, and external-effect work in
+tenant-scoped transactions. Its checked mutation policy names the exact
+authenticated actor, selected project, target identities, authority ceilings,
+and approval requirement. Policy is rechecked before an idempotency replay or
+conflict is disclosed. Approval recording requires a checked lifecycle-approval
+authority bound to the same tenant, exact preview body digest, revision, and
+expiry. Receipt reconciliation is available both by receipt identity and by
+the complete tenant/actor/serving-authority/idempotency scope; absence is an
+explicit `unknown` lookup result.
+
+External effects reserve the exact tenant/target/revision/effect tuple before
+enqueue. Workers atomically claim a ready effect under an opaque durable lease
+bound to executor identity, serving authority, preview, target revision,
+effect kind and document digest, and expiry. Completion consumes that exact
+lease, validates the prior accepted receipt and current authoritative snapshot,
+and returns the completed receipt idempotently on retry. Authoritative snapshot
+ingestion rejects revision regression, terminal lifecycle rollback, reparenting,
+and external owner changes. Durable readers re-encode documents and compare all
+duplicated normalized columns before returning a value.
+
+Server routes, retention workers, SDK client ergonomics, and production
+clock/random-ID and authentication-policy providers remain separate
+integration work. The protocol helpers alone do not claim to implement those
 authority or durability boundaries.
