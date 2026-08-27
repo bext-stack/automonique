@@ -30,7 +30,7 @@ use automonique_protocol::platform_v2_lineage::{
     OrchestrationDispatchId, OrchestrationHeartbeatId, OrchestrationIdentity, OrchestrationKind,
     OrchestrationQuestionId, OrchestrationRecord, OrchestrationRunId, OrchestrationTaskId,
     OrchestrationWorkerId, WorkspaceIntent, WorkspaceIntentConflict, WorkspaceIntentId,
-    WorkspaceIntentOutcome,
+    WorkspaceIntentOutcome, WorkspaceIntentReconciliation,
 };
 use automonique_protocol::primitives::Revision;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -398,6 +398,17 @@ impl LineageIndex {
         {
             return Err(LineageIndexError::IdentityConflict);
         }
+        if let Some(target_id) = item.moved_to() {
+            let target = read_external(&transaction, target_id)?
+                .ok_or(LineageIndexError::NotFound("moved external work target"))?;
+            if target.workspace() != item.workspace()
+                || target.identity().provider() != item.identity().provider()
+                || target.identity().authority() != item.identity().authority()
+                || !target.origin().refines(item.origin())
+            {
+                return Err(LineageIndexError::IdentityConflict);
+            }
+        }
         update_external_row(&transaction, item, expected_revision)?;
         transaction.commit()?;
         Ok(WriteAdmission::Updated { revision: next })
@@ -493,6 +504,46 @@ impl LineageIndex {
         Ok(WriteAdmission::Inserted { revision: 1 })
     }
 
+    /// Transactionally advance a durable accepted/unknown receipt to one exact
+    /// final decision. This records reconciliation only; it never executes the
+    /// underlying create/resume operation.
+    pub fn reconcile_intent(
+        &mut self,
+        intent: &WorkspaceIntent,
+        final_outcome: &WorkspaceIntentOutcome,
+    ) -> Indexed<WriteAdmission> {
+        if final_outcome.reconciliation() != WorkspaceIntentReconciliation::Final {
+            return Err(LineageIndexError::InvalidField("final_outcome"));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let digest = intent_digest(intent);
+        let existing = read_intent(&transaction, intent.intent_id().as_str())?
+            .ok_or(LineageIndexError::NotFound("workspace intent"))?;
+        if existing.request_digest != digest {
+            return Err(LineageIndexError::IdentityConflict);
+        }
+        if existing.reconciliation == "final" {
+            let stored = existing.into_stored()?;
+            return if &stored.outcome == final_outcome {
+                Ok(WriteAdmission::Replayed { revision: 2 })
+            } else {
+                Err(LineageIndexError::IdentityConflict)
+            };
+        }
+        let final_value = intent_fingerprint(&transaction, intent, final_outcome, digest)?;
+        let changed = transaction.execute(
+            "UPDATE lineage_workspace_intents SET outcome_kind=?2,outcome_conflict=?3,outcome_workspace_id=?4,reconciliation='final' WHERE intent_id=?1 AND request_digest=?5 AND reconciliation='poll_receipt'",
+            params![final_value.intent_id, final_value.outcome_kind, final_value.outcome_conflict, final_value.outcome_workspace, digest.as_slice()],
+        )?;
+        if changed != 1 {
+            return Err(LineageIndexError::IdentityConflict);
+        }
+        transaction.commit()?;
+        Ok(WriteAdmission::Updated { revision: 2 })
+    }
+
     /// Look up the immutable request and its accepted/unknown/final decision.
     pub fn intent(&self, id: &WorkspaceIntentId) -> Indexed<Option<StoredWorkspaceIntent>> {
         read_intent(&self.connection, id.as_str())?
@@ -501,7 +552,7 @@ impl LineageIndex {
     }
 
     /// Rebuild the bounded projection for one exact authorized workspace.
-    pub fn projection(&self, workspace: &UserWorkspaceId) -> Indexed<LineageProjection> {
+    fn projection_unchecked(&self, workspace: &UserWorkspaceId) -> Indexed<LineageProjection> {
         let external = read_external_workspace(&self.connection, workspace)?;
         let orchestration = read_orchestration_workspace(&self.connection, workspace)?;
         if external.len().saturating_add(orchestration.len()) > MAX_LINEAGE_RECORDS {
@@ -522,7 +573,7 @@ impl LineageIndex {
         if !authorize(workspace) {
             return Err(LineageIndexError::Unauthorized);
         }
-        self.projection(workspace)
+        self.projection_unchecked(workspace)
     }
 }
 
@@ -1500,6 +1551,9 @@ fn secure_path(path: &Path) -> Indexed<()> {
 
 fn initialize(connection: &mut Connection) -> Indexed<()> {
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 1 {
+        return migrate_v1(connection);
+    }
     if version == LINEAGE_INDEX_SCHEMA_VERSION {
         return Ok(());
     }
@@ -1524,6 +1578,73 @@ fn initialize(connection: &mut Connection) -> Indexed<()> {
     transaction.execute_batch(SCHEMA_V2)?;
     transaction.pragma_update(None, "user_version", LINEAGE_INDEX_SCHEMA_VERSION)?;
     transaction.commit()?;
+    Ok(())
+}
+
+/// Upgrade the short-lived pre-authority branch schema without losing durable
+/// rows. Its provider-only custody is retained under an explicit opaque legacy
+/// authority; no hostname or provider payload is invented during migration.
+fn migrate_v1(connection: &mut Connection) -> Indexed<()> {
+    connection.pragma_update(None, "foreign_keys", false)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        r#"
+ALTER TABLE lineage_workspace_intents RENAME TO lineage_workspace_intents_v1;
+ALTER TABLE lineage_orchestration RENAME TO lineage_orchestration_v1;
+ALTER TABLE lineage_external_work RENAME TO lineage_external_work_v1;
+DROP INDEX lineage_external_by_workspace;
+DROP INDEX lineage_orchestration_by_workspace;
+"#,
+    )?;
+    transaction.execute_batch(SCHEMA_V2)?;
+    transaction.execute_batch(
+        r#"
+INSERT INTO lineage_external_work
+SELECT provider,'legacy-unqualified-'||provider,scope,work_key,workspace_id,revision,
+ external_state,moved_provider,
+ CASE WHEN moved_provider IS NULL THEN NULL ELSE 'legacy-unqualified-'||moved_provider END,
+ moved_scope,moved_key,observed_at_ms,stale_after_ms,freshness_state,latest_message,
+ latest_observed_at_ms,NULL,NULL,NULL
+FROM lineage_external_work_v1;
+
+INSERT INTO lineage_orchestration
+SELECT orchestration_kind,orchestration_id,workspace_id,external_provider,
+ CASE WHEN external_provider IS NULL THEN NULL ELSE 'legacy-unqualified-'||external_provider END,
+ external_scope,external_key,parent_kind,parent_id,status_kind,status_message,observed_at_ms,
+ stale_after_ms,freshness_state,latest_message,latest_observed_at_ms,revision,NULL,NULL,NULL
+FROM lineage_orchestration_v1;
+
+INSERT INTO lineage_workspace_intents
+SELECT intent_id,zeroblob(32),intent_kind,task_kind,task_id,workspace_id,external_provider,
+ CASE WHEN external_provider IS NULL THEN NULL ELSE 'legacy-unqualified-'||external_provider END,
+ external_scope,external_key,base_selector,branch_selector,expected_revision,outcome_kind,
+ outcome_conflict,outcome_workspace_id,'final'
+FROM lineage_workspace_intents_v1;
+"#,
+    )?;
+    let ids = {
+        let mut statement =
+            transaction.prepare("SELECT intent_id FROM lineage_workspace_intents")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for id in ids {
+        let stored = read_intent(&transaction, &id)?
+            .ok_or(LineageIndexError::Corrupt("migrated_intent"))?
+            .into_stored()?;
+        let digest = intent_digest(&stored.intent);
+        transaction.execute(
+            "UPDATE lineage_workspace_intents SET request_digest=?2 WHERE intent_id=?1",
+            params![id, digest.as_slice()],
+        )?;
+    }
+    transaction.execute_batch(
+        "DROP TABLE lineage_workspace_intents_v1; DROP TABLE lineage_orchestration_v1; DROP TABLE lineage_external_work_v1;",
+    )?;
+    transaction.pragma_update(None, "user_version", LINEAGE_INDEX_SCHEMA_VERSION)?;
+    transaction.commit()?;
+    connection.pragma_update(None, "foreign_keys", true)?;
     Ok(())
 }
 

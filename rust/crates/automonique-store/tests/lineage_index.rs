@@ -219,7 +219,7 @@ fn duplicate_intake_replays_exactly_and_conflicts_without_identity_collapse() {
         .unwrap();
     assert_eq!(
         index
-            .projection(&workspace("workspace-1"))
+            .projection_authorized(&workspace("workspace-1"), |_| true)
             .unwrap()
             .external_work_items()
             .len(),
@@ -227,7 +227,7 @@ fn duplicate_intake_replays_exactly_and_conflicts_without_identity_collapse() {
     );
     assert!(
         index
-            .projection(&workspace("workspace-2"))
+            .projection_authorized(&workspace("workspace-2"), |_| true)
             .unwrap()
             .external_work_items()
             .is_empty()
@@ -239,7 +239,12 @@ fn moved_and_closed_sources_are_revisioned_and_survive_reopen() {
     let private = PrivateIndex::new();
     let mut index = LineageIndex::open(private.path()).unwrap();
     let moved_id = external_identity(ExternalWorkProvider::GitLab, "scope-1", "work-1");
-    let replacement = external_identity(ExternalWorkProvider::GitLab, "scope-2", "work-1");
+    let replacement = ExternalWorkIdentity::new(
+        ExternalWorkProvider::GitLab,
+        moved_id.authority().clone(),
+        ExternalWorkScope::new("scope-2").unwrap(),
+        ExternalWorkKey::new("work-1").unwrap(),
+    );
     let closed_id = external_identity(ExternalWorkProvider::Linear, "team-1", "lin-1");
     let ws = workspace("workspace-source");
     index
@@ -288,6 +293,42 @@ fn moved_and_closed_sources_are_revisioned_and_survive_reopen() {
             None,
         )
         .unwrap();
+    assert_eq!(
+        index
+            .update_external(
+                &item(
+                    moved_id.clone(),
+                    ws.clone(),
+                    2,
+                    ExternalWorkState::Moved,
+                    Some(replacement.clone()),
+                ),
+                Revision::FIRST,
+            )
+            .unwrap_err()
+            .category(),
+        "not_found"
+    );
+    assert_eq!(
+        index
+            .projection_authorized(&ws, |_| true)
+            .unwrap()
+            .external_work_items()
+            .iter()
+            .find(|value| value.identity() == &moved_id)
+            .unwrap()
+            .state(),
+        ExternalWorkState::Open
+    );
+    index
+        .intake_external(&item(
+            replacement.clone(),
+            ws.clone(),
+            1,
+            ExternalWorkState::Open,
+            None,
+        ))
+        .unwrap();
     index
         .update_external(
             &item(
@@ -299,15 +340,6 @@ fn moved_and_closed_sources_are_revisioned_and_survive_reopen() {
             ),
             Revision::FIRST,
         )
-        .unwrap();
-    index
-        .intake_external(&item(
-            replacement.clone(),
-            ws.clone(),
-            1,
-            ExternalWorkState::Open,
-            None,
-        ))
         .unwrap();
     let create = WorkspaceIntent::Create(WorkspaceCreateIntent::new(
         WorkspaceIntentId::new("intent-moved").unwrap(),
@@ -338,7 +370,7 @@ fn moved_and_closed_sources_are_revisioned_and_survive_reopen() {
     drop(index);
 
     let reopened = LineageIndex::open(private.path()).unwrap();
-    let projection = reopened.projection(&ws).unwrap();
+    let projection = reopened.projection_authorized(&ws, |_| true).unwrap();
     assert_eq!(projection.external_work_items().len(), 3);
     let moved = projection
         .external_work_items()
@@ -378,7 +410,7 @@ fn workspace_scoped_projection_refuses_to_truncate_past_the_protocol_bound() {
     }
     assert_eq!(
         index
-            .projection(&ws)
+            .projection_authorized(&ws, |_| true)
             .expect_err("projection must not truncate")
             .category(),
         "projection_too_large"
@@ -596,7 +628,7 @@ fn orphan_stale_heartbeat_question_and_cancelled_creation_recover_durably() {
             .unwrap(),
         WriteAdmission::Replayed { revision: 1 }
     );
-    let projection = reopened.projection(&ws).unwrap();
+    let projection = reopened.projection_authorized(&ws, |_| true).unwrap();
     assert_eq!(projection.external_work_items().len(), 1);
     assert_eq!(projection.orchestration().len(), 7);
     let heartbeat = projection
@@ -637,16 +669,18 @@ fn two_handles_cannot_overwrite_a_revision_and_restart_rebuilds_the_winner() {
         None,
     );
     first.update_external(&winner, Revision::FIRST).unwrap();
+    let stale_target = ExternalWorkIdentity::new(
+        ExternalWorkProvider::GitHub,
+        identity.authority().clone(),
+        ExternalWorkScope::new("scope-next").unwrap(),
+        ExternalWorkKey::new("issue-c").unwrap(),
+    );
     let stale = item(
         identity,
         ws.clone(),
         2,
         ExternalWorkState::Moved,
-        Some(external_identity(
-            ExternalWorkProvider::GitHub,
-            "scope-next",
-            "issue-c",
-        )),
+        Some(stale_target),
     );
     let error = second
         .update_external(&stale, Revision::FIRST)
@@ -656,7 +690,10 @@ fn two_handles_cannot_overwrite_a_revision_and_restart_rebuilds_the_winner() {
     drop(second);
     let reopened = LineageIndex::open(private.path()).unwrap();
     assert_eq!(
-        reopened.projection(&ws).unwrap().external_work_items()[0],
+        reopened
+            .projection_authorized(&ws, |_| true)
+            .unwrap()
+            .external_work_items()[0],
         winner
     );
 }
@@ -771,6 +808,20 @@ fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
     assert_eq!(stored.intent, create);
     assert_eq!(stored.outcome, WorkspaceIntentOutcome::Accepted);
     assert_ne!(stored.request_digest, [0; 32]);
+    let final_outcome =
+        WorkspaceIntentOutcome::Conflict(WorkspaceIntentConflict::ExternalWorkClosed);
+    assert_eq!(
+        index.reconcile_intent(&create, &final_outcome).unwrap(),
+        WriteAdmission::Updated { revision: 2 }
+    );
+    assert_eq!(
+        index.intent(create.intent_id()).unwrap().unwrap().outcome,
+        final_outcome
+    );
+    assert_eq!(
+        index.reconcile_intent(&create, &final_outcome).unwrap(),
+        WriteAdmission::Replayed { revision: 2 }
+    );
     let changed = WorkspaceIntent::Create(WorkspaceCreateIntent::new(
         WorkspaceIntentId::new("intent-exact").unwrap(),
         OrchestrationTaskId::new("task-does-not-exist").unwrap(),
@@ -813,7 +864,7 @@ fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
     drop(index);
 
     let reopened = LineageIndex::open(private.path()).unwrap();
-    let projection = reopened.projection(&ws).unwrap();
+    let projection = reopened.projection_authorized(&ws, |_| true).unwrap();
     assert_eq!(projection.external_work_items()[0].origin(), &source_origin);
     let task = projection
         .orchestration()
@@ -822,4 +873,55 @@ fn exact_origins_intent_receipts_and_terminal_revisions_survive_restart() {
         .unwrap();
     assert_eq!(task.origin(), &task_origin);
     assert_eq!(task.revision().get(), 2);
+}
+
+#[test]
+fn populated_v1_index_migrates_without_losing_identity_or_intent() {
+    let private = PrivateIndex::new();
+    fs::File::create(private.path()).unwrap();
+    fs::set_permissions(private.path(), fs::Permissions::from_mode(0o600)).unwrap();
+    let db = Connection::open(private.path()).unwrap();
+    db.execute_batch(r#"
+CREATE TABLE lineage_external_work(provider TEXT,scope TEXT,work_key TEXT,workspace_id TEXT,revision INTEGER,external_state TEXT,moved_provider TEXT,moved_scope TEXT,moved_key TEXT,observed_at_ms INTEGER,stale_after_ms INTEGER,freshness_state TEXT,latest_message TEXT,latest_observed_at_ms INTEGER);
+CREATE INDEX lineage_external_by_workspace ON lineage_external_work(workspace_id,provider,scope,work_key);
+CREATE TABLE lineage_orchestration(orchestration_kind TEXT,orchestration_id TEXT,workspace_id TEXT,external_provider TEXT,external_scope TEXT,external_key TEXT,parent_kind TEXT,parent_id TEXT,status_kind TEXT,status_message TEXT,observed_at_ms INTEGER,stale_after_ms INTEGER,freshness_state TEXT,latest_message TEXT,latest_observed_at_ms INTEGER,revision INTEGER);
+CREATE INDEX lineage_orchestration_by_workspace ON lineage_orchestration(workspace_id,orchestration_kind,orchestration_id);
+CREATE TABLE lineage_workspace_intents(intent_id TEXT,intent_kind TEXT,task_kind TEXT,task_id TEXT,workspace_id TEXT,external_provider TEXT,external_scope TEXT,external_key TEXT,base_selector TEXT,branch_selector TEXT,expected_revision INTEGER,outcome_kind TEXT,outcome_conflict TEXT,outcome_workspace_id TEXT);
+INSERT INTO lineage_external_work VALUES('gitlab','scope-v1','issue-v1','workspace-v1',1,'open',NULL,NULL,NULL,1700000000000,30000,'fresh',NULL,NULL);
+INSERT INTO lineage_orchestration VALUES('run','run-v1','workspace-v1',NULL,NULL,NULL,NULL,NULL,'working',NULL,1700000000000,30000,'fresh',NULL,NULL,1);
+INSERT INTO lineage_orchestration VALUES('task','task-v1','workspace-v1','gitlab','scope-v1','issue-v1','run','run-v1','working',NULL,1700000000000,30000,'fresh',NULL,NULL,1);
+INSERT INTO lineage_workspace_intents VALUES('intent-v1','create','task','task-v1','workspace-v1','gitlab','scope-v1','issue-v1','base-v1','branch-v1',NULL,'created',NULL,'workspace-v1');
+PRAGMA user_version=1;
+"#).unwrap();
+    drop(db);
+
+    let index = LineageIndex::open(private.path()).unwrap();
+    let projection = index
+        .projection_authorized(&workspace("workspace-v1"), |_| true)
+        .unwrap();
+    assert_eq!(projection.external_work_items().len(), 1);
+    assert_eq!(
+        projection.external_work_items()[0]
+            .identity()
+            .authority()
+            .as_str(),
+        "legacy-unqualified-gitlab"
+    );
+    let stored = index
+        .intent(&WorkspaceIntentId::new("intent-v1").unwrap())
+        .unwrap()
+        .unwrap();
+    assert_ne!(stored.request_digest, [0; 32]);
+    assert_eq!(
+        stored.outcome,
+        WorkspaceIntentOutcome::Created(workspace("workspace-v1"))
+    );
+    drop(index);
+    assert_eq!(
+        Connection::open(private.path())
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .unwrap(),
+        LINEAGE_INDEX_SCHEMA_VERSION
+    );
 }
