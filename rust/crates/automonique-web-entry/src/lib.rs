@@ -9304,6 +9304,169 @@ mod tests {
     }
 
     #[test]
+    fn production_rust_and_typescript_v2_clients_cross_the_basic_web_bridge() {
+        use automonique_platform_client::platform_v2_client::{
+            NegotiationResult, PlatformV2Client, WorkContextGetResult,
+        };
+        use automonique_platform_client::{BasicCredential, HttpsTransport};
+        use automonique_protocol::platform_v2::{
+            NegotiatedPlatform, PLATFORM_SCHEMA_V2, PlatformVersion, PlatformVersionOffer,
+            ProjectId, WorkContextAvailability, WorkContextIdentity,
+        };
+        use automonique_protocol::platform_v2_transport::{
+            PlatformNegotiationRequestMessage, PlatformNegotiationResponse,
+            PlatformNegotiationResponseMessage, PlatformV2Refusal, PlatformV2RequestMessage,
+            PlatformV2Response, PlatformV2ResponseMessage,
+        };
+
+        const EXCHANGES: usize = 4;
+        let state_dir = tempfile::tempdir().expect("temporary state");
+        let runtime_dir = tempfile::tempdir().expect("temporary runtime");
+        std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private state");
+        std::fs::set_permissions(runtime_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private runtime");
+        let uid = geteuid().as_raw();
+        let policy = serde_json::json!({
+            "version": 1,
+            "principals": [{
+                "uid": uid, "tenant": "operator", "actor": "operator:v2-production",
+                "serving_authority": "automonique", "projects": ["project-test"],
+                "workspaces": [{
+                    "project": "project-test", "kind": "project", "id": "project-test",
+                    "inherited_authority": {
+                        "filesystem": [], "credentials": [], "network": [],
+                        "tools": [], "providers": [], "models": []
+                    }
+                }],
+                "authority": {
+                    "filesystem": [], "credentials": [], "network": [],
+                    "tools": [], "providers": [], "models": []
+                },
+                "review_authorities": {}
+            }]
+        });
+        let policy_path = state_dir
+            .path()
+            .join(automonique_daemon::PLATFORM_V2_POLICY_FILE_NAME);
+        std::fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
+        std::fs::set_permissions(&policy_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let platform_listener = UnixListener::bind(runtime_dir.path().join("admin.sock"))
+            .expect("fixture platform socket");
+        let platform_server = thread::spawn(move || {
+            for index in 0..EXCHANGES {
+                let (mut stream, _) = platform_listener.accept().expect("platform connection");
+                let mut prefix = [0_u8; 4];
+                stream.read_exact(&mut prefix).expect("platform prefix");
+                let mut payload = vec![0_u8; u32::from_be_bytes(prefix) as usize];
+                stream.read_exact(&mut payload).expect("platform request");
+                let response = if index % 2 == 0 {
+                    let request = PlatformNegotiationRequestMessage::from_canonical_bytes(&payload)
+                        .expect("canonical negotiation");
+                    let negotiated = NegotiatedPlatform::new(
+                        PlatformVersion::V2,
+                        PLATFORM_SCHEMA_V2,
+                        WorkContextAvailability::V2Structured,
+                    )
+                    .unwrap();
+                    PlatformNegotiationResponseMessage::for_request(
+                        &request,
+                        PlatformNegotiationResponse::Negotiated(negotiated),
+                    )
+                    .unwrap()
+                    .to_canonical_bytes()
+                    .unwrap()
+                } else {
+                    let request = PlatformV2RequestMessage::from_canonical_bytes(&payload)
+                        .expect("canonical v2 request");
+                    PlatformV2ResponseMessage::for_request(
+                        &request,
+                        PlatformV2Response::Refused(
+                            PlatformV2Refusal::new("fixture_http_refusal", "fixture HTTP refusal")
+                                .unwrap(),
+                        ),
+                    )
+                    .unwrap()
+                    .to_canonical_bytes()
+                    .unwrap()
+                };
+                stream
+                    .write_all(&u32::try_from(response.len()).unwrap().to_be_bytes())
+                    .unwrap();
+                stream.write_all(&response).unwrap();
+            }
+        });
+
+        let integration = Arc::new(
+            WebIntegration::open(
+                IntegrationConfig {
+                    tenant: String::from("operator"),
+                    actor: String::from("operator:v2-production"),
+                    hosts: fixture_hosts(),
+                },
+                state_dir.path(),
+                runtime_dir.path(),
+            )
+            .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let web_server = thread::spawn(move || {
+            for _ in 0..EXCHANGES {
+                let (stream, _) = listener.accept().expect("HTTP connection");
+                handle(
+                    stream,
+                    &AppState::new(fixture_status()),
+                    &fixture_auth(),
+                    &fixture_manage_chat_auth(),
+                    Some(&integration),
+                    &fixture_hosts(),
+                )
+                .expect("Platform v2 HTTP route");
+            }
+        });
+
+        let endpoint = format!("http://localhost:{}/api/platform/v2", address.port());
+        let credential = BasicCredential::new("ops", "fixture-password").unwrap();
+        let transport = HttpsTransport::new_basic(&endpoint, credential).unwrap();
+        let mut rust_client = PlatformV2Client::new_https(transport);
+        assert!(matches!(
+            rust_client
+                .negotiate(PlatformVersionOffer::new(vec![2]).unwrap())
+                .unwrap(),
+            NegotiationResult::V2(_)
+        ));
+        assert!(matches!(
+            rust_client
+                .get_work_context(WorkContextIdentity::Project(
+                    ProjectId::new("project-test").unwrap()
+                ))
+                .unwrap(),
+            WorkContextGetResult::Refused(refusal)
+                if refusal.category().as_str() == "fixture_http_refusal"
+        ));
+
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let script =
+            repository.join("sdk/typescript/packages/sdk/conformance/rust-http-v2-contract.ts");
+        let status = Command::new("bun")
+            .arg("run")
+            .arg(script)
+            .arg(endpoint)
+            .current_dir(repository)
+            .status()
+            .expect("run TypeScript Platform v2 contract client");
+        assert!(
+            status.success(),
+            "TypeScript Platform v2 contract client failed"
+        );
+
+        web_server.join().expect("web server");
+        platform_server.join().expect("platform server");
+    }
+
+    #[test]
     fn platform_v2_body_limit_is_additive_and_v1_limit_is_unchanged() {
         let v1 = format!(
             "POST /api/platform HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nContent-Type: {PLATFORM_CONTENT_TYPE}\r\nContent-Length: {}\r\n\r\n",
