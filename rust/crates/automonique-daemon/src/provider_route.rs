@@ -103,7 +103,11 @@ fn read_default_provider(path: &Path) -> Option<String> {
     }
     let text = String::from_utf8(bytes).ok()?;
     let document = text.parse::<DocumentMut>().ok()?;
-    let route = document.get("default_provider")?.as_str()?;
+    let route = document
+        .get("provider")?
+        .as_table()?
+        .get("default_provider")?
+        .as_str()?;
     if route.is_empty()
         || route.len() > 64
         || route
@@ -125,7 +129,7 @@ mod tests {
         let home = root.join("jcode-home");
         std::fs::create_dir(&home).expect("provider home");
         let mut route_config = File::create(home.join(JCODE_CONFIG_NAME)).expect("route config");
-        writeln!(route_config, "default_provider = {route:?}").expect("route");
+        writeln!(route_config, "[provider]\ndefault_provider = {route:?}").expect("route");
         let path = root.join("provider");
         std::fs::write(
             &path,
@@ -187,6 +191,24 @@ mod tests {
             &provider,
             &[
                 destination("chatgpt.com", BrokeredScope::Loopback),
+                destination("developers.openai.com", BrokeredScope::Public),
+            ]
+        ));
+    }
+
+    #[test]
+    fn a_legacy_top_level_route_is_not_mistaken_for_the_jcode_schema() {
+        let root = tempfile::tempdir().expect("root");
+        let provider = provider(root.path(), "openai");
+        std::fs::write(
+            provider.home().join(JCODE_CONFIG_NAME),
+            "default_provider = \"openai\"\n",
+        )
+        .expect("legacy-shaped config");
+        assert!(!is_admitted(
+            &provider,
+            &[
+                destination("chatgpt.com", BrokeredScope::Public),
                 destination("developers.openai.com", BrokeredScope::Public),
             ]
         ));
