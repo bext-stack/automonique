@@ -38,7 +38,7 @@ use automonique_protocol::platform_v2_lineage::{
 use automonique_protocol::platform_v2_review::{
     AttentionReason as ReviewAttentionReason, CheckState, ReviewAction, ReviewActionReceipt,
     ReviewActionRequest, ReviewActorId, ReviewAuthentication, ReviewAuthority, ReviewAuthorityId,
-    ReviewAuthorityKind, ReviewFreshnessState, ReviewSnapshot,
+    ReviewAuthorityKind, ReviewFreshnessState, ReviewReceiptOutcome, ReviewSnapshot,
 };
 use automonique_protocol::platform_v2_transport::{
     LIFECYCLE_CAPABILITY_EFFECT_KINDS, LifecycleCapabilities, LifecycleOperationCapability,
@@ -85,6 +85,62 @@ const PREVIEW_LIFETIME_MS: i64 = 5 * 60 * 1_000;
 const APPROVAL_LIFETIME_MS: i64 = 60 * 1_000;
 const EFFECT_LEASE_LIFETIME_MS: i64 = 30 * 1_000;
 const MAX_POLICY_BYTES: u64 = 256 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GitHubRecoveryPhase {
+    NeverStarted,
+    ReconcileOnly,
+    Terminal,
+}
+
+fn github_recovery_phase(
+    outcome: ReviewReceiptOutcome,
+    write_admitted: bool,
+    custody: ReviewExternalEffectCustody,
+) -> Result<GitHubRecoveryPhase, &'static str> {
+    match (outcome, write_admitted, custody) {
+        (ReviewReceiptOutcome::Accepted, false, ReviewExternalEffectCustody::NotStarted) => {
+            Ok(GitHubRecoveryPhase::NeverStarted)
+        }
+        (
+            ReviewReceiptOutcome::Accepted,
+            true,
+            ReviewExternalEffectCustody::CustodyStarted | ReviewExternalEffectCustody::Accepted,
+        )
+        | (ReviewReceiptOutcome::Unknown, true, ReviewExternalEffectCustody::Ambiguous) => {
+            Ok(GitHubRecoveryPhase::ReconcileOnly)
+        }
+        (ReviewReceiptOutcome::Refused, _, ReviewExternalEffectCustody::Refused)
+        | (
+            ReviewReceiptOutcome::Completed | ReviewReceiptOutcome::Conflict,
+            true,
+            ReviewExternalEffectCustody::Completed,
+        ) => Ok(GitHubRecoveryPhase::Terminal),
+        _ => Err("platform_v2_review_confirmation_corrupt"),
+    }
+}
+
+fn stored_github_recovery_phase(
+    action: &StoredReviewAction,
+    plan: &ReviewExternalEffectPlan,
+) -> Result<GitHubRecoveryPhase, &'static str> {
+    github_recovery_phase(
+        action.receipt.outcome(),
+        action.write_admitted_at_ms.is_some(),
+        plan.github_custody()
+            .ok_or("platform_v2_review_plan_invalid")?,
+    )
+}
+
+fn github_receipt_correlation_matches(
+    stored: Option<[u8; 32]>,
+    supplied: Option<&ReviewReceiptCorrelationDigest>,
+) -> Result<bool, &'static str> {
+    let (Some(stored), Some(supplied)) = (stored, supplied) else {
+        return Ok(false);
+    };
+    Ok(review_receipt_correlation_digest(stored)?.as_str() == supplied.as_str())
+}
 
 fn review_confirmation_digest(digest: [u8; 32]) -> Result<ReviewConfirmationDigest, &'static str> {
     let value = digest
@@ -1907,8 +1963,7 @@ impl PlatformV2Runtime {
                     if confirmation_digest.is_none() {
                         return Err("platform_v2_review_confirmation_required");
                     }
-                    if expected_workspace_revision != Some(workspace_record.revision())
-                        || receipt_correlation_digest.is_none()
+                    if expected_workspace_revision.is_none() || receipt_correlation_digest.is_none()
                     {
                         return Err("platform_v2_review_confirmation_changed");
                     }
@@ -1938,6 +1993,14 @@ impl PlatformV2Runtime {
                         return Err("platform_v2_review_conflict");
                     }
                     if plan.is_github_check_rerun() {
+                        let supplied_workspace_revision = expected_workspace_revision
+                            .ok_or("platform_v2_review_confirmation_required")?;
+                        let planned_workspace_revision = plan
+                            .github_expected_workspace_revision()
+                            .ok_or("platform_v2_review_confirmation_changed")?;
+                        if supplied_workspace_revision != planned_workspace_revision {
+                            return Err("platform_v2_review_confirmation_changed");
+                        }
                         let supplied = receipt_correlation_digest
                             .as_ref()
                             .ok_or("platform_v2_review_confirmation_required")?;
@@ -1948,16 +2011,14 @@ impl PlatformV2Runtime {
                         {
                             return Err("platform_v2_review_confirmation_changed");
                         }
-                        self.validate_github_workspace_revision(&principal, &existing, &plan)?;
-                        if existing.receipt.outcome()
-                            != automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Accepted
-                            && existing.receipt.outcome()
-                                != automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Unknown
+                        if stored_github_recovery_phase(&existing, &plan)?
+                            == GitHubRecoveryPhase::Terminal
                         {
                             return Ok(PlatformV2Response::ReviewReceipt(existing.receipt));
                         }
-                        let existing =
-                            self.approve_prepared_github_confirmation(&existing, now_ms)?;
+                        let existing = self.approve_prepared_github_confirmation(
+                            &principal, &existing, &plan, now_ms,
+                        )?;
                         let receipt =
                             self.drive_github_check_rerun(&principal, &existing, &plan, now_ms)?;
                         return Ok(PlatformV2Response::ReviewReceipt(receipt));
@@ -2088,11 +2149,6 @@ impl PlatformV2Runtime {
                         .map_err(review_store_category)?;
                         self.policy_fence.verify()?;
                         self.review_effects.verify_generation()?;
-                        self.validate_workspace_revision(
-                            &principal,
-                            request.workspace(),
-                            workspace_record.revision(),
-                        )?;
                         let admitted = self
                             .reviews
                             .prepare_external_action(
@@ -2157,6 +2213,9 @@ impl PlatformV2Runtime {
                         registry_generation,
                         credential_generation,
                     }) => {
+                        if expected_workspace_revision != Some(workspace_record.revision()) {
+                            return Err("platform_v2_review_confirmation_changed");
+                        }
                         let advertised_plan = ReviewEffectPlan::GitHubCheckRerun {
                             credential_reference: credential_reference.clone(),
                             repository: repository.clone(),
@@ -2218,6 +2277,11 @@ impl PlatformV2Runtime {
                         .map_err(review_store_category)?;
                         self.policy_fence.verify()?;
                         self.review_effects.verify_generation()?;
+                        self.validate_workspace_revision(
+                            &principal,
+                            request.workspace(),
+                            workspace_record.revision(),
+                        )?;
                         let admitted = self
                             .reviews
                             .prepare_external_action(
@@ -2231,12 +2295,12 @@ impl PlatformV2Runtime {
                             ReviewActionAdmission::New(action)
                             | ReviewActionAdmission::Replay(action) => action,
                         };
-                        self.validate_github_workspace_revision(
+                        let action = self.approve_prepared_github_confirmation(
                             &principal,
                             &action,
                             &external_plan,
+                            now_ms,
                         )?;
-                        let action = self.approve_prepared_github_confirmation(&action, now_ms)?;
                         let receipt = self.drive_github_check_rerun(
                             &principal,
                             &action,
@@ -2272,42 +2336,31 @@ impl PlatformV2Runtime {
                     match external {
                         Ok(Some((action, plan))) => {
                             if plan.is_github_check_rerun() {
-                                let Some(expected) = value.receipt_correlation_digest() else {
-                                    continue;
-                                };
-                                let Some(actual) = plan.github_receipt_correlation_digest() else {
-                                    continue;
-                                };
-                                if review_receipt_correlation_digest(actual)?.as_str()
-                                    != expected.as_str()
-                                {
-                                    continue;
-                                }
-                                if self
-                                    .validate_github_workspace_revision(&principal, &action, &plan)
-                                    .is_err()
-                                {
+                                if !github_receipt_correlation_matches(
+                                    plan.github_receipt_correlation_digest(),
+                                    value.receipt_correlation_digest(),
+                                )? {
                                     continue;
                                 }
                             } else if value.receipt_correlation_digest().is_some() {
                                 continue;
                             }
-                            if action.receipt.outcome()
-                                == automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Accepted
-                                || action.receipt.outcome()
-                                    == automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Unknown
-                            {
-                                if plan.is_github_check_rerun() {
-                                    let action = self
-                                        .approve_prepared_github_confirmation(&action, now_ms)?;
-                                    let receipt = self.drive_github_check_rerun(
-                                        &principal,
-                                        &action,
-                                        &plan,
-                                        now_ms,
-                                    )?;
-                                    return Ok(PlatformV2Response::ReviewReceipt(receipt));
+                            if plan.is_github_check_rerun() {
+                                if stored_github_recovery_phase(&action, &plan)?
+                                    == GitHubRecoveryPhase::Terminal
+                                {
+                                    return Ok(PlatformV2Response::ReviewReceipt(action.receipt));
                                 }
+                                let action = self.approve_prepared_github_confirmation(
+                                    &principal, &action, &plan, now_ms,
+                                )?;
+                                let receipt = self
+                                    .drive_github_check_rerun(&principal, &action, &plan, now_ms)?;
+                                return Ok(PlatformV2Response::ReviewReceipt(receipt));
+                            }
+                            if action.receipt.outcome() == ReviewReceiptOutcome::Accepted
+                                || action.receipt.outcome() == ReviewReceiptOutcome::Unknown
+                            {
                                 if action.write_admitted_at_ms.is_none()
                                     && self
                                         .validate_retained_review_execution_fence(
@@ -2413,9 +2466,13 @@ impl PlatformV2Runtime {
             .workspaces
             .get(action.request.workspace())
             .ok_or("platform_v2_scope_denied")?;
-        self.validate_github_workspace_revision(principal, action, plan)?;
+        let phase = stored_github_recovery_phase(action, plan)?;
+        if phase == GitHubRecoveryPhase::Terminal {
+            return Ok(action.receipt.clone());
+        }
         let mut may_submit = false;
-        let action = if action.write_admitted_at_ms.is_none() {
+        let mut refresh_plan = false;
+        let action = if phase == GitHubRecoveryPhase::NeverStarted {
             if self
                 .validate_github_check_execution_fence(principal, action, plan)
                 .is_err()
@@ -2436,15 +2493,19 @@ impl PlatformV2Runtime {
             match write {
                 ReviewWriteAdmission::New(action) => {
                     may_submit = true;
+                    refresh_plan = true;
                     action
                 }
-                ReviewWriteAdmission::Replay(action) => action,
+                ReviewWriteAdmission::Replay(action) => {
+                    refresh_plan = true;
+                    action
+                }
             }
         } else {
             action.clone()
         };
         let refreshed_plan;
-        let plan = if may_submit {
+        let plan = if refresh_plan {
             let (stored, refreshed) = self
                 .reviews
                 .external_action(
@@ -2554,7 +2615,9 @@ impl PlatformV2Runtime {
 
     fn approve_prepared_github_confirmation(
         &mut self,
+        principal: &PrincipalPolicy,
         action: &StoredReviewAction,
+        plan: &ReviewExternalEffectPlan,
         now_ms: i64,
     ) -> Result<StoredReviewAction, &'static str> {
         if action.approval_policy != ApprovalPolicy::Required
@@ -2562,10 +2625,17 @@ impl PlatformV2Runtime {
         {
             return Err("platform_v2_review_confirmation_required");
         }
+        let phase = stored_github_recovery_phase(action, plan)?;
+        if phase == GitHubRecoveryPhase::Terminal {
+            return Ok(action.clone());
+        }
+        if phase == GitHubRecoveryPhase::NeverStarted {
+            self.validate_github_workspace_revision(principal, action, plan)?;
+        }
         if action.approval.is_some() {
             return Ok(action.clone());
         }
-        if action.write_admitted_at_ms.is_some() {
+        if phase != GitHubRecoveryPhase::NeverStarted {
             return Err("platform_v2_review_confirmation_corrupt");
         }
         // This prepared row can only be created after the confirmed transport
@@ -4914,6 +4984,72 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "cross-workspace reads do not inherit a source tuple"
+    #[test]
+    fn github_recovery_phase_gates_only_never_started_custody() {
+        assert_eq!(
+            github_recovery_phase(
+                ReviewReceiptOutcome::Accepted,
+                false,
+                ReviewExternalEffectCustody::NotStarted,
+            ),
+            Ok(GitHubRecoveryPhase::NeverStarted)
+        );
+        for (outcome, custody) in [
+            (
+                ReviewReceiptOutcome::Accepted,
+                ReviewExternalEffectCustody::CustodyStarted,
+            ),
+            (
+                ReviewReceiptOutcome::Accepted,
+                ReviewExternalEffectCustody::Accepted,
+            ),
+            (
+                ReviewReceiptOutcome::Unknown,
+                ReviewExternalEffectCustody::Ambiguous,
+            ),
+        ] {
+            assert_eq!(
+                github_recovery_phase(outcome, true, custody),
+                Ok(GitHubRecoveryPhase::ReconcileOnly)
+            );
+        }
+        for (outcome, admitted, custody) in [
+            (
+                ReviewReceiptOutcome::Refused,
+                false,
+                ReviewExternalEffectCustody::Refused,
+            ),
+            (
+                ReviewReceiptOutcome::Completed,
+                true,
+                ReviewExternalEffectCustody::Completed,
+            ),
+            (
+                ReviewReceiptOutcome::Conflict,
+                true,
+                ReviewExternalEffectCustody::Completed,
+            ),
+        ] {
+            assert_eq!(
+                github_recovery_phase(outcome, admitted, custody),
+                Ok(GitHubRecoveryPhase::Terminal)
+            );
+        }
+        assert!(
+            github_recovery_phase(
+                ReviewReceiptOutcome::Accepted,
+                false,
+                ReviewExternalEffectCustody::Accepted,
+            )
+            .is_err()
+        );
+        assert!(
+            github_recovery_phase(
+                ReviewReceiptOutcome::Unknown,
+                false,
+                ReviewExternalEffectCustody::Ambiguous,
+            )
+            .is_err()
         );
     }
 
@@ -5209,6 +5345,14 @@ mod tests {
         .unwrap();
         assert_ne!(reappeared.items()[0].id(), &original_id);
         assert!(!reappeared.items()[0].unread());
+    fn github_lookup_requires_the_exact_nonlegacy_correlation() {
+        let exact = review_receipt_correlation_digest([7; 32]).unwrap();
+        let wrong = review_receipt_correlation_digest([8; 32]).unwrap();
+        assert!(github_receipt_correlation_matches(Some([7; 32]), Some(&exact)).unwrap());
+        assert!(!github_receipt_correlation_matches(Some([7; 32]), None).unwrap());
+        assert!(!github_receipt_correlation_matches(None, Some(&exact)).unwrap());
+        assert!(!github_receipt_correlation_matches(None, None).unwrap());
+        assert!(!github_receipt_correlation_matches(Some([7; 32]), Some(&wrong)).unwrap());
     }
 
     fn policy(inherited_tools: serde_json::Value) -> PolicyDocument {

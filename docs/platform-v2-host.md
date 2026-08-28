@@ -318,9 +318,13 @@ run ID, and observed attempt across every actor and workspace, so aliases or
 concurrent confirmations cannot create two POST opportunities. Attempts and
 snapshot/check revisions whose next value cannot be represented are refused
 before reservation or custody.
-Approval, write admission, submission, and restart reconciliation each reload
-the authoritative workspace mapping and require that stored revision exactly;
-missing legacy revision data or a changed/removed mapping is non-drivable.
+Never-started approval, write admission, and the final pre-POST check each
+reload the authoritative workspace mapping and require that stored revision
+exactly; missing legacy revision data or a changed/removed mapping prevents the
+first provider mutation. Once write custody has started, restart recovery is
+reconcile-only and does not reinterpret a later workspace revision as provider
+state. Exact correlated terminal receipts likewise remain readable while the
+current principal still owns the mapping.
 After a restart, `custody_started`, accepted, or ambiguous state is reconciled
 with the exact workflow-run GET and is never submitted again. GitHub does not
 return a rerun correlation token, so an exact next attempt completes the
