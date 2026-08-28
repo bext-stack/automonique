@@ -5846,11 +5846,14 @@ mod tests {
         fixture.reset_counts();
         let response =
             restarted.handle(fixture.uid, &uncorrelated_lookup("github-uncorrelated"), 20);
-        assert!(matches!(
-            response,
-            PlatformV2Response::Refused(refusal)
-                if refusal.category().as_str() == "platform_v2_not_found"
-        ));
+        assert!(
+            matches!(
+                response,
+                PlatformV2Response::Refused(ref refusal)
+                    if refusal.category().as_str() == "platform_v2_not_found"
+            ),
+            "unexpected uncorrelated response: {response:?}"
+        );
         assert_eq!(fixture.calls(), (0, 0));
     }
 
@@ -5874,11 +5877,14 @@ mod tests {
         missing.reset_counts();
         let response =
             restarted.handle(missing.uid, &uncorrelated_lookup("github-missing-plan"), 20);
-        assert!(matches!(
-            response,
-            PlatformV2Response::Refused(refusal)
-                if refusal.category().as_str() == "platform_v2_not_found"
-        ));
+        assert!(
+            matches!(
+                response,
+                PlatformV2Response::Refused(ref refusal)
+                    if refusal.category().as_str() == "platform_v2_not_found"
+            ),
+            "unexpected missing-plan response: {response:?}"
+        );
         assert_eq!(missing.calls(), (0, 0));
 
         let legacy = GitHubRecoveryFixture::new();
@@ -5918,11 +5924,14 @@ mod tests {
         let mut restarted = legacy.open();
         legacy.reset_counts();
         let response = restarted.handle(legacy.uid, &uncorrelated_lookup("github-legacy-plan"), 20);
-        assert!(matches!(
-            response,
-            PlatformV2Response::Refused(refusal)
-                if refusal.category().as_str() == "platform_v2_not_found"
-        ));
+        assert!(
+            matches!(
+                response,
+                PlatformV2Response::Refused(ref refusal)
+                    if refusal.category().as_str() == "platform_v2_not_found"
+            ),
+            "unexpected legacy-v5 response: {response:?}"
+        );
         assert_eq!(legacy.calls(), (0, 0));
     }
 
@@ -5992,11 +6001,14 @@ mod tests {
             &correlated_lookup("github-legacy-v5", correlation),
             20,
         );
-        assert!(matches!(
-            response,
-            PlatformV2Response::Refused(refusal)
-                if refusal.category().as_str() == "platform_v2_not_found"
-        ));
+        assert!(
+            matches!(
+                response,
+                PlatformV2Response::Refused(ref refusal)
+                    if refusal.category().as_str() == "platform_v2_not_found"
+            ),
+            "unexpected partial-v5 response: {response:?}"
+        );
         assert_eq!(fixture.calls(), (0, 0));
     }
 
