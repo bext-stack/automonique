@@ -2,7 +2,7 @@
 
 //! The synchronous GitHub client.
 //!
-//! One origin, fourteen operations. The client is the composition of
+//! One origin, sixteen operations. The client is the composition of
 //! [`GitHubOperation`]'s rendering and the `decode_*` functions around a single
 //! bounded HTTP call — it adds no field to a request and repairs no field in a
 //! response, so everything it can send or accept is already provable without a
@@ -28,18 +28,19 @@ use ureq::tls::{RootCerts, TlsConfig};
 
 use crate::request::HttpMethod;
 use crate::response::{
-    CommentRef, GitHubComment, GitHubIssue, GitHubReply, GitHubRepository, IssueListPage,
-    IssueSearchPage, Viewer, decode_comment, decode_comment_ref, decode_comments,
+    CommentRef, GitHubComment, GitHubIssue, GitHubReply, GitHubRepository, GitHubWorkflowRun,
+    IssueListPage, IssueSearchPage, Viewer, decode_comment, decode_comment_ref, decode_comments,
     decode_error_message, decode_issue, decode_issue_list, decode_issue_ref, decode_labels,
-    decode_repository, decode_repository_labels, decode_search, decode_viewer,
+    decode_repository, decode_repository_labels, decode_search, decode_viewer, decode_workflow_run,
 };
 use crate::{
     CommentRequest, CreateIssueRequest, EntityTag, GITHUB_REQUEST_TIMEOUT_SECONDS,
-    GetCommentsRequest, GetIssueCommentRequest, GetIssueRequest, GetRepositoryRequest, GitHubBase,
-    GitHubFailure, GitHubOperation, GitHubOutcome, GitHubRejection, GitHubToken, ListIssuesRequest,
-    ListLabelsRequest, MAX_GITHUB_RESPONSE_BYTES, ManagementReceipt, ManagementRequest, RateLimit,
-    ReplaceLabelsRequest, SearchIssuesRequest, SetStateRequest, UpdateIssueBodyRequest,
-    UpdateIssueCommentRequest, Versioned,
+    GetCommentsRequest, GetIssueCommentRequest, GetIssueRequest, GetRepositoryRequest,
+    GetWorkflowRunRequest, GitHubBase, GitHubFailure, GitHubOperation, GitHubOutcome,
+    GitHubRejection, GitHubToken, ListIssuesRequest, ListLabelsRequest, MAX_GITHUB_RESPONSE_BYTES,
+    ManagementReceipt, ManagementRequest, RateLimit, ReplaceLabelsRequest, RerunWorkflowRequest,
+    SearchIssuesRequest, SetStateRequest, UpdateIssueBodyRequest, UpdateIssueCommentRequest,
+    Versioned,
 };
 
 /// The API version every request pins.
@@ -335,6 +336,30 @@ impl GitHubClient {
         )
     }
 
+    /// Read one exact GitHub Actions workflow run for revision reconciliation.
+    pub fn get_workflow_run(
+        &self,
+        request: &GetWorkflowRunRequest,
+    ) -> Result<GitHubReply<GitHubWorkflowRun>, GitHubFailure> {
+        self.call(
+            &GitHubOperation::GetWorkflowRun(request.clone()),
+            decode_workflow_run,
+        )
+    }
+
+    /// Re-run one exact GitHub Actions workflow run.
+    ///
+    /// GitHub documents an empty `201 Created` response for this operation.
+    /// The endpoint has no idempotency key, so callers must persist their
+    /// submission state before calling and must never blindly replay an
+    /// ambiguous result.
+    pub fn rerun_workflow(
+        &self,
+        request: &RerunWorkflowRequest,
+    ) -> Result<GitHubReply<()>, GitHubFailure> {
+        self.call_empty(&GitHubOperation::RerunWorkflow(request.clone()), 201)
+    }
+
     /// Search issues across repositories.
     ///
     /// # Errors
@@ -445,6 +470,33 @@ impl GitHubClient {
             answer.rate,
             GitHubOutcome::Accepted(decode(&answer.body)?),
         ))
+    }
+
+    fn call_empty(
+        &self,
+        operation: &GitHubOperation,
+        accepted_status: u16,
+    ) -> Result<GitHubReply<()>, GitHubFailure> {
+        let answer = self.send(operation)?;
+        if (300..400).contains(&answer.status) {
+            return Err(GitHubFailure::Redirected);
+        }
+        if !(200..300).contains(&answer.status) {
+            let message = decode_error_message(&answer.body, answer.status);
+            return Ok(GitHubReply::new(
+                answer.rate,
+                GitHubOutcome::Rejected(GitHubRejection::new(
+                    answer.status,
+                    message,
+                    &answer.rate,
+                    answer.retry_after_seconds,
+                )),
+            ));
+        }
+        if answer.status != accepted_status || !answer.body.is_empty() {
+            return Err(GitHubFailure::InvalidResponse);
+        }
+        Ok(GitHubReply::new(answer.rate, GitHubOutcome::Accepted(())))
     }
 
     /// Issue one operation whose accepted response must carry an entity tag.

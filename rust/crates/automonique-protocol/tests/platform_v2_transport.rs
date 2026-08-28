@@ -52,7 +52,7 @@ fn mutation_intent() -> WorkContextMutationIntent {
     )
 }
 fn review_action() -> ReviewActionTransportRequest {
-    ReviewActionTransportRequest::new(
+    ReviewActionTransportRequest::new_confirmed(
         workspace(),
         Revision::FIRST,
         ReviewAction::RerunCheck {
@@ -60,6 +60,7 @@ fn review_action() -> ReviewActionTransportRequest {
             expected_check_revision: Revision::FIRST,
         },
         IdempotencyKey::new("review-action-1").unwrap(),
+        ReviewConfirmationDigest::new("ab".repeat(32)).unwrap(),
     )
     .unwrap()
 }
@@ -153,6 +154,49 @@ fn review_action_transport_rejects_the_same_invalid_batch_shapes_as_typescript()
             Err(PlatformV2TransportError::InvalidBody)
         );
     }
+}
+
+#[test]
+fn check_rerun_requires_an_exact_confirmation_digest_and_other_actions_refuse_it() {
+    let rerun = ReviewAction::RerunCheck {
+        check_id: OpaqueId::new("check-1").unwrap(),
+        expected_check_revision: Revision::FIRST,
+    };
+    assert!(
+        ReviewActionTransportRequest::new(
+            workspace(),
+            Revision::FIRST,
+            rerun.clone(),
+            IdempotencyKey::new("rerun-unconfirmed").unwrap(),
+        )
+        .is_err()
+    );
+    assert!(ReviewConfirmationDigest::new("AB".repeat(32)).is_err());
+    assert!(ReviewConfirmationDigest::new("ab".repeat(31)).is_err());
+    let digest = ReviewConfirmationDigest::new("ab".repeat(32)).unwrap();
+    assert!(!format!("{digest:?}").contains("abababab"));
+    assert!(
+        ReviewActionTransportRequest::new_confirmed(
+            workspace(),
+            Revision::FIRST,
+            ReviewAction::ApproveReview {
+                expected_review_revision: Revision::FIRST,
+            },
+            IdempotencyKey::new("approval-must-not-carry-rerun-confirmation").unwrap(),
+            digest.clone(),
+        )
+        .is_err()
+    );
+    assert!(
+        ReviewActionTransportRequest::new_confirmed(
+            workspace(),
+            Revision::FIRST,
+            rerun,
+            IdempotencyKey::new("rerun-confirmed").unwrap(),
+            digest,
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -374,6 +418,9 @@ fn every_platform_v2_request_kind_round_trips_without_server_owned_inputs() {
             project(),
             UserWorkspaceId::new("workspace-1").unwrap(),
         )),
+        PlatformV2Request::GetReviewCapabilities(
+            ReviewReadRequest::new(project(), workspace()).unwrap(),
+        ),
         PlatformV2Request::ExecuteReviewAction(review_action()),
         PlatformV2Request::GetReviewReceipt(
             ReviewReceiptLookup::new(
@@ -516,6 +563,44 @@ fn response_documents_round_trip_and_review_envelope_fits_its_declared_ceiling()
             "platform_v2_lifecycle_adapter_pending"
         ),
         Err(PlatformV2TransportError::InvalidBody)
+    );
+
+    let review_capability_request = PlatformV2RequestMessage::new(
+        request_id("review-capabilities-response"),
+        PlatformV2Request::GetReviewCapabilities(
+            ReviewReadRequest::new(project(), workspace()).unwrap(),
+        ),
+    );
+    let ci = ReviewAuthority::new(
+        ReviewAuthorityKind::Ci,
+        ReviewAuthorityId::new("ci-1").unwrap(),
+    );
+    let review_capability_response = PlatformV2ResponseMessage::for_request(
+        &review_capability_request,
+        PlatformV2Response::ReviewCapabilities(
+            ReviewCapabilities::new(
+                project(),
+                workspace(),
+                Revision::new(9).unwrap(),
+                vec![
+                    ReviewCheckRerunCapability::new(
+                        ReviewCheckId::new("check-1").unwrap(),
+                        Revision::new(7).unwrap(),
+                        ci,
+                        ReviewConfirmationDigest::new("ab".repeat(32)).unwrap(),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let bytes = review_capability_response.to_canonical_bytes().unwrap();
+    assert_eq!(
+        PlatformV2ResponseMessage::from_canonical_bytes(&bytes, &review_capability_request,)
+            .unwrap(),
+        review_capability_response
     );
 
     let query = WorkContextQuery::new(

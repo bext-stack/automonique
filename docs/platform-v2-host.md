@@ -275,16 +275,62 @@ authority kind/id to one closed target variant:
 - `retained_session` contains the closed provider (`jcode`), opaque provider
   session id, and exact Platform v2 `work_session_id` whose authoritative
   relations must lead to the bound review workspace and provider session;
-- `ci` contains an opaque provider target and credential reference;
+- `ci` keeps its backward-compatible provider target and credential reference;
+  a GitHub rerun capability additionally requires an exact bounded `checks`
+  entry containing `check_id`, numeric `run_id`, 40/64-hex `head_sha`, positive
+  `observed_attempt`, and positive `observed_check_revision`;
 - `pull_request` contains an opaque provider repository and credential
   reference.
 
-Credential references are names, never secret material. Target variants must
+Credential references are names, never secret material in this registry. A
+GitHub rerun is enabled only when the separate private sibling
+`platform-v2-review-github-credentials.json` contains the same reference and
+repository, a header-safe token, and the explicit boolean
+`"actions_write": true`. That file has the same owner, mode, link, size,
+unknown-field, and generation-fence checks as the review registry. Its token
+is moved immediately out of the scrubbed serde/file buffer into a non-Debug,
+zeroizing installed container. Only a short-lived typed-client copy is made at
+the HTTP boundary; both copies scrub on drop. It is never rendered or sourced
+from `gh`, the process environment, or ambient host authentication.
+
+Target variants must
 match their authority family, duplicate bindings and overlapping repository
 roots are refused, repository and `.git` metadata cannot be symlinked or
 group/world writable, and unknown JSON fields are rejected. The registry is
-private composition state: it is never returned by Platform v2 and clients
-cannot supply paths, commands, provider targets, or credential references.
+private composition state: its coordinates are never returned by Platform v2
+and clients cannot supply paths, commands, provider targets, or credential
+references. `GetReviewCapabilities` returns only the exact project/workspace,
+snapshot revision, check id/revision, CI authority, and opaque confirmation
+digest for currently runnable checks. Advertisement performs a fresh typed
+GitHub workflow-run GET and emits
+the capability only when run ID, head SHA, observed attempt, and completed
+status still match; missing, stale, unavailable, or incoherent provider or
+registry/credential state produces no advertised rerun capability. This read
+never performs a provider mutation.
+
+`ExecuteReviewAction(rerun_check)` persists the immutable run/repository/head/
+attempt plan and custody in the review SQLite store before the one allowed
+POST. Only a brand-new write admission in the same process may issue that POST.
+The store atomically and durably reserves the ASCII-case-normalized repository,
+run ID, and observed attempt across every actor and workspace, so aliases or
+concurrent confirmations cannot create two POST opportunities. Attempts and
+snapshot/check revisions whose next value cannot be represented are refused
+before reservation or custody.
+After a restart, `custody_started`, accepted, or ambiguous state is reconciled
+with the exact workflow-run GET and is never submitted again. GitHub does not
+return a rerun correlation token, so an exact next attempt completes the
+receipt only when this process durably retained GitHub's 201 response for the
+exact POST. A crash-before-POST or transport-ambiguous mutation remains
+ambiguous even if another actor creates the next attempt; the old attempt, a
+skipped attempt, or changed head likewise never triggers a second mutation.
+
+Each advertised rerun capability also carries an opaque confirmation digest
+over the authenticated actor, project/workspace, snapshot/check revisions,
+provider target, and exact registry and credential generations. Cockpit first
+renders that capability as an inert confirmation preview. Only an explicit
+confirm returns the digest with the action; the daemon recomputes it before
+persisting an approval and before provider custody. A changed or substituted
+preview fails closed.
 
 ## Private attention source registry
 
@@ -603,12 +649,16 @@ custody binds an operation family as well as the project and idempotency key;
 review custody additionally binds the exact workspace kind and ID. Mutation
 custody cannot admit a review lookup, and custody for one review workspace
 cannot admit another. Legacy custody rows without this complete coordinate fail
-closed after migration. Typed review-action submission and review-receipt
-lookup require their own independent mobile grants. The web bridge admits only
-local `add_comment` and `approve_review` actions for mobile execution;
-provider-session, Git/filesystem, CI, and pull-request action families are
-refused before the daemon socket even if their daemon adapters are installed
-later. Custody is capped at 128 live entries per credential, survives process
+closed after migration. Typed review-action submission, review-capability
+reads, check reruns, and review-receipt lookup require independent
+`execute_review_action`, `get_review_capabilities`, `rerun_check`, and
+`get_review_receipt` mobile grants. The historical execute grant remains
+limited to local `add_comment` and `approve_review`; it never grants a rerun. A
+rerun grant accepts only the typed `rerun_check` action, and the web cockpit
+shows it only when the exact live-preflighted check/revision capability matches
+its fresh review snapshot. Provider-session, Git/filesystem, and pull-request
+action families remain refused before the daemon socket. Custody is capped at
+128 live entries per credential, survives process
 restart and same-delegation access-token rotation, and is deleted on delegation
 regrant or credential revocation. Thus another same-project credential and a
 new delegation cannot read an older mutation receipt.

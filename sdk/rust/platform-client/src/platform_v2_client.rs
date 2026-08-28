@@ -51,8 +51,8 @@ use automonique_protocol::platform_v2_transport::{
     PlatformNegotiationResponseMessage, PlatformV2Refusal, PlatformV2Request,
     PlatformV2RequestMessage, PlatformV2Response, PlatformV2ResponseMessage,
     PlatformV2TransportError, RawMutationApprovalDocument, RawMutationReceiptDocument,
-    ReceiptLookupKey, ReviewActionTransportRequest, ReviewReadRequest, ReviewReceiptLookup,
-    WorkspaceIntentLookup, WorkspaceIntentRequest,
+    ReceiptLookupKey, ReviewActionTransportRequest, ReviewCapabilities, ReviewConfirmationDigest,
+    ReviewReadRequest, ReviewReceiptLookup, WorkspaceIntentLookup, WorkspaceIntentRequest,
 };
 use automonique_protocol::primitives::Revision;
 
@@ -306,6 +306,12 @@ pub enum ReviewReadResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AttentionReadResult {
     Snapshot(Box<AttentionSourceSnapshot>),
+    Refused(PlatformV2Refusal),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReviewCapabilitiesResult {
+    Capabilities(ReviewCapabilities),
     Refused(PlatformV2Refusal),
 }
 
@@ -627,6 +633,27 @@ impl<T> PlatformV2Client<T> {
         }
     }
 
+    pub fn get_review_capabilities(
+        &mut self,
+        project: ProjectId,
+        workspace: WorkContextIdentity,
+    ) -> Result<ReviewCapabilitiesResult, ClientError> {
+        let expected_project = project.clone();
+        let expected_workspace = workspace.clone();
+        let request =
+            ReviewReadRequest::new(project, workspace).map_err(|_| ClientError::Protocol)?;
+        match self.request(PlatformV2Request::GetReviewCapabilities(request))? {
+            PlatformV2Response::ReviewCapabilities(value)
+                if value.project() == &expected_project
+                    && value.workspace() == &expected_workspace =>
+            {
+                Ok(ReviewCapabilitiesResult::Capabilities(value))
+            }
+            PlatformV2Response::Refused(value) => Ok(ReviewCapabilitiesResult::Refused(value)),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
     pub fn execute_review_action(
         &mut self,
         workspace: WorkContextIdentity,
@@ -640,6 +667,39 @@ impl<T> PlatformV2Client<T> {
             expected_revision,
             action,
             idempotency_key,
+        )
+        .map_err(|_| ClientError::Protocol)?;
+        match self.request(PlatformV2Request::ExecuteReviewAction(request))? {
+            PlatformV2Response::ReviewReceipt(value)
+                if value.idempotency_key() == &expected_key =>
+            {
+                Ok(ReviewReceiptResult::Receipt(value))
+            }
+            PlatformV2Response::Refused(value) => Ok(ReviewReceiptResult::Refused(value)),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    /// Confirm one exact server-advertised review action preview.
+    ///
+    /// The confirmation digest must come from the matching current
+    /// [`ReviewCapabilities`]. Rerun actions are deliberately refused by
+    /// `execute_review_action` so callers cannot skip this explicit phase.
+    pub fn execute_confirmed_review_action(
+        &mut self,
+        workspace: WorkContextIdentity,
+        expected_revision: Revision,
+        action: ReviewAction,
+        idempotency_key: IdempotencyKey,
+        confirmation_digest: ReviewConfirmationDigest,
+    ) -> Result<ReviewReceiptResult, ClientError> {
+        let expected_key = idempotency_key.clone();
+        let request = ReviewActionTransportRequest::new_confirmed(
+            workspace,
+            expected_revision,
+            action,
+            idempotency_key,
+            confirmation_digest,
         )
         .map_err(|_| ClientError::Protocol)?;
         match self.request(PlatformV2Request::ExecuteReviewAction(request))? {

@@ -323,6 +323,39 @@ impl fmt::Display for CommentId {
     }
 }
 
+/// One positive GitHub Actions workflow-run identifier.
+///
+/// It is a validated numeric path segment. The connector deliberately has no
+/// workflow name, ref, dispatch input, or arbitrary actions path type.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct WorkflowRunId(u64);
+
+impl WorkflowRunId {
+    /// Validate one workflow-run id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GitHubRefusal::WorkflowRunId`] for zero.
+    pub const fn new(value: u64) -> Result<Self, GitHubRefusal> {
+        if value == 0 {
+            return Err(GitHubRefusal::WorkflowRunId);
+        }
+        Ok(Self(value))
+    }
+
+    /// The numeric id.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for WorkflowRunId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 impl fmt::Display for IssueNumber {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}", self.0)
@@ -614,6 +647,17 @@ mod tests {
     fn a_comment_id_is_positive_and_kept_exactly() {
         assert_eq!(CommentId::new(0).err(), Some(GitHubRefusal::CommentId));
         let id = CommentId::new(u64::MAX).expect("comment id");
+        assert_eq!(id.get(), u64::MAX);
+        assert_eq!(id.to_string(), u64::MAX.to_string());
+    }
+
+    #[test]
+    fn a_workflow_run_id_is_positive_and_kept_exactly() {
+        assert_eq!(
+            WorkflowRunId::new(0).err(),
+            Some(GitHubRefusal::WorkflowRunId)
+        );
+        let id = WorkflowRunId::new(u64::MAX).expect("workflow run id");
         assert_eq!(id.get(), u64::MAX);
         assert_eq!(id.to_string(), u64::MAX.to_string());
     }

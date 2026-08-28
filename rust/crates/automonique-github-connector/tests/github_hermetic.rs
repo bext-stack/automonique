@@ -27,14 +27,15 @@ use std::time::{Duration, Instant};
 use automonique_github_connector::{
     Attribution, ChecklistItem, CommentId, CommentRequest, CreateIssueRequest, EntityTag,
     GITHUB_ACCEPT, GITHUB_API_VERSION, GITHUB_USER_AGENT, GetCommentsRequest,
-    GetIssueCommentRequest, GetIssueRequest, GetRepositoryRequest, GitHubBase, GitHubClient,
-    GitHubFailure, GitHubOperation, GitHubToken, IssueBodyText, IssueFilter, IssueListState,
-    IssueNumber, IssuePriority, IssueSource, IssueState, IssueStatus, IssueTitle, Label,
-    LabelColor, ListIssuesRequest, ListLabelsRequest, MAX_GITHUB_RESPONSE_BYTES, ManagementName,
-    ManagementRequest, Page, RejectionKind, ReplaceLabelsRequest, RepoMap, RepoRule, RepoTarget,
-    SearchIssuesRequest, SetStateRequest, Since, SiteId, TenantId, TenantIssue, ThreadId,
-    TicketDraft, TicketExchange, UpdateIssueBodyRequest, UpdateIssueCommentRequest,
-    body_carries_marker, marker_thread_id, ticket_labels,
+    GetIssueCommentRequest, GetIssueRequest, GetRepositoryRequest, GetWorkflowRunRequest,
+    GitHubBase, GitHubClient, GitHubFailure, GitHubOperation, GitHubToken, IssueBodyText,
+    IssueFilter, IssueListState, IssueNumber, IssuePriority, IssueSource, IssueState, IssueStatus,
+    IssueTitle, Label, LabelColor, ListIssuesRequest, ListLabelsRequest, MAX_GITHUB_RESPONSE_BYTES,
+    ManagementName, ManagementRequest, Page, RejectionKind, ReplaceLabelsRequest, RepoMap,
+    RepoRule, RepoTarget, RerunWorkflowRequest, SearchIssuesRequest, SetStateRequest, Since,
+    SiteId, TenantId, TenantIssue, ThreadId, TicketDraft, TicketExchange, UpdateIssueBodyRequest,
+    UpdateIssueCommentRequest, WorkflowRunId, WorkflowRunStatus, body_carries_marker,
+    marker_thread_id, ticket_labels,
 };
 
 /// Bound on every server-side wait. A test that would otherwise hang fails here.
@@ -312,6 +313,13 @@ fn repository_json() -> String {
     )
 }
 
+fn workflow_run_json(attempt: u32, status: &str) -> String {
+    format!(
+        "{{\"id\":99112233,\"head_sha\":\"0123456789abcdef0123456789abcdef01234567\",\
+         \"run_attempt\":{attempt},\"status\":\"{status}\"}}"
+    )
+}
+
 fn comment_json(body: &str) -> String {
     format!(
         "{{\"id\":9001,\"user\":{{\"login\":\"octocat\"}},\"body\":{},\
@@ -379,6 +387,68 @@ fn the_create_issue_operation_sends_its_exact_request_and_parses_the_issue_back(
     assert_eq!(issue.updated_at, "2026-08-13T17:04:11Z");
     assert_eq!(issue.closed_at, None);
     assert_eq!(issue.body, "corps");
+}
+
+#[test]
+fn workflow_run_read_is_exactly_repository_and_run_scoped() {
+    let fake = FakeGitHub::spawn(vec![Canned::json(&workflow_run_json(3, "completed"))]);
+    let client = github_client(&fake);
+    let request =
+        GetWorkflowRunRequest::new(target(), WorkflowRunId::new(99_112_233).expect("run id"));
+
+    let reply = client.get_workflow_run(&request).expect("call");
+    let run = reply.accepted().expect("accepted run");
+    assert_eq!(run.id, WorkflowRunId::new(99_112_233).unwrap());
+    assert_eq!(run.run_attempt, 3);
+    assert_eq!(run.status, WorkflowRunStatus::Completed);
+    assert_eq!(run.head_sha, "0123456789abcdef0123456789abcdef01234567");
+
+    let captured = fake.only_request();
+    assert_wire_shape(
+        &captured,
+        "GET",
+        "/repos/example-org/example-repo/actions/runs/99112233",
+    );
+    assert!(captured.body.is_empty());
+}
+
+#[test]
+fn workflow_rerun_is_one_bodyless_typed_external_effect() {
+    let fake = FakeGitHub::spawn(vec![Canned::status(201, "")]);
+    let client = github_client(&fake);
+    let request =
+        RerunWorkflowRequest::new(target(), WorkflowRunId::new(99_112_233).expect("run id"));
+    let operation = GitHubOperation::RerunWorkflow(request.clone());
+    assert!(operation.is_external_effect());
+    assert!(operation.body().is_none());
+
+    let reply = client.rerun_workflow(&request).expect("call");
+    assert_eq!(reply.accepted(), Some(&()));
+    let captured = fake.only_request();
+    assert_wire_shape(
+        &captured,
+        "POST",
+        "/repos/example-org/example-repo/actions/runs/99112233/rerun",
+    );
+    assert!(captured.body.is_empty());
+}
+
+#[test]
+fn workflow_rerun_refuses_unexpected_success_shapes() {
+    for canned in [
+        Canned::status(200, ""),
+        Canned::status(201, "{}"),
+        Canned::status(204, ""),
+    ] {
+        let fake = FakeGitHub::spawn(vec![canned]);
+        let client = github_client(&fake);
+        let request =
+            RerunWorkflowRequest::new(target(), WorkflowRunId::new(99_112_233).expect("run id"));
+        assert_eq!(
+            client.rerun_workflow(&request).err(),
+            Some(GitHubFailure::InvalidResponse)
+        );
+    }
 }
 
 #[test]

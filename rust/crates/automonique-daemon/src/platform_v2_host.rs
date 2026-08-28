@@ -14,6 +14,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use automonique_github_connector::{RepoTarget, WorkflowRunId};
 use automonique_protocol::digest::{Sha256, Sha256Digest};
 use automonique_protocol::identity::Actor;
 use automonique_protocol::platform::{ReceiptId, ResourceAuthority};
@@ -29,13 +30,15 @@ use automonique_protocol::platform_v2_lifecycle::{
 };
 use automonique_protocol::platform_v2_lineage::{WorkspaceIntent, WorkspaceIntentOutcome};
 use automonique_protocol::platform_v2_review::{
-    ReviewAction, ReviewActionReceipt, ReviewActionRequest, ReviewActorId, ReviewAuthentication,
-    ReviewAuthority, ReviewAuthorityId, ReviewAuthorityKind, ReviewSnapshot,
+    CheckState, ReviewAction, ReviewActionReceipt, ReviewActionRequest, ReviewActorId,
+    ReviewAuthentication, ReviewAuthority, ReviewAuthorityId, ReviewAuthorityKind,
+    ReviewFreshnessState, ReviewSnapshot,
 };
 use automonique_protocol::platform_v2_transport::{
     LIFECYCLE_CAPABILITY_EFFECT_KINDS, LifecycleCapabilities, LifecycleOperationCapability,
     PlatformV2Refusal, PlatformV2Request, PlatformV2Response, RawMutationApprovalDocument,
-    RawMutationReceiptDocument, ReceiptLookupKey,
+    RawMutationReceiptDocument, ReceiptLookupKey, ReviewCapabilities, ReviewCheckRerunCapability,
+    ReviewConfirmationDigest,
 };
 use automonique_protocol::primitives::{EpochMillis, Revision};
 use automonique_protocol::wire::JsonValue;
@@ -43,7 +46,8 @@ use automonique_store::attention_store::AttentionStore;
 use automonique_store::lineage_index::WorkspaceIntentExecutionReceipt;
 use automonique_store::lineage_index::{IntentAuthorizationScope, LineageIndex};
 use automonique_store::review_store::{
-    ApprovalPolicy, ReviewActionAdmission, ReviewExternalEffectPlan, ReviewStore, ReviewStoreError,
+    ApprovalPolicy, ReviewActionAdmission, ReviewApprovalDecision, ReviewApprovalDocument,
+    ReviewExternalEffectCustody, ReviewExternalEffectPlan, ReviewStore, ReviewStoreError,
     ReviewWriteAdmission, StoredReviewAction,
 };
 use automonique_store::work_context_store::{
@@ -56,6 +60,10 @@ use automonique_store::work_context_store::{
 use serde::Deserialize;
 
 use crate::platform_v2_attention_registry::AttentionRegistry;
+use crate::platform_v2_github_check_adapter::{
+    GitHubCheckRerunCustody, GitHubCheckRerunError, GitHubCheckRerunPlan,
+    GitHubCheckRerunSubmission,
+};
 use crate::platform_v2_review_adapter::{ProductionReviewEffectAdapter, ReviewEffectPlan};
 
 pub const POLICY_FILE_NAME: &str = "platform-v2-policy.json";
@@ -71,6 +79,14 @@ const PREVIEW_LIFETIME_MS: i64 = 5 * 60 * 1_000;
 const APPROVAL_LIFETIME_MS: i64 = 60 * 1_000;
 const EFFECT_LEASE_LIFETIME_MS: i64 = 30 * 1_000;
 const MAX_POLICY_BYTES: u64 = 256 * 1024;
+
+fn review_confirmation_digest(digest: [u8; 32]) -> Result<ReviewConfirmationDigest, &'static str> {
+    let value = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    ReviewConfirmationDigest::new(value).map_err(|_| "platform_v2_response_invalid")
+}
 
 #[derive(Debug)]
 pub enum PlatformV2Host {
@@ -806,7 +822,7 @@ pub fn resolve_web_mobile_request_project(
         }
         PlatformV2Request::SubmitWorkspaceIntent(value) => value.project().clone(),
         PlatformV2Request::GetWorkspaceIntent(value) => value.project().clone(),
-        PlatformV2Request::GetReview(value) => {
+        PlatformV2Request::GetReview(value) | PlatformV2Request::GetReviewCapabilities(value) => {
             if principal
                 .workspaces
                 .get(value.workspace())
@@ -1729,7 +1745,90 @@ impl PlatformV2Runtime {
                     .snapshot(value, &self.attention)
                     .map(PlatformV2Response::AttentionSourceSnapshot)
             }
+            PlatformV2Request::GetReviewCapabilities(value) => {
+                authorize_identity(&principal, value.project(), value.workspace())?;
+                self.validate_policy_mapping(&principal, value.workspace())?;
+                let snapshot = self
+                    .reviews
+                    .snapshot(value.workspace())
+                    .map_err(|_| "platform_v2_store_refused")?
+                    .ok_or("platform_v2_not_found")?;
+                let Some(authority) = principal
+                    .review_authorities
+                    .get(&ReviewAuthorityKind::Ci)
+                    .cloned()
+                else {
+                    return Ok(PlatformV2Response::ReviewCapabilities(
+                        ReviewCapabilities::new(
+                            value.project().clone(),
+                            value.workspace().clone(),
+                            snapshot.revision(),
+                            Vec::new(),
+                        )
+                        .map_err(|_| "platform_v2_response_invalid")?,
+                    ));
+                };
+                let mut rerunnable = Vec::new();
+                for check in snapshot.checks() {
+                    if check.authority() != &authority
+                        || check.freshness().state() != ReviewFreshnessState::Fresh
+                        || !matches!(
+                            check.state(),
+                            CheckState::Passed | CheckState::Failed | CheckState::Cancelled
+                        )
+                    {
+                        continue;
+                    }
+                    let action = ReviewAction::RerunCheck {
+                        check_id: check.id().clone(),
+                        expected_check_revision: check.freshness().observed_revision(),
+                    };
+                    let plan = self.review_effects.plan(
+                        value.project(),
+                        value.workspace(),
+                        &authority,
+                        &action,
+                    );
+                    if plan.as_ref().is_ok_and(|plan| {
+                        matches!(plan, ReviewEffectPlan::GitHubCheckRerun { .. })
+                            && self
+                                .review_effects
+                                .preflight_github_capability(plan)
+                                .is_ok()
+                    }) {
+                        let plan = plan.map_err(|_| "platform_v2_review_ci_check_unavailable")?;
+                        let confirmation = self.review_effects.github_confirmation_digest(
+                            &principal.actor,
+                            value.project(),
+                            value.workspace(),
+                            &authority,
+                            snapshot.revision(),
+                            &action,
+                            &plan,
+                        )?;
+                        rerunnable.push(
+                            ReviewCheckRerunCapability::new(
+                                check.id().clone(),
+                                check.freshness().observed_revision(),
+                                authority.clone(),
+                                review_confirmation_digest(confirmation)?,
+                            )
+                            .map_err(|_| "platform_v2_response_invalid")?,
+                        );
+                    }
+                }
+                Ok(PlatformV2Response::ReviewCapabilities(
+                    ReviewCapabilities::new(
+                        value.project().clone(),
+                        value.workspace().clone(),
+                        snapshot.revision(),
+                        rerunnable,
+                    )
+                    .map_err(|_| "platform_v2_response_invalid")?,
+                ))
+            }
             PlatformV2Request::ExecuteReviewAction(value) => {
+                let confirmation_digest = value.confirmation_digest().cloned();
                 let scope = principal
                     .workspaces
                     .get(value.workspace())
@@ -1754,6 +1853,15 @@ impl PlatformV2Runtime {
                     value.action().clone(),
                 )
                 .map_err(|_| "platform_v2_request_invalid")?;
+                let approval_policy = if matches!(request.action(), ReviewAction::RerunCheck { .. })
+                {
+                    if confirmation_digest.is_none() {
+                        return Err("platform_v2_review_confirmation_required");
+                    }
+                    ApprovalPolicy::Required
+                } else {
+                    ApprovalPolicy::NotRequired
+                };
                 if let Some((existing, plan)) = self
                     .reviews
                     .external_action(
@@ -1767,11 +1875,11 @@ impl PlatformV2Runtime {
                     .map_err(review_store_category)?
                 {
                     let request_digest =
-                        ReviewStore::action_request_digest(&request, ApprovalPolicy::NotRequired)
+                        ReviewStore::action_request_digest(&request, approval_policy)
                             .map_err(review_store_category)?;
                     if existing.request_digest != request_digest
                         || existing.request != request
-                        || existing.approval_policy != ApprovalPolicy::NotRequired
+                        || existing.approval_policy != approval_policy
                     {
                         return Err("platform_v2_review_conflict");
                     }
@@ -1781,6 +1889,13 @@ impl PlatformV2Runtime {
                             != automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Unknown
                     {
                         return Ok(PlatformV2Response::ReviewReceipt(existing.receipt));
+                    }
+                    if plan.is_github_check_rerun() {
+                        let existing =
+                            self.approve_prepared_github_confirmation(&existing, now_ms)?;
+                        let receipt =
+                            self.drive_github_check_rerun(&principal, &existing, &plan, now_ms)?;
+                        return Ok(PlatformV2Response::ReviewReceipt(receipt));
                     }
                     if existing.write_admitted_at_ms.is_none()
                         && self
@@ -1824,7 +1939,7 @@ impl PlatformV2Runtime {
                 }
                 if let Some(existing) = self
                     .reviews
-                    .inspect_action(&request, ApprovalPolicy::NotRequired, now_ms)
+                    .inspect_action(&request, approval_policy, now_ms)
                     .map_err(review_store_category)?
                 {
                     if existing.receipt.outcome()
@@ -1955,6 +2070,85 @@ impl PlatformV2Runtime {
                         )?;
                         Ok(PlatformV2Response::ReviewReceipt(receipt))
                     }
+                    Ok(ReviewEffectPlan::GitHubCheckRerun {
+                        credential_reference,
+                        repository,
+                        run_id,
+                        head_sha,
+                        observed_attempt,
+                        expected_check_revision,
+                        registry_generation,
+                        credential_generation,
+                    }) => {
+                        let advertised_plan = ReviewEffectPlan::GitHubCheckRerun {
+                            credential_reference: credential_reference.clone(),
+                            repository: repository.clone(),
+                            run_id,
+                            head_sha: head_sha.clone(),
+                            observed_attempt,
+                            expected_check_revision,
+                            registry_generation,
+                            credential_generation,
+                        };
+                        let expected_confirmation =
+                            self.review_effects.github_confirmation_digest(
+                                &principal.actor,
+                                &scope.project,
+                                request.workspace(),
+                                request.authority(),
+                                request.expected_revision(),
+                                request.action(),
+                                &advertised_plan,
+                            )?;
+                        if confirmation_digest.as_ref().map(|value| value.as_str())
+                            != Some(review_confirmation_digest(expected_confirmation)?.as_str())
+                        {
+                            return Err("platform_v2_review_confirmation_changed");
+                        }
+                        let request_digest =
+                            ReviewStore::action_request_digest(&request, ApprovalPolicy::Required)
+                                .map_err(review_store_category)?;
+                        let external_plan = ReviewExternalEffectPlan::github_check_rerun(
+                            request_digest,
+                            registry_generation,
+                            credential_generation,
+                            &credential_reference,
+                            repository.owner().as_str(),
+                            repository.repo().as_str(),
+                            run_id.get(),
+                            &head_sha,
+                            observed_attempt,
+                            match request.action() {
+                                ReviewAction::RerunCheck { check_id, .. } => check_id.clone(),
+                                _ => return Err("platform_v2_review_plan_invalid"),
+                            },
+                            expected_check_revision,
+                        )
+                        .map_err(review_store_category)?;
+                        self.policy_fence.verify()?;
+                        self.review_effects.verify_generation()?;
+                        let admitted = self
+                            .reviews
+                            .prepare_external_action(
+                                &request,
+                                ApprovalPolicy::Required,
+                                &external_plan,
+                                now_ms,
+                            )
+                            .map_err(review_store_category)?;
+                        let action = match admitted {
+                            ReviewActionAdmission::New(action)
+                            | ReviewActionAdmission::Replay(action) => action,
+                        };
+                        let action = self.approve_prepared_github_confirmation(&action, now_ms)?;
+                        let receipt = self.drive_github_check_rerun(
+                            &principal,
+                            &action,
+                            &external_plan,
+                            now_ms,
+                        )?;
+                        Ok(PlatformV2Response::ReviewReceipt(receipt))
+                    }
                     Err(category) => {
                         // Resolve the exact grant, revision, freshness and
                         // target before exposing an adapter capability reason.
@@ -1986,6 +2180,17 @@ impl PlatformV2Runtime {
                                 || action.receipt.outcome()
                                     == automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Unknown
                             {
+                                if plan.is_github_check_rerun() {
+                                    let action = self
+                                        .approve_prepared_github_confirmation(&action, now_ms)?;
+                                    let receipt = self.drive_github_check_rerun(
+                                        &principal,
+                                        &action,
+                                        &plan,
+                                        now_ms,
+                                    )?;
+                                    return Ok(PlatformV2Response::ReviewReceipt(receipt));
+                                }
                                 if action.write_admitted_at_ms.is_none()
                                     && self
                                         .validate_retained_review_execution_fence(
@@ -2075,6 +2280,253 @@ impl PlatformV2Runtime {
                     .map_err(|_| category)
             }
         }
+    }
+
+    fn drive_github_check_rerun(
+        &mut self,
+        principal: &PrincipalPolicy,
+        action: &StoredReviewAction,
+        plan: &ReviewExternalEffectPlan,
+        now_ms: i64,
+    ) -> Result<ReviewActionReceipt, &'static str> {
+        let scope = principal
+            .workspaces
+            .get(action.request.workspace())
+            .ok_or("platform_v2_scope_denied")?;
+        let mut may_submit = false;
+        let action = if action.write_admitted_at_ms.is_none() {
+            if self
+                .validate_github_check_execution_fence(principal, action, plan)
+                .is_err()
+            {
+                return self
+                    .reviews
+                    .refuse_external_action_not_started(
+                        &action.preview_id,
+                        action.request_digest,
+                        now_ms,
+                    )
+                    .map_err(review_store_category);
+            }
+            let write = self
+                .reviews
+                .start_write(&action.preview_id, action.request_digest, now_ms)
+                .map_err(review_store_category)?;
+            match write {
+                ReviewWriteAdmission::New(action) => {
+                    may_submit = true;
+                    action
+                }
+                ReviewWriteAdmission::Replay(action) => action,
+            }
+        } else {
+            action.clone()
+        };
+        let refreshed_plan;
+        let plan = if may_submit {
+            let (stored, refreshed) = self
+                .reviews
+                .external_action(
+                    action.request.workspace(),
+                    action.request.actor(),
+                    action.request.authentication(),
+                    action.request.authority(),
+                    action.request.idempotency_key(),
+                    now_ms,
+                )
+                .map_err(review_store_category)?
+                .ok_or("platform_v2_review_plan_missing")?;
+            if stored.preview_id != action.preview_id
+                || stored.request_digest != action.request_digest
+            {
+                return Err("platform_v2_review_plan_invalid");
+            }
+            refreshed_plan = refreshed;
+            &refreshed_plan
+        } else {
+            plan
+        };
+        if may_submit
+            && self
+                .validate_github_check_execution_fence(principal, &action, plan)
+                .is_err()
+        {
+            return self
+                .reviews
+                .settle_github_check_rerun(
+                    &action.preview_id,
+                    action.request_digest,
+                    ReviewExternalEffectCustody::Refused,
+                    now_ms,
+                )
+                .map_err(review_store_category);
+        }
+        let provider_plan = github_provider_plan(principal, &scope.project, &action.request, plan)?;
+        let repository = github_repository(plan)?;
+        let credential_reference = plan
+            .github_credential_reference()
+            .ok_or("platform_v2_review_plan_invalid")?;
+        let credential_generation = plan
+            .github_credential_generation_digest()
+            .ok_or("platform_v2_review_plan_invalid")?;
+        let adapter = match self.review_effects.github_adapter(
+            credential_reference,
+            &repository,
+            credential_generation,
+        ) {
+            Ok(adapter) => adapter,
+            Err(category) if may_submit => {
+                return self
+                    .reviews
+                    .settle_github_check_rerun(
+                        &action.preview_id,
+                        action.request_digest,
+                        ReviewExternalEffectCustody::Refused,
+                        now_ms,
+                    )
+                    .map_err(|_| category);
+            }
+            Err(category) => return Err(category),
+        };
+        let custody = map_store_github_custody(
+            plan.github_custody()
+                .ok_or("platform_v2_review_plan_invalid")?,
+        );
+        let mut submission =
+            GitHubCheckRerunSubmission::restore(&provider_plan, provider_plan.digest(), custody)
+                .map_err(github_rerun_category)?;
+        if let Err(category) = self.policy_fence.verify() {
+            if may_submit {
+                return self
+                    .reviews
+                    .settle_github_check_rerun(
+                        &action.preview_id,
+                        action.request_digest,
+                        ReviewExternalEffectCustody::Refused,
+                        now_ms,
+                    )
+                    .map_err(|_| category);
+            }
+            return Err(category);
+        }
+        let result = if may_submit {
+            adapter.submit(&provider_plan, &mut submission)
+        } else {
+            adapter.reconcile(&provider_plan, &mut submission)
+        };
+        self.policy_fence.verify()?;
+        let settled = match result {
+            Ok(custody) => map_github_store_custody(custody),
+            Err(error) => match submission.custody() {
+                GitHubCheckRerunCustody::Refused => ReviewExternalEffectCustody::Refused,
+                GitHubCheckRerunCustody::Ambiguous
+                | GitHubCheckRerunCustody::CustodyStarted
+                | GitHubCheckRerunCustody::Accepted => ReviewExternalEffectCustody::Ambiguous,
+                GitHubCheckRerunCustody::Completed => ReviewExternalEffectCustody::Completed,
+                GitHubCheckRerunCustody::NotStarted => return Err(github_rerun_category(error)),
+            },
+        };
+        self.reviews
+            .settle_github_check_rerun(&action.preview_id, action.request_digest, settled, now_ms)
+            .map_err(review_store_category)
+    }
+
+    fn approve_prepared_github_confirmation(
+        &mut self,
+        action: &StoredReviewAction,
+        now_ms: i64,
+    ) -> Result<StoredReviewAction, &'static str> {
+        if action.approval_policy != ApprovalPolicy::Required
+            || !matches!(action.request.action(), ReviewAction::RerunCheck { .. })
+        {
+            return Err("platform_v2_review_confirmation_required");
+        }
+        if action.approval.is_some() {
+            return Ok(action.clone());
+        }
+        if action.write_admitted_at_ms.is_some() {
+            return Err("platform_v2_review_confirmation_corrupt");
+        }
+        // This prepared row can only be created after the confirmed transport
+        // digest has been validated.  Completing the adjacent durable approval
+        // is therefore safe after a crash between those two SQLite commits;
+        // provider custody still cannot begin until this approval exists.
+        let approval_expires_at = now_ms
+            .checked_add(APPROVAL_LIFETIME_MS)
+            .ok_or("platform_v2_time_invalid")?;
+        let approval = ReviewApprovalDocument::new(
+            action.preview_id.clone(),
+            action.request.workspace().clone(),
+            action.request.actor().clone(),
+            action.request.authentication(),
+            action.request.authority().clone(),
+            action.request_digest,
+            action.request.expected_revision(),
+            ReviewApprovalDecision::Approved,
+            approval_expires_at,
+        )
+        .map_err(review_store_category)?;
+        self.reviews
+            .decide_action(&approval, now_ms)
+            .map_err(review_store_category)
+    }
+
+    fn validate_github_check_execution_fence(
+        &self,
+        principal: &PrincipalPolicy,
+        action: &StoredReviewAction,
+        plan: &ReviewExternalEffectPlan,
+    ) -> Result<(), &'static str> {
+        self.policy_fence.verify()?;
+        let scope = principal
+            .workspaces
+            .get(action.request.workspace())
+            .ok_or("platform_v2_scope_denied")?;
+        let current = self.review_effects.plan(
+            &scope.project,
+            action.request.workspace(),
+            action.request.authority(),
+            action.request.action(),
+        )?;
+        let ReviewEffectPlan::GitHubCheckRerun {
+            credential_reference,
+            repository,
+            run_id,
+            head_sha,
+            observed_attempt,
+            expected_check_revision,
+            registry_generation,
+            credential_generation,
+        } = current
+        else {
+            return Err("platform_v2_review_registry_changed");
+        };
+        let reconstructed = ReviewExternalEffectPlan::github_check_rerun(
+            plan.request_digest(),
+            registry_generation,
+            credential_generation,
+            &credential_reference,
+            repository.owner().as_str(),
+            repository.repo().as_str(),
+            run_id.get(),
+            &head_sha,
+            observed_attempt,
+            plan.github_check_id()
+                .cloned()
+                .ok_or("platform_v2_review_plan_invalid")?,
+            expected_check_revision,
+        )
+        .map_err(review_store_category)?;
+        if reconstructed.digest() != plan.digest() {
+            return Err("platform_v2_review_registry_changed");
+        }
+        let provider_plan = github_provider_plan(principal, &scope.project, &action.request, plan)?;
+        self.review_effects
+            .github_adapter(&credential_reference, &repository, credential_generation)?
+            .preflight(&provider_plan)
+            .map_err(github_rerun_category)?;
+        self.policy_fence.verify()?;
+        self.review_effects.verify_generation()
     }
 
     fn drive_retained_review_delivery(
@@ -2503,6 +2955,87 @@ fn review_store_category(error: ReviewStoreError) -> &'static str {
         | ReviewStoreError::Corrupt(_)
         | ReviewStoreError::Io(_)
         | ReviewStoreError::Sqlite(_) => "platform_v2_store_refused",
+    }
+}
+
+fn github_repository(plan: &ReviewExternalEffectPlan) -> Result<RepoTarget, &'static str> {
+    RepoTarget::parse(
+        plan.github_repository_owner()
+            .ok_or("platform_v2_review_plan_invalid")?,
+        plan.github_repository_name()
+            .ok_or("platform_v2_review_plan_invalid")?,
+    )
+    .map_err(|_| "platform_v2_review_plan_invalid")
+}
+
+fn github_provider_plan(
+    principal: &PrincipalPolicy,
+    project: &ProjectId,
+    request: &ReviewActionRequest,
+    plan: &ReviewExternalEffectPlan,
+) -> Result<GitHubCheckRerunPlan, &'static str> {
+    GitHubCheckRerunPlan::new(
+        plan.registry_generation_digest(),
+        plan.github_credential_generation_digest()
+            .ok_or("platform_v2_review_plan_invalid")?,
+        plan.github_credential_reference()
+            .ok_or("platform_v2_review_plan_invalid")?,
+        github_repository(plan)?,
+        WorkflowRunId::new(
+            plan.github_run_id()
+                .ok_or("platform_v2_review_plan_invalid")?,
+        )
+        .map_err(|_| "platform_v2_review_plan_invalid")?,
+        plan.github_head_sha()
+            .ok_or("platform_v2_review_plan_invalid")?,
+        plan.github_observed_attempt()
+            .ok_or("platform_v2_review_plan_invalid")?,
+        &principal.actor,
+        project.clone(),
+        request.workspace().clone(),
+        request.authority().clone(),
+        request.idempotency_key().clone(),
+        plan.github_check_id()
+            .cloned()
+            .ok_or("platform_v2_review_plan_invalid")?,
+        request.expected_revision(),
+        plan.github_expected_check_revision()
+            .ok_or("platform_v2_review_plan_invalid")?,
+    )
+    .map_err(github_rerun_category)
+}
+
+const fn map_store_github_custody(value: ReviewExternalEffectCustody) -> GitHubCheckRerunCustody {
+    match value {
+        ReviewExternalEffectCustody::NotStarted => GitHubCheckRerunCustody::NotStarted,
+        ReviewExternalEffectCustody::CustodyStarted => GitHubCheckRerunCustody::CustodyStarted,
+        ReviewExternalEffectCustody::Accepted => GitHubCheckRerunCustody::Accepted,
+        ReviewExternalEffectCustody::Ambiguous => GitHubCheckRerunCustody::Ambiguous,
+        ReviewExternalEffectCustody::Refused => GitHubCheckRerunCustody::Refused,
+        ReviewExternalEffectCustody::Completed => GitHubCheckRerunCustody::Completed,
+    }
+}
+
+const fn map_github_store_custody(value: GitHubCheckRerunCustody) -> ReviewExternalEffectCustody {
+    match value {
+        GitHubCheckRerunCustody::NotStarted => ReviewExternalEffectCustody::NotStarted,
+        GitHubCheckRerunCustody::CustodyStarted => ReviewExternalEffectCustody::CustodyStarted,
+        GitHubCheckRerunCustody::Accepted => ReviewExternalEffectCustody::Accepted,
+        GitHubCheckRerunCustody::Ambiguous => ReviewExternalEffectCustody::Ambiguous,
+        GitHubCheckRerunCustody::Refused => ReviewExternalEffectCustody::Refused,
+        GitHubCheckRerunCustody::Completed => ReviewExternalEffectCustody::Completed,
+    }
+}
+
+const fn github_rerun_category(error: GitHubCheckRerunError) -> &'static str {
+    match error {
+        GitHubCheckRerunError::InvalidPlan | GitHubCheckRerunError::SubmissionState => {
+            "platform_v2_review_plan_invalid"
+        }
+        GitHubCheckRerunError::CapabilityMismatch => "platform_v2_review_ci_credential_incoherent",
+        GitHubCheckRerunError::ProviderUnavailable => "platform_v2_review_ci_provider_unavailable",
+        GitHubCheckRerunError::ProviderRefused => "platform_v2_review_ci_provider_refused",
+        GitHubCheckRerunError::ResourceChanged => "platform_v2_review_ci_check_changed",
     }
 }
 

@@ -68,6 +68,28 @@ describe("mobile Platform v2 delegated authorization", () => {
     ).toEqual(["execute_review_action", "get_review_receipt"]);
   });
 
+  test("keeps capability reads and check reruns separate from legacy review execution", () => {
+    const review = {
+      ...descriptor,
+      actions: [
+        "get_review_capabilities",
+        "execute_review_action",
+        "rerun_check",
+        "get_review_receipt",
+      ],
+    } as const;
+    expect(
+      decodeMobilePlatformV2Authorization(
+        parseCanonical(new TextEncoder().encode(JSON.stringify(review))),
+      ).actions,
+    ).toEqual([
+      "get_review_capabilities",
+      "execute_review_action",
+      "rerun_check",
+      "get_review_receipt",
+    ]);
+  });
+
   test("operator grant encoding carries project identifiers, never client paths", () => {
     const encoded = new TextDecoder().decode(
       toCanonicalBytes(

@@ -13,7 +13,8 @@ use automonique_protocol::platform_v2_review_api::{
 use automonique_protocol::primitives::Revision;
 use automonique_store::review_store::{
     ApprovalPolicy, ReviewActionAdmission, ReviewApprovalDecision, ReviewApprovalDocument,
-    ReviewExternalEffectPlan, ReviewStore, ReviewStoreError, ReviewWriteAdmission,
+    ReviewExternalEffectCustody, ReviewExternalEffectPlan, ReviewStore, ReviewStoreError,
+    ReviewWriteAdmission,
 };
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
@@ -59,7 +60,7 @@ fn downgrade_review_store_to_v1(path: &Path) {
     let connection = Connection::open(path).expect("open v2 store for downgrade");
     connection
         .execute_batch(
-            "DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; ALTER TABLE review_snapshots DROP COLUMN protocol_schema; PRAGMA user_version=1;",
+            "DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; ALTER TABLE review_snapshots DROP COLUMN protocol_schema; PRAGMA user_version=1;",
         )
         .expect("construct historical v1 store");
 }
@@ -192,6 +193,300 @@ fn external_plan(request: &ReviewActionRequest, payload: &[u8]) -> ReviewExterna
         payload.to_vec(),
     )
     .expect("external plan")
+}
+
+fn github_external_plan(request: &ReviewActionRequest) -> ReviewExternalEffectPlan {
+    github_external_plan_for(request, "example-org", "example-repo", 91, 3)
+}
+
+fn github_external_plan_for(
+    request: &ReviewActionRequest,
+    owner: &str,
+    repository: &str,
+    run_id: u64,
+    attempt: u32,
+) -> ReviewExternalEffectPlan {
+    let request_digest =
+        ReviewStore::action_request_digest(request, ApprovalPolicy::NotRequired).expect("digest");
+    ReviewExternalEffectPlan::github_check_rerun(
+        request_digest,
+        [7; 32],
+        [8; 32],
+        "github-actions-mobile",
+        owner,
+        repository,
+        run_id,
+        "0123456789abcdef0123456789abcdef01234567",
+        attempt,
+        ReviewCheckId::new("check-1").unwrap(),
+        revision(7),
+    )
+    .expect("github effect plan")
+}
+
+#[test]
+fn github_run_attempt_reservation_is_atomic_case_insensitive_cross_actor_and_durable() {
+    let private = PrivateStore::new();
+    let (left_request, right_request) = {
+        let mut store = ReviewStore::open(private.path()).unwrap();
+        let base = seed(&mut store);
+        let left = request_variant(
+            &base,
+            "reserve-left",
+            "actor-reserve-left",
+            revision(9),
+            revision(7),
+        );
+        let right = request_variant(
+            &base,
+            "reserve-right",
+            "actor-reserve-right",
+            revision(9),
+            revision(7),
+        );
+        for request in [&left, &right] {
+            store
+                .grant_authority(
+                    request.workspace(),
+                    request.actor(),
+                    request.authentication(),
+                    request.authority(),
+                    11,
+                )
+                .unwrap();
+        }
+        (left, right)
+    };
+    let barrier = Arc::new(Barrier::new(2));
+    let path = private.path().to_path_buf();
+    let left_barrier = Arc::clone(&barrier);
+    let left = std::thread::spawn(move || {
+        let mut store = ReviewStore::open(&path).unwrap();
+        let plan = github_external_plan_for(&left_request, "Example-Org", "Example-Repo", 91, 3);
+        left_barrier.wait();
+        store.prepare_external_action(&left_request, ApprovalPolicy::NotRequired, &plan, 12)
+    });
+    let path = private.path().to_path_buf();
+    let right_barrier = Arc::clone(&barrier);
+    let right = std::thread::spawn(move || {
+        let mut store = ReviewStore::open(&path).unwrap();
+        let plan = github_external_plan_for(&right_request, "example-org", "example-repo", 91, 3);
+        right_barrier.wait();
+        store.prepare_external_action(&right_request, ApprovalPolicy::NotRequired, &plan, 12)
+    });
+    let results = [left.join().unwrap(), right.join().unwrap()];
+    assert_eq!(
+        results.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "exactly one actor must reserve the provider attempt"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(
+                result,
+                Err(ReviewStoreError::Conflict("github_check_run_attempt"))
+            ))
+            .count(),
+        1
+    );
+
+    let base = request();
+    let after_restart = request_variant(
+        &base,
+        "reserve-after-restart",
+        "actor-reserve-after-restart",
+        revision(9),
+        revision(7),
+    );
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    store
+        .grant_authority(
+            after_restart.workspace(),
+            after_restart.actor(),
+            after_restart.authentication(),
+            after_restart.authority(),
+            13,
+        )
+        .unwrap();
+    let plan = github_external_plan_for(&after_restart, "EXAMPLE-ORG", "EXAMPLE-REPO", 91, 3);
+    assert!(matches!(
+        store.prepare_external_action(&after_restart, ApprovalPolicy::NotRequired, &plan, 14),
+        Err(ReviewStoreError::Conflict("github_check_run_attempt"))
+    ));
+}
+
+#[test]
+fn github_plan_rejects_every_successor_overflow_before_reservation() {
+    let base = request();
+    let request_digest =
+        ReviewStore::action_request_digest(&base, ApprovalPolicy::NotRequired).unwrap();
+    assert!(
+        ReviewExternalEffectPlan::github_check_rerun(
+            request_digest,
+            [7; 32],
+            [8; 32],
+            "github-actions-mobile",
+            "example-org",
+            "example-repo",
+            91,
+            "0123456789abcdef0123456789abcdef01234567",
+            u32::MAX,
+            ReviewCheckId::new("check-1").unwrap(),
+            revision(7),
+        )
+        .is_err()
+    );
+    assert!(
+        ReviewExternalEffectPlan::github_check_rerun(
+            request_digest,
+            [7; 32],
+            [8; 32],
+            "github-actions-mobile",
+            "example-org",
+            "example-repo",
+            91,
+            "0123456789abcdef0123456789abcdef01234567",
+            3,
+            ReviewCheckId::new("check-1").unwrap(),
+            revision(i64::MAX as u64),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn github_check_plan_and_custody_survive_restart_without_reopening_write_admission() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let request = seed(&mut store);
+    let plan = github_external_plan(&request);
+    let action = match store
+        .prepare_external_action(&request, ApprovalPolicy::NotRequired, &plan, 12)
+        .unwrap()
+    {
+        ReviewActionAdmission::New(action) => action,
+        ReviewActionAdmission::Replay(_) => panic!("new action expected"),
+    };
+    assert_eq!(
+        store
+            .external_action(
+                request.workspace(),
+                request.actor(),
+                request.authentication(),
+                request.authority(),
+                request.idempotency_key(),
+                13,
+            )
+            .unwrap()
+            .unwrap()
+            .1
+            .github_custody(),
+        Some(ReviewExternalEffectCustody::NotStarted)
+    );
+    assert!(matches!(
+        store
+            .start_write(&action.preview_id, action.request_digest, 13)
+            .unwrap(),
+        ReviewWriteAdmission::New(_)
+    ));
+    drop(store);
+
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let (restarted, restarted_plan) = store
+        .external_action(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            14,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(restarted_plan.digest(), plan.digest());
+    assert_eq!(
+        restarted_plan.github_custody(),
+        Some(ReviewExternalEffectCustody::CustodyStarted)
+    );
+    assert!(matches!(
+        store
+            .start_write(&restarted.preview_id, restarted.request_digest, 14)
+            .unwrap(),
+        ReviewWriteAdmission::Replay(_)
+    ));
+    let unknown = store
+        .settle_github_check_rerun(
+            &restarted.preview_id,
+            restarted.request_digest,
+            ReviewExternalEffectCustody::Ambiguous,
+            15,
+        )
+        .unwrap();
+    assert_eq!(unknown.outcome(), ReviewReceiptOutcome::Unknown);
+    drop(store);
+
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let (restarted, restarted_plan) = store
+        .external_action(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            16,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        restarted_plan.github_custody(),
+        Some(ReviewExternalEffectCustody::Ambiguous)
+    );
+    let completed = store
+        .settle_github_check_rerun(
+            &restarted.preview_id,
+            restarted.request_digest,
+            ReviewExternalEffectCustody::Completed,
+            16,
+        )
+        .unwrap();
+    assert_eq!(completed.outcome(), ReviewReceiptOutcome::Completed);
+    assert_eq!(completed.revision(), Some(revision(10)));
+    let snapshot = store.snapshot(request.workspace()).unwrap().unwrap();
+    let check = snapshot
+        .checks()
+        .iter()
+        .find(|check| check.id().as_str() == "check-1")
+        .unwrap();
+    assert_eq!(check.state(), CheckState::Running);
+    assert_eq!(check.freshness().observed_revision(), revision(8));
+}
+
+#[test]
+fn github_check_external_plan_must_match_the_exact_action_target_revision() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let request = seed(&mut store);
+    let request_digest =
+        ReviewStore::action_request_digest(&request, ApprovalPolicy::NotRequired).unwrap();
+    let wrong = ReviewExternalEffectPlan::github_check_rerun(
+        request_digest,
+        [7; 32],
+        [8; 32],
+        "github-actions-mobile",
+        "example-org",
+        "example-repo",
+        91,
+        "0123456789abcdef0123456789abcdef01234567",
+        3,
+        ReviewCheckId::new("check-2").unwrap(),
+        revision(7),
+    )
+    .unwrap();
+    assert!(matches!(
+        store.prepare_external_action(&request, ApprovalPolicy::NotRequired, &wrong, 12),
+        Err(ReviewStoreError::Conflict("external_effect_request"))
+    ));
 }
 fn seed(store: &mut ReviewStore) -> ReviewActionRequest {
     let snapshot = snapshot();
@@ -639,7 +934,7 @@ fn populated_review_v1_store_migrates_exactly_and_remains_non_actionable() {
     assert_eq!(
         raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .expect("version"),
-        3
+        4
     );
     let schema: String = raw
         .query_row("SELECT protocol_schema FROM review_snapshots", [], |row| {
@@ -695,7 +990,7 @@ fn mislabeled_authority_bearing_v1_document_is_transactionally_upgraded_to_v2() 
     assert_eq!(
         raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .expect("version"),
-        3
+        4
     );
     let protocol_schema: String = raw
         .query_row("SELECT protocol_schema FROM review_snapshots", [], |row| {
@@ -715,7 +1010,7 @@ fn populated_v2_store_adds_external_plan_custody_transactionally() {
     }
     let raw = Connection::open(private.path()).expect("raw");
     raw.execute_batch(
-        "DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+        "DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
     )
         .expect("construct v2 store");
     drop(raw);
@@ -733,7 +1028,7 @@ fn populated_v2_store_adds_external_plan_custody_transactionally() {
     assert_eq!(
         raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .unwrap(),
-        3
+        4
     );
     assert!(
         raw.query_row(
@@ -742,6 +1037,95 @@ fn populated_v2_store_adds_external_plan_custody_transactionally() {
             |row| row.get::<_, bool>(0),
         )
         .unwrap()
+    );
+}
+
+#[test]
+fn populated_real_v3_store_migrates_to_v4_without_losing_review_state() {
+    let private = PrivateStore::new();
+    let expected = snapshot();
+    let request = request();
+    {
+        let mut store = ReviewStore::open(private.path()).unwrap();
+        store.put_snapshot(&expected, 10).unwrap();
+        store
+            .grant_authority(
+                request.workspace(),
+                request.actor(),
+                request.authentication(),
+                request.authority(),
+                11,
+            )
+            .unwrap();
+    }
+    let raw = Connection::open(private.path()).unwrap();
+    raw.execute_batch("DROP TABLE review_github_check_effect_plans; PRAGMA user_version=3;")
+        .unwrap();
+    drop(raw);
+
+    let store = ReviewStore::open(private.path()).expect("migrate populated v3");
+    assert_eq!(
+        store.snapshot(expected.workspace()).unwrap(),
+        Some(expected)
+    );
+    store.validate_action(&request, 12).unwrap();
+    drop(store);
+    let raw = Connection::open(private.path()).unwrap();
+    assert_eq!(
+        raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .unwrap(),
+        4
+    );
+    assert!(raw
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_github_check_effect_plans')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap());
+}
+
+#[test]
+fn failed_populated_v3_to_v4_migration_rolls_back_version_and_preserves_data() {
+    let private = PrivateStore::new();
+    let expected = snapshot();
+    {
+        let mut store = ReviewStore::open(private.path()).unwrap();
+        store.put_snapshot(&expected, 10).unwrap();
+    }
+    let raw = Connection::open(private.path()).unwrap();
+    raw.execute_batch(
+        "DROP TABLE review_github_check_effect_plans; CREATE TABLE review_github_check_effect_plans(marker TEXT) STRICT; PRAGMA user_version=3;",
+    )
+    .unwrap();
+    drop(raw);
+
+    assert!(matches!(
+        ReviewStore::open(private.path()),
+        Err(ReviewStoreError::Sqlite(_))
+    ));
+    let raw = Connection::open(private.path()).unwrap();
+    assert_eq!(
+        raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .unwrap(),
+        3
+    );
+    let document: Vec<u8> = raw
+        .query_row("SELECT document FROM review_snapshots", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(decode_review_snapshot(&document).unwrap(), expected);
+    let columns: i64 = raw
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('review_github_check_effect_plans')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        columns, 1,
+        "failed migration must leave the v3 schema untouched"
     );
 }
 
@@ -788,7 +1172,7 @@ fn v2_migration_terminalizes_legacy_accepted_external_action_without_a_plan() {
     };
     let raw = Connection::open(private.path()).unwrap();
     raw.execute_batch(
-        "DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+        "DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
     )
     .unwrap();
     drop(raw);
@@ -961,7 +1345,7 @@ fn v2_migration_preserves_or_conservatively_terminalizes_every_external_outcome(
         };
         let raw = Connection::open(private.path()).unwrap();
         raw.execute_batch(
-            "DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+            "DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
         )
         .unwrap();
         drop(raw);
@@ -1037,7 +1421,7 @@ fn migration_tombstone_tampering_and_native_missing_plan_corruption_fail_closed(
     };
     let raw = Connection::open(private.path()).unwrap();
     raw.execute_batch(
-        "DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+        "DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
     )
     .unwrap();
     drop(raw);
@@ -1186,7 +1570,7 @@ fn migration_refuses_legacy_completed_external_receipt_without_exact_snapshot_ba
     )
     .unwrap();
     raw.execute_batch(
-        "DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+        "DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
     )
     .unwrap();
     drop(raw);

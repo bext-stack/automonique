@@ -2,7 +2,7 @@
 
 //! Typed client for the GitHub issues surface Automonique works tickets through.
 //!
-//! Two request vocabularies are spelled, and nothing outside them can be.
+//! Three request vocabularies are spelled, and nothing outside them can be.
 //!
 //! The **issue surface** is fourteen operations, one per [`GitHubOperation`]
 //! variant: create an issue, comment on one, open or close one, replace its
@@ -11,6 +11,10 @@
 //! repository push metadata, search issues, and identify the credential. Six
 //! of them are writes, which
 //! [`GitHubOperation::is_external_effect`] answers for directly.
+//!
+//! The **Actions surface** is two repository-scoped operations: read one exact
+//! workflow run and re-run that exact workflow run. It cannot dispatch a new
+//! workflow, cancel one, select a branch, or name an arbitrary API path.
 //!
 //! The **work-management surface** is thirty-seven typed mutations, one per
 //! [`ManagementRequest`] constructor, sent through
@@ -129,21 +133,22 @@ pub use repo_map::{
 };
 pub use request::{
     CommentRequest, CreateIssueRequest, GetCommentsRequest, GetIssueCommentRequest,
-    GetIssueRequest, GetRepositoryRequest, GitHubOperation, HttpMethod, IssueFilter,
-    IssueListState, ListIssuesRequest, ListLabelsRequest, MAX_LIST_PAGE, MAX_SEARCH_PAGE, Page,
-    ReplaceLabelsRequest, SearchIssuesRequest, SetStateRequest, Since, UpdateIssueBodyRequest,
-    UpdateIssueCommentRequest,
+    GetIssueRequest, GetRepositoryRequest, GetWorkflowRunRequest, GitHubOperation, HttpMethod,
+    IssueFilter, IssueListState, ListIssuesRequest, ListLabelsRequest, MAX_LIST_PAGE,
+    MAX_SEARCH_PAGE, Page, ReplaceLabelsRequest, RerunWorkflowRequest, SearchIssuesRequest,
+    SetStateRequest, Since, UpdateIssueBodyRequest, UpdateIssueCommentRequest,
 };
 pub use response::{
-    CommentRef, GitHubComment, GitHubIssue, GitHubReply, GitHubRepository, IssueListPage,
-    IssueSearchPage, MAX_COMMENT_COUNT, MAX_SEARCH_TOTAL, Viewer, decode_comment,
-    decode_comment_ref, decode_comments, decode_error_message, decode_issue, decode_issue_list,
-    decode_issue_ref, decode_labels, decode_repository, decode_repository_labels, decode_search,
-    decode_viewer,
+    CommentRef, GitHubComment, GitHubIssue, GitHubReply, GitHubRepository, GitHubWorkflowRun,
+    IssueListPage, IssueSearchPage, MAX_COMMENT_COUNT, MAX_SEARCH_TOTAL, Viewer, WorkflowRunStatus,
+    decode_comment, decode_comment_ref, decode_comments, decode_error_message, decode_issue,
+    decode_issue_list, decode_issue_ref, decode_labels, decode_repository,
+    decode_repository_labels, decode_search, decode_viewer, decode_workflow_run,
 };
 pub use target::{
     CommentId, GITHUB_API_ORIGIN, GitHubBase, IssueLocator, IssueNumber, IssueState, Label,
     MAX_ISSUE_NUMBER, MAX_LABEL_BYTES, MAX_OWNER_BYTES, MAX_REPO_BYTES, Owner, Repo, RepoTarget,
+    WorkflowRunId,
 };
 pub use ticket::{
     CommentKind, CommentVisibility, GithubLink, IssueBodyText, IssueComment, IssuePriority,
@@ -252,6 +257,8 @@ pub enum GitHubRefusal {
     EntityTag,
     /// A work-management identifier, value, or combination is invalid.
     Management,
+    /// A workflow-run identifier is zero.
+    WorkflowRunId,
 }
 
 impl GitHubRefusal {
@@ -279,6 +286,7 @@ impl GitHubRefusal {
             Self::Rules => "rules",
             Self::EntityTag => "entity_tag",
             Self::Management => "management",
+            Self::WorkflowRunId => "workflow_run_id",
         }
     }
 }
@@ -677,6 +685,8 @@ mod tests {
             GitHubRefusal::Text,
             GitHubRefusal::Rules,
             GitHubRefusal::EntityTag,
+            GitHubRefusal::Management,
+            GitHubRefusal::WorkflowRunId,
         ];
         let mut categories: Vec<&str> = refusals.iter().map(|value| value.category()).collect();
         categories.sort_unstable();

@@ -42,6 +42,7 @@ let cockpitControlHandle = (() => {
   }
 })();
 let cockpitControlBusy = false;
+let cockpitRerunPreview = null;
 let processFilter = "all";
 const expandedProcesses = new Set();
 let ticketFilter = "all";
@@ -2354,16 +2355,53 @@ function renderHostedCockpit(view) {
   const exactAnchor = reviewLink.file && reviewLink.hunk && reviewLink.side && reviewLink.line;
   const addComment = cockpitPresentation.reviewActions.addComment;
   const approveReview = cockpitPresentation.reviewActions.approveReview;
+  const rerunCheck = cockpitPresentation.reviewActions.rerunCheck;
+  const rerunTarget = byId("cockpit-rerun-check-target");
+  const selectedCheck = rerunTarget.value;
+  rerunTarget.replaceChildren();
+  for (const target of rerunCheck.targets || []) {
+    const option = document.createElement("option");
+    option.value = target.check_id;
+    option.textContent = `${target.check_id} · revision ${target.exact_check_revision}`;
+    rerunTarget.append(option);
+  }
+  if (selectedCheck && (rerunCheck.targets || []).some((target) => target.check_id === selectedCheck)) {
+    rerunTarget.value = selectedCheck;
+  }
+  if (rerunTarget.options.length === 0) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "No rerunnable check available";
+    rerunTarget.append(option);
+  }
+  rerunTarget.disabled = !rerunCheck.available || unresolvedControl;
   byId("cockpit-add-comment").disabled = !addComment.available || !exactAnchor || unresolvedControl;
   byId("cockpit-approve-review").disabled = !approveReview.available || unresolvedControl;
+  byId("cockpit-rerun-check").disabled = !rerunCheck.available || unresolvedControl;
   byId("cockpit-add-comment").textContent = addComment.available ? "Add exact comment" : "Add comment unavailable";
   byId("cockpit-approve-review").textContent = approveReview.available ? "Approve review" : "Approve unavailable";
+  byId("cockpit-rerun-check").textContent = rerunCheck.available ? "Preview exact rerun" : "Preview rerun unavailable";
+  const previewTarget = cockpitRerunPreview && (rerunCheck.targets || []).find((target) =>
+    target.check_id === cockpitRerunPreview.check_id
+      && target.exact_revision === cockpitRerunPreview.exact_revision
+      && target.exact_check_revision === cockpitRerunPreview.exact_check_revision
+      && target.confirmation_digest === cockpitRerunPreview.confirmation_digest);
+  if (cockpitRerunPreview && !previewTarget) cockpitRerunPreview = null;
+  const rerunPreview = byId("cockpit-rerun-preview");
+  rerunPreview.hidden = !cockpitRerunPreview;
+  byId("cockpit-rerun-preview-detail").textContent = cockpitRerunPreview
+    ? `${cockpitRerunPreview.check_id} · workspace revision ${cockpitRerunPreview.exact_revision} · check revision ${cockpitRerunPreview.exact_check_revision}`
+    : "";
+  byId("cockpit-rerun-confirm").disabled = !cockpitRerunPreview || unresolvedControl;
+  byId("cockpit-rerun-cancel").disabled = !cockpitRerunPreview || cockpitControlBusy;
   byId("cockpit-review-comment").disabled = !addComment.available || unresolvedControl;
   byId("cockpit-review-action-reason").textContent = unresolvedControl
     ? "An unresolved durable receipt is lookup-only. New writes are disabled."
     : !exactAnchor
       ? "Add comment requires an exact file, hunk, side, and line deep link."
-      : "Only local add-comment and approve-review are enabled; git, CI, and pull-request families remain unavailable.";
+      : rerunCheck.available
+        ? "CI rerun is enabled only for the selected server-advertised exact check revision."
+        : "Only explicitly advertised review actions are enabled; unavailable families are not inferred.";
   const inbox = byId("cockpit-inbox-list");
   inbox.replaceChildren();
   if (cockpitPresentation.inbox.length > 0) {
@@ -3345,6 +3383,7 @@ async function submitCockpitIntent(preview) {
 async function submitCockpitReview(action) {
   const capability = cockpitPresentation?.reviewActions?.[action];
   if (!capability?.available || cockpitControlHandle || cockpitControlBusy) return;
+  if (action === "rerunCheck" && !cockpitRerunPreview) return;
   const idempotencyKey = newCockpitReceiptId("cockpit-review");
   const handle = globalThis.AutomoniquePlatformCockpit.prepareControlHandle(capability, action, idempotencyKey);
   if (!handle || !persistCockpitControl(handle)) {
@@ -3364,19 +3403,38 @@ async function submitCockpitReview(action) {
     line: Number(link.line),
     body: byId("cockpit-review-comment").value.trim(),
     idempotency_key: idempotencyKey,
-  } : {
+  } : action === "approveReview" ? {
     action: "approve_review",
     project_id: capability.project_id,
     workspace_id: capability.workspace_id,
     expected_revision: capability.exact_revision,
     expected_review_revision: capability.exact_review_revision,
     idempotency_key: idempotencyKey,
+  } : (() => {
+    const checkId = byId("cockpit-rerun-check-target").value;
+    const target = (capability.targets || []).find((candidate) => candidate.check_id === checkId);
+    return target ? {
+      action: "rerun_check",
+      project_id: target.project_id,
+      workspace_id: target.workspace_id,
+      expected_revision: target.exact_revision,
+      check_id: target.check_id,
+      expected_check_revision: target.exact_check_revision,
+      confirmation_digest: cockpitRerunPreview?.confirmation_digest,
+      idempotency_key: idempotencyKey,
+    } : null;
+  })();
+  if (!body) {
+    clearCockpitControl();
+    toast("An exact server-advertised check must be selected.", "error");
+    return;
   };
   if (action === "addComment" && !body.body) {
     clearCockpitControl();
     toast("A bounded comment body is required.", "error");
     return;
   }
+  if (action === "rerunCheck") cockpitRerunPreview = null;
   cockpitControlBusy = true;
   renderHostedCockpit(cockpitSnapshot || {});
   try {
@@ -3389,6 +3447,43 @@ async function submitCockpitReview(action) {
     cockpitState = globalThis.AutomoniquePlatformCockpit.reduce(cockpitState, { type: "receipt", receipt: {
       state: "ambiguous", id: idempotencyKey, outcome: "unknown", message: "Transmission was ambiguous. Only receipt lookup is allowed now.",
     } });
+  } finally {
+    cockpitControlBusy = false;
+    renderHostedCockpit(cockpitSnapshot || {});
+  }
+}
+
+async function previewCockpitRerun() {
+  const capability = cockpitPresentation?.reviewActions?.rerunCheck;
+  if (!capability?.available || cockpitControlHandle || cockpitControlBusy) return;
+  const checkId = byId("cockpit-rerun-check-target").value;
+  const target = (capability.targets || []).find((candidate) => candidate.check_id === checkId);
+  if (!target) return;
+  cockpitControlBusy = true;
+  try {
+    const preview = await api("/api/platform/cockpit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action: "preview_rerun_check",
+        project_id: target.project_id,
+        workspace_id: target.workspace_id,
+        expected_revision: target.exact_revision,
+        check_id: target.check_id,
+        expected_check_revision: target.exact_check_revision,
+      }),
+    });
+    if (preview?.state !== "confirmation_preview"
+      || preview.confirmation_digest !== target.confirmation_digest
+      || preview.check_id !== target.check_id
+      || preview.exact_revision !== target.exact_revision
+      || preview.exact_check_revision !== target.exact_check_revision) {
+      throw new Error("invalid rerun preview");
+    }
+    cockpitRerunPreview = Object.freeze(preview);
+  } catch (_error) {
+    cockpitRerunPreview = null;
+    toast("The exact rerun preview is unavailable; nothing was sent.", "error");
   } finally {
     cockpitControlBusy = false;
     renderHostedCockpit(cockpitSnapshot || {});
@@ -3432,6 +3527,12 @@ byId("cockpit-review-controls").addEventListener("submit", (event) => {
   submitCockpitReview("addComment");
 });
 byId("cockpit-approve-review").addEventListener("click", () => submitCockpitReview("approveReview"));
+byId("cockpit-rerun-check").addEventListener("click", previewCockpitRerun);
+byId("cockpit-rerun-confirm").addEventListener("click", () => submitCockpitReview("rerunCheck"));
+byId("cockpit-rerun-cancel").addEventListener("click", () => {
+  cockpitRerunPreview = null;
+  renderHostedCockpit(cockpitSnapshot || {});
+});
 byId("cockpit-copy-link").addEventListener("click", async () => {
   const workspace = cockpitPresentation?.selectedWorkspace;
   if (!workspace) return;

@@ -13,6 +13,7 @@ import {
   MutationApprovalId,
   PlatformVersionNumber,
   ProjectId,
+  ReviewConfirmationDigest,
   UserWorkspaceId,
   WorkContextCursor,
   WorkContextLabel,
@@ -493,6 +494,37 @@ describe("canonical HTTPS Platform v2 client", () => {
       workspace,
       IdempotencyKey("expected-key"),
     )).rejects.toMatchObject({category: "response_idempotency_mismatch"});
+  });
+
+  test("reads a generation-bound rerun preview and submits only its explicit confirmation", async () => {
+    const project = ProjectId("project-a");
+    const workspace = {kind: "user_workspace" as const, id: UserWorkspaceId("workspace-a")};
+    const confirmation = ReviewConfirmationDigest("ab".repeat(32));
+    const action = {kind: "rerun_check" as const, payload: {check_id: "check-1", expected_check_revision: 7n}};
+    const key = IdempotencyKey("review-rerun-confirmed");
+    const adapter = new DeterministicPlatformV2Adapter([
+      {lane: "negotiation", result: {kind: "negotiated", negotiated: negotiatedBody(2n)}},
+      {lane: "v2", request: {kind: "get_review_capabilities", request: {project, workspace}}, result: {kind: "review_capabilities", capabilities: {
+        project,
+        workspace,
+        snapshot_revision: WorkContextRevision(9n),
+        rerunnable_checks: [{authority: {id: "ci-1", kind: "ci"}, check_id: "check-1", confirmation_digest: confirmation, expected_check_revision: WorkContextRevision(7n)}],
+        schema: PLATFORM_SCHEMA_V2,
+      }}},
+      {lane: "v2", request: {kind: "execute_review_action", request: {
+        workspace,
+        expected_revision: WorkContextRevision(9n),
+        action,
+        idempotency_key: key,
+        confirmation_digest: confirmation,
+      }}, result: {kind: "platform_v2_refused", refusal: {category: "provider_unavailable", explanation: "ambiguous", schema: PLATFORM_SCHEMA_V2}}},
+    ]);
+    const client = new PlatformV2Client(adapter);
+    await client.negotiate(offer);
+    const capabilities = await client.getReviewCapabilities(project, workspace);
+    expect(capabilities.kind).toBe("review_capabilities");
+    expect((capabilities.kind === "review_capabilities" ? capabilities.capabilities.rerunnable_checks[0]?.confirmation_digest : null)).toBe(confirmation);
+    expect((await client.executeConfirmedReviewAction(workspace, WorkContextRevision(9n), action, key, confirmation)).kind).toBe("platform_v2_refused");
   });
 
   test("binds pages and resyncs to the exact requested cursor and limit", async () => {

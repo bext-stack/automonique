@@ -76,6 +76,7 @@ import {
   validateReviewAction,
   type ReviewAction,
   type ReviewActionReceipt,
+  type ReviewAuthority,
   type ReviewSnapshot,
 } from "./review-context.js";
 
@@ -151,11 +152,26 @@ export interface ReviewReadRequest {
   readonly workspace: ReviewWorkspaceIdentity;
 }
 export type ReviewWorkspaceIdentity = Extract<WorkContextIdentity, {readonly kind: "user_workspace" | "attempt_workspace" | "session"}>;
+export type ReviewConfirmationDigest = string & {readonly __reviewConfirmationDigest: unique symbol};
+export interface ReviewCheckRerunCapability {
+  readonly authority: ReviewAuthority;
+  readonly check_id: string;
+  readonly confirmation_digest: ReviewConfirmationDigest;
+  readonly expected_check_revision: WorkContextRevisionValue;
+}
+export interface ReviewCapabilities {
+  readonly project: ProjectIdValue;
+  readonly workspace: ReviewWorkspaceIdentity;
+  readonly snapshot_revision: WorkContextRevisionValue;
+  readonly rerunnable_checks: readonly ReviewCheckRerunCapability[];
+  readonly schema: typeof PLATFORM_SCHEMA_V2;
+}
 export interface ReviewActionTransportRequest {
   readonly workspace: ReviewWorkspaceIdentity;
   readonly expected_revision: WorkContextRevisionValue;
   readonly action: ReviewAction;
   readonly idempotency_key: IdempotencyKeyValue;
+  readonly confirmation_digest?: ReviewConfirmationDigest;
 }
 export interface ReviewReceiptLookup {
   readonly project: ProjectIdValue;
@@ -203,6 +219,7 @@ export type PlatformV2Request =
   | {readonly kind: "get_workspace_intent"; readonly lookup: WorkspaceIntentLookup}
   | {readonly kind: "get_review"; readonly request: ReviewReadRequest}
   | {readonly kind: "get_attention_source_snapshot"; readonly request: AttentionReadRequest}
+  | {readonly kind: "get_review_capabilities"; readonly request: ReviewReadRequest}
   | {readonly kind: "execute_review_action"; readonly request: ReviewActionTransportRequest}
   | {readonly kind: "get_review_receipt"; readonly lookup: ReviewReceiptLookup};
 
@@ -221,6 +238,7 @@ export type PlatformV2Response =
   | {readonly kind: "workspace_intent_result"; readonly result: WorkspaceIntentOutcome}
   | {readonly kind: "review_result"; readonly review: ReviewSnapshot}
   | {readonly kind: "attention_source_snapshot"; readonly snapshot: AttentionSourceSnapshot}
+  | {readonly kind: "review_capabilities"; readonly capabilities: ReviewCapabilities}
   | {readonly kind: "review_receipt"; readonly receipt: ReviewActionReceipt}
   | {readonly kind: "platform_v2_refused"; readonly refusal: PlatformV2Refusal};
 
@@ -321,6 +339,36 @@ function reviewWorkspace(value: WorkContextIdentity): ReviewWorkspaceIdentity {
   if (!(["user_workspace", "attempt_workspace", "session"] as const).includes(workspace.kind as "user_workspace" | "attempt_workspace" | "session")) throw new WireError("invalid_json_value", "review workspace kind");
   return workspace as ReviewWorkspaceIdentity;
 }
+export function ReviewConfirmationDigest(value: string): ReviewConfirmationDigest {
+  if (!/^[0-9a-f]{64}$/u.test(value)) throw new WireError("invalid_json_value", "review confirmation digest");
+  return value as ReviewConfirmationDigest;
+}
+function reviewCapabilities(value: JsonValue): ReviewCapabilities {
+  const body = fields(value, ["project", "rerunnable_checks", "schema", "snapshot_revision", "workspace"]);
+  if (stringField(body, "schema") !== PLATFORM_SCHEMA_V2) throw new WireError("invalid_json_value", "review capability schema");
+  const rawChecks = valueField(body, "rerunnable_checks");
+  if (rawChecks.kind !== "array" || rawChecks.items.length > 512) throw new WireError("invalid_json_value", "review capabilities");
+  const checks = rawChecks.items.map((item): ReviewCheckRerunCapability => {
+    const check = fields(item, ["authority", "check_id", "confirmation_digest", "expected_check_revision"]);
+    const authorityValue = fields(valueField(check, "authority"), ["id", "kind"]);
+    const authorityId = boundedRefusalString(stringField(authorityValue, "id"), 256);
+    if (stringField(authorityValue, "kind") !== "ci") throw new WireError("invalid_json_value", "review capability authority");
+    return {
+      authority: {id: authorityId, kind: "ci"},
+      check_id: boundedRefusalString(stringField(check, "check_id"), 256),
+      confirmation_digest: ReviewConfirmationDigest(stringField(check, "confirmation_digest")),
+      expected_check_revision: WorkContextRevision(integerField(check, "expected_check_revision")),
+    };
+  });
+  if (new Set(checks.map((check) => check.check_id)).size !== checks.length) throw new WireError("invalid_json_value", "duplicate review capability");
+  return {
+    project: ProjectId(stringField(body, "project")),
+    rerunnable_checks: checks,
+    schema: PLATFORM_SCHEMA_V2,
+    snapshot_revision: WorkContextRevision(integerField(body, "snapshot_revision")),
+    workspace: reviewWorkspace(plain(valueField(body, "workspace")) as WorkContextIdentity),
+  };
+}
 function previewRef(value: MutationPreviewRef): MutationPreviewRef {
   return {id: MutationPreviewId(value.id), revision: WorkContextRevision(value.revision)};
 }
@@ -389,7 +437,8 @@ function requestBody(request: PlatformV2Request): JsonValue {
     case "get_workspace_intent": return json({intent_id:WorkspaceIntentId(request.lookup.intent_id),project:ProjectId(request.lookup.project),schema:PLATFORM_SCHEMA_V2});
     case "get_review": return json({project:ProjectId(request.request.project),schema:PLATFORM_SCHEMA_V2,workspace:reviewWorkspace(request.request.workspace)});
     case "get_attention_source_snapshot": return json(attentionReadRequest(request.request));
-    case "execute_review_action": { const value=request.request; return json({action:validateReviewAction(value.action),expected_revision:WorkContextRevision(value.expected_revision),idempotency_key:IdempotencyKey(value.idempotency_key),platform_version:BigInt(PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR),schema:PLATFORM_REVIEW_SCHEMA_V1,workspace:reviewWorkspace(value.workspace)}); }
+    case "get_review_capabilities": return json({project:ProjectId(request.request.project),schema:PLATFORM_SCHEMA_V2,workspace:reviewWorkspace(request.request.workspace)});
+    case "execute_review_action": { const value=request.request; const action=validateReviewAction(value.action); const rerun=action.kind==="rerun_check"; if (rerun !== (value.confirmation_digest !== undefined)) throw new WireError("invalid_json_value", "review confirmation required"); const common={action,expected_revision:WorkContextRevision(value.expected_revision),idempotency_key:IdempotencyKey(value.idempotency_key),platform_version:BigInt(PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR),schema:PLATFORM_REVIEW_SCHEMA_V1,workspace:reviewWorkspace(value.workspace)}; return json(rerun?{...common,confirmation_digest:ReviewConfirmationDigest(value.confirmation_digest as string)}:common); }
     case "get_review_receipt": return json({idempotency_key:IdempotencyKey(request.lookup.idempotency_key),project:ProjectId(request.lookup.project),schema:PLATFORM_SCHEMA_V2,workspace:reviewWorkspace(request.lookup.workspace)});
   }
 }
@@ -398,7 +447,7 @@ export function encodePlatformV2Request(requestId: PlatformRequestIdValue, reque
 }
 
 const responseKinds: Readonly<Record<PlatformV2Request["kind"], readonly string[]>> = {
-  get_lifecycle_capabilities:["lifecycle_capabilities"],query_work_contexts:["work_context_page","work_context_resync"],get_work_context:["work_context_record"],prepare_mutation:["mutation_preview","mutation_refused"],decide_mutation:["mutation_approval","mutation_refused"],submit_mutation:["mutation_receipt","mutation_refused"],get_mutation_receipt:["mutation_receipt","mutation_refused"],get_lineage:["lineage_result"],submit_workspace_intent:["workspace_intent_result"],get_workspace_intent:["workspace_intent_result"],get_review:["review_result"],get_attention_source_snapshot:["attention_source_snapshot"],execute_review_action:["review_receipt"],get_review_receipt:["review_receipt"],
+  get_lifecycle_capabilities:["lifecycle_capabilities"],query_work_contexts:["work_context_page","work_context_resync"],get_work_context:["work_context_record"],prepare_mutation:["mutation_preview","mutation_refused"],decide_mutation:["mutation_approval","mutation_refused"],submit_mutation:["mutation_receipt","mutation_refused"],get_mutation_receipt:["mutation_receipt","mutation_refused"],get_lineage:["lineage_result"],submit_workspace_intent:["workspace_intent_result"],get_workspace_intent:["workspace_intent_result"],get_review:["review_result"],get_attention_source_snapshot:["attention_source_snapshot"],get_review_capabilities:["review_capabilities"],execute_review_action:["review_receipt"],get_review_receipt:["review_receipt"],
 };
 export function decodePlatformV2Response(payload: Uint8Array, requestId: PlatformRequestIdValue, requestKind: PlatformV2Request["kind"]): PlatformV2Response {
   const decoded = admitted(payload, MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES, PLATFORM_PROTOCOL, PLATFORM_V2_MAJOR);
@@ -419,6 +468,7 @@ export function decodePlatformV2Response(payload: Uint8Array, requestId: Platfor
     case "workspace_intent_result":return {kind:"workspace_intent_result",result:decodeWorkspaceIntentOutcome(negotiatedV2,bytes)};
     case "review_result":return {kind:"review_result",review:decodeReviewSnapshot(bytes)};
     case "attention_source_snapshot":return {kind:"attention_source_snapshot",snapshot:attentionSnapshot(decoded.body)};
+    case "review_capabilities":return {kind:"review_capabilities",capabilities:reviewCapabilities(decoded.body)};
     case "review_receipt":return {kind:"review_receipt",receipt:decodeReviewActionReceipt(bytes)};
     default:throw new WireError("invalid_json_value","unknown Platform v2 response kind");
   }
