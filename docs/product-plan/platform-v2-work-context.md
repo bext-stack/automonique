@@ -63,7 +63,11 @@ registration is projected into this graph, it is always represented as an
 `AttemptWorkspace`; no alias or conversion grants broader filesystem,
 credential, network, tool, provider, or model authority. RunSpec v1 retains
 its exact historical JSON keys (`workspace`, `workspace_registry_id`, and
-`workspace_token`) as wire compatibility vocabulary only.
+`workspace_token`) as wire compatibility vocabulary only. The affected Rust
+crates are unpublished implementation crates; this terminology correction is
+an intentional source-level rename with no deprecated aliases, so repository
+consumers must migrate their Rust names while installed wire clients remain
+compatible.
 
 ## Structured relation graph
 
@@ -405,9 +409,13 @@ remains read-only.
 - [x] Internal run-execution identities are qualified as attempt-workspace
   registrations, tokens, and registry IDs; RunSpec v1 wire keys remain pinned
   by `run_spec_v1_golden` and the strict decoder suites.
-- [x] An installed Platform v1 adapter negotiates v1, decodes every checked-in
-  canonical request, and re-encodes the exact same bytes in
-  `installed_v1_adapter_fixture_negotiates_and_decodes_without_v2_projection`.
+- [x] Negotiation selects v1 for an installed client's v1-only offer, then the
+  frozen response decoder extracted from the exact last pre-v2 commit admits
+  immutable current-server capability, snapshot, session, receipt, and refusal
+  transcripts in
+  `frozen_pre_v2_client_decodes_current_server_v1_responses_after_v1_negotiation`;
+  commit, path, source hashes, extraction boundary, and licences are checked in
+  beside the corpus.
 - [x] One project relates two repositories, local and SSH host setups, and user
   workspaces backed by both a git worktree and an authorized folder in
   `one_project_spans_repositories_hosts_and_both_authorized_workspace_kinds`.

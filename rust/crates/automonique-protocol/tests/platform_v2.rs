@@ -3,11 +3,9 @@
 use automonique_protocol::platform::{
     ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
 };
-use automonique_protocol::platform_api::PlatformRequestMessage;
 use automonique_protocol::platform_v2::*;
 use automonique_protocol::platform_v2_api::*;
 use automonique_protocol::primitives::Revision;
-use automonique_protocol::wire::{JsonValue, parse_canonical};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -136,48 +134,6 @@ fn version_negotiation_prefers_v2_and_downgrades_truthfully() {
             WorkContextError::VersionOfferInvalid
         ))
     );
-}
-
-#[test]
-fn installed_v1_adapter_fixture_negotiates_and_decodes_without_v2_projection() {
-    let installed_client = PlatformVersionOffer::new(vec![1]).unwrap();
-    let current_server = PlatformVersionOffer::new(vec![1, 2]).unwrap();
-    let negotiated = negotiate_platform_version(&installed_client, &current_server).unwrap();
-    assert_eq!(negotiated.version(), PlatformVersion::V1);
-    assert_eq!(
-        negotiated.schema(),
-        automonique_protocol::platform::PLATFORM_SCHEMA_V1
-    );
-    assert_eq!(
-        negotiated.work_context(),
-        WorkContextAvailability::V1ExistingResourcesOnly
-    );
-
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../../adapters/ag-ui/test/fixtures/platform-requests.json"
-    );
-    let fixture = std::fs::read_to_string(path).expect("installed v1 fixture is checked in");
-    let JsonValue::Object(entries) =
-        parse_canonical(fixture.trim().as_bytes()).expect("installed fixture is canonical JSON")
-    else {
-        panic!("installed v1 fixture is an object of canonical request strings");
-    };
-    assert!(!entries.is_empty());
-    for (label, value) in entries {
-        let JsonValue::String(bytes) = value else {
-            panic!("{label}: fixture entry must be a canonical request string");
-        };
-        let decoded = PlatformRequestMessage::from_canonical_bytes(bytes.as_bytes())
-            .unwrap_or_else(|error| {
-                panic!("{label}: installed v1 request no longer decodes: {error}")
-            });
-        assert_eq!(
-            decoded.to_message().unwrap().to_canonical_bytes(),
-            bytes.as_bytes(),
-            "{label}: v1 decoding must retain the exact canonical wire shape"
-        );
-    }
 }
 
 #[test]
