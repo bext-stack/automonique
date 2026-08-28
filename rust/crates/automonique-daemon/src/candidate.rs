@@ -1851,7 +1851,29 @@ mod tests {
             Err(ControlLockError::Held)
         ));
         drop(adopted);
-        ControlLock::acquire(config.control_lock_path()).expect("final duplicate releases lock");
+
+        // The library suite runs concurrently with tests that spawn real
+        // binaries. A child between fork and exec can briefly inherit this
+        // open-file description; CLOEXEC releases that unrelated duplicate at
+        // exec, but an instantaneous reacquire races that hand-off on loaded
+        // CI runners. Keep this process-wide assertion bounded: a real leaked
+        // descriptor still fails, while a transient pre-exec duplicate does
+        // not make an otherwise exact capability-transfer test flaky. The
+        // control_lock unit test separately proves immediate last-drop release
+        // without concurrent process creation.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match ControlLock::acquire(config.control_lock_path()) {
+                Ok(lock) => {
+                    drop(lock);
+                    break;
+                }
+                Err(ControlLockError::Held) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("final duplicate releases lock: {error:?}"),
+            }
+        }
     }
 
     fn create_database(path: &Path, version: u32, main: bool) {
