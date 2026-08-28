@@ -91,6 +91,24 @@ export interface PlatformV2Refusal {
   readonly schema: typeof PLATFORM_SCHEMA_V2;
 }
 
+export type LifecycleEffectKind =
+  | "create_attempt_workspace"
+  | "create_checkout"
+  | "create_host_setup"
+  | "resume_attempt_workspace"
+  | "resume_session";
+export interface LifecycleOperationCapability {
+  readonly project: ProjectIdValue;
+  readonly effect_kind: LifecycleEffectKind;
+  readonly available: boolean;
+  readonly category: string | null;
+}
+export interface LifecycleCapabilities {
+  readonly projects: readonly ProjectIdValue[];
+  readonly operations: readonly LifecycleOperationCapability[];
+  readonly schema: typeof PLATFORM_SCHEMA_V2;
+}
+
 export type PlatformNegotiationRequest = {
   readonly kind: "negotiate";
   readonly offer: PlatformVersionOffer;
@@ -146,6 +164,7 @@ export interface ReviewReceiptLookup {
 }
 
 export type PlatformV2Request =
+  | {readonly kind: "get_lifecycle_capabilities"}
   | {readonly kind: "query_work_contexts"; readonly query: WorkContextQuery & {readonly project: ProjectIdValue}}
   | {readonly kind: "get_work_context"; readonly identity: WorkContextIdentity}
   | {readonly kind: "prepare_mutation"; readonly request: MutationPrepareRequest}
@@ -162,6 +181,7 @@ export type PlatformV2Request =
 export interface RawMutationApprovalDocument { readonly canonical: Uint8Array }
 export interface RawMutationReceiptDocument { readonly canonical: Uint8Array }
 export type PlatformV2Response =
+  | {readonly kind: "lifecycle_capabilities"; readonly capabilities: LifecycleCapabilities}
   | {readonly kind: "work_context_page"; readonly page: WorkContextPage}
   | {readonly kind: "work_context_resync"; readonly resync: WorkContextResync}
   | {readonly kind: "work_context_record"; readonly record: WorkContextRecord}
@@ -220,6 +240,36 @@ function boundedRefusal(value: JsonValue): PlatformV2Refusal {
   if (stringField(body, "schema") !== PLATFORM_SCHEMA_V2) throw new WireError("invalid_json_value", "platform v2 refusal");
   return {category, explanation, schema: PLATFORM_SCHEMA_V2};
 }
+const lifecycleEffectKinds: readonly LifecycleEffectKind[] = ["create_attempt_workspace","create_checkout","create_host_setup","resume_attempt_workspace","resume_session"];
+function lifecycleEffectKind(value: string): LifecycleEffectKind {
+  if (!lifecycleEffectKinds.includes(value as LifecycleEffectKind)) throw new WireError("invalid_json_value", "lifecycle effect kind");
+  return value as LifecycleEffectKind;
+}
+function lifecycleCapabilities(value: JsonValue): LifecycleCapabilities {
+  const body = fields(value, ["operations", "projects", "schema"]);
+  if (stringField(body, "schema") !== PLATFORM_SCHEMA_V2) throw new WireError("invalid_json_value", "lifecycle capability schema");
+  const rawProjects = valueField(body, "projects");
+  const rawOperations = valueField(body, "operations");
+  if (rawProjects.kind !== "array" || rawOperations.kind !== "array") throw new WireError("invalid_json_value", "lifecycle capabilities");
+  const projects = rawProjects.items.map((item) => {
+    if (item.kind !== "string") throw new WireError("invalid_json_value", "lifecycle project");
+    return ProjectId(item.value);
+  });
+  if (projects.length === 0 || projects.length > 128 || new Set(projects).size !== projects.length) throw new WireError("invalid_json_value", "lifecycle projects");
+  const operations = rawOperations.items.map((item): LifecycleOperationCapability => {
+    const operation = fields(item, ["available", "category", "effect_kind", "project"]);
+    const availableValue = valueField(operation, "available");
+    const categoryValue = valueField(operation, "category");
+    if (availableValue.kind !== "bool") throw new WireError("invalid_json_value", "lifecycle capability availability");
+    const category = categoryValue.kind === "null" ? null : categoryValue.kind === "string" ? boundedRefusalString(categoryValue.value, 128) : (() => { throw new WireError("invalid_json_value", "lifecycle capability category"); })();
+    if (availableValue.value !== (category === null)) throw new WireError("invalid_json_value", "lifecycle capability state");
+    return {available: availableValue.value, category, effect_kind: lifecycleEffectKind(stringField(operation, "effect_kind")), project: ProjectId(stringField(operation, "project"))};
+  });
+  if (operations.length !== projects.length * lifecycleEffectKinds.length) throw new WireError("invalid_json_value", "lifecycle capability completeness");
+  const observed = new Set(operations.map((operation) => `${operation.project}\u0000${operation.effect_kind}`));
+  if (observed.size !== operations.length || projects.some((project) => lifecycleEffectKinds.some((kind) => !observed.has(`${project}\u0000${kind}`))) || operations.some((operation) => !projects.includes(operation.project))) throw new WireError("invalid_json_value", "lifecycle capability matrix");
+  return {operations, projects, schema: PLATFORM_SCHEMA_V2};
+}
 const MUTATION_APPROVAL_FIELDS = ["approval", "schema"] as const;
 const MUTATION_RECEIPT_FIELDS = ["approval_id", "id", "idempotency_key", "outcome", "preview", "preview_digest", "recorded_at_ms", "request_digest", "resulting_revision", "schema"] as const;
 function rawMutationDocument(value: JsonValue, bytes: Uint8Array, expected: readonly string[]): Uint8Array {
@@ -267,6 +317,7 @@ export function decodePlatformNegotiationResponse(payload: Uint8Array, requestId
 
 function requestBody(request: PlatformV2Request): JsonValue {
   switch (request.kind) {
+    case "get_lifecycle_capabilities": return json({schema: PLATFORM_SCHEMA_V2});
     case "query_work_contexts": { if (request.query.project === null) throw new WireError("invalid_json_value", "project scope"); return document(encodeWorkContextQuery(request.query)); }
     case "get_work_context": return json(validateWorkContextIdentity(request.identity));
     case "prepare_mutation": return json({idempotency_key: IdempotencyKey(request.request.idempotency_key), intent: validateWorkContextMutationIntent(request.request.intent), schema: PLATFORM_SCHEMA_V2});
@@ -286,7 +337,7 @@ export function encodePlatformV2Request(requestId: PlatformRequestIdValue, reque
 }
 
 const responseKinds: Readonly<Record<PlatformV2Request["kind"], readonly string[]>> = {
-  query_work_contexts:["work_context_page","work_context_resync"],get_work_context:["work_context_record"],prepare_mutation:["mutation_preview","mutation_refused"],decide_mutation:["mutation_approval","mutation_refused"],submit_mutation:["mutation_receipt","mutation_refused"],get_mutation_receipt:["mutation_receipt","mutation_refused"],get_lineage:["lineage_result"],submit_workspace_intent:["workspace_intent_result"],get_workspace_intent:["workspace_intent_result"],get_review:["review_result"],execute_review_action:["review_receipt"],get_review_receipt:["review_receipt"],
+  get_lifecycle_capabilities:["lifecycle_capabilities"],query_work_contexts:["work_context_page","work_context_resync"],get_work_context:["work_context_record"],prepare_mutation:["mutation_preview","mutation_refused"],decide_mutation:["mutation_approval","mutation_refused"],submit_mutation:["mutation_receipt","mutation_refused"],get_mutation_receipt:["mutation_receipt","mutation_refused"],get_lineage:["lineage_result"],submit_workspace_intent:["workspace_intent_result"],get_workspace_intent:["workspace_intent_result"],get_review:["review_result"],execute_review_action:["review_receipt"],get_review_receipt:["review_receipt"],
 };
 export function decodePlatformV2Response(payload: Uint8Array, requestId: PlatformRequestIdValue, requestKind: PlatformV2Request["kind"]): PlatformV2Response {
   const decoded = admitted(payload, MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES, PLATFORM_PROTOCOL, PLATFORM_V2_MAJOR);
@@ -295,6 +346,7 @@ export function decodePlatformV2Response(payload: Uint8Array, requestId: Platfor
   if (!responseKinds[requestKind].includes(decoded.envelope.kind)) throw new WireError("invalid_json_value", "response kind does not answer request");
   const bytes=bodyBytes(decoded.body);
   switch(decoded.envelope.kind){
+    case "lifecycle_capabilities":return {kind:"lifecycle_capabilities",capabilities:lifecycleCapabilities(decoded.body)};
     case "work_context_page":return {kind:"work_context_page",page:decodeWorkContextPage(bytes)};
     case "work_context_resync":return {kind:"work_context_resync",resync:decodeWorkContextResync(bytes)};
     case "work_context_record":return {kind:"work_context_record",record:validateWorkContextRecord(plain(decoded.body) as WorkContextRecord)};

@@ -261,6 +261,7 @@ const negotiatedV2: NegotiatedPlatform = {
 function encodeV2FixtureResponse(requestId: string, response: PlatformV2Response): Uint8Array {
   let body: JsonValue;
   switch (response.kind) {
+    case "lifecycle_capabilities": body = json(response.capabilities); break;
     case "work_context_page": body = parseCanonical(encodeWorkContextPage(response.page)); break;
     case "work_context_resync": body = parseCanonical(encodeWorkContextResync(response.resync)); break;
     case "work_context_record": body = json(validateWorkContextRecord(response.record)); break;
@@ -272,6 +273,10 @@ function encodeV2FixtureResponse(requestId: string, response: PlatformV2Response
     case "review_result": body = parseCanonical(encodeReviewSnapshot(response.review)); break;
     case "review_receipt": body = parseCanonical(encodeReviewActionReceipt(response.receipt)); break;
     case "platform_v2_refused": body = json(response.refusal); break;
+    default: {
+      const unreachable: never = response;
+      throw new DeterministicFixtureError("unexpected_request", {cause: new Error(String(unreachable))});
+    }
   }
   return fixtureMessage(PLATFORM_PROTOCOL, PLATFORM_V2_MAJOR, requestId, response.kind, body);
 }

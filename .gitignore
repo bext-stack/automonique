@@ -7,3 +7,6 @@ sdk/typescript/packages/sdk/dist/
 .automonique/state/
 artifacts/
 __pycache__/
+node_modules/
+test-results/
+playwright-report/

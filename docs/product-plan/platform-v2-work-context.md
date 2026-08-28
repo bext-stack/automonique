@@ -344,3 +344,55 @@ Server routes, retention workers, SDK client ergonomics, and production
 clock/random-ID and authentication-policy providers remain separate
 integration work. The protocol helpers alone do not claim to implement those
 authority or durability boundaries.
+
+## Hosted web cockpit projection
+
+The hosted dashboard uses `POST /api/platform/cockpit` as a bounded,
+server-owned JSON projection over the local canonical Platform v2 bridge. The
+route accepts the configured Basic principal only; session cookies, mobile
+credentials, and bearer credentials cannot enter it. Each read negotiates v2,
+queries at most 128 typed work-context records, and refuses to present an
+incomplete inventory when the authority reports another page. A selected
+opaque `UserWorkspace` is resolved from that inventory, then read through the
+exact project-qualified lineage and review operations. Canonical integer
+fields are rendered as decimal strings before they cross the browser boundary,
+so JavaScript never parses authoritative revisions through `Number`.
+
+Attention filters are advertised as complete only when every workspace in the
+bounded inventory has an authority-qualified review projection. The web entry
+enriches at most 16 workspaces and gives each non-selected enrichment read a
+single 100 ms local-socket wall-clock budget across connect, write, and every
+response byte; a trickling peer cannot restart that budget. A larger
+inventory, a refusal, or a timed-out workspace produces explicit `partial` or
+`unavailable` attention coverage; unknown workspaces receive no inferred
+attention state. Canonical `idle` remains a known workspace state while the
+four actionable filter counters remain unchanged. The browser keeps the
+structured cockpit snapshot separate from the retained Platform v1 snapshot,
+so filtering, selecting, and detaching cannot discard either surface. When a
+retained session maps to another known workspace, the cached structured shell,
+URL, inspector, and conversation selection move together before attachment;
+anchors from the previous workspace are removed.
+
+If v2 is refused, unavailable, downgraded, or exceeds the cockpit bound, the
+response carries the retained Platform v1 session projection separately and
+an explicit degradation category. It returns no projects, hosts, or workspaces
+in that mode and never reconstructs them from summaries. Task/attempt create,
+attempt resume, and session resume remain disabled with
+`platform_v2_lifecycle_adapter_pending`. The daemon conditionally installs the
+private-registry-backed production lifecycle adapter; the cockpit reads its
+generation-verified, action-specific capability set from the daemon and exposes
+only local `create_host_setup` and `create_checkout` through the existing typed
+`prepare_mutation` preview and `get_mutation_receipt` reconciliation operations.
+An absent, changed, or refused registry leaves those operations unavailable,
+and the preview's exact parent revisions plus preview digest/approval and receipt
+lookup fences remain authoritative. Review action requests preserve
+the exact selected workspace, expected snapshot/review revisions, and
+idempotency key on the typed v2 request, but remain visibly unavailable while
+the daemon returns `platform_v2_review_adapter_pending`. These are integration
+gaps, not browser capabilities.
+
+Within a negotiated v2 response, lineage, review, and attention availability
+remain independent. Any selected-workspace refusal, incomplete attention
+coverage, or unknown freshness is rendered as partial rather than fully
+capable. Canonical stale freshness is called out explicitly and the cockpit
+remains read-only.

@@ -4,6 +4,7 @@
 
 mod agent_auth;
 mod mobile_auth;
+mod platform_cockpit;
 mod platform_v2_bridge;
 
 pub use agent_auth::AgentAuthConfig;
@@ -138,6 +139,7 @@ pub enum Route {
     ApiAgentAccountsAction,
     ApiOperations,
     ApiPlatform,
+    ApiPlatformCockpit,
     ApiPlatformSession,
     ApiPlatformRemote,
     ApiPlatformV2Remote,
@@ -2462,6 +2464,24 @@ impl WebIntegration {
             .map_err(|_| "mobile_credential_authority_busy")?
             .authorize_platform_v2(token, now_ms_i64())
             .map_err(|error| error.category())
+    }
+
+    fn platform_cockpit(
+        &self,
+        request: platform_cockpit::CockpitRequest,
+    ) -> Result<Value, &'static str> {
+        let retained_v1 = self
+            .platform()
+            .ok()
+            .and_then(|view| serde_json::to_value(view).ok())
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "schema": "automonique.dashboard.platform/v2",
+                    "health": "unavailable",
+                    "sessions": []
+                })
+            });
+        platform_cockpit::execute(&self.platform_v2, request, retained_v1)
     }
 
     fn mobile_discovery(&self) -> Result<mobile_auth::MobileDiscovery, &'static str> {
@@ -5367,6 +5387,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                         Route::ApiPlatform
                     }
                 }
+                "/api/platform/cockpit" => Route::ApiPlatformCockpit,
                 "/api/platform/session" => Route::ApiPlatformSession,
                 "/api/platform/v2" => Route::ApiPlatformV2Remote,
                 "/api/mobile/operator-provision" => Route::MobileOperatorProvision,
@@ -5396,6 +5417,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 route,
                 Route::ApiMemorySearch
                     | Route::ApiAgentAccountsAction
+                    | Route::ApiPlatformCockpit
                     | Route::ApiPlatformSession
                     | Route::ApiPlatformRemote
                     | Route::ApiPlatformV2Remote
@@ -5841,6 +5863,7 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         | Route::ApiAgentAccountsAction
         | Route::ApiOperations
         | Route::ApiPlatform
+        | Route::ApiPlatformCockpit
         | Route::ApiPlatformSession
         | Route::ApiPlatformRemote
         | Route::ApiPlatformV2Remote
@@ -5958,6 +5981,18 @@ fn api_response(
             Ok(view) => json_response("200 OK", &view),
             Err(category) => json_error("503 Service Unavailable", category),
         },
+        Route::ApiPlatformCockpit => {
+            match serde_json::from_slice::<platform_cockpit::CockpitRequest>(body) {
+                Ok(request) => match integration.platform_cockpit(request) {
+                    Ok(view) => json_response("200 OK", &view),
+                    Err(
+                        "platform_cockpit_request_invalid" | "platform_cockpit_workspace_not_found",
+                    ) => json_error("400 Bad Request", "platform_cockpit_request_invalid"),
+                    Err(category) => json_error("503 Service Unavailable", category),
+                },
+                Err(_) => json_error("400 Bad Request", "invalid_json"),
+            }
+        }
         Route::ApiPlatformSession => match serde_json::from_slice::<PlatformSessionAction>(body) {
             Ok(request) => match integration.platform_session(request) {
                 Ok(view) => json_response("200 OK", &view),
@@ -6352,6 +6387,7 @@ fn handle(
                     && requested_route == Route::Health;
                 let remote_platform = requested_route == Route::ApiPlatformRemote;
                 let platform_v2 = requested_route == Route::ApiPlatformV2Remote;
+                let platform_cockpit = requested_route == Route::ApiPlatformCockpit;
                 let platform_v2_lane = platform_v2
                     .then(|| {
                         request
@@ -6467,6 +6503,8 @@ fn handle(
                     } else {
                         Route::Unauthorized
                     }
+                } else if platform_cockpit && !basic_authorized {
+                    Route::Unauthorized
                 } else if requested_route == Route::MobilePlatformV2Authorization
                     && request.accept != Some(MOBILE_PLATFORM_V2_AUTH_MEDIA_TYPE)
                 {
@@ -6509,6 +6547,7 @@ fn handle(
                 let issue_session = needs_auth
                     && !remote_platform
                     && !platform_v2
+                    && !platform_cockpit
                     && !mobile_lifecycle
                     && basic_authorized
                     && !session_authorized;
@@ -6550,6 +6589,7 @@ fn handle(
             | Route::ApiAgentAccountsAction
             | Route::ApiOperations
             | Route::ApiPlatform
+            | Route::ApiPlatformCockpit
             | Route::ApiPlatformSession
             | Route::ApiPlatformRemote
             | Route::ApiPlatformV2Remote
@@ -8665,7 +8705,7 @@ mod tests {
         }
         assert!(DASHBOARD_JS.contains("monique-theme"));
         assert!(DASHBOARD_JS.contains("processHierarchy(jobs)"));
-        assert!(DASHBOARD_JS.contains("api(\"/api/platform\")"));
+        assert!(DASHBOARD_JS.contains("api(\"/api/platform/cockpit\""));
         assert!(DASHBOARD_JS.contains("renderPlatform"));
         assert!(DASHBOARD_JS.contains("/api/platform/session"));
         assert!(DASHBOARD_JS.contains("monique-platform-reconciliation"));
@@ -8714,7 +8754,7 @@ mod tests {
         assert!(
             DASHBOARD_HTML.contains("data-panel=\"sessions\" aria-labelledby=\"sessions-title\"")
         );
-        assert!(DASHBOARD_HTML.contains("PRIMARY CONVERSATION SURFACE"));
+        assert!(DASHBOARD_HTML.contains("PRIMARY WORK SURFACE"));
         assert!(DASHBOARD_HTML.contains("SECONDARY / RECOVERY"));
         assert!(DASHBOARD_HTML.contains(
             "This assistant is not attached to an authority-qualified Platform session."
@@ -8754,11 +8794,55 @@ mod tests {
         assert_eq!(show_view.matches("loadChatHistory()").count(), 1);
         assert_eq!(show_view.matches("loadPlatform()").count(), 1);
         assert!(!DASHBOARD_JS.contains("byId(\"sidebar-new-chat\").addEventListener"));
-        assert!(DASHBOARD_JS.contains(
-            "refreshStatus();\nloadConfiguration();\nshowView(window.location.hash.slice(1)"
-        ));
+        assert!(
+            DASHBOARD_JS.contains(
+                "refreshStatus();\nloadConfiguration();\nshowView(window.location.hash ||"
+            )
+        );
         assert!(!DASHBOARD_JS.contains("refreshStatus();\nloadPlatform();"));
         assert!(!DASHBOARD_JS.contains("loadPlatform();\nloadProcesses();\nloadConfiguration();"));
+    }
+
+    #[test]
+    fn dashboard_hosts_a_capability_gated_workspace_first_presentation_shell() {
+        for marker in [
+            "id=\"cockpit-workspace-navigation\"",
+            "id=\"cockpit-workspace-summary\"",
+            "id=\"cockpit-workspace-inspector\"",
+            "id=\"cockpit-external-signal\"",
+            "id=\"cockpit-agent-signal\"",
+            "data-cockpit-attention=\"needs_you\"",
+            "data-cockpit-attention=\"working\"",
+            "data-cockpit-attention=\"blocked\"",
+            "data-cockpit-attention=\"done\"",
+            "id=\"cockpit-action-receipt\" data-state=\"idle\" role=\"status\" aria-live=\"polite\"",
+            "role=\"tablist\" aria-label=\"Selected workspace surfaces\"",
+            "role=\"listbox\" aria-label=\"Hosted workspaces\"",
+            "OPERATIONAL INVENTORY",
+        ] {
+            assert!(
+                DASHBOARD_HTML.contains(marker),
+                "missing cockpit marker {marker}"
+            );
+        }
+        assert!(DASHBOARD_JS.contains("Platform v1 retained-session mode"));
+        assert!(DASHBOARD_HTML.contains("no inference from conversation summaries"));
+        assert!(DASHBOARD_JS.contains("derivePresentation(view, selection)"));
+        assert!(!DASHBOARD_JS.contains("function cockpitDocument"));
+        assert!(DASHBOARD_JS.contains("/api/platform/cockpit"));
+        assert!(DASHBOARD_JS.contains("buildDeepLink"));
+        assert!(DASHBOARD_JS.contains("lifecycleStatus(cockpitPresentation.localLifecycle)"));
+        assert!(!DASHBOARD_JS.contains("adapter is not installed"));
+        assert!(
+            DASHBOARD_JS
+                .contains("Outcome is ambiguous. Lookup by receipt identity without replay.")
+        );
+        assert!(!PLATFORM_COCKPIT_JS.contains(".summary"));
+        assert!(PLATFORM_COCKPIT_JS.contains("automonique.dashboard.cockpit/v2"));
+        assert!(!PLATFORM_COCKPIT_JS.contains("automonique.cockpit/presentation/v1"));
+        assert!(DASHBOARD_CSS.contains(".hosted-workspace-grid"));
+        assert!(DASHBOARD_CSS.contains("@media (max-width: 760px)"));
+        assert!(DASHBOARD_CSS.contains("@media (max-width: 460px)"));
     }
 
     #[test]
@@ -9325,6 +9409,447 @@ mod tests {
             .as_bytes(),
         );
         assert!(wrong_lane.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+    }
+
+    #[test]
+    fn platform_cockpit_http_route_is_basic_only_json() {
+        let body = r#"{"action":"read"}"#;
+        let basic = format!("Basic {}", BASE64_STANDARD.encode("ops:fixture-password"));
+        let request_with = |authorization: &str, content_type: &str| {
+            format!(
+                "POST /api/platform/cockpit HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nX-Forwarded-Proto: https\r\n{authorization}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+
+        let state_dir = tempfile::tempdir().expect("temporary state");
+        let runtime_dir = tempfile::tempdir().expect("temporary runtime");
+        std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private state");
+        std::fs::set_permissions(runtime_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private runtime");
+        let integration = WebIntegration::open(
+            IntegrationConfig {
+                tenant: String::from("operator"),
+                actor: String::from("operator:cockpit-http"),
+                hosts: fixture_hosts(),
+            },
+            state_dir.path(),
+            runtime_dir.path(),
+        );
+        let integration = integration.expect("web integration");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let web_server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle(
+                stream,
+                &AppState::new(fixture_status()),
+                &fixture_auth(),
+                &fixture_manage_chat_auth(),
+                Some(&integration),
+                &fixture_hosts(),
+            )
+            .unwrap();
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .write_all(
+                request_with(&format!("Authorization: {basic}\r\n"), "application/json").as_bytes(),
+            )
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut basic_response = Vec::new();
+        client.read_to_end(&mut basic_response).unwrap();
+        web_server.join().unwrap();
+
+        let boundary = basic_response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("HTTP boundary");
+        let headers = std::str::from_utf8(&basic_response[..boundary]).unwrap();
+        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(headers.contains("Content-Type: application/json"));
+        assert!(headers.contains("Cache-Control: no-store"));
+        let projection: Value =
+            serde_json::from_slice(&basic_response[boundary + 4..]).expect("typed cockpit JSON");
+        assert_eq!(projection["schema"], "automonique.dashboard.cockpit/v2");
+        assert_eq!(projection["mode"], "v1");
+        assert_eq!(
+            projection["degradation"]["category"],
+            "platform_v2_web_binding_unavailable"
+        );
+
+        let bearer_response = exchange_without_integration(
+            request_with(
+                "Authorization: Bearer fixture-token\r\n",
+                "application/json",
+            )
+            .as_bytes(),
+        );
+        assert!(bearer_response.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
+
+        let cookie = fixture_auth().session_cookie();
+        let cookie = cookie.split(';').next().unwrap();
+        let cookie_response = exchange_without_integration(
+            request_with(&format!("Cookie: {cookie}\r\n"), "application/json").as_bytes(),
+        );
+        assert!(cookie_response.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
+
+        let simple_content_type = exchange_without_integration(
+            request_with(&format!("Authorization: {basic}\r\n"), "text/plain").as_bytes(),
+        );
+        assert!(simple_content_type.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+    }
+
+    #[test]
+    fn bound_platform_host_issues_project_scoped_cockpit_inventory_and_capabilities() {
+        use automonique_daemon::platform_v2_host::{
+            LINEAGE_STORE_NAME, PlatformV2Host, REVIEW_STORE_NAME, WORK_CONTEXT_STORE_NAME,
+        };
+        use automonique_protocol::codec::LENGTH_PREFIX_BYTES;
+        use automonique_protocol::platform::{
+            ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
+        };
+        use automonique_protocol::platform_v2::{
+            CheckoutKind, HostSetupKind, NegotiatedPlatform, PLATFORM_SCHEMA_V2, PlatformVersion,
+            ProjectId, V1RepositoryRef, WorkContextAttributes, WorkContextAvailability,
+            WorkContextIdentity, WorkContextLabel, WorkContextLifecycle, WorkContextRecord,
+            WorkContextRelation, WorkContextRelationKind, WorkContextTargetKind,
+        };
+        use automonique_protocol::platform_v2_lifecycle::{
+            ExpectedWorkContext, ExternalParentResolution,
+        };
+        use automonique_protocol::platform_v2_transport::{
+            PlatformNegotiationRequestMessage, PlatformNegotiationResponse,
+            PlatformNegotiationResponseMessage, PlatformV2Request, PlatformV2RequestMessage,
+            PlatformV2Response, PlatformV2ResponseMessage,
+        };
+        use automonique_store::work_context_store::WorkContextStore;
+
+        const PLATFORM_EXCHANGES: usize = 8;
+        let state_dir = tempfile::tempdir().expect("temporary state");
+        let runtime_dir = tempfile::tempdir().expect("temporary runtime");
+        std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private state");
+        std::fs::set_permissions(runtime_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private runtime");
+        let authorized_root = state_dir.path().join("authorized-root");
+        std::fs::create_dir(&authorized_root).unwrap();
+        std::fs::set_permissions(&authorized_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = geteuid().as_raw();
+        let authority = serde_json::json!({
+            "filesystem": [], "credentials": [], "network": [],
+            "tools": [], "providers": [], "models": []
+        });
+        let mut policy_workspaces = vec![
+            serde_json::json!({"project":"project-a","kind":"project","id":"project-a","inherited_authority":authority}),
+            serde_json::json!({"project":"project-a","kind":"host_setup","id":"host-a","inherited_authority":authority}),
+            serde_json::json!({"project":"project-a","kind":"checkout","id":"checkout-a","inherited_authority":authority}),
+            serde_json::json!({"project":"project-a","kind":"user_workspace","id":"workspace-a","inherited_authority":authority}),
+            serde_json::json!({"project":"project-b","kind":"project","id":"project-b","inherited_authority":authority}),
+        ];
+        for index in 0..129 {
+            policy_workspaces.push(serde_json::json!({
+                "project":"project-a", "kind":"host_setup",
+                "id":format!("paged-host-{index:03}"), "inherited_authority":authority
+            }));
+        }
+        let policy = serde_json::json!({
+            "version": 1,
+            "principals": [{
+                "uid": uid, "tenant": "operator", "actor": "operator:cockpit-bound",
+                "serving_authority": "automonique",
+                "projects": ["project-a", "project-b"],
+                "workspaces": policy_workspaces,
+                "authority": authority,
+                "review_authorities": {}
+            }]
+        });
+        let policy_path = state_dir
+            .path()
+            .join(automonique_daemon::PLATFORM_V2_POLICY_FILE_NAME);
+        std::fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
+        std::fs::set_permissions(&policy_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let registry = serde_json::json!({
+            "version":1,"generation":"cockpit-bound-generation",
+            "host_setups":[{"selector":"host-selector-a","host_setup":"host-a","project":"project-a","setup_kind":"local","canonical_root":authorized_root}],
+            "checkouts":[{"selector":"checkout-selector-a","checkout":"checkout-a","project":"project-a","host_setup":"host-a","repository_authority":"github","repository":"owner/repository","checkout_kind":"authorized_folder","canonical_root":authorized_root,"repository_root":null,"base_commit":null,"branch_ref":null}],
+            "workspaces":[{"workspace":"workspace-a","project":"project-a","checkout":"checkout-a","canonical_root":authorized_root}],
+            "task_selectors":[]
+        });
+        let registry_path = state_dir
+            .path()
+            .join(automonique_daemon::platform_v2_lifecycle_adapter::LIFECYCLE_REGISTRY_FILE_NAME);
+        std::fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
+        std::fs::set_permissions(&registry_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let store_path = state_dir.path().join(WORK_CONTEXT_STORE_NAME);
+        let mut store = WorkContextStore::open(&store_path).unwrap();
+        let repository = WorkContextIdentity::Repository(
+            V1RepositoryRef::new(ResourceCoordinate::new(
+                ResourceAuthority::GitHub,
+                ResourceKind::Repository,
+                ResourceId::new("repository-a").unwrap(),
+            ))
+            .unwrap(),
+        );
+        store
+            .put_external_snapshot(
+                "operator",
+                &ExpectedWorkContext::new(repository.clone(), Revision::FIRST),
+                ExternalParentResolution::Available,
+                Some(&ProjectId::new("project-a").unwrap()),
+            )
+            .unwrap();
+        let project_a = WorkContextRecord::new(
+            WorkContextIdentity::Project(ProjectId::new("project-a").unwrap()),
+            Revision::FIRST,
+            WorkContextLifecycle::Active,
+            WorkContextLabel::new("Project A").unwrap(),
+            WorkContextAttributes::EMPTY,
+            vec![
+                WorkContextRelation::new(
+                    WorkContextRelationKind::ProjectRepository,
+                    repository.clone(),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let project_b = WorkContextRecord::new(
+            WorkContextIdentity::Project(ProjectId::new("project-b").unwrap()),
+            Revision::FIRST,
+            WorkContextLifecycle::Active,
+            WorkContextLabel::new("Project B").unwrap(),
+            WorkContextAttributes::EMPTY,
+            Vec::new(),
+        )
+        .unwrap();
+        let host = WorkContextRecord::new(
+            WorkContextIdentity::parse_local(
+                automonique_protocol::platform_v2::WorkContextTargetKind::HostSetup,
+                "host-a",
+            )
+            .unwrap(),
+            Revision::FIRST,
+            WorkContextLifecycle::Active,
+            WorkContextLabel::new("Host A").unwrap(),
+            WorkContextAttributes::host_setup(HostSetupKind::Local),
+            vec![
+                WorkContextRelation::new(
+                    WorkContextRelationKind::HostSetupProject,
+                    project_a.identity().clone(),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let checkout = WorkContextRecord::new(
+            WorkContextIdentity::parse_local(
+                automonique_protocol::platform_v2::WorkContextTargetKind::Checkout,
+                "checkout-a",
+            )
+            .unwrap(),
+            Revision::FIRST,
+            WorkContextLifecycle::Active,
+            WorkContextLabel::new("Checkout A").unwrap(),
+            WorkContextAttributes::checkout(CheckoutKind::AuthorizedFolder),
+            vec![
+                WorkContextRelation::new(
+                    WorkContextRelationKind::CheckoutProject,
+                    project_a.identity().clone(),
+                )
+                .unwrap(),
+                WorkContextRelation::new(
+                    WorkContextRelationKind::CheckoutHostSetup,
+                    host.identity().clone(),
+                )
+                .unwrap(),
+                WorkContextRelation::new(WorkContextRelationKind::CheckoutRepository, repository)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let workspace = WorkContextRecord::new(
+            WorkContextIdentity::UserWorkspace(
+                automonique_protocol::platform_v2::UserWorkspaceId::new("workspace-a").unwrap(),
+            ),
+            Revision::FIRST,
+            WorkContextLifecycle::Active,
+            WorkContextLabel::new("Workspace A").unwrap(),
+            WorkContextAttributes::EMPTY,
+            vec![
+                WorkContextRelation::new(
+                    WorkContextRelationKind::UserWorkspaceProject,
+                    project_a.identity().clone(),
+                )
+                .unwrap(),
+                WorkContextRelation::new(
+                    WorkContextRelationKind::UserWorkspaceCheckout,
+                    checkout.identity().clone(),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        for record in [&project_a, &project_b, &host, &checkout, &workspace] {
+            store.put_authoritative_record("operator", record).unwrap();
+        }
+        for index in 0..129 {
+            let record = WorkContextRecord::new(
+                WorkContextIdentity::parse_local(
+                    WorkContextTargetKind::HostSetup,
+                    &format!("paged-host-{index:03}"),
+                )
+                .unwrap(),
+                Revision::FIRST,
+                WorkContextLifecycle::Active,
+                WorkContextLabel::new(format!("Paged host {index:03}")).unwrap(),
+                WorkContextAttributes::host_setup(HostSetupKind::Ssh),
+                vec![
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::HostSetupProject,
+                        project_a.identity().clone(),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+            store.put_authoritative_record("operator", &record).unwrap();
+        }
+        drop(store);
+
+        let socket = runtime_dir.path().join("admin.sock");
+        let platform_listener = UnixListener::bind(&socket).unwrap();
+        let mut host = PlatformV2Host::open(
+            &policy_path,
+            &store_path,
+            &state_dir.path().join(LINEAGE_STORE_NAME),
+            &state_dir.path().join(REVIEW_STORE_NAME),
+            uid,
+        );
+        let platform_server = thread::spawn(move || {
+            let mut queried_projects = Vec::new();
+            for index in 0..PLATFORM_EXCHANGES {
+                let (mut stream, _) = platform_listener.accept().unwrap();
+                let mut prefix = [0_u8; LENGTH_PREFIX_BYTES];
+                stream.read_exact(&mut prefix).unwrap();
+                let mut payload = vec![0_u8; u32::from_be_bytes(prefix) as usize];
+                stream.read_exact(&mut payload).unwrap();
+                let frame = if index == 0 {
+                    let request = PlatformRequestMessage::from_canonical_bytes(&payload).unwrap();
+                    let response = PlatformResponseMessage::new(
+                        request.request_id().clone(),
+                        PlatformResponse::Refused {
+                            outcome: ReceiptOutcome::Rejected,
+                            explanation: PlatformText::new("fixture retained v1 unavailable")
+                                .unwrap(),
+                        },
+                    )
+                    .to_message()
+                    .unwrap()
+                    .to_canonical_bytes();
+                    let mut frame = u32::try_from(response.len())
+                        .unwrap()
+                        .to_be_bytes()
+                        .to_vec();
+                    frame.extend(response);
+                    frame
+                } else if index == 1 {
+                    let request =
+                        PlatformNegotiationRequestMessage::from_canonical_bytes(&payload).unwrap();
+                    let negotiated = NegotiatedPlatform::new(
+                        PlatformVersion::V2,
+                        PLATFORM_SCHEMA_V2,
+                        WorkContextAvailability::V2Structured,
+                    )
+                    .unwrap();
+                    PlatformNegotiationResponseMessage::for_request(
+                        &request,
+                        PlatformNegotiationResponse::Negotiated(negotiated),
+                    )
+                    .unwrap()
+                    .to_frame()
+                    .unwrap()
+                } else {
+                    let request = PlatformV2RequestMessage::from_canonical_bytes(&payload).unwrap();
+                    if let PlatformV2Request::QueryWorkContexts(query) = request.request() {
+                        queried_projects.push(query.project().unwrap().as_str().to_owned());
+                    }
+                    let response = host.handle(uid, request.request(), 1_000);
+                    if index == 2 {
+                        assert!(
+                            matches!(response, PlatformV2Response::LifecycleCapabilities(_)),
+                            "unexpected capability response: {response:?}"
+                        );
+                    }
+                    PlatformV2ResponseMessage::for_request(&request, response)
+                        .unwrap()
+                        .to_frame()
+                        .unwrap()
+                };
+                stream.write_all(&frame).unwrap();
+            }
+            queried_projects
+        });
+
+        let integration = WebIntegration::open(
+            IntegrationConfig {
+                tenant: String::from("operator"),
+                actor: String::from("operator:cockpit-bound"),
+                hosts: fixture_hosts(),
+            },
+            state_dir.path(),
+            runtime_dir.path(),
+        )
+        .unwrap();
+        let body = r#"{"action":"read","workspace_id":"workspace-a"}"#;
+        let basic = BASE64_STANDARD.encode("ops:fixture-password");
+        let wire = format!(
+            "POST /api/platform/cockpit HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nX-Forwarded-Proto: https\r\nAuthorization: Basic {basic}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let web_server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle(
+                stream,
+                &AppState::new(fixture_status()),
+                &fixture_auth(),
+                &fixture_manage_chat_auth(),
+                Some(&integration),
+                &fixture_hosts(),
+            )
+            .unwrap();
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client.write_all(wire.as_bytes()).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        web_server.join().unwrap();
+        let queried_projects = platform_server.join().unwrap();
+        assert_eq!(queried_projects, ["project-a", "project-a", "project-b"]);
+        let boundary = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        let projection: Value = serde_json::from_slice(&response[boundary + 4..]).unwrap();
+        assert_eq!(projection["mode"], "v2");
+        assert_eq!(projection["projects"].as_array().unwrap().len(), 2);
+        assert_eq!(projection["workspaces"][0]["id"], "workspace-a");
+        assert_eq!(projection["actions"]["lifecycle"]["project"], "project-a");
+        assert_eq!(
+            projection["actions"]["lifecycle"]["operations"]["create_host_setup"]["available"],
+            true
+        );
+        assert_eq!(
+            projection["actions"]["lifecycle"]["operations"]["create_attempt_workspace"]["category"],
+            "platform_v2_lifecycle_adapter_pending"
+        );
     }
 
     #[test]

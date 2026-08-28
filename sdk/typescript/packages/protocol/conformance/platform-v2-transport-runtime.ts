@@ -72,7 +72,7 @@ const fixture = readFileSync(
   "../../../../rust/crates/automonique-protocol/fixtures/platform-v2-transport-v1.txt",
   "utf8",
 ).trimEnd().split("\n");
-if (fixture.length !== 2) throw new Error("transport fixture line count");
+if (fixture.length !== 4) throw new Error("transport fixture line count");
 
 const offer: PlatformVersionOffer = {
   schema: PLATFORM_NEGOTIATION_SCHEMA_V1,
@@ -96,6 +96,57 @@ const v2Frame = encodePlatformV2RequestFrame(v2Id, {
   identity: {kind: "user_workspace", id: UserWorkspaceId("workspace-1")},
 });
 if (v2Frame.length !== v2.length + 4) throw new Error("v2 frame bound");
+
+const capabilitiesId = PlatformRequestId("transport-capabilities");
+const capabilitiesRequest = encodePlatformV2Request(capabilitiesId, {kind: "get_lifecycle_capabilities"});
+if (new TextDecoder().decode(capabilitiesRequest) !== fixture[2]) throw new Error("capability bytes drifted from Rust");
+const capabilityOperations = [
+  "create_attempt_workspace",
+  "create_checkout",
+  "create_host_setup",
+  "resume_attempt_workspace",
+  "resume_session",
+].map((effect_kind) => ({
+  available: effect_kind === "create_checkout" || effect_kind === "create_host_setup",
+  category: effect_kind === "create_checkout" || effect_kind === "create_host_setup" ? null : "platform_v2_lifecycle_adapter_pending",
+  effect_kind,
+  project: "project-1",
+}));
+const capabilityBody = {operations: capabilityOperations, projects: ["project-1"], schema: PLATFORM_SCHEMA_V2};
+const capabilityResponse = responsePayload(
+  capabilitiesId,
+  "lifecycle_capabilities",
+  encoder.encode(JSON.stringify(capabilityBody)),
+);
+if (new TextDecoder().decode(capabilityResponse) !== fixture[3]) throw new Error("capability response bytes drifted from Rust");
+const decodedCapabilities = decodePlatformV2Response(
+  capabilityResponse,
+  capabilitiesId,
+  "get_lifecycle_capabilities",
+);
+if (decodedCapabilities.kind !== "lifecycle_capabilities" || decodedCapabilities.capabilities.operations.length !== 5) throw new Error("lifecycle capabilities response");
+let duplicateProjectsRefused = false;
+try {
+  decodePlatformV2Response(
+    responsePayload(capabilitiesId, "lifecycle_capabilities", encoder.encode(JSON.stringify({...capabilityBody, projects: ["project-1", "project-1"]}))),
+    capabilitiesId,
+    "get_lifecycle_capabilities",
+  );
+} catch (error) {
+  duplicateProjectsRefused = error instanceof WireError;
+}
+if (!duplicateProjectsRefused) throw new Error("duplicate lifecycle projects accepted");
+for (const [label, body] of [
+  ["incomplete lifecycle matrix", {...capabilityBody, operations: capabilityOperations.slice(1)}],
+  ["contradictory lifecycle state", {...capabilityBody, operations: capabilityOperations.map((operation, index) => index === 0 ? {...operation, available: true} : operation)}],
+  ["foreign lifecycle project", {...capabilityBody, operations: capabilityOperations.map((operation, index) => index === 0 ? {...operation, project: "project-2"} : operation)}],
+] as const) {
+  expectWireRefusal(label, () => decodePlatformV2Response(
+    responsePayload(capabilitiesId, "lifecycle_capabilities", encoder.encode(JSON.stringify(body))),
+    capabilitiesId,
+    "get_lifecycle_capabilities",
+  ));
+}
 
 for (const [label, comments] of [
   ["empty review comment batch", []],
@@ -256,4 +307,4 @@ try {
 }
 if (!v1CeilingPreserved) throw new Error("v1 frame ceiling widened");
 
-console.log(JSON.stringify({fixture_lines: fixture.length, negotiation_bytes: negotiation.length, unoffered_refused: unofferedRefused, v1_ceiling_preserved: v1CeilingPreserved, v2_bytes: v2.length}));
+console.log(JSON.stringify({capability_bytes: capabilitiesRequest.length, capability_response_bytes: capabilityResponse.length, duplicate_projects_refused: duplicateProjectsRefused, fixture_lines: fixture.length, negotiation_bytes: negotiation.length, unoffered_refused: unofferedRefused, v1_ceiling_preserved: v1CeilingPreserved, v2_bytes: v2.length}));
