@@ -2191,6 +2191,55 @@ mod tests {
     use super::*;
     use automonique_protocol::platform_v2_transport::PlatformV2Refusal;
 
+    fn canonical_json_bytes(value: &Value) -> Vec<u8> {
+        fn write(value: &Value, output: &mut Vec<u8>) {
+            match value {
+                Value::Null => output.extend_from_slice(b"null"),
+                Value::Bool(value) => {
+                    output.extend_from_slice(if *value { b"true" } else { b"false" });
+                }
+                Value::Number(value) => output.extend_from_slice(value.to_string().as_bytes()),
+                Value::String(value) => output.extend_from_slice(
+                    serde_json::to_string(value)
+                        .expect("a Rust string always serializes as JSON")
+                        .as_bytes(),
+                ),
+                Value::Array(values) => {
+                    output.push(b'[');
+                    for (index, value) in values.iter().enumerate() {
+                        if index != 0 {
+                            output.push(b',');
+                        }
+                        write(value, output);
+                    }
+                    output.push(b']');
+                }
+                Value::Object(values) => {
+                    output.push(b'{');
+                    let mut fields: Vec<_> = values.iter().collect();
+                    fields.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+                    for (index, (key, value)) in fields.into_iter().enumerate() {
+                        if index != 0 {
+                            output.push(b',');
+                        }
+                        output.extend_from_slice(
+                            serde_json::to_string(key)
+                                .expect("a Rust string always serializes as JSON")
+                                .as_bytes(),
+                        );
+                        output.push(b':');
+                        write(value, output);
+                    }
+                    output.push(b'}');
+                }
+            }
+        }
+
+        let mut output = Vec::new();
+        write(value, &mut output);
+        output
+    }
+
     #[test]
     fn cockpit_control_documents_reject_unknown_or_generic_execution_fields() {
         let unknown = serde_json::from_value::<CockpitRequest>(json!({
@@ -2825,7 +2874,7 @@ mod tests {
             "state": "needs_you",
             "unread": 1
         });
-        let review = decode_review_snapshot(&serde_json::to_vec(&review_value).unwrap()).unwrap();
+        let review = decode_review_snapshot(&canonical_json_bytes(&review_value)).unwrap();
 
         let activity = cockpit_activities(Some(&lineage), Some(&review));
         assert_eq!(activity.total, 6);
@@ -2847,8 +2896,7 @@ mod tests {
         attention_value["user_workspace"] = json!("wc_user_1");
         attention_value["items"][0]["platform_session"] = Value::Null;
         let attention =
-            decode_attention_source_snapshot(&serde_json::to_vec(&attention_value).unwrap())
-                .unwrap();
+            decode_attention_source_snapshot(&canonical_json_bytes(&attention_value)).unwrap();
         let inbox = attention_inbox(&UserWorkspaceId::new("wc_user_1").unwrap(), &[attention]);
         assert_eq!(inbox.total, 1);
         assert_eq!(inbox.items[0]["state"], "needs_you");
