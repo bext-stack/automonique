@@ -152,7 +152,7 @@ fn state_filesystem_type(filesystem_type: u64) -> DoctorCheck {
 
 /// Read database and generation health from one authenticated status snapshot.
 ///
-/// The two checks deliberately share one request. Two status calls could
+/// The three checks deliberately share one request. Multiple status calls could
 /// straddle a generation change and make the doctor combine facts that were
 /// never true together. The local client also re-checks the socket owner and
 /// mode before connecting, so a healthy metadata check is a prerequisite, not
@@ -160,7 +160,7 @@ fn state_filesystem_type(filesystem_type: u64) -> DoctorCheck {
 pub fn inspect_control_plane(
     runtime: Option<&OsStr>,
     admin_socket: &DoctorCheck,
-) -> [DoctorCheck; 2] {
+) -> [DoctorCheck; 3] {
     if admin_socket.status() != CheckStatus::Healthy {
         return control_plane_unavailable(
             "database.control-plane-unavailable",
@@ -187,7 +187,7 @@ pub fn inspect_control_plane(
     }
 }
 
-fn status_checks(status: &DaemonStatus) -> [DoctorCheck; 2] {
+fn status_checks(status: &DaemonStatus) -> [DoctorCheck; 3] {
     let database = match (status.operational(), status.durable_state()) {
         (Some(_), Some(durable)) => {
             let complete = [
@@ -235,7 +235,34 @@ fn status_checks(status: &DaemonStatus) -> [DoctorCheck; 2] {
     } else {
         healthy("runtime.foreground-generation")
     };
-    [database, generation]
+    let provider_route = match status.operational() {
+        Some(operational) => match operational.provider_available() {
+            OperationalMetric::Measured(1) => healthy("provider.route-readiness"),
+            OperationalMetric::Measured(0) => non_healthy(
+                "provider.route-readiness",
+                CheckStatus::Finding,
+                "provider.route-unavailable",
+                "The configured provider route is not fully present in this generation's admitted egress policy",
+            ),
+            OperationalMetric::Unavailable => unavailable_for(
+                "provider.route-readiness",
+                "provider.route-readiness-unavailable",
+                "Provider route readiness is unavailable from the live status snapshot",
+            ),
+            OperationalMetric::Measured(_) => non_healthy(
+                "provider.route-readiness",
+                CheckStatus::Finding,
+                "provider.route-readiness-invalid",
+                "The live daemon reported an invalid provider route readiness value",
+            ),
+        },
+        None => unavailable_for(
+            "provider.route-readiness",
+            "provider.route-status-projection-unavailable",
+            "The live daemon did not provide the provider route status projection",
+        ),
+    };
+    [database, generation, provider_route]
 }
 
 fn control_plane_unavailable(
@@ -243,7 +270,7 @@ fn control_plane_unavailable(
     database_message: &str,
     generation_code: &str,
     generation_message: &str,
-) -> [DoctorCheck; 2] {
+) -> [DoctorCheck; 3] {
     [
         unavailable_for(
             "control-plane.database-health",
@@ -254,6 +281,11 @@ fn control_plane_unavailable(
             "runtime.foreground-generation",
             generation_code,
             generation_message,
+        ),
+        unavailable_for(
+            "provider.route-readiness",
+            "provider.route-control-plane-unavailable",
+            "Provider route readiness is unavailable without the control plane",
         ),
     ]
 }
@@ -375,7 +407,7 @@ mod tests {
         OperationalMetric, OperationalStatus, OperationalStatusParts,
     };
 
-    fn status(runs: OperationalMetric) -> DaemonStatus {
+    fn status(runs: OperationalMetric, provider: OperationalMetric) -> DaemonStatus {
         let operational = OperationalStatus::new(OperationalStatusParts {
             observed_ms: 1,
             reconciliation_pending: 0,
@@ -389,7 +421,7 @@ mod tests {
             telegram_pollers_live: 0,
             telegram_pollers_expired: 0,
             telegram_offset_lag: OperationalMetric::Unavailable,
-            provider_available: OperationalMetric::Unavailable,
+            provider_available: provider,
             sandbox_launch_refusals: OperationalMetric::Unavailable,
         })
         .expect("operational status");
@@ -419,21 +451,44 @@ mod tests {
     }
 
     #[test]
-    fn a_complete_live_snapshot_makes_both_control_plane_checks_healthy() {
-        let [database, generation] = status_checks(&status(OperationalMetric::Measured(9)));
+    fn a_complete_live_snapshot_makes_all_control_plane_checks_healthy() {
+        let [database, generation, provider] = status_checks(&status(
+            OperationalMetric::Measured(9),
+            OperationalMetric::Measured(1),
+        ));
         assert_eq!(database.status(), CheckStatus::Healthy);
         assert_eq!(generation.status(), CheckStatus::Healthy);
+        assert_eq!(provider.status(), CheckStatus::Healthy);
     }
 
     #[test]
     fn an_unreadable_store_is_a_finding_without_erasing_generation_identity() {
-        let [database, generation] = status_checks(&status(OperationalMetric::Unavailable));
+        let [database, generation, provider] = status_checks(&status(
+            OperationalMetric::Unavailable,
+            OperationalMetric::Unavailable,
+        ));
         assert_eq!(database.status(), CheckStatus::Finding);
         assert_eq!(
             database.reason().expect("reason").code().as_str(),
             "database.status-incomplete"
         );
         assert_eq!(generation.status(), CheckStatus::Healthy);
+        assert_eq!(provider.status(), CheckStatus::Unavailable);
+    }
+
+    #[test]
+    fn a_configured_provider_without_its_admitted_route_is_a_finding() {
+        let [database, generation, provider] = status_checks(&status(
+            OperationalMetric::Measured(9),
+            OperationalMetric::Measured(0),
+        ));
+        assert_eq!(database.status(), CheckStatus::Healthy);
+        assert_eq!(generation.status(), CheckStatus::Healthy);
+        assert_eq!(provider.status(), CheckStatus::Finding);
+        assert_eq!(
+            provider.reason().expect("reason").code().as_str(),
+            "provider.route-unavailable"
+        );
     }
 
     #[test]

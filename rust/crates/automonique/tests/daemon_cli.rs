@@ -349,7 +349,7 @@ fn the_product_binary_serves_status_and_shutdown_end_to_end() {
         human.contains("telegram offset lag: unavailable\n"),
         "{human}"
     );
-    assert!(human.contains("provider available: measured\n"), "{human}");
+    assert!(human.contains("provider available: 0\n"), "{human}");
     assert!(
         human.contains("sandbox launch refusals: unavailable\n"),
         "{human}"

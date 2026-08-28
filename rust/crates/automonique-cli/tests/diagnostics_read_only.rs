@@ -37,10 +37,12 @@ fn private_unix_admin_socket_and_process_control_are_healthy() {
     let responder = std::thread::spawn(move || {
         let _connection = listener.accept().expect("doctor connects");
     });
-    let [database, generation] = inspect_control_plane(Some(runtime.path().as_os_str()), &admin);
+    let [database, generation, provider] =
+        inspect_control_plane(Some(runtime.path().as_os_str()), &admin);
     responder.join().expect("responder");
     assert_eq!(database.status(), CheckStatus::Unavailable);
     assert_eq!(generation.status(), CheckStatus::Unavailable);
+    assert_eq!(provider.status(), CheckStatus::Unavailable);
     assert_eq!(
         std::fs::symlink_metadata(&socket)
             .expect("metadata")

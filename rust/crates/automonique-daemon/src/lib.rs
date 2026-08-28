@@ -235,6 +235,7 @@ pub mod pm2_inventory;
 pub mod progress;
 pub mod progress_hub;
 pub mod provider_health;
+mod provider_route;
 pub mod provider_session_host;
 pub mod release_activation;
 pub mod release_builder;
@@ -4082,15 +4083,22 @@ impl Daemon {
     }
 
     fn provider_available(&self) -> bool {
-        matches!(
+        if !matches!(
             self.execution_state,
             automonique_protocol::admin::ExecutionState::SandboxEnforceableLaneWired
-        ) && compose::ProviderConfig::load_execution(
+        ) {
+            return false;
+        }
+        let Some(provider) = compose::ProviderConfig::load_execution(
             &self.state_dir.join(compose::PROVIDER_CONFIG_NAME),
         )
         .ok()
-        .flatten()
-        .is_some()
+        .flatten() else {
+            return false;
+        };
+        self.execution
+            .as_ref()
+            .is_some_and(|execution| execution.provider_route_admitted(&provider))
     }
 
     fn gen_ai_usage(&self) -> Option<GenAiUsageObservation> {

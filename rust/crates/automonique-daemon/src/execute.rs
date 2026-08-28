@@ -735,6 +735,20 @@ impl ExecutionLane {
         &self.egress_destinations
     }
 
+    /// Whether the configured provider's own selected route is fully present
+    /// in the destination policy this generation admitted at startup.
+    ///
+    /// This never rereads `egress-destinations`, so status cannot report a
+    /// policy edit as effective before the daemon reload that actually admits
+    /// it.
+    #[must_use]
+    pub(crate) fn provider_route_admitted(
+        &self,
+        provider: &crate::compose::ProviderConfig,
+    ) -> bool {
+        crate::provider_route::is_admitted(provider, &self.egress_destinations)
+    }
+
     /// The entry helper this lane would spawn, when one is configured.
     #[must_use]
     pub fn helper(&self) -> Option<&Path> {
