@@ -22,7 +22,9 @@ use std::time::{Duration, Instant};
 
 use automonique_protocol::digest::{Sha256, Sha256Digest};
 use automonique_protocol::platform::IdempotencyKey;
-use automonique_protocol::platform_v2::{CheckoutKind, HostSetupKind, WorkContextIdentity};
+use automonique_protocol::platform_v2::{
+    CheckoutKind, HostSetupKind, ProjectId, WorkContextIdentity,
+};
 use automonique_protocol::platform_v2_lifecycle::WorkContextMutationIntent;
 use serde::{Deserialize, Serialize};
 
@@ -747,6 +749,22 @@ impl PlatformV2LifecycleEffectAdapter for ProductionLifecycleEffectAdapter {
         Self::preflight_submission(self, intent, resulting_identity)
     }
 
+    fn capability_for_project(
+        &self,
+        project: &ProjectId,
+        effect_kind: &str,
+    ) -> Result<(), &'static str> {
+        self.verify_registry()?;
+        match effect_kind {
+            "create_host_setup" => self.local_host_setup_capability(project),
+            "create_checkout" => self.local_checkout_capability(project),
+            "create_attempt_workspace" | "resume_attempt_workspace" | "resume_session" => {
+                Err("platform_v2_lifecycle_adapter_pending")
+            }
+            _ => Err("platform_v2_lifecycle_operation_unknown"),
+        }
+    }
+
     fn verify_generation(&self) -> Result<(), &'static str> {
         self.verify_registry()
     }
@@ -835,6 +853,49 @@ impl PlatformV2LifecycleEffectAdapter for ProductionLifecycleEffectAdapter {
 }
 
 impl ProductionLifecycleEffectAdapter {
+    fn local_host_setup_capability(&self, project: &ProjectId) -> Result<(), &'static str> {
+        let mut first_error = None;
+        for binding in self.registry.host_setups.iter().filter(|binding| {
+            binding.project == project.as_str()
+                && binding.setup_kind == HostSetupKind::Local.as_str()
+        }) {
+            let result = binding
+                .canonical_root
+                .as_deref()
+                .ok_or("platform_v2_lifecycle_registry_invalid")
+                .and_then(|root| validate_private_root_and_parent(root, self.expected_uid));
+            match result {
+                Ok(()) => return Ok(()),
+                Err(category) => first_error.get_or_insert(category),
+            };
+        }
+        Err(first_error.unwrap_or("platform_v2_local_host_selector_unavailable"))
+    }
+
+    fn local_checkout_capability(&self, project: &ProjectId) -> Result<(), &'static str> {
+        let mut first_error = None;
+        for binding in self
+            .registry
+            .checkouts
+            .iter()
+            .filter(|binding| binding.project == project.as_str())
+        {
+            let local_host = self.registry.host_setups.iter().any(|host| {
+                host.host_setup.as_deref() == Some(binding.host_setup.as_str())
+                    && host.project == binding.project
+                    && host.setup_kind == HostSetupKind::Local.as_str()
+            });
+            if !local_host {
+                continue;
+            }
+            match validate_checkout_binding(binding, self.expected_uid) {
+                Ok(()) => return Ok(()),
+                Err(category) => first_error.get_or_insert(category),
+            };
+        }
+        Err(first_error.unwrap_or("platform_v2_local_checkout_selector_unavailable"))
+    }
+
     fn apply_lifecycle(
         &mut self,
         intent: &WorkContextMutationIntent,
@@ -2013,6 +2074,13 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        assert_eq!(
+            adapter.supported_effect_kinds(),
+            std::collections::BTreeSet::from([
+                String::from("create_host_setup"),
+                String::from("create_checkout"),
+            ])
+        );
         let intent = WorkContextMutationIntent::CreateHostSetup(
             CreateHostSetupIntent::new(
                 WorkContextLabel::new("Remote host").unwrap(),
@@ -2028,6 +2096,97 @@ mod tests {
         assert_eq!(
             adapter.preflight(&intent),
             Err("platform_v2_remote_host_unsupported")
+        );
+        let project = ProjectId::new("project-test").unwrap();
+        assert_eq!(
+            adapter.capability_for_project(&project, "create_host_setup"),
+            Err("platform_v2_local_host_selector_unavailable")
+        );
+        assert_eq!(
+            adapter.capability_for_project(&project, "create_checkout"),
+            Err("platform_v2_local_checkout_selector_unavailable")
+        );
+        assert_eq!(
+            adapter.capability_for_project(&project, "resume_session"),
+            Err("platform_v2_lifecycle_adapter_pending")
+        );
+    }
+
+    #[test]
+    fn lifecycle_capabilities_are_project_scoped_and_registry_derived() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("state");
+        let root = directory.path().join("authorized");
+        private_directory(&state);
+        private_directory(&root);
+        let registry_path = state.join(LIFECYCLE_REGISTRY_FILE_NAME);
+        let journal_path = state.join(LIFECYCLE_JOURNAL_FILE_NAME);
+        let uid = nix::unistd::geteuid().as_raw();
+
+        write_registry(
+            &registry_path,
+            &serde_json::json!({
+                "version": 1, "generation": "generation-empty",
+                "host_setups": [], "checkouts": [], "workspaces": [], "task_selectors": []
+            }),
+        );
+        let empty = ProductionLifecycleEffectAdapter::open(&registry_path, &journal_path, uid)
+            .unwrap()
+            .unwrap();
+        let project = ProjectId::new("project-test").unwrap();
+        assert_eq!(
+            empty.capability_for_project(&project, "create_host_setup"),
+            Err("platform_v2_local_host_selector_unavailable")
+        );
+
+        write_registry(
+            &registry_path,
+            &serde_json::json!({
+                "version": 1, "generation": "generation-host-only",
+                "host_setups": [{
+                    "selector": "host-local", "host_setup": "host-one",
+                    "project": "project-test", "setup_kind": "local",
+                    "canonical_root": root
+                }],
+                "checkouts": [], "workspaces": [], "task_selectors": []
+            }),
+        );
+        let partial = ProductionLifecycleEffectAdapter::open(&registry_path, &journal_path, uid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            partial.capability_for_project(&project, "create_host_setup"),
+            Ok(())
+        );
+        assert_eq!(
+            partial.capability_for_project(&project, "create_checkout"),
+            Err("platform_v2_local_checkout_selector_unavailable")
+        );
+
+        write_registry(&registry_path, &authorized_registry(&root));
+        let installed = ProductionLifecycleEffectAdapter::open(&registry_path, &journal_path, uid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            installed.capability_for_project(&project, "create_host_setup"),
+            Ok(())
+        );
+        assert_eq!(
+            installed.capability_for_project(&project, "create_checkout"),
+            Ok(())
+        );
+        let foreign = ProjectId::new("project-foreign").unwrap();
+        assert_eq!(
+            installed.capability_for_project(&foreign, "create_host_setup"),
+            Err("platform_v2_local_host_selector_unavailable")
+        );
+
+        let replacement = state.join("registry-replacement.json");
+        write_registry(&replacement, &authorized_registry(&root));
+        fs::rename(replacement, &registry_path).unwrap();
+        assert_eq!(
+            installed.capability_for_project(&project, "create_host_setup"),
+            Err("platform_v2_lifecycle_registry_changed")
         );
     }
 

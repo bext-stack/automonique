@@ -159,7 +159,7 @@ fn rust_transport_encoding_matches_the_shared_typescript_corpus() {
         .trim_end()
         .lines()
         .collect::<Vec<_>>();
-    assert_eq!(fixture.len(), 2);
+    assert_eq!(fixture.len(), 4);
 
     let negotiation = PlatformNegotiationRequestMessage::new(
         request_id("transport-negotiate"),
@@ -175,6 +175,70 @@ fn rust_transport_encoding_matches_the_shared_typescript_corpus() {
         PlatformV2Request::GetWorkContext(workspace()),
     );
     assert_eq!(v2.to_canonical_bytes().unwrap(), fixture[1].as_bytes());
+
+    let capabilities = PlatformV2RequestMessage::new(
+        request_id("transport-capabilities"),
+        PlatformV2Request::GetLifecycleCapabilities,
+    );
+    assert_eq!(
+        capabilities.to_canonical_bytes().unwrap(),
+        fixture[2].as_bytes()
+    );
+
+    let capability_response = PlatformV2ResponseMessage::for_request(
+        &capabilities,
+        PlatformV2Response::LifecycleCapabilities(
+            LifecycleCapabilities::new(
+                std::collections::BTreeSet::from([project()]),
+                LIFECYCLE_CAPABILITY_EFFECT_KINDS
+                    .into_iter()
+                    .map(|kind| {
+                        if matches!(kind, "create_checkout" | "create_host_setup") {
+                            LifecycleOperationCapability::available(project(), kind)
+                        } else {
+                            LifecycleOperationCapability::unavailable(
+                                project(),
+                                kind,
+                                "platform_v2_lifecycle_adapter_pending",
+                            )
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        capability_response.to_canonical_bytes().unwrap(),
+        fixture[3].as_bytes()
+    );
+    assert_eq!(
+        PlatformV2ResponseMessage::from_canonical_bytes(fixture[3].as_bytes(), &capabilities)
+            .unwrap(),
+        capability_response
+    );
+
+    let valid = Message::from_canonical_bytes(fixture[3].as_bytes()).unwrap();
+    let mut duplicate_body = valid.body().clone();
+    let JsonValue::Object(fields) = &mut duplicate_body else {
+        panic!("capability response body is an object");
+    };
+    let JsonValue::Array(projects) = fields
+        .iter_mut()
+        .find(|(name, _)| name == "projects")
+        .map(|(_, value)| value)
+        .unwrap()
+    else {
+        panic!("capability projects are an array");
+    };
+    projects.push(JsonValue::String(String::from("project-1")));
+    let duplicate = Message::new(valid.envelope().clone(), duplicate_body).to_canonical_bytes();
+    assert_eq!(
+        PlatformV2ResponseMessage::from_canonical_bytes(&duplicate, &capabilities),
+        Err(PlatformV2TransportError::InvalidBody)
+    );
 }
 
 #[test]
@@ -275,6 +339,7 @@ fn every_platform_v2_request_kind_round_trips_without_server_owned_inputs() {
     )
     .unwrap();
     let requests = vec![
+        PlatformV2Request::GetLifecycleCapabilities,
         PlatformV2Request::QueryWorkContexts(query),
         PlatformV2Request::GetWorkContext(workspace()),
         PlatformV2Request::PrepareMutation(MutationPrepareRequest::new(
@@ -396,6 +461,53 @@ fn mutation_commands_and_receipt_lookups_refuse_server_owned_or_ambiguous_fields
 
 #[test]
 fn response_documents_round_trip_and_review_envelope_fits_its_declared_ceiling() {
+    let capability_request = PlatformV2RequestMessage::new(
+        request_id("capabilities-response"),
+        PlatformV2Request::GetLifecycleCapabilities,
+    );
+    let capability_response = PlatformV2ResponseMessage::for_request(
+        &capability_request,
+        PlatformV2Response::LifecycleCapabilities(
+            LifecycleCapabilities::new(
+                std::collections::BTreeSet::from([project()]),
+                LIFECYCLE_CAPABILITY_EFFECT_KINDS
+                    .into_iter()
+                    .map(|kind| {
+                        if matches!(kind, "create_checkout" | "create_host_setup") {
+                            LifecycleOperationCapability::available(project(), kind)
+                        } else {
+                            LifecycleOperationCapability::unavailable(
+                                project(),
+                                kind,
+                                "platform_v2_lifecycle_adapter_pending",
+                            )
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let bytes = capability_response.to_canonical_bytes().unwrap();
+    assert_eq!(
+        PlatformV2ResponseMessage::from_canonical_bytes(&bytes, &capability_request).unwrap(),
+        capability_response
+    );
+    assert_eq!(
+        LifecycleCapabilities::new(std::collections::BTreeSet::from([project()]), Vec::new()),
+        Err(PlatformV2TransportError::InvalidBody)
+    );
+    assert_eq!(
+        LifecycleOperationCapability::unavailable(
+            project(),
+            "generic_execute",
+            "platform_v2_lifecycle_adapter_pending"
+        ),
+        Err(PlatformV2TransportError::InvalidBody)
+    );
+
     let query = WorkContextQuery::new(
         vec![WorkContextKind::Project],
         vec![],
