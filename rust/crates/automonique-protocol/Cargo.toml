@@ -15,8 +15,12 @@ publish = false
 # reference implementation the differential test checks `digest.rs` against —
 # the point of that test is that the two are written by different people, so it
 # has to be a second implementation rather than a second call into the first.
+# `serde_json` is used only by the independently authored installed-v1 response
+# decoder. That decoder deliberately imports no Automonique protocol or wire
+# types, so the server codec cannot validate itself through shared code.
 [dev-dependencies]
 proptest = { version = "=1.11.0", default-features = false, features = ["std", "bit-set"] }
+serde_json.workspace = true
 sha2.workspace = true
 
 [lints]

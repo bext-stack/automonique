@@ -23,6 +23,16 @@ inside `ResourceRecord.summary`, invent a new v1 `ResourceKind`, or imply that a
 v1 client received structured work context. No overlap is an explicit
 compatibility refusal.
 
+The attempt-workspace terminology is an intentional Rust source break:
+execution-only values use `AttemptWorkspaceRegistration`,
+`AttemptWorkspaceToken`, and `AttemptWorkspaceRegistryId`, while the v2 graph
+keeps `UserWorkspaceId` and `AttemptWorkspaceId` distinct. The affected Rust
+crates are `publish = false`, so no published Rust API compatibility is
+claimed and misleading aliases are not retained. This source rename does not
+rename the installed wire contract: Platform v1 keeps
+`automonique.platform/v1`, and RunSpec v1 keeps the exact JSON fields
+`workspace`, `workspace_registry_id`, and `workspace_token`.
+
 ## Identity, authority, revision, and retention
 
 Every new work-context identity is opaque and meaningful only within the
@@ -56,11 +66,14 @@ under their original issuer's policy.
 | `Session` | Durable work-context session relating one attempt workspace and one existing Platform v1 session identity | `active ↔ hibernated → completed/failed/cancelled` | Retained at least as long as canonical session history and receipts |
 | `Pane` | Presentation/terminal subdivision relating exactly one session; it never owns execution or control | `active → closed` | Closed panes remain while the owning session is retained; focus is client-local and is not lifecycle authority |
 
-The existing internal execution type named `Workspace` remains an
-implementation detail. It is not a `UserWorkspace`. When that implementation
-is exposed in product or protocol language it is qualified as an
+The internal execution types are explicitly named
+`AttemptWorkspaceRegistration`, `AttemptWorkspaceToken`, and
+`AttemptWorkspaceRegistryId`. None is a `UserWorkspace`. When an execution
+registration is projected into this graph, it is always represented as an
 `AttemptWorkspace`; no alias or conversion grants broader filesystem,
-credential, network, provider, or model authority.
+credential, network, tool, provider, or model authority. RunSpec v1 retains
+its exact historical JSON keys (`workspace`, `workspace_registry_id`, and
+`workspace_token`) as wire compatibility vocabulary only.
 
 ## Structured relation graph
 
@@ -396,3 +409,26 @@ remain independent. Any selected-workspace refusal, incomplete attention
 coverage, or unknown freshness is rendered as partial rather than fully
 capable. Canonical stale freshness is called out explicitly and the cockpit
 remains read-only.
+
+## Issue #166 closure evidence
+
+- [x] Internal run-execution identities are qualified as attempt-workspace
+  registrations, tokens, and registry IDs; RunSpec v1 wire keys remain pinned
+  by `run_spec_v1_golden` and the strict decoder suites.
+- [x] A literal installed-client v1-only offer negotiates v1 with the current
+  server; five immutable current-server response transcripts remain
+  byte-identical; and an independently authored strict v1-only decoder accepts
+  them while refusing v2 and additive shapes in
+  `platform_v1_installed_acceptance`. The decoder imports no Automonique
+  protocol types. Fixture provenance and limits are recorded beside the
+  corpus without claiming historical extraction or an unavailable executable.
+- [x] One project relates two repositories, local and SSH host setups, and user
+  workspaces backed by both a git worktree and an authorized folder in
+  `one_project_spans_repositories_hosts_and_both_authorized_workspace_kinds`.
+- [x] Attempt creation and resume refuse cross-workspace identity substitution
+  and widening on each filesystem, credential, network, tool, provider, and
+  model axis in
+  `attempt_create_and_resume_cannot_widen_identity_or_any_authority_axis`.
+- [x] A 640-record authorized inventory round-trips its query and all five
+  bounded 128-item pages, with cursor resynchronization after inventory drift,
+  in `authorized_query_remains_functional_beyond_v1s_512_resource_ceiling`.

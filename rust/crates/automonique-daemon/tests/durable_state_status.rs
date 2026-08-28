@@ -51,17 +51,20 @@ use automonique_protocol::sandbox::{
     WorkspaceContextHash,
 };
 use automonique_protocol::tools::RunId;
-use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
+use automonique_protocol::workspace::{
+    AttemptWorkspaceRegistration, AttemptWorkspaceToken, IsolationKind,
+};
 
 #[path = "support/isolation.rs"]
 mod test_isolation;
 use automonique_runner::{
-    AdmissionFields, AdmissionFieldsParts, ArtifactGrantBindings, CwdToken, ExecutionPlanDigest,
-    ExtensionSetDigest, FallbackEligibility, IntegrationMode, IoReservation, ModelRoutingDigest,
-    PersonaDigest, PortabilityPolicy, ProfileDigest, PromptDeliveryPlan, RemoteAttestationPolicy,
-    RequiredCapabilities, RunCoordinates, RunOrigin, RunSpec, RunSpecParts, RunnerEventDialect,
-    SchedulerDecisionDigest, SchedulerReservationBinding, SchedulerReservationId, SkillsetDigest,
-    ToolsetDigest, WorkspaceRegistryId, WorkspaceReservation,
+    AdmissionFields, AdmissionFieldsParts, ArtifactGrantBindings, AttemptWorkspaceRegistryId,
+    CwdToken, ExecutionPlanDigest, ExtensionSetDigest, FallbackEligibility, IntegrationMode,
+    IoReservation, ModelRoutingDigest, PersonaDigest, PortabilityPolicy, ProfileDigest,
+    PromptDeliveryPlan, RemoteAttestationPolicy, RequiredCapabilities, RunCoordinates, RunOrigin,
+    RunSpec, RunSpecParts, RunnerEventDialect, SchedulerDecisionDigest,
+    SchedulerReservationBinding, SchedulerReservationId, SkillsetDigest, ToolsetDigest,
+    WorkspaceReservation,
 };
 
 fn fixture() -> (tempfile::TempDir, DaemonConfig) {
@@ -299,14 +302,14 @@ fn provider_binary() -> BinaryProvenance {
         .expect("pinned provider binary")
 }
 
-fn workspace() -> WorkspaceRegistration {
-    WorkspaceRegistration::new(
+fn attempt_workspace() -> AttemptWorkspaceRegistration {
+    AttemptWorkspaceRegistration::new(
         "acme",
         "source-1",
         Revision::new(7).expect("revision"),
         "snapshot-1",
         IsolationKind::ReadOnlySnapshot,
-        WorkspaceToken::new("workspace-token-1").expect("token"),
+        AttemptWorkspaceToken::new("workspace-token-1").expect("token"),
     )
     .expect("registered workspace")
 }
@@ -411,8 +414,9 @@ fn document(run: &str) -> Vec<u8> {
         cwd_token: CwdToken::new("cwd-1").expect("cwd"),
         environment: Vec::new(),
         prompt: PromptDeliveryPlan::Stdin,
-        workspace_registry_id: WorkspaceRegistryId::new("workspace-registry-1").expect("registry"),
-        workspace: workspace(),
+        attempt_workspace_registry_id: AttemptWorkspaceRegistryId::new("workspace-registry-1")
+            .expect("registry"),
+        attempt_workspace: attempt_workspace(),
         provider_binary: provider_binary(),
         sandbox: sandbox(),
         admission: admission(),

@@ -27,6 +27,64 @@ fn authority(prefix: &str) -> WorkContextAuthority {
     )
     .unwrap()
 }
+fn widened_authorities() -> [WorkContextAuthority; 6] {
+    [
+        WorkContextAuthority::new(
+            vec![grant("outside")],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap(),
+        WorkContextAuthority::new(
+            vec![],
+            vec![grant("outside")],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap(),
+        WorkContextAuthority::new(
+            vec![],
+            vec![],
+            vec![grant("outside")],
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap(),
+        WorkContextAuthority::new(
+            vec![],
+            vec![],
+            vec![],
+            vec![grant("outside")],
+            vec![],
+            vec![],
+        )
+        .unwrap(),
+        WorkContextAuthority::new(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![grant("outside")],
+            vec![],
+        )
+        .unwrap(),
+        WorkContextAuthority::new(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![grant("outside")],
+        )
+        .unwrap(),
+    ]
+}
 fn identity(kind: WorkContextKind, id: &str) -> WorkContextIdentity {
     WorkContextIdentity::parse_local(kind.into(), id).unwrap()
 }
@@ -60,6 +118,28 @@ fn attempt_record(lifecycle: WorkContextLifecycle, revision: u64) -> WorkContext
             WorkContextRelation::new(
                 WorkContextRelationKind::AttemptUserWorkspace,
                 identity(WorkContextKind::UserWorkspace, "workspace-1"),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap()
+}
+fn user_workspace_record(id: &str, revision: u64) -> WorkContextRecord {
+    WorkContextRecord::new(
+        identity(WorkContextKind::UserWorkspace, id),
+        Revision::new(revision).unwrap(),
+        WorkContextLifecycle::Active,
+        label("User workspace"),
+        WorkContextAttributes::EMPTY,
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::UserWorkspaceProject,
+                identity(WorkContextKind::Project, "project-1"),
+            )
+            .unwrap(),
+            WorkContextRelation::new(
+                WorkContextRelationKind::UserWorkspaceCheckout,
+                identity(WorkContextKind::Checkout, "checkout-1"),
             )
             .unwrap(),
         ],
@@ -293,62 +373,7 @@ fn operation_specific_create_issues_identity_only_in_preview() {
 #[test]
 fn every_authority_axis_is_tighten_only_and_canonical() {
     let narrow = authority("narrow");
-    for widened in [
-        WorkContextAuthority::new(
-            vec![grant("outside")],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        )
-        .unwrap(),
-        WorkContextAuthority::new(
-            vec![],
-            vec![grant("outside")],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        )
-        .unwrap(),
-        WorkContextAuthority::new(
-            vec![],
-            vec![],
-            vec![grant("outside")],
-            vec![],
-            vec![],
-            vec![],
-        )
-        .unwrap(),
-        WorkContextAuthority::new(
-            vec![],
-            vec![],
-            vec![],
-            vec![grant("outside")],
-            vec![],
-            vec![],
-        )
-        .unwrap(),
-        WorkContextAuthority::new(
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![grant("outside")],
-            vec![],
-        )
-        .unwrap(),
-        WorkContextAuthority::new(
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![grant("outside")],
-        )
-        .unwrap(),
-    ] {
+    for widened in widened_authorities() {
         assert!(!widened.is_subset_of(&narrow));
     }
     assert_eq!(
@@ -367,6 +392,131 @@ fn every_authority_axis_is_tighten_only_and_canonical() {
     assert!(WorkContextRegistrySelector::new("registry:checkout_1").is_ok());
     assert!(WorkContextRegistrySelector::new("/srv/private").is_err());
     assert!(AuthorityGrantId::new("../secret").is_err());
+}
+
+#[test]
+fn attempt_create_and_resume_cannot_widen_identity_or_any_authority_axis() {
+    let ceiling = authority("narrow");
+    for (index, widened) in widened_authorities().into_iter().enumerate() {
+        let create = WorkContextMutationIntent::CreateAttemptWorkspace(
+            CreateAttemptWorkspaceIntent::new(
+                label("Attempt"),
+                expected(WorkContextKind::UserWorkspace, "workspace-1", 4),
+                widened.clone(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            MutationPreview::new(
+                MutationPreviewRef::new(
+                    MutationPreviewId::new(format!("preview-create-axis-{index}")).unwrap(),
+                    Revision::FIRST,
+                ),
+                proposal(create, ceiling.clone()),
+                None,
+                Some(issue_work_context_identity_from_random_nonce(
+                    WorkContextKind::AttemptWorkspace,
+                    [u8::try_from(index + 1).unwrap(); 16],
+                )),
+                vec![ResolvedParentSnapshot::WorkContext {
+                    record: user_workspace_record("workspace-1", 4),
+                }],
+                ceiling.clone(),
+                widened.clone(),
+                MutationApprovalRequirement::NotRequired,
+                EpochMillis::from_millis(1),
+                EpochMillis::from_millis(2),
+            ),
+            Err(LifecycleError::AuthorityWidening),
+            "create must refuse widening authority axis {index}"
+        );
+
+        let resume = WorkContextMutationIntent::ResumeAttemptWorkspace(
+            ResumeAttemptWorkspaceIntent::new(
+                expected(WorkContextKind::AttemptWorkspace, "attempt-1", 7),
+                widened.clone(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            MutationPreview::new(
+                MutationPreviewRef::new(
+                    MutationPreviewId::new(format!("preview-resume-axis-{index}")).unwrap(),
+                    Revision::FIRST,
+                ),
+                proposal(resume, ceiling.clone()),
+                Some(attempt_record(WorkContextLifecycle::Hibernated, 7)),
+                None,
+                vec![],
+                ceiling.clone(),
+                widened,
+                MutationApprovalRequirement::NotRequired,
+                EpochMillis::from_millis(1),
+                EpochMillis::from_millis(2),
+            ),
+            Err(LifecycleError::AuthorityWidening),
+            "resume must refuse widening authority axis {index}"
+        );
+    }
+
+    let grants = authority("narrow");
+    let foreign_create = WorkContextMutationIntent::CreateAttemptWorkspace(
+        CreateAttemptWorkspaceIntent::new(
+            label("Attempt"),
+            expected(WorkContextKind::UserWorkspace, "workspace-1", 4),
+            grants.clone(),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        MutationPreview::new(
+            MutationPreviewRef::new(
+                MutationPreviewId::new("preview-create-foreign-workspace").unwrap(),
+                Revision::FIRST,
+            ),
+            proposal(foreign_create, grants.clone()),
+            None,
+            Some(issue_work_context_identity_from_random_nonce(
+                WorkContextKind::AttemptWorkspace,
+                [0x7f; 16],
+            )),
+            vec![ResolvedParentSnapshot::WorkContext {
+                record: user_workspace_record("workspace-2", 4),
+            }],
+            grants.clone(),
+            grants.clone(),
+            MutationApprovalRequirement::NotRequired,
+            EpochMillis::from_millis(1),
+            EpochMillis::from_millis(2),
+        ),
+        Err(LifecycleError::ParentSnapshotMismatch)
+    );
+
+    let foreign_resume = WorkContextMutationIntent::ResumeAttemptWorkspace(
+        ResumeAttemptWorkspaceIntent::new(
+            expected(WorkContextKind::AttemptWorkspace, "attempt-2", 7),
+            grants.clone(),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        MutationPreview::new(
+            MutationPreviewRef::new(
+                MutationPreviewId::new("preview-resume-foreign-attempt").unwrap(),
+                Revision::FIRST,
+            ),
+            proposal(foreign_resume, grants.clone()),
+            Some(attempt_record(WorkContextLifecycle::Hibernated, 7)),
+            None,
+            vec![],
+            grants.clone(),
+            grants,
+            MutationApprovalRequirement::NotRequired,
+            EpochMillis::from_millis(1),
+            EpochMillis::from_millis(2),
+        ),
+        Err(LifecycleError::TargetMismatch)
+    );
 }
 
 #[test]

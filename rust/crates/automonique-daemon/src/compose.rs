@@ -9,8 +9,8 @@
 //! something has to decide what the document says. This module is that
 //! something, and it is deliberately the narrowest such thing that could work:
 //! it composes exactly one shape of run — a **single contained provider
-//! completion, over brokered egress, in a private empty workspace, whose answer
-//! is a file** — and it can compose nothing else.
+//! completion, over brokered egress, in a private empty attempt workspace,
+//! whose answer is a file** — and it can compose nothing else.
 //!
 //! # What the operator supplies, and what the deployment supplies
 //!
@@ -38,20 +38,21 @@
 //! captures no output. So an answer that has to come back to a chat cannot come
 //! back through the spool.
 //!
-//! It comes back through the **workspace**, which is the one durable place the
+//! It comes back through the **attempt workspace**, which is the one durable place the
 //! workload can write and this daemon can read. The composer names an absolute
-//! answer path inside the run's own workspace, the provider is told to write its
-//! final message there, and [`Composition::answer_path`] is what a reader opens
-//! afterwards.
+//! answer path inside the run's own attempt workspace, the provider is told to
+//! write its final message there, and [`Composition::answer_path`] is what a
+//! reader opens afterwards.
 //!
 //! ## Why the composer can name that path at all
 //!
 //! A RunSpec's working directory is an opaque `cwd_token`; resolving it is the
-//! workspace registry's job, and this daemon is the registry. [`crate::execute`]
-//! publishes its resolution as [`crate::execute::run_workspace`], a pure
-//! function of the state directory and the run identity — both of which the
-//! composer chooses. So the composer computes the *same* path the lane will
-//! resolve, through the same function, and writes it into the document.
+//! attempt-workspace registry's job, and this daemon is the registry.
+//! [`crate::execute`] publishes its resolution as
+//! [`crate::execute::run_attempt_workspace`], a pure function of the state
+//! directory and the run identity — both of which the composer chooses. So the
+//! composer computes the *same* path the lane will resolve, through the same
+//! function, and writes it into the document.
 //!
 //! That is worth stating as a choice, because the alternative was available and
 //! is worse: the lane could have rewritten the argv at execute time, when the
@@ -64,7 +65,8 @@
 //! The path is **absolute** for a reason the launch surface forces: the launch
 //! frame has no working-directory line, so the workload starts in whatever
 //! directory the supervisor is in. A relative `answer.md` would be written
-//! wherever the daemon happened to be. `-C <workspace>` tells the provider where
+//! wherever the daemon happened to be. `-C <workspace>` tells the provider which
+//! attempt workspace
 //! to work; the absolute answer path is what makes the file land where this
 //! daemon looks.
 //!
@@ -103,19 +105,22 @@ use automonique_protocol::sandbox::{
     ToolWorkloadEgress, WorkspaceContextHash,
 };
 use automonique_protocol::tools::RunId;
-use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
+use automonique_protocol::workspace::{
+    AttemptWorkspaceRegistration, AttemptWorkspaceToken, IsolationKind,
+};
 use automonique_runner::{
-    AdmissionFields, AdmissionFieldsParts, ArtifactGrantBindings, CwdToken, ExecutionPlanDigest,
-    ExtensionSetDigest, FallbackEligibility, IntegrationMode, IoReservation, ModelRoutingDigest,
-    PersonaDigest, PortabilityPolicy, ProfileDigest, PromptDeliveryPlan, ProtectedPromptReference,
-    RemoteAttestationPolicy, RequiredCapabilities, RunCoordinates, RunOrigin, RunSpec,
-    RunSpecParts, RunnerEventDialect, SchedulerDecisionDigest, SchedulerReservationBinding,
-    SchedulerReservationId, SkillsetDigest, ToolsetDigest, WorkspaceRegistryId,
+    AdmissionFields, AdmissionFieldsParts, ArtifactGrantBindings, AttemptWorkspaceRegistryId,
+    CwdToken, ExecutionPlanDigest, ExtensionSetDigest, FallbackEligibility, IntegrationMode,
+    IoReservation, ModelRoutingDigest, PersonaDigest, PortabilityPolicy, ProfileDigest,
+    PromptDeliveryPlan, ProtectedPromptReference, RemoteAttestationPolicy, RequiredCapabilities,
+    RunCoordinates, RunOrigin, RunSpec, RunSpecParts, RunnerEventDialect, SchedulerDecisionDigest,
+    SchedulerReservationBinding, SchedulerReservationId, SkillsetDigest, ToolsetDigest,
     WorkspaceReservation,
 };
 
 use crate::execute::{
-    DAEMON_BACKEND_ID, DAEMON_WORKSPACE_REGISTRY, is_within_byte_limit, run_workspace,
+    DAEMON_ATTEMPT_WORKSPACE_REGISTRY, DAEMON_BACKEND_ID, is_within_byte_limit,
+    run_attempt_workspace,
 };
 
 /// The provider this deployment runs, a sibling of [`crate::DATABASE_NAME`].
@@ -129,8 +134,9 @@ pub const PROVIDER_CONFIG_NAME: &str = "provider";
 ///
 /// Fixed rather than derived: the composer writes the absolute path into the
 /// argv and [`Composition::answer_path`] carries the same value, so nothing
-/// downstream reconstructs it. It lives in the run's own workspace, which is
-/// created empty for the run, so this file existing means this run wrote it.
+/// downstream reconstructs it. It lives in the run's own attempt workspace,
+/// which is created empty for the run, so this file existing means this run
+/// wrote it.
 pub const ANSWER_LEAF: &str = "answer.md";
 
 /// The two coordinates a composed argv may name, and the only substitution this
@@ -141,8 +147,8 @@ pub const ANSWER_LEAF: &str = "answer.md";
 /// module's own note on why the document names the path rather than the lane
 /// rewriting it. Every occurrence in every argument is replaced; an argument
 /// that names neither is passed through byte for byte.
-pub const WORKSPACE_PLACEHOLDER: &str = "{workspace}";
-/// The run's answer file, absolute. See [`WORKSPACE_PLACEHOLDER`].
+pub const ATTEMPT_WORKSPACE_PLACEHOLDER: &str = "{workspace}";
+/// The run's answer file, absolute. See [`ATTEMPT_WORKSPACE_PLACEHOLDER`].
 pub const ANSWER_PLACEHOLDER: &str = "{answer}";
 
 /// The invocation this build reviewed, mirroring the owner's live vehicle.
@@ -170,7 +176,7 @@ pub const DEFAULT_ARGV: [&str; 13] = [
     "never",
     "--ephemeral",
     "-C",
-    WORKSPACE_PLACEHOLDER,
+    ATTEMPT_WORKSPACE_PLACEHOLDER,
     "-o",
     ANSWER_PLACEHOLDER,
 ];
@@ -403,7 +409,7 @@ impl std::error::Error for ComposeRefusal {}
 ///
 /// A repeated `arg=` key replaces [`DEFAULT_ARGV`] **entirely** — there is no
 /// merging, because a partial override of an invocation has no single meaning.
-/// Each line is one argument, taken literally, with [`WORKSPACE_PLACEHOLDER`]
+/// Each line is one argument, taken literally, with [`ATTEMPT_WORKSPACE_PLACEHOLDER`]
 /// and [`ANSWER_PLACEHOLDER`] substituted:
 ///
 /// ```text
@@ -812,9 +818,10 @@ fn compose_inner(
         return Err(ComposeRefusal::TaskRejected);
     }
 
-    let workspace = run_workspace(inputs.state_dir, run_id);
-    let answer_path = workspace.join(ANSWER_LEAF);
-    let (Some(workspace_text), Some(answer_text)) = (workspace.to_str(), answer_path.to_str())
+    let attempt_workspace_path = run_attempt_workspace(inputs.state_dir, run_id);
+    let answer_path = attempt_workspace_path.join(ANSWER_LEAF);
+    let (Some(attempt_workspace_text), Some(answer_text)) =
+        (attempt_workspace_path.to_str(), answer_path.to_str())
     else {
         return Err(ComposeRefusal::IdentityRejected);
     };
@@ -826,7 +833,7 @@ fn compose_inner(
         provider: inputs.provider,
         provider_binary,
         offered_features: inputs.offered_features,
-        workspace: workspace_text,
+        attempt_workspace_path: attempt_workspace_text,
         answer: answer_text,
         profile,
         managed_session,
@@ -841,7 +848,7 @@ fn compose_inner(
     })
 }
 
-/// Read one composed run's answer back out of its workspace.
+/// Read one composed run's answer back out of its attempt workspace.
 ///
 /// This is the other half of the file the document named, and it is here rather
 /// than at the caller so exactly one module knows what an answer is: `compose`
@@ -909,7 +916,7 @@ struct DocumentParts<'a> {
     provider: &'a ProviderConfig,
     provider_binary: BinaryProvenance,
     offered_features: &'a [HostFeature],
-    workspace: &'a str,
+    attempt_workspace_path: &'a str,
     answer: &'a str,
     profile: ProviderRunProfile,
     managed_session: Option<ManagedSessionMode<'a>>,
@@ -946,7 +953,7 @@ fn document(parts: &DocumentParts<'_>) -> Result<Vec<u8>, ComposeRefusal> {
         executable: parts.provider.binary().to_path_buf(),
         arguments: argv(
             parts.provider.argv(),
-            parts.workspace,
+            parts.attempt_workspace_path,
             parts.answer,
             parts.profile,
             parts.managed_session,
@@ -954,11 +961,11 @@ fn document(parts: &DocumentParts<'_>) -> Result<Vec<u8>, ComposeRefusal> {
         ),
         // Opaque by construction: the resolution is the workspace registry's,
         // and this daemon is the registry. What it resolves to is
-        // `run_workspace`, which is what the argv above already names.
+        // `run_attempt_workspace`, which is what the argv above already names.
         cwd_token: CwdToken::new(format!("{}-cwd", parts.run_id)).map_err(rejected)?,
         environment: environment(
             home,
-            parts.workspace,
+            parts.attempt_workspace_path,
             parts.provider.engine(),
             parts.managed_session,
         ),
@@ -968,9 +975,11 @@ fn document(parts: &DocumentParts<'_>) -> Result<Vec<u8>, ComposeRefusal> {
         prompt: PromptDeliveryPlan::ProtectedReference(
             ProtectedPromptReference::new(parts.prompt_slot).map_err(rejected)?,
         ),
-        workspace_registry_id: WorkspaceRegistryId::new(DAEMON_WORKSPACE_REGISTRY)
-            .map_err(rejected)?,
-        workspace: WorkspaceRegistration::new(
+        attempt_workspace_registry_id: AttemptWorkspaceRegistryId::new(
+            DAEMON_ATTEMPT_WORKSPACE_REGISTRY,
+        )
+        .map_err(rejected)?,
+        attempt_workspace: AttemptWorkspaceRegistration::new(
             COMPOSE_TENANT,
             COMPOSE_PROFILE_ID,
             Revision::FIRST,
@@ -978,7 +987,7 @@ fn document(parts: &DocumentParts<'_>) -> Result<Vec<u8>, ComposeRefusal> {
             // Matches `FilesystemAccess::IsolatedWritable` below; the RunSpec
             // constructor cross-checks the pair and refuses a mismatch.
             IsolationKind::AttemptCopy,
-            WorkspaceToken::new(&format!("{}-workspace", parts.run_id)).map_err(rejected)?,
+            AttemptWorkspaceToken::new(&format!("{}-workspace", parts.run_id)).map_err(rejected)?,
         )
         .map_err(rejected)?,
         provider_binary: parts.provider_binary.clone(),
@@ -992,13 +1001,13 @@ fn document(parts: &DocumentParts<'_>) -> Result<Vec<u8>, ComposeRefusal> {
 /// The configured invocation, with the two coordinates resolved.
 ///
 /// This is the whole of the substitution this module performs: every occurrence
-/// of [`WORKSPACE_PLACEHOLDER`] and [`ANSWER_PLACEHOLDER`] becomes the absolute
+/// of [`ATTEMPT_WORKSPACE_PLACEHOLDER`] and [`ANSWER_PLACEHOLDER`] becomes the absolute
 /// path it names, and nothing else in an argument is touched. The task text is
 /// deliberately not among the things that can be substituted — it reaches the
 /// provider on stdin and never becomes an argument.
 fn argv(
     configured: &[String],
-    workspace: &str,
+    attempt_workspace: &str,
     answer: &str,
     profile: ProviderRunProfile,
     managed_session: Option<ManagedSessionMode<'_>>,
@@ -1009,7 +1018,7 @@ fn argv(
         .map(|argument| {
             OsString::from(
                 argument
-                    .replace(WORKSPACE_PLACEHOLDER, workspace)
+                    .replace(ATTEMPT_WORKSPACE_PLACEHOLDER, attempt_workspace)
                     .replace(ANSWER_PLACEHOLDER, answer),
             )
         })
@@ -1030,7 +1039,7 @@ fn argv(
                 OsString::from("-s"),
                 OsString::from(sandbox),
                 OsString::from("-C"),
-                OsString::from(workspace),
+                OsString::from(attempt_workspace),
                 OsString::from("exec"),
                 OsString::from("resume"),
             ];
@@ -1118,7 +1127,7 @@ fn argv(
 /// contained run's journal.
 fn environment(
     home: &str,
-    workspace: &str,
+    attempt_workspace: &str,
     engine: ProviderEngine,
     managed_session: Option<ManagedSessionMode<'_>>,
 ) -> Vec<(OsString, OsString)> {
@@ -1143,9 +1152,9 @@ fn environment(
             OsString::from("AUTOMONIQUE_PROVIDER_HOME"),
             OsString::from(home),
         ),
-        // The provider's home directory, pointed at the run's own workspace so
+        // The provider's home directory, pointed at the run's own attempt workspace so
         // a provider that writes dotfiles writes them inside the boundary.
-        (OsString::from("HOME"), OsString::from(workspace)),
+        (OsString::from("HOME"), OsString::from(attempt_workspace)),
         (OsString::from("PATH"), OsString::from(COMPOSE_PATH)),
         (OsString::from("TERM"), OsString::from("dumb")),
         (OsString::from("SSL_CERT_FILE"), OsString::from(CA_BUNDLE)),
@@ -1185,7 +1194,7 @@ fn sandbox(parts: &DocumentParts<'_>, home: &str) -> Result<SandboxSpec, Compose
         workspace_context: WorkspaceContextHash::parse(&declared_digest("workspace-context"))
             .map_err(rejected)?,
         base_revision: Revision::FIRST,
-        // The workspace and the executable are granted by admission itself; a
+        // The attempt workspace and the executable are granted by admission itself; a
         // document naming either again would collide, because two grants for
         // one path have no single meaning. What is left is the provider's own
         // home and the CA trust store.

@@ -3,9 +3,11 @@
 use automonique_protocol::platform::{
     ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
 };
+use automonique_protocol::platform_api::PlatformRequestMessage;
 use automonique_protocol::platform_v2::*;
 use automonique_protocol::platform_v2_api::*;
 use automonique_protocol::primitives::Revision;
+use automonique_protocol::wire::{JsonValue, parse_canonical};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -137,6 +139,48 @@ fn version_negotiation_prefers_v2_and_downgrades_truthfully() {
 }
 
 #[test]
+fn installed_v1_adapter_fixture_negotiates_and_decodes_without_v2_projection() {
+    let installed_client = PlatformVersionOffer::new(vec![1]).unwrap();
+    let current_server = PlatformVersionOffer::new(vec![1, 2]).unwrap();
+    let negotiated = negotiate_platform_version(&installed_client, &current_server).unwrap();
+    assert_eq!(negotiated.version(), PlatformVersion::V1);
+    assert_eq!(
+        negotiated.schema(),
+        automonique_protocol::platform::PLATFORM_SCHEMA_V1
+    );
+    assert_eq!(
+        negotiated.work_context(),
+        WorkContextAvailability::V1ExistingResourcesOnly
+    );
+
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../adapters/ag-ui/test/fixtures/platform-requests.json"
+    );
+    let fixture = std::fs::read_to_string(path).expect("installed v1 fixture is checked in");
+    let JsonValue::Object(entries) =
+        parse_canonical(fixture.trim().as_bytes()).expect("installed fixture is canonical JSON")
+    else {
+        panic!("installed v1 fixture is an object of canonical request strings");
+    };
+    assert!(!entries.is_empty());
+    for (label, value) in entries {
+        let JsonValue::String(bytes) = value else {
+            panic!("{label}: fixture entry must be a canonical request string");
+        };
+        let decoded = PlatformRequestMessage::from_canonical_bytes(bytes.as_bytes())
+            .unwrap_or_else(|error| {
+                panic!("{label}: installed v1 request no longer decodes: {error}")
+            });
+        assert_eq!(
+            decoded.to_message().unwrap().to_canonical_bytes(),
+            bytes.as_bytes(),
+            "{label}: v1 decoding must retain the exact canonical wire shape"
+        );
+    }
+}
+
+#[test]
 fn authoritative_identity_issuance_uses_only_random_nonce_bytes() {
     let sensitive_inputs = [
         "/home/operator/repository",
@@ -171,7 +215,7 @@ fn authoritative_identity_issuance_uses_only_random_nonce_bytes() {
 }
 
 #[test]
-fn structured_relations_admit_multiple_repositories_without_summary_identity() {
+fn one_project_spans_repositories_hosts_and_both_authorized_workspace_kinds() {
     let project_id = ProjectId::new("project-1").unwrap();
     let project = WorkContextRecord::new(
         WorkContextIdentity::Project(project_id.clone()),
@@ -268,11 +312,29 @@ fn structured_relations_admit_multiple_repositories_without_summary_identity() {
         vec![
             relation(
                 WorkContextRelationKind::UserWorkspaceProject,
-                WorkContextIdentity::Project(project_id),
+                WorkContextIdentity::Project(project_id.clone()),
             ),
             relation(
                 WorkContextRelationKind::UserWorkspaceCheckout,
                 checkout.identity().clone(),
+            ),
+        ],
+    )
+    .unwrap();
+    let folder_user_workspace = WorkContextRecord::new(
+        WorkContextIdentity::UserWorkspace(UserWorkspaceId::new("user-workspace-folder").unwrap()),
+        Revision::FIRST,
+        WorkContextLifecycle::Active,
+        label("Authorized-folder workspace"),
+        WorkContextAttributes::EMPTY,
+        vec![
+            relation(
+                WorkContextRelationKind::UserWorkspaceProject,
+                WorkContextIdentity::Project(project_id),
+            ),
+            relation(
+                WorkContextRelationKind::UserWorkspaceCheckout,
+                authorized_folder.identity().clone(),
             ),
         ],
     )
@@ -328,6 +390,10 @@ fn structured_relations_admit_multiple_repositories_without_summary_identity() {
         Some(HostSetupKind::Ssh)
     );
     assert_eq!(
+        local_host.attributes().host_setup_kind(),
+        Some(HostSetupKind::Local)
+    );
+    assert_eq!(
         checkout.attributes().checkout_kind(),
         Some(CheckoutKind::GitWorktree)
     );
@@ -342,19 +408,27 @@ fn structured_relations_admit_multiple_repositories_without_summary_identity() {
         local_host,
         authorized_folder,
         user_workspace,
+        folder_user_workspace,
         attempt,
         session,
         pane,
     ];
     records.sort_by(|left, right| left.identity().cmp(right.identity()));
     let encoded =
-        encode_work_context_page(&WorkContextPage::new(9, None, None, false, records).unwrap())
+        encode_work_context_page(&WorkContextPage::new(10, None, None, false, records).unwrap())
             .unwrap();
     assert!(!encoded.windows(5).any(|bytes| bytes == b"/home"));
     let encoded = String::from_utf8(encoded).unwrap();
     assert!(
         encoded.contains(r#""resource":{"authority":"github","id":"repo-a","kind":"repository"}"#)
     );
+    assert!(
+        encoded.contains(
+            r#""resource":{"authority":"automonique","id":"repo-b","kind":"repository"}"#
+        )
+    );
+    assert!(encoded.contains(r#""id":"user-workspace-1","kind":"user_workspace""#));
+    assert!(encoded.contains(r#""id":"user-workspace-folder","kind":"user_workspace""#));
     assert!(encoded.contains(
         r#""resource":{"authority":"automonique","id":"platform-session-1","kind":"session"}"#
     ));
@@ -526,7 +600,7 @@ fn multi_kind_pager_uses_the_page_identity_order() {
 }
 
 #[test]
-fn inventory_above_512_remains_available_through_bounded_pages() {
+fn authorized_query_remains_functional_beyond_v1s_512_resource_ceiling() {
     let inventory: Vec<AuthorizedWorkContextRecord> = (0..640)
         .map(|index| {
             AuthorizedWorkContextRecord::new(
@@ -550,6 +624,10 @@ fn inventory_above_512_remains_available_through_bounded_pages() {
             128,
         )
         .unwrap();
+        assert_eq!(
+            decode_work_context_query(&encode_work_context_query(&query).unwrap()).unwrap(),
+            query
+        );
         let WorkContextQueryResult::Page(page) =
             page_authorized_work_context(&query, &inventory).unwrap()
         else {

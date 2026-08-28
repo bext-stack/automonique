@@ -73,10 +73,10 @@
 
 use crate::filesystem::PathIntent;
 use crate::{
-    ContainmentLimits, LaunchPlan, LaunchPlanError, MAX_RUN_ID_BYTES, MountedTempfs,
-    PortabilityPolicy, PromptDeliveryPlan, ProtectedPromptReference, RemoteAttestationPolicy,
-    RunSpec, RunSpecDigest, RunSpecEncodeError, SocketGrant, TemporaryStorageBudget,
-    WorkspaceRegistryId,
+    AttemptWorkspaceRegistryId, ContainmentLimits, LaunchPlan, LaunchPlanError, MAX_RUN_ID_BYTES,
+    MountedTempfs, PortabilityPolicy, PromptDeliveryPlan, ProtectedPromptReference,
+    RemoteAttestationPolicy, RunSpec, RunSpecDigest, RunSpecEncodeError, SocketGrant,
+    TemporaryStorageBudget,
 };
 use automonique_protocol::models::ExecutorClass;
 use automonique_protocol::provider::BinaryProvenance;
@@ -598,7 +598,7 @@ pub enum AdmissionRefusal {
     SentinelRejected,
     /// A context input is malformed; names the input.
     ContextRejected(&'static str),
-    /// The resolved working directory is not the workspace root or beneath it.
+    /// The resolved working directory is not the attempt-workspace root or beneath it.
     WorkingDirectoryOutsideWorkspace,
     /// The run identifier cannot name a containment cgroup.
     RunIdUnusable,
@@ -674,8 +674,9 @@ impl fmt::Display for AdmissionRefusal {
             Self::ContextRejected(input) => {
                 write!(formatter, "admission context input {input} is invalid")
             }
-            Self::WorkingDirectoryOutsideWorkspace => formatter
-                .write_str("the resolved working directory is outside the resolved workspace root"),
+            Self::WorkingDirectoryOutsideWorkspace => formatter.write_str(
+                "the resolved working directory is outside the resolved attempt-workspace root",
+            ),
             Self::RunIdUnusable => {
                 formatter.write_str("the run identifier cannot name a containment cgroup")
             }
@@ -866,12 +867,12 @@ pub struct AdmissionContextParts {
     /// The execution backend this caller actually is. It must be the backend
     /// the spec names, or the spec belongs to another runner.
     pub backend: ExecutionBackendId,
-    /// The workspace registry record the resolved paths below came from.
-    pub workspace_registry_id: WorkspaceRegistryId,
-    /// The host path the registered workspace resolves to.
-    pub workspace_root: PathBuf,
+    /// The attempt-workspace registry record the resolved paths below came from.
+    pub attempt_workspace_registry_id: AttemptWorkspaceRegistryId,
+    /// The host path the registered attempt workspace resolves to.
+    pub attempt_workspace_root: PathBuf,
     /// The host path the spec's opaque `cwd_token` resolves to. It must be the
-    /// workspace root or beneath it.
+    /// attempt-workspace root or beneath it.
     pub working_directory: PathBuf,
     /// The provenance the caller observed for the program it is about to run.
     /// Hashing the file is the caller's job; this is the result.
@@ -956,11 +957,14 @@ impl AdmissionContext {
     ///
     /// Returns [`AdmissionRefusal::ContextRejected`] naming a malformed input
     /// and [`AdmissionRefusal::WorkingDirectoryOutsideWorkspace`] when the
-    /// resolved working directory escapes the resolved workspace root.
+    /// resolved working directory escapes the resolved attempt-workspace root.
     pub fn new(parts: AdmissionContextParts) -> Result<Self, AdmissionRefusal> {
-        validate_context_path(&parts.workspace_root, "workspace_root")?;
+        validate_context_path(&parts.attempt_workspace_root, "workspace_root")?;
         validate_context_path(&parts.working_directory, "working_directory")?;
-        if !parts.working_directory.starts_with(&parts.workspace_root) {
+        if !parts
+            .working_directory
+            .starts_with(&parts.attempt_workspace_root)
+        {
             return Err(AdmissionRefusal::WorkingDirectoryOutsideWorkspace);
         }
         if parts.host_features.len() > MAX_OFFERED_FEATURES {
@@ -1006,16 +1010,16 @@ impl AdmissionContext {
         &self.parts.backend
     }
 
-    /// The workspace registry record the resolutions came from.
+    /// The attempt-workspace registry record the resolutions came from.
     #[must_use]
-    pub const fn workspace_registry_id(&self) -> &WorkspaceRegistryId {
-        &self.parts.workspace_registry_id
+    pub const fn attempt_workspace_registry_id(&self) -> &AttemptWorkspaceRegistryId {
+        &self.parts.attempt_workspace_registry_id
     }
 
-    /// The resolved workspace root.
+    /// The resolved attempt-workspace root.
     #[must_use]
-    pub fn workspace_root(&self) -> &Path {
-        &self.parts.workspace_root
+    pub fn attempt_workspace_root(&self) -> &Path {
+        &self.parts.attempt_workspace_root
     }
 
     /// The resolved working directory.
@@ -1444,7 +1448,7 @@ pub fn admit(
             "admission.executor_class",
         ));
     }
-    if spec.workspace_registry_id() != context.workspace_registry_id() {
+    if spec.attempt_workspace_registry_id() != context.attempt_workspace_registry_id() {
         return Err(AdmissionRefusal::ContextMismatch("workspace_registry_id"));
     }
     if !spec
@@ -1832,7 +1836,7 @@ fn build_plan(
         }
     };
     plan = plan
-        .filesystem_grant(workspace_intent, context.workspace_root())
+        .filesystem_grant(workspace_intent, context.attempt_workspace_root())
         .map_err(|error| AdmissionRefusal::Plan {
             field: "workspace",
             error,

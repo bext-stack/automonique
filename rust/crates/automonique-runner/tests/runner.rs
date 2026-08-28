@@ -24,18 +24,20 @@ use automonique_protocol::sandbox::{
 };
 use automonique_protocol::tools::{CausationId, CredentialAudiences, NestedCause, RunId};
 use automonique_protocol::wire::MAX_JSON_ENTRIES;
-use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
+use automonique_protocol::workspace::{
+    AttemptWorkspaceRegistration, AttemptWorkspaceToken, IsolationKind,
+};
 use automonique_runner::{
     AdmissionFields, AdmissionFieldsParts, ArtifactGrantBinding, ArtifactGrantBindings,
-    ArtifactGrantDigest, ArtifactGrantId, Authority, BackendPromptSession, CancellationToken,
-    ContainmentEvidence, CwdToken, EventKind, ExecutionPlanDigest, ExtensionSetDigest,
-    FallbackEligibility, IntegrationMode, IoReservation, MAX_RUN_SPEC_BYTES, ModelRoutingDigest,
-    OriginCoordinate, PersonaDigest, PortabilityPolicy, ProfileDigest, PromptDeliveryPlan,
-    ProtectedPromptReference, RemoteAttestationPolicy, RequiredCapabilities, RunCoordinates,
-    RunOrigin, RunOriginSource, RunSpec, RunSpecEncodeError, RunSpecError, RunSpecParts, Runner,
-    RunnerError, RunnerEventDialect, SchedulerDecisionDigest, SchedulerReservationBinding,
-    SchedulerReservationId, SkillsetDigest, Spool, SpoolError, ToolsetDigest, WorkspaceRegistryId,
-    WorkspaceReservation,
+    ArtifactGrantDigest, ArtifactGrantId, AttemptWorkspaceRegistryId, Authority,
+    BackendPromptSession, CancellationToken, ContainmentEvidence, CwdToken, EventKind,
+    ExecutionPlanDigest, ExtensionSetDigest, FallbackEligibility, IntegrationMode, IoReservation,
+    MAX_RUN_SPEC_BYTES, ModelRoutingDigest, OriginCoordinate, PersonaDigest, PortabilityPolicy,
+    ProfileDigest, PromptDeliveryPlan, ProtectedPromptReference, RemoteAttestationPolicy,
+    RequiredCapabilities, RunCoordinates, RunOrigin, RunOriginSource, RunSpec, RunSpecEncodeError,
+    RunSpecError, RunSpecParts, Runner, RunnerError, RunnerEventDialect, SchedulerDecisionDigest,
+    SchedulerReservationBinding, SchedulerReservationId, SkillsetDigest, Spool, SpoolError,
+    ToolsetDigest, WorkspaceReservation,
 };
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -88,8 +90,9 @@ fn parts(_root: &Path, prompt: PromptDeliveryPlan) -> RunSpecParts {
         cwd_token: CwdToken::new("cwd-1").unwrap(),
         environment: Vec::new(),
         prompt,
-        workspace_registry_id: WorkspaceRegistryId::new("workspace-registry-1").unwrap(),
-        workspace: workspace("acme", 7, IsolationKind::ReadOnlySnapshot),
+        attempt_workspace_registry_id: AttemptWorkspaceRegistryId::new("workspace-registry-1")
+            .unwrap(),
+        attempt_workspace: attempt_workspace("acme", 7, IsolationKind::ReadOnlySnapshot),
         provider_binary: provider_binary(),
         sandbox: sandbox(
             "acme",
@@ -211,14 +214,18 @@ fn provider_binary() -> BinaryProvenance {
     .unwrap()
 }
 
-fn workspace(tenant: &str, base: u64, isolation: IsolationKind) -> WorkspaceRegistration {
-    WorkspaceRegistration::new(
+fn attempt_workspace(
+    tenant: &str,
+    base: u64,
+    isolation: IsolationKind,
+) -> AttemptWorkspaceRegistration {
+    AttemptWorkspaceRegistration::new(
         tenant,
         "source-1",
         Revision::new(base).unwrap(),
         "snapshot-1",
         isolation,
-        WorkspaceToken::new("workspace-token-1").unwrap(),
+        AttemptWorkspaceToken::new("workspace-token-1").unwrap(),
     )
     .unwrap()
 }
@@ -498,14 +505,15 @@ fn full_golden_spec_with_context(context_manifest: ContextManifest) -> RunSpec {
             (OsString::from("BETA"), OsString::from("value")),
         ],
         prompt: PromptDeliveryPlan::BackendSession(BackendPromptSession::new("session-1").unwrap()),
-        workspace_registry_id: WorkspaceRegistryId::new("workspace-registry-1").unwrap(),
-        workspace: WorkspaceRegistration::new(
+        attempt_workspace_registry_id: AttemptWorkspaceRegistryId::new("workspace-registry-1")
+            .unwrap(),
+        attempt_workspace: AttemptWorkspaceRegistration::new(
             "acme",
             "fixture-source",
             Revision::new(7).unwrap(),
             "snapshot-1",
             IsolationKind::Overlay,
-            WorkspaceToken::new("workspace-token-1").unwrap(),
+            AttemptWorkspaceToken::new("workspace-token-1").unwrap(),
         )
         .unwrap(),
         provider_binary: BinaryProvenance::new("2.0.0", &digest_text('1'), Some(&digest_text('2')))
@@ -760,15 +768,18 @@ fn path_and_environment_aggregate_bounds_fail_closed() {
 }
 
 #[test]
-fn canonical_workspace_sandbox_and_provider_values_are_embedded_exactly() {
+fn canonical_attempt_workspace_sandbox_and_provider_values_are_embedded_exactly() {
     let root = TempDir::new("canonical-embeddings");
     let spec = RunSpec::new(parts(root.path(), PromptDeliveryPlan::Stdin)).unwrap();
     assert_eq!(
-        spec.workspace_registry_id().as_str(),
+        spec.attempt_workspace_registry_id().as_str(),
         "workspace-registry-1"
     );
-    assert_eq!(spec.workspace().tenant(), "acme");
-    assert_eq!(spec.workspace().base_revision(), Revision::new(7).unwrap());
+    assert_eq!(spec.attempt_workspace().tenant(), "acme");
+    assert_eq!(
+        spec.attempt_workspace().base_revision(),
+        Revision::new(7).unwrap()
+    );
     assert_eq!(spec.sandbox().tenant(), "acme");
     assert_eq!(spec.sandbox().base_revision(), Revision::new(7).unwrap());
     assert_eq!(spec.provider_binary().version(), "1.2.3");
@@ -777,34 +788,35 @@ fn canonical_workspace_sandbox_and_provider_values_are_embedded_exactly() {
         "sha256:1111111111111111111111111111111111111111111111111111111111111111"
     );
     assert_eq!(
-        WorkspaceRegistryId::new("../workspace").unwrap_err(),
+        AttemptWorkspaceRegistryId::new("../workspace").unwrap_err(),
         RunSpecError::FieldInvalid("workspace_registry_id")
     );
 }
 
 #[test]
-fn workspace_and_sandbox_cross_field_mismatches_refuse() {
+fn attempt_workspace_and_sandbox_cross_field_mismatches_refuse() {
     let root = TempDir::new("cross-field-refusal");
 
     let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
-    candidate.workspace = workspace("other-tenant", 7, IsolationKind::ReadOnlySnapshot);
+    candidate.attempt_workspace =
+        attempt_workspace("other-tenant", 7, IsolationKind::ReadOnlySnapshot);
     assert_eq!(
         RunSpec::new(candidate).unwrap_err(),
-        RunSpecError::WorkspaceTenantMismatch
+        RunSpecError::AttemptWorkspaceTenantMismatch
     );
 
     let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
-    candidate.workspace = workspace("acme", 8, IsolationKind::ReadOnlySnapshot);
+    candidate.attempt_workspace = attempt_workspace("acme", 8, IsolationKind::ReadOnlySnapshot);
     assert_eq!(
         RunSpec::new(candidate).unwrap_err(),
-        RunSpecError::WorkspaceBaseMismatch
+        RunSpecError::AttemptWorkspaceBaseMismatch
     );
 
     let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
-    candidate.workspace = workspace("acme", 7, IsolationKind::AttemptCopy);
+    candidate.attempt_workspace = attempt_workspace("acme", 7, IsolationKind::AttemptCopy);
     assert_eq!(
         RunSpec::new(candidate).unwrap_err(),
-        RunSpecError::WorkspaceIsolationMismatch
+        RunSpecError::AttemptWorkspaceIsolationMismatch
     );
 
     let writable_cases = [
@@ -816,7 +828,7 @@ fn workspace_and_sandbox_cross_field_mismatches_refuse() {
     ];
     for (isolation, access) in writable_cases {
         let mut candidate = parts(root.path(), PromptDeliveryPlan::Stdin);
-        candidate.workspace = workspace("acme", 7, isolation);
+        candidate.attempt_workspace = attempt_workspace("acme", 7, isolation);
         candidate.sandbox = sandbox("acme", 7, access, 5_000, 1024 * 1024);
         candidate.admission = admission(1024);
         assert!(RunSpec::new(candidate).is_ok());
