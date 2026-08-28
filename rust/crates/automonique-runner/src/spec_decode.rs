@@ -4,14 +4,15 @@
 
 use crate::{
     AdmissionFields, AdmissionFieldsParts, ArtifactGrantBinding, ArtifactGrantBindings,
-    ArtifactGrantDigest, ArtifactGrantId, BackendPromptSession, CredentialBinding, CwdToken,
-    ExecutionPlanDigest, ExtensionSetDigest, FallbackEligibility, IntegrationMode, IoReservation,
-    MAX_ARTIFACT_GRANT_BINDINGS, MAX_FALLBACK_MODES, MAX_ORIGIN_CAUSES, MAX_RUN_SPEC_BYTES,
-    ModelRoutingDigest, OriginCoordinate, PersonaDigest, PortabilityPolicy, ProfileDigest,
-    PromptDeliveryPlan, ProtectedPromptReference, RemoteAttestationPolicy, RequiredCapabilities,
-    RunCoordinates, RunOrigin, RunOriginSource, RunSpec, RunSpecParts, RunnerEventDialect,
-    SchedulerDecisionDigest, SchedulerReservationBinding, SchedulerReservationId, SkillsetDigest,
-    ToolsetDigest, WorkspaceRegistryId, WorkspaceReservation,
+    ArtifactGrantDigest, ArtifactGrantId, AttemptWorkspaceRegistryId, BackendPromptSession,
+    CredentialBinding, CwdToken, ExecutionPlanDigest, ExtensionSetDigest, FallbackEligibility,
+    IntegrationMode, IoReservation, MAX_ARTIFACT_GRANT_BINDINGS, MAX_FALLBACK_MODES,
+    MAX_ORIGIN_CAUSES, MAX_RUN_SPEC_BYTES, ModelRoutingDigest, OriginCoordinate, PersonaDigest,
+    PortabilityPolicy, ProfileDigest, PromptDeliveryPlan, ProtectedPromptReference,
+    RemoteAttestationPolicy, RequiredCapabilities, RunCoordinates, RunOrigin, RunOriginSource,
+    RunSpec, RunSpecParts, RunnerEventDialect, SchedulerDecisionDigest,
+    SchedulerReservationBinding, SchedulerReservationId, SkillsetDigest, ToolsetDigest,
+    WorkspaceReservation,
 };
 use automonique_protocol::automation::DurableId;
 use automonique_protocol::context::{
@@ -37,7 +38,9 @@ use automonique_protocol::sandbox::{
 };
 use automonique_protocol::tools::{CausationId, CredentialAudiences, NestedCause, RunId};
 use automonique_protocol::wire::{self, JsonValue, MAX_JSON_ENTRIES};
-use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
+use automonique_protocol::workspace::{
+    AttemptWorkspaceRegistration, AttemptWorkspaceToken, IsolationKind,
+};
 use std::ffi::OsString;
 use std::fmt;
 use std::num::NonZeroU64;
@@ -430,12 +433,12 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<RunSpec, RunSpecDecodeError> {
             .map_err(|_| RunSpecDecodeError::Domain("cwd_token"))?,
         environment,
         prompt,
-        workspace_registry_id: WorkspaceRegistryId::new(text(
+        attempt_workspace_registry_id: AttemptWorkspaceRegistryId::new(text(
             value(e, "workspace_registry_id")?,
             "workspace_registry_id",
         )?)
         .map_err(|_| RunSpecDecodeError::Domain("workspace_registry_id"))?,
-        workspace: decode_workspace(value(e, "workspace")?)?,
+        attempt_workspace: decode_attempt_workspace(value(e, "workspace")?)?,
         provider_binary: decode_binary(value(e, "provider_binary")?)?,
         sandbox,
         admission,
@@ -512,7 +515,9 @@ fn decode_binary(value_: &JsonValue) -> Result<BinaryProvenance, RunSpecDecodeEr
     .map_err(|_| RunSpecDecodeError::Domain("provider_binary"))
 }
 
-fn decode_workspace(value_: &JsonValue) -> Result<WorkspaceRegistration, RunSpecDecodeError> {
+fn decode_attempt_workspace(
+    value_: &JsonValue,
+) -> Result<AttemptWorkspaceRegistration, RunSpecDecodeError> {
     let e = exact(
         value_,
         "workspace",
@@ -525,14 +530,14 @@ fn decode_workspace(value_: &JsonValue) -> Result<WorkspaceRegistration, RunSpec
             "token",
         ],
     )?;
-    WorkspaceRegistration::new(
+    AttemptWorkspaceRegistration::new(
         text(value(e, "tenant")?, "workspace_tenant")?,
         text(value(e, "canonical_source")?, "canonical_source")?,
         revision(value(e, "base_revision")?, "workspace_base_revision")?,
         text(value(e, "snapshot")?, "snapshot")?,
         IsolationKind::from_spelling(text(value(e, "isolation")?, "workspace_isolation")?)
             .ok_or(RunSpecDecodeError::Field("workspace_isolation"))?,
-        WorkspaceToken::new(text(value(e, "token")?, "workspace_token")?)
+        AttemptWorkspaceToken::new(text(value(e, "token")?, "workspace_token")?)
             .map_err(|_| RunSpecDecodeError::Domain("workspace_token"))?,
     )
     .map_err(|_| RunSpecDecodeError::Domain("workspace"))

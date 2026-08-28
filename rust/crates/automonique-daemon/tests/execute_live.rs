@@ -74,7 +74,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use automonique_daemon::execute::{
-    DAEMON_WORKSPACE_REGISTRY, locate_launch_helper, offered_host_features,
+    DAEMON_ATTEMPT_WORKSPACE_REGISTRY, locate_launch_helper, offered_host_features,
 };
 use automonique_daemon::{Daemon, DaemonConfig};
 use automonique_protocol::admin::{
@@ -107,18 +107,20 @@ use automonique_protocol::sandbox::{
     SandboxProfile, SandboxSpec, SandboxSpecParts, ToolWorkloadEgress, WorkspaceContextHash,
 };
 use automonique_protocol::tools::RunId;
-use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
+use automonique_protocol::workspace::{
+    AttemptWorkspaceRegistration, AttemptWorkspaceToken, IsolationKind,
+};
 use automonique_runner::capability::HostCapabilities;
 use automonique_runner::control::{CancelDelivery, CancelSink, CancelSinkError};
 use automonique_runner::dispatch::RegistrationHandle;
 use automonique_runner::{
-    AdmissionFields, AdmissionFieldsParts, ArtifactGrantBindings, Authority, ContainmentDomain,
-    CwdToken, EventKind, ExecutionPlanDigest, ExtensionSetDigest, FallbackEligibility,
-    IntegrationMode, IoReservation, ModelRoutingDigest, PersonaDigest, PortabilityPolicy,
-    ProfileDigest, PromptDeliveryPlan, ProtectedPromptReference, RemoteAttestationPolicy,
-    RequiredCapabilities, RunCoordinates, RunOrigin, RunSpec, RunSpecParts, RunnerEventDialect,
-    SchedulerDecisionDigest, SchedulerReservationBinding, SchedulerReservationId, SkillsetDigest,
-    Spool, ToolsetDigest, WorkspaceRegistryId, WorkspaceReservation,
+    AdmissionFields, AdmissionFieldsParts, ArtifactGrantBindings, AttemptWorkspaceRegistryId,
+    Authority, ContainmentDomain, CwdToken, EventKind, ExecutionPlanDigest, ExtensionSetDigest,
+    FallbackEligibility, IntegrationMode, IoReservation, ModelRoutingDigest, PersonaDigest,
+    PortabilityPolicy, ProfileDigest, PromptDeliveryPlan, ProtectedPromptReference,
+    RemoteAttestationPolicy, RequiredCapabilities, RunCoordinates, RunOrigin, RunSpec,
+    RunSpecParts, RunnerEventDialect, SchedulerDecisionDigest, SchedulerReservationBinding,
+    SchedulerReservationId, SkillsetDigest, Spool, ToolsetDigest, WorkspaceReservation,
 };
 use automonique_store::cancel_ledger::CancelLedger;
 
@@ -549,15 +551,17 @@ fn run_spec_with_sandbox(run: &str, script: &str, sandbox: SandboxSpec) -> RunSp
             ProtectedPromptReference::new(PROMPT_SLOT).expect("slot"),
         ),
         // The one registry identity this daemon resolves. Any other is refused.
-        workspace_registry_id: WorkspaceRegistryId::new(DAEMON_WORKSPACE_REGISTRY)
-            .expect("registry"),
-        workspace: WorkspaceRegistration::new(
+        attempt_workspace_registry_id: AttemptWorkspaceRegistryId::new(
+            DAEMON_ATTEMPT_WORKSPACE_REGISTRY,
+        )
+        .expect("registry"),
+        attempt_workspace: AttemptWorkspaceRegistration::new(
             "acme",
             "source-1",
             Revision::new(7).expect("revision"),
             "snapshot-1",
             IsolationKind::AttemptCopy,
-            WorkspaceToken::new("workspace-token-1").expect("token"),
+            AttemptWorkspaceToken::new("workspace-token-1").expect("token"),
         )
         .expect("registered workspace"),
         provider_binary: provider_binary(),

@@ -114,10 +114,10 @@
 //! - **It is not a scheduler.** One request starts one attempt. There is no
 //!   queue, no retry, no backoff and no fairness; [`ExecuteRefusal::LaneSaturated`]
 //!   is a refusal, not a wait.
-//! - **It is not a workspace registry.** See [`DAEMON_WORKSPACE_REGISTRY`]: this
-//!   daemon resolves one workspace — a private empty directory it creates for
-//!   the run — and refuses every document that names a registry it cannot
-//!   resolve.
+//! - **It is not a user-workspace registry.** See
+//!   [`DAEMON_ATTEMPT_WORKSPACE_REGISTRY`]: this daemon resolves one attempt
+//!   workspace — a private empty directory it creates for the run — and refuses
+//!   every document that names a registry it cannot resolve.
 //! - **It is not release trust.** The program's digest is checked against the
 //!   document's pin, which establishes that the bytes on disk are the bytes the
 //!   document named. Who signed those bytes, and whether that party may be
@@ -171,9 +171,9 @@ use automonique_runner::tempfs::{
     reap_stale_mounts,
 };
 use automonique_runner::{
-    Authority as SpoolAuthority, CancellationToken, ContainmentDomain, Controller,
-    EventKind as SpoolEventKind, Exceedance, LaunchPlan, PromptDeliveryPlan, RunContainment,
-    RunSpec, Spool, UnmountError, WorkspaceRegistryId,
+    AttemptWorkspaceRegistryId, Authority as SpoolAuthority, CancellationToken, ContainmentDomain,
+    Controller, EventKind as SpoolEventKind, Exceedance, LaunchPlan, PromptDeliveryPlan,
+    RunContainment, RunSpec, Spool, UnmountError,
 };
 use automonique_store::approval_requests::{
     ApprovalContext, ApprovalProposal, ApprovalRequests, ApprovalState, MAX_APPROVAL_REQUEST_PAGE,
@@ -217,21 +217,22 @@ pub const LAUNCH_HELPER_ENV: &str = "AUTOMONIQUE_LAUNCH_HELPER";
 /// [`ExecuteRefusal::LaunchHelperUnavailable`].
 pub const LAUNCH_HELPER_NAME: &str = "automonique-launch-enter";
 
-/// The one workspace registry identity this daemon can resolve.
+/// The one attempt-workspace registry identity this daemon can resolve.
 ///
-/// A [`RunSpec`]'s working directory is an opaque `cwd_token` that a workspace
-/// registry is supposed to resolve against a registered workspace. This build
-/// has no workspace registry, so it has exactly one honest option and takes it:
+/// A [`RunSpec`]'s working directory is an opaque `cwd_token` that an
+/// attempt-workspace registry is supposed to resolve against a registered
+/// attempt workspace. This build has no general registry, so it has exactly one
+/// honest option and takes it:
 /// it declares an identity of its own, resolves it to a **private empty
 /// directory created for the run**, and refuses every document naming any other
 /// registry with [`ExecuteRefusal::AdmissionRefused`].
 ///
 /// Stated plainly, because it is the difference between a check and a
-/// ceremony: a document that names this identity gets a fresh empty workspace,
-/// not the workspace it was written against. What the check buys is that a
-/// document written against a *real* registry cannot be silently run against
-/// the wrong tree — it is refused instead.
-pub const DAEMON_WORKSPACE_REGISTRY: &str = "automonique-daemon-scratch";
+/// ceremony: a document that names this identity gets a fresh empty attempt
+/// workspace, not the user workspace it was written against. What the check
+/// buys is that a document written against a *real* registry cannot be silently
+/// run against the wrong tree — it is refused instead.
+pub const DAEMON_ATTEMPT_WORKSPACE_REGISTRY: &str = "automonique-daemon-scratch";
 
 /// The one execution backend this daemon is.
 ///
@@ -419,7 +420,7 @@ pub const PROMPTS_DIRECTORY: &str = "prompts";
 /// is load-bearing: the admitted plan grants the workload read-write access to
 /// the workspace directory, so a spool inside it would be a durable lifecycle
 /// record the workload could rewrite.
-const WORKSPACE_LEAF: &str = "workspace";
+const ATTEMPT_WORKSPACE_LEAF: &str = "workspace";
 const PROVIDER_APPROVAL_KEY_DOMAIN: &[u8] = b"automonique.provider-approval/v1/key\0";
 const PROVIDER_APPROVAL_PROPOSER: &str = "automonique.jcode";
 /// The run's authoritative spool directory, outside every grant.
@@ -435,8 +436,8 @@ pub fn run_spool_root(state_dir: &Path, run_id: &str) -> PathBuf {
 ///
 /// # Why this is public, and why it is a function rather than a convention
 ///
-/// [`DAEMON_WORKSPACE_REGISTRY`] says this daemon resolves exactly one
-/// workspace: a private empty directory it creates for the run. Everything
+/// [`DAEMON_ATTEMPT_WORKSPACE_REGISTRY`] says this daemon resolves exactly one
+/// attempt workspace: a private empty directory it creates for the run. Everything
 /// downstream of that — a document whose argv has to name an absolute path
 /// inside the workspace, and a reader that has to find a file the workload left
 /// there — needs the *same* answer this lane will compute, and needs it before
@@ -452,11 +453,11 @@ pub fn run_spool_root(state_dir: &Path, run_id: &str) -> PathBuf {
 /// time and only for a document that was admitted; a run that was refused, or
 /// that never executed, has nothing here.
 #[must_use]
-pub fn run_workspace(state_dir: &Path, run_id: &str) -> PathBuf {
+pub fn run_attempt_workspace(state_dir: &Path, run_id: &str) -> PathBuf {
     state_dir
         .join(RUNS_DIRECTORY)
         .join(run_id)
-        .join(WORKSPACE_LEAF)
+        .join(ATTEMPT_WORKSPACE_LEAF)
 }
 
 /// Everything the execution lane needs, or the reason it has nothing.
@@ -751,11 +752,11 @@ impl ExecutionLane {
         run_spool_root(&self.state_dir, run_id)
     }
 
-    /// Where one run's workspace resolves, through this lane's own state
-    /// directory. See [`run_workspace`].
+    /// Where one run's attempt workspace resolves, through this lane's own
+    /// state directory. See [`run_attempt_workspace`].
     #[must_use]
-    pub fn workspace_root(&self, run_id: &str) -> PathBuf {
-        run_workspace(&self.state_dir, run_id)
+    pub fn attempt_workspace_root(&self, run_id: &str) -> PathBuf {
+        run_attempt_workspace(&self.state_dir, run_id)
     }
 
     /// Runs with a live attempt right now.
@@ -857,7 +858,7 @@ impl ExecutionLane {
         let run_root = self.state_dir.join(RUNS_DIRECTORY).join(run_id);
         // One owner for this path: a composer that has to write it into a
         // document computes the same value through the same function.
-        let workspace = self.workspace_root(run_id);
+        let attempt_workspace_root = self.attempt_workspace_root(run_id);
         let spool_root = run_root.join(SPOOL_LEAF);
 
         let (prompt, prompt_bytes) = self.resolve_prompt(spec)?;
@@ -882,14 +883,16 @@ impl ExecutionLane {
         let context = AdmissionContext::new(AdmissionContextParts {
             backend: ExecutionBackendId::new(DAEMON_BACKEND_ID)
                 .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?,
-            workspace_registry_id: WorkspaceRegistryId::new(DAEMON_WORKSPACE_REGISTRY)
-                .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?,
-            // The workspace root and the working directory are the same
+            attempt_workspace_registry_id: AttemptWorkspaceRegistryId::new(
+                DAEMON_ATTEMPT_WORKSPACE_REGISTRY,
+            )
+            .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?,
+            // The attempt-workspace root and the working directory are the same
             // directory: this daemon resolves one, and a `cwd_token` naming a
             // sub-path of a workspace it did not register would be a resolution
             // it cannot perform.
-            workspace_root: workspace.clone(),
-            working_directory: workspace.clone(),
+            attempt_workspace_root: attempt_workspace_root.clone(),
+            working_directory: attempt_workspace_root.clone(),
             observed_provider_binary: observed,
             host_features: self.offered.clone(),
             prompt: Some(prompt),
@@ -927,14 +930,14 @@ impl ExecutionLane {
         // variable at all.
         let (admitted, broker) = self.start_broker(admitted)?;
 
-        // Admitted, so the run may now have a place on disk. The workspace is
-        // created empty and the spool root beside it, never inside it: the
-        // admitted plan grants the workload read-write access to the workspace,
-        // and a spool under that grant would be a durable lifecycle record the
-        // workload could rewrite.
+        // Admitted, so the run may now have a place on disk. The attempt
+        // workspace is created empty and the spool root beside it, never inside
+        // it: the admitted plan grants the workload read-write access to the
+        // attempt workspace, and a spool under that grant would be a durable
+        // lifecycle record the workload could rewrite.
         private_directory(&self.state_dir.join(RUNS_DIRECTORY))
             .and_then(|()| private_directory(&run_root))
-            .and_then(|()| private_directory(&workspace))
+            .and_then(|()| private_directory(&attempt_workspace_root))
             .and_then(|()| private_directory(&spool_root))
             .map_err(|()| ExecuteRefusal::ExecutionUnavailable)?;
 
@@ -1014,7 +1017,7 @@ impl ExecutionLane {
                     resume_session_id: jcode_resume_session(spec)?,
                     expected_server: spec.provider_binary().version().to_owned(),
                     journal_path: self.state_dir.join(crate::PROVIDER_JOURNAL_NAME),
-                    answer_path: workspace.join(crate::compose::ANSWER_LEAF),
+                    answer_path: attempt_workspace_root.join(crate::compose::ANSWER_LEAF),
                     publisher: self.progress.publisher(run_id),
                     session_capture: Arc::clone(&session_capture),
                     managed_sessions_path: self.managed_sessions_path.clone(),

@@ -6,9 +6,10 @@
 //! is an installed exact wire contract: adding work-context kinds or fields to
 //! its closed enums and records would make old clients reject otherwise valid
 //! messages. V2 therefore owns new identities, relations, queries, and pages.
-//! The existing execution [`crate::workspace::Workspace`] is not used here;
-//! [`AttemptWorkspaceId`] names that security boundary in the user-facing
-//! graph without changing its internal implementation type.
+//! The internal execution [`crate::workspace::AttemptWorkspaceRegistration`]
+//! is not used as a graph identity here; [`AttemptWorkspaceId`] names that
+//! security boundary in the user-facing graph. It must never be confused with
+//! the durable [`UserWorkspaceId`].
 
 use core::fmt;
 

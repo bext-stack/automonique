@@ -70,27 +70,27 @@
 //! assert!(matches!(backend_plan, PromptDeliveryPlan::BackendSession(_)));
 //! ```
 //!
-//! Workspace registration and working-directory tokens remain distinct:
+//! Attempt-workspace registration and working-directory tokens remain distinct:
 //!
 //! ```compile_fail
-//! use automonique_protocol::workspace::WorkspaceToken;
+//! use automonique_protocol::workspace::AttemptWorkspaceToken;
 //! use automonique_runner::CwdToken;
 //! let cwd = CwdToken::new("cwd-1").unwrap();
-//! let workspace: WorkspaceToken = cwd;
+//! let attempt_workspace: AttemptWorkspaceToken = cwd;
 //! ```
 //!
 //! ```compile_fail
-//! use automonique_runner::{CwdToken, WorkspaceRegistryId};
+//! use automonique_runner::{CwdToken, AttemptWorkspaceRegistryId};
 //! let cwd = CwdToken::new("cwd-1").unwrap();
-//! let workspace: WorkspaceRegistryId = cwd;
+//! let attempt_workspace: AttemptWorkspaceRegistryId = cwd;
 //! ```
 //!
 //! ```
-//! use automonique_runner::{CwdToken, WorkspaceRegistryId};
+//! use automonique_runner::{CwdToken, AttemptWorkspaceRegistryId};
 //! let cwd = CwdToken::new("cwd-1").unwrap();
-//! let workspace = WorkspaceRegistryId::new("workspace-1").unwrap();
+//! let attempt_workspace = AttemptWorkspaceRegistryId::new("workspace-1").unwrap();
 //! assert_eq!(cwd.as_str(), "cwd-1");
-//! assert_eq!(workspace.as_str(), "workspace-1");
+//! assert_eq!(attempt_workspace.as_str(), "workspace-1");
 //! ```
 
 use crate::AdmissionFields;
@@ -99,7 +99,7 @@ use automonique_protocol::primitives::BoundedString;
 use automonique_protocol::provider::BinaryProvenance;
 use automonique_protocol::sandbox::{ExecutionBackendId, FilesystemAccess, SandboxSpec};
 use automonique_protocol::tools::RunId;
-use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration};
+use automonique_protocol::workspace::{AttemptWorkspaceRegistration, IsolationKind};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fmt;
@@ -137,9 +137,9 @@ pub enum RunSpecError {
     DuplicateEnvironmentKey,
     EnvironmentValueTooLarge,
     EnvironmentTooLarge,
-    WorkspaceTenantMismatch,
-    WorkspaceBaseMismatch,
-    WorkspaceIsolationMismatch,
+    AttemptWorkspaceTenantMismatch,
+    AttemptWorkspaceBaseMismatch,
+    AttemptWorkspaceIsolationMismatch,
     TimeoutInvalid,
     SpoolLimitInvalid,
 }
@@ -171,15 +171,13 @@ impl fmt::Display for RunSpecError {
             Self::EnvironmentTooLarge => {
                 formatter.write_str("total environment bytes exceed the limit")
             }
-            Self::WorkspaceTenantMismatch => {
-                formatter.write_str("workspace tenant differs from sandbox tenant")
+            Self::AttemptWorkspaceTenantMismatch => {
+                formatter.write_str("attempt workspace tenant differs from sandbox tenant")
             }
-            Self::WorkspaceBaseMismatch => {
-                formatter.write_str("workspace base revision differs from sandbox base revision")
-            }
-            Self::WorkspaceIsolationMismatch => {
-                formatter.write_str("workspace isolation differs from sandbox filesystem policy")
-            }
+            Self::AttemptWorkspaceBaseMismatch => formatter
+                .write_str("attempt workspace base revision differs from sandbox base revision"),
+            Self::AttemptWorkspaceIsolationMismatch => formatter
+                .write_str("attempt workspace isolation differs from sandbox filesystem policy"),
             Self::TimeoutInvalid => {
                 formatter.write_str("sandbox timeout is outside the supported range")
             }
@@ -285,12 +283,13 @@ impl PromptDeliveryPlan {
     }
 }
 
-/// Opaque identity of one registered workspace record. It is deliberately
-/// distinct from the workspace's host-resolved token and cannot carry a path.
+/// Opaque identity of one registered attempt-workspace record. It is
+/// deliberately distinct from the attempt workspace's host-resolved token and
+/// cannot carry a path.
 #[derive(Clone, Eq, PartialEq)]
-pub struct WorkspaceRegistryId(BoundedString<MAX_FIELD_BYTES>);
+pub struct AttemptWorkspaceRegistryId(BoundedString<MAX_FIELD_BYTES>);
 
-impl WorkspaceRegistryId {
+impl AttemptWorkspaceRegistryId {
     pub fn new(value: impl Into<String>) -> Result<Self, RunSpecError> {
         let value = value.into();
         reject_path_shaped_reference(&value, "workspace_registry_id")?;
@@ -305,16 +304,17 @@ impl WorkspaceRegistryId {
     }
 }
 
-impl fmt::Debug for WorkspaceRegistryId {
+impl fmt::Debug for AttemptWorkspaceRegistryId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("WorkspaceRegistryId(<opaque>)")
+        formatter.write_str("AttemptWorkspaceRegistryId(<opaque>)")
     }
 }
 
-/// Opaque workspace-relative working-directory coordinate.
+/// Opaque attempt-workspace-relative working-directory coordinate.
 ///
 /// A token is not a host filesystem path and carries no path-resolution
-/// authority. The workspace registry must resolve it in a later bounded step.
+/// authority. The attempt-workspace registry must resolve it in a later
+/// bounded step.
 #[derive(Clone, Eq, PartialEq)]
 pub struct CwdToken(BoundedString<MAX_FIELD_BYTES>);
 
@@ -412,8 +412,8 @@ pub struct RunSpecParts {
     pub cwd_token: CwdToken,
     pub environment: Vec<(OsString, OsString)>,
     pub prompt: PromptDeliveryPlan,
-    pub workspace_registry_id: WorkspaceRegistryId,
-    pub workspace: WorkspaceRegistration,
+    pub attempt_workspace_registry_id: AttemptWorkspaceRegistryId,
+    pub attempt_workspace: AttemptWorkspaceRegistration,
     pub provider_binary: BinaryProvenance,
     pub sandbox: SandboxSpec,
     pub admission: AdmissionFields,
@@ -436,8 +436,11 @@ impl fmt::Debug for RunSpecParts {
                 &format_args!("<redacted:{} entries>", self.environment.len()),
             )
             .field("prompt", &self.prompt)
-            .field("workspace_registry_id", &self.workspace_registry_id)
-            .field("workspace", &"<registered workspace>")
+            .field(
+                "attempt_workspace_registry_id",
+                &self.attempt_workspace_registry_id,
+            )
+            .field("attempt_workspace", &"<registered attempt workspace>")
             .field("provider_binary", &"<pinned provider binary>")
             .field("sandbox", &"<compiled sandbox spec>")
             .field("admission", &self.admission)
@@ -454,8 +457,8 @@ pub struct RunSpec {
     cwd_token: CwdToken,
     environment: Vec<(OsString, OsString)>,
     prompt: PromptDeliveryPlan,
-    workspace_registry_id: WorkspaceRegistryId,
-    workspace: WorkspaceRegistration,
+    attempt_workspace_registry_id: AttemptWorkspaceRegistryId,
+    attempt_workspace: AttemptWorkspaceRegistration,
     provider_binary: BinaryProvenance,
     sandbox: SandboxSpec,
     admission: AdmissionFields,
@@ -478,8 +481,11 @@ impl fmt::Debug for RunSpec {
                 &format_args!("<redacted:{} entries>", self.environment.len()),
             )
             .field("prompt", &self.prompt)
-            .field("workspace_registry_id", &self.workspace_registry_id)
-            .field("workspace", &"<registered workspace>")
+            .field(
+                "attempt_workspace_registry_id",
+                &self.attempt_workspace_registry_id,
+            )
+            .field("attempt_workspace", &"<registered attempt workspace>")
             .field("provider_binary", &"<pinned provider binary>")
             .field("sandbox", &"<compiled sandbox spec>")
             .field("admission", &self.admission)
@@ -504,7 +510,7 @@ impl RunSpec {
         {
             return Err(RunSpecError::SpoolLimitInvalid);
         }
-        validate_workspace_sandbox(&parts.workspace, &parts.sandbox)?;
+        validate_attempt_workspace_sandbox(&parts.attempt_workspace, &parts.sandbox)?;
         parts
             .admission
             .validate_against(&parts.coordinates, &parts.prompt, &parts.sandbox)?;
@@ -516,8 +522,8 @@ impl RunSpec {
             cwd_token: parts.cwd_token,
             environment: parts.environment,
             prompt: parts.prompt,
-            workspace_registry_id: parts.workspace_registry_id,
-            workspace: parts.workspace,
+            attempt_workspace_registry_id: parts.attempt_workspace_registry_id,
+            attempt_workspace: parts.attempt_workspace,
             provider_binary: parts.provider_binary,
             sandbox: parts.sandbox,
             admission: parts.admission,
@@ -563,11 +569,11 @@ impl RunSpec {
     pub const fn prompt_delivery(&self) -> &PromptDeliveryPlan {
         &self.prompt
     }
-    pub const fn workspace_registry_id(&self) -> &WorkspaceRegistryId {
-        &self.workspace_registry_id
+    pub const fn attempt_workspace_registry_id(&self) -> &AttemptWorkspaceRegistryId {
+        &self.attempt_workspace_registry_id
     }
-    pub const fn workspace(&self) -> &WorkspaceRegistration {
-        &self.workspace
+    pub const fn attempt_workspace(&self) -> &AttemptWorkspaceRegistration {
+        &self.attempt_workspace
     }
     pub const fn provider_binary(&self) -> &BinaryProvenance {
         &self.provider_binary
@@ -696,18 +702,18 @@ fn reject_path_shaped_reference(value: &str, field: &'static str) -> Result<(), 
     Ok(())
 }
 
-fn validate_workspace_sandbox(
-    workspace: &WorkspaceRegistration,
+fn validate_attempt_workspace_sandbox(
+    attempt_workspace: &AttemptWorkspaceRegistration,
     sandbox: &SandboxSpec,
 ) -> Result<(), RunSpecError> {
-    if workspace.tenant() != sandbox.tenant() {
-        return Err(RunSpecError::WorkspaceTenantMismatch);
+    if attempt_workspace.tenant() != sandbox.tenant() {
+        return Err(RunSpecError::AttemptWorkspaceTenantMismatch);
     }
-    if workspace.base_revision() != sandbox.base_revision() {
-        return Err(RunSpecError::WorkspaceBaseMismatch);
+    if attempt_workspace.base_revision() != sandbox.base_revision() {
+        return Err(RunSpecError::AttemptWorkspaceBaseMismatch);
     }
     let access = sandbox.profile().filesystem();
-    let isolation_matches = match workspace.isolation() {
+    let isolation_matches = match attempt_workspace.isolation() {
         IsolationKind::ReadOnlySnapshot => access == FilesystemAccess::ReadOnlySnapshot,
         IsolationKind::AttemptCopy | IsolationKind::Overlay => {
             matches!(
@@ -717,7 +723,7 @@ fn validate_workspace_sandbox(
         }
     };
     if !isolation_matches {
-        return Err(RunSpecError::WorkspaceIsolationMismatch);
+        return Err(RunSpecError::AttemptWorkspaceIsolationMismatch);
     }
     Ok(())
 }

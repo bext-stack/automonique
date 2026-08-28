@@ -8,7 +8,7 @@
 //! The claim is that an operator's `/run <task>` becomes one contained run whose
 //! answer is the reply — composed by this daemon, admitted by the Wave-4
 //! brokered execute lane, run under the real containment, and read back out of
-//! the run's own workspace.
+//! the run's own attempt workspace.
 //!
 //! 1. [`a_composed_document_is_admitted_and_carries_unix_plus_the_broker_grants`]
 //!    pins the composition to the byte. The composed document is decoded,
@@ -17,10 +17,10 @@
 //!    `socket=unix`, one `connect_port` equal to that broker's own, and the two
 //!    proxy variables — and to carry no UDP grant, no port 443, no bind port and
 //!    no resolver file.
-//! 2. [`the_answer_path_is_the_workspace_the_lane_will_resolve`] is the seam the
+//! 2. [`the_answer_path_is_the_attempt_workspace_the_lane_will_resolve`] is the seam the
 //!    whole answer-capture design rests on: the path in the argv is the path
-//!    [`automonique_daemon::execute::run_workspace`] resolves, absolute, inside
-//!    the workspace, and named in the document rather than patched in later.
+//!    [`automonique_daemon::execute::run_attempt_workspace`] resolves, absolute, inside
+//!    the attempt workspace, and named in the document rather than patched in later.
 //! 3. [`the_task_reaches_the_prompt_and_nothing_else`] is the containment of the
 //!    *operator's* input: the task is the prompt, and it is in no argument, no
 //!    environment value and no path.
@@ -60,7 +60,7 @@
 //!
 //! Two runs in one test write two *different* tokens, and each reply is asserted
 //! to carry its own run's token and not the other's — so a lane that read a
-//! fixed path, cached an answer, or reported the wrong run's workspace fails.
+//! fixed path, cached an answer, or reported the wrong run's attempt workspace fails.
 //! Beside them, a workload that writes no answer is asserted to reach
 //! [`RunFailure::NoAnswer`] and one that exits nonzero to reach
 //! [`RunFailure::Failed`], so "the answer came back" is not something this
@@ -84,15 +84,16 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use automonique_daemon::compose::{
-    ANSWER_LEAF, ANSWER_PLACEHOLDER, COMPOSE_MEMORY_BYTES, ComposeRefusal, Composition,
-    CompositionInputs, DEFAULT_ARGV, ManagedSessionMode, PROVIDER_CONFIG_NAME, ProviderConfig,
-    ProviderEngine, ProviderRunProfile, QUESTION_MEMORY_BYTES, QUESTION_MODEL_CONFIG,
-    QUESTION_REASONING_CONFIG, WORKSPACE_PLACEHOLDER, compose, compose_managed,
-    compose_with_profile,
+    ANSWER_LEAF, ANSWER_PLACEHOLDER, ATTEMPT_WORKSPACE_PLACEHOLDER, COMPOSE_MEMORY_BYTES,
+    ComposeRefusal, Composition, CompositionInputs, DEFAULT_ARGV, ManagedSessionMode,
+    PROVIDER_CONFIG_NAME, ProviderConfig, ProviderEngine, ProviderRunProfile,
+    QUESTION_MEMORY_BYTES, QUESTION_MODEL_CONFIG, QUESTION_REASONING_CONFIG, compose,
+    compose_managed, compose_with_profile,
 };
 use automonique_daemon::execute::{
-    DAEMON_BACKEND_ID, DAEMON_DRAINING_REASON, DAEMON_WORKSPACE_REGISTRY, JCODE_INTEGRATION_MODE,
-    JCODE_RESUME_ENV, locate_launch_helper, offered_host_features, run_workspace,
+    DAEMON_ATTEMPT_WORKSPACE_REGISTRY, DAEMON_BACKEND_ID, DAEMON_DRAINING_REASON,
+    JCODE_INTEGRATION_MODE, JCODE_RESUME_ENV, locate_launch_helper, offered_host_features,
+    run_attempt_workspace,
 };
 use automonique_daemon::run_lane::{
     CONVERSATION_PROVIDER_CONFIG_NAME, PROVIDER_DEPLOYMENTS_NAME, SocketRunLane,
@@ -123,8 +124,8 @@ use automonique_runner::admission::{
 };
 use automonique_runner::capability::HostCapabilities;
 use automonique_runner::{
-    ContainmentDomain, LaunchPlan, PromptDeliveryPlan, ProtectedPromptReference, RunSpec,
-    WorkspaceRegistryId,
+    AttemptWorkspaceRegistryId, ContainmentDomain, LaunchPlan, PromptDeliveryPlan,
+    ProtectedPromptReference, RunSpec,
 };
 use automonique_store::approval_requests::{ApprovalRequests, ApprovalState};
 use automonique_store::provider_deployments::{DeploymentRegistration, ProviderDeployments};
@@ -323,7 +324,7 @@ fn admit_composed(
     destinations: &[BrokeredDestination],
 ) -> AdmittedLaunch {
     let spec = RunSpec::from_canonical_bytes(composition.document()).expect("the document decodes");
-    let workspace = run_workspace(&fixture.state_dir(), composition.run_id());
+    let workspace = run_attempt_workspace(&fixture.state_dir(), composition.run_id());
     let prompt = composition.prompt().to_vec();
     let declared = Digest::parse(&format!("sha256:{}", Sha256::digest(&prompt).to_hex()))
         .expect("prompt digest");
@@ -332,9 +333,11 @@ fn admit_composed(
     };
     let context = AdmissionContext::new(AdmissionContextParts {
         backend: ExecutionBackendId::new(DAEMON_BACKEND_ID).expect("backend"),
-        workspace_registry_id: WorkspaceRegistryId::new(DAEMON_WORKSPACE_REGISTRY)
-            .expect("registry"),
-        workspace_root: workspace.clone(),
+        attempt_workspace_registry_id: AttemptWorkspaceRegistryId::new(
+            DAEMON_ATTEMPT_WORKSPACE_REGISTRY,
+        )
+        .expect("registry"),
+        attempt_workspace_root: workspace.clone(),
         working_directory: workspace,
         observed_provider_binary: spec.provider_binary().clone(),
         host_features: features(),
@@ -459,7 +462,7 @@ fn a_composed_document_is_admitted_and_carries_unix_plus_the_broker_grants() {
 /// inside the run's own workspace, and named by the argv rather than patched in
 /// afterwards.
 #[test]
-fn the_answer_path_is_the_workspace_the_lane_will_resolve() {
+fn the_answer_path_is_the_attempt_workspace_the_lane_will_resolve() {
     let fixture = Fixture::new(None, None);
     let home = fixture.provider_home();
     write_private(
@@ -468,11 +471,11 @@ fn the_answer_path_is_the_workspace_the_lane_will_resolve() {
     );
     let composition = compose_for(&fixture, "answerpath1", "say something");
 
-    let workspace = run_workspace(&fixture.state_dir(), "answerpath1");
+    let attempt_workspace = run_attempt_workspace(&fixture.state_dir(), "answerpath1");
     assert_eq!(
         composition.answer_path(),
-        workspace.join(ANSWER_LEAF),
-        "the answer must live in the workspace the execution lane resolves"
+        attempt_workspace.join(ANSWER_LEAF),
+        "the answer must live in the attempt workspace the execution lane resolves"
     );
     assert!(
         composition.answer_path().is_absolute(),
@@ -492,13 +495,13 @@ fn the_answer_path_is_the_workspace_the_lane_will_resolve() {
         "the argv must name the answer file absolutely: {arguments:?}"
     );
     assert!(
-        arguments.contains(&workspace.display().to_string()),
-        "the argv must point the provider at the resolved workspace: {arguments:?}"
+        arguments.contains(&attempt_workspace.display().to_string()),
+        "the argv must point the provider at the resolved attempt workspace: {arguments:?}"
     );
     assert!(
         !arguments
             .iter()
-            .any(|argument| argument.contains(WORKSPACE_PLACEHOLDER)
+            .any(|argument| argument.contains(ATTEMPT_WORKSPACE_PLACEHOLDER)
                 || argument.contains(ANSWER_PLACEHOLDER)),
         "no placeholder may survive into the document: {arguments:?}"
     );
@@ -2177,7 +2180,7 @@ fn an_agentic_scratchpad_creates_and_executes_a_workspace_script() {
         String::from("sh"),
         String::from("-c"),
         format!(
-            "{BUSYBOX} printf 'print(\"scratchpad-script-ok\")\\n' > {WORKSPACE_PLACEHOLDER}/task.py; /usr/bin/python3 {WORKSPACE_PLACEHOLDER}/task.py > {ANSWER_PLACEHOLDER}"
+            "{BUSYBOX} printf 'print(\"scratchpad-script-ok\")\\n' > {ATTEMPT_WORKSPACE_PLACEHOLDER}/task.py; /usr/bin/python3 {ATTEMPT_WORKSPACE_PLACEHOLDER}/task.py > {ANSWER_PLACEHOLDER}"
         ),
     ];
     let fixture = contained_fixture(&argv);

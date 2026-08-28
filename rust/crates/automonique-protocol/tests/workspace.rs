@@ -8,9 +8,9 @@
 use automonique_protocol::primitives::Revision;
 use automonique_protocol::release::ArtifactDigest;
 use automonique_protocol::workspace::{
-    Artifact, ArtifactLink, DeletionState, IsolationKind, LinkRelation, LockRegistry,
-    RetentionClass, StorageLocator, Visibility, WorkspaceError, WorkspaceRegistration,
-    WorkspaceToken,
+    Artifact, ArtifactLink, AttemptWorkspaceRegistration, AttemptWorkspaceToken, DeletionState,
+    IsolationKind, LinkRelation, LockRegistry, RetentionClass, StorageLocator, Visibility,
+    WorkspaceError,
 };
 
 const HEX_A: &str = "aa11bb22cc33dd44ee55ff6600778899aabbccddeeff00112233445566778899";
@@ -20,16 +20,16 @@ fn digest(hex: &str) -> ArtifactDigest {
     ArtifactDigest::new("sha-256", hex).expect("valid digest")
 }
 
-fn token(value: &str) -> WorkspaceToken {
-    WorkspaceToken::new(value).expect("valid token")
+fn token(value: &str) -> AttemptWorkspaceToken {
+    AttemptWorkspaceToken::new(value).expect("valid token")
 }
 
 fn revision(value: u64) -> Revision {
     Revision::new(value).expect("non-zero revision")
 }
 
-fn registration() -> WorkspaceRegistration {
-    WorkspaceRegistration::new(
+fn attempt_workspace_registration() -> AttemptWorkspaceRegistration {
+    AttemptWorkspaceRegistration::new(
         "acme",
         "git+ssh://example.invalid/repo",
         revision(7),
@@ -67,7 +67,7 @@ mod path_unrepresentability {
             "~/home",
         ] {
             assert_eq!(
-                WorkspaceToken::new(candidate)
+                AttemptWorkspaceToken::new(candidate)
                     .expect_err("path-shaped")
                     .category(),
                 "path_shaped_token",
@@ -79,7 +79,7 @@ mod path_unrepresentability {
     #[test]
     fn an_opaque_token_is_accepted_and_round_trips() {
         assert_eq!(token("wt-3f9a").as_str(), "wt-3f9a");
-        assert_eq!(registration().token().as_str(), "wt-1");
+        assert_eq!(attempt_workspace_registration().token().as_str(), "wt-1");
     }
 }
 
@@ -88,7 +88,7 @@ mod base_immutability {
 
     #[test]
     fn an_in_place_base_change_is_refused() {
-        let registered = registration();
+        let registered = attempt_workspace_registration();
         assert_eq!(
             registered
                 .set_base_revision(revision(8))
@@ -101,7 +101,7 @@ mod base_immutability {
 
     #[test]
     fn a_changed_base_means_a_new_registration() {
-        let original = registration();
+        let original = attempt_workspace_registration();
         let moved = original
             .at_new_base(revision(8), "snap-2", token("wt-2"))
             .expect("new registration");

@@ -240,10 +240,13 @@ pub(crate) fn encode(spec: &RunSpec) -> Result<Vec<u8>, RunSpecEncodeError> {
             string(admission.toolset_digest().digest().to_string()),
         ),
         ("work_id", string(spec.work_id().as_str())),
-        ("workspace", encode_workspace(spec.workspace())),
+        (
+            "workspace",
+            encode_attempt_workspace(spec.attempt_workspace()),
+        ),
         (
             "workspace_registry_id",
-            string(spec.workspace_registry_id().as_str()),
+            string(spec.attempt_workspace_registry_id().as_str()),
         ),
         (
             "workspace_reservation",
@@ -287,16 +290,22 @@ fn encode_binary(binary: &automonique_protocol::provider::BinaryProvenance) -> J
     ])
 }
 
-fn encode_workspace(
-    workspace: &automonique_protocol::workspace::WorkspaceRegistration,
+fn encode_attempt_workspace(
+    attempt_workspace: &automonique_protocol::workspace::AttemptWorkspaceRegistration,
 ) -> JsonValue {
     object(vec![
-        ("base_revision", unsigned(workspace.base_revision().get())),
-        ("canonical_source", string(workspace.canonical_source())),
-        ("isolation", string(workspace.isolation().as_str())),
-        ("snapshot", string(workspace.snapshot())),
-        ("tenant", string(workspace.tenant())),
-        ("token", string(workspace.token().as_str())),
+        (
+            "base_revision",
+            unsigned(attempt_workspace.base_revision().get()),
+        ),
+        (
+            "canonical_source",
+            string(attempt_workspace.canonical_source()),
+        ),
+        ("isolation", string(attempt_workspace.isolation().as_str())),
+        ("snapshot", string(attempt_workspace.snapshot())),
+        ("tenant", string(attempt_workspace.tenant())),
+        ("token", string(attempt_workspace.token().as_str())),
     ])
 }
 

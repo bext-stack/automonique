@@ -75,7 +75,7 @@ use std::time::{Duration, Instant};
 
 use automonique_daemon::egress::allowlist_for;
 use automonique_daemon::execute::{
-    DAEMON_WORKSPACE_REGISTRY, locate_launch_helper, offered_host_features,
+    DAEMON_ATTEMPT_WORKSPACE_REGISTRY, locate_launch_helper, offered_host_features,
 };
 use automonique_daemon::{Daemon, DaemonConfig};
 use automonique_egress_broker::allowlist::MAX_ALLOWLIST_ENTRIES;
@@ -102,7 +102,9 @@ use automonique_protocol::sandbox::{
     ToolWorkloadEgress, WorkspaceContextHash,
 };
 use automonique_protocol::tools::RunId;
-use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
+use automonique_protocol::workspace::{
+    AttemptWorkspaceRegistration, AttemptWorkspaceToken, IsolationKind,
+};
 use automonique_runner::admission::{
     AdmissionContext, AdmissionContextParts, AdmissionRefusal, AdmittedLaunch, BrokeredDestination,
     BrokeredScope, PromptSource, ProviderIdentityPolicy, ResolvedPrompt,
@@ -113,13 +115,13 @@ use automonique_runner::capability::HostCapabilities;
 #[path = "support/isolation.rs"]
 mod test_isolation;
 use automonique_runner::{
-    AdmissionFields, AdmissionFieldsParts, ArtifactGrantBindings, ContainmentDomain, CwdToken,
-    ExecutionPlanDigest, ExtensionSetDigest, FallbackEligibility, IntegrationMode, IoReservation,
-    LaunchPlan, ModelRoutingDigest, PersonaDigest, PortabilityPolicy, ProfileDigest,
-    PromptDeliveryPlan, ProtectedPromptReference, RemoteAttestationPolicy, RequiredCapabilities,
-    RunCoordinates, RunOrigin, RunSpec, RunSpecParts, RunnerEventDialect, SchedulerDecisionDigest,
-    SchedulerReservationBinding, SchedulerReservationId, SkillsetDigest, ToolsetDigest,
-    WorkspaceRegistryId, WorkspaceReservation,
+    AdmissionFields, AdmissionFieldsParts, ArtifactGrantBindings, AttemptWorkspaceRegistryId,
+    ContainmentDomain, CwdToken, ExecutionPlanDigest, ExtensionSetDigest, FallbackEligibility,
+    IntegrationMode, IoReservation, LaunchPlan, ModelRoutingDigest, PersonaDigest,
+    PortabilityPolicy, ProfileDigest, PromptDeliveryPlan, ProtectedPromptReference,
+    RemoteAttestationPolicy, RequiredCapabilities, RunCoordinates, RunOrigin, RunSpec,
+    RunSpecParts, RunnerEventDialect, SchedulerDecisionDigest, SchedulerReservationBinding,
+    SchedulerReservationId, SkillsetDigest, ToolsetDigest, WorkspaceReservation,
 };
 
 const BUSYBOX: &str = "/usr/bin/busybox";
@@ -325,15 +327,17 @@ impl Document {
             prompt: PromptDeliveryPlan::ProtectedReference(
                 ProtectedPromptReference::new(&self.slot).expect("slot"),
             ),
-            workspace_registry_id: WorkspaceRegistryId::new(DAEMON_WORKSPACE_REGISTRY)
-                .expect("registry"),
-            workspace: WorkspaceRegistration::new(
+            attempt_workspace_registry_id: AttemptWorkspaceRegistryId::new(
+                DAEMON_ATTEMPT_WORKSPACE_REGISTRY,
+            )
+            .expect("registry"),
+            attempt_workspace: AttemptWorkspaceRegistration::new(
                 "acme",
                 "source-1",
                 Revision::new(7).expect("revision"),
                 "snapshot-1",
                 IsolationKind::AttemptCopy,
-                WorkspaceToken::new("workspace-token-1").expect("token"),
+                AttemptWorkspaceToken::new("workspace-token-1").expect("token"),
             )
             .expect("registered workspace"),
             provider_binary: self.provider_binary.clone(),
@@ -360,9 +364,11 @@ fn context(
     .expect("digest");
     AdmissionContext::new(AdmissionContextParts {
         backend: ExecutionBackendId::new("local-direct").expect("backend"),
-        workspace_registry_id: WorkspaceRegistryId::new(DAEMON_WORKSPACE_REGISTRY)
-            .expect("registry"),
-        workspace_root: root.to_path_buf(),
+        attempt_workspace_registry_id: AttemptWorkspaceRegistryId::new(
+            DAEMON_ATTEMPT_WORKSPACE_REGISTRY,
+        )
+        .expect("registry"),
+        attempt_workspace_root: root.to_path_buf(),
         working_directory: root.to_path_buf(),
         observed_provider_binary: document.provider_binary.clone(),
         host_features: vec![synthetic_feature()],
