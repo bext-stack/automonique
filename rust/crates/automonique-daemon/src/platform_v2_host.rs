@@ -173,7 +173,6 @@ pub trait PlatformV2LifecycleEffectAdapter: Send {
         &self,
         _intent: &WorkspaceIntent,
         _project: &ProjectId,
-        _workspace: &UserWorkspaceId,
     ) -> Result<Option<WorkspaceIntentOutcome>, &'static str> {
         Ok(None)
     }
@@ -1076,6 +1075,55 @@ impl PlatformV2Runtime {
                     return Err("platform_v2_scope_denied");
                 }
                 let allowed = user_workspaces_for_project(&principal, value.project());
+                let (stored, replayed) = if matches!(value.intent(), WorkspaceIntent::Cancel(_)) {
+                    (None, None)
+                } else {
+                    let replayed = self
+                        .lifecycle_effects
+                        .replay_workspace_intent_receipt(value.intent(), value.project())?;
+                    let stored = self
+                        .lineage
+                        .intent_authorized_in_workspaces(
+                            &negotiated_v2()?,
+                            principal.actor.tenant(),
+                            value.intent().intent_id(),
+                            &allowed,
+                        )
+                        .map_err(|_| "platform_v2_intent_refused")?;
+                    (stored, replayed)
+                };
+                if let Some(stored) = stored.as_ref() {
+                    if stored.intent != *value.intent() {
+                        return Err("platform_v2_intent_refused");
+                    }
+                    if stored.outcome.reconciliation()
+                        == automonique_protocol::platform_v2_lineage::WorkspaceIntentReconciliation::Final
+                    {
+                        return Ok(PlatformV2Response::WorkspaceIntentResult(
+                            stored.outcome.clone(),
+                        ));
+                    }
+                }
+                if let Some(outcome) = replayed {
+                    let workspace = completed_workspace_outcome(value.intent(), &outcome)?;
+                    authorize_workspace(&principal, value.project(), workspace)?;
+                    let stored = stored.as_ref().ok_or("platform_v2_intent_refused")?;
+                    if stored.workspace != *workspace {
+                        return Err("platform_v2_workspace_effect_binding_mismatch");
+                    }
+                    self.policy_fence.verify()?;
+                    self.lineage
+                        .reconcile_intent(
+                            principal.actor.tenant(),
+                            &WorkspaceIntentExecutionReceipt {
+                                intent_id: value.intent().intent_id().clone(),
+                                request_digest: stored.request_digest,
+                                outcome: outcome.clone(),
+                            },
+                        )
+                        .map_err(|_| "platform_v2_intent_refused")?;
+                    return Ok(PlatformV2Response::WorkspaceIntentResult(outcome));
+                }
                 let workspace = match value.intent() {
                     WorkspaceIntent::Create(intent) => {
                         let workspace = self
@@ -1174,47 +1222,6 @@ impl PlatformV2Runtime {
                         return Ok(PlatformV2Response::WorkspaceIntentResult(outcome));
                     }
                 };
-                let stored = self
-                    .lineage
-                    .intent_authorized_in_workspaces(
-                        &negotiated_v2()?,
-                        principal.actor.tenant(),
-                        value.intent().intent_id(),
-                        &allowed,
-                    )
-                    .map_err(|_| "platform_v2_intent_refused")?;
-                if let Some(stored) = stored.as_ref() {
-                    if stored.intent != *value.intent() {
-                        return Err("platform_v2_intent_refused");
-                    }
-                    if stored.outcome.reconciliation()
-                        == automonique_protocol::platform_v2_lineage::WorkspaceIntentReconciliation::Final
-                    {
-                        return Ok(PlatformV2Response::WorkspaceIntentResult(
-                            stored.outcome.clone(),
-                        ));
-                    }
-                }
-                if let Some(stored) = stored.as_ref()
-                    && let Some(outcome) = self.lifecycle_effects.replay_workspace_intent_receipt(
-                        value.intent(),
-                        value.project(),
-                        &workspace,
-                    )?
-                {
-                    self.policy_fence.verify()?;
-                    self.lineage
-                        .reconcile_intent(
-                            principal.actor.tenant(),
-                            &WorkspaceIntentExecutionReceipt {
-                                intent_id: value.intent().intent_id().clone(),
-                                request_digest: stored.request_digest,
-                                outcome: outcome.clone(),
-                            },
-                        )
-                        .map_err(|_| "platform_v2_intent_refused")?;
-                    return Ok(PlatformV2Response::WorkspaceIntentResult(outcome));
-                }
                 let workspace_record = self
                     .work_contexts
                     .validate_policy_mapping(
@@ -1323,26 +1330,15 @@ impl PlatformV2Runtime {
                 if stored.outcome.reconciliation()
                     != automonique_protocol::platform_v2_lineage::WorkspaceIntentReconciliation::Final
                 {
-                    let workspace = match &stored.intent {
-                        WorkspaceIntent::Create(intent) => self
-                            .lineage
-                            .task_workspace_authorized(
-                                principal.actor.tenant(),
-                                intent.task(),
-                                &allowed,
-                            )
-                            .map_err(|_| "platform_v2_intent_refused")?
-                            .ok_or("platform_v2_intent_refused")?,
-                        WorkspaceIntent::Resume(intent) => intent.workspace().clone(),
-                        WorkspaceIntent::Cancel(_) => {
-                            return Ok(PlatformV2Response::WorkspaceIntentResult(stored.outcome));
+                    if let Some(outcome) = self
+                        .lifecycle_effects
+                        .replay_workspace_intent_receipt(&stored.intent, value.project())?
+                    {
+                        let workspace = completed_workspace_outcome(&stored.intent, &outcome)?;
+                        authorize_workspace(&principal, value.project(), workspace)?;
+                        if stored.workspace != *workspace {
+                            return Err("platform_v2_workspace_effect_binding_mismatch");
                         }
-                    };
-                    if let Some(outcome) = self.lifecycle_effects.replay_workspace_intent_receipt(
-                        &stored.intent,
-                        value.project(),
-                        &workspace,
-                    )? {
                         self.policy_fence.verify()?;
                         self.lineage
                             .reconcile_intent(
@@ -1366,6 +1362,21 @@ impl PlatformV2Runtime {
                             .ok_or("platform_v2_not_found")?;
                         return Ok(PlatformV2Response::WorkspaceIntentResult(refreshed.outcome));
                     }
+                    let workspace = match &stored.intent {
+                        WorkspaceIntent::Create(intent) => self
+                            .lineage
+                            .task_workspace_authorized(
+                                principal.actor.tenant(),
+                                intent.task(),
+                                &allowed,
+                            )
+                            .map_err(|_| "platform_v2_intent_refused")?
+                            .ok_or("platform_v2_intent_refused")?,
+                        WorkspaceIntent::Resume(intent) => intent.workspace().clone(),
+                        WorkspaceIntent::Cancel(_) => {
+                            return Ok(PlatformV2Response::WorkspaceIntentResult(stored.outcome));
+                        }
+                    };
                     let workspace_record = self
                         .work_contexts
                         .validate_policy_mapping(
@@ -2091,6 +2102,17 @@ fn active_workspace_binding(
         return Err("platform_v2_workspace_checkout_invalid");
     }
     Ok((checkout, record.revision()))
+}
+
+fn completed_workspace_outcome<'a>(
+    intent: &WorkspaceIntent,
+    outcome: &'a WorkspaceIntentOutcome,
+) -> Result<&'a UserWorkspaceId, &'static str> {
+    match (intent, outcome) {
+        (WorkspaceIntent::Create(_), WorkspaceIntentOutcome::Created(workspace))
+        | (WorkspaceIntent::Resume(_), WorkspaceIntentOutcome::Resumed(workspace)) => Ok(workspace),
+        _ => Err("platform_v2_workspace_effect_binding_mismatch"),
+    }
 }
 
 fn user_workspaces_for_project(

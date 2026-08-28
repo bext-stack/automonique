@@ -1145,7 +1145,6 @@ impl PlatformV2LifecycleEffectAdapter for ProductionLifecycleEffectAdapter {
         &self,
         intent: &WorkspaceIntent,
         project: &ProjectId,
-        workspace: &UserWorkspaceId,
     ) -> Result<Option<WorkspaceIntentOutcome>, &'static str> {
         let key = format!("workspace:{}", intent.intent_id().as_str());
         let Some(entry) = self.journal.entries.get(&key) else {
@@ -1179,14 +1178,15 @@ impl PlatformV2LifecycleEffectAdapter for ProductionLifecycleEffectAdapter {
         )?;
         if workspace_receipt_digest(receipt, policy_generation, registry_generation) != entry.digest
             || receipt.project != project.as_str()
-            || receipt.workspace != workspace.as_str()
             || !receipt.matches_intent(intent)
         {
             return Err("platform_v2_workspace_effect_binding_mismatch");
         }
+        let workspace = UserWorkspaceId::new(receipt.workspace.clone())
+            .map_err(|_| "platform_v2_lifecycle_journal_invalid")?;
         Ok(Some(match intent {
-            WorkspaceIntent::Create(_) => WorkspaceIntentOutcome::Created(workspace.clone()),
-            WorkspaceIntent::Resume(_) => WorkspaceIntentOutcome::Resumed(workspace.clone()),
+            WorkspaceIntent::Create(_) => WorkspaceIntentOutcome::Created(workspace),
+            WorkspaceIntent::Resume(_) => WorkspaceIntentOutcome::Resumed(workspace),
             WorkspaceIntent::Cancel(_) => unreachable!("handled above"),
         }))
     }
@@ -2902,7 +2902,7 @@ mod tests {
         );
         fs::set_permissions(&root, fs::Permissions::from_mode(0o770)).unwrap();
         assert_eq!(
-            adapter.replay_workspace_intent_receipt(&create, &project, &workspace,),
+            adapter.replay_workspace_intent_receipt(&create, &project),
             Ok(Some(WorkspaceIntentOutcome::Created(workspace.clone())))
         );
         let altered_create = WorkspaceIntent::Create(WorkspaceCreateIntent::new(
@@ -2918,7 +2918,7 @@ mod tests {
             BranchSelectorId::new("branch-one").unwrap(),
         ));
         assert_eq!(
-            adapter.replay_workspace_intent_receipt(&altered_create, &project, &workspace,),
+            adapter.replay_workspace_intent_receipt(&altered_create, &project),
             Err("platform_v2_workspace_effect_binding_mismatch")
         );
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();

@@ -1281,6 +1281,18 @@ fn production_workspace_effect_adopts_resumes_and_reopens_exact_local_binding() 
     // Simulate a crash after the adapter atomically completed its effects but
     // before either lineage receipt transaction committed.
     let lineage_connection = rusqlite::Connection::open(config.platform_v2_lineage_path()).unwrap();
+    lineage_connection
+        .execute_batch("PRAGMA foreign_keys=OFF;")
+        .unwrap();
+    lineage_connection
+        .execute_batch(
+            "CREATE TEMP TABLE saved_workspace_task AS
+             SELECT * FROM lineage_orchestration
+             WHERE tenant='tenant-live'
+               AND orchestration_kind='task'
+               AND orchestration_id='task-workspace-live';",
+        )
+        .unwrap();
     assert_eq!(
         lineage_connection
             .execute(
@@ -1296,7 +1308,19 @@ fn production_workspace_effect_adopts_resumes_and_reopens_exact_local_binding() 
             .unwrap(),
         2
     );
-    drop(lineage_connection);
+    assert_eq!(
+        lineage_connection
+            .execute(
+                "UPDATE lineage_orchestration
+                 SET workspace_id='wc_user_1'
+                 WHERE tenant='tenant-live'
+                   AND orchestration_kind='task'
+                   AND orchestration_id='task-workspace-live'",
+                [],
+            )
+            .unwrap(),
+        1
+    );
     let mut work_contexts = WorkContextStore::open(config.platform_v2_work_context_path()).unwrap();
     let project = ProjectId::new("project-live").unwrap();
     let workspace_identity = WorkContextIdentity::UserWorkspace(workspace.clone());
@@ -1327,15 +1351,27 @@ fn production_workspace_effect_adopts_resumes_and_reopens_exact_local_binding() 
     assert!(matches!(
         platform_v2(
             &config,
-            "v2-production-workspace-create-final-after-work-context-drift",
-            PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(
+            "v2-production-workspace-create-read-after-lineage-drift",
+            PlatformV2Request::GetWorkspaceIntent(WorkspaceIntentLookup::new(
                 ProjectId::new("project-live").unwrap(),
-                create.clone(),
+                create.intent_id().clone(),
             )),
         ),
         PlatformV2Response::WorkspaceIntentResult(WorkspaceIntentOutcome::Created(value))
             if value == workspace
     ));
+    assert_eq!(
+        lineage_connection
+            .execute(
+                "DELETE FROM lineage_orchestration
+                 WHERE tenant='tenant-live'
+                   AND orchestration_kind='task'
+                   AND orchestration_id='task-workspace-live'",
+                [],
+            )
+            .unwrap(),
+        1
+    );
     assert!(matches!(
         platform_v2(
             &config,
@@ -1348,6 +1384,17 @@ fn production_workspace_effect_adopts_resumes_and_reopens_exact_local_binding() 
         PlatformV2Response::WorkspaceIntentResult(WorkspaceIntentOutcome::Resumed(value))
             if value == workspace
     ));
+    assert_eq!(
+        lineage_connection
+            .execute(
+                "INSERT INTO lineage_orchestration
+                 SELECT * FROM saved_workspace_task",
+                [],
+            )
+            .unwrap(),
+        1
+    );
+    drop(lineage_connection);
     std::fs::set_permissions(&workspace_root, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
     std::fs::set_permissions(&registry_path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -1365,6 +1412,37 @@ fn production_workspace_effect_adopts_resumes_and_reopens_exact_local_binding() 
         ),
         PlatformV2Response::WorkspaceIntentResult(WorkspaceIntentOutcome::Resumed(value))
             if value == workspace
+    ));
+    serving.shutdown(&config);
+
+    let mut narrowed_policy: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config.platform_v2_policy_path()).unwrap()).unwrap();
+    narrowed_policy["principals"][0]["workspaces"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|entry| {
+            !matches!(
+                entry["id"].as_str(),
+                Some("workspace-live" | "attempt-live" | "session-live" | "pane-live")
+            )
+        });
+    std::fs::write(
+        config.platform_v2_policy_path(),
+        serde_json::to_vec(&narrowed_policy).unwrap(),
+    )
+    .unwrap();
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-production-workspace-receipt-does-not-widen-authority",
+            PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(
+                ProjectId::new("project-live").unwrap(),
+                create,
+            )),
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_scope_denied"
     ));
     serving.shutdown(&config);
 }
