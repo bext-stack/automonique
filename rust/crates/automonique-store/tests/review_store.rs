@@ -632,6 +632,19 @@ fn local_comment_effect_is_atomic_exactly_once_and_actor_attributed() {
             .expect("terminal replay"),
         completed
     );
+    assert_eq!(
+        store
+            .non_rerun_receipt(
+                request.workspace(),
+                request.actor(),
+                request.authentication(),
+                request.authority(),
+                request.idempotency_key(),
+                13,
+            )
+            .expect("generic local receipt"),
+        Some(completed.clone())
+    );
     let current = store
         .snapshot(initial.workspace())
         .expect("read")
@@ -2846,6 +2859,12 @@ fn approval_and_ambiguous_receipt_reconcile_after_restart_without_replay() {
         .receipt(&workspace, &actor, authentication, &authority, &key, 25)
         .expect("lookup")
         .expect("receipt");
+    assert!(
+        reopened
+            .non_rerun_receipt(&workspace, &actor, authentication, &authority, &key, 25)
+            .expect("generic rerun exclusion")
+            .is_none()
+    );
     assert_eq!(reconciled.outcome().as_str(), "unknown");
     assert_eq!(reconciled.receipt_id(), accepted.receipt_id());
     assert_eq!(

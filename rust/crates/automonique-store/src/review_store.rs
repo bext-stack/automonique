@@ -21,7 +21,7 @@ use automonique_protocol::platform_v2::WorkContextIdentity;
 use automonique_protocol::platform_v2_review::{
     AttentionEvent, AttentionOrigin, AttentionOriginKind, AttentionReason, CheckProjection,
     CheckState, CommentAgentState, ConflictState, DeliveryState, PullRequestState, ReviewAction,
-    ReviewActionId, ReviewActionReceipt, ReviewActionRequest, ReviewActorId,
+    ReviewActionId, ReviewActionKind, ReviewActionReceipt, ReviewActionRequest, ReviewActorId,
     ReviewAttentionEventId, ReviewAuthentication, ReviewAuthority, ReviewAuthorityId,
     ReviewAuthorityKind, ReviewCheckId, ReviewComment, ReviewCommentId, ReviewDecision,
     ReviewField, ReviewFreshness, ReviewFreshnessState, ReviewReceiptOutcome, ReviewReconciliation,
@@ -2165,6 +2165,45 @@ impl ReviewStore {
             return Err(ReviewStoreError::Unauthorized);
         }
         Ok(action.map(|action| action.receipt))
+    }
+
+    /// Return a generic review receipt only when its immutable action is not a
+    /// GitHub check rerun.
+    ///
+    /// Reruns require their native external-effect plan and exact correlation
+    /// digest. Keeping this distinction in the store prevents a missing or
+    /// legacy plan from turning the generic receipt index into a recovery
+    /// bypass.
+    pub fn non_rerun_receipt(
+        &self,
+        workspace: &WorkContextIdentity,
+        actor: &ReviewActorId,
+        authentication: ReviewAuthentication,
+        authority: &ReviewAuthority,
+        key: &IdempotencyKey,
+        now_ms: i64,
+    ) -> Stored<Option<ReviewActionReceipt>> {
+        validate_time(now_ms)?;
+        require_active_grant(
+            &self.connection,
+            workspace,
+            actor,
+            authentication,
+            authority,
+            now_ms,
+        )?;
+        let (kind, id) = workspace_parts(workspace);
+        let action = read_action_by_key(&self.connection, kind, id, actor.as_str(), key.as_str())?;
+        if let Some(action) = &action
+            && (action.request.authentication() != authentication
+                || action.request.authority() != authority)
+        {
+            return Err(ReviewStoreError::Unauthorized);
+        }
+        Ok(action.and_then(|action| {
+            (action.request.action().kind() != ReviewActionKind::RerunCheck)
+                .then_some(action.receipt)
+        }))
     }
 
     /// Resolve one already-admitted retained-session action and its immutable

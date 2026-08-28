@@ -36,6 +36,7 @@ use crate::platform_v2_github_check_adapter::{
 };
 use nix::libc;
 use serde::Deserialize;
+use serde::Deserializer;
 use zeroize::{Zeroize, Zeroizing};
 
 pub const REVIEW_REGISTRY_FILE_NAME: &str = "platform-v2-review-registry.json";
@@ -126,19 +127,47 @@ struct GitHubCredentialDocument {
     credentials: Vec<GitHubCredential>,
 }
 
+struct SecretString(Zeroizing<String>);
+
+impl SecretString {
+    fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    fn take_bytes(&mut self) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(std::mem::take(&mut *self.0).into_bytes())
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(|value| Self(Zeroizing::new(value)))
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static SECRET_STRING_DROPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        self.0.zeroize();
+        #[cfg(test)]
+        SECRET_STRING_DROPS.with(|drops| drops.set(drops.get() + 1));
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GitHubCredential {
     reference: String,
     repository: String,
     actions_write: bool,
-    token: String,
-}
-
-impl Drop for GitHubCredential {
-    fn drop(&mut self) {
-        self.token.zeroize();
-    }
+    token: SecretString,
 }
 
 struct InstalledGitHubCredentialDocument {
@@ -779,14 +808,14 @@ fn parse_github_credentials(
     let mut references = BTreeSet::<String>::new();
     let mut credentials = Vec::with_capacity(document.credentials.len());
     for mut credential in document.credentials.drain(..) {
-        let token = Zeroizing::new(std::mem::take(&mut credential.token).into_bytes());
         if !safe_github_reference(&credential.reference)
             || !references.insert(credential.reference.clone())
             || parse_repository(&credential.repository).is_err()
-            || GitHubToken::new(token.to_vec()).is_err()
+            || GitHubToken::validate(credential.token.as_bytes()).is_err()
         {
             return Err("platform_v2_review_github_credentials_invalid");
         }
+        let token = credential.token.take_bytes();
         credentials.push(InstalledGitHubCredential {
             reference: credential.reference.clone(),
             repository: credential.repository.clone(),
@@ -1239,6 +1268,8 @@ mod tests {
 
     #[test]
     fn github_credential_staging_bytes_are_scrubbed_on_success_and_error() {
+        let reset_secret_drops = || SECRET_STRING_DROPS.with(|drops| drops.set(0));
+        let secret_drops = || SECRET_STRING_DROPS.with(std::cell::Cell::get);
         assert!(std::mem::needs_drop::<GitHubCredential>());
         let mut valid = github_credentials(true, "example-org/example-repo").into_bytes();
         let installed = parse_github_credentials(&mut valid).unwrap();
@@ -1247,6 +1278,7 @@ mod tests {
         assert!(GitHubToken::new(installed.credentials[0].token.to_vec()).is_ok());
 
         let secret = "github_pat_invalid!secret";
+        reset_secret_drops();
         let mut invalid = format!(
             r#"{{"version":1,"generation":"credential-generation-1","credentials":[{{"reference":"github-actions-mobile","repository":"example-org/example-repo","actions_write":true,"token":"{secret}"}}]}}"#
         )
@@ -1258,6 +1290,27 @@ mod tests {
         assert_eq!(error, "platform_v2_review_github_credentials_invalid");
         assert!(!error.contains(secret));
         assert!(invalid.iter().all(|byte| *byte == 0));
+        assert_eq!(secret_drops(), 1);
+
+        for trailing in [
+            r#","unknown_after_token":true"#,
+            r#","actions_write":"malformed-after-token""#,
+        ] {
+            reset_secret_drops();
+            let secret = "github_pat_partial_deserialize_secret";
+            let mut partial = format!(
+                r#"{{"version":1,"generation":"credential-generation-1","credentials":[{{"reference":"github-actions-mobile","repository":"example-org/example-repo","token":"{secret}"{trailing}}}]}}"#
+            )
+            .into_bytes();
+            let error = match parse_github_credentials(&mut partial) {
+                Ok(_) => panic!("partial invalid credentials accepted"),
+                Err(error) => error,
+            };
+            assert_eq!(error, "platform_v2_review_github_credentials_invalid");
+            assert!(!error.contains(secret));
+            assert!(partial.iter().all(|byte| *byte == 0));
+            assert_eq!(secret_drops(), 1, "trailing field {trailing}");
+        }
 
         let mut malformed = br#"{"token":"github_pat_malformed""#.to_vec();
         let error = match parse_github_credentials(&mut malformed) {

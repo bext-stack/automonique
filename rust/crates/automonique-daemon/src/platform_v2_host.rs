@@ -2435,7 +2435,7 @@ impl PlatformV2Runtime {
                     if value.receipt_correlation_digest().is_some() {
                         continue;
                     }
-                    let receipt = self.reviews.receipt(
+                    let receipt = self.reviews.non_rerun_receipt(
                         value.workspace(),
                         &actor,
                         ReviewAuthentication::UserSession,
@@ -5447,6 +5447,17 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "cross-workspace reads do not inherit a source tuple"
+    fn uncorrelated_lookup(key: &str) -> PlatformV2Request {
+        PlatformV2Request::GetReviewReceipt(
+            ReviewReceiptLookup::new(
+                ProjectId::new("project-test").unwrap(),
+                WorkContextIdentity::UserWorkspace(UserWorkspaceId::new("wc_user_1").unwrap()),
+                IdempotencyKey::new(key).unwrap(),
+            )
+            .unwrap(),
+        )
+    }
+
     #[test]
     fn github_recovery_phase_gates_only_never_started_custody() {
         assert_eq!(
@@ -5816,6 +5827,97 @@ mod tests {
         assert!(!github_receipt_correlation_matches(None, Some(&exact)).unwrap());
         assert!(!github_receipt_correlation_matches(None, None).unwrap());
         assert!(!github_receipt_correlation_matches(Some([7; 32]), Some(&wrong)).unwrap());
+    }
+
+    #[test]
+    fn github_uncorrelated_lookup_never_reads_the_generic_receipt_index() {
+        let fixture = GitHubRecoveryFixture::new();
+        let mut host = fixture.open();
+        seed_github_recovery_action(&mut host, "github-uncorrelated");
+        drop(host);
+
+        let mut restarted = fixture.open();
+        fixture.reset_counts();
+        let response =
+            restarted.handle(fixture.uid, &uncorrelated_lookup("github-uncorrelated"), 20);
+        assert!(matches!(
+            response,
+            PlatformV2Response::Refused(refusal)
+                if refusal.category().as_str() == "platform_v2_not_found"
+        ));
+        assert_eq!(fixture.calls(), (0, 0));
+    }
+
+    #[test]
+    fn github_missing_or_legacy_plan_never_falls_back_to_an_uncorrelated_receipt() {
+        let missing = GitHubRecoveryFixture::new();
+        let mut host = missing.open();
+        seed_github_recovery_action(&mut host, "github-missing-plan");
+        drop(host);
+        let connection = rusqlite::Connection::open(&missing.review_path).unwrap();
+        connection
+            .execute(
+                "DELETE FROM review_github_check_effect_plans
+                 WHERE preview_id=(SELECT preview_id FROM review_action_previews
+                                   WHERE idempotency_key='github-missing-plan')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let mut restarted = missing.open();
+        missing.reset_counts();
+        let response =
+            restarted.handle(missing.uid, &uncorrelated_lookup("github-missing-plan"), 20);
+        assert!(matches!(
+            response,
+            PlatformV2Response::Refused(refusal)
+                if refusal.category().as_str() == "platform_v2_not_found"
+        ));
+        assert_eq!(missing.calls(), (0, 0));
+
+        let legacy = GitHubRecoveryFixture::new();
+        let mut host = legacy.open();
+        seed_github_recovery_action(&mut host, "github-legacy-plan");
+        drop(host);
+        let connection = rusqlite::Connection::open(&legacy.review_path).unwrap();
+        let document: Vec<u8> = connection
+            .query_row(
+                "SELECT plan_document FROM review_github_check_effect_plans
+                 WHERE preview_id=(SELECT preview_id FROM review_action_previews
+                                   WHERE idempotency_key='github-legacy-plan')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut document: serde_json::Value = serde_json::from_slice(&document).unwrap();
+        assert!(
+            document
+                .as_object_mut()
+                .unwrap()
+                .remove("expected_workspace_revision")
+                .is_some()
+        );
+        let document = serde_json::to_vec(&document).unwrap();
+        let digest = Sha256::digest(&document);
+        connection
+            .execute(
+                "UPDATE review_github_check_effect_plans
+                 SET plan_document=?1,plan_digest=?2,expected_workspace_revision=NULL
+                 WHERE preview_id=(SELECT preview_id FROM review_action_previews
+                                   WHERE idempotency_key='github-legacy-plan')",
+                params![document, digest.as_bytes().as_slice()],
+            )
+            .unwrap();
+        drop(connection);
+        let mut restarted = legacy.open();
+        legacy.reset_counts();
+        let response = restarted.handle(legacy.uid, &uncorrelated_lookup("github-legacy-plan"), 20);
+        assert!(matches!(
+            response,
+            PlatformV2Response::Refused(refusal)
+                if refusal.category().as_str() == "platform_v2_not_found"
+        ));
+        assert_eq!(legacy.calls(), (0, 0));
     }
 
     #[test]
