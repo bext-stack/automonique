@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use automonique_protocol::digest::{Sha256, Sha256Digest};
 use automonique_protocol::platform::IdempotencyKey;
 use automonique_protocol::platform_v2::{
-    CheckoutKind, HostSetupKind, ProjectId, UserWorkspaceId, WorkContextIdentity,
+    CheckoutId, CheckoutKind, HostSetupKind, ProjectId, UserWorkspaceId, WorkContextIdentity,
 };
 use automonique_protocol::platform_v2_lifecycle::WorkContextMutationIntent;
 use automonique_protocol::platform_v2_lineage::{
@@ -76,6 +76,12 @@ struct JournalPersistError {
 struct AtomicWriteError {
     category: &'static str,
     installed: bool,
+}
+
+#[derive(Clone, Copy)]
+enum WorkspaceCheckoutValidation {
+    Create,
+    Resume,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -207,6 +213,8 @@ struct JournalWorkspace {
     adopted_by_intent: Option<String>,
     #[serde(default)]
     workspace_revision: Option<u64>,
+    #[serde(default)]
+    adoption_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -301,6 +309,10 @@ impl ProductionLifecycleEffectAdapter {
                         .as_deref()
                         .is_some_and(|intent| !safe_token(intent))
                     || value.workspace_revision == Some(0)
+                    || value
+                        .adoption_digest
+                        .as_deref()
+                        .is_some_and(|digest| !valid_digest(digest))
             })
             || journal.host_setups.iter().any(|(identity, value)| {
                 !safe_token(identity)
@@ -318,6 +330,40 @@ impl ProductionLifecycleEffectAdapter {
                     || !valid_digest(&value.root_digest)
             })
         {
+            return Err("platform_v2_lifecycle_journal_invalid");
+        }
+        if journal.entries.iter().any(|(key, entry)| {
+            if entry.effect_kind != "create_workspace" || entry.state != "completed" {
+                return false;
+            }
+            let Some(intent_id) = key.strip_prefix("workspace:") else {
+                return true;
+            };
+            journal
+                .workspaces
+                .values()
+                .filter(|workspace| {
+                    workspace.adopted_by_intent.as_deref() == Some(intent_id)
+                        && workspace.adoption_digest.as_deref() == Some(entry.digest.as_str())
+                })
+                .count()
+                != 1
+        }) || journal.workspaces.values().any(|workspace| {
+            let Some(intent_id) = workspace.adopted_by_intent.as_deref() else {
+                return workspace.adoption_digest.is_some();
+            };
+            let Some(adoption_digest) = workspace.adoption_digest.as_deref() else {
+                return true;
+            };
+            journal
+                .entries
+                .get(&format!("workspace:{intent_id}"))
+                .is_none_or(|entry| {
+                    entry.effect_kind != "create_workspace"
+                        || !matches!(entry.state.as_str(), "completed" | "unknown")
+                        || entry.digest != adoption_digest
+                })
+        }) {
             return Err("platform_v2_lifecycle_journal_invalid");
         }
         let loaded_generation = JournalGeneration::from(&snapshot.generation);
@@ -587,19 +633,26 @@ impl ProductionLifecycleEffectAdapter {
         &self,
         project: &ProjectId,
         workspace: &UserWorkspaceId,
-        expected_checkout: Option<&str>,
+        expected_checkout: &CheckoutId,
         require_adopted: bool,
+        validation: WorkspaceCheckoutValidation,
     ) -> Result<&WorkspaceBinding, &'static str> {
         let binding = self.workspace(workspace.as_str())?;
-        if binding.project != project.as_str()
-            || expected_checkout.is_some_and(|checkout| checkout != binding.checkout)
-        {
+        if binding.project != project.as_str() || binding.checkout != expected_checkout.as_str() {
             return Err("platform_v2_workspace_selector_mismatch");
         }
         let checkout = self.checkout_by_identity(&binding.checkout)?;
         if checkout.project != binding.project
             || checkout.canonical_root != binding.canonical_root
-            || validate_checkout_materialized(checkout, self.expected_uid).is_err()
+            || match validation {
+                WorkspaceCheckoutValidation::Create => {
+                    validate_checkout_materialized(checkout, self.expected_uid)
+                }
+                WorkspaceCheckoutValidation::Resume => {
+                    validate_checkout_resumable(checkout, self.expected_uid)
+                }
+            }
+            .is_err()
         {
             return Err("platform_v2_lifecycle_workspace_mismatch");
         }
@@ -860,26 +913,44 @@ impl ProductionLifecycleEffectAdapter {
         intent: &WorkspaceIntent,
         project: &ProjectId,
         workspace: &UserWorkspaceId,
+        checkout: &CheckoutId,
         workspace_revision: Revision,
     ) -> Result<(), &'static str> {
         let binding = match intent {
             WorkspaceIntent::Create(create) => {
                 let selector = self.task_selector(create, project, workspace)?;
+                if selector.checkout != checkout.as_str() {
+                    return Err("platform_v2_workspace_selector_mismatch");
+                }
                 self.validate_workspace_binding(
                     project,
                     workspace,
-                    Some(&selector.checkout),
+                    checkout,
                     false,
+                    WorkspaceCheckoutValidation::Create,
                 )?
                 .clone()
             }
             WorkspaceIntent::Resume(_) => self
-                .validate_workspace_binding(project, workspace, None, true)?
+                .validate_workspace_binding(
+                    project,
+                    workspace,
+                    checkout,
+                    true,
+                    WorkspaceCheckoutValidation::Resume,
+                )?
                 .clone(),
             WorkspaceIntent::Cancel(_) => return Err("platform_v2_workspace_intent_invalid"),
         };
         let previous = self.journal.clone();
         if matches!(intent, WorkspaceIntent::Create(_)) {
+            let adoption_digest = self
+                .journal
+                .entries
+                .get(key)
+                .ok_or("platform_v2_lifecycle_journal_invalid")?
+                .digest
+                .clone();
             self.journal.workspaces.insert(
                 workspace.as_str().to_owned(),
                 JournalWorkspace {
@@ -889,6 +960,7 @@ impl ProductionLifecycleEffectAdapter {
                     archived: false,
                     adopted_by_intent: Some(intent.intent_id().as_str().to_owned()),
                     workspace_revision: Some(workspace_revision.get()),
+                    adoption_digest: Some(adoption_digest),
                 },
             );
         } else if let Some(binding) = self.journal.workspaces.get_mut(workspace.as_str()) {
@@ -915,18 +987,16 @@ impl ProductionLifecycleEffectAdapter {
         if entry.state == "completed" {
             return Err("platform_v2_workspace_intent_already_completed");
         }
-        if entry.state == "unknown" {
-            let intent_id = key
-                .strip_prefix("workspace:")
-                .ok_or("platform_v2_lifecycle_journal_invalid")?;
-            if self
-                .journal
-                .workspaces
-                .values()
-                .any(|workspace| workspace.adopted_by_intent.as_deref() == Some(intent_id))
-            {
-                return Err("platform_v2_workspace_intent_already_completed");
-            }
+        let intent_id = key
+            .strip_prefix("workspace:")
+            .ok_or("platform_v2_lifecycle_journal_invalid")?;
+        if self
+            .journal
+            .workspaces
+            .values()
+            .any(|workspace| workspace.adopted_by_intent.as_deref() == Some(intent_id))
+        {
+            return Err("platform_v2_workspace_intent_already_completed");
         }
         let previous = self.journal.clone();
         self.journal.entries.remove(key);
@@ -964,11 +1034,16 @@ impl PlatformV2LifecycleEffectAdapter for ProductionLifecycleEffectAdapter {
         !self.registry.task_selectors.is_empty()
     }
 
+    fn workspace_intent_custody_installed(&self) -> bool {
+        true
+    }
+
     fn preflight_workspace_intent(
         &self,
         intent: &WorkspaceIntent,
         project: &ProjectId,
         workspace: &UserWorkspaceId,
+        checkout: &CheckoutId,
         workspace_revision: Revision,
         _policy_generation: Sha256Digest,
     ) -> Result<(), &'static str> {
@@ -976,11 +1051,15 @@ impl PlatformV2LifecycleEffectAdapter for ProductionLifecycleEffectAdapter {
         match intent {
             WorkspaceIntent::Create(create) => {
                 let selector = self.task_selector(create, project, workspace)?;
+                if selector.checkout != checkout.as_str() {
+                    return Err("platform_v2_workspace_selector_mismatch");
+                }
                 self.validate_workspace_binding(
                     project,
                     workspace,
-                    Some(&selector.checkout),
+                    checkout,
                     false,
+                    WorkspaceCheckoutValidation::Create,
                 )?;
                 Ok(())
             }
@@ -990,11 +1069,65 @@ impl PlatformV2LifecycleEffectAdapter for ProductionLifecycleEffectAdapter {
                 {
                     return Err("platform_v2_workspace_selector_mismatch");
                 }
-                self.validate_workspace_binding(project, workspace, None, true)?;
+                self.validate_workspace_binding(
+                    project,
+                    workspace,
+                    checkout,
+                    true,
+                    WorkspaceCheckoutValidation::Resume,
+                )?;
                 Ok(())
             }
             WorkspaceIntent::Cancel(_) => Err("platform_v2_workspace_intent_invalid"),
         }
+    }
+
+    fn replay_workspace_intent_receipt(
+        &self,
+        intent: &WorkspaceIntent,
+        project: &ProjectId,
+        workspace: &UserWorkspaceId,
+        checkout: &CheckoutId,
+        workspace_revision: Revision,
+    ) -> Result<Option<WorkspaceIntentOutcome>, &'static str> {
+        let key = format!("workspace:{}", intent.intent_id().as_str());
+        let Some(entry) = self.journal.entries.get(&key) else {
+            return Ok(None);
+        };
+        if entry.state != "completed" {
+            return Ok(None);
+        }
+        let expected_kind = match intent {
+            WorkspaceIntent::Create(_) => "create_workspace",
+            WorkspaceIntent::Resume(_) => "resume_workspace",
+            WorkspaceIntent::Cancel(_) => return Err("platform_v2_workspace_intent_invalid"),
+        };
+        if entry.effect_kind != expected_kind {
+            return Err("platform_v2_lifecycle_journal_invalid");
+        }
+        let adopted = self
+            .journal
+            .workspaces
+            .get(workspace.as_str())
+            .ok_or("platform_v2_lifecycle_journal_invalid")?;
+        if adopted.project != project.as_str()
+            || adopted.checkout != checkout.as_str()
+            || adopted.workspace_revision != Some(workspace_revision.get())
+            || adopted.archived
+        {
+            return Err("platform_v2_workspace_effect_binding_mismatch");
+        }
+        if matches!(intent, WorkspaceIntent::Create(_))
+            && (adopted.adopted_by_intent.as_deref() != Some(intent.intent_id().as_str())
+                || adopted.adoption_digest.as_deref() != Some(entry.digest.as_str()))
+        {
+            return Err("platform_v2_lifecycle_journal_invalid");
+        }
+        Ok(Some(match intent {
+            WorkspaceIntent::Create(_) => WorkspaceIntentOutcome::Created(workspace.clone()),
+            WorkspaceIntent::Resume(_) => WorkspaceIntentOutcome::Resumed(workspace.clone()),
+            WorkspaceIntent::Cancel(_) => unreachable!("handled above"),
+        }))
     }
 
     fn execute_workspace_intent(
@@ -1002,6 +1135,7 @@ impl PlatformV2LifecycleEffectAdapter for ProductionLifecycleEffectAdapter {
         intent: &WorkspaceIntent,
         project: &ProjectId,
         workspace: &UserWorkspaceId,
+        checkout: &CheckoutId,
         workspace_revision: Revision,
         policy_generation: Sha256Digest,
     ) -> Result<WorkspaceIntentOutcome, &'static str> {
@@ -1009,6 +1143,7 @@ impl PlatformV2LifecycleEffectAdapter for ProductionLifecycleEffectAdapter {
             intent,
             project,
             workspace,
+            checkout,
             workspace_revision,
             policy_generation,
         )?;
@@ -1029,6 +1164,7 @@ impl PlatformV2LifecycleEffectAdapter for ProductionLifecycleEffectAdapter {
             intent,
             project,
             workspace,
+            checkout,
             workspace_revision,
             policy_generation,
         );
@@ -1043,6 +1179,19 @@ impl PlatformV2LifecycleEffectAdapter for ProductionLifecycleEffectAdapter {
                 return Err("platform_v2_workspace_effect_binding_mismatch");
             }
             Some(entry) if entry.state == "completed" => {
+                if matches!(intent, WorkspaceIntent::Create(_))
+                    && !self
+                        .journal
+                        .workspaces
+                        .get(workspace.as_str())
+                        .is_some_and(|binding| {
+                            binding.adopted_by_intent.as_deref()
+                                == Some(intent.intent_id().as_str())
+                                && binding.adoption_digest.as_deref() == Some(entry.digest.as_str())
+                        })
+                {
+                    return Err("platform_v2_lifecycle_journal_invalid");
+                }
                 return Ok(match intent {
                     WorkspaceIntent::Create(_) => {
                         WorkspaceIntentOutcome::Created(workspace.clone())
@@ -1062,6 +1211,7 @@ impl PlatformV2LifecycleEffectAdapter for ProductionLifecycleEffectAdapter {
                         .is_some_and(|binding| {
                             binding.adopted_by_intent.as_deref()
                                 == Some(intent.intent_id().as_str())
+                                && binding.adoption_digest.as_deref() == Some(entry.digest.as_str())
                         });
                 if completed {
                     self.mark_completed(&key)?;
@@ -1082,7 +1232,14 @@ impl PlatformV2LifecycleEffectAdapter for ProductionLifecycleEffectAdapter {
                 policy_generation,
             )?,
         }
-        self.complete_workspace_intent(&key, intent, project, workspace, workspace_revision)?;
+        self.complete_workspace_intent(
+            &key,
+            intent,
+            project,
+            workspace,
+            checkout,
+            workspace_revision,
+        )?;
         Ok(match intent {
             WorkspaceIntent::Create(_) => WorkspaceIntentOutcome::Created(workspace.clone()),
             WorkspaceIntent::Resume(_) => WorkspaceIntentOutcome::Resumed(workspace.clone()),
@@ -1093,31 +1250,12 @@ impl PlatformV2LifecycleEffectAdapter for ProductionLifecycleEffectAdapter {
     fn cancel_workspace_intent(
         &mut self,
         target: &WorkspaceIntent,
-        project: &ProjectId,
-        workspace: &UserWorkspaceId,
-        workspace_revision: Revision,
+        _project: &ProjectId,
+        _workspace: &UserWorkspaceId,
         _policy_generation: Sha256Digest,
     ) -> Result<(), &'static str> {
-        self.verify_registry()?;
-        match target {
-            WorkspaceIntent::Create(create) => {
-                let selector = self.task_selector(create, project, workspace)?;
-                self.validate_workspace_binding(
-                    project,
-                    workspace,
-                    Some(&selector.checkout),
-                    false,
-                )?;
-            }
-            WorkspaceIntent::Resume(resume) => {
-                if resume.workspace() != workspace
-                    || resume.expected_revision() != workspace_revision
-                {
-                    return Err("platform_v2_workspace_selector_mismatch");
-                }
-                self.validate_workspace_binding(project, workspace, None, true)?;
-            }
-            WorkspaceIntent::Cancel(_) => return Err("platform_v2_workspace_intent_invalid"),
+        if matches!(target, WorkspaceIntent::Cancel(_)) {
+            return Err("platform_v2_workspace_intent_invalid");
         }
         self.cancel_prepared_workspace_intent(&format!("workspace:{}", target.intent_id().as_str()))
     }
@@ -1565,6 +1703,21 @@ fn validate_checkout_materialized(
     binding: &CheckoutBinding,
     expected_uid: u32,
 ) -> Result<(), &'static str> {
+    validate_checkout_state(binding, expected_uid, true)
+}
+
+fn validate_checkout_resumable(
+    binding: &CheckoutBinding,
+    expected_uid: u32,
+) -> Result<(), &'static str> {
+    validate_checkout_state(binding, expected_uid, false)
+}
+
+fn validate_checkout_state(
+    binding: &CheckoutBinding,
+    expected_uid: u32,
+    require_configured_base: bool,
+) -> Result<(), &'static str> {
     validate_private_root_and_parent(&binding.canonical_root, expected_uid)?;
     if CheckoutKind::parse(&binding.checkout_kind).ok() == Some(CheckoutKind::GitWorktree) {
         let repository = binding.repository_root.as_ref().unwrap();
@@ -1584,12 +1737,23 @@ fn validate_checkout_materialized(
         )?;
         let base = binding.base_commit.as_deref().unwrap();
         let branch = binding.branch_ref.as_deref().unwrap();
+        let head = git_text(&binding.canonical_root, &["rev-parse", "HEAD"])?;
         if actual_root != binding.canonical_root
             || expected_repository != repository.as_path()
             || actual_common != expected_common
-            || git_text(&binding.canonical_root, &["rev-parse", "HEAD"])? != base
             || git_text(&binding.canonical_root, &["symbolic-ref", "-q", "HEAD"])? != branch
+            || git_text(&binding.canonical_root, &["rev-parse", branch])? != head
         {
+            return Err("platform_v2_lifecycle_checkout_mismatch");
+        }
+        if require_configured_base {
+            if head != base {
+                return Err("platform_v2_lifecycle_checkout_mismatch");
+            }
+        } else if !git_status(
+            &binding.canonical_root,
+            &["merge-base", "--is-ancestor", base, "HEAD"],
+        )? {
             return Err("platform_v2_lifecycle_checkout_mismatch");
         }
     };
@@ -2226,6 +2390,7 @@ fn workspace_intent_digest(
     intent: &WorkspaceIntent,
     project: &ProjectId,
     workspace: &UserWorkspaceId,
+    checkout: &CheckoutId,
     workspace_revision: Revision,
     policy_generation: Sha256Digest,
 ) -> String {
@@ -2240,6 +2405,7 @@ fn workspace_intent_digest(
     );
     field(&mut hasher, project.as_str());
     field(&mut hasher, workspace.as_str());
+    field(&mut hasher, checkout.as_str());
     hasher.update(&workspace_revision.get().to_be_bytes());
     field(&mut hasher, intent.intent_id().as_str());
     match intent {
@@ -2369,6 +2535,7 @@ mod tests {
         let uid = nix::unistd::geteuid().as_raw();
         let project = ProjectId::new("project-test").unwrap();
         let workspace = UserWorkspaceId::new("workspace-one").unwrap();
+        let checkout = CheckoutId::new("checkout-one").unwrap();
         let policy = Sha256::digest(b"policy-generation-one");
         let create = workspace_create("intent-create-one");
         let mut adapter =
@@ -2382,6 +2549,7 @@ mod tests {
                 &create,
                 &project,
                 &workspace,
+                &checkout,
                 Revision::FIRST,
                 policy,
             ),
@@ -2392,6 +2560,7 @@ mod tests {
                 &create,
                 &project,
                 &workspace,
+                &checkout,
                 Revision::FIRST,
                 policy,
             ),
@@ -2403,6 +2572,18 @@ mod tests {
             adopted.adopted_by_intent.as_deref(),
             Some("intent-create-one")
         );
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o770)).unwrap();
+        assert_eq!(
+            adapter.replay_workspace_intent_receipt(
+                &create,
+                &project,
+                &workspace,
+                &checkout,
+                Revision::FIRST,
+            ),
+            Ok(Some(WorkspaceIntentOutcome::Created(workspace.clone())))
+        );
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
 
         let resume = workspace_resume("intent-resume-one");
         assert_eq!(
@@ -2410,6 +2591,7 @@ mod tests {
                 &resume,
                 &project,
                 &workspace,
+                &checkout,
                 Revision::FIRST,
                 policy,
             ),
@@ -2426,6 +2608,7 @@ mod tests {
                 &resume,
                 &project,
                 &workspace,
+                &checkout,
                 Revision::FIRST,
                 policy,
             ),
@@ -2446,11 +2629,18 @@ mod tests {
         let uid = nix::unistd::geteuid().as_raw();
         let project = ProjectId::new("project-test").unwrap();
         let workspace = UserWorkspaceId::new("workspace-one").unwrap();
+        let checkout = CheckoutId::new("checkout-one").unwrap();
         let policy = Sha256::digest(b"policy-generation-one");
         let create = workspace_create("intent-recover-one");
         let key = format!("workspace:{}", create.intent_id().as_str());
-        let digest =
-            workspace_intent_digest(&create, &project, &workspace, Revision::FIRST, policy);
+        let digest = workspace_intent_digest(
+            &create,
+            &project,
+            &workspace,
+            &checkout,
+            Revision::FIRST,
+            policy,
+        );
         let mut adapter =
             ProductionLifecycleEffectAdapter::open(&registry_path, &journal_path, uid)
                 .unwrap()
@@ -2469,6 +2659,7 @@ mod tests {
                 &create,
                 &project,
                 &workspace,
+                &checkout,
                 Revision::FIRST,
                 policy,
             ),
@@ -2482,6 +2673,7 @@ mod tests {
                 &create,
                 &project,
                 &workspace,
+                &checkout,
                 Revision::FIRST,
                 policy,
             ),
@@ -2491,8 +2683,14 @@ mod tests {
 
         let resume = workspace_resume("intent-resume-unknown");
         let resume_key = format!("workspace:{}", resume.intent_id().as_str());
-        let resume_digest =
-            workspace_intent_digest(&resume, &project, &workspace, Revision::FIRST, policy);
+        let resume_digest = workspace_intent_digest(
+            &resume,
+            &project,
+            &workspace,
+            &checkout,
+            Revision::FIRST,
+            policy,
+        );
         restarted
             .insert_workspace_prepared(
                 resume_key.clone(),
@@ -2513,6 +2711,7 @@ mod tests {
                 &resume,
                 &project,
                 &workspace,
+                &checkout,
                 Revision::FIRST,
                 policy,
             ),
@@ -2524,6 +2723,7 @@ mod tests {
                 &resume,
                 &project,
                 &workspace,
+                &checkout,
                 Revision::FIRST,
                 policy,
             ),
@@ -2536,6 +2736,7 @@ mod tests {
             &cancel_target,
             &project,
             &workspace,
+            &checkout,
             Revision::FIRST,
             policy,
         );
@@ -2548,15 +2749,109 @@ mod tests {
             )
             .unwrap();
         restarted
-            .cancel_workspace_intent(
-                &cancel_target,
-                &project,
-                &workspace,
-                Revision::FIRST,
-                policy,
-            )
+            .cancel_workspace_intent(&cancel_target, &project, &workspace, policy)
             .unwrap();
         assert!(!restarted.journal.entries.contains_key(&cancel_key));
+    }
+
+    #[test]
+    fn completed_create_without_matching_adoption_fails_closed_on_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("state");
+        let root = directory.path().join("authorized");
+        private_directory(&state);
+        private_directory(&root);
+        let registry_path = state.join(LIFECYCLE_REGISTRY_FILE_NAME);
+        let journal_path = state.join(LIFECYCLE_JOURNAL_FILE_NAME);
+        write_registry(&registry_path, &authorized_registry(&root));
+        let uid = nix::unistd::geteuid().as_raw();
+        let project = ProjectId::new("project-test").unwrap();
+        let workspace = UserWorkspaceId::new("workspace-one").unwrap();
+        let checkout = CheckoutId::new("checkout-one").unwrap();
+        let policy = Sha256::digest(b"policy-generation-one");
+        let create = workspace_create("intent-crafted-completed");
+        let key = format!("workspace:{}", create.intent_id().as_str());
+        let digest = workspace_intent_digest(
+            &create,
+            &project,
+            &workspace,
+            &checkout,
+            Revision::FIRST,
+            policy,
+        );
+        let mut adapter =
+            ProductionLifecycleEffectAdapter::open(&registry_path, &journal_path, uid)
+                .unwrap()
+                .unwrap();
+        adapter
+            .insert_workspace_prepared(key.clone(), digest, "create_workspace", policy)
+            .unwrap();
+        adapter.journal.entries.get_mut(&key).unwrap().state = "completed".to_owned();
+        adapter.persist_journal().unwrap();
+        drop(adapter);
+
+        assert!(matches!(
+            ProductionLifecycleEffectAdapter::open(&registry_path, &journal_path, uid),
+            Err("platform_v2_lifecycle_journal_invalid")
+        ));
+    }
+
+    #[test]
+    fn cancellation_without_effect_custody_ignores_removed_selectors_and_root_tamper() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("state");
+        let root = directory.path().join("authorized");
+        private_directory(&state);
+        private_directory(&root);
+        let registry_path = state.join(LIFECYCLE_REGISTRY_FILE_NAME);
+        let journal_path = state.join(LIFECYCLE_JOURNAL_FILE_NAME);
+        write_registry(&registry_path, &authorized_registry(&root));
+        let uid = nix::unistd::geteuid().as_raw();
+        let project = ProjectId::new("project-test").unwrap();
+        let workspace = UserWorkspaceId::new("workspace-one").unwrap();
+        let policy = Sha256::digest(b"policy-generation-one");
+        let target = workspace_create("intent-crash-before-prepare");
+        let mut adapter =
+            ProductionLifecycleEffectAdapter::open(&registry_path, &journal_path, uid)
+                .unwrap()
+                .unwrap();
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o770)).unwrap();
+        let removed_registry = state.join("removed-registry");
+        fs::rename(&registry_path, &removed_registry).unwrap();
+        assert_eq!(
+            adapter.cancel_workspace_intent(&target, &project, &workspace, policy),
+            Ok(())
+        );
+
+        let adopted = workspace_create("intent-adopted-before-cancel");
+        let adopted_key = format!("workspace:{}", adopted.intent_id().as_str());
+        adapter.journal.entries.insert(
+            adopted_key,
+            JournalEntry {
+                digest: "a".repeat(64),
+                state: "unknown".to_owned(),
+                effect_kind: "create_workspace".to_owned(),
+                registry_generation: None,
+                policy_digest: None,
+            },
+        );
+        adapter.journal.workspaces.insert(
+            workspace.as_str().to_owned(),
+            JournalWorkspace {
+                project: project.as_str().to_owned(),
+                checkout: "checkout-one".to_owned(),
+                root_digest: "b".repeat(64),
+                archived: false,
+                adopted_by_intent: Some(adopted.intent_id().as_str().to_owned()),
+                workspace_revision: Some(1),
+                adoption_digest: Some("a".repeat(64)),
+            },
+        );
+        assert_eq!(
+            adapter.cancel_workspace_intent(&adopted, &project, &workspace, policy),
+            Err("platform_v2_workspace_intent_already_completed")
+        );
     }
 
     #[test]
@@ -2572,6 +2867,7 @@ mod tests {
         let uid = nix::unistd::geteuid().as_raw();
         let project = ProjectId::new("project-test").unwrap();
         let workspace = UserWorkspaceId::new("workspace-one").unwrap();
+        let checkout = CheckoutId::new("checkout-one").unwrap();
         let policy = Sha256::digest(b"policy-generation-one");
         let create = workspace_create("intent-tamper-one");
         let mut adapter =
@@ -2595,6 +2891,19 @@ mod tests {
                 &wrong_task,
                 &project,
                 &workspace,
+                &checkout,
+                Revision::FIRST,
+                policy,
+            ),
+            Err("platform_v2_workspace_selector_mismatch")
+        );
+        let alternate_checkout = CheckoutId::new("checkout-other").unwrap();
+        assert_eq!(
+            adapter.preflight_workspace_intent(
+                &create,
+                &project,
+                &workspace,
+                &alternate_checkout,
                 Revision::FIRST,
                 policy,
             ),
@@ -2605,6 +2914,7 @@ mod tests {
                 &create,
                 &project,
                 &workspace,
+                &checkout,
                 Revision::FIRST,
                 policy,
             ),
@@ -2615,6 +2925,7 @@ mod tests {
                 &create,
                 &project,
                 &workspace,
+                &checkout,
                 Revision::FIRST,
                 Sha256::digest(b"policy-generation-two"),
             ),
@@ -2626,10 +2937,158 @@ mod tests {
                 &create,
                 &project,
                 &workspace,
+                &checkout,
                 Revision::FIRST,
                 policy,
             ),
             Err("platform_v2_lifecycle_workspace_mismatch")
+        );
+    }
+
+    #[test]
+    fn adopted_git_worktree_resume_allows_exact_branch_head_advancement() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("state");
+        let repository = directory.path().join("repository");
+        let worktrees = directory.path().join("worktrees");
+        let target = worktrees.join("task-one");
+        private_directory(&state);
+        private_directory(&repository);
+        private_directory(&worktrees);
+        let run = |working_directory: &Path, arguments: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(working_directory)
+                .args(arguments)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{:?}", output.stderr);
+        };
+        run(&repository, &["init", "--quiet"]);
+        fs::set_permissions(repository.join(".git"), fs::Permissions::from_mode(0o700)).unwrap();
+        run(&repository, &["config", "user.name", "Fixture"]);
+        run(
+            &repository,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        fs::write(repository.join("README"), b"base\n").unwrap();
+        run(&repository, &["add", "README"]);
+        run(&repository, &["commit", "--quiet", "-m", "base"]);
+        let base = git_text(&repository, &["rev-parse", "HEAD"]).unwrap();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["worktree", "add", "--quiet", "-b", "work/task-one"])
+            .arg(&target)
+            .arg(&base)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(target.join(".git"), fs::Permissions::from_mode(0o600)).unwrap();
+
+        let registry_path = state.join(LIFECYCLE_REGISTRY_FILE_NAME);
+        let journal_path = state.join(LIFECYCLE_JOURNAL_FILE_NAME);
+        write_registry(
+            &registry_path,
+            &serde_json::json!({
+                "version": 1, "generation": "generation-resume",
+                "host_setups": [{
+                    "selector": "host-local", "host_setup": "host-one",
+                    "project": "project-test", "setup_kind": "local",
+                    "canonical_root": repository
+                }],
+                "checkouts": [{
+                    "selector": "checkout-git", "checkout": "checkout-git",
+                    "project": "project-test", "host_setup": "host-one",
+                    "repository_authority": "github", "repository": "owner/repository",
+                    "checkout_kind": "git_worktree", "canonical_root": target,
+                    "repository_root": repository, "base_commit": base,
+                    "branch_ref": "refs/heads/work/task-one"
+                }],
+                "workspaces": [{
+                    "workspace": "workspace-one", "project": "project-test",
+                    "checkout": "checkout-git", "canonical_root": target
+                }],
+                "task_selectors": [{
+                    "base_selector": "base-one", "branch_selector": "branch-one",
+                    "project": "project-test", "workspace": "workspace-one",
+                    "checkout": "checkout-git", "task": "task-one",
+                    "external_provider": "github", "external_authority": "authority-one",
+                    "external_scope": "scope-one", "external_key": "work-one"
+                }]
+            }),
+        );
+        let uid = nix::unistd::geteuid().as_raw();
+        let project = ProjectId::new("project-test").unwrap();
+        let workspace = UserWorkspaceId::new("workspace-one").unwrap();
+        let checkout = CheckoutId::new("checkout-git").unwrap();
+        let policy = Sha256::digest(b"policy-generation-one");
+        let create = workspace_create("intent-git-create");
+        let mut adapter =
+            ProductionLifecycleEffectAdapter::open(&registry_path, &journal_path, uid)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            adapter.execute_workspace_intent(
+                &create,
+                &project,
+                &workspace,
+                &checkout,
+                Revision::FIRST,
+                policy,
+            ),
+            Ok(WorkspaceIntentOutcome::Created(workspace.clone()))
+        );
+
+        fs::write(target.join("advanced"), b"advanced\n").unwrap();
+        run(&target, &["add", "advanced"]);
+        run(&target, &["commit", "--quiet", "-m", "advance"]);
+        assert_ne!(git_text(&target, &["rev-parse", "HEAD"]).unwrap(), base);
+        assert_eq!(
+            adapter.preflight_workspace_intent(
+                &create,
+                &project,
+                &workspace,
+                &checkout,
+                Revision::FIRST,
+                policy,
+            ),
+            Err("platform_v2_lifecycle_workspace_mismatch")
+        );
+        let resume = workspace_resume("intent-git-resume");
+        assert_eq!(
+            adapter.execute_workspace_intent(
+                &resume,
+                &project,
+                &workspace,
+                &checkout,
+                Revision::FIRST,
+                policy,
+            ),
+            Ok(WorkspaceIntentOutcome::Resumed(workspace))
+        );
+        drop(adapter);
+        let mut restarted =
+            ProductionLifecycleEffectAdapter::open(&registry_path, &journal_path, uid)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            restarted.execute_workspace_intent(
+                &resume,
+                &project,
+                &UserWorkspaceId::new("workspace-one").unwrap(),
+                &checkout,
+                Revision::FIRST,
+                policy,
+            ),
+            Ok(WorkspaceIntentOutcome::Resumed(
+                UserWorkspaceId::new("workspace-one").unwrap()
+            ))
         );
     }
 

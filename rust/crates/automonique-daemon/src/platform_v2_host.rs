@@ -18,8 +18,9 @@ use automonique_protocol::digest::{Sha256, Sha256Digest};
 use automonique_protocol::identity::Actor;
 use automonique_protocol::platform::{ReceiptId, ResourceAuthority};
 use automonique_protocol::platform_v2::{
-    NegotiatedPlatform, PlatformVersionOffer, ProjectId, UserWorkspaceId, WorkContextIdentity,
-    WorkContextQueryResult, WorkContextTargetKind, negotiate_platform_version,
+    CheckoutId, NegotiatedPlatform, PlatformVersionOffer, ProjectId, UserWorkspaceId,
+    WorkContextIdentity, WorkContextLifecycle, WorkContextQueryResult, WorkContextRecord,
+    WorkContextRelationKind, WorkContextTargetKind, negotiate_platform_version,
 };
 use automonique_protocol::platform_v2_lifecycle::{
     AuthorityGrantId, MutationApprovalId, MutationApprovalRequirement, MutationExplanation,
@@ -134,15 +135,36 @@ pub trait PlatformV2LifecycleEffectAdapter: Send {
         false
     }
 
+    /// Whether this adapter can prove that a workspace intent has no durable
+    /// effect custody. Cancellation must consult custody even when mutable
+    /// registry selectors no longer permit new workspace effects.
+    fn workspace_intent_custody_installed(&self) -> bool {
+        self.workspace_intents_supported()
+    }
+
     fn preflight_workspace_intent(
         &self,
         _intent: &WorkspaceIntent,
         _project: &ProjectId,
         _workspace: &UserWorkspaceId,
+        _checkout: &CheckoutId,
         _workspace_revision: Revision,
         _policy_generation: Sha256Digest,
     ) -> Result<(), &'static str> {
         Err("platform_v2_workspace_executor_unavailable")
+    }
+
+    /// Replay only a durably completed adapter receipt. This must not consult
+    /// mutable selector or filesystem state.
+    fn replay_workspace_intent_receipt(
+        &self,
+        _intent: &WorkspaceIntent,
+        _project: &ProjectId,
+        _workspace: &UserWorkspaceId,
+        _checkout: &CheckoutId,
+        _workspace_revision: Revision,
+    ) -> Result<Option<WorkspaceIntentOutcome>, &'static str> {
+        Ok(None)
     }
 
     fn execute_workspace_intent(
@@ -150,6 +172,7 @@ pub trait PlatformV2LifecycleEffectAdapter: Send {
         _intent: &WorkspaceIntent,
         _project: &ProjectId,
         _workspace: &UserWorkspaceId,
+        _checkout: &CheckoutId,
         _workspace_revision: Revision,
         _policy_generation: Sha256Digest,
     ) -> Result<WorkspaceIntentOutcome, &'static str> {
@@ -161,7 +184,6 @@ pub trait PlatformV2LifecycleEffectAdapter: Send {
         _target: &WorkspaceIntent,
         _project: &ProjectId,
         _workspace: &UserWorkspaceId,
-        _workspace_revision: Revision,
         _policy_generation: Sha256Digest,
     ) -> Result<(), &'static str> {
         Err("platform_v2_workspace_executor_unavailable")
@@ -1008,10 +1030,6 @@ impl PlatformV2Runtime {
                             .map_err(|_| "platform_v2_create_scope_denied")?
                             .ok_or("platform_v2_create_scope_denied")?;
                         authorize_workspace(&principal, value.project(), &workspace)?;
-                        self.validate_policy_mapping(
-                            &principal,
-                            &WorkContextIdentity::UserWorkspace(workspace.clone()),
-                        )?;
                         workspace
                     }
                     WorkspaceIntent::Resume(intent) => {
@@ -1028,19 +1046,6 @@ impl PlatformV2Runtime {
                         if &task_workspace != intent.workspace() {
                             return Err("platform_v2_resume_scope_denied");
                         }
-                        self.work_contexts
-                            .validate_resumable_user_workspace(
-                                principal.actor.tenant(),
-                                value.project(),
-                                intent.workspace(),
-                                intent.expected_revision(),
-                            )
-                            .map_err(|error| match error.category() {
-                                "stale_revision" => "platform_v2_resume_stale_revision",
-                                "not_found" => "platform_v2_resume_not_found",
-                                "unavailable" => "platform_v2_resume_not_resumable",
-                                _ => "platform_v2_resume_refused",
-                            })?;
                         intent.workspace().clone()
                     }
                     WorkspaceIntent::Cancel(intent) => {
@@ -1076,21 +1081,29 @@ impl PlatformV2Runtime {
                         {
                             return Err("platform_v2_intent_refused");
                         }
-                        if self.lifecycle_effects.workspace_intents_supported() {
-                            let workspace_revision = self
-                                .work_contexts
-                                .validate_policy_mapping(
+                        let target_workspace = match &target.intent {
+                            WorkspaceIntent::Create(create) => self
+                                .lineage
+                                .task_workspace_authorized(
                                     principal.actor.tenant(),
-                                    value.project(),
-                                    &WorkContextIdentity::UserWorkspace(intent.workspace().clone()),
+                                    create.task(),
+                                    &allowed,
                                 )
-                                .map_err(|_| "platform_v2_policy_incoherent")?
-                                .revision();
+                                .map_err(|_| "platform_v2_intent_refused")?
+                                .ok_or("platform_v2_intent_refused")?,
+                            WorkspaceIntent::Resume(resume) => resume.workspace().clone(),
+                            WorkspaceIntent::Cancel(_) => {
+                                return Err("platform_v2_intent_refused");
+                            }
+                        };
+                        if target_workspace != *intent.workspace() {
+                            return Err("platform_v2_intent_refused");
+                        }
+                        if self.lifecycle_effects.workspace_intent_custody_installed() {
                             self.lifecycle_effects.cancel_workspace_intent(
                                 &target.intent,
                                 value.project(),
                                 intent.workspace(),
-                                workspace_revision,
                                 self.policy_fence.generation.binding_digest(),
                             )?;
                             self.policy_fence.verify()?;
@@ -1103,15 +1116,68 @@ impl PlatformV2Runtime {
                         return Ok(PlatformV2Response::WorkspaceIntentResult(outcome));
                     }
                 };
-                let workspace_revision = self
+                let stored = self
+                    .lineage
+                    .intent_authorized_in_workspaces(
+                        &negotiated_v2()?,
+                        principal.actor.tenant(),
+                        value.intent().intent_id(),
+                        &allowed,
+                    )
+                    .map_err(|_| "platform_v2_intent_refused")?;
+                if let Some(stored) = stored.as_ref() {
+                    if stored.intent != *value.intent() {
+                        return Err("platform_v2_intent_refused");
+                    }
+                    if stored.outcome.reconciliation()
+                        == automonique_protocol::platform_v2_lineage::WorkspaceIntentReconciliation::Final
+                    {
+                        return Ok(PlatformV2Response::WorkspaceIntentResult(
+                            stored.outcome.clone(),
+                        ));
+                    }
+                }
+                let workspace_record = self
                     .work_contexts
                     .validate_policy_mapping(
                         principal.actor.tenant(),
                         value.project(),
                         &WorkContextIdentity::UserWorkspace(workspace.clone()),
                     )
-                    .map_err(|_| "platform_v2_policy_incoherent")?
-                    .revision();
+                    .map_err(|_| "platform_v2_policy_incoherent")?;
+                let (checkout, workspace_revision) = active_workspace_binding(&workspace_record)
+                    .map_err(|category| match value.intent() {
+                        WorkspaceIntent::Create(_) => category,
+                        WorkspaceIntent::Resume(_) => "platform_v2_resume_not_resumable",
+                        WorkspaceIntent::Cancel(_) => unreachable!("handled above"),
+                    })?;
+                if let WorkspaceIntent::Resume(intent) = value.intent()
+                    && intent.expected_revision() != workspace_revision
+                {
+                    return Err("platform_v2_resume_stale_revision");
+                }
+                if let Some(stored) = stored.as_ref()
+                    && let Some(outcome) = self.lifecycle_effects.replay_workspace_intent_receipt(
+                        value.intent(),
+                        value.project(),
+                        &workspace,
+                        &checkout,
+                        workspace_revision,
+                    )?
+                {
+                    self.policy_fence.verify()?;
+                    self.lineage
+                        .reconcile_intent(
+                            principal.actor.tenant(),
+                            &WorkspaceIntentExecutionReceipt {
+                                intent_id: value.intent().intent_id().clone(),
+                                request_digest: stored.request_digest,
+                                outcome: outcome.clone(),
+                            },
+                        )
+                        .map_err(|_| "platform_v2_intent_refused")?;
+                    return Ok(PlatformV2Response::WorkspaceIntentResult(outcome));
+                }
                 if !self.lifecycle_effects.workspace_intents_supported() {
                     return Err(match value.intent() {
                         WorkspaceIntent::Create(_) => {
@@ -1125,6 +1191,7 @@ impl PlatformV2Runtime {
                     value.intent(),
                     value.project(),
                     &workspace,
+                    &checkout,
                     workspace_revision,
                     self.policy_fence.generation.binding_digest(),
                 )?;
@@ -1155,6 +1222,7 @@ impl PlatformV2Runtime {
                     value.intent(),
                     value.project(),
                     &workspace,
+                    &checkout,
                     workspace_revision,
                     self.policy_fence.generation.binding_digest(),
                 )?;
@@ -1199,9 +1267,6 @@ impl PlatformV2Runtime {
                 if stored.outcome.reconciliation()
                     != automonique_protocol::platform_v2_lineage::WorkspaceIntentReconciliation::Final
                 {
-                    if !self.lifecycle_effects.workspace_intents_supported() {
-                        return Err("platform_v2_workspace_intent_recovery_unavailable");
-                    }
                     let workspace = match &stored.intent {
                         WorkspaceIntent::Create(intent) => self
                             .lineage
@@ -1217,19 +1282,65 @@ impl PlatformV2Runtime {
                             return Ok(PlatformV2Response::WorkspaceIntentResult(stored.outcome));
                         }
                     };
-                    let workspace_revision = self
+                    let workspace_record = self
                         .work_contexts
                         .validate_policy_mapping(
                             principal.actor.tenant(),
                             value.project(),
                             &WorkContextIdentity::UserWorkspace(workspace.clone()),
                         )
-                        .map_err(|_| "platform_v2_policy_incoherent")?
-                        .revision();
+                        .map_err(|_| "platform_v2_policy_incoherent")?;
+                    let (checkout, workspace_revision) = active_workspace_binding(&workspace_record)
+                        .map_err(|category| match &stored.intent {
+                            WorkspaceIntent::Create(_) => category,
+                            WorkspaceIntent::Resume(_) => "platform_v2_resume_not_resumable",
+                            WorkspaceIntent::Cancel(_) => unreachable!("handled above"),
+                        })?;
+                    if let WorkspaceIntent::Resume(intent) = &stored.intent
+                        && intent.expected_revision() != workspace_revision
+                    {
+                        return Err("platform_v2_resume_stale_revision");
+                    }
+                    if let Some(outcome) =
+                        self.lifecycle_effects.replay_workspace_intent_receipt(
+                            &stored.intent,
+                            value.project(),
+                            &workspace,
+                            &checkout,
+                            workspace_revision,
+                        )?
+                    {
+                        self.policy_fence.verify()?;
+                        self.lineage
+                            .reconcile_intent(
+                                principal.actor.tenant(),
+                                &WorkspaceIntentExecutionReceipt {
+                                    intent_id: stored.intent.intent_id().clone(),
+                                    request_digest: stored.request_digest,
+                                    outcome,
+                                },
+                            )
+                            .map_err(|_| "platform_v2_intent_refused")?;
+                        let refreshed = self
+                            .lineage
+                            .intent_authorized_in_workspaces(
+                                &negotiated_v2()?,
+                                principal.actor.tenant(),
+                                value.intent_id(),
+                                &allowed,
+                            )
+                            .map_err(|_| "platform_v2_store_refused")?
+                            .ok_or("platform_v2_not_found")?;
+                        return Ok(PlatformV2Response::WorkspaceIntentResult(refreshed.outcome));
+                    }
+                    if !self.lifecycle_effects.workspace_intents_supported() {
+                        return Err("platform_v2_workspace_intent_recovery_unavailable");
+                    }
                     self.lifecycle_effects.preflight_workspace_intent(
                         &stored.intent,
                         value.project(),
                         &workspace,
+                        &checkout,
                         workspace_revision,
                         self.policy_fence.generation.binding_digest(),
                     )?;
@@ -1238,6 +1349,7 @@ impl PlatformV2Runtime {
                         &stored.intent,
                         value.project(),
                         &workspace,
+                        &checkout,
                         workspace_revision,
                         self.policy_fence.generation.binding_digest(),
                     )?;
@@ -1903,6 +2015,30 @@ fn authorize_workspace(
         project,
         &WorkContextIdentity::UserWorkspace(workspace.clone()),
     )
+}
+
+fn active_workspace_binding(
+    record: &WorkContextRecord,
+) -> Result<(CheckoutId, Revision), &'static str> {
+    if record.lifecycle() != WorkContextLifecycle::Active {
+        return Err("platform_v2_workspace_not_active");
+    }
+    let mut checkouts = record.relations().iter().filter_map(|relation| {
+        if relation.kind() != WorkContextRelationKind::UserWorkspaceCheckout {
+            return None;
+        }
+        match relation.target() {
+            WorkContextIdentity::Checkout(checkout) => Some(checkout.clone()),
+            _ => None,
+        }
+    });
+    let checkout = checkouts
+        .next()
+        .ok_or("platform_v2_workspace_checkout_invalid")?;
+    if checkouts.next().is_some() {
+        return Err("platform_v2_workspace_checkout_invalid");
+    }
+    Ok((checkout, record.revision()))
 }
 
 fn user_workspaces_for_project(

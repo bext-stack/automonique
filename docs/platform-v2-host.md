@@ -171,14 +171,23 @@ already operator-authorized local checkout as the task's daemon-custodied
 `UserWorkspace`. The registry entry must match the project, workspace,
 checkout, task, external-work coordinate, and both opaque base and branch
 selectors. The lineage index independently proves that the task and external
-item are already bound to that same workspace. A resume intent succeeds only
-for an active workspace at the requested revision whose identical checkout
-binding was previously adopted into the journal. Neither operation creates a
-directory, changes a ref, starts a provider, or creates an attempt/session.
+item are already bound to that same workspace. The authoritative WorkContext
+record must also be active and relate that workspace to exactly the same
+checkout identity; another checkout or root in the same project is refused.
+Create validates a Git worktree at the configured immutable base commit and
+exact branch. Resume requires the requested live workspace revision and the
+prior adoption, but permits the exact branch HEAD to advance normally when the
+configured base remains an ancestor. It still proves the canonical repository
+common directory, registered worktree, worktree root, symbolic branch and
+branch-to-HEAD identity. Neither operation creates a directory, changes a ref,
+starts a provider, or creates an attempt/session.
 
 Workspace effects use a prepared/completed/unknown journal record bound to the
 full registry file generation and a digest of the full policy file generation. The
-workspace adoption and completed state install in one atomic journal rewrite.
+workspace adoption, its live revision, the intent digest and completed state
+install in one atomic journal rewrite. On open, every completed create must
+have exactly one matching adopted workspace with the same intent and digest;
+a completed-only or mismatched row fails closed.
 After restart a prepared record is therefore provably not completed and may be
 completed only after the exact bindings revalidate; a completed record is an
 idempotent receipt. Unknown create custody becomes completed only when the
@@ -187,7 +196,13 @@ as not started and a later poll may submit it again; it is never replayed in
 the reconciliation call. A changed policy or registry generation cannot
 complete an older accepted effect. Cancellation removes only prepared or
 verified-not-started unknown custody and refuses once completed adoption is
-visible. Polling a non-final receipt without a compatible adapter returns a
+visible. An accepted intent for which the adapter has no prepared custody is
+provably cancellable even if its mutable selector or root has since
+disappeared; cancellation still consults the installed journal adapter to
+fence a concurrent or ambiguous completion. Exact final lineage receipts are
+authorized from their stored workspace scope and replay before mutable adapter
+preflight, so later selector or root drift cannot erase a truthful final
+outcome. Polling a non-final receipt without a compatible adapter returns a
 typed recovery refusal.
 
 The current lineage schema still cannot create a previously unknown workspace:
