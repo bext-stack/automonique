@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Bounded, refusing decoders for the fourteen operations.
+//! Bounded, refusing decoders for the issue and Actions read operations.
 //!
 //! Each decoder takes the accepted response bytes and returns either the
 //! operation's typed payload or a [`GitHubFailure`]. Nothing panics on hostile
@@ -176,6 +176,44 @@ pub struct GitHubRepository {
     pub archived: bool,
     /// Whether GitHub marks the repository disabled.
     pub disabled: bool,
+}
+
+/// Closed workflow-run lifecycle values returned by GitHub Actions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkflowRunStatus {
+    Queued,
+    InProgress,
+    Completed,
+    Requested,
+    Waiting,
+    Pending,
+}
+
+impl WorkflowRunStatus {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "queued" => Some(Self::Queued),
+            "in_progress" => Some(Self::InProgress),
+            "completed" => Some(Self::Completed),
+            "requested" => Some(Self::Requested),
+            "waiting" => Some(Self::Waiting),
+            "pending" => Some(Self::Pending),
+            _ => None,
+        }
+    }
+}
+
+/// The immutable and monotonic fields needed to reconcile one workflow rerun.
+///
+/// The adapter intentionally retains neither logs nor workflow inputs. A later
+/// `run_attempt` on the same `id` and `head_sha` is the only positive evidence
+/// that an ambiguous rerun request took effect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitHubWorkflowRun {
+    pub id: crate::WorkflowRunId,
+    pub head_sha: String,
+    pub run_attempt: u32,
+    pub status: WorkflowRunStatus,
 }
 
 /// One comment on an issue.
@@ -394,6 +432,38 @@ pub fn decode_repository(bytes: &[u8]) -> Result<GitHubRepository, GitHubFailure
         updated_at: timestamp(&object, "updated_at")?,
         archived: boolean(&object, "archived")?,
         disabled: boolean(&object, "disabled")?,
+    })
+}
+
+/// Decode the exact workflow-run fields used by rerun reconciliation.
+///
+/// Unknown fields are ignored, but every retained field is required and
+/// bounded. GitHub currently emits SHA-1 commit ids; 64 hexadecimal digits are
+/// also admitted so a repository hash migration does not silently disable the
+/// reconciliation fence.
+pub fn decode_workflow_run(bytes: &[u8]) -> Result<GitHubWorkflowRun, GitHubFailure> {
+    let object = envelope(bytes)?;
+    let id = crate::WorkflowRunId::new(identifier(&object, "id")?)
+        .map_err(|_| GitHubFailure::FieldOutOfBounds)?;
+    let head_sha = nonempty(&object, "head_sha", 64)?;
+    if !matches!(head_sha.len(), 40 | 64) || !head_sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(GitHubFailure::FieldOutOfBounds);
+    }
+    let run_attempt = object
+        .get("run_attempt")
+        .ok_or(GitHubFailure::MissingField)?
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or(GitHubFailure::FieldOutOfBounds)?;
+    let status = WorkflowRunStatus::parse(required_str(&object, "status")?)
+        .ok_or(GitHubFailure::FieldOutOfBounds)?;
+    Ok(GitHubWorkflowRun {
+        id,
+        head_sha,
+        run_attempt,
+        status,
     })
 }
 
@@ -704,6 +774,51 @@ mod tests {
                "updated_at":"2026-08-21T18:04:11Z",
                "archived":false,"disabled":false}"#,
         )
+    }
+
+    fn workflow_run_json() -> String {
+        String::from(
+            r#"{"id":99112233,"head_sha":"0123456789abcdef0123456789abcdef01234567",
+               "run_attempt":3,"status":"completed"}"#,
+        )
+    }
+
+    #[test]
+    fn workflow_run_decoding_keeps_only_reconciliation_fields() {
+        let run = decode_workflow_run(workflow_run_json().as_bytes()).expect("decode");
+        assert_eq!(run.id, crate::WorkflowRunId::new(99_112_233).unwrap());
+        assert_eq!(run.run_attempt, 3);
+        assert_eq!(run.status, WorkflowRunStatus::Completed);
+        assert_eq!(run.head_sha, "0123456789abcdef0123456789abcdef01234567");
+    }
+
+    #[test]
+    fn workflow_run_decoding_refuses_missing_or_unusable_fences() {
+        for key in ["id", "head_sha", "run_attempt", "status"] {
+            let mut row: Value = serde_json::from_str(&workflow_run_json()).expect("row");
+            row.as_object_mut().expect("object").remove(key);
+            assert_eq!(
+                decode_workflow_run(row.to_string().as_bytes()),
+                Err(GitHubFailure::MissingField),
+                "dropping {key} must be refused"
+            );
+        }
+        for (key, value) in [
+            ("id", serde_json::json!(0)),
+            ("head_sha", serde_json::json!("not-a-commit")),
+            ("run_attempt", serde_json::json!(0)),
+            ("status", serde_json::json!("mystery")),
+        ] {
+            let mut row: Value = serde_json::from_str(&workflow_run_json()).expect("row");
+            row.as_object_mut()
+                .expect("object")
+                .insert(key.to_owned(), value);
+            assert_eq!(
+                decode_workflow_run(row.to_string().as_bytes()),
+                Err(GitHubFailure::FieldOutOfBounds),
+                "invalid {key} must be refused"
+            );
+        }
     }
 
     #[test]

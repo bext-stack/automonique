@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! The fourteen operations, and the exact method, path and body each renders.
+//! The sixteen operations, and the exact method, path and body each renders.
 //!
 //! [`GitHubOperation`] is the second half of the target lock (the first is the
 //! origin in `target`). A path is never a caller string: it is assembled here
@@ -15,7 +15,7 @@
 //! a protocol one: it lets a test assert one exact captured request instead of
 //! a set of permutations.
 
-use crate::target::{CommentId, IssueNumber, Label, RepoTarget};
+use crate::target::{CommentId, IssueNumber, Label, RepoTarget, WorkflowRunId};
 use crate::ticket::{IssueBodyText, IssueTitle};
 use crate::{
     EntityTag, GitHubRefusal, IssueState, MAX_ISSUE_LABELS, MAX_PER_PAGE, MAX_SEARCH_QUERY_BYTES,
@@ -651,6 +651,63 @@ pub struct GetRepositoryRequest {
     target: RepoTarget,
 }
 
+/// Read one exact GitHub Actions workflow run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GetWorkflowRunRequest {
+    target: RepoTarget,
+    run_id: WorkflowRunId,
+}
+
+impl GetWorkflowRunRequest {
+    /// Bind one validated repository and workflow-run id.
+    #[must_use]
+    pub const fn new(target: RepoTarget, run_id: WorkflowRunId) -> Self {
+        Self { target, run_id }
+    }
+
+    /// The repository.
+    #[must_use]
+    pub const fn target(&self) -> &RepoTarget {
+        &self.target
+    }
+
+    /// The workflow run.
+    #[must_use]
+    pub const fn run_id(&self) -> WorkflowRunId {
+        self.run_id
+    }
+}
+
+/// Re-run one exact GitHub Actions workflow run.
+///
+/// This type has no body because debug logging and alternate rerun modes are
+/// intentionally outside the Mobile review capability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RerunWorkflowRequest {
+    target: RepoTarget,
+    run_id: WorkflowRunId,
+}
+
+impl RerunWorkflowRequest {
+    /// Bind one validated repository and workflow-run id.
+    #[must_use]
+    pub const fn new(target: RepoTarget, run_id: WorkflowRunId) -> Self {
+        Self { target, run_id }
+    }
+
+    /// The repository.
+    #[must_use]
+    pub const fn target(&self) -> &RepoTarget {
+        &self.target
+    }
+
+    /// The workflow run.
+    #[must_use]
+    pub const fn run_id(&self) -> WorkflowRunId {
+        self.run_id
+    }
+}
+
 impl GetRepositoryRequest {
     /// Name the exact repository to read.
     #[must_use]
@@ -771,6 +828,10 @@ pub enum GitHubOperation {
     ListIssues(ListIssuesRequest),
     /// `GET /repos/{owner}/{repo}`
     GetRepository(GetRepositoryRequest),
+    /// `GET /repos/{owner}/{repo}/actions/runs/{run_id}`
+    GetWorkflowRun(GetWorkflowRunRequest),
+    /// `POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun`
+    RerunWorkflow(RerunWorkflowRequest),
     /// `GET /search/issues`
     SearchIssues(SearchIssuesRequest),
     /// `GET /user`
@@ -782,7 +843,7 @@ impl GitHubOperation {
     #[must_use]
     pub const fn method(&self) -> HttpMethod {
         match self {
-            Self::CreateIssue(_) | Self::Comment(_) => HttpMethod::Post,
+            Self::CreateIssue(_) | Self::Comment(_) | Self::RerunWorkflow(_) => HttpMethod::Post,
             Self::SetState(_) | Self::UpdateIssueBody(_) | Self::UpdateIssueComment(_) => {
                 HttpMethod::Patch
             }
@@ -793,6 +854,7 @@ impl GitHubOperation {
             | Self::ListLabels(_)
             | Self::ListIssues(_)
             | Self::GetRepository(_)
+            | Self::GetWorkflowRun(_)
             | Self::SearchIssues(_)
             | Self::Whoami => HttpMethod::Get,
         }
@@ -812,6 +874,7 @@ impl GitHubOperation {
                 | Self::ReplaceLabels(_)
                 | Self::UpdateIssueBody(_)
                 | Self::UpdateIssueComment(_)
+                | Self::RerunWorkflow(_)
         )
     }
 
@@ -896,6 +959,13 @@ impl GitHubOperation {
                 path
             }
             Self::GetRepository(request) => repository_path(request.target()),
+            Self::GetWorkflowRun(request) => workflow_run_path(request.target(), request.run_id()),
+            Self::RerunWorkflow(request) => {
+                format!(
+                    "{}/rerun",
+                    workflow_run_path(request.target(), request.run_id())
+                )
+            }
             Self::SearchIssues(request) => {
                 let page = request.page();
                 let mut path = String::from("/search/issues?q=");
@@ -958,6 +1028,8 @@ impl GitHubOperation {
             | Self::ListLabels(_)
             | Self::ListIssues(_)
             | Self::GetRepository(_)
+            | Self::GetWorkflowRun(_)
+            | Self::RerunWorkflow(_)
             | Self::SearchIssues(_)
             | Self::Whoami => None,
         }
@@ -986,6 +1058,11 @@ fn repository_path(target: &RepoTarget) -> String {
         target.owner().as_str(),
         target.repo().as_str()
     )
+}
+
+/// One exact repository-scoped GitHub Actions workflow-run endpoint.
+fn workflow_run_path(target: &RepoTarget, run_id: WorkflowRunId) -> String {
+    format!("{}/actions/runs/{run_id}", repository_path(target))
 }
 
 /// One repository-scoped issue-comment endpoint.
