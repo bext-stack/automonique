@@ -5988,6 +5988,12 @@ fn api_response(
                     Err(
                         "platform_cockpit_request_invalid" | "platform_cockpit_workspace_not_found",
                     ) => json_error("400 Bad Request", "platform_cockpit_request_invalid"),
+                    Err(
+                        "platform_cockpit_stale_revision"
+                        | "platform_cockpit_review_stale"
+                        | "platform_cockpit_project_workspace_mismatch"
+                        | "platform_cockpit_exact_task_binding_mismatch",
+                    ) => json_error("409 Conflict", "platform_cockpit_control_conflict"),
                     Err(category) => json_error("503 Service Unavailable", category),
                 },
                 Err(_) => json_error("400 Bad Request", "invalid_json"),

@@ -247,3 +247,28 @@ test("cross-workspace retained session selection updates URL and cockpit before 
 
   await expect(page.locator("#platform-session-coordinate")).toContainText("session-2");
 });
+
+test("an ambiguous durable handle reloads through lookup only and never replays submit", async ({ page }) => {
+  const actions = [];
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname !== "/api/platform/cockpit") return;
+    try {
+      actions.push(request.postDataJSON()?.action);
+    } catch (_error) {
+      // Only JSON cockpit requests are relevant to this assertion.
+    }
+  });
+  await page.evaluate(() => localStorage.setItem("automonique-cockpit-control-v1", JSON.stringify({
+    version: 1,
+    family: "workspace_intent",
+    action: "resume",
+    project_id: "project-1",
+    workspace_id: "workspace-1",
+    receipt_id: "intent-ambiguous-reload",
+  })));
+  await page.reload();
+  await expect(page.locator("#cockpit-action-receipt")).toContainText(/ambiguous/i);
+  expect(actions).toContain("get_workspace_intent");
+  expect(actions).not.toContain("submit_workspace_create");
+  expect(actions).not.toContain("submit_workspace_resume");
+});

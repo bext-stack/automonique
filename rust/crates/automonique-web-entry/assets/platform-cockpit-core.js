@@ -7,6 +7,7 @@
   const WORKSPACE_ATTENTION_STATES = Object.freeze(["idle", ...ATTENTION_STATES]);
   const SURFACES = Object.freeze(["conversation", "files", "activity"]);
   const RECEIPT_STATES = Object.freeze(["idle", "pending", "refused", "ambiguous", "completed"]);
+  const CONTROL_FAMILIES = Object.freeze(["workspace_intent", "review_action"]);
   const LINK_KEYS = Object.freeze(["workspace", "session", "pane", "file", "hunk", "side", "line"]);
 
   function validDecimal(value, allowZero = true) {
@@ -119,6 +120,41 @@
     });
   }
 
+  function controlCapability(document, family, operation) {
+    const capability = family === "workspace_intent"
+      ? document?.actions?.lifecycle?.operations?.[operation]
+      : document?.actions?.review?.operations?.[operation];
+    const available = capability?.available === true
+      && (family === "workspace_intent"
+        ? capability.submit_operation === "submit_workspace_intent"
+          && capability.receipt_operation === "get_workspace_intent"
+        : capability.execute_operation === "execute_review_action"
+          && capability.receipt_operation === "get_review_receipt")
+      && boundedText(capability.project_id, 256)
+      && boundedText(capability.workspace_id, 256)
+      && validDecimal(capability.exact_revision, false);
+    return Object.freeze({
+      available: available === true,
+      reason: available ? null : boundedText(capability?.category, 128)
+        || boundedText(family === "workspace_intent" ? document?.actions?.lifecycle?.category : document?.actions?.review?.category, 128)
+        || "platform_cockpit_control_unavailable",
+      family,
+      operation,
+      project_id: available ? capability.project_id : null,
+      workspace_id: available ? capability.workspace_id : null,
+      exact_revision: available ? capability.exact_revision : null,
+      exact_review_revision: available && validDecimal(capability.exact_review_revision, false)
+        ? capability.exact_review_revision : null,
+      task_id: available ? boundedText(capability.task_id, 256) : null,
+      external_work: available && capability.external_work && typeof capability.external_work === "object"
+        ? Object.freeze({ ...capability.external_work }) : null,
+    });
+  }
+
+  function disabledCapability(capability, reason) {
+    return Object.freeze({ ...capability, available: false, reason });
+  }
+
   function lifecycleStatus(localLifecycle) {
     const host = localLifecycle?.createHostSetup || {};
     const checkout = localLifecycle?.createCheckout || {};
@@ -196,6 +232,11 @@
     const activities = structured && Array.isArray(document.activities)
       ? document.activities.map(normalizeActivity).filter(Boolean).sort((left, right) => left.at.localeCompare(right.at) || left.id.localeCompare(right.id))
       : [];
+    const writesAvailable = mode === "v2" && !freshnessStates(document).includes("stale");
+    const create = controlCapability(document, "workspace_intent", "create_attempt_workspace");
+    const resume = controlCapability(document, "workspace_intent", "resume_attempt_workspace");
+    const addComment = controlCapability(document, "review_action", "add_comment");
+    const approveReview = controlCapability(document, "review_action", "approve_review");
     return Object.freeze({
       mode,
       degradation,
@@ -208,8 +249,12 @@
       attention: Object.freeze(Object.fromEntries(ATTENTION_STATES.map((state) => [state, attentionAvailable ? workspaces.filter((item) => item.attention === state).length : null]))),
       activities: Object.freeze(activities),
       receipt: normalizeReceipt(document?.receipt),
-      create: mutationCapability(document, "create_attempt_workspace"),
-      resume: mutationCapability(document, "resume_attempt_workspace"),
+      create: writesAvailable ? create : disabledCapability(create, "platform_cockpit_projection_incomplete_or_stale"),
+      resume: writesAvailable ? resume : disabledCapability(resume, "platform_cockpit_projection_incomplete_or_stale"),
+      reviewActions: Object.freeze({
+        addComment: writesAvailable ? addComment : disabledCapability(addComment, "platform_cockpit_projection_incomplete_or_stale"),
+        approveReview: writesAvailable ? approveReview : disabledCapability(approveReview, "platform_cockpit_projection_incomplete_or_stale"),
+      }),
       localLifecycle: Object.freeze({
         createHostSetup: mutationCapability(document, "create_host_setup"),
         createCheckout: mutationCapability(document, "create_checkout"),
@@ -269,6 +314,52 @@
     });
   }
 
+  function validControlHandle(value) {
+    if (!value || typeof value !== "object" || !CONTROL_FAMILIES.includes(value.family)) return null;
+    const action = boundedText(value.action, 64);
+    const projectId = boundedText(value.project_id, 256);
+    const workspaceId = boundedText(value.workspace_id, 256);
+    const receiptId = boundedText(value.receipt_id, 256);
+    if (!action || !projectId || !workspaceId || !receiptId) return null;
+    return Object.freeze({
+      version: 1,
+      family: value.family,
+      action,
+      project_id: projectId,
+      workspace_id: workspaceId,
+      receipt_id: receiptId,
+    });
+  }
+
+  function prepareControlHandle(capability, action, receiptId) {
+    if (capability?.available !== true || !CONTROL_FAMILIES.includes(capability.family)) return null;
+    return validControlHandle({
+      family: capability.family,
+      action,
+      project_id: capability.project_id,
+      workspace_id: capability.workspace_id,
+      receipt_id: receiptId,
+    });
+  }
+
+  function serializeControlHandle(value) {
+    const handle = validControlHandle(value);
+    return handle ? JSON.stringify(handle) : null;
+  }
+
+  function parseControlHandle(value) {
+    if (typeof value !== "string" || value.length > 2048) return null;
+    try {
+      return validControlHandle(JSON.parse(value));
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function controlRecoveryDirective(handle) {
+    return validControlHandle(handle) ? "lookup_only" : "may_submit";
+  }
+
   function reduce(state, event) {
     const current = state || initialState();
     if (!event || typeof event !== "object") return current;
@@ -307,13 +398,17 @@
     ATTENTION_STATES,
     browserProfile,
     buildDeepLink,
+    controlRecoveryDirective,
     decimalGreater,
     derivePresentation,
     initialState,
     lifecycleStatus,
+    parseControlHandle,
     parseDeepLink,
     receiptDirective,
+    prepareControlHandle,
     reduce,
+    serializeControlHandle,
     validDecimal,
   });
 })(globalThis);

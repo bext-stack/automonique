@@ -33,6 +33,15 @@ let cockpitState = globalThis.AutomoniquePlatformCockpit.initialState(
 );
 let cockpitPresentation = null;
 let cockpitTaskWorkspaceId = null;
+const cockpitControlStorageKey = "automonique-cockpit-control-v1";
+let cockpitControlHandle = (() => {
+  try {
+    return globalThis.AutomoniquePlatformCockpit.parseControlHandle(localStorage.getItem(cockpitControlStorageKey));
+  } catch (_error) {
+    return null;
+  }
+})();
+let cockpitControlBusy = false;
 let processFilter = "all";
 const expandedProcesses = new Set();
 let ticketFilter = "all";
@@ -2274,16 +2283,22 @@ function renderHostedCockpit(view) {
 
   const create = byId("cockpit-create-preview");
   const resume = byId("cockpit-resume-preview");
-  create.disabled = cockpitPresentation.create.available !== true;
-  resume.disabled = cockpitPresentation.resume.available !== true;
+  const unresolvedControl = Boolean(cockpitControlHandle) || cockpitControlBusy;
+  create.disabled = cockpitPresentation.create.available !== true || unresolvedControl;
+  resume.disabled = cockpitPresentation.resume.available !== true || unresolvedControl;
+  create.textContent = cockpitPresentation.create.available ? "Prepare create" : "Create unavailable";
+  resume.textContent = cockpitPresentation.resume.available ? "Prepare resume" : "Resume unavailable";
   const localLifecycle = globalThis.AutomoniquePlatformCockpit.lifecycleStatus(cockpitPresentation.localLifecycle);
   const lifecycleReason = byId("cockpit-action-reason");
   lifecycleReason.dataset.localLifecycle = localLifecycle.state;
   lifecycleReason.textContent = localLifecycle.message;
   if (workspace?.id !== cockpitTaskWorkspaceId) {
-    byId("cockpit-task-input").value = workspace?.task || "";
+    byId("cockpit-task-input").value = cockpitPresentation.create.task_id || cockpitPresentation.resume.task_id || "";
     cockpitTaskWorkspaceId = workspace?.id || null;
   }
+  byId("cockpit-task-input").disabled = !(cockpitPresentation.create.available || cockpitPresentation.resume.available);
+  byId("cockpit-base-selector").disabled = !cockpitPresentation.create.available || unresolvedControl;
+  byId("cockpit-branch-selector").disabled = !cockpitPresentation.create.available || unresolvedControl;
 
   const copy = byId("cockpit-copy-link");
   copy.disabled = !workspace;
@@ -2293,7 +2308,21 @@ function renderHostedCockpit(view) {
   byId("cockpit-inspector-anchor").textContent = link.file ? `${link.file} · ${link.hunk} · ${link.side}:${link.line}` : "—";
 
   renderCockpitReadModels(cockpitPresentation.readModels);
-  renderCockpitReceipt(cockpitPresentation.receipt);
+  renderCockpitReceipt(cockpitState.receipt.state === "idle" ? cockpitPresentation.receipt : cockpitState.receipt);
+  const reviewLink = globalThis.AutomoniquePlatformCockpit.parseDeepLink(window.location.hash);
+  const exactAnchor = reviewLink.file && reviewLink.hunk && reviewLink.side && reviewLink.line;
+  const addComment = cockpitPresentation.reviewActions.addComment;
+  const approveReview = cockpitPresentation.reviewActions.approveReview;
+  byId("cockpit-add-comment").disabled = !addComment.available || !exactAnchor || unresolvedControl;
+  byId("cockpit-approve-review").disabled = !approveReview.available || unresolvedControl;
+  byId("cockpit-add-comment").textContent = addComment.available ? "Add exact comment" : "Add comment unavailable";
+  byId("cockpit-approve-review").textContent = approveReview.available ? "Approve review" : "Approve unavailable";
+  byId("cockpit-review-comment").disabled = !addComment.available || unresolvedControl;
+  byId("cockpit-review-action-reason").textContent = unresolvedControl
+    ? "An unresolved durable receipt is lookup-only. New writes are disabled."
+    : !exactAnchor
+      ? "Add comment requires an exact file, hunk, side, and line deep link."
+      : "Only local add-comment and approve-review are enabled; git, CI, and pull-request families remain unavailable.";
   const activity = byId("cockpit-activity-list");
   activity.replaceChildren();
   if (cockpitPresentation.activities.length === 0) {
@@ -2659,6 +2688,7 @@ async function loadPlatform({ announce = false } = {}) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action: "read", ...(workspaceId ? { workspace_id: workspaceId } : {}) }),
     }));
+    if (cockpitControlHandle) await reconcileCockpitControl();
     if (platformMutation) await reconcilePlatformMutation();
     else if (platformSelectedSession && platformSelectedSessionVisible() && byId("platform-session-detail").hidden) await openPlatformSession(platformSelectedSession);
     else if (platformSelectedSession && platformSelectedSessionVisible() && !platformBusy) await pagePlatformHistory();
@@ -3097,7 +3127,7 @@ document.querySelector(".cockpit-surface-tabs").addEventListener("keydown", (eve
 });
 function previewCockpitAction(action) {
   const capability = cockpitPresentation?.[action];
-  if (!capability?.available) return;
+  if (!capability?.available || cockpitControlHandle || cockpitControlBusy) return;
   cockpitState = globalThis.AutomoniquePlatformCockpit.reduce(cockpitState, { type: "preview", action, capability });
   const root = byId("cockpit-action-preview");
   root.hidden = false;
@@ -3105,13 +3135,212 @@ function previewCockpitAction(action) {
   const title = document.createElement("strong");
   title.textContent = `${words(action)} preview · no mutation sent`;
   const details = document.createElement("span");
-  details.textContent = `${capability.authority} · ${capability.workspace_id} · exact revision ${capability.exact_revision}`;
+  details.textContent = `${capability.project_id} · ${capability.workspace_id} · exact revision ${capability.exact_revision}`;
   const task = document.createElement("p");
-  task.textContent = byId("cockpit-task-input").value.trim() || "No task text supplied.";
-  root.append(title, details, task);
+  task.textContent = `Bound task ${capability.task_id || "unavailable"}. The durable intent identity will be stored before transmission.`;
+  const confirm = document.createElement("button");
+  confirm.type = "button";
+  confirm.className = "button primary";
+  confirm.textContent = `Confirm ${action}`;
+  confirm.addEventListener("click", () => submitCockpitIntent(action));
+  root.append(title, details, task, confirm);
+}
+
+function newCockpitReceiptId(prefix) {
+  return `${prefix}-${crypto.randomUUID()}`;
+}
+
+function persistCockpitControl(handle) {
+  const serialized = globalThis.AutomoniquePlatformCockpit.serializeControlHandle(handle);
+  if (!serialized) return false;
+  try {
+    localStorage.setItem(cockpitControlStorageKey, serialized);
+    cockpitControlHandle = handle;
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function clearCockpitControl() {
+  try {
+    localStorage.removeItem(cockpitControlStorageKey);
+  } catch (_error) {
+    // The in-memory handle still settles; storage was already unavailable.
+  }
+  cockpitControlHandle = null;
+}
+
+function cockpitReceiptState(response, handle) {
+  if (response?.state === "refused") {
+    return { state: "refused", id: handle.receipt_id, outcome: response.category, message: response.explanation || response.category };
+  }
+  if (response?.state === "missing") {
+    return { state: "ambiguous", id: handle.receipt_id, outcome: "unknown", message: "No durable receipt is visible yet. Lookup remains safe; the write will not be replayed." };
+  }
+  if (handle.family === "workspace_intent" && response?.state === "receipt") {
+    const kind = response?.outcome?.kind;
+    if (["accepted", "unknown"].includes(kind)) {
+      return { state: "pending", id: handle.receipt_id, outcome: kind, message: "Workspace intent is durable and still requires receipt lookup." };
+    }
+    return { state: "completed", id: handle.receipt_id, outcome: kind, message: `Workspace intent settled as ${kind || "unknown"}.` };
+  }
+  if (handle.family === "review_action" && response?.state === "receipt") {
+    const directive = globalThis.AutomoniquePlatformCockpit.receiptDirective(response);
+    if (directive === "reconcile") return { state: "pending", id: handle.receipt_id, outcome: response?.receipt?.outcome, message: "Review action is durable and still requires receipt lookup." };
+    return { state: response?.receipt?.outcome === "completed" ? "completed" : "refused", id: handle.receipt_id, outcome: response?.receipt?.outcome, message: `Review action settled as ${response?.receipt?.outcome || "unknown"}.` };
+  }
+  return { state: "ambiguous", id: handle.receipt_id, outcome: "unknown", message: "The response was not a recognized durable receipt. Lookup remains safe." };
+}
+
+function applyCockpitControlResponse(response, handle) {
+  const receipt = cockpitReceiptState(response, handle);
+  cockpitState = globalThis.AutomoniquePlatformCockpit.reduce(cockpitState, { type: "receipt", receipt });
+  if (["completed", "refused"].includes(receipt.state)) clearCockpitControl();
+  renderHostedCockpit(cockpitSnapshot || {});
+}
+
+async function submitCockpitIntent(action) {
+  const capability = cockpitPresentation?.[action];
+  if (!capability?.available || cockpitControlHandle || cockpitControlBusy) return;
+  const baseSelector = byId("cockpit-base-selector").value.trim();
+  const branchSelector = byId("cockpit-branch-selector").value.trim();
+  if (action === "create" && (!baseSelector || !branchSelector)) {
+    toast("Exact base and branch selectors are required.", "error");
+    return;
+  }
+  const intentId = newCockpitReceiptId("cockpit-intent");
+  const handle = globalThis.AutomoniquePlatformCockpit.prepareControlHandle(capability, action, intentId);
+  if (!handle || !persistCockpitControl(handle)) {
+    toast("The durable intent identity could not be stored; nothing was sent.", "error");
+    return;
+  }
+  cockpitControlBusy = true;
+  renderHostedCockpit(cockpitSnapshot || {});
+  const body = action === "create" ? {
+    action: "submit_workspace_create",
+    project_id: capability.project_id,
+    workspace_id: capability.workspace_id,
+    expected_revision: capability.exact_revision,
+    intent_id: intentId,
+    task_id: capability.task_id,
+    external_work: capability.external_work,
+    base_selector: baseSelector,
+    branch_selector: branchSelector,
+  } : {
+    action: "submit_workspace_resume",
+    project_id: capability.project_id,
+    workspace_id: capability.workspace_id,
+    expected_revision: capability.exact_revision,
+    intent_id: intentId,
+    task_id: capability.task_id,
+  };
+  try {
+    applyCockpitControlResponse(await api("/api/platform/cockpit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }), handle);
+  } catch (_error) {
+    cockpitState = globalThis.AutomoniquePlatformCockpit.reduce(cockpitState, { type: "receipt", receipt: {
+      state: "ambiguous", id: intentId, outcome: "unknown", message: "Transmission was ambiguous. Only receipt lookup is allowed now.",
+    } });
+  } finally {
+    cockpitControlBusy = false;
+    renderHostedCockpit(cockpitSnapshot || {});
+  }
+}
+
+async function submitCockpitReview(action) {
+  const capability = cockpitPresentation?.reviewActions?.[action];
+  if (!capability?.available || cockpitControlHandle || cockpitControlBusy) return;
+  const idempotencyKey = newCockpitReceiptId("cockpit-review");
+  const handle = globalThis.AutomoniquePlatformCockpit.prepareControlHandle(capability, action, idempotencyKey);
+  if (!handle || !persistCockpitControl(handle)) {
+    toast("The durable review receipt identity could not be stored; nothing was sent.", "error");
+    return;
+  }
+  const link = globalThis.AutomoniquePlatformCockpit.parseDeepLink(window.location.hash);
+  const body = action === "addComment" ? {
+    action: "add_comment",
+    project_id: capability.project_id,
+    workspace_id: capability.workspace_id,
+    expected_revision: capability.exact_revision,
+    comment_id: newCockpitReceiptId("cockpit-comment"),
+    file_id: link.file,
+    hunk_id: link.hunk,
+    side: link.side,
+    line: Number(link.line),
+    body: byId("cockpit-review-comment").value.trim(),
+    idempotency_key: idempotencyKey,
+  } : {
+    action: "approve_review",
+    project_id: capability.project_id,
+    workspace_id: capability.workspace_id,
+    expected_revision: capability.exact_revision,
+    expected_review_revision: capability.exact_review_revision,
+    idempotency_key: idempotencyKey,
+  };
+  if (action === "addComment" && !body.body) {
+    clearCockpitControl();
+    toast("A bounded comment body is required.", "error");
+    return;
+  }
+  cockpitControlBusy = true;
+  renderHostedCockpit(cockpitSnapshot || {});
+  try {
+    applyCockpitControlResponse(await api("/api/platform/cockpit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }), handle);
+  } catch (_error) {
+    cockpitState = globalThis.AutomoniquePlatformCockpit.reduce(cockpitState, { type: "receipt", receipt: {
+      state: "ambiguous", id: idempotencyKey, outcome: "unknown", message: "Transmission was ambiguous. Only receipt lookup is allowed now.",
+    } });
+  } finally {
+    cockpitControlBusy = false;
+    renderHostedCockpit(cockpitSnapshot || {});
+  }
+}
+
+async function reconcileCockpitControl() {
+  const handle = cockpitControlHandle;
+  if (!handle || cockpitControlBusy) return;
+  cockpitControlBusy = true;
+  try {
+    const body = handle.family === "workspace_intent" ? {
+      action: "get_workspace_intent",
+      project_id: handle.project_id,
+      workspace_id: handle.workspace_id,
+      intent_id: handle.receipt_id,
+    } : {
+      action: "get_review_receipt",
+      project_id: handle.project_id,
+      workspace_id: handle.workspace_id,
+      idempotency_key: handle.receipt_id,
+    };
+    applyCockpitControlResponse(await api("/api/platform/cockpit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }), handle);
+  } catch (_error) {
+    cockpitState = globalThis.AutomoniquePlatformCockpit.reduce(cockpitState, { type: "receipt", receipt: {
+      state: "ambiguous", id: handle.receipt_id, outcome: "unknown", message: "Receipt lookup is unavailable. The write will not be replayed.",
+    } });
+  } finally {
+    cockpitControlBusy = false;
+    renderHostedCockpit(cockpitSnapshot || {});
+  }
 }
 byId("cockpit-create-preview").addEventListener("click", () => previewCockpitAction("create"));
 byId("cockpit-resume-preview").addEventListener("click", () => previewCockpitAction("resume"));
+byId("cockpit-review-controls").addEventListener("submit", (event) => {
+  event.preventDefault();
+  submitCockpitReview("addComment");
+});
+byId("cockpit-approve-review").addEventListener("click", () => submitCockpitReview("approveReview"));
 byId("cockpit-copy-link").addEventListener("click", async () => {
   const workspace = cockpitPresentation?.selectedWorkspace;
   if (!workspace) return;

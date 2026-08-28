@@ -44,6 +44,96 @@ test("uncertain receipts reconcile without replay and known refusals settle", ()
   expect(cockpit.receiptDirective({ state: "refused", outcome: "conflict" })).toBe("settled");
 });
 
+test("durable cockpit handles are persisted before send and reload is lookup-only", () => {
+  const capability = {
+    available: true,
+    family: "workspace_intent",
+    project_id: "project-1",
+    workspace_id: "workspace-1",
+  };
+  const handle = cockpit.prepareControlHandle(capability, "create", "intent-1");
+  expect(handle).toEqual({
+    version: 1,
+    family: "workspace_intent",
+    action: "create",
+    project_id: "project-1",
+    workspace_id: "workspace-1",
+    receipt_id: "intent-1",
+  });
+  const restored = cockpit.parseControlHandle(cockpit.serializeControlHandle(handle));
+  expect(restored).toEqual(handle);
+  expect(cockpit.controlRecoveryDirective(restored)).toBe("lookup_only");
+  expect(cockpit.controlRecoveryDirective(null)).toBe("may_submit");
+});
+
+test("malformed or cross-field-expanded durable handles fail closed", () => {
+  expect(cockpit.parseControlHandle('{"family":"workspace_intent"}')).toBeNull();
+  expect(cockpit.parseControlHandle(JSON.stringify({
+    family: "generic_execute",
+    action: "shell",
+    project_id: "project-1",
+    workspace_id: "workspace-1",
+    receipt_id: "receipt-1",
+  }))).toBeNull();
+  expect(cockpit.prepareControlHandle({ available: false }, "create", "intent-1")).toBeNull();
+});
+
+test("typed workspace and review controls require exact server operations and fresh complete mode", () => {
+  const controlled = structuredClone(fixture);
+  controlled.actions.lifecycle.operations = {
+    create_attempt_workspace: {
+      available: true,
+      submit_operation: "submit_workspace_intent",
+      receipt_operation: "get_workspace_intent",
+      project_id: "project-1",
+      workspace_id: "workspace-1",
+      exact_revision: "9007199254740995",
+      task_id: "task-1",
+      external_work: { provider: "github", authority: "github.com", scope: "owner/repo", key: "42" },
+    },
+    resume_attempt_workspace: {
+      available: true,
+      submit_operation: "submit_workspace_intent",
+      receipt_operation: "get_workspace_intent",
+      project_id: "project-1",
+      workspace_id: "workspace-1",
+      exact_revision: "9007199254740995",
+      task_id: "task-1",
+    },
+  };
+  controlled.actions.review = { operations: {
+    add_comment: {
+      available: true,
+      execute_operation: "execute_review_action",
+      receipt_operation: "get_review_receipt",
+      project_id: "project-1",
+      workspace_id: "workspace-1",
+      exact_revision: "7",
+    },
+    approve_review: {
+      available: true,
+      execute_operation: "execute_review_action",
+      receipt_operation: "get_review_receipt",
+      project_id: "project-1",
+      workspace_id: "workspace-1",
+      exact_revision: "7",
+      exact_review_revision: "6",
+    },
+  } };
+  const view = cockpit.derivePresentation(controlled);
+  expect(view.create.available).toBe(true);
+  expect(view.create.project_id).toBe("project-1");
+  expect(view.resume.available).toBe(true);
+  expect(view.reviewActions.addComment.available).toBe(true);
+  expect(view.reviewActions.approveReview.exact_review_revision).toBe("6");
+
+  controlled.review.document.review.freshness.state = "stale";
+  const stale = cockpit.derivePresentation(controlled);
+  expect(stale.create.available).toBe(false);
+  expect(stale.reviewActions.approveReview.available).toBe(false);
+  expect(stale.create.reason).toBe("platform_cockpit_projection_incomplete_or_stale");
+});
+
 test("v1 degrades explicitly and never infers workspace state from summaries", () => {
   const view = cockpit.derivePresentation({ sessions: [{ summary: "Working on branch secret with 9 unread" }] });
   expect(view.mode).toBe("v1");
