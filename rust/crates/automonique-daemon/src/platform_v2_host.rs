@@ -20,7 +20,7 @@ use automonique_protocol::platform::{ReceiptId, ResourceAuthority};
 use automonique_protocol::platform_v2::{
     CheckoutId, NegotiatedPlatform, PlatformVersionOffer, ProjectId, UserWorkspaceId,
     WorkContextIdentity, WorkContextLifecycle, WorkContextQueryResult, WorkContextRecord,
-    WorkContextRelationKind, WorkContextTargetKind, negotiate_platform_version,
+    WorkContextRelationKind, WorkContextTargetKind, WorkSessionId, negotiate_platform_version,
 };
 use automonique_protocol::platform_v2_lifecycle::{
     AuthorityGrantId, MutationApprovalId, MutationApprovalRequirement, MutationExplanation,
@@ -29,8 +29,8 @@ use automonique_protocol::platform_v2_lifecycle::{
 };
 use automonique_protocol::platform_v2_lineage::{WorkspaceIntent, WorkspaceIntentOutcome};
 use automonique_protocol::platform_v2_review::{
-    ReviewActionRequest, ReviewActorId, ReviewAuthentication, ReviewAuthority, ReviewAuthorityId,
-    ReviewAuthorityKind,
+    ReviewAction, ReviewActionReceipt, ReviewActionRequest, ReviewActorId, ReviewAuthentication,
+    ReviewAuthority, ReviewAuthorityId, ReviewAuthorityKind, ReviewSnapshot,
 };
 use automonique_protocol::platform_v2_transport::{
     LIFECYCLE_CAPABILITY_EFFECT_KINDS, LifecycleCapabilities, LifecycleOperationCapability,
@@ -38,9 +38,13 @@ use automonique_protocol::platform_v2_transport::{
     RawMutationReceiptDocument, ReceiptLookupKey,
 };
 use automonique_protocol::primitives::{EpochMillis, Revision};
+use automonique_protocol::wire::JsonValue;
 use automonique_store::lineage_index::WorkspaceIntentExecutionReceipt;
 use automonique_store::lineage_index::{IntentAuthorizationScope, LineageIndex};
-use automonique_store::review_store::{ReviewStore, ReviewStoreError};
+use automonique_store::review_store::{
+    ApprovalPolicy, ReviewActionAdmission, ReviewExternalEffectPlan, ReviewStore, ReviewStoreError,
+    ReviewWriteAdmission, StoredReviewAction,
+};
 use automonique_store::work_context_store::{
     ApprovalPolicyDecision, ExternalEffectCompletionPolicy, ExternalEffectExecutorPolicy,
     ExternalEffectReconciliation, ExternalEffectReconciliationOutcome,
@@ -109,6 +113,207 @@ pub enum PlatformV2EffectReconciliation {
     VerifiedNotStarted(Vec<u8>),
     Completed(Vec<u8>),
     Unknown(Vec<u8>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlatformV2ReviewDeliveryState {
+    NotStarted,
+    Pending,
+    Completed,
+    Refused,
+    Ambiguous,
+}
+
+/// Immutable execution fence passed to the scheduler with a retained-session
+/// delivery. The scheduler must revalidate this complete server-owned lineage
+/// immediately before the provider receives `payload`.
+pub struct PlatformV2ReviewExecutionFence<'a> {
+    tenant: &'a str,
+    project: &'a ProjectId,
+    review_workspace: &'a WorkContextIdentity,
+    expected_registry_generation: [u8; 32],
+    work_session_id: &'a WorkSessionId,
+    expected_work_session_revision: Revision,
+    provider: &'a str,
+    provider_session_id: &'a str,
+    expected_provider_session_revision: Revision,
+}
+
+impl PlatformV2ReviewExecutionFence<'_> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) const fn new<'a>(
+        tenant: &'a str,
+        project: &'a ProjectId,
+        review_workspace: &'a WorkContextIdentity,
+        expected_registry_generation: [u8; 32],
+        work_session_id: &'a WorkSessionId,
+        expected_work_session_revision: Revision,
+        provider: &'a str,
+        provider_session_id: &'a str,
+        expected_provider_session_revision: Revision,
+    ) -> PlatformV2ReviewExecutionFence<'a> {
+        PlatformV2ReviewExecutionFence {
+            tenant,
+            project,
+            review_workspace,
+            expected_registry_generation,
+            work_session_id,
+            expected_work_session_revision,
+            provider,
+            provider_session_id,
+            expected_provider_session_revision,
+        }
+    }
+
+    #[must_use]
+    pub const fn tenant(&self) -> &str {
+        self.tenant
+    }
+
+    #[must_use]
+    pub const fn project(&self) -> &ProjectId {
+        self.project
+    }
+
+    #[must_use]
+    pub const fn review_workspace(&self) -> &WorkContextIdentity {
+        self.review_workspace
+    }
+
+    #[must_use]
+    pub const fn expected_registry_generation(&self) -> [u8; 32] {
+        self.expected_registry_generation
+    }
+
+    #[must_use]
+    pub const fn work_session_id(&self) -> &WorkSessionId {
+        self.work_session_id
+    }
+
+    #[must_use]
+    pub const fn expected_work_session_revision(&self) -> Revision {
+        self.expected_work_session_revision
+    }
+
+    #[must_use]
+    pub const fn provider(&self) -> &str {
+        self.provider
+    }
+
+    #[must_use]
+    pub const fn provider_session_id(&self) -> &str {
+        self.provider_session_id
+    }
+
+    #[must_use]
+    pub const fn expected_provider_session_revision(&self) -> Revision {
+        self.expected_provider_session_revision
+    }
+}
+
+/// Exact durable inbox identity and exact provider bytes. Reconciliation must
+/// match every field, not merely the idempotency key.
+pub struct PlatformV2ReviewDeliveryCoordinate<'a> {
+    fence: PlatformV2ReviewExecutionFence<'a>,
+    transport_key: &'a str,
+    payload: &'a [u8],
+}
+
+impl PlatformV2ReviewDeliveryCoordinate<'_> {
+    pub(crate) const fn new<'a>(
+        fence: PlatformV2ReviewExecutionFence<'a>,
+        transport_key: &'a str,
+        payload: &'a [u8],
+    ) -> PlatformV2ReviewDeliveryCoordinate<'a> {
+        PlatformV2ReviewDeliveryCoordinate {
+            fence,
+            transport_key,
+            payload,
+        }
+    }
+
+    #[must_use]
+    pub const fn fence(&self) -> &PlatformV2ReviewExecutionFence<'_> {
+        &self.fence
+    }
+
+    #[must_use]
+    pub const fn transport_key(&self) -> &str {
+        self.transport_key
+    }
+
+    #[must_use]
+    pub const fn payload(&self) -> &[u8] {
+        self.payload
+    }
+}
+
+/// A scheduler failure is either a proof that no external custody started or
+/// an ambiguity that forbids blind replay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlatformV2ReviewDeliveryError {
+    RefusedNotStarted(&'static str),
+    Ambiguous(&'static str),
+}
+
+/// Durable scheduler boundary for one retained provider session. The v2 host
+/// owns target selection and payload construction; implementations may only
+/// inspect or submit those already-closed coordinates.
+pub trait PlatformV2ReviewDelivery {
+    fn inspect_target(
+        &self,
+        provider: &str,
+        provider_session_id: &str,
+    ) -> Result<Revision, &'static str>;
+
+    fn reconcile(
+        &mut self,
+        coordinate: &PlatformV2ReviewDeliveryCoordinate<'_>,
+    ) -> Result<PlatformV2ReviewDeliveryState, PlatformV2ReviewDeliveryError>;
+
+    /// Prove that the exact closed coordinate is admissible at the durable
+    /// delivery boundary before the review store admits a write. This is a
+    /// pre-custody check: deterministic encoding or size refusal must never be
+    /// promoted to an ambiguous provider outcome.
+    fn preflight(
+        &self,
+        _coordinate: &PlatformV2ReviewDeliveryCoordinate<'_>,
+    ) -> Result<(), PlatformV2ReviewDeliveryError> {
+        Ok(())
+    }
+
+    fn submit(
+        &mut self,
+        coordinate: &PlatformV2ReviewDeliveryCoordinate<'_>,
+        now_ms: i64,
+    ) -> Result<PlatformV2ReviewDeliveryState, PlatformV2ReviewDeliveryError>;
+}
+
+struct UnavailableReviewDelivery;
+
+impl PlatformV2ReviewDelivery for UnavailableReviewDelivery {
+    fn inspect_target(&self, _: &str, _: &str) -> Result<Revision, &'static str> {
+        Err("platform_v2_review_agent_adapter_unavailable")
+    }
+
+    fn reconcile(
+        &mut self,
+        _: &PlatformV2ReviewDeliveryCoordinate<'_>,
+    ) -> Result<PlatformV2ReviewDeliveryState, PlatformV2ReviewDeliveryError> {
+        Err(PlatformV2ReviewDeliveryError::RefusedNotStarted(
+            "platform_v2_review_agent_adapter_unavailable",
+        ))
+    }
+
+    fn submit(
+        &mut self,
+        _: &PlatformV2ReviewDeliveryCoordinate<'_>,
+        _: i64,
+    ) -> Result<PlatformV2ReviewDeliveryState, PlatformV2ReviewDeliveryError> {
+        Err(PlatformV2ReviewDeliveryError::RefusedNotStarted(
+            "platform_v2_review_agent_adapter_unavailable",
+        ))
+    }
 }
 
 /// Typed external-effect boundary. It receives only the closed lifecycle
@@ -485,8 +690,20 @@ impl PlatformV2Host {
         request: &PlatformV2Request,
         now_ms: i64,
     ) -> PlatformV2Response {
+        self.handle_with_review_delivery(uid, request, now_ms, &mut UnavailableReviewDelivery)
+    }
+
+    pub fn handle_with_review_delivery(
+        &mut self,
+        uid: u32,
+        request: &PlatformV2Request,
+        now_ms: i64,
+        review_delivery: &mut dyn PlatformV2ReviewDelivery,
+    ) -> PlatformV2Response {
         match self {
-            Self::Enabled(runtime) => runtime.handle(uid, request, now_ms).unwrap_or_else(refused),
+            Self::Enabled(runtime) => runtime
+                .handle(uid, request, now_ms, review_delivery)
+                .unwrap_or_else(refused),
             Self::Disabled(category) => refused(category),
         }
     }
@@ -780,6 +997,7 @@ impl PlatformV2Runtime {
         uid: u32,
         request: &PlatformV2Request,
         now_ms: i64,
+        review_delivery: &mut dyn PlatformV2ReviewDelivery,
     ) -> Result<PlatformV2Response, &'static str> {
         self.policy_fence.verify()?;
         let principal = self
@@ -1494,6 +1712,88 @@ impl PlatformV2Runtime {
                     value.action().clone(),
                 )
                 .map_err(|_| "platform_v2_request_invalid")?;
+                if let Some((existing, plan)) = self
+                    .reviews
+                    .external_action(
+                        request.workspace(),
+                        request.actor(),
+                        request.authentication(),
+                        request.authority(),
+                        request.idempotency_key(),
+                        now_ms,
+                    )
+                    .map_err(review_store_category)?
+                {
+                    let request_digest =
+                        ReviewStore::action_request_digest(&request, ApprovalPolicy::NotRequired)
+                            .map_err(review_store_category)?;
+                    if existing.request_digest != request_digest
+                        || existing.request != request
+                        || existing.approval_policy != ApprovalPolicy::NotRequired
+                    {
+                        return Err("platform_v2_review_conflict");
+                    }
+                    if existing.receipt.outcome()
+                        != automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Accepted
+                        && existing.receipt.outcome()
+                            != automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Unknown
+                    {
+                        return Ok(PlatformV2Response::ReviewReceipt(existing.receipt));
+                    }
+                    if existing.write_admitted_at_ms.is_none()
+                        && self
+                            .validate_retained_review_execution_fence(
+                                &principal,
+                                &existing,
+                                &plan,
+                                review_delivery,
+                            )
+                            .is_err()
+                    {
+                        let receipt = self
+                            .reviews
+                            .refuse_external_action_not_started(
+                                &existing.preview_id,
+                                existing.request_digest,
+                                now_ms,
+                            )
+                            .map_err(review_store_category)?;
+                        return Ok(PlatformV2Response::ReviewReceipt(receipt));
+                    }
+                    let write =
+                        match self.start_retained_review_write_or_refuse(&existing, now_ms)? {
+                            Ok(write) => write,
+                            Err(receipt) => {
+                                return Ok(PlatformV2Response::ReviewReceipt(receipt));
+                            }
+                        };
+                    let action = match write {
+                        ReviewWriteAdmission::New(action)
+                        | ReviewWriteAdmission::Replay(action) => action,
+                    };
+                    let receipt = self.drive_retained_review_delivery(
+                        &principal,
+                        &action,
+                        &plan,
+                        review_delivery,
+                        now_ms,
+                    )?;
+                    return Ok(PlatformV2Response::ReviewReceipt(receipt));
+                }
+                if let Some(existing) = self
+                    .reviews
+                    .inspect_action(&request, ApprovalPolicy::NotRequired, now_ms)
+                    .map_err(review_store_category)?
+                {
+                    if existing.receipt.outcome()
+                        == automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Accepted
+                        || existing.receipt.outcome()
+                            == automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Unknown
+                    {
+                        return Err("platform_v2_review_plan_missing");
+                    }
+                    return Ok(PlatformV2Response::ReviewReceipt(existing.receipt));
+                }
                 match self.review_effects.plan(
                     &scope.project,
                     request.workspace(),
@@ -1507,6 +1807,110 @@ impl PlatformV2Runtime {
                             .execute_local_action(&request, now_ms)
                             .map_err(review_store_category)?;
                         self.policy_fence.verify()?;
+                        Ok(PlatformV2Response::ReviewReceipt(receipt))
+                    }
+                    Ok(ReviewEffectPlan::RetainedSession {
+                        provider,
+                        provider_session_id,
+                        work_session_id,
+                        registry_generation,
+                    }) => {
+                        let snapshot = self
+                            .reviews
+                            .snapshot(request.workspace())
+                            .map_err(review_store_category)?
+                            .ok_or("platform_v2_not_found")?;
+                        let payload = retained_review_payload(&snapshot, request.action())?;
+                        let work_session_revision = self
+                            .work_contexts
+                            .validate_retained_session_lineage(
+                                principal.actor.tenant(),
+                                &scope.project,
+                                request.workspace(),
+                                &work_session_id,
+                                &provider_session_id,
+                            )
+                            .map_err(|_| "platform_v2_review_session_lineage_refused")?;
+                        let provider_session_revision =
+                            review_delivery.inspect_target(&provider, &provider_session_id)?;
+                        let request_digest = ReviewStore::action_request_digest(
+                            &request,
+                            ApprovalPolicy::NotRequired,
+                        )
+                        .map_err(review_store_category)?;
+                        let transport_key = format!(
+                            "v2-review-{}",
+                            request_digest
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<String>()
+                        );
+                        let external_plan = ReviewExternalEffectPlan::retained_session(
+                            request_digest,
+                            registry_generation,
+                            &provider,
+                            work_session_id.as_str(),
+                            &provider_session_id,
+                            work_session_revision,
+                            provider_session_revision,
+                            &transport_key,
+                            payload,
+                        )
+                        .map_err(review_store_category)?;
+                        self.policy_fence.verify()?;
+                        self.review_effects.verify_generation()?;
+                        let admitted = self
+                            .reviews
+                            .prepare_external_action(
+                                &request,
+                                ApprovalPolicy::NotRequired,
+                                &external_plan,
+                                now_ms,
+                            )
+                            .map_err(review_store_category)?;
+                        let action = match admitted {
+                            ReviewActionAdmission::New(action)
+                            | ReviewActionAdmission::Replay(action) => action,
+                        };
+                        self.policy_fence.verify()?;
+                        self.review_effects.verify_generation()?;
+                        if self
+                            .validate_retained_review_execution_fence(
+                                &principal,
+                                &action,
+                                &external_plan,
+                                review_delivery,
+                            )
+                            .is_err()
+                        {
+                            let receipt = self
+                                .reviews
+                                .refuse_external_action_not_started(
+                                    &action.preview_id,
+                                    action.request_digest,
+                                    now_ms,
+                                )
+                                .map_err(review_store_category)?;
+                            return Ok(PlatformV2Response::ReviewReceipt(receipt));
+                        }
+                        let write =
+                            match self.start_retained_review_write_or_refuse(&action, now_ms)? {
+                                Ok(write) => write,
+                                Err(receipt) => {
+                                    return Ok(PlatformV2Response::ReviewReceipt(receipt));
+                                }
+                            };
+                        let action = match write {
+                            ReviewWriteAdmission::New(action)
+                            | ReviewWriteAdmission::Replay(action) => action,
+                        };
+                        let receipt = self.drive_retained_review_delivery(
+                            &principal,
+                            &action,
+                            &external_plan,
+                            review_delivery,
+                            now_ms,
+                        )?;
                         Ok(PlatformV2Response::ReviewReceipt(receipt))
                     }
                     Err(category) => {
@@ -1525,6 +1929,67 @@ impl PlatformV2Runtime {
                 let actor = ReviewActorId::new(principal.actor.id().to_owned())
                     .map_err(|_| "platform_v2_policy_invalid")?;
                 for authority in principal.review_authorities.values() {
+                    let external = self.reviews.external_action(
+                        value.workspace(),
+                        &actor,
+                        ReviewAuthentication::UserSession,
+                        authority,
+                        value.idempotency_key(),
+                        now_ms,
+                    );
+                    match external {
+                        Ok(Some((action, plan))) => {
+                            if action.receipt.outcome()
+                                == automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Accepted
+                                || action.receipt.outcome()
+                                    == automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Unknown
+                            {
+                                if action.write_admitted_at_ms.is_none()
+                                    && self
+                                        .validate_retained_review_execution_fence(
+                                            &principal,
+                                            &action,
+                                            &plan,
+                                            review_delivery,
+                                        )
+                                        .is_err()
+                                {
+                                    let receipt = self
+                                        .reviews
+                                        .refuse_external_action_not_started(
+                                            &action.preview_id,
+                                            action.request_digest,
+                                            now_ms,
+                                        )
+                                        .map_err(review_store_category)?;
+                                    return Ok(PlatformV2Response::ReviewReceipt(receipt));
+                                }
+                                let write = match self
+                                    .start_retained_review_write_or_refuse(&action, now_ms)?
+                                {
+                                    Ok(write) => write,
+                                    Err(receipt) => {
+                                        return Ok(PlatformV2Response::ReviewReceipt(receipt));
+                                    }
+                                };
+                                let action = match write {
+                                    ReviewWriteAdmission::New(action)
+                                    | ReviewWriteAdmission::Replay(action) => action,
+                                };
+                                let receipt = self.drive_retained_review_delivery(
+                                    &principal,
+                                    &action,
+                                    &plan,
+                                    review_delivery,
+                                    now_ms,
+                                )?;
+                                return Ok(PlatformV2Response::ReviewReceipt(receipt));
+                            }
+                            return Ok(PlatformV2Response::ReviewReceipt(action.receipt));
+                        }
+                        Ok(None) | Err(ReviewStoreError::Unauthorized) => {}
+                        Err(_) => return Err("platform_v2_receipt_refused"),
+                    }
                     let receipt = self.reviews.receipt(
                         value.workspace(),
                         &actor,
@@ -1544,6 +2009,237 @@ impl PlatformV2Runtime {
                 Err("platform_v2_not_found")
             }
         }
+    }
+
+    fn start_retained_review_write_or_refuse(
+        &mut self,
+        action: &StoredReviewAction,
+        now_ms: i64,
+    ) -> Result<Result<ReviewWriteAdmission, ReviewActionReceipt>, &'static str> {
+        match self
+            .reviews
+            .start_write(&action.preview_id, action.request_digest, now_ms)
+        {
+            Ok(write) => Ok(Ok(write)),
+            Err(error) => {
+                let category = review_store_category(error);
+                self.reviews
+                    .refuse_external_action_not_started(
+                        &action.preview_id,
+                        action.request_digest,
+                        now_ms,
+                    )
+                    .map(Err)
+                    .map_err(|_| category)
+            }
+        }
+    }
+
+    fn drive_retained_review_delivery(
+        &mut self,
+        principal: &PrincipalPolicy,
+        action: &StoredReviewAction,
+        plan: &ReviewExternalEffectPlan,
+        delivery: &mut dyn PlatformV2ReviewDelivery,
+        now_ms: i64,
+    ) -> Result<ReviewActionReceipt, &'static str> {
+        let scope = principal
+            .workspaces
+            .get(action.request.workspace())
+            .ok_or("platform_v2_scope_denied")?;
+        let work_session_id = WorkSessionId::new(plan.work_session_id().to_owned())
+            .map_err(|_| "platform_v2_review_plan_invalid")?;
+        let coordinate = PlatformV2ReviewDeliveryCoordinate::new(
+            PlatformV2ReviewExecutionFence::new(
+                principal.actor.tenant(),
+                &scope.project,
+                action.request.workspace(),
+                plan.registry_generation_digest(),
+                &work_session_id,
+                plan.work_session_revision(),
+                plan.provider(),
+                plan.provider_session_id(),
+                plan.provider_session_revision(),
+            ),
+            plan.transport_key(),
+            plan.payload(),
+        );
+        let mut disposition = match delivery.reconcile(&coordinate) {
+            Ok(disposition) => disposition,
+            Err(error) => {
+                return self.settle_review_delivery_error(action, plan, error, now_ms);
+            }
+        };
+        if disposition == PlatformV2ReviewDeliveryState::NotStarted {
+            if self
+                .validate_retained_review_execution_fence(principal, action, plan, delivery)
+                .is_err()
+            {
+                return self
+                    .reviews
+                    .complete_retained_session_delivery(
+                        &action.preview_id,
+                        action.request_digest,
+                        plan.transport_key(),
+                        false,
+                        now_ms,
+                    )
+                    .map_err(review_store_category);
+            }
+            disposition = match delivery.submit(&coordinate, now_ms) {
+                Ok(disposition) => disposition,
+                Err(error) => {
+                    return self.settle_review_delivery_error(action, plan, error, now_ms);
+                }
+            };
+        }
+        match disposition {
+            PlatformV2ReviewDeliveryState::Completed => self
+                .reviews
+                .complete_retained_session_delivery(
+                    &action.preview_id,
+                    action.request_digest,
+                    plan.transport_key(),
+                    true,
+                    now_ms,
+                )
+                .map_err(review_store_category),
+            PlatformV2ReviewDeliveryState::NotStarted | PlatformV2ReviewDeliveryState::Refused => {
+                self.reviews
+                    .complete_retained_session_delivery(
+                        &action.preview_id,
+                        action.request_digest,
+                        plan.transport_key(),
+                        false,
+                        now_ms,
+                    )
+                    .map_err(review_store_category)
+            }
+            PlatformV2ReviewDeliveryState::Pending => Ok(action.receipt.clone()),
+            PlatformV2ReviewDeliveryState::Ambiguous => self
+                .reviews
+                .mark_ambiguous(&action.preview_id, action.request_digest, now_ms)
+                .map_err(review_store_category),
+        }
+    }
+
+    fn settle_review_delivery_error(
+        &mut self,
+        action: &StoredReviewAction,
+        plan: &ReviewExternalEffectPlan,
+        error: PlatformV2ReviewDeliveryError,
+        now_ms: i64,
+    ) -> Result<ReviewActionReceipt, &'static str> {
+        match error {
+            PlatformV2ReviewDeliveryError::RefusedNotStarted(_) => self
+                .reviews
+                .complete_retained_session_delivery(
+                    &action.preview_id,
+                    action.request_digest,
+                    plan.transport_key(),
+                    false,
+                    now_ms,
+                )
+                .map_err(review_store_category),
+            PlatformV2ReviewDeliveryError::Ambiguous(_) => self
+                .reviews
+                .mark_ambiguous(&action.preview_id, action.request_digest, now_ms)
+                .map_err(review_store_category),
+        }
+    }
+
+    /// Re-open every mutable selector used to create a retained-session plan
+    /// and prove it still names the exact durable fence. This runs immediately
+    /// before write admission and again after admission, immediately before a
+    /// scheduler submission that reconciliation proved has not started.
+    fn validate_retained_review_execution_fence(
+        &self,
+        principal: &PrincipalPolicy,
+        action: &StoredReviewAction,
+        plan: &ReviewExternalEffectPlan,
+        delivery: &dyn PlatformV2ReviewDelivery,
+    ) -> Result<(), &'static str> {
+        self.policy_fence.verify()?;
+        let scope = principal
+            .workspaces
+            .get(action.request.workspace())
+            .ok_or("platform_v2_scope_denied")?;
+        let current = self.review_effects.plan(
+            &scope.project,
+            action.request.workspace(),
+            action.request.authority(),
+            action.request.action(),
+        )?;
+        let ReviewEffectPlan::RetainedSession {
+            provider,
+            provider_session_id,
+            work_session_id,
+            registry_generation,
+        } = current
+        else {
+            return Err("platform_v2_review_registry_changed");
+        };
+        if provider != plan.provider()
+            || provider_session_id != plan.provider_session_id()
+            || work_session_id.as_str() != plan.work_session_id()
+        {
+            return Err("platform_v2_review_registry_changed");
+        }
+        let current_plan = ReviewExternalEffectPlan::retained_session(
+            plan.request_digest(),
+            registry_generation,
+            &provider,
+            work_session_id.as_str(),
+            &provider_session_id,
+            plan.work_session_revision(),
+            plan.provider_session_revision(),
+            plan.transport_key(),
+            plan.payload().to_vec(),
+        )
+        .map_err(review_store_category)?;
+        if current_plan.digest() != plan.digest() {
+            return Err("platform_v2_review_registry_changed");
+        }
+        let work_revision = self
+            .work_contexts
+            .validate_retained_session_lineage(
+                principal.actor.tenant(),
+                &scope.project,
+                action.request.workspace(),
+                &work_session_id,
+                &provider_session_id,
+            )
+            .map_err(|_| "platform_v2_review_session_lineage_refused")?;
+        if work_revision != plan.work_session_revision() {
+            return Err("platform_v2_review_work_session_changed");
+        }
+        let provider_revision = delivery.inspect_target(&provider, &provider_session_id)?;
+        if provider_revision != plan.provider_session_revision() {
+            return Err("platform_v2_review_session_changed");
+        }
+        let coordinate = PlatformV2ReviewDeliveryCoordinate::new(
+            PlatformV2ReviewExecutionFence::new(
+                principal.actor.tenant(),
+                &scope.project,
+                action.request.workspace(),
+                plan.registry_generation_digest(),
+                &work_session_id,
+                plan.work_session_revision(),
+                plan.provider(),
+                plan.provider_session_id(),
+                plan.provider_session_revision(),
+            ),
+            plan.transport_key(),
+            plan.payload(),
+        );
+        delivery
+            .preflight(&coordinate)
+            .map_err(|error| match error {
+                PlatformV2ReviewDeliveryError::RefusedNotStarted(category)
+                | PlatformV2ReviewDeliveryError::Ambiguous(category) => category,
+            })?;
+        self.policy_fence.verify()?;
+        self.review_effects.verify_generation()
     }
 
     fn validate_policy_mapping(
@@ -1766,6 +2462,114 @@ fn review_store_category(error: ReviewStoreError) -> &'static str {
         | ReviewStoreError::Io(_)
         | ReviewStoreError::Sqlite(_) => "platform_v2_store_refused",
     }
+}
+
+fn retained_review_payload(
+    snapshot: &ReviewSnapshot,
+    action: &ReviewAction,
+) -> Result<Vec<u8>, &'static str> {
+    let targets: Vec<(
+        &automonique_protocol::platform_v2_review::ReviewCommentId,
+        Revision,
+    )> = match action {
+        ReviewAction::SendCommentToAgent {
+            comment_id,
+            expected_comment_revision,
+        } => vec![(comment_id, *expected_comment_revision)],
+        ReviewAction::BatchSendCommentsToAgent { comments } => comments
+            .iter()
+            .map(|target| (target.comment_id(), target.expected_revision()))
+            .collect(),
+        _ => return Err("platform_v2_review_agent_action_invalid"),
+    };
+    let mut encoded_comments = Vec::with_capacity(targets.len());
+    for (comment_id, expected_revision) in targets {
+        let comment = snapshot
+            .comments()
+            .iter()
+            .find(|comment| comment.id() == comment_id && comment.revision() == expected_revision)
+            .ok_or("platform_v2_review_agent_action_invalid")?;
+        encoded_comments.push(JsonValue::Object(vec![
+            (
+                "actor".to_owned(),
+                JsonValue::String(comment.actor().as_str().to_owned()),
+            ),
+            (
+                "anchor".to_owned(),
+                JsonValue::Object(vec![
+                    (
+                        "file_id".to_owned(),
+                        JsonValue::String(comment.anchor().file_id().as_str().to_owned()),
+                    ),
+                    (
+                        "hunk_id".to_owned(),
+                        JsonValue::String(comment.anchor().hunk_id().as_str().to_owned()),
+                    ),
+                    (
+                        "line".to_owned(),
+                        JsonValue::Integer(i64::from(comment.anchor().line())),
+                    ),
+                    (
+                        "side".to_owned(),
+                        JsonValue::String(comment.anchor().side().as_str().to_owned()),
+                    ),
+                ]),
+            ),
+            (
+                "body".to_owned(),
+                JsonValue::String(comment.body().as_str().to_owned()),
+            ),
+            (
+                "comment_id".to_owned(),
+                JsonValue::String(comment.id().as_str().to_owned()),
+            ),
+            (
+                "comment_revision".to_owned(),
+                JsonValue::Integer(
+                    i64::try_from(comment.revision().get())
+                        .map_err(|_| "platform_v2_review_agent_action_invalid")?,
+                ),
+            ),
+        ]));
+    }
+    Ok(JsonValue::Object(vec![
+        (
+            "comments".to_owned(),
+            JsonValue::Array(encoded_comments),
+        ),
+        (
+            "instruction".to_owned(),
+            JsonValue::String(
+                "Address these exact review comments in the named workspace; preserve their IDs in your response."
+                    .to_owned(),
+            ),
+        ),
+        (
+            "schema".to_owned(),
+            JsonValue::String("automonique.platform/review-agent-delivery/v1".to_owned()),
+        ),
+        (
+            "snapshot_revision".to_owned(),
+            JsonValue::Integer(
+                i64::try_from(snapshot.revision().get())
+                    .map_err(|_| "platform_v2_review_agent_action_invalid")?,
+            ),
+        ),
+        (
+            "workspace".to_owned(),
+            JsonValue::Object(vec![
+                (
+                    "id".to_owned(),
+                    JsonValue::String(snapshot.workspace().id().to_owned()),
+                ),
+                (
+                    "kind".to_owned(),
+                    JsonValue::String(snapshot.workspace().kind().as_str().to_owned()),
+                ),
+            ]),
+        ),
+    ])
+    .to_canonical_bytes())
 }
 
 #[cfg(test)]

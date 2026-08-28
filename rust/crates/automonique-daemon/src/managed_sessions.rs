@@ -43,7 +43,7 @@ use automonique_runner::{Authority as SpoolAuthority, Event as SpoolEvent, Event
 use nix::unistd::geteuid;
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, TransactionBehavior, params};
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 const MAX_SESSIONS: usize = automonique_protocol::platform::MAX_SNAPSHOT_RESOURCES;
 
 const SCHEMA: &str = r#"
@@ -97,6 +97,46 @@ ALTER TABLE managed_sessions ADD COLUMN run_state TEXT NOT NULL DEFAULT 'complet
     CHECK (run_state IN ('in_flight', 'completed'));
 "#;
 
+/// Split history idempotency into database-enforced transport domains. Legacy
+/// rows predate retained-review v2 and therefore migrate truthfully into the
+/// platform-v1 domain. Occurrence identity remains global within each domain,
+/// preserving v1's existing cross-session conflict behavior, while the added
+/// domain makes identical caller-chosen v1 and server-derived v2 keys disjoint.
+const SCHEMA_V4: &str = r#"
+ALTER TABLE managed_session_history RENAME TO managed_session_history_v3;
+DROP INDEX managed_session_history_page;
+CREATE TABLE managed_session_history (
+    provider_session_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL CHECK (sequence >= 1),
+    source_domain TEXT NOT NULL CHECK (source_domain IN ('platform_v1','retained_review_v2')),
+    source_key TEXT NOT NULL,
+    at_ms INTEGER NOT NULL CHECK (at_ms >= 0),
+    role TEXT CHECK (role IN ('user', 'assistant')),
+    text TEXT,
+    truncated INTEGER CHECK (truncated IN (0, 1)),
+    evidence TEXT CHECK (evidence IN ('authoritative','synthetic')),
+    tool_state TEXT CHECK (tool_state IN ('pending','in_progress','completed','error')),
+    unknown_source TEXT CHECK (unknown_source IN ('adapter_event','simulation_event')),
+    run_state TEXT CHECK (run_state IN ('started','cancel_requested','completed','failed','cancelled','timed_out')),
+    CHECK ((role IS NOT NULL AND text IS NOT NULL AND truncated IS NOT NULL AND evidence IS NOT NULL AND tool_state IS NULL AND unknown_source IS NULL AND run_state IS NULL)
+        OR (role IS NULL AND truncated IS NOT NULL AND evidence IS NOT NULL AND tool_state IS NOT NULL AND unknown_source IS NULL AND run_state IS NULL)
+        OR (role IS NULL AND text IS NULL AND truncated IS NULL AND evidence IS NULL AND tool_state IS NULL AND unknown_source IS NULL AND run_state IS NOT NULL)
+        OR (role IS NULL AND text IS NULL AND truncated IS NULL AND evidence IS NULL AND tool_state IS NULL AND unknown_source IS NOT NULL AND run_state IS NULL)),
+    PRIMARY KEY(provider_session_id, sequence),
+    UNIQUE(source_domain, source_key)
+) STRICT;
+INSERT INTO managed_session_history(
+    provider_session_id,sequence,source_domain,source_key,at_ms,role,text,truncated,
+    evidence,tool_state,unknown_source,run_state
+)
+SELECT provider_session_id,sequence,'platform_v1',source_key,at_ms,role,text,truncated,
+       evidence,tool_state,unknown_source,run_state
+FROM managed_session_history_v3;
+DROP TABLE managed_session_history_v3;
+CREATE INDEX managed_session_history_page
+    ON managed_session_history(provider_session_id, sequence);
+"#;
+
 #[derive(Debug)]
 pub enum ManagedSessionError {
     InvalidField(&'static str),
@@ -140,6 +180,30 @@ pub enum ManagedRunState {
     InFlight,
     /// The run reached a terminal spool state.
     Completed,
+}
+
+/// Database-enforced idempotency namespace for authoritative turn history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedHistorySource<'a> {
+    /// Existing Platform v1 new-request and follow-up history.
+    PlatformV1(&'a str),
+    /// Platform v2 retained-review delivery history.
+    RetainedReviewV2(&'a str),
+}
+
+impl<'a> ManagedHistorySource<'a> {
+    const fn domain(self) -> &'static str {
+        match self {
+            Self::PlatformV1(_) => "platform_v1",
+            Self::RetainedReviewV2(_) => "retained_review_v2",
+        }
+    }
+
+    const fn key(self) -> &'a str {
+        match self {
+            Self::PlatformV1(key) | Self::RetainedReviewV2(key) => key,
+        }
+    }
 }
 
 impl ManagedRunState {
@@ -436,12 +500,14 @@ impl ManagedSessionStore {
     pub fn record_completed_turn(
         &mut self,
         provider_session_id: &str,
-        source_key: &str,
+        source: ManagedHistorySource<'_>,
         user_text: &str,
         assistant_text: &str,
         spool_events: &[SpoolEvent],
         at_ms: i64,
     ) -> Managed<()> {
+        let source_domain = source.domain();
+        let source_key = source.key();
         ResourceId::new(provider_session_id)
             .map_err(|_| ManagedSessionError::InvalidField("provider_session_id"))?;
         IdempotencyKey::new(source_key)
@@ -455,29 +521,41 @@ impl ManagedSessionStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing: Option<(String, i64, String, i64)> = transaction
+        let existing: Option<(String, String, i64, String, i64)> = transaction
             .query_row(
-                "SELECT user.text,user.truncated,assistant.text,assistant.truncated
+                "SELECT user.provider_session_id,user.text,user.truncated,
+                        assistant.text,assistant.truncated
                  FROM managed_session_history user
-                 JOIN managed_session_history assistant ON assistant.source_key=?3
-                 WHERE user.source_key=?2 AND user.provider_session_id=?1
-                   AND assistant.provider_session_id=?1",
+                 JOIN managed_session_history assistant
+                   ON assistant.source_domain=?1 AND assistant.source_key=?3
+                 WHERE user.source_domain=?1 AND user.source_key=?2
+                   AND assistant.provider_session_id=user.provider_session_id",
                 params![
-                    provider_session_id,
+                    source_domain,
                     format!("{source_key}:user"),
                     format!("{source_key}:assistant")
                 ],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?;
         if let Some((
+            stored_session,
             stored_user,
             stored_user_truncated,
             stored_assistant,
             stored_assistant_truncated,
         )) = existing
         {
-            if stored_user != user_text.as_str()
+            if stored_session != provider_session_id
+                || stored_user != user_text.as_str()
                 || stored_user_truncated != i64::from(user_truncated)
                 || stored_assistant != assistant_text.as_str()
                 || stored_assistant_truncated != i64::from(assistant_truncated)
@@ -497,9 +575,9 @@ impl ManagedSessionStore {
             .ok_or(ManagedSessionError::InvalidField("sequence"))?;
         let user_key = format!("{source_key}:user");
         transaction.execute(
-            "INSERT INTO managed_session_history(provider_session_id,sequence,source_key,at_ms,role,text,truncated,evidence,tool_state,unknown_source,run_state)
-             VALUES(?1,?2,?3,?4,'user',?5,?6,'authoritative',NULL,NULL,NULL) ON CONFLICT(source_key) DO NOTHING",
-            params![provider_session_id, sequence, user_key, at_ms, user_text.as_str(), user_truncated],
+            "INSERT INTO managed_session_history(provider_session_id,sequence,source_domain,source_key,at_ms,role,text,truncated,evidence,tool_state,unknown_source,run_state)
+             VALUES(?1,?2,?3,?4,?5,'user',?6,?7,'authoritative',NULL,NULL,NULL) ON CONFLICT(source_domain,source_key) DO NOTHING",
+            params![provider_session_id, sequence, source_domain, user_key, at_ms, user_text.as_str(), user_truncated],
         )?;
         for (index, event) in projected.iter().enumerate() {
             sequence = sequence
@@ -508,19 +586,19 @@ impl ManagedSessionStore {
             let key = format!("{source_key}:spool:{index}");
             match event {
                 PendingHistoryEvent::ToolState { at_ms, evidence, state, label, truncated } => transaction.execute(
-                    "INSERT INTO managed_session_history(provider_session_id,sequence,source_key,at_ms,role,text,truncated,evidence,tool_state,unknown_source,run_state)
-                     VALUES(?1,?2,?3,?4,NULL,?5,?6,?7,?8,NULL,NULL) ON CONFLICT(source_key) DO NOTHING",
-                    params![provider_session_id, sequence, key, at_ms, label.as_ref().map(SessionHistoryText::as_str), truncated, evidence.as_str(), state.as_str()],
+                    "INSERT INTO managed_session_history(provider_session_id,sequence,source_domain,source_key,at_ms,role,text,truncated,evidence,tool_state,unknown_source,run_state)
+                     VALUES(?1,?2,?3,?4,?5,NULL,?6,?7,?8,?9,NULL,NULL) ON CONFLICT(source_domain,source_key) DO NOTHING",
+                    params![provider_session_id, sequence, source_domain, key, at_ms, label.as_ref().map(SessionHistoryText::as_str), truncated, evidence.as_str(), state.as_str()],
                 )?,
                 PendingHistoryEvent::RunState { at_ms, state } => transaction.execute(
-                    "INSERT INTO managed_session_history(provider_session_id,sequence,source_key,at_ms,role,text,truncated,evidence,tool_state,unknown_source,run_state)
-                     VALUES(?1,?2,?3,?4,NULL,NULL,NULL,NULL,NULL,NULL,?5) ON CONFLICT(source_key) DO NOTHING",
-                    params![provider_session_id, sequence, key, at_ms, state.as_str()],
+                    "INSERT INTO managed_session_history(provider_session_id,sequence,source_domain,source_key,at_ms,role,text,truncated,evidence,tool_state,unknown_source,run_state)
+                     VALUES(?1,?2,?3,?4,?5,NULL,NULL,NULL,NULL,NULL,NULL,?6) ON CONFLICT(source_domain,source_key) DO NOTHING",
+                    params![provider_session_id, sequence, source_domain, key, at_ms, state.as_str()],
                 )?,
                 PendingHistoryEvent::Unknown { at_ms, source } => transaction.execute(
-                    "INSERT INTO managed_session_history(provider_session_id,sequence,source_key,at_ms,role,text,truncated,evidence,tool_state,unknown_source,run_state)
-                     VALUES(?1,?2,?3,?4,NULL,NULL,NULL,NULL,NULL,?5,NULL) ON CONFLICT(source_key) DO NOTHING",
-                    params![provider_session_id, sequence, key, at_ms, source.as_str()],
+                    "INSERT INTO managed_session_history(provider_session_id,sequence,source_domain,source_key,at_ms,role,text,truncated,evidence,tool_state,unknown_source,run_state)
+                     VALUES(?1,?2,?3,?4,?5,NULL,NULL,NULL,NULL,NULL,?6,NULL) ON CONFLICT(source_domain,source_key) DO NOTHING",
+                    params![provider_session_id, sequence, source_domain, key, at_ms, source.as_str()],
                 )?,
             };
         }
@@ -528,9 +606,9 @@ impl ManagedSessionStore {
             .checked_add(1)
             .ok_or(ManagedSessionError::InvalidField("sequence"))?;
         transaction.execute(
-            "INSERT INTO managed_session_history(provider_session_id,sequence,source_key,at_ms,role,text,truncated,evidence,tool_state,unknown_source,run_state)
-             VALUES(?1,?2,?3,?4,'assistant',?5,?6,'authoritative',NULL,NULL,NULL) ON CONFLICT(source_key) DO NOTHING",
-            params![provider_session_id, sequence, format!("{source_key}:assistant"), at_ms, assistant_text.as_str(), assistant_truncated],
+            "INSERT INTO managed_session_history(provider_session_id,sequence,source_domain,source_key,at_ms,role,text,truncated,evidence,tool_state,unknown_source,run_state)
+             VALUES(?1,?2,?3,?4,?5,'assistant',?6,?7,'authoritative',NULL,NULL,NULL) ON CONFLICT(source_domain,source_key) DO NOTHING",
+            params![provider_session_id, sequence, source_domain, format!("{source_key}:assistant"), at_ms, assistant_text.as_str(), assistant_truncated],
         )?;
         transaction.commit()?;
         Ok(())
@@ -878,17 +956,25 @@ fn initialize(connection: &mut Connection) -> Managed<()> {
         transaction.execute_batch(SCHEMA)?;
         transaction.execute_batch(SCHEMA_V2)?;
         transaction.execute_batch(SCHEMA_V3)?;
+        transaction.execute_batch(SCHEMA_V4)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
     } else if version == 1 {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA_V2)?;
         transaction.execute_batch(SCHEMA_V3)?;
+        transaction.execute_batch(SCHEMA_V4)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
     } else if version == 2 {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA_V3)?;
+        transaction.execute_batch(SCHEMA_V4)?;
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        transaction.commit()?;
+    } else if version == 3 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SCHEMA_V4)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
     } else if version != SCHEMA_VERSION {
@@ -1018,6 +1104,143 @@ mod tests {
     }
 
     #[test]
+    fn legacy_v3_history_migrates_to_v1_domain_without_changing_replay() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.path().join("managed.sqlite3");
+        {
+            let mut store = ManagedSessionStore::open(&path).unwrap();
+            store
+                .record_completed_turn(
+                    "session-1",
+                    ManagedHistorySource::PlatformV1("legacy-turn"),
+                    "legacy prompt",
+                    "legacy answer",
+                    &[],
+                    10,
+                )
+                .unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "DROP INDEX managed_session_history_page;
+                     ALTER TABLE managed_session_history RENAME TO managed_session_history_v4;",
+                )
+                .unwrap();
+            store.connection.execute_batch(SCHEMA_V2).unwrap();
+            store
+                .connection
+                .execute_batch(
+                    "INSERT INTO managed_session_history(
+                         provider_session_id,sequence,source_key,at_ms,role,text,truncated,
+                         evidence,tool_state,unknown_source,run_state
+                     )
+                     SELECT provider_session_id,sequence,source_key,at_ms,role,text,truncated,
+                            evidence,tool_state,unknown_source,run_state
+                     FROM managed_session_history_v4;
+                     DROP TABLE managed_session_history_v4;",
+                )
+                .unwrap();
+            store
+                .connection
+                .pragma_update(None, "user_version", 3_u32)
+                .unwrap();
+        }
+
+        let mut migrated = ManagedSessionStore::open(&path).unwrap();
+        assert_eq!(
+            migrated
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM managed_session_history
+                     WHERE source_domain='platform_v1'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        migrated
+            .record_completed_turn(
+                "session-1",
+                ManagedHistorySource::PlatformV1("legacy-turn"),
+                "legacy prompt",
+                "legacy answer",
+                &[],
+                11,
+            )
+            .unwrap();
+        migrated
+            .record_completed_turn(
+                "session-1",
+                ManagedHistorySource::RetainedReviewV2("legacy-turn"),
+                "v2 prompt",
+                "v2 answer",
+                &[],
+                12,
+            )
+            .unwrap();
+        let ManagedHistoryRead::Page { head, .. } = migrated.history("session-1", 0, 16).unwrap()
+        else {
+            panic!("migrated history page");
+        };
+        assert_eq!(head, 4);
+    }
+
+    #[test]
+    fn history_identity_is_global_within_each_typed_source_domain() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let mut store = ManagedSessionStore::open(root.path().join("managed.sqlite3")).unwrap();
+        for (session, domain, prompt) in [
+            (
+                "session-1",
+                ManagedHistorySource::PlatformV1("chosen-key"),
+                "v1 session one",
+            ),
+            (
+                "session-1",
+                ManagedHistorySource::RetainedReviewV2("chosen-key"),
+                "v2 session one",
+            ),
+        ] {
+            store
+                .record_completed_turn(session, domain, prompt, "answer", &[], 10)
+                .unwrap();
+        }
+        assert!(
+            store
+                .record_completed_turn(
+                    "session-2",
+                    ManagedHistorySource::PlatformV1("chosen-key"),
+                    "must conflict",
+                    "answer",
+                    &[],
+                    10,
+                )
+                .is_err(),
+            "one v1 occurrence cannot be attributed to a second session"
+        );
+        store
+            .record_completed_turn(
+                "session-2",
+                ManagedHistorySource::PlatformV1("session-2-key"),
+                "v1 session two",
+                "answer",
+                &[],
+                10,
+            )
+            .unwrap();
+        for session in ["session-1", "session-2"] {
+            let ManagedHistoryRead::Page { head, .. } = store.history(session, 0, 16).unwrap()
+            else {
+                panic!("history page");
+            };
+            assert_eq!(head, if session == "session-1" { 4 } else { 2 });
+        }
+    }
+
+    #[test]
     fn receipt_intent_is_typed_idempotent_and_conflict_detecting() {
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -1063,15 +1286,36 @@ mod tests {
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let mut store = ManagedSessionStore::open(root.path().join("managed.sqlite3")).unwrap();
         store
-            .record_completed_turn("session-1", "turn-1", "hello", "world", &[], 10)
+            .record_completed_turn(
+                "session-1",
+                ManagedHistorySource::PlatformV1("turn-1"),
+                "hello",
+                "world",
+                &[],
+                10,
+            )
             .unwrap();
         assert!(
             store
-                .record_completed_turn("session-1", "turn-1", "changed", "world", &[], 10)
+                .record_completed_turn(
+                    "session-1",
+                    ManagedHistorySource::PlatformV1("turn-1"),
+                    "changed",
+                    "world",
+                    &[],
+                    10,
+                )
                 .is_err()
         );
         store
-            .record_completed_turn("session-1", "turn-1", "hello", "world", &[], 10)
+            .record_completed_turn(
+                "session-1",
+                ManagedHistorySource::PlatformV1("turn-1"),
+                "hello",
+                "world",
+                &[],
+                10,
+            )
             .unwrap();
         let ManagedHistoryRead::Page {
             events,
@@ -1112,7 +1356,14 @@ mod tests {
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let mut store = ManagedSessionStore::open(root.path().join("managed.sqlite3")).unwrap();
         store
-            .record_completed_turn("session-1", "turn-1", "hello", "world", &[], 10)
+            .record_completed_turn(
+                "session-1",
+                ManagedHistorySource::PlatformV1("turn-1"),
+                "hello",
+                "world",
+                &[],
+                10,
+            )
             .unwrap();
         store.connection.execute(
             "DELETE FROM managed_session_history WHERE provider_session_id='session-1' AND sequence < 2",
@@ -1182,7 +1433,14 @@ mod tests {
 
         let mut store = ManagedSessionStore::open(root.path().join("managed.sqlite3")).unwrap();
         store
-            .record_completed_turn("session-1", "turn-1", "hello", "world", &events, 10)
+            .record_completed_turn(
+                "session-1",
+                ManagedHistorySource::PlatformV1("turn-1"),
+                "hello",
+                "world",
+                &events,
+                10,
+            )
             .unwrap();
         let ManagedHistoryRead::Page {
             events, has_more, ..

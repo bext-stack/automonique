@@ -11,9 +11,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use automonique_daemon::platform_v2_host::{
+    PlatformV2Host, PlatformV2ReviewDelivery, PlatformV2ReviewDeliveryCoordinate,
+    PlatformV2ReviewDeliveryError, PlatformV2ReviewDeliveryState,
+};
 use automonique_daemon::{Daemon, DaemonConfig};
 use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse};
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
+use automonique_protocol::digest::Sha256;
 use automonique_protocol::platform::{
     ClaimControlRequest, ClientId, ExecuteRequest, GetReceiptRequest, IdempotencyKey,
     ListSessionsRequest, PlatformAction, PlatformParameter, PlatformRequest, PlatformResponse,
@@ -48,7 +53,9 @@ use automonique_protocol::platform_v2_lineage::{
     WorkspaceResumeIntent,
 };
 use automonique_protocol::platform_v2_review::{
-    ReviewAction, ReviewCommentId, ReviewReceiptOutcome, ReviewText,
+    CommentAgentState, ReviewAction, ReviewActionRequest, ReviewActorId, ReviewAuthentication,
+    ReviewAuthority, ReviewAuthorityId, ReviewAuthorityKind, ReviewComment, ReviewCommentId,
+    ReviewCommentTarget, ReviewReceiptOutcome, ReviewSnapshot, ReviewText,
 };
 use automonique_protocol::platform_v2_review_api::{
     decode_review_action_request, decode_review_snapshot,
@@ -67,9 +74,10 @@ use automonique_store::approval_requests::{
 };
 use automonique_store::lineage_index::LineageIndex;
 use automonique_store::provider_journal::{ProcessSpawn, ProviderJournal, SessionOpening};
-use automonique_store::review_store::ReviewStore;
+use automonique_store::review_store::{ApprovalPolicy, ReviewExternalEffectPlan, ReviewStore};
 use automonique_store::run_index::{RunIndex, RunIndexEntry, RunSpoolState, StateAdvance};
 use automonique_store::work_context_store::{MutationPolicyDecision, WorkContextStore};
+use automonique_store::{InboxSubmission, Store};
 
 #[path = "support/isolation.rs"]
 mod test_isolation;
@@ -453,6 +461,347 @@ fn configure_v2(config: &DaemonConfig) {
             None,
         )
         .unwrap();
+}
+
+fn configure_retained_review_delivery(config: &DaemonConfig) -> ReviewSnapshot {
+    let policy_path = config.platform_v2_policy_path();
+    let mut policy: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&policy_path).unwrap()).unwrap();
+    let empty = serde_json::json!({
+        "filesystem": [], "credentials": [], "network": [],
+        "tools": [], "providers": [], "models": []
+    });
+    policy["principals"][0]["workspaces"]
+        .as_array_mut()
+        .unwrap()
+        .extend([
+            serde_json::json!({"project":"project-live","kind":"user_workspace","id":"review-workspace-live","inherited_authority":empty.clone()}),
+            serde_json::json!({"project":"project-live","kind":"attempt_workspace","id":"review-attempt-live","inherited_authority":empty.clone()}),
+            serde_json::json!({"project":"project-live","kind":"session","id":"review-session-live","inherited_authority":empty}),
+        ]);
+    std::fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
+
+    let workspace =
+        WorkContextIdentity::UserWorkspace(UserWorkspaceId::new("review-workspace-live").unwrap());
+    let attempt = WorkContextRecord::new(
+        WorkContextIdentity::AttemptWorkspace(
+            AttemptWorkspaceId::new("review-attempt-live").unwrap(),
+        ),
+        Revision::FIRST,
+        WorkContextLifecycle::Running,
+        WorkContextLabel::new("Review attempt").unwrap(),
+        WorkContextAttributes::EMPTY,
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::AttemptUserWorkspace,
+                workspace.clone(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let session = WorkContextRecord::new(
+        WorkContextIdentity::Session(WorkSessionId::new("review-session-live").unwrap()),
+        Revision::FIRST,
+        WorkContextLifecycle::Active,
+        WorkContextLabel::new("Review session").unwrap(),
+        WorkContextAttributes::EMPTY,
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::SessionAttemptWorkspace,
+                attempt.identity().clone(),
+            )
+            .unwrap(),
+            WorkContextRelation::new(
+                WorkContextRelationKind::SessionPlatformSession,
+                WorkContextIdentity::PlatformSession(
+                    V1SessionRef::new(ResourceCoordinate::new(
+                        ResourceAuthority::Automonique,
+                        ResourceKind::Session,
+                        ResourceId::new("review-provider-session-live").unwrap(),
+                    ))
+                    .unwrap(),
+                ),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let mut contexts = WorkContextStore::open(config.platform_v2_work_context_path()).unwrap();
+    for record in [
+        live_workspace(
+            "review-workspace-live",
+            Revision::FIRST,
+            WorkContextLifecycle::Active,
+        ),
+        attempt,
+        session,
+    ] {
+        contexts
+            .put_authoritative_record("tenant-live", &record)
+            .unwrap();
+    }
+    drop(contexts);
+
+    let base = decode_review_snapshot(REVIEW_SNAPSHOT).unwrap();
+    let original = &base.comments()[0];
+    let comment = ReviewComment::new(
+        original.id().clone(),
+        original.revision(),
+        original.actor().clone(),
+        original.body().clone(),
+        original.anchor().clone(),
+        CommentAgentState::NotSent,
+        original.unread(),
+    );
+    let snapshot = ReviewSnapshot::new(
+        workspace,
+        base.revision(),
+        base.files().to_vec(),
+        vec![comment],
+        base.proposals().to_vec(),
+        base.checks().to_vec(),
+        base.review().clone(),
+        base.pull_request().clone(),
+        base.delivery().clone(),
+        base.attention_events().to_vec(),
+    )
+    .unwrap();
+    ReviewStore::open_scoped(config.platform_v2_review_path(), "tenant-live")
+        .unwrap()
+        .put_snapshot(&snapshot, 20)
+        .unwrap();
+
+    let registry = serde_json::json!({
+        "version": 1,
+        "generation": "review-live-generation-1",
+        "bindings": [{
+            "project": "project-live",
+            "workspace_kind": "user_workspace",
+            "workspace_id": "review-workspace-live",
+            "authority_kind": "review",
+            "authority_id": "authority-1",
+            "target": {
+                "kind": "retained_session",
+                "provider": "jcode",
+                "session_id": "review-provider-session-live",
+                "work_session_id": "review-session-live"
+            }
+        }]
+    });
+    let registry_path = config.state_dir().join("platform-v2-review-registry.json");
+    std::fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
+    std::fs::set_permissions(&registry_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    automonique_daemon::managed_sessions::ManagedSessionStore::open(config.managed_sessions_path())
+        .unwrap()
+        .observe_active(
+            "review-provider-session-live",
+            "review-provider-run-live",
+            21,
+        )
+        .unwrap();
+    snapshot
+}
+
+/// Seed the exact crash window after durable plan reservation and before
+/// write admission. Recovery must re-open every mutable fence before it lets
+/// the scheduler take custody.
+fn reserve_unadmitted_retained_review(
+    config: &DaemonConfig,
+    snapshot: &ReviewSnapshot,
+    idempotency_key: &str,
+) -> IdempotencyKey {
+    let comment = &snapshot.comments()[0];
+    let key = IdempotencyKey::new(idempotency_key).unwrap();
+    let actor = ReviewActorId::new("operator-live").unwrap();
+    let authority = ReviewAuthority::new(
+        ReviewAuthorityKind::Review,
+        ReviewAuthorityId::new("authority-1").unwrap(),
+    );
+    let request = ReviewActionRequest::new(
+        snapshot.workspace().clone(),
+        snapshot.revision(),
+        actor.clone(),
+        ReviewAuthentication::UserSession,
+        authority.clone(),
+        key.clone(),
+        ReviewAction::SendCommentToAgent {
+            comment_id: comment.id().clone(),
+            expected_comment_revision: comment.revision(),
+        },
+    )
+    .unwrap();
+    let request_digest = ReviewStore::action_request_digest(&request, ApprovalPolicy::NotRequired)
+        .expect("request digest");
+    let registry = std::fs::read(config.state_dir().join("platform-v2-review-registry.json"))
+        .expect("registry");
+    let registry_generation = *Sha256::digest(&registry).as_bytes();
+    let contexts = WorkContextStore::open(config.platform_v2_work_context_path()).unwrap();
+    let work_revision = contexts
+        .validate_retained_session_lineage(
+            "tenant-live",
+            &ProjectId::new("project-live").unwrap(),
+            snapshot.workspace(),
+            &WorkSessionId::new("review-session-live").unwrap(),
+            "review-provider-session-live",
+        )
+        .unwrap();
+    let sessions = automonique_daemon::managed_sessions::ManagedSessionStore::open(
+        config.managed_sessions_path(),
+    )
+    .unwrap();
+    let provider_revision = Revision::new(
+        sessions
+            .by_id("review-provider-session-live")
+            .unwrap()
+            .unwrap()
+            .revision,
+    )
+    .unwrap();
+    let transport_key = format!(
+        "v2-review-{}",
+        request_digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "schema": "automonique.platform/review-agent-delivery/v1",
+        "comment_id": comment.id().as_str(),
+        "body": comment.body().as_str(),
+    }))
+    .unwrap();
+    let plan = ReviewExternalEffectPlan::retained_session(
+        request_digest,
+        registry_generation,
+        "jcode",
+        "review-session-live",
+        "review-provider-session-live",
+        work_revision,
+        provider_revision,
+        &transport_key,
+        payload,
+    )
+    .unwrap();
+    let mut reviews =
+        ReviewStore::open_scoped(config.platform_v2_review_path(), "tenant-live").unwrap();
+    reviews
+        .grant_authority(
+            snapshot.workspace(),
+            &actor,
+            ReviewAuthentication::UserSession,
+            &authority,
+            0,
+        )
+        .unwrap();
+    reviews
+        .prepare_external_action(&request, ApprovalPolicy::NotRequired, &plan, 22)
+        .unwrap();
+    key
+}
+
+fn advance_retained_work_session(config: &DaemonConfig) {
+    let mut contexts = WorkContextStore::open(config.platform_v2_work_context_path()).unwrap();
+    let identity = WorkContextIdentity::Session(WorkSessionId::new("review-session-live").unwrap());
+    let current = contexts
+        .validate_policy_mapping(
+            "tenant-live",
+            &ProjectId::new("project-live").unwrap(),
+            &identity,
+        )
+        .unwrap();
+    let advanced = WorkContextRecord::new(
+        current.identity().clone(),
+        current.revision().checked_next().unwrap(),
+        WorkContextLifecycle::Hibernated,
+        current.label().clone(),
+        current.attributes(),
+        current.relations().to_vec(),
+    )
+    .unwrap();
+    contexts
+        .put_authoritative_record("tenant-live", &advanced)
+        .unwrap();
+}
+
+fn advance_retained_review_with_unrelated_comment(
+    config: &DaemonConfig,
+    snapshot: &ReviewSnapshot,
+) {
+    let original = &snapshot.comments()[0];
+    let unrelated = ReviewComment::new(
+        ReviewCommentId::new("review-unrelated-live").unwrap(),
+        Revision::FIRST,
+        original.actor().clone(),
+        ReviewText::new("unrelated review activity").unwrap(),
+        original.anchor().clone(),
+        CommentAgentState::NotSent,
+        false,
+    );
+    let advanced = ReviewSnapshot::new(
+        snapshot.workspace().clone(),
+        snapshot.revision().checked_next().unwrap(),
+        snapshot.files().to_vec(),
+        vec![original.clone(), unrelated],
+        snapshot.proposals().to_vec(),
+        snapshot.checks().to_vec(),
+        snapshot.review().clone(),
+        snapshot.pull_request().clone(),
+        snapshot.delivery().clone(),
+        snapshot.attention_events().to_vec(),
+    )
+    .unwrap();
+    ReviewStore::open_scoped(config.platform_v2_review_path(), "tenant-live")
+        .unwrap()
+        .put_snapshot(&advanced, 23)
+        .unwrap();
+}
+
+struct ScriptedRetainedDelivery {
+    provider_revision: Revision,
+    submitted: bool,
+    state: PlatformV2ReviewDeliveryState,
+}
+
+impl PlatformV2ReviewDelivery for ScriptedRetainedDelivery {
+    fn inspect_target(
+        &self,
+        provider: &str,
+        provider_session_id: &str,
+    ) -> Result<Revision, &'static str> {
+        assert_eq!(provider, "jcode");
+        assert_eq!(provider_session_id, "review-provider-session-live");
+        Ok(self.provider_revision)
+    }
+
+    fn reconcile(
+        &mut self,
+        coordinate: &PlatformV2ReviewDeliveryCoordinate<'_>,
+    ) -> Result<PlatformV2ReviewDeliveryState, PlatformV2ReviewDeliveryError> {
+        assert_eq!(coordinate.fence().provider(), "jcode");
+        assert_eq!(
+            coordinate.fence().provider_session_id(),
+            "review-provider-session-live"
+        );
+        assert!(!coordinate.payload().is_empty());
+        Ok(if self.submitted {
+            self.state
+        } else {
+            PlatformV2ReviewDeliveryState::NotStarted
+        })
+    }
+
+    fn submit(
+        &mut self,
+        coordinate: &PlatformV2ReviewDeliveryCoordinate<'_>,
+        _now_ms: i64,
+    ) -> Result<PlatformV2ReviewDeliveryState, PlatformV2ReviewDeliveryError> {
+        assert!(!self.submitted);
+        assert!(coordinate.transport_key().starts_with("v2-review-"));
+        self.submitted = true;
+        self.state = PlatformV2ReviewDeliveryState::Pending;
+        Ok(self.state)
+    }
 }
 
 fn live_repository(id: &str) -> WorkContextIdentity {
@@ -1133,6 +1482,619 @@ fn configured_v2_uses_kernel_principal_scope_and_durable_idempotency() {
         PlatformV2Response::ReviewReceipt(found) if found == comment_receipt
     ));
     serving.shutdown(&config);
+}
+
+#[test]
+fn retained_review_replay_reconciles_after_unrelated_snapshot_advance() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let snapshot = configure_retained_review_delivery(&config);
+    let uid = nix::unistd::geteuid().as_raw();
+    let mut host = PlatformV2Host::open(
+        &config.platform_v2_policy_path(),
+        &config.platform_v2_work_context_path(),
+        &config.platform_v2_lineage_path(),
+        &config.platform_v2_review_path(),
+        uid,
+    );
+    let provider_revision = Revision::new(
+        automonique_daemon::managed_sessions::ManagedSessionStore::open(
+            config.managed_sessions_path(),
+        )
+        .unwrap()
+        .by_id("review-provider-session-live")
+        .unwrap()
+        .unwrap()
+        .revision,
+    )
+    .unwrap();
+    let mut delivery = ScriptedRetainedDelivery {
+        provider_revision,
+        submitted: false,
+        state: PlatformV2ReviewDeliveryState::NotStarted,
+    };
+    let comment = &snapshot.comments()[0];
+    let action = ReviewActionTransportRequest::new(
+        snapshot.workspace().clone(),
+        snapshot.revision(),
+        ReviewAction::SendCommentToAgent {
+            comment_id: comment.id().clone(),
+            expected_comment_revision: comment.revision(),
+        },
+        IdempotencyKey::new("review-retained-rebase-live").unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        host.handle_with_review_delivery(
+            uid,
+            &PlatformV2Request::ExecuteReviewAction(action.clone()),
+            22,
+            &mut delivery,
+        ),
+        PlatformV2Response::ReviewReceipt(receipt)
+            if receipt.outcome() == ReviewReceiptOutcome::Accepted
+    ));
+
+    advance_retained_review_with_unrelated_comment(&config, &snapshot);
+    delivery.state = PlatformV2ReviewDeliveryState::Completed;
+    let completed = host.handle_with_review_delivery(
+        uid,
+        &PlatformV2Request::ExecuteReviewAction(action),
+        24,
+        &mut delivery,
+    );
+    assert!(matches!(
+        completed,
+        PlatformV2Response::ReviewReceipt(receipt)
+            if receipt.outcome() == ReviewReceiptOutcome::Completed
+    ));
+    let current = ReviewStore::open_scoped(config.platform_v2_review_path(), "tenant-live")
+        .unwrap()
+        .snapshot(snapshot.workspace())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        current.revision(),
+        snapshot
+            .revision()
+            .checked_next()
+            .unwrap()
+            .checked_next()
+            .unwrap()
+    );
+    assert_eq!(
+        current
+            .comments()
+            .iter()
+            .find(|candidate| candidate.id() == comment.id())
+            .unwrap()
+            .agent_state(),
+        CommentAgentState::Sent
+    );
+    assert_eq!(
+        current
+            .comments()
+            .iter()
+            .find(|candidate| candidate.id().as_str() == "review-unrelated-live")
+            .unwrap()
+            .agent_state(),
+        CommentAgentState::NotSent
+    );
+}
+
+#[test]
+fn retained_review_escaping_heavy_envelope_refuses_before_write_and_replays_terminally() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let snapshot = configure_retained_review_delivery(&config);
+    let original = &snapshot.comments()[0];
+    let mut comments = vec![original.clone()];
+    let mut targets = Vec::new();
+    for index in 0..100 {
+        let id = ReviewCommentId::new(format!("escaping-comment-{index:03}")).unwrap();
+        comments.push(ReviewComment::new(
+            id.clone(),
+            Revision::FIRST,
+            original.actor().clone(),
+            ReviewText::new("\\".repeat(4096)).unwrap(),
+            original.anchor().clone(),
+            CommentAgentState::NotSent,
+            false,
+        ));
+        targets.push(ReviewCommentTarget::new(id, Revision::FIRST));
+    }
+    comments.sort_by(|left, right| left.id().as_str().cmp(right.id().as_str()));
+    let oversized_snapshot = ReviewSnapshot::new(
+        snapshot.workspace().clone(),
+        snapshot.revision().checked_next().unwrap(),
+        snapshot.files().to_vec(),
+        comments,
+        snapshot.proposals().to_vec(),
+        snapshot.checks().to_vec(),
+        snapshot.review().clone(),
+        snapshot.pull_request().clone(),
+        snapshot.delivery().clone(),
+        snapshot.attention_events().to_vec(),
+    )
+    .unwrap();
+    ReviewStore::open_scoped(config.platform_v2_review_path(), "tenant-live")
+        .unwrap()
+        .put_snapshot(&oversized_snapshot, 22)
+        .unwrap();
+
+    let action = ReviewActionTransportRequest::new(
+        oversized_snapshot.workspace().clone(),
+        oversized_snapshot.revision(),
+        ReviewAction::BatchSendCommentsToAgent { comments: targets },
+        IdempotencyKey::new("review-retained-envelope-boundary-live").unwrap(),
+    )
+    .unwrap();
+    let serving = serve(&config);
+    let first = platform_v2(
+        &config,
+        "v2-review-retained-envelope-boundary",
+        PlatformV2Request::ExecuteReviewAction(action.clone()),
+    );
+    let PlatformV2Response::ReviewReceipt(first_receipt) = first else {
+        panic!("oversized envelope must produce a durable review receipt");
+    };
+    assert_eq!(first_receipt.outcome(), ReviewReceiptOutcome::Refused);
+    let replay = platform_v2(
+        &config,
+        "v2-review-retained-envelope-boundary-replay",
+        PlatformV2Request::ExecuteReviewAction(action.clone()),
+    );
+    assert!(matches!(
+        replay,
+        PlatformV2Response::ReviewReceipt(receipt) if receipt == first_receipt
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-review-retained-envelope-boundary-lookup",
+            PlatformV2Request::GetReviewReceipt(
+                ReviewReceiptLookup::new(
+                    ProjectId::new("project-live").unwrap(),
+                    oversized_snapshot.workspace().clone(),
+                    action.idempotency_key().clone(),
+                )
+                .unwrap(),
+            ),
+        ),
+        PlatformV2Response::ReviewReceipt(receipt) if receipt == first_receipt
+    ));
+    serving.shutdown(&config);
+
+    let custody = rusqlite::Connection::open(config.platform_v2_review_path()).unwrap();
+    let (outcome, write_admitted_at_ms): (String, Option<i64>) = custody
+        .query_row(
+            "SELECT r.outcome,p.write_admitted_at_ms
+             FROM review_action_previews p JOIN review_action_receipts r USING(preview_id)
+             WHERE p.idempotency_key='review-retained-envelope-boundary-live'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(outcome, "refused");
+    assert_eq!(write_admitted_at_ms, None);
+    assert_eq!(
+        custody
+            .query_row(
+                "SELECT COUNT(*) FROM review_external_effect_targets",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0,
+        "pre-write refusal must release every reserved comment target"
+    );
+    assert_eq!(
+        custody
+            .query_row(
+                "SELECT COUNT(*) FROM review_external_effect_plans",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1,
+        "the exact plan remains retained for terminal replay validation"
+    );
+    let scheduler = rusqlite::Connection::open(config.database_path()).unwrap();
+    assert_eq!(
+        scheduler
+            .query_row(
+                "SELECT COUNT(*) FROM inbox WHERE transport='platform_v2.retained_review'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0,
+        "an oversized envelope must never enter scheduler custody"
+    );
+}
+
+#[test]
+fn retained_review_comment_is_planned_once_and_submitted_to_the_exact_live_session() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let snapshot = configure_retained_review_delivery(&config);
+    let serving = serve(&config);
+    let comment = &snapshot.comments()[0];
+    let action = ReviewActionTransportRequest::new(
+        snapshot.workspace().clone(),
+        snapshot.revision(),
+        ReviewAction::SendCommentToAgent {
+            comment_id: comment.id().clone(),
+            expected_comment_revision: comment.revision(),
+        },
+        IdempotencyKey::new("review-retained-live-once").unwrap(),
+    )
+    .unwrap();
+    let first = platform_v2(
+        &config,
+        "v2-review-retained-live",
+        PlatformV2Request::ExecuteReviewAction(action.clone()),
+    );
+    assert!(matches!(
+        first,
+        PlatformV2Response::ReviewReceipt(ref receipt)
+            if receipt.outcome() == ReviewReceiptOutcome::Accepted
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-review-retained-live-replay",
+            PlatformV2Request::ExecuteReviewAction(action.clone()),
+        ),
+        PlatformV2Response::ReviewReceipt(_)
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let terminal = loop {
+        let response = platform_v2(
+            &config,
+            "v2-review-retained-live-lookup",
+            PlatformV2Request::GetReviewReceipt(
+                ReviewReceiptLookup::new(
+                    ProjectId::new("project-live").unwrap(),
+                    snapshot.workspace().clone(),
+                    action.idempotency_key().clone(),
+                )
+                .unwrap(),
+            ),
+        );
+        if let PlatformV2Response::ReviewReceipt(receipt) = response
+            && matches!(
+                receipt.outcome(),
+                ReviewReceiptOutcome::Completed
+                    | ReviewReceiptOutcome::Refused
+                    | ReviewReceiptOutcome::Unknown
+            )
+        {
+            break receipt;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "retained delivery did not leave the scheduler pending state"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    serving.shutdown(&config);
+
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-review-retained-live-after-restart",
+            PlatformV2Request::GetReviewReceipt(
+                ReviewReceiptLookup::new(
+                    ProjectId::new("project-live").unwrap(),
+                    snapshot.workspace().clone(),
+                    action.idempotency_key().clone(),
+                )
+                .unwrap(),
+            ),
+        ),
+        PlatformV2Response::ReviewReceipt(receipt) if receipt == terminal
+    ));
+    serving.shutdown(&config);
+
+    let scheduler = rusqlite::Connection::open(config.database_path()).unwrap();
+    let deliveries: i64 = scheduler
+        .query_row(
+            "SELECT COUNT(*) FROM inbox WHERE transport='platform_v2.retained_review' AND scope='review-provider-session-live'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(deliveries, 1);
+    let (transport_key, payload): (String, Vec<u8>) = scheduler
+        .query_row(
+            "SELECT transport_key,payload FROM inbox WHERE transport='platform_v2.retained_review' AND scope='review-provider-session-live'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let payload_text = std::str::from_utf8(&payload).unwrap();
+    assert!(payload_text.contains("automonique.platform/review-agent-delivery/v1"));
+    assert!(payload_text.contains(comment.id().as_str()));
+    assert!(payload_text.contains(comment.body().as_str()));
+    assert!(payload_text.contains("review-workspace-live"));
+
+    let custody = rusqlite::Connection::open(config.platform_v2_review_path()).unwrap();
+    let (planned_key, planned_payload): (String, Vec<u8>) = custody
+        .query_row(
+            "SELECT transport_key,payload FROM review_external_effect_plans",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(planned_key, transport_key);
+    let envelope: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(envelope["tenant"], "tenant-live");
+    assert_eq!(envelope["project"], "project-live");
+    assert_eq!(envelope["review_workspace_kind"], "user_workspace");
+    assert_eq!(envelope["review_workspace_id"], "review-workspace-live");
+    let registry_generation = Sha256::digest(
+        &std::fs::read(config.state_dir().join("platform-v2-review-registry.json")).unwrap(),
+    );
+    let registry_generation = registry_generation
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_eq!(
+        envelope["expected_registry_generation"],
+        registry_generation
+    );
+    assert_eq!(envelope["work_session_id"], "review-session-live");
+    assert_eq!(envelope["expected_work_session_revision"], 1);
+    assert_eq!(envelope["provider"], "jcode");
+    assert_eq!(
+        envelope["provider_session_id"],
+        "review-provider-session-live"
+    );
+    assert_eq!(envelope["expected_provider_session_revision"], 1);
+    assert_eq!(
+        envelope["payload"].as_str().unwrap().as_bytes(),
+        planned_payload
+    );
+}
+
+#[test]
+fn retained_review_recovery_refuses_before_custody_when_work_session_revision_changed() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let snapshot = configure_retained_review_delivery(&config);
+    let key = reserve_unadmitted_retained_review(&config, &snapshot, "review-work-fence-live");
+    advance_retained_work_session(&config);
+
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-review-work-fence-recovery",
+            PlatformV2Request::GetReviewReceipt(
+                ReviewReceiptLookup::new(
+                    ProjectId::new("project-live").unwrap(),
+                    snapshot.workspace().clone(),
+                    key,
+                )
+                .unwrap(),
+            ),
+        ),
+        PlatformV2Response::ReviewReceipt(receipt)
+            if receipt.outcome() == ReviewReceiptOutcome::Refused
+    ));
+    serving.shutdown(&config);
+
+    let scheduler = rusqlite::Connection::open(config.database_path()).unwrap();
+    let deliveries: i64 = scheduler
+        .query_row(
+            "SELECT COUNT(*) FROM inbox WHERE transport='platform_v2.retained_review'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(deliveries, 0, "a stale work fence never reaches custody");
+}
+
+#[test]
+fn retained_review_recovery_refuses_before_custody_when_write_admission_is_stale() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let snapshot = configure_retained_review_delivery(&config);
+    let key = reserve_unadmitted_retained_review(&config, &snapshot, "review-write-stale-live");
+    advance_retained_review_with_unrelated_comment(&config, &snapshot);
+
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-review-write-stale-recovery",
+            PlatformV2Request::GetReviewReceipt(
+                ReviewReceiptLookup::new(
+                    ProjectId::new("project-live").unwrap(),
+                    snapshot.workspace().clone(),
+                    key,
+                )
+                .unwrap(),
+            ),
+        ),
+        PlatformV2Response::ReviewReceipt(receipt)
+            if receipt.outcome() == ReviewReceiptOutcome::Refused
+    ));
+    serving.shutdown(&config);
+
+    let scheduler = rusqlite::Connection::open(config.database_path()).unwrap();
+    let deliveries: i64 = scheduler
+        .query_row(
+            "SELECT COUNT(*) FROM inbox WHERE transport='platform_v2.retained_review'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        deliveries, 0,
+        "a stale write admission never reaches custody"
+    );
+}
+
+#[test]
+fn retained_review_recovery_refuses_before_custody_when_provider_revision_changed() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let snapshot = configure_retained_review_delivery(&config);
+    let key = reserve_unadmitted_retained_review(&config, &snapshot, "review-provider-fence-live");
+    automonique_daemon::managed_sessions::ManagedSessionStore::open(config.managed_sessions_path())
+        .unwrap()
+        .observe_terminal(
+            "review-provider-session-live",
+            "review-provider-run-live",
+            23,
+        )
+        .unwrap();
+
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-review-provider-fence-recovery",
+            PlatformV2Request::GetReviewReceipt(
+                ReviewReceiptLookup::new(
+                    ProjectId::new("project-live").unwrap(),
+                    snapshot.workspace().clone(),
+                    key,
+                )
+                .unwrap(),
+            ),
+        ),
+        PlatformV2Response::ReviewReceipt(receipt)
+            if receipt.outcome() == ReviewReceiptOutcome::Refused
+    ));
+    serving.shutdown(&config);
+
+    let scheduler = rusqlite::Connection::open(config.database_path()).unwrap();
+    let deliveries: i64 = scheduler
+        .query_row(
+            "SELECT COUNT(*) FROM inbox WHERE transport='platform_v2.retained_review'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        deliveries, 0,
+        "a stale provider fence never reaches custody"
+    );
+}
+
+#[test]
+fn retained_review_recovery_refuses_before_custody_when_registry_generation_changed() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let snapshot = configure_retained_review_delivery(&config);
+    let key = reserve_unadmitted_retained_review(&config, &snapshot, "review-registry-fence-live");
+    let registry_path = config.state_dir().join("platform-v2-review-registry.json");
+    let mut registry: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry_path).unwrap()).unwrap();
+    registry["generation"] = serde_json::json!("review-live-generation-2");
+    std::fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
+
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-review-registry-fence-recovery",
+            PlatformV2Request::GetReviewReceipt(
+                ReviewReceiptLookup::new(
+                    ProjectId::new("project-live").unwrap(),
+                    snapshot.workspace().clone(),
+                    key,
+                )
+                .unwrap(),
+            ),
+        ),
+        PlatformV2Response::ReviewReceipt(receipt)
+            if receipt.outcome() == ReviewReceiptOutcome::Refused
+    ));
+    serving.shutdown(&config);
+
+    let scheduler = rusqlite::Connection::open(config.database_path()).unwrap();
+    let deliveries: i64 = scheduler
+        .query_row(
+            "SELECT COUNT(*) FROM inbox WHERE transport='platform_v2.retained_review'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        deliveries, 0,
+        "a stale registry fence never reaches custody"
+    );
+}
+
+#[test]
+fn retained_review_recovery_refuses_wrong_coordinate_key_preemption() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let snapshot = configure_retained_review_delivery(&config);
+    let key = reserve_unadmitted_retained_review(&config, &snapshot, "review-key-preempt-live");
+    let custody = rusqlite::Connection::open(config.platform_v2_review_path()).unwrap();
+    let transport_key: String = custody
+        .query_row(
+            "SELECT transport_key FROM review_external_effect_plans",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(custody);
+    Store::open(config.database_path())
+        .unwrap()
+        .submit_inbox(InboxSubmission {
+            transport: "platform_v2.retained_review",
+            transport_key: &transport_key,
+            scope: "wrong-provider-session",
+            payload: br#"{"wrong":"coordinate"}"#,
+            received_ms: 23,
+        })
+        .unwrap();
+
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-review-key-preempt-recovery",
+            PlatformV2Request::GetReviewReceipt(
+                ReviewReceiptLookup::new(
+                    ProjectId::new("project-live").unwrap(),
+                    snapshot.workspace().clone(),
+                    key,
+                )
+                .unwrap(),
+            ),
+        ),
+        PlatformV2Response::ReviewReceipt(receipt)
+            if receipt.outcome() == ReviewReceiptOutcome::Refused
+    ));
+    serving.shutdown(&config);
+
+    let scheduler = rusqlite::Connection::open(config.database_path()).unwrap();
+    let (deliveries, scope): (i64, String) = scheduler
+        .query_row(
+            "SELECT COUNT(*),MIN(scope) FROM inbox WHERE transport='platform_v2.retained_review' AND transport_key=?1",
+            [&transport_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(deliveries, 1);
+    assert_eq!(scope, "wrong-provider-session");
 }
 
 #[test]

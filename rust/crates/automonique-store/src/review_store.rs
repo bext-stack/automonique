@@ -9,6 +9,7 @@
 //! Provider observations use a separate table and can never create a local
 //! authority grant.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::fs::OpenOptions;
@@ -37,8 +38,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{StoreError, validate_database_path};
 
-pub const REVIEW_STORE_SCHEMA_VERSION: u32 = 2;
+pub const REVIEW_STORE_SCHEMA_VERSION: u32 = 3;
 const MAX_PROVIDER_OBSERVATION_BYTES: usize = 4096;
+const MAX_REVIEW_EFFECT_PAYLOAD_BYTES: usize = 1_048_576;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE review_current (
@@ -197,6 +199,46 @@ const ADD_SNAPSHOT_PROTOCOL_SCHEMA_V2: &str = r#"
 ALTER TABLE review_snapshots ADD COLUMN protocol_schema TEXT NOT NULL
     DEFAULT 'automonique.platform/review/v1'
     CHECK (protocol_schema IN ('automonique.platform/review/v1', 'automonique.platform/review/v2'));
+"#;
+
+const ADD_EXTERNAL_EFFECT_PLANS_V3: &str = r#"
+CREATE TABLE review_external_effect_plans (
+    preview_id TEXT PRIMARY KEY REFERENCES review_action_previews(preview_id),
+    request_digest BLOB NOT NULL CHECK (length(request_digest) = 32),
+    effect_kind TEXT NOT NULL CHECK (effect_kind = 'retained_session'),
+    registry_generation_digest BLOB NOT NULL CHECK (length(registry_generation_digest) = 32),
+    provider TEXT NOT NULL,
+    work_session_id TEXT NOT NULL,
+    provider_session_id TEXT NOT NULL,
+    work_session_revision INTEGER NOT NULL CHECK (work_session_revision >= 1),
+    provider_session_revision INTEGER NOT NULL CHECK (provider_session_revision >= 1),
+    transport_key TEXT NOT NULL UNIQUE,
+    payload BLOB NOT NULL CHECK (length(payload) > 0 AND length(payload) <= 1048576),
+    payload_digest BLOB NOT NULL CHECK (length(payload_digest) = 32),
+    plan_document BLOB NOT NULL,
+    plan_digest BLOB NOT NULL CHECK (length(plan_digest) = 32),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0)
+) STRICT;
+
+CREATE TABLE review_external_effect_targets (
+    preview_id TEXT NOT NULL REFERENCES review_external_effect_plans(preview_id),
+    workspace_kind TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    comment_id TEXT NOT NULL,
+    comment_revision INTEGER NOT NULL CHECK (comment_revision >= 1),
+    disposition TEXT NOT NULL CHECK (disposition IN ('reserved', 'delivered', 'refused', 'delivered_conflict')),
+    PRIMARY KEY (preview_id, comment_id),
+    UNIQUE (workspace_kind, workspace_id, comment_id, comment_revision)
+) STRICT;
+
+-- Evidence written only while upgrading a pre-plan schema. It is the exact
+-- reason one legacy retained action may truthfully have a terminal receipt
+-- without a v3 external-effect plan; native v3 rows never receive one.
+CREATE TABLE review_external_effect_migration_tombstones (
+    preview_id TEXT PRIMARY KEY REFERENCES review_action_previews(preview_id),
+    outcome TEXT NOT NULL CHECK (outcome IN ('completed', 'refused', 'conflict')),
+    receipt_digest BLOB NOT NULL CHECK (length(receipt_digest) = 32)
+) STRICT;
 "#;
 
 #[derive(Debug)]
@@ -406,6 +448,7 @@ pub struct StoredReviewAction {
     pub approval_policy: ApprovalPolicy,
     pub approved: bool,
     pub approval: Option<StoredReviewApproval>,
+    pub external_effect_plan_digest: Option<[u8; 32]>,
     pub write_admission_id: Option<String>,
     pub write_admitted_at_ms: Option<i64>,
 }
@@ -415,6 +458,155 @@ pub struct StoredReviewComment {
     pub workspace: WorkContextIdentity,
     pub snapshot_revision: Revision,
     pub comment: ReviewComment,
+}
+
+/// Exact, durable target and bytes for one retained-session review effect.
+/// The scheduler may recover this plan after a crash; mutable registry state
+/// is never consulted to reconstruct an already-admitted write.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewExternalEffectPlan {
+    request_digest: [u8; 32],
+    registry_generation_digest: [u8; 32],
+    provider: String,
+    work_session_id: String,
+    provider_session_id: String,
+    work_session_revision: Revision,
+    provider_session_revision: Revision,
+    transport_key: String,
+    payload: Vec<u8>,
+    payload_digest: [u8; 32],
+    document: Vec<u8>,
+    digest: [u8; 32],
+}
+
+impl ReviewExternalEffectPlan {
+    #[allow(clippy::too_many_arguments)]
+    pub fn retained_session(
+        request_digest: [u8; 32],
+        registry_generation_digest: [u8; 32],
+        provider: &str,
+        work_session_id: &str,
+        provider_session_id: &str,
+        work_session_revision: Revision,
+        provider_session_revision: Revision,
+        transport_key: &str,
+        payload: Vec<u8>,
+    ) -> Stored<Self> {
+        if ReviewField::new(provider).is_err()
+            || ReviewField::new(work_session_id).is_err()
+            || ReviewField::new(provider_session_id).is_err()
+            || ReviewField::new(transport_key).is_err()
+            || payload.is_empty()
+            || payload.len() > MAX_REVIEW_EFFECT_PAYLOAD_BYTES
+            || std::str::from_utf8(&payload).is_err()
+        {
+            return Err(ReviewStoreError::InvalidField("external_effect_plan"));
+        }
+        let payload_digest = digest(&payload);
+        let document = JsonValue::Object(vec![
+            (
+                "effect_kind".to_owned(),
+                JsonValue::String("retained_session".to_owned()),
+            ),
+            (
+                "payload_digest".to_owned(),
+                JsonValue::String(digest_token(&payload_digest)),
+            ),
+            (
+                "provider".to_owned(),
+                JsonValue::String(provider.to_owned()),
+            ),
+            (
+                "provider_session_id".to_owned(),
+                JsonValue::String(provider_session_id.to_owned()),
+            ),
+            (
+                "registry_generation_digest".to_owned(),
+                JsonValue::String(digest_token(&registry_generation_digest)),
+            ),
+            (
+                "request_digest".to_owned(),
+                JsonValue::String(digest_token(&request_digest)),
+            ),
+            (
+                "schema".to_owned(),
+                JsonValue::String("automonique.store/review-external-effect/v1".to_owned()),
+            ),
+            (
+                "provider_session_revision".to_owned(),
+                JsonValue::Integer(db_revision(provider_session_revision)?),
+            ),
+            (
+                "work_session_revision".to_owned(),
+                JsonValue::Integer(db_revision(work_session_revision)?),
+            ),
+            (
+                "transport_key".to_owned(),
+                JsonValue::String(transport_key.to_owned()),
+            ),
+            (
+                "work_session_id".to_owned(),
+                JsonValue::String(work_session_id.to_owned()),
+            ),
+        ])
+        .to_canonical_bytes();
+        let plan_digest = digest(&document);
+        Ok(Self {
+            request_digest,
+            registry_generation_digest,
+            provider: provider.to_owned(),
+            work_session_id: work_session_id.to_owned(),
+            provider_session_id: provider_session_id.to_owned(),
+            work_session_revision,
+            provider_session_revision,
+            transport_key: transport_key.to_owned(),
+            payload,
+            payload_digest,
+            document,
+            digest: plan_digest,
+        })
+    }
+
+    #[must_use]
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+    #[must_use]
+    pub const fn registry_generation_digest(&self) -> [u8; 32] {
+        self.registry_generation_digest
+    }
+    #[must_use]
+    pub fn work_session_id(&self) -> &str {
+        &self.work_session_id
+    }
+    #[must_use]
+    pub fn provider_session_id(&self) -> &str {
+        &self.provider_session_id
+    }
+    #[must_use]
+    pub const fn work_session_revision(&self) -> Revision {
+        self.work_session_revision
+    }
+    #[must_use]
+    pub const fn provider_session_revision(&self) -> Revision {
+        self.provider_session_revision
+    }
+    #[must_use]
+    pub fn transport_key(&self) -> &str {
+        &self.transport_key
+    }
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+    #[must_use]
+    pub const fn request_digest(&self) -> [u8; 32] {
+        self.request_digest
+    }
+    #[must_use]
+    pub const fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
 }
 
 #[derive(Debug)]
@@ -665,17 +857,52 @@ impl ReviewStore {
         approval: ApprovalPolicy,
         created_at_ms: i64,
     ) -> Stored<ReviewActionAdmission> {
+        self.prepare_action_with_external_plan(request, approval, None, created_at_ms)
+    }
+
+    /// Atomically bind the complete external plan to the accepted receipt.
+    /// There is no crash window in which custody exists but the scheduler
+    /// target or bytes must be reconstructed from mutable registry state.
+    pub fn prepare_external_action(
+        &mut self,
+        request: &ReviewActionRequest,
+        approval: ApprovalPolicy,
+        plan: &ReviewExternalEffectPlan,
+        created_at_ms: i64,
+    ) -> Stored<ReviewActionAdmission> {
+        self.prepare_action_with_external_plan(request, approval, Some(plan), created_at_ms)
+    }
+
+    fn prepare_action_with_external_plan(
+        &mut self,
+        request: &ReviewActionRequest,
+        approval: ApprovalPolicy,
+        external_plan: Option<&ReviewExternalEffectPlan>,
+        created_at_ms: i64,
+    ) -> Stored<ReviewActionAdmission> {
         validate_time(created_at_ms)?;
         let document = encode_review_action_request(request).map_err(protocol)?;
         decode_review_action_request(&document).map_err(protocol)?;
         let protocol_request_digest = digest(&document);
         let preview_document = encode_preview_document(&protocol_request_digest, approval);
         let request_digest = digest(&preview_document);
+        let retained_session_action = matches!(
+            request.action(),
+            ReviewAction::SendCommentToAgent { .. } | ReviewAction::BatchSendCommentsToAgent { .. }
+        );
+        if external_plan.is_some() && !retained_session_action {
+            return Err(ReviewStoreError::InvalidField("external_effect_action"));
+        }
+        if retained_session_action && external_plan.is_none() {
+            return Err(ReviewStoreError::InvalidField("external_effect_plan"));
+        }
+        if external_plan.is_some_and(|plan| plan.request_digest != request_digest) {
+            return Err(ReviewStoreError::Conflict("external_effect_request"));
+        }
         let (kind, id) = workspace_parts(request.workspace());
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_active_authority(&transaction, request, created_at_ms)?;
         if let Some(existing) = read_action_by_key(
             &transaction,
             kind,
@@ -686,14 +913,31 @@ impl ReviewStore {
             if existing.request_digest != request_digest || existing.approval_policy != approval {
                 return Err(ReviewStoreError::Conflict("idempotency_key"));
             }
+            if existing.receipt.outcome() == ReviewReceiptOutcome::Refused
+                && existing.write_admitted_at_ms.is_none()
+                && existing.external_effect_plan_digest.is_some()
+                && matches!(
+                    existing.request.action(),
+                    ReviewAction::SendCommentToAgent { .. }
+                        | ReviewAction::BatchSendCommentsToAgent { .. }
+                )
+            {
+                require_exact_external_plan(&transaction, &existing.preview_id, external_plan)?;
+                transaction.commit()?;
+                return Ok(ReviewActionAdmission::Replay(existing));
+            }
+            require_active_authority(&transaction, request, created_at_ms)?;
             if is_terminal(existing.receipt.outcome()) {
+                require_exact_external_plan(&transaction, &existing.preview_id, external_plan)?;
                 transaction.commit()?;
                 return Ok(ReviewActionAdmission::Replay(existing));
             }
             validate_current_action(&transaction, &existing.request)?;
+            require_exact_external_plan(&transaction, &existing.preview_id, external_plan)?;
             transaction.commit()?;
             return Ok(ReviewActionAdmission::Replay(existing));
         }
+        require_active_authority(&transaction, request, created_at_ms)?;
         // Authorization is decided before revealing whether the workspace or
         // revision exists, so an ungranted actor cannot use stale refusals as
         // a revision oracle.
@@ -720,6 +964,10 @@ impl ReviewStore {
         transaction.execute(
             "INSERT INTO review_action_previews(preview_id,workspace_kind,workspace_id,expected_revision,actor_id,authentication,authority_kind,authority_id,idempotency_key,action_kind,action_id,request_document,protocol_request_digest,preview_document,request_digest,approval_policy,approval_required,created_at_ms,write_admission_id,write_admitted_at_ms,write_admission_document,write_admission_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,NULL,NULL,NULL,NULL)",
             params![preview_id, kind, id, db_revision(request.expected_revision())?, request.actor().as_str(), request.authentication().as_str(), request.authority().kind().as_str(), request.authority().id().as_str(), request.idempotency_key().as_str(), request.action().kind().as_str(), action_id.as_str(), document, protocol_request_digest.as_slice(), preview_document, request_digest.as_slice(), approval.as_str(), i64::from(approval == ApprovalPolicy::Required), created_at_ms])?;
+        if let Some(plan) = external_plan {
+            insert_external_plan(&transaction, &preview_id, plan, created_at_ms)?;
+            reserve_external_targets(&transaction, &preview_id, request)?;
+        }
         transaction.execute(
             "INSERT INTO review_action_receipts(receipt_id,preview_id,receipt_document,receipt_digest,request_digest,approval_digest,outcome,result_revision,current_revision,updated_at_ms) VALUES(?1,?2,?3,?4,?5,NULL,?6,NULL,NULL,?7)",
             params![receipt.receipt_id().as_str(), preview_id, receipt_document, receipt_digest.as_slice(), request_digest.as_slice(), receipt.outcome().as_str(), created_at_ms])?;
@@ -727,6 +975,59 @@ impl ReviewStore {
             .ok_or(ReviewStoreError::Corrupt("preview"))?;
         transaction.commit()?;
         Ok(ReviewActionAdmission::New(stored))
+    }
+
+    /// Canonical request-plus-approval digest used to construct an exact plan
+    /// before the atomic admission transaction.
+    pub fn action_request_digest(
+        request: &ReviewActionRequest,
+        approval: ApprovalPolicy,
+    ) -> Stored<[u8; 32]> {
+        let document = encode_review_action_request(request).map_err(protocol)?;
+        decode_review_action_request(&document).map_err(protocol)?;
+        Ok(digest(&encode_preview_document(
+            &digest(&document),
+            approval,
+        )))
+    }
+
+    /// Inspect an exact action without creating custody. This is the adapter
+    /// preflight seam: a missing external target can still refuse without an
+    /// accepted receipt, while an existing idempotency key is checked against
+    /// the complete canonical request before any target availability is
+    /// disclosed.
+    pub fn inspect_action(
+        &self,
+        request: &ReviewActionRequest,
+        approval: ApprovalPolicy,
+        now_ms: i64,
+    ) -> Stored<Option<StoredReviewAction>> {
+        validate_time(now_ms)?;
+        let document = encode_review_action_request(request).map_err(protocol)?;
+        decode_review_action_request(&document).map_err(protocol)?;
+        let protocol_request_digest = digest(&document);
+        let preview_document = encode_preview_document(&protocol_request_digest, approval);
+        let request_digest = digest(&preview_document);
+        let (kind, id) = workspace_parts(request.workspace());
+        require_active_authority(&self.connection, request, now_ms)?;
+        let existing = read_action_by_key(
+            &self.connection,
+            kind,
+            id,
+            request.actor().as_str(),
+            request.idempotency_key().as_str(),
+        )?;
+        if let Some(existing) = existing {
+            if existing.request_digest != request_digest || existing.approval_policy != approval {
+                return Err(ReviewStoreError::Conflict("idempotency_key"));
+            }
+            if !is_terminal(existing.receipt.outcome()) {
+                validate_current_action(&self.connection, &existing.request)?;
+            }
+            return Ok(Some(existing));
+        }
+        validate_current_action(&self.connection, request)?;
+        Ok(None)
     }
 
     /// Validate the exact actor grant, workspace revision, and action against
@@ -972,6 +1273,9 @@ impl ReviewStore {
                 ReviewReconciliation::Final,
             )
             .map_err(protocol)?;
+            if action.external_effect_plan_digest.is_some() {
+                release_external_plan_before_write(&transaction, approval.preview_id())?;
+            }
             update_receipt(&transaction, approval.preview_id(), &refused, decided_at_ms)?;
         }
         let result = read_action_by_preview(&transaction, approval.preview_id())?
@@ -997,6 +1301,16 @@ impl ReviewStore {
             read_action_by_preview(&transaction, preview_id)?.ok_or(ReviewStoreError::NotFound)?;
         if action.request_digest != request_digest {
             return Err(ReviewStoreError::Conflict("request_digest"));
+        }
+        if matches!(
+            action.request.action(),
+            ReviewAction::SendCommentToAgent { .. } | ReviewAction::BatchSendCommentsToAgent { .. }
+        ) && action.external_effect_plan_digest.is_none()
+        {
+            return Err(ReviewStoreError::Conflict("external_effect_plan"));
+        }
+        if is_terminal(action.receipt.outcome()) {
+            return Err(ReviewStoreError::Conflict("terminal_receipt"));
         }
         require_active_authority(&transaction, &action.request, now_ms)?;
         if action.write_admitted_at_ms.is_some() {
@@ -1024,6 +1338,59 @@ impl ReviewStore {
             .ok_or(ReviewStoreError::Corrupt("preview"))?;
         transaction.commit()?;
         Ok(ReviewWriteAdmission::New(result))
+    }
+
+    /// Settle retained-session custody when a target fence changes after
+    /// preparation but before any external write is admitted.
+    pub fn refuse_external_action_not_started(
+        &mut self,
+        preview_id: &str,
+        request_digest: [u8; 32],
+        now_ms: i64,
+    ) -> Stored<ReviewActionReceipt> {
+        validate_time(now_ms)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let action =
+            read_action_by_preview(&transaction, preview_id)?.ok_or(ReviewStoreError::NotFound)?;
+        if action.request_digest != request_digest {
+            return Err(ReviewStoreError::Conflict("request_digest"));
+        }
+        if is_terminal(action.receipt.outcome()) {
+            if action.receipt.outcome() == ReviewReceiptOutcome::Refused {
+                transaction.commit()?;
+                return Ok(action.receipt);
+            }
+            return Err(ReviewStoreError::Conflict("terminal_receipt"));
+        }
+        if action.external_effect_plan_digest.is_none()
+            || !matches!(
+                action.request.action(),
+                ReviewAction::SendCommentToAgent { .. }
+                    | ReviewAction::BatchSendCommentsToAgent { .. }
+            )
+        {
+            return Err(ReviewStoreError::InvalidField("external_effect_action"));
+        }
+        if action.write_admitted_at_ms.is_some() {
+            return Err(ReviewStoreError::Conflict("write_already_started"));
+        }
+        release_external_plan_before_write(&transaction, preview_id)?;
+        let refused = ReviewActionReceipt::new(
+            action.receipt.receipt_id().clone(),
+            action.receipt.idempotency_key().clone(),
+            action.receipt.action_id().clone(),
+            action.receipt.actor().clone(),
+            ReviewReceiptOutcome::Refused,
+            None,
+            None,
+            ReviewReconciliation::Final,
+        )
+        .map_err(protocol)?;
+        update_receipt(&transaction, preview_id, &refused, now_ms)?;
+        transaction.commit()?;
+        Ok(refused)
     }
 
     /// Close the crash-ambiguous window without replaying the mutation.
@@ -1101,6 +1468,9 @@ impl ReviewStore {
         }
         if receipt.outcome() == ReviewReceiptOutcome::Accepted {
             return Err(ReviewStoreError::InvalidField("receipt_outcome"));
+        }
+        if action.external_effect_plan_digest.is_some() {
+            return Err(ReviewStoreError::InvalidField("external_effect_completion"));
         }
         if is_terminal(action.receipt.outcome()) {
             if action.receipt == *receipt {
@@ -1274,6 +1644,137 @@ impl ReviewStore {
         Ok(action.map(|action| action.receipt))
     }
 
+    /// Resolve one already-admitted retained-session action and its immutable
+    /// plan under the caller's exact grant. This is the recovery path used by
+    /// receipt polling after a daemon restart.
+    pub fn external_action(
+        &self,
+        workspace: &WorkContextIdentity,
+        actor: &ReviewActorId,
+        authentication: ReviewAuthentication,
+        authority: &ReviewAuthority,
+        key: &IdempotencyKey,
+        now_ms: i64,
+    ) -> Stored<Option<(StoredReviewAction, ReviewExternalEffectPlan)>> {
+        validate_time(now_ms)?;
+        require_active_grant(
+            &self.connection,
+            workspace,
+            actor,
+            authentication,
+            authority,
+            now_ms,
+        )?;
+        let (kind, id) = workspace_parts(workspace);
+        let Some(action) =
+            read_action_by_key(&self.connection, kind, id, actor.as_str(), key.as_str())?
+        else {
+            return Ok(None);
+        };
+        if action.request.authentication() != authentication
+            || action.request.authority() != authority
+        {
+            return Err(ReviewStoreError::Unauthorized);
+        }
+        let Some(plan) = read_external_plan(&self.connection, &action.preview_id)? else {
+            return Ok(None);
+        };
+        Ok(Some((action, plan)))
+    }
+
+    /// Materialize the exact next snapshot and final receipt after the durable
+    /// scheduler lane proves a retained-session delivery terminal. This is one
+    /// transaction, so receipt and comment delivery state cannot diverge.
+    pub fn complete_retained_session_delivery(
+        &mut self,
+        preview_id: &str,
+        request_digest: [u8; 32],
+        transport_key: &str,
+        delivered: bool,
+        recorded_at_ms: i64,
+    ) -> Stored<ReviewActionReceipt> {
+        validate_time(recorded_at_ms)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let action =
+            read_action_by_preview(&transaction, preview_id)?.ok_or(ReviewStoreError::NotFound)?;
+        if action.request_digest != request_digest
+            || action.write_admitted_at_ms.is_none()
+            || !matches!(
+                action.request.action(),
+                ReviewAction::SendCommentToAgent { .. }
+                    | ReviewAction::BatchSendCommentsToAgent { .. }
+            )
+        {
+            return Err(ReviewStoreError::Conflict("external_effect_completion"));
+        }
+        let plan = read_external_plan(&transaction, preview_id)?
+            .ok_or(ReviewStoreError::Corrupt("external_effect_plan"))?;
+        if plan.request_digest != request_digest || plan.transport_key != transport_key {
+            return Err(ReviewStoreError::Conflict("external_effect_completion"));
+        }
+        if is_terminal(action.receipt.outcome()) {
+            transaction.commit()?;
+            return Ok(action.receipt);
+        }
+        let (kind, id) = workspace_parts(action.request.workspace());
+        let current = read_current_snapshot(&transaction, kind, id)?
+            .ok_or(ReviewStoreError::Corrupt("current_snapshot"))?;
+        let original =
+            read_snapshot_revision(&transaction, kind, id, action.request.expected_revision())?
+                .ok_or(ReviewStoreError::Corrupt("external_effect_snapshot"))?;
+        let targets_exact = external_targets_are_exact(&original, &current, &action.request)?;
+        if !targets_exact {
+            let (outcome, disposition) = if delivered {
+                (ReviewReceiptOutcome::Conflict, "delivered_conflict")
+            } else {
+                (ReviewReceiptOutcome::Refused, "refused")
+            };
+            settle_external_targets(&transaction, preview_id, disposition)?;
+            let terminal = ReviewActionReceipt::new(
+                action.receipt.receipt_id().clone(),
+                action.receipt.idempotency_key().clone(),
+                action.receipt.action_id().clone(),
+                action.receipt.actor().clone(),
+                outcome,
+                None,
+                delivered.then_some(current.revision()),
+                ReviewReconciliation::Final,
+            )
+            .map_err(protocol)?;
+            update_receipt(&transaction, preview_id, &terminal, recorded_at_ms)?;
+            transaction.commit()?;
+            return Ok(terminal);
+        }
+        let next =
+            retained_session_delivery_snapshot(&original, &current, &action.request, delivered)?;
+        persist_snapshot(&transaction, &next, recorded_at_ms)?;
+        settle_external_targets(
+            &transaction,
+            preview_id,
+            if delivered { "delivered" } else { "refused" },
+        )?;
+        let receipt = ReviewActionReceipt::new(
+            action.receipt.receipt_id().clone(),
+            action.receipt.idempotency_key().clone(),
+            action.receipt.action_id().clone(),
+            action.receipt.actor().clone(),
+            if delivered {
+                ReviewReceiptOutcome::Completed
+            } else {
+                ReviewReceiptOutcome::Refused
+            },
+            delivered.then_some(next.revision()),
+            None,
+            ReviewReconciliation::Final,
+        )
+        .map_err(protocol)?;
+        update_receipt(&transaction, preview_id, &receipt, recorded_at_ms)?;
+        transaction.commit()?;
+        Ok(receipt)
+    }
+
     pub fn comment(
         &self,
         workspace: &WorkContextIdentity,
@@ -1407,9 +1908,15 @@ fn initialize(connection: &mut Connection) -> Stored<bool> {
     if fresh {
         transaction.execute_batch(SCHEMA_V1)?;
         transaction.execute_batch(ADD_SNAPSHOT_PROTOCOL_SCHEMA_V2)?;
+        transaction.execute_batch(ADD_EXTERNAL_EFFECT_PLANS_V3)?;
     } else if version == 1 {
         transaction.execute_batch(ADD_SNAPSHOT_PROTOCOL_SCHEMA_V2)?;
         migrate_review_v1_snapshots(&transaction)?;
+        transaction.execute_batch(ADD_EXTERNAL_EFFECT_PLANS_V3)?;
+        terminalize_legacy_external_actions(&transaction)?;
+    } else if version == 2 {
+        transaction.execute_batch(ADD_EXTERNAL_EFFECT_PLANS_V3)?;
+        terminalize_legacy_external_actions(&transaction)?;
     } else {
         return Err(ReviewStoreError::SchemaVersion {
             found: version,
@@ -1419,6 +1926,145 @@ fn initialize(connection: &mut Connection) -> Stored<bool> {
     transaction.pragma_update(None, "user_version", REVIEW_STORE_SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(fresh)
+}
+
+fn terminalize_legacy_external_actions(connection: &Connection) -> Stored<()> {
+    type LegacyAction = (
+        String,
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        Option<i64>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        i64,
+    );
+    let actions: Vec<LegacyAction> = {
+        let mut statement = connection.prepare(
+            "SELECT p.preview_id,p.request_document,p.request_digest,p.action_id,p.write_admitted_at_ms,r.receipt_document,r.receipt_digest,r.request_digest,r.outcome,r.updated_at_ms FROM review_action_previews p JOIN review_action_receipts r ON r.preview_id=p.preview_id ORDER BY p.preview_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            })?
+            .collect::<Result<_, _>>()?
+    };
+    for (
+        preview_id,
+        request_document,
+        preview_request_digest,
+        action_id,
+        write_admitted_at_ms,
+        receipt_document,
+        receipt_digest,
+        receipt_request_digest,
+        projected_outcome,
+        updated_at_ms,
+    ) in actions
+    {
+        let request = decode_review_action_request(&request_document)
+            .map_err(|_| ReviewStoreError::Corrupt("legacy_external_action"))?;
+        if !matches!(
+            request.action(),
+            ReviewAction::SendCommentToAgent { .. } | ReviewAction::BatchSendCommentsToAgent { .. }
+        ) {
+            continue;
+        }
+        let receipt = decode_review_action_receipt(&receipt_document)
+            .map_err(|_| ReviewStoreError::Corrupt("legacy_external_receipt"))?;
+        let stored_receipt_digest: [u8; 32] = receipt_digest
+            .try_into()
+            .map_err(|_| ReviewStoreError::Corrupt("legacy_external_receipt"))?;
+        let preview_request_digest: [u8; 32] = preview_request_digest
+            .try_into()
+            .map_err(|_| ReviewStoreError::Corrupt("legacy_external_action"))?;
+        let receipt_request_digest: [u8; 32] = receipt_request_digest
+            .try_into()
+            .map_err(|_| ReviewStoreError::Corrupt("legacy_external_receipt"))?;
+        if digest(&receipt_document) != stored_receipt_digest
+            || receipt_request_digest != preview_request_digest
+            || receipt.outcome().as_str() != projected_outcome
+            || receipt.idempotency_key() != request.idempotency_key()
+            || receipt.actor() != request.actor()
+            || receipt.action_id().as_str() != action_id
+        {
+            return Err(ReviewStoreError::Corrupt("legacy_external_receipt"));
+        }
+        let terminal = match receipt.outcome() {
+            ReviewReceiptOutcome::Completed
+            | ReviewReceiptOutcome::Conflict
+            | ReviewReceiptOutcome::Refused => receipt.clone(),
+            ReviewReceiptOutcome::Accepted if write_admitted_at_ms.is_none() => {
+                ReviewActionReceipt::new(
+                    receipt.receipt_id().clone(),
+                    receipt.idempotency_key().clone(),
+                    receipt.action_id().clone(),
+                    receipt.actor().clone(),
+                    ReviewReceiptOutcome::Refused,
+                    None,
+                    None,
+                    ReviewReconciliation::Final,
+                )
+                .map_err(|_| ReviewStoreError::Corrupt("legacy_external_receipt"))?
+            }
+            ReviewReceiptOutcome::Accepted | ReviewReceiptOutcome::Unknown => {
+                if receipt.outcome() == ReviewReceiptOutcome::Unknown
+                    && write_admitted_at_ms.is_none()
+                {
+                    return Err(ReviewStoreError::Corrupt("legacy_external_receipt"));
+                }
+                let (kind, id) = workspace_parts(request.workspace());
+                let current: i64 = connection
+                    .query_row(
+                        "SELECT revision FROM review_current WHERE workspace_kind=?1 AND workspace_id=?2",
+                        params![kind, id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .ok_or(ReviewStoreError::Corrupt("legacy_external_action"))?;
+                ReviewActionReceipt::new(
+                    receipt.receipt_id().clone(),
+                    receipt.idempotency_key().clone(),
+                    receipt.action_id().clone(),
+                    receipt.actor().clone(),
+                    ReviewReceiptOutcome::Conflict,
+                    None,
+                    Some(parse_revision(current)?),
+                    ReviewReconciliation::Final,
+                )
+                .map_err(|_| ReviewStoreError::Corrupt("legacy_external_receipt"))?
+            }
+        };
+        if terminal.outcome() == ReviewReceiptOutcome::Completed {
+            validate_legacy_external_completed_basis(connection, &request, &terminal)?;
+        }
+        if terminal != receipt {
+            update_receipt(connection, &preview_id, &terminal, updated_at_ms)?;
+        }
+        let terminal_document = encode_review_action_receipt(&terminal)
+            .map_err(|_| ReviewStoreError::Corrupt("legacy_external_receipt"))?;
+        let terminal_digest = digest(&terminal_document);
+        connection.execute(
+            "INSERT INTO review_external_effect_migration_tombstones(preview_id,outcome,receipt_digest) VALUES(?1,?2,?3)",
+            params![preview_id, terminal.outcome().as_str(), terminal_digest.as_slice()],
+        )?;
+        read_action_by_preview(connection, &preview_id)?
+            .ok_or(ReviewStoreError::Corrupt("legacy_external_action"))?;
+    }
+    Ok(())
 }
 
 fn migrate_review_v1_snapshots(connection: &Connection) -> Stored<()> {
@@ -1519,7 +2165,7 @@ fn bind_authority_namespace(
         Some(_) => Ok(()),
         None => {
             let populated: bool = connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM review_current UNION ALL SELECT 1 FROM review_snapshots UNION ALL SELECT 1 FROM review_comments UNION ALL SELECT 1 FROM review_authority_grants UNION ALL SELECT 1 FROM review_authority_grant_events UNION ALL SELECT 1 FROM review_action_previews UNION ALL SELECT 1 FROM review_action_approvals UNION ALL SELECT 1 FROM review_action_receipts UNION ALL SELECT 1 FROM review_completion_evidence UNION ALL SELECT 1 FROM review_provider_observations)",
+                "SELECT EXISTS(SELECT 1 FROM review_current UNION ALL SELECT 1 FROM review_snapshots UNION ALL SELECT 1 FROM review_comments UNION ALL SELECT 1 FROM review_authority_grants UNION ALL SELECT 1 FROM review_authority_grant_events UNION ALL SELECT 1 FROM review_action_previews UNION ALL SELECT 1 FROM review_action_approvals UNION ALL SELECT 1 FROM review_action_receipts UNION ALL SELECT 1 FROM review_completion_evidence UNION ALL SELECT 1 FROM review_provider_observations UNION ALL SELECT 1 FROM review_external_effect_plans)",
                 [],
                 |row| row.get(0),
             )?;
@@ -1699,6 +2345,14 @@ fn encode_write_admission(
         (
             "expected_revision".to_owned(),
             JsonValue::Integer(db_revision(action.request.expected_revision())?),
+        ),
+        (
+            "external_effect_plan_digest".to_owned(),
+            action
+                .external_effect_plan_digest
+                .map_or(JsonValue::Null, |value| {
+                    JsonValue::String(digest_token(&value))
+                }),
         ),
         (
             "request_digest".to_owned(),
@@ -2215,6 +2869,185 @@ fn local_action_snapshot(
     .map_err(protocol)
 }
 
+fn external_targets_are_exact(
+    original: &ReviewSnapshot,
+    current: &ReviewSnapshot,
+    request: &ReviewActionRequest,
+) -> Stored<bool> {
+    for (comment_id, expected_revision) in external_action_targets(request)? {
+        let original_comment = original.comments().iter().find(|comment| {
+            comment.id().as_str() == comment_id && comment.revision() == expected_revision
+        });
+        let current_comment = current
+            .comments()
+            .iter()
+            .find(|comment| comment.id().as_str() == comment_id);
+        if original_comment.is_none() || current_comment != original_comment {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn settle_external_targets(
+    connection: &Connection,
+    preview_id: &str,
+    disposition: &str,
+) -> Stored<()> {
+    let (expected, already_settled, total): (i64, i64, i64) = connection.query_row(
+        "SELECT coalesce(sum(disposition='reserved'),0),coalesce(sum(disposition=?2),0),count(*) FROM review_external_effect_targets WHERE preview_id=?1",
+        params![preview_id, disposition],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if expected == 0 {
+        return if total > 0 && already_settled == total {
+            Ok(())
+        } else {
+            Err(ReviewStoreError::Corrupt("external_effect_targets"))
+        };
+    }
+    let changed = connection.execute(
+        "UPDATE review_external_effect_targets SET disposition=?1 WHERE preview_id=?2 AND disposition='reserved'",
+        params![disposition, preview_id],
+    )?;
+    if changed
+        != usize::try_from(expected)
+            .map_err(|_| ReviewStoreError::Corrupt("external_effect_targets"))?
+    {
+        return Err(ReviewStoreError::Conflict("external_effect_completion"));
+    }
+    Ok(())
+}
+
+fn release_external_plan_before_write(connection: &Connection, preview_id: &str) -> Stored<()> {
+    let targets = connection.execute(
+        "DELETE FROM review_external_effect_targets WHERE preview_id=?1 AND disposition='reserved'",
+        [preview_id],
+    )?;
+    if targets == 0 {
+        return Err(ReviewStoreError::Corrupt("external_effect_targets"));
+    }
+    let plans: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM review_external_effect_plans WHERE preview_id=?1)",
+        [preview_id],
+        |row| row.get(0),
+    )?;
+    if !plans {
+        return Err(ReviewStoreError::Corrupt("external_effect_plan"));
+    }
+    Ok(())
+}
+
+fn retained_session_delivery_snapshot(
+    original: &ReviewSnapshot,
+    current: &ReviewSnapshot,
+    request: &ReviewActionRequest,
+    delivered: bool,
+) -> Stored<ReviewSnapshot> {
+    if current.schema() != ReviewSchemaVersion::V2
+        || original.schema() != ReviewSchemaVersion::V2
+        || current.workspace() != request.workspace()
+        || original.workspace() != request.workspace()
+        || original.revision() != request.expected_revision()
+        || !external_targets_are_exact(original, current, request)?
+    {
+        return Err(ReviewStoreError::Conflict("retained_session_snapshot"));
+    }
+    let next_revision = current
+        .revision()
+        .get()
+        .checked_add(1)
+        .and_then(|value| Revision::new(value).ok())
+        .ok_or(ReviewStoreError::InvalidField("revision"))?;
+    let targets: BTreeSet<&str> = match request.action() {
+        ReviewAction::SendCommentToAgent { comment_id, .. } => {
+            std::iter::once(comment_id.as_str()).collect()
+        }
+        ReviewAction::BatchSendCommentsToAgent { comments } => comments
+            .iter()
+            .map(|target| target.comment_id().as_str())
+            .collect(),
+        _ => return Err(ReviewStoreError::InvalidField("retained_session_action")),
+    };
+    let next_state = if delivered {
+        CommentAgentState::Sent
+    } else {
+        CommentAgentState::Refused
+    };
+    let mut comments = Vec::with_capacity(current.comments().len());
+    for comment in current.comments() {
+        if targets.contains(comment.id().as_str()) {
+            let revision = comment
+                .revision()
+                .get()
+                .checked_add(1)
+                .and_then(|value| Revision::new(value).ok())
+                .ok_or(ReviewStoreError::InvalidField("comment_revision"))?;
+            comments.push(ReviewComment::new(
+                comment.id().clone(),
+                revision,
+                comment.actor().clone(),
+                comment.body().clone(),
+                comment.anchor().clone(),
+                next_state,
+                comment.unread(),
+            ));
+        } else {
+            comments.push(comment.clone());
+        }
+    }
+    let mut attention_events = Vec::with_capacity(current.attention_events().len());
+    for event in current.attention_events() {
+        let target_comment_revision = event
+            .origin()
+            .id()
+            .filter(|id| {
+                event.origin().kind() == AttentionOriginKind::Comment
+                    && targets.contains(id.as_str())
+            })
+            .and_then(|id| {
+                comments
+                    .iter()
+                    .find(|comment| comment.id().as_str() == id.as_str())
+            })
+            .map(ReviewComment::revision);
+        let origin_revision = target_comment_revision.unwrap_or_else(|| {
+            if matches!(
+                event.reason(),
+                AttentionReason::Conflict | AttentionReason::Complete
+            ) {
+                next_revision
+            } else {
+                event.origin().revision()
+            }
+        });
+        let origin = AttentionOrigin::new(
+            event.origin().kind(),
+            event.origin().id().cloned(),
+            event.origin().authority().clone(),
+            origin_revision,
+        )
+        .map_err(protocol)?;
+        attention_events.push(
+            AttentionEvent::new(event.id().clone(), origin, event.reason(), event.unread())
+                .map_err(protocol)?,
+        );
+    }
+    ReviewSnapshot::new(
+        current.workspace().clone(),
+        next_revision,
+        current.files().to_vec(),
+        comments,
+        current.proposals().to_vec(),
+        current.checks().to_vec(),
+        current.review().clone(),
+        current.pull_request().clone(),
+        current.delivery().clone(),
+        attention_events,
+    )
+    .map_err(protocol)
+}
+
 fn read_snapshot_revision(
     connection: &Connection,
     kind: &str,
@@ -2317,8 +3150,160 @@ fn validate_snapshot_comments(
     Ok(())
 }
 
+fn validate_external_effect_custody(
+    connection: &Connection,
+    action: &StoredReviewAction,
+    plan: Option<&ReviewExternalEffectPlan>,
+) -> Stored<()> {
+    let retained_action = matches!(
+        action.request.action(),
+        ReviewAction::SendCommentToAgent { .. } | ReviewAction::BatchSendCommentsToAgent { .. }
+    );
+    let rows: Vec<(String, i64, String, String, String)> = {
+        let mut statement = connection.prepare(
+            "SELECT comment_id,comment_revision,workspace_kind,workspace_id,disposition FROM review_external_effect_targets WHERE preview_id=?1 ORDER BY comment_id",
+        )?;
+        statement
+            .query_map([&action.preview_id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .collect::<Result<_, _>>()?
+    };
+    if !retained_action {
+        return if plan.is_none() && rows.is_empty() {
+            Ok(())
+        } else {
+            Err(ReviewStoreError::Corrupt("external_effect_custody"))
+        };
+    }
+    if plan.is_none() {
+        return if rows.is_empty() && migration_tombstone_matches(connection, action)? {
+            Ok(())
+        } else {
+            Err(ReviewStoreError::Corrupt("external_effect_custody"))
+        };
+    }
+    if action.receipt.outcome() == ReviewReceiptOutcome::Refused
+        && action.write_admitted_at_ms.is_none()
+        && rows.is_empty()
+    {
+        return Ok(());
+    }
+    let (workspace_kind, workspace_id) = workspace_parts(action.request.workspace());
+    let expected: BTreeSet<(String, i64)> = external_action_targets(&action.request)?
+        .into_iter()
+        .map(|(comment_id, revision)| Ok((comment_id.to_owned(), db_revision(revision)?)))
+        .collect::<Stored<_>>()?;
+    let actual: BTreeSet<(String, i64)> = rows
+        .iter()
+        .map(|(comment_id, revision, _, _, _)| (comment_id.clone(), *revision))
+        .collect();
+    let expected_disposition = match action.receipt.outcome() {
+        ReviewReceiptOutcome::Accepted | ReviewReceiptOutcome::Unknown => "reserved",
+        ReviewReceiptOutcome::Completed => "delivered",
+        ReviewReceiptOutcome::Refused => "refused",
+        ReviewReceiptOutcome::Conflict => "delivered_conflict",
+    };
+    if expected != actual
+        || rows.iter().any(|(_, _, kind, id, disposition)| {
+            kind != workspace_kind || id != workspace_id || disposition != expected_disposition
+        })
+    {
+        return Err(ReviewStoreError::Corrupt("external_effect_custody"));
+    }
+    Ok(())
+}
+
+fn migration_tombstone_matches(
+    connection: &Connection,
+    action: &StoredReviewAction,
+) -> Stored<bool> {
+    let raw: Option<(String, Vec<u8>)> = connection
+        .query_row(
+            "SELECT outcome,receipt_digest FROM review_external_effect_migration_tombstones WHERE preview_id=?1",
+            [&action.preview_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((outcome, stored_digest)) = raw else {
+        return Ok(false);
+    };
+    let stored_digest: [u8; 32] = stored_digest
+        .try_into()
+        .map_err(|_| ReviewStoreError::Corrupt("external_effect_migration_tombstone"))?;
+    let receipt_document = encode_review_action_receipt(&action.receipt).map_err(protocol)?;
+    if !is_terminal(action.receipt.outcome())
+        || outcome != action.receipt.outcome().as_str()
+        || stored_digest != digest(&receipt_document)
+    {
+        return Err(ReviewStoreError::Corrupt(
+            "external_effect_migration_tombstone",
+        ));
+    }
+    Ok(true)
+}
+
 fn validate_completed_basis(connection: &Connection, action: &StoredReviewAction) -> Stored<()> {
     if action.receipt.outcome() != ReviewReceiptOutcome::Completed {
+        return Ok(());
+    }
+    if action.external_effect_plan_digest.is_none()
+        && migration_tombstone_matches(connection, action)?
+    {
+        return validate_legacy_external_completed_basis(
+            connection,
+            &action.request,
+            &action.receipt,
+        );
+    }
+    if action.external_effect_plan_digest.is_some() {
+        let result = action
+            .receipt
+            .revision()
+            .ok_or(ReviewStoreError::Corrupt("completion_basis"))?;
+        if result <= action.request.expected_revision() {
+            return Err(ReviewStoreError::Corrupt("completion_basis"));
+        }
+        let (kind, id) = workspace_parts(action.request.workspace());
+        let original =
+            read_snapshot_revision(connection, kind, id, action.request.expected_revision())?
+                .ok_or(ReviewStoreError::Corrupt("completion_basis"))?;
+        let completed = read_snapshot_revision(connection, kind, id, result)?
+            .ok_or(ReviewStoreError::Corrupt("completion_basis"))?;
+        for (comment_id, expected_revision) in external_action_targets(&action.request)? {
+            let original_comment = original
+                .comments()
+                .iter()
+                .find(|comment| {
+                    comment.id().as_str() == comment_id && comment.revision() == expected_revision
+                })
+                .ok_or(ReviewStoreError::Corrupt("completion_basis"))?;
+            let completed_comment = completed
+                .comments()
+                .iter()
+                .find(|comment| comment.id().as_str() == comment_id)
+                .ok_or(ReviewStoreError::Corrupt("completion_basis"))?;
+            let next_comment_revision = expected_revision
+                .get()
+                .checked_add(1)
+                .and_then(|value| Revision::new(value).ok())
+                .ok_or(ReviewStoreError::Corrupt("completion_basis"))?;
+            if completed_comment.revision() != next_comment_revision
+                || completed_comment.actor() != original_comment.actor()
+                || completed_comment.body() != original_comment.body()
+                || completed_comment.anchor() != original_comment.anchor()
+                || completed_comment.unread() != original_comment.unread()
+                || completed_comment.agent_state() != CommentAgentState::Sent
+            {
+                return Err(ReviewStoreError::Corrupt("completion_basis"));
+            }
+        }
         return Ok(());
     }
     let expected_result = action
@@ -2347,6 +3332,58 @@ fn validate_completed_basis(connection: &Connection, action: &StoredReviewAction
     } else {
         Err(ReviewStoreError::Corrupt("completion_basis"))
     }
+}
+
+fn validate_legacy_external_completed_basis(
+    connection: &Connection,
+    request: &ReviewActionRequest,
+    receipt: &ReviewActionReceipt,
+) -> Stored<()> {
+    let expected_result = request
+        .expected_revision()
+        .get()
+        .checked_add(1)
+        .and_then(|value| Revision::new(value).ok())
+        .ok_or(ReviewStoreError::Corrupt("completion_basis"))?;
+    if receipt.outcome() != ReviewReceiptOutcome::Completed
+        || receipt.revision() != Some(expected_result)
+    {
+        return Err(ReviewStoreError::Corrupt("completion_basis"));
+    }
+    let (kind, id) = workspace_parts(request.workspace());
+    let original = read_snapshot_revision(connection, kind, id, request.expected_revision())?
+        .ok_or(ReviewStoreError::Corrupt("completion_basis"))?;
+    let completed = read_snapshot_revision(connection, kind, id, expected_result)?
+        .ok_or(ReviewStoreError::Corrupt("completion_basis"))?;
+    for (comment_id, expected_revision) in external_action_targets(request)? {
+        let original_comment = original
+            .comments()
+            .iter()
+            .find(|comment| {
+                comment.id().as_str() == comment_id && comment.revision() == expected_revision
+            })
+            .ok_or(ReviewStoreError::Corrupt("completion_basis"))?;
+        let completed_comment = completed
+            .comments()
+            .iter()
+            .find(|comment| comment.id().as_str() == comment_id)
+            .ok_or(ReviewStoreError::Corrupt("completion_basis"))?;
+        let next_comment_revision = expected_revision
+            .get()
+            .checked_add(1)
+            .and_then(|value| Revision::new(value).ok())
+            .ok_or(ReviewStoreError::Corrupt("completion_basis"))?;
+        if completed_comment.revision() != next_comment_revision
+            || completed_comment.actor() != original_comment.actor()
+            || completed_comment.body() != original_comment.body()
+            || completed_comment.anchor() != original_comment.anchor()
+            || completed_comment.unread() != original_comment.unread()
+            || completed_comment.agent_state() != CommentAgentState::Sent
+        {
+            return Err(ReviewStoreError::Corrupt("completion_basis"));
+        }
+    }
+    Ok(())
 }
 
 fn encode_approval(value: &ReviewApprovalDocument) -> Stored<Vec<u8>> {
@@ -2532,6 +3569,166 @@ fn read_action_by_key(
                 .and_then(|v| v.ok_or(ReviewStoreError::Corrupt("preview")))
         })
         .transpose()
+}
+
+fn insert_external_plan(
+    transaction: &rusqlite::Transaction<'_>,
+    preview_id: &str,
+    plan: &ReviewExternalEffectPlan,
+    created_at_ms: i64,
+) -> Stored<()> {
+    transaction.execute(
+        "INSERT INTO review_external_effect_plans(preview_id,request_digest,effect_kind,registry_generation_digest,provider,work_session_id,provider_session_id,work_session_revision,provider_session_revision,transport_key,payload,payload_digest,plan_document,plan_digest,created_at_ms) VALUES(?1,?2,'retained_session',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+        params![
+            preview_id,
+            plan.request_digest.as_slice(),
+            plan.registry_generation_digest.as_slice(),
+            plan.provider,
+            plan.work_session_id,
+            plan.provider_session_id,
+            db_revision(plan.work_session_revision)?,
+            db_revision(plan.provider_session_revision)?,
+            plan.transport_key,
+            plan.payload,
+            plan.payload_digest.as_slice(),
+            plan.document,
+            plan.digest.as_slice(),
+            created_at_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+fn external_action_targets(request: &ReviewActionRequest) -> Stored<Vec<(&str, Revision)>> {
+    match request.action() {
+        ReviewAction::SendCommentToAgent {
+            comment_id,
+            expected_comment_revision,
+        } => Ok(vec![(comment_id.as_str(), *expected_comment_revision)]),
+        ReviewAction::BatchSendCommentsToAgent { comments } => Ok(comments
+            .iter()
+            .map(|target| (target.comment_id().as_str(), target.expected_revision()))
+            .collect()),
+        _ => Err(ReviewStoreError::InvalidField("external_effect_action")),
+    }
+}
+
+fn reserve_external_targets(
+    transaction: &rusqlite::Transaction<'_>,
+    preview_id: &str,
+    request: &ReviewActionRequest,
+) -> Stored<()> {
+    let (kind, id) = workspace_parts(request.workspace());
+    for (comment_id, comment_revision) in external_action_targets(request)? {
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT preview_id FROM review_external_effect_targets WHERE workspace_kind=?1 AND workspace_id=?2 AND comment_id=?3 AND comment_revision=?4",
+                params![kind, id, comment_id, db_revision(comment_revision)?],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if existing.as_deref().is_some_and(|value| value != preview_id) {
+            return Err(ReviewStoreError::Conflict("external_effect_target"));
+        }
+        transaction.execute(
+            "INSERT OR IGNORE INTO review_external_effect_targets(preview_id,workspace_kind,workspace_id,comment_id,comment_revision,disposition) VALUES(?1,?2,?3,?4,?5,'reserved')",
+            params![preview_id, kind, id, comment_id, db_revision(comment_revision)?],
+        )?;
+    }
+    Ok(())
+}
+
+fn require_exact_external_plan(
+    connection: &Connection,
+    preview_id: &str,
+    expected: Option<&ReviewExternalEffectPlan>,
+) -> Stored<()> {
+    let stored = read_external_plan(connection, preview_id)?;
+    match (stored.as_ref(), expected) {
+        (None, None) => Ok(()),
+        (Some(stored), Some(expected)) if stored == expected => Ok(()),
+        _ => Err(ReviewStoreError::Conflict("external_effect_plan")),
+    }
+}
+
+fn read_external_plan(
+    connection: &Connection,
+    preview_id: &str,
+) -> Stored<Option<ReviewExternalEffectPlan>> {
+    type Raw = (
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        String,
+        String,
+        i64,
+        i64,
+        String,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+    );
+    let raw: Option<Raw> = connection
+        .query_row(
+            "SELECT request_digest,registry_generation_digest,provider,work_session_id,provider_session_id,work_session_revision,provider_session_revision,transport_key,payload,payload_digest,plan_document,plan_digest FROM review_external_effect_plans WHERE preview_id=?1",
+            [preview_id],
+            |row| {
+                Ok((
+                    row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
+                    row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
+                    row.get(10)?, row.get(11)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        request_digest,
+        registry_generation_digest,
+        provider,
+        work_session_id,
+        provider_session_id,
+        work_session_revision,
+        provider_session_revision,
+        transport_key,
+        payload,
+        payload_digest,
+        document,
+        plan_digest,
+    )) = raw
+    else {
+        return Ok(None);
+    };
+    let request_digest: [u8; 32] = request_digest
+        .try_into()
+        .map_err(|_| ReviewStoreError::Corrupt("external_effect_request_digest"))?;
+    let registry_generation_digest: [u8; 32] = registry_generation_digest
+        .try_into()
+        .map_err(|_| ReviewStoreError::Corrupt("external_effect_registry_digest"))?;
+    let stored_payload_digest: [u8; 32] = payload_digest
+        .try_into()
+        .map_err(|_| ReviewStoreError::Corrupt("external_effect_payload_digest"))?;
+    let stored_plan_digest: [u8; 32] = plan_digest
+        .try_into()
+        .map_err(|_| ReviewStoreError::Corrupt("external_effect_plan_digest"))?;
+    let plan = ReviewExternalEffectPlan::retained_session(
+        request_digest,
+        registry_generation_digest,
+        &provider,
+        &work_session_id,
+        &provider_session_id,
+        parse_revision(work_session_revision)?,
+        parse_revision(provider_session_revision)?,
+        &transport_key,
+        payload,
+    )?;
+    if plan.payload_digest != stored_payload_digest
+        || plan.document != document
+        || plan.digest != stored_plan_digest
+    {
+        return Err(ReviewStoreError::Corrupt("external_effect_plan"));
+    }
+    Ok(Some(plan))
 }
 
 fn read_action_by_preview_in_scope(
@@ -2721,6 +3918,13 @@ fn read_action_by_preview(
     let approved = approval
         .as_ref()
         .is_some_and(|value| value.document.decision() == ReviewApprovalDecision::Approved);
+    let external_plan = read_external_plan(connection, preview_id)?;
+    let external_effect_plan_digest = external_plan.as_ref().map(ReviewExternalEffectPlan::digest);
+    let migration_tombstone: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM review_external_effect_migration_tombstones WHERE preview_id=?1)",
+        [preview_id],
+        |row| row.get(0),
+    )?;
     let admission_fields = [
         raw.write_admission_id.is_some(),
         raw.write_admitted_at_ms.is_some(),
@@ -2755,6 +3959,7 @@ fn read_action_by_preview(
             approval_policy,
             approved,
             approval: approval.clone(),
+            external_effect_plan_digest,
             write_admission_id: None,
             write_admitted_at_ms: None,
         };
@@ -2764,7 +3969,11 @@ fn read_action_by_preview(
             admitted_at,
             admission_id,
         )?;
-        if digest(document) != stored_digest || document != expected {
+        if digest(document) != stored_digest
+            || (migration_tombstone
+                && automonique_protocol::wire::parse_canonical(document).is_err())
+            || (!migration_tombstone && document != expected)
+        {
             return Err(ReviewStoreError::Corrupt("write_admission"));
         }
     }
@@ -2777,9 +3986,11 @@ fn read_action_by_preview(
         approval_policy,
         approved,
         approval,
+        external_effect_plan_digest,
         write_admission_id: raw.write_admission_id,
         write_admitted_at_ms: raw.write_admitted_at_ms,
     };
+    validate_external_effect_custody(connection, &action, external_plan.as_ref())?;
     validate_completed_basis(connection, &action)?;
     Ok(Some(action))
 }

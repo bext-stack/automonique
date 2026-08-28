@@ -221,21 +221,40 @@ expose an accepted local write, and an exact idempotency replay returns the
 same terminal receipt without advancing the snapshot again. The policy file is
 fenced immediately before and after this transaction.
 
-Agent comment delivery, stage/unstage/commit/conflict resolution, CI reruns,
-and pull-request open/update/merge remain unavailable. After full authority and
-target validation they refuse before custody as
-`platform_v2_review_agent_adapter_unavailable`,
-`platform_v2_review_git_adapter_unavailable`,
+Stage/unstage/commit/conflict resolution, CI reruns, and pull-request
+open/update/merge remain unavailable. After full authority and target
+validation they refuse before custody as `platform_v2_review_git_adapter_unavailable`,
 `platform_v2_review_ci_adapter_unavailable`, or
 `platform_v2_review_pull_request_adapter_unavailable`. No request text becomes
-a path, command, provider payload, or credential. The private target registry
-below establishes the missing identity boundary, but deliberately does not
-turn a binding into an executable capability. Git still lacks a server-owned
-snapshot-to-blob/index/HEAD provenance document; retained sessions lack a
-typed idempotent delivery endpoint; and CI/pull-request providers lack typed
-credential consumers plus read-after-write reconciliation. Until those exact
-boundaries exist there is no external effect, hence no prepared custody or
-ambiguous write to recover.
+a path, command, provider payload, or credential. Git still lacks a
+server-owned snapshot-to-blob/index/HEAD provenance document, while CI and
+pull-request providers lack typed credential consumers plus read-after-write
+reconciliation.
+
+Single and batch comment delivery is available only for an exact `jcode`
+`retained_session` binding. The host proves the work-session -> attempt ->
+user-workspace ancestry and its exact Platform-v1 provider-session relation,
+then reads the selected comments from the authoritative review snapshot. It
+persists the registry generation, both session revisions, sorted comment
+coordinates and bodies, SHA-256 payload digest, and derived scheduler key in
+the same transaction as the accepted review receipt. The same transaction
+reserves every exact comment revision, so a second key cannot admit a duplicate
+delivery. Only then may the write admission be recorded.
+
+Recovery reconciles the complete persisted transport, key, provider-session
+scope, execution fence, and payload bytes; a key match alone is never evidence
+for this effect. An absent delivery is submitted to the dedicated
+`platform_v2.retained_review` lane. Immediately before provider custody that
+lane reopens the private registry and work-context stores and requires the
+persisted registry generation, work-session lineage/revision, and managed
+provider-session revision. It does not create or finalize a Platform-v1
+receipt. A proven completion marks the exact comments `sent` atomically with
+the final receipt, rebasing over unrelated review changes when the targets are
+still byte-for-byte exact. A proven pre-custody refusal marks them `refused`;
+an outcome that may have crossed provider custody remains ambiguous and is
+never blindly replayed. `GetReviewReceipt` drives the same reconciliation after
+restart. A changed fence before provider custody fails closed rather than
+retargeting it.
 Cancellations of already-existing durable lineage intents remain immediate,
 final store operations.
 
@@ -253,7 +272,9 @@ The bounded version-1 document maps an exact project, workspace kind/id, and
 authority kind/id to one closed target variant:
 
 - `local_repository` contains only a canonical uid-owned repository root;
-- `retained_session` contains an opaque provider and retained-session id;
+- `retained_session` contains the closed provider (`jcode`), opaque provider
+  session id, and exact Platform v2 `work_session_id` whose authoritative
+  relations must lead to the bound review workspace and provider session;
 - `ci` contains an opaque provider target and credential reference;
 - `pull_request` contains an opaque provider repository and credential
   reference.

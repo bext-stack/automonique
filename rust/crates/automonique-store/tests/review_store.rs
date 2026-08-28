@@ -13,7 +13,7 @@ use automonique_protocol::platform_v2_review_api::{
 use automonique_protocol::primitives::Revision;
 use automonique_store::review_store::{
     ApprovalPolicy, ReviewActionAdmission, ReviewApprovalDecision, ReviewApprovalDocument,
-    ReviewStore, ReviewStoreError, ReviewWriteAdmission,
+    ReviewExternalEffectPlan, ReviewStore, ReviewStoreError, ReviewWriteAdmission,
 };
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
@@ -59,7 +59,7 @@ fn downgrade_review_store_to_v1(path: &Path) {
     let connection = Connection::open(path).expect("open v2 store for downgrade");
     connection
         .execute_batch(
-            "ALTER TABLE review_snapshots DROP COLUMN protocol_schema; PRAGMA user_version=1;",
+            "DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; ALTER TABLE review_snapshots DROP COLUMN protocol_schema; PRAGMA user_version=1;",
         )
         .expect("construct historical v1 store");
 }
@@ -170,6 +170,28 @@ fn request_variant(
         },
     )
     .expect("request")
+}
+fn external_plan(request: &ReviewActionRequest, payload: &[u8]) -> ReviewExternalEffectPlan {
+    let request_digest =
+        ReviewStore::action_request_digest(request, ApprovalPolicy::NotRequired).expect("digest");
+    ReviewExternalEffectPlan::retained_session(
+        request_digest,
+        [7; 32],
+        "jcode",
+        "work-session-1",
+        "provider-session-1",
+        revision(3),
+        revision(5),
+        &format!(
+            "v2-review-{}",
+            request_digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ),
+        payload.to_vec(),
+    )
+    .expect("external plan")
 }
 fn seed(store: &mut ReviewStore) -> ReviewActionRequest {
     let snapshot = snapshot();
@@ -617,7 +639,7 @@ fn populated_review_v1_store_migrates_exactly_and_remains_non_actionable() {
     assert_eq!(
         raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .expect("version"),
-        2
+        3
     );
     let schema: String = raw
         .query_row("SELECT protocol_schema FROM review_snapshots", [], |row| {
@@ -673,7 +695,7 @@ fn mislabeled_authority_bearing_v1_document_is_transactionally_upgraded_to_v2() 
     assert_eq!(
         raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .expect("version"),
-        2
+        3
     );
     let protocol_schema: String = raw
         .query_row("SELECT protocol_schema FROM review_snapshots", [], |row| {
@@ -681,6 +703,503 @@ fn mislabeled_authority_bearing_v1_document_is_transactionally_upgraded_to_v2() 
         })
         .expect("schema projection");
     assert_eq!(protocol_schema, PLATFORM_REVIEW_SCHEMA_V2);
+}
+
+#[test]
+fn populated_v2_store_adds_external_plan_custody_transactionally() {
+    let private = PrivateStore::new();
+    let expected = snapshot();
+    {
+        let mut store = ReviewStore::open(private.path()).expect("open v3");
+        store.put_snapshot(&expected, 10).expect("snapshot");
+    }
+    let raw = Connection::open(private.path()).expect("raw");
+    raw.execute_batch(
+        "DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+    )
+        .expect("construct v2 store");
+    drop(raw);
+
+    let migrated = ReviewStore::open(private.path()).expect("migrate v2");
+    assert_eq!(
+        migrated
+            .snapshot(expected.workspace())
+            .expect("read")
+            .expect("snapshot"),
+        expected
+    );
+    drop(migrated);
+    let raw = Connection::open(private.path()).expect("raw reopen");
+    assert_eq!(
+        raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .unwrap(),
+        3
+    );
+    assert!(
+        raw.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_external_effect_plans')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn v2_migration_terminalizes_legacy_accepted_external_action_without_a_plan() {
+    let private = PrivateStore::new();
+    let (request, action) = {
+        let mut store = ReviewStore::open(private.path()).expect("open v3");
+        let snapshot = action_snapshot(false);
+        store.put_snapshot(&snapshot, 10).expect("snapshot");
+        let actor = ReviewActorId::new("actor-legacy-external").unwrap();
+        let authority = snapshot.review().authority().clone();
+        store
+            .grant_authority(
+                snapshot.workspace(),
+                &actor,
+                ReviewAuthentication::UserSession,
+                &authority,
+                11,
+            )
+            .unwrap();
+        let comment = &snapshot.comments()[0];
+        let request = ReviewActionRequest::new(
+            snapshot.workspace().clone(),
+            snapshot.revision(),
+            actor,
+            ReviewAuthentication::UserSession,
+            authority,
+            IdempotencyKey::new("legacy-external").unwrap(),
+            ReviewAction::SendCommentToAgent {
+                comment_id: comment.id().clone(),
+                expected_comment_revision: comment.revision(),
+            },
+        )
+        .unwrap();
+        let plan = external_plan(&request, b"legacy payload unavailable after migration");
+        let ReviewActionAdmission::New(action) = store
+            .prepare_external_action(&request, ApprovalPolicy::NotRequired, &plan, 20)
+            .unwrap()
+        else {
+            panic!("new")
+        };
+        (request, action)
+    };
+    let raw = Connection::open(private.path()).unwrap();
+    raw.execute_batch(
+        "DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+    )
+    .unwrap();
+    drop(raw);
+
+    let store = ReviewStore::open(private.path()).expect("migrate legacy external custody");
+    let receipt = store
+        .receipt(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            21,
+        )
+        .unwrap()
+        .expect("terminal receipt");
+    assert_eq!(receipt.outcome(), ReviewReceiptOutcome::Refused);
+    assert_eq!(receipt.reconciliation(), ReviewReconciliation::Final);
+    assert!(
+        store
+            .external_action(
+                request.workspace(),
+                request.actor(),
+                request.authentication(),
+                request.authority(),
+                request.idempotency_key(),
+                21,
+            )
+            .unwrap()
+            .is_none()
+    );
+    let raw = Connection::open(private.path()).unwrap();
+    let (outcome, updated_at_ms): (String, i64) = raw
+        .query_row(
+            "SELECT outcome,updated_at_ms FROM review_action_receipts WHERE preview_id=?1",
+            [&action.preview_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(outcome, "refused");
+    assert_eq!(updated_at_ms, 20);
+}
+
+#[test]
+fn v2_migration_preserves_or_conservatively_terminalizes_every_external_outcome() {
+    let cases = [
+        ("accepted", ReviewReceiptOutcome::Refused),
+        ("accepted_write", ReviewReceiptOutcome::Conflict),
+        ("unknown", ReviewReceiptOutcome::Conflict),
+        ("completed", ReviewReceiptOutcome::Completed),
+        ("conflict", ReviewReceiptOutcome::Conflict),
+        ("refused", ReviewReceiptOutcome::Refused),
+    ];
+    for (case, expected) in cases {
+        let private = PrivateStore::new();
+        let (request, preview_id) = {
+            let mut store = ReviewStore::open(private.path()).unwrap();
+            let snapshot = action_snapshot(false);
+            store.put_snapshot(&snapshot, 10).unwrap();
+            let actor = ReviewActorId::new(format!("actor-migrate-{case}")).unwrap();
+            let authority = snapshot.review().authority().clone();
+            store
+                .grant_authority(
+                    snapshot.workspace(),
+                    &actor,
+                    ReviewAuthentication::UserSession,
+                    &authority,
+                    11,
+                )
+                .unwrap();
+            let comment = &snapshot.comments()[0];
+            let request = ReviewActionRequest::new(
+                snapshot.workspace().clone(),
+                snapshot.revision(),
+                actor,
+                ReviewAuthentication::UserSession,
+                authority,
+                IdempotencyKey::new(format!("migrate-{case}")).unwrap(),
+                ReviewAction::SendCommentToAgent {
+                    comment_id: comment.id().clone(),
+                    expected_comment_revision: comment.revision(),
+                },
+            )
+            .unwrap();
+            let plan = external_plan(&request, format!("migration payload {case}").as_bytes());
+            let ReviewActionAdmission::New(action) = store
+                .prepare_external_action(&request, ApprovalPolicy::NotRequired, &plan, 20)
+                .unwrap()
+            else {
+                panic!("new")
+            };
+            match case {
+                "accepted" => {}
+                "accepted_write" => {
+                    store
+                        .start_write(&action.preview_id, action.request_digest, 21)
+                        .unwrap();
+                }
+                "unknown" => {
+                    store
+                        .start_write(&action.preview_id, action.request_digest, 21)
+                        .unwrap();
+                    store
+                        .mark_ambiguous(&action.preview_id, action.request_digest, 22)
+                        .unwrap();
+                }
+                "completed" => {
+                    store
+                        .start_write(&action.preview_id, action.request_digest, 21)
+                        .unwrap();
+                    store
+                        .complete_retained_session_delivery(
+                            &action.preview_id,
+                            action.request_digest,
+                            plan.transport_key(),
+                            true,
+                            22,
+                        )
+                        .unwrap();
+                }
+                "conflict" => {
+                    store
+                        .start_write(&action.preview_id, action.request_digest, 21)
+                        .unwrap();
+                    let mutated = ReviewComment::new(
+                        comment.id().clone(),
+                        revision(comment.revision().get() + 1),
+                        comment.actor().clone(),
+                        ReviewText::new("Migration conflict target changed").unwrap(),
+                        comment.anchor().clone(),
+                        comment.agent_state(),
+                        comment.unread(),
+                    );
+                    let advanced = ReviewSnapshot::new(
+                        snapshot.workspace().clone(),
+                        revision(snapshot.revision().get() + 1),
+                        snapshot.files().to_vec(),
+                        vec![mutated],
+                        snapshot.proposals().to_vec(),
+                        snapshot.checks().to_vec(),
+                        snapshot.review().clone(),
+                        snapshot.pull_request().clone(),
+                        snapshot.delivery().clone(),
+                        snapshot.attention_events().to_vec(),
+                    )
+                    .unwrap();
+                    store.put_snapshot(&advanced, 22).unwrap();
+                    store
+                        .complete_retained_session_delivery(
+                            &action.preview_id,
+                            action.request_digest,
+                            plan.transport_key(),
+                            true,
+                            23,
+                        )
+                        .unwrap();
+                }
+                "refused" => {
+                    store
+                        .refuse_external_action_not_started(
+                            &action.preview_id,
+                            action.request_digest,
+                            21,
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            (request, action.preview_id)
+        };
+        let raw = Connection::open(private.path()).unwrap();
+        raw.execute_batch(
+            "DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+        )
+        .unwrap();
+        drop(raw);
+
+        let store = ReviewStore::open(private.path()).unwrap();
+        let migrated = store
+            .receipt(
+                request.workspace(),
+                request.actor(),
+                request.authentication(),
+                request.authority(),
+                request.idempotency_key(),
+                30,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated.outcome(), expected, "case={case}");
+        assert_eq!(migrated.reconciliation(), ReviewReconciliation::Final);
+        drop(store);
+        let raw = Connection::open(private.path()).unwrap();
+        let (outcome, tombstone_digest, receipt_digest): (String, Vec<u8>, Vec<u8>) = raw
+            .query_row(
+                "SELECT t.outcome,t.receipt_digest,r.receipt_digest FROM review_external_effect_migration_tombstones t JOIN review_action_receipts r USING(preview_id) WHERE t.preview_id=?1",
+                [&preview_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(outcome, expected.as_str());
+        assert_eq!(tombstone_digest, receipt_digest);
+    }
+}
+
+#[test]
+fn migration_tombstone_tampering_and_native_missing_plan_corruption_fail_closed() {
+    let private = PrivateStore::new();
+    let (preview_id, request) = {
+        let mut store = ReviewStore::open(private.path()).unwrap();
+        let snapshot = action_snapshot(false);
+        store.put_snapshot(&snapshot, 10).unwrap();
+        let actor = ReviewActorId::new("actor-migration-corrupt").unwrap();
+        let authority = snapshot.review().authority().clone();
+        store
+            .grant_authority(
+                snapshot.workspace(),
+                &actor,
+                ReviewAuthentication::UserSession,
+                &authority,
+                11,
+            )
+            .unwrap();
+        let comment = &snapshot.comments()[0];
+        let request = ReviewActionRequest::new(
+            snapshot.workspace().clone(),
+            snapshot.revision(),
+            actor,
+            ReviewAuthentication::UserSession,
+            authority,
+            IdempotencyKey::new("migration-corrupt").unwrap(),
+            ReviewAction::SendCommentToAgent {
+                comment_id: comment.id().clone(),
+                expected_comment_revision: comment.revision(),
+            },
+        )
+        .unwrap();
+        let plan = external_plan(&request, b"migration corruption payload");
+        let ReviewActionAdmission::New(action) = store
+            .prepare_external_action(&request, ApprovalPolicy::NotRequired, &plan, 20)
+            .unwrap()
+        else {
+            panic!("new")
+        };
+        (action.preview_id, request)
+    };
+    let raw = Connection::open(private.path()).unwrap();
+    raw.execute_batch(
+        "DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+    )
+    .unwrap();
+    drop(raw);
+    ReviewStore::open(private.path()).unwrap();
+    let raw = Connection::open(private.path()).unwrap();
+    raw.execute(
+        "UPDATE review_external_effect_migration_tombstones SET receipt_digest=zeroblob(32) WHERE preview_id=?1",
+        [&preview_id],
+    )
+    .unwrap();
+    drop(raw);
+    let store = ReviewStore::open(private.path()).unwrap();
+    assert!(matches!(
+        store.receipt(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            30,
+        ),
+        Err(ReviewStoreError::Corrupt(
+            "external_effect_migration_tombstone"
+        ))
+    ));
+
+    let native = PrivateStore::new();
+    let request = {
+        let mut store = ReviewStore::open(native.path()).unwrap();
+        let snapshot = action_snapshot(false);
+        store.put_snapshot(&snapshot, 10).unwrap();
+        let actor = ReviewActorId::new("actor-native-missing-plan").unwrap();
+        let authority = snapshot.review().authority().clone();
+        store
+            .grant_authority(
+                snapshot.workspace(),
+                &actor,
+                ReviewAuthentication::UserSession,
+                &authority,
+                11,
+            )
+            .unwrap();
+        let comment = &snapshot.comments()[0];
+        let request = ReviewActionRequest::new(
+            snapshot.workspace().clone(),
+            snapshot.revision(),
+            actor,
+            ReviewAuthentication::UserSession,
+            authority,
+            IdempotencyKey::new("native-missing-plan").unwrap(),
+            ReviewAction::SendCommentToAgent {
+                comment_id: comment.id().clone(),
+                expected_comment_revision: comment.revision(),
+            },
+        )
+        .unwrap();
+        let plan = external_plan(&request, b"native missing plan");
+        store
+            .prepare_external_action(&request, ApprovalPolicy::NotRequired, &plan, 20)
+            .unwrap();
+        request
+    };
+    let raw = Connection::open(native.path()).unwrap();
+    raw.execute("DELETE FROM review_external_effect_targets", [])
+        .unwrap();
+    raw.execute("DELETE FROM review_external_effect_plans", [])
+        .unwrap();
+    drop(raw);
+    let store = ReviewStore::open(native.path()).unwrap();
+    assert!(matches!(
+        store.receipt(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            30,
+        ),
+        Err(ReviewStoreError::Corrupt("external_effect_custody"))
+    ));
+}
+
+#[test]
+fn migration_refuses_legacy_completed_external_receipt_without_exact_snapshot_basis() {
+    let private = PrivateStore::new();
+    let completed_revision = {
+        let mut store = ReviewStore::open(private.path()).unwrap();
+        let snapshot = action_snapshot(false);
+        store.put_snapshot(&snapshot, 10).unwrap();
+        let actor = ReviewActorId::new("actor-completed-without-basis").unwrap();
+        let authority = snapshot.review().authority().clone();
+        store
+            .grant_authority(
+                snapshot.workspace(),
+                &actor,
+                ReviewAuthentication::UserSession,
+                &authority,
+                11,
+            )
+            .unwrap();
+        let comment = &snapshot.comments()[0];
+        let request = ReviewActionRequest::new(
+            snapshot.workspace().clone(),
+            snapshot.revision(),
+            actor,
+            ReviewAuthentication::UserSession,
+            authority,
+            IdempotencyKey::new("completed-without-basis").unwrap(),
+            ReviewAction::SendCommentToAgent {
+                comment_id: comment.id().clone(),
+                expected_comment_revision: comment.revision(),
+            },
+        )
+        .unwrap();
+        let plan = external_plan(&request, b"completed migration basis");
+        let ReviewActionAdmission::New(action) = store
+            .prepare_external_action(&request, ApprovalPolicy::NotRequired, &plan, 20)
+            .unwrap()
+        else {
+            panic!("new")
+        };
+        store
+            .start_write(&action.preview_id, action.request_digest, 21)
+            .unwrap();
+        store
+            .complete_retained_session_delivery(
+                &action.preview_id,
+                action.request_digest,
+                plan.transport_key(),
+                true,
+                22,
+            )
+            .unwrap()
+            .revision()
+            .unwrap()
+    };
+    let raw = Connection::open(private.path()).unwrap();
+    raw.execute(
+        "DELETE FROM review_comments WHERE snapshot_revision=?1",
+        [i64::try_from(completed_revision.get()).unwrap()],
+    )
+    .unwrap();
+    raw.execute(
+        "DELETE FROM review_snapshots WHERE revision=?1",
+        [i64::try_from(completed_revision.get()).unwrap()],
+    )
+    .unwrap();
+    raw.execute_batch(
+        "DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+    )
+    .unwrap();
+    drop(raw);
+    assert!(matches!(
+        ReviewStore::open(private.path()),
+        Err(ReviewStoreError::Corrupt("completion_basis"))
+    ));
+    let raw = Connection::open(private.path()).unwrap();
+    assert_eq!(
+        raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .unwrap(),
+        2
+    );
 }
 
 #[test]
@@ -824,16 +1343,36 @@ fn typed_git_and_batch_actions_keep_one_write_custody() {
             action,
         )
         .expect("request");
-        let ReviewActionAdmission::New(prepared) = store
-            .prepare_action(&request, ApprovalPolicy::NotRequired, 20 + index as i64)
-            .expect("prepare")
-        else {
+        let plan = matches!(
+            request.action(),
+            ReviewAction::BatchSendCommentsToAgent { .. }
+        )
+        .then(|| external_plan(&request, b"exact batch payload"));
+        let first = if let Some(plan) = plan.as_ref() {
+            store.prepare_external_action(
+                &request,
+                ApprovalPolicy::NotRequired,
+                plan,
+                20 + index as i64,
+            )
+        } else {
+            store.prepare_action(&request, ApprovalPolicy::NotRequired, 20 + index as i64)
+        };
+        let ReviewActionAdmission::New(prepared) = first.expect("prepare") else {
             panic!("first admission must be new")
         };
+        let replay = if let Some(plan) = plan.as_ref() {
+            store.prepare_external_action(
+                &request,
+                ApprovalPolicy::NotRequired,
+                plan,
+                30 + index as i64,
+            )
+        } else {
+            store.prepare_action(&request, ApprovalPolicy::NotRequired, 30 + index as i64)
+        };
         assert!(matches!(
-            store
-                .prepare_action(&request, ApprovalPolicy::NotRequired, 30 + index as i64)
-                .expect("prepare replay"),
+            replay.expect("prepare replay"),
             ReviewActionAdmission::Replay(_)
         ));
         assert!(matches!(
@@ -913,6 +1452,685 @@ fn typed_git_and_batch_actions_keep_one_write_custody() {
             .expect("resolve replay"),
         ReviewWriteAdmission::Replay(_)
     ));
+}
+
+#[test]
+fn retained_session_plan_is_exact_and_completion_advances_selected_comments_once() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).expect("open");
+    let snapshot = action_snapshot(false);
+    store.put_snapshot(&snapshot, 10).expect("snapshot");
+    let actor = ReviewActorId::new("actor-retained-session").expect("actor");
+    let authority = snapshot.review().authority().clone();
+    store
+        .grant_authority(
+            snapshot.workspace(),
+            &actor,
+            ReviewAuthentication::UserSession,
+            &authority,
+            11,
+        )
+        .expect("grant");
+    let comment = &snapshot.comments()[0];
+    let request = ReviewActionRequest::new(
+        snapshot.workspace().clone(),
+        snapshot.revision(),
+        actor,
+        ReviewAuthentication::UserSession,
+        authority,
+        IdempotencyKey::new("retained-session-delivery").expect("key"),
+        ReviewAction::SendCommentToAgent {
+            comment_id: comment.id().clone(),
+            expected_comment_revision: comment.revision(),
+        },
+    )
+    .expect("request");
+    let plan = external_plan(&request, b"exact retained-session payload");
+    let ReviewActionAdmission::New(action) = store
+        .prepare_external_action(&request, ApprovalPolicy::NotRequired, &plan, 20)
+        .expect("prepare exact plan")
+    else {
+        panic!("new plan")
+    };
+    drop(store);
+    let mut store = ReviewStore::open(private.path()).expect("reopen after plan admission");
+    let (recovered, recovered_plan) = store
+        .external_action(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            21,
+        )
+        .expect("recover plan")
+        .expect("external action");
+    assert_eq!(recovered.preview_id, action.preview_id);
+    assert_eq!(recovered_plan, plan);
+    let divergent = external_plan(&request, b"different payload");
+    assert!(matches!(
+        store.prepare_external_action(&request, ApprovalPolicy::NotRequired, &divergent, 22),
+        Err(ReviewStoreError::Conflict("external_effect_plan"))
+    ));
+    let ReviewWriteAdmission::New(_) = store
+        .start_write(&action.preview_id, action.request_digest, 23)
+        .expect("write admission")
+    else {
+        panic!("new write")
+    };
+    let completed = store
+        .complete_retained_session_delivery(
+            &action.preview_id,
+            action.request_digest,
+            plan.transport_key(),
+            true,
+            24,
+        )
+        .expect("complete");
+    assert_eq!(completed.outcome(), ReviewReceiptOutcome::Completed);
+    let next = store
+        .snapshot(snapshot.workspace())
+        .expect("snapshot read")
+        .expect("next snapshot");
+    assert_eq!(next.revision(), revision(snapshot.revision().get() + 1));
+    let delivered = next
+        .comments()
+        .iter()
+        .find(|candidate| candidate.id() == comment.id())
+        .expect("delivered comment");
+    assert_eq!(delivered.revision(), revision(comment.revision().get() + 1));
+    assert_eq!(delivered.agent_state(), CommentAgentState::Sent);
+    assert_eq!(
+        store
+            .complete_retained_session_delivery(
+                &action.preview_id,
+                action.request_digest,
+                plan.transport_key(),
+                true,
+                25,
+            )
+            .expect("completion replay"),
+        completed
+    );
+    let raw = Connection::open(private.path()).expect("raw");
+    let payload: Vec<u8> = raw
+        .query_row(
+            "SELECT payload FROM review_external_effect_plans WHERE preview_id=?1",
+            [&action.preview_id],
+            |row| row.get(0),
+        )
+        .expect("persisted payload");
+    assert_eq!(payload, b"exact retained-session payload");
+}
+
+#[test]
+fn external_acceptance_requires_a_plan_and_reserves_each_exact_target_once() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let snapshot = action_snapshot(false);
+    store.put_snapshot(&snapshot, 10).unwrap();
+    let actor = ReviewActorId::new("actor-reservation").unwrap();
+    let authority = snapshot.review().authority().clone();
+    store
+        .grant_authority(
+            snapshot.workspace(),
+            &actor,
+            ReviewAuthentication::UserSession,
+            &authority,
+            11,
+        )
+        .unwrap();
+    let comment = &snapshot.comments()[0];
+    let request = ReviewActionRequest::new(
+        snapshot.workspace().clone(),
+        snapshot.revision(),
+        actor.clone(),
+        ReviewAuthentication::UserSession,
+        authority.clone(),
+        IdempotencyKey::new("reservation-one").unwrap(),
+        ReviewAction::SendCommentToAgent {
+            comment_id: comment.id().clone(),
+            expected_comment_revision: comment.revision(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        store.prepare_action(&request, ApprovalPolicy::NotRequired, 20),
+        Err(ReviewStoreError::InvalidField("external_effect_plan"))
+    ));
+    let plan = external_plan(&request, b"first exact payload");
+    store
+        .prepare_external_action(&request, ApprovalPolicy::NotRequired, &plan, 21)
+        .unwrap();
+
+    let duplicate = ReviewActionRequest::new(
+        snapshot.workspace().clone(),
+        snapshot.revision(),
+        actor,
+        ReviewAuthentication::UserSession,
+        authority,
+        IdempotencyKey::new("reservation-two").unwrap(),
+        ReviewAction::SendCommentToAgent {
+            comment_id: comment.id().clone(),
+            expected_comment_revision: comment.revision(),
+        },
+    )
+    .unwrap();
+    let duplicate_plan = external_plan(&duplicate, b"second payload must not be admitted");
+    assert!(matches!(
+        store
+            .prepare_external_action(&duplicate, ApprovalPolicy::NotRequired, &duplicate_plan, 22,),
+        Err(ReviewStoreError::Conflict("external_effect_target"))
+    ));
+    let raw = Connection::open(private.path()).unwrap();
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM review_action_previews", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT count(*) FROM review_external_effect_targets WHERE disposition='reserved'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn concurrent_external_keys_cannot_reserve_the_same_exact_target_twice() {
+    let private = PrivateStore::new();
+    let (snapshot, actor, authority) = {
+        let mut store = ReviewStore::open(private.path()).unwrap();
+        let snapshot = action_snapshot(false);
+        store.put_snapshot(&snapshot, 10).unwrap();
+        let actor = ReviewActorId::new("actor-concurrent-reservation").unwrap();
+        let authority = snapshot.review().authority().clone();
+        store
+            .grant_authority(
+                snapshot.workspace(),
+                &actor,
+                ReviewAuthentication::UserSession,
+                &authority,
+                11,
+            )
+            .unwrap();
+        (snapshot, actor, authority)
+    };
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = (0..2)
+        .map(|index| {
+            let path = private.path().to_path_buf();
+            let snapshot = snapshot.clone();
+            let actor = actor.clone();
+            let authority = authority.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let comment = &snapshot.comments()[0];
+                let request = ReviewActionRequest::new(
+                    snapshot.workspace().clone(),
+                    snapshot.revision(),
+                    actor,
+                    ReviewAuthentication::UserSession,
+                    authority,
+                    IdempotencyKey::new(format!("concurrent-reservation-{index}")).unwrap(),
+                    ReviewAction::SendCommentToAgent {
+                        comment_id: comment.id().clone(),
+                        expected_comment_revision: comment.revision(),
+                    },
+                )
+                .unwrap();
+                let plan = external_plan(&request, format!("payload-{index}").as_bytes());
+                let mut store = ReviewStore::open(path).unwrap();
+                barrier.wait();
+                store.prepare_external_action(
+                    &request,
+                    ApprovalPolicy::NotRequired,
+                    &plan,
+                    20 + index,
+                )
+            })
+        })
+        .collect();
+    let outcomes: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Ok(ReviewActionAdmission::New(_))))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| {
+                matches!(
+                    outcome,
+                    Err(ReviewStoreError::Conflict("external_effect_target"))
+                )
+            })
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn pre_write_external_refusal_is_terminal_and_releases_the_undelivered_target() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let snapshot = action_snapshot(false);
+    store.put_snapshot(&snapshot, 10).unwrap();
+    let actor = ReviewActorId::new("actor-pre-write-refusal").unwrap();
+    let authority = snapshot.review().authority().clone();
+    store
+        .grant_authority(
+            snapshot.workspace(),
+            &actor,
+            ReviewAuthentication::UserSession,
+            &authority,
+            11,
+        )
+        .unwrap();
+    let comment = &snapshot.comments()[0];
+    let request = ReviewActionRequest::new(
+        snapshot.workspace().clone(),
+        snapshot.revision(),
+        actor.clone(),
+        ReviewAuthentication::UserSession,
+        authority.clone(),
+        IdempotencyKey::new("pre-write-refusal").unwrap(),
+        ReviewAction::SendCommentToAgent {
+            comment_id: comment.id().clone(),
+            expected_comment_revision: comment.revision(),
+        },
+    )
+    .unwrap();
+    let plan = external_plan(&request, b"never submitted");
+    let ReviewActionAdmission::New(action) = store
+        .prepare_external_action(&request, ApprovalPolicy::NotRequired, &plan, 20)
+        .unwrap()
+    else {
+        panic!("new")
+    };
+    store
+        .revoke_authority(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            21,
+        )
+        .unwrap();
+    let refused = store
+        .refuse_external_action_not_started(&action.preview_id, action.request_digest, 22)
+        .unwrap();
+    assert_eq!(refused.outcome(), ReviewReceiptOutcome::Refused);
+    assert_eq!(
+        store
+            .refuse_external_action_not_started(&action.preview_id, action.request_digest, 22)
+            .unwrap(),
+        refused
+    );
+    assert!(matches!(
+        store
+            .prepare_external_action(&request, ApprovalPolicy::NotRequired, &plan, 23)
+            .unwrap(),
+        ReviewActionAdmission::Replay(replayed) if replayed.receipt == refused
+    ));
+    assert!(matches!(
+        store.start_write(&action.preview_id, action.request_digest, 23),
+        Err(ReviewStoreError::Conflict("terminal_receipt"))
+    ));
+
+    store
+        .reauthorize_authority_until(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            "pre-write-refusal-reauthorization",
+            revision(1),
+            24,
+            100,
+        )
+        .unwrap();
+
+    let retry = ReviewActionRequest::new(
+        snapshot.workspace().clone(),
+        snapshot.revision(),
+        actor,
+        ReviewAuthentication::UserSession,
+        authority,
+        IdempotencyKey::new("pre-write-refusal-retry").unwrap(),
+        ReviewAction::SendCommentToAgent {
+            comment_id: comment.id().clone(),
+            expected_comment_revision: comment.revision(),
+        },
+    )
+    .unwrap();
+    let retry_plan = external_plan(&retry, b"new fence and exact retry");
+    assert!(matches!(
+        store
+            .prepare_external_action(&retry, ApprovalPolicy::NotRequired, &retry_plan, 25,)
+            .unwrap(),
+        ReviewActionAdmission::New(_)
+    ));
+}
+
+#[test]
+fn pre_write_refusal_survives_expiry_and_an_unrelated_snapshot_advance() {
+    let expired = PrivateStore::new();
+    let mut store = ReviewStore::open(expired.path()).unwrap();
+    let snapshot = action_snapshot(false);
+    store.put_snapshot(&snapshot, 10).unwrap();
+    let actor = ReviewActorId::new("actor-expired-refusal").unwrap();
+    let authority = snapshot.review().authority().clone();
+    store
+        .grant_authority_until(
+            snapshot.workspace(),
+            &actor,
+            ReviewAuthentication::UserSession,
+            &authority,
+            11,
+            22,
+        )
+        .unwrap();
+    let comment = &snapshot.comments()[0];
+    let request = ReviewActionRequest::new(
+        snapshot.workspace().clone(),
+        snapshot.revision(),
+        actor,
+        ReviewAuthentication::UserSession,
+        authority,
+        IdempotencyKey::new("expired-pre-write-refusal").unwrap(),
+        ReviewAction::SendCommentToAgent {
+            comment_id: comment.id().clone(),
+            expected_comment_revision: comment.revision(),
+        },
+    )
+    .unwrap();
+    let plan = external_plan(&request, b"expires while queued");
+    let ReviewActionAdmission::New(action) = store
+        .prepare_external_action(&request, ApprovalPolicy::NotRequired, &plan, 20)
+        .unwrap()
+    else {
+        panic!("new")
+    };
+    assert_eq!(
+        store
+            .refuse_external_action_not_started(&action.preview_id, action.request_digest, 23)
+            .unwrap()
+            .outcome(),
+        ReviewReceiptOutcome::Refused
+    );
+
+    let advanced = PrivateStore::new();
+    let mut store = ReviewStore::open(advanced.path()).unwrap();
+    let snapshot = action_snapshot(false);
+    store.put_snapshot(&snapshot, 10).unwrap();
+    let actor = ReviewActorId::new("actor-stale-refusal").unwrap();
+    let authority = snapshot.review().authority().clone();
+    store
+        .grant_authority(
+            snapshot.workspace(),
+            &actor,
+            ReviewAuthentication::UserSession,
+            &authority,
+            11,
+        )
+        .unwrap();
+    let comment = &snapshot.comments()[0];
+    let request = ReviewActionRequest::new(
+        snapshot.workspace().clone(),
+        snapshot.revision(),
+        actor.clone(),
+        ReviewAuthentication::UserSession,
+        authority.clone(),
+        IdempotencyKey::new("stale-pre-write-refusal").unwrap(),
+        ReviewAction::SendCommentToAgent {
+            comment_id: comment.id().clone(),
+            expected_comment_revision: comment.revision(),
+        },
+    )
+    .unwrap();
+    let plan = external_plan(&request, b"snapshot advances while queued");
+    let ReviewActionAdmission::New(action) = store
+        .prepare_external_action(&request, ApprovalPolicy::NotRequired, &plan, 20)
+        .unwrap()
+    else {
+        panic!("new")
+    };
+    let unrelated = ReviewActionRequest::new(
+        snapshot.workspace().clone(),
+        snapshot.revision(),
+        actor,
+        ReviewAuthentication::UserSession,
+        authority,
+        IdempotencyKey::new("advance-before-refusal").unwrap(),
+        ReviewAction::AddComment {
+            comment_id: ReviewCommentId::new("unrelated-before-refusal").unwrap(),
+            anchor: comment.anchor().clone(),
+            body: ReviewText::new("Unrelated review advance").unwrap(),
+        },
+    )
+    .unwrap();
+    store.execute_local_action(&unrelated, 21).unwrap();
+    assert!(matches!(
+        store.start_write(&action.preview_id, action.request_digest, 22),
+        Err(ReviewStoreError::StaleRevision { .. })
+    ));
+    assert_eq!(
+        store
+            .refuse_external_action_not_started(&action.preview_id, action.request_digest, 23)
+            .unwrap()
+            .outcome(),
+        ReviewReceiptOutcome::Refused
+    );
+}
+
+#[test]
+fn retained_session_terminal_delivery_rebases_over_unrelated_review_advance() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).expect("open");
+    let snapshot = action_snapshot(false);
+    store.put_snapshot(&snapshot, 10).expect("snapshot");
+    let actor = ReviewActorId::new("actor-retained-conflict").expect("actor");
+    let authority = snapshot.review().authority().clone();
+    store
+        .grant_authority(
+            snapshot.workspace(),
+            &actor,
+            ReviewAuthentication::UserSession,
+            &authority,
+            11,
+        )
+        .expect("grant");
+    let comment = &snapshot.comments()[0];
+    let delivery = ReviewActionRequest::new(
+        snapshot.workspace().clone(),
+        snapshot.revision(),
+        actor.clone(),
+        ReviewAuthentication::UserSession,
+        authority.clone(),
+        IdempotencyKey::new("retained-conflict-delivery").unwrap(),
+        ReviewAction::SendCommentToAgent {
+            comment_id: comment.id().clone(),
+            expected_comment_revision: comment.revision(),
+        },
+    )
+    .unwrap();
+    let plan = external_plan(&delivery, b"payload delivered before local conflict");
+    let ReviewActionAdmission::New(action) = store
+        .prepare_external_action(&delivery, ApprovalPolicy::NotRequired, &plan, 20)
+        .unwrap()
+    else {
+        panic!("new")
+    };
+    store
+        .start_write(&action.preview_id, action.request_digest, 21)
+        .unwrap();
+    let local = ReviewActionRequest::new(
+        snapshot.workspace().clone(),
+        snapshot.revision(),
+        actor,
+        ReviewAuthentication::UserSession,
+        authority,
+        IdempotencyKey::new("unrelated-local-comment").unwrap(),
+        ReviewAction::AddComment {
+            comment_id: ReviewCommentId::new("comment-unrelated").unwrap(),
+            anchor: comment.anchor().clone(),
+            body: ReviewText::new("Unrelated local change").unwrap(),
+        },
+    )
+    .unwrap();
+    store.execute_local_action(&local, 22).unwrap();
+    let completed = store
+        .complete_retained_session_delivery(
+            &action.preview_id,
+            action.request_digest,
+            plan.transport_key(),
+            true,
+            23,
+        )
+        .unwrap();
+    assert_eq!(completed.outcome(), ReviewReceiptOutcome::Completed);
+    assert_eq!(
+        completed.revision(),
+        Some(revision(snapshot.revision().get() + 2))
+    );
+    let current = store.snapshot(snapshot.workspace()).unwrap().unwrap();
+    assert_eq!(
+        current
+            .comments()
+            .iter()
+            .find(|candidate| candidate.id() == comment.id())
+            .unwrap()
+            .agent_state(),
+        CommentAgentState::Sent
+    );
+}
+
+#[test]
+fn delivered_effect_on_a_mutated_target_is_terminal_evidence_not_a_replayable_write() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let snapshot = action_snapshot(false);
+    store.put_snapshot(&snapshot, 10).unwrap();
+    let actor = ReviewActorId::new("actor-mutated-delivery").unwrap();
+    let authority = snapshot.review().authority().clone();
+    store
+        .grant_authority(
+            snapshot.workspace(),
+            &actor,
+            ReviewAuthentication::UserSession,
+            &authority,
+            11,
+        )
+        .unwrap();
+    let original = &snapshot.comments()[0];
+    let request = ReviewActionRequest::new(
+        snapshot.workspace().clone(),
+        snapshot.revision(),
+        actor,
+        ReviewAuthentication::UserSession,
+        authority,
+        IdempotencyKey::new("mutated-delivery").unwrap(),
+        ReviewAction::SendCommentToAgent {
+            comment_id: original.id().clone(),
+            expected_comment_revision: original.revision(),
+        },
+    )
+    .unwrap();
+    let plan = external_plan(&request, b"payload crossed the external boundary");
+    let ReviewActionAdmission::New(action) = store
+        .prepare_external_action(&request, ApprovalPolicy::NotRequired, &plan, 20)
+        .unwrap()
+    else {
+        panic!("new")
+    };
+    store
+        .start_write(&action.preview_id, action.request_digest, 21)
+        .unwrap();
+
+    let mutated_comment = ReviewComment::new(
+        original.id().clone(),
+        revision(original.revision().get() + 1),
+        original.actor().clone(),
+        ReviewText::new("Target changed while delivery was pending").unwrap(),
+        original.anchor().clone(),
+        original.agent_state(),
+        original.unread(),
+    );
+    let advanced = ReviewSnapshot::new(
+        snapshot.workspace().clone(),
+        revision(snapshot.revision().get() + 1),
+        snapshot.files().to_vec(),
+        vec![mutated_comment],
+        snapshot.proposals().to_vec(),
+        snapshot.checks().to_vec(),
+        snapshot.review().clone(),
+        snapshot.pull_request().clone(),
+        snapshot.delivery().clone(),
+        snapshot.attention_events().to_vec(),
+    )
+    .unwrap();
+    store.put_snapshot(&advanced, 22).unwrap();
+    let terminal = store
+        .complete_retained_session_delivery(
+            &action.preview_id,
+            action.request_digest,
+            plan.transport_key(),
+            true,
+            23,
+        )
+        .unwrap();
+    assert_eq!(terminal.outcome(), ReviewReceiptOutcome::Conflict);
+    assert_eq!(terminal.current_revision(), Some(advanced.revision()));
+    assert_eq!(
+        store
+            .complete_retained_session_delivery(
+                &action.preview_id,
+                action.request_digest,
+                plan.transport_key(),
+                true,
+                24,
+            )
+            .unwrap(),
+        terminal
+    );
+    drop(store);
+
+    let reopened = ReviewStore::open(private.path()).expect("terminal evidence reopens");
+    assert_eq!(
+        reopened
+            .receipt(
+                request.workspace(),
+                request.actor(),
+                request.authentication(),
+                request.authority(),
+                request.idempotency_key(),
+                25,
+            )
+            .unwrap(),
+        Some(terminal)
+    );
+    let raw = Connection::open(private.path()).unwrap();
+    assert_eq!(
+        raw.query_row(
+            "SELECT disposition FROM review_external_effect_targets WHERE preview_id=?1",
+            [&action.preview_id],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        "delivered_conflict"
+    );
 }
 
 #[test]
