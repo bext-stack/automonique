@@ -137,6 +137,7 @@ pub(crate) enum CockpitRequest {
         project_id: String,
         workspace_id: String,
         idempotency_key: String,
+        receipt_correlation_digest: Option<String>,
     },
 }
 
@@ -276,7 +277,14 @@ pub(crate) fn execute(
             project_id,
             workspace_id,
             idempotency_key,
-        } => get_review_receipt(bridge, &project_id, &workspace_id, &idempotency_key),
+            receipt_correlation_digest,
+        } => get_review_receipt(
+            bridge,
+            &project_id,
+            &workspace_id,
+            &idempotency_key,
+            receipt_correlation_digest.as_deref(),
+        ),
     }
 }
 
@@ -692,6 +700,7 @@ fn review_actions(
                         "check_id": check.id().as_str(),
                         "exact_check_revision": capability.expected_check_revision().to_string(),
                         "confirmation_digest": capability.confirmation_digest().as_str()
+                        ,"receipt_correlation_digest": capability.receipt_correlation_digest().as_str()
                     }))
                 })
                 .collect::<Vec<_>>()
@@ -1338,6 +1347,7 @@ fn execute_review_action(
             context.project.clone(),
             context.workspace.clone(),
             idempotency_key.clone(),
+            None,
         )?
     {
         return action_receipt(&receipt);
@@ -1379,9 +1389,15 @@ fn existing_review_receipt(
     project: ProjectId,
     workspace: WorkContextIdentity,
     idempotency_key: IdempotencyKey,
+    receipt_correlation_digest: Option<ReviewReceiptCorrelationDigest>,
 ) -> Result<Option<ReviewActionReceipt>, &'static str> {
-    let lookup = ReviewReceiptLookup::new(project, workspace, idempotency_key)
-        .map_err(|_| "platform_cockpit_request_invalid")?;
+    let lookup = match receipt_correlation_digest {
+        Some(digest) => {
+            ReviewReceiptLookup::new_correlated(project, workspace, idempotency_key, digest)
+        }
+        None => ReviewReceiptLookup::new(project, workspace, idempotency_key),
+    }
+    .map_err(|_| "platform_cockpit_request_invalid")?;
     match bridge.request(PlatformV2Request::GetReviewReceipt(lookup))? {
         PlatformV2Response::ReviewReceipt(value) => Ok(Some(value)),
         PlatformV2Response::Refused(value)
@@ -1399,6 +1415,7 @@ fn get_review_receipt(
     project_id: &str,
     workspace_id: &str,
     idempotency_key: &str,
+    receipt_correlation_digest: Option<&str>,
 ) -> Result<Value, &'static str> {
     require_v2(bridge)?;
     let project =
@@ -1410,7 +1427,17 @@ fn get_review_receipt(
     exact_workspace_record(bridge, &capabilities, &project, &workspace_id)?;
     let idempotency_key = IdempotencyKey::new(idempotency_key.to_owned())
         .map_err(|_| "platform_cockpit_request_invalid")?;
-    match existing_review_receipt(bridge, project, workspace, idempotency_key)? {
+    let receipt_correlation_digest = receipt_correlation_digest
+        .map(|value| ReviewReceiptCorrelationDigest::new(value.to_owned()))
+        .transpose()
+        .map_err(|_| "platform_cockpit_request_invalid")?;
+    match existing_review_receipt(
+        bridge,
+        project,
+        workspace,
+        idempotency_key,
+        receipt_correlation_digest,
+    )? {
         Some(value) => action_receipt(&value),
         None => Ok(json!({
             "schema": SCHEMA,
@@ -2327,6 +2354,22 @@ mod tests {
             "idempotency_key": "rerun-test"
         }));
         assert!(matches!(confirmed, Ok(CockpitRequest::RerunCheck { .. })));
+
+        let correlated_lookup = serde_json::from_value::<CockpitRequest>(json!({
+            "action": "get_review_receipt",
+            "project_id": "project-test",
+            "workspace_id": "workspace-test",
+            "idempotency_key": "rerun-test",
+            "receipt_correlation_digest": "cd".repeat(32)
+        }))
+        .unwrap();
+        assert!(matches!(
+            correlated_lookup,
+            CockpitRequest::GetReviewReceipt {
+                receipt_correlation_digest: Some(value),
+                ..
+            } if value == "cd".repeat(32)
+        ));
     }
 
     #[test]

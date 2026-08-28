@@ -232,6 +232,9 @@ impl PlatformV2Bridge {
                             project: &project,
                             workspace: lookup.workspace(),
                             idempotency_key: lookup.idempotency_key().as_str(),
+                            receipt_correlation_digest: lookup
+                                .receipt_correlation_digest()
+                                .map(|digest| digest.as_str()),
                         }
                     }
                     PlatformV2Request::ExecuteReviewAction(value) => {
@@ -239,6 +242,9 @@ impl PlatformV2Bridge {
                             project: &project,
                             workspace: value.workspace(),
                             idempotency_key: value.idempotency_key().as_str(),
+                            receipt_correlation_digest: value
+                                .receipt_correlation_digest()
+                                .map(|digest| digest.as_str()),
                         }
                     }
                     _ => match submit_idempotency_key.as_deref() {

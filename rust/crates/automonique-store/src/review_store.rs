@@ -38,7 +38,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{StoreError, validate_database_path};
 
-pub const REVIEW_STORE_SCHEMA_VERSION: u32 = 5;
+pub const REVIEW_STORE_SCHEMA_VERSION: u32 = 6;
 const MAX_PROVIDER_OBSERVATION_BYTES: usize = 4096;
 const MAX_REVIEW_EFFECT_PAYLOAD_BYTES: usize = 1_048_576;
 
@@ -267,6 +267,9 @@ CREATE TABLE review_github_check_effect_plans (
 "#;
 const ADD_REVIEW_RECEIPT_CORRELATION_V5: &str = r#"
 ALTER TABLE review_github_check_effect_plans ADD COLUMN receipt_correlation_digest BLOB CHECK (receipt_correlation_digest IS NULL OR length(receipt_correlation_digest) = 32);
+"#;
+const ADD_GITHUB_WORKSPACE_REVISION_V6: &str = r#"
+ALTER TABLE review_github_check_effect_plans ADD COLUMN expected_workspace_revision INTEGER CHECK (expected_workspace_revision IS NULL OR expected_workspace_revision >= 1);
 "#;
 
 #[derive(Debug)]
@@ -546,6 +549,7 @@ impl ReviewExternalEffectCustody {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GitHubCheckEffectPlan {
     receipt_correlation_digest: [u8; 32],
+    expected_workspace_revision: Option<Revision>,
     credential_generation_digest: [u8; 32],
     credential_reference: String,
     repository_owner: String,
@@ -660,6 +664,43 @@ impl ReviewExternalEffectPlan {
         observed_attempt: u32,
         check_id: ReviewCheckId,
         expected_check_revision: Revision,
+        expected_workspace_revision: Revision,
+        receipt_correlation_digest: [u8; 32],
+    ) -> Stored<Self> {
+        if receipt_correlation_digest == [0; 32] {
+            return Err(ReviewStoreError::InvalidField("receipt_correlation_digest"));
+        }
+        Self::github_check_rerun_stored(
+            request_digest,
+            registry_generation_digest,
+            credential_generation_digest,
+            credential_reference,
+            repository_owner,
+            repository_name,
+            run_id,
+            head_sha,
+            observed_attempt,
+            check_id,
+            expected_check_revision,
+            Some(expected_workspace_revision),
+            receipt_correlation_digest,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn github_check_rerun_stored(
+        request_digest: [u8; 32],
+        registry_generation_digest: [u8; 32],
+        credential_generation_digest: [u8; 32],
+        credential_reference: &str,
+        repository_owner: &str,
+        repository_name: &str,
+        run_id: u64,
+        head_sha: &str,
+        observed_attempt: u32,
+        check_id: ReviewCheckId,
+        expected_check_revision: Revision,
+        expected_workspace_revision: Option<Revision>,
         receipt_correlation_digest: [u8; 32],
     ) -> Stored<Self> {
         if !safe_effect_coordinate(credential_reference)
@@ -730,6 +771,12 @@ impl ReviewExternalEffectPlan {
                 JsonValue::String(digest_token(&receipt_correlation_digest)),
             ));
         }
+        if let Some(expected_workspace_revision) = expected_workspace_revision {
+            fields.push((
+                "expected_workspace_revision".to_owned(),
+                JsonValue::Integer(db_revision(expected_workspace_revision)?),
+            ));
+        }
         let document = JsonValue::Object(fields).to_canonical_bytes();
         let plan_digest = digest(&document);
         Ok(Self {
@@ -747,6 +794,7 @@ impl ReviewExternalEffectPlan {
             digest: plan_digest,
             github_check: Some(GitHubCheckEffectPlan {
                 receipt_correlation_digest,
+                expected_workspace_revision,
                 credential_generation_digest,
                 credential_reference: credential_reference.to_owned(),
                 repository_owner: repository_owner.to_owned(),
@@ -825,6 +873,13 @@ impl ReviewExternalEffectPlan {
         self.github_check.as_ref().and_then(|p| {
             (p.receipt_correlation_digest != [0; 32]).then_some(p.receipt_correlation_digest)
         })
+    }
+
+    #[must_use]
+    pub fn github_expected_workspace_revision(&self) -> Option<Revision> {
+        self.github_check
+            .as_ref()
+            .and_then(|plan| plan.expected_workspace_revision)
     }
 
     #[must_use]
@@ -2379,23 +2434,30 @@ fn initialize(connection: &mut Connection) -> Stored<bool> {
         transaction.execute_batch(ADD_EXTERNAL_EFFECT_PLANS_V3)?;
         transaction.execute_batch(ADD_GITHUB_CHECK_EFFECT_PLANS_V4)?;
         transaction.execute_batch(ADD_REVIEW_RECEIPT_CORRELATION_V5)?;
+        transaction.execute_batch(ADD_GITHUB_WORKSPACE_REVISION_V6)?;
     } else if version == 1 {
         transaction.execute_batch(ADD_SNAPSHOT_PROTOCOL_SCHEMA_V2)?;
         migrate_review_v1_snapshots(&transaction)?;
         transaction.execute_batch(ADD_EXTERNAL_EFFECT_PLANS_V3)?;
         transaction.execute_batch(ADD_GITHUB_CHECK_EFFECT_PLANS_V4)?;
         transaction.execute_batch(ADD_REVIEW_RECEIPT_CORRELATION_V5)?;
+        transaction.execute_batch(ADD_GITHUB_WORKSPACE_REVISION_V6)?;
         terminalize_legacy_external_actions(&transaction)?;
     } else if version == 2 {
         transaction.execute_batch(ADD_EXTERNAL_EFFECT_PLANS_V3)?;
         transaction.execute_batch(ADD_GITHUB_CHECK_EFFECT_PLANS_V4)?;
         transaction.execute_batch(ADD_REVIEW_RECEIPT_CORRELATION_V5)?;
+        transaction.execute_batch(ADD_GITHUB_WORKSPACE_REVISION_V6)?;
         terminalize_legacy_external_actions(&transaction)?;
     } else if version == 3 {
         transaction.execute_batch(ADD_GITHUB_CHECK_EFFECT_PLANS_V4)?;
         transaction.execute_batch(ADD_REVIEW_RECEIPT_CORRELATION_V5)?;
+        transaction.execute_batch(ADD_GITHUB_WORKSPACE_REVISION_V6)?;
     } else if version == 4 {
         transaction.execute_batch(ADD_REVIEW_RECEIPT_CORRELATION_V5)?;
+        transaction.execute_batch(ADD_GITHUB_WORKSPACE_REVISION_V6)?;
+    } else if version == 5 {
+        transaction.execute_batch(ADD_GITHUB_WORKSPACE_REVISION_V6)?;
     } else {
         return Err(ReviewStoreError::SchemaVersion {
             found: version,
@@ -4246,7 +4308,7 @@ fn insert_external_plan(
             return Err(ReviewStoreError::Conflict("github_check_run_attempt"));
         }
         transaction.execute(
-            "INSERT INTO review_github_check_effect_plans(preview_id,request_digest,registry_generation_digest,credential_generation_digest,credential_reference,repository_owner,repository_name,repository_owner_normalized,repository_name_normalized,run_id,head_sha,observed_attempt,check_id,expected_check_revision,custody,plan_document,plan_digest,created_at_ms,updated_at_ms,receipt_correlation_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'not_started',?15,?16,?17,?17,?18)",
+            "INSERT INTO review_github_check_effect_plans(preview_id,request_digest,registry_generation_digest,credential_generation_digest,credential_reference,repository_owner,repository_name,repository_owner_normalized,repository_name_normalized,run_id,head_sha,observed_attempt,check_id,expected_check_revision,custody,plan_document,plan_digest,created_at_ms,updated_at_ms,receipt_correlation_digest,expected_workspace_revision) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'not_started',?15,?16,?17,?17,?18,?19)",
             params![
                 preview_id,
                 plan.request_digest.as_slice(),
@@ -4266,6 +4328,7 @@ fn insert_external_plan(
                 plan.digest.as_slice(),
                 created_at_ms,
                 github.receipt_correlation_digest.as_slice(),
+                github.expected_workspace_revision.map(db_revision).transpose()?,
             ],
         ).map_err(|error| match &error {
             rusqlite::Error::SqliteFailure(code, _)
@@ -4471,11 +4534,12 @@ fn read_github_check_plan(
         Vec<u8>,
         Vec<u8>,
         Option<Vec<u8>>,
+        Option<i64>,
     );
     let raw: Option<Raw> = connection.query_row(
-        "SELECT request_digest,registry_generation_digest,credential_generation_digest,credential_reference,repository_owner,repository_name,repository_owner_normalized,repository_name_normalized,run_id,head_sha,observed_attempt,check_id,expected_check_revision,custody,plan_document,plan_digest,receipt_correlation_digest FROM review_github_check_effect_plans WHERE preview_id=?1",
+        "SELECT request_digest,registry_generation_digest,credential_generation_digest,credential_reference,repository_owner,repository_name,repository_owner_normalized,repository_name_normalized,run_id,head_sha,observed_attempt,check_id,expected_check_revision,custody,plan_document,plan_digest,receipt_correlation_digest,expected_workspace_revision FROM review_github_check_effect_plans WHERE preview_id=?1",
         [preview_id],
-        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?,row.get(15)?,row.get(16)?)),
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?,row.get(15)?,row.get(16)?,row.get(17)?)),
     ).optional()?;
     let Some((
         request_digest,
@@ -4495,6 +4559,7 @@ fn read_github_check_plan(
         document,
         stored_digest,
         correlation_digest,
+        expected_workspace_revision,
     )) = raw
     else {
         return Ok(None);
@@ -4527,7 +4592,7 @@ fn read_github_check_plan(
         .map_err(|_| ReviewStoreError::Corrupt("external_effect_plan"))?;
     let check_id = ReviewCheckId::new(check_id)
         .map_err(|_| ReviewStoreError::Corrupt("external_effect_plan"))?;
-    let mut plan = ReviewExternalEffectPlan::github_check_rerun(
+    let mut plan = ReviewExternalEffectPlan::github_check_rerun_stored(
         request_digest,
         registry_digest,
         credential_digest,
@@ -4539,6 +4604,9 @@ fn read_github_check_plan(
         observed_attempt,
         check_id,
         parse_revision(expected_revision)?,
+        expected_workspace_revision
+            .map(parse_revision)
+            .transpose()?,
         correlation_digest,
     )?;
     if plan.document != document || plan.digest != stored_digest {

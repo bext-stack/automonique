@@ -1937,13 +1937,6 @@ impl PlatformV2Runtime {
                     {
                         return Err("platform_v2_review_conflict");
                     }
-                    if existing.receipt.outcome()
-                        != automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Accepted
-                        && existing.receipt.outcome()
-                            != automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Unknown
-                    {
-                        return Ok(PlatformV2Response::ReviewReceipt(existing.receipt));
-                    }
                     if plan.is_github_check_rerun() {
                         let supplied = receipt_correlation_digest
                             .as_ref()
@@ -1955,11 +1948,26 @@ impl PlatformV2Runtime {
                         {
                             return Err("platform_v2_review_confirmation_changed");
                         }
+                        self.validate_github_workspace_revision(&principal, &existing, &plan)?;
+                        if existing.receipt.outcome()
+                            != automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Accepted
+                            && existing.receipt.outcome()
+                                != automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Unknown
+                        {
+                            return Ok(PlatformV2Response::ReviewReceipt(existing.receipt));
+                        }
                         let existing =
                             self.approve_prepared_github_confirmation(&existing, now_ms)?;
                         let receipt =
                             self.drive_github_check_rerun(&principal, &existing, &plan, now_ms)?;
                         return Ok(PlatformV2Response::ReviewReceipt(receipt));
+                    }
+                    if existing.receipt.outcome()
+                        != automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Accepted
+                        && existing.receipt.outcome()
+                            != automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Unknown
+                    {
+                        return Ok(PlatformV2Response::ReviewReceipt(existing.receipt));
                     }
                     if existing.write_admitted_at_ms.is_none()
                         && self
@@ -2080,6 +2088,11 @@ impl PlatformV2Runtime {
                         .map_err(review_store_category)?;
                         self.policy_fence.verify()?;
                         self.review_effects.verify_generation()?;
+                        self.validate_workspace_revision(
+                            &principal,
+                            request.workspace(),
+                            workspace_record.revision(),
+                        )?;
                         let admitted = self
                             .reviews
                             .prepare_external_action(
@@ -2199,6 +2212,7 @@ impl PlatformV2Runtime {
                                 _ => return Err("platform_v2_review_plan_invalid"),
                             },
                             expected_check_revision,
+                            workspace_record.revision(),
                             expected_correlation,
                         )
                         .map_err(review_store_category)?;
@@ -2217,6 +2231,11 @@ impl PlatformV2Runtime {
                             ReviewActionAdmission::New(action)
                             | ReviewActionAdmission::Replay(action) => action,
                         };
+                        self.validate_github_workspace_revision(
+                            &principal,
+                            &action,
+                            &external_plan,
+                        )?;
                         let action = self.approve_prepared_github_confirmation(&action, now_ms)?;
                         let receipt = self.drive_github_check_rerun(
                             &principal,
@@ -2252,7 +2271,10 @@ impl PlatformV2Runtime {
                     );
                     match external {
                         Ok(Some((action, plan))) => {
-                            if let Some(expected) = value.receipt_correlation_digest() {
+                            if plan.is_github_check_rerun() {
+                                let Some(expected) = value.receipt_correlation_digest() else {
+                                    continue;
+                                };
                                 let Some(actual) = plan.github_receipt_correlation_digest() else {
                                     continue;
                                 };
@@ -2261,6 +2283,14 @@ impl PlatformV2Runtime {
                                 {
                                     continue;
                                 }
+                                if self
+                                    .validate_github_workspace_revision(&principal, &action, &plan)
+                                    .is_err()
+                                {
+                                    continue;
+                                }
+                            } else if value.receipt_correlation_digest().is_some() {
+                                continue;
                             }
                             if action.receipt.outcome()
                                 == automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Accepted
@@ -2383,6 +2413,7 @@ impl PlatformV2Runtime {
             .workspaces
             .get(action.request.workspace())
             .ok_or("platform_v2_scope_denied")?;
+        self.validate_github_workspace_revision(principal, action, plan)?;
         let mut may_submit = false;
         let action = if action.write_admitted_at_ms.is_none() {
             if self
@@ -2572,6 +2603,20 @@ impl PlatformV2Runtime {
             .workspaces
             .get(action.request.workspace())
             .ok_or("platform_v2_scope_denied")?;
+        let workspace_record = self
+            .work_contexts
+            .validate_policy_mapping(
+                principal.actor.tenant(),
+                &scope.project,
+                action.request.workspace(),
+            )
+            .map_err(|_| "platform_v2_review_workspace_changed")?;
+        let expected_workspace_revision = plan
+            .github_expected_workspace_revision()
+            .ok_or("platform_v2_review_workspace_changed")?;
+        if workspace_record.revision() != expected_workspace_revision {
+            return Err("platform_v2_review_workspace_changed");
+        }
         let current = self.review_effects.plan(
             &scope.project,
             action.request.workspace(),
@@ -2605,6 +2650,7 @@ impl PlatformV2Runtime {
                 .cloned()
                 .ok_or("platform_v2_review_plan_invalid")?,
             expected_check_revision,
+            expected_workspace_revision,
             plan.github_receipt_correlation_digest()
                 .ok_or("platform_v2_review_plan_invalid")?,
         )
@@ -2619,6 +2665,37 @@ impl PlatformV2Runtime {
             .map_err(github_rerun_category)?;
         self.policy_fence.verify()?;
         self.review_effects.verify_generation()
+    }
+
+    fn validate_github_workspace_revision(
+        &self,
+        principal: &PrincipalPolicy,
+        action: &StoredReviewAction,
+        plan: &ReviewExternalEffectPlan,
+    ) -> Result<(), &'static str> {
+        let expected = plan
+            .github_expected_workspace_revision()
+            .ok_or("platform_v2_review_workspace_changed")?;
+        self.validate_workspace_revision(principal, action.request.workspace(), expected)
+    }
+
+    fn validate_workspace_revision(
+        &self,
+        principal: &PrincipalPolicy,
+        workspace: &WorkContextIdentity,
+        expected: Revision,
+    ) -> Result<(), &'static str> {
+        let scope = principal
+            .workspaces
+            .get(workspace)
+            .ok_or("platform_v2_scope_denied")?;
+        let current = self
+            .work_contexts
+            .validate_policy_mapping(principal.actor.tenant(), &scope.project, workspace)
+            .map_err(|_| "platform_v2_review_workspace_changed")?;
+        (current.revision() == expected)
+            .then_some(())
+            .ok_or("platform_v2_review_workspace_changed")
     }
 
     fn drive_retained_review_delivery(

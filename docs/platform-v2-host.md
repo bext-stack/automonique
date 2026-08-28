@@ -310,13 +310,17 @@ registry/credential state produces no advertised rerun capability. This read
 never performs a provider mutation.
 
 `ExecuteReviewAction(rerun_check)` persists the immutable run/repository/head/
-attempt plan and custody in the review SQLite store before the one allowed
-POST. Only a brand-new write admission in the same process may issue that POST.
+attempt plan, the distinct authoritative workspace revision, and custody in the
+review SQLite store before the one allowed POST. Only a brand-new write
+admission in the same process may issue that POST.
 The store atomically and durably reserves the ASCII-case-normalized repository,
 run ID, and observed attempt across every actor and workspace, so aliases or
 concurrent confirmations cannot create two POST opportunities. Attempts and
 snapshot/check revisions whose next value cannot be represented are refused
 before reservation or custody.
+Approval, write admission, submission, and restart reconciliation each reload
+the authoritative workspace mapping and require that stored revision exactly;
+missing legacy revision data or a changed/removed mapping is non-drivable.
 After a restart, `custody_started`, accepted, or ambiguous state is reconciled
 with the exact workflow-run GET and is never submitted again. GitHub does not
 return a rerun correlation token, so an exact next attempt completes the
@@ -339,7 +343,9 @@ custody and survives restart. Rerun clients must use the correlated receipt
 lookup: the daemon returns a receipt only when the idempotency key and this
 exact digest select the same durable GitHub plan. A legacy uncorrelated lookup
 remains available for non-rerun review actions, but is not attribution evidence
-for a rerun; older, external, cross-action, and same-key mismatches fail closed.
+for a rerun. Migrated GitHub plans missing either correlation or the workspace
+revision remain readable only as non-drivable legacy custody; older, external,
+cross-action, and same-key mismatches fail closed.
 
 ## Private attention source registry
 
@@ -678,8 +684,10 @@ receipt-ID binding exists before an ambiguous response. The private SQLite
 custody binds an operation family as well as the project and idempotency key;
 review custody additionally binds the exact workspace kind and ID. Mutation
 custody cannot admit a review lookup, and custody for one review workspace
-cannot admit another. Legacy custody rows without this complete coordinate fail
-closed after migration. Typed review-action submission, review-capability
+cannot admit another. GitHub rerun custody also binds the opaque receipt
+correlation digest, including across web-entry restart; an uncorrelated or
+substituted lookup is refused before opening the daemon socket. Legacy custody
+rows without this complete coordinate fail closed after migration. Typed review-action submission, review-capability
 reads, check reruns, and review-receipt lookup require independent
 `execute_review_action`, `get_review_capabilities`, `rerun_check`, and
 `get_review_receipt` mobile grants. The historical execute grant remains
