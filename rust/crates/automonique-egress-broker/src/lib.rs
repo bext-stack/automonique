@@ -77,8 +77,11 @@
 //! It does not terminate TLS, mint certificates, or hold a trust root, so it
 //! cannot read, alter, or record request contents even by mistake; a change
 //! that made it able to would announce itself as this crate acquiring a TLS
-//! dependency. It has no logging surface at all: what an operator can learn
-//! from it is [`BrokerStats`], which is counters.
+//! dependency. It has no request logging surface: what an operator can learn
+//! from it is [`BrokerStats`] plus the latest exact, parser-validated
+//! destination that the allowlist refused. That one bounded coordinate lets
+//! the owning run explain a provider failure without retaining headers,
+//! payload bytes, or resolved addresses.
 //!
 //! # No proxy authentication, deliberately
 //!
@@ -145,6 +148,54 @@ pub const MAX_RESOLVED_ADDRESSES: usize = 4;
 
 /// Longest any configurable deadline may be.
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// The latest exact `CONNECT` destination refused by an allowlist decision.
+///
+/// The host has already passed the broker's bounded authority parser and is
+/// normalized exactly as an allowlist host is. No header or request body is
+/// retained with it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefusedDestination {
+    host: DestinationHost,
+    port: u16,
+}
+
+impl RefusedDestination {
+    /// The normalized host the workload requested.
+    #[must_use]
+    pub const fn host(&self) -> &DestinationHost {
+        &self.host
+    }
+
+    /// The exact requested port.
+    #[must_use]
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+/// Read-only custody for one broker's bounded destination-refusal observation.
+#[derive(Clone)]
+pub struct RefusedDestinationObserver {
+    latest: Arc<Mutex<Option<RefusedDestination>>>,
+}
+
+impl fmt::Debug for RefusedDestinationObserver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RefusedDestinationObserver")
+            .field("has_refusal", &self.latest().is_some())
+            .finish()
+    }
+}
+
+impl RefusedDestinationObserver {
+    /// The latest allowlist-refused coordinate, if one has occurred.
+    #[must_use]
+    pub fn latest(&self) -> Option<RefusedDestination> {
+        self.latest.lock().ok()?.clone()
+    }
+}
 
 /// How often the accept loop checks for shutdown while idle.
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -440,6 +491,7 @@ struct Shared {
     config: BrokerConfig,
     counters: Counters,
     ledger: RefusalLedger,
+    refused_destination: Arc<Mutex<Option<RefusedDestination>>>,
     live: Mutex<LiveConnections>,
     stopping: AtomicBool,
 }
@@ -552,6 +604,7 @@ impl EgressBroker {
             config,
             counters: Counters::default(),
             ledger: RefusalLedger::default(),
+            refused_destination: Arc::new(Mutex::new(None)),
             live: Mutex::new(LiveConnections::default()),
             stopping: AtomicBool::new(false),
         });
@@ -605,6 +658,17 @@ impl EgressBroker {
     #[must_use]
     pub fn refusals(&self) -> Vec<RefusalRecord> {
         self.shared.ledger.entries()
+    }
+
+    /// A read-only handle to this broker's latest allowlist-refused target.
+    ///
+    /// The handle owns only the bounded observation, not the broker config or
+    /// any provider credential, and may safely outlive broker teardown.
+    #[must_use]
+    pub fn refused_destination_observer(&self) -> RefusedDestinationObserver {
+        RefusedDestinationObserver {
+            latest: Arc::clone(&self.shared.refused_destination),
+        }
     }
 
     /// The bound loopback address. Its port is what a launch plan grants.
@@ -891,6 +955,12 @@ fn serve(shared: &Arc<Shared>, client: TcpStream, peer: SocketAddr) {
             .counters
             .denied_destination
             .fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut latest) = shared.refused_destination.lock() {
+            *latest = Some(RefusedDestination {
+                host: read.request.host().clone(),
+                port: read.request.port(),
+            });
+        }
         refuse(&client, Refusal::Forbidden, config.head_timeout);
         return;
     };

@@ -86,10 +86,12 @@ non-empty policy that belongs to another provider.
   that same live snapshot. It never rereads the file and therefore cannot call
   an unapplied edit healthy.
 
-The remaining diagnostic gap is per-run detail: the typed provider fault still
-carries `category=rejected` without the destination. The provider log remains
-the place to identify that host until the broker/provider protocol preserves it
-in a bounded safe field.
+For a run that still asks its own broker for a destination outside the admitted
+set, the authoritative `provider_fault` keeps `category=rejected` and adds the
+exact normalized `host:port` the broker refused. That coordinate comes from the
+broker's bounded `CONNECT` parser; headers, request bytes, resolved addresses,
+and credentials are neither retained nor projected. A generic provider fault
+stays generic when no allowlist decision occurred.
 
 ## The Anthropic route is not a failover
 

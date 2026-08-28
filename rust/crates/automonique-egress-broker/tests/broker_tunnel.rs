@@ -296,6 +296,12 @@ fn a_destination_that_is_not_allowlisted_is_refused_and_never_dialled() {
     );
     assert_eq!(broker.stats().denied_destination, 2);
     assert_eq!(broker.stats().established, 0);
+    let refused = broker
+        .refused_destination_observer()
+        .latest()
+        .expect("the latest exact refused destination is retained");
+    assert_eq!(refused.host().to_string(), "localhost");
+    assert_eq!(refused.port(), allowed.port());
 }
 
 #[test]
