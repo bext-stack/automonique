@@ -39,6 +39,7 @@ use automonique_protocol::platform_v2_transport::{
 };
 use automonique_protocol::primitives::{EpochMillis, Revision};
 use automonique_protocol::wire::JsonValue;
+use automonique_store::attention_store::AttentionStore;
 use automonique_store::lineage_index::WorkspaceIntentExecutionReceipt;
 use automonique_store::lineage_index::{IntentAuthorizationScope, LineageIndex};
 use automonique_store::review_store::{
@@ -54,12 +55,17 @@ use automonique_store::work_context_store::{
 };
 use serde::Deserialize;
 
+use crate::platform_v2_attention_registry::AttentionRegistry;
 use crate::platform_v2_review_adapter::{ProductionReviewEffectAdapter, ReviewEffectPlan};
 
 pub const POLICY_FILE_NAME: &str = "platform-v2-policy.json";
 pub const WORK_CONTEXT_STORE_NAME: &str = "platform-v2-work-context.sqlite3";
 pub const LINEAGE_STORE_NAME: &str = "platform-v2-lineage.sqlite3";
 pub const REVIEW_STORE_NAME: &str = "platform-v2-review.sqlite3";
+pub const ATTENTION_STORE_NAME: &str =
+    crate::platform_v2_attention_registry::ATTENTION_STORE_FILE_NAME;
+pub const ATTENTION_REGISTRY_NAME: &str =
+    crate::platform_v2_attention_registry::ATTENTION_REGISTRY_FILE_NAME;
 
 const PREVIEW_LIFETIME_MS: i64 = 5 * 60 * 1_000;
 const APPROVAL_LIFETIME_MS: i64 = 60 * 1_000;
@@ -78,6 +84,8 @@ pub struct PlatformV2Runtime {
     work_contexts: WorkContextStore,
     lineage: LineageIndex,
     reviews: ReviewStore,
+    attention: AttentionStore,
+    attention_registry: AttentionRegistry,
     review_effects: ProductionReviewEffectAdapter,
     nonces: HostNonces,
     lifecycle_effects: Box<dyn PlatformV2LifecycleEffectAdapter>,
@@ -93,6 +101,8 @@ impl std::fmt::Debug for PlatformV2Runtime {
             .field("work_contexts", &self.work_contexts)
             .field("lineage", &self.lineage)
             .field("reviews", &self.reviews)
+            .field("attention", &self.attention)
+            .field("attention_registry", &self.attention_registry)
             .field("review_effects", &self.review_effects)
             .field("nonces", &self.nonces)
             .field("lifecycle_effects", &"typed adapter")
@@ -806,6 +816,17 @@ pub fn resolve_web_mobile_request_project(
             }
             value.project().clone()
         }
+        PlatformV2Request::GetAttentionSourceSnapshot(value) => {
+            let workspace = WorkContextIdentity::UserWorkspace(value.user_workspace().clone());
+            if principal
+                .workspaces
+                .get(&workspace)
+                .is_none_or(|scope| &scope.project != value.project())
+            {
+                return Err("platform_v2_mobile_project_denied");
+            }
+            value.project().clone()
+        }
         PlatformV2Request::ExecuteReviewAction(value) => principal
             .workspaces
             .get(value.workspace())
@@ -948,6 +969,17 @@ impl PlatformV2Runtime {
             .tenant();
         let mut reviews = ReviewStore::open_scoped(review_path, tenant)
             .map_err(|_| "platform_v2_store_unavailable")?;
+        let state_dir = policy_path
+            .parent()
+            .ok_or("platform_v2_state_path_invalid")?;
+        let mut attention =
+            AttentionStore::open_scoped(state_dir.join(ATTENTION_STORE_NAME), tenant)
+                .map_err(|_| "platform_v2_store_unavailable")?;
+        let attention_registry = AttentionRegistry::open(
+            &state_dir.join(ATTENTION_REGISTRY_NAME),
+            expected_uid,
+            &mut attention,
+        )?;
         // Grants are copied from the server-owned policy into the store. The
         // exact same grant is an idempotent replay on restart.
         for principal in principals.values() {
@@ -985,6 +1017,8 @@ impl PlatformV2Runtime {
             work_contexts,
             lineage,
             reviews,
+            attention,
+            attention_registry,
             review_effects,
             nonces: HostNonces::new()?,
             lifecycle_effects,
@@ -1686,6 +1720,14 @@ impl PlatformV2Runtime {
                     .map_err(|_| "platform_v2_store_refused")?
                     .map(PlatformV2Response::ReviewResult)
                     .ok_or("platform_v2_not_found")
+            }
+            PlatformV2Request::GetAttentionSourceSnapshot(value) => {
+                let workspace = WorkContextIdentity::UserWorkspace(value.user_workspace().clone());
+                authorize_identity(&principal, value.project(), &workspace)?;
+                self.validate_policy_mapping(&principal, &workspace)?;
+                self.attention_registry
+                    .snapshot(value, &self.attention)
+                    .map(PlatformV2Response::AttentionSourceSnapshot)
             }
             PlatformV2Request::ExecuteReviewAction(value) => {
                 let scope = principal
@@ -3100,6 +3142,10 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use automonique_protocol::platform::IdempotencyKey;
+    use automonique_protocol::platform_v2::{WorkContextAttributes, WorkContextLabel};
+    use automonique_protocol::platform_v2_attention::{
+        AttentionReadRequest, AttentionSource, AttentionSourceId, AttentionSourceKind,
+    };
     use automonique_protocol::platform_v2_transport::{
         LineageReadRequest, ReviewReadRequest, ReviewReceiptLookup,
     };
@@ -3196,6 +3242,79 @@ mod tests {
                 .supported_effect_kinds()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn runtime_debug_redacts_private_attention_store_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let policy_path = directory.path().join("policy.json");
+        let uid = nix::unistd::geteuid().as_raw();
+        let empty_authority = serde_json::json!({
+            "filesystem": [], "credentials": [], "network": [],
+            "tools": [], "providers": [], "models": []
+        });
+        write_generation_policy(
+            &policy_path,
+            &serde_json::json!({
+                "version": 1,
+                "principals": [{
+                    "uid": uid,
+                    "tenant": "runtime-tenant",
+                    "actor": "runtime-actor",
+                    "serving_authority": "automonique",
+                    "projects": ["runtime-project"],
+                    "workspaces": [{
+                        "project": "runtime-project",
+                        "kind": "project",
+                        "id": "runtime-project",
+                        "inherited_authority": empty_authority
+                    }],
+                    "authority": empty_authority,
+                    "review_authorities": {}
+                }]
+            }),
+        );
+        let work_context_path = directory.path().join("work-context.sqlite3");
+        let mut work_contexts = WorkContextStore::open(&work_context_path).unwrap();
+        work_contexts
+            .put_authoritative_record(
+                "runtime-tenant",
+                &WorkContextRecord::new(
+                    WorkContextIdentity::Project(ProjectId::new("runtime-project").unwrap()),
+                    Revision::FIRST,
+                    WorkContextLifecycle::Active,
+                    WorkContextLabel::new("Runtime project").unwrap(),
+                    WorkContextAttributes::EMPTY,
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        drop(work_contexts);
+        let host = PlatformV2Host::open_with_lifecycle_adapter(
+            &policy_path,
+            &work_context_path,
+            &directory.path().join("lineage.sqlite3"),
+            &directory.path().join("review.sqlite3"),
+            uid,
+            Box::new(UnavailableLifecycleEffectAdapter),
+        );
+        let PlatformV2Host::Enabled(mut runtime) = host else {
+            panic!("expected enabled Platform v2 runtime, got {host:?}");
+        };
+        let attention_path = directory
+            .path()
+            .join("runtime-attention-private-path-sentinel.sqlite3");
+        runtime.attention =
+            AttentionStore::open_scoped(&attention_path, "runtime-attention-authority-sentinel")
+                .unwrap();
+
+        let debug = format!("{runtime:?}");
+        assert!(debug.contains("attention: AttentionStore { state: \"open\" }"));
+        assert!(!debug.contains(attention_path.to_str().unwrap()));
+        assert!(!debug.contains("runtime-attention-private-path-sentinel"));
+        assert!(!debug.contains("runtime-attention-authority-sentinel"));
     }
 
     #[test]
@@ -3427,6 +3546,41 @@ mod tests {
                 &mismatched_review,
             ),
             Err("platform_v2_mobile_project_denied")
+        );
+        let attention_source = AttentionSource::new(
+            AttentionSourceKind::Review,
+            AttentionSourceId::new("review-source").unwrap(),
+        );
+        let mismatched_attention =
+            PlatformV2Request::GetAttentionSourceSnapshot(AttentionReadRequest::new(
+                attention_source.clone(),
+                project_b.clone(),
+                workspace_a.clone(),
+            ));
+        assert_eq!(
+            resolve_web_mobile_request_project(
+                &path,
+                uid,
+                "tenant-test",
+                "actor-test",
+                &roots,
+                &mismatched_attention,
+            ),
+            Err("platform_v2_mobile_project_denied")
+        );
+        let valid_attention = PlatformV2Request::GetAttentionSourceSnapshot(
+            AttentionReadRequest::new(attention_source, project_a.clone(), workspace_a.clone()),
+        );
+        assert_eq!(
+            resolve_web_mobile_request_project(
+                &path,
+                uid,
+                "tenant-test",
+                "actor-test",
+                &roots,
+                &valid_attention,
+            ),
+            Ok(project_a)
         );
         let mismatched_review_receipt = PlatformV2Request::GetReviewReceipt(
             ReviewReceiptLookup::new(

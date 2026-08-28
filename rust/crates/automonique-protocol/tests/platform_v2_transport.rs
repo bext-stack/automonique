@@ -11,6 +11,8 @@ use automonique_protocol::platform::{
 };
 use automonique_protocol::platform_api::{PlatformApiError, PlatformRequestMessage};
 use automonique_protocol::platform_v2::*;
+use automonique_protocol::platform_v2_attention::*;
+use automonique_protocol::platform_v2_attention_api::decode_attention_source_snapshot;
 use automonique_protocol::platform_v2_lifecycle::*;
 use automonique_protocol::platform_v2_lineage::*;
 use automonique_protocol::platform_v2_review::*;
@@ -364,6 +366,14 @@ fn every_platform_v2_request_kind_round_trips_without_server_owned_inputs() {
         PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(project(), intent)),
         PlatformV2Request::GetWorkspaceIntent(WorkspaceIntentLookup::new(project(), intent_id)),
         PlatformV2Request::GetReview(ReviewReadRequest::new(project(), workspace()).unwrap()),
+        PlatformV2Request::GetAttentionSourceSnapshot(AttentionReadRequest::new(
+            AttentionSource::new(
+                AttentionSourceKind::ProviderSession,
+                AttentionSourceId::new("provider-feed-1").unwrap(),
+            ),
+            project(),
+            UserWorkspaceId::new("workspace-1").unwrap(),
+        )),
         PlatformV2Request::ExecuteReviewAction(review_action()),
         PlatformV2Request::GetReviewReceipt(
             ReviewReceiptLookup::new(
@@ -569,6 +579,42 @@ fn response_documents_round_trip_and_review_envelope_fits_its_declared_ceiling()
             &PlatformV2RequestMessage::new(
                 request_id("review-response"),
                 PlatformV2Request::GetWorkContext(workspace()),
+            ),
+        ),
+        Err(PlatformV2TransportError::ResponseMismatch)
+    );
+
+    let attention_snapshot = decode_attention_source_snapshot(include_bytes!(
+        "../fixtures/platform-v2-attention-v1.json"
+    ))
+    .unwrap();
+    let attention_request = PlatformV2RequestMessage::new(
+        request_id("attention-response"),
+        PlatformV2Request::GetAttentionSourceSnapshot(AttentionReadRequest::new(
+            attention_snapshot.source().clone(),
+            attention_snapshot.project().clone(),
+            attention_snapshot.user_workspace().clone(),
+        )),
+    );
+    let attention_response = PlatformV2ResponseMessage::for_request(
+        &attention_request,
+        PlatformV2Response::AttentionSourceSnapshot(attention_snapshot),
+    )
+    .unwrap();
+    let attention_bytes = attention_response.to_canonical_bytes().unwrap();
+    assert_eq!(
+        PlatformV2ResponseMessage::from_canonical_bytes(&attention_bytes, &attention_request)
+            .unwrap(),
+        attention_response
+    );
+    assert_eq!(
+        PlatformV2ResponseMessage::from_canonical_bytes(
+            &attention_bytes,
+            &PlatformV2RequestMessage::new(
+                request_id("attention-response"),
+                PlatformV2Request::GetReview(
+                    ReviewReadRequest::new(project(), workspace()).unwrap()
+                ),
             ),
         ),
         Err(PlatformV2TransportError::ResponseMismatch)

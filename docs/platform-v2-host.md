@@ -286,6 +286,60 @@ group/world writable, and unknown JSON fields are rejected. The registry is
 private composition state: it is never returned by Platform v2 and clients
 cannot supply paths, commands, provider targets, or credential references.
 
+## Private attention source registry
+
+The optional `platform-v2-attention-registry.json` sibling is the only
+production bootstrap source for `get_attention_source_snapshot`. With no file,
+the method refuses as `platform_v2_attention_registry_unavailable`; it never
+projects an empty board or assigns a request-time revision or timestamp. The
+file is opened with `O_NOFOLLOW`, must be owned by the daemon uid with exact
+mode `0600` and one hard link, and is bounded to 2 MiB. Its descriptor identity,
+timestamps, length, and digest are rechecked before every read. A changed or
+removed file refuses until restart as `platform_v2_attention_registry_changed`.
+
+The version-1 registry has this closed shape:
+
+```json
+{
+  "version": 1,
+  "generation": "operator-generation-1",
+  "snapshots": [
+    {"schema": "automonique.platform/attention/v1", "semantics": "atomic_replace"}
+  ]
+}
+```
+
+Each `snapshots` entry is the complete canonical attention document described
+in [Platform v2 authoritative attention
+navigation](product-plan/platform-v2-attention-navigation.md); the abbreviated
+entry above only identifies the nested schema and is not itself installable.
+Operators must supply all required fields exactly as demonstrated by the
+[installable canonical fixture](../rust/crates/automonique-protocol/fixtures/platform-v2-attention-v1.json).
+Unknown outer or nested fields,
+duplicate source/project/workspace tuples, malformed coordinates, and
+non-monotone replacements are refused.
+
+On startup, the complete validated registry generation is imported in one
+transaction into the tenant-bound `platform-v2-attention.sqlite3` store. The
+store accepts only an exact idempotent replay or a contract-validated
+successor, integrity-binds the canonical bytes, durably retains every issued
+item identity across every project and `UserWorkspace` tuple owned by that
+source so a removed or moved ID cannot be reused, and revalidates duplicated
+scope/revision/time fields on every read. If any tuple conflicts, no tuple from
+that registry generation is committed. Request authorization remains bound to
+the exact tuple and is not inferred from this source-lifetime identity custody.
+The host first authorizes the exact
+project and `UserWorkspace` through the current policy/work-context mapping,
+then requires the registry tuple and persisted document to remain
+byte-identical. Stale rows left by a removed registry entry are therefore
+unreachable.
+
+This is a fail-closed transport and operator-bootstrap foundation, not a live
+attention feed. It does not discover sources, derive attention from provider or
+review runtime state, reload a changed registry without restart, or install a
+desktop, web, or mobile consumer. Those producer, discovery, and client flows
+remain required before cross-client attention acceptance can be claimed.
+
 ## Private lifecycle selector registry
 
 The optional `platform-v2-lifecycle-registry.json` sibling is operator-owned,
