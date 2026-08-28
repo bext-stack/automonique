@@ -108,7 +108,7 @@ pub mod relay;
 pub mod request;
 pub mod substitute;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -149,7 +149,13 @@ pub const MAX_RESOLVED_ADDRESSES: usize = 4;
 /// Longest any configurable deadline may be.
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(3600);
 
-/// The latest exact `CONNECT` destination refused by an allowlist decision.
+/// Most refusal events retained for one run broker.
+///
+/// A cursor older than this window is reported as ambiguous rather than being
+/// matched to a destination the observer can no longer prove was the only one.
+pub const MAX_REFUSED_DESTINATION_EVENTS: usize = 256;
+
+/// One exact `CONNECT` destination refused by an allowlist decision.
 ///
 /// The host has already passed the broker's bounded authority parser and is
 /// normalized exactly as an allowlist host is. No header or request body is
@@ -158,6 +164,90 @@ pub const MAX_TIMEOUT: Duration = Duration::from_secs(3600);
 pub struct RefusedDestination {
     host: DestinationHost,
     port: u16,
+}
+
+/// A monotonic position in one broker's destination-refusal stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RefusedDestinationCursor(u64);
+
+/// What one bounded interval of the refusal stream proves.
+#[derive(Clone, Eq, PartialEq)]
+pub enum RefusedDestinationWindow {
+    /// No allowlist refusal occurred after the supplied cursor.
+    Empty,
+    /// Every retained refusal after the cursor named this same coordinate.
+    Unambiguous(RefusedDestination),
+    /// The interval named different coordinates or exceeded retained history.
+    Ambiguous,
+}
+
+impl fmt::Debug for RefusedDestinationWindow {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RefusedDestinationWindow")
+            .field(
+                "state",
+                &match self {
+                    Self::Empty => "empty",
+                    Self::Unambiguous(_) => "unambiguous",
+                    Self::Ambiguous => "ambiguous",
+                },
+            )
+            .finish()
+    }
+}
+
+#[derive(Default)]
+struct RefusedDestinationState {
+    sequence: u64,
+    history_lost: bool,
+    events: VecDeque<(u64, RefusedDestination)>,
+}
+
+impl RefusedDestinationState {
+    fn record(&mut self, destination: RefusedDestination) {
+        let Some(sequence) = self.sequence.checked_add(1) else {
+            self.history_lost = true;
+            self.events.clear();
+            return;
+        };
+        self.sequence = sequence;
+        self.events.push_back((sequence, destination));
+        if self.events.len() > MAX_REFUSED_DESTINATION_EVENTS {
+            self.events.pop_front();
+        }
+    }
+
+    fn take_since(&self, cursor: &mut RefusedDestinationCursor) -> RefusedDestinationWindow {
+        let end = self.sequence;
+        let start = cursor.0;
+        cursor.0 = end;
+        if self.history_lost || start > end {
+            return RefusedDestinationWindow::Ambiguous;
+        }
+        if start == end {
+            return RefusedDestinationWindow::Empty;
+        }
+        let Some((first_retained, _)) = self.events.front() else {
+            return RefusedDestinationWindow::Ambiguous;
+        };
+        if start.saturating_add(1) < *first_retained {
+            return RefusedDestinationWindow::Ambiguous;
+        }
+        let mut observed = self
+            .events
+            .iter()
+            .filter(|(sequence, _)| *sequence > start)
+            .map(|(_, destination)| destination);
+        let Some(first) = observed.next().cloned() else {
+            return RefusedDestinationWindow::Ambiguous;
+        };
+        if observed.all(|destination| destination == &first) {
+            RefusedDestinationWindow::Unambiguous(first)
+        } else {
+            RefusedDestinationWindow::Ambiguous
+        }
+    }
 }
 
 impl RefusedDestination {
@@ -177,23 +267,39 @@ impl RefusedDestination {
 /// Read-only custody for one broker's bounded destination-refusal observation.
 #[derive(Clone)]
 pub struct RefusedDestinationObserver {
-    latest: Arc<Mutex<Option<RefusedDestination>>>,
+    state: Arc<Mutex<RefusedDestinationState>>,
 }
 
 impl fmt::Debug for RefusedDestinationObserver {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RefusedDestinationObserver")
-            .field("has_refusal", &self.latest().is_some())
+            .field(
+                "has_refusal",
+                &self.state.lock().is_ok_and(|state| state.sequence != 0),
+            )
             .finish()
     }
 }
 
 impl RefusedDestinationObserver {
-    /// The latest allowlist-refused coordinate, if one has occurred.
+    /// Snapshot the current monotonic position before a provider request.
     #[must_use]
-    pub fn latest(&self) -> Option<RefusedDestination> {
-        self.latest.lock().ok()?.clone()
+    pub fn cursor(&self) -> Option<RefusedDestinationCursor> {
+        Some(RefusedDestinationCursor(self.state.lock().ok()?.sequence))
+    }
+
+    /// Consume the bounded refusal interval after `cursor` and advance it.
+    ///
+    /// Repeated refusals of one coordinate remain unambiguous. Different
+    /// coordinates, lost history, a poisoned observer, or an invalid cursor
+    /// all fail closed as [`RefusedDestinationWindow::Ambiguous`].
+    pub fn take_since(&self, cursor: &mut RefusedDestinationCursor) -> RefusedDestinationWindow {
+        self.state
+            .lock()
+            .map_or(RefusedDestinationWindow::Ambiguous, |state| {
+                state.take_since(cursor)
+            })
     }
 }
 
@@ -491,7 +597,7 @@ struct Shared {
     config: BrokerConfig,
     counters: Counters,
     ledger: RefusalLedger,
-    refused_destination: Arc<Mutex<Option<RefusedDestination>>>,
+    refused_destination: Arc<Mutex<RefusedDestinationState>>,
     live: Mutex<LiveConnections>,
     stopping: AtomicBool,
 }
@@ -604,7 +710,7 @@ impl EgressBroker {
             config,
             counters: Counters::default(),
             ledger: RefusalLedger::default(),
-            refused_destination: Arc::new(Mutex::new(None)),
+            refused_destination: Arc::new(Mutex::new(RefusedDestinationState::default())),
             live: Mutex::new(LiveConnections::default()),
             stopping: AtomicBool::new(false),
         });
@@ -667,7 +773,7 @@ impl EgressBroker {
     #[must_use]
     pub fn refused_destination_observer(&self) -> RefusedDestinationObserver {
         RefusedDestinationObserver {
-            latest: Arc::clone(&self.shared.refused_destination),
+            state: Arc::clone(&self.shared.refused_destination),
         }
     }
 
@@ -955,8 +1061,8 @@ fn serve(shared: &Arc<Shared>, client: TcpStream, peer: SocketAddr) {
             .counters
             .denied_destination
             .fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut latest) = shared.refused_destination.lock() {
-            *latest = Some(RefusedDestination {
+        if let Ok(mut state) = shared.refused_destination.lock() {
+            state.record(RefusedDestination {
                 host: read.request.host().clone(),
                 port: read.request.port(),
             });

@@ -87,11 +87,13 @@ non-empty policy that belongs to another provider.
   an unapplied edit healthy.
 
 For a run that still asks its own broker for a destination outside the admitted
-set, the authoritative `provider_fault` keeps `category=rejected` and adds the
-exact normalized `host:port` the broker refused. That coordinate comes from the
-broker's bounded `CONNECT` parser; headers, request bytes, resolved addresses,
-and credentials are neither retained nor projected. A generic provider fault
-stays generic when no allowlist decision occurred.
+set, the authoritative terminal `provider_fault` keeps `category=rejected` and
+adds the exact normalized `host:port` when every refusal observed since that
+turn's request baseline names the same coordinate. Repeated retries of that
+coordinate remain exact; a stale refusal, different destinations, lost history,
+and steering or unrelated errors stay generic rather than guessing. The
+coordinate comes from the broker's bounded `CONNECT` parser; headers, request
+bytes, resolved addresses, and credentials are neither retained nor projected.
 
 ## The Anthropic route is not a failover
 

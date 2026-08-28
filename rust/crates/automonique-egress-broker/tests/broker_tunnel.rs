@@ -18,7 +18,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use automonique_egress_broker::{AddressScope, BrokerConfig, DestinationAllowlist, EgressBroker};
+use automonique_egress_broker::{
+    AddressScope, BrokerConfig, DestinationAllowlist, EgressBroker, RefusedDestinationWindow,
+};
 
 /// Bound on every client-side wait. A test that would otherwise hang fails here.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -177,6 +179,12 @@ fn read_status(stream: &mut TcpStream) -> String {
         .to_owned()
 }
 
+fn refuse_destination(broker: &EgressBroker, host: &str, port: u16) {
+    let mut stream = client(broker);
+    write!(stream, "CONNECT {host}:{port} HTTP/1.1\r\n\r\n").expect("send CONNECT");
+    assert_eq!(read_status(&mut stream), "HTTP/1.1 403 Forbidden");
+}
+
 /// Poll the broker's counters until `settled` holds, or the client bound
 /// elapses.
 ///
@@ -263,6 +271,9 @@ fn a_destination_that_is_not_allowlisted_is_refused_and_never_dialled() {
     let forbidden = FakeDestination::spawn(Behaviour::Echo);
     let broker = broker_allowing("127.0.0.1", allowed.port(), AddressScope::Loopback);
 
+    let observer = broker.refused_destination_observer();
+    let mut cursor = observer.cursor().expect("initial refusal cursor");
+
     // Same host, different port.
     let mut stream = client(&broker);
     write!(
@@ -296,12 +307,62 @@ fn a_destination_that_is_not_allowlisted_is_refused_and_never_dialled() {
     );
     assert_eq!(broker.stats().denied_destination, 2);
     assert_eq!(broker.stats().established, 0);
-    let refused = broker
-        .refused_destination_observer()
-        .latest()
-        .expect("the latest exact refused destination is retained");
-    assert_eq!(refused.host().to_string(), "localhost");
-    assert_eq!(refused.port(), allowed.port());
+    assert_eq!(
+        observer.take_since(&mut cursor),
+        RefusedDestinationWindow::Ambiguous,
+        "two different coordinates cannot be attributed to one provider fault"
+    );
+    assert_eq!(
+        observer.take_since(&mut cursor),
+        RefusedDestinationWindow::Empty,
+        "taking a refusal interval advances its cursor"
+    );
+}
+
+#[test]
+fn a_refusal_cursor_excludes_stale_events_and_accepts_repeated_coordinates() {
+    let broker = EgressBroker::start(BrokerConfig::default()).expect("deny-all broker starts");
+    let observer = broker.refused_destination_observer();
+    refuse_destination(&broker, "stale.example", 443);
+    let mut cursor = observer.cursor().expect("cursor after stale refusal");
+    assert_eq!(
+        observer.take_since(&mut cursor),
+        RefusedDestinationWindow::Empty
+    );
+
+    refuse_destination(&broker, "retry.example", 443);
+    refuse_destination(&broker, "RETRY.example", 443);
+    let RefusedDestinationWindow::Unambiguous(refused) = observer.take_since(&mut cursor) else {
+        panic!("retries of one normalized coordinate must remain unambiguous")
+    };
+    assert_eq!(refused.host().to_string(), "retry.example");
+    assert_eq!(refused.port(), 443);
+    assert_eq!(
+        observer.take_since(&mut cursor),
+        RefusedDestinationWindow::Empty
+    );
+}
+
+#[test]
+fn concurrent_different_refusals_are_ambiguous_whatever_arrival_order_wins() {
+    let broker =
+        Arc::new(EgressBroker::start(BrokerConfig::default()).expect("deny-all broker starts"));
+    let observer = broker.refused_destination_observer();
+    let mut cursor = observer.cursor().expect("initial refusal cursor");
+    let clients: Vec<_> = [("first.example", 443), ("second.example", 8443)]
+        .into_iter()
+        .map(|(host, port)| {
+            let broker = Arc::clone(&broker);
+            thread::spawn(move || refuse_destination(&broker, host, port))
+        })
+        .collect();
+    for client in clients {
+        client.join().expect("refusal client");
+    }
+    assert_eq!(
+        observer.take_since(&mut cursor),
+        RefusedDestinationWindow::Ambiguous
+    );
 }
 
 #[test]
