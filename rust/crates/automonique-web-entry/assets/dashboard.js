@@ -829,11 +829,9 @@ const frenchUi = Object.freeze({
   "The QR encoder did not load. Use Copy invite instead.": "L’encodeur QR n’a pas été chargé. Utilisez plutôt Copier l’invitation.",
   "LIFECYCLE ACTIONS": "ACTIONS DU CYCLE DE VIE",
   "Create or resume a workspace": "Créer ou reprendre un espace de travail",
-  "Unavailable: the Platform v2 lifecycle host adapter is not installed.": "Indisponible : l’adaptateur hôte du cycle de vie Platform v2 n’est pas installé.",
   "Task input remains local while lifecycle actions are unavailable": "La tâche reste locale tant que les actions du cycle de vie sont indisponibles",
   "Create unavailable": "Création indisponible",
   "Resume unavailable": "Reprise indisponible",
-  "Unavailable: the Platform v2 lifecycle host adapter is not installed (platform_v2_lifecycle_adapter_pending).": "Indisponible : l’adaptateur hôte du cycle de vie Platform v2 n’est pas installé (platform_v2_lifecycle_adapter_pending).",
   "Task create and resume remain unavailable. Local host setup and checkout support typed preview and receipt operations.": "La création et la reprise de tâche restent indisponibles. La configuration d’hôte local et le checkout prennent en charge des opérations typées d’aperçu et de reçu.",
 });
 const localizedTextSources = new WeakMap();
