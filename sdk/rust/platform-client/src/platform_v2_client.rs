@@ -322,6 +322,48 @@ pub enum ReviewReceiptResult {
     Refused(PlatformV2Refusal),
 }
 
+/// Exact server-advertised coordinates required to confirm one review action.
+///
+/// The digest types are already length- and grammar-bounded by the protocol,
+/// while the workspace revision prevents a capability from being replayed
+/// against a different authoritative workspace state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewActionConfirmation {
+    confirmation_digest: ReviewConfirmationDigest,
+    expected_workspace_revision: Revision,
+    receipt_correlation_digest: ReviewReceiptCorrelationDigest,
+}
+
+impl ReviewActionConfirmation {
+    #[must_use]
+    pub const fn new(
+        confirmation_digest: ReviewConfirmationDigest,
+        expected_workspace_revision: Revision,
+        receipt_correlation_digest: ReviewReceiptCorrelationDigest,
+    ) -> Self {
+        Self {
+            confirmation_digest,
+            expected_workspace_revision,
+            receipt_correlation_digest,
+        }
+    }
+
+    #[must_use]
+    pub const fn confirmation_digest(&self) -> &ReviewConfirmationDigest {
+        &self.confirmation_digest
+    }
+
+    #[must_use]
+    pub const fn expected_workspace_revision(&self) -> Revision {
+        self.expected_workspace_revision
+    }
+
+    #[must_use]
+    pub const fn receipt_correlation_digest(&self) -> &ReviewReceiptCorrelationDigest {
+        &self.receipt_correlation_digest
+    }
+}
+
 /// Client whose v2 methods remain unavailable until this exact connection has
 /// negotiated structured Platform major two.
 type RawExchange<T> = fn(&mut T, PlatformV2Lane, &[u8]) -> Result<Vec<u8>, ClientError>;
@@ -683,7 +725,7 @@ impl<T> PlatformV2Client<T> {
 
     /// Confirm one exact server-advertised review action preview.
     ///
-    /// The confirmation digest must come from the matching current
+    /// The confirmation coordinates must come from the matching current
     /// [`ReviewCapabilities`]. Rerun actions are deliberately refused by
     /// `execute_review_action` so callers cannot skip this explicit phase.
     pub fn execute_confirmed_review_action(
@@ -692,11 +734,14 @@ impl<T> PlatformV2Client<T> {
         expected_revision: Revision,
         action: ReviewAction,
         idempotency_key: IdempotencyKey,
-        confirmation_digest: ReviewConfirmationDigest,
-        expected_workspace_revision: Revision,
-        receipt_correlation_digest: ReviewReceiptCorrelationDigest,
+        confirmation: ReviewActionConfirmation,
     ) -> Result<ReviewReceiptResult, ClientError> {
         let expected_key = idempotency_key.clone();
+        let ReviewActionConfirmation {
+            confirmation_digest,
+            expected_workspace_revision,
+            receipt_correlation_digest,
+        } = confirmation;
         let request = ReviewActionTransportRequest::new_confirmed_correlated(
             workspace,
             expected_revision,
