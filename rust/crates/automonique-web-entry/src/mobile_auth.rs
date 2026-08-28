@@ -35,6 +35,7 @@ pub const MOBILE_PLATFORM_V2_AUTH_SCHEMA: &str = "automonique.mobile-platform-v2
 pub const MOBILE_PLATFORM_V2_AUTH_MEDIA_TYPE: &str =
     "application/vnd.automonique.mobile-platform-v2-authorization.v1+json";
 pub const MAX_MOBILE_ACTIONS: usize = 4;
+pub const MAX_MOBILE_PLATFORM_V2_ACTIONS: usize = 11;
 pub const MAX_MOBILE_V2_PROJECT_ROOTS: usize = 32;
 const MAX_MOBILE_V2_RECEIPT_CUSTODY: usize = 128;
 pub(crate) const MOBILE_V2_DISPATCH_LEASE_MILLIS: i64 = 10_000;
@@ -174,6 +175,8 @@ pub enum MobilePlatformV2Action {
     SubmitWorkspaceIntent,
     GetWorkspaceIntent,
     GetReview,
+    ExecuteReviewAction,
+    GetReviewReceipt,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1842,7 +1845,7 @@ fn admit_platform_v2_scope(
     if project_roots.is_empty()
         || project_roots.len() > MAX_MOBILE_V2_PROJECT_ROOTS
         || actions.is_empty()
-        || actions.len() > 9
+        || actions.len() > MAX_MOBILE_PLATFORM_V2_ACTIONS
     {
         return Err(MobileAuthError::InvalidRequest);
     }
@@ -1857,7 +1860,7 @@ fn admit_platform_v2_scope(
     if project_roots.is_empty()
         || project_roots.len() > MAX_MOBILE_V2_PROJECT_ROOTS
         || actions.is_empty()
-        || actions.len() > 9
+        || actions.len() > MAX_MOBILE_PLATFORM_V2_ACTIONS
     {
         return Err(MobileAuthError::InvalidRequest);
     }
@@ -2321,6 +2324,8 @@ mod tests {
                 MobilePlatformV2Action::SubmitMutation,
                 MobilePlatformV2Action::QueryWorkContexts,
                 MobilePlatformV2Action::PrepareMutation,
+                MobilePlatformV2Action::GetReviewReceipt,
+                MobilePlatformV2Action::ExecuteReviewAction,
             ],
         }
     }
@@ -2360,6 +2365,8 @@ mod tests {
                 MobilePlatformV2Action::QueryWorkContexts,
                 MobilePlatformV2Action::PrepareMutation,
                 MobilePlatformV2Action::SubmitMutation,
+                MobilePlatformV2Action::ExecuteReviewAction,
+                MobilePlatformV2Action::GetReviewReceipt,
             ]
         );
         assert_eq!(

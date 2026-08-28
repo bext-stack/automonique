@@ -478,7 +478,10 @@ the exact credential, delegation, and principal generation. Mobile receipt
 polling accepts only that idempotency coordinate and checks the binding before
 opening the socket; receipt-ID lookup is refused because no mobile-owned
 receipt-ID binding exists before an ambiguous response. The private SQLite
-custody is capped at 128 live entries per credential, survives process restart
+custody applies identically to typed review-action submission and review-receipt
+lookup; those operations require their own independent mobile grants and never
+inherit provider-session, Git, filesystem, CI, or pull-request authority. It is
+capped at 128 live entries per credential, survives process restart
 and same-delegation access-token rotation, and is deleted on delegation
 regrant or credential revocation. Thus another same-project credential and a
 new delegation cannot read an older mutation receipt.
