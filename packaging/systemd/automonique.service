@@ -3,7 +3,8 @@
 [Unit]
 Description=Automonique local automation daemon
 Requires=automonique.socket
-After=automonique.socket
+Requires=automonique-tempfs-owner.service
+After=automonique.socket automonique-tempfs-owner.service
 StartLimitIntervalSec=60s
 StartLimitBurst=5
 
@@ -21,6 +22,7 @@ StateDirectory=automonique
 StateDirectoryMode=0700
 Environment=XDG_RUNTIME_DIR=%t
 Environment=XDG_STATE_HOME=%S
+Environment=AUTOMONIQUE_TEMPFS_OWNER_SOCKET=%t/automonique/tempfs-owner.sock
 Delegate=yes
 
 [Install]

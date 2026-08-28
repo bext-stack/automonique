@@ -387,12 +387,18 @@ pub struct NamespacedOutcome {
 /// Supervisor-side ownership of a FUSE connection mounted by the launch
 /// helper inside the workload user+mount namespace.
 pub(crate) struct NamespacedMountedTempfs {
-    state: SharedState,
-    channel: Arc<ExceedanceChannel>,
-    session: Option<BackgroundSession>,
+    backing: NamespacedBacking,
     statfs_at_mount: StatfsReadback,
     checkpoint_path: Option<PathBuf>,
     checkpoint_sequence: u64,
+}
+
+enum NamespacedBacking {
+    Local {
+        state: SharedState,
+        session: Option<BackgroundSession>,
+    },
+    Remote(crate::tempfs_owner::RemoteCustody),
 }
 
 impl NamespacedMountedTempfs {
@@ -403,13 +409,16 @@ impl NamespacedMountedTempfs {
     }
 
     #[must_use]
-    pub(crate) fn exceedance_channel(&self) -> Arc<ExceedanceChannel> {
-        Arc::clone(&self.channel)
+    pub(crate) fn first_exceedance(&self) -> Option<crate::Exceedance> {
+        self.snapshot()?.first_exceedance()
     }
 
     #[must_use]
-    pub(crate) fn snapshot(&self) -> LedgerSnapshot {
-        snapshot(&self.state)
+    pub(crate) fn snapshot(&self) -> Option<LedgerSnapshot> {
+        match &self.backing {
+            NamespacedBacking::Local { state, .. } => Some(snapshot(state)),
+            NamespacedBacking::Remote(remote) => remote.snapshot().ok(),
+        }
     }
 
     pub(crate) fn write_checkpoint(
@@ -417,6 +426,12 @@ impl NamespacedMountedTempfs {
         phase: Phase,
         final_record: Option<FinalRecord>,
     ) -> io::Result<()> {
+        if let NamespacedBacking::Remote(remote) = &mut self.backing {
+            if phase != Phase::Live || final_record.is_some() {
+                return Err(io::Error::other("remote finalization belongs to the owner"));
+            }
+            return remote.checkpoint().map_err(io::Error::other);
+        }
         let Some(path) = self.checkpoint_path.clone() else {
             return Ok(());
         };
@@ -425,7 +440,9 @@ impl NamespacedMountedTempfs {
             sequence: self.checkpoint_sequence,
             at_millis: now_millis(),
             phase,
-            snapshot: self.snapshot(),
+            snapshot: self
+                .snapshot()
+                .ok_or_else(|| io::Error::other("temporary-storage snapshot unavailable"))?,
             mount_evidence: format!(
                 "{NAMESPACED_REPORT_PREFIX} fstype=fuse.{FS_SUBTYPE} source={FS_NAME} user_id=0"
             ),
@@ -435,10 +452,23 @@ impl NamespacedMountedTempfs {
         .write(&path)
     }
 
-    pub(crate) fn reconcile(mut self) -> Result<NamespacedOutcome, NamespacedMountError> {
-        let unmount_confirmed =
-            finish_namespaced_session(self.session.take(), SESSION_JOIN_DEADLINE);
-        let ledger = self.snapshot();
+    pub(crate) fn reconcile(self) -> Result<NamespacedOutcome, NamespacedMountError> {
+        let Self {
+            backing,
+            statfs_at_mount,
+            checkpoint_path,
+            checkpoint_sequence,
+        } = self;
+        let (state, mut session) = match backing {
+            NamespacedBacking::Local { state, session, .. } => (state, session),
+            NamespacedBacking::Remote(remote) => {
+                return remote
+                    .reconcile()
+                    .map_err(|error| NamespacedMountError::Io(io::Error::other(error)));
+            }
+        };
+        let unmount_confirmed = finish_namespaced_session(session.take(), SESSION_JOIN_DEADLINE);
+        let ledger = snapshot(&state);
         let statfs_from_ledger = StatfsReadback::from_ledger(&ledger)
             .map_err(|_| NamespacedMountError::Protocol("ledger relations are inconsistent"))?;
         let final_record = FinalRecord {
@@ -446,14 +476,50 @@ impl NamespacedMountedTempfs {
             unmount_confirmed,
             aborted: false,
         };
-        self.write_checkpoint(Phase::Final, Some(final_record))?;
+        if let Some(path) = checkpoint_path {
+            Checkpoint {
+                sequence: checkpoint_sequence.saturating_add(1),
+                at_millis: now_millis(),
+                phase: Phase::Final,
+                snapshot: ledger.clone(),
+                mount_evidence: format!(
+                    "{NAMESPACED_REPORT_PREFIX} fstype=fuse.{FS_SUBTYPE} source={FS_NAME} user_id=0"
+                ),
+                statfs_at_mount,
+                final_record: Some(final_record),
+            }
+            .write(&path)?;
+        }
         Ok(NamespacedOutcome {
             ledger,
-            statfs_at_mount: self.statfs_at_mount,
+            statfs_at_mount,
             statfs_from_ledger,
             unmount_confirmed,
         })
     }
+}
+
+#[cfg(test)]
+pub(crate) fn namespaced_owner_fixture(
+    checkpoint: &Path,
+    budget: TemporaryStorageBudget,
+) -> NamespacedMountedTempfs {
+    let channel = Arc::new(ExceedanceChannel::default());
+    let filesystem = QuotaFs::new(budget, 0, 0, Arc::clone(&channel));
+    let state = filesystem.state();
+    let ledger = snapshot(&state);
+    let statfs_at_mount = StatfsReadback::from_ledger(&ledger).expect("empty ledger is consistent");
+    NamespacedMountedTempfs {
+        backing: NamespacedBacking::Local {
+            state,
+            session: None,
+        },
+        statfs_at_mount,
+        checkpoint_path: Some(checkpoint.to_path_buf()),
+        checkpoint_sequence: 0,
+    }
+    .with_checkpoint(checkpoint)
+    .expect("private test checkpoint")
 }
 
 impl Outcome {
@@ -1058,11 +1124,52 @@ fn send_descriptor(socket: &UnixStream, descriptor: std::os::fd::BorrowedFd<'_>)
 
 pub(crate) fn receive_namespaced_tempfs(
     control: &mut UnixStream,
+    cgroup: &Path,
     budget: TemporaryStorageBudget,
     workload_namespace_uid: u32,
     checkpoint: &Path,
 ) -> Result<NamespacedMountedTempfs, NamespacedMountError> {
     let descriptor = receive_namespaced_descriptor(control)?;
+    if std::env::var_os(crate::tempfs_owner::OWNER_SOCKET_ENV).is_some() {
+        let run_id = cgroup
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(NamespacedMountError::Protocol("cgroup run id malformed"))?;
+        let remote = crate::tempfs_owner::RemoteCustody::open(
+            descriptor,
+            control,
+            run_id,
+            cgroup,
+            budget,
+            workload_namespace_uid,
+            checkpoint,
+        )
+        .map_err(|error| NamespacedMountError::Io(io::Error::other(error)))?;
+        let durable = Checkpoint::read(checkpoint)
+            .map_err(|_| NamespacedMountError::Protocol("owner checkpoint unreadable"))?;
+        return Ok(NamespacedMountedTempfs {
+            backing: NamespacedBacking::Remote(remote),
+            statfs_at_mount: durable.statfs_at_mount,
+            checkpoint_path: Some(checkpoint.to_path_buf()),
+            checkpoint_sequence: durable.sequence,
+        });
+    }
+    start_namespaced_tempfs(
+        descriptor,
+        control,
+        budget,
+        workload_namespace_uid,
+        checkpoint,
+    )
+}
+
+pub(crate) fn start_namespaced_tempfs(
+    descriptor: OwnedFd,
+    control: &mut UnixStream,
+    budget: TemporaryStorageBudget,
+    workload_namespace_uid: u32,
+    checkpoint: &Path,
+) -> Result<NamespacedMountedTempfs, NamespacedMountError> {
     let channel = Arc::new(ExceedanceChannel::default());
     let filesystem = QuotaFs::new(budget, workload_namespace_uid, 0, Arc::clone(&channel));
     let state = filesystem.state();
@@ -1103,9 +1210,10 @@ pub(crate) fn receive_namespaced_tempfs(
     // behind that barrier, so there is no interval in which admitted storage
     // can be used without a canonical recovery record.
     let mounted = NamespacedMountedTempfs {
-        state,
-        channel,
-        session: Some(session),
+        backing: NamespacedBacking::Local {
+            state,
+            session: Some(session),
+        },
         statfs_at_mount: statfs,
         checkpoint_path: None,
         checkpoint_sequence: 0,
@@ -1174,6 +1282,17 @@ fn receive_namespaced_descriptor(socket: &UnixStream) -> Result<OwnedFd, Namespa
         ));
     }
     Ok(descriptors.pop().expect("length checked"))
+}
+
+impl NamespacedMountedTempfs {
+    pub(crate) fn session_finished(&self) -> bool {
+        match &self.backing {
+            NamespacedBacking::Local { session, .. } => session
+                .as_ref()
+                .is_some_and(|session| session.guard.is_finished()),
+            NamespacedBacking::Remote(_) => false,
+        }
+    }
 }
 
 fn finish_namespaced_session(session: Option<BackgroundSession>, deadline: Duration) -> bool {
@@ -1423,9 +1542,10 @@ mod tests {
         let state = filesystem.state();
         let statfs_at_mount = StatfsReadback::from_ledger(&snapshot(&state)).unwrap();
         let mounted = NamespacedMountedTempfs {
-            state,
-            channel,
-            session: None,
+            backing: NamespacedBacking::Local {
+                state,
+                session: None,
+            },
             statfs_at_mount,
             checkpoint_path: Some(checkpoint),
             checkpoint_sequence: 1,

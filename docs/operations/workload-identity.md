@@ -163,9 +163,22 @@ most every 250 ms and immediately on a refusal. Delegated `run_compose` and
 production lane.
 
 The old supervisor-visible attachment API and its
-`WorkloadIdentityTemporaryStorageConflict` refusal deliberately remain. Crash
-adoption is not complete: the FUSE server is still a thread in the daemon, so a
-daemon process death closes the live connection even though the last live
-checkpoint survives. Removing the refusal everywhere requires moving server
-ownership to a durable adoptable process (or an equivalent kernel-backed
-owner) and proving restart recovery while a workload is live.
+`WorkloadIdentityTemporaryStorageConflict` refusal deliberately remain for
+callers that do not request the composed private namespace path. Production
+ownership is instead transferred to `automonique-tempfs-owner.service`, a
+sibling service outside the daemon's process and cgroup kill domain. Its
+private versioned Unix protocol accepts only same-uid peers, binds one owner to
+the exact run and cgroup inode, and fences every request on the next durable
+checkpoint sequence. The daemon keeps only a private adoption token and a
+non-secret custody record in the run directory; a new daemon generation uses
+both to adopt a still-live ledger without taking the FUSE descriptor back.
+
+The owner writes a live checkpoint every 200 ms, within the 250 ms monitoring
+contract, and on every explicit poll. If the owner itself restarts, its lost
+FUSE descriptor is unrecoverable: startup converts the last live checkpoint
+to a monotonic `Final` record with `aborted=true` and
+`unmount_confirmed=false`, removes the adoption material, and never reports a
+successful adoption. The delegated namespace tests remain the kernel evidence
+for mounting, exact quota enforcement and teardown; owner protocol, restart,
+redaction and systemd-domain tests cover the durable custody boundary on hosts
+without delegated FUSE/cgroup prerequisites.

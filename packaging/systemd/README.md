@@ -6,10 +6,10 @@ Install the units in this directory under `~/.config/systemd/user/`, then run:
 
 ```sh
 systemctl --user daemon-reload
-systemctl --user enable --now automonique.socket automonique.service
+systemctl --user enable --now automonique.socket automonique-tempfs-owner.service automonique.service
 systemctl --user enable --now automonique-manage-worker.service
 systemctl --user enable --now automonique-backup.timer
-systemctl --user status automonique.service
+systemctl --user status automonique-tempfs-owner.service automonique.service
 ```
 
 The socket unit owns the private admin listener across daemon restarts, and
@@ -25,6 +25,26 @@ daemon atomically reloads `approvals/approvals.conf` without changing its PID;
 a refused replacement leaves the active policy intact and is reported in the
 unit status. Upgrade replaces that binary atomically and restarts the service
 without unbinding the admin endpoint.
+
+`automonique-tempfs-owner.service` is deliberately a sibling of the daemon,
+not `PartOf=` it and not a child in its cgroup. It owns the private
+`%t/automonique/tempfs-owner.sock`, authenticates same-uid peers, and retains
+the FUSE connection and exact quota ledger while `automonique.service`
+restarts. Install or update its unit in the same transaction as the daemon
+unit, run `systemctl --user daemon-reload`, then restart the owner only when no
+run is live; restarting it necessarily loses kernel FUSE descriptors and is a
+typed aborted reconciliation, never a successful adoption. Uninstall stops
+the daemon first, waits for all runs to reconcile, then disables and stops the
+owner before removing either unit.
+
+```sh
+systemctl --user stop automonique.service
+# Confirm the run inventory is terminal before continuing.
+systemctl --user disable --now automonique-tempfs-owner.service
+systemctl --user disable automonique.service automonique.socket
+systemctl --user daemon-reload
+```
+
 The timer writes an online recovery set every five minutes.
 `automonique-recovery.service` is started manually after a restore; it disables
 external transports and refuses provider starts.
@@ -253,15 +273,21 @@ mv "$XDG_STATE_HOME/automonique/bin/automonique-launch-enter.next" \
   "$XDG_STATE_HOME/automonique/bin/automonique-launch-enter"
 mv "$XDG_STATE_HOME/automonique/bin/automonique.next" \
   "$XDG_STATE_HOME/automonique/bin/automonique"
+systemctl --user restart automonique-tempfs-owner.service
 systemctl --user restart automonique.service
+systemctl --user is-active --quiet automonique-tempfs-owner.service
 "$XDG_STATE_HOME/automonique/bin/automonique" status --json
 ```
 
 Before the restart, recheck that the live daemon is ready with no running work,
 pending inbox/outbox effects, ambiguous outbound effect or reconciliation.
 Rollback installs both `.previous` binaries through the same `.next` and rename
-sequence, then restarts and checks the service. The Manage fleet worker remains
-a separate service and is not restarted by a daemon-only deployment.
+sequence, restarts the owner first and then the daemon, and checks both. The
+owner restart is allowed here only because the zero-work gate proved that no
+live FUSE descriptor can be lost. A unit-only update likewise runs
+`systemctl --user daemon-reload` and restarts owner then daemon behind that
+same gate. The Manage fleet worker remains a separate service and is not
+restarted by a daemon-only deployment.
 
 ## Shutdown drain budget
 

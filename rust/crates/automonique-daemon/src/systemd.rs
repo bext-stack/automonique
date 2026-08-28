@@ -271,6 +271,7 @@ mod tests {
             "StateDirectory=automonique",
             "Environment=XDG_RUNTIME_DIR=%t",
             "Environment=XDG_STATE_HOME=%S",
+            "Environment=AUTOMONIQUE_TEMPFS_OWNER_SOCKET=%t/automonique/tempfs-owner.sock",
             "Delegate=yes",
             "Restart=on-failure",
             "ExecStart=%S/automonique/bin/automonique daemon --foreground",
@@ -280,6 +281,38 @@ mod tests {
                 "missing service contract directive: {directive}"
             );
         }
+        assert!(
+            unit.lines()
+                .any(|line| line == "Requires=automonique-tempfs-owner.service")
+        );
+        assert!(
+            unit.lines().any(|line| {
+                line == "After=automonique.socket automonique-tempfs-owner.service"
+            })
+        );
+    }
+
+    #[test]
+    fn temporary_storage_owner_is_a_separate_restart_domain() {
+        let unit = include_str!("../../../../packaging/systemd/automonique-tempfs-owner.service");
+        for directive in [
+            "ExecStart=%S/automonique/bin/automonique-launch-enter --temporary-storage-owner",
+            "Restart=on-failure",
+            "RuntimeDirectory=automonique",
+            "RuntimeDirectoryMode=0700",
+            "Environment=XDG_RUNTIME_DIR=%t",
+            "Environment=XDG_STATE_HOME=%S",
+            "Environment=AUTOMONIQUE_TEMPFS_OWNER_SOCKET=%t/automonique/tempfs-owner.sock",
+            "Before=automonique.service",
+            "WantedBy=default.target",
+        ] {
+            assert!(
+                unit.lines().any(|line| line == directive),
+                "missing owner contract: {directive}"
+            );
+        }
+        assert!(!unit.contains("PartOf=automonique.service"));
+        assert!(!unit.contains("KillMode=process"));
     }
 
     #[test]

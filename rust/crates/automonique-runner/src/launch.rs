@@ -1162,10 +1162,7 @@ impl NamespacedSandboxedChild {
     /// The first typed quota refusal, when one has already happened.
     #[must_use]
     pub fn temporary_storage_exceedance(&self) -> Option<crate::tempfs_ledger::Exceedance> {
-        self.temporary_storage
-            .as_ref()?
-            .exceedance_channel()
-            .first()
+        self.temporary_storage.as_ref()?.first_exceedance()
     }
 
     /// Persist one exact live-ledger snapshot for restart/reaper readback.
@@ -1181,7 +1178,7 @@ impl NamespacedSandboxedChild {
 
     #[must_use]
     pub fn temporary_storage_readback(&self) -> Option<crate::StatfsReadback> {
-        crate::StatfsReadback::from_ledger(&self.temporary_storage.as_ref()?.snapshot()).ok()
+        crate::StatfsReadback::from_ledger(&self.temporary_storage.as_ref()?.snapshot()?).ok()
     }
 
     /// Wait for the workload, then reconcile from the filesystem ledger after
@@ -1256,6 +1253,7 @@ pub fn spawn_sandboxed_with_namespaced_temporary_storage(
         supervisor.write_all(&frame)?;
         receive_namespaced_tempfs(
             &mut supervisor,
+            containment.path(),
             budget,
             nix::unistd::getuid().as_raw(),
             checkpoint,
@@ -1349,10 +1347,7 @@ impl SandboxedSession {
     /// storage and its exact ledger has recorded one.
     #[must_use]
     pub fn temporary_storage_exceedance(&self) -> Option<crate::tempfs_ledger::Exceedance> {
-        self.temporary_storage
-            .as_ref()?
-            .exceedance_channel()
-            .first()
+        self.temporary_storage.as_ref()?.first_exceedance()
     }
 
     /// Persist the current exact ledger on the production supervision cadence.
@@ -1365,7 +1360,7 @@ impl SandboxedSession {
 
     /// Statfs-shaped evidence from the exact in-memory filesystem ledger.
     pub fn temporary_storage_readback(&self) -> Option<crate::StatfsReadback> {
-        crate::StatfsReadback::from_ledger(&self.temporary_storage.as_ref()?.snapshot()).ok()
+        crate::StatfsReadback::from_ledger(&self.temporary_storage.as_ref()?.snapshot()?).ok()
     }
 
     /// Finish the private FUSE server after the workload namespace has ended.
@@ -1472,6 +1467,7 @@ pub fn spawn_sandboxed_session_with_namespaced_temporary_storage(
         supervisor.write_all(&frame)?;
         receive_namespaced_tempfs(
             &mut supervisor,
+            containment.path(),
             budget,
             nix::unistd::getuid().as_raw(),
             checkpoint,
@@ -1504,11 +1500,10 @@ pub fn spawn_sandboxed_session_with_namespaced_temporary_storage(
 /// written to stderr as a single bounded line containing no plan content.
 #[must_use]
 pub fn launch_entry_helper_main() -> i32 {
-    // Two auxiliary modes share the binary so the AppArmor profile that
-    // grants it `userns` covers every process that needs the grant: the
-    // mapper the launch spawns for itself, and the capability probe's
-    // throwaway child. Either is selected by exactly one argument; a launch
-    // takes none, and anything else is refused.
+    // Three auxiliary modes share the binary: the identity mapper, the
+    // capability probe's throwaway child, and the separately supervised
+    // temporary-storage owner. Each is selected by exactly one argument; a
+    // launch takes none, and anything else is refused.
     let mut arguments = std::env::args_os().skip(1);
     match (arguments.next(), arguments.next()) {
         (None, None) => {}
@@ -1517,6 +1512,9 @@ pub fn launch_entry_helper_main() -> i32 {
         }
         (Some(mode), None) if mode == crate::identity::PROBE_MODE_FLAG => {
             return crate::identity::probe_workload_identity_main();
+        }
+        (Some(mode), None) if mode == crate::tempfs_owner::OWNER_MODE_FLAG => {
+            return crate::tempfs_owner::owner_main();
         }
         _ => {
             eprintln!("automonique-launch-enter: refused: unknown argument");

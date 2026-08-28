@@ -896,9 +896,13 @@ impl ExecutionLane {
         // temporary-storage budget unenforceable, and admission refuses the
         // document rather than admitting it with the budget acknowledged.
         let verified_fuse = FusePrerequisites::host_default().verify();
-        let temporary_storage = match &verified_fuse {
-            Ok(_) => TemporaryStorageEnforcement::Available,
-            Err(error) => TemporaryStorageEnforcement::Unavailable(error.to_string()),
+        let temporary_storage = match (
+            &verified_fuse,
+            automonique_runner::tempfs_owner::verify_available(),
+        ) {
+            (Ok(_), Ok(())) => TemporaryStorageEnforcement::Available,
+            (Err(error), _) => TemporaryStorageEnforcement::Unavailable(error.to_string()),
+            (Ok(_), Err(error)) => TemporaryStorageEnforcement::Unavailable(error.to_string()),
         };
 
         let context = AdmissionContext::new(AdmissionContextParts {
@@ -1393,10 +1397,10 @@ fn recover_private_temporary_storage_checkpoints(runs: &Path) {
             && checkpoint
                 .mount_evidence
                 .starts_with("automonique.namespaced-tempfs/v1 ")
+            && let Ok(adopted) = automonique_runner::tempfs_owner::adopt_run(&entry.path())
         {
             let _ = crate::structured_log::emit_temporary_storage_checkpoint_recovered(
-                &run_id,
-                &checkpoint,
+                &run_id, &adopted,
             );
         }
     }

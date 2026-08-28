@@ -33,6 +33,7 @@ pub mod tempfs;
 pub mod tempfs_checkpoint;
 pub mod tempfs_fs;
 pub mod tempfs_ledger;
+pub mod tempfs_owner;
 pub mod tempfs_readback;
 
 pub use boundary::{
