@@ -174,7 +174,7 @@ use automonique_runner::tempfs::{
 use automonique_runner::{
     AttemptWorkspaceRegistryId, Authority as SpoolAuthority, CancellationToken, ContainmentDomain,
     Controller, EventKind as SpoolEventKind, Exceedance, LaunchPlan, NamespacedOutcome,
-    PromptDeliveryPlan, RunContainment, RunSpec, Spool, TemporaryStorageBudget,
+    PromptDeliveryPlan, RunContainment, RunSpec, Spool, StatfsReadback, TemporaryStorageBudget,
 };
 use automonique_store::approval_requests::{
     ApprovalContext, ApprovalProposal, ApprovalRequests, ApprovalState, MAX_APPROVAL_REQUEST_PAGE,
@@ -1671,6 +1671,13 @@ impl JcodePreparedRun {
         };
         let mut host = match spawned {
             Ok(host) => host,
+            Err(JcodeHostError::TemporaryStorageExceeded {
+                exceedance,
+                readback,
+            }) => {
+                writer.temporary_storage_exceeded(exceedance, readback);
+                return writer.finish(RunSpoolState::Failed);
+            }
             Err(_) => return writer.finish(RunSpoolState::Failed),
         };
         if writer.started(host.operating_system_process_id()).is_err() {
@@ -1710,6 +1717,20 @@ impl JcodePreparedRun {
             BTreeMap::new();
         let mut mapper = JcodeProgressMapper::new(resume_session_id.is_some());
         writer.project(&mut mapper, host.take_events());
+        let mut last_temporary_storage_checkpoint = Instant::now();
+        // This forced observation is the custody boundary before the prompt:
+        // startup may have touched TMPDIR, but a refusal there must never be
+        // followed by a turn request. It also refreshes the checkpoint clock
+        // from the exact instant the caller takes over startup supervision.
+        match poll_jcode_temporary_storage(&mut host, &mut last_temporary_storage_checkpoint, true)
+        {
+            Ok(Some((exceedance, readback))) => {
+                writer.temporary_storage_exceeded(exceedance, readback);
+                return finish_failed_jcode_host(host, writer, now_ms);
+            }
+            Ok(None) => {}
+            Err(()) => return finish_failed_jcode_host(host, writer, now_ms),
+        }
         writer.begin_provider_request();
         if host
             .start_turn(&format!("{run_id}-turn"), &prompt, now_ms)
@@ -1719,7 +1740,6 @@ impl JcodePreparedRun {
         }
 
         let mut cancellation_sent = false;
-        let mut last_temporary_storage_checkpoint = Instant::now();
         let final_state = 'run: loop {
             loop {
                 match control.receiver.try_recv() {
@@ -1746,6 +1766,7 @@ impl JcodePreparedRun {
             let temporary_storage = match poll_jcode_temporary_storage(
                 &mut host,
                 &mut last_temporary_storage_checkpoint,
+                false,
             ) {
                 Ok(storage) => storage,
                 Err(()) => break RunSpoolState::Failed,
@@ -1813,7 +1834,32 @@ impl JcodePreparedRun {
                     _ => {}
                 }
             }
-            writer.project_turn_outcome(&mut mapper, events, &outcome);
+            // `poll_turn` may have blocked while the provider handled ENOSPC
+            // and then emitted a terminal frame. Observe the ledger again
+            // before selecting that terminal outcome so quota refusal wins
+            // independently of provider/socket scheduling, like the direct
+            // backend's post-`try_wait` arbitration.
+            match poll_jcode_temporary_storage(
+                &mut host,
+                &mut last_temporary_storage_checkpoint,
+                false,
+            ) {
+                Ok(Some((exceedance, readback))) => {
+                    // Quota custody is already the authoritative terminal
+                    // fact, so retain provider events without correlating a
+                    // competing provider-refusal attribution.
+                    writer.project(&mut mapper, events);
+                    let _ = host.cancel(
+                        crate::unix_millis().unwrap_or(now_ms),
+                        Duration::from_millis(100),
+                    );
+                    writer.project(&mut mapper, host.take_events());
+                    writer.temporary_storage_exceeded(exceedance, readback);
+                    break 'run RunSpoolState::Failed;
+                }
+                Ok(None) => writer.project_turn_outcome(&mut mapper, events, &outcome),
+                Err(()) => break 'run RunSpoolState::Failed,
+            }
             match outcome {
                 Ok(JcodeTurnOutcome::Pending) => {}
                 Ok(JcodeTurnOutcome::Completed(result)) => {
@@ -1841,6 +1887,7 @@ impl JcodePreparedRun {
                         match poll_jcode_temporary_storage(
                             &mut host,
                             &mut last_temporary_storage_checkpoint,
+                            false,
                         ) {
                             Ok(Some((exceedance, readback))) => {
                                 writer.temporary_storage_exceeded(exceedance, readback);
@@ -1951,6 +1998,7 @@ impl JcodePreparedRun {
                         match poll_jcode_temporary_storage(
                             &mut host,
                             &mut last_temporary_storage_checkpoint,
+                            false,
                         ) {
                             Ok(Some((exceedance, readback))) => {
                                 writer.temporary_storage_exceeded(exceedance, readback);
@@ -2080,21 +2128,44 @@ fn finish_failed_jcode_host(
     }
 }
 
-fn poll_jcode_temporary_storage(
-    host: &mut JcodeSessionHost,
+trait JcodeTemporaryStorageHost {
+    fn checkpoint_temporary_storage(&mut self) -> Result<(), ()>;
+    fn temporary_storage_exceedance(&self) -> Option<Exceedance>;
+    fn temporary_storage_readback(&self) -> Option<StatfsReadback>;
+}
+
+impl JcodeTemporaryStorageHost for JcodeSessionHost {
+    fn checkpoint_temporary_storage(&mut self) -> Result<(), ()> {
+        JcodeSessionHost::checkpoint_temporary_storage(self).map_err(|_| ())
+    }
+
+    fn temporary_storage_exceedance(&self) -> Option<Exceedance> {
+        JcodeSessionHost::temporary_storage_exceedance(self)
+    }
+
+    fn temporary_storage_readback(&self) -> Option<StatfsReadback> {
+        JcodeSessionHost::temporary_storage_readback(self)
+    }
+}
+
+fn poll_jcode_temporary_storage<H: JcodeTemporaryStorageHost>(
+    host: &mut H,
     last_checkpoint: &mut Instant,
-) -> Result<Option<(Exceedance, Option<automonique_runner::StatfsReadback>)>, ()> {
-    if last_checkpoint.elapsed()
-        >= automonique_runner::backend::TEMPORARY_STORAGE_CHECKPOINT_INTERVAL
+    force_checkpoint: bool,
+) -> Result<Option<(Exceedance, Option<StatfsReadback>)>, ()> {
+    if let Some(exceedance) = host.temporary_storage_exceedance() {
+        host.checkpoint_temporary_storage()?;
+        *last_checkpoint = Instant::now();
+        return Ok(Some((exceedance, host.temporary_storage_readback())));
+    }
+    if force_checkpoint
+        || last_checkpoint.elapsed()
+            >= automonique_runner::backend::TEMPORARY_STORAGE_CHECKPOINT_INTERVAL
     {
-        host.checkpoint_temporary_storage().map_err(|_| ())?;
+        host.checkpoint_temporary_storage()?;
         *last_checkpoint = Instant::now();
     }
-    let Some(exceedance) = host.temporary_storage_exceedance() else {
-        return Ok(None);
-    };
-    host.checkpoint_temporary_storage().map_err(|_| ())?;
-    Ok(Some((exceedance, host.temporary_storage_readback())))
+    Ok(None)
 }
 
 struct JcodeSpoolWriter {
@@ -3015,18 +3086,21 @@ fn is_containment_run_id(run_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_PROVIDER_BINARY_BYTES, PROVIDER_APPROVAL_PROPOSER, TokenCancelSink, admission_refusal,
-        describe_refused_destination, expire_unanswered_approvals, is_containment_run_id,
-        is_safe_segment, is_within_byte_limit, provider_binary_digest,
+        JcodeTemporaryStorageHost, MAX_PROVIDER_BINARY_BYTES, PROVIDER_APPROVAL_PROPOSER,
+        TokenCancelSink, admission_refusal, describe_refused_destination,
+        expire_unanswered_approvals, is_containment_run_id, is_safe_segment,
+        is_within_byte_limit, poll_jcode_temporary_storage, provider_binary_digest,
     };
     use crate::attempt_host::DaemonAttemptHost;
     use crate::progress::JcodeProgressMapper;
     use automonique_agents::JcodeEvent;
     use automonique_egress_broker::{BrokerConfig, EgressBroker};
     use automonique_protocol::execute_api::ExecuteRefusal;
-    use automonique_runner::CancellationToken;
     use automonique_runner::admission::AdmissionRefusal;
     use automonique_runner::dispatch::DispatchOutcome;
+    use automonique_runner::{
+        CancellationToken, Exceedance, StatfsReadback, TemporaryStorageResource,
+    };
     use automonique_store::approval_requests::{
         ApprovalContext, ApprovalOutcome, ApprovalProposal, ApprovalRequests, ApprovalState,
     };
@@ -3037,8 +3111,98 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     const FAR_FUTURE_MS: i64 = 9_000_000_000_000;
+
+    #[derive(Default)]
+    struct FakeJcodeTemporaryStorage {
+        exceedance: Option<Exceedance>,
+        checkpoint_count: usize,
+        refuse_checkpoint: bool,
+    }
+
+    impl JcodeTemporaryStorageHost for FakeJcodeTemporaryStorage {
+        fn checkpoint_temporary_storage(&mut self) -> Result<(), ()> {
+            self.checkpoint_count += 1;
+            if self.refuse_checkpoint {
+                Err(())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn temporary_storage_exceedance(&self) -> Option<Exceedance> {
+            self.exceedance
+        }
+
+        fn temporary_storage_readback(&self) -> Option<StatfsReadback> {
+            None
+        }
+    }
+
+    fn byte_exceedance() -> Exceedance {
+        Exceedance {
+            resource: TemporaryStorageResource::Bytes,
+            requested: 2,
+            used: 4,
+            ceiling: 5,
+        }
+    }
+
+    #[test]
+    fn a_quota_refusal_arriving_with_provider_completion_wins_terminal_arbitration() {
+        let mut host = FakeJcodeTemporaryStorage::default();
+        let mut checkpoint = Instant::now();
+
+        // This is the pre-poll observation. The provider then returns a
+        // completion while its last write is refused by the filesystem.
+        assert_eq!(
+            poll_jcode_temporary_storage(&mut host, &mut checkpoint, false),
+            Ok(None)
+        );
+        host.exceedance = Some(byte_exceedance());
+
+        // The production loop performs this second observation before it
+        // selects the provider outcome, so the refusal is durable and wins.
+        assert_eq!(
+            poll_jcode_temporary_storage(&mut host, &mut checkpoint, false),
+            Ok(Some((byte_exceedance(), None)))
+        );
+        assert_eq!(host.checkpoint_count, 1);
+    }
+
+    #[test]
+    fn cancellation_observation_checkpoints_a_concurrent_quota_refusal_immediately() {
+        let mut host = FakeJcodeTemporaryStorage {
+            exceedance: Some(byte_exceedance()),
+            ..FakeJcodeTemporaryStorage::default()
+        };
+        let mut checkpoint = Instant::now() - Duration::from_millis(1);
+
+        assert_eq!(
+            poll_jcode_temporary_storage(&mut host, &mut checkpoint, true),
+            Ok(Some((byte_exceedance(), None)))
+        );
+        // `force_checkpoint` and quota observation share one write: no
+        // cancellation boundary can acknowledge the refusal without custody.
+        assert_eq!(host.checkpoint_count, 1);
+    }
+
+    #[test]
+    fn checkpoint_failure_is_fail_closed_before_provider_progress_is_selected() {
+        let mut host = FakeJcodeTemporaryStorage {
+            refuse_checkpoint: true,
+            ..FakeJcodeTemporaryStorage::default()
+        };
+        let mut checkpoint = Instant::now();
+
+        assert_eq!(
+            poll_jcode_temporary_storage(&mut host, &mut checkpoint, true),
+            Err(())
+        );
+        assert_eq!(host.checkpoint_count, 1);
+    }
 
     fn approval_store(root: &Path) -> ApprovalRequests {
         ApprovalRequests::open(root.join("approval-requests.sqlite3")).expect("approval requests")

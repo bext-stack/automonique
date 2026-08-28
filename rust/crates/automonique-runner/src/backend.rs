@@ -1470,13 +1470,26 @@ impl SupervisedRun {
         let temporary_storage_readback =
             exceeded.and_then(|exceedance| self.record_temporary_storage_exceedance(exceedance));
 
-        let namespaced_temporary_storage = match self.child.take() {
-            Some(child) => child.finish_namespaced()?,
-            None => None,
+        // Reconciliation is fallible because its final checkpoint is durable.
+        // It must nevertheless never short-circuit the canonical terminal
+        // append: otherwise the daemon could observe a supervisor error and
+        // advance its read model to `failed` while the spool still said
+        // `running`. A reconciliation failure changes the terminal payload to
+        // `failed`, then is returned only after the spool and containment have
+        // both been settled.
+        let namespaced_reconciliation = match self.child.take() {
+            Some(child) => child.finish_namespaced(),
+            None => Ok(None),
         };
+        let terminal_payload =
+            terminal_payload_after_reconciliation(payload, namespaced_reconciliation.is_err());
 
         let mut spool = self.spool.take().expect("a supervised run holds its spool");
-        let recorded = spool.append(EventKind::Terminal, Authority::Authoritative, payload);
+        let recorded = spool.append(
+            EventKind::Terminal,
+            Authority::Authoritative,
+            terminal_payload,
+        );
         let status = spool.status();
         self.observed.observe(status.last_sequence());
         // Dropping the spool releases its exclusive lock; the record is already
@@ -1492,6 +1505,7 @@ impl SupervisedRun {
         recorded?;
         drained?;
         disposed?;
+        let namespaced_temporary_storage = namespaced_reconciliation?;
         Ok((
             status,
             temporary_storage_readback,
@@ -1536,6 +1550,14 @@ impl SupervisedRun {
             let _ = self.append_frame(&frame);
         }
         readback.ok()
+    }
+}
+
+fn terminal_payload_after_reconciliation(requested: &[u8], reconciliation_failed: bool) -> &[u8] {
+    if reconciliation_failed {
+        TERMINAL_FAILED
+    } else {
+        requested
     }
 }
 
@@ -1591,5 +1613,24 @@ fn outcome_from_status(status: &ExitStatus) -> ExecutionOutcome {
         None => ExecutionOutcome::FailedBySignal {
             signal: status.signal().unwrap_or(0),
         },
+    }
+}
+
+#[cfg(test)]
+mod namespaced_finalization_tests {
+    use super::*;
+
+    #[test]
+    fn a_reconciliation_failure_forces_the_canonical_terminal_to_failed() {
+        for requested in [TERMINAL_COMPLETED, TERMINAL_CANCELLED, TERMINAL_TIMED_OUT] {
+            assert_eq!(
+                terminal_payload_after_reconciliation(requested, true),
+                TERMINAL_FAILED
+            );
+            assert_eq!(
+                terminal_payload_after_reconciliation(requested, false),
+                requested
+            );
+        }
     }
 }

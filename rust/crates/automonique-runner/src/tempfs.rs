@@ -1060,6 +1060,7 @@ pub(crate) fn receive_namespaced_tempfs(
     control: &mut UnixStream,
     budget: TemporaryStorageBudget,
     workload_namespace_uid: u32,
+    checkpoint: &Path,
 ) -> Result<NamespacedMountedTempfs, NamespacedMountError> {
     let descriptor = receive_namespaced_descriptor(control)?;
     let channel = Arc::new(ExceedanceChannel::default());
@@ -1097,15 +1098,22 @@ pub(crate) fn receive_namespaced_tempfs(
             "helper statfs did not confirm the empty exact budget",
         ));
     }
-    control.write_all(NAMESPACED_MOUNT_ACCEPTED)?;
-    Ok(NamespacedMountedTempfs {
+    // The helper cannot leave its admission barrier until the accepted byte is
+    // written.  Install and durably populate the checkpoint while it is still
+    // behind that barrier, so there is no interval in which admitted storage
+    // can be used without a canonical recovery record.
+    let mounted = NamespacedMountedTempfs {
         state,
         channel,
         session: Some(session),
         statfs_at_mount: statfs,
         checkpoint_path: None,
         checkpoint_sequence: 0,
-    })
+    }
+    .with_checkpoint(checkpoint)
+    .map_err(NamespacedMountError::Io)?;
+    control.write_all(NAMESPACED_MOUNT_ACCEPTED)?;
+    Ok(mounted)
 }
 
 fn read_namespaced_report(control: &mut UnixStream) -> Result<String, NamespacedMountError> {
@@ -1317,6 +1325,7 @@ fn bounded_stderr(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn a_missing_dev_fuse_is_refused_before_anything_is_mounted() {
@@ -1400,5 +1409,31 @@ mod tests {
         assert_eq!(run_id_of(Path::new("/state/runs/run-1/other"), runs), None);
         assert_eq!(run_id_of(Path::new("/state/runs/run-1/a/tmp"), runs), None);
         assert_eq!(run_id_of(Path::new("/elsewhere/run-1/tmp"), runs), None);
+    }
+
+    #[test]
+    fn a_final_checkpoint_failure_is_a_reported_reconciliation_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let checkpoint = directory.path().join("removed").join("ledger");
+        let budget =
+            TemporaryStorageBudget::from_bytes(2 * crate::tempfs_ledger::STATFS_BLOCK_BYTES)
+                .unwrap();
+        let channel = Arc::new(ExceedanceChannel::default());
+        let filesystem = QuotaFs::new(budget, 0, 0, Arc::clone(&channel));
+        let state = filesystem.state();
+        let statfs_at_mount = StatfsReadback::from_ledger(&snapshot(&state)).unwrap();
+        let mounted = NamespacedMountedTempfs {
+            state,
+            channel,
+            session: None,
+            statfs_at_mount,
+            checkpoint_path: Some(checkpoint),
+            checkpoint_sequence: 1,
+        };
+        assert!(matches!(
+            mounted.reconcile(),
+            Err(NamespacedMountError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound
+        ));
     }
 }

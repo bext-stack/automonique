@@ -1254,10 +1254,13 @@ pub fn spawn_sandboxed_with_namespaced_temporary_storage(
         .spawn()?;
     let setup = (|| -> Result<NamespacedMountedTempfs, LaunchError> {
         supervisor.write_all(&frame)?;
-        let mounted =
-            receive_namespaced_tempfs(&mut supervisor, budget, nix::unistd::getuid().as_raw())
-                .map_err(|error| LaunchError::Io(io::Error::other(error.to_string())))?;
-        mounted.with_checkpoint(checkpoint).map_err(LaunchError::Io)
+        receive_namespaced_tempfs(
+            &mut supervisor,
+            budget,
+            nix::unistd::getuid().as_raw(),
+            checkpoint,
+        )
+        .map_err(|error| LaunchError::Io(io::Error::other(error.to_string())))
     })();
     let temporary_storage = match setup {
         Ok(mounted) => mounted,
@@ -1467,10 +1470,13 @@ pub fn spawn_sandboxed_session_with_namespaced_temporary_storage(
         .spawn()?;
     let setup = (|| -> Result<NamespacedMountedTempfs, LaunchError> {
         supervisor.write_all(&frame)?;
-        let mounted =
-            receive_namespaced_tempfs(&mut supervisor, budget, nix::unistd::getuid().as_raw())
-                .map_err(|error| LaunchError::Io(io::Error::other(error.to_string())))?;
-        mounted.with_checkpoint(checkpoint).map_err(LaunchError::Io)
+        receive_namespaced_tempfs(
+            &mut supervisor,
+            budget,
+            nix::unistd::getuid().as_raw(),
+            checkpoint,
+        )
+        .map_err(|error| LaunchError::Io(io::Error::other(error.to_string())))
     })();
     let temporary_storage = match setup {
         Ok(storage) => storage,

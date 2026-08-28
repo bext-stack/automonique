@@ -12,9 +12,9 @@
 use automonique_runner::filesystem::PathIntent;
 use automonique_runner::identity;
 use automonique_runner::{
-    Checkpoint, CheckpointPhase, ContainmentDomain, ContainmentError, ContainmentLimits,
-    FusePrerequisites, LaunchPlan, RunContainment, STATFS_BLOCK_BYTES, StatfsReadback,
-    StdoutCapture, TemporaryStorageBudget, spawn_sandboxed_with_namespaced_temporary_storage,
+    Checkpoint, CheckpointPhase, ContainmentDomain, ContainmentLimits, FusePrerequisites,
+    LaunchPlan, RunContainment, STATFS_BLOCK_BYTES, StatfsReadback, StdoutCapture,
+    TemporaryStorageBudget, spawn_sandboxed_with_namespaced_temporary_storage,
 };
 use sha2::{Digest as _, Sha256};
 use std::fs;
@@ -26,7 +26,6 @@ use std::time::Duration;
 
 const HELPER: &str = env!("CARGO_BIN_EXE_automonique-launch-enter");
 const BUSYBOX: &str = "/usr/bin/busybox";
-const REQUIRE_ENFORCED_ENV: &str = "AUTOMONIQUE_REQUIRE_ENFORCED_CONTAINMENT";
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 
 struct TempDir(PathBuf);
@@ -56,40 +55,19 @@ impl Drop for TempDir {
     }
 }
 
-fn not_proven(reason: impl std::fmt::Display) {
-    eprintln!("[namespaced-tempfs] NOT PROVEN: {reason}");
+fn prerequisites() -> ContainmentDomain {
+    let domain = ContainmentDomain::discover()
+        .unwrap_or_else(|error| panic!("delegated cgroup proof unavailable: {error}"));
     assert!(
-        std::env::var_os(REQUIRE_ENFORCED_ENV).is_none(),
-        "{REQUIRE_ENFORCED_ENV} requires the delegated proof: {reason}"
+        Path::new(BUSYBOX).is_file(),
+        "static busybox is unavailable"
     );
-}
-
-fn prerequisites() -> Option<ContainmentDomain> {
-    let domain = match ContainmentDomain::discover() {
-        Ok(domain) => domain,
-        Err(
-            error @ (ContainmentError::DomainNotDelegated
-            | ContainmentError::NotUnifiedCgroupV2
-            | ContainmentError::MissingAtomicKill),
-        ) => {
-            not_proven(error);
-            return None;
-        }
-        Err(error) => panic!("unexpected containment refusal: {error}"),
-    };
-    if !Path::new(BUSYBOX).is_file() {
-        not_proven("static busybox is unavailable");
-        return None;
-    }
-    if let Err(error) = FusePrerequisites::host_default().verify() {
-        not_proven(error);
-        return None;
-    }
-    if let Err(error) = identity::probe_with_launch_helper(Path::new(HELPER)) {
-        not_proven(format!("workload identity unavailable: {error}"));
-        return None;
-    }
-    Some(domain)
+    FusePrerequisites::host_default()
+        .verify()
+        .unwrap_or_else(|error| panic!("FUSE proof unavailable: {error}"));
+    identity::probe_with_launch_helper(Path::new(HELPER))
+        .unwrap_or_else(|error| panic!("workload identity proof unavailable: {error}"));
+    domain
 }
 
 fn digest(path: &Path) -> String {
@@ -97,10 +75,9 @@ fn digest(path: &Path) -> String {
 }
 
 #[test]
+#[ignore = "delegated kernel proof; run the ignored test inside a Delegate=yes scope"]
 fn separated_workload_uses_in_namespace_tempfs_and_restart_reads_exact_ledger() {
-    let Some(domain) = prerequisites() else {
-        return;
-    };
+    let domain = prerequisites();
     let temporary = TempDir::new();
     let mountpoint = temporary.subdir("tmp");
     let checkpoint = temporary.0.join("tempfs-ledger");
