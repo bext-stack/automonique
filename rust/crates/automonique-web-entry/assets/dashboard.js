@@ -3227,6 +3227,10 @@ function applyCockpitControlResponse(response, handle) {
 async function submitCockpitIntent(preview) {
   if (!preview || cockpitControlHandle || cockpitControlBusy) return;
   const action = preview.action;
+  if (cockpitPresentation?.[action]?.available !== true) {
+    toast("The current exact capability is unavailable; review a fresh preview.", "error");
+    return;
+  }
   const intentId = newCockpitReceiptId("cockpit-intent");
   const handle = globalThis.AutomoniquePlatformCockpit.prepareControlHandle({
     available: true,

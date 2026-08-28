@@ -291,6 +291,18 @@ test("create confirmation shows exact selectors before any mutation can be sent"
     await page.locator("#cockpit-branch-selector").fill("unreviewed-branch");
     cockpit.actions.lifecycle.operations.create_attempt_workspace = {
       ...cockpit.actions.lifecycle.operations.create_attempt_workspace,
+      available: false,
+      category: "platform_v2_lineage_stale",
+    };
+    await page.evaluate((view) => globalThis.renderPlatform(view), cockpit);
+    await page.getByRole("button", { name: "Confirm create" }).click();
+    expect(requests.map(({ action }) => action)).not.toContain("submit_workspace_create");
+    expect(await page.evaluate(() => localStorage.getItem("automonique-cockpit-control-v1"))).toBeNull();
+
+    cockpit.actions.lifecycle.operations.create_attempt_workspace = {
+      ...cockpit.actions.lifecycle.operations.create_attempt_workspace,
+      available: true,
+      category: null,
       project_id: "project-drifted",
       workspace_id: "workspace-drifted",
       exact_revision: "9007199254740996",
