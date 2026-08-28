@@ -2796,7 +2796,11 @@ impl PlatformV2Runtime {
                     .lineage
                     .projection_authorized(&negotiated_v2()?, &scope, |_| true)
                     .map_err(|_| "platform_v2_attention_source_unavailable")?;
-                orchestration_attention_items(projection.orchestration())?
+                let current = self
+                    .attention
+                    .snapshot(source, request.project(), workspace)
+                    .map_err(|_| "platform_v2_attention_store_refused")?;
+                orchestration_attention_items(projection.orchestration(), current.as_ref())?
             }
             AttentionSourceKind::ProviderSession => {
                 let work_session = WorkSessionId::new(source.id().as_str().to_owned())
@@ -2832,7 +2836,16 @@ impl PlatformV2Runtime {
                         platform_session.coordinate().id.as_str(),
                     )
                     .map_err(|_| "platform_v2_attention_source_unavailable")?;
-                retained_session_attention_items(&session, platform_session, observed_at_ms)?
+                let current = self
+                    .attention
+                    .snapshot(source, request.project(), workspace)
+                    .map_err(|_| "platform_v2_attention_store_refused")?;
+                retained_session_attention_items(
+                    &session,
+                    platform_session,
+                    observed_at_ms,
+                    current.as_ref(),
+                )?
             }
             _ => return Ok(None),
         };
@@ -3015,10 +3028,9 @@ impl PlatformV2Runtime {
 fn persist_runtime_attention_snapshot(
     store: &mut AttentionStore,
     request: &AttentionReadRequest,
-    mut desired: Vec<AttentionItem>,
+    desired: Vec<AttentionItem>,
     observed_at_ms: u64,
 ) -> Result<AttentionSourceSnapshot, &'static str> {
-    desired.sort_by(|left, right| left.id().as_str().cmp(right.id().as_str()));
     let current = store
         .snapshot(
             request.source(),
@@ -3026,14 +3038,42 @@ fn persist_runtime_attention_snapshot(
             request.user_workspace(),
         )
         .map_err(|_| "platform_v2_attention_store_refused")?;
+    let snapshot =
+        prepare_runtime_attention_snapshot(request, desired, observed_at_ms, current.as_ref())?;
+    if current.as_ref() == Some(&snapshot) {
+        return Ok(snapshot);
+    }
+    store
+        .put_snapshot(&snapshot)
+        .map_err(|_| "platform_v2_attention_store_refused")?;
+    Ok(snapshot)
+}
+
+fn prepare_runtime_attention_snapshot(
+    request: &AttentionReadRequest,
+    mut desired: Vec<AttentionItem>,
+    observed_at_ms: u64,
+    current: Option<&AttentionSourceSnapshot>,
+) -> Result<AttentionSourceSnapshot, &'static str> {
+    desired.sort_by(|left, right| left.id().as_str().cmp(right.id().as_str()));
+    if let Some(current) = current
+        && current.items().len() == desired.len()
+        && current
+            .items()
+            .iter()
+            .zip(&desired)
+            .all(|(old, item)| attention_item_equal_except_revision_and_observed(old, item))
+    {
+        // Observation is not a source change. Detect replay before allocating
+        // a successor so an exact replay remains readable at Revision::MAX.
+        return Ok(current.clone());
+    }
     let revision = current
-        .as_ref()
         .map_or(Ok(Revision::FIRST), |value| value.revision().checked_next())
         .map_err(|_| "platform_v2_attention_revision_exhausted")?;
     for item in &mut desired {
-        let previous = current
-            .as_ref()
-            .and_then(|snapshot| snapshot.items().iter().find(|old| old.id() == item.id()));
+        let previous =
+            current.and_then(|snapshot| snapshot.items().iter().find(|old| old.id() == item.id()));
         let (item_revision, item_observed_at_ms) =
             previous.map_or((revision, item.observed_at_ms()), |old| {
                 if attention_item_equal_except_revision_and_observed(old, item) {
@@ -3054,14 +3094,8 @@ fn persist_runtime_attention_snapshot(
         )
         .map_err(|_| "platform_v2_attention_projection_invalid")?;
     }
-    if let Some(current) = &current
-        && current.items() == desired.as_slice()
-    {
-        return Ok(current.clone());
-    }
-    let previous_revision = current.as_ref().map(AttentionSourceSnapshot::revision);
+    let previous_revision = current.map(AttentionSourceSnapshot::revision);
     let snapshot_observed_at_ms = current
-        .as_ref()
         .map_or(observed_at_ms, |value| {
             value.observed_at_ms().max(observed_at_ms)
         })
@@ -3082,9 +3116,6 @@ fn persist_runtime_attention_snapshot(
         desired,
     )
     .map_err(|_| "platform_v2_attention_projection_invalid")?;
-    store
-        .put_snapshot(&snapshot)
-        .map_err(|_| "platform_v2_attention_store_refused")?;
     Ok(snapshot)
 }
 
@@ -3158,6 +3189,7 @@ const fn review_attention_reason(reason: ReviewAttentionReason) -> AttentionItem
 
 fn orchestration_attention_items(
     records: &[OrchestrationRecord],
+    current: Option<&AttentionSourceSnapshot>,
 ) -> Result<Vec<AttentionItem>, &'static str> {
     records
         .iter()
@@ -3171,16 +3203,13 @@ fn orchestration_attention_items(
                 LineageStatus::Waiting(_) => None,
                 LineageStatus::Done(_) => Some(AttentionItemReason::Complete),
             }?;
-            let id = format!(
-                "{}:{}:r{}",
-                record.identity().kind().as_str(),
-                record.identity().id(),
-                record.revision()
+            let prefix = runtime_attention_incarnation_prefix(
+                "orchestration",
+                &[record.identity().kind().as_str(), record.identity().id()],
             );
             Some(
-                AttentionItemId::new(id)
-                    .map_err(|_| "platform_v2_attention_source_exceeds_bound")
-                    .and_then(|id| {
+                runtime_attention_incarnation_id(current, &prefix, record.revision()).and_then(
+                    |id| {
                         AttentionItem::new(
                             id,
                             Revision::FIRST,
@@ -3192,7 +3221,8 @@ fn orchestration_attention_items(
                             None,
                         )
                         .map_err(|_| "platform_v2_attention_projection_invalid")
-                    }),
+                    },
+                ),
             )
         })
         .collect()
@@ -3202,6 +3232,7 @@ fn retained_session_attention_items(
     session: &WorkContextRecord,
     platform_session: V1SessionRef,
     observed_at_ms: u64,
+    current: Option<&AttentionSourceSnapshot>,
 ) -> Result<Vec<AttentionItem>, &'static str> {
     let reason = match session.lifecycle() {
         WorkContextLifecycle::Active
@@ -3217,8 +3248,9 @@ fn retained_session_attention_items(
     let Some(reason) = reason else {
         return Ok(Vec::new());
     };
-    let id = AttentionItemId::new(format!("session-state:{}", session.revision()))
-        .map_err(|_| "platform_v2_attention_projection_invalid")?;
+    let prefix =
+        runtime_attention_incarnation_prefix("retained-session", &[session.identity().id()]);
+    let id = runtime_attention_incarnation_id(current, &prefix, session.revision())?;
     AttentionItem::new(
         id,
         Revision::FIRST,
@@ -3231,6 +3263,38 @@ fn retained_session_attention_items(
     )
     .map(|item| vec![item])
     .map_err(|_| "platform_v2_attention_projection_invalid")
+}
+
+fn runtime_attention_incarnation_prefix(domain: &str, components: &[&str]) -> String {
+    let mut material = Vec::new();
+    for component in std::iter::once(domain).chain(components.iter().copied()) {
+        let bytes = component.as_bytes();
+        material.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        material.extend_from_slice(bytes);
+    }
+    format!(
+        "runtime-{domain}-{}-i",
+        automonique_protocol::digest::Sha256::digest(&material).to_hex()
+    )
+}
+
+fn runtime_attention_incarnation_id(
+    current: Option<&AttentionSourceSnapshot>,
+    prefix: &str,
+    incarnation: Revision,
+) -> Result<AttentionItemId, &'static str> {
+    let mut matching = current
+        .into_iter()
+        .flat_map(AttentionSourceSnapshot::items)
+        .filter(|item| item.id().as_str().starts_with(prefix));
+    if let Some(existing) = matching.next() {
+        if matching.next().is_some() {
+            return Err("platform_v2_attention_projection_invalid");
+        }
+        return Ok(existing.id().clone());
+    }
+    AttentionItemId::new(format!("{prefix}{incarnation}"))
+        .map_err(|_| "platform_v2_attention_projection_invalid")
 }
 
 fn current_mutation_policy(
@@ -4049,8 +4113,8 @@ mod tests {
             Revision::new(9).unwrap(),
         )
         .unwrap();
-        let orchestration_items = orchestration_attention_items(&[orchestration]).unwrap();
-        assert_eq!(orchestration_items[0].id().as_str(), "worker:worker-1:r9");
+        let orchestration_items = orchestration_attention_items(&[orchestration], None).unwrap();
+        assert!(orchestration_items[0].id().as_str().ends_with("-i9"));
         assert_eq!(
             orchestration_items[0].reason(),
             AttentionItemReason::AgentWorking
@@ -4086,10 +4150,11 @@ mod tests {
         )
         .unwrap();
         let session_items =
-            retained_session_attention_items(&session, platform_session.clone(), 2_000).unwrap();
+            retained_session_attention_items(&session, platform_session.clone(), 2_000, None)
+                .unwrap();
         assert_eq!(session_items[0].platform_session(), Some(&platform_session));
         assert_eq!(session_items[0].reason(), AttentionItemReason::AgentWorking);
-        assert!(session_items[0].id().as_str().contains("4"));
+        assert!(session_items[0].id().as_str().ends_with("-i4"));
         assert_eq!(
             review_attention_items_from_snapshot(None, 2_001),
             Err("platform_v2_attention_not_found"),
@@ -4181,6 +4246,278 @@ mod tests {
                 .is_none(),
             "cross-workspace reads do not inherit a source tuple"
         );
+    }
+
+    #[test]
+    fn runtime_attention_replay_at_max_revision_does_not_require_a_successor() {
+        let source = AttentionSource::new(
+            AttentionSourceKind::Review,
+            AttentionSourceId::new("workspace-1").unwrap(),
+        );
+        let project = ProjectId::new("project-1").unwrap();
+        let workspace = UserWorkspaceId::new("workspace-1").unwrap();
+        let request = AttentionReadRequest::new(source.clone(), project.clone(), workspace.clone());
+        let maximum = Revision::new(u64::MAX).unwrap();
+        let current_item = AttentionItem::new(
+            AttentionItemId::new("review-item-1").unwrap(),
+            maximum,
+            10,
+            AttentionItemReason::ReviewRequested.state(),
+            AttentionItemReason::ReviewRequested,
+            true,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        let current = AttentionSourceSnapshot::new(
+            source,
+            project,
+            workspace,
+            maximum,
+            Some(Revision::new(u64::MAX - 1).unwrap()),
+            10,
+            vec![current_item],
+        )
+        .unwrap();
+        let desired = |unread| {
+            AttentionItem::new(
+                AttentionItemId::new("review-item-1").unwrap(),
+                Revision::FIRST,
+                20,
+                AttentionItemReason::ReviewRequested.state(),
+                AttentionItemReason::ReviewRequested,
+                unread,
+                Vec::new(),
+                None,
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            prepare_runtime_attention_snapshot(&request, vec![desired(true)], 20, Some(&current)),
+            Ok(current.clone()),
+            "an exact replay remains the exact durable document at Revision::MAX"
+        );
+        assert_eq!(
+            prepare_runtime_attention_snapshot(&request, vec![desired(false)], 20, Some(&current),),
+            Err("platform_v2_attention_revision_exhausted"),
+            "a real change must still fail closed when no successor exists"
+        );
+    }
+
+    #[test]
+    fn runtime_attention_logical_items_survive_churn_but_not_an_absent_interval() {
+        use automonique_protocol::platform_v2_lineage::{
+            LineageFreshness, LineageFreshnessState, LineageMessage, LineageOrigin,
+            OrchestrationIdentity, OrchestrationRunId,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let mut store = AttentionStore::open_scoped(
+            directory.path().join("orchestration-attention.sqlite3"),
+            "tenant-test",
+        )
+        .unwrap();
+        let request = AttentionReadRequest::new(
+            AttentionSource::new(
+                AttentionSourceKind::Orchestration,
+                AttentionSourceId::new("workspace-1").unwrap(),
+            ),
+            ProjectId::new("project-1").unwrap(),
+            UserWorkspaceId::new("workspace-1").unwrap(),
+        );
+        let record = |status, revision, observed_at_ms| {
+            OrchestrationRecord::new_with_origin(
+                OrchestrationIdentity::Run(OrchestrationRunId::new("run-1").unwrap()),
+                LineageOrigin::workspace_only(UserWorkspaceId::new("workspace-1").unwrap()),
+                None,
+                None,
+                status,
+                LineageFreshness::new(observed_at_ms, 60_000, LineageFreshnessState::Fresh)
+                    .unwrap(),
+                None,
+                Revision::new(revision).unwrap(),
+            )
+            .unwrap()
+        };
+
+        let first_items =
+            orchestration_attention_items(&[record(LineageStatus::Working, 7, 700)], None).unwrap();
+        let first =
+            persist_runtime_attention_snapshot(&mut store, &request, first_items, 700).unwrap();
+        let original_id = first.items()[0].id().clone();
+        let unchanged_items =
+            orchestration_attention_items(&[record(LineageStatus::Working, 8, 800)], Some(&first))
+                .unwrap();
+        let unchanged =
+            persist_runtime_attention_snapshot(&mut store, &request, unchanged_items, 800).unwrap();
+        assert_eq!(
+            unchanged, first,
+            "unrelated record revision churn is replay"
+        );
+
+        let changed_items = orchestration_attention_items(
+            &[record(
+                LineageStatus::Blocked(LineageMessage::new("dependency").unwrap()),
+                9,
+                900,
+            )],
+            Some(&unchanged),
+        )
+        .unwrap();
+        let changed =
+            persist_runtime_attention_snapshot(&mut store, &request, changed_items, 900).unwrap();
+        assert_eq!(changed.items()[0].id(), &original_id);
+        assert_eq!(changed.items()[0].revision(), Revision::new(2).unwrap());
+        assert_eq!(
+            changed.items()[0].reason(),
+            AttentionItemReason::ExternalBlocker
+        );
+
+        let absent_items = orchestration_attention_items(
+            &[record(
+                LineageStatus::Waiting(LineageMessage::new("idle").unwrap()),
+                10,
+                1_000,
+            )],
+            Some(&changed),
+        )
+        .unwrap();
+        let absent =
+            persist_runtime_attention_snapshot(&mut store, &request, absent_items, 1_000).unwrap();
+        assert!(absent.items().is_empty());
+        let reappeared_items = orchestration_attention_items(
+            &[record(LineageStatus::Working, 11, 1_100)],
+            Some(&absent),
+        )
+        .unwrap();
+        let reappeared =
+            persist_runtime_attention_snapshot(&mut store, &request, reappeared_items, 1_100)
+                .unwrap();
+        assert_ne!(reappeared.items()[0].id(), &original_id);
+        assert!(reappeared.items()[0].id().as_str().ends_with("-i11"));
+
+        let mut session_store = AttentionStore::open_scoped(
+            directory.path().join("session-attention.sqlite3"),
+            "tenant-test",
+        )
+        .unwrap();
+        let session_request = AttentionReadRequest::new(
+            AttentionSource::new(
+                AttentionSourceKind::ProviderSession,
+                AttentionSourceId::new("work-session-1").unwrap(),
+            ),
+            ProjectId::new("project-1").unwrap(),
+            UserWorkspaceId::new("workspace-1").unwrap(),
+        );
+        let platform_session = V1SessionRef::new(ResourceCoordinate::new(
+            ResourceAuthority::Automonique,
+            ResourceKind::Session,
+            ResourceId::new("provider-session-1").unwrap(),
+        ))
+        .unwrap();
+        let session = |lifecycle, revision| {
+            WorkContextRecord::new(
+                WorkContextIdentity::Session(WorkSessionId::new("work-session-1").unwrap()),
+                Revision::new(revision).unwrap(),
+                lifecycle,
+                WorkContextLabel::new("Retained session").unwrap(),
+                WorkContextAttributes::EMPTY,
+                vec![
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::SessionAttemptWorkspace,
+                        WorkContextIdentity::AttemptWorkspace(
+                            AttemptWorkspaceId::new("attempt-1").unwrap(),
+                        ),
+                    )
+                    .unwrap(),
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::SessionPlatformSession,
+                        WorkContextIdentity::PlatformSession(platform_session.clone()),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap()
+        };
+        let first_items = retained_session_attention_items(
+            &session(WorkContextLifecycle::Active, 3),
+            platform_session.clone(),
+            300,
+            None,
+        )
+        .unwrap();
+        let first = persist_runtime_attention_snapshot(
+            &mut session_store,
+            &session_request,
+            first_items,
+            300,
+        )
+        .unwrap();
+        let original_id = first.items()[0].id().clone();
+        let unchanged_items = retained_session_attention_items(
+            &session(WorkContextLifecycle::Active, 4),
+            platform_session.clone(),
+            400,
+            Some(&first),
+        )
+        .unwrap();
+        let unchanged = persist_runtime_attention_snapshot(
+            &mut session_store,
+            &session_request,
+            unchanged_items,
+            400,
+        )
+        .unwrap();
+        assert_eq!(unchanged, first);
+        let changed_items = retained_session_attention_items(
+            &session(WorkContextLifecycle::Completed, 5),
+            platform_session.clone(),
+            500,
+            Some(&unchanged),
+        )
+        .unwrap();
+        let changed = persist_runtime_attention_snapshot(
+            &mut session_store,
+            &session_request,
+            changed_items,
+            500,
+        )
+        .unwrap();
+        assert_eq!(changed.items()[0].id(), &original_id);
+        assert_eq!(changed.items()[0].reason(), AttentionItemReason::Complete);
+        let absent_items = retained_session_attention_items(
+            &session(WorkContextLifecycle::Hibernated, 6),
+            platform_session.clone(),
+            600,
+            Some(&changed),
+        )
+        .unwrap();
+        let absent = persist_runtime_attention_snapshot(
+            &mut session_store,
+            &session_request,
+            absent_items,
+            600,
+        )
+        .unwrap();
+        assert!(absent.items().is_empty());
+        let reappeared_items = retained_session_attention_items(
+            &session(WorkContextLifecycle::Active, 7),
+            platform_session,
+            700,
+            Some(&absent),
+        )
+        .unwrap();
+        let reappeared = persist_runtime_attention_snapshot(
+            &mut session_store,
+            &session_request,
+            reappeared_items,
+            700,
+        )
+        .unwrap();
+        assert_ne!(reappeared.items()[0].id(), &original_id);
+        assert!(reappeared.items()[0].id().as_str().ends_with("-i7"));
     }
 
     fn policy(inherited_tools: serde_json::Value) -> PolicyDocument {

@@ -68,9 +68,13 @@ Runtime snapshots pass through the same atomic attention store. A semantically
 unchanged observation replays the exact durable document. A changed complete
 item set advances the source revision once, points to the exact predecessor,
 advances changed item revisions, and preserves unchanged item revisions and
-observation times. A restart therefore cannot reset a source or reuse a removed
-item id. The hosted cockpit discovers only those deterministic source ids from
-its bounded authorized work-context inventory and renders
+observation times. One logical orchestration or retained-session record keeps
+its current item id across unrelated producer revisions and attention-state
+changes. A `Waiting` orchestration record or `Hibernated` session removes that
+item atomically; a later reappearance mints a new incarnation instead of
+reusing the retired id. A restart therefore cannot reset a source or reuse a
+removed item id. The hosted cockpit discovers only those deterministic source
+ids from its bounded authorized work-context inventory and renders
 `get_attention_source_snapshot` results; it does not substitute review summary
 attention. Desktop and mobile consumers and cross-client live acceptance remain
 separate milestones.
