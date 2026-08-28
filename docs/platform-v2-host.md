@@ -189,15 +189,48 @@ same terminal receipt without advancing the snapshot again. The policy file is
 fenced immediately before and after this transaction.
 
 Agent comment delivery, stage/unstage/commit/conflict resolution, CI reruns,
-and pull-request open/update/merge still have no credential-and-target-bound
-provider registry. After full authority and target validation they refuse
-before custody as `platform_v2_review_agent_adapter_unavailable`,
+and pull-request open/update/merge remain unavailable. After full authority and
+target validation they refuse before custody as
+`platform_v2_review_agent_adapter_unavailable`,
 `platform_v2_review_git_adapter_unavailable`,
 `platform_v2_review_ci_adapter_unavailable`, or
 `platform_v2_review_pull_request_adapter_unavailable`. No request text becomes
-a path, command, provider payload, or credential.
+a path, command, provider payload, or credential. The private target registry
+below establishes the missing identity boundary, but deliberately does not
+turn a binding into an executable capability. Git still lacks a server-owned
+snapshot-to-blob/index/HEAD provenance document; retained sessions lack a
+typed idempotent delivery endpoint; and CI/pull-request providers lack typed
+credential consumers plus read-after-write reconciliation. Until those exact
+boundaries exist there is no external effect, hence no prepared custody or
+ambiguous write to recover.
 Cancellations of already-existing durable lineage intents remain immediate,
 final store operations.
+
+## Private review target registry
+
+The optional `platform-v2-review-registry.json` sibling is operator-owned,
+opened with `O_NOFOLLOW`, restricted to the daemon uid, exact mode `0600`, one
+hard link, and a 512 KiB limit. Its descriptor identity, timestamps, length,
+and SHA-256 digest are rechecked before every external review action. Removing
+or changing an installed generation requires a restart and actions fail closed
+as `platform_v2_review_registry_changed`; an installed malformed or insecure
+file disables Platform v2 instead of silently falling back.
+
+The bounded version-1 document maps an exact project, workspace kind/id, and
+authority kind/id to one closed target variant:
+
+- `local_repository` contains only a canonical uid-owned repository root;
+- `retained_session` contains an opaque provider and retained-session id;
+- `ci` contains an opaque provider target and credential reference;
+- `pull_request` contains an opaque provider repository and credential
+  reference.
+
+Credential references are names, never secret material. Target variants must
+match their authority family, duplicate bindings and overlapping repository
+roots are refused, repository and `.git` metadata cannot be symlinked or
+group/world writable, and unknown JSON fields are rejected. The registry is
+private composition state: it is never returned by Platform v2 and clients
+cannot supply paths, commands, provider targets, or credential references.
 
 ## Private lifecycle selector registry
 
