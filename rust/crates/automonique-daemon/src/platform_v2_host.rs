@@ -5447,6 +5447,9 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "cross-workspace reads do not inherit a source tuple"
+        );
+    }
+
     fn uncorrelated_lookup(key: &str) -> PlatformV2Request {
         PlatformV2Request::GetReviewReceipt(
             ReviewReceiptLookup::new(
@@ -5819,6 +5822,9 @@ mod tests {
         .unwrap();
         assert_ne!(reappeared.items()[0].id(), &original_id);
         assert!(!reappeared.items()[0].unread());
+    }
+
+    #[test]
     fn github_lookup_requires_the_exact_nonlegacy_correlation() {
         let exact = review_receipt_correlation_digest([7; 32]).unwrap();
         let wrong = review_receipt_correlation_digest([8; 32]).unwrap();
