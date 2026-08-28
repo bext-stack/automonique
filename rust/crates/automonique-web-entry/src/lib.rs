@@ -9480,7 +9480,9 @@ mod tests {
         let projection: Value =
             serde_json::from_slice(&basic_response[boundary + 4..]).expect("typed cockpit JSON");
         assert_eq!(projection["schema"], "automonique.dashboard.cockpit/v2");
-        assert_eq!(projection["mode"], "v1");
+        assert_eq!(projection["mode"], "partial");
+        assert_eq!(projection["degradation"]["platform"], "v2");
+        assert_eq!(projection["degradation"]["state"], "unavailable");
         assert_eq!(
             projection["degradation"]["category"],
             "platform_v2_web_binding_unavailable"
@@ -9533,7 +9535,7 @@ mod tests {
         };
         use automonique_store::work_context_store::WorkContextStore;
 
-        const PLATFORM_EXCHANGES: usize = 8;
+        const PLATFORM_EXCHANGES: usize = 11;
         let state_dir = tempfile::tempdir().expect("temporary state");
         let runtime_dir = tempfile::tempdir().expect("temporary runtime");
         std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))
@@ -9555,7 +9557,7 @@ mod tests {
             serde_json::json!({"project":"project-a","kind":"user_workspace","id":"workspace-a","inherited_authority":authority}),
             serde_json::json!({"project":"project-b","kind":"project","id":"project-b","inherited_authority":authority}),
         ];
-        for index in 0..129 {
+        for index in 0..513 {
             policy_workspaces.push(serde_json::json!({
                 "project":"project-a", "kind":"host_setup",
                 "id":format!("paged-host-{index:03}"), "inherited_authority":authority
@@ -9702,7 +9704,7 @@ mod tests {
         for record in [&project_a, &project_b, &host, &checkout, &workspace] {
             store.put_authoritative_record("operator", record).unwrap();
         }
-        for index in 0..129 {
+        for index in 0..513 {
             let record = WorkContextRecord::new(
                 WorkContextIdentity::parse_local(
                     WorkContextTargetKind::HostSetup,
@@ -9837,7 +9839,17 @@ mod tests {
         client.read_to_end(&mut response).unwrap();
         web_server.join().unwrap();
         let queried_projects = platform_server.join().unwrap();
-        assert_eq!(queried_projects, ["project-a", "project-a", "project-b"]);
+        assert_eq!(
+            queried_projects,
+            [
+                "project-a",
+                "project-a",
+                "project-a",
+                "project-a",
+                "project-a",
+                "project-b"
+            ]
+        );
         let boundary = response
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
@@ -9846,6 +9858,7 @@ mod tests {
         let projection: Value = serde_json::from_slice(&response[boundary + 4..]).unwrap();
         assert_eq!(projection["mode"], "v2");
         assert_eq!(projection["projects"].as_array().unwrap().len(), 2);
+        assert_eq!(projection["hosts"].as_array().unwrap().len(), 514);
         assert_eq!(projection["workspaces"][0]["id"], "workspace-a");
         assert_eq!(projection["actions"]["lifecycle"]["project"], "project-a");
         assert_eq!(

@@ -2303,7 +2303,7 @@ function renderHostedCockpit(view) {
   const copy = byId("cockpit-copy-link");
   copy.disabled = !workspace;
   byId("cockpit-inspector-workspace").textContent = workspace?.id || "No workspace selected";
-  byId("cockpit-inspector-session").textContent = workspace?.session_id || link.session || "—";
+  byId("cockpit-inspector-session").textContent = link.session || workspace?.session_id || "—";
   byId("cockpit-inspector-pane").textContent = link.pane || "—";
   byId("cockpit-inspector-anchor").textContent = link.file ? `${link.file} · ${link.hunk} · ${link.side}:${link.line}` : "—";
 
@@ -2581,7 +2581,7 @@ async function selectPlatformSession(sessionId) {
   const previous = platformSelectedSession;
   platformSelectedSession = sessionId;
   cockpitState = globalThis.AutomoniquePlatformCockpit.reduce(cockpitState, { type: "select_session", session: sessionId });
-  const matchingWorkspace = cockpitPresentation?.workspaces.find((workspace) => workspace.session_id === sessionId) || null;
+  const matchingWorkspace = cockpitPresentation?.workspaces.find((workspace) => workspace.session_ids.includes(sessionId)) || null;
   if (matchingWorkspace) {
     cockpitState = globalThis.AutomoniquePlatformCockpit.reduce(cockpitState, { type: "select_workspace", workspace: matchingWorkspace.id });
   }
@@ -3349,7 +3349,7 @@ byId("cockpit-copy-link").addEventListener("click", async () => {
     ...(current.workspace === workspace.id ? current : {}),
     view: "sessions",
     workspace: workspace.id,
-    session: workspace.session_id || platformSelectedSession,
+    session: current.session || workspace.session_id || platformSelectedSession,
   })}`;
   try {
     await navigator.clipboard.writeText(link);

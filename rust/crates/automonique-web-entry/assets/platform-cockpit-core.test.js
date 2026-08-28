@@ -18,7 +18,14 @@ const fixture = {
     id: "workspace-1",
     project_id: "project-1",
     host_id: "host-1",
-    session_id: "session-1",
+    attempts: [{
+      id: "attempt-1", label: "Attempt 1", revision: "2", lifecycle: "running",
+      sessions: [{
+        id: "runtime-session-1", label: "Session 1", revision: "3", lifecycle: "active",
+        platform_session_id: "session-1",
+        panes: [{ id: "pane-1", label: "Pane 1", revision: "4", lifecycle: "active" }],
+      }],
+    }],
     label: "Cockpit shell",
     attention: "needs_you",
     revision: "9007199254740995",
@@ -141,6 +148,65 @@ test("v1 degrades explicitly and never infers workspace state from summaries", (
   expect(view.workspaces).toEqual([]);
   expect(view.attention.working).toBe(null);
   expect(view.resume.available).toBe(false);
+});
+
+test("negotiated v2 unavailability stays partial and never masquerades as v1", () => {
+  const view = cockpit.derivePresentation({
+    schema: "automonique.dashboard.cockpit/v2",
+    mode: "partial",
+    degradation: { platform: "v2", state: "unavailable", category: "platform_v2_inventory_resync_required" },
+    retained_v1: { sessions: [{ summary: "retained only" }] },
+    projects: [], hosts: [], workspaces: [],
+    attention: { state: "unavailable", category: "platform_v2_unavailable" },
+    actions: { lifecycle: { available: false }, review: { available: false } },
+  });
+  expect(view.mode).toBe("partial");
+  expect(view.degradation).toContain("platform_v2_inventory_resync_required");
+  expect(view.workspaces).toEqual([]);
+  expect(view.create.available).toBe(false);
+});
+
+test("attempt session and pane hierarchy preserves siblings without overwrite", () => {
+  const nested = structuredClone(fixture);
+  nested.workspaces[0].attempts[0].sessions.push({
+    id: "runtime-session-2", label: "Session 2", revision: "5", lifecycle: "active",
+    platform_session_id: "session-2",
+    panes: [
+      { id: "pane-2", label: "Pane 2", revision: "6", lifecycle: "active" },
+      { id: "pane-3", label: "Pane 3", revision: "7", lifecycle: "closed" },
+    ],
+  });
+  const view = cockpit.derivePresentation(nested, { session: "session-2", pane: "pane-3" });
+  expect(view.selectedWorkspace.id).toBe("workspace-1");
+  expect(view.selectedWorkspace.session_id).toBeNull();
+  expect(view.selectedWorkspace.session_ids).toEqual(["session-1", "session-2"]);
+  expect(view.selectedWorkspace.attempts[0].sessions[1].panes.map((pane) => pane.id)).toEqual(["pane-2", "pane-3"]);
+});
+
+test("workspace lineage preserves exact external moves, origin, and orchestration parent meaning", () => {
+  const lineage = structuredClone(fixture);
+  const origin = { workspace: "workspace-1", attempt: "attempt-1", session: "runtime-session-1", pane: "pane-1" };
+  lineage.workspaces[0].lineage = {
+    external_work_items: [{
+      identity: { provider: "github", authority: "github.com", scope: "owner/repo", key: "41" },
+      moved_to: { provider: "github", authority: "github.com", scope: "owner/repo", key: "42" },
+      state: "moved", freshness: "fresh", origin, revision: "8", observed_at: "100", latest_message: "Moved",
+    }],
+    orchestration: [{
+      kind: "task", id: "task-42", status: "blocked", status_message: "Awaiting review",
+      freshness: "fresh", origin, parent: { kind: "run", id: "run-1" },
+      external_work: { provider: "github", authority: "github.com", scope: "owner/repo", key: "42" },
+      revision: "9", observed_at: "101", latest_message: null,
+    }],
+  };
+  const view = cockpit.derivePresentation(lineage, { pane: "pane-1" });
+  expect(view.selectedWorkspace.lineage.external_work_items[0].moved_to.key).toBe("42");
+  expect(view.selectedWorkspace.lineage.external_work_items[0].origin.pane).toBe("pane-1");
+  expect(view.selectedWorkspace.lineage.orchestration[0].parent).toEqual({ kind: "run", id: "run-1" });
+  expect(view.selectedWorkspace.lineage.orchestration[0].status_message).toBe("Awaiting review");
+
+  lineage.workspaces[0].lineage.orchestration = Array.from({ length: 129 }, () => lineage.workspaces[0].lineage.orchestration[0]);
+  expect(cockpit.derivePresentation(lineage).selectedWorkspace.lineage).toBeNull();
 });
 
 test("malformed structured collections fail closed to unavailable presentation state", () => {
@@ -307,9 +373,10 @@ test("reducer cannot manufacture a preview from an unavailable server action", (
 });
 
 test("deep links preserve exact workspace session pane and complete review anchors", () => {
-  const hash = cockpit.buildDeepLink({ view: "sessions", workspace: "ws/opaque", session: "s:1", pane: "pane-2", file: "file-4", hunk: "hunk-7", side: "head", line: "9007199254740995" });
-  expect(hash).toBe("#sessions?workspace=ws%2Fopaque&session=s%3A1&pane=pane-2&file=file-4&hunk=hunk-7&side=head&line=9007199254740995");
-  expect(cockpit.parseDeepLink(hash)).toEqual({ view: "sessions", workspace: "ws/opaque", session: "s:1", pane: "pane-2", file: "file-4", hunk: "hunk-7", side: "head", line: "9007199254740995" });
+  const hash = cockpit.buildDeepLink({ view: "sessions", workspace: "ws/opaque", session: "s:1", pane: "pane-2", file: "file-4", hunk: "hunk-7", side: "new", line: "9007199254740995" });
+  expect(hash).toBe("#sessions?workspace=ws%2Fopaque&session=s%3A1&pane=pane-2&file=file-4&hunk=hunk-7&side=new&line=9007199254740995");
+  expect(cockpit.parseDeepLink(hash)).toEqual({ view: "sessions", workspace: "ws/opaque", session: "s:1", pane: "pane-2", file: "file-4", hunk: "hunk-7", side: "new", line: "9007199254740995" });
+  expect(cockpit.parseDeepLink("#sessions?workspace=ws&file=f&hunk=h&side=head&line=3")).toEqual({ view: "sessions", workspace: "ws" });
   expect(cockpit.parseDeepLink("#sessions?workspace=ws&file=f&line=3")).toEqual({ view: "sessions", workspace: "ws" });
   expect(cockpit.buildDeepLink({ view: "sessions", workspace: "ws", file: "f", line: "3" })).toBe("#sessions?workspace=ws");
 });

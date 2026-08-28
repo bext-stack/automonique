@@ -43,8 +43,8 @@ const cockpit = {
   projects: [{ id: "project-1", label: "Automonique", revision: "1", lifecycle: "active" }],
   hosts: [{ id: "host-1", label: "Local host", revision: "1", lifecycle: "active", project_id: "project-1", kind: "local" }],
   workspaces: [
-    { id: "workspace-1", label: "Cockpit", revision: "9007199254740995", lifecycle: "active", project_id: "project-1", host_id: "host-1", session_id: "session-1", attention: "needs_you" },
-    { id: "workspace-2", label: "Blocked workspace", revision: "7", lifecycle: "active", project_id: "project-1", host_id: "host-1", session_id: "session-2", attention: "blocked" },
+    { id: "workspace-1", label: "Cockpit", revision: "9007199254740995", lifecycle: "active", project_id: "project-1", host_id: "host-1", attempts: [{ id: "attempt-1", label: "Attempt 1", revision: "2", lifecycle: "running", sessions: [{ id: "runtime-session-1", label: "Session 1", revision: "3", lifecycle: "active", platform_session_id: "session-1", panes: [] }] }], attention: "needs_you" },
+    { id: "workspace-2", label: "Blocked workspace", revision: "7", lifecycle: "active", project_id: "project-1", host_id: "host-1", attempts: [{ id: "attempt-2", label: "Attempt 2", revision: "2", lifecycle: "running", sessions: [{ id: "runtime-session-2", label: "Session 2", revision: "3", lifecycle: "active", platform_session_id: "session-2", panes: [] }] }], attention: "blocked" },
   ],
   selected: { workspace: "workspace-1" },
   lineage: { state: "available", document: { workspace: "workspace-1", external_work_items: [], orchestration: [] } },
@@ -232,7 +232,7 @@ test("partial lineage and review refusals disable attention filtering without in
 });
 
 test("cross-workspace retained session selection updates URL and cockpit before attach settles", async ({ page }) => {
-  await page.goto("https://cockpit.test/#sessions?workspace=workspace-1&session=session-1&file=file-1&hunk=hunk-1&side=head&line=1");
+  await page.goto("https://cockpit.test/#sessions?workspace=workspace-1&session=session-1&file=file-1&hunk=hunk-1&side=new&line=1");
   await expect(page.getByRole("heading", { name: "Cockpit", exact: true })).toBeVisible();
 
   await page.locator(".platform-session-option").filter({ hasText: "Blocked workspace conversation" }).click();

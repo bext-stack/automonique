@@ -14,8 +14,9 @@ use automonique_protocol::platform_v2::{
 use automonique_protocol::platform_v2_lineage::{
     BaseSelectorId, BranchSelectorId, ExternalWorkAuthorityId, ExternalWorkIdentity,
     ExternalWorkKey, ExternalWorkProvider, ExternalWorkScope, ExternalWorkState,
-    LineageFreshnessState, LineageProjection, OrchestrationIdentity, OrchestrationTaskId,
-    WorkspaceCreateIntent, WorkspaceIntent, WorkspaceIntentId, WorkspaceResumeIntent,
+    LineageFreshnessState, LineageProjection, LineageStatus, OrchestrationIdentity,
+    OrchestrationTaskId, WorkspaceCreateIntent, WorkspaceIntent, WorkspaceIntentId,
+    WorkspaceResumeIntent,
 };
 use automonique_protocol::platform_v2_lineage_api::encode_lineage_projection;
 use automonique_protocol::platform_v2_lineage_api::encode_workspace_intent_outcome;
@@ -119,8 +120,8 @@ pub(crate) struct CockpitExternalWork {
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CockpitDiffSide {
-    Base,
-    Head,
+    Old,
+    New,
 }
 
 pub(crate) fn execute(
@@ -226,20 +227,20 @@ fn read(
         .map_err(|_| "platform_cockpit_request_invalid")?;
     let negotiated = match bridge.negotiate() {
         Ok(value) if value.version() == PlatformVersion::V2 => value,
-        Ok(_) => return Ok(fallback(retained_v1, "platform_v2_not_negotiated")),
-        Err(category) => return Ok(fallback(retained_v1, category)),
+        Ok(_) => return Ok(v1_fallback(retained_v1, "platform_v2_not_negotiated")),
+        Err(category) => return Ok(v2_unavailable(retained_v1, category)),
     };
     let capabilities = match bridge.request(PlatformV2Request::GetLifecycleCapabilities) {
         Ok(PlatformV2Response::LifecycleCapabilities(value)) => value,
         Ok(PlatformV2Response::Refused(value)) => {
-            return Ok(fallback(retained_v1, value.category().as_str()));
+            return Ok(v2_unavailable(retained_v1, value.category().as_str()));
         }
         Ok(_) => return Err("platform_v2_response_invalid"),
-        Err(category) => return Ok(fallback(retained_v1, category)),
+        Err(category) => return Ok(v2_unavailable(retained_v1, category)),
     };
     let records = match inventory(bridge, capabilities.projects()) {
         Ok(records) => records,
-        Err(category) => return Ok(fallback(retained_v1, &category)),
+        Err(category) => return Ok(v2_unavailable(retained_v1, &category)),
     };
     let selected = select_workspace(&records, selected_id.as_ref().map(UserWorkspaceId::as_str))?;
     let selected_identity = selected.map(|record| record.identity().clone());
@@ -313,7 +314,7 @@ fn read(
         "retained_v1": retained_v1,
         "projects": named_records(&records, WorkContextKind::Project),
         "hosts": host_records(&records),
-        "workspaces": workspace_records(&records, &attention.observations),
+        "workspaces": workspace_records(&records, &attention.observations, lineage_projection.as_ref()),
         "selected": { "workspace": selected_identity.as_ref().map(WorkContextIdentity::id) },
         "lineage": lineage,
         "review": review,
@@ -993,8 +994,8 @@ fn add_comment(
             ReviewHunkId::new(hunk_id.to_owned())
                 .map_err(|_| "platform_cockpit_request_invalid")?,
             match side {
-                CockpitDiffSide::Base => DiffSide::Old,
-                CockpitDiffSide::Head => DiffSide::New,
+                CockpitDiffSide::Old => DiffSide::Old,
+                CockpitDiffSide::New => DiffSide::New,
             },
             line,
         )
@@ -1295,6 +1296,7 @@ fn attention_coverage(state: &str, category: Option<&str>, known: usize, total: 
 fn workspace_records(
     records: &[WorkContextRecord],
     attention: &BTreeMap<String, Value>,
+    selected_lineage: Option<&LineageProjection>,
 ) -> Vec<Value> {
     let checkouts: BTreeMap<_, _> = records
         .iter()
@@ -1307,24 +1309,61 @@ fn workspace_records(
             )
         })
         .collect();
-    let attempts: BTreeMap<_, _> = records
+    let mut panes_by_session = BTreeMap::<String, Vec<Value>>::new();
+    for record in records
         .iter()
-        .filter(|record| record.kind() == WorkContextKind::AttemptWorkspace)
-        .filter_map(|record| {
-            relation(record, WorkContextRelationKind::AttemptUserWorkspace)
-                .map(|workspace| (record.identity().id().to_owned(), workspace.id().to_owned()))
-        })
-        .collect();
-    let sessions: BTreeMap<_, _> = records
+        .filter(|record| record.kind() == WorkContextKind::Pane)
+    {
+        if let Some(session) = relation(record, WorkContextRelationKind::PaneSession) {
+            panes_by_session
+                .entry(session.id().to_owned())
+                .or_default()
+                .push(base_record(record));
+        }
+    }
+    let mut sessions_by_attempt = BTreeMap::<String, Vec<Value>>::new();
+    for record in records
         .iter()
         .filter(|record| record.kind() == WorkContextKind::Session)
-        .filter_map(|record| {
-            let attempt = relation(record, WorkContextRelationKind::SessionAttemptWorkspace)?;
-            let workspace = attempts.get(attempt.id())?.clone();
-            let session = relation(record, WorkContextRelationKind::SessionPlatformSession)?;
-            Some((workspace, session.id().to_owned()))
-        })
-        .collect();
+    {
+        let Some(attempt) = relation(record, WorkContextRelationKind::SessionAttemptWorkspace)
+        else {
+            continue;
+        };
+        let platform_session = relation(record, WorkContextRelationKind::SessionPlatformSession);
+        let mut value = base_record(record);
+        value["platform_session_id"] = platform_session
+            .as_ref()
+            .map(WorkContextIdentity::id)
+            .into();
+        value["panes"] = panes_by_session
+            .remove(record.identity().id())
+            .unwrap_or_default()
+            .into();
+        sessions_by_attempt
+            .entry(attempt.id().to_owned())
+            .or_default()
+            .push(value);
+    }
+    let mut attempts_by_workspace = BTreeMap::<String, Vec<Value>>::new();
+    for record in records
+        .iter()
+        .filter(|record| record.kind() == WorkContextKind::AttemptWorkspace)
+    {
+        let Some(workspace) = relation(record, WorkContextRelationKind::AttemptUserWorkspace)
+        else {
+            continue;
+        };
+        let mut value = base_record(record);
+        value["sessions"] = sessions_by_attempt
+            .remove(record.identity().id())
+            .unwrap_or_default()
+            .into();
+        attempts_by_workspace
+            .entry(workspace.id().to_owned())
+            .or_default()
+            .push(value);
+    }
     records
         .iter()
         .filter(|record| record.kind() == WorkContextKind::UserWorkspace)
@@ -1332,6 +1371,9 @@ fn workspace_records(
             let project = relation(record, WorkContextRelationKind::UserWorkspaceProject);
             let checkout = relation(record, WorkContextRelationKind::UserWorkspaceCheckout);
             let observation = attention.get(record.identity().id());
+            let lineage = selected_lineage
+                .filter(|lineage| lineage.workspace().as_str() == record.identity().id())
+                .map(lineage_read_model);
             json!({
                 "id": record.identity().id(),
                 "label": record.label().as_str(),
@@ -1340,7 +1382,11 @@ fn workspace_records(
                 "project_id": project.as_ref().map(WorkContextIdentity::id),
                 "checkout_id": checkout.as_ref().map(WorkContextIdentity::id),
                 "host_id": checkout.as_ref().and_then(|value| checkouts.get(value.id())).cloned().flatten(),
-                "session_id": sessions.get(record.identity().id()),
+                "attempts": attempts_by_workspace.remove(record.identity().id()).unwrap_or_default(),
+                "task": lineage.as_ref().and_then(|value| value.get("task")).cloned().unwrap_or(Value::Null),
+                "external_work": lineage.as_ref().and_then(|value| value.get("external_work")).cloned().unwrap_or(Value::Null),
+                "internal_agent": lineage.as_ref().and_then(|value| value.get("internal_agent")).cloned().unwrap_or(Value::Null),
+                "lineage": lineage.unwrap_or(Value::Null),
                 "attention": observation
                     .and_then(|value| value.get("value"))
                     .cloned()
@@ -1356,6 +1402,92 @@ fn workspace_records(
             })
         })
         .collect()
+}
+
+fn lineage_read_model(lineage: &LineageProjection) -> Value {
+    let external_work_items: Vec<Value> = lineage
+        .external_work_items()
+        .iter()
+        .map(|item| {
+            json!({
+                "identity": external_work_json(item.identity()),
+                "revision": item.revision().to_string(),
+                "state": item.state().as_str(),
+                "moved_to": item.moved_to().map(external_work_json),
+                "origin": lineage_origin_json(item.origin()),
+                "freshness": item.freshness().state().as_str(),
+                "observed_at": item.freshness().observed_at_ms().to_string(),
+                "latest_message": item.latest_useful_message().map(|message| message.text().as_str())
+            })
+        })
+        .collect();
+    let orchestration: Vec<Value> = lineage
+        .orchestration()
+        .iter()
+        .map(|item| {
+            json!({
+                "kind": item.identity().kind().as_str(),
+                "id": item.identity().id(),
+                "revision": item.revision().to_string(),
+                "parent": item.parent().map(|parent| json!({ "kind": parent.kind().as_str(), "id": parent.id() })),
+                "external_work": item.external_work().map(external_work_json),
+                "status": item.status().kind(),
+                "status_message": lineage_status_message(item.status()),
+                "origin": lineage_origin_json(item.origin()),
+                "freshness": item.freshness().state().as_str(),
+                "observed_at": item.freshness().observed_at_ms().to_string(),
+                "latest_message": item.latest_useful_message().map(|message| message.text().as_str())
+            })
+        })
+        .collect();
+    let external_work = (external_work_items.len() == 1).then(|| {
+        let item = &external_work_items[0];
+        json!({
+            "state": item["state"],
+            "freshness": item["freshness"],
+            "observed_at": item["observed_at"],
+            "reference": item["identity"]
+        })
+    });
+    let tasks: Vec<_> = lineage
+        .orchestration()
+        .iter()
+        .filter(|item| matches!(item.identity(), OrchestrationIdentity::Task(_)))
+        .collect();
+    let task = (tasks.len() == 1).then(|| tasks[0]);
+    let internal_agent = task.map(|item| {
+        json!({
+            "state": item.status().kind(),
+            "freshness": item.freshness().state().as_str(),
+            "observed_at": item.freshness().observed_at_ms().to_string(),
+            "reference": { "kind": item.identity().kind().as_str(), "id": item.identity().id() }
+        })
+    });
+    json!({
+        "external_work_items": external_work_items,
+        "orchestration": orchestration,
+        "task": task.map(|item| item.identity().id()),
+        "external_work": external_work,
+        "internal_agent": internal_agent
+    })
+}
+
+fn lineage_origin_json(origin: &automonique_protocol::platform_v2_lineage::LineageOrigin) -> Value {
+    json!({
+        "workspace": origin.workspace().as_str(),
+        "attempt": origin.attempt().map(|value| value.as_str()),
+        "session": origin.session().map(|value| value.as_str()),
+        "pane": origin.pane().map(|value| value.as_str())
+    })
+}
+
+fn lineage_status_message(status: &LineageStatus) -> Option<&str> {
+    match status {
+        LineageStatus::Working => None,
+        LineageStatus::Blocked(message)
+        | LineageStatus::Waiting(message)
+        | LineageStatus::Done(message) => Some(message.as_str()),
+    }
 }
 
 fn base_record(record: &WorkContextRecord) -> Value {
@@ -1399,7 +1531,7 @@ fn stringify_integers(value: Value) -> Value {
     }
 }
 
-fn fallback(retained_v1: Value, category: &str) -> Value {
+fn v1_fallback(retained_v1: Value, category: &str) -> Value {
     json!({
         "schema": SCHEMA,
         "mode": "v1",
@@ -1420,6 +1552,17 @@ fn fallback(retained_v1: Value, category: &str) -> Value {
             "review": { "available": false, "category": REVIEW_ADAPTER_PENDING }
         }
     })
+}
+
+fn v2_unavailable(retained_v1: Value, category: &str) -> Value {
+    let mut value = v1_fallback(retained_v1, category);
+    value["mode"] = json!("partial");
+    value["degradation"] = json!({
+        "platform": "v2",
+        "state": "unavailable",
+        "category": category
+    });
+    value
 }
 
 fn unavailable(category: &str) -> Value {
@@ -1495,13 +1638,17 @@ mod tests {
 
     #[test]
     fn fallback_never_fabricates_v2_inventory() {
-        let value = fallback(
+        let value = v1_fallback(
             json!({ "sessions": [{ "summary": "working on a branch" }] }),
             "unavailable",
         );
         assert_eq!(value["mode"], "v1");
         assert_eq!(value["workspaces"], json!([]));
         assert_eq!(value["actions"]["lifecycle"]["available"], false);
+        let unavailable = v2_unavailable(json!({ "sessions": [] }), "v2_down");
+        assert_eq!(unavailable["mode"], "partial");
+        assert_eq!(unavailable["degradation"]["platform"], "v2");
+        assert_eq!(unavailable["degradation"]["state"], "unavailable");
     }
 
     #[test]
@@ -1632,6 +1779,11 @@ mod tests {
     #[test]
     fn work_context_inventory_accepts_the_bound_and_refuses_overflow() {
         assert_eq!(
+            verify_inventory_capacity(WORK_CONTEXT_PAGE_LIMIT as usize * 4, 1),
+            Ok(()),
+            "a fifth page must remain accepted beyond 512 records"
+        );
+        assert_eq!(
             verify_inventory_capacity(MAX_COCKPIT_WORK_CONTEXTS - 128, 128),
             Ok(())
         );
@@ -1643,5 +1795,227 @@ mod tests {
             verify_inventory_capacity(usize::MAX, usize::MAX),
             Err(String::from("platform_v2_inventory_exceeds_bound"))
         );
+    }
+
+    #[test]
+    fn hierarchy_preserves_attempt_session_and_pane_siblings_beyond_512_records() {
+        use automonique_protocol::platform::{
+            ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
+        };
+        use automonique_protocol::platform_v2::{
+            V1SessionRef, WorkContextAttributes, WorkContextLabel, WorkContextRelation,
+            WorkContextTargetKind,
+        };
+
+        let project = WorkContextIdentity::Project(ProjectId::new("project-hierarchy").unwrap());
+        let checkout =
+            WorkContextIdentity::parse_local(WorkContextTargetKind::Checkout, "checkout-hierarchy")
+                .unwrap();
+        let workspace = WorkContextIdentity::UserWorkspace(
+            UserWorkspaceId::new("workspace-hierarchy").unwrap(),
+        );
+        let mut records = vec![
+            WorkContextRecord::new(
+                workspace.clone(),
+                Revision::FIRST,
+                WorkContextLifecycle::Active,
+                WorkContextLabel::new("Workspace hierarchy").unwrap(),
+                WorkContextAttributes::EMPTY,
+                vec![
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::UserWorkspaceProject,
+                        project,
+                    )
+                    .unwrap(),
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::UserWorkspaceCheckout,
+                        checkout,
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap(),
+        ];
+        for index in 0..128 {
+            let attempt = WorkContextIdentity::parse_local(
+                WorkContextTargetKind::AttemptWorkspace,
+                &format!("attempt-{index:03}"),
+            )
+            .unwrap();
+            let session = WorkContextIdentity::parse_local(
+                WorkContextTargetKind::Session,
+                &format!("runtime-session-{index:03}"),
+            )
+            .unwrap();
+            records.push(
+                WorkContextRecord::new(
+                    attempt.clone(),
+                    Revision::FIRST,
+                    WorkContextLifecycle::Running,
+                    WorkContextLabel::new(format!("Attempt {index:03}")).unwrap(),
+                    WorkContextAttributes::EMPTY,
+                    vec![
+                        WorkContextRelation::new(
+                            WorkContextRelationKind::AttemptUserWorkspace,
+                            workspace.clone(),
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+            );
+            records.push(
+                WorkContextRecord::new(
+                    session.clone(),
+                    Revision::FIRST,
+                    WorkContextLifecycle::Active,
+                    WorkContextLabel::new(format!("Session {index:03}")).unwrap(),
+                    WorkContextAttributes::EMPTY,
+                    vec![
+                        WorkContextRelation::new(
+                            WorkContextRelationKind::SessionAttemptWorkspace,
+                            attempt,
+                        )
+                        .unwrap(),
+                        WorkContextRelation::new(
+                            WorkContextRelationKind::SessionPlatformSession,
+                            WorkContextIdentity::PlatformSession(
+                                V1SessionRef::new(ResourceCoordinate::new(
+                                    ResourceAuthority::Automonique,
+                                    ResourceKind::Session,
+                                    ResourceId::new(format!("platform-session-{index:03}"))
+                                        .unwrap(),
+                                ))
+                                .unwrap(),
+                            ),
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+            );
+            for pane_index in 0..2 {
+                records.push(
+                    WorkContextRecord::new(
+                        WorkContextIdentity::parse_local(
+                            WorkContextTargetKind::Pane,
+                            &format!("pane-{index:03}-{pane_index}"),
+                        )
+                        .unwrap(),
+                        Revision::FIRST,
+                        WorkContextLifecycle::Active,
+                        WorkContextLabel::new(format!("Pane {index:03}-{pane_index}")).unwrap(),
+                        WorkContextAttributes::EMPTY,
+                        vec![
+                            WorkContextRelation::new(
+                                WorkContextRelationKind::PaneSession,
+                                session.clone(),
+                            )
+                            .unwrap(),
+                        ],
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+        assert_eq!(records.len(), 513);
+        let projection = workspace_records(&records, &BTreeMap::new(), None);
+        let attempts = projection[0]["attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), 128);
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt["sessions"].as_array().unwrap().len())
+                .sum::<usize>(),
+            128
+        );
+        assert_eq!(
+            attempts
+                .iter()
+                .flat_map(|attempt| attempt["sessions"].as_array().unwrap())
+                .map(|session| session["panes"].as_array().unwrap().len())
+                .sum::<usize>(),
+            256
+        );
+    }
+
+    #[test]
+    fn lineage_read_model_preserves_external_and_orchestration_meaning() {
+        use automonique_protocol::platform_v2_lineage::{
+            ExternalWorkItem, LineageFreshness, LineageMessage, LineageStatus, OrchestrationRecord,
+            OrchestrationRunId,
+        };
+
+        let workspace = UserWorkspaceId::new("workspace-lineage").unwrap();
+        let identity = ExternalWorkIdentity::new(
+            ExternalWorkProvider::GitHub,
+            ExternalWorkAuthorityId::new("github.com").unwrap(),
+            ExternalWorkScope::new("owner/repository").unwrap(),
+            ExternalWorkKey::new("42").unwrap(),
+        );
+        let freshness = LineageFreshness::new(123, 60_000, LineageFreshnessState::Fresh).unwrap();
+        let external = ExternalWorkItem::new(
+            identity.clone(),
+            workspace.clone(),
+            Revision::FIRST,
+            ExternalWorkState::Open,
+            None,
+            freshness,
+            None,
+        )
+        .unwrap();
+        let run_identity = OrchestrationIdentity::Run(OrchestrationRunId::new("run-42").unwrap());
+        let run = OrchestrationRecord::new(
+            run_identity.clone(),
+            workspace.clone(),
+            Some(identity.clone()),
+            None,
+            LineageStatus::Working,
+            freshness,
+            None,
+        )
+        .unwrap();
+        let task = OrchestrationRecord::new(
+            OrchestrationIdentity::Task(OrchestrationTaskId::new("task-42").unwrap()),
+            workspace.clone(),
+            Some(identity),
+            Some(run_identity),
+            LineageStatus::Blocked(LineageMessage::new("awaiting review").unwrap()),
+            freshness,
+            None,
+        )
+        .unwrap();
+        let projection =
+            LineageProjection::new(workspace, vec![external], vec![run, task]).unwrap();
+        let value = lineage_read_model(&projection);
+        assert_eq!(value["task"], "task-42");
+        assert_eq!(value["external_work"]["state"], "open");
+        assert_eq!(value["external_work"]["freshness"], "fresh");
+        assert_eq!(
+            value["external_work_items"][0]["origin"]["workspace"],
+            "workspace-lineage"
+        );
+        assert_eq!(value["external_work_items"][0]["moved_to"], Value::Null);
+        assert_eq!(
+            value["external_work"]["reference"],
+            json!({
+                "provider": "github",
+                "authority": "github.com",
+                "scope": "owner/repository",
+                "key": "42"
+            })
+        );
+        assert_eq!(value["internal_agent"]["state"], "blocked");
+        assert_eq!(value["internal_agent"]["reference"]["kind"], "task");
+        let orchestration = value["orchestration"].as_array().unwrap();
+        let task = orchestration
+            .iter()
+            .find(|record| record["kind"] == "task")
+            .unwrap();
+        assert_eq!(task["status"], "blocked");
+        assert_eq!(task["status_message"], "awaiting review");
+        assert_eq!(task["origin"]["workspace"], "workspace-lineage");
+        assert_eq!(task["parent"]["kind"], "run");
+        assert_eq!(task["parent"]["id"], "run-42");
     }
 }
