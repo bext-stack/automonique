@@ -334,9 +334,10 @@ preview fails closed.
 
 ## Private attention source registry
 
-The optional `platform-v2-attention-registry.json` sibling is the only
-production bootstrap source for `get_attention_source_snapshot`. With no file,
-the method refuses as `platform_v2_attention_registry_unavailable`; it never
+The optional `platform-v2-attention-registry.json` sibling is the private
+bootstrap source for attention tuples outside the runtime-owned review,
+orchestration, and retained-session conventions. With no file, an unknown
+source refuses as `platform_v2_attention_registry_unavailable`; it never
 projects an empty board or assigns a request-time revision or timestamp. The
 file is opened with `O_NOFOLLOW`, must be owned by the daemon uid with exact
 mode `0600` and one hard link, and is bounded to 2 MiB. Its descriptor identity,
@@ -380,11 +381,15 @@ then requires the registry tuple and persisted document to remain
 byte-identical. Stale rows left by a removed registry entry are therefore
 unreachable.
 
-This is a fail-closed transport and operator-bootstrap foundation, not a live
-attention feed. It does not discover sources, derive attention from provider or
-review runtime state, reload a changed registry without restart, or install a
-desktop, web, or mobile consumer. Those producer, discovery, and client flows
-remain required before cross-client attention acceptance can be claimed.
+The live daemon additionally derives bounded runtime sources from its durable
+review store, lineage index, and retained work-context/session graph. Review
+and orchestration source ids equal the authorized `UserWorkspace` id;
+provider-session source ids equal the retained `WorkSession` id advertised by
+the same bounded work-context inventory. The host revalidates exact policy and
+lineage before every read, persists each complete replacement through the
+attention store, and never creates client-local pane or layout coordinates.
+`monique.1clic.pro` consumes these snapshots directly. Registry hot reload,
+desktop/mobile consumers, and cross-client acceptance remain outstanding.
 
 ## Private lifecycle selector registry
 

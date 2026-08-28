@@ -49,8 +49,28 @@ out-of-order item IDs, mixed state/reason pairs, cyclic or over-depth agent
 paths, and provider/local coordinate confusion. When explicitly bootstrapped,
 the Platform v2 host serves only snapshots validated from its private operator
 source registry and tenant-bound durable store. An absent, changed, malformed,
-unauthorized, stale, or unregistered source refuses explicitly; the host never
-synthesizes observation time or source revision from the request time. This
-contract and bootstrap path do not yet provide a runtime producer, source
-discovery, hot reload, or a client consumer, so they are foundation work rather
-than completion of the live cross-client attention flow.
+unauthorized, stale, or unregistered bootstrap source refuses explicitly; the
+host never synthesizes its observation time or source revision from the request
+time. That path remains available for sources outside the runtime conventions.
+
+The production host also projects three runtime-owned source families from the
+same tenant-bound durable state used by Platform v2. Review and orchestration
+sources use the exact `UserWorkspace` id as their source id. Provider-session
+sources use the exact retained `WorkSession` id already present in the bounded
+authorized work-context catalogue. A review source exists only when its durable
+review snapshot exists; absence refuses rather than becoming an empty review.
+Orchestration projection overflow remains explicitly unavailable. A retained
+session read revalidates the exact session-to-attempt-to-workspace lineage and
+copies only its authority-qualified Platform session coordinate. It never
+derives a pane, tab, label, or local layout target.
+
+Runtime snapshots pass through the same atomic attention store. A semantically
+unchanged observation replays the exact durable document. A changed complete
+item set advances the source revision once, points to the exact predecessor,
+advances changed item revisions, and preserves unchanged item revisions and
+observation times. A restart therefore cannot reset a source or reuse a removed
+item id. The hosted cockpit discovers only those deterministic source ids from
+its bounded authorized work-context inventory and renders
+`get_attention_source_snapshot` results; it does not substitute review summary
+attention. Desktop and mobile consumers and cross-client live acceptance remain
+separate milestones.

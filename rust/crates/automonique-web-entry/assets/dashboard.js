@@ -2410,11 +2410,11 @@ function renderHostedCockpit(view) {
       const title = document.createElement("strong");
       title.textContent = `${words(entry.state)} · ${words(entry.reason)}`;
       const detail = document.createElement("span");
-      detail.textContent = `${words(entry.origin_kind)} · source revision ${entry.source_revision} · ${entry.unread} unread`;
+      detail.textContent = `${words(entry.source_kind)} · observed ${entry.observed_at_ms} ms · source revision ${entry.source_revision} · item revision ${entry.item_revision} · ${entry.unread} unread`;
       const exactLink = document.createElement("a");
       exactLink.href = entry.deep_link;
-      exactLink.textContent = "Open exact review context";
-      exactLink.setAttribute("aria-label", `Open exact review context for ${words(entry.reason)} at source revision ${entry.source_revision}`);
+      exactLink.textContent = "Open exact attention context";
+      exactLink.setAttribute("aria-label", `Open exact attention context for ${words(entry.reason)} at source revision ${entry.source_revision}`);
       item.append(title, detail, exactLink);
       inbox.append(item);
     });
@@ -2423,7 +2423,7 @@ function renderHostedCockpit(view) {
     inbox,
     cockpitPresentation.inboxCoverage,
     "No structured attention",
-    "The complete authoritative review projection has no attention events.",
+    "The complete authoritative attention source snapshots have no items.",
   );
 
   const activity = byId("cockpit-activity-list");

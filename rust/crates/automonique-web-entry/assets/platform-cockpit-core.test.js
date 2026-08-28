@@ -54,7 +54,7 @@ const fixture = {
   } },
   attention: { state: "available", known_workspaces: "1", total_workspaces: "1" },
   activities: completeCollection([], ["lineage", "review"]),
-  inbox: completeCollection([], ["review"]),
+  inbox: completeCollection([], ["attention"]),
 };
 
 test("decimal fences stay exact beyond Number.MAX_SAFE_INTEGER", () => {
@@ -331,36 +331,49 @@ test("activity and inbox keep lossless chronology and exact deep links", () => {
         link: { workspace: "workspace-1" },
       },
     ], ["lineage", "review"]),
-    inbox: completeCollection([{
-      id: "attention-comment",
-      state: "needs_you",
-      reason: "comment_reply",
-      origin_kind: "comment",
-      source_revision: "9007199254740996",
-      unread: "1",
-      link: {
-        workspace: "workspace-1",
-        file: "file-1",
-        hunk: "hunk-1",
-        side: "new",
-        line: "9007199254740995",
+    inbox: completeCollection([
+      {
+        id: "attention-comment",
+        state: "needs_you",
+        reason: "comment_reply",
+        source_kind: "review",
+        source_id: "workspace-1",
+        item_revision: "7",
+        observed_at_ms: "9007199254740997",
+        source_revision: "2",
+        unread: "1",
+        link: { workspace: "workspace-1" },
       },
-    }], ["review"]),
+      {
+        id: "older-independent-source",
+        state: "blocked",
+        reason: "external_blocker",
+        source_kind: "orchestration",
+        source_id: "workspace-1",
+        item_revision: "9007199254740996",
+        observed_at_ms: "1",
+        source_revision: "9007199254740996",
+        unread: "0",
+        link: { workspace: "workspace-1" },
+      },
+    ], ["attention"]),
   });
   expect(view.activities.map(({ id }) => id)).toEqual(["newer", "older"]);
   expect(view.activities[1].deep_link).toBe(
     "#sessions?workspace=workspace-1&session=runtime-session-1&pane=pane-1",
   );
-  expect(view.inbox[0].source_revision).toBe("9007199254740996");
-  expect(view.inbox[0].deep_link).toBe(
-    "#sessions?workspace=workspace-1&file=file-1&hunk=hunk-1&side=new&line=9007199254740995",
-  );
+  expect(view.inbox[0].id).toBe("attention-comment");
+  expect(view.inbox[0].source_revision).toBe("2");
+  expect(view.inbox[0].deep_link).toBe("#sessions?workspace=workspace-1");
 
   const fullInbox = Array.from({ length: 256 }, (_, index) => ({
     id: `attention-${index}`,
     state: "needs_you",
     reason: "comment_reply",
-    origin_kind: "comment",
+    source_kind: "review",
+    source_id: "workspace-1",
+    item_revision: String(index + 1),
+    observed_at_ms: String(index + 1),
     source_revision: String(index + 1),
     unread: "1",
     link: { workspace: "workspace-1" },
@@ -381,7 +394,7 @@ test("activity and inbox keep lossless chronology and exact deep links", () => {
       omitted: "3",
       sources: { lineage: { state: "available" }, review: { state: "available" } },
     },
-    inbox: completeCollection(fullInbox, ["review"]),
+    inbox: completeCollection(fullInbox, ["attention"]),
   });
   expect(bounded.activities).toHaveLength(256);
   expect(bounded.activityCoverage).toMatchObject({ state: "partial", total: "259", omitted: "3" });
@@ -396,7 +409,7 @@ test("activity and inbox keep lossless chronology and exact deep links", () => {
     },
     inbox: {
       state: "unavailable", items: [], total: "0", omitted: "0",
-      sources: { review: { state: "refused", category: "review_refused" } },
+      sources: { attention: { state: "refused", category: "attention_refused" } },
     },
   });
   expect(unavailable.activityCoverage.state).toBe("partial");
