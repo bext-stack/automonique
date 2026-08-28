@@ -15,6 +15,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Arc;
 
 use automonique_github_connector::{GitHubToken, RepoTarget, WorkflowRunId};
 use automonique_protocol::digest::{Sha256, Sha256Digest};
@@ -27,6 +29,8 @@ use automonique_protocol::platform_v2_review::{
 };
 use automonique_protocol::primitives::Revision;
 
+#[cfg(test)]
+use crate::platform_v2_github_check_adapter::SharedGitHubActionsTransport;
 use crate::platform_v2_github_check_adapter::{
     GitHubActionsWriteCapability, GitHubCheckRerunAdapter,
 };
@@ -178,6 +182,8 @@ pub(crate) enum ReviewEffectPlan {
 pub(crate) struct ProductionReviewEffectAdapter {
     installed: Option<InstalledRegistry>,
     github_credentials: Option<InstalledGitHubCredentials>,
+    #[cfg(test)]
+    github_test_transport: Option<SharedGitHubActionsTransport>,
 }
 
 struct InstalledRegistry {
@@ -225,6 +231,8 @@ impl ProductionReviewEffectAdapter {
             return Ok(Self {
                 installed: None,
                 github_credentials,
+                #[cfg(test)]
+                github_test_transport: None,
             });
         };
         let document: RegistryDocument = serde_json::from_slice(&snapshot.bytes)
@@ -238,6 +246,8 @@ impl ProductionReviewEffectAdapter {
                 document,
             }),
             github_credentials,
+            #[cfg(test)]
+            github_test_transport: None,
         })
     }
 
@@ -397,15 +407,41 @@ impl ProductionReviewEffectAdapter {
         // The typed connector owns this one short-lived copy. The installed
         // credential remains in its zeroizing container and is never Clone or
         // Debug; the client copy is scrubbed by GitHubToken on drop.
-        let token = GitHubToken::new(credential.token.to_vec())
-            .map_err(|_| "platform_v2_review_ci_credential_invalid")?;
-        let capability = GitHubActionsWriteCapability::production(
-            credential_reference,
-            repository.clone(),
-            token,
-        )
-        .map_err(|_| "platform_v2_review_ci_credential_invalid")?;
+        #[cfg(test)]
+        let capability = if let Some(transport) = &self.github_test_transport {
+            GitHubActionsWriteCapability::testing(
+                credential_reference,
+                repository.clone(),
+                Arc::clone(transport),
+            )
+            .map_err(|_| "platform_v2_review_ci_credential_invalid")?
+        } else {
+            let token = GitHubToken::new(credential.token.to_vec())
+                .map_err(|_| "platform_v2_review_ci_credential_invalid")?;
+            GitHubActionsWriteCapability::production(
+                credential_reference,
+                repository.clone(),
+                token,
+            )
+            .map_err(|_| "platform_v2_review_ci_credential_invalid")?
+        };
+        #[cfg(not(test))]
+        let capability = {
+            let token = GitHubToken::new(credential.token.to_vec())
+                .map_err(|_| "platform_v2_review_ci_credential_invalid")?;
+            GitHubActionsWriteCapability::production(
+                credential_reference,
+                repository.clone(),
+                token,
+            )
+            .map_err(|_| "platform_v2_review_ci_credential_invalid")?
+        };
         Ok(GitHubCheckRerunAdapter::new(capability))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_github_test_transport(&mut self, transport: SharedGitHubActionsTransport) {
+        self.github_test_transport = Some(transport);
     }
 
     /// Advertise a rerun only after a fresh, mutation-free provider GET proves

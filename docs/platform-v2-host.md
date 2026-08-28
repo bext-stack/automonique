@@ -347,9 +347,11 @@ custody and survives restart. Rerun clients must use the correlated receipt
 lookup: the daemon returns a receipt only when the idempotency key and this
 exact digest select the same durable GitHub plan. A legacy uncorrelated lookup
 remains available for non-rerun review actions, but is not attribution evidence
-for a rerun. Migrated GitHub plans missing either correlation or the workspace
-revision remain readable only as non-drivable legacy custody; older, external,
-cross-action, and same-key mismatches fail closed.
+for a rerun. Correlation and authoritative workspace revision form one native
+recovery identity: migrated GitHub plans missing either field are unavailable
+to lookup, approval, drive, reconciliation, and terminal replay, and never
+fall back to the generic receipt index. Older, external, cross-action, and
+same-key mismatches fail closed.
 
 ## Private attention source registry
 

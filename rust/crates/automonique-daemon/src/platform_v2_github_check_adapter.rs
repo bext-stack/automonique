@@ -28,6 +28,8 @@ use automonique_protocol::platform_v2_review::{
     ReviewAuthority, ReviewAuthorityKind, ReviewCheckId,
 };
 use automonique_protocol::primitives::Revision;
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
 
 const MAX_CREDENTIAL_REFERENCE_BYTES: usize = 256;
 
@@ -272,7 +274,7 @@ impl GitHubCheckRerunSubmission {
     }
 }
 
-trait GitHubActionsTransport {
+pub(crate) trait GitHubActionsTransport {
     fn get_workflow_run(
         &self,
         request: &GetWorkflowRunRequest,
@@ -282,6 +284,35 @@ trait GitHubActionsTransport {
         &self,
         request: &RerunWorkflowRequest,
     ) -> Result<GitHubReply<()>, GitHubFailure>;
+}
+
+#[cfg(test)]
+pub(crate) type SharedGitHubActionsTransport = Arc<Mutex<Box<dyn GitHubActionsTransport + Send>>>;
+
+#[cfg(test)]
+struct SharedTestTransport(SharedGitHubActionsTransport);
+
+#[cfg(test)]
+impl GitHubActionsTransport for SharedTestTransport {
+    fn get_workflow_run(
+        &self,
+        request: &GetWorkflowRunRequest,
+    ) -> Result<GitHubReply<GitHubWorkflowRun>, GitHubFailure> {
+        self.0
+            .lock()
+            .expect("test GitHub transport")
+            .get_workflow_run(request)
+    }
+
+    fn rerun_workflow(
+        &self,
+        request: &RerunWorkflowRequest,
+    ) -> Result<GitHubReply<()>, GitHubFailure> {
+        self.0
+            .lock()
+            .expect("test GitHub transport")
+            .rerun_workflow(request)
+    }
 }
 
 impl GitHubActionsTransport for GitHubClient {
@@ -307,7 +338,10 @@ impl GitHubActionsTransport for GitHubClient {
 pub struct GitHubActionsWriteCapability {
     credential_reference: String,
     target: RepoTarget,
+    #[cfg(not(test))]
     client: GitHubClient,
+    #[cfg(test)]
+    client: Box<dyn GitHubActionsTransport>,
 }
 
 impl GitHubActionsWriteCapability {
@@ -320,11 +354,41 @@ impl GitHubActionsWriteCapability {
         if !safe_reference(credential_reference) {
             return Err(GitHubCheckRerunError::InvalidPlan);
         }
+        let client = GitHubClient::new(GitHubBase::production(), token);
         Ok(Self {
             credential_reference: credential_reference.to_owned(),
             target,
-            client: GitHubClient::new(GitHubBase::production(), token),
+            #[cfg(not(test))]
+            client,
+            #[cfg(test)]
+            client: Box::new(client),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing(
+        credential_reference: &str,
+        target: RepoTarget,
+        transport: SharedGitHubActionsTransport,
+    ) -> Result<Self, GitHubCheckRerunError> {
+        if !safe_reference(credential_reference) {
+            return Err(GitHubCheckRerunError::InvalidPlan);
+        }
+        Ok(Self {
+            credential_reference: credential_reference.to_owned(),
+            target,
+            client: Box::new(SharedTestTransport(transport)),
+        })
+    }
+
+    #[cfg(not(test))]
+    fn transport(&self) -> &GitHubClient {
+        &self.client
+    }
+
+    #[cfg(test)]
+    fn transport(&self) -> &dyn GitHubActionsTransport {
+        self.client.as_ref()
     }
 }
 
@@ -342,7 +406,7 @@ impl GitHubCheckRerunAdapter {
     /// Verify the exact observed run before custody begins.
     pub fn preflight(&self, plan: &GitHubCheckRerunPlan) -> Result<(), GitHubCheckRerunError> {
         preflight(
-            &self.capability.client,
+            self.capability.transport(),
             &self.capability.credential_reference,
             &self.capability.target,
             plan,
@@ -359,7 +423,7 @@ impl GitHubCheckRerunAdapter {
         observed_attempt: u32,
     ) -> Result<(), GitHubCheckRerunError> {
         preflight_observation(
-            &self.capability.client,
+            self.capability.transport(),
             &self.capability.target,
             target,
             run_id,
@@ -375,7 +439,7 @@ impl GitHubCheckRerunAdapter {
         submission: &mut GitHubCheckRerunSubmission,
     ) -> Result<GitHubCheckRerunCustody, GitHubCheckRerunError> {
         submit(
-            &self.capability.client,
+            self.capability.transport(),
             &self.capability.credential_reference,
             &self.capability.target,
             plan,
@@ -390,7 +454,7 @@ impl GitHubCheckRerunAdapter {
         submission: &mut GitHubCheckRerunSubmission,
     ) -> Result<GitHubCheckRerunCustody, GitHubCheckRerunError> {
         reconcile(
-            &self.capability.client,
+            self.capability.transport(),
             &self.capability.credential_reference,
             &self.capability.target,
             plan,
@@ -400,7 +464,7 @@ impl GitHubCheckRerunAdapter {
 }
 
 fn preflight_observation(
-    transport: &impl GitHubActionsTransport,
+    transport: &(impl GitHubActionsTransport + ?Sized),
     capability_target: &RepoTarget,
     target: &RepoTarget,
     run_id: WorkflowRunId,
@@ -433,7 +497,7 @@ fn preflight_observation(
 }
 
 fn preflight(
-    transport: &impl GitHubActionsTransport,
+    transport: &(impl GitHubActionsTransport + ?Sized),
     credential_reference: &str,
     target: &RepoTarget,
     plan: &GitHubCheckRerunPlan,
@@ -447,7 +511,7 @@ fn preflight(
 }
 
 fn submit(
-    transport: &impl GitHubActionsTransport,
+    transport: &(impl GitHubActionsTransport + ?Sized),
     credential_reference: &str,
     target: &RepoTarget,
     plan: &GitHubCheckRerunPlan,
@@ -487,7 +551,7 @@ fn submit(
 }
 
 fn reconcile(
-    transport: &impl GitHubActionsTransport,
+    transport: &(impl GitHubActionsTransport + ?Sized),
     credential_reference: &str,
     target: &RepoTarget,
     plan: &GitHubCheckRerunPlan,
@@ -543,7 +607,7 @@ fn reconcile(
 }
 
 fn inspect(
-    transport: &impl GitHubActionsTransport,
+    transport: &(impl GitHubActionsTransport + ?Sized),
     plan: &GitHubCheckRerunPlan,
 ) -> Result<GitHubWorkflowRun, GitHubCheckRerunError> {
     let request = GetWorkflowRunRequest::new(plan.target.clone(), plan.run_id);
