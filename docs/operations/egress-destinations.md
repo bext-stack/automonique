@@ -4,9 +4,9 @@
 
 `egress-destinations` in the daemon's state directory reads like a security
 allowlist, and it is one. It is also the only thing standing between a run and
-the provider it has to reach, and nothing in the product says so. Removing a
-line takes every task run down, and the operator's evidence is a refusal that
-names no host.
+the provider it has to reach. Removing a required line takes every task run
+down. Status and doctor now detect that route mismatch from the running
+generation; an individual run refusal still does not name the host.
 
 This page exists because that happened.
 
@@ -72,21 +72,24 @@ A restart works too. Either way, confirm with a run rather than with the file:
 an escalated `ask` that reports `route=operational_jcode` and a run that reaches
 `state=completed` is the proof.
 
-## What does not tell you
+## What status and doctor now tell you
 
-None of the surfaces an operator would reach for says anything:
+The daemon evaluates JCode's bounded `config.toml` against the destination
+snapshot its execution lane admitted at startup. It fails closed for an
+unknown route, unreadable configuration, partial route, wrong scope, or a
+non-empty policy that belongs to another provider.
 
-- `automonique status` reports `provider available: measured` and
-  `execution: sandbox_enforceable_lane_wired` throughout the outage. Neither
-  field is about reachability.
-- `automonique doctor` has no check that reads the configured provider's own
-  routing against the admitted destinations. It should; that is
-  [#158](https://github.com/bext-stack/automonique/issues/158).
-- The run's typed refusal carries `category=rejected` and no destination. The
-  broker knows which host it refused and the refusal does not carry it.
+- `automonique status` prints `provider available: 1` only when the sandbox,
+  executable configuration, selected JCode route, and every required admitted
+  destination agree. It prints `0` for the outage described above.
+- `automonique doctor` reports `provider.route-unavailable` as a finding from
+  that same live snapshot. It never rereads the file and therefore cannot call
+  an unapplied edit healthy.
 
-Until at least the first of those changes, the file's own header comment is the
-warning, and it is the only one.
+The remaining diagnostic gap is per-run detail: the typed provider fault still
+carries `category=rejected` without the destination. The provider log remains
+the place to identify that host until the broker/provider protocol preserves it
+in a bounded safe field.
 
 ## The Anthropic route is not a failover
 
@@ -102,7 +105,8 @@ OAuth token refresh failed: error sending request for url
 
 Production has not noticed because `default_provider = "openai"` never asks. The
 consequence is worth stating plainly: **there is one working route and nothing
-behind it.** Whether to broker the refresh endpoint is an owner decision, not a
-cleanup — brokering a host is a real grant, and the alternative is to record
-that the Anthropic route is unavailable to sandboxed runs and stop presenting it
-as failover.
+behind it.** This implementation does not widen the policy. If an operator
+selects `anthropic`, readiness requires both `api.anthropic.com:443` and
+`platform.claude.com:443` under `public`; without that explicit grant, status is
+`0` and doctor records the route as unavailable rather than presenting it as
+failover.

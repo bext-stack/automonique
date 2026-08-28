@@ -49,6 +49,7 @@ rustix.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
+toml_edit.workspace = true
 ureq.workspace = true
 
 [dev-dependencies]

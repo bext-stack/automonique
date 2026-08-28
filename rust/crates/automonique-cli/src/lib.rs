@@ -1153,7 +1153,7 @@ fn admin_status<W: Write, E: Write>(
             operational.telegram_pollers_live(),
             operational.telegram_pollers_expired(),
             operational.telegram_offset_lag().state(),
-            operational.provider_available().state(),
+            metric_text(operational.provider_available()),
             operational.sandbox_launch_refusals().state(),
             metric_text(durable.runs_registered()),
             metric_text(durable.automations_registered()),
@@ -1488,7 +1488,8 @@ fn admin_shutdown<W: Write, E: Write>(
 
 fn inspect_doctor(runtime: Option<&OsStr>) -> Result<DoctorReportV1, DoctorReportError> {
     let admin_socket = inspect_admin_socket(runtime);
-    let [database_health, foreground_generation] = inspect_control_plane(runtime, &admin_socket);
+    let [database_health, foreground_generation, provider_route] =
+        inspect_control_plane(runtime, &admin_socket);
     DoctorReportV1::new([
         runtime_check(runtime),
         inspect_state_filesystem(std::env::var_os("XDG_STATE_HOME").as_deref()),
@@ -1497,6 +1498,7 @@ fn inspect_doctor(runtime: Option<&OsStr>) -> Result<DoctorReportV1, DoctorRepor
         inspect_process_control(),
         database_health,
         foreground_generation,
+        provider_route,
         inspect_cgroup_v2_controllers(Path::new("/sys/fs/cgroup/cgroup.controllers")),
         // The controller list above is the hierarchy's, not this process's.
         // Delegation is asked separately so a host with a complete controller
