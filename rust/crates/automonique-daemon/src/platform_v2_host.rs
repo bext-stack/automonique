@@ -1773,15 +1773,19 @@ impl PlatformV2Runtime {
                         check_id: check.id().clone(),
                         expected_check_revision: check.freshness().observed_revision(),
                     };
-                    if matches!(
-                        self.review_effects.plan(
-                            value.project(),
-                            value.workspace(),
-                            &authority,
-                            &action,
-                        ),
-                        Ok(ReviewEffectPlan::GitHubCheckRerun { .. })
-                    ) {
+                    let plan = self.review_effects.plan(
+                        value.project(),
+                        value.workspace(),
+                        &authority,
+                        &action,
+                    );
+                    if plan.as_ref().is_ok_and(|plan| {
+                        matches!(plan, ReviewEffectPlan::GitHubCheckRerun { .. })
+                            && self
+                                .review_effects
+                                .preflight_github_capability(plan)
+                                .is_ok()
+                    }) {
                         rerunnable.push(
                             ReviewCheckRerunCapability::new(
                                 check.id().clone(),

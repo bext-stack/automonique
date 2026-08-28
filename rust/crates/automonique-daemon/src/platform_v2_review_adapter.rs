@@ -31,6 +31,7 @@ use crate::platform_v2_github_check_adapter::{
 };
 use nix::libc;
 use serde::Deserialize;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const REVIEW_REGISTRY_FILE_NAME: &str = "platform-v2-review-registry.json";
 pub const REVIEW_GITHUB_CREDENTIALS_FILE_NAME: &str = "platform-v2-review-github-credentials.json";
@@ -52,7 +53,7 @@ struct FileGeneration {
 }
 
 struct PrivateSnapshot {
-    bytes: Vec<u8>,
+    bytes: Zeroizing<Vec<u8>>,
     generation: FileGeneration,
 }
 
@@ -111,7 +112,7 @@ enum RegistryTarget {
     },
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GitHubCredentialDocument {
     version: u8,
@@ -120,13 +121,30 @@ struct GitHubCredentialDocument {
     credentials: Vec<GitHubCredential>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GitHubCredential {
     reference: String,
     repository: String,
     actions_write: bool,
     token: String,
+}
+
+impl Drop for GitHubCredential {
+    fn drop(&mut self) {
+        self.token.zeroize();
+    }
+}
+
+struct InstalledGitHubCredentialDocument {
+    credentials: Vec<InstalledGitHubCredential>,
+}
+
+struct InstalledGitHubCredential {
+    reference: String,
+    repository: String,
+    actions_write: bool,
+    token: Zeroizing<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -172,7 +190,7 @@ struct InstalledGitHubCredentials {
     path: PathBuf,
     expected_uid: u32,
     generation: FileGeneration,
-    document: GitHubCredentialDocument,
+    document: InstalledGitHubCredentialDocument,
 }
 
 impl std::fmt::Debug for ProductionReviewEffectAdapter {
@@ -191,10 +209,8 @@ impl ProductionReviewEffectAdapter {
             .ok_or("platform_v2_review_registry_invalid")?
             .join(REVIEW_GITHUB_CREDENTIALS_FILE_NAME);
         let github_credentials = match read_private_file(&credential_path, expected_uid)? {
-            Some(snapshot) => {
-                let document: GitHubCredentialDocument = serde_json::from_slice(&snapshot.bytes)
-                    .map_err(|_| "platform_v2_review_github_credentials_invalid")?;
-                validate_github_credentials(&document)?;
+            Some(mut snapshot) => {
+                let document = parse_github_credentials(&mut snapshot.bytes)?;
                 Some(InstalledGitHubCredentials {
                     path: credential_path,
                     expected_uid,
@@ -304,6 +320,15 @@ impl ProductionReviewEffectAdapter {
                 .ok_or("platform_v2_review_ci_check_unavailable")?;
             let check_revision = Revision::new(check.observed_check_revision)
                 .map_err(|_| "platform_v2_review_registry_incoherent")?;
+            if check.observed_attempt.checked_add(1).is_none()
+                || check_revision
+                    .get()
+                    .checked_add(1)
+                    .and_then(|next| Revision::new(next).ok())
+                    .is_none()
+            {
+                return Err("platform_v2_review_registry_incoherent");
+            }
             if check_revision != *expected_check_revision {
                 return Err("platform_v2_review_ci_check_changed");
             }
@@ -368,7 +393,10 @@ impl ProductionReviewEffectAdapter {
         if !credential.actions_write || credential.repository != coordinate {
             return Err("platform_v2_review_ci_credential_incoherent");
         }
-        let token = GitHubToken::new(credential.token.as_bytes().to_vec())
+        // The typed connector owns this one short-lived copy. The installed
+        // credential remains in its zeroizing container and is never Clone or
+        // Debug; the client copy is scrubbed by GitHubToken on drop.
+        let token = GitHubToken::new(credential.token.to_vec())
             .map_err(|_| "platform_v2_review_ci_credential_invalid")?;
         let capability = GitHubActionsWriteCapability::production(
             credential_reference,
@@ -377,6 +405,31 @@ impl ProductionReviewEffectAdapter {
         )
         .map_err(|_| "platform_v2_review_ci_credential_invalid")?;
         Ok(GitHubCheckRerunAdapter::new(capability))
+    }
+
+    /// Advertise a rerun only after a fresh, mutation-free provider GET proves
+    /// the registry's exact run attempt, head SHA, and completed status.
+    pub(crate) fn preflight_github_capability(
+        &self,
+        plan: &ReviewEffectPlan,
+    ) -> Result<(), &'static str> {
+        let ReviewEffectPlan::GitHubCheckRerun {
+            credential_reference,
+            repository,
+            run_id,
+            head_sha,
+            observed_attempt,
+            credential_generation,
+            ..
+        } = plan
+        else {
+            return Err("platform_v2_review_ci_check_unavailable");
+        };
+        let adapter =
+            self.github_adapter(credential_reference, repository, *credential_generation)?;
+        adapter
+            .preflight_observation(repository, *run_id, head_sha, *observed_attempt)
+            .map_err(|_| "platform_v2_review_ci_preflight_refused")
     }
 
     fn verify_github_credential_generation(
@@ -551,8 +604,18 @@ fn validate_registry(document: &RegistryDocument, expected_uid: u32) -> Result<(
                         || !check_ids.insert(&check.check_id)
                         || WorkflowRunId::new(check.run_id).is_err()
                         || check.observed_attempt == 0
-                        || Revision::new(check.observed_check_revision).is_err()
+                        || check.observed_attempt.checked_add(1).is_none()
                         || !valid_head_sha(&check.head_sha)
+                    {
+                        return Err("platform_v2_review_registry_invalid");
+                    }
+                    let check_revision = Revision::new(check.observed_check_revision)
+                        .map_err(|_| "platform_v2_review_registry_invalid")?;
+                    if check_revision
+                        .get()
+                        .checked_add(1)
+                        .and_then(|next| Revision::new(next).ok())
+                        .is_none()
                     {
                         return Err("platform_v2_review_registry_invalid");
                     }
@@ -582,24 +645,39 @@ fn validate_registry(document: &RegistryDocument, expected_uid: u32) -> Result<(
     Ok(())
 }
 
-fn validate_github_credentials(document: &GitHubCredentialDocument) -> Result<(), &'static str> {
+fn parse_github_credentials(
+    bytes: &mut [u8],
+) -> Result<InstalledGitHubCredentialDocument, &'static str> {
+    let parsed = serde_json::from_slice::<GitHubCredentialDocument>(bytes);
+    // The private-file snapshot is only a serde staging buffer. Scrub it on
+    // both valid and invalid JSON paths before returning or validating fields.
+    bytes.zeroize();
+    let mut document = parsed.map_err(|_| "platform_v2_review_github_credentials_invalid")?;
     if document.version != 1
         || !safe_token(&document.generation)
         || document.credentials.len() > MAX_BINDINGS
     {
         return Err("platform_v2_review_github_credentials_invalid");
     }
-    let mut references = BTreeSet::new();
-    for credential in &document.credentials {
+    let mut references = BTreeSet::<String>::new();
+    let mut credentials = Vec::with_capacity(document.credentials.len());
+    for mut credential in document.credentials.drain(..) {
+        let token = Zeroizing::new(std::mem::take(&mut credential.token).into_bytes());
         if !safe_github_reference(&credential.reference)
-            || !references.insert(&credential.reference)
+            || !references.insert(credential.reference.clone())
             || parse_repository(&credential.repository).is_err()
-            || GitHubToken::new(credential.token.as_bytes().to_vec()).is_err()
+            || GitHubToken::new(token.to_vec()).is_err()
         {
             return Err("platform_v2_review_github_credentials_invalid");
         }
+        credentials.push(InstalledGitHubCredential {
+            reference: credential.reference.clone(),
+            repository: credential.repository.clone(),
+            actions_write: credential.actions_write,
+            token,
+        });
     }
-    Ok(())
+    Ok(InstalledGitHubCredentialDocument { credentials })
 }
 
 fn parse_repository(value: &str) -> Result<RepoTarget, &'static str> {
@@ -665,7 +743,7 @@ fn read_private_file(
         .metadata()
         .map_err(|_| "platform_v2_review_registry_insecure")?;
     validate_private_file_metadata(&before, expected_uid)?;
-    let mut bytes = Vec::new();
+    let mut bytes = Zeroizing::new(Vec::new());
     file.by_ref()
         .take(MAX_REGISTRY_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -938,6 +1016,37 @@ mod tests {
             _ => panic!("exact GitHub plan expected"),
         }
         assert!(!format!("{adapter:?}").contains("github_pat_fixture"));
+    }
+
+    #[test]
+    fn github_credential_staging_bytes_are_scrubbed_on_success_and_error() {
+        assert!(std::mem::needs_drop::<GitHubCredential>());
+        let mut valid = github_credentials(true, "example-org/example-repo").into_bytes();
+        let installed = parse_github_credentials(&mut valid).unwrap();
+        assert!(valid.iter().all(|byte| *byte == 0));
+        assert_eq!(installed.credentials.len(), 1);
+        assert!(GitHubToken::new(installed.credentials[0].token.to_vec()).is_ok());
+
+        let secret = "github_pat_invalid!secret";
+        let mut invalid = format!(
+            r#"{{"version":1,"generation":"credential-generation-1","credentials":[{{"reference":"github-actions-mobile","repository":"example-org/example-repo","actions_write":true,"token":"{secret}"}}]}}"#
+        )
+        .into_bytes();
+        let error = match parse_github_credentials(&mut invalid) {
+            Ok(_) => panic!("invalid token accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "platform_v2_review_github_credentials_invalid");
+        assert!(!error.contains(secret));
+        assert!(invalid.iter().all(|byte| *byte == 0));
+
+        let mut malformed = br#"{"token":"github_pat_malformed""#.to_vec();
+        let error = match parse_github_credentials(&mut malformed) {
+            Ok(_) => panic!("malformed credentials accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "platform_v2_review_github_credentials_invalid");
+        assert!(malformed.iter().all(|byte| *byte == 0));
     }
 
     #[test]

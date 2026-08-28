@@ -87,6 +87,9 @@ impl GitHubCheckRerunPlan {
         if !safe_reference(credential_reference)
             || authority.kind() != ReviewAuthorityKind::Ci
             || observed_run_attempt == 0
+            || observed_run_attempt.checked_add(1).is_none()
+            || revision_successor(expected_snapshot_revision).is_none()
+            || revision_successor(expected_check_revision).is_none()
             || !valid_head_sha(head_sha)
         {
             return Err(GitHubCheckRerunError::InvalidPlan);
@@ -198,6 +201,13 @@ impl GitHubCheckRerunPlan {
     pub const fn expected_check_revision(&self) -> Revision {
         self.expected_check_revision
     }
+}
+
+fn revision_successor(value: Revision) -> Option<Revision> {
+    value
+        .get()
+        .checked_add(1)
+        .and_then(|next| Revision::new(next).ok())
 }
 
 /// Durable custody state for a single plan digest.
@@ -339,6 +349,25 @@ impl GitHubCheckRerunAdapter {
         )
     }
 
+    /// Read the live provider baseline used to advertise one exact capability.
+    /// This method is deliberately GET-only and accepts no path or operation.
+    pub fn preflight_observation(
+        &self,
+        target: &RepoTarget,
+        run_id: WorkflowRunId,
+        head_sha: &str,
+        observed_attempt: u32,
+    ) -> Result<(), GitHubCheckRerunError> {
+        preflight_observation(
+            &self.capability.client,
+            &self.capability.target,
+            target,
+            run_id,
+            head_sha,
+            observed_attempt,
+        )
+    }
+
     /// Perform the only POST. The durable state must already say custody began.
     pub fn submit(
         &self,
@@ -368,6 +397,39 @@ impl GitHubCheckRerunAdapter {
             submission,
         )
     }
+}
+
+fn preflight_observation(
+    transport: &impl GitHubActionsTransport,
+    capability_target: &RepoTarget,
+    target: &RepoTarget,
+    run_id: WorkflowRunId,
+    head_sha: &str,
+    observed_attempt: u32,
+) -> Result<(), GitHubCheckRerunError> {
+    if capability_target != target
+        || observed_attempt == 0
+        || observed_attempt.checked_add(1).is_none()
+        || !valid_head_sha(head_sha)
+    {
+        return Err(GitHubCheckRerunError::CapabilityMismatch);
+    }
+    let request = GetWorkflowRunRequest::new(target.clone(), run_id);
+    let run = match transport.get_workflow_run(&request) {
+        Ok(reply) => match reply.into_outcome() {
+            GitHubOutcome::Accepted(run) => run,
+            GitHubOutcome::Rejected(_) => return Err(GitHubCheckRerunError::ProviderRefused),
+        },
+        Err(_) => return Err(GitHubCheckRerunError::ProviderUnavailable),
+    };
+    if run.id != run_id
+        || run.head_sha != head_sha
+        || run.run_attempt != observed_attempt
+        || run.status != WorkflowRunStatus::Completed
+    {
+        return Err(GitHubCheckRerunError::ResourceChanged);
+    }
+    Ok(())
 }
 
 fn preflight(
@@ -700,6 +762,72 @@ mod tests {
             Err(GitHubCheckRerunError::ResourceChanged)
         );
         assert_eq!(transport.write_count.get(), 0);
+    }
+
+    #[test]
+    fn advertised_capability_preflight_is_get_only_and_exact_on_head_attempt_and_status() {
+        let exact = FakeTransport::new(vec![accepted(run(3))], vec![]);
+        assert_eq!(
+            preflight_observation(
+                &exact,
+                &target(),
+                &target(),
+                WorkflowRunId::new(91).unwrap(),
+                "0123456789abcdef0123456789abcdef01234567",
+                3,
+            ),
+            Ok(())
+        );
+        assert_eq!((exact.read_count.get(), exact.write_count.get()), (1, 0));
+
+        let mut wrong_head = run(3);
+        wrong_head.head_sha = "ffffffffffffffffffffffffffffffffffffffff".to_owned();
+        let mut running = run(3);
+        running.status = WorkflowRunStatus::InProgress;
+        for observed in [run(4), wrong_head, running] {
+            let transport = FakeTransport::new(vec![accepted(observed)], vec![]);
+            assert_eq!(
+                preflight_observation(
+                    &transport,
+                    &target(),
+                    &target(),
+                    WorkflowRunId::new(91).unwrap(),
+                    "0123456789abcdef0123456789abcdef01234567",
+                    3,
+                ),
+                Err(GitHubCheckRerunError::ResourceChanged)
+            );
+            assert_eq!(
+                (transport.read_count.get(), transport.write_count.get()),
+                (1, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn plan_refuses_attempt_and_revision_successor_overflow() {
+        let mut baseline = plan();
+        baseline.observed_run_attempt = u32::MAX;
+        assert_eq!(
+            GitHubCheckRerunPlan::new(
+                baseline.registry_generation_digest,
+                baseline.credential_generation_digest,
+                &baseline.credential_reference,
+                baseline.target,
+                baseline.run_id,
+                &baseline.head_sha,
+                baseline.observed_run_attempt,
+                &Actor::new("tenant-1", "actor-1").unwrap(),
+                baseline.project,
+                baseline.workspace,
+                baseline.authority,
+                baseline.idempotency_key,
+                baseline.check_id,
+                Revision::new(9).unwrap(),
+                Revision::new(7).unwrap(),
+            ),
+            Err(GitHubCheckRerunError::InvalidPlan)
+        );
     }
 
     #[test]

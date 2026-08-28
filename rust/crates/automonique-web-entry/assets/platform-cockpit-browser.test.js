@@ -53,13 +53,16 @@ test("preview is inert and confirmed controls persist their receipt before sendi
   expect(preview).not.toContain("fetch(");
   expect(preview).not.toContain("api(");
   expect(preview).not.toContain("platformPost(");
-  const submitStart = script.indexOf("async function submitCockpitIntent(action)");
+  const submitStart = script.indexOf("async function submitCockpitIntent(preview)");
   const submitEnd = script.indexOf("async function submitCockpitReview", submitStart);
   const submit = script.slice(submitStart, submitEnd);
   expect(submit.indexOf("persistCockpitControl(handle)")).toBeLessThan(submit.indexOf('api("/api/platform/cockpit"'));
   expect(script).toContain("Only receipt lookup is allowed now");
   expect(html).toContain('id="cockpit-create-preview" type="button" disabled');
   expect(html).toContain('id="cockpit-resume-preview" type="button" disabled');
+  expect(html).toContain('id="cockpit-rerun-check" type="button" disabled');
+  expect(script).toContain('action: "rerun_check"');
+  expect(script).toContain('action: "get_review_receipt"');
 });
 
 test("generic recovery remains secondary to the hosted workspace surface", () => {

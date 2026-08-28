@@ -250,6 +250,8 @@ CREATE TABLE review_github_check_effect_plans (
     credential_reference TEXT NOT NULL,
     repository_owner TEXT NOT NULL,
     repository_name TEXT NOT NULL,
+    repository_owner_normalized TEXT NOT NULL CHECK(repository_owner_normalized = lower(repository_owner)),
+    repository_name_normalized TEXT NOT NULL CHECK(repository_name_normalized = lower(repository_name)),
     run_id TEXT NOT NULL,
     head_sha TEXT NOT NULL,
     observed_attempt INTEGER NOT NULL CHECK (observed_attempt >= 1),
@@ -259,7 +261,8 @@ CREATE TABLE review_github_check_effect_plans (
     plan_document BLOB NOT NULL,
     plan_digest BLOB NOT NULL CHECK (length(plan_digest) = 32),
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
-    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms)
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+    UNIQUE(repository_owner_normalized,repository_name_normalized,run_id,observed_attempt)
 ) STRICT;
 "#;
 
@@ -659,6 +662,8 @@ impl ReviewExternalEffectPlan {
             || !safe_effect_coordinate(repository_name)
             || run_id == 0
             || observed_attempt == 0
+            || observed_attempt.checked_add(1).is_none()
+            || revision_successor(expected_check_revision).is_err()
             || !valid_effect_head_sha(head_sha)
         {
             return Err(ReviewStoreError::InvalidField("external_effect_plan"));
@@ -1151,6 +1156,16 @@ impl ReviewStore {
                 || plan.github_expected_check_revision() != Some(*expected_check_revision))
         {
             return Err(ReviewStoreError::Conflict("external_effect_request"));
+        }
+        if external_plan.is_some_and(ReviewExternalEffectPlan::is_github_check_rerun) {
+            revision_successor(request.expected_revision())?;
+            if let ReviewAction::RerunCheck {
+                expected_check_revision,
+                ..
+            } = request.action()
+            {
+                revision_successor(*expected_check_revision)?;
+            }
         }
         let (kind, id) = workspace_parts(request.workspace());
         let transaction = self
@@ -2647,6 +2662,15 @@ fn validate_time(value: i64) -> Stored<()> {
 }
 fn db_revision(value: Revision) -> Stored<i64> {
     i64::try_from(value.get()).map_err(|_| ReviewStoreError::InvalidField("revision"))
+}
+fn revision_successor(value: Revision) -> Stored<Revision> {
+    let next = value
+        .get()
+        .checked_add(1)
+        .and_then(|next| Revision::new(next).ok())
+        .ok_or(ReviewStoreError::InvalidField("revision"))?;
+    db_revision(next)?;
+    Ok(next)
 }
 fn parse_revision(value: i64) -> Stored<Revision> {
     u64::try_from(value)
@@ -4187,8 +4211,18 @@ fn insert_external_plan(
     created_at_ms: i64,
 ) -> Stored<()> {
     if let Some(github) = &plan.github_check {
+        let owner_normalized = github.repository_owner.to_ascii_lowercase();
+        let repository_normalized = github.repository_name.to_ascii_lowercase();
+        let reserved: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM review_github_check_effect_plans WHERE repository_owner_normalized=?1 AND repository_name_normalized=?2 AND run_id=?3 AND observed_attempt=?4)",
+            params![owner_normalized,repository_normalized,github.run_id.to_string(),i64::from(github.observed_attempt)],
+            |row| row.get(0),
+        )?;
+        if reserved {
+            return Err(ReviewStoreError::Conflict("github_check_run_attempt"));
+        }
         transaction.execute(
-            "INSERT INTO review_github_check_effect_plans(preview_id,request_digest,registry_generation_digest,credential_generation_digest,credential_reference,repository_owner,repository_name,run_id,head_sha,observed_attempt,check_id,expected_check_revision,custody,plan_document,plan_digest,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'not_started',?13,?14,?15,?15)",
+            "INSERT INTO review_github_check_effect_plans(preview_id,request_digest,registry_generation_digest,credential_generation_digest,credential_reference,repository_owner,repository_name,repository_owner_normalized,repository_name_normalized,run_id,head_sha,observed_attempt,check_id,expected_check_revision,custody,plan_document,plan_digest,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'not_started',?15,?16,?17,?17)",
             params![
                 preview_id,
                 plan.request_digest.as_slice(),
@@ -4197,6 +4231,8 @@ fn insert_external_plan(
                 github.credential_reference,
                 github.repository_owner,
                 github.repository_name,
+                owner_normalized,
+                repository_normalized,
                 github.run_id.to_string(),
                 github.head_sha,
                 i64::from(github.observed_attempt),
@@ -4206,7 +4242,14 @@ fn insert_external_plan(
                 plan.digest.as_slice(),
                 created_at_ms,
             ],
-        )?;
+        ).map_err(|error| match &error {
+            rusqlite::Error::SqliteFailure(code, _)
+                if matches!(code.extended_code, 1555 | 2067) =>
+            {
+                ReviewStoreError::Conflict("github_check_run_attempt")
+            }
+            _ => ReviewStoreError::Sqlite(error),
+        })?;
         return Ok(());
     }
     transaction.execute(
@@ -4394,6 +4437,8 @@ fn read_github_check_plan(
         String,
         String,
         String,
+        String,
+        String,
         i64,
         String,
         i64,
@@ -4402,9 +4447,9 @@ fn read_github_check_plan(
         Vec<u8>,
     );
     let raw: Option<Raw> = connection.query_row(
-        "SELECT request_digest,registry_generation_digest,credential_generation_digest,credential_reference,repository_owner,repository_name,run_id,head_sha,observed_attempt,check_id,expected_check_revision,custody,plan_document,plan_digest FROM review_github_check_effect_plans WHERE preview_id=?1",
+        "SELECT request_digest,registry_generation_digest,credential_generation_digest,credential_reference,repository_owner,repository_name,repository_owner_normalized,repository_name_normalized,run_id,head_sha,observed_attempt,check_id,expected_check_revision,custody,plan_document,plan_digest FROM review_github_check_effect_plans WHERE preview_id=?1",
         [preview_id],
-        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?)),
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?,row.get(15)?)),
     ).optional()?;
     let Some((
         request_digest,
@@ -4413,6 +4458,8 @@ fn read_github_check_plan(
         credential_reference,
         owner,
         repository,
+        owner_normalized,
+        repository_normalized,
         run_id,
         head_sha,
         observed_attempt,
@@ -4425,6 +4472,11 @@ fn read_github_check_plan(
     else {
         return Ok(None);
     };
+    if owner.to_ascii_lowercase() != owner_normalized
+        || repository.to_ascii_lowercase() != repository_normalized
+    {
+        return Err(ReviewStoreError::Corrupt("external_effect_reservation"));
+    }
     let request_digest: [u8; 32] = request_digest
         .try_into()
         .map_err(|_| ReviewStoreError::Corrupt("external_effect_request_digest"))?;

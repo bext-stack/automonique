@@ -459,6 +459,48 @@
     });
   }
 
+  function rerunCapability(document) {
+    const capability = document?.actions?.review?.operations?.rerun_check;
+    const rawTargets = Array.isArray(capability?.targets) && capability.targets.length <= 512
+      ? capability.targets : [];
+    const targets = rawTargets.map((target) => {
+      const projectId = boundedText(target?.project_id, 256);
+      const workspaceId = boundedText(target?.workspace_id, 256);
+      const checkId = boundedText(target?.check_id, 256);
+      if (!projectId || !workspaceId || !checkId
+        || !validDecimal(target?.exact_revision, false)
+        || !validDecimal(target?.exact_check_revision, false)) return null;
+      return Object.freeze({
+        project_id: projectId,
+        workspace_id: workspaceId,
+        exact_revision: target.exact_revision,
+        check_id: checkId,
+        exact_check_revision: target.exact_check_revision,
+      });
+    });
+    const unique = new Set(targets.filter(Boolean).map((target) => target.check_id));
+    const available = capability?.available === true
+      && capability?.execute_operation === "rerun_check"
+      && capability?.receipt_operation === "get_review_receipt"
+      && targets.length > 0
+      && targets.every(Boolean)
+      && unique.size === targets.length
+      && targets.every((target) => target.project_id === targets[0].project_id
+        && target.workspace_id === targets[0].workspace_id
+        && target.exact_revision === targets[0].exact_revision);
+    return Object.freeze({
+      available,
+      reason: available ? null : boundedText(capability?.category, 128)
+        || "platform_cockpit_ci_family_unavailable",
+      family: "review_action",
+      operation: "rerun_check",
+      project_id: available ? targets[0].project_id : null,
+      workspace_id: available ? targets[0].workspace_id : null,
+      exact_revision: available ? targets[0].exact_revision : null,
+      targets: Object.freeze(available ? targets : []),
+    });
+  }
+
   function disabledCapability(capability, reason) {
     return Object.freeze({ ...capability, available: false, reason });
   }
@@ -563,6 +605,7 @@
     const resume = controlCapability(document, "workspace_intent", "resume_attempt_workspace");
     const addComment = controlCapability(document, "review_action", "add_comment");
     const approveReview = controlCapability(document, "review_action", "approve_review");
+    const rerunCheck = rerunCapability(document);
     const reviewDocument = document?.review?.state === "available" ? document?.review?.document : null;
     const reviewSemantics = projectReviewSemantics(reviewDocument);
     return Object.freeze({
@@ -585,6 +628,7 @@
       reviewActions: Object.freeze({
         addComment: writesAvailable ? addComment : disabledCapability(addComment, "platform_cockpit_projection_incomplete_or_stale"),
         approveReview: writesAvailable ? approveReview : disabledCapability(approveReview, "platform_cockpit_projection_incomplete_or_stale"),
+        rerunCheck: writesAvailable ? rerunCheck : disabledCapability(rerunCheck, "platform_cockpit_projection_incomplete_or_stale"),
       }),
       localLifecycle: Object.freeze({
         createHostSetup: mutationCapability(document, "create_host_setup"),

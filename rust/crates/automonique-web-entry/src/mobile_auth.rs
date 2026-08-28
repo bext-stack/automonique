@@ -196,12 +196,14 @@ pub enum MobilePlatformV2Action {
     GetWorkspaceIntent,
     GetReview,
     GetAttentionSourceSnapshot,
+    GetReviewCapabilities,
     ExecuteReviewAction,
+    RerunCheck,
     GetReviewReceipt,
 }
 
 impl MobilePlatformV2Action {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::QueryWorkContexts,
         Self::GetLineage,
         Self::PrepareMutation,
@@ -212,7 +214,9 @@ impl MobilePlatformV2Action {
         Self::GetWorkspaceIntent,
         Self::GetReview,
         Self::GetAttentionSourceSnapshot,
+        Self::GetReviewCapabilities,
         Self::ExecuteReviewAction,
+        Self::RerunCheck,
         Self::GetReviewReceipt,
     ];
 }
@@ -2487,6 +2491,8 @@ mod tests {
                 MobilePlatformV2Action::PrepareMutation,
                 MobilePlatformV2Action::GetReviewReceipt,
                 MobilePlatformV2Action::ExecuteReviewAction,
+                MobilePlatformV2Action::RerunCheck,
+                MobilePlatformV2Action::GetReviewCapabilities,
             ],
         }
     }
@@ -2526,7 +2532,9 @@ mod tests {
                 MobilePlatformV2Action::QueryWorkContexts,
                 MobilePlatformV2Action::PrepareMutation,
                 MobilePlatformV2Action::SubmitMutation,
+                MobilePlatformV2Action::GetReviewCapabilities,
                 MobilePlatformV2Action::ExecuteReviewAction,
+                MobilePlatformV2Action::RerunCheck,
                 MobilePlatformV2Action::GetReviewReceipt,
             ]
         );
@@ -2602,6 +2610,68 @@ mod tests {
             )
             .expect("complete Platform v2 grant");
         assert_eq!(descriptor.actions, MobilePlatformV2Action::ALL.to_vec());
+    }
+
+    #[test]
+    fn review_capability_and_rerun_grants_serde_persist_and_are_removed_by_narrow_regrant() {
+        let (root, mut auth) = authority();
+        let issued = auth.operator_provision(request(), NOW).unwrap();
+        let granted = auth
+            .grant_platform_v2(
+                MobilePlatformV2GrantRequest {
+                    credential_id: issued.authorization.credential_id.clone(),
+                    project_roots: vec!["project-a".to_owned()],
+                    actions: vec![
+                        MobilePlatformV2Action::RerunCheck,
+                        MobilePlatformV2Action::ExecuteReviewAction,
+                        MobilePlatformV2Action::GetReviewCapabilities,
+                    ],
+                },
+                NOW + 1,
+            )
+            .unwrap();
+        assert_eq!(
+            granted.actions,
+            vec![
+                MobilePlatformV2Action::GetReviewCapabilities,
+                MobilePlatformV2Action::ExecuteReviewAction,
+                MobilePlatformV2Action::RerunCheck,
+            ]
+        );
+        let wire = serde_json::to_string(&granted).unwrap();
+        assert!(wire.contains("get_review_capabilities"));
+        assert!(wire.contains("rerun_check"));
+        let decoded: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        let decoded_actions: Vec<MobilePlatformV2Action> =
+            serde_json::from_value(decoded["actions"].clone()).unwrap();
+        assert_eq!(decoded_actions, granted.actions);
+        drop(auth);
+
+        let mut auth = MobileCredentialAuthority::open(
+            root.path().join("mobile.sqlite3"),
+            "ops.example.test",
+            "operator:mobile",
+        )
+        .unwrap();
+        let reopened = auth
+            .authorize_platform_v2(&issued.access_token, NOW + 2)
+            .unwrap();
+        assert!(reopened.allows(MobilePlatformV2Action::GetReviewCapabilities));
+        assert!(reopened.allows(MobilePlatformV2Action::RerunCheck));
+
+        let narrowed = auth
+            .grant_platform_v2(
+                MobilePlatformV2GrantRequest {
+                    credential_id: issued.authorization.credential_id.clone(),
+                    project_roots: vec!["project-a".to_owned()],
+                    actions: vec![MobilePlatformV2Action::ExecuteReviewAction],
+                },
+                NOW + 3,
+            )
+            .unwrap();
+        assert!(narrowed.allows(MobilePlatformV2Action::ExecuteReviewAction));
+        assert!(!narrowed.allows(MobilePlatformV2Action::GetReviewCapabilities));
+        assert!(!narrowed.allows(MobilePlatformV2Action::RerunCheck));
     }
 
     #[test]

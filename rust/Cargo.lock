@@ -302,6 +302,7 @@ dependencies = [
  "tempfile",
  "toml_edit",
  "ureq",
+ "zeroize",
 ]
 
 [[package]]

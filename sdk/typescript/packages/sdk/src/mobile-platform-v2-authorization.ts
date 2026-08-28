@@ -35,7 +35,9 @@ export const MOBILE_PLATFORM_V2_ACTIONS = [
   "get_workspace_intent",
   "get_review",
   "get_attention_source_snapshot",
+  "get_review_capabilities",
   "execute_review_action",
+  "rerun_check",
   "get_review_receipt",
 ] as const;
 

@@ -21,8 +21,9 @@ use automonique_protocol::platform_v2_lineage::{
 use automonique_protocol::platform_v2_lineage_api::encode_lineage_projection;
 use automonique_protocol::platform_v2_lineage_api::encode_workspace_intent_outcome;
 use automonique_protocol::platform_v2_review::{
-    AttentionReason, DiffSide, ReviewAction, ReviewActionReceipt, ReviewAnchor, ReviewCommentId,
-    ReviewDecision, ReviewFileId, ReviewFreshnessState, ReviewHunkId, ReviewSnapshot, ReviewText,
+    AttentionReason, DiffSide, ReviewAction, ReviewActionReceipt, ReviewAnchor, ReviewCheckId,
+    ReviewCommentId, ReviewDecision, ReviewFileId, ReviewFreshnessState, ReviewHunkId,
+    ReviewSnapshot, ReviewText,
 };
 use automonique_protocol::platform_v2_review_api::{
     encode_review_action_receipt, encode_review_snapshot,
@@ -106,6 +107,14 @@ pub(crate) enum CockpitRequest {
         workspace_id: String,
         expected_revision: String,
         expected_review_revision: String,
+        idempotency_key: String,
+    },
+    RerunCheck {
+        project_id: String,
+        workspace_id: String,
+        expected_revision: String,
+        check_id: String,
+        expected_check_revision: String,
         idempotency_key: String,
     },
     GetReviewReceipt {
@@ -215,6 +224,22 @@ pub(crate) fn execute(
             &expected_review_revision,
             &idempotency_key,
         ),
+        CockpitRequest::RerunCheck {
+            project_id,
+            workspace_id,
+            expected_revision,
+            check_id,
+            expected_check_revision,
+            idempotency_key,
+        } => rerun_check(
+            bridge,
+            &project_id,
+            &workspace_id,
+            &expected_revision,
+            &check_id,
+            &expected_check_revision,
+            &idempotency_key,
+        ),
         CockpitRequest::GetReviewReceipt {
             project_id,
             workspace_id,
@@ -308,10 +333,32 @@ fn read(
         selected,
         lineage_projection.as_ref(),
     );
+    let review_capabilities = match (
+        review_snapshot.as_ref(),
+        selected_identity.as_ref(),
+        selected_project.as_ref(),
+    ) {
+        (Some(snapshot), Some(workspace), Some(WorkContextIdentity::Project(project))) => {
+            let request = ReviewReadRequest::new(project.clone(), workspace.clone())
+                .map_err(|_| "platform_cockpit_selection_invalid")?;
+            match bridge.request(PlatformV2Request::GetReviewCapabilities(request)) {
+                Ok(PlatformV2Response::ReviewCapabilities(value))
+                    if value.project() == project
+                        && value.workspace() == workspace
+                        && value.snapshot_revision() == snapshot.revision() =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
     let review_actions = review_actions(
         selected,
         selected_project.as_ref(),
         review_snapshot.as_ref(),
+        review_capabilities.as_ref(),
     );
     let attention = attention_inventory(bridge, &records, selected_identity.as_ref(), &review);
     let activity_items = cockpit_activities(lineage_projection.as_ref(), review_snapshot.as_ref());
@@ -551,6 +598,7 @@ fn review_actions(
     selected: Option<&WorkContextRecord>,
     selected_project: Option<&WorkContextIdentity>,
     snapshot: Option<&ReviewSnapshot>,
+    capabilities: Option<&automonique_protocol::platform_v2_transport::ReviewCapabilities>,
 ) -> Value {
     let exact = selected.zip(snapshot).and_then(|(workspace, snapshot)| {
         let WorkContextIdentity::Project(project) = selected_project? else {
@@ -595,6 +643,39 @@ fn review_actions(
     let fresh = exact.is_some();
     let approve = exact
         .is_some_and(|(_, _, snapshot)| snapshot.review().decision() == ReviewDecision::Pending);
+    let rerunnable_checks = exact
+        .zip(capabilities)
+        .map(|((workspace, project, snapshot), capabilities)| {
+            capabilities
+                .rerunnable_checks()
+                .iter()
+                .filter_map(|capability| {
+                    let check = snapshot.checks().iter().find(|check| {
+                        check.id() == capability.check_id()
+                            && check.authority() == capability.authority()
+                            && check.freshness().state() == ReviewFreshnessState::Fresh
+                            && check.freshness().observed_revision()
+                                == capability.expected_check_revision()
+                    })?;
+                    Some(json!({
+                        "project_id": project.as_str(),
+                        "workspace_id": workspace.identity().id(),
+                        "exact_revision": snapshot.revision().to_string(),
+                        "check_id": check.id().as_str(),
+                        "exact_check_revision": capability.expected_check_revision().to_string()
+                    }))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let rerun_available = !rerunnable_checks.is_empty();
+    let rerun = json!({
+        "available": rerun_available,
+        "category": if rerun_available { Value::Null } else { json!("platform_cockpit_ci_family_unavailable") },
+        "execute_operation": if rerun_available { json!("rerun_check") } else { Value::Null },
+        "receipt_operation": if rerun_available { json!("get_review_receipt") } else { Value::Null },
+        "targets": rerunnable_checks
+    });
     json!({
         "available": fresh,
         "category": if fresh { Value::Null } else { json!(REVIEW_ADAPTER_PENDING) },
@@ -607,7 +688,7 @@ fn review_actions(
             "unstage": action(false, "platform_cockpit_git_family_unavailable"),
             "commit": action(false, "platform_cockpit_git_family_unavailable"),
             "resolve_conflict": action(false, "platform_cockpit_git_family_unavailable"),
-            "rerun_check": action(false, "platform_cockpit_ci_family_unavailable"),
+            "rerun_check": rerun,
             "open_pull_request": action(false, "platform_cockpit_pull_request_family_unavailable"),
             "update_pull_request": action(false, "platform_cockpit_pull_request_family_unavailable"),
             "merge_pull_request": action(false, "platform_cockpit_pull_request_family_unavailable")
@@ -1055,6 +1136,56 @@ fn approve_review(
         bridge,
         context,
         action,
+        IdempotencyKey::new(idempotency_key.to_owned())
+            .map_err(|_| "platform_cockpit_request_invalid")?,
+    )
+}
+
+fn rerun_check(
+    bridge: &PlatformV2Bridge,
+    project_id: &str,
+    workspace_id: &str,
+    expected_revision: &str,
+    check_id: &str,
+    expected_check_revision: &str,
+    idempotency_key: &str,
+) -> Result<Value, &'static str> {
+    let context = review_control_context(bridge, project_id, workspace_id, expected_revision)?;
+    let check_id =
+        ReviewCheckId::new(check_id.to_owned()).map_err(|_| "platform_cockpit_request_invalid")?;
+    let expected_check_revision = parse_revision(expected_check_revision)?;
+    let capability_request =
+        ReviewReadRequest::new(context.project.clone(), context.workspace.clone())
+            .map_err(|_| "platform_cockpit_request_invalid")?;
+    let capabilities =
+        match bridge.request(PlatformV2Request::GetReviewCapabilities(capability_request))? {
+            PlatformV2Response::ReviewCapabilities(value) => value,
+            PlatformV2Response::Refused(_) => return Err("platform_cockpit_ci_family_unavailable"),
+            _ => return Err("platform_v2_response_invalid"),
+        };
+    if capabilities.project() != &context.project
+        || capabilities.workspace() != &context.workspace
+        || capabilities.snapshot_revision() != context.snapshot.revision()
+        || !capabilities.rerunnable_checks().iter().any(|candidate| {
+            candidate.check_id() == &check_id
+                && candidate.expected_check_revision() == expected_check_revision
+                && context.snapshot.checks().iter().any(|check| {
+                    check.id() == &check_id
+                        && check.authority() == candidate.authority()
+                        && check.freshness().state() == ReviewFreshnessState::Fresh
+                        && check.freshness().observed_revision() == expected_check_revision
+                })
+        })
+    {
+        return Err("platform_cockpit_review_stale");
+    }
+    execute_review_action(
+        bridge,
+        context,
+        ReviewAction::RerunCheck {
+            check_id,
+            expected_check_revision,
+        },
         IdempotencyKey::new(idempotency_key.to_owned())
             .map_err(|_| "platform_cockpit_request_invalid")?,
     )

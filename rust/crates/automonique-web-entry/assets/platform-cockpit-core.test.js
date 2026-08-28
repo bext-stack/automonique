@@ -170,6 +170,18 @@ test("typed workspace and review controls require exact server operations and fr
       exact_revision: "7",
       exact_review_revision: "6",
     },
+    rerun_check: {
+      available: true,
+      execute_operation: "rerun_check",
+      receipt_operation: "get_review_receipt",
+      targets: [{
+        project_id: "project-1",
+        workspace_id: "workspace-1",
+        exact_revision: "7",
+        check_id: "check-ci-1",
+        exact_check_revision: "5",
+      }],
+    },
   } };
   const view = cockpit.derivePresentation(controlled);
   expect(view.create.available).toBe(true);
@@ -177,6 +189,15 @@ test("typed workspace and review controls require exact server operations and fr
   expect(view.resume.available).toBe(true);
   expect(view.reviewActions.addComment.available).toBe(true);
   expect(view.reviewActions.approveReview.exact_review_revision).toBe("6");
+  expect(view.reviewActions.rerunCheck.available).toBe(true);
+  expect(view.reviewActions.rerunCheck.targets[0].check_id).toBe("check-ci-1");
+
+  const substitutedCheckRevision = structuredClone(controlled);
+  substitutedCheckRevision.actions.review.operations.rerun_check.targets.push({
+    ...substitutedCheckRevision.actions.review.operations.rerun_check.targets[0],
+    exact_check_revision: "6",
+  });
+  expect(cockpit.derivePresentation(substitutedCheckRevision).reviewActions.rerunCheck.available).toBe(false);
 
   const missingExternal = structuredClone(controlled);
   delete missingExternal.actions.lifecycle.operations.create_attempt_workspace.external_work;

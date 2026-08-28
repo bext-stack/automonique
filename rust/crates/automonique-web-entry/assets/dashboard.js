@@ -2354,16 +2354,40 @@ function renderHostedCockpit(view) {
   const exactAnchor = reviewLink.file && reviewLink.hunk && reviewLink.side && reviewLink.line;
   const addComment = cockpitPresentation.reviewActions.addComment;
   const approveReview = cockpitPresentation.reviewActions.approveReview;
+  const rerunCheck = cockpitPresentation.reviewActions.rerunCheck;
+  const rerunTarget = byId("cockpit-rerun-check-target");
+  const selectedCheck = rerunTarget.value;
+  rerunTarget.replaceChildren();
+  for (const target of rerunCheck.targets || []) {
+    const option = document.createElement("option");
+    option.value = target.check_id;
+    option.textContent = `${target.check_id} · revision ${target.exact_check_revision}`;
+    rerunTarget.append(option);
+  }
+  if (selectedCheck && (rerunCheck.targets || []).some((target) => target.check_id === selectedCheck)) {
+    rerunTarget.value = selectedCheck;
+  }
+  if (rerunTarget.options.length === 0) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "No rerunnable check available";
+    rerunTarget.append(option);
+  }
+  rerunTarget.disabled = !rerunCheck.available || unresolvedControl;
   byId("cockpit-add-comment").disabled = !addComment.available || !exactAnchor || unresolvedControl;
   byId("cockpit-approve-review").disabled = !approveReview.available || unresolvedControl;
+  byId("cockpit-rerun-check").disabled = !rerunCheck.available || unresolvedControl;
   byId("cockpit-add-comment").textContent = addComment.available ? "Add exact comment" : "Add comment unavailable";
   byId("cockpit-approve-review").textContent = approveReview.available ? "Approve review" : "Approve unavailable";
+  byId("cockpit-rerun-check").textContent = rerunCheck.available ? "Rerun exact check" : "Rerun unavailable";
   byId("cockpit-review-comment").disabled = !addComment.available || unresolvedControl;
   byId("cockpit-review-action-reason").textContent = unresolvedControl
     ? "An unresolved durable receipt is lookup-only. New writes are disabled."
     : !exactAnchor
       ? "Add comment requires an exact file, hunk, side, and line deep link."
-      : "Only local add-comment and approve-review are enabled; git, CI, and pull-request families remain unavailable.";
+      : rerunCheck.available
+        ? "CI rerun is enabled only for the selected server-advertised exact check revision."
+        : "Only explicitly advertised review actions are enabled; unavailable families are not inferred.";
   const inbox = byId("cockpit-inbox-list");
   inbox.replaceChildren();
   if (cockpitPresentation.inbox.length > 0) {
@@ -3364,13 +3388,30 @@ async function submitCockpitReview(action) {
     line: Number(link.line),
     body: byId("cockpit-review-comment").value.trim(),
     idempotency_key: idempotencyKey,
-  } : {
+  } : action === "approveReview" ? {
     action: "approve_review",
     project_id: capability.project_id,
     workspace_id: capability.workspace_id,
     expected_revision: capability.exact_revision,
     expected_review_revision: capability.exact_review_revision,
     idempotency_key: idempotencyKey,
+  } : (() => {
+    const checkId = byId("cockpit-rerun-check-target").value;
+    const target = (capability.targets || []).find((candidate) => candidate.check_id === checkId);
+    return target ? {
+      action: "rerun_check",
+      project_id: target.project_id,
+      workspace_id: target.workspace_id,
+      expected_revision: target.exact_revision,
+      check_id: target.check_id,
+      expected_check_revision: target.exact_check_revision,
+      idempotency_key: idempotencyKey,
+    } : null;
+  })();
+  if (!body) {
+    clearCockpitControl();
+    toast("An exact server-advertised check must be selected.", "error");
+    return;
   };
   if (action === "addComment" && !body.body) {
     clearCockpitControl();
@@ -3432,6 +3473,7 @@ byId("cockpit-review-controls").addEventListener("submit", (event) => {
   submitCockpitReview("addComment");
 });
 byId("cockpit-approve-review").addEventListener("click", () => submitCockpitReview("approveReview"));
+byId("cockpit-rerun-check").addEventListener("click", () => submitCockpitReview("rerunCheck"));
 byId("cockpit-copy-link").addEventListener("click", async () => {
   const workspace = cockpitPresentation?.selectedWorkspace;
   if (!workspace) return;

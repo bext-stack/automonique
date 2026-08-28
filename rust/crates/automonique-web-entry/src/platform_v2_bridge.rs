@@ -340,23 +340,22 @@ impl PlatformV2Bridge {
             PlatformV2Request::GetAttentionSourceSnapshot(_) => {
                 MobilePlatformV2Action::GetAttentionSourceSnapshot
             }
-            PlatformV2Request::ExecuteReviewAction(_) => {
-                MobilePlatformV2Action::ExecuteReviewAction
+            PlatformV2Request::GetReviewCapabilities(_) => {
+                MobilePlatformV2Action::GetReviewCapabilities
             }
+            PlatformV2Request::ExecuteReviewAction(value) => match value.action() {
+                ReviewAction::AddComment { .. } | ReviewAction::ApproveReview { .. } => {
+                    MobilePlatformV2Action::ExecuteReviewAction
+                }
+                ReviewAction::RerunCheck { .. } => MobilePlatformV2Action::RerunCheck,
+                _ => return Err("platform_v2_mobile_action_denied"),
+            },
             PlatformV2Request::GetReviewReceipt(_) => MobilePlatformV2Action::GetReviewReceipt,
             PlatformV2Request::GetWorkContext(_) => {
                 return Err("platform_v2_mobile_action_denied");
             }
         };
         if !authorization.allows(action) {
-            return Err("platform_v2_mobile_action_denied");
-        }
-        if let PlatformV2Request::ExecuteReviewAction(value) = request
-            && !matches!(
-                value.action(),
-                ReviewAction::AddComment { .. } | ReviewAction::ApproveReview { .. }
-            )
-        {
             return Err("platform_v2_mobile_action_denied");
         }
         let roots = authorization
@@ -752,7 +751,7 @@ mod tests {
     };
     use automonique_protocol::platform_v2_transport::{
         MutationReceiptLookup, MutationSubmitRequest, PlatformNegotiationRequest,
-        PlatformV2Request, ReviewActionTransportRequest, ReviewReceiptLookup,
+        PlatformV2Request, ReviewActionTransportRequest, ReviewReadRequest, ReviewReceiptLookup,
     };
     use automonique_protocol::primitives::{OpaqueId, Revision};
 
@@ -1428,6 +1427,102 @@ mod tests {
                     if value.category().as_str() == "platform_v2_mobile_action_denied"
             ));
         }
+    }
+
+    #[test]
+    fn mobile_capability_read_and_rerun_require_their_own_exact_grants() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = nix::unistd::geteuid().as_raw();
+        write_policy(root.path(), uid, "tenant-test", "actor-test");
+        let bridge = bridge(
+            root.path(),
+            root.path().join("absent.sock"),
+            "tenant-test",
+            "actor-test",
+        );
+        let mut authority = MobileCredentialAuthority::open_scoped(
+            root.path().join("mobile.sqlite3"),
+            "ops.example.test",
+            "tenant-test",
+            "actor-test",
+        )
+        .unwrap();
+        let authorization = grant_mobile(
+            &mut authority,
+            vec![
+                MobilePlatformV2Action::GetReviewCapabilities,
+                MobilePlatformV2Action::RerunCheck,
+            ],
+            vec!["project-test"],
+        );
+        let workspace = WorkContextIdentity::UserWorkspace(
+            automonique_protocol::platform_v2::UserWorkspaceId::new("workspace-test").unwrap(),
+        );
+        let capability_request = PlatformV2RequestMessage::new(
+            RequestId::new("mobile-review-capability-exact-grant").unwrap(),
+            PlatformV2Request::GetReviewCapabilities(
+                ReviewReadRequest::new(ProjectId::new("project-test").unwrap(), workspace.clone())
+                    .unwrap(),
+            ),
+        );
+        let legacy_read = grant_mobile(
+            &mut authority,
+            vec![MobilePlatformV2Action::GetReview],
+            vec!["project-test"],
+        );
+        let denied = bridge
+            .exchange_mobile(
+                PlatformV2Lane::V2,
+                &capability_request.to_canonical_bytes().unwrap(),
+                &legacy_read,
+                &mut authority,
+                1_002,
+            )
+            .unwrap();
+        let denied =
+            PlatformV2ResponseMessage::from_canonical_bytes(&denied, &capability_request).unwrap();
+        assert!(matches!(
+            denied.response(),
+            PlatformV2Response::Refused(value)
+                if value.category().as_str() == "platform_v2_mobile_action_denied"
+        ));
+        assert_eq!(
+            bridge.exchange_mobile(
+                PlatformV2Lane::V2,
+                &capability_request.to_canonical_bytes().unwrap(),
+                &authorization,
+                &mut authority,
+                1_002,
+            ),
+            Err("platform_v2_bridge_unavailable")
+        );
+
+        let rerun_request = PlatformV2RequestMessage::new(
+            RequestId::new("mobile-review-rerun-exact-grant").unwrap(),
+            PlatformV2Request::ExecuteReviewAction(
+                ReviewActionTransportRequest::new(
+                    workspace,
+                    Revision::FIRST,
+                    ReviewAction::RerunCheck {
+                        check_id: OpaqueId::new("check-one").unwrap(),
+                        expected_check_revision: Revision::FIRST,
+                    },
+                    IdempotencyKey::new("mobile:review:rerun:exact").unwrap(),
+                )
+                .unwrap(),
+            ),
+        );
+        assert_eq!(
+            bridge.exchange_mobile(
+                PlatformV2Lane::V2,
+                &rerun_request.to_canonical_bytes().unwrap(),
+                &authorization,
+                &mut authority,
+                1_003,
+            ),
+            Err("platform_v2_bridge_unavailable")
+        );
     }
 
     #[test]
