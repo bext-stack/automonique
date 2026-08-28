@@ -2212,6 +2212,32 @@ function renderCockpitReceipt(receipt) {
   root.textContent = `${words(receipt.state)} · ${receipt.message || descriptions[receipt.state] || "Structured receipt state"}`;
 }
 
+function cockpitCollectionCoverage(coverage) {
+  const unavailable = Object.entries(coverage?.sources || {})
+    .filter(([, source]) => source.state !== "available")
+    .map(([name, source]) => `${words(name)} ${words(source.state)}${source.category ? ` (${source.category})` : ""}`);
+  const omitted = coverage?.omitted && coverage.omitted !== "0"
+    ? `${coverage.omitted} of ${coverage.total} newest-ordered records omitted by the dashboard bound`
+    : null;
+  return [...unavailable, omitted].filter(Boolean).join(" · ");
+}
+
+function appendCockpitCollectionState(root, coverage, emptyTitle, emptyDetail) {
+  if (coverage.state === "complete" && coverage.total !== "0") return;
+  const item = document.createElement("li");
+  const title = document.createElement("strong");
+  const detail = document.createElement("span");
+  if (coverage.state === "complete") {
+    title.textContent = emptyTitle;
+    detail.textContent = emptyDetail;
+  } else {
+    title.textContent = coverage.state === "partial" ? "Structured projection is partial" : "Structured projection unavailable";
+    detail.textContent = cockpitCollectionCoverage(coverage) || "The authenticated server did not provide complete source coverage.";
+  }
+  item.append(title, detail);
+  root.append(item);
+}
+
 function updateCockpitLink(workspace, sessionId = null) {
   const current = globalThis.AutomoniquePlatformCockpit.parseDeepLink(window.location.hash);
   const switchingWorkspace = Boolean(workspace && current.workspace && current.workspace !== workspace.id);
@@ -2338,34 +2364,57 @@ function renderHostedCockpit(view) {
     : !exactAnchor
       ? "Add comment requires an exact file, hunk, side, and line deep link."
       : "Only local add-comment and approve-review are enabled; git, CI, and pull-request families remain unavailable.";
+  const inbox = byId("cockpit-inbox-list");
+  inbox.replaceChildren();
+  if (cockpitPresentation.inbox.length > 0) {
+    cockpitPresentation.inbox.forEach((entry) => {
+      const item = document.createElement("li");
+      const title = document.createElement("strong");
+      title.textContent = `${words(entry.state)} · ${words(entry.reason)}`;
+      const detail = document.createElement("span");
+      detail.textContent = `${words(entry.origin_kind)} · source revision ${entry.source_revision} · ${entry.unread} unread`;
+      const exactLink = document.createElement("a");
+      exactLink.href = entry.deep_link;
+      exactLink.textContent = "Open exact review context";
+      exactLink.setAttribute("aria-label", `Open exact review context for ${words(entry.reason)} at source revision ${entry.source_revision}`);
+      item.append(title, detail, exactLink);
+      inbox.append(item);
+    });
+  }
+  appendCockpitCollectionState(
+    inbox,
+    cockpitPresentation.inboxCoverage,
+    "No structured attention",
+    "The complete authoritative review projection has no attention events.",
+  );
+
   const activity = byId("cockpit-activity-list");
   activity.replaceChildren();
-  if (cockpitPresentation.activities.length === 0) {
-    const item = document.createElement("li");
-    const title = document.createElement("strong");
-    title.textContent = "No structured activity";
-    const detail = document.createElement("span");
-    detail.textContent = "Retained history remains in Conversation.";
-    item.append(title, detail);
-    activity.append(item);
-  } else {
+  if (cockpitPresentation.activities.length > 0) {
     cockpitPresentation.activities.forEach((entry) => {
       const item = document.createElement("li");
       const title = document.createElement("strong");
       title.textContent = entry.label;
       const detail = document.createElement("span");
-      detail.textContent = `${entry.at} · ${entry.source || entry.kind}`;
+      detail.textContent = `Observed ${entry.at} ms · ${entry.source || entry.kind} · ${words(entry.freshness)} · source revision ${entry.source_revision}`;
       if (entry.deep_link) {
-        const link = document.createElement("a");
-        link.href = entry.deep_link;
-        link.textContent = "Open exact context";
-        item.append(title, detail, link);
+        const exactLink = document.createElement("a");
+        exactLink.href = entry.deep_link;
+        exactLink.textContent = "Open exact context";
+        exactLink.setAttribute("aria-label", `Open exact context for ${entry.label} at source revision ${entry.source_revision}`);
+        item.append(title, detail, exactLink);
       } else {
         item.append(title, detail);
       }
       activity.append(item);
     });
   }
+  appendCockpitCollectionState(
+    activity,
+    cockpitPresentation.activityCoverage,
+    "No structured activity",
+    "The complete lineage and review projections contain no activity. Retained history remains in Conversation.",
+  );
 }
 
 function renderPlatform(view) {

@@ -56,6 +56,50 @@ const cockpit = {
   lineage: { state: "available", document: { workspace: "workspace-1", external_work_items: [], orchestration: [] } },
   review: { state: "available", document: freshCockpitReview },
   attention: { state: "available", known_workspaces: "2", total_workspaces: "2" },
+  inbox: {
+    state: "complete", total: "1", omitted: "0", sources: { review: { state: "available" } },
+    items: [{
+      id: "attention-comment",
+      state: "needs_you",
+      reason: "comment_reply",
+      origin_kind: "comment",
+      source_revision: "9007199254741002",
+      unread: "1",
+      link: {
+        workspace: "workspace-1",
+        file: "file-text",
+        hunk: "hunk-text",
+        side: "new",
+        line: "9007199254740995",
+      },
+    }],
+  },
+  activities: {
+    state: "complete", total: "2", omitted: "0",
+    sources: { lineage: { state: "available" }, review: { state: "available" } },
+    items: [
+      {
+        id: "activity-review",
+        at: "1800000000001",
+        kind: "review",
+        label: "Review pending",
+        source: "review",
+        freshness: "fresh",
+        source_revision: "9007199254741003",
+        link: { workspace: "workspace-1" },
+      },
+      {
+        id: "activity-agent",
+        at: "1800000000000",
+        kind: "task",
+        label: "Task working",
+        source: "orchestration",
+        freshness: "fresh",
+        source_revision: "9007199254741002",
+        link: { workspace: "workspace-1", session: "runtime-session-1" },
+      },
+    ],
+  },
   actions: {
     lifecycle: { available: false, category: "platform_v2_lifecycle_adapter_pending" },
     review: { available: false, category: "platform_v2_review_adapter_pending" },
@@ -213,6 +257,55 @@ test("workspace-first layout does not overflow the active viewport", async ({ pa
   await expect(page.locator("#cockpit-workspace-navigation")).toBeVisible();
   await expect(page.locator("#cockpit-workspace-summary")).toBeVisible();
   await expect(page.locator("#cockpit-workspace-inspector")).toBeVisible();
+});
+
+test("attention inbox and chronological activity are accessible at desktop and mobile widths", async ({ page }) => {
+  await page.getByRole("tab", { name: "Activity" }).click();
+  const inbox = page.getByRole("list", { name: "Structured workspace attention inbox" });
+  const activity = page.getByRole("list", { name: "Chronological workspace activity" });
+  await expect(inbox).toBeVisible();
+  await expect(activity).toBeVisible();
+  await expect(inbox.getByText("Needs You · comment reply")).toBeVisible();
+  const reviewLink = inbox.getByRole("link", { name: /Open exact review context for comment reply/ });
+  await expect(reviewLink).toHaveAttribute(
+    "href",
+    "#sessions?workspace=workspace-1&file=file-text&hunk=hunk-text&side=new&line=9007199254740995",
+  );
+  await expect(activity.locator("li").first()).toContainText("Review pending");
+  await expect(activity.locator("li").nth(1)).toContainText("Task working");
+  await expect(activity.getByRole("link", { name: /Open exact context for Task working/ })).toHaveAttribute(
+    "href",
+    "#sessions?workspace=workspace-1&session=runtime-session-1",
+  );
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
+  expect(overflow).toBe(false);
+});
+
+test("partial and truncated collection coverage is never rendered as known empty", async ({ page }) => {
+  await page.getByRole("tab", { name: "Activity" }).click();
+  await page.evaluate((view) => globalThis.renderPlatform(view), {
+    ...cockpit,
+    inbox: {
+      state: "unavailable", items: [], total: "0", omitted: "0",
+      sources: { review: { state: "refused", category: "review_authority_refused" } },
+    },
+    activities: {
+      state: "partial",
+      items: [cockpit.activities.items[0]],
+      total: "4",
+      omitted: "3",
+      sources: {
+        lineage: { state: "available" },
+        review: { state: "refused", category: "review_authority_refused" },
+      },
+    },
+  });
+  await expect(page.locator("#cockpit-inbox-list")).toContainText("Structured projection unavailable");
+  await expect(page.locator("#cockpit-inbox-list")).toContainText("review_authority_refused");
+  await expect(page.locator("#cockpit-inbox-list")).not.toContainText("has no authoritative attention events");
+  await expect(page.locator("#cockpit-activity-list")).toContainText("Structured projection is partial");
+  await expect(page.locator("#cockpit-activity-list")).toContainText("3 of 4 newest-ordered records omitted");
+  await expect(page.locator("#cockpit-activity-list")).toContainText("review_authority_refused");
 });
 
 test("attention filtering preserves structured workspaces and retained sessions", async ({ page }) => {

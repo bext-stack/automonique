@@ -21,8 +21,8 @@ use automonique_protocol::platform_v2_lineage::{
 use automonique_protocol::platform_v2_lineage_api::encode_lineage_projection;
 use automonique_protocol::platform_v2_lineage_api::encode_workspace_intent_outcome;
 use automonique_protocol::platform_v2_review::{
-    DiffSide, ReviewAction, ReviewActionReceipt, ReviewAnchor, ReviewCommentId, ReviewDecision,
-    ReviewFileId, ReviewFreshnessState, ReviewHunkId, ReviewSnapshot, ReviewText,
+    AttentionReason, DiffSide, ReviewAction, ReviewActionReceipt, ReviewAnchor, ReviewCommentId,
+    ReviewDecision, ReviewFileId, ReviewFreshnessState, ReviewHunkId, ReviewSnapshot, ReviewText,
 };
 use automonique_protocol::platform_v2_review_api::{
     encode_review_action_receipt, encode_review_snapshot,
@@ -44,8 +44,15 @@ const REVIEW_ADAPTER_PENDING: &str = "platform_v2_review_adapter_pending";
 const MAX_ATTENTION_WORKSPACES: usize = 16;
 const MAX_COCKPIT_PROJECTS: usize = 128;
 const MAX_COCKPIT_WORK_CONTEXTS: usize = 1024;
+const MAX_COCKPIT_ACTIVITIES: usize = 256;
 const WORK_CONTEXT_PAGE_LIMIT: u16 = 128;
 const ATTENTION_READ_TIMEOUT: Duration = Duration::from_millis(100);
+
+#[derive(Debug)]
+struct BoundedCockpitItems {
+    items: Vec<Value>,
+    total: usize,
+}
 
 #[derive(Debug)]
 struct AttentionInventory {
@@ -307,6 +314,19 @@ fn read(
         review_snapshot.as_ref(),
     );
     let attention = attention_inventory(bridge, &records, selected_identity.as_ref(), &review);
+    let activity_items = cockpit_activities(lineage_projection.as_ref(), review_snapshot.as_ref());
+    let inbox_items = review_snapshot
+        .as_ref()
+        .map(review_inbox)
+        .unwrap_or(BoundedCockpitItems {
+            items: Vec::new(),
+            total: 0,
+        });
+    let activities = collection_projection(
+        activity_items,
+        &[("lineage", &lineage), ("review", &review)],
+    );
+    let inbox = collection_projection(inbox_items, &[("review", &review)]);
     Ok(json!({
         "schema": SCHEMA,
         "mode": "v2",
@@ -319,6 +339,8 @@ fn read(
         "lineage": lineage,
         "review": review,
         "attention": attention.coverage,
+        "activities": activities,
+        "inbox": inbox,
         "actions": {
             "lifecycle": lifecycle,
             "review": review_actions
@@ -1490,6 +1512,231 @@ fn lineage_status_message(status: &LineageStatus) -> Option<&str> {
     }
 }
 
+fn cockpit_activities(
+    lineage: Option<&LineageProjection>,
+    review: Option<&ReviewSnapshot>,
+) -> BoundedCockpitItems {
+    let mut values = Vec::<(u64, String, Value)>::new();
+    if let Some(lineage) = lineage {
+        for (index, item) in lineage.external_work_items().iter().enumerate() {
+            let id = format!("external-work-{index}");
+            let at = item.freshness().observed_at_ms();
+            values.push((
+                at,
+                id.clone(),
+                json!({
+                    "id": id,
+                    "at": at.to_string(),
+                    "kind": "external_work",
+                    "label": format!("External work {}", item.state().as_str()),
+                    "source": "external_work",
+                    "freshness": item.freshness().state().as_str(),
+                    "source_revision": item.revision().to_string(),
+                    "link": lineage_origin_json(item.origin())
+                }),
+            ));
+        }
+        for (index, item) in lineage.orchestration().iter().enumerate() {
+            let id = format!("orchestration-{index}");
+            let at = item.freshness().observed_at_ms();
+            values.push((
+                at,
+                id.clone(),
+                json!({
+                    "id": id,
+                    "at": at.to_string(),
+                    "kind": item.identity().kind().as_str(),
+                    "label": format!(
+                        "{} {}",
+                        item.identity().kind().as_str().replace('_', " "),
+                        item.status().kind()
+                    ),
+                    "source": "orchestration",
+                    "freshness": item.freshness().state().as_str(),
+                    "source_revision": item.revision().to_string(),
+                    "link": lineage_origin_json(item.origin())
+                }),
+            ));
+        }
+    }
+    if let Some(review) = review {
+        let workspace = review.workspace().id();
+        let mut push_review = |id: String,
+                               at: u64,
+                               kind: &'static str,
+                               label: String,
+                               freshness: ReviewFreshnessState,
+                               source_revision: Revision| {
+            values.push((
+                at,
+                id.clone(),
+                json!({
+                    "id": id,
+                    "at": at.to_string(),
+                    "kind": kind,
+                    "label": label,
+                    "source": "review",
+                    "freshness": freshness.as_str(),
+                    "source_revision": source_revision.to_string(),
+                    "link": { "workspace": workspace }
+                }),
+            ));
+        };
+        for check in review.checks() {
+            push_review(
+                format!("check-{}", check.id().as_str()),
+                check.freshness().observed_at_ms(),
+                "check",
+                format!("Check {}", check.state().as_str()),
+                check.freshness().state(),
+                check.freshness().observed_revision(),
+            );
+        }
+        push_review(
+            "review-status".to_owned(),
+            review.review().freshness().observed_at_ms(),
+            "review",
+            format!("Review {}", review.review().decision().as_str()),
+            review.review().freshness().state(),
+            review.review().freshness().observed_revision(),
+        );
+        push_review(
+            "pull-request-status".to_owned(),
+            review.pull_request().freshness().observed_at_ms(),
+            "pull_request",
+            format!(
+                "Pull request {} · {}",
+                review.pull_request().state().as_str(),
+                review.pull_request().readiness().as_str()
+            ),
+            review.pull_request().freshness().state(),
+            review.pull_request().freshness().observed_revision(),
+        );
+        push_review(
+            "delivery-status".to_owned(),
+            review.delivery().freshness().observed_at_ms(),
+            "delivery",
+            format!("Delivery {}", review.delivery().state().as_str()),
+            review.delivery().freshness().state(),
+            review.delivery().freshness().observed_revision(),
+        );
+    }
+    values.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let total = values.len();
+    values.truncate(MAX_COCKPIT_ACTIVITIES);
+    BoundedCockpitItems {
+        items: values.into_iter().map(|(_, _, value)| value).collect(),
+        total,
+    }
+}
+
+fn review_inbox(review: &ReviewSnapshot) -> BoundedCockpitItems {
+    let mut values: Vec<_> = review
+        .attention_events()
+        .iter()
+        .map(|event| {
+            let mut link = json!({ "workspace": review.workspace().id() });
+            if event.reason() == AttentionReason::CommentReply
+                && let Some(comment) = event.origin().id().and_then(|id| {
+                    review
+                        .comments()
+                        .iter()
+                        .find(|comment| comment.id().as_str() == id.as_str())
+                })
+            {
+                let anchor = comment.anchor();
+                link = json!({
+                    "workspace": review.workspace().id(),
+                    "file": anchor.file_id().as_str(),
+                    "hunk": anchor.hunk_id().as_str(),
+                    "side": anchor.side().as_str(),
+                    "line": anchor.line().to_string()
+                });
+            }
+            json!({
+                "id": event.id().as_str(),
+                "state": attention_state_for_reason(event.reason()),
+                "reason": event.reason().as_str(),
+                "origin_kind": event.origin().kind().as_str(),
+                "source_revision": event.source_revision().to_string(),
+                "unread": event.unread().to_string(),
+                "link": link
+            })
+        })
+        .collect();
+    values.sort_by(|left, right| {
+        let left_revision = left["source_revision"].as_str().unwrap_or_default();
+        let right_revision = right["source_revision"].as_str().unwrap_or_default();
+        right_revision
+            .len()
+            .cmp(&left_revision.len())
+            .then_with(|| right_revision.cmp(left_revision))
+            .then_with(|| {
+                left["id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .cmp(right["id"].as_str().unwrap_or_default())
+            })
+    });
+    let total = values.len();
+    BoundedCockpitItems {
+        items: values,
+        total,
+    }
+}
+
+fn collection_projection(bounded: BoundedCockpitItems, sources: &[(&str, &Value)]) -> Value {
+    let available_sources = sources
+        .iter()
+        .filter(|(_, value)| value["state"] == "available")
+        .count();
+    let omitted = bounded.total.saturating_sub(bounded.items.len());
+    let state = if available_sources == sources.len() && omitted == 0 {
+        "complete"
+    } else if available_sources == 0 {
+        "unavailable"
+    } else {
+        "partial"
+    };
+    let source_coverage = sources
+        .iter()
+        .map(|(name, value)| {
+            let mut coverage = serde_json::Map::new();
+            coverage.insert(
+                "state".to_owned(),
+                value
+                    .get("state")
+                    .cloned()
+                    .unwrap_or_else(|| json!("unavailable")),
+            );
+            if let Some(category) = value.get("category") {
+                coverage.insert("category".to_owned(), category.clone());
+            }
+            ((*name).to_owned(), Value::Object(coverage))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    json!({
+        "state": state,
+        "items": bounded.items,
+        "total": bounded.total.to_string(),
+        "omitted": omitted.to_string(),
+        "sources": source_coverage
+    })
+}
+
+const fn attention_state_for_reason(reason: AttentionReason) -> &'static str {
+    match reason {
+        AttentionReason::ReviewRequested
+        | AttentionReason::CommentReply
+        | AttentionReason::ApprovalRequired => "needs_you",
+        AttentionReason::CheckRunning | AttentionReason::DeliveryPending => "working",
+        AttentionReason::CheckFailed
+        | AttentionReason::Conflict
+        | AttentionReason::ExternalBlocker => "blocked",
+        AttentionReason::Complete => "done",
+    }
+}
+
 fn base_record(record: &WorkContextRecord) -> Value {
     json!({
         "id": record.identity().id(),
@@ -1538,6 +1785,19 @@ fn v1_fallback(retained_v1: Value, category: &str) -> Value {
         "degradation": { "category": category },
         "retained_v1": retained_v1,
         "projects": [], "hosts": [], "workspaces": [],
+        "activities": {
+            "state": "unavailable", "items": [], "total": "0", "omitted": "0",
+            "sources": {
+                "lineage": { "state": "unavailable", "category": category },
+                "review": { "state": "unavailable", "category": category }
+            }
+        },
+        "inbox": {
+            "state": "unavailable", "items": [], "total": "0", "omitted": "0",
+            "sources": {
+                "review": { "state": "unavailable", "category": category }
+            }
+        },
         "selected": { "workspace": Value::Null },
         "lineage": unavailable("platform_v2_unavailable"),
         "review": unavailable("platform_v2_unavailable"),
@@ -1644,11 +1904,21 @@ mod tests {
         );
         assert_eq!(value["mode"], "v1");
         assert_eq!(value["workspaces"], json!([]));
+        assert_eq!(value["activities"]["state"], "unavailable");
+        assert_eq!(
+            value["activities"]["sources"]["lineage"]["category"],
+            "unavailable"
+        );
+        assert_eq!(value["inbox"]["state"], "unavailable");
         assert_eq!(value["actions"]["lifecycle"]["available"], false);
         let unavailable = v2_unavailable(json!({ "sessions": [] }), "v2_down");
         assert_eq!(unavailable["mode"], "partial");
         assert_eq!(unavailable["degradation"]["platform"], "v2");
         assert_eq!(unavailable["degradation"]["state"], "unavailable");
+        assert_eq!(
+            unavailable["activities"]["sources"]["review"]["category"],
+            "v2_down"
+        );
     }
 
     #[test]
@@ -2017,5 +2287,107 @@ mod tests {
         assert_eq!(task["origin"]["workspace"], "workspace-lineage");
         assert_eq!(task["parent"]["kind"], "run");
         assert_eq!(task["parent"]["id"], "run-42");
+    }
+
+    #[test]
+    fn authoritative_activity_and_inbox_keep_chronology_and_exact_comment_anchor() {
+        use automonique_protocol::platform_v2_lineage::{
+            ExternalWorkItem, LineageFreshness, LineageMessage, LineageOrigin, OrchestrationRecord,
+            OrchestrationRunId,
+        };
+        use automonique_protocol::platform_v2_review_api::decode_review_snapshot;
+
+        let workspace = UserWorkspaceId::new("wc_user_1").unwrap();
+        let freshness = LineageFreshness::new(100, 60_000, LineageFreshnessState::Fresh).unwrap();
+        let external_identity = ExternalWorkIdentity::new(
+            ExternalWorkProvider::GitHub,
+            ExternalWorkAuthorityId::new("github.com").unwrap(),
+            ExternalWorkScope::new("owner/repository").unwrap(),
+            ExternalWorkKey::new("42").unwrap(),
+        );
+        let external = ExternalWorkItem::new_with_origin(
+            external_identity.clone(),
+            LineageOrigin::workspace_only(workspace.clone()),
+            Revision::FIRST,
+            ExternalWorkState::Open,
+            None,
+            freshness,
+            None,
+        )
+        .unwrap();
+        let orchestration = OrchestrationRecord::new_with_origin(
+            OrchestrationIdentity::Run(OrchestrationRunId::new("run-42").unwrap()),
+            LineageOrigin::workspace_only(workspace.clone()),
+            Some(external_identity),
+            None,
+            LineageStatus::Blocked(LineageMessage::new("awaiting review").unwrap()),
+            LineageFreshness::new(200, 60_000, LineageFreshnessState::Fresh).unwrap(),
+            None,
+            Revision::FIRST,
+        )
+        .unwrap();
+        let lineage =
+            LineageProjection::new(workspace, vec![external], vec![orchestration]).unwrap();
+
+        let mut review_value: Value = serde_json::from_slice(include_bytes!(
+            "../../automonique-protocol/fixtures/platform-v2-review-v2.json"
+        ))
+        .unwrap();
+        review_value["attention_events"][0] = json!({
+            "id": "attention-comment",
+            "origin": {
+                "authority": { "id": "authority-1", "kind": "review" },
+                "id": "comment-1",
+                "kind": "comment",
+                "revision": 2
+            },
+            "reason": "comment_reply",
+            "unread": 1
+        });
+        review_value["attention"] = json!({
+            "reason": "comment_reply",
+            "source_revision": 2,
+            "state": "needs_you",
+            "unread": 1
+        });
+        let review = decode_review_snapshot(&serde_json::to_vec(&review_value).unwrap()).unwrap();
+
+        let activity = cockpit_activities(Some(&lineage), Some(&review));
+        assert_eq!(activity.total, 6);
+        assert_eq!(activity.items[0]["at"], "1800000000000");
+        assert_eq!(activity.items.last().unwrap()["at"], "100");
+        assert!(
+            activity
+                .items
+                .iter()
+                .all(|value| value["link"]["workspace"] == "wc_user_1")
+        );
+
+        let inbox = review_inbox(&review);
+        assert_eq!(inbox.total, 1);
+        assert_eq!(inbox.items[0]["state"], "needs_you");
+        assert_eq!(inbox.items[0]["source_revision"], "2");
+        assert_eq!(inbox.items[0]["link"]["workspace"], "wc_user_1");
+        assert_eq!(inbox.items[0]["link"]["file"], "file-1");
+        assert_eq!(inbox.items[0]["link"]["hunk"], "hunk-1");
+        assert_eq!(inbox.items[0]["link"]["side"], "new");
+        assert_eq!(inbox.items[0]["link"]["line"], "11");
+
+        let available = json!({ "state": "available" });
+        let refused = json!({ "state": "refused", "category": "review_refused" });
+        let projection = collection_projection(
+            BoundedCockpitItems {
+                items: vec![json!({ "id": "newest" }); MAX_COCKPIT_ACTIVITIES],
+                total: MAX_COCKPIT_ACTIVITIES + 3,
+            },
+            &[("lineage", &available), ("review", &refused)],
+        );
+        assert_eq!(projection["state"], "partial");
+        assert_eq!(projection["total"], "259");
+        assert_eq!(projection["omitted"], "3");
+        assert_eq!(
+            projection["sources"]["review"]["category"],
+            "review_refused"
+        );
     }
 }

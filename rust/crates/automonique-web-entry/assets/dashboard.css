@@ -1074,6 +1074,10 @@ kbd { padding: 1px 4px; border: 1px solid var(--line-bright); border-bottom-colo
 .cockpit-read-model-grid strong { margin-top: 8px; color: var(--violet); }
 .cockpit-read-model-grid strong[data-available="true"] { color: var(--green); }
 .cockpit-read-model-grid p { color: var(--muted); font-size: var(--font-xs); line-height: 1.45; }
+.cockpit-timeline-section > header { padding: 14px 16px 9px; border-bottom: 1px solid var(--line); background: var(--panel-2); }
+.cockpit-timeline-section > header small { display: block; color: var(--quiet); font: var(--font-2xs) ui-monospace, monospace; letter-spacing: .08em; }
+.cockpit-timeline-section > header h3 { margin: 4px 0 0; color: var(--text); font-size: var(--font-md); }
+.cockpit-timeline-section + .cockpit-timeline-section { border-top: 1px solid var(--line); }
 .cockpit-activity-list { display: grid; margin: 0; padding: 0; list-style: none; }
 .cockpit-activity-list li { display: grid; grid-template-columns: minmax(160px, .6fr) minmax(0, 1fr) auto; gap: 14px; align-items: center; padding: 13px 16px; border-bottom: 1px solid var(--line); }
 .cockpit-activity-list strong { color: var(--violet); font-size: var(--font-sm); }
