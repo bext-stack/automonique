@@ -435,7 +435,10 @@ impl NamespacedMountedTempfs {
         let Some(path) = self.checkpoint_path.clone() else {
             return Ok(());
         };
-        self.checkpoint_sequence += 1;
+        self.checkpoint_sequence = self
+            .checkpoint_sequence
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("checkpoint sequence exhausted"))?;
         Checkpoint {
             sequence: self.checkpoint_sequence,
             at_millis: now_millis(),
@@ -477,8 +480,11 @@ impl NamespacedMountedTempfs {
             aborted: false,
         };
         if let Some(path) = checkpoint_path {
+            let sequence = checkpoint_sequence
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("checkpoint sequence exhausted"))?;
             Checkpoint {
-                sequence: checkpoint_sequence.saturating_add(1),
+                sequence,
                 at_millis: now_millis(),
                 phase: Phase::Final,
                 snapshot: ledger.clone(),

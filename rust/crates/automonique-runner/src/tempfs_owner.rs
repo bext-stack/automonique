@@ -814,7 +814,7 @@ fn authenticate(fields: &[&str], custody: &Custody) -> Result<(), OwnerError> {
 }
 
 fn sequence_is_next(request: u64, fence: u64, durable: u64) -> bool {
-    durable == fence && request == fence.saturating_add(1)
+    durable == fence && fence.checked_add(1) == Some(request)
 }
 
 fn verify_cgroup(path: &Path, dev: u64, ino: u64) -> Result<(), OwnerError> {
@@ -902,8 +902,12 @@ fn cleanup_custody_state(checkpoint: &Path) {
 fn write_aborted_final(path: &Path, checkpoint: Checkpoint) -> Result<(), OwnerError> {
     let statfs = crate::StatfsReadback::from_ledger(&checkpoint.snapshot)
         .map_err(|_| OwnerError::Refused("checkpoint ledger"))?;
+    let sequence = checkpoint
+        .sequence
+        .checked_add(1)
+        .ok_or(OwnerError::Refused("sequence exhausted"))?;
     Checkpoint {
-        sequence: checkpoint.sequence.saturating_add(1),
+        sequence,
         at_millis: crate::tempfs_checkpoint::now_millis(),
         phase: CheckpointPhase::Final,
         snapshot: checkpoint.snapshot,
@@ -1248,6 +1252,23 @@ mod tests {
         assert!(!sequence_is_next(7, 7, 7));
         assert!(!sequence_is_next(9, 7, 7));
         assert!(!sequence_is_next(8, 6, 7));
+        assert!(!sequence_is_next(u64::MAX, u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn exhausted_live_checkpoint_is_never_rewritten_as_a_non_monotonic_final() {
+        let directory = tempfile::tempdir().unwrap();
+        let checkpoint = directory.path().join("checkpoint");
+        live_checkpoint(&checkpoint, u64::MAX);
+
+        let durable = Checkpoint::read(&checkpoint).unwrap();
+        assert!(matches!(
+            write_aborted_final(&checkpoint, durable),
+            Err(OwnerError::Refused("sequence exhausted"))
+        ));
+        let unchanged = Checkpoint::read(&checkpoint).unwrap();
+        assert_eq!(unchanged.phase, CheckpointPhase::Live);
+        assert_eq!(unchanged.sequence, u64::MAX);
     }
 
     #[test]
