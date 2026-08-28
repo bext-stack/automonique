@@ -77,8 +77,11 @@
 //! It does not terminate TLS, mint certificates, or hold a trust root, so it
 //! cannot read, alter, or record request contents even by mistake; a change
 //! that made it able to would announce itself as this crate acquiring a TLS
-//! dependency. It has no logging surface at all: what an operator can learn
-//! from it is [`BrokerStats`], which is counters.
+//! dependency. It has no request logging surface: what an operator can learn
+//! from it is [`BrokerStats`] plus the latest exact, parser-validated
+//! destination that the allowlist refused. That one bounded coordinate lets
+//! the owning run explain a provider failure without retaining headers,
+//! payload bytes, or resolved addresses.
 //!
 //! # No proxy authentication, deliberately
 //!
@@ -105,7 +108,7 @@ pub mod relay;
 pub mod request;
 pub mod substitute;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -145,6 +148,183 @@ pub const MAX_RESOLVED_ADDRESSES: usize = 4;
 
 /// Longest any configurable deadline may be.
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// Most refusal events retained for one run broker.
+///
+/// A cursor older than this window is reported as ambiguous rather than being
+/// matched to a destination the observer can no longer prove was the only one.
+pub const MAX_REFUSED_DESTINATION_EVENTS: usize = 256;
+
+/// One exact `CONNECT` destination refused by an allowlist decision.
+///
+/// The host has already passed the broker's bounded authority parser and is
+/// normalized exactly as an allowlist host is. No header or request body is
+/// retained with it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefusedDestination {
+    host: DestinationHost,
+    port: u16,
+}
+
+/// A monotonic position bound to the one broker stream that issued it.
+///
+/// The stream reference is private and the cursor is deliberately neither
+/// cloneable nor copyable. A caller can advance the one cursor it received,
+/// but cannot forge a numeric position, replay a copied position, or apply a
+/// position from another run's broker to this one.
+pub struct RefusedDestinationCursor {
+    state: Arc<Mutex<RefusedDestinationState>>,
+    sequence: u64,
+}
+
+impl fmt::Debug for RefusedDestinationCursor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RefusedDestinationCursor")
+            .field("state", &"bound")
+            .finish()
+    }
+}
+
+/// What one bounded interval of the refusal stream proves.
+#[derive(Clone, Eq, PartialEq)]
+pub enum RefusedDestinationWindow {
+    /// No allowlist refusal occurred after the supplied cursor.
+    Empty,
+    /// Every retained refusal after the cursor named this same coordinate.
+    Unambiguous(RefusedDestination),
+    /// The interval named different coordinates or exceeded retained history.
+    Ambiguous,
+}
+
+impl fmt::Debug for RefusedDestinationWindow {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RefusedDestinationWindow")
+            .field(
+                "state",
+                &match self {
+                    Self::Empty => "empty",
+                    Self::Unambiguous(_) => "unambiguous",
+                    Self::Ambiguous => "ambiguous",
+                },
+            )
+            .finish()
+    }
+}
+
+#[derive(Default)]
+struct RefusedDestinationState {
+    sequence: u64,
+    history_lost: bool,
+    events: VecDeque<(u64, RefusedDestination)>,
+}
+
+impl RefusedDestinationState {
+    fn record(&mut self, destination: RefusedDestination) {
+        let Some(sequence) = self.sequence.checked_add(1) else {
+            self.history_lost = true;
+            self.events.clear();
+            return;
+        };
+        self.sequence = sequence;
+        self.events.push_back((sequence, destination));
+        if self.events.len() > MAX_REFUSED_DESTINATION_EVENTS {
+            self.events.pop_front();
+        }
+    }
+
+    fn take_since(&self, cursor: &mut RefusedDestinationCursor) -> RefusedDestinationWindow {
+        let end = self.sequence;
+        let start = cursor.sequence;
+        cursor.sequence = end;
+        if self.history_lost || start > end {
+            return RefusedDestinationWindow::Ambiguous;
+        }
+        if start == end {
+            return RefusedDestinationWindow::Empty;
+        }
+        let Some((first_retained, _)) = self.events.front() else {
+            return RefusedDestinationWindow::Ambiguous;
+        };
+        if start.saturating_add(1) < *first_retained {
+            return RefusedDestinationWindow::Ambiguous;
+        }
+        let mut observed = self
+            .events
+            .iter()
+            .filter(|(sequence, _)| *sequence > start)
+            .map(|(_, destination)| destination);
+        let Some(first) = observed.next().cloned() else {
+            return RefusedDestinationWindow::Ambiguous;
+        };
+        if observed.all(|destination| destination == &first) {
+            RefusedDestinationWindow::Unambiguous(first)
+        } else {
+            RefusedDestinationWindow::Ambiguous
+        }
+    }
+}
+
+impl RefusedDestination {
+    /// The normalized host the workload requested.
+    #[must_use]
+    pub const fn host(&self) -> &DestinationHost {
+        &self.host
+    }
+
+    /// The exact requested port.
+    #[must_use]
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+/// Read-only custody for one broker's bounded destination-refusal observation.
+#[derive(Clone)]
+pub struct RefusedDestinationObserver {
+    state: Arc<Mutex<RefusedDestinationState>>,
+}
+
+impl fmt::Debug for RefusedDestinationObserver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RefusedDestinationObserver")
+            .field(
+                "has_refusal",
+                &self.state.lock().is_ok_and(|state| state.sequence != 0),
+            )
+            .finish()
+    }
+}
+
+impl RefusedDestinationObserver {
+    /// Snapshot the current monotonic position before a provider request.
+    #[must_use]
+    pub fn cursor(&self) -> Option<RefusedDestinationCursor> {
+        let sequence = self.state.lock().ok()?.sequence;
+        Some(RefusedDestinationCursor {
+            state: Arc::clone(&self.state),
+            sequence,
+        })
+    }
+
+    /// Consume the bounded refusal interval after `cursor` and advance it.
+    ///
+    /// Repeated refusals of one coordinate remain unambiguous. Different
+    /// coordinates, lost history, a poisoned observer, or an invalid cursor
+    /// all fail closed as [`RefusedDestinationWindow::Ambiguous`].
+    pub fn take_since(&self, cursor: &mut RefusedDestinationCursor) -> RefusedDestinationWindow {
+        if !Arc::ptr_eq(&self.state, &cursor.state) {
+            return RefusedDestinationWindow::Ambiguous;
+        }
+        self.state
+            .lock()
+            .map_or(RefusedDestinationWindow::Ambiguous, |state| {
+                state.take_since(cursor)
+            })
+    }
+}
 
 /// How often the accept loop checks for shutdown while idle.
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -440,6 +620,7 @@ struct Shared {
     config: BrokerConfig,
     counters: Counters,
     ledger: RefusalLedger,
+    refused_destination: Arc<Mutex<RefusedDestinationState>>,
     live: Mutex<LiveConnections>,
     stopping: AtomicBool,
 }
@@ -552,6 +733,7 @@ impl EgressBroker {
             config,
             counters: Counters::default(),
             ledger: RefusalLedger::default(),
+            refused_destination: Arc::new(Mutex::new(RefusedDestinationState::default())),
             live: Mutex::new(LiveConnections::default()),
             stopping: AtomicBool::new(false),
         });
@@ -605,6 +787,17 @@ impl EgressBroker {
     #[must_use]
     pub fn refusals(&self) -> Vec<RefusalRecord> {
         self.shared.ledger.entries()
+    }
+
+    /// A read-only handle to this broker's latest allowlist-refused target.
+    ///
+    /// The handle owns only the bounded observation, not the broker config or
+    /// any provider credential, and may safely outlive broker teardown.
+    #[must_use]
+    pub fn refused_destination_observer(&self) -> RefusedDestinationObserver {
+        RefusedDestinationObserver {
+            state: Arc::clone(&self.shared.refused_destination),
+        }
     }
 
     /// The bound loopback address. Its port is what a launch plan grants.
@@ -891,6 +1084,12 @@ fn serve(shared: &Arc<Shared>, client: TcpStream, peer: SocketAddr) {
             .counters
             .denied_destination
             .fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut state) = shared.refused_destination.lock() {
+            state.record(RefusedDestination {
+                host: read.request.host().clone(),
+                port: read.request.port(),
+            });
+        }
         refuse(&client, Refusal::Forbidden, config.head_timeout);
         return;
     };

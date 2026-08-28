@@ -1369,6 +1369,73 @@ fn a_contained_jcode_protocol_turn_answers_through_the_production_lane() {
 }
 
 #[test]
+fn a_contained_jcode_route_refusal_names_its_destination_in_the_authoritative_spool() {
+    let test = "a_contained_jcode_route_refusal_names_its_destination_in_the_authoritative_spool";
+    if let Some(reason) = first_failing_gate() {
+        not_proven(test, reason);
+        return;
+    }
+    let fixture = Fixture::new(
+        None,
+        Some(&format!("127.0.0.1 {} loopback\n", unused_loopback_port())),
+    );
+    let home = fixture.provider_home();
+    let script = concat!(
+        "IFS= read -r request; printf '%s\\n' '",
+        "{\"v\":1,\"reply_to\":1,\"ev\":\"hello_ok\",\"version\":1,\"server\":\"jcode/refused-route-fixture\",",
+        "\"capabilities\":[\"sessions\",\"streaming\",\"cancellation\",\"soft_interrupt\",",
+        "\"stdin_requests\",\"history\",\"model_catalog\",\"reasoning_effort\",\"usage\",\"runtime_info\"]}'; ",
+        "IFS= read -r request; printf '%s\\n' '",
+        "{\"v\":1,\"reply_to\":2,\"ev\":\"attached\",\"session\":{\"session_id\":\"jcode-refused-route-session\",\"status\":\"idle\"}}'; ",
+        "IFS= read -r request; /usr/bin/busybox sleep 1; ",
+        "proxy_port=${HTTPS_PROXY##*:}; ",
+        "printf 'CONNECT Missing.Example:443 HTTP/1.1\\r\\n\\r\\n' | ",
+        "/usr/bin/busybox nc 127.0.0.1 \"$proxy_port\" >/dev/null; ",
+        "printf '%s\\n' '",
+        "{\"v\":1,\"reply_to\":3,\"ev\":\"error\",\"code\":\"rejected\"}'; ",
+        "while IFS= read -r request; do :; done"
+    );
+    write_private(
+        &fixture.state_dir().join(PROVIDER_CONFIG_NAME),
+        &format!(
+            "engine=jcode\nbinary={BUSYBOX}\nhome={}\nversion=jcode/refused-route-fixture\narg=sh\narg=-c\narg={script}\narg=api-stdio\n",
+            home.display()
+        ),
+    );
+
+    let serving = serve(&fixture.config);
+    let mut lane = open_lane(&fixture);
+    let run = std::thread::spawn(move || lane.run("exercise a refused provider route"));
+    let index =
+        automonique_store::run_index::RunIndex::open(fixture.state_dir().join(RUN_INDEX_NAME))
+            .expect("run index");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let run_id = wait_for_ready_run(&index, deadline, "JCode refusal run did not become live");
+    assert_eq!(
+        run.join().expect("run thread"),
+        Err(RunFailure::Failed),
+        "the provider refusal is terminal"
+    );
+    let projected = automonique_runner::read_events(
+        fixture.state_dir().join("runs").join(&run_id).join("spool"),
+        &run_id,
+    )
+    .expect("verified spool events");
+    assert!(
+        projected.iter().any(|event| {
+            ProgressFrame::from_canonical_bytes(event.payload()).is_ok_and(|frame| {
+                frame.kind() == automonique_protocol::event::EventKind::ProviderFault
+                    && frame.authority() == automonique_protocol::event::Authority::Authoritative
+                    && frame.body().text().map(|text| text.as_str())
+                        == Some("provider route refused destination missing.example:443")
+            })
+        }),
+        "the production JCode spool must bind the terminal fault to its broker refusal"
+    );
+    serving.shutdown(&fixture.config);
+}
+
+#[test]
 fn a_jcode_provider_permission_waits_for_the_durable_operator_decision() {
     let test = "a_jcode_provider_permission_waits_for_the_durable_operator_decision";
     if let Some(reason) = first_failing_gate() {

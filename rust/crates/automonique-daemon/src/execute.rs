@@ -138,7 +138,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use automonique_egress_broker::{BrokerConfig, EgressBroker};
+use automonique_egress_broker::{
+    BrokerConfig, EgressBroker, RefusedDestinationCursor, RefusedDestinationObserver,
+    RefusedDestinationWindow,
+};
 use automonique_protocol::digest::{ALGORITHM, Sha256};
 use automonique_protocol::event::{Authority as FrameAuthority, RetryCategory, RetryContext};
 use automonique_protocol::execute_api::ExecuteRefusal;
@@ -185,7 +188,7 @@ use sha2::Digest as _;
 
 use crate::attempt_host::DaemonAttemptHost;
 use crate::jcode_session_host::{
-    HOST_CLOSED_REASON, JcodeInputRequest, JcodeSessionHost, JcodeTurnOutcome,
+    HOST_CLOSED_REASON, JcodeHostError, JcodeInputRequest, JcodeSessionHost, JcodeTurnOutcome,
 };
 use crate::progress::{JcodeProgressMapper, ProviderProgressMapper};
 use crate::progress_hub::ProgressHub;
@@ -943,6 +946,9 @@ impl ExecutionLane {
         // the other branch and gets no broker, no socket grant and no proxy
         // variable at all.
         let (admitted, broker) = self.start_broker(admitted)?;
+        let refused_destination = broker
+            .as_ref()
+            .map(EgressBroker::refused_destination_observer);
 
         // Admitted, so the run may now have a place on disk. The attempt
         // workspace is created empty and the spool root beside it, never inside
@@ -1037,6 +1043,7 @@ impl ExecutionLane {
                     managed_sessions_path: self.managed_sessions_path.clone(),
                     controls: Arc::clone(&self.jcode_controls),
                     temporary_storage: Some(temporary_storage_watch.clone()),
+                    refused_destination,
                     approval: ProviderApprovalContext {
                         store_path: self.state_dir.join(crate::APPROVAL_REQUESTS_NAME),
                         spec_digest: admitted
@@ -1433,6 +1440,8 @@ struct JcodePreparedParts<'a> {
     /// The run's temporary-storage watch, when it has a mount. `None` only
     /// for callers that run without one, such as tests of the protocol alone.
     temporary_storage: Option<TemporaryStorageWatch>,
+    /// The bounded target most recently refused by this run's own broker.
+    refused_destination: Option<RefusedDestinationObserver>,
     approval: ProviderApprovalContext,
 }
 
@@ -1500,6 +1509,7 @@ struct JcodePreparedRun {
     managed_sessions_path: PathBuf,
     controls: Arc<JcodeControlRegistry>,
     temporary_storage: Option<TemporaryStorageWatch>,
+    refused_destination: Option<RefusedDestinationObserver>,
     approval: ProviderApprovalContext,
     observed: ObservedSequence,
 }
@@ -1533,6 +1543,7 @@ impl JcodePreparedRun {
             managed_sessions_path: parts.managed_sessions_path,
             controls: parts.controls,
             temporary_storage: parts.temporary_storage,
+            refused_destination: parts.refused_destination,
             approval: parts.approval,
             observed: ObservedSequence::default(),
         })
@@ -1561,6 +1572,7 @@ impl JcodePreparedRun {
             managed_sessions_path,
             controls,
             temporary_storage,
+            refused_destination,
             approval,
             observed,
         } = self;
@@ -1574,6 +1586,8 @@ impl JcodePreparedRun {
             publisher,
             observed: observed.clone(),
             progress_stopped: false,
+            refused_destination,
+            refused_destination_cursor: None,
         };
         if cancellation.is_cancelled() {
             return writer.finish(RunSpoolState::Cancelled);
@@ -1635,6 +1649,7 @@ impl JcodePreparedRun {
             BTreeMap::new();
         let mut mapper = JcodeProgressMapper::new(resume_session_id.is_some());
         writer.project(&mut mapper, host.take_events());
+        writer.begin_provider_request();
         if host
             .start_turn(&format!("{run_id}-turn"), &prompt, now_ms)
             .is_err()
@@ -1673,7 +1688,7 @@ impl JcodePreparedRun {
                     crate::unix_millis().unwrap_or(now_ms),
                     Duration::from_millis(100),
                 );
-                writer.project(&mut mapper, host.take_events());
+                writer.project_turn_outcome(&mut mapper, host.take_events(), &cancelled);
                 match cancelled {
                     Ok(JcodeTurnOutcome::Cancelled | JcodeTurnOutcome::Completed(_)) => {
                         break RunSpoolState::Cancelled;
@@ -1732,7 +1747,7 @@ impl JcodePreparedRun {
                     _ => {}
                 }
             }
-            writer.project(&mut mapper, events);
+            writer.project_turn_outcome(&mut mapper, events, &outcome);
             match outcome {
                 Ok(JcodeTurnOutcome::Pending) => {}
                 Ok(JcodeTurnOutcome::Completed(result)) => {
@@ -1795,7 +1810,11 @@ impl JcodePreparedRun {
                                     crate::unix_millis().unwrap_or(now_ms),
                                     Duration::from_millis(100),
                                 );
-                                writer.project(&mut mapper, host.take_events());
+                                writer.project_turn_outcome(
+                                    &mut mapper,
+                                    host.take_events(),
+                                    &response,
+                                );
                                 match response {
                                     Ok(JcodeTurnOutcome::Pending) => {
                                         let _ = command.response.send(Ok(()));
@@ -1902,7 +1921,12 @@ impl JcodePreparedRun {
                         crate::unix_millis().unwrap_or(now_ms),
                         Duration::from_millis(100),
                     );
-                    writer.project(&mut mapper, host.take_events());
+                    let events = host.take_events();
+                    if forced_state.is_none() {
+                        writer.project_turn_outcome(&mut mapper, events, &decided);
+                    } else {
+                        writer.project(&mut mapper, events);
+                    }
                     if let Some(state) = forced_state {
                         if state == RunSpoolState::Cancelled
                             && matches!(decided, Ok(JcodeTurnOutcome::Pending))
@@ -1959,6 +1983,8 @@ struct JcodeSpoolWriter {
     publisher: Box<dyn ProgressPublisher>,
     observed: ObservedSequence,
     progress_stopped: bool,
+    refused_destination: Option<RefusedDestinationObserver>,
+    refused_destination_cursor: Option<RefusedDestinationCursor>,
 }
 
 impl JcodeSpoolWriter {
@@ -2071,13 +2097,68 @@ impl JcodeSpoolWriter {
         mapper: &mut JcodeProgressMapper,
         events: Vec<automonique_agents::JcodeEvent>,
     ) {
+        self.project_events(mapper, events, false);
+    }
+
+    fn project_turn_outcome(
+        &mut self,
+        mapper: &mut JcodeProgressMapper,
+        events: Vec<automonique_agents::JcodeEvent>,
+        outcome: &Result<JcodeTurnOutcome, JcodeHostError>,
+    ) {
+        self.project_events(
+            mapper,
+            events,
+            matches!(outcome, Err(JcodeHostError::ProviderRefused)),
+        );
+    }
+
+    fn project_events(
+        &mut self,
+        mapper: &mut JcodeProgressMapper,
+        events: Vec<automonique_agents::JcodeEvent>,
+        terminal_provider_refusal: bool,
+    ) {
+        let correlated_faults = events
+            .iter()
+            .filter(|event| matches!(event, automonique_agents::JcodeEvent::Error { .. }))
+            .count();
         for event in events {
-            if let Some(frame) = mapper.project_event(event)
+            let correlated_terminal_fault = terminal_provider_refusal
+                && correlated_faults == 1
+                && matches!(event, automonique_agents::JcodeEvent::Error { .. });
+            if let Some(frame) = mapper
+                .project_event(event)
+                .map(|frame| self.with_refused_destination(frame, correlated_terminal_fault))
                 && self.append_frame(&frame).is_err()
             {
                 self.stop_progress();
             }
         }
+    }
+
+    fn begin_provider_request(&mut self) {
+        self.refused_destination_cursor = self
+            .refused_destination
+            .as_ref()
+            .and_then(RefusedDestinationObserver::cursor);
+    }
+
+    /// Replace a generic provider fault with the exact bounded destination
+    /// this run's own broker refused. The observation contains only the parsed
+    /// CONNECT authority; no provider text, header, credential, address, or
+    /// payload crosses this boundary.
+    fn with_refused_destination(
+        &mut self,
+        frame: CapturedFrame,
+        correlated_terminal_fault: bool,
+    ) -> CapturedFrame {
+        describe_refused_destination(
+            frame,
+            self.refused_destination.as_ref(),
+            self.refused_destination_cursor.as_mut(),
+            correlated_terminal_fault,
+        )
     }
 
     fn stop_progress(&mut self) {
@@ -2198,6 +2279,48 @@ impl JcodeSpoolWriter {
             state,
             last_sequence: status.last_sequence(),
         }
+    }
+}
+
+fn describe_refused_destination(
+    frame: CapturedFrame,
+    observer: Option<&RefusedDestinationObserver>,
+    cursor: Option<&mut RefusedDestinationCursor>,
+    correlated_terminal_fault: bool,
+) -> CapturedFrame {
+    if frame.kind != automonique_protocol::event::EventKind::ProviderFault
+        || !correlated_terminal_fault
+    {
+        return frame;
+    }
+    let Some((observer, cursor)) = observer.zip(cursor) else {
+        return frame;
+    };
+    let RefusedDestinationWindow::Unambiguous(refused) = observer.take_since(cursor) else {
+        return frame;
+    };
+    let Some(text) = ProgressText::new(format!(
+        "provider route refused destination {}:{}",
+        refused.host(),
+        refused.port()
+    ))
+    .ok() else {
+        return frame;
+    };
+    let Ok(body) = ProgressBody::new(
+        frame.kind,
+        ProgressBodyParts {
+            text: Some(text),
+            step: frame.body.step(),
+            retry: frame.body.retry(),
+        },
+    ) else {
+        return frame;
+    };
+    CapturedFrame {
+        authority: frame.authority,
+        kind: frame.kind,
+        body,
     }
 }
 
@@ -2803,10 +2926,13 @@ fn is_containment_run_id(run_id: &str) -> bool {
 mod tests {
     use super::{
         MAX_PROVIDER_BINARY_BYTES, PROVIDER_APPROVAL_PROPOSER, TokenCancelSink, admission_refusal,
-        expire_unanswered_approvals, is_containment_run_id, is_safe_segment, is_within_byte_limit,
-        provider_binary_digest,
+        describe_refused_destination, expire_unanswered_approvals, is_containment_run_id,
+        is_safe_segment, is_within_byte_limit, provider_binary_digest,
     };
     use crate::attempt_host::DaemonAttemptHost;
+    use crate::progress::JcodeProgressMapper;
+    use automonique_agents::JcodeEvent;
+    use automonique_egress_broker::{BrokerConfig, EgressBroker};
     use automonique_protocol::execute_api::ExecuteRefusal;
     use automonique_runner::CancellationToken;
     use automonique_runner::admission::AdmissionRefusal;
@@ -2815,6 +2941,8 @@ mod tests {
         ApprovalContext, ApprovalOutcome, ApprovalProposal, ApprovalRequests, ApprovalState,
     };
     use std::fs;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpStream;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::Arc;
@@ -3120,5 +3248,104 @@ mod tests {
             assert!(is_safe_segment(ordinary), "{ordinary} must be accepted");
             assert!(is_containment_run_id(ordinary));
         }
+    }
+
+    fn generic_provider_fault(reply_to: u64) -> automonique_runner::backend::CapturedFrame {
+        JcodeProgressMapper::new(false)
+            .project_event(JcodeEvent::Error {
+                reply_to: Some(reply_to),
+                code: "rejected".to_owned(),
+            })
+            .expect("provider fault frame")
+    }
+
+    fn refuse_destination(broker: &EgressBroker, host: &str, port: u16) {
+        let mut client = TcpStream::connect(broker.local_addr()).expect("connect to broker");
+        write!(client, "CONNECT {host}:{port} HTTP/1.1\r\n\r\n").expect("write CONNECT");
+        let mut response = String::new();
+        client.read_to_string(&mut response).expect("read refusal");
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+    }
+
+    #[test]
+    fn a_terminal_provider_fault_names_one_retried_destination_and_consumes_its_window() {
+        let broker = EgressBroker::start(BrokerConfig::default()).expect("deny-all broker starts");
+        let observer = broker.refused_destination_observer();
+        let mut cursor = observer.cursor().expect("request baseline");
+        refuse_destination(&broker, "Missing.Example", 443);
+        refuse_destination(&broker, "missing.example", 443);
+
+        let generic = generic_provider_fault(3);
+        assert!(generic.body.text().is_none());
+        let expected_retry = generic.body.retry();
+        let described =
+            describe_refused_destination(generic, Some(&observer), Some(&mut cursor), true);
+
+        assert_eq!(
+            described.body.text().map(|text| text.as_str()),
+            Some("provider route refused destination missing.example:443")
+        );
+        assert_eq!(described.body.retry(), expected_retry);
+        assert!(!format!("{observer:?}").contains("missing.example"));
+
+        let after_consumption = describe_refused_destination(
+            generic_provider_fault(3),
+            Some(&observer),
+            Some(&mut cursor),
+            true,
+        );
+        assert!(after_consumption.body.text().is_none());
+    }
+
+    #[test]
+    fn stale_and_ambiguous_refusals_never_replace_an_authoritative_fault() {
+        let broker = EgressBroker::start(BrokerConfig::default()).expect("deny-all broker starts");
+        let observer = broker.refused_destination_observer();
+        refuse_destination(&broker, "stale.example", 443);
+        let mut cursor = observer.cursor().expect("baseline excludes stale refusal");
+        let stale = describe_refused_destination(
+            generic_provider_fault(3),
+            Some(&observer),
+            Some(&mut cursor),
+            true,
+        );
+        assert!(stale.body.text().is_none());
+
+        refuse_destination(&broker, "first.example", 443);
+        refuse_destination(&broker, "second.example", 443);
+        let ambiguous = describe_refused_destination(
+            generic_provider_fault(3),
+            Some(&observer),
+            Some(&mut cursor),
+            true,
+        );
+        assert!(ambiguous.body.text().is_none());
+    }
+
+    #[test]
+    fn a_steering_error_cannot_consume_the_turns_refusal_window() {
+        let broker = EgressBroker::start(BrokerConfig::default()).expect("deny-all broker starts");
+        let observer = broker.refused_destination_observer();
+        let mut cursor = observer.cursor().expect("request baseline");
+        refuse_destination(&broker, "turn.example", 443);
+
+        let steering = describe_refused_destination(
+            generic_provider_fault(4),
+            Some(&observer),
+            Some(&mut cursor),
+            false,
+        );
+        assert!(steering.body.text().is_none());
+
+        let terminal = describe_refused_destination(
+            generic_provider_fault(3),
+            Some(&observer),
+            Some(&mut cursor),
+            true,
+        );
+        assert_eq!(
+            terminal.body.text().map(|text| text.as_str()),
+            Some("provider route refused destination turn.example:443")
+        );
     }
 }
