@@ -3128,6 +3128,12 @@ document.querySelector(".cockpit-surface-tabs").addEventListener("keydown", (eve
 function previewCockpitAction(action) {
   const capability = cockpitPresentation?.[action];
   if (!capability?.available || cockpitControlHandle || cockpitControlBusy) return;
+  const baseSelector = byId("cockpit-base-selector").value.trim();
+  const branchSelector = byId("cockpit-branch-selector").value.trim();
+  if (action === "create" && (!baseSelector || !branchSelector)) {
+    toast("Exact base and branch selectors are required before preview.", "error");
+    return;
+  }
   cockpitState = globalThis.AutomoniquePlatformCockpit.reduce(cockpitState, { type: "preview", action, capability });
   const root = byId("cockpit-action-preview");
   root.hidden = false;
@@ -3138,12 +3144,16 @@ function previewCockpitAction(action) {
   details.textContent = `${capability.project_id} · ${capability.workspace_id} · exact revision ${capability.exact_revision}`;
   const task = document.createElement("p");
   task.textContent = `Bound task ${capability.task_id || "unavailable"}. The durable intent identity will be stored before transmission.`;
+  const selectors = document.createElement("p");
+  selectors.textContent = action === "create"
+    ? `Exact base ${baseSelector} · exact branch ${branchSelector}`
+    : `Exact existing workspace ${capability.workspace_id}`;
   const confirm = document.createElement("button");
   confirm.type = "button";
   confirm.className = "button primary";
   confirm.textContent = `Confirm ${action}`;
   confirm.addEventListener("click", () => submitCockpitIntent(action));
-  root.append(title, details, task, confirm);
+  root.append(title, details, task, selectors, confirm);
 }
 
 function newCockpitReceiptId(prefix) {

@@ -248,6 +248,46 @@ test("cross-workspace retained session selection updates URL and cockpit before 
   await expect(page.locator("#platform-session-coordinate")).toContainText("session-2");
 });
 
+test("create confirmation shows exact selectors before any mutation can be sent", async ({ page }) => {
+  const previous = cockpit.actions.lifecycle;
+  cockpit.actions.lifecycle = {
+    available: true,
+    operations: {
+      create_attempt_workspace: {
+        available: true,
+        submit_operation: "submit_workspace_intent",
+        receipt_operation: "get_workspace_intent",
+        project_id: "project-1",
+        workspace_id: "workspace-1",
+        exact_revision: "9007199254740995",
+        task_id: "task-1",
+        external_work: { provider: "github", authority: "github.com", scope: "bext-stack/automonique", key: "170" },
+      },
+      resume_attempt_workspace: { available: false, category: "platform_v2_lifecycle_adapter_pending" },
+    },
+  };
+  const actions = [];
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname !== "/api/platform/cockpit") return;
+    actions.push(request.postDataJSON()?.action);
+  });
+  try {
+    await page.reload();
+    await page.locator("#cockpit-create-preview").click();
+    await expect(page.locator("#cockpit-action-preview")).toBeHidden();
+    await page.locator("#cockpit-base-selector").fill("base-main");
+    await page.locator("#cockpit-branch-selector").fill("branch-task-170");
+    await page.locator("#cockpit-create-preview").click();
+    await expect(page.locator("#cockpit-action-preview")).toContainText("Bound task task-1");
+    await expect(page.locator("#cockpit-action-preview")).toContainText(
+      "Exact base base-main · exact branch branch-task-170",
+    );
+    expect(actions).not.toContain("submit_workspace_create");
+  } finally {
+    cockpit.actions.lifecycle = previous;
+  }
+});
+
 test("an ambiguous durable handle reloads through lookup only and never replays submit", async ({ page }) => {
   const actions = [];
   page.on("request", (request) => {
