@@ -45,7 +45,7 @@ describe("mobile Platform v2 delegated authorization", () => {
     for (const hostile of [
       { ...descriptor, project_roots: ["project-b", "project-a"] },
       { ...descriptor, actions: ["get_lineage", "get_lineage"] },
-      { ...descriptor, actions: ["execute_review_action"] },
+      { ...descriptor, actions: ["generic_execute"] },
       { ...descriptor, ambient_authority: true },
     ]) {
       expect(() =>
@@ -54,6 +54,18 @@ describe("mobile Platform v2 delegated authorization", () => {
         ),
       ).toThrow();
     }
+  });
+
+  test("admits narrowly delegated review execution and receipt lookup", () => {
+    const review = {
+      ...descriptor,
+      actions: ["execute_review_action", "get_review_receipt"],
+    } as const;
+    expect(
+      decodeMobilePlatformV2Authorization(
+        parseCanonical(new TextEncoder().encode(JSON.stringify(review))),
+      ).actions,
+    ).toEqual(["execute_review_action", "get_review_receipt"]);
   });
 
   test("operator grant encoding carries project identifiers, never client paths", () => {

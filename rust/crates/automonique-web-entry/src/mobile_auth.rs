@@ -20,7 +20,7 @@ use automonique_protocol::codegen::supported_mobile_protocol_versions;
 use automonique_protocol::platform::{
     PlatformRequest, ResourceAuthority, ResourceKind, SessionCommandState, SessionList,
 };
-use automonique_protocol::platform_v2::ProjectId;
+use automonique_protocol::platform_v2::{ProjectId, WorkContextIdentity};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -35,6 +35,7 @@ pub const MOBILE_PLATFORM_V2_AUTH_SCHEMA: &str = "automonique.mobile-platform-v2
 pub const MOBILE_PLATFORM_V2_AUTH_MEDIA_TYPE: &str =
     "application/vnd.automonique.mobile-platform-v2-authorization.v1+json";
 pub const MAX_MOBILE_ACTIONS: usize = 4;
+pub const MAX_MOBILE_PLATFORM_V2_ACTIONS: usize = 11;
 pub const MAX_MOBILE_V2_PROJECT_ROOTS: usize = 32;
 const MAX_MOBILE_V2_RECEIPT_CUSTODY: usize = 128;
 pub(crate) const MOBILE_V2_DISPATCH_LEASE_MILLIS: i64 = 10_000;
@@ -140,6 +141,26 @@ CREATE TABLE IF NOT EXISTS mobile_platform_v2_receipt_requests (
     REFERENCES mobile_platform_v2_receipt_custody(project_id,idempotency_key)
     ON DELETE CASCADE
 ) STRICT;
+CREATE TABLE IF NOT EXISTS mobile_platform_v2_exact_receipt_custody (
+  receipt_family TEXT NOT NULL CHECK(receipt_family IN ('mutation','review')),
+  project_id TEXT NOT NULL CHECK(length(project_id) BETWEEN 1 AND 128),
+  workspace_kind TEXT NOT NULL CHECK(length(workspace_kind) BETWEEN 0 AND 32),
+  workspace_id TEXT NOT NULL CHECK(length(workspace_id) BETWEEN 0 AND 256),
+  idempotency_key TEXT NOT NULL CHECK(length(idempotency_key) BETWEEN 1 AND 128),
+  credential_id TEXT NOT NULL CHECK(length(credential_id) = 46),
+  delegation_id TEXT NOT NULL CHECK(length(delegation_id) = 46),
+  principal_generation INTEGER NOT NULL
+    CHECK(principal_generation BETWEEN 1 AND 9007199254740991),
+  request_sha256 BLOB NOT NULL CHECK(length(request_sha256) = 32),
+  created_at_ms INTEGER NOT NULL CHECK(created_at_ms BETWEEN 0 AND 9007199254740991),
+  expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms BETWEEN 0 AND 9007199254740991),
+  CHECK(
+    (receipt_family = 'mutation' AND workspace_kind = '' AND workspace_id = '') OR
+    (receipt_family = 'review' AND length(workspace_kind) > 0 AND length(workspace_id) > 0)
+  ),
+  PRIMARY KEY(receipt_family,project_id,workspace_kind,workspace_id,idempotency_key),
+  FOREIGN KEY(credential_id) REFERENCES mobile_credentials(credential_id) ON DELETE CASCADE
+) STRICT;
 CREATE TABLE IF NOT EXISTS mobile_platform_v2_dispatch_leases (
   credential_id TEXT PRIMARY KEY CHECK(length(credential_id) = 46),
   lease_id TEXT NOT NULL UNIQUE CHECK(length(lease_id) = 46),
@@ -174,6 +195,8 @@ pub enum MobilePlatformV2Action {
     SubmitWorkspaceIntent,
     GetWorkspaceIntent,
     GetReview,
+    ExecuteReviewAction,
+    GetReviewReceipt,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -527,14 +550,58 @@ pub(crate) struct MobilePlatformV2DispatchLease {
 
 pub(crate) enum MobilePlatformV2ReceiptCustody<'coordinate> {
     None,
-    Bind {
+    BindMutation {
         project: &'coordinate ProjectId,
         idempotency_key: &'coordinate str,
     },
-    Read {
+    ReadMutation {
         project: &'coordinate ProjectId,
         idempotency_key: &'coordinate str,
     },
+    BindReview {
+        project: &'coordinate ProjectId,
+        workspace: &'coordinate WorkContextIdentity,
+        idempotency_key: &'coordinate str,
+    },
+    ReadReview {
+        project: &'coordinate ProjectId,
+        workspace: &'coordinate WorkContextIdentity,
+        idempotency_key: &'coordinate str,
+    },
+}
+
+struct ReceiptCustodyCoordinate<'coordinate> {
+    receipt_family: &'static str,
+    project: &'coordinate ProjectId,
+    workspace_kind: &'coordinate str,
+    workspace_id: &'coordinate str,
+    idempotency_key: &'coordinate str,
+}
+
+impl<'coordinate> ReceiptCustodyCoordinate<'coordinate> {
+    fn mutation(project: &'coordinate ProjectId, idempotency_key: &'coordinate str) -> Self {
+        Self {
+            receipt_family: "mutation",
+            project,
+            workspace_kind: "",
+            workspace_id: "",
+            idempotency_key,
+        }
+    }
+
+    fn review(
+        project: &'coordinate ProjectId,
+        workspace: &'coordinate WorkContextIdentity,
+        idempotency_key: &'coordinate str,
+    ) -> Self {
+        Self {
+            receipt_family: "review",
+            project,
+            workspace_kind: workspace.kind().as_str(),
+            workspace_id: workspace.id(),
+            idempotency_key,
+        }
+    }
 }
 
 impl MobileCredentialAuthority {
@@ -901,6 +968,10 @@ impl MobileCredentialAuthority {
             params![request.credential_id],
         )?;
         transaction.execute(
+            "DELETE FROM mobile_platform_v2_exact_receipt_custody WHERE credential_id=?1",
+            params![request.credential_id],
+        )?;
+        transaction.execute(
             "INSERT INTO mobile_platform_v2_authorizations(
                credential_id,credential_revision,authorization_revision,
                principal_generation,delegation_id,tenant_id,actor_id,issued_at_ms,
@@ -1018,25 +1089,44 @@ impl MobileCredentialAuthority {
         )?;
         match custody {
             MobilePlatformV2ReceiptCustody::None => {}
-            MobilePlatformV2ReceiptCustody::Bind {
+            MobilePlatformV2ReceiptCustody::BindMutation {
                 project,
                 idempotency_key,
             } => bind_receipt_custody_on(
                 &transaction,
                 expected,
-                project,
-                idempotency_key,
+                ReceiptCustodyCoordinate::mutation(project, idempotency_key),
                 &request_sha256,
                 now_ms,
             )?,
-            MobilePlatformV2ReceiptCustody::Read {
+            MobilePlatformV2ReceiptCustody::ReadMutation {
                 project,
                 idempotency_key,
             } => authorize_receipt_custody_on(
                 &transaction,
                 expected,
+                ReceiptCustodyCoordinate::mutation(project, idempotency_key),
+                now_ms,
+            )?,
+            MobilePlatformV2ReceiptCustody::BindReview {
                 project,
+                workspace,
                 idempotency_key,
+            } => bind_receipt_custody_on(
+                &transaction,
+                expected,
+                ReceiptCustodyCoordinate::review(project, workspace, idempotency_key),
+                &request_sha256,
+                now_ms,
+            )?,
+            MobilePlatformV2ReceiptCustody::ReadReview {
+                project,
+                workspace,
+                idempotency_key,
+            } => authorize_receipt_custody_on(
+                &transaction,
+                expected,
+                ReceiptCustodyCoordinate::review(project, workspace, idempotency_key),
                 now_ms,
             )?,
         }
@@ -1088,7 +1178,7 @@ impl MobileCredentialAuthority {
     ) -> Result<(), MobileAuthError> {
         let lease = self.acquire_platform_v2_dispatch(
             authorization,
-            MobilePlatformV2ReceiptCustody::Bind {
+            MobilePlatformV2ReceiptCustody::BindMutation {
                 project,
                 idempotency_key,
             },
@@ -1108,8 +1198,52 @@ impl MobileCredentialAuthority {
     ) -> Result<(), MobileAuthError> {
         let lease = self.acquire_platform_v2_dispatch(
             authorization,
-            MobilePlatformV2ReceiptCustody::Read {
+            MobilePlatformV2ReceiptCustody::ReadMutation {
                 project,
+                idempotency_key,
+            },
+            idempotency_key.as_bytes(),
+            now_ms,
+        )?;
+        self.release_platform_v2_dispatch(&lease)
+    }
+
+    #[cfg(test)]
+    pub fn bind_platform_v2_review_receipt_custody(
+        &mut self,
+        authorization: &MobilePlatformV2Authorization,
+        project: &ProjectId,
+        workspace: &WorkContextIdentity,
+        idempotency_key: &str,
+        now_ms: i64,
+    ) -> Result<(), MobileAuthError> {
+        let lease = self.acquire_platform_v2_dispatch(
+            authorization,
+            MobilePlatformV2ReceiptCustody::BindReview {
+                project,
+                workspace,
+                idempotency_key,
+            },
+            idempotency_key.as_bytes(),
+            now_ms,
+        )?;
+        self.release_platform_v2_dispatch(&lease)
+    }
+
+    #[cfg(test)]
+    pub fn authorize_platform_v2_review_receipt_custody(
+        &mut self,
+        authorization: &MobilePlatformV2Authorization,
+        project: &ProjectId,
+        workspace: &WorkContextIdentity,
+        idempotency_key: &str,
+        now_ms: i64,
+    ) -> Result<(), MobileAuthError> {
+        let lease = self.acquire_platform_v2_dispatch(
+            authorization,
+            MobilePlatformV2ReceiptCustody::ReadReview {
+                project,
+                workspace,
                 idempotency_key,
             },
             idempotency_key.as_bytes(),
@@ -1265,6 +1399,11 @@ impl MobileCredentialAuthority {
             }
             transaction.execute(
                 "UPDATE mobile_platform_v2_receipt_custody SET expires_at_ms=?1
+                 WHERE credential_id=?2",
+                params![access_expires_at_ms, row.credential_id],
+            )?;
+            transaction.execute(
+                "UPDATE mobile_platform_v2_exact_receipt_custody SET expires_at_ms=?1
                  WHERE credential_id=?2",
                 params![access_expires_at_ms, row.credential_id],
             )?;
@@ -1701,53 +1840,51 @@ fn reauthorize_platform_v2_on(
 fn bind_receipt_custody_on(
     connection: &Connection,
     authorization: &MobilePlatformV2Authorization,
-    project: &ProjectId,
-    idempotency_key: &str,
+    coordinate: ReceiptCustodyCoordinate<'_>,
     request_sha256: &[u8; 32],
     now_ms: i64,
 ) -> Result<(), MobileAuthError> {
-    validate_receipt_coordinate(idempotency_key)?;
+    validate_receipt_coordinate(coordinate.idempotency_key)?;
     connection.execute(
-        "DELETE FROM mobile_platform_v2_receipt_custody WHERE expires_at_ms<=?1",
+        "DELETE FROM mobile_platform_v2_exact_receipt_custody WHERE expires_at_ms<=?1",
         params![now_ms],
     )?;
     let existing = connection
         .query_row(
-            "SELECT credential_id,delegation_id,principal_generation
-             FROM mobile_platform_v2_receipt_custody
-             WHERE project_id=?1 AND idempotency_key=?2",
-            params![project.as_str(), idempotency_key],
+            "SELECT credential_id,delegation_id,principal_generation,request_sha256
+             FROM mobile_platform_v2_exact_receipt_custody
+             WHERE receipt_family=?1 AND project_id=?2 AND workspace_kind=?3
+               AND workspace_id=?4 AND idempotency_key=?5",
+            params![
+                coordinate.receipt_family,
+                coordinate.project.as_str(),
+                coordinate.workspace_kind,
+                coordinate.workspace_id,
+                coordinate.idempotency_key
+            ],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, u64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
                 ))
             },
         )
         .optional()?;
-    if let Some((credential_id, delegation_id, generation)) = existing {
+    if let Some((credential_id, delegation_id, generation, bound_digest)) = existing {
         if credential_id != authorization.credential_id
             || delegation_id != authorization.delegation_id
             || generation != authorization.principal_generation
         {
             return Err(MobileAuthError::InvalidCredential);
         }
-        let bound_digest = connection
-            .query_row(
-                "SELECT request_sha256 FROM mobile_platform_v2_receipt_requests
-                 WHERE project_id=?1 AND idempotency_key=?2",
-                params![project.as_str(), idempotency_key],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?
-            .ok_or(MobileAuthError::InvalidCredential)?;
         return (bound_digest.as_slice() == request_sha256)
             .then_some(())
             .ok_or(MobileAuthError::InvalidCredential);
     }
     let count = connection.query_row(
-        "SELECT COUNT(*) FROM mobile_platform_v2_receipt_custody
+        "SELECT COUNT(*) FROM mobile_platform_v2_exact_receipt_custody
          WHERE credential_id=?1",
         params![authorization.credential_id],
         |row| row.get::<_, u64>(0),
@@ -1756,25 +1893,24 @@ fn bind_receipt_custody_on(
         return Err(MobileAuthError::InvalidRequest);
     }
     connection.execute(
-        "INSERT INTO mobile_platform_v2_receipt_custody(
-           project_id,idempotency_key,credential_id,delegation_id,
-           principal_generation,created_at_ms,expires_at_ms
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        "INSERT INTO mobile_platform_v2_exact_receipt_custody(
+           receipt_family,project_id,workspace_kind,workspace_id,idempotency_key,
+           credential_id,delegation_id,principal_generation,request_sha256,
+           created_at_ms,expires_at_ms
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
         params![
-            project.as_str(),
-            idempotency_key,
+            coordinate.receipt_family,
+            coordinate.project.as_str(),
+            coordinate.workspace_kind,
+            coordinate.workspace_id,
+            coordinate.idempotency_key,
             authorization.credential_id,
             authorization.delegation_id,
             authorization.principal_generation,
+            request_sha256.as_slice(),
             now_ms,
             authorization.expires_at_ms,
         ],
-    )?;
-    connection.execute(
-        "INSERT INTO mobile_platform_v2_receipt_requests(
-           project_id,idempotency_key,request_sha256
-         ) VALUES(?1,?2,?3)",
-        params![project.as_str(), idempotency_key, request_sha256.as_slice()],
     )?;
     Ok(())
 }
@@ -1782,17 +1918,23 @@ fn bind_receipt_custody_on(
 fn authorize_receipt_custody_on(
     connection: &Connection,
     authorization: &MobilePlatformV2Authorization,
-    project: &ProjectId,
-    idempotency_key: &str,
+    coordinate: ReceiptCustodyCoordinate<'_>,
     now_ms: i64,
 ) -> Result<(), MobileAuthError> {
-    validate_receipt_coordinate(idempotency_key)?;
+    validate_receipt_coordinate(coordinate.idempotency_key)?;
     let custody = connection
         .query_row(
             "SELECT credential_id,delegation_id,principal_generation,expires_at_ms
-             FROM mobile_platform_v2_receipt_custody
-             WHERE project_id=?1 AND idempotency_key=?2",
-            params![project.as_str(), idempotency_key],
+             FROM mobile_platform_v2_exact_receipt_custody
+             WHERE receipt_family=?1 AND project_id=?2 AND workspace_kind=?3
+               AND workspace_id=?4 AND idempotency_key=?5",
+            params![
+                coordinate.receipt_family,
+                coordinate.project.as_str(),
+                coordinate.workspace_kind,
+                coordinate.workspace_id,
+                coordinate.idempotency_key
+            ],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -1842,7 +1984,7 @@ fn admit_platform_v2_scope(
     if project_roots.is_empty()
         || project_roots.len() > MAX_MOBILE_V2_PROJECT_ROOTS
         || actions.is_empty()
-        || actions.len() > 9
+        || actions.len() > MAX_MOBILE_PLATFORM_V2_ACTIONS
     {
         return Err(MobileAuthError::InvalidRequest);
     }
@@ -1857,7 +1999,7 @@ fn admit_platform_v2_scope(
     if project_roots.is_empty()
         || project_roots.len() > MAX_MOBILE_V2_PROJECT_ROOTS
         || actions.is_empty()
-        || actions.len() > 9
+        || actions.len() > MAX_MOBILE_PLATFORM_V2_ACTIONS
     {
         return Err(MobileAuthError::InvalidRequest);
     }
@@ -1874,6 +2016,10 @@ fn revoke_platform_v2(
 ) -> Result<(), MobileAuthError> {
     connection.execute(
         "DELETE FROM mobile_platform_v2_receipt_custody WHERE credential_id=?1",
+        params![credential_id],
+    )?;
+    connection.execute(
+        "DELETE FROM mobile_platform_v2_exact_receipt_custody WHERE credential_id=?1",
         params![credential_id],
     )?;
     let generation = connection
@@ -2321,6 +2467,8 @@ mod tests {
                 MobilePlatformV2Action::SubmitMutation,
                 MobilePlatformV2Action::QueryWorkContexts,
                 MobilePlatformV2Action::PrepareMutation,
+                MobilePlatformV2Action::GetReviewReceipt,
+                MobilePlatformV2Action::ExecuteReviewAction,
             ],
         }
     }
@@ -2360,6 +2508,8 @@ mod tests {
                 MobilePlatformV2Action::QueryWorkContexts,
                 MobilePlatformV2Action::PrepareMutation,
                 MobilePlatformV2Action::SubmitMutation,
+                MobilePlatformV2Action::ExecuteReviewAction,
+                MobilePlatformV2Action::GetReviewReceipt,
             ]
         );
         assert_eq!(
@@ -2491,10 +2641,44 @@ mod tests {
             NOW + 2,
         )
         .expect("bind custody");
+        let workspace = WorkContextIdentity::UserWorkspace(
+            automonique_protocol::platform_v2::UserWorkspaceId::new("workspace-a").unwrap(),
+        );
+        let other_workspace = WorkContextIdentity::UserWorkspace(
+            automonique_protocol::platform_v2::UserWorkspaceId::new("workspace-b").unwrap(),
+        );
+        assert!(
+            auth.authorize_platform_v2_review_receipt_custody(
+                &first_descriptor,
+                &project,
+                &workspace,
+                "mobile:mutation:one",
+                NOW + 2,
+            )
+            .is_err()
+        );
+        auth.bind_platform_v2_review_receipt_custody(
+            &first_descriptor,
+            &project,
+            &workspace,
+            "mobile:review:one",
+            NOW + 2,
+        )
+        .expect("bind exact review custody");
+        assert!(
+            auth.authorize_platform_v2_review_receipt_custody(
+                &first_descriptor,
+                &project,
+                &other_workspace,
+                "mobile:review:one",
+                NOW + 2,
+            )
+            .is_err()
+        );
         assert!(matches!(
             auth.acquire_platform_v2_dispatch(
                 &first_descriptor,
-                MobilePlatformV2ReceiptCustody::Bind {
+                MobilePlatformV2ReceiptCustody::BindMutation {
                     project: &project,
                     idempotency_key: "mobile:mutation:one",
                 },
@@ -2525,32 +2709,6 @@ mod tests {
             NOW + 3,
         )
         .expect("durable custody");
-        auth.connection
-            .execute(
-                "DELETE FROM mobile_platform_v2_receipt_requests
-                 WHERE project_id=?1 AND idempotency_key=?2",
-                params![project.as_str(), "mobile:mutation:one"],
-            )
-            .expect("simulate custody written by the prior schema");
-        auth.authorize_platform_v2_receipt_custody(
-            &first_descriptor,
-            &project,
-            "mobile:mutation:one",
-            NOW + 3,
-        )
-        .expect("legacy custody remains readable");
-        assert!(matches!(
-            auth.acquire_platform_v2_dispatch(
-                &first_descriptor,
-                MobilePlatformV2ReceiptCustody::Bind {
-                    project: &project,
-                    idempotency_key: "mobile:mutation:one",
-                },
-                b"mobile:mutation:one",
-                NOW + 3,
-            ),
-            Err(MobileAuthError::InvalidCredential)
-        ));
 
         let second = auth.operator_provision(request(), NOW + 3).expect("second");
         let second_descriptor = auth
@@ -2564,6 +2722,16 @@ mod tests {
                 &second_descriptor,
                 &project,
                 "mobile:mutation:one",
+                NOW + 4,
+            )
+            .is_err()
+        );
+        assert!(
+            auth.authorize_platform_v2_review_receipt_custody(
+                &second_descriptor,
+                &project,
+                &workspace,
+                "mobile:review:one",
                 NOW + 4,
             )
             .is_err()
@@ -2604,6 +2772,16 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            auth.authorize_platform_v2_review_receipt_custody(
+                &regranted,
+                &project,
+                &workspace,
+                "mobile:review:one",
+                NOW + 6,
+            )
+            .is_err()
+        );
         for index in 0..MAX_MOBILE_V2_RECEIPT_CUSTODY {
             auth.bind_platform_v2_receipt_custody(
                 &regranted,
@@ -2632,22 +2810,63 @@ mod tests {
         assert_eq!(
             auth.connection
                 .query_row(
-                    "SELECT COUNT(*) FROM mobile_platform_v2_receipt_custody",
+                    "SELECT COUNT(*) FROM mobile_platform_v2_exact_receipt_custody",
                     [],
                     |row| row.get::<_, u64>(0),
                 )
                 .expect("custody count"),
             0
         );
-        assert_eq!(
-            auth.connection
-                .query_row(
-                    "SELECT COUNT(*) FROM mobile_platform_v2_receipt_requests",
-                    [],
-                    |row| row.get::<_, u64>(0),
+    }
+
+    #[test]
+    fn legacy_receipt_custody_rows_fail_closed_after_exact_schema_migration() {
+        let (root, mut auth) = authority();
+        let issued = auth.operator_provision(request(), NOW).expect("credential");
+        let authorization = auth
+            .grant_platform_v2(
+                platform_v2_grant(&issued.authorization.credential_id),
+                NOW + 1,
+            )
+            .expect("grant");
+        let project = ProjectId::new("project-a").unwrap();
+        auth.connection
+            .execute(
+                "INSERT INTO mobile_platform_v2_receipt_custody(
+                   project_id,idempotency_key,credential_id,delegation_id,
+                   principal_generation,created_at_ms,expires_at_ms
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    project.as_str(),
+                    "mobile:legacy:one",
+                    authorization.credential_id,
+                    authorization.delegation_id,
+                    authorization.principal_generation,
+                    NOW + 1,
+                    authorization.expires_at_ms,
+                ],
+            )
+            .expect("legacy custody");
+        auth.connection
+            .execute_batch("DROP TABLE mobile_platform_v2_exact_receipt_custody;")
+            .expect("simulate prior schema");
+        drop(auth);
+
+        let mut reopened = MobileCredentialAuthority::open(
+            root.path().join("mobile.sqlite3"),
+            "ops.example.test",
+            "operator:mobile",
+        )
+        .expect("restart-safe additive migration");
+        assert!(
+            reopened
+                .authorize_platform_v2_receipt_custody(
+                    &authorization,
+                    &project,
+                    "mobile:legacy:one",
+                    NOW + 2,
                 )
-                .expect("request binding count"),
-            0
+                .is_err()
         );
     }
 
@@ -2681,6 +2900,7 @@ mod tests {
         auth.connection
             .execute_batch(
                 "DROP TABLE mobile_platform_v2_dispatch_leases;
+                 DROP TABLE mobile_platform_v2_exact_receipt_custody;
                  DROP TABLE mobile_platform_v2_receipt_requests;
                  DROP TABLE mobile_platform_v2_receipt_custody;
                  DROP TABLE mobile_platform_v2_authorizations;",
