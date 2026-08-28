@@ -34,6 +34,18 @@ authority-qualified Platform v1 `session` coordinate on every item. Review and
 orchestration sources forbid that coordinate, so clients cannot infer a
 provider session from labels, chronology, or summaries.
 
+`unread` is authoritative producer state and notification eligibility, not a
+cross-client acknowledgement bit. Review projection preserves exactly
+`event.unread() > 0`. Orchestration projects `Working` as read, `Blocked` and
+`Done` as unread, and omits `Waiting`. Provider sessions project `Active`,
+`Preparing`, and `Running` as read; `Failed` and `Completed` as unread;
+`Archived`, `Cancelled`, and `Closed` as read; and omit `Hibernated`. A client
+that acknowledges or opens an item keeps that local read custody under the
+exact `(source, item, item_revision)` tuple. It may notify once when an
+authoritative unread item revision first appears, but must not rewrite the
+server snapshot. Exact replay cannot notify again; a removed item that later
+reappears has a new opaque identity and is independently eligible.
+
 The contract has no representation for client-local pane, tab, window,
 terminal, host path, or workspace-layout identifiers. ShellDeck consumes the
 project, `UserWorkspace`, and optional authority-qualified Platform session,
@@ -49,8 +61,39 @@ out-of-order item IDs, mixed state/reason pairs, cyclic or over-depth agent
 paths, and provider/local coordinate confusion. When explicitly bootstrapped,
 the Platform v2 host serves only snapshots validated from its private operator
 source registry and tenant-bound durable store. An absent, changed, malformed,
-unauthorized, stale, or unregistered source refuses explicitly; the host never
-synthesizes observation time or source revision from the request time. This
-contract and bootstrap path do not yet provide a runtime producer, source
-discovery, hot reload, or a client consumer, so they are foundation work rather
-than completion of the live cross-client attention flow.
+unauthorized, stale, or unregistered bootstrap source refuses explicitly; the
+host never synthesizes its observation time or source revision from the request
+time. That path remains available for sources outside the runtime conventions.
+
+The production host also projects three runtime-owned source families from the
+same tenant-bound durable state used by Platform v2. Review and orchestration
+sources use the exact `UserWorkspace` id as their source id. Provider-session
+sources use the exact retained `WorkSession` id already present in the bounded
+authorized work-context catalogue. A review source exists only when its durable
+review snapshot exists; absence refuses rather than becoming an empty review.
+Orchestration projection overflow remains explicitly unavailable. A retained
+session read revalidates the exact session-to-attempt-to-workspace lineage and
+copies only its authority-qualified Platform session coordinate. It never
+derives a pane, tab, label, or local layout target. Its read-only lineage gate
+admits valid terminal `Completed`, `Failed`, and `Cancelled` session records;
+the separate mutation and review-delivery gate remains limited to active or
+hibernated retained sessions.
+
+Runtime snapshots pass through the same atomic attention store. A semantically
+unchanged observation replays the exact durable document. A changed complete
+item set advances the source revision once, points to the exact predecessor,
+advances changed item revisions, and preserves unchanged item revisions and
+observation times. One logical orchestration or retained-session record keeps
+its current item id across unrelated producer revisions and attention-state
+changes. A `Waiting` orchestration record or `Hibernated` session removes that
+item atomically; a later reappearance mints a new incarnation instead of
+reusing the retired id. A restart therefore cannot reset a source or reuse a
+removed item id. The hosted cockpit discovers only those deterministic source
+ids from its bounded authorized work-context inventory. Review-source discovery
+uses only the typed existence of a durable review snapshot, so an absent review
+does not hide valid orchestration or session attention. The cockpit renders
+`get_attention_source_snapshot` results and does not substitute review summary
+attention. Runtime-owned tuples are rejected from the private bootstrap
+registry before its atomic import, including after restart, so bootstrap and
+runtime custody cannot shadow each other. Desktop and mobile consumers and
+cross-client live acceptance remain separate milestones.

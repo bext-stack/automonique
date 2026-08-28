@@ -19,20 +19,26 @@ use automonique_protocol::digest::{Sha256, Sha256Digest};
 use automonique_protocol::identity::Actor;
 use automonique_protocol::platform::{ReceiptId, ResourceAuthority};
 use automonique_protocol::platform_v2::{
-    CheckoutId, NegotiatedPlatform, PlatformVersionOffer, ProjectId, UserWorkspaceId,
+    CheckoutId, NegotiatedPlatform, PlatformVersionOffer, ProjectId, UserWorkspaceId, V1SessionRef,
     WorkContextIdentity, WorkContextLifecycle, WorkContextQueryResult, WorkContextRecord,
     WorkContextRelationKind, WorkContextTargetKind, WorkSessionId, negotiate_platform_version,
+};
+use automonique_protocol::platform_v2_attention::{
+    AttentionItem, AttentionItemId, AttentionItemReason, AttentionReadRequest, AttentionSourceKind,
+    AttentionSourceSnapshot,
 };
 use automonique_protocol::platform_v2_lifecycle::{
     AuthorityGrantId, MutationApprovalId, MutationApprovalRequirement, MutationExplanation,
     MutationRefusal, MutationRefusalCategory, WorkContextAuthority, WorkContextMutationIntent,
     WorkContextMutationProposal,
 };
-use automonique_protocol::platform_v2_lineage::{WorkspaceIntent, WorkspaceIntentOutcome};
+use automonique_protocol::platform_v2_lineage::{
+    LineageStatus, OrchestrationRecord, WorkspaceIntent, WorkspaceIntentOutcome,
+};
 use automonique_protocol::platform_v2_review::{
-    CheckState, ReviewAction, ReviewActionReceipt, ReviewActionRequest, ReviewActorId,
-    ReviewAuthentication, ReviewAuthority, ReviewAuthorityId, ReviewAuthorityKind,
-    ReviewFreshnessState, ReviewSnapshot,
+    AttentionReason as ReviewAttentionReason, CheckState, ReviewAction, ReviewActionReceipt,
+    ReviewActionRequest, ReviewActorId, ReviewAuthentication, ReviewAuthority, ReviewAuthorityId,
+    ReviewAuthorityKind, ReviewFreshnessState, ReviewSnapshot,
 };
 use automonique_protocol::platform_v2_transport::{
     LIFECYCLE_CAPABILITY_EFFECT_KINDS, LifecycleCapabilities, LifecycleOperationCapability,
@@ -991,10 +997,14 @@ impl PlatformV2Runtime {
         let mut attention =
             AttentionStore::open_scoped(state_dir.join(ATTENTION_STORE_NAME), tenant)
                 .map_err(|_| "platform_v2_store_unavailable")?;
+        let principal = principals
+            .get(&expected_uid)
+            .ok_or("platform_v2_policy_invalid")?;
         let attention_registry = AttentionRegistry::open(
             &state_dir.join(ATTENTION_REGISTRY_NAME),
             expected_uid,
             &mut attention,
+            |snapshot| runtime_attention_source_reserved(principal, snapshot),
         )?;
         // Grants are copied from the server-owned policy into the store. The
         // exact same grant is an idempotent replay on restart.
@@ -1741,9 +1751,13 @@ impl PlatformV2Runtime {
                 let workspace = WorkContextIdentity::UserWorkspace(value.user_workspace().clone());
                 authorize_identity(&principal, value.project(), &workspace)?;
                 self.validate_policy_mapping(&principal, &workspace)?;
-                self.attention_registry
-                    .snapshot(value, &self.attention)
-                    .map(PlatformV2Response::AttentionSourceSnapshot)
+                match self.runtime_attention_snapshot(&principal, value, now_ms)? {
+                    Some(snapshot) => Ok(PlatformV2Response::AttentionSourceSnapshot(snapshot)),
+                    None => self
+                        .attention_registry
+                        .snapshot(value, &self.attention)
+                        .map(PlatformV2Response::AttentionSourceSnapshot),
+                }
             }
             PlatformV2Request::GetReviewCapabilities(value) => {
                 authorize_identity(&principal, value.project(), value.workspace())?;
@@ -2751,6 +2765,111 @@ impl PlatformV2Runtime {
             .map_err(|_| "platform_v2_policy_incoherent")
     }
 
+    /// Project a source only from durable state already owned by this runtime.
+    /// Source discovery is deliberately bounded by the existing authorized
+    /// work-context catalogue: review and orchestration use the exact user
+    /// workspace id, while provider-session sources use the exact retained
+    /// work-session id. Unknown spellings fall through to the private bootstrap
+    /// registry; no label, pane, or local presentation coordinate is inferred.
+    fn runtime_attention_snapshot(
+        &mut self,
+        principal: &PrincipalPolicy,
+        request: &AttentionReadRequest,
+        now_ms: i64,
+    ) -> Result<Option<AttentionSourceSnapshot>, &'static str> {
+        let observed_at_ms = u64::try_from(now_ms).map_err(|_| "platform_v2_time_invalid")?;
+        let source = request.source();
+        let workspace = request.user_workspace();
+        let desired = match source.kind() {
+            AttentionSourceKind::Review if workspace_source_matches(source, workspace) => {
+                refuse_registry_runtime_collision(&self.attention_registry, request)?;
+                let identity = WorkContextIdentity::UserWorkspace(workspace.clone());
+                let review = self
+                    .reviews
+                    .snapshot(&identity)
+                    .map_err(|_| "platform_v2_store_refused")?;
+                review_attention_items_from_snapshot(review.as_ref(), observed_at_ms)?
+            }
+            AttentionSourceKind::Orchestration if workspace_source_matches(source, workspace) => {
+                refuse_registry_runtime_collision(&self.attention_registry, request)?;
+                let scope = IntentAuthorizationScope::new(
+                    principal.actor.tenant().to_owned(),
+                    request.project().clone(),
+                    workspace.clone(),
+                )
+                .map_err(|_| "platform_v2_scope_denied")?;
+                let projection = self
+                    .lineage
+                    .projection_authorized(&negotiated_v2()?, &scope, |_| true)
+                    .map_err(|_| "platform_v2_attention_source_unavailable")?;
+                let current = self
+                    .attention
+                    .snapshot(source, request.project(), workspace)
+                    .map_err(|_| "platform_v2_attention_store_refused")?;
+                orchestration_attention_items(projection.orchestration(), current.as_ref())?
+            }
+            AttentionSourceKind::ProviderSession => {
+                let work_session = WorkSessionId::new(source.id().as_str().to_owned())
+                    .map_err(|_| "platform_v2_attention_not_found")?;
+                let identity = WorkContextIdentity::Session(work_session.clone());
+                let Some(scope) = principal.workspaces.get(&identity) else {
+                    return Ok(None);
+                };
+                if &scope.project != request.project() {
+                    return Err("platform_v2_scope_denied");
+                }
+                refuse_registry_runtime_collision(&self.attention_registry, request)?;
+                let session = self
+                    .work_contexts
+                    .validate_policy_mapping(principal.actor.tenant(), request.project(), &identity)
+                    .map_err(|_| "platform_v2_policy_incoherent")?;
+                let platform_session = session
+                    .relations()
+                    .iter()
+                    .find(|relation| {
+                        relation.kind() == WorkContextRelationKind::SessionPlatformSession
+                    })
+                    .and_then(|relation| match relation.target() {
+                        WorkContextIdentity::PlatformSession(value) => Some(value.clone()),
+                        _ => None,
+                    })
+                    .ok_or("platform_v2_attention_source_unavailable")?;
+                let session = self
+                    .work_contexts
+                    .validate_retained_session_attention_lineage(
+                        principal.actor.tenant(),
+                        request.project(),
+                        &WorkContextIdentity::UserWorkspace(workspace.clone()),
+                        &work_session,
+                        platform_session.coordinate().id.as_str(),
+                    )
+                    .map_err(|_| "platform_v2_attention_source_unavailable")?;
+                let current = self
+                    .attention
+                    .snapshot(source, request.project(), workspace)
+                    .map_err(|_| "platform_v2_attention_store_refused")?;
+                retained_session_attention_items(
+                    &session,
+                    platform_session,
+                    observed_at_ms,
+                    current.as_ref(),
+                )?
+            }
+            _ => return Ok(None),
+        };
+        self.persist_runtime_attention(request, desired, observed_at_ms)
+            .map(Some)
+    }
+
+    fn persist_runtime_attention(
+        &mut self,
+        request: &AttentionReadRequest,
+        desired: Vec<AttentionItem>,
+        observed_at_ms: u64,
+    ) -> Result<AttentionSourceSnapshot, &'static str> {
+        persist_runtime_attention_snapshot(&mut self.attention, request, desired, observed_at_ms)
+    }
+
     fn validate_all_policy_mappings(
         &self,
         principal: &PrincipalPolicy,
@@ -2912,6 +3031,312 @@ impl PlatformV2Runtime {
             .map(|_| ())
             .map_err(|_| "platform_v2_effect_policy_refused")
     }
+}
+
+fn persist_runtime_attention_snapshot(
+    store: &mut AttentionStore,
+    request: &AttentionReadRequest,
+    desired: Vec<AttentionItem>,
+    observed_at_ms: u64,
+) -> Result<AttentionSourceSnapshot, &'static str> {
+    let current = store
+        .snapshot(
+            request.source(),
+            request.project(),
+            request.user_workspace(),
+        )
+        .map_err(|_| "platform_v2_attention_store_refused")?;
+    let snapshot =
+        prepare_runtime_attention_snapshot(request, desired, observed_at_ms, current.as_ref())?;
+    if current.as_ref() == Some(&snapshot) {
+        return Ok(snapshot);
+    }
+    store
+        .put_snapshot(&snapshot)
+        .map_err(|_| "platform_v2_attention_store_refused")?;
+    Ok(snapshot)
+}
+
+fn prepare_runtime_attention_snapshot(
+    request: &AttentionReadRequest,
+    mut desired: Vec<AttentionItem>,
+    observed_at_ms: u64,
+    current: Option<&AttentionSourceSnapshot>,
+) -> Result<AttentionSourceSnapshot, &'static str> {
+    desired.sort_by(|left, right| left.id().as_str().cmp(right.id().as_str()));
+    if let Some(current) = current
+        && current.items().len() == desired.len()
+        && current
+            .items()
+            .iter()
+            .zip(&desired)
+            .all(|(old, item)| attention_item_equal_except_revision_and_observed(old, item))
+    {
+        // Observation is not a source change. Detect replay before allocating
+        // a successor so an exact replay remains readable at Revision::MAX.
+        return Ok(current.clone());
+    }
+    let revision = current
+        .map_or(Ok(Revision::FIRST), |value| value.revision().checked_next())
+        .map_err(|_| "platform_v2_attention_revision_exhausted")?;
+    for item in &mut desired {
+        let previous =
+            current.and_then(|snapshot| snapshot.items().iter().find(|old| old.id() == item.id()));
+        let (item_revision, item_observed_at_ms) =
+            previous.map_or((revision, item.observed_at_ms()), |old| {
+                if attention_item_equal_except_revision_and_observed(old, item) {
+                    (old.revision(), old.observed_at_ms())
+                } else {
+                    (revision, item.observed_at_ms().max(old.observed_at_ms()))
+                }
+            });
+        *item = AttentionItem::new(
+            item.id().clone(),
+            item_revision,
+            item_observed_at_ms,
+            item.state(),
+            item.reason(),
+            item.unread(),
+            item.nested_agent_path().to_vec(),
+            item.platform_session().cloned(),
+        )
+        .map_err(|_| "platform_v2_attention_projection_invalid")?;
+    }
+    let previous_revision = current.map(AttentionSourceSnapshot::revision);
+    let snapshot_observed_at_ms = current
+        .map_or(observed_at_ms, |value| {
+            value.observed_at_ms().max(observed_at_ms)
+        })
+        .max(
+            desired
+                .iter()
+                .map(AttentionItem::observed_at_ms)
+                .max()
+                .unwrap_or(0),
+        );
+    let snapshot = AttentionSourceSnapshot::new(
+        request.source().clone(),
+        request.project().clone(),
+        request.user_workspace().clone(),
+        revision,
+        previous_revision,
+        snapshot_observed_at_ms,
+        desired,
+    )
+    .map_err(|_| "platform_v2_attention_projection_invalid")?;
+    Ok(snapshot)
+}
+
+fn workspace_source_matches(
+    source: &automonique_protocol::platform_v2_attention::AttentionSource,
+    workspace: &UserWorkspaceId,
+) -> bool {
+    source.id().as_str() == workspace.as_str()
+}
+
+fn refuse_registry_runtime_collision(
+    registry: &AttentionRegistry,
+    request: &AttentionReadRequest,
+) -> Result<(), &'static str> {
+    if registry.contains(request) {
+        Err("platform_v2_attention_registry_runtime_collision")
+    } else {
+        Ok(())
+    }
+}
+
+fn runtime_attention_source_reserved(
+    principal: &PrincipalPolicy,
+    snapshot: &AttentionSourceSnapshot,
+) -> bool {
+    match snapshot.source().kind() {
+        AttentionSourceKind::Review | AttentionSourceKind::Orchestration => principal
+            .workspaces
+            .keys()
+            .any(|identity| {
+                matches!(identity, WorkContextIdentity::UserWorkspace(workspace) if workspace.as_str() == snapshot.source().id().as_str())
+            }),
+        AttentionSourceKind::ProviderSession => principal.workspaces.keys().any(|identity| {
+            matches!(identity, WorkContextIdentity::Session(session) if session.as_str() == snapshot.source().id().as_str())
+        }),
+    }
+}
+
+fn attention_item_equal_except_revision_and_observed(
+    left: &AttentionItem,
+    right: &AttentionItem,
+) -> bool {
+    left.id() == right.id()
+        && left.state() == right.state()
+        && left.reason() == right.reason()
+        && left.unread() == right.unread()
+        && left.nested_agent_path() == right.nested_agent_path()
+        && left.platform_session() == right.platform_session()
+}
+
+fn review_attention_items(
+    review: &ReviewSnapshot,
+    observed_at_ms: u64,
+) -> Result<Vec<AttentionItem>, &'static str> {
+    review
+        .attention_events()
+        .iter()
+        .map(|event| {
+            let reason = review_attention_reason(event.reason());
+            AttentionItem::new(
+                AttentionItemId::new(event.id().as_str().to_owned())
+                    .map_err(|_| "platform_v2_attention_projection_invalid")?,
+                Revision::FIRST,
+                observed_at_ms,
+                reason.state(),
+                reason,
+                event.unread() > 0,
+                Vec::new(),
+                None,
+            )
+            .map_err(|_| "platform_v2_attention_projection_invalid")
+        })
+        .collect()
+}
+
+fn review_attention_items_from_snapshot(
+    review: Option<&ReviewSnapshot>,
+    observed_at_ms: u64,
+) -> Result<Vec<AttentionItem>, &'static str> {
+    review_attention_items(
+        review.ok_or("platform_v2_attention_not_found")?,
+        observed_at_ms,
+    )
+}
+
+const fn review_attention_reason(reason: ReviewAttentionReason) -> AttentionItemReason {
+    match reason {
+        ReviewAttentionReason::ReviewRequested => AttentionItemReason::ReviewRequested,
+        ReviewAttentionReason::CommentReply => AttentionItemReason::CommentReply,
+        ReviewAttentionReason::ApprovalRequired => AttentionItemReason::ApprovalRequired,
+        ReviewAttentionReason::CheckRunning => AttentionItemReason::CheckRunning,
+        ReviewAttentionReason::CheckFailed => AttentionItemReason::CheckFailed,
+        ReviewAttentionReason::Conflict => AttentionItemReason::Conflict,
+        ReviewAttentionReason::DeliveryPending => AttentionItemReason::DeliveryPending,
+        ReviewAttentionReason::Complete => AttentionItemReason::Complete,
+        ReviewAttentionReason::ExternalBlocker => AttentionItemReason::ExternalBlocker,
+    }
+}
+
+fn orchestration_attention_items(
+    records: &[OrchestrationRecord],
+    current: Option<&AttentionSourceSnapshot>,
+) -> Result<Vec<AttentionItem>, &'static str> {
+    records
+        .iter()
+        .filter_map(|record| {
+            let (reason, unread) = match record.status() {
+                LineageStatus::Working => Some((AttentionItemReason::AgentWorking, false)),
+                LineageStatus::Blocked(_) => Some((AttentionItemReason::ExternalBlocker, true)),
+                // Waiting does not say who or what is awaited. Projecting it
+                // as approval-required or externally blocked would invent a
+                // stronger condition than the durable lineage record.
+                LineageStatus::Waiting(_) => None,
+                LineageStatus::Done(_) => Some((AttentionItemReason::Complete, true)),
+            }?;
+            let prefix = runtime_attention_incarnation_prefix(
+                "orchestration",
+                &[record.identity().kind().as_str(), record.identity().id()],
+            );
+            Some(
+                runtime_attention_incarnation_id(current, &prefix, record.revision()).and_then(
+                    |id| {
+                        AttentionItem::new(
+                            id,
+                            Revision::FIRST,
+                            record.freshness().observed_at_ms(),
+                            reason.state(),
+                            reason,
+                            unread,
+                            Vec::new(),
+                            None,
+                        )
+                        .map_err(|_| "platform_v2_attention_projection_invalid")
+                    },
+                ),
+            )
+        })
+        .collect()
+}
+
+fn retained_session_attention_items(
+    session: &WorkContextRecord,
+    platform_session: V1SessionRef,
+    observed_at_ms: u64,
+    current: Option<&AttentionSourceSnapshot>,
+) -> Result<Vec<AttentionItem>, &'static str> {
+    let projection = retained_session_attention_projection(session.lifecycle());
+    let Some((reason, unread)) = projection else {
+        return Ok(Vec::new());
+    };
+    let prefix =
+        runtime_attention_incarnation_prefix("retained-session", &[session.identity().id()]);
+    let id = runtime_attention_incarnation_id(current, &prefix, session.revision())?;
+    AttentionItem::new(
+        id,
+        Revision::FIRST,
+        observed_at_ms,
+        reason.state(),
+        reason,
+        unread,
+        Vec::new(),
+        Some(platform_session),
+    )
+    .map(|item| vec![item])
+    .map_err(|_| "platform_v2_attention_projection_invalid")
+}
+
+const fn retained_session_attention_projection(
+    lifecycle: WorkContextLifecycle,
+) -> Option<(AttentionItemReason, bool)> {
+    match lifecycle {
+        WorkContextLifecycle::Active
+        | WorkContextLifecycle::Preparing
+        | WorkContextLifecycle::Running => Some((AttentionItemReason::AgentWorking, false)),
+        WorkContextLifecycle::Completed => Some((AttentionItemReason::Complete, true)),
+        WorkContextLifecycle::Archived
+        | WorkContextLifecycle::Cancelled
+        | WorkContextLifecycle::Closed => Some((AttentionItemReason::Complete, false)),
+        WorkContextLifecycle::Failed => Some((AttentionItemReason::ExternalBlocker, true)),
+        WorkContextLifecycle::Hibernated => None,
+    }
+}
+
+fn runtime_attention_incarnation_prefix(domain: &str, components: &[&str]) -> String {
+    let mut material = Vec::new();
+    for component in std::iter::once(domain).chain(components.iter().copied()) {
+        let bytes = component.as_bytes();
+        material.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        material.extend_from_slice(bytes);
+    }
+    format!(
+        "runtime-{domain}-{}-i",
+        automonique_protocol::digest::Sha256::digest(&material).to_hex()
+    )
+}
+
+fn runtime_attention_incarnation_id(
+    current: Option<&AttentionSourceSnapshot>,
+    prefix: &str,
+    incarnation: Revision,
+) -> Result<AttentionItemId, &'static str> {
+    let mut matching = current
+        .into_iter()
+        .flat_map(AttentionSourceSnapshot::items)
+        .filter(|item| item.id().as_str().starts_with(prefix));
+    if let Some(existing) = matching.next() {
+        if matching.next().is_some() {
+            return Err("platform_v2_attention_projection_invalid");
+        }
+        return Ok(existing.id().clone());
+    }
+    AttentionItemId::new(format!("{prefix}{incarnation}"))
+        .map_err(|_| "platform_v2_attention_projection_invalid")
 }
 
 fn current_mutation_policy(
@@ -3674,14 +4099,962 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    use automonique_protocol::platform::IdempotencyKey;
-    use automonique_protocol::platform_v2::{WorkContextAttributes, WorkContextLabel};
+    use automonique_protocol::platform::{
+        IdempotencyKey, ResourceCoordinate, ResourceId, ResourceKind,
+    };
+    use automonique_protocol::platform_v2::{
+        AttemptWorkspaceId, CheckoutKind, HostSetupKind, V1RepositoryRef, WorkContextAttributes,
+        WorkContextLabel, WorkContextRelation,
+    };
     use automonique_protocol::platform_v2_attention::{
         AttentionReadRequest, AttentionSource, AttentionSourceId, AttentionSourceKind,
+    };
+    use automonique_protocol::platform_v2_lifecycle::{
+        ExpectedWorkContext, ExternalParentResolution,
     };
     use automonique_protocol::platform_v2_transport::{
         LineageReadRequest, ReviewReadRequest, ReviewReceiptLookup,
     };
+
+    fn seed_runtime_attention_contexts(
+        path: &Path,
+        tenant: &str,
+        session_lifecycle: WorkContextLifecycle,
+    ) {
+        let mut store = WorkContextStore::open(path).unwrap();
+        let project = WorkContextIdentity::Project(ProjectId::new("project-runtime").unwrap());
+        let repository = WorkContextIdentity::Repository(
+            V1RepositoryRef::new(ResourceCoordinate::new(
+                ResourceAuthority::GitHub,
+                ResourceKind::Repository,
+                ResourceId::new("repository-runtime").unwrap(),
+            ))
+            .unwrap(),
+        );
+        store
+            .put_external_snapshot(
+                tenant,
+                &ExpectedWorkContext::new(repository.clone(), Revision::FIRST),
+                ExternalParentResolution::Available,
+                Some(&ProjectId::new("project-runtime").unwrap()),
+            )
+            .unwrap();
+        let project_record = WorkContextRecord::new(
+            project.clone(),
+            Revision::FIRST,
+            WorkContextLifecycle::Active,
+            WorkContextLabel::new("Runtime project").unwrap(),
+            WorkContextAttributes::EMPTY,
+            vec![
+                WorkContextRelation::new(WorkContextRelationKind::ProjectRepository, repository)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let host = WorkContextRecord::new(
+            WorkContextIdentity::parse_local(WorkContextTargetKind::HostSetup, "host-runtime")
+                .unwrap(),
+            Revision::FIRST,
+            WorkContextLifecycle::Active,
+            WorkContextLabel::new("Runtime host").unwrap(),
+            WorkContextAttributes::host_setup(HostSetupKind::Local),
+            vec![
+                WorkContextRelation::new(
+                    WorkContextRelationKind::HostSetupProject,
+                    project.clone(),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let checkout = WorkContextRecord::new(
+            WorkContextIdentity::parse_local(WorkContextTargetKind::Checkout, "checkout-runtime")
+                .unwrap(),
+            Revision::FIRST,
+            WorkContextLifecycle::Active,
+            WorkContextLabel::new("Runtime checkout").unwrap(),
+            WorkContextAttributes::checkout(CheckoutKind::GitWorktree),
+            vec![
+                WorkContextRelation::new(WorkContextRelationKind::CheckoutProject, project.clone())
+                    .unwrap(),
+                WorkContextRelation::new(
+                    WorkContextRelationKind::CheckoutHostSetup,
+                    host.identity().clone(),
+                )
+                .unwrap(),
+                WorkContextRelation::new(
+                    WorkContextRelationKind::CheckoutRepository,
+                    project_record.relations()[0].target().clone(),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let workspace = WorkContextRecord::new(
+            WorkContextIdentity::UserWorkspace(UserWorkspaceId::new("workspace-runtime").unwrap()),
+            Revision::FIRST,
+            WorkContextLifecycle::Active,
+            WorkContextLabel::new("Runtime workspace").unwrap(),
+            WorkContextAttributes::EMPTY,
+            vec![
+                WorkContextRelation::new(
+                    WorkContextRelationKind::UserWorkspaceProject,
+                    project.clone(),
+                )
+                .unwrap(),
+                WorkContextRelation::new(
+                    WorkContextRelationKind::UserWorkspaceCheckout,
+                    checkout.identity().clone(),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let attempt = WorkContextRecord::new(
+            WorkContextIdentity::AttemptWorkspace(
+                AttemptWorkspaceId::new("attempt-runtime").unwrap(),
+            ),
+            Revision::FIRST,
+            WorkContextLifecycle::Running,
+            WorkContextLabel::new("Runtime attempt").unwrap(),
+            WorkContextAttributes::EMPTY,
+            vec![
+                WorkContextRelation::new(
+                    WorkContextRelationKind::AttemptUserWorkspace,
+                    workspace.identity().clone(),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let session = WorkContextRecord::new(
+            WorkContextIdentity::Session(WorkSessionId::new("work-session-runtime").unwrap()),
+            Revision::FIRST,
+            session_lifecycle,
+            WorkContextLabel::new("Runtime session").unwrap(),
+            WorkContextAttributes::EMPTY,
+            vec![
+                WorkContextRelation::new(
+                    WorkContextRelationKind::SessionAttemptWorkspace,
+                    attempt.identity().clone(),
+                )
+                .unwrap(),
+                WorkContextRelation::new(
+                    WorkContextRelationKind::SessionPlatformSession,
+                    WorkContextIdentity::PlatformSession(
+                        V1SessionRef::new(ResourceCoordinate::new(
+                            ResourceAuthority::Automonique,
+                            ResourceKind::Session,
+                            ResourceId::new("provider-session-runtime").unwrap(),
+                        ))
+                        .unwrap(),
+                    ),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        for record in [
+            &project_record,
+            &host,
+            &checkout,
+            &workspace,
+            &attempt,
+            &session,
+        ] {
+            store.put_authoritative_record(tenant, record).unwrap();
+        }
+    }
+
+    fn write_runtime_attention_policy(path: &Path, uid: u32) {
+        let authority = serde_json::json!({
+            "filesystem": [], "credentials": [], "network": [],
+            "tools": [], "providers": [], "models": []
+        });
+        write_generation_policy(
+            path,
+            &serde_json::json!({
+                "version": 1,
+                "principals": [{
+                    "uid": uid,
+                    "tenant": "tenant-runtime",
+                    "actor": "actor-runtime",
+                    "serving_authority": "automonique",
+                    "projects": ["project-runtime"],
+                    "workspaces": [
+                        {"project": "project-runtime", "kind": "project", "id": "project-runtime", "inherited_authority": authority},
+                        {"project": "project-runtime", "kind": "host_setup", "id": "host-runtime", "inherited_authority": authority},
+                        {"project": "project-runtime", "kind": "checkout", "id": "checkout-runtime", "inherited_authority": authority},
+                        {"project": "project-runtime", "kind": "user_workspace", "id": "workspace-runtime", "inherited_authority": authority},
+                        {"project": "project-runtime", "kind": "attempt_workspace", "id": "attempt-runtime", "inherited_authority": authority},
+                        {"project": "project-runtime", "kind": "session", "id": "work-session-runtime", "inherited_authority": authority}
+                    ],
+                    "authority": authority,
+                    "review_authorities": {}
+                }]
+            }),
+        );
+    }
+
+    #[test]
+    fn runtime_attention_producers_preserve_authoritative_identities_and_coordinates() {
+        use automonique_protocol::platform_v2_lineage::{
+            LineageFreshness, LineageFreshnessState, OrchestrationIdentity, OrchestrationWorkerId,
+        };
+        use automonique_protocol::platform_v2_review_api::decode_review_snapshot;
+
+        let review = decode_review_snapshot(include_bytes!(
+            "../../automonique-protocol/fixtures/platform-v2-review-v2.json"
+        ))
+        .unwrap();
+        let review_items = review_attention_items(&review, 1_800_000_000_001).unwrap();
+        assert_eq!(review_items.len(), review.attention_events().len());
+        assert!(
+            review_items
+                .iter()
+                .all(|item| item.platform_session().is_none())
+        );
+        assert_eq!(
+            review_items[0].id().as_str(),
+            review.attention_events()[0].id().as_str()
+        );
+        assert!(
+            review_items
+                .iter()
+                .zip(review.attention_events())
+                .all(|(item, event)| item.unread() == (event.unread() > 0)),
+            "review unread remains the exact durable event count projection"
+        );
+
+        let orchestration = OrchestrationRecord::new_with_origin(
+            OrchestrationIdentity::Worker(OrchestrationWorkerId::new("worker-1").unwrap()),
+            automonique_protocol::platform_v2_lineage::LineageOrigin::workspace_only(
+                UserWorkspaceId::new("workspace-1").unwrap(),
+            ),
+            None,
+            Some(
+                automonique_protocol::platform_v2_lineage::OrchestrationIdentity::Dispatch(
+                    automonique_protocol::platform_v2_lineage::OrchestrationDispatchId::new(
+                        "dispatch-1",
+                    )
+                    .unwrap(),
+                ),
+            ),
+            LineageStatus::Working,
+            LineageFreshness::new(1_700, 60_000, LineageFreshnessState::Fresh).unwrap(),
+            None,
+            Revision::new(9).unwrap(),
+        )
+        .unwrap();
+        let orchestration_items = orchestration_attention_items(&[orchestration], None).unwrap();
+        assert!(orchestration_items[0].id().as_str().ends_with("-i9"));
+        assert_eq!(
+            orchestration_items[0].reason(),
+            AttentionItemReason::AgentWorking
+        );
+        assert!(!orchestration_items[0].unread());
+        assert!(orchestration_items[0].nested_agent_path().is_empty());
+
+        let platform_session = V1SessionRef::new(ResourceCoordinate::new(
+            ResourceAuthority::Automonique,
+            ResourceKind::Session,
+            ResourceId::new("provider-session-1").unwrap(),
+        ))
+        .unwrap();
+        let session = WorkContextRecord::new(
+            WorkContextIdentity::Session(WorkSessionId::new("work-session-1").unwrap()),
+            Revision::new(4).unwrap(),
+            WorkContextLifecycle::Active,
+            WorkContextLabel::new("Retained session").unwrap(),
+            WorkContextAttributes::EMPTY,
+            vec![
+                WorkContextRelation::new(
+                    WorkContextRelationKind::SessionAttemptWorkspace,
+                    WorkContextIdentity::AttemptWorkspace(
+                        AttemptWorkspaceId::new("attempt-1").unwrap(),
+                    ),
+                )
+                .unwrap(),
+                WorkContextRelation::new(
+                    WorkContextRelationKind::SessionPlatformSession,
+                    WorkContextIdentity::PlatformSession(platform_session.clone()),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let session_items =
+            retained_session_attention_items(&session, platform_session.clone(), 2_000, None)
+                .unwrap();
+        assert_eq!(session_items[0].platform_session(), Some(&platform_session));
+        assert_eq!(session_items[0].reason(), AttentionItemReason::AgentWorking);
+        assert!(!session_items[0].unread());
+        assert!(session_items[0].id().as_str().ends_with("-i4"));
+        assert_eq!(
+            review_attention_items_from_snapshot(None, 2_001),
+            Err("platform_v2_attention_not_found"),
+            "an absent durable producer must not become an empty source"
+        );
+        let review_source = AttentionSource::new(
+            AttentionSourceKind::Review,
+            AttentionSourceId::new("workspace-1").unwrap(),
+        );
+        assert!(workspace_source_matches(
+            &review_source,
+            &UserWorkspaceId::new("workspace-1").unwrap()
+        ));
+        assert!(!workspace_source_matches(
+            &review_source,
+            &UserWorkspaceId::new("workspace-2").unwrap()
+        ));
+    }
+
+    #[test]
+    fn runtime_attention_unread_policy_is_exhaustive() {
+        use automonique_protocol::platform_v2_lineage::{
+            LineageFreshness, LineageFreshnessState, LineageMessage, LineageOrigin,
+            OrchestrationIdentity, OrchestrationRunId,
+        };
+
+        let orchestration_record = |status| {
+            OrchestrationRecord::new_with_origin(
+                OrchestrationIdentity::Run(OrchestrationRunId::new("run-unread").unwrap()),
+                LineageOrigin::workspace_only(UserWorkspaceId::new("workspace-unread").unwrap()),
+                None,
+                None,
+                status,
+                LineageFreshness::new(1_000, 60_000, LineageFreshnessState::Fresh).unwrap(),
+                None,
+                Revision::FIRST,
+            )
+            .unwrap()
+        };
+        for (status, expected) in [
+            (
+                LineageStatus::Working,
+                Some((AttentionItemReason::AgentWorking, false)),
+            ),
+            (
+                LineageStatus::Blocked(LineageMessage::new("blocked").unwrap()),
+                Some((AttentionItemReason::ExternalBlocker, true)),
+            ),
+            (
+                LineageStatus::Done(LineageMessage::new("done").unwrap()),
+                Some((AttentionItemReason::Complete, true)),
+            ),
+            (
+                LineageStatus::Waiting(LineageMessage::new("waiting").unwrap()),
+                None,
+            ),
+        ] {
+            let items =
+                orchestration_attention_items(&[orchestration_record(status)], None).unwrap();
+            match expected {
+                Some((reason, unread)) => {
+                    assert_eq!(items.len(), 1);
+                    assert_eq!(items[0].reason(), reason);
+                    assert_eq!(items[0].state(), reason.state());
+                    assert_eq!(items[0].unread(), unread);
+                }
+                None => assert!(items.is_empty()),
+            }
+        }
+
+        let platform_session = V1SessionRef::new(ResourceCoordinate::new(
+            ResourceAuthority::Automonique,
+            ResourceKind::Session,
+            ResourceId::new("provider-session-unread").unwrap(),
+        ))
+        .unwrap();
+        let session_record = |lifecycle| {
+            WorkContextRecord::new(
+                WorkContextIdentity::Session(WorkSessionId::new("work-session-unread").unwrap()),
+                Revision::FIRST,
+                lifecycle,
+                WorkContextLabel::new("Retained session").unwrap(),
+                WorkContextAttributes::EMPTY,
+                vec![
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::SessionAttemptWorkspace,
+                        WorkContextIdentity::AttemptWorkspace(
+                            AttemptWorkspaceId::new("attempt-unread").unwrap(),
+                        ),
+                    )
+                    .unwrap(),
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::SessionPlatformSession,
+                        WorkContextIdentity::PlatformSession(platform_session.clone()),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap()
+        };
+        let lifecycle_policy = [
+            (
+                WorkContextLifecycle::Active,
+                Some((AttentionItemReason::AgentWorking, false)),
+            ),
+            (
+                WorkContextLifecycle::Preparing,
+                Some((AttentionItemReason::AgentWorking, false)),
+            ),
+            (
+                WorkContextLifecycle::Running,
+                Some((AttentionItemReason::AgentWorking, false)),
+            ),
+            (
+                WorkContextLifecycle::Failed,
+                Some((AttentionItemReason::ExternalBlocker, true)),
+            ),
+            (
+                WorkContextLifecycle::Completed,
+                Some((AttentionItemReason::Complete, true)),
+            ),
+            (
+                WorkContextLifecycle::Archived,
+                Some((AttentionItemReason::Complete, false)),
+            ),
+            (
+                WorkContextLifecycle::Cancelled,
+                Some((AttentionItemReason::Complete, false)),
+            ),
+            (
+                WorkContextLifecycle::Closed,
+                Some((AttentionItemReason::Complete, false)),
+            ),
+            (WorkContextLifecycle::Hibernated, None),
+        ];
+        for (lifecycle, expected) in lifecycle_policy {
+            assert_eq!(retained_session_attention_projection(lifecycle), expected);
+        }
+        for lifecycle in [
+            WorkContextLifecycle::Active,
+            WorkContextLifecycle::Failed,
+            WorkContextLifecycle::Completed,
+            WorkContextLifecycle::Cancelled,
+            WorkContextLifecycle::Hibernated,
+        ] {
+            let expected = retained_session_attention_projection(lifecycle);
+            let items = retained_session_attention_items(
+                &session_record(lifecycle),
+                platform_session.clone(),
+                1_000,
+                None,
+            )
+            .unwrap();
+            match expected {
+                Some((reason, unread)) => {
+                    assert_eq!(items.len(), 1);
+                    assert_eq!(items[0].reason(), reason);
+                    assert_eq!(items[0].state(), reason.state());
+                    assert_eq!(items[0].unread(), unread);
+                }
+                None => assert!(items.is_empty()),
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_provider_session_attention_uses_read_lineage_without_control_authority() {
+        for (lifecycle, reason, unread) in [
+            (
+                WorkContextLifecycle::Completed,
+                AttentionItemReason::Complete,
+                true,
+            ),
+            (
+                WorkContextLifecycle::Failed,
+                AttentionItemReason::ExternalBlocker,
+                true,
+            ),
+            (
+                WorkContextLifecycle::Cancelled,
+                AttentionItemReason::Complete,
+                false,
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let policy_path = directory.path().join("policy.json");
+            let contexts_path = directory.path().join("work-context.sqlite3");
+            let uid = nix::unistd::geteuid().as_raw();
+            seed_runtime_attention_contexts(&contexts_path, "tenant-runtime", lifecycle);
+            write_runtime_attention_policy(&policy_path, uid);
+            let mut host = PlatformV2Host::open_with_lifecycle_adapter(
+                &policy_path,
+                &contexts_path,
+                &directory.path().join("lineage.sqlite3"),
+                &directory.path().join("review.sqlite3"),
+                uid,
+                Box::new(UnavailableLifecycleEffectAdapter),
+            );
+            let response = host.handle(
+                uid,
+                &PlatformV2Request::GetAttentionSourceSnapshot(AttentionReadRequest::new(
+                    AttentionSource::new(
+                        AttentionSourceKind::ProviderSession,
+                        AttentionSourceId::new("work-session-runtime").unwrap(),
+                    ),
+                    ProjectId::new("project-runtime").unwrap(),
+                    UserWorkspaceId::new("workspace-runtime").unwrap(),
+                )),
+                2_000,
+            );
+            let PlatformV2Response::AttentionSourceSnapshot(snapshot) = response else {
+                panic!("terminal provider attention refused for {lifecycle:?}: {response:?}")
+            };
+            assert_eq!(snapshot.items().len(), 1);
+            assert_eq!(snapshot.items()[0].reason(), reason);
+            assert_eq!(snapshot.items()[0].unread(), unread);
+            assert_eq!(
+                snapshot.items()[0]
+                    .platform_session()
+                    .unwrap()
+                    .coordinate()
+                    .id
+                    .as_str(),
+                "provider-session-runtime"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_runtime_tuple_collision_refuses_before_import_on_every_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let policy_path = directory.path().join("policy.json");
+        let contexts_path = directory.path().join("work-context.sqlite3");
+        let uid = nix::unistd::geteuid().as_raw();
+        seed_runtime_attention_contexts(
+            &contexts_path,
+            "tenant-runtime",
+            WorkContextLifecycle::Active,
+        );
+        write_runtime_attention_policy(&policy_path, uid);
+
+        let mut raw: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../automonique-protocol/fixtures/platform-v2-attention-v1.json"
+        ))
+        .unwrap();
+        raw["source"]["id"] = serde_json::json!("work-session-runtime");
+        raw["project"] = serde_json::json!("project-runtime");
+        raw["user_workspace"] = serde_json::json!("workspace-runtime");
+        let registry_path = directory.path().join(ATTENTION_REGISTRY_NAME);
+        fs::write(
+            &registry_path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "generation": "runtime-collision",
+                "snapshots": [raw]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&registry_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        for _restart in 0..2 {
+            let host = PlatformV2Host::open_with_lifecycle_adapter(
+                &policy_path,
+                &contexts_path,
+                &directory.path().join("lineage.sqlite3"),
+                &directory.path().join("review.sqlite3"),
+                uid,
+                Box::new(UnavailableLifecycleEffectAdapter),
+            );
+            assert!(matches!(
+                host,
+                PlatformV2Host::Disabled("platform_v2_attention_registry_runtime_collision")
+            ));
+            let attention = AttentionStore::open_scoped(
+                directory.path().join(ATTENTION_STORE_NAME),
+                "tenant-runtime",
+            )
+            .unwrap();
+            assert!(
+                attention
+                    .snapshot(
+                        &AttentionSource::new(
+                            AttentionSourceKind::ProviderSession,
+                            AttentionSourceId::new("work-session-runtime").unwrap(),
+                        ),
+                        &ProjectId::new("project-runtime").unwrap(),
+                        &UserWorkspaceId::new("workspace-runtime").unwrap(),
+                    )
+                    .unwrap()
+                    .is_none(),
+                "a rejected registry must not import or shadow runtime custody"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_attention_replacement_is_idempotent_monotone_and_lifetime_safe() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let mut store = AttentionStore::open_scoped(
+            directory.path().join("runtime-attention.sqlite3"),
+            "tenant-test",
+        )
+        .unwrap();
+        let source = AttentionSource::new(
+            AttentionSourceKind::Review,
+            AttentionSourceId::new("workspace-1").unwrap(),
+        );
+        let project = ProjectId::new("project-1").unwrap();
+        let workspace = UserWorkspaceId::new("workspace-1").unwrap();
+        let request = AttentionReadRequest::new(source.clone(), project.clone(), workspace.clone());
+        let item = |unread, observed_at_ms| {
+            AttentionItem::new(
+                AttentionItemId::new("review-item-1").unwrap(),
+                Revision::FIRST,
+                observed_at_ms,
+                AttentionItemReason::ReviewRequested.state(),
+                AttentionItemReason::ReviewRequested,
+                unread,
+                Vec::new(),
+                None,
+            )
+            .unwrap()
+        };
+
+        let first =
+            persist_runtime_attention_snapshot(&mut store, &request, vec![item(true, 10)], 10)
+                .unwrap();
+        let replay =
+            persist_runtime_attention_snapshot(&mut store, &request, vec![item(true, 20)], 20)
+                .unwrap();
+        assert_eq!(
+            replay, first,
+            "read-time observation cannot churn a stable source"
+        );
+        let changed =
+            persist_runtime_attention_snapshot(&mut store, &request, vec![item(false, 30)], 30)
+                .unwrap();
+        assert_eq!(changed.revision(), Revision::new(2).unwrap());
+        assert_eq!(changed.previous_revision(), Some(Revision::FIRST));
+        assert_eq!(changed.items()[0].revision(), Revision::new(2).unwrap());
+        let removed =
+            persist_runtime_attention_snapshot(&mut store, &request, Vec::new(), 40).unwrap();
+        assert_eq!(removed.previous_revision(), Some(Revision::new(2).unwrap()));
+        assert_eq!(
+            persist_runtime_attention_snapshot(&mut store, &request, vec![item(false, 50)], 50),
+            Err("platform_v2_attention_store_refused"),
+            "a removed source-lifetime item id cannot be reused"
+        );
+        assert!(
+            store
+                .snapshot(&source, &ProjectId::new("project-2").unwrap(), &workspace,)
+                .unwrap()
+                .is_none(),
+            "cross-project reads do not inherit a source tuple"
+        );
+        assert!(
+            store
+                .snapshot(
+                    &source,
+                    &project,
+                    &UserWorkspaceId::new("workspace-2").unwrap(),
+                )
+                .unwrap()
+                .is_none(),
+            "cross-workspace reads do not inherit a source tuple"
+        );
+    }
+
+    #[test]
+    fn runtime_attention_replay_at_max_revision_does_not_require_a_successor() {
+        let source = AttentionSource::new(
+            AttentionSourceKind::Review,
+            AttentionSourceId::new("workspace-1").unwrap(),
+        );
+        let project = ProjectId::new("project-1").unwrap();
+        let workspace = UserWorkspaceId::new("workspace-1").unwrap();
+        let request = AttentionReadRequest::new(source.clone(), project.clone(), workspace.clone());
+        let maximum = Revision::new(u64::MAX).unwrap();
+        let current_item = AttentionItem::new(
+            AttentionItemId::new("review-item-1").unwrap(),
+            maximum,
+            10,
+            AttentionItemReason::ReviewRequested.state(),
+            AttentionItemReason::ReviewRequested,
+            true,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        let current = AttentionSourceSnapshot::new(
+            source,
+            project,
+            workspace,
+            maximum,
+            Some(Revision::new(u64::MAX - 1).unwrap()),
+            10,
+            vec![current_item],
+        )
+        .unwrap();
+        let desired = |unread| {
+            AttentionItem::new(
+                AttentionItemId::new("review-item-1").unwrap(),
+                Revision::FIRST,
+                20,
+                AttentionItemReason::ReviewRequested.state(),
+                AttentionItemReason::ReviewRequested,
+                unread,
+                Vec::new(),
+                None,
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            prepare_runtime_attention_snapshot(&request, vec![desired(true)], 20, Some(&current)),
+            Ok(current.clone()),
+            "an exact replay remains the exact durable document at Revision::MAX"
+        );
+        assert_eq!(
+            prepare_runtime_attention_snapshot(&request, vec![desired(false)], 20, Some(&current),),
+            Err("platform_v2_attention_revision_exhausted"),
+            "a real change must still fail closed when no successor exists"
+        );
+    }
+
+    #[test]
+    fn runtime_attention_logical_items_survive_churn_but_not_an_absent_interval() {
+        use automonique_protocol::platform_v2_lineage::{
+            LineageFreshness, LineageFreshnessState, LineageMessage, LineageOrigin,
+            OrchestrationIdentity, OrchestrationRunId,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let orchestration_store_path = directory.path().join("orchestration-attention.sqlite3");
+        let mut store =
+            AttentionStore::open_scoped(&orchestration_store_path, "tenant-test").unwrap();
+        let request = AttentionReadRequest::new(
+            AttentionSource::new(
+                AttentionSourceKind::Orchestration,
+                AttentionSourceId::new("workspace-1").unwrap(),
+            ),
+            ProjectId::new("project-1").unwrap(),
+            UserWorkspaceId::new("workspace-1").unwrap(),
+        );
+        let record = |status, revision, observed_at_ms| {
+            OrchestrationRecord::new_with_origin(
+                OrchestrationIdentity::Run(OrchestrationRunId::new("run-1").unwrap()),
+                LineageOrigin::workspace_only(UserWorkspaceId::new("workspace-1").unwrap()),
+                None,
+                None,
+                status,
+                LineageFreshness::new(observed_at_ms, 60_000, LineageFreshnessState::Fresh)
+                    .unwrap(),
+                None,
+                Revision::new(revision).unwrap(),
+            )
+            .unwrap()
+        };
+
+        let first_items =
+            orchestration_attention_items(&[record(LineageStatus::Working, 7, 700)], None).unwrap();
+        let first =
+            persist_runtime_attention_snapshot(&mut store, &request, first_items, 700).unwrap();
+        let original_id = first.items()[0].id().clone();
+        assert!(!first.items()[0].unread());
+        let unchanged_items =
+            orchestration_attention_items(&[record(LineageStatus::Working, 8, 800)], Some(&first))
+                .unwrap();
+        let unchanged =
+            persist_runtime_attention_snapshot(&mut store, &request, unchanged_items, 800).unwrap();
+        assert_eq!(
+            unchanged, first,
+            "unrelated record revision churn is replay"
+        );
+
+        let changed_items = orchestration_attention_items(
+            &[record(
+                LineageStatus::Blocked(LineageMessage::new("dependency").unwrap()),
+                9,
+                900,
+            )],
+            Some(&unchanged),
+        )
+        .unwrap();
+        let changed =
+            persist_runtime_attention_snapshot(&mut store, &request, changed_items, 900).unwrap();
+        assert_eq!(changed.items()[0].id(), &original_id);
+        assert_eq!(changed.items()[0].revision(), Revision::new(2).unwrap());
+        assert_eq!(
+            changed.items()[0].reason(),
+            AttentionItemReason::ExternalBlocker
+        );
+        assert!(changed.items()[0].unread());
+
+        let done_items = orchestration_attention_items(
+            &[record(
+                LineageStatus::Done(LineageMessage::new("complete").unwrap()),
+                10,
+                1_000,
+            )],
+            Some(&changed),
+        )
+        .unwrap();
+        let done =
+            persist_runtime_attention_snapshot(&mut store, &request, done_items, 1_000).unwrap();
+        assert_eq!(done.items()[0].id(), &original_id);
+        assert_eq!(done.items()[0].revision(), Revision::new(3).unwrap());
+        assert_eq!(done.items()[0].reason(), AttentionItemReason::Complete);
+        assert!(done.items()[0].unread());
+
+        let absent_items = orchestration_attention_items(
+            &[record(
+                LineageStatus::Waiting(LineageMessage::new("idle").unwrap()),
+                11,
+                1_100,
+            )],
+            Some(&done),
+        )
+        .unwrap();
+        let absent =
+            persist_runtime_attention_snapshot(&mut store, &request, absent_items, 1_100).unwrap();
+        assert!(absent.items().is_empty());
+        drop(store);
+        let mut store =
+            AttentionStore::open_scoped(&orchestration_store_path, "tenant-test").unwrap();
+        let reappeared_items = orchestration_attention_items(
+            &[record(LineageStatus::Working, 12, 1_200)],
+            Some(&absent),
+        )
+        .unwrap();
+        let reappeared =
+            persist_runtime_attention_snapshot(&mut store, &request, reappeared_items, 1_200)
+                .unwrap();
+        assert_ne!(reappeared.items()[0].id(), &original_id);
+        assert!(!reappeared.items()[0].unread());
+
+        let session_store_path = directory.path().join("session-attention.sqlite3");
+        let mut session_store =
+            AttentionStore::open_scoped(&session_store_path, "tenant-test").unwrap();
+        let session_request = AttentionReadRequest::new(
+            AttentionSource::new(
+                AttentionSourceKind::ProviderSession,
+                AttentionSourceId::new("work-session-1").unwrap(),
+            ),
+            ProjectId::new("project-1").unwrap(),
+            UserWorkspaceId::new("workspace-1").unwrap(),
+        );
+        let platform_session = V1SessionRef::new(ResourceCoordinate::new(
+            ResourceAuthority::Automonique,
+            ResourceKind::Session,
+            ResourceId::new("provider-session-1").unwrap(),
+        ))
+        .unwrap();
+        let session = |lifecycle, revision| {
+            WorkContextRecord::new(
+                WorkContextIdentity::Session(WorkSessionId::new("work-session-1").unwrap()),
+                Revision::new(revision).unwrap(),
+                lifecycle,
+                WorkContextLabel::new("Retained session").unwrap(),
+                WorkContextAttributes::EMPTY,
+                vec![
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::SessionAttemptWorkspace,
+                        WorkContextIdentity::AttemptWorkspace(
+                            AttemptWorkspaceId::new("attempt-1").unwrap(),
+                        ),
+                    )
+                    .unwrap(),
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::SessionPlatformSession,
+                        WorkContextIdentity::PlatformSession(platform_session.clone()),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap()
+        };
+        let first_items = retained_session_attention_items(
+            &session(WorkContextLifecycle::Active, 3),
+            platform_session.clone(),
+            300,
+            None,
+        )
+        .unwrap();
+        let first = persist_runtime_attention_snapshot(
+            &mut session_store,
+            &session_request,
+            first_items,
+            300,
+        )
+        .unwrap();
+        let original_id = first.items()[0].id().clone();
+        assert!(!first.items()[0].unread());
+        let unchanged_items = retained_session_attention_items(
+            &session(WorkContextLifecycle::Active, 4),
+            platform_session.clone(),
+            400,
+            Some(&first),
+        )
+        .unwrap();
+        let unchanged = persist_runtime_attention_snapshot(
+            &mut session_store,
+            &session_request,
+            unchanged_items,
+            400,
+        )
+        .unwrap();
+        assert_eq!(unchanged, first);
+        let changed_items = retained_session_attention_items(
+            &session(WorkContextLifecycle::Completed, 5),
+            platform_session.clone(),
+            500,
+            Some(&unchanged),
+        )
+        .unwrap();
+        let changed = persist_runtime_attention_snapshot(
+            &mut session_store,
+            &session_request,
+            changed_items,
+            500,
+        )
+        .unwrap();
+        assert_eq!(changed.items()[0].id(), &original_id);
+        assert_eq!(changed.items()[0].reason(), AttentionItemReason::Complete);
+        assert!(changed.items()[0].unread());
+        let absent_items = retained_session_attention_items(
+            &session(WorkContextLifecycle::Hibernated, 6),
+            platform_session.clone(),
+            600,
+            Some(&changed),
+        )
+        .unwrap();
+        let absent = persist_runtime_attention_snapshot(
+            &mut session_store,
+            &session_request,
+            absent_items,
+            600,
+        )
+        .unwrap();
+        assert!(absent.items().is_empty());
+        drop(session_store);
+        let mut session_store =
+            AttentionStore::open_scoped(&session_store_path, "tenant-test").unwrap();
+        let reappeared_items = retained_session_attention_items(
+            &session(WorkContextLifecycle::Active, 7),
+            platform_session,
+            700,
+            Some(&absent),
+        )
+        .unwrap();
+        let reappeared = persist_runtime_attention_snapshot(
+            &mut session_store,
+            &session_request,
+            reappeared_items,
+            700,
+        )
+        .unwrap();
+        assert_ne!(reappeared.items()[0].id(), &original_id);
+        assert!(!reappeared.items()[0].unread());
+    }
 
     fn policy(inherited_tools: serde_json::Value) -> PolicyDocument {
         serde_json::from_value(serde_json::json!({

@@ -162,6 +162,7 @@ impl AttentionRegistry {
         path: &Path,
         expected_uid: u32,
         store: &mut AttentionStore,
+        mut source_reserved: impl FnMut(&AttentionSourceSnapshot) -> bool,
     ) -> Result<Self, &'static str> {
         let Some(private) = read_private_file(path, expected_uid)? else {
             return Ok(Self::default());
@@ -189,6 +190,9 @@ impl AttentionRegistry {
             );
             if !keys.insert(key) {
                 return Err("platform_v2_attention_registry_invalid");
+            }
+            if source_reserved(&snapshot) {
+                return Err("platform_v2_attention_registry_runtime_collision");
             }
             snapshots.push(snapshot);
         }
@@ -240,6 +244,16 @@ impl AttentionRegistry {
             return Err("platform_v2_attention_store_refused");
         }
         Ok(stored)
+    }
+
+    pub(crate) fn contains(&self, request: &AttentionReadRequest) -> bool {
+        self.installed.as_ref().is_some_and(|installed| {
+            installed.snapshots.iter().any(|snapshot| {
+                snapshot.source() == request.source()
+                    && snapshot.project() == request.project()
+                    && snapshot.user_workspace() == request.user_workspace()
+            })
+        })
     }
 }
 
@@ -370,9 +384,13 @@ mod tests {
     fn absent_registry_refuses_instead_of_projecting_empty_attention() {
         let directory = private_directory();
         let mut store = store(directory.path());
-        let registry =
-            AttentionRegistry::open(&directory.path().join("absent.json"), uid(), &mut store)
-                .unwrap();
+        let registry = AttentionRegistry::open(
+            &directory.path().join("absent.json"),
+            uid(),
+            &mut store,
+            |_| false,
+        )
+        .unwrap();
         let snapshot = decode_attention_source_snapshot(include_bytes!(
             "../../automonique-protocol/fixtures/platform-v2-attention-v1.json"
         ))
@@ -401,7 +419,7 @@ mod tests {
         snapshot["items"][0]["platform_session"]["id"] = serde_json::json!("session-secret-value");
         write_registry(&path, vec![snapshot], "attention-secret-generation");
         let mut store = store(directory.path());
-        let registry = AttentionRegistry::open(&path, uid(), &mut store).unwrap();
+        let registry = AttentionRegistry::open(&path, uid(), &mut store, |_| false).unwrap();
         assert_eq!(
             format!("{registry:?}"),
             "AttentionRegistry { state: \"installed\", snapshot_count: 1 }"
@@ -436,7 +454,7 @@ mod tests {
         let path = directory.path().join("registry.json");
         write_registry(&path, vec![fixture()], "generation-1");
         let mut store = store(directory.path());
-        let registry = AttentionRegistry::open(&path, uid(), &mut store).unwrap();
+        let registry = AttentionRegistry::open(&path, uid(), &mut store, |_| false).unwrap();
         let expected = decode_attention_source_snapshot(include_bytes!(
             "../../automonique-protocol/fixtures/platform-v2-attention-v1.json"
         ))
@@ -486,7 +504,7 @@ mod tests {
         let path = directory.path().join("registry.json");
         write_registry(&path, vec![fixture()], "generation-7");
         let mut store = store(directory.path());
-        AttentionRegistry::open(&path, uid(), &mut store).unwrap();
+        AttentionRegistry::open(&path, uid(), &mut store, |_| false).unwrap();
 
         let mut stale = fixture();
         stale["revision"] = serde_json::json!(6);
@@ -495,9 +513,54 @@ mod tests {
         stale["items"][0]["observed_at_ms"] = serde_json::json!(1_890);
         write_registry(&path, vec![stale], "generation-6");
         assert_eq!(
-            AttentionRegistry::open(&path, uid(), &mut store).unwrap_err(),
+            AttentionRegistry::open(&path, uid(), &mut store, |_| false).unwrap_err(),
             "platform_v2_attention_store_refused"
         );
+    }
+
+    #[test]
+    fn runtime_owned_collision_is_rejected_before_import_and_again_after_restart() {
+        let directory = private_directory();
+        let path = directory.path().join("registry.json");
+        let original_raw = fixture();
+        write_registry(&path, vec![original_raw.clone()], "collision-generation");
+        let original = decode_attention_source_snapshot(
+            &serde_json::to_vec(&original_raw).expect("snapshot JSON"),
+        )
+        .unwrap();
+        let mut successor_raw = original_raw;
+        successor_raw["revision"] = serde_json::json!(8);
+        successor_raw["previous_revision"] = serde_json::json!(7);
+        successor_raw["observed_at_ms"] = serde_json::json!(2_100);
+        successor_raw["items"][0]["revision"] = serde_json::json!(8);
+        successor_raw["items"][0]["observed_at_ms"] = serde_json::json!(2_090);
+        let successor = decode_attention_source_snapshot(
+            &serde_json::to_vec(&successor_raw).expect("snapshot JSON"),
+        )
+        .unwrap();
+        let mut attention = store(directory.path());
+        attention.put_snapshot(&original).unwrap();
+        attention.put_snapshot(&successor).unwrap();
+
+        for _restart in 0..2 {
+            assert_eq!(
+                AttentionRegistry::open(&path, uid(), &mut attention, |_| true).unwrap_err(),
+                "platform_v2_attention_registry_runtime_collision"
+            );
+            assert_eq!(
+                attention
+                    .snapshot(
+                        successor.source(),
+                        successor.project(),
+                        successor.user_workspace(),
+                    )
+                    .unwrap(),
+                Some(successor.clone()),
+                "collision refusal must not re-import or shadow runtime custody"
+            );
+            drop(attention);
+            attention = store(directory.path());
+        }
     }
 
     #[test]
@@ -515,7 +578,7 @@ mod tests {
             "generation-1",
         );
         let mut store = store(directory.path());
-        AttentionRegistry::open(&path, uid(), &mut store).unwrap();
+        AttentionRegistry::open(&path, uid(), &mut store, |_| false).unwrap();
 
         let mut successor_a = current_a.clone();
         successor_a["revision"] = serde_json::json!(8);
@@ -535,7 +598,7 @@ mod tests {
             "generation-2",
         );
         assert_eq!(
-            AttentionRegistry::open(&path, uid(), &mut store).unwrap_err(),
+            AttentionRegistry::open(&path, uid(), &mut store, |_| false).unwrap_err(),
             "platform_v2_attention_store_refused"
         );
 
@@ -562,7 +625,7 @@ mod tests {
         let path = directory.path().join("registry.json");
         write_registry(&path, vec![fixture()], "generation-1");
         let mut store = store(directory.path());
-        let registry = AttentionRegistry::open(&path, uid(), &mut store).unwrap();
+        let registry = AttentionRegistry::open(&path, uid(), &mut store, |_| false).unwrap();
         let expected = decode_attention_source_snapshot(include_bytes!(
             "../../automonique-protocol/fixtures/platform-v2-attention-v1.json"
         ))
@@ -580,13 +643,13 @@ mod tests {
 
         write_registry(&path, vec![fixture(), fixture()], "generation-3");
         assert!(matches!(
-            AttentionRegistry::open(&path, uid(), &mut store),
+            AttentionRegistry::open(&path, uid(), &mut store, |_| false),
             Err("platform_v2_attention_registry_invalid")
         ));
         write_registry(&path, vec![fixture()], "generation-4");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
         assert!(matches!(
-            AttentionRegistry::open(&path, uid(), &mut store),
+            AttentionRegistry::open(&path, uid(), &mut store, |_| false),
             Err("platform_v2_attention_registry_insecure")
         ));
 
@@ -608,7 +671,7 @@ mod tests {
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(matches!(
-            AttentionRegistry::open(&path, uid(), &mut store),
+            AttentionRegistry::open(&path, uid(), &mut store, |_| false),
             Err("platform_v2_attention_registry_invalid")
         ));
     }

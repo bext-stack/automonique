@@ -11,6 +11,10 @@ use automonique_protocol::platform_v2::{
     WorkContextKind, WorkContextLifecycle, WorkContextQuery, WorkContextRecord,
     WorkContextRelationKind,
 };
+use automonique_protocol::platform_v2_attention::{
+    AttentionItemState, AttentionReadRequest, AttentionSource, AttentionSourceId,
+    AttentionSourceKind, AttentionSourceSnapshot,
+};
 use automonique_protocol::platform_v2_lineage::{
     BaseSelectorId, BranchSelectorId, ExternalWorkAuthorityId, ExternalWorkIdentity,
     ExternalWorkKey, ExternalWorkProvider, ExternalWorkScope, ExternalWorkState,
@@ -21,9 +25,8 @@ use automonique_protocol::platform_v2_lineage::{
 use automonique_protocol::platform_v2_lineage_api::encode_lineage_projection;
 use automonique_protocol::platform_v2_lineage_api::encode_workspace_intent_outcome;
 use automonique_protocol::platform_v2_review::{
-    AttentionReason, DiffSide, ReviewAction, ReviewActionReceipt, ReviewAnchor, ReviewCheckId,
-    ReviewCommentId, ReviewDecision, ReviewFileId, ReviewFreshnessState, ReviewHunkId,
-    ReviewSnapshot, ReviewText,
+    DiffSide, ReviewAction, ReviewActionReceipt, ReviewAnchor, ReviewCheckId, ReviewCommentId,
+    ReviewDecision, ReviewFileId, ReviewFreshnessState, ReviewHunkId, ReviewSnapshot, ReviewText,
 };
 use automonique_protocol::platform_v2_review_api::{
     encode_review_action_receipt, encode_review_snapshot,
@@ -43,9 +46,11 @@ const SCHEMA: &str = "automonique.dashboard.cockpit/v2";
 const ADAPTER_PENDING: &str = "platform_v2_lifecycle_adapter_pending";
 const REVIEW_ADAPTER_PENDING: &str = "platform_v2_review_adapter_pending";
 const MAX_ATTENTION_WORKSPACES: usize = 16;
+const MAX_ATTENTION_SOURCES_PER_WORKSPACE: usize = 64;
 const MAX_COCKPIT_PROJECTS: usize = 128;
 const MAX_COCKPIT_WORK_CONTEXTS: usize = 1024;
 const MAX_COCKPIT_ACTIVITIES: usize = 256;
+const MAX_COCKPIT_INBOX_ITEMS: usize = 256;
 const WORK_CONTEXT_PAGE_LIMIT: u16 = 128;
 const ATTENTION_READ_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -59,6 +64,8 @@ struct BoundedCockpitItems {
 struct AttentionInventory {
     coverage: Value,
     observations: BTreeMap<String, Value>,
+    selected_inbox: BoundedCockpitItems,
+    selected_source: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -384,20 +391,16 @@ fn read(
         review_snapshot.as_ref(),
         review_capabilities.as_ref(),
     );
-    let attention = attention_inventory(bridge, &records, selected_identity.as_ref(), &review);
+    let attention = attention_inventory(bridge, &records, selected_identity.as_ref());
     let activity_items = cockpit_activities(lineage_projection.as_ref(), review_snapshot.as_ref());
-    let inbox_items = review_snapshot
-        .as_ref()
-        .map(review_inbox)
-        .unwrap_or(BoundedCockpitItems {
-            items: Vec::new(),
-            total: 0,
-        });
     let activities = collection_projection(
         activity_items,
         &[("lineage", &lineage), ("review", &review)],
     );
-    let inbox = collection_projection(inbox_items, &[("review", &review)]);
+    let inbox = collection_projection(
+        attention.selected_inbox,
+        &[("attention", &attention.selected_source)],
+    );
     Ok(json!({
         "schema": SCHEMA,
         "mode": "v2",
@@ -1445,7 +1448,6 @@ fn attention_inventory(
     bridge: &PlatformV2Bridge,
     records: &[WorkContextRecord],
     selected: Option<&WorkContextIdentity>,
-    selected_review: &Value,
 ) -> AttentionInventory {
     let workspaces: Vec<_> = records
         .iter()
@@ -1461,27 +1463,35 @@ fn attention_inventory(
                 total,
             ),
             observations: BTreeMap::new(),
+            selected_inbox: BoundedCockpitItems {
+                items: Vec::new(),
+                total: 0,
+            },
+            selected_source: unavailable("platform_v2_attention_inventory_exceeds_bound"),
         };
     }
-
+    let mut selected_inbox = BoundedCockpitItems {
+        items: Vec::new(),
+        total: 0,
+    };
+    let mut selected_source = unavailable("no_selected_workspace");
     let observations = workspaces
         .into_iter()
         .map(|record| {
-            let review = if selected == Some(record.identity()) {
-                selected_review.clone()
-            } else {
-                bounded_review(bridge, record)
-            };
-            (
-                record.identity().id().to_owned(),
-                attention_observation(&review),
-            )
+            let read = bounded_attention_sources(bridge, records, record);
+            if selected == Some(record.identity()) {
+                selected_inbox = read.inbox;
+                selected_source = read.observation.clone();
+            }
+            (record.identity().id().to_owned(), read.observation)
         })
         .collect::<BTreeMap<_, _>>();
     let coverage = summarize_attention(&observations, total);
     AttentionInventory {
         coverage,
         observations,
+        selected_inbox,
+        selected_source,
     }
 }
 
@@ -1500,50 +1510,221 @@ fn summarize_attention(observations: &BTreeMap<String, Value>, total: usize) -> 
     attention_coverage(state, category, known, total)
 }
 
-fn bounded_review(bridge: &PlatformV2Bridge, record: &WorkContextRecord) -> Value {
+struct WorkspaceAttentionRead {
+    observation: Value,
+    inbox: BoundedCockpitItems,
+}
+
+fn bounded_attention_sources(
+    bridge: &PlatformV2Bridge,
+    records: &[WorkContextRecord],
+    workspace: &WorkContextRecord,
+) -> WorkspaceAttentionRead {
     let Some(WorkContextIdentity::Project(project)) =
-        relation(record, WorkContextRelationKind::UserWorkspaceProject)
+        relation(workspace, WorkContextRelationKind::UserWorkspaceProject)
     else {
-        return unavailable("platform_v2_workspace_project_unavailable");
+        return unavailable_attention("platform_v2_workspace_project_unavailable");
     };
-    let Ok(request) = ReviewReadRequest::new(project, record.identity().clone()) else {
-        return unavailable("platform_cockpit_selection_invalid");
+    let WorkContextIdentity::UserWorkspace(workspace_id) = workspace.identity() else {
+        return unavailable_attention("platform_cockpit_selection_invalid");
     };
-    match bridge.request_with_timeout(
-        PlatformV2Request::GetReview(request),
-        ATTENTION_READ_TIMEOUT,
-    ) {
-        Ok(PlatformV2Response::ReviewResult(value)) => encode_review_snapshot(&value)
-            .map_err(|_| "platform_cockpit_projection_invalid")
-            .and_then(available_document)
-            .unwrap_or_else(unavailable),
-        Ok(PlatformV2Response::Refused(value)) => {
-            refused(value.category().as_str(), value.explanation().as_str())
+    let review_exists = match review_attention_source_exists(bridge, &project, workspace) {
+        Ok(value) => value,
+        Err(category) => return unavailable_attention(&category),
+    };
+    let sources = match authoritative_attention_sources(records, workspace, review_exists) {
+        Ok(sources) => sources,
+        Err(category) => return unavailable_attention(category),
+    };
+
+    let mut snapshots = Vec::new();
+    for source in sources {
+        let request = AttentionReadRequest::new(source, project.clone(), workspace_id.clone());
+        match bridge.request_with_timeout(
+            PlatformV2Request::GetAttentionSourceSnapshot(request),
+            ATTENTION_READ_TIMEOUT,
+        ) {
+            Ok(PlatformV2Response::AttentionSourceSnapshot(snapshot)) => snapshots.push(snapshot),
+            Ok(PlatformV2Response::Refused(value)) => {
+                return unavailable_attention(value.category().as_str());
+            }
+            Ok(_) => return unavailable_attention("platform_v2_response_invalid"),
+            Err(category) => return unavailable_attention(category),
         }
-        Ok(_) => unavailable("platform_v2_response_invalid"),
-        Err(category) => unavailable(category),
+    }
+    let state = snapshots
+        .iter()
+        .flat_map(|snapshot| snapshot.items())
+        .map(|item| item.state())
+        .max_by_key(|state| attention_item_precedence(*state))
+        .map_or("idle", AttentionItemState::as_str);
+    let inbox = attention_inbox(workspace_id, &snapshots);
+    WorkspaceAttentionRead {
+        observation: json!({ "state": "available", "value": state, "category": Value::Null }),
+        inbox,
     }
 }
 
-fn attention_observation(review: &Value) -> Value {
-    let attention = review
-        .pointer("/document/attention/state")
-        .and_then(Value::as_str)
-        .filter(|value| {
-            matches!(
-                *value,
-                "idle" | "needs_you" | "working" | "blocked" | "done"
-            )
-        });
-    if let Some(attention) = attention {
-        json!({ "state": "available", "value": attention, "category": Value::Null })
-    } else {
-        let category = review
-            .get("category")
-            .and_then(Value::as_str)
-            .unwrap_or("platform_v2_attention_unavailable");
-        json!({ "state": "unavailable", "value": Value::Null, "category": category })
+fn review_attention_source_exists(
+    bridge: &PlatformV2Bridge,
+    project: &ProjectId,
+    workspace: &WorkContextRecord,
+) -> Result<bool, String> {
+    let request = ReviewReadRequest::new(project.clone(), workspace.identity().clone())
+        .map_err(|_| String::from("platform_v2_response_invalid"))?;
+    review_attention_source_presence(
+        bridge.request_with_timeout(
+            PlatformV2Request::GetReview(request),
+            ATTENTION_READ_TIMEOUT,
+        ),
+        workspace.identity(),
+    )
+}
+
+fn review_attention_source_presence(
+    response: Result<PlatformV2Response, &'static str>,
+    workspace: &WorkContextIdentity,
+) -> Result<bool, String> {
+    match response {
+        Ok(PlatformV2Response::ReviewResult(review)) if review.workspace() == workspace => Ok(true),
+        Ok(PlatformV2Response::Refused(value))
+            if value.category().as_str() == "platform_v2_not_found" =>
+        {
+            Ok(false)
+        }
+        Ok(PlatformV2Response::Refused(value)) => Err(value.category().as_str().to_owned()),
+        Ok(_) => Err(String::from("platform_v2_response_invalid")),
+        Err(category) => Err(category.to_owned()),
     }
+}
+
+fn authoritative_attention_sources(
+    records: &[WorkContextRecord],
+    workspace: &WorkContextRecord,
+    review_exists: bool,
+) -> Result<Vec<AttentionSource>, &'static str> {
+    let WorkContextIdentity::UserWorkspace(workspace_id) = workspace.identity() else {
+        return Err("platform_cockpit_selection_invalid");
+    };
+    let Ok(workspace_source_id) = AttentionSourceId::new(workspace_id.as_str().to_owned()) else {
+        return Err("platform_v2_attention_source_exceeds_bound");
+    };
+    let mut sources = Vec::new();
+    if review_exists {
+        sources.push(AttentionSource::new(
+            AttentionSourceKind::Review,
+            workspace_source_id.clone(),
+        ));
+    }
+    sources.push(AttentionSource::new(
+        AttentionSourceKind::Orchestration,
+        workspace_source_id,
+    ));
+    let attempts: std::collections::BTreeSet<_> = records
+        .iter()
+        .filter(|record| record.kind() == WorkContextKind::AttemptWorkspace)
+        .filter(|record| {
+            relation(record, WorkContextRelationKind::AttemptUserWorkspace).as_ref()
+                == Some(workspace.identity())
+        })
+        .map(|record| record.identity().id().to_owned())
+        .collect();
+    for session in records
+        .iter()
+        .filter(|record| record.kind() == WorkContextKind::Session)
+    {
+        if relation(session, WorkContextRelationKind::SessionAttemptWorkspace)
+            .is_some_and(|attempt| attempts.contains(attempt.id()))
+        {
+            let Ok(id) = AttentionSourceId::new(session.identity().id().to_owned()) else {
+                return Err("platform_v2_attention_source_exceeds_bound");
+            };
+            sources.push(AttentionSource::new(
+                AttentionSourceKind::ProviderSession,
+                id,
+            ));
+        }
+    }
+    if sources.len() > MAX_ATTENTION_SOURCES_PER_WORKSPACE {
+        return Err("platform_v2_attention_source_inventory_exceeds_bound");
+    }
+    if !attention_sources_unique(&sources) {
+        return Err("platform_v2_attention_source_inventory_duplicate");
+    }
+    Ok(sources)
+}
+
+fn attention_sources_unique(sources: &[AttentionSource]) -> bool {
+    sources
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        == sources.len()
+}
+
+fn unavailable_attention(category: &str) -> WorkspaceAttentionRead {
+    WorkspaceAttentionRead {
+        observation: json!({ "state": "unavailable", "value": Value::Null, "category": category }),
+        inbox: BoundedCockpitItems {
+            items: Vec::new(),
+            total: 0,
+        },
+    }
+}
+
+const fn attention_item_precedence(state: AttentionItemState) -> u8 {
+    match state {
+        AttentionItemState::Blocked => 4,
+        AttentionItemState::NeedsYou => 3,
+        AttentionItemState::Working => 2,
+        AttentionItemState::Done => 1,
+    }
+}
+
+fn attention_inbox(
+    workspace: &UserWorkspaceId,
+    snapshots: &[AttentionSourceSnapshot],
+) -> BoundedCockpitItems {
+    let mut items: Vec<_> = snapshots.iter().flat_map(|snapshot| snapshot.items().iter().map(|item| {
+        let mut link = json!({ "workspace": workspace.as_str() });
+        if let Some(session) = item.platform_session() {
+            link["session"] = json!(session.coordinate().id.as_str());
+        }
+        json!({
+            "id": format!("{}:{}:{}", snapshot.source().kind().as_str(), snapshot.source().id().as_str(), item.id().as_str()),
+            "state": item.state().as_str(),
+            "reason": item.reason().as_str(),
+            "source_kind": snapshot.source().kind().as_str(),
+            "source_id": snapshot.source().id().as_str(),
+            "source_revision": snapshot.revision().to_string(),
+            "item_revision": item.revision().to_string(),
+            "observed_at_ms": item.observed_at_ms().to_string(),
+            "unread": item.unread().to_string(),
+            "link": link
+        })
+    })).collect();
+    items.sort_by(|left, right| {
+        right["observed_at_ms"]
+            .as_str()
+            .unwrap_or_default()
+            .len()
+            .cmp(&left["observed_at_ms"].as_str().unwrap_or_default().len())
+            .then_with(|| {
+                right["observed_at_ms"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .cmp(left["observed_at_ms"].as_str().unwrap_or_default())
+            })
+            .then_with(|| {
+                left["id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .cmp(right["id"].as_str().unwrap_or_default())
+            })
+    });
+    let total = items.len();
+    items.truncate(MAX_COCKPIT_INBOX_ITEMS);
+    BoundedCockpitItems { items, total }
 }
 
 fn attention_coverage(state: &str, category: Option<&str>, known: usize, total: usize) -> Value {
@@ -1870,61 +2051,6 @@ fn cockpit_activities(
     }
 }
 
-fn review_inbox(review: &ReviewSnapshot) -> BoundedCockpitItems {
-    let mut values: Vec<_> = review
-        .attention_events()
-        .iter()
-        .map(|event| {
-            let mut link = json!({ "workspace": review.workspace().id() });
-            if event.reason() == AttentionReason::CommentReply
-                && let Some(comment) = event.origin().id().and_then(|id| {
-                    review
-                        .comments()
-                        .iter()
-                        .find(|comment| comment.id().as_str() == id.as_str())
-                })
-            {
-                let anchor = comment.anchor();
-                link = json!({
-                    "workspace": review.workspace().id(),
-                    "file": anchor.file_id().as_str(),
-                    "hunk": anchor.hunk_id().as_str(),
-                    "side": anchor.side().as_str(),
-                    "line": anchor.line().to_string()
-                });
-            }
-            json!({
-                "id": event.id().as_str(),
-                "state": attention_state_for_reason(event.reason()),
-                "reason": event.reason().as_str(),
-                "origin_kind": event.origin().kind().as_str(),
-                "source_revision": event.source_revision().to_string(),
-                "unread": event.unread().to_string(),
-                "link": link
-            })
-        })
-        .collect();
-    values.sort_by(|left, right| {
-        let left_revision = left["source_revision"].as_str().unwrap_or_default();
-        let right_revision = right["source_revision"].as_str().unwrap_or_default();
-        right_revision
-            .len()
-            .cmp(&left_revision.len())
-            .then_with(|| right_revision.cmp(left_revision))
-            .then_with(|| {
-                left["id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .cmp(right["id"].as_str().unwrap_or_default())
-            })
-    });
-    let total = values.len();
-    BoundedCockpitItems {
-        items: values,
-        total,
-    }
-}
-
 fn collection_projection(bounded: BoundedCockpitItems, sources: &[(&str, &Value)]) -> Value {
     let available_sources = sources
         .iter()
@@ -1962,19 +2088,6 @@ fn collection_projection(bounded: BoundedCockpitItems, sources: &[(&str, &Value)
         "omitted": omitted.to_string(),
         "sources": source_coverage
     })
-}
-
-const fn attention_state_for_reason(reason: AttentionReason) -> &'static str {
-    match reason {
-        AttentionReason::ReviewRequested
-        | AttentionReason::CommentReply
-        | AttentionReason::ApprovalRequired => "needs_you",
-        AttentionReason::CheckRunning | AttentionReason::DeliveryPending => "working",
-        AttentionReason::CheckFailed
-        | AttentionReason::Conflict
-        | AttentionReason::ExternalBlocker => "blocked",
-        AttentionReason::Complete => "done",
-    }
 }
 
 fn base_record(record: &WorkContextRecord) -> Value {
@@ -2076,6 +2189,56 @@ fn refused(category: &str, explanation: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use automonique_protocol::platform_v2_transport::PlatformV2Refusal;
+
+    fn canonical_json_bytes(value: &Value) -> Vec<u8> {
+        fn write(value: &Value, output: &mut Vec<u8>) {
+            match value {
+                Value::Null => output.extend_from_slice(b"null"),
+                Value::Bool(value) => {
+                    output.extend_from_slice(if *value { b"true" } else { b"false" });
+                }
+                Value::Number(value) => output.extend_from_slice(value.to_string().as_bytes()),
+                Value::String(value) => output.extend_from_slice(
+                    serde_json::to_string(value)
+                        .expect("a Rust string always serializes as JSON")
+                        .as_bytes(),
+                ),
+                Value::Array(values) => {
+                    output.push(b'[');
+                    for (index, value) in values.iter().enumerate() {
+                        if index != 0 {
+                            output.push(b',');
+                        }
+                        write(value, output);
+                    }
+                    output.push(b']');
+                }
+                Value::Object(values) => {
+                    output.push(b'{');
+                    let mut fields: Vec<_> = values.iter().collect();
+                    fields.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+                    for (index, (key, value)) in fields.into_iter().enumerate() {
+                        if index != 0 {
+                            output.push(b',');
+                        }
+                        output.extend_from_slice(
+                            serde_json::to_string(key)
+                                .expect("a Rust string always serializes as JSON")
+                                .as_bytes(),
+                        );
+                        output.push(b':');
+                        write(value, output);
+                    }
+                    output.push(b'}');
+                }
+            }
+        }
+
+        let mut output = Vec::new();
+        write(value, &mut output);
+        output
+    }
 
     #[test]
     fn cockpit_control_documents_reject_unknown_or_generic_execution_fields() {
@@ -2270,17 +2433,11 @@ mod tests {
         let observations = BTreeMap::from([
             (
                 String::from("workspace-a"),
-                attention_observation(&json!({
-                    "state": "available",
-                    "document": { "attention": { "state": "needs_you" } }
-                })),
+                json!({ "state": "available", "value": "needs_you", "category": Value::Null }),
             ),
             (
                 String::from("workspace-b"),
-                attention_observation(&json!({
-                    "state": "available",
-                    "document": { "attention": { "state": "blocked" } }
-                })),
+                json!({ "state": "available", "value": "blocked", "category": Value::Null }),
             ),
         ]);
         let complete = summarize_attention(&observations, 2);
@@ -2288,18 +2445,10 @@ mod tests {
         assert_eq!(complete["known_workspaces"], "2");
         assert_eq!(observations["workspace-a"]["value"], "needs_you");
         assert_eq!(observations["workspace-b"]["value"], "blocked");
-        assert_eq!(
-            attention_observation(&json!({
-                "state": "available",
-                "document": { "attention": { "state": "idle" } }
-            }))["value"],
-            "idle"
-        );
-
         let mut partial = observations;
         partial.insert(
             String::from("workspace-b"),
-            attention_observation(&unavailable("review_adapter_unavailable")),
+            json!({ "state": "unavailable", "value": Value::Null, "category": "attention_source_unavailable" }),
         );
         let partial = summarize_attention(&partial, 2);
         assert_eq!(partial["state"], "partial");
@@ -2318,6 +2467,106 @@ mod tests {
         assert_eq!(value["state"], "unavailable");
         assert_eq!(value["known_workspaces"], "0");
         assert_eq!(value["total_workspaces"], "17");
+    }
+
+    #[test]
+    fn retention_gap_or_source_refusal_discards_partial_attention_aggregation() {
+        let unavailable = unavailable_attention("platform_v2_attention_resync_required");
+        assert_eq!(unavailable.observation["state"], "unavailable");
+        assert_eq!(
+            unavailable.observation["category"],
+            "platform_v2_attention_resync_required"
+        );
+        assert_eq!(unavailable.inbox.total, 0);
+        assert!(unavailable.inbox.items.is_empty());
+        let projection = collection_projection(
+            unavailable.inbox,
+            &[("attention", &unavailable.observation)],
+        );
+        assert_eq!(projection["state"], "unavailable");
+        assert_eq!(projection["items"], json!([]));
+    }
+
+    #[test]
+    fn bounded_source_discovery_rejects_duplicates_but_keeps_kinds_distinct() {
+        let review = AttentionSource::new(
+            AttentionSourceKind::Review,
+            AttentionSourceId::new("workspace-1").unwrap(),
+        );
+        let orchestration = AttentionSource::new(
+            AttentionSourceKind::Orchestration,
+            AttentionSourceId::new("workspace-1").unwrap(),
+        );
+        assert!(attention_sources_unique(&[review.clone(), orchestration]));
+        assert!(!attention_sources_unique(&[review.clone(), review]));
+    }
+
+    #[test]
+    fn workspace_without_review_discovers_existing_orchestration_without_review_inference() {
+        use automonique_protocol::platform_v2::{
+            WorkContextAttributes, WorkContextLabel, WorkContextRelation, WorkContextTargetKind,
+        };
+
+        let workspace = WorkContextRecord::new(
+            WorkContextIdentity::UserWorkspace(UserWorkspaceId::new("workspace-1").unwrap()),
+            Revision::FIRST,
+            WorkContextLifecycle::Active,
+            WorkContextLabel::new("Workspace").unwrap(),
+            WorkContextAttributes::EMPTY,
+            vec![
+                WorkContextRelation::new(
+                    WorkContextRelationKind::UserWorkspaceProject,
+                    WorkContextIdentity::Project(ProjectId::new("project-1").unwrap()),
+                )
+                .unwrap(),
+                WorkContextRelation::new(
+                    WorkContextRelationKind::UserWorkspaceCheckout,
+                    WorkContextIdentity::parse_local(WorkContextTargetKind::Checkout, "checkout-1")
+                        .unwrap(),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let absent_review =
+            authoritative_attention_sources(std::slice::from_ref(&workspace), &workspace, false)
+                .unwrap();
+        assert_eq!(absent_review.len(), 1);
+        assert_eq!(absent_review[0].kind(), AttentionSourceKind::Orchestration);
+        let present_review =
+            authoritative_attention_sources(std::slice::from_ref(&workspace), &workspace, true)
+                .unwrap();
+        assert_eq!(
+            present_review
+                .iter()
+                .map(AttentionSource::kind)
+                .collect::<Vec<_>>(),
+            vec![
+                AttentionSourceKind::Review,
+                AttentionSourceKind::Orchestration
+            ]
+        );
+        assert_eq!(
+            review_attention_source_presence(
+                Ok(PlatformV2Response::Refused(
+                    PlatformV2Refusal::new("platform_v2_not_found", "absent").unwrap(),
+                )),
+                workspace.identity(),
+            ),
+            Ok(false),
+            "typed producer absence is source discovery, not workspace failure"
+        );
+        assert_eq!(
+            review_attention_source_presence(
+                Ok(PlatformV2Response::Refused(
+                    PlatformV2Refusal::new("platform_v2_scope_denied", "denied").unwrap(),
+                )),
+                workspace.identity(),
+            ),
+            Err(String::from("platform_v2_scope_denied")),
+            "authorization failures must not be reclassified as absence"
+        );
     }
 
     #[test]
@@ -2564,7 +2813,8 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_activity_and_inbox_keep_chronology_and_exact_comment_anchor() {
+    fn authoritative_activity_and_attention_inbox_keep_chronology_without_local_coordinates() {
+        use automonique_protocol::platform_v2_attention_api::decode_attention_source_snapshot;
         use automonique_protocol::platform_v2_lineage::{
             ExternalWorkItem, LineageFreshness, LineageMessage, LineageOrigin, OrchestrationRecord,
             OrchestrationRunId,
@@ -2624,7 +2874,7 @@ mod tests {
             "state": "needs_you",
             "unread": 1
         });
-        let review = decode_review_snapshot(&serde_json::to_vec(&review_value).unwrap()).unwrap();
+        let review = decode_review_snapshot(&canonical_json_bytes(&review_value)).unwrap();
 
         let activity = cockpit_activities(Some(&lineage), Some(&review));
         assert_eq!(activity.total, 6);
@@ -2637,15 +2887,25 @@ mod tests {
                 .all(|value| value["link"]["workspace"] == "wc_user_1")
         );
 
-        let inbox = review_inbox(&review);
+        let mut attention_value: Value = serde_json::from_slice(include_bytes!(
+            "../../automonique-protocol/fixtures/platform-v2-attention-v1.json"
+        ))
+        .unwrap();
+        attention_value["source"] = json!({ "kind": "review", "id": "wc_user_1" });
+        attention_value["project"] = json!("project-1");
+        attention_value["user_workspace"] = json!("wc_user_1");
+        attention_value["items"][0]["platform_session"] = Value::Null;
+        let attention =
+            decode_attention_source_snapshot(&canonical_json_bytes(&attention_value)).unwrap();
+        let inbox = attention_inbox(&UserWorkspaceId::new("wc_user_1").unwrap(), &[attention]);
         assert_eq!(inbox.total, 1);
         assert_eq!(inbox.items[0]["state"], "needs_you");
-        assert_eq!(inbox.items[0]["source_revision"], "2");
+        assert_eq!(inbox.items[0]["source_kind"], "review");
+        assert_eq!(inbox.items[0]["source_id"], "wc_user_1");
+        assert_eq!(inbox.items[0]["source_revision"], "7");
         assert_eq!(inbox.items[0]["link"]["workspace"], "wc_user_1");
-        assert_eq!(inbox.items[0]["link"]["file"], "file-1");
-        assert_eq!(inbox.items[0]["link"]["hunk"], "hunk-1");
-        assert_eq!(inbox.items[0]["link"]["side"], "new");
-        assert_eq!(inbox.items[0]["link"]["line"], "11");
+        assert!(inbox.items[0]["link"].get("file").is_none());
+        assert!(inbox.items[0]["link"].get("pane").is_none());
 
         let available = json!({ "state": "available" });
         let refused = json!({ "state": "refused", "category": "review_refused" });

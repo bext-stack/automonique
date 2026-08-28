@@ -342,19 +342,25 @@
   }
 
   function normalizeInbox(value) {
-    const id = boundedText(value?.id, 256);
+    const id = boundedText(value?.id, 768);
     const state = explicitEnum(value?.state, ATTENTION_STATES);
     const reason = boundedText(value?.reason, 64);
-    const originKind = boundedText(value?.origin_kind, 64);
+    const sourceKind = explicitEnum(value?.source_kind, ["review", "orchestration", "provider_session"]);
+    const sourceId = boundedText(value?.source_id, 256);
+    const itemRevision = validDecimal(value?.item_revision, false) ? value.item_revision : null;
+    const observedAt = validDecimal(value?.observed_at_ms) ? value.observed_at_ms : null;
     const sourceRevision = validDecimal(value?.source_revision, false) ? value.source_revision : null;
     const unread = validDecimal(value?.unread) ? value.unread : null;
     const linkedWorkspace = boundedText(value?.link?.workspace, 256);
-    if (!id || !state || !reason || !originKind || !sourceRevision || unread === null || !linkedWorkspace) return null;
+    if (!id || !state || !reason || !sourceKind || !sourceId || !itemRevision || !observedAt || !sourceRevision || unread === null || !linkedWorkspace) return null;
     return Object.freeze({
       id,
       state,
       reason,
-      origin_kind: originKind,
+      source_kind: sourceKind,
+      source_id: sourceId,
+      item_revision: itemRevision,
+      observed_at_ms: observedAt,
       source_revision: sourceRevision,
       unread,
       deep_link: buildDeepLink({ view: "sessions", ...value.link }),
@@ -596,11 +602,11 @@
         return left.id.localeCompare(right.id);
       });
     const inboxCollection = structured
-      ? normalizeCollection(document.inbox, normalizeInbox, MAX_INBOX_ITEMS, ["review"])
-      : unavailableCollection(["review"], "platform_v2_unavailable");
+      ? normalizeCollection(document.inbox, normalizeInbox, MAX_INBOX_ITEMS, ["attention"])
+      : unavailableCollection(["attention"], "platform_v2_unavailable");
     const inbox = [...inboxCollection.items].sort((left, right) => {
-        if (left.source_revision !== right.source_revision) {
-          return decimalGreater(left.source_revision, right.source_revision) ? -1 : 1;
+        if (left.observed_at_ms !== right.observed_at_ms) {
+          return decimalGreater(left.observed_at_ms, right.observed_at_ms) ? -1 : 1;
         }
         return left.id.localeCompare(right.id);
       });

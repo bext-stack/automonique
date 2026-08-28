@@ -172,6 +172,86 @@ fn retained_provider_session_requires_exact_session_attempt_workspace_lineage() 
         ),
         Err(WorkContextStoreError::Unauthorized)
     ));
+    assert!(matches!(
+        store.validate_retained_session_attention_lineage(
+            "tenant-1",
+            &project_id,
+            attempt.identity(),
+            &work_session_id,
+            "provider-session-exact",
+        ),
+        Err(WorkContextStoreError::Unauthorized)
+    ));
+
+    for (id, provider_id, lifecycle) in [
+        (
+            "retained-completed-session",
+            "provider-session-completed",
+            WorkContextLifecycle::Completed,
+        ),
+        (
+            "retained-failed-session",
+            "provider-session-failed",
+            WorkContextLifecycle::Failed,
+        ),
+        (
+            "retained-cancelled-session",
+            "provider-session-cancelled",
+            WorkContextLifecycle::Cancelled,
+        ),
+    ] {
+        let terminal = WorkContextRecord::new(
+            identity(WorkContextKind::Session, id),
+            revision(1),
+            lifecycle,
+            label("terminal session"),
+            WorkContextAttributes::EMPTY,
+            vec![
+                WorkContextRelation::new(
+                    WorkContextRelationKind::SessionAttemptWorkspace,
+                    attempt.identity().clone(),
+                )
+                .unwrap(),
+                WorkContextRelation::new(
+                    WorkContextRelationKind::SessionPlatformSession,
+                    WorkContextIdentity::PlatformSession(
+                        V1SessionRef::new(ResourceCoordinate::new(
+                            ResourceAuthority::Automonique,
+                            ResourceKind::Session,
+                            ResourceId::new(provider_id).unwrap(),
+                        ))
+                        .unwrap(),
+                    ),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        store
+            .put_authoritative_record("tenant-1", &terminal)
+            .unwrap();
+        let terminal_id = WorkSessionId::new(id).unwrap();
+        let readable = store
+            .validate_retained_session_attention_lineage(
+                "tenant-1",
+                &project_id,
+                workspace.identity(),
+                &terminal_id,
+                provider_id,
+            )
+            .unwrap();
+        assert_eq!(readable.lifecycle(), lifecycle);
+        assert!(matches!(
+            store.validate_retained_session_lineage(
+                "tenant-1",
+                &project_id,
+                workspace.identity(),
+                &terminal_id,
+                provider_id,
+            ),
+            Err(WorkContextStoreError::Unavailable)
+        ));
+    }
 }
 impl PrivateStore {
     fn new() -> Self {
