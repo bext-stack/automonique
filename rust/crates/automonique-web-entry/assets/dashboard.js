@@ -3385,7 +3385,12 @@ async function submitCockpitReview(action) {
   if (!capability?.available || cockpitControlHandle || cockpitControlBusy) return;
   if (action === "rerunCheck" && !cockpitRerunPreview) return;
   const idempotencyKey = newCockpitReceiptId("cockpit-review");
-  const handle = globalThis.AutomoniquePlatformCockpit.prepareControlHandle(capability, action, idempotencyKey);
+  const handle = globalThis.AutomoniquePlatformCockpit.prepareControlHandle(
+    capability,
+    action,
+    idempotencyKey,
+    action === "rerunCheck" ? cockpitRerunPreview?.receipt_correlation_digest : null,
+  );
   if (!handle || !persistCockpitControl(handle)) {
     toast("The durable review receipt identity could not be stored; nothing was sent.", "error");
     return;
@@ -3475,6 +3480,7 @@ async function previewCockpitRerun() {
     });
     if (preview?.state !== "confirmation_preview"
       || preview.confirmation_digest !== target.confirmation_digest
+      || preview.receipt_correlation_digest !== target.receipt_correlation_digest
       || preview.check_id !== target.check_id
       || preview.exact_revision !== target.exact_revision
       || preview.exact_check_revision !== target.exact_check_revision) {
@@ -3505,6 +3511,7 @@ async function reconcileCockpitControl() {
       project_id: handle.project_id,
       workspace_id: handle.workspace_id,
       idempotency_key: handle.receipt_id,
+      receipt_correlation_digest: handle.receipt_correlation_digest,
     };
     applyCockpitControlResponse(await api("/api/platform/cockpit", {
       method: "POST",

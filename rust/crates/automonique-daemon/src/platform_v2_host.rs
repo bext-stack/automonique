@@ -38,13 +38,13 @@ use automonique_protocol::platform_v2_lineage::{
 use automonique_protocol::platform_v2_review::{
     AttentionReason as ReviewAttentionReason, CheckState, ReviewAction, ReviewActionReceipt,
     ReviewActionRequest, ReviewActorId, ReviewAuthentication, ReviewAuthority, ReviewAuthorityId,
-    ReviewAuthorityKind, ReviewFreshnessState, ReviewSnapshot,
+    ReviewAuthorityKind, ReviewFreshnessState, ReviewReceiptOutcome, ReviewSnapshot,
 };
 use automonique_protocol::platform_v2_transport::{
     LIFECYCLE_CAPABILITY_EFFECT_KINDS, LifecycleCapabilities, LifecycleOperationCapability,
     PlatformV2Refusal, PlatformV2Request, PlatformV2Response, RawMutationApprovalDocument,
     RawMutationReceiptDocument, ReceiptLookupKey, ReviewCapabilities, ReviewCheckRerunCapability,
-    ReviewConfirmationDigest,
+    ReviewConfirmationDigest, ReviewReceiptCorrelationDigest,
 };
 use automonique_protocol::primitives::{EpochMillis, Revision};
 use automonique_protocol::wire::JsonValue;
@@ -86,12 +86,94 @@ const APPROVAL_LIFETIME_MS: i64 = 60 * 1_000;
 const EFFECT_LEASE_LIFETIME_MS: i64 = 30 * 1_000;
 const MAX_POLICY_BYTES: u64 = 256 * 1024;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GitHubRecoveryPhase {
+    NeverStarted,
+    ReconcileOnly,
+    Terminal,
+}
+
+fn github_recovery_phase(
+    outcome: ReviewReceiptOutcome,
+    write_admitted: bool,
+    custody: ReviewExternalEffectCustody,
+) -> Result<GitHubRecoveryPhase, &'static str> {
+    match (outcome, write_admitted, custody) {
+        (ReviewReceiptOutcome::Accepted, false, ReviewExternalEffectCustody::NotStarted) => {
+            Ok(GitHubRecoveryPhase::NeverStarted)
+        }
+        (
+            ReviewReceiptOutcome::Accepted,
+            true,
+            ReviewExternalEffectCustody::CustodyStarted | ReviewExternalEffectCustody::Accepted,
+        )
+        | (ReviewReceiptOutcome::Unknown, true, ReviewExternalEffectCustody::Ambiguous) => {
+            Ok(GitHubRecoveryPhase::ReconcileOnly)
+        }
+        (ReviewReceiptOutcome::Refused, _, ReviewExternalEffectCustody::Refused)
+        | (
+            ReviewReceiptOutcome::Completed | ReviewReceiptOutcome::Conflict,
+            true,
+            ReviewExternalEffectCustody::Completed,
+        ) => Ok(GitHubRecoveryPhase::Terminal),
+        _ => Err("platform_v2_review_confirmation_corrupt"),
+    }
+}
+
+fn stored_github_recovery_phase(
+    action: &StoredReviewAction,
+    plan: &ReviewExternalEffectPlan,
+) -> Result<GitHubRecoveryPhase, &'static str> {
+    require_native_github_recovery_identity(plan)?;
+    github_recovery_phase(
+        action.receipt.outcome(),
+        action.write_admitted_at_ms.is_some(),
+        plan.github_custody()
+            .ok_or("platform_v2_review_plan_invalid")?,
+    )
+}
+
+fn require_native_github_recovery_identity(
+    plan: &ReviewExternalEffectPlan,
+) -> Result<(Revision, [u8; 32]), &'static str> {
+    match (
+        plan.github_expected_workspace_revision(),
+        plan.github_receipt_correlation_digest(),
+    ) {
+        (Some(workspace_revision), Some(receipt_correlation)) => {
+            Ok((workspace_revision, receipt_correlation))
+        }
+        _ => Err("platform_v2_review_plan_invalid"),
+    }
+}
+
+fn github_receipt_correlation_matches(
+    stored: Option<[u8; 32]>,
+    supplied: Option<&ReviewReceiptCorrelationDigest>,
+) -> Result<bool, &'static str> {
+    let (Some(stored), Some(supplied)) = (stored, supplied) else {
+        return Ok(false);
+    };
+    Ok(review_receipt_correlation_digest(stored)?.as_str() == supplied.as_str())
+}
+
 fn review_confirmation_digest(digest: [u8; 32]) -> Result<ReviewConfirmationDigest, &'static str> {
     let value = digest
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     ReviewConfirmationDigest::new(value).map_err(|_| "platform_v2_response_invalid")
+}
+fn review_receipt_correlation_digest(
+    digest: [u8; 32],
+) -> Result<ReviewReceiptCorrelationDigest, &'static str> {
+    ReviewReceiptCorrelationDigest::new(
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+    )
+    .map_err(|_| "platform_v2_response_invalid")
 }
 
 #[derive(Debug)]
@@ -1761,7 +1843,18 @@ impl PlatformV2Runtime {
             }
             PlatformV2Request::GetReviewCapabilities(value) => {
                 authorize_identity(&principal, value.project(), value.workspace())?;
-                self.validate_policy_mapping(&principal, value.workspace())?;
+                let scope = principal
+                    .workspaces
+                    .get(value.workspace())
+                    .ok_or("platform_v2_scope_denied")?;
+                let workspace_record = self
+                    .work_contexts
+                    .validate_policy_mapping(
+                        principal.actor.tenant(),
+                        &scope.project,
+                        value.workspace(),
+                    )
+                    .map_err(|_| "platform_v2_policy_incoherent")?;
                 let snapshot = self
                     .reviews
                     .snapshot(value.workspace())
@@ -1777,6 +1870,7 @@ impl PlatformV2Runtime {
                             value.project().clone(),
                             value.workspace().clone(),
                             snapshot.revision(),
+                            workspace_record.revision(),
                             Vec::new(),
                         )
                         .map_err(|_| "platform_v2_response_invalid")?,
@@ -1817,6 +1911,7 @@ impl PlatformV2Runtime {
                             value.workspace(),
                             &authority,
                             snapshot.revision(),
+                            workspace_record.revision(),
                             &action,
                             &plan,
                         )?;
@@ -1826,6 +1921,7 @@ impl PlatformV2Runtime {
                                 check.freshness().observed_revision(),
                                 authority.clone(),
                                 review_confirmation_digest(confirmation)?,
+                                review_receipt_correlation_digest(ProductionReviewEffectAdapter::github_receipt_correlation_digest(confirmation))?,
                             )
                             .map_err(|_| "platform_v2_response_invalid")?,
                         );
@@ -1836,6 +1932,7 @@ impl PlatformV2Runtime {
                         value.project().clone(),
                         value.workspace().clone(),
                         snapshot.revision(),
+                        workspace_record.revision(),
                         rerunnable,
                     )
                     .map_err(|_| "platform_v2_response_invalid")?,
@@ -1843,6 +1940,8 @@ impl PlatformV2Runtime {
             }
             PlatformV2Request::ExecuteReviewAction(value) => {
                 let confirmation_digest = value.confirmation_digest().cloned();
+                let expected_workspace_revision = value.expected_workspace_revision();
+                let receipt_correlation_digest = value.receipt_correlation_digest().cloned();
                 let scope = principal
                     .workspaces
                     .get(value.workspace())
@@ -1850,7 +1949,14 @@ impl PlatformV2Runtime {
                 if !principal.projects.contains(&scope.project) {
                     return Err("platform_v2_scope_denied");
                 }
-                self.validate_policy_mapping(&principal, value.workspace())?;
+                let workspace_record = self
+                    .work_contexts
+                    .validate_policy_mapping(
+                        principal.actor.tenant(),
+                        &scope.project,
+                        value.workspace(),
+                    )
+                    .map_err(|_| "platform_v2_policy_incoherent")?;
                 let authority = principal
                     .review_authorities
                     .get(&value.action().required_authority())
@@ -1871,6 +1977,10 @@ impl PlatformV2Runtime {
                 {
                     if confirmation_digest.is_none() {
                         return Err("platform_v2_review_confirmation_required");
+                    }
+                    if expected_workspace_revision.is_none() || receipt_correlation_digest.is_none()
+                    {
+                        return Err("platform_v2_review_confirmation_changed");
                     }
                     ApprovalPolicy::Required
                 } else {
@@ -1897,19 +2007,43 @@ impl PlatformV2Runtime {
                     {
                         return Err("platform_v2_review_conflict");
                     }
+                    if plan.is_github_check_rerun() {
+                        let supplied_workspace_revision = expected_workspace_revision
+                            .ok_or("platform_v2_review_confirmation_required")?;
+                        let planned_workspace_revision = plan
+                            .github_expected_workspace_revision()
+                            .ok_or("platform_v2_review_confirmation_changed")?;
+                        if supplied_workspace_revision != planned_workspace_revision {
+                            return Err("platform_v2_review_confirmation_changed");
+                        }
+                        let supplied = receipt_correlation_digest
+                            .as_ref()
+                            .ok_or("platform_v2_review_confirmation_required")?;
+                        let actual = plan
+                            .github_receipt_correlation_digest()
+                            .ok_or("platform_v2_review_confirmation_changed")?;
+                        if review_receipt_correlation_digest(actual)?.as_str() != supplied.as_str()
+                        {
+                            return Err("platform_v2_review_confirmation_changed");
+                        }
+                        if stored_github_recovery_phase(&existing, &plan)?
+                            == GitHubRecoveryPhase::Terminal
+                        {
+                            return Ok(PlatformV2Response::ReviewReceipt(existing.receipt));
+                        }
+                        let existing = self.approve_prepared_github_confirmation(
+                            &principal, &existing, &plan, now_ms,
+                        )?;
+                        let receipt =
+                            self.drive_github_check_rerun(&principal, &existing, &plan, now_ms)?;
+                        return Ok(PlatformV2Response::ReviewReceipt(receipt));
+                    }
                     if existing.receipt.outcome()
                         != automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Accepted
                         && existing.receipt.outcome()
                             != automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Unknown
                     {
                         return Ok(PlatformV2Response::ReviewReceipt(existing.receipt));
-                    }
-                    if plan.is_github_check_rerun() {
-                        let existing =
-                            self.approve_prepared_github_confirmation(&existing, now_ms)?;
-                        let receipt =
-                            self.drive_github_check_rerun(&principal, &existing, &plan, now_ms)?;
-                        return Ok(PlatformV2Response::ReviewReceipt(receipt));
                     }
                     if existing.write_admitted_at_ms.is_none()
                         && self
@@ -2094,6 +2228,9 @@ impl PlatformV2Runtime {
                         registry_generation,
                         credential_generation,
                     }) => {
+                        if expected_workspace_revision != Some(workspace_record.revision()) {
+                            return Err("platform_v2_review_confirmation_changed");
+                        }
                         let advertised_plan = ReviewEffectPlan::GitHubCheckRerun {
                             credential_reference: credential_reference.clone(),
                             repository: repository.clone(),
@@ -2111,11 +2248,23 @@ impl PlatformV2Runtime {
                                 request.workspace(),
                                 request.authority(),
                                 request.expected_revision(),
+                                workspace_record.revision(),
                                 request.action(),
                                 &advertised_plan,
                             )?;
                         if confirmation_digest.as_ref().map(|value| value.as_str())
                             != Some(review_confirmation_digest(expected_confirmation)?.as_str())
+                        {
+                            return Err("platform_v2_review_confirmation_changed");
+                        }
+                        let expected_correlation =
+                            ProductionReviewEffectAdapter::github_receipt_correlation_digest(
+                                expected_confirmation,
+                            );
+                        if receipt_correlation_digest.as_ref().map(|v| v.as_str())
+                            != Some(
+                                review_receipt_correlation_digest(expected_correlation)?.as_str(),
+                            )
                         {
                             return Err("platform_v2_review_confirmation_changed");
                         }
@@ -2137,10 +2286,17 @@ impl PlatformV2Runtime {
                                 _ => return Err("platform_v2_review_plan_invalid"),
                             },
                             expected_check_revision,
+                            workspace_record.revision(),
+                            expected_correlation,
                         )
                         .map_err(review_store_category)?;
                         self.policy_fence.verify()?;
                         self.review_effects.verify_generation()?;
+                        self.validate_workspace_revision(
+                            &principal,
+                            request.workspace(),
+                            workspace_record.revision(),
+                        )?;
                         let admitted = self
                             .reviews
                             .prepare_external_action(
@@ -2154,7 +2310,12 @@ impl PlatformV2Runtime {
                             ReviewActionAdmission::New(action)
                             | ReviewActionAdmission::Replay(action) => action,
                         };
-                        let action = self.approve_prepared_github_confirmation(&action, now_ms)?;
+                        let action = self.approve_prepared_github_confirmation(
+                            &principal,
+                            &action,
+                            &external_plan,
+                            now_ms,
+                        )?;
                         let receipt = self.drive_github_check_rerun(
                             &principal,
                             &action,
@@ -2189,22 +2350,42 @@ impl PlatformV2Runtime {
                     );
                     match external {
                         Ok(Some((action, plan))) => {
-                            if action.receipt.outcome()
-                                == automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Accepted
-                                || action.receipt.outcome()
-                                    == automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Unknown
-                            {
-                                if plan.is_github_check_rerun() {
-                                    let action = self
-                                        .approve_prepared_github_confirmation(&action, now_ms)?;
-                                    let receipt = self.drive_github_check_rerun(
-                                        &principal,
-                                        &action,
-                                        &plan,
-                                        now_ms,
-                                    )?;
-                                    return Ok(PlatformV2Response::ReviewReceipt(receipt));
+                            if plan.is_github_check_rerun() {
+                                let Ok((_, stored_correlation)) =
+                                    require_native_github_recovery_identity(&plan)
+                                else {
+                                    // A migrated or otherwise partial GitHub
+                                    // plan has no complete native recovery
+                                    // identity. It is deliberately invisible
+                                    // and must never fall through to the
+                                    // generic receipt index.
+                                    continue;
+                                };
+                                if !github_receipt_correlation_matches(
+                                    Some(stored_correlation),
+                                    value.receipt_correlation_digest(),
+                                )? {
+                                    continue;
                                 }
+                            } else if value.receipt_correlation_digest().is_some() {
+                                continue;
+                            }
+                            if plan.is_github_check_rerun() {
+                                if stored_github_recovery_phase(&action, &plan)?
+                                    == GitHubRecoveryPhase::Terminal
+                                {
+                                    return Ok(PlatformV2Response::ReviewReceipt(action.receipt));
+                                }
+                                let action = self.approve_prepared_github_confirmation(
+                                    &principal, &action, &plan, now_ms,
+                                )?;
+                                let receipt = self
+                                    .drive_github_check_rerun(&principal, &action, &plan, now_ms)?;
+                                return Ok(PlatformV2Response::ReviewReceipt(receipt));
+                            }
+                            if action.receipt.outcome() == ReviewReceiptOutcome::Accepted
+                                || action.receipt.outcome() == ReviewReceiptOutcome::Unknown
+                            {
                                 if action.write_admitted_at_ms.is_none()
                                     && self
                                         .validate_retained_review_execution_fence(
@@ -2251,7 +2432,10 @@ impl PlatformV2Runtime {
                         Ok(None) | Err(ReviewStoreError::Unauthorized) => {}
                         Err(_) => return Err("platform_v2_receipt_refused"),
                     }
-                    let receipt = self.reviews.receipt(
+                    if value.receipt_correlation_digest().is_some() {
+                        continue;
+                    }
+                    let receipt = self.reviews.non_rerun_receipt(
                         value.workspace(),
                         &actor,
                         ReviewAuthentication::UserSession,
@@ -2303,12 +2487,18 @@ impl PlatformV2Runtime {
         plan: &ReviewExternalEffectPlan,
         now_ms: i64,
     ) -> Result<ReviewActionReceipt, &'static str> {
+        require_native_github_recovery_identity(plan)?;
         let scope = principal
             .workspaces
             .get(action.request.workspace())
             .ok_or("platform_v2_scope_denied")?;
+        let phase = stored_github_recovery_phase(action, plan)?;
+        if phase == GitHubRecoveryPhase::Terminal {
+            return Ok(action.receipt.clone());
+        }
         let mut may_submit = false;
-        let action = if action.write_admitted_at_ms.is_none() {
+        let mut refresh_plan = false;
+        let action = if phase == GitHubRecoveryPhase::NeverStarted {
             if self
                 .validate_github_check_execution_fence(principal, action, plan)
                 .is_err()
@@ -2329,15 +2519,19 @@ impl PlatformV2Runtime {
             match write {
                 ReviewWriteAdmission::New(action) => {
                     may_submit = true;
+                    refresh_plan = true;
                     action
                 }
-                ReviewWriteAdmission::Replay(action) => action,
+                ReviewWriteAdmission::Replay(action) => {
+                    refresh_plan = true;
+                    action
+                }
             }
         } else {
             action.clone()
         };
         let refreshed_plan;
-        let plan = if may_submit {
+        let plan = if refresh_plan {
             let (stored, refreshed) = self
                 .reviews
                 .external_action(
@@ -2447,18 +2641,28 @@ impl PlatformV2Runtime {
 
     fn approve_prepared_github_confirmation(
         &mut self,
+        principal: &PrincipalPolicy,
         action: &StoredReviewAction,
+        plan: &ReviewExternalEffectPlan,
         now_ms: i64,
     ) -> Result<StoredReviewAction, &'static str> {
+        require_native_github_recovery_identity(plan)?;
         if action.approval_policy != ApprovalPolicy::Required
             || !matches!(action.request.action(), ReviewAction::RerunCheck { .. })
         {
             return Err("platform_v2_review_confirmation_required");
         }
+        let phase = stored_github_recovery_phase(action, plan)?;
+        if phase == GitHubRecoveryPhase::Terminal {
+            return Ok(action.clone());
+        }
+        if phase == GitHubRecoveryPhase::NeverStarted {
+            self.validate_github_workspace_revision(principal, action, plan)?;
+        }
         if action.approval.is_some() {
             return Ok(action.clone());
         }
-        if action.write_admitted_at_ms.is_some() {
+        if phase != GitHubRecoveryPhase::NeverStarted {
             return Err("platform_v2_review_confirmation_corrupt");
         }
         // This prepared row can only be created after the confirmed transport
@@ -2496,6 +2700,20 @@ impl PlatformV2Runtime {
             .workspaces
             .get(action.request.workspace())
             .ok_or("platform_v2_scope_denied")?;
+        let workspace_record = self
+            .work_contexts
+            .validate_policy_mapping(
+                principal.actor.tenant(),
+                &scope.project,
+                action.request.workspace(),
+            )
+            .map_err(|_| "platform_v2_review_workspace_changed")?;
+        let expected_workspace_revision = plan
+            .github_expected_workspace_revision()
+            .ok_or("platform_v2_review_workspace_changed")?;
+        if workspace_record.revision() != expected_workspace_revision {
+            return Err("platform_v2_review_workspace_changed");
+        }
         let current = self.review_effects.plan(
             &scope.project,
             action.request.workspace(),
@@ -2529,6 +2747,9 @@ impl PlatformV2Runtime {
                 .cloned()
                 .ok_or("platform_v2_review_plan_invalid")?,
             expected_check_revision,
+            expected_workspace_revision,
+            plan.github_receipt_correlation_digest()
+                .ok_or("platform_v2_review_plan_invalid")?,
         )
         .map_err(review_store_category)?;
         if reconstructed.digest() != plan.digest() {
@@ -2541,6 +2762,37 @@ impl PlatformV2Runtime {
             .map_err(github_rerun_category)?;
         self.policy_fence.verify()?;
         self.review_effects.verify_generation()
+    }
+
+    fn validate_github_workspace_revision(
+        &self,
+        principal: &PrincipalPolicy,
+        action: &StoredReviewAction,
+        plan: &ReviewExternalEffectPlan,
+    ) -> Result<(), &'static str> {
+        let expected = plan
+            .github_expected_workspace_revision()
+            .ok_or("platform_v2_review_workspace_changed")?;
+        self.validate_workspace_revision(principal, action.request.workspace(), expected)
+    }
+
+    fn validate_workspace_revision(
+        &self,
+        principal: &PrincipalPolicy,
+        workspace: &WorkContextIdentity,
+        expected: Revision,
+    ) -> Result<(), &'static str> {
+        let scope = principal
+            .workspaces
+            .get(workspace)
+            .ok_or("platform_v2_scope_denied")?;
+        let current = self
+            .work_contexts
+            .validate_policy_mapping(principal.actor.tenant(), &scope.project, workspace)
+            .map_err(|_| "platform_v2_review_workspace_changed")?;
+        (current.revision() == expected)
+            .then_some(())
+            .ok_or("platform_v2_review_workspace_changed")
     }
 
     fn drive_retained_review_delivery(
@@ -4098,7 +4350,13 @@ impl WorkContextNonceSource for HostNonces {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
+    use automonique_github_connector::{
+        GetWorkflowRunRequest, GitHubFailure, GitHubOutcome, GitHubReply, GitHubWorkflowRun,
+        RateLimit, RerunWorkflowRequest, WorkflowRunStatus,
+    };
     use automonique_protocol::platform::{
         IdempotencyKey, ResourceCoordinate, ResourceId, ResourceKind,
     };
@@ -4112,9 +4370,448 @@ mod tests {
     use automonique_protocol::platform_v2_lifecycle::{
         ExpectedWorkContext, ExternalParentResolution,
     };
+    use automonique_protocol::platform_v2_review::{ReviewCheckId, ReviewReceiptOutcome};
+    use automonique_protocol::platform_v2_review_api::decode_review_snapshot;
     use automonique_protocol::platform_v2_transport::{
         LineageReadRequest, ReviewReadRequest, ReviewReceiptLookup,
     };
+    use automonique_store::review_store::ReviewActionAdmission;
+    use rusqlite::params;
+
+    use crate::platform_v2_github_check_adapter::{
+        GitHubActionsTransport, SharedGitHubActionsTransport,
+    };
+
+    const GITHUB_RECOVERY_REVIEW_SNAPSHOT: &[u8] =
+        include_bytes!("../../automonique-protocol/fixtures/platform-v2-review-v2.json");
+
+    #[derive(Default)]
+    struct ProviderCallCounts {
+        reads: AtomicUsize,
+        writes: AtomicUsize,
+    }
+
+    struct CountingGitHubTransport {
+        counts: Arc<ProviderCallCounts>,
+        attempt: Arc<AtomicU32>,
+    }
+
+    impl GitHubActionsTransport for CountingGitHubTransport {
+        fn get_workflow_run(
+            &self,
+            _: &GetWorkflowRunRequest,
+        ) -> Result<GitHubReply<GitHubWorkflowRun>, GitHubFailure> {
+            self.counts.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(GitHubReply::new(
+                RateLimit::new(None, None, None),
+                GitHubOutcome::Accepted(GitHubWorkflowRun {
+                    id: WorkflowRunId::new(91).unwrap(),
+                    head_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                    run_attempt: self.attempt.load(Ordering::SeqCst),
+                    status: WorkflowRunStatus::Completed,
+                }),
+            ))
+        }
+
+        fn rerun_workflow(
+            &self,
+            _: &RerunWorkflowRequest,
+        ) -> Result<GitHubReply<()>, GitHubFailure> {
+            self.counts.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(GitHubReply::new(
+                RateLimit::new(None, None, None),
+                GitHubOutcome::Accepted(()),
+            ))
+        }
+    }
+
+    struct GitHubRecoveryFixture {
+        _directory: tempfile::TempDir,
+        policy_path: PathBuf,
+        work_context_path: PathBuf,
+        lineage_path: PathBuf,
+        review_path: PathBuf,
+        uid: u32,
+        counts: Arc<ProviderCallCounts>,
+        attempt: Arc<AtomicU32>,
+        transport: SharedGitHubActionsTransport,
+    }
+
+    impl GitHubRecoveryFixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let uid = nix::unistd::geteuid().as_raw();
+            let policy_path = directory.path().join(POLICY_FILE_NAME);
+            let work_context_path = directory.path().join(WORK_CONTEXT_STORE_NAME);
+            let lineage_path = directory.path().join(LINEAGE_STORE_NAME);
+            let review_path = directory.path().join(REVIEW_STORE_NAME);
+            let empty = serde_json::json!({
+                "filesystem": [], "credentials": [], "network": [],
+                "tools": [], "providers": [], "models": []
+            });
+            let policy = serde_json::json!({
+                "version": 1,
+                "principals": [{
+                    "uid": uid,
+                    "tenant": "tenant-test",
+                    "actor": "actor-test",
+                    "serving_authority": "automonique",
+                    "projects": ["project-test"],
+                    "workspaces": [
+                        {"project":"project-test","kind":"project","id":"project-test","inherited_authority":empty.clone()},
+                        {"project":"project-test","kind":"host_setup","id":"host-test","inherited_authority":empty.clone()},
+                        {"project":"project-test","kind":"checkout","id":"checkout-test","inherited_authority":empty.clone()},
+                        {"project":"project-test","kind":"user_workspace","id":"wc_user_1","inherited_authority":empty.clone()}
+                    ],
+                    "authority": empty,
+                    "review_authorities": {"ci":"authority-1"}
+                }]
+            });
+            write_generation_policy(&policy_path, &policy);
+
+            let project = WorkContextRecord::new(
+                WorkContextIdentity::Project(ProjectId::new("project-test").unwrap()),
+                Revision::FIRST,
+                WorkContextLifecycle::Active,
+                WorkContextLabel::new("Project test").unwrap(),
+                WorkContextAttributes::EMPTY,
+                Vec::new(),
+            )
+            .unwrap();
+            let host = WorkContextRecord::new(
+                WorkContextIdentity::parse_local(WorkContextTargetKind::HostSetup, "host-test")
+                    .unwrap(),
+                Revision::FIRST,
+                WorkContextLifecycle::Active,
+                WorkContextLabel::new("Host test").unwrap(),
+                WorkContextAttributes::host_setup(HostSetupKind::Local),
+                vec![
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::HostSetupProject,
+                        project.identity().clone(),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+            let repository = WorkContextIdentity::Repository(
+                V1RepositoryRef::new(ResourceCoordinate::new(
+                    ResourceAuthority::GitHub,
+                    ResourceKind::Repository,
+                    ResourceId::new("repository-test").unwrap(),
+                ))
+                .unwrap(),
+            );
+            let checkout = WorkContextRecord::new(
+                WorkContextIdentity::parse_local(WorkContextTargetKind::Checkout, "checkout-test")
+                    .unwrap(),
+                Revision::FIRST,
+                WorkContextLifecycle::Active,
+                WorkContextLabel::new("Checkout test").unwrap(),
+                WorkContextAttributes::checkout(CheckoutKind::AuthorizedFolder),
+                vec![
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::CheckoutProject,
+                        project.identity().clone(),
+                    )
+                    .unwrap(),
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::CheckoutHostSetup,
+                        host.identity().clone(),
+                    )
+                    .unwrap(),
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::CheckoutRepository,
+                        repository.clone(),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+            let workspace = Self::workspace_record(Revision::FIRST, WorkContextLifecycle::Active);
+            let mut contexts = WorkContextStore::open(&work_context_path).unwrap();
+            contexts
+                .put_external_snapshot(
+                    "tenant-test",
+                    &ExpectedWorkContext::new(repository, Revision::FIRST),
+                    ExternalParentResolution::Available,
+                    Some(&ProjectId::new("project-test").unwrap()),
+                )
+                .unwrap();
+            for record in [project, host, checkout, workspace] {
+                contexts
+                    .put_authoritative_record("tenant-test", &record)
+                    .unwrap();
+            }
+            drop(contexts);
+            ReviewStore::open_scoped(&review_path, "tenant-test")
+                .unwrap()
+                .put_snapshot(
+                    &decode_review_snapshot(GITHUB_RECOVERY_REVIEW_SNAPSHOT).unwrap(),
+                    1,
+                )
+                .unwrap();
+
+            let registry = serde_json::json!({
+                "version":1,"generation":"github-recovery-test",
+                "bindings":[{
+                    "project":"project-test","workspace_kind":"user_workspace","workspace_id":"wc_user_1",
+                    "authority_kind":"ci","authority_id":"authority-1",
+                    "target":{"kind":"ci","provider":"github","target":"example-org/example-repo",
+                        "credential_reference":"github-actions-mobile","checks":[{
+                            "check_id":"check-1","run_id":91,
+                            "head_sha":"0123456789abcdef0123456789abcdef01234567",
+                            "observed_attempt":3,"observed_check_revision":7
+                        }]}
+                }]
+            });
+            let credentials = serde_json::json!({
+                "version":1,"generation":"github-credentials-test",
+                "credentials":[{"reference":"github-actions-mobile",
+                    "repository":"example-org/example-repo","actions_write":true,
+                    "token":"github_pat_test_only_not_a_secret"}]
+            });
+            for (path, document) in [
+                (
+                    directory
+                        .path()
+                        .join(crate::platform_v2_review_adapter::REVIEW_REGISTRY_FILE_NAME),
+                    registry,
+                ),
+                (
+                    directory.path().join(
+                        crate::platform_v2_review_adapter::REVIEW_GITHUB_CREDENTIALS_FILE_NAME,
+                    ),
+                    credentials,
+                ),
+            ] {
+                fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let counts = Arc::new(ProviderCallCounts::default());
+            let attempt = Arc::new(AtomicU32::new(3));
+            let transport: SharedGitHubActionsTransport =
+                Arc::new(Mutex::new(Box::new(CountingGitHubTransport {
+                    counts: Arc::clone(&counts),
+                    attempt: Arc::clone(&attempt),
+                })));
+            Self {
+                _directory: directory,
+                policy_path,
+                work_context_path,
+                lineage_path,
+                review_path,
+                uid,
+                counts,
+                attempt,
+                transport,
+            }
+        }
+
+        fn workspace_record(
+            revision: Revision,
+            lifecycle: WorkContextLifecycle,
+        ) -> WorkContextRecord {
+            WorkContextRecord::new(
+                WorkContextIdentity::UserWorkspace(UserWorkspaceId::new("wc_user_1").unwrap()),
+                revision,
+                lifecycle,
+                WorkContextLabel::new("Workspace test").unwrap(),
+                WorkContextAttributes::EMPTY,
+                vec![
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::UserWorkspaceProject,
+                        WorkContextIdentity::Project(ProjectId::new("project-test").unwrap()),
+                    )
+                    .unwrap(),
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::UserWorkspaceCheckout,
+                        WorkContextIdentity::parse_local(
+                            WorkContextTargetKind::Checkout,
+                            "checkout-test",
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap()
+        }
+
+        fn open(&self) -> PlatformV2Host {
+            let mut host = PlatformV2Host::open(
+                &self.policy_path,
+                &self.work_context_path,
+                &self.lineage_path,
+                &self.review_path,
+                self.uid,
+            );
+            let PlatformV2Host::Enabled(runtime) = &mut host else {
+                panic!("GitHub recovery fixture host unavailable: {host:?}");
+            };
+            runtime
+                .review_effects
+                .set_github_test_transport(Arc::clone(&self.transport));
+            host
+        }
+
+        fn advance_workspace(&self) {
+            WorkContextStore::open(&self.work_context_path)
+                .unwrap()
+                .put_authoritative_record(
+                    "tenant-test",
+                    &Self::workspace_record(
+                        Revision::new(2).unwrap(),
+                        WorkContextLifecycle::Archived,
+                    ),
+                )
+                .unwrap();
+        }
+
+        fn reset_counts(&self) {
+            self.counts.reads.store(0, Ordering::SeqCst);
+            self.counts.writes.store(0, Ordering::SeqCst);
+        }
+
+        fn set_attempt(&self, attempt: u32) {
+            self.attempt.store(attempt, Ordering::SeqCst);
+        }
+
+        fn calls(&self) -> (usize, usize) {
+            (
+                self.counts.reads.load(Ordering::SeqCst),
+                self.counts.writes.load(Ordering::SeqCst),
+            )
+        }
+    }
+
+    fn seed_github_recovery_action(
+        host: &mut PlatformV2Host,
+        key: &str,
+    ) -> (
+        StoredReviewAction,
+        ReviewExternalEffectPlan,
+        ReviewReceiptCorrelationDigest,
+    ) {
+        let PlatformV2Host::Enabled(runtime) = host else {
+            panic!("enabled host required")
+        };
+        let workspace =
+            WorkContextIdentity::UserWorkspace(UserWorkspaceId::new("wc_user_1").unwrap());
+        let authority = ReviewAuthority::new(
+            ReviewAuthorityKind::Ci,
+            ReviewAuthorityId::new("authority-1").unwrap(),
+        );
+        let action = ReviewAction::RerunCheck {
+            check_id: ReviewCheckId::new("check-1").unwrap(),
+            expected_check_revision: Revision::new(7).unwrap(),
+        };
+        let request = ReviewActionRequest::new(
+            workspace.clone(),
+            Revision::new(9).unwrap(),
+            ReviewActorId::new("actor-test").unwrap(),
+            ReviewAuthentication::UserSession,
+            authority.clone(),
+            IdempotencyKey::new(key).unwrap(),
+            action.clone(),
+        )
+        .unwrap();
+        let effect = runtime
+            .review_effects
+            .plan(
+                &ProjectId::new("project-test").unwrap(),
+                &workspace,
+                &authority,
+                &action,
+            )
+            .unwrap();
+        let ReviewEffectPlan::GitHubCheckRerun {
+            credential_reference,
+            repository,
+            run_id,
+            head_sha,
+            observed_attempt,
+            expected_check_revision,
+            registry_generation,
+            credential_generation,
+        } = effect
+        else {
+            panic!("GitHub effect plan required")
+        };
+        let request_digest =
+            ReviewStore::action_request_digest(&request, ApprovalPolicy::Required).unwrap();
+        let correlation = [9; 32];
+        let plan = ReviewExternalEffectPlan::github_check_rerun(
+            request_digest,
+            registry_generation,
+            credential_generation,
+            &credential_reference,
+            repository.owner().as_str(),
+            repository.repo().as_str(),
+            run_id.get(),
+            &head_sha,
+            observed_attempt,
+            ReviewCheckId::new("check-1").unwrap(),
+            expected_check_revision,
+            Revision::FIRST,
+            correlation,
+        )
+        .unwrap();
+        let stored = match runtime
+            .reviews
+            .prepare_external_action(&request, ApprovalPolicy::Required, &plan, 10)
+            .unwrap()
+        {
+            ReviewActionAdmission::New(action) => action,
+            ReviewActionAdmission::Replay(_) => panic!("new action required"),
+        };
+        (
+            stored,
+            plan,
+            review_receipt_correlation_digest(correlation).unwrap(),
+        )
+    }
+
+    fn approve_and_start_github_action(
+        host: &mut PlatformV2Host,
+        action: &StoredReviewAction,
+        plan: &ReviewExternalEffectPlan,
+    ) -> StoredReviewAction {
+        let PlatformV2Host::Enabled(runtime) = host else {
+            panic!("enabled host required")
+        };
+        let principal = runtime
+            .principals
+            .get(&nix::unistd::geteuid().as_raw())
+            .unwrap()
+            .clone();
+        let approved = runtime
+            .approve_prepared_github_confirmation(&principal, action, plan, 11)
+            .unwrap();
+        match runtime
+            .reviews
+            .start_write(&approved.preview_id, approved.request_digest, 12)
+            .unwrap()
+        {
+            ReviewWriteAdmission::New(action) | ReviewWriteAdmission::Replay(action) => action,
+        }
+    }
+
+    fn correlated_lookup(
+        key: &str,
+        correlation: ReviewReceiptCorrelationDigest,
+    ) -> PlatformV2Request {
+        PlatformV2Request::GetReviewReceipt(
+            ReviewReceiptLookup::new_correlated(
+                ProjectId::new("project-test").unwrap(),
+                WorkContextIdentity::UserWorkspace(UserWorkspaceId::new("wc_user_1").unwrap()),
+                IdempotencyKey::new(key).unwrap(),
+                correlation,
+            )
+            .unwrap(),
+        )
+    }
 
     fn seed_runtime_attention_contexts(
         path: &Path,
@@ -4762,6 +5459,86 @@ mod tests {
         );
     }
 
+    fn uncorrelated_lookup(key: &str) -> PlatformV2Request {
+        PlatformV2Request::GetReviewReceipt(
+            ReviewReceiptLookup::new(
+                ProjectId::new("project-test").unwrap(),
+                WorkContextIdentity::UserWorkspace(UserWorkspaceId::new("wc_user_1").unwrap()),
+                IdempotencyKey::new(key).unwrap(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn github_recovery_phase_gates_only_never_started_custody() {
+        assert_eq!(
+            github_recovery_phase(
+                ReviewReceiptOutcome::Accepted,
+                false,
+                ReviewExternalEffectCustody::NotStarted,
+            ),
+            Ok(GitHubRecoveryPhase::NeverStarted)
+        );
+        for (outcome, custody) in [
+            (
+                ReviewReceiptOutcome::Accepted,
+                ReviewExternalEffectCustody::CustodyStarted,
+            ),
+            (
+                ReviewReceiptOutcome::Accepted,
+                ReviewExternalEffectCustody::Accepted,
+            ),
+            (
+                ReviewReceiptOutcome::Unknown,
+                ReviewExternalEffectCustody::Ambiguous,
+            ),
+        ] {
+            assert_eq!(
+                github_recovery_phase(outcome, true, custody),
+                Ok(GitHubRecoveryPhase::ReconcileOnly)
+            );
+        }
+        for (outcome, admitted, custody) in [
+            (
+                ReviewReceiptOutcome::Refused,
+                false,
+                ReviewExternalEffectCustody::Refused,
+            ),
+            (
+                ReviewReceiptOutcome::Completed,
+                true,
+                ReviewExternalEffectCustody::Completed,
+            ),
+            (
+                ReviewReceiptOutcome::Conflict,
+                true,
+                ReviewExternalEffectCustody::Completed,
+            ),
+        ] {
+            assert_eq!(
+                github_recovery_phase(outcome, admitted, custody),
+                Ok(GitHubRecoveryPhase::Terminal)
+            );
+        }
+        assert!(
+            github_recovery_phase(
+                ReviewReceiptOutcome::Accepted,
+                false,
+                ReviewExternalEffectCustody::Accepted,
+            )
+            .is_err()
+        );
+        assert!(
+            github_recovery_phase(
+                ReviewReceiptOutcome::Unknown,
+                false,
+                ReviewExternalEffectCustody::Ambiguous,
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn runtime_attention_replay_at_max_revision_does_not_require_a_successor() {
         let source = AttentionSource::new(
@@ -5054,6 +5831,340 @@ mod tests {
         .unwrap();
         assert_ne!(reappeared.items()[0].id(), &original_id);
         assert!(!reappeared.items()[0].unread());
+    }
+
+    #[test]
+    fn github_lookup_requires_the_exact_nonlegacy_correlation() {
+        let exact = review_receipt_correlation_digest([7; 32]).unwrap();
+        let wrong = review_receipt_correlation_digest([8; 32]).unwrap();
+        assert!(github_receipt_correlation_matches(Some([7; 32]), Some(&exact)).unwrap());
+        assert!(!github_receipt_correlation_matches(Some([7; 32]), None).unwrap());
+        assert!(!github_receipt_correlation_matches(None, Some(&exact)).unwrap());
+        assert!(!github_receipt_correlation_matches(None, None).unwrap());
+        assert!(!github_receipt_correlation_matches(Some([7; 32]), Some(&wrong)).unwrap());
+    }
+
+    #[test]
+    fn github_uncorrelated_lookup_never_reads_the_generic_receipt_index() {
+        let fixture = GitHubRecoveryFixture::new();
+        let mut host = fixture.open();
+        seed_github_recovery_action(&mut host, "github-uncorrelated");
+        drop(host);
+
+        let mut restarted = fixture.open();
+        fixture.reset_counts();
+        let response =
+            restarted.handle(fixture.uid, &uncorrelated_lookup("github-uncorrelated"), 20);
+        assert!(
+            matches!(
+                response,
+                PlatformV2Response::Refused(ref refusal)
+                    if refusal.category().as_str() == "platform_v2_not_found"
+            ),
+            "unexpected uncorrelated response: {response:?}"
+        );
+        assert_eq!(fixture.calls(), (0, 0));
+    }
+
+    #[test]
+    fn github_missing_or_legacy_plan_never_falls_back_to_an_uncorrelated_receipt() {
+        let missing = GitHubRecoveryFixture::new();
+        let mut host = missing.open();
+        seed_github_recovery_action(&mut host, "github-missing-plan");
+        drop(host);
+        let connection = rusqlite::Connection::open(&missing.review_path).unwrap();
+        connection
+            .execute(
+                "DELETE FROM review_github_check_effect_plans
+                 WHERE preview_id=(SELECT preview_id FROM review_action_previews
+                                   WHERE idempotency_key='github-missing-plan')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let mut restarted = missing.open();
+        missing.reset_counts();
+        let response =
+            restarted.handle(missing.uid, &uncorrelated_lookup("github-missing-plan"), 20);
+        assert!(
+            matches!(
+                response,
+                PlatformV2Response::Refused(ref refusal)
+                    if refusal.category().as_str() == "platform_v2_not_found"
+            ),
+            "unexpected missing-plan response: {response:?}"
+        );
+        assert_eq!(missing.calls(), (0, 0));
+
+        let legacy = GitHubRecoveryFixture::new();
+        let mut host = legacy.open();
+        seed_github_recovery_action(&mut host, "github-legacy-plan");
+        drop(host);
+        let connection = rusqlite::Connection::open(&legacy.review_path).unwrap();
+        let document: Vec<u8> = connection
+            .query_row(
+                "SELECT plan_document FROM review_github_check_effect_plans
+                 WHERE preview_id=(SELECT preview_id FROM review_action_previews
+                                   WHERE idempotency_key='github-legacy-plan')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut document: serde_json::Value = serde_json::from_slice(&document).unwrap();
+        assert!(
+            document
+                .as_object_mut()
+                .unwrap()
+                .remove("expected_workspace_revision")
+                .is_some()
+        );
+        let document = crate::agent_harness::canonical_json_bytes(&document);
+        let digest = Sha256::digest(&document);
+        connection
+            .execute(
+                "UPDATE review_github_check_effect_plans
+                 SET plan_document=?1,plan_digest=?2,expected_workspace_revision=NULL
+                 WHERE preview_id=(SELECT preview_id FROM review_action_previews
+                                   WHERE idempotency_key='github-legacy-plan')",
+                params![document, digest.as_bytes().as_slice()],
+            )
+            .unwrap();
+        drop(connection);
+        let mut restarted = legacy.open();
+        legacy.reset_counts();
+        let response = restarted.handle(legacy.uid, &uncorrelated_lookup("github-legacy-plan"), 20);
+        assert!(
+            matches!(
+                response,
+                PlatformV2Response::Refused(ref refusal)
+                    if refusal.category().as_str() == "platform_v2_not_found"
+            ),
+            "unexpected legacy-v5 response: {response:?}"
+        );
+        assert_eq!(legacy.calls(), (0, 0));
+    }
+
+    #[test]
+    fn github_never_started_recovery_after_restart_and_workspace_advance_makes_zero_provider_calls()
+    {
+        let fixture = GitHubRecoveryFixture::new();
+        let mut host = fixture.open();
+        let (_, _, correlation) = seed_github_recovery_action(&mut host, "github-never-started");
+        drop(host);
+        fixture.advance_workspace();
+
+        let mut restarted = fixture.open();
+        fixture.reset_counts();
+        let response = restarted.handle(
+            fixture.uid,
+            &correlated_lookup("github-never-started", correlation),
+            20,
+        );
+        assert!(matches!(
+            response,
+            PlatformV2Response::Refused(refusal)
+                if refusal.category().as_str() == "platform_v2_review_workspace_changed"
+        ));
+        assert_eq!(fixture.calls(), (0, 0));
+    }
+
+    #[test]
+    fn github_legacy_v5_partial_recovery_identity_is_not_found_without_provider_calls() {
+        let fixture = GitHubRecoveryFixture::new();
+        let mut host = fixture.open();
+        let (_, _, correlation) = seed_github_recovery_action(&mut host, "github-legacy-v5");
+        drop(host);
+
+        let connection = rusqlite::Connection::open(&fixture.review_path).unwrap();
+        let document: Vec<u8> = connection
+            .query_row(
+                "SELECT plan_document FROM review_github_check_effect_plans WHERE preview_id=(SELECT preview_id FROM review_action_previews WHERE idempotency_key='github-legacy-v5')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut document: serde_json::Value = serde_json::from_slice(&document).unwrap();
+        assert!(
+            document
+                .as_object_mut()
+                .unwrap()
+                .remove("expected_workspace_revision")
+                .is_some()
+        );
+        let document = crate::agent_harness::canonical_json_bytes(&document);
+        let digest = Sha256::digest(&document);
+        connection
+            .execute(
+                "UPDATE review_github_check_effect_plans
+                 SET plan_document=?1,plan_digest=?2,expected_workspace_revision=NULL
+                 WHERE preview_id=(SELECT preview_id FROM review_action_previews WHERE idempotency_key='github-legacy-v5')",
+                params![document, digest.as_bytes().as_slice()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut restarted = fixture.open();
+        fixture.reset_counts();
+        let response = restarted.handle(
+            fixture.uid,
+            &correlated_lookup("github-legacy-v5", correlation),
+            20,
+        );
+        assert!(
+            matches!(
+                response,
+                PlatformV2Response::Refused(ref refusal)
+                    if refusal.category().as_str() == "platform_v2_not_found"
+            ),
+            "unexpected partial-v5 response: {response:?}"
+        );
+        assert_eq!(fixture.calls(), (0, 0));
+    }
+
+    #[test]
+    fn github_started_recovery_after_workspace_advance_reconciles_once_and_never_posts() {
+        for (suffix, custody) in [
+            ("custody-started", None),
+            ("accepted", Some(ReviewExternalEffectCustody::Accepted)),
+            ("ambiguous", Some(ReviewExternalEffectCustody::Ambiguous)),
+        ] {
+            let fixture = GitHubRecoveryFixture::new();
+            let key = format!("github-started-{suffix}");
+            let mut host = fixture.open();
+            let (prepared, plan, correlation) = seed_github_recovery_action(&mut host, &key);
+            let started = approve_and_start_github_action(&mut host, &prepared, &plan);
+            if let Some(custody) = custody {
+                let PlatformV2Host::Enabled(runtime) = &mut host else {
+                    panic!("enabled host required")
+                };
+                runtime
+                    .reviews
+                    .settle_github_check_rerun(
+                        &started.preview_id,
+                        started.request_digest,
+                        custody,
+                        13,
+                    )
+                    .unwrap();
+            }
+            drop(host);
+            fixture.advance_workspace();
+
+            let mut restarted = fixture.open();
+            fixture.reset_counts();
+            let response = restarted.handle(fixture.uid, &correlated_lookup(&key, correlation), 20);
+            let expected_outcome = if custody == Some(ReviewExternalEffectCustody::Accepted) {
+                ReviewReceiptOutcome::Accepted
+            } else {
+                ReviewReceiptOutcome::Unknown
+            };
+            assert!(matches!(
+                response,
+                PlatformV2Response::ReviewReceipt(receipt)
+                    if receipt.outcome() == expected_outcome
+            ));
+            assert_eq!(fixture.calls(), (1, 0), "phase {suffix}");
+        }
+    }
+
+    #[test]
+    fn github_accepted_restart_recovery_preserves_attribution_until_exact_next_attempt() {
+        let fixture = GitHubRecoveryFixture::new();
+        let key = "github-accepted-baseline-then-next";
+        let mut host = fixture.open();
+        let (prepared, plan, correlation) = seed_github_recovery_action(&mut host, key);
+        let started = approve_and_start_github_action(&mut host, &prepared, &plan);
+        let PlatformV2Host::Enabled(runtime) = &mut host else {
+            panic!("enabled host required")
+        };
+        runtime
+            .reviews
+            .settle_github_check_rerun(
+                &started.preview_id,
+                started.request_digest,
+                ReviewExternalEffectCustody::Accepted,
+                13,
+            )
+            .unwrap();
+        drop(host);
+
+        fixture.reset_counts();
+        let mut first_restart = fixture.open();
+        let first = first_restart.handle(
+            fixture.uid,
+            &correlated_lookup(key, correlation.clone()),
+            20,
+        );
+        assert!(matches!(
+            first,
+            PlatformV2Response::ReviewReceipt(receipt)
+                if receipt.outcome() == ReviewReceiptOutcome::Accepted
+        ));
+        assert_eq!(fixture.calls(), (1, 0), "one GET and no POST per poll");
+        drop(first_restart);
+
+        let raw = rusqlite::Connection::open(&fixture.review_path).unwrap();
+        let custody: String = raw
+            .query_row(
+                "SELECT custody FROM review_github_check_effect_plans
+                 WHERE preview_id=(SELECT preview_id FROM review_action_previews
+                                   WHERE idempotency_key=?1)",
+                [key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(custody, "accepted", "the baseline poll stays durable");
+        drop(raw);
+
+        fixture.set_attempt(4);
+        let mut second_restart = fixture.open();
+        let second = second_restart.handle(fixture.uid, &correlated_lookup(key, correlation), 21);
+        assert!(matches!(
+            second,
+            PlatformV2Response::ReviewReceipt(receipt)
+                if receipt.outcome() == ReviewReceiptOutcome::Completed
+        ));
+        assert_eq!(
+            fixture.calls(),
+            (2, 0),
+            "each poll performs one GET and restart recovery never posts"
+        );
+    }
+
+    #[test]
+    fn github_terminal_recovery_after_workspace_advance_returns_without_provider_io() {
+        let fixture = GitHubRecoveryFixture::new();
+        let mut host = fixture.open();
+        let (prepared, plan, correlation) =
+            seed_github_recovery_action(&mut host, "github-terminal");
+        let started = approve_and_start_github_action(&mut host, &prepared, &plan);
+        let PlatformV2Host::Enabled(runtime) = &mut host else {
+            panic!("enabled host required")
+        };
+        let terminal = runtime
+            .reviews
+            .settle_github_check_rerun(
+                &started.preview_id,
+                started.request_digest,
+                ReviewExternalEffectCustody::Completed,
+                13,
+            )
+            .unwrap();
+        drop(host);
+        fixture.advance_workspace();
+
+        let mut restarted = fixture.open();
+        fixture.reset_counts();
+        let response = restarted.handle(
+            fixture.uid,
+            &correlated_lookup("github-terminal", correlation),
+            20,
+        );
+        assert!(matches!(
+            response,
+            PlatformV2Response::ReviewReceipt(receipt) if receipt == terminal
+        ));
+        assert_eq!(fixture.calls(), (0, 0));
     }
 
     fn policy(inherited_tools: serde_json::Value) -> PolicyDocument {

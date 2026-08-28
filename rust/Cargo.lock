@@ -325,6 +325,7 @@ dependencies = [
  "serde",
  "serde_json",
  "ureq",
+ "zeroize",
 ]
 
 [[package]]

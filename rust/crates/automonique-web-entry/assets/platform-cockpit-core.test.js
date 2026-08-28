@@ -181,6 +181,7 @@ test("typed workspace and review controls require exact server operations and fr
         check_id: "check-ci-1",
         exact_check_revision: "5",
         confirmation_digest: "ab".repeat(32),
+        receipt_correlation_digest: "cd".repeat(32),
       }],
     },
   } };
@@ -193,6 +194,21 @@ test("typed workspace and review controls require exact server operations and fr
   expect(view.reviewActions.rerunCheck.available).toBe(true);
   expect(view.reviewActions.rerunCheck.targets[0].check_id).toBe("check-ci-1");
   expect(view.reviewActions.rerunCheck.targets[0].confirmation_digest).toBe("ab".repeat(32));
+  expect(view.reviewActions.rerunCheck.targets[0].receipt_correlation_digest).toBe("cd".repeat(32));
+
+  const rerunHandle = cockpit.prepareControlHandle(
+    view.reviewActions.rerunCheck,
+    "rerunCheck",
+    "receipt-rerun-1",
+    view.reviewActions.rerunCheck.targets[0].receipt_correlation_digest,
+  );
+  expect(cockpit.parseControlHandle(cockpit.serializeControlHandle(rerunHandle))).toEqual(rerunHandle);
+  expect(rerunHandle.receipt_correlation_digest).toBe("cd".repeat(32));
+  expect(cockpit.prepareControlHandle(
+    view.reviewActions.rerunCheck,
+    "rerunCheck",
+    "receipt-rerun-2",
+  )).toBeNull();
 
   const substitutedCheckRevision = structuredClone(controlled);
   substitutedCheckRevision.actions.review.operations.rerun_check.targets.push({
@@ -203,6 +219,9 @@ test("typed workspace and review controls require exact server operations and fr
   const malformedConfirmation = structuredClone(controlled);
   malformedConfirmation.actions.review.operations.rerun_check.targets[0].confirmation_digest = "forged";
   expect(cockpit.derivePresentation(malformedConfirmation).reviewActions.rerunCheck.available).toBe(false);
+  const missingCorrelation = structuredClone(controlled);
+  delete missingCorrelation.actions.review.operations.rerun_check.targets[0].receipt_correlation_digest;
+  expect(cockpit.derivePresentation(missingCorrelation).reviewActions.rerunCheck.available).toBe(false);
 
   const missingExternal = structuredClone(controlled);
   delete missingExternal.actions.lifecycle.operations.create_attempt_workspace.external_work;

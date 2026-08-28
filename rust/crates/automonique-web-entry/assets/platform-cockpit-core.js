@@ -475,8 +475,11 @@
       const checkId = boundedText(target?.check_id, 256);
       const confirmationDigest = typeof target?.confirmation_digest === "string"
         && /^[0-9a-f]{64}$/.test(target.confirmation_digest) ? target.confirmation_digest : null;
+      const receiptCorrelationDigest = typeof target?.receipt_correlation_digest === "string"
+        && /^[0-9a-f]{64}$/.test(target.receipt_correlation_digest) ? target.receipt_correlation_digest : null;
       if (!projectId || !workspaceId || !checkId
         || !confirmationDigest
+        || !receiptCorrelationDigest
         || !validDecimal(target?.exact_revision, false)
         || !validDecimal(target?.exact_check_revision, false)) return null;
       return Object.freeze({
@@ -486,6 +489,7 @@
         check_id: checkId,
         exact_check_revision: target.exact_check_revision,
         confirmation_digest: confirmationDigest,
+        receipt_correlation_digest: receiptCorrelationDigest,
       });
     });
     const unique = new Set(targets.filter(Boolean).map((target) => target.check_id));
@@ -707,7 +711,12 @@
     const projectId = boundedText(value.project_id, 256);
     const workspaceId = boundedText(value.workspace_id, 256);
     const receiptId = boundedText(value.receipt_id, 256);
-    if (!action || !projectId || !workspaceId || !receiptId) return null;
+    const receiptCorrelationDigest = typeof value.receipt_correlation_digest === "string"
+      && /^[0-9a-f]{64}$/.test(value.receipt_correlation_digest)
+      ? value.receipt_correlation_digest : null;
+    if (!action || !projectId || !workspaceId || !receiptId
+      || (action === "rerunCheck" && !receiptCorrelationDigest)
+      || (action !== "rerunCheck" && receiptCorrelationDigest)) return null;
     return Object.freeze({
       version: 1,
       family: value.family,
@@ -715,10 +724,11 @@
       project_id: projectId,
       workspace_id: workspaceId,
       receipt_id: receiptId,
+      ...(receiptCorrelationDigest ? { receipt_correlation_digest: receiptCorrelationDigest } : {}),
     });
   }
 
-  function prepareControlHandle(capability, action, receiptId) {
+  function prepareControlHandle(capability, action, receiptId, receiptCorrelationDigest = null) {
     if (capability?.available !== true || !CONTROL_FAMILIES.includes(capability.family)) return null;
     return validControlHandle({
       family: capability.family,
@@ -726,6 +736,7 @@
       project_id: capability.project_id,
       workspace_id: capability.workspace_id,
       receipt_id: receiptId,
+      receipt_correlation_digest: receiptCorrelationDigest,
     });
   }
 

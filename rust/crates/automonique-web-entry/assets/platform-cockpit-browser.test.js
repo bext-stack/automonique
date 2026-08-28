@@ -63,6 +63,7 @@ test("preview is inert and confirmed controls persist their receipt before sendi
   expect(html).toContain('id="cockpit-rerun-check" type="button" disabled');
   expect(script).toContain('action: "rerun_check"');
   expect(script).toContain('action: "get_review_receipt"');
+  expect(script).toContain("receipt_correlation_digest: handle.receipt_correlation_digest");
 });
 
 test("check rerun requires a server preview followed by a distinct explicit confirm", () => {

@@ -300,7 +300,8 @@ group/world writable, and unknown JSON fields are rejected. The registry is
 private composition state: its coordinates are never returned by Platform v2
 and clients cannot supply paths, commands, provider targets, or credential
 references. `GetReviewCapabilities` returns only the exact project/workspace,
-snapshot revision, check id/revision, CI authority, and opaque confirmation
+snapshot revision, authoritative workspace revision, check id/revision, CI
+authority, opaque confirmation digest, and non-authorizing receipt-correlation
 digest for currently runnable checks. Advertisement performs a fresh typed
 GitHub workflow-run GET and emits
 the capability only when run ID, head SHA, observed attempt, and completed
@@ -309,13 +310,21 @@ registry/credential state produces no advertised rerun capability. This read
 never performs a provider mutation.
 
 `ExecuteReviewAction(rerun_check)` persists the immutable run/repository/head/
-attempt plan and custody in the review SQLite store before the one allowed
-POST. Only a brand-new write admission in the same process may issue that POST.
+attempt plan, the distinct authoritative workspace revision, and custody in the
+review SQLite store before the one allowed POST. Only a brand-new write
+admission in the same process may issue that POST.
 The store atomically and durably reserves the ASCII-case-normalized repository,
 run ID, and observed attempt across every actor and workspace, so aliases or
 concurrent confirmations cannot create two POST opportunities. Attempts and
 snapshot/check revisions whose next value cannot be represented are refused
 before reservation or custody.
+Never-started approval, write admission, and the final pre-POST check each
+reload the authoritative workspace mapping and require that stored revision
+exactly; missing legacy revision data or a changed/removed mapping prevents the
+first provider mutation. Once write custody has started, restart recovery is
+reconcile-only and does not reinterpret a later workspace revision as provider
+state. Exact correlated terminal receipts likewise remain readable while the
+current principal still owns the mapping.
 After a restart, `custody_started`, accepted, or ambiguous state is reconciled
 with the exact workflow-run GET and is never submitted again. GitHub does not
 return a rerun correlation token, so an exact next attempt completes the
@@ -326,11 +335,23 @@ skipped attempt, or changed head likewise never triggers a second mutation.
 
 Each advertised rerun capability also carries an opaque confirmation digest
 over the authenticated actor, project/workspace, snapshot/check revisions,
-provider target, and exact registry and credential generations. Cockpit first
+authoritative workspace revision, provider target, and exact registry and
+credential generations. Cockpit first
 renders that capability as an inert confirmation preview. Only an explicit
 confirm returns the digest with the action; the daemon recomputes it before
 persisting an approval and before provider custody. A changed or substituted
 preview fails closed.
+
+The correlation digest is persisted with the admitted provider plan before
+custody and survives restart. Rerun clients must use the correlated receipt
+lookup: the daemon returns a receipt only when the idempotency key and this
+exact digest select the same durable GitHub plan. A legacy uncorrelated lookup
+remains available for non-rerun review actions, but is not attribution evidence
+for a rerun. Correlation and authoritative workspace revision form one native
+recovery identity: migrated GitHub plans missing either field are unavailable
+to lookup, approval, drive, reconciliation, and terminal replay, and never
+fall back to the generic receipt index. Older, external, cross-action, and
+same-key mismatches fail closed.
 
 ## Private attention source registry
 
@@ -669,8 +690,10 @@ receipt-ID binding exists before an ambiguous response. The private SQLite
 custody binds an operation family as well as the project and idempotency key;
 review custody additionally binds the exact workspace kind and ID. Mutation
 custody cannot admit a review lookup, and custody for one review workspace
-cannot admit another. Legacy custody rows without this complete coordinate fail
-closed after migration. Typed review-action submission, review-capability
+cannot admit another. GitHub rerun custody also binds the opaque receipt
+correlation digest, including across web-entry restart; an uncorrelated or
+substituted lookup is refused before opening the daemon socket. Legacy custody
+rows without this complete coordinate fail closed after migration. Typed review-action submission, review-capability
 reads, check reruns, and review-receipt lookup require independent
 `execute_review_action`, `get_review_capabilities`, `rerun_check`, and
 `get_review_receipt` mobile grants. The historical execute grant remains

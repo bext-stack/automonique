@@ -15,6 +15,7 @@ use std::fmt;
 
 use crate::GitHubRefusal;
 use automonique_connector_substrate::secret::scrub_rendered;
+use zeroize::Zeroize;
 
 /// Longest bearer credential accepted.
 ///
@@ -34,14 +35,16 @@ pub const MAX_GITHUB_TOKEN_BYTES: usize = 512;
 pub struct GitHubToken(Vec<u8>);
 
 impl GitHubToken {
-    /// Construct a bounded, header-safe bearer credential.
+    /// Validate a borrowed credential without taking or copying its custody.
+    ///
+    /// This is intended for secret-bearing configuration parsers that already
+    /// keep the source bytes in a zeroizing container.
     ///
     /// # Errors
     ///
-    /// Returns [`GitHubRefusal::Token`] when the secret is empty, longer than
-    /// [`MAX_GITHUB_TOKEN_BYTES`], or contains a byte outside `token68`.
-    pub fn new(secret: impl Into<Vec<u8>>) -> Result<Self, GitHubRefusal> {
-        let secret = secret.into();
+    /// Returns [`GitHubRefusal::Token`] for the same invalid values as
+    /// [`Self::new`].
+    pub fn validate(secret: &[u8]) -> Result<(), GitHubRefusal> {
         if secret.is_empty()
             || secret.len() > MAX_GITHUB_TOKEN_BYTES
             || !secret.iter().all(|byte| {
@@ -50,6 +53,23 @@ impl GitHubToken {
             })
         {
             return Err(GitHubRefusal::Token);
+        }
+        Ok(())
+    }
+
+    /// Construct a bounded, header-safe bearer credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GitHubRefusal::Token`] when the secret is empty, longer than
+    /// [`MAX_GITHUB_TOKEN_BYTES`], or contains a byte outside `token68`.
+    pub fn new(secret: impl Into<Vec<u8>>) -> Result<Self, GitHubRefusal> {
+        let mut secret = secret.into();
+        if let Err(error) = Self::validate(&secret) {
+            // `Self` is never constructed on this path, so scrub the owned
+            // allocation explicitly rather than relying on `Drop`.
+            secret.zeroize();
+            return Err(error);
         }
         Ok(Self(secret))
     }

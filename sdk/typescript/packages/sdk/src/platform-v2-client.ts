@@ -28,6 +28,7 @@ import {
   type ReceiptId,
   type ReviewAction,
   type ReviewConfirmationDigest,
+  type ReviewReceiptCorrelationDigest,
   type ReviewWorkspaceIdentity,
   type UserWorkspaceId,
   type WorkspaceIntent,
@@ -625,8 +626,8 @@ export class PlatformV2Client {
     return response;
   }
 
-  async executeConfirmedReviewAction(workspace: ReviewWorkspaceIdentity, expectedRevision: WorkContextRevision, action: ReviewAction, idempotencyKey: IdempotencyKey, confirmationDigest: ReviewConfirmationDigest, signal?: AbortSignal) {
-    const response = requireResponse(await this.#request({kind: "execute_review_action", request: {workspace, expected_revision: expectedRevision, action, idempotency_key: idempotencyKey, confirmation_digest: confirmationDigest}}, signal), ["review_receipt"] as const);
+  async executeConfirmedReviewAction(workspace: ReviewWorkspaceIdentity, expectedRevision: WorkContextRevision, action: ReviewAction, idempotencyKey: IdempotencyKey, confirmationDigest: ReviewConfirmationDigest, expectedWorkspaceRevision: WorkContextRevision, receiptCorrelationDigest: ReviewReceiptCorrelationDigest, signal?: AbortSignal) {
+    const response = requireResponse(await this.#request({kind: "execute_review_action", request: {workspace, expected_revision: expectedRevision, action, idempotency_key: idempotencyKey, confirmation_digest: confirmationDigest, expected_workspace_revision: expectedWorkspaceRevision, receipt_correlation_digest: receiptCorrelationDigest}}, signal), ["review_receipt"] as const);
     if (response.kind === "review_receipt" && response.receipt.idempotency_key !== idempotencyKey) {
       throw new PlatformTransportError(502, "response_idempotency_mismatch");
     }
@@ -638,6 +639,12 @@ export class PlatformV2Client {
     if (response.kind === "review_receipt" && response.receipt.idempotency_key !== idempotencyKey) {
       throw new PlatformTransportError(502, "response_idempotency_mismatch");
     }
+    return response;
+  }
+
+  async getCorrelatedReviewReceipt(project: ProjectId, workspace: ReviewWorkspaceIdentity, idempotencyKey: IdempotencyKey, receiptCorrelationDigest: ReviewReceiptCorrelationDigest, signal?: AbortSignal) {
+    const response = requireResponse(await this.#request({kind: "get_review_receipt", lookup: {project, workspace, idempotency_key: idempotencyKey, receipt_correlation_digest: receiptCorrelationDigest}}, signal), ["review_receipt"] as const);
+    if (response.kind === "review_receipt" && response.receipt.idempotency_key !== idempotencyKey) throw new PlatformTransportError(502, "response_idempotency_mismatch");
     return response;
   }
 }

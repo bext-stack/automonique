@@ -52,7 +52,8 @@ use automonique_protocol::platform_v2_transport::{
     PlatformV2RequestMessage, PlatformV2Response, PlatformV2ResponseMessage,
     PlatformV2TransportError, RawMutationApprovalDocument, RawMutationReceiptDocument,
     ReceiptLookupKey, ReviewActionTransportRequest, ReviewCapabilities, ReviewConfirmationDigest,
-    ReviewReadRequest, ReviewReceiptLookup, WorkspaceIntentLookup, WorkspaceIntentRequest,
+    ReviewReadRequest, ReviewReceiptCorrelationDigest, ReviewReceiptLookup, WorkspaceIntentLookup,
+    WorkspaceIntentRequest,
 };
 use automonique_protocol::primitives::Revision;
 
@@ -319,6 +320,48 @@ pub enum ReviewCapabilitiesResult {
 pub enum ReviewReceiptResult {
     Receipt(ReviewActionReceipt),
     Refused(PlatformV2Refusal),
+}
+
+/// Exact server-advertised coordinates required to confirm one review action.
+///
+/// The digest types are already length- and grammar-bounded by the protocol,
+/// while the workspace revision prevents a capability from being replayed
+/// against a different authoritative workspace state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewActionConfirmation {
+    confirmation_digest: ReviewConfirmationDigest,
+    expected_workspace_revision: Revision,
+    receipt_correlation_digest: ReviewReceiptCorrelationDigest,
+}
+
+impl ReviewActionConfirmation {
+    #[must_use]
+    pub const fn new(
+        confirmation_digest: ReviewConfirmationDigest,
+        expected_workspace_revision: Revision,
+        receipt_correlation_digest: ReviewReceiptCorrelationDigest,
+    ) -> Self {
+        Self {
+            confirmation_digest,
+            expected_workspace_revision,
+            receipt_correlation_digest,
+        }
+    }
+
+    #[must_use]
+    pub const fn confirmation_digest(&self) -> &ReviewConfirmationDigest {
+        &self.confirmation_digest
+    }
+
+    #[must_use]
+    pub const fn expected_workspace_revision(&self) -> Revision {
+        self.expected_workspace_revision
+    }
+
+    #[must_use]
+    pub const fn receipt_correlation_digest(&self) -> &ReviewReceiptCorrelationDigest {
+        &self.receipt_correlation_digest
+    }
 }
 
 /// Client whose v2 methods remain unavailable until this exact connection has
@@ -682,7 +725,7 @@ impl<T> PlatformV2Client<T> {
 
     /// Confirm one exact server-advertised review action preview.
     ///
-    /// The confirmation digest must come from the matching current
+    /// The confirmation coordinates must come from the matching current
     /// [`ReviewCapabilities`]. Rerun actions are deliberately refused by
     /// `execute_review_action` so callers cannot skip this explicit phase.
     pub fn execute_confirmed_review_action(
@@ -691,15 +734,22 @@ impl<T> PlatformV2Client<T> {
         expected_revision: Revision,
         action: ReviewAction,
         idempotency_key: IdempotencyKey,
-        confirmation_digest: ReviewConfirmationDigest,
+        confirmation: ReviewActionConfirmation,
     ) -> Result<ReviewReceiptResult, ClientError> {
         let expected_key = idempotency_key.clone();
-        let request = ReviewActionTransportRequest::new_confirmed(
+        let ReviewActionConfirmation {
+            confirmation_digest,
+            expected_workspace_revision,
+            receipt_correlation_digest,
+        } = confirmation;
+        let request = ReviewActionTransportRequest::new_confirmed_correlated(
             workspace,
             expected_revision,
             action,
             idempotency_key,
             confirmation_digest,
+            expected_workspace_revision,
+            receipt_correlation_digest,
         )
         .map_err(|_| ClientError::Protocol)?;
         match self.request(PlatformV2Request::ExecuteReviewAction(request))? {
@@ -722,6 +772,32 @@ impl<T> PlatformV2Client<T> {
         let expected_key = idempotency_key.clone();
         let lookup = ReviewReceiptLookup::new(project, workspace, idempotency_key)
             .map_err(|_| ClientError::Protocol)?;
+        match self.request(PlatformV2Request::GetReviewReceipt(lookup))? {
+            PlatformV2Response::ReviewReceipt(value)
+                if value.idempotency_key() == &expected_key =>
+            {
+                Ok(ReviewReceiptResult::Receipt(value))
+            }
+            PlatformV2Response::Refused(value) => Ok(ReviewReceiptResult::Refused(value)),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    pub fn get_correlated_review_receipt(
+        &mut self,
+        project: ProjectId,
+        workspace: WorkContextIdentity,
+        idempotency_key: IdempotencyKey,
+        receipt_correlation_digest: ReviewReceiptCorrelationDigest,
+    ) -> Result<ReviewReceiptResult, ClientError> {
+        let expected_key = idempotency_key.clone();
+        let lookup = ReviewReceiptLookup::new_correlated(
+            project,
+            workspace,
+            idempotency_key,
+            receipt_correlation_digest,
+        )
+        .map_err(|_| ClientError::Protocol)?;
         match self.request(PlatformV2Request::GetReviewReceipt(lookup))? {
             PlatformV2Response::ReviewReceipt(value)
                 if value.idempotency_key() == &expected_key =>

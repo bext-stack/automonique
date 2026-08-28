@@ -12,9 +12,9 @@ use automonique_protocol::platform_v2_review_api::{
 };
 use automonique_protocol::primitives::Revision;
 use automonique_store::review_store::{
-    ApprovalPolicy, ReviewActionAdmission, ReviewApprovalDecision, ReviewApprovalDocument,
-    ReviewExternalEffectCustody, ReviewExternalEffectPlan, ReviewStore, ReviewStoreError,
-    ReviewWriteAdmission,
+    ApprovalPolicy, REVIEW_STORE_SCHEMA_VERSION, ReviewActionAdmission, ReviewApprovalDecision,
+    ReviewApprovalDocument, ReviewExternalEffectCustody, ReviewExternalEffectPlan, ReviewStore,
+    ReviewStoreError, ReviewWriteAdmission,
 };
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
@@ -220,6 +220,8 @@ fn github_external_plan_for(
         attempt,
         ReviewCheckId::new("check-1").unwrap(),
         revision(7),
+        revision(11),
+        [9; 32],
     )
     .expect("github effect plan")
 }
@@ -334,6 +336,8 @@ fn github_plan_rejects_every_successor_overflow_before_reservation() {
             u32::MAX,
             ReviewCheckId::new("check-1").unwrap(),
             revision(7),
+            revision(11),
+            [9; 32],
         )
         .is_err()
     );
@@ -350,8 +354,57 @@ fn github_plan_rejects_every_successor_overflow_before_reservation() {
             3,
             ReviewCheckId::new("check-1").unwrap(),
             revision(i64::MAX as u64),
+            revision(11),
+            [9; 32],
         )
         .is_err()
+    );
+    assert!(
+        ReviewExternalEffectPlan::github_check_rerun(
+            request_digest,
+            [7; 32],
+            [8; 32],
+            "github-actions-mobile",
+            "example-org",
+            "example-repo",
+            91,
+            "0123456789abcdef0123456789abcdef01234567",
+            3,
+            ReviewCheckId::new("check-1").unwrap(),
+            revision(7),
+            revision(11),
+            [0; 32],
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn github_plan_digest_binds_the_authoritative_workspace_revision() {
+    let request = request();
+    let first = github_external_plan(&request);
+    let request_digest =
+        ReviewStore::action_request_digest(&request, ApprovalPolicy::NotRequired).unwrap();
+    let changed = ReviewExternalEffectPlan::github_check_rerun(
+        request_digest,
+        [7; 32],
+        [8; 32],
+        "github-actions-mobile",
+        "example-org",
+        "example-repo",
+        91,
+        "0123456789abcdef0123456789abcdef01234567",
+        3,
+        ReviewCheckId::new("check-1").unwrap(),
+        revision(7),
+        revision(12),
+        [9; 32],
+    )
+    .unwrap();
+    assert_ne!(first.digest(), changed.digest());
+    assert_eq!(
+        changed.github_expected_workspace_revision(),
+        Some(revision(12))
     );
 }
 
@@ -405,6 +458,14 @@ fn github_check_plan_and_custody_survive_restart_without_reopening_write_admissi
         .unwrap()
         .unwrap();
     assert_eq!(restarted_plan.digest(), plan.digest());
+    assert_eq!(
+        restarted_plan.github_receipt_correlation_digest(),
+        Some([9; 32])
+    );
+    assert_eq!(
+        restarted_plan.github_expected_workspace_revision(),
+        Some(revision(11))
+    );
     assert_eq!(
         restarted_plan.github_custody(),
         Some(ReviewExternalEffectCustody::CustodyStarted)
@@ -481,6 +542,8 @@ fn github_check_external_plan_must_match_the_exact_action_target_revision() {
         3,
         ReviewCheckId::new("check-2").unwrap(),
         revision(7),
+        revision(11),
+        [9; 32],
     )
     .unwrap();
     assert!(matches!(
@@ -568,6 +631,19 @@ fn local_comment_effect_is_atomic_exactly_once_and_actor_attributed() {
             .execute_local_action(&request, 13)
             .expect("terminal replay"),
         completed
+    );
+    assert_eq!(
+        store
+            .non_rerun_receipt(
+                request.workspace(),
+                request.actor(),
+                request.authentication(),
+                request.authority(),
+                request.idempotency_key(),
+                13,
+            )
+            .expect("generic local receipt"),
+        Some(completed.clone())
     );
     let current = store
         .snapshot(initial.workspace())
@@ -934,7 +1010,7 @@ fn populated_review_v1_store_migrates_exactly_and_remains_non_actionable() {
     assert_eq!(
         raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .expect("version"),
-        4
+        REVIEW_STORE_SCHEMA_VERSION
     );
     let schema: String = raw
         .query_row("SELECT protocol_schema FROM review_snapshots", [], |row| {
@@ -990,7 +1066,7 @@ fn mislabeled_authority_bearing_v1_document_is_transactionally_upgraded_to_v2() 
     assert_eq!(
         raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .expect("version"),
-        4
+        REVIEW_STORE_SCHEMA_VERSION
     );
     let protocol_schema: String = raw
         .query_row("SELECT protocol_schema FROM review_snapshots", [], |row| {
@@ -1028,7 +1104,7 @@ fn populated_v2_store_adds_external_plan_custody_transactionally() {
     assert_eq!(
         raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .unwrap(),
-        4
+        REVIEW_STORE_SCHEMA_VERSION
     );
     assert!(
         raw.query_row(
@@ -1074,7 +1150,7 @@ fn populated_real_v3_store_migrates_to_v4_without_losing_review_state() {
     assert_eq!(
         raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .unwrap(),
-        4
+        REVIEW_STORE_SCHEMA_VERSION
     );
     assert!(raw
         .query_row(
@@ -1083,6 +1159,98 @@ fn populated_real_v3_store_migrates_to_v4_without_losing_review_state() {
             |row| row.get::<_, bool>(0),
         )
         .unwrap());
+}
+
+#[test]
+fn v4_store_adds_nullable_receipt_correlation_transactionally() {
+    let private = PrivateStore::new();
+    drop(ReviewStore::open(private.path()).unwrap());
+    let raw = Connection::open(private.path()).unwrap();
+    raw.execute_batch(
+        "ALTER TABLE review_github_check_effect_plans DROP COLUMN receipt_correlation_digest;
+         ALTER TABLE review_github_check_effect_plans DROP COLUMN expected_workspace_revision;
+         PRAGMA user_version=4;",
+    )
+    .unwrap();
+    drop(raw);
+    drop(ReviewStore::open(private.path()).expect("migrate v4"));
+    let raw = Connection::open(private.path()).unwrap();
+    assert_eq!(
+        raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .unwrap(),
+        REVIEW_STORE_SCHEMA_VERSION
+    );
+    let columns: i64 = raw.query_row("SELECT count(*) FROM pragma_table_info('review_github_check_effect_plans') WHERE name='receipt_correlation_digest'", [], |row| row.get(0)).unwrap();
+    assert_eq!(columns, 1);
+}
+
+#[test]
+fn v5_store_adds_nullable_workspace_revision_and_preserves_legacy_as_unbound() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let request = seed(&mut store);
+    let plan = github_external_plan(&request);
+    store
+        .prepare_external_action(&request, ApprovalPolicy::NotRequired, &plan, 12)
+        .unwrap();
+    drop(store);
+    let raw = Connection::open(private.path()).unwrap();
+    let document: Vec<u8> = raw
+        .query_row(
+            "SELECT plan_document FROM review_github_check_effect_plans",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let legacy_document = String::from_utf8(document)
+        .unwrap()
+        .replace(",\"expected_workspace_revision\":11", "")
+        .into_bytes();
+    let legacy_digest = Sha256::digest(&legacy_document);
+    raw.execute(
+        "UPDATE review_github_check_effect_plans
+         SET plan_document=?1,plan_digest=?2",
+        params![legacy_document, legacy_digest.as_slice()],
+    )
+    .unwrap();
+    raw.execute_batch(
+        "ALTER TABLE review_github_check_effect_plans DROP COLUMN expected_workspace_revision;
+         PRAGMA user_version=5;",
+    )
+    .unwrap();
+    drop(raw);
+    let store = ReviewStore::open(private.path()).expect("migrate v5");
+    let (_, legacy_plan) = store
+        .external_action(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            13,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(legacy_plan.github_expected_workspace_revision(), None);
+    assert_eq!(
+        legacy_plan.github_receipt_correlation_digest(),
+        Some([9; 32])
+    );
+    drop(store);
+    let raw = Connection::open(private.path()).unwrap();
+    assert_eq!(
+        raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .unwrap(),
+        REVIEW_STORE_SCHEMA_VERSION
+    );
+    let columns: i64 = raw
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('review_github_check_effect_plans') WHERE name='expected_workspace_revision'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(columns, 1);
 }
 
 #[test]
@@ -2691,6 +2859,12 @@ fn approval_and_ambiguous_receipt_reconcile_after_restart_without_replay() {
         .receipt(&workspace, &actor, authentication, &authority, &key, 25)
         .expect("lookup")
         .expect("receipt");
+    assert!(
+        reopened
+            .non_rerun_receipt(&workspace, &actor, authentication, &authority, &key, 25)
+            .expect("generic rerun exclusion")
+            .is_none()
+    );
     assert_eq!(reconciled.outcome().as_str(), "unknown");
     assert_eq!(reconciled.receipt_id(), accepted.receipt_id());
     assert_eq!(

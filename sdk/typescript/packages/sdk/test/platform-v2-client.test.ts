@@ -14,6 +14,7 @@ import {
   PlatformVersionNumber,
   ProjectId,
   ReviewConfirmationDigest,
+  ReviewReceiptCorrelationDigest,
   UserWorkspaceId,
   WorkContextCursor,
   WorkContextLabel,
@@ -500,6 +501,7 @@ describe("canonical HTTPS Platform v2 client", () => {
     const project = ProjectId("project-a");
     const workspace = {kind: "user_workspace" as const, id: UserWorkspaceId("workspace-a")};
     const confirmation = ReviewConfirmationDigest("ab".repeat(32));
+    const correlation = ReviewReceiptCorrelationDigest("cd".repeat(32));
     const action = {kind: "rerun_check" as const, payload: {check_id: "check-1", expected_check_revision: 7n}};
     const key = IdempotencyKey("review-rerun-confirmed");
     const adapter = new DeterministicPlatformV2Adapter([
@@ -508,7 +510,8 @@ describe("canonical HTTPS Platform v2 client", () => {
         project,
         workspace,
         snapshot_revision: WorkContextRevision(9n),
-        rerunnable_checks: [{authority: {id: "ci-1", kind: "ci"}, check_id: "check-1", confirmation_digest: confirmation, expected_check_revision: WorkContextRevision(7n)}],
+        workspace_revision: WorkContextRevision(4n),
+        rerunnable_checks: [{authority: {id: "ci-1", kind: "ci"}, check_id: "check-1", confirmation_digest: confirmation, receipt_correlation_digest: correlation, expected_check_revision: WorkContextRevision(7n)}],
         schema: PLATFORM_SCHEMA_V2,
       }}},
       {lane: "v2", request: {kind: "execute_review_action", request: {
@@ -517,6 +520,8 @@ describe("canonical HTTPS Platform v2 client", () => {
         action,
         idempotency_key: key,
         confirmation_digest: confirmation,
+        expected_workspace_revision: WorkContextRevision(4n),
+        receipt_correlation_digest: correlation,
       }}, result: {kind: "platform_v2_refused", refusal: {category: "provider_unavailable", explanation: "ambiguous", schema: PLATFORM_SCHEMA_V2}}},
     ]);
     const client = new PlatformV2Client(adapter);
@@ -524,7 +529,7 @@ describe("canonical HTTPS Platform v2 client", () => {
     const capabilities = await client.getReviewCapabilities(project, workspace);
     expect(capabilities.kind).toBe("review_capabilities");
     expect((capabilities.kind === "review_capabilities" ? capabilities.capabilities.rerunnable_checks[0]?.confirmation_digest : null)).toBe(confirmation);
-    expect((await client.executeConfirmedReviewAction(workspace, WorkContextRevision(9n), action, key, confirmation)).kind).toBe("platform_v2_refused");
+    expect((await client.executeConfirmedReviewAction(workspace, WorkContextRevision(9n), action, key, confirmation, WorkContextRevision(4n), correlation)).kind).toBe("platform_v2_refused");
   });
 
   test("binds pages and resyncs to the exact requested cursor and limit", async () => {

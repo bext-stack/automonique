@@ -5,15 +5,15 @@ use automonique_platform_client::platform_v2_client::testing::{
 };
 use automonique_platform_client::platform_v2_client::{
     AttentionReadResult, NegotiationResult, PlatformV2Client, PlatformV2ClientError as ClientError,
-    WorkContextGetResult,
+    ReviewActionConfirmation, ReviewReceiptResult, WorkContextGetResult,
 };
 use automonique_protocol::identity::Actor;
 use automonique_protocol::platform::{IdempotencyKey, ResourceAuthority};
 use automonique_protocol::platform_v2::{
     NegotiatedPlatform, PLATFORM_SCHEMA_V2, PlatformVersion, PlatformVersionOffer, ProjectId,
-    WorkContextAttributes, WorkContextAvailability, WorkContextCursor, WorkContextIdentity,
-    WorkContextKind, WorkContextLabel, WorkContextLifecycle, WorkContextPage, WorkContextQuery,
-    WorkContextRecord, WorkContextResync,
+    UserWorkspaceId, WorkContextAttributes, WorkContextAvailability, WorkContextCursor,
+    WorkContextIdentity, WorkContextKind, WorkContextLabel, WorkContextLifecycle, WorkContextPage,
+    WorkContextQuery, WorkContextRecord, WorkContextResync,
 };
 use automonique_protocol::platform_v2_attention::{
     AttentionSource, AttentionSourceId, AttentionSourceKind,
@@ -26,8 +26,10 @@ use automonique_protocol::platform_v2_lifecycle::{
 };
 use automonique_protocol::platform_v2_lifecycle_api::work_context_mutation_preview_digest;
 use automonique_protocol::platform_v2_lineage::LineageProjection;
+use automonique_protocol::platform_v2_review::{ReviewAction, ReviewCheckId};
 use automonique_protocol::platform_v2_transport::{
-    PlatformNegotiationResponse, PlatformV2Refusal, PlatformV2Response, RawMutationApprovalDocument,
+    PlatformNegotiationResponse, PlatformV2Refusal, PlatformV2Response,
+    RawMutationApprovalDocument, ReviewConfirmationDigest, ReviewReceiptCorrelationDigest,
 };
 use automonique_protocol::primitives::{EpochMillis, Revision};
 
@@ -143,6 +145,80 @@ fn negotiates_v2_then_preserves_exact_request_coordinates() {
         &automonique_protocol::platform_v2_transport::PlatformV2Request::GetWorkContext(project(
             "project-a"
         ))
+    );
+}
+
+#[test]
+fn confirmed_review_action_preserves_the_bounded_confirmation_coordinates() {
+    let workspace =
+        WorkContextIdentity::UserWorkspace(UserWorkspaceId::new("workspace-a").unwrap());
+    let expected_revision = Revision::new(7).unwrap();
+    let expected_workspace_revision = Revision::new(11).unwrap();
+    let action = ReviewAction::RerunCheck {
+        check_id: ReviewCheckId::new("check-1").unwrap(),
+        expected_check_revision: Revision::new(5).unwrap(),
+    };
+    let idempotency_key = IdempotencyKey::new("rerun-check-once").unwrap();
+    let confirmation_digest = ReviewConfirmationDigest::new("ab".repeat(32)).unwrap();
+    let receipt_correlation_digest = ReviewReceiptCorrelationDigest::new("cd".repeat(32)).unwrap();
+    let confirmation = ReviewActionConfirmation::new(
+        confirmation_digest.clone(),
+        expected_workspace_revision,
+        receipt_correlation_digest.clone(),
+    );
+    assert_eq!(confirmation.confirmation_digest(), &confirmation_digest);
+    assert_eq!(
+        confirmation.expected_workspace_revision(),
+        expected_workspace_revision
+    );
+    assert_eq!(
+        confirmation.receipt_correlation_digest(),
+        &receipt_correlation_digest
+    );
+
+    let transport = DeterministicPlatformV2Transport::new([
+        v2_negotiation(),
+        DeterministicPlatformV2Step::V2(Box::new(PlatformV2Response::Refused(
+            PlatformV2Refusal::new("unavailable", "provider unavailable").unwrap(),
+        ))),
+    ]);
+    let mut client = PlatformV2Client::new_testing(transport);
+    client
+        .negotiate(PlatformVersionOffer::new(vec![2]).unwrap())
+        .unwrap();
+    assert!(matches!(
+        client
+            .execute_confirmed_review_action(
+                workspace.clone(),
+                expected_revision,
+                action.clone(),
+                idempotency_key.clone(),
+                confirmation,
+            )
+            .unwrap(),
+        ReviewReceiptResult::Refused(_)
+    ));
+
+    let requests = client.transport().requests();
+    assert_eq!(requests.len(), 1);
+    let automonique_protocol::platform_v2_transport::PlatformV2Request::ExecuteReviewAction(
+        request,
+    ) = requests[0].request()
+    else {
+        panic!("confirmed review action request expected")
+    };
+    assert_eq!(request.workspace(), &workspace);
+    assert_eq!(request.expected_revision(), expected_revision);
+    assert_eq!(request.action(), &action);
+    assert_eq!(request.idempotency_key(), &idempotency_key);
+    assert_eq!(request.confirmation_digest(), Some(&confirmation_digest));
+    assert_eq!(
+        request.expected_workspace_revision(),
+        Some(expected_workspace_revision)
+    );
+    assert_eq!(
+        request.receipt_correlation_digest(),
+        Some(&receipt_correlation_digest)
     );
 }
 

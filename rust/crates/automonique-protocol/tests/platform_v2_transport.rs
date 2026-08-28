@@ -52,7 +52,7 @@ fn mutation_intent() -> WorkContextMutationIntent {
     )
 }
 fn review_action() -> ReviewActionTransportRequest {
-    ReviewActionTransportRequest::new_confirmed(
+    ReviewActionTransportRequest::new_confirmed_correlated(
         workspace(),
         Revision::FIRST,
         ReviewAction::RerunCheck {
@@ -61,6 +61,11 @@ fn review_action() -> ReviewActionTransportRequest {
         },
         IdempotencyKey::new("review-action-1").unwrap(),
         ReviewConfirmationDigest::new("ab".repeat(32)).unwrap(),
+        Revision::new(4).unwrap(),
+        automonique_protocol::platform_v2_transport::ReviewReceiptCorrelationDigest::new(
+            "cd".repeat(32),
+        )
+        .unwrap(),
     )
     .unwrap()
 }
@@ -176,7 +181,7 @@ fn check_rerun_requires_an_exact_confirmation_digest_and_other_actions_refuse_it
     let digest = ReviewConfirmationDigest::new("ab".repeat(32)).unwrap();
     assert!(!format!("{digest:?}").contains("abababab"));
     assert!(
-        ReviewActionTransportRequest::new_confirmed(
+        ReviewActionTransportRequest::new_confirmed_correlated(
             workspace(),
             Revision::FIRST,
             ReviewAction::ApproveReview {
@@ -184,16 +189,23 @@ fn check_rerun_requires_an_exact_confirmation_digest_and_other_actions_refuse_it
             },
             IdempotencyKey::new("approval-must-not-carry-rerun-confirmation").unwrap(),
             digest.clone(),
+            Revision::new(4).unwrap(),
+            ReviewReceiptCorrelationDigest::new("cd".repeat(32)).unwrap(),
         )
         .is_err()
     );
     assert!(
-        ReviewActionTransportRequest::new_confirmed(
+        ReviewActionTransportRequest::new_confirmed_correlated(
             workspace(),
             Revision::FIRST,
             rerun,
             IdempotencyKey::new("rerun-confirmed").unwrap(),
             digest,
+            Revision::new(4).unwrap(),
+            automonique_protocol::platform_v2_transport::ReviewReceiptCorrelationDigest::new(
+                "cd".repeat(32)
+            )
+            .unwrap(),
         )
         .is_ok()
     );
@@ -582,12 +594,14 @@ fn response_documents_round_trip_and_review_envelope_fits_its_declared_ceiling()
                 project(),
                 workspace(),
                 Revision::new(9).unwrap(),
+                Revision::new(4).unwrap(),
                 vec![
                     ReviewCheckRerunCapability::new(
                         ReviewCheckId::new("check-1").unwrap(),
                         Revision::new(7).unwrap(),
                         ci,
                         ReviewConfirmationDigest::new("ab".repeat(32)).unwrap(),
+                        automonique_protocol::platform_v2_transport::ReviewReceiptCorrelationDigest::new("cd".repeat(32)).unwrap(),
                     )
                     .unwrap(),
                 ],
@@ -882,4 +896,30 @@ fn review_reads_and_receipts_accept_only_review_workspace_kinds() {
             Err(PlatformV2TransportError::InvalidBody)
         );
     }
+}
+
+#[test]
+fn correlated_review_receipt_lookup_is_exact_and_redacted() {
+    let digest = ReviewReceiptCorrelationDigest::new("cd".repeat(32)).unwrap();
+    assert!(!format!("{digest:?}").contains("cdcd"));
+    let request = PlatformV2RequestMessage::new(
+        request_id("correlated-receipt"),
+        PlatformV2Request::GetReviewReceipt(
+            ReviewReceiptLookup::new_correlated(
+                project(),
+                workspace(),
+                IdempotencyKey::new("lookup-correlated").unwrap(),
+                digest,
+            )
+            .unwrap(),
+        ),
+    );
+    let bytes = request.to_canonical_bytes().unwrap();
+    let decoded = PlatformV2RequestMessage::from_canonical_bytes(&bytes).unwrap();
+    assert_eq!(decoded, request);
+    assert!(
+        std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("receipt_correlation_digest")
+    );
 }

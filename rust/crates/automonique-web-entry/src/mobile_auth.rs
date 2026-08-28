@@ -152,6 +152,10 @@ CREATE TABLE IF NOT EXISTS mobile_platform_v2_exact_receipt_custody (
   principal_generation INTEGER NOT NULL
     CHECK(principal_generation BETWEEN 1 AND 9007199254740991),
   request_sha256 BLOB NOT NULL CHECK(length(request_sha256) = 32),
+  receipt_correlation_digest TEXT CHECK(
+    receipt_correlation_digest IS NULL OR
+    (length(receipt_correlation_digest) = 64 AND receipt_correlation_digest = lower(receipt_correlation_digest))
+  ),
   created_at_ms INTEGER NOT NULL CHECK(created_at_ms BETWEEN 0 AND 9007199254740991),
   expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms BETWEEN 0 AND 9007199254740991),
   CHECK(
@@ -584,11 +588,13 @@ pub(crate) enum MobilePlatformV2ReceiptCustody<'coordinate> {
         project: &'coordinate ProjectId,
         workspace: &'coordinate WorkContextIdentity,
         idempotency_key: &'coordinate str,
+        receipt_correlation_digest: Option<&'coordinate str>,
     },
     ReadReview {
         project: &'coordinate ProjectId,
         workspace: &'coordinate WorkContextIdentity,
         idempotency_key: &'coordinate str,
+        receipt_correlation_digest: Option<&'coordinate str>,
     },
 }
 
@@ -657,6 +663,7 @@ impl MobileCredentialAuthority {
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.execute_batch(SCHEMA)?;
+        ensure_review_receipt_correlation_column(&connection)?;
         let origin = format!("https://{canonical_host}");
         let server_identity = load_or_create_server_identity(&connection, &origin)?;
         let discovery = MobileDiscovery {
@@ -1119,6 +1126,7 @@ impl MobileCredentialAuthority {
                 expected,
                 ReceiptCustodyCoordinate::mutation(project, idempotency_key),
                 &request_sha256,
+                None,
                 now_ms,
             )?,
             MobilePlatformV2ReceiptCustody::ReadMutation {
@@ -1128,27 +1136,32 @@ impl MobileCredentialAuthority {
                 &transaction,
                 expected,
                 ReceiptCustodyCoordinate::mutation(project, idempotency_key),
+                None,
                 now_ms,
             )?,
             MobilePlatformV2ReceiptCustody::BindReview {
                 project,
                 workspace,
                 idempotency_key,
+                receipt_correlation_digest,
             } => bind_receipt_custody_on(
                 &transaction,
                 expected,
                 ReceiptCustodyCoordinate::review(project, workspace, idempotency_key),
                 &request_sha256,
+                receipt_correlation_digest,
                 now_ms,
             )?,
             MobilePlatformV2ReceiptCustody::ReadReview {
                 project,
                 workspace,
                 idempotency_key,
+                receipt_correlation_digest,
             } => authorize_receipt_custody_on(
                 &transaction,
                 expected,
                 ReceiptCustodyCoordinate::review(project, workspace, idempotency_key),
+                receipt_correlation_digest,
                 now_ms,
             )?,
         }
@@ -1245,6 +1258,7 @@ impl MobileCredentialAuthority {
                 project,
                 workspace,
                 idempotency_key,
+                receipt_correlation_digest: None,
             },
             idempotency_key.as_bytes(),
             now_ms,
@@ -1267,6 +1281,7 @@ impl MobileCredentialAuthority {
                 project,
                 workspace,
                 idempotency_key,
+                receipt_correlation_digest: None,
             },
             idempotency_key.as_bytes(),
             now_ms,
@@ -1506,6 +1521,27 @@ impl MobileCredentialAuthority {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+fn ensure_review_receipt_correlation_column(
+    connection: &Connection,
+) -> Result<(), MobileAuthError> {
+    let mut statement = connection.prepare(
+        "SELECT name FROM pragma_table_info('mobile_platform_v2_exact_receipt_custody')",
+    )?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if !columns.contains("receipt_correlation_digest") {
+        connection.execute_batch(
+            "ALTER TABLE mobile_platform_v2_exact_receipt_custody
+             ADD COLUMN receipt_correlation_digest TEXT CHECK(
+               receipt_correlation_digest IS NULL OR
+               (length(receipt_correlation_digest) = 64 AND receipt_correlation_digest = lower(receipt_correlation_digest))
+             );",
+        )?;
+    }
+    Ok(())
 }
 
 fn issue_credential(
@@ -1864,6 +1900,7 @@ fn bind_receipt_custody_on(
     authorization: &MobilePlatformV2Authorization,
     coordinate: ReceiptCustodyCoordinate<'_>,
     request_sha256: &[u8; 32],
+    receipt_correlation_digest: Option<&str>,
     now_ms: i64,
 ) -> Result<(), MobileAuthError> {
     validate_receipt_coordinate(coordinate.idempotency_key)?;
@@ -1873,7 +1910,7 @@ fn bind_receipt_custody_on(
     )?;
     let existing = connection
         .query_row(
-            "SELECT credential_id,delegation_id,principal_generation,request_sha256
+            "SELECT credential_id,delegation_id,principal_generation,request_sha256,receipt_correlation_digest
              FROM mobile_platform_v2_exact_receipt_custody
              WHERE receipt_family=?1 AND project_id=?2 AND workspace_kind=?3
                AND workspace_id=?4 AND idempotency_key=?5",
@@ -1890,18 +1927,22 @@ fn bind_receipt_custody_on(
                     row.get::<_, String>(1)?,
                     row.get::<_, u64>(2)?,
                     row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             },
         )
         .optional()?;
-    if let Some((credential_id, delegation_id, generation, bound_digest)) = existing {
+    if let Some((credential_id, delegation_id, generation, bound_digest, bound_correlation)) =
+        existing
+    {
         if credential_id != authorization.credential_id
             || delegation_id != authorization.delegation_id
             || generation != authorization.principal_generation
         {
             return Err(MobileAuthError::InvalidCredential);
         }
-        return (bound_digest.as_slice() == request_sha256)
+        return (bound_digest.as_slice() == request_sha256
+            && bound_correlation.as_deref() == receipt_correlation_digest)
             .then_some(())
             .ok_or(MobileAuthError::InvalidCredential);
     }
@@ -1918,8 +1959,8 @@ fn bind_receipt_custody_on(
         "INSERT INTO mobile_platform_v2_exact_receipt_custody(
            receipt_family,project_id,workspace_kind,workspace_id,idempotency_key,
            credential_id,delegation_id,principal_generation,request_sha256,
-           created_at_ms,expires_at_ms
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+           created_at_ms,expires_at_ms,receipt_correlation_digest
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
         params![
             coordinate.receipt_family,
             coordinate.project.as_str(),
@@ -1932,6 +1973,7 @@ fn bind_receipt_custody_on(
             request_sha256.as_slice(),
             now_ms,
             authorization.expires_at_ms,
+            receipt_correlation_digest,
         ],
     )?;
     Ok(())
@@ -1941,12 +1983,13 @@ fn authorize_receipt_custody_on(
     connection: &Connection,
     authorization: &MobilePlatformV2Authorization,
     coordinate: ReceiptCustodyCoordinate<'_>,
+    receipt_correlation_digest: Option<&str>,
     now_ms: i64,
 ) -> Result<(), MobileAuthError> {
     validate_receipt_coordinate(coordinate.idempotency_key)?;
     let custody = connection
         .query_row(
-            "SELECT credential_id,delegation_id,principal_generation,expires_at_ms
+            "SELECT credential_id,delegation_id,principal_generation,expires_at_ms,receipt_correlation_digest
              FROM mobile_platform_v2_exact_receipt_custody
              WHERE receipt_family=?1 AND project_id=?2 AND workspace_kind=?3
                AND workspace_id=?4 AND idempotency_key=?5",
@@ -1963,6 +2006,7 @@ fn authorize_receipt_custody_on(
                     row.get::<_, String>(1)?,
                     row.get::<_, u64>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             },
         )
@@ -1971,7 +2015,8 @@ fn authorize_receipt_custody_on(
     (custody.0 == authorization.credential_id
         && custody.1 == authorization.delegation_id
         && custody.2 <= authorization.principal_generation
-        && custody.3 > now_ms)
+        && custody.3 > now_ms
+        && custody.4.as_deref() == receipt_correlation_digest)
         .then_some(())
         .ok_or(MobileAuthError::InvalidCredential)
 }
@@ -2922,6 +2967,81 @@ mod tests {
                 .expect("custody count"),
             0
         );
+    }
+
+    #[test]
+    fn correlated_review_receipt_custody_survives_restart_and_refuses_substitution() {
+        let (root, mut auth) = authority();
+        let issued = auth.operator_provision(request(), NOW).expect("provision");
+        let descriptor = auth
+            .grant_platform_v2(
+                platform_v2_grant(&issued.authorization.credential_id),
+                NOW + 1,
+            )
+            .expect("grant");
+        let project = ProjectId::new("project-a").unwrap();
+        let workspace = WorkContextIdentity::UserWorkspace(
+            automonique_protocol::platform_v2::UserWorkspaceId::new("workspace-a").unwrap(),
+        );
+        let correlation = "ab".repeat(32);
+        let lease = auth
+            .acquire_platform_v2_dispatch(
+                &descriptor,
+                MobilePlatformV2ReceiptCustody::BindReview {
+                    project: &project,
+                    workspace: &workspace,
+                    idempotency_key: "mobile:review:correlated",
+                    receipt_correlation_digest: Some(&correlation),
+                },
+                b"confirmed github request",
+                NOW + 2,
+            )
+            .expect("bind correlated custody");
+        auth.release_platform_v2_dispatch(&lease).unwrap();
+        drop(auth);
+
+        let mut auth = MobileCredentialAuthority::open(
+            root.path().join("mobile.sqlite3"),
+            "ops.example.test",
+            "operator:mobile",
+        )
+        .unwrap();
+        let descriptor = auth
+            .authorize_platform_v2(&issued.access_token, NOW + 3)
+            .unwrap();
+        for substituted in [
+            None,
+            Some("cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"),
+        ] {
+            assert!(matches!(
+                auth.acquire_platform_v2_dispatch(
+                    &descriptor,
+                    MobilePlatformV2ReceiptCustody::ReadReview {
+                        project: &project,
+                        workspace: &workspace,
+                        idempotency_key: "mobile:review:correlated",
+                        receipt_correlation_digest: substituted,
+                    },
+                    b"lookup",
+                    NOW + 3,
+                ),
+                Err(MobileAuthError::InvalidCredential)
+            ));
+        }
+        let lease = auth
+            .acquire_platform_v2_dispatch(
+                &descriptor,
+                MobilePlatformV2ReceiptCustody::ReadReview {
+                    project: &project,
+                    workspace: &workspace,
+                    idempotency_key: "mobile:review:correlated",
+                    receipt_correlation_digest: Some(&correlation),
+                },
+                b"lookup",
+                NOW + 3,
+            )
+            .expect("exact correlated recovery");
+        auth.release_platform_v2_dispatch(&lease).unwrap();
     }
 
     #[test]
