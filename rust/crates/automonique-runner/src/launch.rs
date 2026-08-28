@@ -10,19 +10,22 @@
 //!    no plan content appears in process listings;
 //! 2. migrates itself into the run's [`RunContainment`] cgroup and confirms
 //!    membership from the kernel ([`crate::containment`]);
-//! 3. replaces stdin with the prompt descriptor the plan names — an anonymous,
-//!    sealed, memory-backed file — or with `/dev/null` when it names none, so
-//!    the workload cannot read the plan channel either way;
-//! 4. opens the workload once and copies the verified bytes into an immutable
+//! 3. opens the workload once and copies the verified bytes into an immutable
 //!    sealed descriptor;
-//! 5. when the plan carries `identity=subordinate`, gives itself the workload
+//! 4. when the plan carries `identity=subordinate`, gives itself the workload
 //!    identity ([`crate::identity`]): an unprivileged user namespace whose
 //!    subordinate mapping is written by the host's setuid
 //!    `newuidmap`/`newgidmap`, a uid switch inside it to a host uid that is
 //!    not the supervisor's, and a capability set reduced to the three
 //!    discretionary-access capabilities the workload keeps over the
 //!    supervisor's files — every step read back from the kernel. A plan that
-//!    does not ask keeps the supervisor's identity, exactly as before;
+//!    does not ask keeps the supervisor's identity, exactly as before. A
+//!    private namespaced-temporary-storage launch additionally creates its
+//!    mount namespace and mounts the run's FUSE filesystem here, while the
+//!    helper is namespace root but before any workload instruction runs;
+//! 5. replaces stdin with the prompt descriptor the plan names — an anonymous,
+//!    sealed, memory-backed file — or with `/dev/null` when it names none, so
+//!    the workload cannot read the plan/control channel either way;
 //! 6. closes every descriptor except the sealed program descriptor and the
 //!    standard streams and verifies the closure ([`crate::descriptors`]);
 //! 7. installs the plan's Landlock filesystem allowlist
@@ -32,7 +35,7 @@
 //!    creating every socket shape the plan does not grant — including UDP,
 //!    raw and packet sockets, and non-TCP stream protocols that Landlock's
 //!    TCP rules cannot see — and denies every namespace-creating syscall, so
-//!    the identity of step 5 cannot be nested away;
+//!    the identity of step 4 cannot be nested away;
 //! 10. applies the plan's per-process resource limits and verifies their
 //!     kernel readback;
 //! 11. `execveat`s the sealed descriptor with exactly the environment the plan
@@ -181,6 +184,11 @@ use crate::descriptors::{DescriptorAllowlist, close_all_except, verify_only_allo
 use crate::filesystem::{FilesystemPolicy, PathIntent};
 use crate::network::TcpBindConnectPolicy;
 use crate::seccomp::SocketFamilyPolicy;
+use crate::tempfs::{
+    FusePrerequisites, NamespacedMountError, NamespacedMountedTempfs, NamespacedOutcome,
+    receive_namespaced_tempfs,
+};
+use crate::tempfs_ledger::TemporaryStorageBudget;
 use crate::{HELPER_REFUSED_EXIT, RunContainment};
 use nix::fcntl::{AtFlags, FcntlArg, OFlag, SealFlag};
 use nix::sys::memfd::MemFdCreateFlag;
@@ -189,13 +197,14 @@ use sha2::{Digest as _, Sha256};
 use std::ffi::CString;
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::ops::Deref;
 use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::Duration;
 
 /// Exact first line of every launch plan frame.
 pub const FRAME_HEADER: &str = "schema=automonique.launch/v3";
@@ -235,6 +244,9 @@ const SHA256_HEX_BYTES: usize = 64;
 /// helper. It is consumed before `execve`; the workload receives only the
 /// environment declared by [`LaunchPlan`].
 const SESSION_STREAM_ENV: &str = "AUTOMONIQUE_SESSION_STREAM";
+/// A missing or wedged helper must refuse a composed launch rather than hold
+/// the supervisor forever before the workload exists.
+const NAMESPACED_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Why a launch plan is refused, before any child exists.
 ///
@@ -257,6 +269,9 @@ pub enum LaunchPlanError {
     PromptRejected,
     /// The descriptor limit is repeated or outside the closed launch range.
     ResourceLimitRejected,
+    /// The private in-namespace temporary-storage request is malformed or
+    /// contradicts the launch policy around it.
+    NamespacedTemporaryStorageRejected,
     /// The encoded frame exceeds [`MAX_FRAME_BYTES`].
     FrameTooLarge,
     /// The frame is malformed, truncated, or carries an unknown key.
@@ -285,6 +300,9 @@ impl fmt::Display for LaunchPlanError {
             ),
             Self::ResourceLimitRejected => formatter
                 .write_str("descriptor limit must be unique and retain the three standard streams"),
+            Self::NamespacedTemporaryStorageRejected => formatter.write_str(
+                "namespaced temporary storage requires one bounded absolute mountpoint, an exact budget, and identity separation",
+            ),
             Self::FrameTooLarge => write!(
                 formatter,
                 "encoded launch frame exceeds {MAX_FRAME_BYTES} bytes"
@@ -315,6 +333,13 @@ pub struct LaunchPlan {
     prompt: Option<Vec<u8>>,
     rlimit_nofile: Option<u64>,
     separate_identity: bool,
+    namespaced_temporary_storage: Option<NamespacedTemporaryStorage>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NamespacedTemporaryStorage {
+    mountpoint: PathBuf,
+    budget: TemporaryStorageBudget,
 }
 
 /// Redacting: a derived `Debug` would print environment values and prompt
@@ -338,6 +363,10 @@ impl fmt::Debug for LaunchPlan {
             .field("prompt_bytes", &self.prompt_len())
             .field("rlimit_nofile", &self.rlimit_nofile)
             .field("separate_identity", &self.separate_identity)
+            .field(
+                "namespaced_temporary_storage",
+                &self.namespaced_temporary_storage,
+            )
             .finish()
     }
 }
@@ -420,6 +449,7 @@ impl LaunchPlan {
             prompt: None,
             rlimit_nofile: None,
             separate_identity: false,
+            namespaced_temporary_storage: None,
         })
     }
 
@@ -613,6 +643,23 @@ impl LaunchPlan {
         Ok(self)
     }
 
+    fn namespaced_temporary_storage(
+        mut self,
+        mountpoint: impl Into<PathBuf>,
+        budget: TemporaryStorageBudget,
+    ) -> Result<Self, LaunchPlanError> {
+        let mountpoint = mountpoint.into();
+        if self.namespaced_temporary_storage.is_some()
+            || !mountpoint.is_absolute()
+            || mountpoint.as_os_str().is_empty()
+            || mountpoint.as_os_str().len() > MAX_LAUNCH_ARG_BYTES
+        {
+            return Err(LaunchPlanError::NamespacedTemporaryStorageRejected);
+        }
+        self.namespaced_temporary_storage = Some(NamespacedTemporaryStorage { mountpoint, budget });
+        Ok(self)
+    }
+
     /// Whether this plan runs its workload under a separated host uid.
     #[must_use]
     pub const fn separates_workload_identity(&self) -> bool {
@@ -729,6 +776,19 @@ impl LaunchPlan {
         {
             return Err(LaunchPlanError::ResourceLimitRejected);
         }
+        if let Some(temporary_storage) = &self.namespaced_temporary_storage {
+            let tmpdir = temporary_storage.mountpoint.as_os_str().as_encoded_bytes();
+            let exact_environment = self
+                .environment
+                .iter()
+                .any(|(name, value)| name == "TMPDIR" && value == tmpdir);
+            let exact_grant = self.filesystem.iter().any(|(intent, path)| {
+                *intent == PathIntent::ReadWrite && path == &temporary_storage.mountpoint
+            });
+            if !self.separate_identity || !exact_environment || !exact_grant {
+                return Err(LaunchPlanError::NamespacedTemporaryStorageRejected);
+            }
+        }
         Ok(())
     }
 
@@ -748,6 +808,14 @@ impl LaunchPlan {
         }
         if self.separate_identity {
             frame.push_str("identity=subordinate\n");
+        }
+        if let Some(temporary_storage) = &self.namespaced_temporary_storage {
+            frame.push_str(&format!(
+                "tempfs={}:{}:{}\n",
+                hex(temporary_storage.mountpoint.as_os_str().as_encoded_bytes()),
+                temporary_storage.budget.bytes(),
+                temporary_storage.budget.objects()
+            ));
         }
         for argument in &self.arguments {
             frame.push_str(&format!("arg={}\n", hex(argument)));
@@ -835,6 +903,26 @@ impl LaunchPlan {
                     // A second line refuses in the builder: one request has
                     // one spelling, and a repeat is a broken frame.
                     *current = current.clone().separate_workload_identity()?;
+                }
+                ("tempfs", Some(current)) => {
+                    let mut fields = value.split(':');
+                    let path = fields.next().ok_or(LaunchPlanError::FrameRejected)?;
+                    let bytes = fields
+                        .next()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .ok_or(LaunchPlanError::FrameRejected)?;
+                    let objects = fields
+                        .next()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .ok_or(LaunchPlanError::FrameRejected)?;
+                    if fields.next().is_some() {
+                        return Err(LaunchPlanError::FrameRejected);
+                    }
+                    let path = unhex(path).ok_or(LaunchPlanError::FrameRejected)?;
+                    let path = PathBuf::from(os_string_from_bytes(path)?);
+                    let budget = TemporaryStorageBudget::new(bytes, objects)
+                        .map_err(|_| LaunchPlanError::FrameRejected)?;
+                    *current = current.clone().namespaced_temporary_storage(path, budget)?;
                 }
                 ("grant", Some(current)) => {
                     let (intent, path_hex) = value
@@ -1003,6 +1091,147 @@ pub fn spawn_sandboxed_with_stdout(
     Ok(child)
 }
 
+/// A launch that owns the supervisor side of a FUSE filesystem mounted only
+/// in the workload's user+mount namespace.
+pub struct NamespacedSandboxedChild {
+    child: Option<Child>,
+    temporary_storage: Option<NamespacedMountedTempfs>,
+    kill_interface: PathBuf,
+}
+
+impl fmt::Debug for NamespacedSandboxedChild {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NamespacedSandboxedChild")
+            .field("pid", &self.child.as_ref().map(Child::id))
+            .finish_non_exhaustive()
+    }
+}
+
+impl NamespacedSandboxedChild {
+    /// Take the workload's captured stdout, when the launch requested it.
+    pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.as_mut()?.stdout.take()
+    }
+
+    /// The helper pid, which becomes the workload pid after enforcement.
+    #[must_use]
+    pub fn id(&self) -> u32 {
+        self.child.as_ref().expect("a live launch has a child").id()
+    }
+
+    /// The first typed quota refusal, when one has already happened.
+    #[must_use]
+    pub fn temporary_storage_exceedance(&self) -> Option<crate::tempfs_ledger::Exceedance> {
+        self.temporary_storage
+            .as_ref()?
+            .exceedance_channel()
+            .first()
+    }
+
+    /// Persist one exact live-ledger snapshot for restart/reaper readback.
+    ///
+    /// Production integration calls this on the same cadence as the existing
+    /// supervisor-mounted filesystem and immediately on a quota refusal.
+    pub fn checkpoint_temporary_storage(&mut self) -> io::Result<()> {
+        self.temporary_storage
+            .as_mut()
+            .expect("a live launch has temporary storage")
+            .write_checkpoint(crate::tempfs_checkpoint::Phase::Live, None)
+    }
+
+    /// Wait for the workload, then reconcile from the filesystem ledger after
+    /// the private mount namespace has ended.
+    pub fn wait(mut self) -> Result<(ExitStatus, NamespacedOutcome), NamespacedMountError> {
+        let status = self
+            .child
+            .as_mut()
+            .expect("a live launch has a child")
+            .wait()
+            .map_err(NamespacedMountError::Io)?;
+        self.child = None;
+        let outcome = self
+            .temporary_storage
+            .take()
+            .expect("a namespaced launch has temporary storage")
+            .reconcile()?;
+        Ok((status, outcome))
+    }
+}
+
+impl Drop for NamespacedSandboxedChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = std::fs::write(&self.kill_interface, b"1");
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.child = None;
+        if let Some(temporary_storage) = self.temporary_storage.take() {
+            let _ = temporary_storage.reconcile();
+        }
+    }
+}
+
+/// Spawn a separated workload whose quota filesystem is mounted by the entry
+/// helper inside that workload's user+mount namespace and served by the
+/// supervisor over an `SCM_RIGHTS`-transferred `/dev/fuse` connection.
+///
+/// This is a bounded runner primitive, not yet the daemon admission path. The
+/// existing identity+temporary-storage conflict remains authoritative until
+/// the daemon owns this result and its restart reconciliation end to end.
+pub fn spawn_sandboxed_with_namespaced_temporary_storage(
+    helper: &Path,
+    plan: &LaunchPlan,
+    containment: &RunContainment,
+    mountpoint: &Path,
+    budget: TemporaryStorageBudget,
+    checkpoint: &Path,
+    stdout: StdoutCapture,
+) -> Result<NamespacedSandboxedChild, LaunchError> {
+    FusePrerequisites::host_default()
+        .verify()
+        .map_err(|error| LaunchError::Io(io::Error::other(error.to_string())))?;
+    let plan = plan
+        .clone()
+        .namespaced_temporary_storage(mountpoint, budget)?;
+    let frame = plan.encode()?;
+    let (mut supervisor, workload) = UnixStream::pair()?;
+    supervisor.set_read_timeout(Some(NAMESPACED_HANDSHAKE_DEADLINE))?;
+    supervisor.set_write_timeout(Some(NAMESPACED_HANDSHAKE_DEADLINE))?;
+    let workload: OwnedFd = workload.into();
+    let mut child = Command::new(helper)
+        .env_clear()
+        .env(crate::CGROUP_DIR_ENV, containment.path())
+        .env(crate::tempfs::NAMESPACED_CONTROL_ENV, "1")
+        .stdin(Stdio::from(workload))
+        .stdout(stdout.stdio())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let setup = (|| -> Result<NamespacedMountedTempfs, LaunchError> {
+        supervisor.write_all(&frame)?;
+        let mounted =
+            receive_namespaced_tempfs(&mut supervisor, budget, nix::unistd::getuid().as_raw())
+                .map_err(|error| LaunchError::Io(io::Error::other(error.to_string())))?;
+        mounted.with_checkpoint(checkpoint).map_err(LaunchError::Io)
+    })();
+    let temporary_storage = match setup {
+        Ok(mounted) => mounted,
+        Err(error) => {
+            let _ = std::fs::write(containment.path().join("cgroup.kill"), b"1");
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    drop(supervisor);
+    Ok(NamespacedSandboxedChild {
+        child: Some(child),
+        temporary_storage: Some(temporary_storage),
+        kill_interface: containment.path().join("cgroup.kill"),
+    })
+}
+
 /// A sandboxed workload whose stdin and stdout remain connected to its
 /// supervisor for multiple serialized turns.
 #[derive(Debug)]
@@ -1159,7 +1388,18 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
             return Err("session stream marker malformed".to_owned());
         }
     };
-    let frame = if session_stream {
+    let namespaced_control = match std::env::var(crate::tempfs::NAMESPACED_CONTROL_ENV) {
+        Ok(value) if value == "1" => true,
+        Ok(_) => return Err("namespaced tempfs control marker malformed".to_owned()),
+        Err(std::env::VarError::NotPresent) => false,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("namespaced tempfs control marker malformed".to_owned());
+        }
+    };
+    if session_stream && namespaced_control {
+        return Err("session and namespaced tempfs controls cannot share stdin".to_owned());
+    }
+    let frame = if session_stream || namespaced_control {
         read_session_launch_frame()?
     } else {
         let mut frame = Vec::new();
@@ -1174,17 +1414,57 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
     if session_stream && plan.prompt.is_some() {
         return Err("session stream cannot carry a one-shot prompt".to_owned());
     }
+    if namespaced_control != plan.namespaced_temporary_storage.is_some() {
+        return Err("namespaced tempfs control and plan do not match".to_owned());
+    }
 
     // 2. Enter the cgroup before the workload exists; confirm from the kernel.
     let target = std::env::var_os(crate::CGROUP_DIR_ENV)
         .ok_or_else(|| "no containment target".to_owned())?;
     join_and_confirm_membership(Path::new(&target)).map_err(|error| error.to_string())?;
 
-    // 3. The plan channel must not reach the workload: stdin becomes the
-    //    plan's prompt descriptor, or /dev/null when it names no prompt.
-    //    Either source is opened before descriptor closure, so the closure
-    //    verification below still proves exactly the standard streams remain,
-    //    and after the dup2 the original is closed immediately.
+    // 3. Open, copy, and verify the program before filesystem policy is
+    //    installed. Landlock binds the staged inode, its name is removed, and
+    //    the retained descriptor is the object execveat consumes; the source
+    //    path is never resolved again.
+    let program_descriptor = staged_verified_program_descriptor(&plan)?;
+
+    // 4. When the plan asks, become the workload identity: a host uid that is
+    //    not the supervisor's, in a user namespace of this process's own,
+    //    with the capability set the workload keeps. Every step is read back
+    //    from the kernel and any failure refuses the launch. The mapper this
+    //    spawns is reaped, and its pipe closed, before the descriptor closure
+    //    below. A plan that does not ask launches with the supervisor's
+    //    identity, exactly as every plan did before the line existed.
+    if plan.separate_identity {
+        if let Some(temporary_storage) = &plan.namespaced_temporary_storage {
+            let verified = FusePrerequisites::host_default()
+                .verify()
+                .map_err(|error| format!("namespaced temporary storage refused: {error}"))?;
+            let duplicate = rustix::io::dup(std::io::stdin())
+                .map_err(|error| format!("namespaced control duplication failed: {error}"))?;
+            let mut control = UnixStream::from(duplicate);
+            crate::identity::separate_workload_identity_with_namespace_setup(|identity| {
+                crate::tempfs::mount_in_workload_namespace(
+                    &verified,
+                    &temporary_storage.mountpoint,
+                    temporary_storage.budget,
+                    identity,
+                    &mut control,
+                )
+            })
+            .map_err(|error| format!("workload identity refused: {error}"))?;
+            drop(control);
+        } else {
+            crate::identity::separate_workload_identity()
+                .map_err(|error| format!("workload identity refused: {error}"))?;
+        }
+    }
+
+    // 5. The plan/control channel must not reach the workload: stdin becomes
+    //    the plan's prompt descriptor, or /dev/null when it names no prompt.
+    //    For an in-namespace mount this happens only after the descriptor
+    //    handoff and kernel readback have completed on the private socket.
     if !session_stream {
         let stdin_source = match plan.prompt.as_deref() {
             Some(prompt) => sealed_prompt_descriptor(prompt)?,
@@ -1193,24 +1473,6 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
         nix::unistd::dup2(stdin_source.as_raw_fd(), 0)
             .map_err(|_| "stdin replacement failed".to_owned())?;
         drop(stdin_source);
-    }
-
-    // 4. Open, copy, and verify the program before filesystem policy is
-    //    installed. Landlock binds the staged inode, its name is removed, and
-    //    the retained descriptor is the object execveat consumes; the source
-    //    path is never resolved again.
-    let program_descriptor = staged_verified_program_descriptor(&plan)?;
-
-    // 5. When the plan asks, become the workload identity: a host uid that is
-    //    not the supervisor's, in a user namespace of this process's own,
-    //    with the capability set the workload keeps. Every step is read back
-    //    from the kernel and any failure refuses the launch. The mapper this
-    //    spawns is reaped, and its pipe closed, before the descriptor closure
-    //    below. A plan that does not ask launches with the supervisor's
-    //    identity, exactly as every plan did before the line existed.
-    if plan.separate_identity {
-        crate::identity::separate_workload_identity()
-            .map_err(|error| format!("workload identity refused: {error}"))?;
     }
 
     // 6. Close everything but the standard streams and the staged program.
@@ -1701,6 +1963,48 @@ mod tests {
         let unknown = encoded.replace("identity=subordinate", "identity=root");
         assert!(matches!(
             LaunchPlan::decode(unknown.as_bytes()),
+            Err(LaunchPlanError::FrameRejected)
+        ));
+    }
+
+    #[test]
+    fn namespaced_tempfs_frame_requires_exact_identity_tmpdir_and_write_grant() {
+        let digest = "a".repeat(64);
+        let mountpoint = Path::new("/tmp/automonique-namespaced-frame");
+        let budget = TemporaryStorageBudget::from_bytes(2 * 4096).unwrap();
+        let base = LaunchPlan::new("/usr/bin/true", &digest).unwrap();
+        for incomplete in [
+            base.clone()
+                .namespaced_temporary_storage(mountpoint, budget)
+                .unwrap(),
+            base.clone()
+                .separate_workload_identity()
+                .unwrap()
+                .environment("TMPDIR", mountpoint.as_os_str().as_encoded_bytes())
+                .unwrap()
+                .namespaced_temporary_storage(mountpoint, budget)
+                .unwrap(),
+        ] {
+            assert!(matches!(
+                incomplete.encode(),
+                Err(LaunchPlanError::NamespacedTemporaryStorageRejected)
+            ));
+        }
+        let complete = base
+            .separate_workload_identity()
+            .unwrap()
+            .filesystem_grant(PathIntent::ReadWrite, mountpoint)
+            .unwrap()
+            .environment("TMPDIR", mountpoint.as_os_str().as_encoded_bytes())
+            .unwrap()
+            .namespaced_temporary_storage(mountpoint, budget)
+            .unwrap();
+        let encoded = String::from_utf8(complete.encode().unwrap()).unwrap();
+        assert!(encoded.contains("\ntempfs="), "{encoded}");
+        assert_eq!(LaunchPlan::decode(encoded.as_bytes()).unwrap(), complete);
+        let malformed = encoded.replace(":8192:2", ":0:2");
+        assert!(matches!(
+            LaunchPlan::decode(malformed.as_bytes()),
             Err(LaunchPlanError::FrameRejected)
         ));
     }

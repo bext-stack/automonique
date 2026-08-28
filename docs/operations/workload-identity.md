@@ -8,7 +8,8 @@ including any secret placed there) and open `/proc/<pid>/fd/0` (its prompt),
 and could trace it. Audit finding F-10 named this the largest real sandbox
 gap. This page records how a workload gets a host uid of its own, what that
 does and does not close, why the request is per-plan and off by default, and
-the kernel limitation that keeps it apart from the temporary-storage mount.
+how the runner's bounded in-namespace temporary-storage primitive avoids the
+kernel conflict without yet changing daemon admission.
 
 ## The mechanism
 
@@ -98,12 +99,13 @@ not the ability to end the run.
 These are prerequisites for a plan that asks; a host without them runs every
 ordinary plan untouched and refuses only the asking ones, typed.
 
-## The kernel limitation: no separated identity with the FUSE tempfs
+## Temporary storage in the workload namespace
 
-The identity switch and the per-run FUSE temporary-storage mount (#140) are,
-on this kernel, **mutually exclusive**, which is why the combination is a
-typed admission refusal (`WorkloadIdentityTemporaryStorageConflict`) and the
-separation is not yet the default.
+The existing supervisor-mounted per-run FUSE filesystem (#140) and identity
+switch are, on this kernel, **mutually exclusive**. That production path still
+has a typed admission refusal (`WorkloadIdentityTemporaryStorageConflict`),
+and separation is not yet the default. The refusal must remain until the
+daemon uses the composed path and its delegated run proofs exercise it.
 
 The tempfs is mounted by the supervisor through the setuid `fusermount3`, so
 the FUSE connection's owning user namespace (`fc->user_ns`) is the init user
@@ -130,15 +132,28 @@ ownership change on the supervisor's mount can lift the refusal. `#140` is
 deliberately untouched: its mount options, prerequisites and every test are
 exactly what they were.
 
-**Intended end state.** The mount is performed *inside* the workload's
-namespace: the launch helper, which owns the workload's user namespace and can
-unshare a mount namespace beside it, performs the FUSE mount itself, so
-`fc->user_ns` is the workload's namespace and access is ordinary. That makes
-the mount private to the workload's mount namespace, so the supervisor's
-`statvfs` reconcile (`temporary_storage_readback`) must move to the ledger the
-QuotaFs server already maintains, or read through `/proc/<workload>/root`.
-When that lands, the combination refusal is removed, a document vocabulary can
-request the separation, and `uid_separation` joins the daemon's enforced
-properties. Until then: every #140 delegated proof passes unchanged, the
-identity proofs in `tests/workload_identity.rs` pass for plans that ask, and
-`a_plan_that_does_not_ask_keeps_the_supervisor_identity` pins the default.
+The runner now has a bounded primitive that performs the mount *inside* the
+workload namespace. The launch helper opens `/dev/fuse` after creating the
+user namespace, unshares its mount namespace, makes mount propagation private,
+and performs the FUSE mount while it is namespace root. It passes only the
+opened FUSE descriptor back to the supervisor over its private control socket;
+the supervisor owns the `QuotaFs` server and sets the filesystem root uid to
+the uid number the workload sees in that namespace. Before accepting, the
+helper reads `/proc/self/mountinfo` and `statfs` from the workload namespace,
+and the supervisor validates the exact bounded report. The control descriptor
+is replaced before descriptor closure and no workload instruction runs before
+the handshake succeeds.
+
+Because the mount is private, supervisor reconciliation derives a statfs-shaped
+readback from the exact filesystem ledger. Checkpoint decoding validates the
+ledger's byte/object usage, peaks and refusal records before accepting restart
+state. The delegated proof in `tests/namespaced_tempfs.rs` composes identity,
+the private mount, a real write/read, a real ceiling refusal, namespace teardown
+and a fresh read of the final checkpoint.
+
+This is a runner primitive, not daemon production wiring. The daemon still
+uses the supervisor-mounted path, has no RunSpec vocabulary requesting identity
+separation, and does not advertise `uid_separation`. It must adopt the composed
+owner/lifecycle, checkpoint the live ledger on its existing cadence, and pass
+the delegated `run_compose` and `execute_brokered` proofs before the conflict
+refusal can be removed. The existing #140 and identity proofs remain unchanged.

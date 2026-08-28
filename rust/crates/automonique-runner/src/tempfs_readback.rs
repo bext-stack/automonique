@@ -16,6 +16,9 @@
 //! connection through `fusectl`, after which every pending and future request
 //! fails with `ENOTCONN` instead of waiting.
 
+use crate::tempfs_ledger::{
+    LedgerSnapshot, MAX_NAME_BYTES, MAX_RECORDED_EXCEEDANCES, Resource, STATFS_BLOCK_BYTES,
+};
 use nix::errno::Errno;
 use nix::sys::statvfs::statvfs;
 use std::ffi::OsString;
@@ -174,7 +177,83 @@ pub struct StatfsReadback {
     pub name_max: u64,
 }
 
+/// A persisted filesystem ledger cannot be converted into readback evidence
+/// because its internal accounting relations are impossible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LedgerReadbackError;
+
+impl fmt::Display for LedgerReadbackError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("temporary-storage ledger relations are inconsistent")
+    }
+}
+
+impl std::error::Error for LedgerReadbackError {}
+
 impl StatfsReadback {
+    /// Derive the same bounded capacity/usage view `statvfs` exposes from the
+    /// quota filesystem's own ledger.
+    ///
+    /// This is filesystem evidence rather than requested configuration: every
+    /// mutation is reserved in the ledger before the in-memory tree changes.
+    /// Persisted snapshots are fully cross-checked before use, so a torn or
+    /// forged checkpoint cannot widen or invent a readback after restart.
+    pub fn from_ledger(snapshot: &LedgerSnapshot) -> Result<Self, LedgerReadbackError> {
+        let budget = snapshot.budget;
+        let refused_total = snapshot
+            .refused_bytes
+            .checked_add(snapshot.refused_objects)
+            .ok_or(LedgerReadbackError)?;
+        if snapshot.used_bytes > budget.bytes()
+            || snapshot.used_objects > budget.objects()
+            || snapshot.peak_bytes < snapshot.used_bytes
+            || snapshot.peak_bytes > budget.bytes()
+            || snapshot.peak_objects < snapshot.used_objects
+            || snapshot.peak_objects > budget.objects()
+            || snapshot.recorded.len()
+                != usize::try_from(refused_total.min(MAX_RECORDED_EXCEEDANCES as u64))
+                    .map_err(|_| LedgerReadbackError)?
+        {
+            return Err(LedgerReadbackError);
+        }
+        let mut recorded_bytes = 0_u64;
+        let mut recorded_objects = 0_u64;
+        for exceedance in &snapshot.recorded {
+            let valid = match exceedance.resource {
+                Resource::Bytes => {
+                    recorded_bytes += 1;
+                    exceedance.requested > 0
+                        && exceedance.used <= budget.bytes()
+                        && exceedance.ceiling == budget.bytes()
+                }
+                Resource::Objects => {
+                    recorded_objects += 1;
+                    exceedance.requested == 1
+                        && exceedance.used <= budget.objects()
+                        && exceedance.ceiling == budget.objects()
+                }
+            };
+            if !valid {
+                return Err(LedgerReadbackError);
+            }
+        }
+        if recorded_bytes > snapshot.refused_bytes || recorded_objects > snapshot.refused_objects {
+            return Err(LedgerReadbackError);
+        }
+        let blocks = budget.bytes() / STATFS_BLOCK_BYTES;
+        let blocks_free = (budget.bytes() - snapshot.used_bytes) / STATFS_BLOCK_BYTES;
+        Ok(Self {
+            block_size: STATFS_BLOCK_BYTES,
+            fragment_size: STATFS_BLOCK_BYTES,
+            blocks,
+            blocks_free,
+            blocks_available: blocks_free,
+            files: budget.objects(),
+            files_free: budget.objects() - snapshot.used_objects,
+            name_max: u64::from(MAX_NAME_BYTES),
+        })
+    }
+
     /// Total capacity in bytes: for this filesystem, the byte ceiling.
     #[must_use]
     pub const fn ceiling_bytes(&self) -> u64 {
@@ -386,6 +465,45 @@ pub(crate) fn classify(evidence: MountEvidence, subtype: &str, deadline: Duratio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tempfs_ledger::{Ledger, TemporaryStorageBudget};
+
+    #[test]
+    fn ledger_readback_is_exact_and_refuses_impossible_restart_state() {
+        let budget = TemporaryStorageBudget::new(2 * STATFS_BLOCK_BYTES, 2).unwrap();
+        let mut ledger = Ledger::new(budget);
+        ledger.reserve_object().unwrap();
+        ledger.reserve_bytes(STATFS_BLOCK_BYTES + 1).unwrap();
+        ledger.reserve_bytes(2 * STATFS_BLOCK_BYTES).unwrap_err();
+        let snapshot = ledger.snapshot();
+        let readback = StatfsReadback::from_ledger(&snapshot).unwrap();
+        assert_eq!(readback.ceiling_bytes(), budget.bytes());
+        assert_eq!(readback.used_bytes(), 2 * STATFS_BLOCK_BYTES);
+        assert_eq!(readback.used_objects(), 1);
+
+        for malformed in [
+            LedgerSnapshot {
+                used_bytes: budget.bytes() + 1,
+                ..snapshot.clone()
+            },
+            LedgerSnapshot {
+                peak_bytes: 0,
+                ..snapshot.clone()
+            },
+            LedgerSnapshot {
+                refused_bytes: 0,
+                ..snapshot.clone()
+            },
+            LedgerSnapshot {
+                recorded: Vec::new(),
+                ..snapshot
+            },
+        ] {
+            assert_eq!(
+                StatfsReadback::from_ledger(&malformed),
+                Err(LedgerReadbackError)
+            );
+        }
+    }
 
     #[test]
     fn mountinfo_lines_parse_including_escapes_and_optional_fields() {

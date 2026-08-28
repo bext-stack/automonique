@@ -24,6 +24,25 @@ this page records the product decisions the integration makes.
 | Readback is bounded. Every `statvfs` the supervisor issues against its own mount runs under a deadline; on expiry the supervisor writes `/sys/fs/fuse/connections/<minor>/abort`, which the kernel lets the mount owner do, and the reconciliation continues from the last checkpoint. A stuck server cannot hang the run's end. The daemon records every reconcile's outcome in the native journal (see below). | `automonique_runner::tempfs::MountedTempfs::reconcile`, `automonique_daemon::execute::Attempt` |
 | A dead owner leaves a stale mount (`ENOTCONN`; `auto_unmount` does not clean up a same-uid mount on this host). When the daemon opens its execution lane at start, the reaper walks `/proc/self/mountinfo` for this uid's `fuse.automonique-tempfs` entries under the runs directory, detaches every disconnected one lazily, reads the dead owner's last checkpoint beside it, and reports each one to the native journal. A live entry is left alone: it belongs to a still-running supervisor (a previous generation during handoff). | `automonique_runner::tempfs::reap_stale_mounts`, `automonique_daemon::execute::ExecutionLane::open` |
 
+## Bounded identity-composed primitive
+
+The runner also exposes a private-mount launch primitive for the identity
+separation work. Its helper opens `/dev/fuse` and mounts after entering the
+workload user and mount namespaces, passes the FUSE descriptor to the
+supervisor, and admits the launch only after exact mountinfo and `statfs`
+readback inside that namespace. On namespace teardown the supervisor observes
+the FUSE connection close and derives the final statfs-shaped evidence from the
+filesystem ledger. `StatfsReadback::from_ledger` rejects impossible usage,
+peaks, resource totals or recorded refusals; checkpoint decoding uses the same
+validation, so a fresh reader cannot accept internally inconsistent restart
+state.
+
+`tests/namespaced_tempfs.rs` is the delegated end-to-end proof for that bounded
+runner path. It does not change daemon admission: the daemon still uses the
+supervisor-mounted lifecycle described above, and the typed
+`WorkloadIdentityTemporaryStorageConflict` refusal remains until daemon
+composition and restart/live-checkpoint integration are proven.
+
 ## Where the outcome is recorded
 
 Three records, none of them a configuration claim:

@@ -255,6 +255,9 @@ pub enum WorkloadIdentityDenial {
     MapperUnavailable,
     /// `unshare(CLONE_NEWUSER)` was refused by the kernel.
     NamespaceCreationRefused,
+    /// A caller-supplied setup that must run as root in the new user
+    /// namespace was refused. The workload identity has not been installed.
+    NamespaceSetupRefused,
     /// The mapper exited without writing the mapping.
     MappingRefused,
     /// The mapping the kernel reports is not the one that was requested.
@@ -274,7 +277,7 @@ pub enum WorkloadIdentityDenial {
 
 impl WorkloadIdentityDenial {
     /// Every denial, for closed coverage.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::NoLaunchHelper,
         Self::HelperUnavailable,
         Self::ProbeInconclusive,
@@ -285,6 +288,7 @@ impl WorkloadIdentityDenial {
         Self::SubordinateRangeUnusable,
         Self::MapperUnavailable,
         Self::NamespaceCreationRefused,
+        Self::NamespaceSetupRefused,
         Self::MappingRefused,
         Self::MappingUnconfirmed,
         Self::CredentialSwitchRefused,
@@ -306,6 +310,7 @@ impl WorkloadIdentityDenial {
             Self::SubordinateRangeUnusable => "subordinate_range_unusable",
             Self::MapperUnavailable => "mapper_unavailable",
             Self::NamespaceCreationRefused => "namespace_creation_refused",
+            Self::NamespaceSetupRefused => "namespace_setup_refused",
             Self::MappingRefused => "mapping_refused",
             Self::MappingUnconfirmed => "mapping_unconfirmed",
             Self::CredentialSwitchRefused => "credential_switch_refused",
@@ -348,6 +353,9 @@ impl fmt::Display for WorkloadIdentityDenial {
                 "newuidmap or newgidmap is missing, not setuid root, or not executable"
             }
             Self::NamespaceCreationRefused => "the kernel refused an unprivileged user namespace",
+            Self::NamespaceSetupRefused => {
+                "the required setup inside the workload user namespace was refused"
+            }
             Self::MappingRefused => "the mapper did not write the namespace's id maps",
             Self::MappingUnconfirmed => "the kernel's id maps are not the ones requested",
             Self::CredentialSwitchRefused => {
@@ -639,6 +647,21 @@ fn verify_mapper(path: &Path) -> Result<(), IdentityError> {
 /// The caller must be single-threaded: `unshare(CLONE_NEWUSER)` refuses a
 /// threaded process, and the credential calls are per-thread on Linux.
 pub fn separate_workload_identity() -> Result<WorkloadIdentity, IdentityError> {
+    separate_workload_identity_with_namespace_setup(|_| Ok(()))
+}
+
+/// Give the caller one fail-closed setup window as namespace root before the
+/// irreversible workload uid/capability switch.
+///
+/// The callback runs only after the uid/gid maps have been confirmed from the
+/// kernel, and while this single thread is uid 0 with its capabilities in the
+/// new user namespace. Returning an error refuses the identity transition;
+/// no workload instruction has run. This exists for mechanisms whose kernel
+/// ownership must be the workload user namespace, notably an accompanying
+/// mount namespace and its `/dev/fuse` connection.
+pub(crate) fn separate_workload_identity_with_namespace_setup(
+    setup: impl FnOnce(WorkloadIdentity) -> Result<(), String>,
+) -> Result<WorkloadIdentity, IdentityError> {
     let plan = resolve_identity_plan()?;
 
     // The mapper is this very binary, spawned through `/proc/self/exe` so a
@@ -697,6 +720,9 @@ pub fn separate_workload_identity() -> Result<WorkloadIdentity, IdentityError> {
     }
 
     confirm_maps(&plan)?;
+    setup(plan.workload).map_err(|detail| {
+        IdentityError::new(WorkloadIdentityDenial::NamespaceSetupRefused, detail)
+    })?;
     switch_credentials(&plan)?;
     confirm_identity(&plan)?;
 

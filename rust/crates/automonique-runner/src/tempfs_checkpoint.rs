@@ -278,20 +278,22 @@ impl Checkpoint {
                 aborted: aborted.ok_or(malformed("aborted"))?,
             }),
         };
+        let snapshot = LedgerSnapshot {
+            budget,
+            used_bytes: used_bytes.ok_or(malformed("used_bytes"))?,
+            used_objects: used_objects.ok_or(malformed("used_objects"))?,
+            peak_bytes: peak_bytes.ok_or(malformed("peak_bytes"))?,
+            peak_objects: peak_objects.ok_or(malformed("peak_objects"))?,
+            refused_bytes: refused_bytes.ok_or(malformed("refused_bytes"))?,
+            refused_objects: refused_objects.ok_or(malformed("refused_objects"))?,
+            recorded,
+        };
+        StatfsReadback::from_ledger(&snapshot).map_err(|_| malformed("ledger relations"))?;
         Ok(Self {
             sequence: sequence.ok_or(malformed("sequence"))?,
             at_millis: at_millis.ok_or(malformed("at_millis"))?,
             phase,
-            snapshot: LedgerSnapshot {
-                budget,
-                used_bytes: used_bytes.ok_or(malformed("used_bytes"))?,
-                used_objects: used_objects.ok_or(malformed("used_objects"))?,
-                peak_bytes: peak_bytes.ok_or(malformed("peak_bytes"))?,
-                peak_objects: peak_objects.ok_or(malformed("peak_objects"))?,
-                refused_bytes: refused_bytes.ok_or(malformed("refused_bytes"))?,
-                refused_objects: refused_objects.ok_or(malformed("refused_objects"))?,
-                recorded,
-            },
+            snapshot,
             mount_evidence: mount_evidence.ok_or(malformed("mount_evidence"))?,
             statfs_at_mount: statfs_at_mount.ok_or(malformed("statfs_at_mount"))?,
             final_record,
@@ -454,6 +456,16 @@ mod tests {
         assert!(matches!(
             Checkpoint::decode(&unknown),
             Err(CheckpointError::Malformed("unknown key"))
+        ));
+        let impossible_usage = text.replace("used_bytes=5", "used_bytes=999999");
+        assert!(matches!(
+            Checkpoint::decode(&impossible_usage),
+            Err(CheckpointError::Malformed("ledger relations"))
+        ));
+        let missing_refusal = text.replace("refused_bytes=1", "refused_bytes=0");
+        assert!(matches!(
+            Checkpoint::decode(&missing_refusal),
+            Err(CheckpointError::Malformed("ledger relations"))
         ));
         // A final checkpoint without its record is incomplete.
         let final_without_record = text.replace("phase=live", "phase=final");

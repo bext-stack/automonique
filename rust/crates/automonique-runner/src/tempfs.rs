@@ -22,13 +22,18 @@ use crate::tempfs_readback::{
     mount_evidence, mount_table, statfs_bounded,
 };
 use fuser::{BackgroundSession, Config, Session, SessionACL};
+use nix::mount::{MsFlags, mount};
+use nix::sched::{CloneFlags, unshare};
 use nix::unistd::{AccessFlags, access};
-use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
+use rustix::net::{
+    RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer,
+    SendAncillaryMessage, SendFlags, recvmsg, sendmsg,
+};
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, IoSliceMut};
+use std::io::{self, IoSlice, IoSliceMut, Read as _, Write as _};
 use std::mem::MaybeUninit;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -56,6 +61,14 @@ const COMM_FD_ENV: &str = "_FUSE_COMMFD";
 /// kernel check mode bits; the three flags keep the scratch tree from ever
 /// executing anything or carrying a device node.
 const MOUNT_OPTIONS: &str = "default_permissions,nosuid,nodev,noexec";
+/// The launch-helper control protocol is private to one release-pinned parent
+/// and helper. It never reaches the workload.
+pub(crate) const NAMESPACED_CONTROL_ENV: &str = "AUTOMONIQUE_TEMPFS_CONTROL";
+const NAMESPACED_DESCRIPTOR_BYTE: &[u8] = b"F";
+const NAMESPACED_SERVER_READY: &[u8] = b"S";
+const NAMESPACED_MOUNT_ACCEPTED: &[u8] = b"A";
+const NAMESPACED_REPORT_PREFIX: &str = "automonique.namespaced-tempfs/v1";
+const MAX_NAMESPACED_REPORT_BYTES: usize = 512;
 /// The setuid bit, as `st_mode` carries it.
 const S_ISUID: u32 = 0o4000;
 /// Bound on the helper's diagnostic kept in an error.
@@ -329,6 +342,118 @@ pub struct Outcome {
     pub aborted: bool,
     /// The mount table showed no entry after unmounting.
     pub unmount_confirmed: bool,
+}
+
+/// Why the private parent/helper handoff for an in-namespace mount failed.
+#[derive(Debug)]
+pub enum NamespacedMountError {
+    Io(io::Error),
+    Session(io::Error),
+    Protocol(&'static str),
+}
+
+impl fmt::Display for NamespacedMountError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "namespaced tempfs I/O failed: {error}"),
+            Self::Session(error) => write!(formatter, "namespaced FUSE session failed: {error}"),
+            Self::Protocol(reason) => {
+                write!(formatter, "namespaced tempfs handshake refused: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NamespacedMountError {}
+
+impl From<io::Error> for NamespacedMountError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+/// Final evidence from a mount that existed only in the workload's mount
+/// namespace. Usage comes from the quota filesystem's own validated ledger;
+/// `unmount_confirmed` means the kernel closed the FUSE connection when that
+/// namespace ended and the serving thread joined.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamespacedOutcome {
+    pub ledger: LedgerSnapshot,
+    pub statfs_at_mount: StatfsReadback,
+    pub statfs_from_ledger: StatfsReadback,
+    pub unmount_confirmed: bool,
+}
+
+/// Supervisor-side ownership of a FUSE connection mounted by the launch
+/// helper inside the workload user+mount namespace.
+pub(crate) struct NamespacedMountedTempfs {
+    state: SharedState,
+    channel: Arc<ExceedanceChannel>,
+    session: Option<BackgroundSession>,
+    statfs_at_mount: StatfsReadback,
+    checkpoint_path: Option<PathBuf>,
+    checkpoint_sequence: u64,
+}
+
+impl NamespacedMountedTempfs {
+    pub(crate) fn with_checkpoint(mut self, path: impl Into<PathBuf>) -> io::Result<Self> {
+        self.checkpoint_path = Some(path.into());
+        self.write_checkpoint(Phase::Live, None)?;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub(crate) fn exceedance_channel(&self) -> Arc<ExceedanceChannel> {
+        Arc::clone(&self.channel)
+    }
+
+    #[must_use]
+    pub(crate) fn snapshot(&self) -> LedgerSnapshot {
+        snapshot(&self.state)
+    }
+
+    pub(crate) fn write_checkpoint(
+        &mut self,
+        phase: Phase,
+        final_record: Option<FinalRecord>,
+    ) -> io::Result<()> {
+        let Some(path) = self.checkpoint_path.clone() else {
+            return Ok(());
+        };
+        self.checkpoint_sequence += 1;
+        Checkpoint {
+            sequence: self.checkpoint_sequence,
+            at_millis: now_millis(),
+            phase,
+            snapshot: self.snapshot(),
+            mount_evidence: format!(
+                "{NAMESPACED_REPORT_PREFIX} fstype=fuse.{FS_SUBTYPE} source={FS_NAME} user_id=0"
+            ),
+            statfs_at_mount: self.statfs_at_mount,
+            final_record,
+        }
+        .write(&path)
+    }
+
+    pub(crate) fn reconcile(mut self) -> Result<NamespacedOutcome, NamespacedMountError> {
+        let unmount_confirmed =
+            finish_namespaced_session(self.session.take(), SESSION_JOIN_DEADLINE);
+        let ledger = self.snapshot();
+        let statfs_from_ledger = StatfsReadback::from_ledger(&ledger)
+            .map_err(|_| NamespacedMountError::Protocol("ledger relations are inconsistent"))?;
+        let final_record = FinalRecord {
+            statfs_before_unmount: Some(statfs_from_ledger),
+            unmount_confirmed,
+            aborted: false,
+        };
+        self.write_checkpoint(Phase::Final, Some(final_record))?;
+        Ok(NamespacedOutcome {
+            ledger,
+            statfs_at_mount: self.statfs_at_mount,
+            statfs_from_ledger,
+            unmount_confirmed,
+        })
+    }
 }
 
 impl Outcome {
@@ -822,6 +947,240 @@ fn validate_mountpoint(mountpoint: &Path) -> Result<PathBuf, MountError> {
         return Err(rejected("already a mountpoint"));
     }
     Ok(canonical)
+}
+
+/// Mount and kernel-confirm the quota filesystem while the launch helper is
+/// namespace root. The descriptor is opened only after both user and mount
+/// namespaces exist, then transferred to the supervisor for serving.
+pub(crate) fn mount_in_workload_namespace(
+    verified: &VerifiedFuse,
+    mountpoint: &Path,
+    budget: TemporaryStorageBudget,
+    identity: crate::identity::WorkloadIdentity,
+    control: &mut UnixStream,
+) -> Result<(), String> {
+    unshare(CloneFlags::CLONE_NEWNS)
+        .map_err(|error| format!("mount namespace creation failed: {error}"))?;
+    mount::<str, Path, str, str>(
+        None,
+        Path::new("/"),
+        None,
+        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+        None,
+    )
+    .map_err(|error| format!("mount propagation isolation failed: {error}"))?;
+    let mountpoint = validate_mountpoint(mountpoint).map_err(|error| error.to_string())?;
+    let descriptor = File::options()
+        .read(true)
+        .write(true)
+        .open(verified.dev_fuse())
+        .map_err(|error| format!("/dev/fuse open inside workload namespace failed: {error}"))?;
+    let root_mode = fs::metadata(&mountpoint)
+        .map_err(|error| format!("mountpoint mode unreadable: {error}"))?
+        .permissions()
+        .mode();
+    let options = format!(
+        "fd={},rootmode={root_mode:o},user_id=0,group_id=0,allow_other,subtype={FS_SUBTYPE},default_permissions",
+        descriptor.as_raw_fd(),
+    );
+    mount(
+        Some(FS_NAME),
+        &mountpoint,
+        Some("fuse"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        Some(options.as_str()),
+    )
+    .map_err(|error| format!("in-namespace FUSE mount failed: {error}"))?;
+    send_descriptor(control, descriptor.as_fd())
+        .map_err(|error| format!("FUSE descriptor handoff failed: {error}"))?;
+    drop(descriptor);
+
+    let mut ready = [0_u8; 1];
+    control
+        .read_exact(&mut ready)
+        .map_err(|error| format!("FUSE server readiness unreadable: {error}"))?;
+    if ready != NAMESPACED_SERVER_READY {
+        return Err("FUSE server readiness malformed".to_owned());
+    }
+    let evidence = mount_evidence(&mountpoint)
+        .map_err(|error| format!("in-namespace mount table unreadable: {error}"))?
+        .ok_or_else(|| "in-namespace mount evidence missing".to_owned())?;
+    if !evidence.is_fuse_subtype(FS_SUBTYPE)
+        || evidence.source != FS_NAME
+        || evidence.user_id() != Some(0)
+    {
+        return Err(format!(
+            "in-namespace mount evidence mismatched: {evidence}"
+        ));
+    }
+    let statfs = statfs_bounded(&mountpoint, DEFAULT_READBACK_DEADLINE)
+        .map_err(|error| format!("in-namespace statfs unavailable: {error:?}"))?;
+    if statfs.ceiling_bytes() != budget.bytes()
+        || statfs.files != budget.objects()
+        || statfs.used_bytes() != 0
+        || statfs.used_objects() != 0
+    {
+        return Err(format!("in-namespace statfs mismatched: {statfs}"));
+    }
+    writeln!(
+        control,
+        "{NAMESPACED_REPORT_PREFIX} ns_uid={} statfs={statfs}",
+        identity.namespace_uid()
+    )
+    .map_err(|error| format!("in-namespace report failed: {error}"))?;
+    let mut accepted = [0_u8; 1];
+    control
+        .read_exact(&mut accepted)
+        .map_err(|error| format!("in-namespace acceptance unreadable: {error}"))?;
+    if accepted != NAMESPACED_MOUNT_ACCEPTED {
+        return Err("in-namespace acceptance malformed".to_owned());
+    }
+    Ok(())
+}
+
+fn send_descriptor(socket: &UnixStream, descriptor: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+    let descriptors = [descriptor];
+    let mut space = [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut ancillary = SendAncillaryBuffer::new(&mut space);
+    if !ancillary.push(SendAncillaryMessage::ScmRights(&descriptors)) {
+        return Err(io::Error::other("descriptor ancillary buffer too small"));
+    }
+    let buffers = [IoSlice::new(NAMESPACED_DESCRIPTOR_BYTE)];
+    loop {
+        match sendmsg(socket, &buffers, &mut ancillary, SendFlags::NOSIGNAL) {
+            Ok(1) => return Ok(()),
+            Ok(_) => return Err(io::Error::other("descriptor handoff was partial")),
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+pub(crate) fn receive_namespaced_tempfs(
+    control: &mut UnixStream,
+    budget: TemporaryStorageBudget,
+    workload_namespace_uid: u32,
+) -> Result<NamespacedMountedTempfs, NamespacedMountError> {
+    let descriptor = receive_namespaced_descriptor(control)?;
+    let channel = Arc::new(ExceedanceChannel::default());
+    let filesystem = QuotaFs::new(budget, workload_namespace_uid, 0, Arc::clone(&channel));
+    let state = filesystem.state();
+    let session = Session::from_fd(filesystem, descriptor, SessionACL::All, Config::default())
+        .and_then(Session::spawn)
+        .map_err(NamespacedMountError::Session)?;
+    control.write_all(NAMESPACED_SERVER_READY)?;
+    let report = read_namespaced_report(control)?;
+    let fields = report
+        .strip_prefix(&format!("{NAMESPACED_REPORT_PREFIX} ns_uid="))
+        .ok_or(NamespacedMountError::Protocol(
+            "helper report schema mismatched",
+        ))?;
+    let (namespace_uid, statfs) =
+        fields
+            .split_once(" statfs=")
+            .ok_or(NamespacedMountError::Protocol(
+                "helper report fields mismatched",
+            ))?;
+    if namespace_uid.parse::<u32>().ok() != Some(workload_namespace_uid) {
+        return Err(NamespacedMountError::Protocol(
+            "helper reported a different workload namespace uid",
+        ));
+    }
+    let statfs = StatfsReadback::from_spelling(statfs)
+        .ok_or(NamespacedMountError::Protocol("helper statfs malformed"))?;
+    if statfs.ceiling_bytes() != budget.bytes()
+        || statfs.files != budget.objects()
+        || statfs.used_bytes() != 0
+        || statfs.used_objects() != 0
+    {
+        return Err(NamespacedMountError::Protocol(
+            "helper statfs did not confirm the empty exact budget",
+        ));
+    }
+    control.write_all(NAMESPACED_MOUNT_ACCEPTED)?;
+    Ok(NamespacedMountedTempfs {
+        state,
+        channel,
+        session: Some(session),
+        statfs_at_mount: statfs,
+        checkpoint_path: None,
+        checkpoint_sequence: 0,
+    })
+}
+
+fn read_namespaced_report(control: &mut UnixStream) -> Result<String, NamespacedMountError> {
+    let mut bytes = Vec::new();
+    loop {
+        let mut byte = [0_u8; 1];
+        control.read_exact(&mut byte)?;
+        if byte[0] == b'\n' {
+            return String::from_utf8(bytes)
+                .map_err(|_| NamespacedMountError::Protocol("helper report was not UTF-8"));
+        }
+        if bytes.len() == MAX_NAMESPACED_REPORT_BYTES {
+            return Err(NamespacedMountError::Protocol(
+                "helper report exceeded its bound",
+            ));
+        }
+        bytes.push(byte[0]);
+    }
+}
+
+fn receive_namespaced_descriptor(socket: &UnixStream) -> Result<OwnedFd, NamespacedMountError> {
+    let mut marker = [0_u8; 1];
+    let mut descriptors = Vec::new();
+    let (bytes, flags) = {
+        let mut vectors = [IoSliceMut::new(&mut marker)];
+        let mut space = [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(1))];
+        let mut ancillary = RecvAncillaryBuffer::new(&mut space);
+        let received = loop {
+            match recvmsg(
+                socket,
+                &mut vectors,
+                &mut ancillary,
+                RecvFlags::CMSG_CLOEXEC,
+            ) {
+                Ok(received) => break received,
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(error) => return Err(NamespacedMountError::Io(error.into())),
+            }
+        };
+        for message in ancillary.drain() {
+            let RecvAncillaryMessage::ScmRights(rights) = message else {
+                return Err(NamespacedMountError::Protocol(
+                    "helper sent an unexpected control message",
+                ));
+            };
+            descriptors.extend(rights);
+        }
+        (received.bytes, received.flags)
+    };
+    if bytes != 1
+        || marker != NAMESPACED_DESCRIPTOR_BYTE
+        || flags.contains(ReturnFlags::CTRUNC)
+        || flags.contains(ReturnFlags::TRUNC)
+        || descriptors.len() != 1
+    {
+        return Err(NamespacedMountError::Protocol(
+            "helper FUSE descriptor handoff malformed",
+        ));
+    }
+    Ok(descriptors.pop().expect("length checked"))
+}
+
+fn finish_namespaced_session(session: Option<BackgroundSession>, deadline: Duration) -> bool {
+    let Some(session) = session else {
+        return false;
+    };
+    let until = Instant::now() + deadline;
+    while Instant::now() < until {
+        if session.guard.is_finished() {
+            return session.join().is_ok();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(session);
+    false
 }
 
 /// Run `fusermount3 -o <options> -- <mountpoint>` with a socket on its stdin
