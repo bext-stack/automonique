@@ -68,8 +68,8 @@ use automonique_protocol::platform_v2_transport::{
     MutationSubmitRequest, PlatformNegotiationRequest, PlatformNegotiationRequestMessage,
     PlatformNegotiationResponse, PlatformNegotiationResponseMessage, PlatformV2Request,
     PlatformV2RequestMessage, PlatformV2Response, PlatformV2ResponseMessage, ReceiptLookupKey,
-    ReviewActionTransportRequest, ReviewReceiptLookup, WorkspaceIntentLookup,
-    WorkspaceIntentRequest,
+    ReviewActionTransportRequest, ReviewConfirmationDigest, ReviewReceiptLookup,
+    WorkspaceIntentLookup, WorkspaceIntentRequest,
 };
 use automonique_protocol::primitives::{EpochMillis, Revision};
 use automonique_store::approval_requests::{
@@ -1460,11 +1460,12 @@ fn configured_v2_uses_kernel_principal_scope_and_durable_idempotency() {
     ));
 
     let fixture_action = decode_review_action_request(REVIEW_ACTION).unwrap();
-    let action = ReviewActionTransportRequest::new(
+    let action = ReviewActionTransportRequest::new_confirmed(
         fixture_action.workspace().clone(),
         fixture_action.expected_revision(),
         fixture_action.action().clone(),
         fixture_action.idempotency_key().clone(),
+        ReviewConfirmationDigest::new("ab".repeat(32)).unwrap(),
     )
     .unwrap();
     let client_document = PlatformV2RequestMessage::new(
