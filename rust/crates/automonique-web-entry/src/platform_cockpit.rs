@@ -8,16 +8,29 @@ use std::time::Duration;
 use automonique_protocol::platform::IdempotencyKey;
 use automonique_protocol::platform_v2::{
     PlatformVersion, ProjectId, UserWorkspaceId, WorkContextCursor, WorkContextIdentity,
-    WorkContextKind, WorkContextQuery, WorkContextRecord, WorkContextRelationKind,
+    WorkContextKind, WorkContextLifecycle, WorkContextQuery, WorkContextRecord,
+    WorkContextRelationKind,
+};
+use automonique_protocol::platform_v2_lineage::{
+    BaseSelectorId, BranchSelectorId, ExternalWorkAuthorityId, ExternalWorkIdentity,
+    ExternalWorkKey, ExternalWorkProvider, ExternalWorkScope, ExternalWorkState,
+    LineageFreshnessState, LineageProjection, LineageStatus, OrchestrationIdentity,
+    OrchestrationTaskId, WorkspaceCreateIntent, WorkspaceIntent, WorkspaceIntentId,
+    WorkspaceResumeIntent,
 };
 use automonique_protocol::platform_v2_lineage_api::encode_lineage_projection;
-use automonique_protocol::platform_v2_review::{ReviewAction, ReviewActionReceipt};
+use automonique_protocol::platform_v2_lineage_api::encode_workspace_intent_outcome;
+use automonique_protocol::platform_v2_review::{
+    DiffSide, ReviewAction, ReviewActionReceipt, ReviewAnchor, ReviewCommentId, ReviewDecision,
+    ReviewFileId, ReviewFreshnessState, ReviewHunkId, ReviewSnapshot, ReviewText,
+};
 use automonique_protocol::platform_v2_review_api::{
     encode_review_action_receipt, encode_review_snapshot,
 };
 use automonique_protocol::platform_v2_transport::{
     LifecycleCapabilities, LineageReadRequest, PlatformV2Request, PlatformV2Response,
-    ReviewActionTransportRequest, ReviewReadRequest,
+    ReviewActionTransportRequest, ReviewReadRequest, ReviewReceiptLookup, WorkspaceIntentLookup,
+    WorkspaceIntentRequest,
 };
 use automonique_protocol::primitives::Revision;
 use serde::Deserialize;
@@ -47,12 +60,68 @@ pub(crate) enum CockpitRequest {
         #[serde(default)]
         workspace_id: Option<String>,
     },
+    SubmitWorkspaceCreate {
+        project_id: String,
+        workspace_id: String,
+        expected_revision: String,
+        intent_id: String,
+        task_id: String,
+        external_work: CockpitExternalWork,
+        base_selector: String,
+        branch_selector: String,
+    },
+    SubmitWorkspaceResume {
+        project_id: String,
+        workspace_id: String,
+        expected_revision: String,
+        intent_id: String,
+        task_id: String,
+    },
+    GetWorkspaceIntent {
+        project_id: String,
+        workspace_id: String,
+        intent_id: String,
+    },
+    AddComment {
+        project_id: String,
+        workspace_id: String,
+        expected_revision: String,
+        comment_id: String,
+        file_id: String,
+        hunk_id: String,
+        side: CockpitDiffSide,
+        line: u32,
+        body: String,
+        idempotency_key: String,
+    },
     ApproveReview {
+        project_id: String,
         workspace_id: String,
         expected_revision: String,
         expected_review_revision: String,
         idempotency_key: String,
     },
+    GetReviewReceipt {
+        project_id: String,
+        workspace_id: String,
+        idempotency_key: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CockpitExternalWork {
+    provider: String,
+    authority: String,
+    scope: String,
+    key: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CockpitDiffSide {
+    Old,
+    New,
 }
 
 pub(crate) fn execute(
@@ -62,18 +131,88 @@ pub(crate) fn execute(
 ) -> Result<Value, &'static str> {
     match request {
         CockpitRequest::Read { workspace_id } => read(bridge, workspace_id.as_deref(), retained_v1),
+        CockpitRequest::SubmitWorkspaceCreate {
+            project_id,
+            workspace_id,
+            expected_revision,
+            intent_id,
+            task_id,
+            external_work,
+            base_selector,
+            branch_selector,
+        } => submit_workspace_create(
+            bridge,
+            &project_id,
+            &workspace_id,
+            &expected_revision,
+            &intent_id,
+            &task_id,
+            external_work,
+            &base_selector,
+            &branch_selector,
+        ),
+        CockpitRequest::SubmitWorkspaceResume {
+            project_id,
+            workspace_id,
+            expected_revision,
+            intent_id,
+            task_id,
+        } => submit_workspace_resume(
+            bridge,
+            &project_id,
+            &workspace_id,
+            &expected_revision,
+            &intent_id,
+            &task_id,
+        ),
+        CockpitRequest::GetWorkspaceIntent {
+            project_id,
+            workspace_id,
+            intent_id,
+        } => get_workspace_intent(bridge, &project_id, &workspace_id, &intent_id),
+        CockpitRequest::AddComment {
+            project_id,
+            workspace_id,
+            expected_revision,
+            comment_id,
+            file_id,
+            hunk_id,
+            side,
+            line,
+            body,
+            idempotency_key,
+        } => add_comment(
+            bridge,
+            &project_id,
+            &workspace_id,
+            &expected_revision,
+            &comment_id,
+            &file_id,
+            &hunk_id,
+            side,
+            line,
+            &body,
+            &idempotency_key,
+        ),
         CockpitRequest::ApproveReview {
+            project_id,
             workspace_id,
             expected_revision,
             expected_review_revision,
             idempotency_key,
         } => approve_review(
             bridge,
+            &project_id,
             &workspace_id,
             &expected_revision,
             &expected_review_revision,
             &idempotency_key,
         ),
+        CockpitRequest::GetReviewReceipt {
+            project_id,
+            workspace_id,
+            idempotency_key,
+        } => get_review_receipt(bridge, &project_id, &workspace_id, &idempotency_key),
     }
 }
 
@@ -88,67 +227,85 @@ fn read(
         .map_err(|_| "platform_cockpit_request_invalid")?;
     let negotiated = match bridge.negotiate() {
         Ok(value) if value.version() == PlatformVersion::V2 => value,
-        Ok(_) => return Ok(fallback(retained_v1, "platform_v2_not_negotiated")),
-        Err(category) => return Ok(fallback(retained_v1, category)),
+        Ok(_) => return Ok(v1_fallback(retained_v1, "platform_v2_not_negotiated")),
+        Err(category) => return Ok(v2_unavailable(retained_v1, category)),
     };
     let capabilities = match bridge.request(PlatformV2Request::GetLifecycleCapabilities) {
         Ok(PlatformV2Response::LifecycleCapabilities(value)) => value,
         Ok(PlatformV2Response::Refused(value)) => {
-            return Ok(fallback(retained_v1, value.category().as_str()));
+            return Ok(v2_unavailable(retained_v1, value.category().as_str()));
         }
         Ok(_) => return Err("platform_v2_response_invalid"),
-        Err(category) => return Ok(fallback(retained_v1, category)),
+        Err(category) => return Ok(v2_unavailable(retained_v1, category)),
     };
     let records = match inventory(bridge, capabilities.projects()) {
         Ok(records) => records,
-        Err(category) => return Ok(fallback(retained_v1, &category)),
+        Err(category) => return Ok(v2_unavailable(retained_v1, &category)),
     };
     let selected = select_workspace(&records, selected_id.as_ref().map(UserWorkspaceId::as_str))?;
     let selected_identity = selected.map(|record| record.identity().clone());
     let selected_project =
         selected.and_then(|record| relation(record, WorkContextRelationKind::UserWorkspaceProject));
-    let lifecycle = lifecycle_actions(&capabilities, selected_project.as_ref());
-
-    let lineage = match (selected_identity.as_ref(), selected_project.as_ref()) {
-        (
-            Some(WorkContextIdentity::UserWorkspace(workspace)),
-            Some(WorkContextIdentity::Project(project)),
-        ) => {
-            match bridge.request(PlatformV2Request::GetLineage(LineageReadRequest::new(
-                project.clone(),
-                workspace.clone(),
-            ))) {
-                Ok(PlatformV2Response::LineageResult(value)) => available_document(
-                    encode_lineage_projection(&negotiated, &value)
-                        .map_err(|_| "platform_cockpit_projection_invalid")?,
-                )?,
-                Ok(PlatformV2Response::Refused(value)) => {
-                    refused(value.category().as_str(), value.explanation().as_str())
+    let (lineage, lineage_projection) =
+        match (selected_identity.as_ref(), selected_project.as_ref()) {
+            (
+                Some(WorkContextIdentity::UserWorkspace(workspace)),
+                Some(WorkContextIdentity::Project(project)),
+            ) => {
+                match bridge.request(PlatformV2Request::GetLineage(LineageReadRequest::new(
+                    project.clone(),
+                    workspace.clone(),
+                ))) {
+                    Ok(PlatformV2Response::LineageResult(value)) => (
+                        available_document(
+                            encode_lineage_projection(&negotiated, &value)
+                                .map_err(|_| "platform_cockpit_projection_invalid")?,
+                        )?,
+                        Some(value),
+                    ),
+                    Ok(PlatformV2Response::Refused(value)) => (
+                        refused(value.category().as_str(), value.explanation().as_str()),
+                        None,
+                    ),
+                    Ok(_) => return Err("platform_v2_response_invalid"),
+                    Err(category) => (unavailable(category), None),
                 }
-                Ok(_) => return Err("platform_v2_response_invalid"),
-                Err(category) => unavailable(category),
             }
-        }
-        _ => unavailable("no_selected_workspace"),
-    };
-    let review = match (selected_identity.as_ref(), selected_project.as_ref()) {
+            _ => (unavailable("no_selected_workspace"), None),
+        };
+    let (review, review_snapshot) = match (selected_identity.as_ref(), selected_project.as_ref()) {
         (Some(workspace), Some(WorkContextIdentity::Project(project))) => {
             let request = ReviewReadRequest::new(project.clone(), workspace.clone())
                 .map_err(|_| "platform_cockpit_selection_invalid")?;
             match bridge.request(PlatformV2Request::GetReview(request)) {
-                Ok(PlatformV2Response::ReviewResult(value)) => available_document(
-                    encode_review_snapshot(&value)
-                        .map_err(|_| "platform_cockpit_projection_invalid")?,
-                )?,
-                Ok(PlatformV2Response::Refused(value)) => {
-                    refused(value.category().as_str(), value.explanation().as_str())
-                }
+                Ok(PlatformV2Response::ReviewResult(value)) => (
+                    available_document(
+                        encode_review_snapshot(&value)
+                            .map_err(|_| "platform_cockpit_projection_invalid")?,
+                    )?,
+                    Some(value),
+                ),
+                Ok(PlatformV2Response::Refused(value)) => (
+                    refused(value.category().as_str(), value.explanation().as_str()),
+                    None,
+                ),
                 Ok(_) => return Err("platform_v2_response_invalid"),
-                Err(category) => unavailable(category),
+                Err(category) => (unavailable(category), None),
             }
         }
-        _ => unavailable("no_selected_workspace"),
+        _ => (unavailable("no_selected_workspace"), None),
     };
+    let lifecycle = lifecycle_actions(
+        &capabilities,
+        selected_project.as_ref(),
+        selected,
+        lineage_projection.as_ref(),
+    );
+    let review_actions = review_actions(
+        selected,
+        selected_project.as_ref(),
+        review_snapshot.as_ref(),
+    );
     let attention = attention_inventory(bridge, &records, selected_identity.as_ref(), &review);
     Ok(json!({
         "schema": SCHEMA,
@@ -157,14 +314,14 @@ fn read(
         "retained_v1": retained_v1,
         "projects": named_records(&records, WorkContextKind::Project),
         "hosts": host_records(&records),
-        "workspaces": workspace_records(&records, &attention.observations),
+        "workspaces": workspace_records(&records, &attention.observations, lineage_projection.as_ref()),
         "selected": { "workspace": selected_identity.as_ref().map(WorkContextIdentity::id) },
         "lineage": lineage,
         "review": review,
         "attention": attention.coverage,
         "actions": {
             "lifecycle": lifecycle,
-            "review": { "available": false, "category": REVIEW_ADAPTER_PENDING }
+            "review": review_actions
         }
     }))
 }
@@ -229,6 +386,8 @@ fn verify_inventory_capacity(current: usize, incoming: usize) -> Result<(), Stri
 fn lifecycle_actions(
     capabilities: &LifecycleCapabilities,
     selected_project: Option<&WorkContextIdentity>,
+    selected: Option<&WorkContextRecord>,
+    lineage: Option<&LineageProjection>,
 ) -> Value {
     let project = match selected_project {
         Some(WorkContextIdentity::Project(project)) => Some(project),
@@ -260,45 +419,644 @@ fn lifecycle_actions(
             .iter()
             .any(|value| value.project() == project && value.available_now())
     });
+    let binding = selected
+        .zip(lineage)
+        .and_then(|(workspace, lineage)| exact_task_binding(workspace, lineage));
+    let intent_operation = |kind: &str, needs_external: bool| {
+        let capability = project.and_then(|project| {
+            capabilities
+                .operations()
+                .iter()
+                .find(|value| value.project() == project && value.effect_kind() == kind)
+        });
+        let binding_available = binding
+            .as_ref()
+            .is_some_and(|(_, external)| !needs_external || external.is_some());
+        let available = capability.is_some_and(|value| value.available_now()) && binding_available;
+        let category = capability
+            .and_then(|value| value.category())
+            .map(|value| value.as_str())
+            .unwrap_or(if binding_available {
+                "platform_v2_project_scope_unavailable"
+            } else {
+                "platform_v2_exact_task_binding_unavailable"
+            });
+        let (task_id, external_work) = binding
+            .as_ref()
+            .map(|(task, external)| {
+                (
+                    json!(task.as_str()),
+                    external.clone().unwrap_or(Value::Null),
+                )
+            })
+            .unwrap_or((Value::Null, Value::Null));
+        json!({
+            "available": available,
+            "category": if available { Value::Null } else { json!(category) },
+            "submit_operation": if available { json!("submit_workspace_intent") } else { Value::Null },
+            "receipt_operation": if available { json!("get_workspace_intent") } else { Value::Null },
+            "project_id": if available { project.map(|value| json!(value.as_str())).unwrap_or(Value::Null) } else { Value::Null },
+            "workspace_id": if available { selected.map(|value| json!(value.identity().id())).unwrap_or(Value::Null) } else { Value::Null },
+            "exact_revision": if available { selected.map(|value| json!(value.revision().to_string())).unwrap_or(Value::Null) } else { Value::Null },
+            "task_id": if available { task_id } else { Value::Null },
+            "external_work": if available && needs_external { external_work } else { Value::Null }
+        })
+    };
     json!({
         "available": any_available,
         "project": project.map(ProjectId::as_str),
         "operations": {
             "create_host_setup": operation("create_host_setup", true),
             "create_checkout": operation("create_checkout", true),
-            "create_attempt_workspace": operation("create_attempt_workspace", false),
-            "resume_attempt_workspace": operation("resume_attempt_workspace", false),
+            "create_attempt_workspace": intent_operation("create_attempt_workspace", true),
+            "resume_attempt_workspace": intent_operation("resume_attempt_workspace", false),
             "resume_session": operation("resume_session", false)
         }
     })
 }
 
+fn exact_task_binding(
+    workspace: &WorkContextRecord,
+    lineage: &LineageProjection,
+) -> Option<(OrchestrationTaskId, Option<Value>)> {
+    let WorkContextIdentity::UserWorkspace(workspace_id) = workspace.identity() else {
+        return None;
+    };
+    if workspace.lifecycle() != WorkContextLifecycle::Active || lineage.workspace() != workspace_id
+    {
+        return None;
+    }
+    let mut tasks = lineage.orchestration().iter().filter(|record| {
+        record.workspace() == workspace_id
+            && record.freshness().state() == LineageFreshnessState::Fresh
+            && matches!(record.identity(), OrchestrationIdentity::Task(_))
+    });
+    let task = tasks.next()?;
+    if tasks.next().is_some() {
+        return None;
+    }
+    let OrchestrationIdentity::Task(task_id) = task.identity() else {
+        return None;
+    };
+    let external = task.external_work().and_then(|identity| {
+        lineage
+            .external_work_items()
+            .iter()
+            .find(|item| {
+                item.identity() == identity
+                    && item.workspace() == workspace_id
+                    && item.state() == ExternalWorkState::Open
+                    && item.freshness().state() == LineageFreshnessState::Fresh
+            })
+            .map(|item| external_work_json(item.identity()))
+    });
+    if task.external_work().is_some() && external.is_none() {
+        return None;
+    }
+    Some((task_id.clone(), external))
+}
+
+fn external_work_json(value: &ExternalWorkIdentity) -> Value {
+    json!({
+        "provider": value.provider().as_str(),
+        "authority": value.authority().as_str(),
+        "scope": value.scope().as_str(),
+        "key": value.key().as_str()
+    })
+}
+
+fn review_actions(
+    selected: Option<&WorkContextRecord>,
+    selected_project: Option<&WorkContextIdentity>,
+    snapshot: Option<&ReviewSnapshot>,
+) -> Value {
+    let exact = selected.zip(snapshot).and_then(|(workspace, snapshot)| {
+        let WorkContextIdentity::Project(project) = selected_project? else {
+            return None;
+        };
+        if workspace.lifecycle() != WorkContextLifecycle::Active
+            || snapshot.workspace() != workspace.identity()
+            || !review_snapshot_is_fresh(snapshot)
+        {
+            return None;
+        }
+        Some((workspace, project, snapshot))
+    });
+    let action = |available: bool, category: &str| {
+        let (workspace, project, exact_revision, exact_review_revision) = exact
+            .map(|(workspace, project, snapshot)| {
+                (
+                    json!(workspace.identity().id()),
+                    json!(project.as_str()),
+                    json!(snapshot.revision().to_string()),
+                    json!(
+                        snapshot
+                            .review()
+                            .freshness()
+                            .observed_revision()
+                            .to_string()
+                    ),
+                )
+            })
+            .unwrap_or((Value::Null, Value::Null, Value::Null, Value::Null));
+        json!({
+            "available": available && exact.is_some(),
+            "category": if available && exact.is_some() { Value::Null } else { json!(category) },
+            "execute_operation": if available && exact.is_some() { json!("execute_review_action") } else { Value::Null },
+            "receipt_operation": if available && exact.is_some() { json!("get_review_receipt") } else { Value::Null },
+            "project_id": project,
+            "workspace_id": workspace,
+            "exact_revision": exact_revision,
+            "exact_review_revision": if available { exact_review_revision } else { Value::Null }
+        })
+    };
+    let fresh = exact.is_some();
+    let approve = exact
+        .is_some_and(|(_, _, snapshot)| snapshot.review().decision() == ReviewDecision::Pending);
+    json!({
+        "available": fresh,
+        "category": if fresh { Value::Null } else { json!(REVIEW_ADAPTER_PENDING) },
+        "operations": {
+            "add_comment": action(fresh, REVIEW_ADAPTER_PENDING),
+            "approve_review": action(approve, if fresh { "platform_v2_review_not_pending" } else { REVIEW_ADAPTER_PENDING }),
+            "send_comment_to_agent": action(false, "platform_cockpit_review_family_unavailable"),
+            "batch_send_comments_to_agent": action(false, "platform_cockpit_review_family_unavailable"),
+            "stage": action(false, "platform_cockpit_git_family_unavailable"),
+            "unstage": action(false, "platform_cockpit_git_family_unavailable"),
+            "commit": action(false, "platform_cockpit_git_family_unavailable"),
+            "resolve_conflict": action(false, "platform_cockpit_git_family_unavailable"),
+            "rerun_check": action(false, "platform_cockpit_ci_family_unavailable"),
+            "open_pull_request": action(false, "platform_cockpit_pull_request_family_unavailable"),
+            "update_pull_request": action(false, "platform_cockpit_pull_request_family_unavailable"),
+            "merge_pull_request": action(false, "platform_cockpit_pull_request_family_unavailable")
+        }
+    })
+}
+
+fn review_snapshot_is_fresh(snapshot: &ReviewSnapshot) -> bool {
+    snapshot.review().freshness().state() == ReviewFreshnessState::Fresh
+        && snapshot.pull_request().freshness().state() == ReviewFreshnessState::Fresh
+        && snapshot.delivery().freshness().state() == ReviewFreshnessState::Fresh
+        && snapshot
+            .checks()
+            .iter()
+            .all(|check| check.freshness().state() == ReviewFreshnessState::Fresh)
+}
+
+struct WorkspaceControlContext {
+    project: ProjectId,
+    workspace: UserWorkspaceId,
+    record: WorkContextRecord,
+    lineage: LineageProjection,
+}
+
+fn workspace_control_context(
+    bridge: &PlatformV2Bridge,
+    project_id: &str,
+    workspace_id: &str,
+    expected_revision: &str,
+    effect_kind: &str,
+) -> Result<WorkspaceControlContext, &'static str> {
+    require_v2(bridge)?;
+    let project =
+        ProjectId::new(project_id.to_owned()).map_err(|_| "platform_cockpit_request_invalid")?;
+    let workspace = UserWorkspaceId::new(workspace_id.to_owned())
+        .map_err(|_| "platform_cockpit_request_invalid")?;
+    let revision = parse_revision(expected_revision)?;
+    let capabilities = lifecycle_capabilities(bridge)?;
+    if !capabilities.projects().contains(&project)
+        || !capabilities.operations().iter().any(|operation| {
+            operation.project() == &project
+                && operation.effect_kind() == effect_kind
+                && operation.available_now()
+        })
+    {
+        return Err("platform_cockpit_capability_unavailable");
+    }
+    let record = exact_workspace_record(bridge, &capabilities, &project, &workspace)?;
+    if record.lifecycle() != WorkContextLifecycle::Active || record.revision() != revision {
+        return Err("platform_cockpit_stale_revision");
+    }
+    let lineage = match bridge.request(PlatformV2Request::GetLineage(LineageReadRequest::new(
+        project.clone(),
+        workspace.clone(),
+    )))? {
+        PlatformV2Response::LineageResult(value) => value,
+        PlatformV2Response::Refused(_) => return Err("platform_cockpit_lineage_unavailable"),
+        _ => return Err("platform_v2_response_invalid"),
+    };
+    if lineage.workspace() != &workspace
+        || lineage
+            .external_work_items()
+            .iter()
+            .any(|value| value.freshness().state() != LineageFreshnessState::Fresh)
+        || lineage
+            .orchestration()
+            .iter()
+            .any(|value| value.freshness().state() != LineageFreshnessState::Fresh)
+    {
+        return Err("platform_cockpit_lineage_stale");
+    }
+    Ok(WorkspaceControlContext {
+        project,
+        workspace,
+        record,
+        lineage,
+    })
+}
+
+fn require_v2(bridge: &PlatformV2Bridge) -> Result<(), &'static str> {
+    bridge.negotiate().and_then(|value| {
+        (value.version() == PlatformVersion::V2)
+            .then_some(())
+            .ok_or("platform_v2_not_negotiated")
+    })
+}
+
+fn lifecycle_capabilities(
+    bridge: &PlatformV2Bridge,
+) -> Result<LifecycleCapabilities, &'static str> {
+    match bridge.request(PlatformV2Request::GetLifecycleCapabilities)? {
+        PlatformV2Response::LifecycleCapabilities(value) => Ok(value),
+        PlatformV2Response::Refused(_) => Err("platform_cockpit_capability_unavailable"),
+        _ => Err("platform_v2_response_invalid"),
+    }
+}
+
+fn exact_workspace_record(
+    bridge: &PlatformV2Bridge,
+    capabilities: &LifecycleCapabilities,
+    project: &ProjectId,
+    workspace: &UserWorkspaceId,
+) -> Result<WorkContextRecord, &'static str> {
+    let records = inventory(bridge, capabilities.projects())
+        .map_err(|_| "platform_cockpit_inventory_unavailable")?;
+    let record = records
+        .into_iter()
+        .find(|record| record.identity() == &WorkContextIdentity::UserWorkspace(workspace.clone()))
+        .ok_or("platform_cockpit_workspace_not_found")?;
+    if !workspace_matches_project(&record, project) {
+        return Err("platform_cockpit_project_workspace_mismatch");
+    }
+    Ok(record)
+}
+
+fn workspace_matches_project(record: &WorkContextRecord, project: &ProjectId) -> bool {
+    relation(record, WorkContextRelationKind::UserWorkspaceProject)
+        == Some(WorkContextIdentity::Project(project.clone()))
+}
+
+fn parse_external_work(value: CockpitExternalWork) -> Result<ExternalWorkIdentity, &'static str> {
+    Ok(ExternalWorkIdentity::new(
+        ExternalWorkProvider::parse(&value.provider)
+            .map_err(|_| "platform_cockpit_request_invalid")?,
+        ExternalWorkAuthorityId::new(value.authority)
+            .map_err(|_| "platform_cockpit_request_invalid")?,
+        ExternalWorkScope::new(value.scope).map_err(|_| "platform_cockpit_request_invalid")?,
+        ExternalWorkKey::new(value.key).map_err(|_| "platform_cockpit_request_invalid")?,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_workspace_create(
+    bridge: &PlatformV2Bridge,
+    project_id: &str,
+    workspace_id: &str,
+    expected_revision: &str,
+    intent_id: &str,
+    task_id: &str,
+    external_work: CockpitExternalWork,
+    base_selector: &str,
+    branch_selector: &str,
+) -> Result<Value, &'static str> {
+    let context = workspace_control_context(
+        bridge,
+        project_id,
+        workspace_id,
+        expected_revision,
+        "create_attempt_workspace",
+    )?;
+    let task = OrchestrationTaskId::new(task_id.to_owned())
+        .map_err(|_| "platform_cockpit_request_invalid")?;
+    let external_work = parse_external_work(external_work)?;
+    let binding = exact_task_binding(&context.record, &context.lineage)
+        .ok_or("platform_cockpit_exact_task_binding_unavailable")?;
+    if binding.0 != task || binding.1 != Some(external_work_json(&external_work)) {
+        return Err("platform_cockpit_exact_task_binding_mismatch");
+    }
+    let intent_id = WorkspaceIntentId::new(intent_id.to_owned())
+        .map_err(|_| "platform_cockpit_request_invalid")?;
+    if let Some(value) =
+        existing_workspace_intent(bridge, context.project.clone(), intent_id.clone())?
+    {
+        return workspace_intent_result(bridge, &intent_id, &context.workspace, value, false);
+    }
+    let intent = WorkspaceIntent::Create(WorkspaceCreateIntent::new(
+        intent_id.clone(),
+        task,
+        external_work,
+        BaseSelectorId::new(base_selector.to_owned())
+            .map_err(|_| "platform_cockpit_request_invalid")?,
+        BranchSelectorId::new(branch_selector.to_owned())
+            .map_err(|_| "platform_cockpit_request_invalid")?,
+    ));
+    submit_workspace_intent(
+        bridge,
+        context.project,
+        context.workspace,
+        intent_id,
+        intent,
+    )
+}
+
+fn submit_workspace_resume(
+    bridge: &PlatformV2Bridge,
+    project_id: &str,
+    workspace_id: &str,
+    expected_revision: &str,
+    intent_id: &str,
+    task_id: &str,
+) -> Result<Value, &'static str> {
+    let context = workspace_control_context(
+        bridge,
+        project_id,
+        workspace_id,
+        expected_revision,
+        "resume_attempt_workspace",
+    )?;
+    let task = OrchestrationTaskId::new(task_id.to_owned())
+        .map_err(|_| "platform_cockpit_request_invalid")?;
+    let binding = exact_task_binding(&context.record, &context.lineage)
+        .ok_or("platform_cockpit_exact_task_binding_unavailable")?;
+    if binding.0 != task {
+        return Err("platform_cockpit_exact_task_binding_mismatch");
+    }
+    let intent_id = WorkspaceIntentId::new(intent_id.to_owned())
+        .map_err(|_| "platform_cockpit_request_invalid")?;
+    if let Some(value) =
+        existing_workspace_intent(bridge, context.project.clone(), intent_id.clone())?
+    {
+        return workspace_intent_result(bridge, &intent_id, &context.workspace, value, false);
+    }
+    let intent = WorkspaceIntent::Resume(WorkspaceResumeIntent::new(
+        intent_id.clone(),
+        task,
+        context.workspace.clone(),
+        context.record.revision(),
+    ));
+    submit_workspace_intent(
+        bridge,
+        context.project,
+        context.workspace,
+        intent_id,
+        intent,
+    )
+}
+
+fn existing_workspace_intent(
+    bridge: &PlatformV2Bridge,
+    project: ProjectId,
+    intent_id: WorkspaceIntentId,
+) -> Result<Option<automonique_protocol::platform_v2_lineage::WorkspaceIntentOutcome>, &'static str>
+{
+    match bridge.request(PlatformV2Request::GetWorkspaceIntent(
+        WorkspaceIntentLookup::new(project, intent_id),
+    ))? {
+        PlatformV2Response::WorkspaceIntentResult(value) => Ok(Some(value)),
+        PlatformV2Response::Refused(value)
+            if value.category().as_str() == "platform_v2_not_found" =>
+        {
+            Ok(None)
+        }
+        PlatformV2Response::Refused(_) => Err("platform_cockpit_intent_lookup_refused"),
+        _ => Err("platform_v2_response_invalid"),
+    }
+}
+
+fn submit_workspace_intent(
+    bridge: &PlatformV2Bridge,
+    project: ProjectId,
+    workspace: UserWorkspaceId,
+    intent_id: WorkspaceIntentId,
+    intent: WorkspaceIntent,
+) -> Result<Value, &'static str> {
+    match bridge.request(PlatformV2Request::SubmitWorkspaceIntent(
+        WorkspaceIntentRequest::new(project, intent),
+    ))? {
+        PlatformV2Response::WorkspaceIntentResult(value) => {
+            workspace_intent_result(bridge, &intent_id, &workspace, value, true)
+        }
+        PlatformV2Response::Refused(value) => Ok(json!({
+            "schema": SCHEMA,
+            "state": "refused",
+            "intent_id": intent_id.as_str(),
+            "category": value.category().as_str(),
+            "explanation": value.explanation().as_str()
+        })),
+        _ => Err("platform_v2_response_invalid"),
+    }
+}
+
+fn workspace_intent_result(
+    bridge: &PlatformV2Bridge,
+    intent_id: &WorkspaceIntentId,
+    expected_workspace: &UserWorkspaceId,
+    value: automonique_protocol::platform_v2_lineage::WorkspaceIntentOutcome,
+    allow_pending: bool,
+) -> Result<Value, &'static str> {
+    use automonique_protocol::platform_v2_lineage::WorkspaceIntentOutcome;
+
+    match &value {
+        WorkspaceIntentOutcome::Created(workspace) | WorkspaceIntentOutcome::Resumed(workspace)
+            if workspace != expected_workspace =>
+        {
+            return Err("platform_cockpit_intent_workspace_mismatch");
+        }
+        WorkspaceIntentOutcome::Accepted | WorkspaceIntentOutcome::Unknown if !allow_pending => {
+            return Ok(json!({
+                "schema": SCHEMA,
+                "state": "pending",
+                "intent_id": intent_id.as_str(),
+                "category": "platform_cockpit_intent_custody_pending"
+            }));
+        }
+        WorkspaceIntentOutcome::Cancelled(_) => {
+            return Err("platform_cockpit_intent_family_unavailable");
+        }
+        _ => {}
+    }
+    let negotiated = bridge.negotiate()?;
+    let document = stringify_integers(
+        serde_json::from_slice(
+            &encode_workspace_intent_outcome(&negotiated, &value)
+                .map_err(|_| "platform_cockpit_projection_invalid")?,
+        )
+        .map_err(|_| "platform_cockpit_projection_invalid")?,
+    );
+    Ok(json!({
+        "schema": SCHEMA,
+        "state": "receipt",
+        "intent_id": intent_id.as_str(),
+        "outcome": document
+    }))
+}
+
+fn get_workspace_intent(
+    bridge: &PlatformV2Bridge,
+    project_id: &str,
+    workspace_id: &str,
+    intent_id: &str,
+) -> Result<Value, &'static str> {
+    require_v2(bridge)?;
+    let project =
+        ProjectId::new(project_id.to_owned()).map_err(|_| "platform_cockpit_request_invalid")?;
+    let workspace = UserWorkspaceId::new(workspace_id.to_owned())
+        .map_err(|_| "platform_cockpit_request_invalid")?;
+    let intent_id = WorkspaceIntentId::new(intent_id.to_owned())
+        .map_err(|_| "platform_cockpit_request_invalid")?;
+    let capabilities = lifecycle_capabilities(bridge)?;
+    exact_workspace_record(bridge, &capabilities, &project, &workspace)?;
+    match existing_workspace_intent(bridge, project, intent_id.clone())? {
+        Some(value) => workspace_intent_result(bridge, &intent_id, &workspace, value, false),
+        None => Ok(json!({
+            "schema": SCHEMA,
+            "state": "missing",
+            "intent_id": intent_id.as_str(),
+            "category": "platform_v2_not_found"
+        })),
+    }
+}
+
+struct ReviewControlContext {
+    project: ProjectId,
+    workspace: WorkContextIdentity,
+    snapshot: ReviewSnapshot,
+}
+
+fn review_control_context(
+    bridge: &PlatformV2Bridge,
+    project_id: &str,
+    workspace_id: &str,
+    expected_revision: &str,
+) -> Result<ReviewControlContext, &'static str> {
+    require_v2(bridge)?;
+    let project =
+        ProjectId::new(project_id.to_owned()).map_err(|_| "platform_cockpit_request_invalid")?;
+    let workspace_id = UserWorkspaceId::new(workspace_id.to_owned())
+        .map_err(|_| "platform_cockpit_request_invalid")?;
+    let workspace = WorkContextIdentity::UserWorkspace(workspace_id.clone());
+    let capabilities = lifecycle_capabilities(bridge)?;
+    let record = exact_workspace_record(bridge, &capabilities, &project, &workspace_id)?;
+    if record.lifecycle() != WorkContextLifecycle::Active {
+        return Err("platform_cockpit_workspace_inactive");
+    }
+    let request = ReviewReadRequest::new(project.clone(), workspace.clone())
+        .map_err(|_| "platform_cockpit_request_invalid")?;
+    let snapshot = match bridge.request(PlatformV2Request::GetReview(request))? {
+        PlatformV2Response::ReviewResult(value) => value,
+        PlatformV2Response::Refused(_) => return Err("platform_cockpit_review_unavailable"),
+        _ => return Err("platform_v2_response_invalid"),
+    };
+    if snapshot.workspace() != &workspace
+        || snapshot.revision() != parse_revision(expected_revision)?
+        || !review_snapshot_is_fresh(&snapshot)
+    {
+        return Err("platform_cockpit_review_stale");
+    }
+    Ok(ReviewControlContext {
+        project,
+        workspace,
+        snapshot,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_comment(
+    bridge: &PlatformV2Bridge,
+    project_id: &str,
+    workspace_id: &str,
+    expected_revision: &str,
+    comment_id: &str,
+    file_id: &str,
+    hunk_id: &str,
+    side: CockpitDiffSide,
+    line: u32,
+    body: &str,
+    idempotency_key: &str,
+) -> Result<Value, &'static str> {
+    let context = review_control_context(bridge, project_id, workspace_id, expected_revision)?;
+    let action = ReviewAction::AddComment {
+        comment_id: ReviewCommentId::new(comment_id.to_owned())
+            .map_err(|_| "platform_cockpit_request_invalid")?,
+        anchor: ReviewAnchor::new(
+            ReviewFileId::new(file_id.to_owned())
+                .map_err(|_| "platform_cockpit_request_invalid")?,
+            ReviewHunkId::new(hunk_id.to_owned())
+                .map_err(|_| "platform_cockpit_request_invalid")?,
+            match side {
+                CockpitDiffSide::Old => DiffSide::Old,
+                CockpitDiffSide::New => DiffSide::New,
+            },
+            line,
+        )
+        .map_err(|_| "platform_cockpit_request_invalid")?,
+        body: ReviewText::new(body.to_owned()).map_err(|_| "platform_cockpit_request_invalid")?,
+    };
+    execute_review_action(
+        bridge,
+        context,
+        action,
+        IdempotencyKey::new(idempotency_key.to_owned())
+            .map_err(|_| "platform_cockpit_request_invalid")?,
+    )
+}
+
 fn approve_review(
     bridge: &PlatformV2Bridge,
+    project_id: &str,
     workspace_id: &str,
     expected_revision: &str,
     expected_review_revision: &str,
     idempotency_key: &str,
 ) -> Result<Value, &'static str> {
-    bridge.negotiate().and_then(|value| {
-        (value.version() == PlatformVersion::V2)
-            .then_some(())
-            .ok_or("platform_v2_not_negotiated")
-    })?;
-    let workspace = WorkContextIdentity::UserWorkspace(
-        UserWorkspaceId::new(workspace_id.to_owned())
-            .map_err(|_| "platform_cockpit_request_invalid")?,
-    );
-    let expected_revision = parse_revision(expected_revision)?;
+    let context = review_control_context(bridge, project_id, workspace_id, expected_revision)?;
+    let expected_review_revision = parse_revision(expected_review_revision)?;
+    if context.snapshot.review().freshness().observed_revision() != expected_review_revision
+        || context.snapshot.review().decision() != ReviewDecision::Pending
+    {
+        return Err("platform_cockpit_review_stale");
+    }
     let action = ReviewAction::ApproveReview {
-        expected_review_revision: parse_revision(expected_review_revision)?,
+        expected_review_revision,
     };
-    let request = ReviewActionTransportRequest::new(
-        workspace,
-        expected_revision,
+    execute_review_action(
+        bridge,
+        context,
         action,
         IdempotencyKey::new(idempotency_key.to_owned())
             .map_err(|_| "platform_cockpit_request_invalid")?,
+    )
+}
+
+fn execute_review_action(
+    bridge: &PlatformV2Bridge,
+    context: ReviewControlContext,
+    action: ReviewAction,
+    idempotency_key: IdempotencyKey,
+) -> Result<Value, &'static str> {
+    if let Some(receipt) = existing_review_receipt(
+        bridge,
+        context.project.clone(),
+        context.workspace.clone(),
+        idempotency_key.clone(),
+    )? {
+        return action_receipt(&receipt);
+    }
+    let request = ReviewActionTransportRequest::new(
+        context.workspace,
+        context.snapshot.revision(),
+        action,
+        idempotency_key,
     )
     .map_err(|_| "platform_cockpit_request_invalid")?;
     match bridge.request(PlatformV2Request::ExecuteReviewAction(request))? {
@@ -310,6 +1068,52 @@ fn approve_review(
             "explanation": value.explanation().as_str()
         })),
         _ => Err("platform_v2_response_invalid"),
+    }
+}
+
+fn existing_review_receipt(
+    bridge: &PlatformV2Bridge,
+    project: ProjectId,
+    workspace: WorkContextIdentity,
+    idempotency_key: IdempotencyKey,
+) -> Result<Option<ReviewActionReceipt>, &'static str> {
+    let lookup = ReviewReceiptLookup::new(project, workspace, idempotency_key)
+        .map_err(|_| "platform_cockpit_request_invalid")?;
+    match bridge.request(PlatformV2Request::GetReviewReceipt(lookup))? {
+        PlatformV2Response::ReviewReceipt(value) => Ok(Some(value)),
+        PlatformV2Response::Refused(value)
+            if value.category().as_str() == "platform_v2_not_found" =>
+        {
+            Ok(None)
+        }
+        PlatformV2Response::Refused(_) => Err("platform_cockpit_review_lookup_refused"),
+        _ => Err("platform_v2_response_invalid"),
+    }
+}
+
+fn get_review_receipt(
+    bridge: &PlatformV2Bridge,
+    project_id: &str,
+    workspace_id: &str,
+    idempotency_key: &str,
+) -> Result<Value, &'static str> {
+    require_v2(bridge)?;
+    let project =
+        ProjectId::new(project_id.to_owned()).map_err(|_| "platform_cockpit_request_invalid")?;
+    let workspace_id = UserWorkspaceId::new(workspace_id.to_owned())
+        .map_err(|_| "platform_cockpit_request_invalid")?;
+    let workspace = WorkContextIdentity::UserWorkspace(workspace_id.clone());
+    let capabilities = lifecycle_capabilities(bridge)?;
+    exact_workspace_record(bridge, &capabilities, &project, &workspace_id)?;
+    let idempotency_key = IdempotencyKey::new(idempotency_key.to_owned())
+        .map_err(|_| "platform_cockpit_request_invalid")?;
+    match existing_review_receipt(bridge, project, workspace, idempotency_key)? {
+        Some(value) => action_receipt(&value),
+        None => Ok(json!({
+            "schema": SCHEMA,
+            "state": "missing",
+            "category": "platform_v2_not_found"
+        })),
     }
 }
 
@@ -492,6 +1296,7 @@ fn attention_coverage(state: &str, category: Option<&str>, known: usize, total: 
 fn workspace_records(
     records: &[WorkContextRecord],
     attention: &BTreeMap<String, Value>,
+    selected_lineage: Option<&LineageProjection>,
 ) -> Vec<Value> {
     let checkouts: BTreeMap<_, _> = records
         .iter()
@@ -504,24 +1309,61 @@ fn workspace_records(
             )
         })
         .collect();
-    let attempts: BTreeMap<_, _> = records
+    let mut panes_by_session = BTreeMap::<String, Vec<Value>>::new();
+    for record in records
         .iter()
-        .filter(|record| record.kind() == WorkContextKind::AttemptWorkspace)
-        .filter_map(|record| {
-            relation(record, WorkContextRelationKind::AttemptUserWorkspace)
-                .map(|workspace| (record.identity().id().to_owned(), workspace.id().to_owned()))
-        })
-        .collect();
-    let sessions: BTreeMap<_, _> = records
+        .filter(|record| record.kind() == WorkContextKind::Pane)
+    {
+        if let Some(session) = relation(record, WorkContextRelationKind::PaneSession) {
+            panes_by_session
+                .entry(session.id().to_owned())
+                .or_default()
+                .push(base_record(record));
+        }
+    }
+    let mut sessions_by_attempt = BTreeMap::<String, Vec<Value>>::new();
+    for record in records
         .iter()
         .filter(|record| record.kind() == WorkContextKind::Session)
-        .filter_map(|record| {
-            let attempt = relation(record, WorkContextRelationKind::SessionAttemptWorkspace)?;
-            let workspace = attempts.get(attempt.id())?.clone();
-            let session = relation(record, WorkContextRelationKind::SessionPlatformSession)?;
-            Some((workspace, session.id().to_owned()))
-        })
-        .collect();
+    {
+        let Some(attempt) = relation(record, WorkContextRelationKind::SessionAttemptWorkspace)
+        else {
+            continue;
+        };
+        let platform_session = relation(record, WorkContextRelationKind::SessionPlatformSession);
+        let mut value = base_record(record);
+        value["platform_session_id"] = platform_session
+            .as_ref()
+            .map(WorkContextIdentity::id)
+            .into();
+        value["panes"] = panes_by_session
+            .remove(record.identity().id())
+            .unwrap_or_default()
+            .into();
+        sessions_by_attempt
+            .entry(attempt.id().to_owned())
+            .or_default()
+            .push(value);
+    }
+    let mut attempts_by_workspace = BTreeMap::<String, Vec<Value>>::new();
+    for record in records
+        .iter()
+        .filter(|record| record.kind() == WorkContextKind::AttemptWorkspace)
+    {
+        let Some(workspace) = relation(record, WorkContextRelationKind::AttemptUserWorkspace)
+        else {
+            continue;
+        };
+        let mut value = base_record(record);
+        value["sessions"] = sessions_by_attempt
+            .remove(record.identity().id())
+            .unwrap_or_default()
+            .into();
+        attempts_by_workspace
+            .entry(workspace.id().to_owned())
+            .or_default()
+            .push(value);
+    }
     records
         .iter()
         .filter(|record| record.kind() == WorkContextKind::UserWorkspace)
@@ -529,6 +1371,9 @@ fn workspace_records(
             let project = relation(record, WorkContextRelationKind::UserWorkspaceProject);
             let checkout = relation(record, WorkContextRelationKind::UserWorkspaceCheckout);
             let observation = attention.get(record.identity().id());
+            let lineage = selected_lineage
+                .filter(|lineage| lineage.workspace().as_str() == record.identity().id())
+                .map(lineage_read_model);
             json!({
                 "id": record.identity().id(),
                 "label": record.label().as_str(),
@@ -537,7 +1382,11 @@ fn workspace_records(
                 "project_id": project.as_ref().map(WorkContextIdentity::id),
                 "checkout_id": checkout.as_ref().map(WorkContextIdentity::id),
                 "host_id": checkout.as_ref().and_then(|value| checkouts.get(value.id())).cloned().flatten(),
-                "session_id": sessions.get(record.identity().id()),
+                "attempts": attempts_by_workspace.remove(record.identity().id()).unwrap_or_default(),
+                "task": lineage.as_ref().and_then(|value| value.get("task")).cloned().unwrap_or(Value::Null),
+                "external_work": lineage.as_ref().and_then(|value| value.get("external_work")).cloned().unwrap_or(Value::Null),
+                "internal_agent": lineage.as_ref().and_then(|value| value.get("internal_agent")).cloned().unwrap_or(Value::Null),
+                "lineage": lineage.unwrap_or(Value::Null),
                 "attention": observation
                     .and_then(|value| value.get("value"))
                     .cloned()
@@ -553,6 +1402,92 @@ fn workspace_records(
             })
         })
         .collect()
+}
+
+fn lineage_read_model(lineage: &LineageProjection) -> Value {
+    let external_work_items: Vec<Value> = lineage
+        .external_work_items()
+        .iter()
+        .map(|item| {
+            json!({
+                "identity": external_work_json(item.identity()),
+                "revision": item.revision().to_string(),
+                "state": item.state().as_str(),
+                "moved_to": item.moved_to().map(external_work_json),
+                "origin": lineage_origin_json(item.origin()),
+                "freshness": item.freshness().state().as_str(),
+                "observed_at": item.freshness().observed_at_ms().to_string(),
+                "latest_message": item.latest_useful_message().map(|message| message.text().as_str())
+            })
+        })
+        .collect();
+    let orchestration: Vec<Value> = lineage
+        .orchestration()
+        .iter()
+        .map(|item| {
+            json!({
+                "kind": item.identity().kind().as_str(),
+                "id": item.identity().id(),
+                "revision": item.revision().to_string(),
+                "parent": item.parent().map(|parent| json!({ "kind": parent.kind().as_str(), "id": parent.id() })),
+                "external_work": item.external_work().map(external_work_json),
+                "status": item.status().kind(),
+                "status_message": lineage_status_message(item.status()),
+                "origin": lineage_origin_json(item.origin()),
+                "freshness": item.freshness().state().as_str(),
+                "observed_at": item.freshness().observed_at_ms().to_string(),
+                "latest_message": item.latest_useful_message().map(|message| message.text().as_str())
+            })
+        })
+        .collect();
+    let external_work = (external_work_items.len() == 1).then(|| {
+        let item = &external_work_items[0];
+        json!({
+            "state": item["state"],
+            "freshness": item["freshness"],
+            "observed_at": item["observed_at"],
+            "reference": item["identity"]
+        })
+    });
+    let tasks: Vec<_> = lineage
+        .orchestration()
+        .iter()
+        .filter(|item| matches!(item.identity(), OrchestrationIdentity::Task(_)))
+        .collect();
+    let task = (tasks.len() == 1).then(|| tasks[0]);
+    let internal_agent = task.map(|item| {
+        json!({
+            "state": item.status().kind(),
+            "freshness": item.freshness().state().as_str(),
+            "observed_at": item.freshness().observed_at_ms().to_string(),
+            "reference": { "kind": item.identity().kind().as_str(), "id": item.identity().id() }
+        })
+    });
+    json!({
+        "external_work_items": external_work_items,
+        "orchestration": orchestration,
+        "task": task.map(|item| item.identity().id()),
+        "external_work": external_work,
+        "internal_agent": internal_agent
+    })
+}
+
+fn lineage_origin_json(origin: &automonique_protocol::platform_v2_lineage::LineageOrigin) -> Value {
+    json!({
+        "workspace": origin.workspace().as_str(),
+        "attempt": origin.attempt().map(|value| value.as_str()),
+        "session": origin.session().map(|value| value.as_str()),
+        "pane": origin.pane().map(|value| value.as_str())
+    })
+}
+
+fn lineage_status_message(status: &LineageStatus) -> Option<&str> {
+    match status {
+        LineageStatus::Working => None,
+        LineageStatus::Blocked(message)
+        | LineageStatus::Waiting(message)
+        | LineageStatus::Done(message) => Some(message.as_str()),
+    }
 }
 
 fn base_record(record: &WorkContextRecord) -> Value {
@@ -596,7 +1531,7 @@ fn stringify_integers(value: Value) -> Value {
     }
 }
 
-fn fallback(retained_v1: Value, category: &str) -> Value {
+fn v1_fallback(retained_v1: Value, category: &str) -> Value {
     json!({
         "schema": SCHEMA,
         "mode": "v1",
@@ -619,6 +1554,17 @@ fn fallback(retained_v1: Value, category: &str) -> Value {
     })
 }
 
+fn v2_unavailable(retained_v1: Value, category: &str) -> Value {
+    let mut value = v1_fallback(retained_v1, category);
+    value["mode"] = json!("partial");
+    value["degradation"] = json!({
+        "platform": "v2",
+        "state": "unavailable",
+        "category": category
+    });
+    value
+}
+
 fn unavailable(category: &str) -> Value {
     json!({ "state": "unavailable", "category": category })
 }
@@ -632,6 +1578,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cockpit_control_documents_reject_unknown_or_generic_execution_fields() {
+        let unknown = serde_json::from_value::<CockpitRequest>(json!({
+            "action": "get_workspace_intent",
+            "project_id": "project-test",
+            "workspace_id": "workspace-test",
+            "intent_id": "intent-test",
+            "actor": "browser-asserted"
+        }));
+        assert!(unknown.is_err());
+        let generic = serde_json::from_value::<CockpitRequest>(json!({
+            "action": "execute",
+            "command": "anything"
+        }));
+        assert!(generic.is_err());
+    }
+
+    #[test]
+    fn workspace_project_custody_is_exact_and_cross_project_fails_closed() {
+        use automonique_protocol::platform_v2::{
+            WorkContextAttributes, WorkContextLabel, WorkContextRelation, WorkContextTargetKind,
+        };
+
+        let project_a = ProjectId::new("project-a").unwrap();
+        let project_b = ProjectId::new("project-b").unwrap();
+        let record = WorkContextRecord::new(
+            WorkContextIdentity::UserWorkspace(UserWorkspaceId::new("workspace-a").unwrap()),
+            Revision::FIRST,
+            WorkContextLifecycle::Active,
+            WorkContextLabel::new("Workspace A").unwrap(),
+            WorkContextAttributes::EMPTY,
+            vec![
+                WorkContextRelation::new(
+                    WorkContextRelationKind::UserWorkspaceProject,
+                    WorkContextIdentity::Project(project_a.clone()),
+                )
+                .unwrap(),
+                WorkContextRelation::new(
+                    WorkContextRelationKind::UserWorkspaceCheckout,
+                    WorkContextIdentity::parse_local(WorkContextTargetKind::Checkout, "checkout-a")
+                        .unwrap(),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        assert!(workspace_matches_project(&record, &project_a));
+        assert!(!workspace_matches_project(&record, &project_b));
+        assert_ne!(record.revision(), Revision::new(2).unwrap());
+    }
+
+    #[test]
     fn integer_projection_is_lossless_for_javascript_clients() {
         let value =
             stringify_integers(json!({ "revision": 9_007_199_254_740_995_u64, "items": [7] }));
@@ -641,13 +1638,17 @@ mod tests {
 
     #[test]
     fn fallback_never_fabricates_v2_inventory() {
-        let value = fallback(
+        let value = v1_fallback(
             json!({ "sessions": [{ "summary": "working on a branch" }] }),
             "unavailable",
         );
         assert_eq!(value["mode"], "v1");
         assert_eq!(value["workspaces"], json!([]));
         assert_eq!(value["actions"]["lifecycle"]["available"], false);
+        let unavailable = v2_unavailable(json!({ "sessions": [] }), "v2_down");
+        assert_eq!(unavailable["mode"], "partial");
+        assert_eq!(unavailable["degradation"]["platform"], "v2");
+        assert_eq!(unavailable["degradation"]["state"], "unavailable");
     }
 
     #[test]
@@ -673,6 +1674,8 @@ mod tests {
         let installed = lifecycle_actions(
             &capabilities,
             Some(&WorkContextIdentity::Project(project.clone())),
+            None,
+            None,
         );
         assert_eq!(installed["available"], true);
         assert_eq!(
@@ -708,6 +1711,8 @@ mod tests {
         let absent = lifecycle_actions(
             &absent_capabilities,
             Some(&WorkContextIdentity::Project(project)),
+            None,
+            None,
         );
         assert_eq!(absent["available"], false);
         assert_eq!(
@@ -774,6 +1779,11 @@ mod tests {
     #[test]
     fn work_context_inventory_accepts_the_bound_and_refuses_overflow() {
         assert_eq!(
+            verify_inventory_capacity(WORK_CONTEXT_PAGE_LIMIT as usize * 4, 1),
+            Ok(()),
+            "a fifth page must remain accepted beyond 512 records"
+        );
+        assert_eq!(
             verify_inventory_capacity(MAX_COCKPIT_WORK_CONTEXTS - 128, 128),
             Ok(())
         );
@@ -785,5 +1795,227 @@ mod tests {
             verify_inventory_capacity(usize::MAX, usize::MAX),
             Err(String::from("platform_v2_inventory_exceeds_bound"))
         );
+    }
+
+    #[test]
+    fn hierarchy_preserves_attempt_session_and_pane_siblings_beyond_512_records() {
+        use automonique_protocol::platform::{
+            ResourceAuthority, ResourceCoordinate, ResourceId, ResourceKind,
+        };
+        use automonique_protocol::platform_v2::{
+            V1SessionRef, WorkContextAttributes, WorkContextLabel, WorkContextRelation,
+            WorkContextTargetKind,
+        };
+
+        let project = WorkContextIdentity::Project(ProjectId::new("project-hierarchy").unwrap());
+        let checkout =
+            WorkContextIdentity::parse_local(WorkContextTargetKind::Checkout, "checkout-hierarchy")
+                .unwrap();
+        let workspace = WorkContextIdentity::UserWorkspace(
+            UserWorkspaceId::new("workspace-hierarchy").unwrap(),
+        );
+        let mut records = vec![
+            WorkContextRecord::new(
+                workspace.clone(),
+                Revision::FIRST,
+                WorkContextLifecycle::Active,
+                WorkContextLabel::new("Workspace hierarchy").unwrap(),
+                WorkContextAttributes::EMPTY,
+                vec![
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::UserWorkspaceProject,
+                        project,
+                    )
+                    .unwrap(),
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::UserWorkspaceCheckout,
+                        checkout,
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap(),
+        ];
+        for index in 0..128 {
+            let attempt = WorkContextIdentity::parse_local(
+                WorkContextTargetKind::AttemptWorkspace,
+                &format!("attempt-{index:03}"),
+            )
+            .unwrap();
+            let session = WorkContextIdentity::parse_local(
+                WorkContextTargetKind::Session,
+                &format!("runtime-session-{index:03}"),
+            )
+            .unwrap();
+            records.push(
+                WorkContextRecord::new(
+                    attempt.clone(),
+                    Revision::FIRST,
+                    WorkContextLifecycle::Running,
+                    WorkContextLabel::new(format!("Attempt {index:03}")).unwrap(),
+                    WorkContextAttributes::EMPTY,
+                    vec![
+                        WorkContextRelation::new(
+                            WorkContextRelationKind::AttemptUserWorkspace,
+                            workspace.clone(),
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+            );
+            records.push(
+                WorkContextRecord::new(
+                    session.clone(),
+                    Revision::FIRST,
+                    WorkContextLifecycle::Active,
+                    WorkContextLabel::new(format!("Session {index:03}")).unwrap(),
+                    WorkContextAttributes::EMPTY,
+                    vec![
+                        WorkContextRelation::new(
+                            WorkContextRelationKind::SessionAttemptWorkspace,
+                            attempt,
+                        )
+                        .unwrap(),
+                        WorkContextRelation::new(
+                            WorkContextRelationKind::SessionPlatformSession,
+                            WorkContextIdentity::PlatformSession(
+                                V1SessionRef::new(ResourceCoordinate::new(
+                                    ResourceAuthority::Automonique,
+                                    ResourceKind::Session,
+                                    ResourceId::new(format!("platform-session-{index:03}"))
+                                        .unwrap(),
+                                ))
+                                .unwrap(),
+                            ),
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+            );
+            for pane_index in 0..2 {
+                records.push(
+                    WorkContextRecord::new(
+                        WorkContextIdentity::parse_local(
+                            WorkContextTargetKind::Pane,
+                            &format!("pane-{index:03}-{pane_index}"),
+                        )
+                        .unwrap(),
+                        Revision::FIRST,
+                        WorkContextLifecycle::Active,
+                        WorkContextLabel::new(format!("Pane {index:03}-{pane_index}")).unwrap(),
+                        WorkContextAttributes::EMPTY,
+                        vec![
+                            WorkContextRelation::new(
+                                WorkContextRelationKind::PaneSession,
+                                session.clone(),
+                            )
+                            .unwrap(),
+                        ],
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+        assert_eq!(records.len(), 513);
+        let projection = workspace_records(&records, &BTreeMap::new(), None);
+        let attempts = projection[0]["attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), 128);
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt["sessions"].as_array().unwrap().len())
+                .sum::<usize>(),
+            128
+        );
+        assert_eq!(
+            attempts
+                .iter()
+                .flat_map(|attempt| attempt["sessions"].as_array().unwrap())
+                .map(|session| session["panes"].as_array().unwrap().len())
+                .sum::<usize>(),
+            256
+        );
+    }
+
+    #[test]
+    fn lineage_read_model_preserves_external_and_orchestration_meaning() {
+        use automonique_protocol::platform_v2_lineage::{
+            ExternalWorkItem, LineageFreshness, LineageMessage, LineageStatus, OrchestrationRecord,
+            OrchestrationRunId,
+        };
+
+        let workspace = UserWorkspaceId::new("workspace-lineage").unwrap();
+        let identity = ExternalWorkIdentity::new(
+            ExternalWorkProvider::GitHub,
+            ExternalWorkAuthorityId::new("github.com").unwrap(),
+            ExternalWorkScope::new("owner/repository").unwrap(),
+            ExternalWorkKey::new("42").unwrap(),
+        );
+        let freshness = LineageFreshness::new(123, 60_000, LineageFreshnessState::Fresh).unwrap();
+        let external = ExternalWorkItem::new(
+            identity.clone(),
+            workspace.clone(),
+            Revision::FIRST,
+            ExternalWorkState::Open,
+            None,
+            freshness,
+            None,
+        )
+        .unwrap();
+        let run_identity = OrchestrationIdentity::Run(OrchestrationRunId::new("run-42").unwrap());
+        let run = OrchestrationRecord::new(
+            run_identity.clone(),
+            workspace.clone(),
+            Some(identity.clone()),
+            None,
+            LineageStatus::Working,
+            freshness,
+            None,
+        )
+        .unwrap();
+        let task = OrchestrationRecord::new(
+            OrchestrationIdentity::Task(OrchestrationTaskId::new("task-42").unwrap()),
+            workspace.clone(),
+            Some(identity),
+            Some(run_identity),
+            LineageStatus::Blocked(LineageMessage::new("awaiting review").unwrap()),
+            freshness,
+            None,
+        )
+        .unwrap();
+        let projection =
+            LineageProjection::new(workspace, vec![external], vec![run, task]).unwrap();
+        let value = lineage_read_model(&projection);
+        assert_eq!(value["task"], "task-42");
+        assert_eq!(value["external_work"]["state"], "open");
+        assert_eq!(value["external_work"]["freshness"], "fresh");
+        assert_eq!(
+            value["external_work_items"][0]["origin"]["workspace"],
+            "workspace-lineage"
+        );
+        assert_eq!(value["external_work_items"][0]["moved_to"], Value::Null);
+        assert_eq!(
+            value["external_work"]["reference"],
+            json!({
+                "provider": "github",
+                "authority": "github.com",
+                "scope": "owner/repository",
+                "key": "42"
+            })
+        );
+        assert_eq!(value["internal_agent"]["state"], "blocked");
+        assert_eq!(value["internal_agent"]["reference"]["kind"], "task");
+        let orchestration = value["orchestration"].as_array().unwrap();
+        let task = orchestration
+            .iter()
+            .find(|record| record["kind"] == "task")
+            .unwrap();
+        assert_eq!(task["status"], "blocked");
+        assert_eq!(task["status_message"], "awaiting review");
+        assert_eq!(task["origin"]["workspace"], "workspace-lineage");
+        assert_eq!(task["parent"]["kind"], "run");
+        assert_eq!(task["parent"]["id"], "run-42");
     }
 }

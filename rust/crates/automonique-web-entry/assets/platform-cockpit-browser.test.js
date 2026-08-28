@@ -45,14 +45,19 @@ test("workspace shell exposes accessible tabs, live receipt state, and keyboard 
   expect(css).toContain("button:focus-visible");
 });
 
-test("preview controls cannot call a create or resume backend route", () => {
+test("preview is inert and confirmed controls persist their receipt before sending", () => {
   const start = script.indexOf("function previewCockpitAction(action)");
-  const end = script.indexOf('byId("cockpit-create-preview")', start);
+  const end = script.indexOf("function newCockpitReceiptId", start);
   const preview = script.slice(start, end);
   expect(preview).toContain("no mutation sent");
   expect(preview).not.toContain("fetch(");
   expect(preview).not.toContain("api(");
   expect(preview).not.toContain("platformPost(");
+  const submitStart = script.indexOf("async function submitCockpitIntent(action)");
+  const submitEnd = script.indexOf("async function submitCockpitReview", submitStart);
+  const submit = script.slice(submitStart, submitEnd);
+  expect(submit.indexOf("persistCockpitControl(handle)")).toBeLessThan(submit.indexOf('api("/api/platform/cockpit"'));
+  expect(script).toContain("Only receipt lookup is allowed now");
   expect(html).toContain('id="cockpit-create-preview" type="button" disabled');
   expect(html).toContain('id="cockpit-resume-preview" type="button" disabled');
 });

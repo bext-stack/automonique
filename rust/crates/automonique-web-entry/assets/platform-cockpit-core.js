@@ -7,7 +7,9 @@
   const WORKSPACE_ATTENTION_STATES = Object.freeze(["idle", ...ATTENTION_STATES]);
   const SURFACES = Object.freeze(["conversation", "files", "activity"]);
   const RECEIPT_STATES = Object.freeze(["idle", "pending", "refused", "ambiguous", "completed"]);
+  const CONTROL_FAMILIES = Object.freeze(["workspace_intent", "review_action"]);
   const LINK_KEYS = Object.freeze(["workspace", "session", "pane", "file", "hunk", "side", "line"]);
+  const MAX_LINEAGE_RECORDS = 128;
 
   function validDecimal(value, allowZero = true) {
     return typeof value === "string"
@@ -58,7 +60,128 @@
       freshness,
       unread: Number.isSafeInteger(value.unread) && value.unread >= 0 ? value.unread : null,
       observed_at: boundedText(value.observed_at, 64),
-      reference: boundedText(value.reference, 256),
+      reference: normalizeReference(value.reference),
+    });
+  }
+
+  function normalizeReference(value) {
+    if (typeof value === "string") return boundedText(value, 256);
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const entries = Object.entries(value);
+    if (entries.length === 0 || entries.length > 8) return null;
+    const normalized = {};
+    for (const [key, item] of entries) {
+      if (!/^[a-z_]{1,32}$/.test(key)) return null;
+      const text = boundedText(item, 256);
+      if (!text) return null;
+      normalized[key] = text;
+    }
+    return Object.freeze(normalized);
+  }
+
+  function normalizeExternalIdentity(value) {
+    const provider = explicitEnum(value?.provider, ["github", "gitlab", "linear", "jira_compatible"]);
+    const authority = boundedText(value?.authority, 256);
+    const scope = boundedText(value?.scope, 256);
+    const key = boundedText(value?.key, 256);
+    return provider && authority && scope && key
+      ? Object.freeze({ provider, authority, scope, key }) : null;
+  }
+
+  function normalizeOrigin(value) {
+    const workspace = boundedText(value?.workspace, 256);
+    const attempt = boundedText(value?.attempt, 256);
+    const session = boundedText(value?.session, 256);
+    const pane = boundedText(value?.pane, 256);
+    if (!workspace || (session && !attempt) || (pane && !session)) return null;
+    return Object.freeze({ workspace, attempt, session, pane });
+  }
+
+  function normalizeExternalWorkItem(value) {
+    const identity = normalizeExternalIdentity(value?.identity);
+    const movedTo = normalizeExternalIdentity(value?.moved_to);
+    const state = explicitEnum(value?.state, ["open", "moved", "closed"]);
+    const freshness = explicitEnum(value?.freshness, ["fresh", "stale"]);
+    const origin = normalizeOrigin(value?.origin);
+    if (!identity || !state || !freshness || !origin || !validDecimal(value?.revision, false)
+      || !validDecimal(value?.observed_at, false) || (state === "moved") !== Boolean(movedTo)) return null;
+    return Object.freeze({
+      identity, moved_to: movedTo, state, freshness, origin,
+      revision: value.revision,
+      observed_at: value.observed_at,
+      latest_message: boundedText(value.latest_message, 2048),
+    });
+  }
+
+  function normalizeOrchestrationRecord(value) {
+    const kind = explicitEnum(value?.kind, ["run", "task", "dispatch", "worker", "heartbeat", "question", "decision_gate"]);
+    const id = boundedText(value?.id, 256);
+    const status = explicitEnum(value?.status, ["working", "blocked", "waiting", "done"]);
+    const freshness = explicitEnum(value?.freshness, ["fresh", "stale"]);
+    const origin = normalizeOrigin(value?.origin);
+    const parent = value?.parent == null ? null : normalizeReference(value.parent);
+    const externalWork = value?.external_work == null ? null : normalizeExternalIdentity(value.external_work);
+    const statusMessage = boundedText(value?.status_message, 2048);
+    if (!kind || !id || !status || !freshness || !origin || !validDecimal(value?.revision, false)
+      || !validDecimal(value?.observed_at, false) || (value?.parent != null && !parent)
+      || (value?.external_work != null && !externalWork)
+      || (status === "working" ? statusMessage !== null : statusMessage === null)) return null;
+    return Object.freeze({
+      kind, id, status, status_message: statusMessage, freshness, origin,
+      parent, external_work: externalWork,
+      revision: value.revision,
+      observed_at: value.observed_at,
+      latest_message: boundedText(value.latest_message, 2048),
+    });
+  }
+
+  function normalizeLineage(value) {
+    if (!value || typeof value !== "object" || !Array.isArray(value.external_work_items)
+      || !Array.isArray(value.orchestration)
+      || value.external_work_items.length + value.orchestration.length > MAX_LINEAGE_RECORDS) return null;
+    const externalWorkItems = value.external_work_items.map(normalizeExternalWorkItem);
+    const orchestration = value.orchestration.map(normalizeOrchestrationRecord);
+    if (externalWorkItems.some((item) => !item) || orchestration.some((item) => !item)) return null;
+    return Object.freeze({
+      external_work_items: Object.freeze(externalWorkItems),
+      orchestration: Object.freeze(orchestration),
+    });
+  }
+
+  function normalizePane(value) {
+    const id = boundedText(value?.id, 256);
+    return id ? Object.freeze({
+      id,
+      label: boundedText(value.label, 256) || id,
+      revision: validDecimal(value.revision, false) ? value.revision : null,
+      lifecycle: boundedText(value.lifecycle, 32),
+    }) : null;
+  }
+
+  function normalizeSession(value) {
+    const id = boundedText(value?.id, 256);
+    if (!id) return null;
+    const panes = Array.isArray(value.panes) ? value.panes.map(normalizePane).filter(Boolean) : [];
+    return Object.freeze({
+      id,
+      label: boundedText(value.label, 256) || id,
+      revision: validDecimal(value.revision, false) ? value.revision : null,
+      lifecycle: boundedText(value.lifecycle, 32),
+      platform_session_id: boundedText(value.platform_session_id, 256),
+      panes: Object.freeze(panes),
+    });
+  }
+
+  function normalizeAttempt(value) {
+    const id = boundedText(value?.id, 256);
+    if (!id) return null;
+    const sessions = Array.isArray(value.sessions) ? value.sessions.map(normalizeSession).filter(Boolean) : [];
+    return Object.freeze({
+      id,
+      label: boundedText(value.label, 256) || id,
+      revision: validDecimal(value.revision, false) ? value.revision : null,
+      lifecycle: boundedText(value.lifecycle, 32),
+      sessions: Object.freeze(sessions),
     });
   }
 
@@ -66,17 +189,22 @@
     if (!value || typeof value !== "object") return null;
     const id = boundedText(value.id, 256);
     if (!id) return null;
+    const attempts = Array.isArray(value.attempts) ? value.attempts.map(normalizeAttempt).filter(Boolean) : [];
+    const sessionIds = attempts.flatMap((attempt) => attempt.sessions.map((session) => session.platform_session_id).filter(Boolean));
     return Object.freeze({
       id,
       project_id: boundedText(value.project_id, 256),
       host_id: boundedText(value.host_id, 256),
-      session_id: boundedText(value.session_id, 256),
+      session_id: sessionIds.length === 1 ? sessionIds[0] : null,
+      session_ids: Object.freeze(sessionIds),
+      attempts: Object.freeze(attempts),
       label: boundedText(value.label, 256) || id,
       task: boundedText(value.task, 2048),
       branch: boundedText(value.branch, 512),
       attention: explicitEnum(value.attention, WORKSPACE_ATTENTION_STATES),
-      external_work: normalizeSignal(value.external_work, ["open", "in_review", "merged", "closed", "unknown"]),
-      internal_agent: normalizeSignal(value.internal_agent, ["idle", "queued", "running", "waiting", "failed", "completed", "unknown"]),
+      external_work: normalizeSignal(value.external_work, ["open", "moved", "closed"]),
+      internal_agent: normalizeSignal(value.internal_agent, ["working", "blocked", "waiting", "done"]),
+      lineage: normalizeLineage(value.lineage),
       revision: validDecimal(value.revision, false) ? value.revision : null,
     });
   }
@@ -119,6 +247,45 @@
     });
   }
 
+  function controlCapability(document, family, operation) {
+    const capability = family === "workspace_intent"
+      ? document?.actions?.lifecycle?.operations?.[operation]
+      : document?.actions?.review?.operations?.[operation];
+    const taskId = family === "workspace_intent" ? boundedText(capability?.task_id, 256) : null;
+    const externalWork = family === "workspace_intent" && operation === "create_attempt_workspace"
+      ? normalizeExternalIdentity(capability?.external_work) : null;
+    const available = capability?.available === true
+      && (family === "workspace_intent"
+        ? capability.submit_operation === "submit_workspace_intent"
+          && capability.receipt_operation === "get_workspace_intent"
+        : capability.execute_operation === "execute_review_action"
+          && capability.receipt_operation === "get_review_receipt")
+      && boundedText(capability.project_id, 256)
+      && boundedText(capability.workspace_id, 256)
+      && validDecimal(capability.exact_revision, false)
+      && (family !== "workspace_intent" || Boolean(taskId))
+      && (operation !== "create_attempt_workspace" || Boolean(externalWork));
+    return Object.freeze({
+      available: available === true,
+      reason: available ? null : boundedText(capability?.category, 128)
+        || boundedText(family === "workspace_intent" ? document?.actions?.lifecycle?.category : document?.actions?.review?.category, 128)
+        || "platform_cockpit_control_unavailable",
+      family,
+      operation,
+      project_id: available ? capability.project_id : null,
+      workspace_id: available ? capability.workspace_id : null,
+      exact_revision: available ? capability.exact_revision : null,
+      exact_review_revision: available && validDecimal(capability.exact_review_revision, false)
+        ? capability.exact_review_revision : null,
+      task_id: available ? taskId : null,
+      external_work: available ? externalWork : null,
+    });
+  }
+
+  function disabledCapability(capability, reason) {
+    return Object.freeze({ ...capability, available: false, reason });
+  }
+
   function lifecycleStatus(localLifecycle) {
     const host = localLifecycle?.createHostSetup || {};
     const checkout = localLifecycle?.createCheckout || {};
@@ -153,8 +320,11 @@
   }
 
   function partialReasons(document, selectedWorkspace) {
-    if (document?.mode !== "v2") return [];
+    if (!["v2", "partial"].includes(document?.mode)) return [];
     const reasons = [];
+    if (document.mode === "partial") {
+      reasons.push(boundedText(document?.degradation?.category, 128) || "platform_v2_unavailable");
+    }
     if (selectedWorkspace) {
       ["lineage", "review"].forEach((name) => {
         const projection = document?.[name];
@@ -180,14 +350,16 @@
     const workspaces = structured && Array.isArray(document.workspaces) ? document.workspaces.map(normalizeWorkspace).filter(Boolean) : [];
     const workspaceId = boundedText(selection.workspace, 256) || boundedText(document?.selected?.workspace, 256);
     const sessionId = boundedText(selection.session, 256) || boundedText(document?.selected?.session, 256);
+    const paneId = boundedText(selection.pane, 256);
     const selectedWorkspace = workspaces.find((item) => item.id === workspaceId)
-      || workspaces.find((item) => item.session_id === sessionId)
+      || workspaces.find((item) => sessionId && item.session_ids.includes(sessionId))
+      || workspaces.find((item) => paneId && item.attempts.some((attempt) => attempt.sessions.some((session) => session.panes.some((pane) => pane.id === paneId))))
       || workspaces[0]
       || null;
     const reasons = partialReasons(document, selectedWorkspace);
-    const v2 = structured && document.mode === "v2";
+    const v2 = structured && ["v2", "partial"].includes(document.mode);
     const attentionAvailable = v2 && document?.attention?.state === "available";
-    const mode = v2 ? (reasons.length === 0 ? "v2" : "partial") : "v1";
+    const mode = v2 ? (document.mode === "partial" || reasons.length > 0 ? "partial" : "v2") : "v1";
     const degradation = mode === "v1"
       ? `Platform v1: workspace context is unavailable (${boundedText(document?.degradation?.category, 128) || "Platform v2 unavailable"}). Retained sessions remain available.`
       : mode === "partial"
@@ -196,6 +368,11 @@
     const activities = structured && Array.isArray(document.activities)
       ? document.activities.map(normalizeActivity).filter(Boolean).sort((left, right) => left.at.localeCompare(right.at) || left.id.localeCompare(right.id))
       : [];
+    const writesAvailable = mode === "v2" && !freshnessStates(document).includes("stale");
+    const create = controlCapability(document, "workspace_intent", "create_attempt_workspace");
+    const resume = controlCapability(document, "workspace_intent", "resume_attempt_workspace");
+    const addComment = controlCapability(document, "review_action", "add_comment");
+    const approveReview = controlCapability(document, "review_action", "approve_review");
     return Object.freeze({
       mode,
       degradation,
@@ -208,8 +385,12 @@
       attention: Object.freeze(Object.fromEntries(ATTENTION_STATES.map((state) => [state, attentionAvailable ? workspaces.filter((item) => item.attention === state).length : null]))),
       activities: Object.freeze(activities),
       receipt: normalizeReceipt(document?.receipt),
-      create: mutationCapability(document, "create_attempt_workspace"),
-      resume: mutationCapability(document, "resume_attempt_workspace"),
+      create: writesAvailable ? create : disabledCapability(create, "platform_cockpit_projection_incomplete_or_stale"),
+      resume: writesAvailable ? resume : disabledCapability(resume, "platform_cockpit_projection_incomplete_or_stale"),
+      reviewActions: Object.freeze({
+        addComment: writesAvailable ? addComment : disabledCapability(addComment, "platform_cockpit_projection_incomplete_or_stale"),
+        approveReview: writesAvailable ? approveReview : disabledCapability(approveReview, "platform_cockpit_projection_incomplete_or_stale"),
+      }),
       localLifecycle: Object.freeze({
         createHostSetup: mutationCapability(document, "create_host_setup"),
         createCheckout: mutationCapability(document, "create_checkout"),
@@ -237,7 +418,7 @@
       const value = cleanLinkValue(params.get(key));
       if (value) result[key] = value;
     });
-    const anchorComplete = result.file && result.hunk && ["base", "head"].includes(result.side) && validDecimal(result.line, false);
+    const anchorComplete = result.file && result.hunk && ["old", "new"].includes(result.side) && validDecimal(result.line, false);
     if (!anchorComplete) ["file", "hunk", "side", "line"].forEach((key) => delete result[key]);
     return Object.freeze(result);
   }
@@ -249,7 +430,7 @@
       if (value) params.set(key, value);
     });
     const anchorComplete = cleanLinkValue(link?.file) && cleanLinkValue(link?.hunk)
-      && ["base", "head"].includes(link?.side) && validDecimal(link?.line, false);
+      && ["old", "new"].includes(link?.side) && validDecimal(link?.line, false);
     if (anchorComplete) ["file", "hunk", "side", "line"].forEach((key) => params.set(key, link[key]));
     const query = params.toString();
     return `#sessions${query ? `?${query}` : ""}`;
@@ -267,6 +448,52 @@
       receipt: normalizeReceipt(null),
       preview: null,
     });
+  }
+
+  function validControlHandle(value) {
+    if (!value || typeof value !== "object" || !CONTROL_FAMILIES.includes(value.family)) return null;
+    const action = boundedText(value.action, 64);
+    const projectId = boundedText(value.project_id, 256);
+    const workspaceId = boundedText(value.workspace_id, 256);
+    const receiptId = boundedText(value.receipt_id, 256);
+    if (!action || !projectId || !workspaceId || !receiptId) return null;
+    return Object.freeze({
+      version: 1,
+      family: value.family,
+      action,
+      project_id: projectId,
+      workspace_id: workspaceId,
+      receipt_id: receiptId,
+    });
+  }
+
+  function prepareControlHandle(capability, action, receiptId) {
+    if (capability?.available !== true || !CONTROL_FAMILIES.includes(capability.family)) return null;
+    return validControlHandle({
+      family: capability.family,
+      action,
+      project_id: capability.project_id,
+      workspace_id: capability.workspace_id,
+      receipt_id: receiptId,
+    });
+  }
+
+  function serializeControlHandle(value) {
+    const handle = validControlHandle(value);
+    return handle ? JSON.stringify(handle) : null;
+  }
+
+  function parseControlHandle(value) {
+    if (typeof value !== "string" || value.length > 2048) return null;
+    try {
+      return validControlHandle(JSON.parse(value));
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function controlRecoveryDirective(handle) {
+    return validControlHandle(handle) ? "lookup_only" : "may_submit";
   }
 
   function reduce(state, event) {
@@ -307,13 +534,17 @@
     ATTENTION_STATES,
     browserProfile,
     buildDeepLink,
+    controlRecoveryDirective,
     decimalGreater,
     derivePresentation,
     initialState,
     lifecycleStatus,
+    parseControlHandle,
     parseDeepLink,
     receiptDirective,
+    prepareControlHandle,
     reduce,
+    serializeControlHandle,
     validDecimal,
   });
 })(globalThis);
