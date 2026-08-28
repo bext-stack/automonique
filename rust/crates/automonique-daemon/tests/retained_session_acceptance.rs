@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use automonique_daemon::managed_sessions::ManagedSessionStore;
+use automonique_daemon::managed_sessions::{ManagedHistorySource, ManagedSessionStore};
 use automonique_daemon::{Daemon, DaemonConfig};
 use automonique_platform_client::{
     ActionResult, ControlClaimResult, PlatformClient, SessionHistoryResult, UnixTransport,
@@ -303,7 +303,7 @@ fn one_retained_session_survives_three_scoped_clients_ambiguity_and_reconnect() 
     sessions
         .record_completed_turn(
             SESSION_ID,
-            "acceptance-turn-1",
+            ManagedHistorySource::PlatformV1("acceptance-turn-1"),
             "operator follow-up\0normalized",
             "bounded sanitized answer",
             &spool_events,

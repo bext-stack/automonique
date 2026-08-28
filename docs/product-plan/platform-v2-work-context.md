@@ -398,11 +398,20 @@ only local `create_host_setup` and `create_checkout` through the existing typed
 `prepare_mutation` preview and `get_mutation_receipt` reconciliation operations.
 An absent, changed, or refused registry leaves those operations unavailable,
 and the preview's exact parent revisions plus preview digest/approval and receipt
-lookup fences remain authoritative. Review action requests preserve
-the exact selected workspace, expected snapshot/review revisions, and
-idempotency key on the typed v2 request, but remain visibly unavailable while
-the daemon returns `platform_v2_review_adapter_pending`. These are integration
-gaps, not browser capabilities.
+lookup fences remain authoritative. Review action requests preserve the exact
+selected workspace, expected snapshot/review revisions, and idempotency key on
+the typed v2 request. The daemon now executes exact single/batch comment
+delivery when an operator-owned `jcode` retained-session binding passes
+work-session lineage, managed-session revision, registry generation,
+durable-plan, exact-comment reservation, and full scheduler-coordinate
+reconciliation checks. The dedicated scheduler lane repeats every mutable
+registry/work/provider fence immediately before provider custody and retains
+ambiguity instead of replaying when its durable run evidence cannot prove that
+nothing started. The web cockpit still
+keeps that action visibly unavailable until its own confirmation and
+receipt-polling path is wired; git, CI, and pull-request effects remain
+server-unavailable. These remaining items are integration gaps, not browser
+capabilities.
 
 Within a negotiated v2 response, lineage, review, and attention availability
 remain independent. Any selected-workspace refusal, incomplete attention

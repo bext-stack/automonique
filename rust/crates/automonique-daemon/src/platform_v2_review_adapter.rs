@@ -17,7 +17,9 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use automonique_protocol::digest::{Sha256, Sha256Digest};
-use automonique_protocol::platform_v2::{ProjectId, WorkContextIdentity, WorkContextTargetKind};
+use automonique_protocol::platform_v2::{
+    ProjectId, WorkContextIdentity, WorkContextTargetKind, WorkSessionId,
+};
 use automonique_protocol::platform_v2_review::{
     ReviewAction, ReviewAuthority, ReviewAuthorityId, ReviewAuthorityKind,
 };
@@ -76,6 +78,7 @@ enum RegistryTarget {
     RetainedSession {
         provider: String,
         session_id: String,
+        work_session_id: String,
     },
     Ci {
         provider: String,
@@ -89,9 +92,15 @@ enum RegistryTarget {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ReviewEffectPlan {
     LocalStore,
+    RetainedSession {
+        provider: String,
+        provider_session_id: String,
+        work_session_id: WorkSessionId,
+        registry_generation: [u8; 32],
+    },
 }
 
 /// Registry-fenced review adapter composition.
@@ -152,25 +161,49 @@ impl ProductionReviewEffectAdapter {
             return Ok(ReviewEffectPlan::LocalStore);
         }
         self.verify_generation()?;
-        // Resolve the private target before returning a family-specific
-        // refusal. This proves the registry is coherent without revealing its
-        // contents or treating its presence as authority to perform a write.
-        if let Some(installed) = &self.installed {
-            let binding = installed
+        let binding = self.installed.as_ref().and_then(|installed| {
+            installed
                 .document
                 .bindings
                 .iter()
-                .find(|binding| binding.matches(project, workspace, authority));
-            if let Some(binding) = binding
-                && !binding.target.accepts(authority.kind())
-            {
-                return Err("platform_v2_review_registry_incoherent");
+                .find(|binding| binding.matches(project, workspace, authority))
+        });
+        if let Some(binding) = binding
+            && !binding.target.accepts(authority.kind())
+        {
+            return Err("platform_v2_review_registry_incoherent");
+        }
+        if matches!(
+            action,
+            ReviewAction::SendCommentToAgent { .. } | ReviewAction::BatchSendCommentsToAgent { .. }
+        ) && let (
+            Some(installed),
+            Some(RegistryBinding {
+                target:
+                    RegistryTarget::RetainedSession {
+                        provider,
+                        session_id,
+                        work_session_id,
+                    },
+                ..
+            }),
+        ) = (&self.installed, binding)
+        {
+            if provider != "jcode" {
+                return Err("platform_v2_review_agent_provider_unavailable");
             }
+            return Ok(ReviewEffectPlan::RetainedSession {
+                provider: provider.clone(),
+                provider_session_id: session_id.clone(),
+                work_session_id: WorkSessionId::new(work_session_id.clone())
+                    .map_err(|_| "platform_v2_review_registry_incoherent")?,
+                registry_generation: *installed.generation.digest.as_bytes(),
+            });
         }
         Err(unavailable_category(action))
     }
 
-    fn verify_generation(&self) -> Result<(), &'static str> {
+    pub(crate) fn verify_generation(&self) -> Result<(), &'static str> {
         let Some(installed) = &self.installed else {
             return Ok(());
         };
@@ -181,6 +214,24 @@ impl ProductionReviewEffectAdapter {
         }
         Ok(())
     }
+}
+
+/// Reopen and validate the private registry immediately before an already
+/// admitted retained-session effect crosses into provider custody.
+pub(crate) fn verify_registry_generation(
+    path: &Path,
+    expected_uid: u32,
+    expected_digest: [u8; 32],
+) -> Result<(), &'static str> {
+    let snapshot =
+        read_private_file(path, expected_uid)?.ok_or("platform_v2_review_registry_changed")?;
+    let document: RegistryDocument = serde_json::from_slice(&snapshot.bytes)
+        .map_err(|_| "platform_v2_review_registry_invalid")?;
+    validate_registry(&document, expected_uid)?;
+    if snapshot.generation.digest.as_bytes() != &expected_digest {
+        return Err("platform_v2_review_registry_changed");
+    }
+    Ok(())
 }
 
 impl RegistryBinding {
@@ -285,8 +336,13 @@ fn validate_registry(document: &RegistryDocument, expected_uid: u32) -> Result<(
             RegistryTarget::RetainedSession {
                 provider,
                 session_id,
+                work_session_id,
             } => {
-                if !safe_token(provider) || !safe_token(session_id) {
+                if !safe_token(provider)
+                    || !safe_token(session_id)
+                    || !safe_token(work_session_id)
+                    || WorkSessionId::new(work_session_id.clone()).is_err()
+                {
                     return Err("platform_v2_review_registry_invalid");
                 }
             }
@@ -446,7 +502,10 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use automonique_protocol::platform_v2::{ProjectId, UserWorkspaceId};
-    use automonique_protocol::platform_v2_review::{ReviewAuthorityId, ReviewProposalId};
+    use automonique_protocol::platform_v2_review::{
+        ReviewAuthorityId, ReviewCommentId, ReviewProposalId,
+    };
+    use automonique_protocol::primitives::Revision;
     use tempfile::TempDir;
 
     fn uid() -> u32 {
@@ -480,6 +539,20 @@ mod tests {
 
     fn workspace() -> WorkContextIdentity {
         WorkContextIdentity::UserWorkspace(UserWorkspaceId::new("workspace-1").unwrap())
+    }
+
+    fn review_authority() -> ReviewAuthority {
+        ReviewAuthority::new(
+            ReviewAuthorityKind::Review,
+            ReviewAuthorityId::new("review-1").unwrap(),
+        )
+    }
+
+    fn send_action() -> ReviewAction {
+        ReviewAction::SendCommentToAgent {
+            comment_id: ReviewCommentId::new("comment-1").unwrap(),
+            expected_comment_revision: Revision::FIRST,
+        }
     }
 
     #[test]
@@ -518,6 +591,39 @@ mod tests {
             ),
             Err("platform_v2_review_git_adapter_unavailable")
         );
+    }
+
+    #[test]
+    fn exact_jcode_retained_session_binding_is_a_closed_delivery_plan() {
+        let temporary = TempDir::new().unwrap();
+        let registry = temporary.path().join("registry.json");
+        write_registry(
+            &registry,
+            r#"{"version":1,"generation":"generation-1","bindings":[{"project":"project-1","workspace_kind":"user_workspace","workspace_id":"workspace-1","authority_kind":"review","authority_id":"review-1","target":{"kind":"retained_session","provider":"jcode","session_id":"provider-session-1","work_session_id":"work-session-1"}}]}"#,
+        );
+        let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
+        let plan = adapter
+            .plan(
+                &ProjectId::new("project-1").unwrap(),
+                &workspace(),
+                &review_authority(),
+                &send_action(),
+            )
+            .unwrap();
+        match plan {
+            ReviewEffectPlan::RetainedSession {
+                provider,
+                provider_session_id,
+                work_session_id,
+                registry_generation,
+            } => {
+                assert_eq!(provider, "jcode");
+                assert_eq!(provider_session_id, "provider-session-1");
+                assert_eq!(work_session_id.as_str(), "work-session-1");
+                assert_ne!(registry_generation, [0; 32]);
+            }
+            ReviewEffectPlan::LocalStore => panic!("external action became local"),
+        }
     }
 
     #[test]
@@ -614,6 +720,33 @@ mod tests {
                 &git_authority(),
                 &action()
             ),
+            Err("platform_v2_review_registry_changed")
+        );
+    }
+
+    #[test]
+    fn queued_registry_generation_is_securely_reverified_before_execution() {
+        let temporary = TempDir::new().unwrap();
+        let registry = temporary.path().join("registry.json");
+        write_registry(
+            &registry,
+            r#"{"version":1,"generation":"generation-1","bindings":[]}"#,
+        );
+        let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
+        let expected = *adapter
+            .installed
+            .as_ref()
+            .unwrap()
+            .generation
+            .digest
+            .as_bytes();
+        verify_registry_generation(&registry, uid(), expected).unwrap();
+        write_registry(
+            &registry,
+            r#"{"version":1,"generation":"generation-2","bindings":[]}"#,
+        );
+        assert_eq!(
+            verify_registry_generation(&registry, uid(), expected),
             Err("platform_v2_review_registry_changed")
         );
     }

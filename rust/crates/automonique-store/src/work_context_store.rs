@@ -16,12 +16,13 @@ use std::path::{Path, PathBuf};
 
 use automonique_protocol::identity::Actor;
 use automonique_protocol::platform::{
-    IdempotencyKey, ReceiptId, ReceiptOutcome, ResourceAuthority,
+    IdempotencyKey, ReceiptId, ReceiptOutcome, ResourceAuthority, ResourceKind,
 };
 use automonique_protocol::platform_v2::{
     AuthorizedWorkContextRecord, ProjectId, WorkContextIdentity, WorkContextKind,
     WorkContextLifecycle, WorkContextPage, WorkContextQuery, WorkContextQueryResult,
-    WorkContextRecord, WorkContextTargetKind, page_authorized_work_context,
+    WorkContextRecord, WorkContextRelationKind, WorkContextTargetKind, WorkSessionId,
+    page_authorized_work_context,
 };
 use automonique_protocol::platform_v2_api::{decode_work_context_page, encode_work_context_page};
 use automonique_protocol::platform_v2_lifecycle::{
@@ -901,6 +902,71 @@ impl WorkContextStore {
         let record = validate_policy_mapping_on(&tx, tenant, project, identity)?;
         tx.commit()?;
         Ok(record)
+    }
+
+    /// Prove that an operator-selected retained provider session belongs to
+    /// the exact Platform v2 review workspace through the authoritative
+    /// session -> attempt -> user-workspace lineage. The opaque provider id is
+    /// accepted only from the typed v1 session relation and never inferred
+    /// from a label or client value.
+    pub fn validate_retained_session_lineage(
+        &self,
+        tenant: &str,
+        project: &ProjectId,
+        review_workspace: &WorkContextIdentity,
+        work_session_id: &WorkSessionId,
+        provider_session_id: &str,
+    ) -> Stored<Revision> {
+        validate_tenant(tenant)?;
+        let tx = self.connection.unchecked_transaction()?;
+        let review = validate_policy_mapping_on(&tx, tenant, project, review_workspace)?;
+        let session_identity = WorkContextIdentity::Session(work_session_id.clone());
+        let session = validate_policy_mapping_on(&tx, tenant, project, &session_identity)?;
+        if !matches!(
+            session.lifecycle(),
+            WorkContextLifecycle::Active | WorkContextLifecycle::Hibernated
+        ) {
+            return Err(WorkContextStoreError::Unavailable);
+        }
+        let attempt_identity = session
+            .relations()
+            .iter()
+            .find(|relation| relation.kind() == WorkContextRelationKind::SessionAttemptWorkspace)
+            .map(|relation| relation.target().clone())
+            .ok_or(WorkContextStoreError::Corrupt("retained_session_attempt"))?;
+        let platform_session = session
+            .relations()
+            .iter()
+            .find(|relation| relation.kind() == WorkContextRelationKind::SessionPlatformSession)
+            .map(|relation| relation.target())
+            .ok_or(WorkContextStoreError::Corrupt("retained_platform_session"))?;
+        let Some(coordinate) = platform_session.v1_coordinate() else {
+            return Err(WorkContextStoreError::Corrupt("retained_platform_session"));
+        };
+        if coordinate.authority != ResourceAuthority::Automonique
+            || coordinate.kind != ResourceKind::Session
+            || coordinate.id.as_str() != provider_session_id
+        {
+            return Err(WorkContextStoreError::Unauthorized);
+        }
+        let attempt = validate_policy_mapping_on(&tx, tenant, project, &attempt_identity)?;
+        let user_workspace = attempt
+            .relations()
+            .iter()
+            .find(|relation| relation.kind() == WorkContextRelationKind::AttemptUserWorkspace)
+            .map(|relation| relation.target())
+            .ok_or(WorkContextStoreError::Corrupt("retained_session_workspace"))?;
+        let in_lineage = match review.identity() {
+            WorkContextIdentity::Session(_) => review.identity() == &session_identity,
+            WorkContextIdentity::AttemptWorkspace(_) => review.identity() == &attempt_identity,
+            WorkContextIdentity::UserWorkspace(_) => review.identity() == user_workspace,
+            _ => false,
+        };
+        if !in_lineage {
+            return Err(WorkContextStoreError::Unauthorized);
+        }
+        tx.commit()?;
+        Ok(session.revision())
     }
 
     /// Validate the complete bounded policy registry in one SQLite snapshot.

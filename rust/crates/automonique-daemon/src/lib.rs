@@ -2022,6 +2022,149 @@ impl Drop for SocketCleanup {
     }
 }
 
+struct DaemonReviewDelivery<'a> {
+    store: &'a mut Store,
+    managed_sessions: &'a managed_sessions::ManagedSessionStore,
+    database_path: &'a Path,
+}
+
+impl platform_v2_host::PlatformV2ReviewDelivery for DaemonReviewDelivery<'_> {
+    fn inspect_target(
+        &self,
+        provider: &str,
+        provider_session_id: &str,
+    ) -> Result<Revision, &'static str> {
+        if provider != "jcode" {
+            return Err("platform_v2_review_agent_provider_unavailable");
+        }
+        let session = self
+            .managed_sessions
+            .by_id(provider_session_id)
+            .map_err(|_| "platform_v2_review_session_unavailable")?
+            .filter(|session| session.open)
+            .ok_or("platform_v2_review_session_unavailable")?;
+        Revision::new(session.revision).map_err(|_| "platform_v2_review_session_revision_invalid")
+    }
+
+    fn reconcile(
+        &mut self,
+        coordinate: &platform_v2_host::PlatformV2ReviewDeliveryCoordinate<'_>,
+    ) -> Result<
+        platform_v2_host::PlatformV2ReviewDeliveryState,
+        platform_v2_host::PlatformV2ReviewDeliveryError,
+    > {
+        let envelope = retained_review_envelope(coordinate)?;
+        let state = managed_tui::retained_review_disposition(
+            self.database_path,
+            coordinate.transport_key(),
+            coordinate.fence().provider_session_id(),
+            &envelope,
+        )
+        .map_err(|error| {
+            if error.category() == "retained_review_coordinate_conflict" {
+                platform_v2_host::PlatformV2ReviewDeliveryError::RefusedNotStarted(
+                    "platform_v2_review_delivery_coordinate_conflict",
+                )
+            } else {
+                platform_v2_host::PlatformV2ReviewDeliveryError::Ambiguous(
+                    "platform_v2_review_delivery_state_unavailable",
+                )
+            }
+        })?;
+        Ok(match state {
+            None => platform_v2_host::PlatformV2ReviewDeliveryState::NotStarted,
+            Some(managed_tui::RetainedReviewDisposition::Pending) => {
+                platform_v2_host::PlatformV2ReviewDeliveryState::Pending
+            }
+            Some(managed_tui::RetainedReviewDisposition::Completed) => {
+                platform_v2_host::PlatformV2ReviewDeliveryState::Completed
+            }
+            Some(managed_tui::RetainedReviewDisposition::RefusedNotStarted) => {
+                platform_v2_host::PlatformV2ReviewDeliveryState::Refused
+            }
+            Some(managed_tui::RetainedReviewDisposition::Ambiguous) => {
+                platform_v2_host::PlatformV2ReviewDeliveryState::Ambiguous
+            }
+        })
+    }
+
+    fn preflight(
+        &self,
+        coordinate: &platform_v2_host::PlatformV2ReviewDeliveryCoordinate<'_>,
+    ) -> Result<(), platform_v2_host::PlatformV2ReviewDeliveryError> {
+        retained_review_envelope(coordinate).map(|_| ())
+    }
+
+    fn submit(
+        &mut self,
+        coordinate: &platform_v2_host::PlatformV2ReviewDeliveryCoordinate<'_>,
+        now_ms: i64,
+    ) -> Result<
+        platform_v2_host::PlatformV2ReviewDeliveryState,
+        platform_v2_host::PlatformV2ReviewDeliveryError,
+    > {
+        let fence = coordinate.fence();
+        let observed = self
+            .inspect_target(fence.provider(), fence.provider_session_id())
+            .map_err(platform_v2_host::PlatformV2ReviewDeliveryError::RefusedNotStarted)?;
+        if observed != fence.expected_provider_session_revision() {
+            return Err(
+                platform_v2_host::PlatformV2ReviewDeliveryError::RefusedNotStarted(
+                    "platform_v2_review_session_changed",
+                ),
+            );
+        }
+        let envelope = retained_review_envelope(coordinate)?;
+        self.store
+            .submit_inbox(InboxSubmission {
+                transport: managed_tui::RETAINED_REVIEW_TRANSPORT,
+                transport_key: coordinate.transport_key(),
+                scope: fence.provider_session_id(),
+                payload: &envelope,
+                received_ms: now_ms,
+            })
+            .map_err(|error| match error {
+                StoreError::IdempotencyConflict(_) => {
+                    platform_v2_host::PlatformV2ReviewDeliveryError::RefusedNotStarted(
+                        "platform_v2_review_delivery_coordinate_conflict",
+                    )
+                }
+                StoreError::InvalidField(_) => {
+                    platform_v2_host::PlatformV2ReviewDeliveryError::RefusedNotStarted(
+                        "platform_v2_review_delivery_submission_refused",
+                    )
+                }
+                _ => platform_v2_host::PlatformV2ReviewDeliveryError::Ambiguous(
+                    "platform_v2_review_delivery_store_unavailable",
+                ),
+            })?;
+        self.reconcile(coordinate)
+    }
+}
+
+fn retained_review_envelope(
+    coordinate: &platform_v2_host::PlatformV2ReviewDeliveryCoordinate<'_>,
+) -> Result<Vec<u8>, platform_v2_host::PlatformV2ReviewDeliveryError> {
+    let fence = coordinate.fence();
+    managed_tui::retained_review_envelope(managed_tui::RetainedReviewEnvelopeInput {
+        tenant: fence.tenant(),
+        project: fence.project(),
+        review_workspace: fence.review_workspace(),
+        expected_registry_generation: fence.expected_registry_generation(),
+        work_session_id: fence.work_session_id(),
+        expected_work_session_revision: fence.expected_work_session_revision(),
+        provider: fence.provider(),
+        provider_session_id: fence.provider_session_id(),
+        expected_provider_session_revision: fence.expected_provider_session_revision(),
+        payload: coordinate.payload(),
+    })
+    .map_err(|_| {
+        platform_v2_host::PlatformV2ReviewDeliveryError::RefusedNotStarted(
+            "platform_v2_review_delivery_envelope_refused",
+        )
+    })
+}
+
 impl Daemon {
     /// Establish private directories, durable state, the fenced generation,
     /// and the local administration endpoint.
@@ -2558,6 +2701,10 @@ impl Daemon {
             database_path: &database_path,
             platform_store_path: &platform_store_path,
             managed_sessions_path: &managed_sessions_path,
+            work_context_path: &config.platform_v2_work_context_path(),
+            review_registry_path: &state_dir
+                .join(platform_v2_review_adapter::REVIEW_REGISTRY_FILE_NAME),
+            expected_uid: geteuid().as_raw(),
             state_dir: &state_dir,
             admin_socket: &admin_socket,
             run_index_path: &run_index_path,
@@ -3165,6 +3312,11 @@ impl Daemon {
             database_path: &self.config.database_path(),
             platform_store_path: &self.config.platform_store_path(),
             managed_sessions_path: &self.config.managed_sessions_path(),
+            work_context_path: &self.config.platform_v2_work_context_path(),
+            review_registry_path: &self
+                .state_dir
+                .join(platform_v2_review_adapter::REVIEW_REGISTRY_FILE_NAME),
+            expected_uid: geteuid().as_raw(),
             state_dir: &self.state_dir,
             admin_socket: &self.config.admin_socket(),
             run_index_path: &self.config.run_index_path(),
@@ -5228,7 +5380,18 @@ impl Daemon {
         peer_uid: u32,
     ) -> Result<(), DaemonError> {
         let now_ms = unix_millis()?;
-        let response = self.platform_v2.handle(peer_uid, message.request(), now_ms);
+        let database_path = self.state_dir.join(DATABASE_NAME);
+        let mut review_delivery = DaemonReviewDelivery {
+            store: &mut self.store,
+            managed_sessions: &self.managed_sessions,
+            database_path: &database_path,
+        };
+        let response = self.platform_v2.handle_with_review_delivery(
+            peer_uid,
+            message.request(),
+            now_ms,
+            &mut review_delivery,
+        );
         let frame = PlatformV2ResponseMessage::for_request(message, response)
             .and_then(|response| response.to_frame())
             .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
@@ -10303,10 +10466,17 @@ mod tests {
     use std::time::Duration;
 
     use automonique_policy::approval::ApprovalRequirement;
+    use automonique_protocol::primitives::Revision;
 
     use super::{
-        Daemon, DaemonConfig, DrainPhase, OperationalMetric, activated_listener_fd,
-        drain_shutdown_workers, durable_count, named_shutdown_workers, validate_admin_listener,
+        Daemon, DaemonConfig, DaemonReviewDelivery, DrainPhase, OperationalMetric, Store,
+        activated_listener_fd, drain_shutdown_workers, durable_count, managed_sessions,
+        named_shutdown_workers, validate_admin_listener,
+    };
+    use crate::platform_v2_host::{
+        PlatformV2ReviewDelivery, PlatformV2ReviewDeliveryCoordinate,
+        PlatformV2ReviewDeliveryError, PlatformV2ReviewDeliveryState,
+        PlatformV2ReviewExecutionFence,
     };
 
     #[test]
@@ -10360,6 +10530,124 @@ mod tests {
         ] {
             assert_eq!(refused.unwrap_err().category(), "socket_activation_refused");
         }
+    }
+
+    #[test]
+    fn retained_review_delivery_uses_exact_managed_revision_and_durable_inbox_key() {
+        use automonique_protocol::platform_v2::{ProjectId, WorkContextIdentity, WorkSessionId};
+
+        let (_root, config) = private_roots();
+        std::fs::create_dir(config.state_dir()).expect("state dir");
+        std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
+            .expect("private state dir");
+        let mut store = Store::open(config.database_path()).expect("store");
+        let mut sessions =
+            managed_sessions::ManagedSessionStore::open(config.managed_sessions_path())
+                .expect("sessions");
+        let observed = sessions
+            .observe_active("provider-session-review", "run-review-1", 10)
+            .expect("session");
+        let expected = Revision::new(observed.revision).expect("revision");
+        let project = ProjectId::new("project-review".to_owned()).unwrap();
+        let work_session = WorkSessionId::new("work-session-review".to_owned()).unwrap();
+        let workspace = WorkContextIdentity::Session(work_session.clone());
+        let work_revision = Revision::new(1).unwrap();
+        let fence = PlatformV2ReviewExecutionFence::new(
+            "tenant-review",
+            &project,
+            &workspace,
+            [7; 32],
+            &work_session,
+            work_revision,
+            "jcode",
+            "provider-session-review",
+            expected,
+        );
+        let coordinate = PlatformV2ReviewDeliveryCoordinate::new(
+            fence,
+            "v2-review-exact",
+            b"exact persisted review payload",
+        );
+        let database_path = config.database_path();
+        {
+            let mut delivery = DaemonReviewDelivery {
+                store: &mut store,
+                managed_sessions: &sessions,
+                database_path: &database_path,
+            };
+            assert_eq!(
+                delivery
+                    .inspect_target("jcode", "provider-session-review")
+                    .expect("inspect"),
+                expected
+            );
+            assert_eq!(
+                delivery.reconcile(&coordinate).unwrap(),
+                PlatformV2ReviewDeliveryState::NotStarted
+            );
+            assert_eq!(
+                delivery.submit(&coordinate, 11).expect("submit"),
+                PlatformV2ReviewDeliveryState::Pending
+            );
+            assert_eq!(
+                delivery.reconcile(&coordinate).unwrap(),
+                PlatformV2ReviewDeliveryState::Pending
+            );
+            let changed = PlatformV2ReviewDeliveryCoordinate::new(
+                PlatformV2ReviewExecutionFence::new(
+                    "tenant-review",
+                    &project,
+                    &workspace,
+                    [7; 32],
+                    &work_session,
+                    work_revision,
+                    "jcode",
+                    "provider-session-review",
+                    expected,
+                ),
+                "v2-review-exact",
+                b"different payload",
+            );
+            assert_eq!(
+                delivery.reconcile(&changed),
+                Err(PlatformV2ReviewDeliveryError::RefusedNotStarted(
+                    "platform_v2_review_delivery_coordinate_conflict"
+                ))
+            );
+        }
+        sessions
+            .observe_terminal("provider-session-review", "run-review-1", 12)
+            .expect("advance session");
+        let mut delivery = DaemonReviewDelivery {
+            store: &mut store,
+            managed_sessions: &sessions,
+            database_path: &database_path,
+        };
+        let stale = PlatformV2ReviewDeliveryCoordinate::new(
+            PlatformV2ReviewExecutionFence::new(
+                "tenant-review",
+                &project,
+                &workspace,
+                [7; 32],
+                &work_session,
+                work_revision,
+                "jcode",
+                "provider-session-review",
+                expected,
+            ),
+            "v2-review-stale-target",
+            b"must not submit",
+        );
+        assert_eq!(
+            delivery.submit(&stale, 13),
+            Err(PlatformV2ReviewDeliveryError::RefusedNotStarted(
+                "platform_v2_review_session_changed"
+            ))
+        );
+        assert_eq!(
+            delivery.reconcile(&stale).unwrap(),
+            PlatformV2ReviewDeliveryState::NotStarted
+        );
     }
 
     /// A private runtime and state root of this test's own, never the

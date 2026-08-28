@@ -25,6 +25,154 @@ struct PrivateStore {
     _directory: TempDir,
     path: PathBuf,
 }
+
+#[test]
+fn retained_provider_session_requires_exact_session_attempt_workspace_lineage() {
+    let private = PrivateStore::new();
+    let mut store = WorkContextStore::open(private.path()).unwrap();
+    let repository = ExpectedWorkContext::new(repository("retained-repo"), revision(1));
+    store
+        .put_external_snapshot(
+            "tenant-1",
+            &repository,
+            ExternalParentResolution::Available,
+            Some(&ProjectId::new("retained-project").unwrap()),
+        )
+        .unwrap();
+    let project = WorkContextRecord::new(
+        identity(WorkContextKind::Project, "retained-project"),
+        revision(1),
+        WorkContextLifecycle::Active,
+        label("project"),
+        WorkContextAttributes::EMPTY,
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::ProjectRepository,
+                repository.identity().clone(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let host = WorkContextRecord::new(
+        identity(WorkContextKind::HostSetup, "retained-host"),
+        revision(1),
+        WorkContextLifecycle::Active,
+        label("host"),
+        WorkContextAttributes::host_setup(HostSetupKind::Local),
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::HostSetupProject,
+                project.identity().clone(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let checkout = WorkContextRecord::new(
+        identity(WorkContextKind::Checkout, "retained-checkout"),
+        revision(1),
+        WorkContextLifecycle::Active,
+        label("checkout"),
+        WorkContextAttributes::checkout(CheckoutKind::GitWorktree),
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::CheckoutProject,
+                project.identity().clone(),
+            )
+            .unwrap(),
+            WorkContextRelation::new(
+                WorkContextRelationKind::CheckoutHostSetup,
+                host.identity().clone(),
+            )
+            .unwrap(),
+            WorkContextRelation::new(
+                WorkContextRelationKind::CheckoutRepository,
+                repository.identity().clone(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let workspace = user_workspace(
+        "retained-workspace",
+        "retained-project",
+        "retained-checkout",
+        1,
+    );
+    let attempt = WorkContextRecord::new(
+        identity(WorkContextKind::AttemptWorkspace, "retained-attempt"),
+        revision(2),
+        WorkContextLifecycle::Running,
+        label("attempt"),
+        WorkContextAttributes::EMPTY,
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::AttemptUserWorkspace,
+                workspace.identity().clone(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let provider_session = WorkContextIdentity::PlatformSession(
+        V1SessionRef::new(ResourceCoordinate::new(
+            ResourceAuthority::Automonique,
+            ResourceKind::Session,
+            ResourceId::new("provider-session-exact").unwrap(),
+        ))
+        .unwrap(),
+    );
+    let session = WorkContextRecord::new(
+        identity(WorkContextKind::Session, "retained-work-session"),
+        revision(4),
+        WorkContextLifecycle::Active,
+        label("session"),
+        WorkContextAttributes::EMPTY,
+        vec![
+            WorkContextRelation::new(
+                WorkContextRelationKind::SessionAttemptWorkspace,
+                attempt.identity().clone(),
+            )
+            .unwrap(),
+            WorkContextRelation::new(
+                WorkContextRelationKind::SessionPlatformSession,
+                provider_session,
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    for record in [&project, &host, &checkout, &workspace, &attempt, &session] {
+        store.put_authoritative_record("tenant-1", record).unwrap();
+    }
+    let project_id = ProjectId::new("retained-project").unwrap();
+    let work_session_id = WorkSessionId::new("retained-work-session").unwrap();
+    for review_workspace in [workspace.identity(), attempt.identity(), session.identity()] {
+        assert_eq!(
+            store
+                .validate_retained_session_lineage(
+                    "tenant-1",
+                    &project_id,
+                    review_workspace,
+                    &work_session_id,
+                    "provider-session-exact",
+                )
+                .unwrap(),
+            revision(4)
+        );
+    }
+    assert!(matches!(
+        store.validate_retained_session_lineage(
+            "tenant-1",
+            &project_id,
+            workspace.identity(),
+            &work_session_id,
+            "provider-session-other",
+        ),
+        Err(WorkContextStoreError::Unauthorized)
+    ));
+}
 impl PrivateStore {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
