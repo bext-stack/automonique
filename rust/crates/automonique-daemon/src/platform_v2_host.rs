@@ -3142,6 +3142,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use automonique_protocol::platform::IdempotencyKey;
+    use automonique_protocol::platform_v2::{WorkContextAttributes, WorkContextLabel};
     use automonique_protocol::platform_v2_attention::{
         AttentionReadRequest, AttentionSource, AttentionSourceId, AttentionSourceKind,
     };
@@ -3241,6 +3242,79 @@ mod tests {
                 .supported_effect_kinds()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn runtime_debug_redacts_private_attention_store_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let policy_path = directory.path().join("policy.json");
+        let uid = nix::unistd::geteuid().as_raw();
+        let empty_authority = serde_json::json!({
+            "filesystem": [], "credentials": [], "network": [],
+            "tools": [], "providers": [], "models": []
+        });
+        write_generation_policy(
+            &policy_path,
+            &serde_json::json!({
+                "version": 1,
+                "principals": [{
+                    "uid": uid,
+                    "tenant": "runtime-tenant",
+                    "actor": "runtime-actor",
+                    "serving_authority": "automonique",
+                    "projects": ["runtime-project"],
+                    "workspaces": [{
+                        "project": "runtime-project",
+                        "kind": "project",
+                        "id": "runtime-project",
+                        "inherited_authority": empty_authority
+                    }],
+                    "authority": empty_authority,
+                    "review_authorities": {}
+                }]
+            }),
+        );
+        let work_context_path = directory.path().join("work-context.sqlite3");
+        let mut work_contexts = WorkContextStore::open(&work_context_path).unwrap();
+        work_contexts
+            .put_authoritative_record(
+                "runtime-tenant",
+                &WorkContextRecord::new(
+                    WorkContextIdentity::Project(ProjectId::new("runtime-project").unwrap()),
+                    Revision::FIRST,
+                    WorkContextLifecycle::Active,
+                    WorkContextLabel::new("Runtime project").unwrap(),
+                    WorkContextAttributes::EMPTY,
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        drop(work_contexts);
+        let host = PlatformV2Host::open_with_lifecycle_adapter(
+            &policy_path,
+            &work_context_path,
+            &directory.path().join("lineage.sqlite3"),
+            &directory.path().join("review.sqlite3"),
+            uid,
+            Box::new(UnavailableLifecycleEffectAdapter),
+        );
+        let PlatformV2Host::Enabled(mut runtime) = host else {
+            panic!("expected enabled Platform v2 runtime, got {host:?}");
+        };
+        let attention_path = directory
+            .path()
+            .join("runtime-attention-private-path-sentinel.sqlite3");
+        runtime.attention =
+            AttentionStore::open_scoped(&attention_path, "runtime-attention-authority-sentinel")
+                .unwrap();
+
+        let debug = format!("{runtime:?}");
+        assert!(debug.contains("attention: AttentionStore { state: \"open\" }"));
+        assert!(!debug.contains(attention_path.to_str().unwrap()));
+        assert!(!debug.contains("runtime-attention-private-path-sentinel"));
+        assert!(!debug.contains("runtime-attention-authority-sentinel"));
     }
 
     #[test]

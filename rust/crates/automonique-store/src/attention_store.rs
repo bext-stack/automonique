@@ -106,11 +106,19 @@ impl From<rusqlite::Error> for AttentionStoreError {
 }
 type Stored<T> = Result<T, AttentionStoreError>;
 
-#[derive(Debug)]
 pub struct AttentionStore {
     connection: Connection,
     path: PathBuf,
     authority_namespace: String,
+}
+
+impl fmt::Debug for AttentionStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AttentionStore")
+            .field("state", &"open")
+            .finish()
+    }
 }
 
 impl AttentionStore {
@@ -482,6 +490,26 @@ mod tests {
             AttentionStore::open_scoped(directory.path().join("attention.sqlite3"), "tenant")
                 .unwrap();
         (directory, store)
+    }
+
+    #[test]
+    fn debug_is_state_only_and_redacts_private_store_identity() {
+        let directory = tempdir().unwrap();
+        std::fs::set_permissions(
+            directory.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let path = directory
+            .path()
+            .join("attention-private-path-sentinel.sqlite3");
+        let store = AttentionStore::open_scoped(&path, "attention-authority-sentinel").unwrap();
+
+        let debug = format!("{store:?}");
+        assert_eq!(debug, "AttentionStore { state: \"open\" }");
+        assert!(!debug.contains(path.to_str().unwrap()));
+        assert!(!debug.contains("attention-private-path-sentinel"));
+        assert!(!debug.contains("attention-authority-sentinel"));
     }
 
     #[test]
