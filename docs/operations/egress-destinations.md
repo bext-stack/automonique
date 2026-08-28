@@ -6,7 +6,9 @@
 allowlist, and it is one. It is also the only thing standing between a run and
 the provider it has to reach. Removing a required line takes every task run
 down. Status and doctor now detect that route mismatch from the running
-generation; an individual run refusal still does not name the host.
+generation. An individual run names one normalized `host:port` only when its
+own bounded broker interval proves that every refusal since the turn baseline
+was for that exact coordinate; otherwise it remains generic.
 
 This page exists because that happened.
 
@@ -37,7 +39,7 @@ Eleven hours later someone ran a task and went looking.
 > actually dials**, not the ones the engine is called after. Read
 > `jcode-provider/config.toml` before you decide a line is obsolete.
 
-The provider's own log is the only place the truth is written down:
+The provider's own log remains the detailed diagnostic source:
 
 ```sh
 tail -n 200 "$STATE/runs/<run>/workspace/.jcode/logs/jcode-$(date -u +%F).log"
