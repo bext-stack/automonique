@@ -293,6 +293,28 @@ fn successor_validation_refuses_scope_drift_time_regression_and_same_revision_ed
     )
     .unwrap();
     assert!(current.validate_successor(&other_workspace).is_err());
+
+    let regressed_item_observation = AttentionSourceSnapshot::new(
+        source(AttentionSourceKind::ProviderSession),
+        ProjectId::new("project-1").unwrap(),
+        UserWorkspaceId::new("workspace-1").unwrap(),
+        revision(2),
+        Some(revision(1)),
+        2_002,
+        vec![item(
+            "attention-1",
+            2,
+            1_999,
+            AttentionItemState::NeedsYou,
+            AttentionItemReason::ApprovalRequired,
+        )],
+    )
+    .unwrap();
+    assert!(
+        current
+            .validate_successor(&regressed_item_observation)
+            .is_err()
+    );
 }
 
 #[test]

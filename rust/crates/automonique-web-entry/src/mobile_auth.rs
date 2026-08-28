@@ -35,7 +35,7 @@ pub const MOBILE_PLATFORM_V2_AUTH_SCHEMA: &str = "automonique.mobile-platform-v2
 pub const MOBILE_PLATFORM_V2_AUTH_MEDIA_TYPE: &str =
     "application/vnd.automonique.mobile-platform-v2-authorization.v1+json";
 pub const MAX_MOBILE_ACTIONS: usize = 4;
-pub const MAX_MOBILE_PLATFORM_V2_ACTIONS: usize = 11;
+pub const MAX_MOBILE_PLATFORM_V2_ACTIONS: usize = MobilePlatformV2Action::ALL.len();
 pub const MAX_MOBILE_V2_PROJECT_ROOTS: usize = 32;
 const MAX_MOBILE_V2_RECEIPT_CUSTODY: usize = 128;
 pub(crate) const MOBILE_V2_DISPATCH_LEASE_MILLIS: i64 = 10_000;
@@ -198,6 +198,23 @@ pub enum MobilePlatformV2Action {
     GetAttentionSourceSnapshot,
     ExecuteReviewAction,
     GetReviewReceipt,
+}
+
+impl MobilePlatformV2Action {
+    pub const ALL: [Self; 12] = [
+        Self::QueryWorkContexts,
+        Self::GetLineage,
+        Self::PrepareMutation,
+        Self::DecideMutation,
+        Self::SubmitMutation,
+        Self::GetMutationReceipt,
+        Self::SubmitWorkspaceIntent,
+        Self::GetWorkspaceIntent,
+        Self::GetReview,
+        Self::GetAttentionSourceSnapshot,
+        Self::ExecuteReviewAction,
+        Self::GetReviewReceipt,
+    ];
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -2568,6 +2585,23 @@ mod tests {
                 "session_scope",
             ]
         );
+    }
+
+    #[test]
+    fn every_platform_v2_action_remains_grantable_together() {
+        let (_root, mut auth) = authority();
+        let issued = auth.operator_provision(request(), NOW).expect("provision");
+        let descriptor = auth
+            .grant_platform_v2(
+                MobilePlatformV2GrantRequest {
+                    credential_id: issued.authorization.credential_id.clone(),
+                    project_roots: vec!["project-a".to_owned()],
+                    actions: MobilePlatformV2Action::ALL.to_vec(),
+                },
+                NOW + 1,
+            )
+            .expect("complete Platform v2 grant");
+        assert_eq!(descriptor.actions, MobilePlatformV2Action::ALL.to_vec());
     }
 
     #[test]

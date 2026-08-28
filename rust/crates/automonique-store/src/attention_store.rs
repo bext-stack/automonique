@@ -7,6 +7,7 @@
 //! validated by the protocol contract; reads revalidate canonical bytes,
 //! digest, and duplicated lookup fields before returning anything.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::fs::OpenOptions;
@@ -20,7 +21,9 @@ use automonique_protocol::platform_v2_attention::{
 use automonique_protocol::platform_v2_attention_api::{
     decode_attention_source_snapshot, encode_attention_source_snapshot,
 };
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use sha2::{Digest, Sha256};
 
 use crate::{StoreError, validate_database_path};
@@ -43,6 +46,19 @@ CREATE TABLE attention_source_current (
     snapshot_document BLOB NOT NULL,
     snapshot_digest BLOB NOT NULL CHECK (length(snapshot_digest) = 32),
     PRIMARY KEY (source_kind, source_id, project_id, user_workspace_id)
+) STRICT;
+
+CREATE TABLE attention_item_history (
+    source_kind TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    user_workspace_id TEXT NOT NULL,
+    item_id TEXT NOT NULL CHECK (length(item_id) BETWEEN 1 AND 256),
+    first_source_revision INTEGER NOT NULL CHECK (first_source_revision >= 1),
+    PRIMARY KEY (source_kind, source_id, project_id, user_workspace_id, item_id),
+    FOREIGN KEY (source_kind, source_id, project_id, user_workspace_id)
+      REFERENCES attention_source_current(source_kind, source_id, project_id, user_workspace_id)
+      ON DELETE RESTRICT
 ) STRICT;
 "#;
 
@@ -142,37 +158,33 @@ impl AttentionStore {
 
     /// Persist one complete source-owned snapshot.
     pub fn put_snapshot(&mut self, snapshot: &AttentionSourceSnapshot) -> Stored<()> {
-        let document = encode_attention_source_snapshot(snapshot).map_err(protocol)?;
-        let document_digest: [u8; 32] = Sha256::digest(&document).into();
+        self.put_snapshots(std::slice::from_ref(snapshot))
+    }
+
+    /// Atomically persist a complete registry generation. Either every exact
+    /// tuple is accepted or none of its durable state changes.
+    pub fn put_snapshots(&mut self, snapshots: &[AttentionSourceSnapshot]) -> Stored<()> {
+        let mut keys = BTreeSet::new();
+        let mut prepared = Vec::with_capacity(snapshots.len());
+        for snapshot in snapshots {
+            let key = (
+                snapshot.source().kind().as_str(),
+                snapshot.source().id().as_str(),
+                snapshot.project().as_str(),
+                snapshot.user_workspace().as_str(),
+            );
+            if !keys.insert(key) {
+                return Err(AttentionStoreError::Conflict("duplicate_source"));
+            }
+            let document = encode_attention_source_snapshot(snapshot).map_err(protocol)?;
+            let digest: [u8; 32] = Sha256::digest(&document).into();
+            prepared.push((snapshot, document, digest));
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing: Option<Vec<u8>> = transaction.query_row(
-            "SELECT snapshot_document FROM attention_source_current WHERE source_kind=?1 AND source_id=?2 AND project_id=?3 AND user_workspace_id=?4",
-            params![snapshot.source().kind().as_str(), snapshot.source().id().as_str(), snapshot.project().as_str(), snapshot.user_workspace().as_str()],
-            |row| row.get(0),
-        ).optional()?;
-        if let Some(existing) = existing {
-            if existing == document {
-                transaction.commit()?;
-                return Ok(());
-            }
-            let current = decode_attention_source_snapshot(&existing).map_err(protocol)?;
-            current
-                .validate_successor(snapshot)
-                .map_err(|_| AttentionStoreError::Conflict("source_revision"))?;
-            let changed = transaction.execute(
-                "UPDATE attention_source_current SET source_revision=?1,observed_at_ms=?2,snapshot_document=?3,snapshot_digest=?4 WHERE source_kind=?5 AND source_id=?6 AND project_id=?7 AND user_workspace_id=?8 AND source_revision=?9",
-                params![to_db(snapshot.revision().get())?, to_db(snapshot.observed_at_ms())?, document, document_digest.as_slice(), snapshot.source().kind().as_str(), snapshot.source().id().as_str(), snapshot.project().as_str(), snapshot.user_workspace().as_str(), to_db(current.revision().get())?],
-            )?;
-            if changed != 1 {
-                return Err(AttentionStoreError::Conflict("source_revision"));
-            }
-        } else {
-            transaction.execute(
-                "INSERT INTO attention_source_current(source_kind,source_id,project_id,user_workspace_id,source_revision,observed_at_ms,snapshot_document,snapshot_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![snapshot.source().kind().as_str(), snapshot.source().id().as_str(), snapshot.project().as_str(), snapshot.user_workspace().as_str(), to_db(snapshot.revision().get())?, to_db(snapshot.observed_at_ms())?, document, document_digest.as_slice()],
-            )?;
+        for (snapshot, document, digest) in &prepared {
+            put_prepared_snapshot(&transaction, snapshot, document, digest)?;
         }
         transaction.commit()?;
         Ok(())
@@ -208,8 +220,117 @@ impl AttentionStore {
         {
             return Err(AttentionStoreError::Corrupt("snapshot_binding"));
         }
+        validate_current_item_history(&self.connection, &snapshot)?;
         Ok(Some(snapshot))
     }
+}
+
+fn put_prepared_snapshot(
+    transaction: &Transaction<'_>,
+    snapshot: &AttentionSourceSnapshot,
+    document: &[u8],
+    document_digest: &[u8; 32],
+) -> Stored<()> {
+    let existing: Option<Vec<u8>> = transaction.query_row(
+            "SELECT snapshot_document FROM attention_source_current WHERE source_kind=?1 AND source_id=?2 AND project_id=?3 AND user_workspace_id=?4",
+            params![snapshot.source().kind().as_str(), snapshot.source().id().as_str(), snapshot.project().as_str(), snapshot.user_workspace().as_str()],
+            |row| row.get(0),
+        ).optional()?;
+    if let Some(existing) = existing {
+        let current = decode_attention_source_snapshot(&existing).map_err(protocol)?;
+        validate_current_item_history(transaction, &current)?;
+        if existing.as_slice() == document {
+            return Ok(());
+        }
+        current
+            .validate_successor(snapshot)
+            .map_err(|_| AttentionStoreError::Conflict("source_revision"))?;
+        admit_new_item_identities(transaction, &current, snapshot)?;
+        let changed = transaction.execute(
+                "UPDATE attention_source_current SET source_revision=?1,observed_at_ms=?2,snapshot_document=?3,snapshot_digest=?4 WHERE source_kind=?5 AND source_id=?6 AND project_id=?7 AND user_workspace_id=?8 AND source_revision=?9",
+                params![to_db(snapshot.revision().get())?, to_db(snapshot.observed_at_ms())?, document, document_digest.as_slice(), snapshot.source().kind().as_str(), snapshot.source().id().as_str(), snapshot.project().as_str(), snapshot.user_workspace().as_str(), to_db(current.revision().get())?],
+            )?;
+        if changed != 1 {
+            return Err(AttentionStoreError::Conflict("source_revision"));
+        }
+    } else {
+        transaction.execute(
+                "INSERT INTO attention_source_current(source_kind,source_id,project_id,user_workspace_id,source_revision,observed_at_ms,snapshot_document,snapshot_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![snapshot.source().kind().as_str(), snapshot.source().id().as_str(), snapshot.project().as_str(), snapshot.user_workspace().as_str(), to_db(snapshot.revision().get())?, to_db(snapshot.observed_at_ms())?, document, document_digest.as_slice()],
+            )?;
+        insert_item_identities(transaction, snapshot)?;
+    }
+    Ok(())
+}
+
+fn validate_current_item_history(
+    connection: &Connection,
+    snapshot: &AttentionSourceSnapshot,
+) -> Stored<()> {
+    for item in snapshot.items() {
+        if !item_identity_exists(connection, snapshot, item.id().as_str())? {
+            return Err(AttentionStoreError::Corrupt("item_history"));
+        }
+    }
+    Ok(())
+}
+
+fn admit_new_item_identities(
+    transaction: &Transaction<'_>,
+    current: &AttentionSourceSnapshot,
+    next: &AttentionSourceSnapshot,
+) -> Stored<()> {
+    let current_ids = current
+        .items()
+        .iter()
+        .map(|item| item.id().as_str())
+        .collect::<BTreeSet<_>>();
+    for item in next.items() {
+        if current_ids.contains(item.id().as_str()) {
+            continue;
+        }
+        if item_identity_exists(transaction, next, item.id().as_str())? {
+            return Err(AttentionStoreError::Conflict("item_identity_reused"));
+        }
+        insert_item_identity(transaction, next, item.id().as_str())?;
+    }
+    Ok(())
+}
+
+fn insert_item_identities(
+    transaction: &Transaction<'_>,
+    snapshot: &AttentionSourceSnapshot,
+) -> Stored<()> {
+    for item in snapshot.items() {
+        insert_item_identity(transaction, snapshot, item.id().as_str())?;
+    }
+    Ok(())
+}
+
+fn insert_item_identity(
+    transaction: &Transaction<'_>,
+    snapshot: &AttentionSourceSnapshot,
+    item_id: &str,
+) -> Stored<()> {
+    transaction.execute(
+        "INSERT INTO attention_item_history(source_kind,source_id,project_id,user_workspace_id,item_id,first_source_revision) VALUES(?1,?2,?3,?4,?5,?6)",
+        params![snapshot.source().kind().as_str(), snapshot.source().id().as_str(), snapshot.project().as_str(), snapshot.user_workspace().as_str(), item_id, to_db(snapshot.revision().get())?],
+    )?;
+    Ok(())
+}
+
+fn item_identity_exists(
+    connection: &Connection,
+    snapshot: &AttentionSourceSnapshot,
+    item_id: &str,
+) -> Stored<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM attention_item_history WHERE source_kind=?1 AND source_id=?2 AND project_id=?3 AND user_workspace_id=?4 AND item_id=?5)",
+            params![snapshot.source().kind().as_str(), snapshot.source().id().as_str(), snapshot.project().as_str(), snapshot.user_workspace().as_str(), item_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
 }
 
 fn initialize(connection: &mut Connection) -> Stored<bool> {
@@ -281,6 +402,16 @@ mod tests {
         previous: Option<u64>,
         state: AttentionItemState,
     ) -> AttentionSourceSnapshot {
+        scoped_snapshot("project", revision_value, previous, state, true)
+    }
+
+    fn scoped_snapshot(
+        project: &str,
+        revision_value: u64,
+        previous: Option<u64>,
+        state: AttentionItemState,
+        with_item: bool,
+    ) -> AttentionSourceSnapshot {
         let reason = match state {
             AttentionItemState::NeedsYou => AttentionItemReason::ApprovalRequired,
             AttentionItemState::Working => AttentionItemReason::AgentWorking,
@@ -292,24 +423,27 @@ mod tests {
                 AttentionSourceKind::Review,
                 AttentionSourceId::new("review-source").unwrap(),
             ),
-            ProjectId::new("project").unwrap(),
+            ProjectId::new(project).unwrap(),
             UserWorkspaceId::new("workspace").unwrap(),
             Revision::new(revision_value).unwrap(),
             previous.map(|value| Revision::new(value).unwrap()),
             1_000 + revision_value,
-            vec![
-                AttentionItem::new(
-                    AttentionItemId::new("item").unwrap(),
-                    Revision::new(revision_value).unwrap(),
-                    1_000,
-                    state,
-                    reason,
-                    true,
-                    Vec::new(),
-                    None,
-                )
-                .unwrap(),
-            ],
+            with_item
+                .then(|| {
+                    AttentionItem::new(
+                        AttentionItemId::new("item").unwrap(),
+                        Revision::new(revision_value).unwrap(),
+                        1_000,
+                        state,
+                        reason,
+                        true,
+                        Vec::new(),
+                        None,
+                    )
+                    .unwrap()
+                })
+                .into_iter()
+                .collect(),
         )
         .unwrap()
     }
@@ -408,5 +542,67 @@ mod tests {
             ),
             Err(AttentionStoreError::Corrupt("snapshot_integrity"))
         ));
+    }
+
+    #[test]
+    fn a_retired_item_identity_cannot_reappear() {
+        let (_directory, mut store) = store();
+        let first = snapshot(1, None, AttentionItemState::Working);
+        store.put_snapshot(&first).unwrap();
+        let removed = scoped_snapshot("project", 2, Some(1), AttentionItemState::Done, false);
+        store.put_snapshot(&removed).unwrap();
+        let reused = scoped_snapshot("project", 3, Some(2), AttentionItemState::Done, true);
+        assert!(matches!(
+            store.put_snapshot(&reused),
+            Err(AttentionStoreError::Conflict("item_identity_reused"))
+        ));
+        assert_eq!(
+            store
+                .snapshot(
+                    removed.source(),
+                    removed.project(),
+                    removed.user_workspace()
+                )
+                .unwrap(),
+            Some(removed)
+        );
+    }
+
+    #[test]
+    fn registry_batch_rolls_back_earlier_tuple_when_a_later_tuple_conflicts() {
+        let (_directory, mut store) = store();
+        let current_a = scoped_snapshot("project-a", 1, None, AttentionItemState::Working, true);
+        let current_b = scoped_snapshot("project-b", 1, None, AttentionItemState::Working, true);
+        store
+            .put_snapshots(&[current_a.clone(), current_b.clone()])
+            .unwrap();
+
+        let successor_a = scoped_snapshot("project-a", 2, Some(1), AttentionItemState::Done, true);
+        let wrong_predecessor_b =
+            scoped_snapshot("project-b", 3, Some(2), AttentionItemState::Done, true);
+        assert!(matches!(
+            store.put_snapshots(&[successor_a, wrong_predecessor_b]),
+            Err(AttentionStoreError::Conflict("source_revision"))
+        ));
+        assert_eq!(
+            store
+                .snapshot(
+                    current_a.source(),
+                    current_a.project(),
+                    current_a.user_workspace(),
+                )
+                .unwrap(),
+            Some(current_a)
+        );
+        assert_eq!(
+            store
+                .snapshot(
+                    current_b.source(),
+                    current_b.project(),
+                    current_b.user_workspace(),
+                )
+                .unwrap(),
+            Some(current_b)
+        );
     }
 }

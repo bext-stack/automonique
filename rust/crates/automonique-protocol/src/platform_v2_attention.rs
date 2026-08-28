@@ -367,6 +367,7 @@ impl AttentionSourceSnapshot {
         for next_item in &next.items {
             if let Some(current) = self.items.iter().find(|item| item.id() == next_item.id())
                 && (next_item.revision() < current.revision()
+                    || next_item.observed_at_ms() < current.observed_at_ms()
                     || (next_item.revision() == current.revision() && next_item != current))
             {
                 return Err(AttentionContractError::SuccessorInvalid);

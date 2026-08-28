@@ -22,7 +22,8 @@ revision; the same item revision is immutable. Removal is represented only by
 absence from the next complete source snapshot. The Rust successor validator
 checks the source, project, workspace, predecessor, source revision,
 observation time, and surviving item revisions before a consumer replaces its
-current value.
+current value. The durable host store additionally retains every previously
+issued item identity after removal and refuses later reuse.
 
 Each item contains a closed `NeedsYou`, `Working`, `Done`, or `Blocked` state,
 a compatible closed reason, an explicit unread boolean, its observation time,
@@ -43,8 +44,11 @@ Canonical Rust codecs and the
 `fixtures/platform-v2-attention-v1.json` corpus reject unknown fields, unknown
 enum spellings, wrong schemas, malformed coordinate kinds, oversized frames,
 out-of-order item IDs, mixed state/reason pairs, cyclic or over-depth agent
-paths, and provider/local coordinate confusion. The live Platform v2 host
-publishes only snapshots validated from its private operator source registry
-and tenant-bound durable store. An absent, changed, malformed, unauthorized,
-stale, or unregistered source refuses explicitly; the host never synthesizes
-observation time or source revision from the request time.
+paths, and provider/local coordinate confusion. When explicitly bootstrapped,
+the Platform v2 host serves only snapshots validated from its private operator
+source registry and tenant-bound durable store. An absent, changed, malformed,
+unauthorized, stale, or unregistered source refuses explicitly; the host never
+synthesizes observation time or source revision from the request time. This
+contract and bootstrap path do not yet provide a runtime producer, source
+discovery, hot reload, or a client consumer, so they are foundation work rather
+than completion of the live cross-client attention flow.

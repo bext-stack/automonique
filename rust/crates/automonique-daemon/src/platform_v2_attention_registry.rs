@@ -168,11 +168,11 @@ impl AttentionRegistry {
             if !keys.insert(key) {
                 return Err("platform_v2_attention_registry_invalid");
             }
-            store
-                .put_snapshot(&snapshot)
-                .map_err(|_| "platform_v2_attention_store_refused")?;
             snapshots.push(snapshot);
         }
+        store
+            .put_snapshots(&snapshots)
+            .map_err(|_| "platform_v2_attention_store_refused")?;
         Ok(Self {
             installed: Some(InstalledRegistry {
                 path: path.to_path_buf(),
@@ -434,6 +434,61 @@ mod tests {
             AttentionRegistry::open(&path, uid(), &mut store).unwrap_err(),
             "platform_v2_attention_store_refused"
         );
+    }
+
+    #[test]
+    fn a_later_tuple_conflict_rolls_back_the_complete_registry_import() {
+        let directory = private_directory();
+        let path = directory.path().join("registry.json");
+        let mut current_a = fixture();
+        current_a["project"] = serde_json::json!("project-a");
+        let mut current_b = fixture();
+        current_b["project"] = serde_json::json!("project-b");
+        write_registry(
+            &path,
+            vec![current_a.clone(), current_b.clone()],
+            "generation-1",
+        );
+        let mut store = store(directory.path());
+        AttentionRegistry::open(&path, uid(), &mut store).unwrap();
+
+        let mut successor_a = current_a.clone();
+        successor_a["revision"] = serde_json::json!(8);
+        successor_a["previous_revision"] = serde_json::json!(7);
+        successor_a["observed_at_ms"] = serde_json::json!(2_100);
+        successor_a["items"][0]["revision"] = serde_json::json!(8);
+        successor_a["items"][0]["observed_at_ms"] = serde_json::json!(2_090);
+        let mut wrong_predecessor_b = current_b.clone();
+        wrong_predecessor_b["revision"] = serde_json::json!(9);
+        wrong_predecessor_b["previous_revision"] = serde_json::json!(8);
+        wrong_predecessor_b["observed_at_ms"] = serde_json::json!(2_200);
+        wrong_predecessor_b["items"][0]["revision"] = serde_json::json!(9);
+        wrong_predecessor_b["items"][0]["observed_at_ms"] = serde_json::json!(2_190);
+        write_registry(
+            &path,
+            vec![successor_a, wrong_predecessor_b],
+            "generation-2",
+        );
+        assert_eq!(
+            AttentionRegistry::open(&path, uid(), &mut store).unwrap_err(),
+            "platform_v2_attention_store_refused"
+        );
+
+        for raw in [current_a, current_b] {
+            let expected =
+                decode_attention_source_snapshot(&serde_json::to_vec(&raw).expect("snapshot JSON"))
+                    .unwrap();
+            assert_eq!(
+                store
+                    .snapshot(
+                        expected.source(),
+                        expected.project(),
+                        expected.user_workspace(),
+                    )
+                    .unwrap(),
+                Some(expected)
+            );
+        }
     }
 
     #[test]
