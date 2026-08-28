@@ -19,8 +19,8 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use automonique_agents::{
     JCODE_API_SCHEMA_ID, JCODE_API_VERSION, JcodeEvent, JcodeExecutionIdentity, JcodeFrameDecoder,
@@ -30,7 +30,10 @@ use automonique_agents::{
 };
 use automonique_protocol::provenance::{CausationId, CorrelationId, Provenance, TraceId};
 use automonique_runner::{
-    LaunchPlan, LaunchPlanError, RunContainment, SandboxedSession, spawn_sandboxed_session,
+    Exceedance, LaunchPlan, LaunchPlanError, NamespacedMountError, NamespacedOutcome,
+    RunContainment, SandboxedSession, StatfsReadback, TemporaryStorageBudget,
+    backend::TEMPORARY_STORAGE_CHECKPOINT_INTERVAL, spawn_sandboxed_session,
+    spawn_sandboxed_session_with_namespaced_temporary_storage,
 };
 use automonique_store::provider_journal::{
     ApprovalDecision, ApprovalRecord, BindingRecord, CursorAdvance, FinishReason,
@@ -53,9 +56,16 @@ pub enum JcodeHostError {
     Io(std::io::Error),
     Protocol(JcodeProtocolError),
     Journal(ProviderJournalError),
+    TemporaryStorage(NamespacedMountError),
+    TemporaryStorageExceeded {
+        exceedance: Exceedance,
+        readback: Option<StatfsReadback>,
+    },
     Containment(automonique_runner::ContainmentError),
     ProviderRefused,
-    ProviderEof { incomplete_frame: bool },
+    ProviderEof {
+        incomplete_frame: bool,
+    },
     TurnAlreadyOpen,
     NoOpenTurn,
     ApprovalMismatch,
@@ -70,6 +80,13 @@ impl fmt::Display for JcodeHostError {
             Self::Io(error) => write!(formatter, "JCode I/O: {error}"),
             Self::Protocol(error) => write!(formatter, "JCode protocol: {error}"),
             Self::Journal(error) => write!(formatter, "JCode journal: {error}"),
+            Self::TemporaryStorage(error) => write!(formatter, "JCode temporary storage: {error}"),
+            Self::TemporaryStorageExceeded { exceedance, .. } => {
+                write!(
+                    formatter,
+                    "JCode temporary-storage budget exceeded during startup: {exceedance}"
+                )
+            }
             Self::Containment(error) => write!(formatter, "JCode containment: {error}"),
             Self::ProviderRefused => formatter.write_str("JCode refused a correlated request"),
             Self::ProviderEof { incomplete_frame } => {
@@ -109,6 +126,18 @@ impl From<ProviderJournalError> for JcodeHostError {
     fn from(value: ProviderJournalError) -> Self {
         Self::Journal(value)
     }
+}
+
+impl From<NamespacedMountError> for JcodeHostError {
+    fn from(value: NamespacedMountError) -> Self {
+        Self::TemporaryStorage(value)
+    }
+}
+
+struct NamespacedStorageLaunch {
+    mountpoint: PathBuf,
+    budget: TemporaryStorageBudget,
+    checkpoint: PathBuf,
 }
 
 /// The journal's reason for a request left pending when its host closed in the
@@ -237,6 +266,74 @@ impl JcodeSessionHost {
         now_ms: i64,
         startup_timeout: Duration,
     ) -> Result<Self, JcodeHostError> {
+        Self::spawn_inner(
+            helper,
+            plan,
+            containment,
+            journal_path,
+            logical_key,
+            working_dir,
+            resume_session_id,
+            model,
+            expected_server,
+            now_ms,
+            startup_timeout,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_namespaced_temporary_storage(
+        helper: &Path,
+        plan: &LaunchPlan,
+        containment: RunContainment,
+        journal_path: &Path,
+        logical_key: &str,
+        working_dir: &Path,
+        resume_session_id: Option<&str>,
+        model: Option<&str>,
+        expected_server: &str,
+        now_ms: i64,
+        startup_timeout: Duration,
+        mountpoint: &Path,
+        budget: TemporaryStorageBudget,
+        checkpoint: &Path,
+    ) -> Result<Self, JcodeHostError> {
+        Self::spawn_inner(
+            helper,
+            plan,
+            containment,
+            journal_path,
+            logical_key,
+            working_dir,
+            resume_session_id,
+            model,
+            expected_server,
+            now_ms,
+            startup_timeout,
+            Some(NamespacedStorageLaunch {
+                mountpoint: mountpoint.to_path_buf(),
+                budget,
+                checkpoint: checkpoint.to_path_buf(),
+            }),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_inner(
+        helper: &Path,
+        plan: &LaunchPlan,
+        containment: RunContainment,
+        journal_path: &Path,
+        logical_key: &str,
+        working_dir: &Path,
+        resume_session_id: Option<&str>,
+        model: Option<&str>,
+        expected_server: &str,
+        now_ms: i64,
+        startup_timeout: Duration,
+        temporary_storage: Option<NamespacedStorageLaunch>,
+    ) -> Result<Self, JcodeHostError> {
         validate_key(logical_key, "logical_key")?;
         if now_ms < 0 || !working_dir.is_absolute() {
             return Err(JcodeHostError::InvalidField("startup"));
@@ -267,8 +364,18 @@ impl JcodeSessionHost {
             &configuration_sha256,
             expected_server,
         )?;
-        let mut process = spawn_sandboxed_session(helper, &launch_plan, &containment)
-            .map_err(JcodeHostError::Launch)?;
+        let mut process = match temporary_storage {
+            Some(storage) => spawn_sandboxed_session_with_namespaced_temporary_storage(
+                helper,
+                &launch_plan,
+                &containment,
+                &storage.mountpoint,
+                storage.budget,
+                &storage.checkpoint,
+            ),
+            None => spawn_sandboxed_session(helper, &launch_plan, &containment),
+        }
+        .map_err(JcodeHostError::Launch)?;
         let stream = match process.try_clone_stream() {
             Ok(stream) => stream,
             Err(error) => {
@@ -276,13 +383,18 @@ impl JcodeSessionHost {
                 return Err(JcodeHostError::Io(error));
             }
         };
-        stream.set_read_timeout(Some(startup_timeout))?;
+        let startup_deadline = Instant::now()
+            .checked_add(startup_timeout)
+            .ok_or(JcodeHostError::InvalidField("startup_timeout"))?;
         let mut host = StartupHost {
             process,
             reader: BufReader::new(stream),
             decoder: JcodeFrameDecoder::new(),
             incomplete_frame: false,
             next_request_id: 1,
+            startup_deadline,
+            last_temporary_storage_checkpoint: Instant::now(),
+            pending_line: Vec::new(),
         };
         let hello_id = host.send(&JcodeRequest::Hello {
             min_version: JCODE_API_VERSION,
@@ -340,7 +452,9 @@ impl JcodeSessionHost {
             ));
         }
 
+        host.observe_temporary_storage()?;
         let mut journal = ProviderJournal::open(journal_path)?;
+        host.observe_temporary_storage()?;
         super::provider_session_host::retire_orphaned_attempt(&mut journal, logical_key, now_ms)
             .map_err(|error| match error {
                 super::provider_session_host::SessionHostError::Journal(error) => {
@@ -348,6 +462,7 @@ impl JcodeSessionHost {
                 }
                 _ => JcodeHostError::InvalidField("orphan_recovery"),
             })?;
+        host.observe_temporary_storage()?;
         let spawn_key = format!("{logical_key}:{now_ms}");
         let process_receipt = journal.record_process(ProcessSpawn {
             spawn_key: &spawn_key,
@@ -360,11 +475,13 @@ impl JcodeSessionHost {
             force_version_change: false,
             spawned_ms: now_ms,
         })?;
+        host.observe_temporary_storage()?;
         let session = journal.open_session(SessionOpening {
             process_id: process_receipt.process_id,
             provider_session_key: &provider_session_id,
             opened_ms: now_ms,
         })?;
+        host.observe_temporary_storage()?;
         let capability_digest = digest(capabilities.join("\n").as_bytes());
         journal.bind_capability(BindingRecord {
             session_id: session.session_id,
@@ -373,6 +490,7 @@ impl JcodeSessionHost {
             value_digest: &capability_digest,
             bound_ms: now_ms,
         })?;
+        host.observe_temporary_storage()?;
         let schema_digest = digest(server.as_bytes());
         journal.bind_schema(BindingRecord {
             session_id: session.session_id,
@@ -381,6 +499,7 @@ impl JcodeSessionHost {
             value_digest: &schema_digest,
             bound_ms: now_ms,
         })?;
+        host.observe_temporary_storage()?;
         journal.bind_capability(BindingRecord {
             session_id: session.session_id,
             name: "jcode-execution-config",
@@ -388,6 +507,12 @@ impl JcodeSessionHost {
             value_digest: &configuration_sha256,
             bound_ms: now_ms,
         })?;
+        // The provider has completed synchronous negotiation but has not been
+        // handed a prompt. Refuse here if startup itself crossed the scratch
+        // ceiling, and leave one fresh checkpoint as the custody boundary
+        // between startup and the caller's turn admission.
+        host.observe_temporary_storage()?;
+        host.process.checkpoint_temporary_storage()?;
 
         Ok(Self {
             logical_key: logical_key.to_owned(),
@@ -423,6 +548,21 @@ impl JcodeSessionHost {
     #[must_use]
     pub fn operating_system_process_id(&self) -> u32 {
         self.process.id()
+    }
+
+    #[must_use]
+    pub fn temporary_storage_exceedance(&self) -> Option<automonique_runner::Exceedance> {
+        self.process.temporary_storage_exceedance()
+    }
+
+    #[must_use]
+    pub fn temporary_storage_readback(&self) -> Option<automonique_runner::StatfsReadback> {
+        self.process.temporary_storage_readback()
+    }
+
+    pub fn checkpoint_temporary_storage(&mut self) -> Result<(), JcodeHostError> {
+        self.process.checkpoint_temporary_storage()?;
+        Ok(())
     }
 
     /// The input-request capability the contained engine advertised.
@@ -841,12 +981,21 @@ impl JcodeSessionHost {
     /// its turn was over did not. `reason` is a bounded static spelling chosen
     /// by this crate, never caller or provider text.
     pub fn close_with_reason(
-        mut self,
+        self,
         now_ms: i64,
         reason: &'static str,
     ) -> Result<(), JcodeHostError> {
+        self.close_with_reason_and_temporary_storage(now_ms, reason)
+            .map(|_| ())
+    }
+
+    pub fn close_with_reason_and_temporary_storage(
+        mut self,
+        now_ms: i64,
+        reason: &'static str,
+    ) -> Result<Option<NamespacedOutcome>, JcodeHostError> {
         if self.closed {
-            return Ok(());
+            return Ok(None);
         }
         if let Some(pending) = self.pending.take() {
             self.abort_pending(pending, now_ms, reason)?;
@@ -860,6 +1009,7 @@ impl JcodeSessionHost {
         self.session_revision = session.revision;
         let _ = self.process.kill();
         let _ = self.process.wait();
+        let temporary_storage = self.process.reconcile_temporary_storage();
         let process = self.journal.finish_process(ProcessExit {
             process_id: self.process_id,
             expected_revision: self.process_revision,
@@ -873,7 +1023,7 @@ impl JcodeSessionHost {
                 .map_err(JcodeHostError::Containment)?;
         }
         self.closed = true;
-        Ok(())
+        Ok(temporary_storage?)
     }
 
     fn drive_one(&mut self, now_ms: i64) -> Result<JcodeTurnOutcome, JcodeHostError> {
@@ -1214,15 +1364,62 @@ impl Drop for JcodeSessionHost {
     }
 }
 
-struct StartupHost {
-    process: SandboxedSession,
+trait StartupProcess {
+    fn write_all(&mut self, bytes: &[u8]) -> Result<(), std::io::Error>;
+    fn checkpoint_temporary_storage(&mut self) -> Result<(), std::io::Error>;
+    fn temporary_storage_exceedance(&self) -> Option<Exceedance>;
+    fn temporary_storage_readback(&self) -> Option<StatfsReadback>;
+}
+
+impl StartupProcess for SandboxedSession {
+    fn write_all(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {
+        SandboxedSession::write_all(self, bytes)
+    }
+
+    fn checkpoint_temporary_storage(&mut self) -> Result<(), std::io::Error> {
+        SandboxedSession::checkpoint_temporary_storage(self)
+    }
+
+    fn temporary_storage_exceedance(&self) -> Option<Exceedance> {
+        SandboxedSession::temporary_storage_exceedance(self)
+    }
+
+    fn temporary_storage_readback(&self) -> Option<StatfsReadback> {
+        SandboxedSession::temporary_storage_readback(self)
+    }
+}
+
+struct StartupHost<P = SandboxedSession> {
+    process: P,
     reader: BufReader<std::os::unix::net::UnixStream>,
     decoder: JcodeFrameDecoder,
     incomplete_frame: bool,
     next_request_id: u64,
+    startup_deadline: Instant,
+    last_temporary_storage_checkpoint: Instant,
+    pending_line: Vec<u8>,
 }
 
-impl StartupHost {
+impl<P: StartupProcess> StartupHost<P> {
+    fn observe_temporary_storage(&mut self) -> Result<(), JcodeHostError> {
+        if let Some(exceedance) = self.process.temporary_storage_exceedance() {
+            // The refusal is not surfaced until its exact ledger has been
+            // durably checkpointed. The typed error then reaches the run spool
+            // without allowing a prompt to cross this boundary.
+            self.process.checkpoint_temporary_storage()?;
+            return Err(JcodeHostError::TemporaryStorageExceeded {
+                exceedance,
+                readback: self.process.temporary_storage_readback(),
+            });
+        }
+        if self.last_temporary_storage_checkpoint.elapsed() >= TEMPORARY_STORAGE_CHECKPOINT_INTERVAL
+        {
+            self.process.checkpoint_temporary_storage()?;
+            self.last_temporary_storage_checkpoint = Instant::now();
+        }
+        Ok(())
+    }
+
     fn send(&mut self, request: &JcodeRequest) -> Result<u64, JcodeHostError> {
         let id = self.next_request_id;
         let encoded = encode_jcode_request(id, request)?;
@@ -1235,24 +1432,59 @@ impl StartupHost {
     }
 
     fn next_event(&mut self) -> Result<JcodeEvent, JcodeHostError> {
-        let mut line = Vec::new();
-        let read = self.reader.read_until(b'\n', &mut line)?;
-        if read == 0 {
-            return Err(JcodeHostError::ProviderEof {
-                incomplete_frame: self.incomplete_frame,
-            });
+        loop {
+            self.observe_temporary_storage()?;
+            let remaining = self
+                .startup_deadline
+                .saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(JcodeHostError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "JCode startup deadline elapsed",
+                )));
+            }
+            self.reader
+                .get_ref()
+                .set_read_timeout(Some(remaining.min(TEMPORARY_STORAGE_CHECKPOINT_INTERVAL)))?;
+            let read = self.reader.read_until(b'\n', &mut self.pending_line);
+            if self.pending_line.len() > MAX_EVENT_LINE_BYTES {
+                return Err(JcodeHostError::Protocol(JcodeProtocolError::FrameTooLarge));
+            }
+            match read {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    // `read_until` may already have appended a partial frame.
+                    // Keep it across the cadence tick rather than dropping
+                    // provider bytes merely because a checkpoint became due.
+                    continue;
+                }
+                Err(error) => return Err(JcodeHostError::Io(error)),
+                Ok(0) => {
+                    self.incomplete_frame |= !self.pending_line.is_empty();
+                    return Err(JcodeHostError::ProviderEof {
+                        incomplete_frame: self.incomplete_frame,
+                    });
+                }
+                Ok(_) if !self.pending_line.ends_with(b"\n") => {
+                    self.incomplete_frame = true;
+                    continue;
+                }
+                Ok(_) => {}
+            }
+            let line = std::mem::take(&mut self.pending_line);
+            let events = self.decoder.push(&line)?;
+            if events.len() != 1 {
+                return Err(JcodeHostError::Protocol(JcodeProtocolError::InvalidFrame));
+            }
+            return events
+                .into_iter()
+                .next()
+                .ok_or(JcodeHostError::Protocol(JcodeProtocolError::InvalidFrame));
         }
-        if !line.ends_with(b"\n") {
-            self.incomplete_frame = true;
-        }
-        let events = self.decoder.push(&line)?;
-        if events.len() != 1 {
-            return Err(JcodeHostError::Protocol(JcodeProtocolError::InvalidFrame));
-        }
-        events
-            .into_iter()
-            .next()
-            .ok_or(JcodeHostError::Protocol(JcodeProtocolError::InvalidFrame))
     }
 }
 
@@ -1268,5 +1500,139 @@ fn validate_key(value: &str, field: &'static str) -> Result<(), JcodeHostError> 
         Err(JcodeHostError::InvalidField(field))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod startup_storage_tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    struct FakeStartupProcess {
+        checkpoints: Arc<AtomicUsize>,
+        exceedance: Option<Exceedance>,
+        refuse_checkpoint: bool,
+    }
+
+    impl StartupProcess for FakeStartupProcess {
+        fn write_all(&mut self, _bytes: &[u8]) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+
+        fn checkpoint_temporary_storage(&mut self) -> Result<(), std::io::Error> {
+            self.checkpoints.fetch_add(1, Ordering::SeqCst);
+            if self.refuse_checkpoint {
+                Err(std::io::Error::other("injected checkpoint refusal"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn temporary_storage_exceedance(&self) -> Option<Exceedance> {
+            self.exceedance
+        }
+
+        fn temporary_storage_readback(&self) -> Option<StatfsReadback> {
+            None
+        }
+    }
+
+    fn startup_host(
+        process: FakeStartupProcess,
+        stream: UnixStream,
+        deadline: Duration,
+    ) -> StartupHost<FakeStartupProcess> {
+        StartupHost {
+            process,
+            reader: BufReader::new(stream),
+            decoder: JcodeFrameDecoder::new(),
+            incomplete_frame: false,
+            next_request_id: 1,
+            startup_deadline: Instant::now() + deadline,
+            last_temporary_storage_checkpoint: Instant::now(),
+            pending_line: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn synchronous_startup_ticks_the_checkpoint_before_its_deadline() {
+        let checkpoints = Arc::new(AtomicUsize::new(0));
+        let (reader, writer) = UnixStream::pair().unwrap();
+        let closer = thread::spawn(move || {
+            thread::sleep(TEMPORARY_STORAGE_CHECKPOINT_INTERVAL * 2 + Duration::from_millis(30));
+            drop(writer);
+        });
+        let mut host = startup_host(
+            FakeStartupProcess {
+                checkpoints: Arc::clone(&checkpoints),
+                exceedance: None,
+                refuse_checkpoint: false,
+            },
+            reader,
+            TEMPORARY_STORAGE_CHECKPOINT_INTERVAL * 3,
+        );
+        assert!(matches!(
+            host.next_event(),
+            Err(JcodeHostError::ProviderEof {
+                incomplete_frame: false
+            })
+        ));
+        closer.join().unwrap();
+        assert!(
+            checkpoints.load(Ordering::SeqCst) >= 2,
+            "a synchronous startup wait must not leave a checkpoint gap above 250ms"
+        );
+    }
+
+    #[test]
+    fn a_startup_quota_refusal_is_checkpointed_and_typed_before_provider_input() {
+        let checkpoints = Arc::new(AtomicUsize::new(0));
+        let (reader, _writer) = UnixStream::pair().unwrap();
+        let exceedance = Exceedance {
+            resource: automonique_runner::TemporaryStorageResource::Bytes,
+            requested: 4097,
+            used: 4096,
+            ceiling: 4096,
+        };
+        let mut host = startup_host(
+            FakeStartupProcess {
+                checkpoints: Arc::clone(&checkpoints),
+                exceedance: Some(exceedance),
+                refuse_checkpoint: false,
+            },
+            reader,
+            Duration::from_secs(1),
+        );
+        assert!(matches!(
+            host.next_event(),
+            Err(JcodeHostError::TemporaryStorageExceeded {
+                exceedance: observed,
+                readback: None,
+            }) if observed == exceedance
+        ));
+        assert_eq!(checkpoints.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn startup_checkpoint_failure_is_refused_before_any_provider_event() {
+        let checkpoints = Arc::new(AtomicUsize::new(0));
+        let (reader, _writer) = UnixStream::pair().unwrap();
+        let mut host = startup_host(
+            FakeStartupProcess {
+                checkpoints: Arc::clone(&checkpoints),
+                exceedance: None,
+                refuse_checkpoint: true,
+            },
+            reader,
+            Duration::from_secs(1),
+        );
+        host.last_temporary_storage_checkpoint =
+            Instant::now() - TEMPORARY_STORAGE_CHECKPOINT_INTERVAL;
+
+        assert!(matches!(host.next_event(), Err(JcodeHostError::Io(_))));
+        assert_eq!(checkpoints.load(Ordering::SeqCst), 1);
     }
 }

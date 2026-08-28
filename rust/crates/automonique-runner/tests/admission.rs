@@ -1226,6 +1226,42 @@ fn identity_separation_and_the_temporary_storage_mount_cannot_combine() {
 }
 
 #[test]
+fn required_uid_separation_attaches_only_the_private_namespaced_tempfs_path() {
+    let workspace = TempDir::new("namespaced-attachment");
+    let mountpoint = workspace.path().join("tmp");
+    fs::create_dir(&mountpoint).unwrap();
+    let uid_implementation = ImplementationDigest::parse(&digest_text('e')).unwrap();
+    let mut sandbox = sandbox_parts();
+    sandbox.required_features = RequiredFeatures::declare(&[RequiredFeature::new(
+        "uid_separation",
+        std::slice::from_ref(&uid_implementation),
+    )
+    .unwrap()])
+    .unwrap();
+    let mut parts = spec_parts();
+    parts.sandbox = SandboxSpec::compile(sandbox).unwrap();
+    let spec = RunSpec::new(parts).unwrap();
+    let mut context = context_parts(workspace.path());
+    context.host_features = vec![HostFeature::new("uid_separation", uid_implementation).unwrap()];
+    let admitted = admit(&spec, &AdmissionContext::new(context).unwrap()).unwrap();
+    assert!(admitted.plan().separates_workload_identity());
+    let attached = admitted
+        .with_namespaced_temporary_storage(&mountpoint)
+        .unwrap();
+    let frame = String::from_utf8(attached.plan().encode().unwrap()).unwrap();
+    assert!(frame.contains("\nidentity=subordinate\n"), "{frame}");
+    assert!(frame.contains("\ntempfs="), "{frame}");
+    assert!(frame.contains("\nenv=544d50444952:"), "{frame}");
+
+    // The legacy supervisor-visible mount seam remains fail-closed for this
+    // same plan; only the explicit private-mount attachment may compose it.
+    assert!(matches!(
+        refuse_identity_temporary_storage_conflict(attached.plan()),
+        Err(AdmissionRefusal::WorkloadIdentityTemporaryStorageConflict)
+    ));
+}
+
+#[test]
 fn a_byte_ceiling_that_statfs_cannot_report_exactly_is_refused() {
     let workspace = TempDir::new("tempfs-misaligned");
     // Not a multiple of the 4096-byte readback block.

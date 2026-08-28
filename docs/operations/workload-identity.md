@@ -8,7 +8,8 @@ including any secret placed there) and open `/proc/<pid>/fd/0` (its prompt),
 and could trace it. Audit finding F-10 named this the largest real sandbox
 gap. This page records how a workload gets a host uid of its own, what that
 does and does not close, why the request is per-plan and off by default, and
-the kernel limitation that keeps it apart from the temporary-storage mount.
+how the runner's bounded in-namespace temporary-storage primitive avoids the
+kernel conflict in daemon admission and execution.
 
 ## The mechanism
 
@@ -68,7 +69,7 @@ cannot open a nested namespace in which it would be root again.
 | The workload runs as a host uid that is not the supervisor's. From `execve` on, a process of the supervisor's uid gets `EACCES` reading `/proc/<pid>/environ` and opening `/proc/<pid>/fd/0`: the credential change marks the workload non-dumpable, so its `/proc` files become root-owned. The delegated-scope proof `a_same_uid_observer_cannot_read_the_workload_environ_or_stdin` reads both from the supervisor uid and from a same-uid sibling and asserts the refusals; `the_workload_runs_as_a_host_uid_outside_the_supervisor_uid` reads `/proc/<pid>/status` from outside the namespace. | `automonique_runner::identity`, `automonique_runner::launch` |
 | Identity separation is **not** discretionary-access separation. The workload keeps `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH`/`CAP_FOWNER` over inodes the supervisor owns — the workspace and the provider home — because a workload that could not open them would not be a workload. The Landlock allowlist stays the filesystem boundary. | `automonique_runner::identity` |
 | The capability probe exercises the switch, rather than reading a config file: it runs the launch helper in a throwaway probe mode that performs the whole switch on itself and reports its own kernel view. So a host whose subordinate files, mapping helpers or AppArmor policy would refuse the launch refuses the probe the same way, and readiness (`SandboxEnforceableLaneWired` / `SandboxUnavailableLaneWired`) reflects it. | `automonique_runner::capability::WorkloadIdentityFinding`, `automonique_daemon::execute::offered_host_features` |
-| Fail-closed, per plan. A plan that asks is refused by the entry helper — before the workload exists — when any prerequisite is missing, with a typed reason. A plan that asks **and** would attach the enforced temporary-storage mount is refused at admission with `WorkloadIdentityTemporaryStorageConflict`, naming the kernel limitation below; each feature works alone. No RunSpec field can request the separation yet, so the daemon lane composes every run without it and `uid_separation` is not in the daemon's `ENFORCED_PROPERTIES`; it joins them when the limitation below is resolved and a document vocabulary exists. | `automonique_runner::admission::refuse_identity_temporary_storage_conflict`, `automonique_runner::launch` |
+| Fail-closed, per plan. A plan that asks is refused by the entry helper — before the workload exists — when any prerequisite is missing, with a typed reason. The stable `sandbox.required_features` vocabulary requests `uid_separation`; the daemon offers its exact measured implementation digest and admission adds the identity switch only for a matching requirement. A temporary-storage budget then uses the explicit in-namespace attachment. The legacy supervisor-visible attachment still refuses the combination with `WorkloadIdentityTemporaryStorageConflict`. | `automonique_runner::admission`, `automonique_runner::launch`, `automonique_daemon::execute` |
 
 Signalling is deliberately **not** blocked: the supervisor's uid owns the
 workload's user namespace, so it keeps `CAP_KILL` over that namespace, which
@@ -98,12 +99,14 @@ not the ability to end the run.
 These are prerequisites for a plan that asks; a host without them runs every
 ordinary plan untouched and refuses only the asking ones, typed.
 
-## The kernel limitation: no separated identity with the FUSE tempfs
+## Temporary storage in the workload namespace
 
-The identity switch and the per-run FUSE temporary-storage mount (#140) are,
-on this kernel, **mutually exclusive**, which is why the combination is a
-typed admission refusal (`WorkloadIdentityTemporaryStorageConflict`) and the
-separation is not yet the default.
+The legacy supervisor-mounted per-run FUSE filesystem (#140) and identity
+switch are, on this kernel, **mutually exclusive**. That compatibility path
+still has a typed admission refusal
+(`WorkloadIdentityTemporaryStorageConflict`). Production uses the private
+in-namespace mount described below; the old refusal remains while crash
+adoption is incomplete.
 
 The tempfs is mounted by the supervisor through the setuid `fusermount3`, so
 the FUSE connection's owning user namespace (`fc->user_ns`) is the init user
@@ -130,15 +133,52 @@ ownership change on the supervisor's mount can lift the refusal. `#140` is
 deliberately untouched: its mount options, prerequisites and every test are
 exactly what they were.
 
-**Intended end state.** The mount is performed *inside* the workload's
-namespace: the launch helper, which owns the workload's user namespace and can
-unshare a mount namespace beside it, performs the FUSE mount itself, so
-`fc->user_ns` is the workload's namespace and access is ordinary. That makes
-the mount private to the workload's mount namespace, so the supervisor's
-`statvfs` reconcile (`temporary_storage_readback`) must move to the ledger the
-QuotaFs server already maintains, or read through `/proc/<workload>/root`.
-When that lands, the combination refusal is removed, a document vocabulary can
-request the separation, and `uid_separation` joins the daemon's enforced
-properties. Until then: every #140 delegated proof passes unchanged, the
-identity proofs in `tests/workload_identity.rs` pass for plans that ask, and
-`a_plan_that_does_not_ask_keeps_the_supervisor_identity` pins the default.
+The runner now has a bounded primitive that performs the mount *inside* the
+workload namespace. The launch helper opens `/dev/fuse` after creating the
+user namespace, unshares its mount namespace, makes mount propagation private,
+and performs the FUSE mount while it is namespace root. It passes only the
+opened FUSE descriptor back to the supervisor over its private control socket;
+the supervisor owns the `QuotaFs` server and sets the filesystem root uid to
+the uid number the workload sees in that namespace. Before accepting, the
+helper reads `/proc/self/mountinfo` and `statfs` from the workload namespace,
+and the supervisor validates the exact bounded report. The control descriptor
+is replaced before descriptor closure and no workload instruction runs before
+the handshake succeeds.
+
+Because the mount is private, supervisor reconciliation derives a statfs-shaped
+readback from the exact filesystem ledger. Checkpoint decoding validates the
+ledger's byte/object usage, peaks and refusal records before accepting restart
+state. The delegated proof in `tests/namespaced_tempfs.rs` composes identity,
+the private mount, a real write/read, a real ceiling refusal, namespace teardown
+and a fresh read of the final checkpoint.
+
+The daemon production lane now uses this path for both direct processes and
+JCode sessions. The existing `required_features` protocol vocabulary requests
+`uid_separation` by its stable boundary-property name and pins the measured
+implementation digest; admission adds the identity switch only when the
+document requires that exact feature. The daemon advertises it only after
+probing the release-pinned launch helper, then checkpoints the live ledger at
+most every 250 ms and immediately on a refusal. Delegated `run_compose` and
+`execute_brokered` proofs read the final private-mount checkpoint from the real
+production lane.
+
+The old supervisor-visible attachment API and its
+`WorkloadIdentityTemporaryStorageConflict` refusal deliberately remain for
+callers that do not request the composed private namespace path. Production
+ownership is instead transferred to `automonique-tempfs-owner.service`, a
+sibling service outside the daemon's process and cgroup kill domain. Its
+private versioned Unix protocol accepts only same-uid peers, binds one owner to
+the exact run and cgroup inode, and fences every request on the next durable
+checkpoint sequence. The daemon keeps only a private adoption token and a
+non-secret custody record in the run directory; a new daemon generation uses
+both to adopt a still-live ledger without taking the FUSE descriptor back.
+
+The owner writes a live checkpoint every 200 ms, within the 250 ms monitoring
+contract, and on every explicit poll. If the owner itself restarts, its lost
+FUSE descriptor is unrecoverable: startup converts the last live checkpoint
+to a monotonic `Final` record with `aborted=true` and
+`unmount_confirmed=false`, removes the adoption material, and never reports a
+successful adoption. The delegated namespace tests remain the kernel evidence
+for mounting, exact quota enforcement and teardown; owner protocol, restart,
+redaction and systemd-domain tests cover the durable custody boundary on hosts
+without delegated FUSE/cgroup prerequisites.

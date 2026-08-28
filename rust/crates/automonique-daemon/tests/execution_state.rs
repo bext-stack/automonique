@@ -96,8 +96,9 @@ fn reported_execution_state_matches_an_independent_measurement() {
 
     // The independent measurement asks for exactly the properties the
     // composed launch path enforces — the same question the daemon asks.
-    let independent =
-        HostCapabilities::probe().select_mode(&automonique_daemon::execute::ENFORCED_PROPERTIES);
+    let helper = automonique_daemon::execute::locate_launch_helper();
+    let independent = HostCapabilities::probe_with_launch_helper(helper.as_deref())
+        .select_mode(&automonique_daemon::execute::ENFORCED_PROPERTIES);
     let expected = match independent {
         Ok(_) => ExecutionState::SandboxEnforceableLaneWired,
         Err(_) => ExecutionState::SandboxUnavailableLaneWired,

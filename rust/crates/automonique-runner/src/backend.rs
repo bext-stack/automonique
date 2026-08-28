@@ -91,11 +91,16 @@
 //! by its own pipe rather than by growing a buffer in this process.
 
 use crate::containment::{ContainmentDomain, ContainmentError, ContainmentLimits, RunContainment};
-use crate::launch::{LaunchError, LaunchPlan, StdoutCapture, spawn_sandboxed_with_stdout};
+use crate::launch::{
+    LaunchError, LaunchPlan, NamespacedSandboxedChild, StdoutCapture,
+    spawn_sandboxed_with_namespaced_temporary_storage, spawn_sandboxed_with_stdout,
+};
 use crate::runner::CancellationToken;
 use crate::spool::{Authority, EventKind, Spool, SpoolError, Status};
+use crate::tempfs::NamespacedOutcome;
 use crate::tempfs_fs::ExceedanceChannel;
 use crate::tempfs_ledger::Exceedance;
+use crate::tempfs_ledger::TemporaryStorageBudget;
 use crate::tempfs_readback::{ReadbackError, StatfsReadback, statfs_bounded};
 use automonique_protocol::event::{
     Authority as FrameAuthority, EventKind as FrameKind, RetryCategory, RetryContext,
@@ -139,6 +144,8 @@ pub const STARTED_PAYLOAD_PREFIX: &str = "direct-process pid=";
 /// interval and needs no signal handler, no `pidfd`, and no thread beyond the
 /// caller's own.
 pub const SUPERVISION_POLL: Duration = Duration::from_millis(5);
+/// Maximum interval between durable live-ledger snapshots.
+pub const TEMPORARY_STORAGE_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Bound on how long disposal waits for the killed tree to leave the cgroup.
 ///
@@ -358,11 +365,12 @@ pub enum ExecutionOutcome {
     TimedOut,
     /// The workload crossed its temporary-storage budget. The FUSE filesystem
     /// refused the write or the object at the syscall that asked (`ENOSPC` /
-    /// `EDQUOT`), the supervisor read the first refusal from the mount's
-    /// exceedance channel, and the tree was killed. The exceedance names the
-    /// ceiling that tripped, exactly as the filesystem observed it; the
-    /// `statfs` readback that corroborates it is on the reconcile's own
-    /// [`crate::Outcome`], which the caller holds beside this report.
+    /// `EDQUOT`). The supervisor either observed the refusal live and killed
+    /// the tree, or retained it from final reconciliation after the workload
+    /// exited immediately. The exceedance names the ceiling that tripped,
+    /// exactly as the filesystem observed it; the `statfs` readback that
+    /// corroborates it is on the reconcile's own [`crate::Outcome`], which the
+    /// caller holds beside this report.
     TemporaryStorageExceeded {
         /// The first refusal the filesystem's ledger recorded.
         exceedance: Exceedance,
@@ -412,7 +420,7 @@ impl fmt::Display for ExecutionOutcome {
             Self::TimedOut => formatter.write_str("the run exceeded its deadline and was killed"),
             Self::TemporaryStorageExceeded { exceedance } => write!(
                 formatter,
-                "the run crossed its temporary-storage budget and was killed: {exceedance}"
+                "the run crossed its temporary-storage budget: {exceedance}"
             ),
         }
     }
@@ -443,6 +451,8 @@ pub enum BackendError {
     Spool(SpoolError),
     /// Waiting on the supervised child failed.
     Wait(std::io::Error),
+    /// The exact live temporary-storage ledger could not be checkpointed.
+    TemporaryStorage(std::io::Error),
     /// The spawned child's pid does not fit the kernel's `pid_t`, so the
     /// supervisor cannot name the process it just created.
     PidUnrepresentable,
@@ -471,6 +481,12 @@ impl fmt::Display for BackendError {
             Self::Launch(error) => write!(formatter, "backend launch failed: {error}"),
             Self::Spool(error) => write!(formatter, "backend record failed: {error}"),
             Self::Wait(error) => write!(formatter, "backend wait failed: {error}"),
+            Self::TemporaryStorage(error) => {
+                write!(
+                    formatter,
+                    "backend temporary-storage checkpoint failed: {error}"
+                )
+            }
             Self::PidUnrepresentable => {
                 formatter.write_str("the spawned child's pid is not representable")
             }
@@ -508,6 +524,7 @@ pub struct ExecutionReport {
     supervised_pid: Option<Pid>,
     status: Status,
     temporary_storage_readback: Option<StatfsReadback>,
+    namespaced_temporary_storage: Option<NamespacedOutcome>,
 }
 
 impl ExecutionReport {
@@ -526,6 +543,11 @@ impl ExecutionReport {
     #[must_use]
     pub const fn temporary_storage_readback(&self) -> Option<StatfsReadback> {
         self.temporary_storage_readback
+    }
+
+    #[must_use]
+    pub const fn namespaced_temporary_storage(&self) -> Option<&NamespacedOutcome> {
+        self.namespaced_temporary_storage.as_ref()
     }
 
     /// The pid of the process this supervisor spawned, if one was ever created.
@@ -617,6 +639,7 @@ impl DirectProcessBackend {
             capture: None,
             observed: ObservedSequence::default(),
             temporary_storage: None,
+            namespaced_temporary_storage: None,
         })
     }
 }
@@ -642,6 +665,14 @@ pub struct PreparedRun {
     /// is contained the first time the ledger refuses it, and read back once
     /// the tree is dead so the spool carries the kernel's account of it.
     temporary_storage: Option<TemporaryStorageWatch>,
+    namespaced_temporary_storage: Option<NamespacedTemporaryStorage>,
+}
+
+#[derive(Clone, Debug)]
+struct NamespacedTemporaryStorage {
+    mountpoint: PathBuf,
+    budget: TemporaryStorageBudget,
+    checkpoint: PathBuf,
 }
 
 /// What a supervisor watches to contain one run's temporary storage.
@@ -786,6 +817,23 @@ impl PreparedRun {
         self
     }
 
+    /// Mount and serve the plan's already-admitted scratch filesystem inside
+    /// its separated workload namespace.
+    #[must_use]
+    pub fn with_namespaced_temporary_storage(
+        mut self,
+        mountpoint: impl Into<PathBuf>,
+        budget: TemporaryStorageBudget,
+        checkpoint: impl Into<PathBuf>,
+    ) -> Self {
+        self.namespaced_temporary_storage = Some(NamespacedTemporaryStorage {
+            mountpoint: mountpoint.into(),
+            budget,
+            checkpoint: checkpoint.into(),
+        });
+        self
+    }
+
     /// A handle on the sequence this attempt's spool has reached.
     ///
     /// Cloned before [`Self::execute`] consumes the attempt, because the point
@@ -822,6 +870,7 @@ impl PreparedRun {
             capture,
             observed,
             temporary_storage,
+            namespaced_temporary_storage,
             ..
         } = self;
         let mut supervised = SupervisedRun {
@@ -835,11 +884,13 @@ impl PreparedRun {
             frame_run_id,
             observed,
             temporary_storage,
+            namespaced_temporary_storage,
+            last_temporary_storage_checkpoint: Instant::now(),
         };
 
         // No `?` between here and `finish`: a supervision failure must not be
         // allowed to skip the terminal record. The error is carried, not thrown.
-        let (supervised_pid, outcome, failure) =
+        let (supervised_pid, mut outcome, failure) =
             match supervised.supervise(&helper, &plan, cancellation, deadline) {
                 Ok((pid, outcome)) => (pid, Some(outcome), None),
                 Err((pid, error)) => (pid, None, Some(error)),
@@ -856,18 +907,34 @@ impl PreparedRun {
         if let Some(error) = failure {
             return Err(error);
         }
-        let (status, temporary_storage_readback) = finished?;
+        let FinishedRun {
+            status,
+            temporary_storage_readback,
+            namespaced_temporary_storage,
+            final_exceedance,
+        } = finished?;
+        if let Some(exceedance) = final_exceedance {
+            outcome = Some(ExecutionOutcome::TemporaryStorageExceeded { exceedance });
+        }
         Ok(ExecutionReport {
             outcome: outcome.expect("a run without a failure produced an outcome"),
             supervised_pid,
             status,
             temporary_storage_readback,
+            namespaced_temporary_storage,
         })
     }
 }
 
 /// The pid of a spawned child, or the supervisor error that ended the attempt.
 type Supervision = Result<(Option<Pid>, ExecutionOutcome), (Option<Pid>, BackendError)>;
+
+struct FinishedRun {
+    status: Status,
+    temporary_storage_readback: Option<StatfsReadback>,
+    namespaced_temporary_storage: Option<NamespacedOutcome>,
+    final_exceedance: Option<Exceedance>,
+}
 
 /// The three things one attempt owns while it runs.
 ///
@@ -878,7 +945,7 @@ type Supervision = Result<(Option<Pid>, ExecutionOutcome), (Option<Pid>, Backend
 struct SupervisedRun {
     spool: Option<Spool>,
     containment: Option<RunContainment>,
-    child: Option<Child>,
+    child: Option<SupervisedChild>,
     /// The live reader, once stdout has been piped to one.
     reader: Option<ProgressReader>,
     /// Where appended frames are republished, for as long as anyone is reading.
@@ -894,6 +961,74 @@ struct SupervisedRun {
     /// every supervision interval so the first refusal contains the run, and
     /// read back at `finish` so the spool carries the kernel's account of it.
     temporary_storage: Option<TemporaryStorageWatch>,
+    namespaced_temporary_storage: Option<NamespacedTemporaryStorage>,
+    last_temporary_storage_checkpoint: Instant,
+}
+
+enum SupervisedChild {
+    Plain(Child),
+    Namespaced(Box<NamespacedSandboxedChild>),
+}
+
+impl SupervisedChild {
+    fn id(&self) -> u32 {
+        match self {
+            Self::Plain(child) => child.id(),
+            Self::Namespaced(child) => child.id(),
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        match self {
+            Self::Plain(child) => child.try_wait(),
+            Self::Namespaced(child) => child.try_wait(),
+        }
+    }
+
+    fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        match self {
+            Self::Plain(child) => child.wait(),
+            Self::Namespaced(child) => child.wait_process(),
+        }
+    }
+
+    fn take_stdout(&mut self) -> Option<ChildStdout> {
+        match self {
+            Self::Plain(child) => child.stdout.take(),
+            Self::Namespaced(child) => child.take_stdout(),
+        }
+    }
+
+    fn checkpoint_temporary_storage(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(_) => Ok(()),
+            Self::Namespaced(child) => child.checkpoint_temporary_storage(),
+        }
+    }
+
+    fn temporary_storage_exceedance(&self) -> Option<Exceedance> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Namespaced(child) => child.temporary_storage_exceedance(),
+        }
+    }
+
+    fn temporary_storage_readback(&self) -> Option<StatfsReadback> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Namespaced(child) => child.temporary_storage_readback(),
+        }
+    }
+
+    fn finish_namespaced(self) -> Result<Option<NamespacedOutcome>, BackendError> {
+        match self {
+            Self::Plain(_) => Ok(None),
+            Self::Namespaced(child) => (*child)
+                .wait()
+                .map(|(_, outcome)| Some(outcome))
+                .map_err(|error| BackendError::Wait(std::io::Error::other(error.to_string()))),
+        }
+    }
 }
 
 /// The reader thread and the queue it fills.
@@ -1167,8 +1302,22 @@ impl SupervisedRun {
         } else {
             StdoutCapture::Inherit
         };
-        let child = spawn_sandboxed_with_stdout(helper, plan, containment, stdout)
-            .map_err(|error| (None, BackendError::Launch(error)))?;
+        let child = match self.namespaced_temporary_storage.as_ref() {
+            Some(storage) => spawn_sandboxed_with_namespaced_temporary_storage(
+                helper,
+                plan,
+                containment,
+                &storage.mountpoint,
+                storage.budget,
+                &storage.checkpoint,
+                stdout,
+            )
+            .map(Box::new)
+            .map(SupervisedChild::Namespaced),
+            None => spawn_sandboxed_with_stdout(helper, plan, containment, stdout)
+                .map(SupervisedChild::Plain),
+        }
+        .map_err(|error| (None, BackendError::Launch(error)))?;
         let raw = i32::try_from(child.id()).map_err(|_| (None, BackendError::PidUnrepresentable));
         self.child = Some(child);
         let pid = Pid::from_raw(raw?);
@@ -1197,29 +1346,63 @@ impl SupervisedRun {
 
         let deadline_from = Instant::now();
         loop {
-            let child = self.child.as_mut().expect("the child was just adopted");
-            match child.try_wait() {
-                Ok(Some(status)) => return Ok((Some(pid), outcome_from_status(&status))),
-                Ok(None) => {}
+            let exited = match self
+                .child
+                .as_mut()
+                .expect("the child was just adopted")
+                .try_wait()
+            {
+                Ok(status) => status,
                 Err(error) => return Err((Some(pid), BackendError::Wait(error))),
-            }
+            };
             // The loop the supervisor already runs is where progress is
             // absorbed, because it is the one place that holds the spool.
             self.poll_progress();
+            if self.last_temporary_storage_checkpoint.elapsed()
+                >= TEMPORARY_STORAGE_CHECKPOINT_INTERVAL
+            {
+                if let Err(error) = self
+                    .child
+                    .as_mut()
+                    .expect("the child was just adopted")
+                    .checkpoint_temporary_storage()
+                {
+                    return Err((Some(pid), BackendError::TemporaryStorage(error)));
+                }
+                self.last_temporary_storage_checkpoint = Instant::now();
+            }
             // A temporary-storage refusal contains the run the first time the
             // ledger records one. The ceiling has already held — the workload
             // saw its own `ENOSPC`/`EDQUOT` — and this is the policy the ticket
             // names on top of it: the run does not continue past its first
             // budget refusal.
             if let Some(exceedance) = self
-                .temporary_storage
+                .child
                 .as_ref()
-                .and_then(TemporaryStorageWatch::first)
+                .and_then(SupervisedChild::temporary_storage_exceedance)
+                .or_else(|| {
+                    self.temporary_storage
+                        .as_ref()
+                        .and_then(TemporaryStorageWatch::first)
+                })
             {
+                let _ = self
+                    .child
+                    .as_mut()
+                    .expect("the child was just adopted")
+                    .checkpoint_temporary_storage();
                 return Ok((
                     Some(pid),
                     ExecutionOutcome::TemporaryStorageExceeded { exceedance },
                 ));
+            }
+            // A refusal wins over a nearly simultaneous process exit: the
+            // filesystem enforced the document's ceiling, and losing that
+            // typed outcome merely because the workload handled `ENOSPC` and
+            // exited before this poll would make the supervisor timing decide
+            // the run's durable result.
+            if let Some(status) = exited {
+                return Ok((Some(pid), outcome_from_status(&status)));
             }
             if cancellation.is_cancelled() {
                 return Ok((Some(pid), ExecutionOutcome::Cancelled));
@@ -1243,7 +1426,7 @@ impl SupervisedRun {
         let stdout = self
             .child
             .as_mut()
-            .and_then(|child| child.stdout.take())
+            .and_then(SupervisedChild::take_stdout)
             .ok_or(BackendError::ProgressUnreadable)?;
         let (sender, batches) = sync_channel(PROGRESS_QUEUE_BATCHES);
         let handle = std::thread::Builder::new()
@@ -1287,7 +1470,7 @@ impl SupervisedRun {
         payload: &[u8],
         drain: Duration,
         exceeded: Option<Exceedance>,
-    ) -> Result<(Status, Option<StatfsReadback>), BackendError> {
+    ) -> Result<FinishedRun, BackendError> {
         let drained = self.terminate_tree(drain);
         // Only now: the tree is dead, so the pipe's last writer is gone and the
         // reader reaches end of file instead of waiting on a live process. What
@@ -1296,17 +1479,46 @@ impl SupervisedRun {
         // the same deadline the cgroup drain gets, so a tree that would not die
         // costs this attempt its progress rather than its terminal record.
         self.drain_progress(drain);
-        // A budget exceedance is the last word before the terminal event: the
-        // tree is dead, so the mount's `statvfs` is its final usage, and the
-        // transcript is drained, so the frame follows everything the workload
-        // said.
-        let temporary_storage_readback =
-            exceeded.and_then(|exceedance| self.record_temporary_storage_exceedance(exceedance));
+        // Reconciliation is fallible because its final checkpoint is durable.
+        // It must nevertheless never short-circuit the canonical terminal
+        // append: otherwise the daemon could observe a supervisor error and
+        // advance its read model to `failed` while the spool still said
+        // `running`. A reconciliation failure changes the terminal payload to
+        // `failed`, then is returned only after the spool and containment have
+        // both been settled.
+        let observed_namespaced_readback = self
+            .child
+            .as_ref()
+            .and_then(SupervisedChild::temporary_storage_readback);
+        let namespaced_reconciliation = match self.child.take() {
+            Some(child) => child.finish_namespaced(),
+            None => Ok(None),
+        };
+        // Reconciliation is the final filesystem observation and therefore
+        // arbitrates a refusal that arrived after the last live checkpoint —
+        // including a workload that handled ENOSPC and exited immediately.
+        // The warning still precedes the canonical terminal event, while its
+        // statfs-shaped readback comes from that same final ledger.
+        let reconciled = namespaced_reconciliation
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref);
+        let final_exceedance = final_temporary_storage_exceedance(exceeded, reconciled);
+        let final_readback = reconciled
+            .map(|outcome| outcome.statfs_from_ledger)
+            .or(observed_namespaced_readback);
+        let temporary_storage_readback = final_exceedance.and_then(|exceedance| {
+            self.record_temporary_storage_exceedance(exceedance, final_readback)
+        });
+        let terminal_payload = terminal_payload_after_reconciliation(
+            payload,
+            namespaced_reconciliation.is_err(),
+            final_exceedance.is_some(),
+        );
 
         let mut spool = self.spool.take().expect("a supervised run holds its spool");
-        let recorded = spool.append(EventKind::Terminal, Authority::Authoritative, payload);
+        let recorded = append_canonical_terminal(&mut spool, &self.observed, terminal_payload);
         let status = spool.status();
-        self.observed.observe(status.last_sequence());
         // Dropping the spool releases its exclusive lock; the record is already
         // durable, so a reader may re-open and re-verify it immediately.
         drop(spool);
@@ -1320,7 +1532,13 @@ impl SupervisedRun {
         recorded?;
         drained?;
         disposed?;
-        Ok((status, temporary_storage_readback))
+        let namespaced_temporary_storage = namespaced_reconciliation?;
+        Ok(FinishedRun {
+            status,
+            temporary_storage_readback,
+            namespaced_temporary_storage,
+            final_exceedance,
+        })
     }
 
     /// Record the one warning a temporary-storage exceedance leaves in the
@@ -1336,9 +1554,15 @@ impl SupervisedRun {
     fn record_temporary_storage_exceedance(
         &mut self,
         exceedance: Exceedance,
+        final_readback: Option<StatfsReadback>,
     ) -> Option<StatfsReadback> {
-        let watch = self.temporary_storage.as_ref()?;
-        let readback = watch.readback(TEMPORARY_STORAGE_READBACK_DEADLINE);
+        let readback = if let Some(readback) = final_readback {
+            Ok(readback)
+        } else {
+            self.temporary_storage
+                .as_ref()?
+                .readback(TEMPORARY_STORAGE_READBACK_DEADLINE)
+        };
         if let Some(frame) = temporary_storage_exceeded_frame(exceedance, &readback)
             && self
                 .spool
@@ -1352,6 +1576,40 @@ impl SupervisedRun {
         }
         readback.ok()
     }
+}
+
+fn final_temporary_storage_exceedance(
+    observed: Option<Exceedance>,
+    reconciled: Option<&NamespacedOutcome>,
+) -> Option<Exceedance> {
+    observed.or_else(|| reconciled.and_then(|outcome| outcome.ledger.first_exceedance()))
+}
+
+fn terminal_payload_after_reconciliation(
+    requested: &[u8],
+    reconciliation_failed: bool,
+    temporary_storage_exceeded: bool,
+) -> &[u8] {
+    if reconciliation_failed || temporary_storage_exceeded {
+        TERMINAL_FAILED
+    } else {
+        requested
+    }
+}
+
+/// Append the terminal record and advance only to the sequence the canonical
+/// spool actually reached. Kept as one seam so fault-injection tests exercise
+/// the same append/observation ordering as production reconciliation errors.
+fn append_canonical_terminal(
+    spool: &mut Spool,
+    observed: &ObservedSequence,
+    payload: &[u8],
+) -> Result<(), SpoolError> {
+    spool
+        .append(EventKind::Terminal, Authority::Authoritative, payload)
+        .map(|recorded| {
+            observed.observe(recorded.sequence());
+        })
 }
 
 impl Drop for SupervisedRun {
@@ -1406,5 +1664,100 @@ fn outcome_from_status(status: &ExitStatus) -> ExecutionOutcome {
         None => ExecutionOutcome::FailedBySignal {
             signal: status.signal().unwrap_or(0),
         },
+    }
+}
+
+#[cfg(test)]
+mod namespaced_finalization_tests {
+    use super::*;
+    use crate::RunState;
+    use crate::tempfs_ledger::{LedgerSnapshot, Resource, STATFS_BLOCK_BYTES};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn a_reconciliation_failure_forces_the_canonical_terminal_to_failed() {
+        for requested in [TERMINAL_COMPLETED, TERMINAL_CANCELLED, TERMINAL_TIMED_OUT] {
+            assert_eq!(
+                terminal_payload_after_reconciliation(requested, true, false),
+                TERMINAL_FAILED
+            );
+            assert_eq!(
+                terminal_payload_after_reconciliation(requested, false, false),
+                requested
+            );
+        }
+    }
+
+    #[test]
+    fn a_reconciliation_failure_is_durable_in_the_reopened_canonical_spool() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let run_id = "reconciliation-fault";
+        let mut spool = Spool::open(directory.path(), run_id, 64 * 1024).unwrap();
+        let started = spool
+            .append(EventKind::Started, Authority::Authoritative, b"pid=1")
+            .unwrap();
+        let observed = ObservedSequence::default();
+        observed.observe(started.sequence());
+
+        let payload = terminal_payload_after_reconciliation(TERMINAL_COMPLETED, true, false);
+        append_canonical_terminal(&mut spool, &observed, payload).unwrap();
+        drop(spool);
+
+        let reopened = Spool::open(directory.path(), run_id, 64 * 1024).unwrap();
+        assert_eq!(reopened.status().state(), RunState::Failed);
+        assert_eq!(reopened.status().last_sequence(), observed.get());
+        assert_eq!(reopened.status().last_sequence(), 2);
+        let events = reopened.events_after(0).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind(), EventKind::Terminal);
+        assert_eq!(events[1].payload(), TERMINAL_FAILED);
+    }
+
+    #[test]
+    fn a_final_ledger_refusal_overrides_an_immediate_successful_exit() {
+        let budget = TemporaryStorageBudget::new(2 * STATFS_BLOCK_BYTES, 8).unwrap();
+        let exceedance = Exceedance {
+            resource: Resource::Bytes,
+            requested: 1,
+            used: budget.bytes(),
+            ceiling: budget.bytes(),
+        };
+        let ledger = LedgerSnapshot {
+            budget,
+            used_bytes: budget.bytes(),
+            used_objects: 1,
+            peak_bytes: budget.bytes(),
+            peak_objects: 1,
+            refused_bytes: 1,
+            refused_objects: 0,
+            recorded: vec![exceedance],
+        };
+        let readback = StatfsReadback::from_ledger(&ledger).unwrap();
+        let reconciled = NamespacedOutcome {
+            ledger,
+            statfs_at_mount: StatfsReadback::from_ledger(&LedgerSnapshot {
+                budget,
+                used_bytes: 0,
+                used_objects: 0,
+                peak_bytes: 0,
+                peak_objects: 0,
+                refused_bytes: 0,
+                refused_objects: 0,
+                recorded: Vec::new(),
+            })
+            .unwrap(),
+            statfs_from_ledger: readback,
+            unmount_confirmed: true,
+        };
+
+        assert_eq!(
+            final_temporary_storage_exceedance(None, Some(&reconciled)),
+            Some(exceedance)
+        );
+        assert_eq!(
+            terminal_payload_after_reconciliation(TERMINAL_COMPLETED, false, true),
+            TERMINAL_FAILED
+        );
     }
 }

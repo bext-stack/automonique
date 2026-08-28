@@ -150,7 +150,8 @@ const TERMINAL_DEADLINE: Duration = Duration::from_secs(90);
 /// this test agrees with the daemon by asking the same question rather than by
 /// assuming the answer.
 fn sandbox_enforceable() -> bool {
-    HostCapabilities::probe()
+    let helper = locate_launch_helper();
+    HostCapabilities::probe_with_launch_helper(helper.as_deref())
         .select_mode(&automonique_daemon::execute::ENFORCED_PROPERTIES)
         .is_ok()
 }

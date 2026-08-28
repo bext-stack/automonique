@@ -48,9 +48,8 @@
 //! cargo build -p automonique-runner --bin automonique-launch-enter
 //! cargo test -p automonique-daemon --test execute_brokered --no-run
 //! systemd-run --user --scope -p Delegate=yes \
-//!   --setenv=AUTOMONIQUE_REQUIRE_ENFORCED_CONTAINMENT=1 \
 //!   "$(ls -t target/debug/deps/execute_brokered-* | grep -v '\.d$' | head -1)" \
-//!   --test-threads=1 --nocapture
+//!   --ignored --test-threads=1 --nocapture
 //! ```
 //!
 //! The scope must wrap the **test binary** rather than `cargo test`: cgroup v2
@@ -125,7 +124,6 @@ use automonique_runner::{
 };
 
 const BUSYBOX: &str = "/usr/bin/busybox";
-const REQUIRE_ENFORCED_ENV: &str = "AUTOMONIQUE_REQUIRE_ENFORCED_CONTAINMENT";
 const MEMORY_BYTES: u64 = 128 * 1024 * 1024;
 const PROCESSES: u64 = 64;
 const TIMEOUT_MILLIS: u64 = 30_000;
@@ -827,7 +825,8 @@ fn connect_head(port: u16) -> String {
 // --- the enforced proof ---------------------------------------------------
 
 fn sandbox_enforceable() -> bool {
-    HostCapabilities::probe()
+    let helper = locate_launch_helper();
+    HostCapabilities::probe_with_launch_helper(helper.as_deref())
         .select_mode(&automonique_daemon::execute::ENFORCED_PROPERTIES)
         .is_ok()
 }
@@ -843,14 +842,6 @@ fn first_failing_gate() -> Option<ExecuteRefusal> {
         return Some(ExecuteRefusal::ContainmentUnavailable);
     }
     None
-}
-
-fn not_proven(test: &str, reason: &str) {
-    assert!(
-        std::env::var_os(REQUIRE_ENFORCED_ENV).is_none(),
-        "{test}: {REQUIRE_ENFORCED_ENV} is set but this host cannot prove it: {reason}"
-    );
-    eprintln!("[execute_brokered] NOT PROVEN: {test}: {reason}");
 }
 
 /// A private root with the daemon's state directory, its prompt slots, and its
@@ -1055,15 +1046,14 @@ fn workload_script(witness: &Path) -> String {
 /// through the real socket, admitted by the real bridge, under the real
 /// containment, with a real broker started and torn down by the lane.
 #[test]
+#[ignore = "delegated production proof; run the ignored test inside a Delegate=yes scope"]
 fn a_contained_workload_reaches_only_its_allowlisted_destination() {
-    let test = "a_contained_workload_reaches_only_its_allowlisted_destination";
-    if !Path::new(BUSYBOX).exists() {
-        not_proven(test, "no static busybox at /usr/bin/busybox");
-        return;
-    }
+    assert!(
+        Path::new(BUSYBOX).exists(),
+        "delegated proof requires static busybox at /usr/bin/busybox"
+    );
     if let Some(gate) = first_failing_gate() {
-        not_proven(test, &format!("this host refuses at {gate}"));
-        return;
+        panic!("delegated proof host refuses at {gate}");
     }
 
     // One destination this deployment permits, and one it does not. Both are
@@ -1116,6 +1106,14 @@ fn a_contained_workload_reaches_only_its_allowlisted_destination() {
         let mut document = Document::hermetic(run);
         document.script = workload_script(&witness(run));
         document.features = required_features();
+        assert!(
+            document
+                .features
+                .as_slice()
+                .iter()
+                .any(|feature| feature.name() == "uid_separation"),
+            "the delegated production proof must request uid separation"
+        );
         document.provider_binary = provider_binary.clone();
         let payload = document
             .spec()
@@ -1137,6 +1135,26 @@ fn a_contained_workload_reaches_only_its_allowlisted_destination() {
             "expected the brokered run to start, got {started:?}"
         );
         assert_eq!(await_terminal(&config, run), RunState::Completed);
+        let checkpoint = automonique_runner::Checkpoint::read(
+            &config
+                .state_dir()
+                .join("runs")
+                .join(run)
+                .join(automonique_runner::CHECKPOINT_LEAF),
+        )
+        .expect("production run leaves an exact private-mount checkpoint");
+        assert_eq!(checkpoint.phase, automonique_runner::CheckpointPhase::Final);
+        assert!(
+            checkpoint
+                .mount_evidence
+                .starts_with("automonique.namespaced-tempfs/v1 ")
+        );
+        assert!(
+            checkpoint
+                .final_record
+                .as_ref()
+                .is_some_and(|record| record.unmount_confirmed)
+        );
     }
 
     // THE ALLOWLISTED DESTINATION WAS REACHED, THROUGH THE BROKER.
@@ -1184,15 +1202,14 @@ fn a_contained_workload_reaches_only_its_allowlisted_destination() {
 /// The negative control for the policy file: without it, the enforced proof
 /// would pass just as well against a lane that granted egress unconditionally.
 #[test]
+#[ignore = "delegated production proof; run the ignored test inside a Delegate=yes scope"]
 fn a_brokered_document_without_a_destination_policy_is_refused() {
-    let test = "a_brokered_document_without_a_destination_policy_is_refused";
-    if !Path::new(BUSYBOX).exists() {
-        not_proven(test, "no static busybox at /usr/bin/busybox");
-        return;
-    }
+    assert!(
+        Path::new(BUSYBOX).exists(),
+        "delegated proof requires static busybox at /usr/bin/busybox"
+    );
     if let Some(gate) = first_failing_gate() {
-        not_proven(test, &format!("this host refuses at {gate}"));
-        return;
+        panic!("delegated proof host refuses at {gate}");
     }
 
     let run = "brokerunset1";
@@ -1210,6 +1227,14 @@ fn a_brokered_document_without_a_destination_policy_is_refused() {
     let mut document = Document::hermetic(run);
     document.script = workload_script(&witness);
     document.features = required_features();
+    assert!(
+        document
+            .features
+            .as_slice()
+            .iter()
+            .any(|feature| feature.name() == "uid_separation"),
+        "the delegated production proof must request uid separation"
+    );
     document.provider_binary = {
         let bytes = std::fs::read(BUSYBOX).expect("busybox is readable");
         BinaryProvenance::new(

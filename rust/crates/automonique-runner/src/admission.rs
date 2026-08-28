@@ -1256,6 +1256,42 @@ impl AdmittedLaunch {
         Ok(self)
     }
 
+    /// Attach scratch storage that the launch helper mounts inside the
+    /// workload's separated user+mount namespace.
+    ///
+    /// Unlike [`Self::with_temporary_storage`], no supervisor-visible mount
+    /// exists yet. The exact admitted budget and mountpoint are sealed into the
+    /// launch frame; the helper and supervisor complete the kernel handshake
+    /// before the workload executes. This path therefore requires the plan to
+    /// have explicitly required `uid_separation`.
+    pub fn with_namespaced_temporary_storage(
+        mut self,
+        mountpoint: &Path,
+    ) -> Result<Self, AdmissionRefusal> {
+        if self.temporary_storage_attached {
+            return Err(AdmissionRefusal::TemporaryStorageAlreadyAttached);
+        }
+        if !self.plan.separates_workload_identity() {
+            return Err(AdmissionRefusal::WorkloadIdentityTemporaryStorageConflict);
+        }
+        let refused = |error: LaunchPlanError| AdmissionRefusal::Plan {
+            field: "sandbox.budgets.temporary_storage",
+            error,
+        };
+        let plan = self
+            .plan
+            .clone()
+            .filesystem_grant(PathIntent::ReadWrite, mountpoint)
+            .and_then(|plan| plan.environment("TMPDIR", mountpoint.as_os_str().as_encoded_bytes()))
+            .and_then(|plan| {
+                plan.with_namespaced_temporary_storage(mountpoint, self.temporary_storage_budget)
+            })
+            .map_err(refused)?;
+        self.plan = plan;
+        self.temporary_storage_attached = true;
+        Ok(self)
+    }
+
     /// The closed list of spec fields admission did not consult.
     #[must_use]
     pub const fn informational_fields() -> &'static [&'static str] {
@@ -1801,6 +1837,16 @@ fn build_plan(
             error,
         }
     })?;
+    if spec.sandbox().required_features().iter().any(|feature| {
+        feature.name() == crate::capability::BoundaryProperty::UidSeparation.as_str()
+    }) {
+        plan = plan
+            .separate_workload_identity()
+            .map_err(|error| AdmissionRefusal::Plan {
+                field: "sandbox.required_features.uid_separation",
+                error,
+            })?;
+    }
     plan = plan
         .rlimit_descriptors(spec.sandbox().budgets().rlimit_descriptors().quantity())
         .map_err(|error| AdmissionRefusal::Plan {
