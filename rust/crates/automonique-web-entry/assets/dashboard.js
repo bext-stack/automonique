@@ -3134,6 +3134,16 @@ function previewCockpitAction(action) {
     toast("Exact base and branch selectors are required before preview.", "error");
     return;
   }
+  const preview = Object.freeze({
+    action,
+    project_id: capability.project_id,
+    workspace_id: capability.workspace_id,
+    exact_revision: capability.exact_revision,
+    task_id: capability.task_id,
+    external_work: capability.external_work,
+    base_selector: action === "create" ? baseSelector : null,
+    branch_selector: action === "create" ? branchSelector : null,
+  });
   cockpitState = globalThis.AutomoniquePlatformCockpit.reduce(cockpitState, { type: "preview", action, capability });
   const root = byId("cockpit-action-preview");
   root.hidden = false;
@@ -3141,19 +3151,23 @@ function previewCockpitAction(action) {
   const title = document.createElement("strong");
   title.textContent = `${words(action)} preview · no mutation sent`;
   const details = document.createElement("span");
-  details.textContent = `${capability.project_id} · ${capability.workspace_id} · exact revision ${capability.exact_revision}`;
+  details.textContent = `${preview.project_id} · ${preview.workspace_id} · exact revision ${preview.exact_revision}`;
   const task = document.createElement("p");
-  task.textContent = `Bound task ${capability.task_id || "unavailable"}. The durable intent identity will be stored before transmission.`;
+  task.textContent = `Bound task ${preview.task_id || "unavailable"}. The durable intent identity will be stored before transmission.`;
+  const external = document.createElement("p");
+  external.textContent = action === "create"
+    ? `External work ${preview.external_work.provider} · ${preview.external_work.authority} · ${preview.external_work.scope} · ${preview.external_work.key}`
+    : "No external-work identity is added by resume.";
   const selectors = document.createElement("p");
   selectors.textContent = action === "create"
-    ? `Exact base ${baseSelector} · exact branch ${branchSelector}`
-    : `Exact existing workspace ${capability.workspace_id}`;
+    ? `Exact base ${preview.base_selector} · exact branch ${preview.branch_selector}`
+    : `Exact existing workspace ${preview.workspace_id}`;
   const confirm = document.createElement("button");
   confirm.type = "button";
   confirm.className = "button primary";
   confirm.textContent = `Confirm ${action}`;
-  confirm.addEventListener("click", () => submitCockpitIntent(action));
-  root.append(title, details, task, selectors, confirm);
+  confirm.addEventListener("click", () => submitCockpitIntent(preview));
+  root.append(title, details, task, external, selectors, confirm);
 }
 
 function newCockpitReceiptId(prefix) {
@@ -3210,17 +3224,16 @@ function applyCockpitControlResponse(response, handle) {
   renderHostedCockpit(cockpitSnapshot || {});
 }
 
-async function submitCockpitIntent(action) {
-  const capability = cockpitPresentation?.[action];
-  if (!capability?.available || cockpitControlHandle || cockpitControlBusy) return;
-  const baseSelector = byId("cockpit-base-selector").value.trim();
-  const branchSelector = byId("cockpit-branch-selector").value.trim();
-  if (action === "create" && (!baseSelector || !branchSelector)) {
-    toast("Exact base and branch selectors are required.", "error");
-    return;
-  }
+async function submitCockpitIntent(preview) {
+  if (!preview || cockpitControlHandle || cockpitControlBusy) return;
+  const action = preview.action;
   const intentId = newCockpitReceiptId("cockpit-intent");
-  const handle = globalThis.AutomoniquePlatformCockpit.prepareControlHandle(capability, action, intentId);
+  const handle = globalThis.AutomoniquePlatformCockpit.prepareControlHandle({
+    available: true,
+    family: "workspace_intent",
+    project_id: preview.project_id,
+    workspace_id: preview.workspace_id,
+  }, action, intentId);
   if (!handle || !persistCockpitControl(handle)) {
     toast("The durable intent identity could not be stored; nothing was sent.", "error");
     return;
@@ -3229,21 +3242,21 @@ async function submitCockpitIntent(action) {
   renderHostedCockpit(cockpitSnapshot || {});
   const body = action === "create" ? {
     action: "submit_workspace_create",
-    project_id: capability.project_id,
-    workspace_id: capability.workspace_id,
-    expected_revision: capability.exact_revision,
+    project_id: preview.project_id,
+    workspace_id: preview.workspace_id,
+    expected_revision: preview.exact_revision,
     intent_id: intentId,
-    task_id: capability.task_id,
-    external_work: capability.external_work,
-    base_selector: baseSelector,
-    branch_selector: branchSelector,
+    task_id: preview.task_id,
+    external_work: preview.external_work,
+    base_selector: preview.base_selector,
+    branch_selector: preview.branch_selector,
   } : {
     action: "submit_workspace_resume",
-    project_id: capability.project_id,
-    workspace_id: capability.workspace_id,
-    expected_revision: capability.exact_revision,
+    project_id: preview.project_id,
+    workspace_id: preview.workspace_id,
+    expected_revision: preview.exact_revision,
     intent_id: intentId,
-    task_id: capability.task_id,
+    task_id: preview.task_id,
   };
   try {
     applyCockpitControlResponse(await api("/api/platform/cockpit", {

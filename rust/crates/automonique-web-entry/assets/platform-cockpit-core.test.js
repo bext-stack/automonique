@@ -134,6 +134,13 @@ test("typed workspace and review controls require exact server operations and fr
   expect(view.reviewActions.addComment.available).toBe(true);
   expect(view.reviewActions.approveReview.exact_review_revision).toBe("6");
 
+  const missingExternal = structuredClone(controlled);
+  delete missingExternal.actions.lifecycle.operations.create_attempt_workspace.external_work;
+  expect(cockpit.derivePresentation(missingExternal).create.available).toBe(false);
+  const missingTask = structuredClone(controlled);
+  delete missingTask.actions.lifecycle.operations.resume_attempt_workspace.task_id;
+  expect(cockpit.derivePresentation(missingTask).resume.available).toBe(false);
+
   controlled.review.document.review.freshness.state = "stale";
   const stale = cockpit.derivePresentation(controlled);
   expect(stale.create.available).toBe(false);

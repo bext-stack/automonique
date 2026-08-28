@@ -266,10 +266,10 @@ test("create confirmation shows exact selectors before any mutation can be sent"
       resume_attempt_workspace: { available: false, category: "platform_v2_lifecycle_adapter_pending" },
     },
   };
-  const actions = [];
+  const requests = [];
   page.on("request", (request) => {
     if (new URL(request.url()).pathname !== "/api/platform/cockpit") return;
-    actions.push(request.postDataJSON()?.action);
+    requests.push(request.postDataJSON());
   });
   try {
     await page.reload();
@@ -282,7 +282,37 @@ test("create confirmation shows exact selectors before any mutation can be sent"
     await expect(page.locator("#cockpit-action-preview")).toContainText(
       "Exact base base-main · exact branch branch-task-170",
     );
-    expect(actions).not.toContain("submit_workspace_create");
+    await expect(page.locator("#cockpit-action-preview")).toContainText(
+      "External work github · github.com · bext-stack/automonique · 170",
+    );
+    expect(requests.map(({ action }) => action)).not.toContain("submit_workspace_create");
+
+    await page.locator("#cockpit-base-selector").fill("unreviewed-base");
+    await page.locator("#cockpit-branch-selector").fill("unreviewed-branch");
+    cockpit.actions.lifecycle.operations.create_attempt_workspace = {
+      ...cockpit.actions.lifecycle.operations.create_attempt_workspace,
+      project_id: "project-drifted",
+      workspace_id: "workspace-drifted",
+      exact_revision: "9007199254740996",
+      task_id: "task-drifted",
+      external_work: { provider: "gitlab", authority: "gitlab.example", scope: "other/repository", key: "999" },
+    };
+    await page.evaluate((view) => globalThis.renderPlatform(view), cockpit);
+    const submitted = page.waitForRequest((request) =>
+      new URL(request.url()).pathname === "/api/platform/cockpit"
+        && request.postDataJSON()?.action === "submit_workspace_create",
+    );
+    await page.getByRole("button", { name: "Confirm create" }).click();
+    await submitted;
+    expect(requests.find(({ action }) => action === "submit_workspace_create")).toMatchObject({
+      project_id: "project-1",
+      workspace_id: "workspace-1",
+      expected_revision: "9007199254740995",
+      task_id: "task-1",
+      external_work: { provider: "github", authority: "github.com", scope: "bext-stack/automonique", key: "170" },
+      base_selector: "base-main",
+      branch_selector: "branch-task-170",
+    });
   } finally {
     cockpit.actions.lifecycle = previous;
   }

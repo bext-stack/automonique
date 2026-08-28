@@ -251,6 +251,9 @@
     const capability = family === "workspace_intent"
       ? document?.actions?.lifecycle?.operations?.[operation]
       : document?.actions?.review?.operations?.[operation];
+    const taskId = family === "workspace_intent" ? boundedText(capability?.task_id, 256) : null;
+    const externalWork = family === "workspace_intent" && operation === "create_attempt_workspace"
+      ? normalizeExternalIdentity(capability?.external_work) : null;
     const available = capability?.available === true
       && (family === "workspace_intent"
         ? capability.submit_operation === "submit_workspace_intent"
@@ -259,7 +262,9 @@
           && capability.receipt_operation === "get_review_receipt")
       && boundedText(capability.project_id, 256)
       && boundedText(capability.workspace_id, 256)
-      && validDecimal(capability.exact_revision, false);
+      && validDecimal(capability.exact_revision, false)
+      && (family !== "workspace_intent" || Boolean(taskId))
+      && (operation !== "create_attempt_workspace" || Boolean(externalWork));
     return Object.freeze({
       available: available === true,
       reason: available ? null : boundedText(capability?.category, 128)
@@ -272,9 +277,8 @@
       exact_revision: available ? capability.exact_revision : null,
       exact_review_revision: available && validDecimal(capability.exact_review_revision, false)
         ? capability.exact_review_revision : null,
-      task_id: available ? boundedText(capability.task_id, 256) : null,
-      external_work: available && capability.external_work && typeof capability.external_work === "object"
-        ? Object.freeze({ ...capability.external_work }) : null,
+      task_id: available ? taskId : null,
+      external_work: available ? externalWork : null,
     });
   }
 
