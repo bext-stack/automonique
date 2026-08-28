@@ -22,6 +22,13 @@ approvals, receipts, actor, workspace, expected revision, authority, request
 digest, and idempotency key. External provider observations are kept in a
 separate table and cannot create local authority grants.
 
+Cross-client navigation from an attention item is a separate additive contract
+because review/v2 does not carry authoritative source observation time,
+source-scoped replacement revisions, nested-agent lineage, or an exact
+provider-session coordinate. See [Platform v2 authoritative attention
+navigation](platform-v2-attention-navigation.md). Clients must not manufacture
+those values from review chronology or local pane state.
+
 Approval is a checked document rather than an unauthenticated flag. It binds
 the preview, workspace, request digest and revision, authenticated approver,
 exact authority identity, approved/refused decision, and expiry. The approver's
