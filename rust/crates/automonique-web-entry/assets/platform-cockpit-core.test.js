@@ -4,6 +4,10 @@ import { expect, test } from "bun:test";
 import "./platform-cockpit-core.js";
 
 const cockpit = globalThis.AutomoniquePlatformCockpit;
+const renderCorpus = JSON.parse(await Bun.file(new URL(
+  "../../automonique-protocol/fixtures/platform-v2-render-conformance-v1.json",
+  import.meta.url,
+)).text());
 
 const fixture = {
   schema: "automonique.dashboard.cockpit/v2",
@@ -31,7 +35,15 @@ const fixture = {
     revision: "9007199254740995",
   }],
   lineage: { state: "available", document: { value: { external_work_items: [], orchestration: [] } } },
-  review: { state: "available", document: { files: [], checks: [], review: { decision: "pending", freshness: { state: "fresh" } }, delivery: { state: "pending", freshness: { state: "fresh" } } } },
+  review: { state: "available", document: {
+    revision: "9007199254740995",
+    attention: { state: "needs_you", reason: "review_requested", unread: "1", source_revision: "7" },
+    files: [],
+    checks: [{ id: "check-1", state: "passed", required: true, freshness: { state: "fresh", observed_revision: "7" } }],
+    review: { decision: "pending", freshness: { state: "fresh", observed_revision: "8" } },
+    pull_request: { state: "open", readiness: "ready", freshness: { state: "fresh", observed_revision: "8" } },
+    delivery: { state: "pending", freshness: { state: "fresh", observed_revision: "7" } },
+  } },
   attention: { state: "available", known_workspaces: "1", total_workspaces: "1" },
 };
 
@@ -41,6 +53,28 @@ test("decimal fences stay exact beyond Number.MAX_SAFE_INTEGER", () => {
   expect(cockpit.decimalGreater("9007199254740995", "9007199254740996")).toBe(false);
   expect(cockpit.validDecimal("09007199254740995", false)).toBe(false);
   expect(cockpit.validDecimal(9007199254740995, false)).toBe(false);
+});
+
+test("shared render corpus projects every exact hosted semantic without revision loss", () => {
+  expect(renderCorpus.schema).toBe("automonique.render-conformance/v1");
+  expect(renderCorpus.cases.map(({ id }) => id)).toEqual(["idle", "needs_you", "working", "blocked", "done"]);
+  for (const fixtureCase of renderCorpus.cases) {
+    expect(cockpit.projectReviewSemantics(fixtureCase.input)).toEqual(fixtureCase.expected);
+    expect(cockpit.projectReviewSemantics(fixtureCase.input).source_revision).toBe(fixtureCase.input.revision);
+  }
+});
+
+test("semantic projector refuses numeric, future, and unknown review truth", () => {
+  const baseline = structuredClone(renderCorpus.cases[1].input);
+  expect(cockpit.projectReviewSemantics({ ...baseline, revision: 9007199254741011 })).toBeNull();
+  expect(cockpit.projectReviewSemantics({
+    ...baseline,
+    review: { ...baseline.review, freshness: { ...baseline.review.freshness, observed_revision: "9007199254741012" } },
+  })).toBeNull();
+  expect(cockpit.projectReviewSemantics({
+    ...baseline,
+    pull_request: { ...baseline.pull_request, state: "secret_provider_state" },
+  })).toBeNull();
 });
 
 test("uncertain receipts reconcile without replay and known refusals settle", () => {

@@ -18,6 +18,8 @@ const v2Source = await readFile(join(sdkRoot, "platform-v2-client.js"), "utf8");
 assert.equal(typeof main.PlatformV2Client, "function");
 assert.equal(typeof main.HttpsPlatformV2Transport, "function");
 assert.equal(typeof testing.DeterministicPlatformV2Adapter, "function");
+assert.equal(typeof testing.createRenderConformanceCorpus, "function");
+assert.equal(testing.createRenderConformanceCorpus().cases[0].input.revision, 9007199254741001n);
 assert.deepEqual(Object.keys(v2).sort(), [
   "BasicHttpsPlatformV2Transport",
   "HttpsPlatformV2Transport",

@@ -2170,16 +2170,31 @@ function cockpitSignal(id, label, signal) {
 }
 
 function renderCockpitReadModels(readModels) {
+  const semantics = readModels.semantics;
+  const semanticWords = (key) => key.split(".").slice(1).map(words).join(" · ");
+  const withSource = (value) => `${semanticWords(value.semantic_key)} · ${semanticWords(value.freshness_key)} · source revision ${value.source_revision}`;
+  const previews = semantics?.previews.length
+    ? `${semantics.previews.map((value) => semanticWords(value.semantic_key)).join(" · ")} · source revision ${semantics.source_revision}`
+    : semantics ? `No previews · source revision ${semantics.source_revision}` : null;
+  const review = semantics
+    ? `${semanticWords(semantics.attention.semantic_key)}${semantics.attention.reason_key ? ` · ${semanticWords(semantics.attention.reason_key)}` : ""} · ${withSource(semantics.review)} · ${withSource(semantics.pull_request)}`
+    : null;
+  const checks = semantics?.checks.length
+    ? semantics.checks.map(withSource).join(" · ")
+    : semantics ? `No checks · source revision ${semantics.source_revision}` : null;
+  const delivery = semantics ? withSource(semantics.delivery) : null;
   const values = [
-    ["cockpit-files-state", readModels.files, (value) => `${count(value.length)} bounded file${value.length === 1 ? "" : "s"}`],
-    ["cockpit-review-state", readModels.review, () => "Structured review available"],
-    ["cockpit-checks-state", readModels.checks, (value) => `${count(value.length)} structured check${value.length === 1 ? "" : "s"}`],
-    ["cockpit-delivery-state", readModels.delivery, () => "Structured delivery available"],
+    ["cockpit-files-state", previews, semantics?.previews.map((value) => value.semantic_key).join(" ")],
+    ["cockpit-review-state", review, semantics ? `${semantics.attention.semantic_key} ${semantics.review.semantic_key} ${semantics.pull_request.semantic_key}` : null],
+    ["cockpit-checks-state", checks, semantics?.checks.map((value) => value.semantic_key).join(" ")],
+    ["cockpit-delivery-state", delivery, semantics?.delivery.semantic_key],
   ];
-  values.forEach(([id, value, available]) => {
+  values.forEach(([id, value, semanticKey]) => {
     const node = byId(id);
-    node.textContent = value === null ? "Unavailable" : available(value);
+    node.textContent = value === null ? "Unavailable" : value;
     node.dataset.available = String(value !== null);
+    if (semanticKey) node.dataset.semanticKey = semanticKey;
+    else delete node.dataset.semanticKey;
   });
 }
 
