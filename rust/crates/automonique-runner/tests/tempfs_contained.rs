@@ -29,11 +29,10 @@ use automonique_runner::backend::{
     DirectProcessBackend, ExecutionOutcome, TEMPORARY_STORAGE_EXCEEDED_WARNING,
 };
 use automonique_runner::filesystem::PathIntent;
-use automonique_runner::tempfs::{FusePrerequisites, MountedTempfs};
+use automonique_runner::tempfs::FusePrerequisites;
 use automonique_runner::{
     CancellationToken, ContainmentDomain, ContainmentError, ContainmentLimits, Event, EventKind,
     LaunchPlan, STATFS_BLOCK_BYTES, Spool, TemporaryStorageBudget, TemporaryStorageResource,
-    VerifiedFuse,
 };
 use sha2::{Digest as _, Sha256};
 use std::fs;
@@ -45,7 +44,6 @@ use std::time::Duration;
 const HELPER: &str = env!("CARGO_BIN_EXE_automonique-launch-enter");
 const BUSYBOX: &str = "/usr/bin/busybox";
 const REQUIRE_ENFORCED_ENV: &str = "AUTOMONIQUE_REQUIRE_ENFORCED_CONTAINMENT";
-const READBACK_DEADLINE: Duration = Duration::from_secs(5);
 const RUN_DEADLINE: Duration = Duration::from_secs(30);
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
@@ -89,7 +87,6 @@ fn busybox_sha256() -> String {
 
 struct Proof {
     domain: ContainmentDomain,
-    fuse: VerifiedFuse,
 }
 
 fn proof_or_not_proven(proof: &str) -> Option<Proof> {
@@ -121,8 +118,8 @@ fn proof_or_not_proven(proof: &str) -> Option<Proof> {
         not_proven(format!("the launch helper is not built at {HELPER}"));
         return None;
     }
-    let fuse = match FusePrerequisites::host_default().verify() {
-        Ok(fuse) => fuse,
+    match FusePrerequisites::host_default().verify() {
+        Ok(_) => {}
         Err(error) => {
             not_proven(format!("FUSE unavailable: {error}"));
             return None;
@@ -132,7 +129,7 @@ fn proof_or_not_proven(proof: &str) -> Option<Proof> {
         "[tempfs-contained] ENFORCED {proof}: domain {}",
         domain.root().display()
     );
-    Some(Proof { domain, fuse })
+    Some(Proof { domain })
 }
 
 #[test]
@@ -150,11 +147,8 @@ fn a_contained_workload_that_overflows_its_budget_is_killed_with_a_typed_outcome
 
     // Eight blocks of scratch, eight objects.
     let budget = TemporaryStorageBudget::new(8 * STATFS_BLOCK_BYTES, 8).unwrap();
-    let mounted = MountedTempfs::mount(&proof.fuse, &mountpoint, budget)
-        .unwrap()
-        .with_checkpoint(run_root.join("tempfs-ledger"))
-        .unwrap();
-    let mnt = mounted.mountpoint().to_path_buf();
+    let checkpoint = run_root.join("tempfs-ledger");
+    let mnt = mountpoint;
 
     // The workload writes far past the ceiling into $TMPDIR — the grant and the
     // variable are exactly what admission attaches — then sleeps, so it is
@@ -180,6 +174,8 @@ fn a_contained_workload_that_overflows_its_budget_is_killed_with_a_typed_outcome
         .filesystem_grant(PathIntent::Read, "/dev/zero")
         .unwrap()
         .environment("TMPDIR", mnt.as_os_str().as_encoded_bytes())
+        .unwrap()
+        .separate_workload_identity()
         .unwrap();
 
     let backend = DirectProcessBackend::new(HELPER).unwrap();
@@ -195,7 +191,7 @@ fn a_contained_workload_that_overflows_its_budget_is_killed_with_a_typed_outcome
             spool,
         )
         .unwrap()
-        .with_temporary_storage(mounted.watch());
+        .with_namespaced_temporary_storage(&mnt, budget, &checkpoint);
     let report = prepared
         .execute(&CancellationToken::new(), RUN_DEADLINE)
         .unwrap();
@@ -272,18 +268,22 @@ fn a_contained_workload_that_overflows_its_budget_is_killed_with_a_typed_outcome
         "the warning is the last word before the terminal event"
     );
 
-    // The kernel evidence: the reconcile's `statfs`, read after the tree is
-    // gone, shows the filesystem was filled to exactly its ceiling.
-    let outcome = mounted.reconcile(READBACK_DEADLINE).unwrap();
-    assert!(outcome.exceeded());
+    // The private namespace mount's exact ledger is reconciled by the backend
+    // after the workload tree is gone. No supervisor-visible path walk is
+    // involved, and the final checkpoint is independently readable.
+    let outcome = report
+        .namespaced_temporary_storage()
+        .expect("the namespaced mount reconciles with the run");
+    assert!(outcome.ledger.exceeded());
     assert!(outcome.unmount_confirmed);
-    let statfs = outcome
-        .statfs_before_unmount
-        .expect("the server answered the reconcile readback");
+    let statfs = outcome.statfs_from_ledger;
     assert_eq!(statfs.blocks_free, 0, "the ceiling held: no free blocks");
     assert_eq!(statfs.used_bytes(), 8 * STATFS_BLOCK_BYTES);
     assert_eq!(outcome.ledger.peak_bytes, 8 * STATFS_BLOCK_BYTES);
     assert!(outcome.ledger.refused_bytes >= 1);
+    let restarted = automonique_runner::Checkpoint::read(&checkpoint).unwrap();
+    assert_eq!(restarted.phase, automonique_runner::CheckpointPhase::Final);
+    assert_eq!(restarted.snapshot, outcome.ledger);
 }
 
 /// The spool names the run it belongs to; the backend requires the two to

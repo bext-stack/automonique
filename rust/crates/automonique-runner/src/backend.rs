@@ -1485,13 +1485,8 @@ impl SupervisedRun {
             terminal_payload_after_reconciliation(payload, namespaced_reconciliation.is_err());
 
         let mut spool = self.spool.take().expect("a supervised run holds its spool");
-        let recorded = spool.append(
-            EventKind::Terminal,
-            Authority::Authoritative,
-            terminal_payload,
-        );
+        let recorded = append_canonical_terminal(&mut spool, &self.observed, terminal_payload);
         let status = spool.status();
-        self.observed.observe(status.last_sequence());
         // Dropping the spool releases its exclusive lock; the record is already
         // durable, so a reader may re-open and re-verify it immediately.
         drop(spool);
@@ -1561,6 +1556,21 @@ fn terminal_payload_after_reconciliation(requested: &[u8], reconciliation_failed
     }
 }
 
+/// Append the terminal record and advance only to the sequence the canonical
+/// spool actually reached. Kept as one seam so fault-injection tests exercise
+/// the same append/observation ordering as production reconciliation errors.
+fn append_canonical_terminal(
+    spool: &mut Spool,
+    observed: &ObservedSequence,
+    payload: &[u8],
+) -> Result<(), SpoolError> {
+    spool
+        .append(EventKind::Terminal, Authority::Authoritative, payload)
+        .map(|recorded| {
+            observed.observe(recorded.sequence());
+        })
+}
+
 impl Drop for SupervisedRun {
     fn drop(&mut self) {
         // Reached only when `finish` did not run — a panic, or an early return
@@ -1619,6 +1629,8 @@ fn outcome_from_status(status: &ExitStatus) -> ExecutionOutcome {
 #[cfg(test)]
 mod namespaced_finalization_tests {
     use super::*;
+    use crate::RunState;
+    use std::os::unix::fs::PermissionsExt as _;
 
     #[test]
     fn a_reconciliation_failure_forces_the_canonical_terminal_to_failed() {
@@ -1632,5 +1644,31 @@ mod namespaced_finalization_tests {
                 requested
             );
         }
+    }
+
+    #[test]
+    fn a_reconciliation_failure_is_durable_in_the_reopened_canonical_spool() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let run_id = "reconciliation-fault";
+        let mut spool = Spool::open(directory.path(), run_id, 64 * 1024).unwrap();
+        let started = spool
+            .append(EventKind::Started, Authority::Authoritative, b"pid=1")
+            .unwrap();
+        let observed = ObservedSequence::default();
+        observed.observe(started.sequence());
+
+        let payload = terminal_payload_after_reconciliation(TERMINAL_COMPLETED, true);
+        append_canonical_terminal(&mut spool, &observed, payload).unwrap();
+        drop(spool);
+
+        let reopened = Spool::open(directory.path(), run_id, 64 * 1024).unwrap();
+        assert_eq!(reopened.status().state(), RunState::Failed);
+        assert_eq!(reopened.status().last_sequence(), observed.get());
+        assert_eq!(reopened.status().last_sequence(), 2);
+        let events = reopened.events_after(0).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind(), EventKind::Terminal);
+        assert_eq!(events[1].payload(), TERMINAL_FAILED);
     }
 }

@@ -1227,6 +1227,14 @@ fn a_brokered_document_without_a_destination_policy_is_refused() {
     let mut document = Document::hermetic(run);
     document.script = workload_script(&witness);
     document.features = required_features();
+    assert!(
+        document
+            .features
+            .as_slice()
+            .iter()
+            .any(|feature| feature.name() == "uid_separation"),
+        "the delegated production proof must request uid separation"
+    );
     document.provider_binary = {
         let bytes = std::fs::read(BUSYBOX).expect("busybox is readable");
         BinaryProvenance::new(

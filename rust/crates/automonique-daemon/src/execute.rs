@@ -1738,6 +1738,18 @@ impl JcodePreparedRun {
         {
             return finish_failed_jcode_host(host, writer, now_ms);
         }
+        // `start_turn` writes to the provider and can therefore block while
+        // the provider is already using its scratch filesystem. Re-observe
+        // before any provider outcome or control state can be selected.
+        match poll_jcode_temporary_storage(&mut host, &mut last_temporary_storage_checkpoint, true)
+        {
+            Ok(Some((exceedance, readback))) => {
+                writer.temporary_storage_exceeded(exceedance, readback);
+                return finish_failed_jcode_host(host, writer, now_ms);
+            }
+            Ok(None) => {}
+            Err(()) => return finish_failed_jcode_host(host, writer, now_ms),
+        }
 
         let mut cancellation_sent = false;
         let final_state = 'run: loop {
@@ -1771,13 +1783,38 @@ impl JcodePreparedRun {
                 Ok(storage) => storage,
                 Err(()) => break RunSpoolState::Failed,
             };
+            // This refusal has already been checkpointed. It is therefore the
+            // first durable terminal fact and must win over a cancellation or
+            // deadline observed later in this same supervision iteration.
+            if let Some((exceedance, readback)) = temporary_storage {
+                let _ = host.cancel(
+                    crate::unix_millis().unwrap_or(now_ms),
+                    Duration::from_millis(100),
+                );
+                writer.project(&mut mapper, host.take_events());
+                writer.temporary_storage_exceeded(exceedance, readback);
+                break RunSpoolState::Failed;
+            }
             if cancellation.is_cancelled() && !cancellation_sent {
                 cancellation_sent = true;
                 let cancelled = host.cancel(
                     crate::unix_millis().unwrap_or(now_ms),
                     Duration::from_millis(100),
                 );
-                writer.project_turn_outcome(&mut mapper, host.take_events(), &cancelled);
+                let events = host.take_events();
+                match poll_jcode_temporary_storage(
+                    &mut host,
+                    &mut last_temporary_storage_checkpoint,
+                    true,
+                ) {
+                    Ok(Some((exceedance, readback))) => {
+                        writer.project(&mut mapper, events);
+                        writer.temporary_storage_exceeded(exceedance, readback);
+                        break RunSpoolState::Failed;
+                    }
+                    Ok(None) => writer.project_turn_outcome(&mut mapper, events, &cancelled),
+                    Err(()) => break RunSpoolState::Failed,
+                }
                 match cancelled {
                     Ok(JcodeTurnOutcome::Cancelled | JcodeTurnOutcome::Completed(_)) => {
                         break RunSpoolState::Cancelled;
@@ -1793,22 +1830,6 @@ impl JcodePreparedRun {
             }
             if elapsed >= timeout {
                 break RunSpoolState::TimedOut;
-            }
-            // A temporary-storage refusal ends the run the first time the
-            // ledger records one, exactly as the direct backend does: the
-            // ceiling has already held (the provider saw its own `ENOSPC` or
-            // `EDQUOT`), and the run does not continue past it. The provider
-            // is asked to cancel so it can leave cleanly, the refusal and the
-            // mount's readback are recorded as the last word before the
-            // terminal event, and closing the host below ends the tree.
-            if let Some((exceedance, readback)) = temporary_storage {
-                let _ = host.cancel(
-                    crate::unix_millis().unwrap_or(now_ms),
-                    Duration::from_millis(100),
-                );
-                writer.project(&mut mapper, host.take_events());
-                writer.temporary_storage_exceeded(exceedance, readback);
-                break RunSpoolState::Failed;
             }
             let outcome = host.poll_turn(
                 crate::unix_millis().unwrap_or(now_ms),
@@ -1923,6 +1944,18 @@ impl JcodePreparedRun {
                                 Duration::from_millis(100),
                             );
                             writer.project(&mut mapper, host.take_events());
+                            match poll_jcode_temporary_storage(
+                                &mut host,
+                                &mut last_temporary_storage_checkpoint,
+                                true,
+                            ) {
+                                Ok(Some((exceedance, readback))) => {
+                                    writer.temporary_storage_exceeded(exceedance, readback);
+                                    break 'run RunSpoolState::Failed;
+                                }
+                                Ok(None) => {}
+                                Err(()) => break 'run RunSpoolState::Failed,
+                            }
                             break 'run state;
                         }
                         match control.receiver.try_recv() {
@@ -1934,11 +1967,32 @@ impl JcodePreparedRun {
                                     crate::unix_millis().unwrap_or(now_ms),
                                     Duration::from_millis(100),
                                 );
-                                writer.project_turn_outcome(
-                                    &mut mapper,
-                                    host.take_events(),
-                                    &response,
-                                );
+                                let events = host.take_events();
+                                match poll_jcode_temporary_storage(
+                                    &mut host,
+                                    &mut last_temporary_storage_checkpoint,
+                                    false,
+                                ) {
+                                    Ok(Some((exceedance, readback))) => {
+                                        writer.project(&mut mapper, events);
+                                        writer.temporary_storage_exceeded(exceedance, readback);
+                                        let _ = command
+                                            .response
+                                            .send(Err(SteerRefusal::ProviderRefused));
+                                        break 'run RunSpoolState::Failed;
+                                    }
+                                    Ok(None) => writer.project_turn_outcome(
+                                        &mut mapper,
+                                        events,
+                                        &response,
+                                    ),
+                                    Err(()) => {
+                                        let _ = command
+                                            .response
+                                            .send(Err(SteerRefusal::ProviderRefused));
+                                        break 'run RunSpoolState::Failed;
+                                    }
+                                }
                                 match response {
                                     Ok(JcodeTurnOutcome::Pending) => {
                                         let _ = command.response.send(Ok(()));
@@ -2058,10 +2112,21 @@ impl JcodePreparedRun {
                         Duration::from_millis(100),
                     );
                     let events = host.take_events();
-                    if forced_state.is_none() {
-                        writer.project_turn_outcome(&mut mapper, events, &decided);
-                    } else {
-                        writer.project(&mut mapper, events);
+                    match poll_jcode_temporary_storage(
+                        &mut host,
+                        &mut last_temporary_storage_checkpoint,
+                        false,
+                    ) {
+                        Ok(Some((exceedance, readback))) => {
+                            writer.project(&mut mapper, events);
+                            writer.temporary_storage_exceeded(exceedance, readback);
+                            break 'run RunSpoolState::Failed;
+                        }
+                        Ok(None) if forced_state.is_none() => {
+                            writer.project_turn_outcome(&mut mapper, events, &decided);
+                        }
+                        Ok(None) => writer.project(&mut mapper, events),
+                        Err(()) => break 'run RunSpoolState::Failed,
                     }
                     if let Some(state) = forced_state {
                         if state == RunSpoolState::Cancelled
@@ -2072,6 +2137,18 @@ impl JcodePreparedRun {
                                 Duration::from_millis(100),
                             );
                             writer.project(&mut mapper, host.take_events());
+                            match poll_jcode_temporary_storage(
+                                &mut host,
+                                &mut last_temporary_storage_checkpoint,
+                                true,
+                            ) {
+                                Ok(Some((exceedance, readback))) => {
+                                    writer.temporary_storage_exceeded(exceedance, readback);
+                                    break 'run RunSpoolState::Failed;
+                                }
+                                Ok(None) => {}
+                                Err(()) => break 'run RunSpoolState::Failed,
+                            }
                         }
                         break state;
                     }
@@ -2101,13 +2178,23 @@ impl JcodePreparedRun {
             let _ = response.send(Err(SteerRefusal::SessionNotLive));
         }
         drop(control);
-        let (final_state, temporary_storage) = match host.close_with_reason_and_temporary_storage(
-            crate::unix_millis().unwrap_or(now_ms),
-            close_reason,
-        ) {
+        let (mut final_state, temporary_storage) = match host
+            .close_with_reason_and_temporary_storage(
+                crate::unix_millis().unwrap_or(now_ms),
+                close_reason,
+            ) {
             Ok(outcome) => (final_state, outcome),
             Err(_) => (RunSpoolState::Failed, None),
         };
+        // Reconciliation is the last observer. If the provider crossed the
+        // ceiling while closing, retain the typed refusal and do not let the
+        // earlier provider/control outcome overwrite it.
+        if let Some(outcome) = temporary_storage.as_ref()
+            && let Some(exceedance) = outcome.ledger.first_exceedance()
+        {
+            writer.temporary_storage_exceeded(exceedance, Some(outcome.statfs_from_ledger));
+            final_state = RunSpoolState::Failed;
+        }
         writer.finish_with_temporary_storage(final_state, temporary_storage)
     }
 }
@@ -3087,9 +3174,9 @@ fn is_containment_run_id(run_id: &str) -> bool {
 mod tests {
     use super::{
         JcodeTemporaryStorageHost, MAX_PROVIDER_BINARY_BYTES, PROVIDER_APPROVAL_PROPOSER,
-        TokenCancelSink, admission_refusal, describe_refused_destination,
+        TokenCancelSink, admission_refusal, advance, describe_refused_destination,
         expire_unanswered_approvals, is_containment_run_id, is_safe_segment,
-        is_within_byte_limit, poll_jcode_temporary_storage, provider_binary_digest,
+        is_within_byte_limit, poll_jcode_temporary_storage, provider_binary_digest, spool_state,
     };
     use crate::attempt_host::DaemonAttemptHost;
     use crate::progress::JcodeProgressMapper;
@@ -3099,11 +3186,13 @@ mod tests {
     use automonique_runner::admission::AdmissionRefusal;
     use automonique_runner::dispatch::DispatchOutcome;
     use automonique_runner::{
-        CancellationToken, Exceedance, StatfsReadback, TemporaryStorageResource,
+        Authority, CancellationToken, EventKind, Exceedance, Spool, StatfsReadback,
+        TemporaryStorageResource,
     };
     use automonique_store::approval_requests::{
         ApprovalContext, ApprovalOutcome, ApprovalProposal, ApprovalRequests, ApprovalState,
     };
+    use automonique_store::run_index::{RunIndex, RunIndexEntry, RunSpoolState};
     use std::fs;
     use std::io::{Read as _, Write as _};
     use std::net::TcpStream;
@@ -3202,6 +3291,54 @@ mod tests {
             Err(())
         );
         assert_eq!(host.checkpoint_count, 1);
+    }
+
+    #[test]
+    fn a_failed_reconciliation_spool_reopens_and_advances_the_read_index_exactly() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let spool_root = root.path().join("spool");
+        fs::create_dir(&spool_root).unwrap();
+        fs::set_permissions(&spool_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let index_path = root.path().join("run-index.sqlite3");
+        let run_id = "reconcile-fault-run";
+
+        let mut spool = Spool::open(&spool_root, run_id, 64 * 1024).unwrap();
+        spool
+            .append(EventKind::Started, Authority::Authoritative, b"pid=1")
+            .unwrap();
+        // This is the canonical terminal selected by the backend when its
+        // final checkpoint/reconciliation returns an error.
+        spool
+            .append(EventKind::Terminal, Authority::Authoritative, b"failed")
+            .unwrap();
+        drop(spool);
+        let reopened = Spool::open(&spool_root, run_id, 64 * 1024).unwrap();
+        let status = reopened.status();
+        assert_eq!(status.last_sequence(), 2);
+
+        let mut index = RunIndex::open(&index_path).unwrap();
+        let registered = index
+            .register(RunIndexEntry {
+                submission_id: 1,
+                run_id,
+                registered_at_ms: 1,
+            })
+            .unwrap();
+        drop(index);
+        advance(
+            &index_path,
+            1,
+            registered.revision,
+            spool_state(status.state()),
+            status.last_sequence(),
+        );
+
+        let reopened_index = RunIndex::open(&index_path).unwrap();
+        let record = reopened_index.entry(1).unwrap().unwrap();
+        assert_eq!(record.spool_state, RunSpoolState::Failed);
+        assert_eq!(record.last_sequence, status.last_sequence());
+        assert_eq!(record.revision, 3);
     }
 
     fn approval_store(root: &Path) -> ApprovalRequests {

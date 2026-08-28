@@ -267,6 +267,15 @@ fn features() -> Vec<HostFeature> {
     }
 }
 
+fn assert_delegated_identity_feature() {
+    assert!(
+        features()
+            .iter()
+            .any(|feature| feature.name() == "uid_separation"),
+        "the delegated production proof must compose a document that requests uid separation"
+    );
+}
+
 fn compose_for(fixture: &Fixture, run_id: &str, task: &str) -> Composition {
     compose(
         task,
@@ -1236,6 +1245,7 @@ fn a_contained_run_answers_through_the_real_lane() {
         not_proven(test, reason);
         return;
     }
+    assert_delegated_identity_feature();
 
     let fixture = contained_fixture(&echo_prompt_argv());
     let serving = serve(&fixture.config);
@@ -1334,6 +1344,7 @@ fn a_contained_jcode_protocol_turn_answers_through_the_production_lane() {
         not_proven(test, reason);
         return;
     }
+    assert_delegated_identity_feature();
     let fixture = Fixture::new(
         None,
         Some(&format!("127.0.0.1 {} loopback\n", unused_loopback_port())),
