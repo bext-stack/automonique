@@ -9,6 +9,14 @@ const renderCorpus = JSON.parse(await Bun.file(new URL(
   import.meta.url,
 )).text());
 
+const completeCollection = (items, sources) => ({
+  state: "complete",
+  items,
+  total: String(items.length),
+  omitted: "0",
+  sources: Object.fromEntries(sources.map((name) => [name, { state: "available" }])),
+});
+
 const fixture = {
   schema: "automonique.dashboard.cockpit/v2",
   mode: "v2",
@@ -45,6 +53,8 @@ const fixture = {
     delivery: { state: "pending", freshness: { state: "fresh", observed_revision: "7" } },
   } },
   attention: { state: "available", known_workspaces: "1", total_workspaces: "1" },
+  activities: completeCollection([], ["lineage", "review"]),
+  inbox: completeCollection([], ["review"]),
 };
 
 test("decimal fences stay exact beyond Number.MAX_SAFE_INTEGER", () => {
@@ -188,6 +198,8 @@ test("v1 degrades explicitly and never infers workspace state from summaries", (
   expect(view.degradation).toContain("Platform v1");
   expect(view.workspaces).toEqual([]);
   expect(view.attention.working).toBe(null);
+  expect(view.activityCoverage.state).toBe("unavailable");
+  expect(view.inboxCoverage.state).toBe("unavailable");
   expect(view.resume.available).toBe(false);
 });
 
@@ -262,7 +274,108 @@ test("malformed structured collections fail closed to unavailable presentation s
   expect(view.hosts).toEqual([]);
   expect(view.workspaces).toEqual([]);
   expect(view.activities).toEqual([]);
+  expect(view.inbox).toEqual([]);
+  expect(view.activityCoverage.state).toBe("unavailable");
+  expect(view.inboxCoverage.state).toBe("unavailable");
   expect(view.create.available).toBe(false);
+});
+
+test("activity and inbox keep lossless chronology and exact deep links", () => {
+  const view = cockpit.derivePresentation({
+    ...fixture,
+    activities: completeCollection([
+      {
+        id: "older",
+        at: "9007199254740995",
+        kind: "task",
+        label: "Task working",
+        source: "orchestration",
+        freshness: "fresh",
+        source_revision: "8",
+        link: { workspace: "workspace-1", session: "runtime-session-1", pane: "pane-1" },
+      },
+      {
+        id: "newer",
+        at: "9007199254740997",
+        kind: "review",
+        label: "Review pending",
+        source: "review",
+        freshness: "stale",
+        source_revision: "9",
+        link: { workspace: "workspace-1" },
+      },
+    ], ["lineage", "review"]),
+    inbox: completeCollection([{
+      id: "attention-comment",
+      state: "needs_you",
+      reason: "comment_reply",
+      origin_kind: "comment",
+      source_revision: "9007199254740996",
+      unread: "1",
+      link: {
+        workspace: "workspace-1",
+        file: "file-1",
+        hunk: "hunk-1",
+        side: "new",
+        line: "9007199254740995",
+      },
+    }], ["review"]),
+  });
+  expect(view.activities.map(({ id }) => id)).toEqual(["newer", "older"]);
+  expect(view.activities[1].deep_link).toBe(
+    "#sessions?workspace=workspace-1&session=runtime-session-1&pane=pane-1",
+  );
+  expect(view.inbox[0].source_revision).toBe("9007199254740996");
+  expect(view.inbox[0].deep_link).toBe(
+    "#sessions?workspace=workspace-1&file=file-1&hunk=hunk-1&side=new&line=9007199254740995",
+  );
+
+  const fullInbox = Array.from({ length: 256 }, (_, index) => ({
+    id: `attention-${index}`,
+    state: "needs_you",
+    reason: "comment_reply",
+    origin_kind: "comment",
+    source_revision: String(index + 1),
+    unread: "1",
+    link: { workspace: "workspace-1" },
+  }));
+  const bounded = cockpit.derivePresentation({
+    ...fixture,
+    activities: {
+      state: "partial",
+      items: Array.from({ length: 256 }, (_, index) => ({
+        id: `activity-${index}`,
+        at: "1",
+        kind: "review",
+        freshness: "fresh",
+        source_revision: "1",
+        link: { workspace: "workspace-1" },
+      })),
+      total: "259",
+      omitted: "3",
+      sources: { lineage: { state: "available" }, review: { state: "available" } },
+    },
+    inbox: completeCollection(fullInbox, ["review"]),
+  });
+  expect(bounded.activities).toHaveLength(256);
+  expect(bounded.activityCoverage).toMatchObject({ state: "partial", total: "259", omitted: "3" });
+  expect(bounded.inbox).toHaveLength(256);
+  expect(bounded.inboxCoverage).toMatchObject({ state: "complete", total: "256", omitted: "0" });
+
+  const unavailable = cockpit.derivePresentation({
+    ...fixture,
+    activities: {
+      state: "partial", items: [], total: "0", omitted: "0",
+      sources: { lineage: { state: "available" }, review: { state: "refused", category: "review_refused" } },
+    },
+    inbox: {
+      state: "unavailable", items: [], total: "0", omitted: "0",
+      sources: { review: { state: "refused", category: "review_refused" } },
+    },
+  });
+  expect(unavailable.activityCoverage.state).toBe("partial");
+  expect(unavailable.activityCoverage.sources.review.category).toBe("review_refused");
+  expect(unavailable.inboxCoverage.state).toBe("unavailable");
 });
 
 test("server-owned structured fixture exposes exact selected workspace and review", () => {

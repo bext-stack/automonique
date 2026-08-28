@@ -10,6 +10,10 @@
   const CONTROL_FAMILIES = Object.freeze(["workspace_intent", "review_action"]);
   const LINK_KEYS = Object.freeze(["workspace", "session", "pane", "file", "hunk", "side", "line"]);
   const MAX_LINEAGE_RECORDS = 128;
+  const MAX_ACTIVITIES = 256;
+  const MAX_INBOX_ITEMS = 256;
+  const COLLECTION_STATES = Object.freeze(["complete", "partial", "unavailable"]);
+  const SOURCE_STATES = Object.freeze(["available", "refused", "unavailable"]);
   const REVIEW_DECISIONS = Object.freeze(["pending", "approved", "changes_requested", "dismissed"]);
   const CHECK_STATES = Object.freeze(["queued", "running", "passed", "failed", "cancelled", "unavailable"]);
   const PULL_REQUEST_STATES = Object.freeze(["absent", "draft", "open", "closed", "merged"]);
@@ -319,9 +323,11 @@
 
   function normalizeActivity(value) {
     const id = boundedText(value?.id, 256);
-    const at = boundedText(value?.at, 64);
+    const at = validDecimal(value?.at) ? value.at : null;
     const kind = boundedText(value?.kind, 64);
-    if (!id || !at || !kind) return null;
+    const freshness = explicitEnum(value?.freshness, FRESHNESS_STATES);
+    const sourceRevision = validDecimal(value?.source_revision, false) ? value.source_revision : null;
+    if (!id || !at || !kind || !freshness || !sourceRevision) return null;
     const linkedWorkspace = boundedText(value?.link?.workspace, 256);
     return Object.freeze({
       id,
@@ -329,7 +335,75 @@
       kind,
       label: boundedText(value?.label, 512) || kind,
       source: boundedText(value?.source, 64),
+      freshness,
+      source_revision: sourceRevision,
       deep_link: linkedWorkspace ? buildDeepLink({ view: "sessions", ...value.link }) : null,
+    });
+  }
+
+  function normalizeInbox(value) {
+    const id = boundedText(value?.id, 256);
+    const state = explicitEnum(value?.state, ATTENTION_STATES);
+    const reason = boundedText(value?.reason, 64);
+    const originKind = boundedText(value?.origin_kind, 64);
+    const sourceRevision = validDecimal(value?.source_revision, false) ? value.source_revision : null;
+    const unread = validDecimal(value?.unread) ? value.unread : null;
+    const linkedWorkspace = boundedText(value?.link?.workspace, 256);
+    if (!id || !state || !reason || !originKind || !sourceRevision || unread === null || !linkedWorkspace) return null;
+    return Object.freeze({
+      id,
+      state,
+      reason,
+      origin_kind: originKind,
+      source_revision: sourceRevision,
+      unread,
+      deep_link: buildDeepLink({ view: "sessions", ...value.link }),
+    });
+  }
+
+  function unavailableCollection(sourceNames, category = "platform_cockpit_collection_invalid") {
+    return Object.freeze({
+      state: "unavailable",
+      items: Object.freeze([]),
+      total: "0",
+      omitted: "0",
+      sources: Object.freeze(Object.fromEntries(sourceNames.map((name) => [name, Object.freeze({ state: "unavailable", category })]))),
+    });
+  }
+
+  function normalizeCollection(value, normalizeItem, maximum, sourceNames) {
+    if (!value || typeof value !== "object" || !Array.isArray(value.items)
+      || value.items.length > maximum || !validDecimal(value.total) || !validDecimal(value.omitted)) {
+      return unavailableCollection(sourceNames);
+    }
+    const items = value.items.map(normalizeItem);
+    if (items.some((item) => !item)
+      || BigInt(value.total) !== BigInt(items.length) + BigInt(value.omitted)) {
+      return unavailableCollection(sourceNames);
+    }
+    const sources = {};
+    for (const name of sourceNames) {
+      const source = value.sources?.[name];
+      const state = explicitEnum(source?.state, SOURCE_STATES);
+      if (!state) return unavailableCollection(sourceNames);
+      sources[name] = Object.freeze({
+        state,
+        category: boundedText(source?.category, 128),
+      });
+    }
+    const available = Object.values(sources).filter((source) => source.state === "available").length;
+    const expectedState = available === sourceNames.length && value.omitted === "0"
+      ? "complete"
+      : available === 0 ? "unavailable" : "partial";
+    if (explicitEnum(value.state, COLLECTION_STATES) !== expectedState) {
+      return unavailableCollection(sourceNames);
+    }
+    return Object.freeze({
+      state: expectedState,
+      items: Object.freeze(items),
+      total: value.total,
+      omitted: value.omitted,
+      sources: Object.freeze(sources),
     });
   }
 
@@ -468,9 +542,22 @@
       : mode === "partial"
         ? `Platform v2 is partial (${reasons.join(", ")}). Unavailable context is not inferred and workspace actions remain read-only.`
         : null;
-    const activities = structured && Array.isArray(document.activities)
-      ? document.activities.map(normalizeActivity).filter(Boolean).sort((left, right) => left.at.localeCompare(right.at) || left.id.localeCompare(right.id))
-      : [];
+    const activityCollection = structured
+      ? normalizeCollection(document.activities, normalizeActivity, MAX_ACTIVITIES, ["lineage", "review"])
+      : unavailableCollection(["lineage", "review"], "platform_v2_unavailable");
+    const activities = [...activityCollection.items].sort((left, right) => {
+        if (left.at !== right.at) return decimalGreater(left.at, right.at) ? -1 : 1;
+        return left.id.localeCompare(right.id);
+      });
+    const inboxCollection = structured
+      ? normalizeCollection(document.inbox, normalizeInbox, MAX_INBOX_ITEMS, ["review"])
+      : unavailableCollection(["review"], "platform_v2_unavailable");
+    const inbox = [...inboxCollection.items].sort((left, right) => {
+        if (left.source_revision !== right.source_revision) {
+          return decimalGreater(left.source_revision, right.source_revision) ? -1 : 1;
+        }
+        return left.id.localeCompare(right.id);
+      });
     const writesAvailable = mode === "v2" && !freshnessStates(document).includes("stale");
     const create = controlCapability(document, "workspace_intent", "create_attempt_workspace");
     const resume = controlCapability(document, "workspace_intent", "resume_attempt_workspace");
@@ -489,6 +576,9 @@
       attentionAvailable,
       attention: Object.freeze(Object.fromEntries(ATTENTION_STATES.map((state) => [state, attentionAvailable ? workspaces.filter((item) => item.attention === state).length : null]))),
       activities: Object.freeze(activities),
+      activityCoverage: activityCollection,
+      inbox: Object.freeze(inbox),
+      inboxCoverage: inboxCollection,
       receipt: normalizeReceipt(document?.receipt),
       create: writesAvailable ? create : disabledCapability(create, "platform_cockpit_projection_incomplete_or_stale"),
       resume: writesAvailable ? resume : disabledCapability(resume, "platform_cockpit_projection_incomplete_or_stale"),
