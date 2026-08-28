@@ -43,7 +43,8 @@ Canonical Rust codecs and the
 `fixtures/platform-v2-attention-v1.json` corpus reject unknown fields, unknown
 enum spellings, wrong schemas, malformed coordinate kinds, oversized frames,
 out-of-order item IDs, mixed state/reason pairs, cyclic or over-depth agent
-paths, and provider/local coordinate confusion. This slice defines the typed
-server/consumer boundary; a host transport must publish only source-owned
-snapshots and must not synthesize observation time or source revision from the
-request time.
+paths, and provider/local coordinate confusion. The live Platform v2 host
+publishes only snapshots validated from its private operator source registry
+and tenant-bound durable store. An absent, changed, malformed, unauthorized,
+stale, or unregistered source refuses explicitly; the host never synthesizes
+observation time or source revision from the request time.

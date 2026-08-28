@@ -39,6 +39,7 @@ use automonique_protocol::platform_v2_transport::{
 };
 use automonique_protocol::primitives::{EpochMillis, Revision};
 use automonique_protocol::wire::JsonValue;
+use automonique_store::attention_store::AttentionStore;
 use automonique_store::lineage_index::WorkspaceIntentExecutionReceipt;
 use automonique_store::lineage_index::{IntentAuthorizationScope, LineageIndex};
 use automonique_store::review_store::{
@@ -54,12 +55,17 @@ use automonique_store::work_context_store::{
 };
 use serde::Deserialize;
 
+use crate::platform_v2_attention_registry::AttentionRegistry;
 use crate::platform_v2_review_adapter::{ProductionReviewEffectAdapter, ReviewEffectPlan};
 
 pub const POLICY_FILE_NAME: &str = "platform-v2-policy.json";
 pub const WORK_CONTEXT_STORE_NAME: &str = "platform-v2-work-context.sqlite3";
 pub const LINEAGE_STORE_NAME: &str = "platform-v2-lineage.sqlite3";
 pub const REVIEW_STORE_NAME: &str = "platform-v2-review.sqlite3";
+pub const ATTENTION_STORE_NAME: &str =
+    crate::platform_v2_attention_registry::ATTENTION_STORE_FILE_NAME;
+pub const ATTENTION_REGISTRY_NAME: &str =
+    crate::platform_v2_attention_registry::ATTENTION_REGISTRY_FILE_NAME;
 
 const PREVIEW_LIFETIME_MS: i64 = 5 * 60 * 1_000;
 const APPROVAL_LIFETIME_MS: i64 = 60 * 1_000;
@@ -78,6 +84,8 @@ pub struct PlatformV2Runtime {
     work_contexts: WorkContextStore,
     lineage: LineageIndex,
     reviews: ReviewStore,
+    attention: AttentionStore,
+    attention_registry: AttentionRegistry,
     review_effects: ProductionReviewEffectAdapter,
     nonces: HostNonces,
     lifecycle_effects: Box<dyn PlatformV2LifecycleEffectAdapter>,
@@ -93,6 +101,8 @@ impl std::fmt::Debug for PlatformV2Runtime {
             .field("work_contexts", &self.work_contexts)
             .field("lineage", &self.lineage)
             .field("reviews", &self.reviews)
+            .field("attention", &self.attention)
+            .field("attention_registry", &self.attention_registry)
             .field("review_effects", &self.review_effects)
             .field("nonces", &self.nonces)
             .field("lifecycle_effects", &"typed adapter")
@@ -806,6 +816,17 @@ pub fn resolve_web_mobile_request_project(
             }
             value.project().clone()
         }
+        PlatformV2Request::GetAttentionSourceSnapshot(value) => {
+            let workspace = WorkContextIdentity::UserWorkspace(value.user_workspace().clone());
+            if principal
+                .workspaces
+                .get(&workspace)
+                .is_none_or(|scope| &scope.project != value.project())
+            {
+                return Err("platform_v2_mobile_project_denied");
+            }
+            value.project().clone()
+        }
         PlatformV2Request::ExecuteReviewAction(value) => principal
             .workspaces
             .get(value.workspace())
@@ -948,6 +969,17 @@ impl PlatformV2Runtime {
             .tenant();
         let mut reviews = ReviewStore::open_scoped(review_path, tenant)
             .map_err(|_| "platform_v2_store_unavailable")?;
+        let state_dir = policy_path
+            .parent()
+            .ok_or("platform_v2_state_path_invalid")?;
+        let mut attention =
+            AttentionStore::open_scoped(state_dir.join(ATTENTION_STORE_NAME), tenant)
+                .map_err(|_| "platform_v2_store_unavailable")?;
+        let attention_registry = AttentionRegistry::open(
+            &state_dir.join(ATTENTION_REGISTRY_NAME),
+            expected_uid,
+            &mut attention,
+        )?;
         // Grants are copied from the server-owned policy into the store. The
         // exact same grant is an idempotent replay on restart.
         for principal in principals.values() {
@@ -985,6 +1017,8 @@ impl PlatformV2Runtime {
             work_contexts,
             lineage,
             reviews,
+            attention,
+            attention_registry,
             review_effects,
             nonces: HostNonces::new()?,
             lifecycle_effects,
@@ -1686,6 +1720,14 @@ impl PlatformV2Runtime {
                     .map_err(|_| "platform_v2_store_refused")?
                     .map(PlatformV2Response::ReviewResult)
                     .ok_or("platform_v2_not_found")
+            }
+            PlatformV2Request::GetAttentionSourceSnapshot(value) => {
+                let workspace = WorkContextIdentity::UserWorkspace(value.user_workspace().clone());
+                authorize_identity(&principal, value.project(), &workspace)?;
+                self.validate_policy_mapping(&principal, &workspace)?;
+                self.attention_registry
+                    .snapshot(value, &self.attention)
+                    .map(PlatformV2Response::AttentionSourceSnapshot)
             }
             PlatformV2Request::ExecuteReviewAction(value) => {
                 let scope = principal
@@ -3100,6 +3142,9 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use automonique_protocol::platform::IdempotencyKey;
+    use automonique_protocol::platform_v2_attention::{
+        AttentionReadRequest, AttentionSource, AttentionSourceId, AttentionSourceKind,
+    };
     use automonique_protocol::platform_v2_transport::{
         LineageReadRequest, ReviewReadRequest, ReviewReceiptLookup,
     };
@@ -3427,6 +3472,41 @@ mod tests {
                 &mismatched_review,
             ),
             Err("platform_v2_mobile_project_denied")
+        );
+        let attention_source = AttentionSource::new(
+            AttentionSourceKind::Review,
+            AttentionSourceId::new("review-source").unwrap(),
+        );
+        let mismatched_attention =
+            PlatformV2Request::GetAttentionSourceSnapshot(AttentionReadRequest::new(
+                attention_source.clone(),
+                project_b.clone(),
+                workspace_a.clone(),
+            ));
+        assert_eq!(
+            resolve_web_mobile_request_project(
+                &path,
+                uid,
+                "tenant-test",
+                "actor-test",
+                &roots,
+                &mismatched_attention,
+            ),
+            Err("platform_v2_mobile_project_denied")
+        );
+        let valid_attention = PlatformV2Request::GetAttentionSourceSnapshot(
+            AttentionReadRequest::new(attention_source, project_a.clone(), workspace_a.clone()),
+        );
+        assert_eq!(
+            resolve_web_mobile_request_project(
+                &path,
+                uid,
+                "tenant-test",
+                "actor-test",
+                &roots,
+                &valid_attention,
+            ),
+            Ok(project_a)
         );
         let mismatched_review_receipt = PlatformV2Request::GetReviewReceipt(
             ReviewReceiptLookup::new(

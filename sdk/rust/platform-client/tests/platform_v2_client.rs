@@ -4,7 +4,8 @@ use automonique_platform_client::platform_v2_client::testing::{
     DeterministicPlatformV2Step, DeterministicPlatformV2Transport,
 };
 use automonique_platform_client::platform_v2_client::{
-    NegotiationResult, PlatformV2Client, PlatformV2ClientError as ClientError, WorkContextGetResult,
+    AttentionReadResult, NegotiationResult, PlatformV2Client, PlatformV2ClientError as ClientError,
+    WorkContextGetResult,
 };
 use automonique_protocol::identity::Actor;
 use automonique_protocol::platform::{IdempotencyKey, ResourceAuthority};
@@ -14,6 +15,10 @@ use automonique_protocol::platform_v2::{
     WorkContextKind, WorkContextLabel, WorkContextLifecycle, WorkContextPage, WorkContextQuery,
     WorkContextRecord, WorkContextResync,
 };
+use automonique_protocol::platform_v2_attention::{
+    AttentionSource, AttentionSourceId, AttentionSourceKind,
+};
+use automonique_protocol::platform_v2_attention_api::decode_attention_source_snapshot;
 use automonique_protocol::platform_v2_lifecycle::{
     CreateProjectIntent, MutationApproval, MutationApprovalDecision, MutationApprovalId,
     MutationApprovalRequirement, MutationPreview, MutationPreviewId, MutationPreviewRef,
@@ -58,6 +63,56 @@ fn v2_negotiation() -> DeterministicPlatformV2Step {
     DeterministicPlatformV2Step::Negotiation(PlatformNegotiationResponse::Negotiated(negotiated(
         PlatformVersion::V2,
     )))
+}
+
+#[test]
+fn attention_reads_preserve_and_revalidate_the_exact_source_scope() {
+    let snapshot = decode_attention_source_snapshot(include_bytes!(
+        "../../../../rust/crates/automonique-protocol/fixtures/platform-v2-attention-v1.json"
+    ))
+    .unwrap();
+    let transport = DeterministicPlatformV2Transport::new([
+        v2_negotiation(),
+        DeterministicPlatformV2Step::V2(Box::new(PlatformV2Response::AttentionSourceSnapshot(
+            snapshot.clone(),
+        ))),
+    ]);
+    let mut client = PlatformV2Client::new_testing(transport);
+    client
+        .negotiate(PlatformVersionOffer::new(vec![2]).unwrap())
+        .unwrap();
+    assert!(matches!(
+        client
+            .get_attention_source_snapshot(
+                snapshot.source().clone(),
+                snapshot.project().clone(),
+                snapshot.user_workspace().clone(),
+            )
+            .unwrap(),
+        AttentionReadResult::Snapshot(_)
+    ));
+
+    let transport = DeterministicPlatformV2Transport::new([
+        v2_negotiation(),
+        DeterministicPlatformV2Step::V2(Box::new(PlatformV2Response::AttentionSourceSnapshot(
+            snapshot.clone(),
+        ))),
+    ]);
+    let mut client = PlatformV2Client::new_testing(transport);
+    client
+        .negotiate(PlatformVersionOffer::new(vec![2]).unwrap())
+        .unwrap();
+    assert_eq!(
+        client.get_attention_source_snapshot(
+            AttentionSource::new(
+                AttentionSourceKind::ProviderSession,
+                AttentionSourceId::new("other-source").unwrap(),
+            ),
+            snapshot.project().clone(),
+            snapshot.user_workspace().clone(),
+        ),
+        Err(ClientError::Protocol)
+    );
 }
 
 #[test]

@@ -14,6 +14,7 @@ import {
   encodePlatformV2Request,
   parseCanonical,
   type IdempotencyKey,
+  type AttentionSource,
   type MutationApprovalDecision,
   type MutationApprovalId,
   type MutationPreviewDigest,
@@ -588,6 +589,19 @@ export class PlatformV2Client {
   async getReview(project: ProjectId, workspace: ReviewWorkspaceIdentity, signal?: AbortSignal) {
     const response = requireResponse(await this.#request({kind: "get_review", request: {project, workspace}}, signal), ["review_result"] as const);
     if (response.kind === "review_result" && !sameIdentity(response.review.workspace, workspace)) {
+      throw new PlatformTransportError(502, "response_coordinate_mismatch");
+    }
+    return response;
+  }
+
+  async getAttentionSourceSnapshot(source: AttentionSource, project: ProjectId, userWorkspace: UserWorkspaceId, signal?: AbortSignal) {
+    const response = requireResponse(await this.#request({kind: "get_attention_source_snapshot", request: {source, project, user_workspace: userWorkspace}}, signal), ["attention_source_snapshot"] as const);
+    if (response.kind === "attention_source_snapshot" && (
+      response.snapshot.source.kind !== source.kind
+      || response.snapshot.source.id !== source.id
+      || response.snapshot.project !== project
+      || response.snapshot.user_workspace !== userWorkspace
+    )) {
       throw new PlatformTransportError(502, "response_coordinate_mismatch");
     }
     return response;

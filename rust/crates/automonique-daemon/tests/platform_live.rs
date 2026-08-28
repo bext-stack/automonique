@@ -34,6 +34,9 @@ use automonique_protocol::platform_v2::{
     WorkContextRecord, WorkContextRelation, WorkContextRelationKind, WorkContextTargetKind,
     WorkSessionId,
 };
+use automonique_protocol::platform_v2_attention::{
+    AttentionReadRequest, AttentionSource, AttentionSourceId, AttentionSourceKind,
+};
 use automonique_protocol::platform_v2_lifecycle::{
     AuthorityGrantId, CreateAttemptWorkspaceIntent, CreateCheckoutIntent,
     CreateUserWorkspaceIntent, ExpectedWorkContext, ExternalParentResolution,
@@ -86,6 +89,8 @@ const REVIEW_SNAPSHOT: &[u8] =
     include_bytes!("../../automonique-protocol/fixtures/platform-v2-review-v2.json");
 const REVIEW_ACTION: &[u8] =
     include_bytes!("../../automonique-protocol/fixtures/platform-v2-review-action-v1.json");
+const ATTENTION_SNAPSHOT: &[u8] =
+    include_bytes!("../../automonique-protocol/fixtures/platform-v2-attention-v1.json");
 
 static FULL_DAEMON_TEST_GUARD: Mutex<()> = Mutex::new(());
 
@@ -1060,6 +1065,128 @@ fn multi_tenant_policy_fails_closed_without_changing_v1() {
         PlatformV2Response::Refused(refusal)
             if refusal.category().as_str() == "platform_v2_policy_insecure"
     ));
+    serving.shutdown(&config);
+}
+
+#[test]
+fn configured_v2_attention_reads_only_persisted_registry_owned_snapshots() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let mut snapshot: serde_json::Value = serde_json::from_slice(ATTENTION_SNAPSHOT).unwrap();
+    snapshot["project"] = serde_json::json!("project-live");
+    snapshot["user_workspace"] = serde_json::json!("workspace-live");
+    let registry = serde_json::json!({
+        "version": 1,
+        "generation": "attention-live-generation-1",
+        "snapshots": [snapshot],
+    });
+    let registry_path = config
+        .state_dir()
+        .join(automonique_daemon::platform_v2_host::ATTENTION_REGISTRY_NAME);
+    std::fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
+    std::fs::set_permissions(&registry_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let serving = serve(&config);
+    let source = AttentionSource::new(
+        AttentionSourceKind::ProviderSession,
+        AttentionSourceId::new("provider-feed-1").unwrap(),
+    );
+    let response = platform_v2(
+        &config,
+        "attention-live-exact",
+        PlatformV2Request::GetAttentionSourceSnapshot(AttentionReadRequest::new(
+            source.clone(),
+            ProjectId::new("project-live").unwrap(),
+            UserWorkspaceId::new("workspace-live").unwrap(),
+        )),
+    );
+    let PlatformV2Response::AttentionSourceSnapshot(snapshot) = response else {
+        panic!("expected authoritative attention snapshot")
+    };
+    assert_eq!(snapshot.project().as_str(), "project-live");
+    assert_eq!(snapshot.user_workspace().as_str(), "workspace-live");
+    assert_eq!(snapshot.revision(), Revision::new(7).unwrap());
+    assert_eq!(snapshot.observed_at_ms(), 2_000);
+
+    for (request_id, project, workspace) in [
+        (
+            "attention-live-foreign-project",
+            "foreign-project",
+            "workspace-live",
+        ),
+        (
+            "attention-live-foreign-workspace",
+            "project-live",
+            "foreign-workspace",
+        ),
+    ] {
+        let unauthorized = platform_v2(
+            &config,
+            request_id,
+            PlatformV2Request::GetAttentionSourceSnapshot(AttentionReadRequest::new(
+                source.clone(),
+                ProjectId::new(project).unwrap(),
+                UserWorkspaceId::new(workspace).unwrap(),
+            )),
+        );
+        assert!(
+            matches!(unauthorized, PlatformV2Response::Refused(refusal) if refusal.category().as_str() == "platform_v2_scope_denied")
+        );
+    }
+
+    let missing = platform_v2(
+        &config,
+        "attention-live-missing",
+        PlatformV2Request::GetAttentionSourceSnapshot(AttentionReadRequest::new(
+            source.clone(),
+            ProjectId::new("project-live").unwrap(),
+            UserWorkspaceId::new("wc_user_1").unwrap(),
+        )),
+    );
+    assert!(
+        matches!(missing, PlatformV2Response::Refused(refusal) if refusal.category().as_str() == "platform_v2_attention_not_found")
+    );
+
+    let mut drifted = registry;
+    drifted["generation"] = serde_json::json!("attention-live-generation-2");
+    std::fs::write(&registry_path, serde_json::to_vec(&drifted).unwrap()).unwrap();
+    let changed = platform_v2(
+        &config,
+        "attention-live-drift",
+        PlatformV2Request::GetAttentionSourceSnapshot(AttentionReadRequest::new(
+            source,
+            ProjectId::new("project-live").unwrap(),
+            UserWorkspaceId::new("workspace-live").unwrap(),
+        )),
+    );
+    assert!(
+        matches!(changed, PlatformV2Response::Refused(refusal) if refusal.category().as_str() == "platform_v2_attention_registry_changed")
+    );
+    serving.shutdown(&config);
+}
+
+#[test]
+fn configured_v2_attention_refuses_when_registry_is_absent() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let serving = serve(&config);
+    let response = platform_v2(
+        &config,
+        "attention-live-absent",
+        PlatformV2Request::GetAttentionSourceSnapshot(AttentionReadRequest::new(
+            AttentionSource::new(
+                AttentionSourceKind::Review,
+                AttentionSourceId::new("review-source").unwrap(),
+            ),
+            ProjectId::new("project-live").unwrap(),
+            UserWorkspaceId::new("workspace-live").unwrap(),
+        )),
+    );
+    assert!(
+        matches!(response, PlatformV2Response::Refused(refusal) if refusal.category().as_str() == "platform_v2_attention_registry_unavailable")
+    );
     serving.shutdown(&config);
 }
 

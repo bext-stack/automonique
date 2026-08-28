@@ -408,6 +408,48 @@ describe("canonical HTTPS Platform v2 client", () => {
       .rejects.toMatchObject({category: "response_coordinate_mismatch"});
   });
 
+  test("attention reads preserve and revalidate the exact source scope", async () => {
+    const source = {kind: "review" as const, id: "review-source"};
+    const project = ProjectId("project-a");
+    const workspace = UserWorkspaceId("workspace-a");
+    const snapshot = {
+      items: [],
+      observed_at_ms: 1n,
+      previous_revision: null,
+      project,
+      revision: WorkContextRevision(1n),
+      schema: "automonique.platform/attention/v1" as const,
+      semantics: "atomic_replace" as const,
+      source,
+      user_workspace: workspace,
+    };
+    const adapter = new DeterministicPlatformV2Adapter([
+      {lane: "negotiation", result: {kind: "negotiated", negotiated: negotiatedBody(2n)}},
+      {
+        lane: "v2",
+        request: {kind: "get_attention_source_snapshot", request: {source, project, user_workspace: workspace}},
+        result: {kind: "attention_source_snapshot", snapshot},
+      },
+    ]);
+    const client = new PlatformV2Client(adapter);
+    await client.negotiate(offer);
+    expect((await client.getAttentionSourceSnapshot(source, project, workspace)).kind)
+      .toBe("attention_source_snapshot");
+
+    const mismatched = new DeterministicPlatformV2Adapter([
+      {lane: "negotiation", result: {kind: "negotiated", negotiated: negotiatedBody(2n)}},
+      {
+        lane: "v2",
+        request: {kind: "get_attention_source_snapshot", request: {source, project, user_workspace: workspace}},
+        result: {kind: "attention_source_snapshot", snapshot: {...snapshot, source: {...source, id: "other-source"}}},
+      },
+    ]);
+    const mismatchedClient = new PlatformV2Client(mismatched);
+    await mismatchedClient.negotiate(offer);
+    await expect(mismatchedClient.getAttentionSourceSnapshot(source, project, workspace))
+      .rejects.toMatchObject({category: "response_coordinate_mismatch"});
+  });
+
   test("preserves the exact idempotency lookup and supports AbortSignal", async () => {
     const key = IdempotencyKey("mutation-1");
     const adapter = new DeterministicPlatformV2Adapter([

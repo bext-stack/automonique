@@ -195,6 +195,7 @@ pub enum MobilePlatformV2Action {
     SubmitWorkspaceIntent,
     GetWorkspaceIntent,
     GetReview,
+    GetAttentionSourceSnapshot,
     ExecuteReviewAction,
     GetReviewReceipt,
 }

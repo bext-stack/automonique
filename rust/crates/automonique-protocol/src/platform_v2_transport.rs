@@ -28,6 +28,12 @@ use crate::platform_v2_api::{
     encode_work_context_page, encode_work_context_query, encode_work_context_resync, exact_fields,
     identity, identity_json, object, record, record_json, string,
 };
+use crate::platform_v2_attention::{AttentionReadRequest, AttentionSourceSnapshot};
+use crate::platform_v2_attention_api::{
+    AttentionApiError, MAX_ATTENTION_SNAPSHOT_CANONICAL_BYTES, decode_attention_read_request,
+    decode_attention_source_snapshot, encode_attention_read_request,
+    encode_attention_source_snapshot,
+};
 use crate::platform_v2_lifecycle::{
     MAX_MUTATION_CANONICAL_BYTES, MutationApproval, MutationApprovalDecision, MutationApprovalId,
     MutationPreview, MutationPreviewDigest, MutationPreviewRef, MutationReceipt, MutationRefusal,
@@ -82,6 +88,10 @@ const _: () = assert!(
     MAX_REVIEW_SNAPSHOT_CANONICAL_BYTES + PLATFORM_V2_ENVELOPE_OVERHEAD_BYTES
         <= MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES
 );
+const _: () = assert!(
+    MAX_ATTENTION_SNAPSHOT_CANONICAL_BYTES + PLATFORM_V2_ENVELOPE_OVERHEAD_BYTES
+        <= MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES
+);
 const _: () = assert!(MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES <= u32::MAX as usize);
 
 pub type PlatformV2RefusalCategory = BoundedString<128>;
@@ -119,6 +129,7 @@ pub enum PlatformV2TransportError {
     Lifecycle(LifecycleApiError),
     Lineage(LineageApiError),
     Review(ReviewApiError),
+    Attention(AttentionApiError),
     InvalidBody,
     CorrelationMismatch,
     NegotiationMismatch,
@@ -138,6 +149,12 @@ impl PlatformV2TransportError {
             Self::Lifecycle(value) => value.category(),
             Self::Lineage(value) => value.category(),
             Self::Review(value) => value.category(),
+            Self::Attention(value) => match value {
+                AttentionApiError::Codec(error) => error.category(),
+                AttentionApiError::Contract(_) => "attention_value_invalid",
+                AttentionApiError::InvalidBody => "attention_invalid_body",
+                AttentionApiError::FrameTooLarge => "frame_too_large",
+            },
             Self::InvalidBody => "platform_v2_invalid_body",
             Self::CorrelationMismatch => "platform_v2_correlation_mismatch",
             Self::NegotiationMismatch => "platform_negotiation_mismatch",
@@ -176,6 +193,11 @@ impl From<LineageApiError> for PlatformV2TransportError {
 impl From<ReviewApiError> for PlatformV2TransportError {
     fn from(value: ReviewApiError) -> Self {
         Self::Review(value)
+    }
+}
+impl From<AttentionApiError> for PlatformV2TransportError {
+    fn from(value: AttentionApiError) -> Self {
+        Self::Attention(value)
     }
 }
 
@@ -1004,6 +1026,7 @@ pub enum PlatformV2Request {
     SubmitWorkspaceIntent(WorkspaceIntentRequest),
     GetWorkspaceIntent(WorkspaceIntentLookup),
     GetReview(ReviewReadRequest),
+    GetAttentionSourceSnapshot(AttentionReadRequest),
     ExecuteReviewAction(ReviewActionTransportRequest),
     GetReviewReceipt(ReviewReceiptLookup),
 }
@@ -1022,6 +1045,7 @@ pub enum PlatformV2Response {
     LineageResult(LineageProjection),
     WorkspaceIntentResult(WorkspaceIntentOutcome),
     ReviewResult(ReviewSnapshot),
+    AttentionSourceSnapshot(AttentionSourceSnapshot),
     ReviewReceipt(ReviewActionReceipt),
     Refused(PlatformV2Refusal),
 }
@@ -1187,6 +1211,7 @@ fn request_kind(value: &PlatformV2Request) -> &'static str {
         PlatformV2Request::SubmitWorkspaceIntent(_) => "submit_workspace_intent",
         PlatformV2Request::GetWorkspaceIntent(_) => "get_workspace_intent",
         PlatformV2Request::GetReview(_) => "get_review",
+        PlatformV2Request::GetAttentionSourceSnapshot(_) => "get_attention_source_snapshot",
         PlatformV2Request::ExecuteReviewAction(_) => "execute_review_action",
         PlatformV2Request::GetReviewReceipt(_) => "get_review_receipt",
     }
@@ -1275,6 +1300,9 @@ fn request_body(value: &PlatformV2Request) -> Result<JsonValue, PlatformV2Transp
             ("schema", JsonValue::String(PLATFORM_SCHEMA_V2.to_owned())),
         ]),
         PlatformV2Request::GetReview(value) => scope_json(&value.project, Some(&value.workspace)),
+        PlatformV2Request::GetAttentionSourceSnapshot(value) => {
+            document(encode_attention_read_request(value)?)?
+        }
         PlatformV2Request::ExecuteReviewAction(value) => object(vec![
             ("action", action_json(&value.action)?),
             (
@@ -1440,6 +1468,9 @@ fn request_from_message(message: &Message) -> Result<PlatformV2Request, Platform
                 workspace.ok_or(PlatformV2TransportError::InvalidBody)?,
             )?)
         }
+        "get_attention_source_snapshot" => {
+            PlatformV2Request::GetAttentionSourceSnapshot(decode_attention_read_request(&bytes)?)
+        }
         "execute_review_action" => {
             exact_fields(
                 message.body(),
@@ -1583,6 +1614,7 @@ fn response_kind(value: &PlatformV2Response) -> &'static str {
         PlatformV2Response::LineageResult(_) => "lineage_result",
         PlatformV2Response::WorkspaceIntentResult(_) => "workspace_intent_result",
         PlatformV2Response::ReviewResult(_) => "review_result",
+        PlatformV2Response::AttentionSourceSnapshot(_) => "attention_source_snapshot",
         PlatformV2Response::ReviewReceipt(_) => "review_receipt",
         PlatformV2Response::Refused(_) => "platform_v2_refused",
     }
@@ -1620,6 +1652,9 @@ fn response_answers_request(request: &PlatformV2Request, response: &PlatformV2Re
         ) | (
             PlatformV2Request::GetReview(_),
             PlatformV2Response::ReviewResult(_)
+        ) | (
+            PlatformV2Request::GetAttentionSourceSnapshot(_),
+            PlatformV2Response::AttentionSourceSnapshot(_)
         ) | (
             PlatformV2Request::ExecuteReviewAction(_) | PlatformV2Request::GetReviewReceipt(_),
             PlatformV2Response::ReviewReceipt(_)
@@ -1689,6 +1724,9 @@ fn response_body(value: &PlatformV2Response) -> Result<JsonValue, PlatformV2Tran
             document(encode_workspace_intent_outcome(&v2(), value)?)?
         }
         PlatformV2Response::ReviewResult(value) => document(encode_review_snapshot(value)?)?,
+        PlatformV2Response::AttentionSourceSnapshot(value) => {
+            document(encode_attention_source_snapshot(value)?)?
+        }
         PlatformV2Response::ReviewReceipt(value) => document(encode_review_action_receipt(value)?)?,
         PlatformV2Response::Refused(value) => refusal_json(value),
     })
@@ -1785,6 +1823,9 @@ fn response_from_message(
             decode_workspace_intent_outcome(&v2(), &bytes)?,
         ),
         "review_result" => PlatformV2Response::ReviewResult(decode_review_snapshot(&bytes)?),
+        "attention_source_snapshot" => {
+            PlatformV2Response::AttentionSourceSnapshot(decode_attention_source_snapshot(&bytes)?)
+        }
         "review_receipt" => {
             PlatformV2Response::ReviewReceipt(decode_review_action_receipt(&bytes)?)
         }

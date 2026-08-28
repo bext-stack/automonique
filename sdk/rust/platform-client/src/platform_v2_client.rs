@@ -32,6 +32,9 @@ use automonique_protocol::platform_v2::{
     NegotiatedPlatform, PlatformVersion, PlatformVersionOffer, ProjectId, UserWorkspaceId,
     WorkContextIdentity, WorkContextPage, WorkContextQuery, WorkContextRecord, WorkContextResync,
 };
+use automonique_protocol::platform_v2_attention::{
+    AttentionReadRequest, AttentionSource, AttentionSourceSnapshot,
+};
 use automonique_protocol::platform_v2_lifecycle::{
     MutationApprovalDecision, MutationApprovalId, MutationPreview, MutationPreviewDigest,
     MutationPreviewRef, MutationRefusal, WorkContextMutationIntent,
@@ -297,6 +300,12 @@ pub enum WorkspaceIntentResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReviewReadResult {
     Snapshot(Box<ReviewSnapshot>),
+    Refused(PlatformV2Refusal),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AttentionReadResult {
+    Snapshot(Box<AttentionSourceSnapshot>),
     Refused(PlatformV2Refusal),
 }
 
@@ -591,6 +600,29 @@ impl<T> PlatformV2Client<T> {
                 Ok(ReviewReadResult::Snapshot(Box::new(value)))
             }
             PlatformV2Response::Refused(value) => Ok(ReviewReadResult::Refused(value)),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    pub fn get_attention_source_snapshot(
+        &mut self,
+        source: AttentionSource,
+        project: ProjectId,
+        user_workspace: UserWorkspaceId,
+    ) -> Result<AttentionReadResult, ClientError> {
+        let expected_source = source.clone();
+        let expected_project = project.clone();
+        let expected_workspace = user_workspace.clone();
+        let request = AttentionReadRequest::new(source, project, user_workspace);
+        match self.request(PlatformV2Request::GetAttentionSourceSnapshot(request))? {
+            PlatformV2Response::AttentionSourceSnapshot(value)
+                if value.source() == &expected_source
+                    && value.project() == &expected_project
+                    && value.user_workspace() == &expected_workspace =>
+            {
+                Ok(AttentionReadResult::Snapshot(Box::new(value)))
+            }
+            PlatformV2Response::Refused(value) => Ok(AttentionReadResult::Refused(value)),
             _ => Err(ClientError::Protocol),
         }
     }

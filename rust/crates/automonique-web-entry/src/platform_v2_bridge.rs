@@ -337,6 +337,9 @@ impl PlatformV2Bridge {
             }
             PlatformV2Request::GetWorkspaceIntent(_) => MobilePlatformV2Action::GetWorkspaceIntent,
             PlatformV2Request::GetReview(_) => MobilePlatformV2Action::GetReview,
+            PlatformV2Request::GetAttentionSourceSnapshot(_) => {
+                MobilePlatformV2Action::GetAttentionSourceSnapshot
+            }
             PlatformV2Request::ExecuteReviewAction(_) => {
                 MobilePlatformV2Action::ExecuteReviewAction
             }

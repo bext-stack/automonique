@@ -24,6 +24,7 @@ import {
   PLATFORM_SCHEMA_V2,
   MAX_MUTATION_CANONICAL_BYTES,
   PlatformVersionNumber,
+  ProjectId,
   SupportedPlatformVersionNumber,
   UserWorkspaceId,
   WorkContextRevision,
@@ -180,6 +181,44 @@ encodePlatformV2Request(v2Id, {
     workspace: {kind: "user_workspace", id: UserWorkspaceId("workspace-1")},
   },
 });
+
+const attentionId = PlatformRequestId("transport-attention");
+const attentionRequest = encodePlatformV2Request(attentionId, {
+  kind: "get_attention_source_snapshot",
+  request: {
+    source: {kind: "provider_session", id: "provider-feed-1"},
+    project: ProjectId("project-1"),
+    user_workspace: UserWorkspaceId("workspace-1"),
+  },
+});
+if (!new TextDecoder().decode(attentionRequest).includes('"kind":"get_attention_source_snapshot"')) throw new Error("attention request kind");
+const attentionFixture = readFileSync(
+  "../../../../rust/crates/automonique-protocol/fixtures/platform-v2-attention-v1.json",
+);
+const attentionResponse = responsePayload(attentionId, "attention_source_snapshot", attentionFixture);
+const decodedAttention = decodePlatformV2Response(
+  attentionResponse,
+  attentionId,
+  "get_attention_source_snapshot",
+);
+if (decodedAttention.kind !== "attention_source_snapshot"
+  || decodedAttention.snapshot.revision !== 7n
+  || decodedAttention.snapshot.items[0]?.platform_session?.id !== "session-1") {
+  throw new Error("attention response");
+}
+const attentionText = new TextDecoder().decode(attentionFixture);
+for (const [label, hostile] of [
+  ["attention unknown local target", attentionText.replace("{", '{"tab_id":"local-tab",')],
+  ["attention state reason mismatch", attentionText.replace('"state":"needs_you"', '"state":"done"')],
+  ["attention provider session missing", attentionText.replace('{"authority":"automonique","id":"session-1","kind":"session"}', "null")],
+  ["attention client coordinate", attentionText.replace('"authority":"automonique"', '"authority":"client"')],
+] as const) {
+  expectWireRefusal(label, () => decodePlatformV2Response(
+    responsePayload(attentionId, "attention_source_snapshot", encoder.encode(hostile)),
+    attentionId,
+    "get_attention_source_snapshot",
+  ));
+}
 
 const negotiatedBody = parseCanonical(encodeNegotiatedPlatform({
   schema: PLATFORM_SCHEMA_V2,

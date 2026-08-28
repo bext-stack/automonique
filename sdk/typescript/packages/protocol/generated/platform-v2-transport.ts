@@ -192,6 +192,33 @@ export interface ReviewReceiptLookup {
   readonly workspace: ReviewWorkspaceIdentity;
   readonly idempotency_key: IdempotencyKeyValue;
 }
+export type AttentionSourceKind = "review" | "orchestration" | "provider_session";
+export type AttentionItemState = "needs_you" | "working" | "done" | "blocked";
+export type AttentionItemReason = "review_requested" | "comment_reply" | "approval_required" | "agent_working" | "check_running" | "delivery_pending" | "complete" | "conflict" | "check_failed" | "external_blocker";
+export interface AttentionSource { readonly kind: AttentionSourceKind; readonly id: string }
+export interface AttentionReadRequest { readonly source: AttentionSource; readonly project: ProjectIdValue; readonly user_workspace: UserWorkspaceIdValue }
+export interface AttentionPlatformSession { readonly authority: "ai_operations" | "automonique" | "github" | "provider"; readonly kind: "session"; readonly id: string }
+export interface AttentionItem {
+  readonly id: string;
+  readonly nested_agent_path: readonly string[];
+  readonly observed_at_ms: bigint;
+  readonly platform_session: AttentionPlatformSession | null;
+  readonly reason: AttentionItemReason;
+  readonly revision: WorkContextRevisionValue;
+  readonly state: AttentionItemState;
+  readonly unread: boolean;
+}
+export interface AttentionSourceSnapshot {
+  readonly items: readonly AttentionItem[];
+  readonly observed_at_ms: bigint;
+  readonly previous_revision: WorkContextRevisionValue | null;
+  readonly project: ProjectIdValue;
+  readonly revision: WorkContextRevisionValue;
+  readonly schema: "automonique.platform/attention/v1";
+  readonly semantics: "atomic_replace";
+  readonly source: AttentionSource;
+  readonly user_workspace: UserWorkspaceIdValue;
+}
 
 export type PlatformV2Request =
   | {readonly kind: "get_lifecycle_capabilities"}
@@ -205,6 +232,7 @@ export type PlatformV2Request =
   | {readonly kind: "submit_workspace_intent"; readonly request: WorkspaceIntentRequest}
   | {readonly kind: "get_workspace_intent"; readonly lookup: WorkspaceIntentLookup}
   | {readonly kind: "get_review"; readonly request: ReviewReadRequest}
+  | {readonly kind: "get_attention_source_snapshot"; readonly request: AttentionReadRequest}
   | {readonly kind: "execute_review_action"; readonly request: ReviewActionTransportRequest}
   | {readonly kind: "get_review_receipt"; readonly lookup: ReviewReceiptLookup};
 
@@ -222,6 +250,7 @@ export type PlatformV2Response =
   | {readonly kind: "lineage_result"; readonly lineage: LineageProjection}
   | {readonly kind: "workspace_intent_result"; readonly result: WorkspaceIntentOutcome}
   | {readonly kind: "review_result"; readonly review: ReviewSnapshot}
+  | {readonly kind: "attention_source_snapshot"; readonly snapshot: AttentionSourceSnapshot}
   | {readonly kind: "review_receipt"; readonly receipt: ReviewActionReceipt}
   | {readonly kind: "platform_v2_refused"; readonly refusal: PlatformV2Refusal};
 
@@ -325,6 +354,37 @@ function reviewWorkspace(value: WorkContextIdentity): ReviewWorkspaceIdentity {
 function previewRef(value: MutationPreviewRef): MutationPreviewRef {
   return {id: MutationPreviewId(value.id), revision: WorkContextRevision(value.revision)};
 }
+function attentionOpaque(value: string, name: string): string {
+  if (!isWellFormedUnicode(value) || byteLength(value) === 0 || byteLength(value) > 256 || /\p{Cc}/u.test(value)) throw new WireError("invalid_json_value", name);
+  return value;
+}
+function attentionSource(value: JsonValue): AttentionSource {
+  const body=fields(value,["id","kind"]);const kind=stringField(body,"kind");
+  if (!(kind==="review"||kind==="orchestration"||kind==="provider_session")) throw new WireError("invalid_json_value","attention source kind");
+  return {id:attentionOpaque(stringField(body,"id"),"attention source id"),kind};
+}
+function attentionReadRequest(value: AttentionReadRequest): unknown {
+  if (!(value.source.kind==="review"||value.source.kind==="orchestration"||value.source.kind==="provider_session")) throw new WireError("invalid_json_value","attention source kind");
+  return {project:ProjectId(value.project),schema:"automonique.platform/attention/v1",source:{id:attentionOpaque(value.source.id,"attention source id"),kind:value.source.kind},user_workspace:UserWorkspaceId(value.user_workspace)};
+}
+function attentionIdOrder(left: string, right: string): number {
+  const a=new TextEncoder().encode(left);const b=new TextEncoder().encode(right);const length=Math.min(a.length,b.length);
+  for(let index=0;index<length;index+=1){if(a[index]!==b[index])return a[index]!<b[index]!?-1:1;}
+  return a.length-b.length;
+}
+function attentionSnapshot(value: JsonValue): AttentionSourceSnapshot {
+  const body=fields(value,["items","observed_at_ms","previous_revision","project","revision","schema","semantics","source","user_workspace"]);
+  if(stringField(body,"schema")!=="automonique.platform/attention/v1"||stringField(body,"semantics")!=="atomic_replace")throw new WireError("invalid_json_value","attention schema");
+  const revision=WorkContextRevision(integerField(body,"revision"));const observed=integerField(body,"observed_at_ms");
+  if(observed<0n||observed>9223372036854775807n)throw new WireError("invalid_json_value","attention observed time");
+  const previousValue=valueField(body,"previous_revision");const previous=previousValue.kind==="null"?null:previousValue.kind==="integer"?WorkContextRevision(previousValue.value):(()=>{throw new WireError("invalid_json_value","attention previous revision")})();
+  if((revision===1n)!==(previous===null)||previous!==null&&previous>=revision)throw new WireError("invalid_json_value","attention revision chain");
+  const source=attentionSource(valueField(body,"source"));const rawItems=valueField(body,"items");if(rawItems.kind!=="array"||rawItems.items.length>256)throw new WireError("invalid_json_value","attention items");
+  const reasonState:Readonly<Record<AttentionItemReason,AttentionItemState>>={review_requested:"needs_you",comment_reply:"needs_you",approval_required:"needs_you",agent_working:"working",check_running:"working",delivery_pending:"working",complete:"done",conflict:"blocked",check_failed:"blocked",external_blocker:"blocked"};
+  const items=rawItems.items.map((raw):AttentionItem=>{const item=fields(raw,["id","nested_agent_path","observed_at_ms","platform_session","reason","revision","state","unread"]);const id=attentionOpaque(stringField(item,"id"),"attention item id");const itemRevision=WorkContextRevision(integerField(item,"revision"));const itemObserved=integerField(item,"observed_at_ms");if(itemRevision>revision||itemObserved<0n||itemObserved>observed)throw new WireError("invalid_json_value","attention item revision");const reason=stringField(item,"reason") as AttentionItemReason;const state=stringField(item,"state") as AttentionItemState;if(reasonState[reason]!==state)throw new WireError("invalid_json_value","attention state reason");const unread=valueField(item,"unread");if(unread.kind!=="bool")throw new WireError("invalid_json_value","attention unread");const path=valueField(item,"nested_agent_path");if(path.kind!=="array"||path.items.length>16)throw new WireError("invalid_json_value","attention agent path");const nested=path.items.map((part)=>{if(part.kind!=="string")throw new WireError("invalid_json_value","attention agent path");return attentionOpaque(part.value,"attention agent id")});if(new Set(nested).size!==nested.length)throw new WireError("invalid_json_value","attention agent cycle");const coordinate=valueField(item,"platform_session");let session:AttentionPlatformSession|null=null;if(coordinate.kind!=="null"){const sessionFields=fields(coordinate,["authority","id","kind"]);const authority=stringField(sessionFields,"authority");if(!(authority==="ai_operations"||authority==="automonique"||authority==="github"||authority==="provider")||stringField(sessionFields,"kind")!=="session")throw new WireError("invalid_json_value","attention session");session={authority,id:attentionOpaque(stringField(sessionFields,"id"),"attention session id"),kind:"session"};}if((source.kind==="provider_session")!==(session!==null))throw new WireError("invalid_json_value","attention source session");return{id,nested_agent_path:nested,observed_at_ms:itemObserved,platform_session:session,reason,revision:itemRevision,state,unread:unread.value};});
+  if(items.some((item,index)=>index>0&&attentionIdOrder(items[index-1]!.id,item.id)>=0))throw new WireError("invalid_json_value","attention item ordering");
+  return{items,observed_at_ms:observed,previous_revision:previous,project:ProjectId(stringField(body,"project")),revision,schema:"automonique.platform/attention/v1",semantics:"atomic_replace",source,user_workspace:UserWorkspaceId(stringField(body,"user_workspace"))};
+}
 
 export function encodePlatformNegotiationRequest(requestId: PlatformRequestIdValue, request: PlatformNegotiationRequest): Uint8Array {
   if (request.kind !== "negotiate") throw new WireError("invalid_json_value", "negotiation kind");
@@ -358,6 +418,7 @@ function requestBody(request: PlatformV2Request): JsonValue {
     case "submit_workspace_intent": return json({intent:plain(document(encodeWorkspaceIntent(negotiatedV2,request.request.intent))),project:ProjectId(request.request.project),schema:PLATFORM_SCHEMA_V2});
     case "get_workspace_intent": return json({intent_id:WorkspaceIntentId(request.lookup.intent_id),project:ProjectId(request.lookup.project),schema:PLATFORM_SCHEMA_V2});
     case "get_review": return json({project:ProjectId(request.request.project),schema:PLATFORM_SCHEMA_V2,workspace:reviewWorkspace(request.request.workspace)});
+    case "get_attention_source_snapshot": return json(attentionReadRequest(request.request));
     case "execute_review_action": { const value=request.request; return json({action:validateReviewAction(value.action),expected_revision:WorkContextRevision(value.expected_revision),idempotency_key:IdempotencyKey(value.idempotency_key),platform_version:BigInt(PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR),schema:PLATFORM_REVIEW_SCHEMA_V1,workspace:reviewWorkspace(value.workspace)}); }
     case "get_review_receipt": return json({idempotency_key:IdempotencyKey(request.lookup.idempotency_key),project:ProjectId(request.lookup.project),schema:PLATFORM_SCHEMA_V2,workspace:reviewWorkspace(request.lookup.workspace)});
   }
@@ -367,7 +428,7 @@ export function encodePlatformV2Request(requestId: PlatformRequestIdValue, reque
 }
 
 const responseKinds: Readonly<Record<PlatformV2Request["kind"], readonly string[]>> = {
-  get_lifecycle_capabilities:["lifecycle_capabilities"],query_work_contexts:["work_context_page","work_context_resync"],get_work_context:["work_context_record"],prepare_mutation:["mutation_preview","mutation_refused"],decide_mutation:["mutation_approval","mutation_refused"],submit_mutation:["mutation_receipt","mutation_refused"],get_mutation_receipt:["mutation_receipt","mutation_refused"],get_lineage:["lineage_result"],submit_workspace_intent:["workspace_intent_result"],get_workspace_intent:["workspace_intent_result"],get_review:["review_result"],execute_review_action:["review_receipt"],get_review_receipt:["review_receipt"],
+  get_lifecycle_capabilities:["lifecycle_capabilities"],query_work_contexts:["work_context_page","work_context_resync"],get_work_context:["work_context_record"],prepare_mutation:["mutation_preview","mutation_refused"],decide_mutation:["mutation_approval","mutation_refused"],submit_mutation:["mutation_receipt","mutation_refused"],get_mutation_receipt:["mutation_receipt","mutation_refused"],get_lineage:["lineage_result"],submit_workspace_intent:["workspace_intent_result"],get_workspace_intent:["workspace_intent_result"],get_review:["review_result"],get_attention_source_snapshot:["attention_source_snapshot"],execute_review_action:["review_receipt"],get_review_receipt:["review_receipt"],
 };
 export function decodePlatformV2Response(payload: Uint8Array, requestId: PlatformRequestIdValue, requestKind: PlatformV2Request["kind"]): PlatformV2Response {
   const decoded = admitted(payload, MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES, PLATFORM_PROTOCOL, PLATFORM_V2_MAJOR);
@@ -387,6 +448,7 @@ export function decodePlatformV2Response(payload: Uint8Array, requestId: Platfor
     case "lineage_result":return {kind:"lineage_result",lineage:decodeLineageProjection(negotiatedV2,bytes)};
     case "workspace_intent_result":return {kind:"workspace_intent_result",result:decodeWorkspaceIntentOutcome(negotiatedV2,bytes)};
     case "review_result":return {kind:"review_result",review:decodeReviewSnapshot(bytes)};
+    case "attention_source_snapshot":return {kind:"attention_source_snapshot",snapshot:attentionSnapshot(decoded.body)};
     case "review_receipt":return {kind:"review_receipt",receipt:decodeReviewActionReceipt(bytes)};
     default:throw new WireError("invalid_json_value","unknown Platform v2 response kind");
   }
