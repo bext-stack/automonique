@@ -827,7 +827,8 @@ fn connect_head(port: u16) -> String {
 // --- the enforced proof ---------------------------------------------------
 
 fn sandbox_enforceable() -> bool {
-    HostCapabilities::probe()
+    let helper = locate_launch_helper();
+    HostCapabilities::probe_with_launch_helper(helper.as_deref())
         .select_mode(&automonique_daemon::execute::ENFORCED_PROPERTIES)
         .is_ok()
 }
@@ -1116,6 +1117,14 @@ fn a_contained_workload_reaches_only_its_allowlisted_destination() {
         let mut document = Document::hermetic(run);
         document.script = workload_script(&witness(run));
         document.features = required_features();
+        assert!(
+            document
+                .features
+                .as_slice()
+                .iter()
+                .any(|feature| feature.name() == "uid_separation"),
+            "the delegated production proof must request uid separation"
+        );
         document.provider_binary = provider_binary.clone();
         let payload = document
             .spec()
@@ -1137,6 +1146,26 @@ fn a_contained_workload_reaches_only_its_allowlisted_destination() {
             "expected the brokered run to start, got {started:?}"
         );
         assert_eq!(await_terminal(&config, run), RunState::Completed);
+        let checkpoint = automonique_runner::Checkpoint::read(
+            &config
+                .state_dir()
+                .join("runs")
+                .join(run)
+                .join(automonique_runner::CHECKPOINT_LEAF),
+        )
+        .expect("production run leaves an exact private-mount checkpoint");
+        assert_eq!(checkpoint.phase, automonique_runner::CheckpointPhase::Final);
+        assert!(
+            checkpoint
+                .mount_evidence
+                .starts_with("automonique.namespaced-tempfs/v1 ")
+        );
+        assert!(
+            checkpoint
+                .final_record
+                .as_ref()
+                .is_some_and(|record| record.unmount_confirmed)
+        );
     }
 
     // THE ALLOWLISTED DESTINATION WAS REACHED, THROUGH THE BROKER.

@@ -660,6 +660,21 @@ impl LaunchPlan {
         Ok(self)
     }
 
+    pub(crate) fn with_namespaced_temporary_storage(
+        self,
+        mountpoint: impl Into<PathBuf>,
+        budget: TemporaryStorageBudget,
+    ) -> Result<Self, LaunchPlanError> {
+        let mountpoint = mountpoint.into();
+        match &self.namespaced_temporary_storage {
+            Some(existing) if existing.mountpoint == mountpoint && existing.budget == budget => {
+                Ok(self)
+            }
+            Some(_) => Err(LaunchPlanError::NamespacedTemporaryStorageRejected),
+            None => self.namespaced_temporary_storage(mountpoint, budget),
+        }
+    }
+
     /// Whether this plan runs its workload under a separated host uid.
     #[must_use]
     pub const fn separates_workload_identity(&self) -> bool {
@@ -1120,6 +1135,30 @@ impl NamespacedSandboxedChild {
         self.child.as_ref().expect("a live launch has a child").id()
     }
 
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child
+            .as_mut()
+            .expect("a live launch has a child")
+            .try_wait()
+    }
+
+    pub fn kill(&mut self) -> io::Result<()> {
+        let child = self.child.as_mut().expect("a live launch has a child");
+        let direct = child.kill();
+        match std::fs::write(&self.kill_interface, b"1") {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => direct.or(Ok(())),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn wait_process(&mut self) -> io::Result<ExitStatus> {
+        self.child
+            .as_mut()
+            .expect("a live launch has a child")
+            .wait()
+    }
+
     /// The first typed quota refusal, when one has already happened.
     #[must_use]
     pub fn temporary_storage_exceedance(&self) -> Option<crate::tempfs_ledger::Exceedance> {
@@ -1138,6 +1177,11 @@ impl NamespacedSandboxedChild {
             .as_mut()
             .expect("a live launch has temporary storage")
             .write_checkpoint(crate::tempfs_checkpoint::Phase::Live, None)
+    }
+
+    #[must_use]
+    pub fn temporary_storage_readback(&self) -> Option<crate::StatfsReadback> {
+        crate::StatfsReadback::from_ledger(&self.temporary_storage.as_ref()?.snapshot()).ok()
     }
 
     /// Wait for the workload, then reconcile from the filesystem ledger after
@@ -1194,7 +1238,7 @@ pub fn spawn_sandboxed_with_namespaced_temporary_storage(
         .map_err(|error| LaunchError::Io(io::Error::other(error.to_string())))?;
     let plan = plan
         .clone()
-        .namespaced_temporary_storage(mountpoint, budget)?;
+        .with_namespaced_temporary_storage(mountpoint, budget)?;
     let frame = plan.encode()?;
     let (mut supervisor, workload) = UnixStream::pair()?;
     supervisor.set_read_timeout(Some(NAMESPACED_HANDSHAKE_DEADLINE))?;
@@ -1234,7 +1278,6 @@ pub fn spawn_sandboxed_with_namespaced_temporary_storage(
 
 /// A sandboxed workload whose stdin and stdout remain connected to its
 /// supervisor for multiple serialized turns.
-#[derive(Debug)]
 pub struct SandboxedSession {
     child: Child,
     stream: UnixStream,
@@ -1244,6 +1287,17 @@ pub struct SandboxedSession {
     /// signal to its pid is refused with `EPERM`; the cgroup's kill interface
     /// is a supervisor-owned file and reaches the whole tree.
     kill_interface: PathBuf,
+    temporary_storage: Option<NamespacedMountedTempfs>,
+}
+
+impl fmt::Debug for SandboxedSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SandboxedSession")
+            .field("pid", &self.child.id())
+            .field("temporary_storage", &self.temporary_storage.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SandboxedSession {
@@ -1287,6 +1341,39 @@ impl SandboxedSession {
     pub fn id(&self) -> u32 {
         self.child.id()
     }
+
+    /// First filesystem quota refusal, if the session has private temporary
+    /// storage and its exact ledger has recorded one.
+    #[must_use]
+    pub fn temporary_storage_exceedance(&self) -> Option<crate::tempfs_ledger::Exceedance> {
+        self.temporary_storage
+            .as_ref()?
+            .exceedance_channel()
+            .first()
+    }
+
+    /// Persist the current exact ledger on the production supervision cadence.
+    pub fn checkpoint_temporary_storage(&mut self) -> io::Result<()> {
+        let Some(storage) = self.temporary_storage.as_mut() else {
+            return Ok(());
+        };
+        storage.write_checkpoint(crate::tempfs_checkpoint::Phase::Live, None)
+    }
+
+    /// Statfs-shaped evidence from the exact in-memory filesystem ledger.
+    pub fn temporary_storage_readback(&self) -> Option<crate::StatfsReadback> {
+        crate::StatfsReadback::from_ledger(&self.temporary_storage.as_ref()?.snapshot()).ok()
+    }
+
+    /// Finish the private FUSE server after the workload namespace has ended.
+    pub fn reconcile_temporary_storage(
+        &mut self,
+    ) -> Result<Option<NamespacedOutcome>, NamespacedMountError> {
+        self.temporary_storage
+            .take()
+            .map(NamespacedMountedTempfs::reconcile)
+            .transpose()
+    }
 }
 
 impl Drop for SandboxedSession {
@@ -1296,6 +1383,9 @@ impl Drop for SandboxedSession {
         // both cases leaving the child behind would outlive its journal owner.
         let _ = self.kill();
         let _ = self.child.wait();
+        if let Some(storage) = self.temporary_storage.take() {
+            let _ = storage.reconcile();
+        }
     }
 }
 
@@ -1336,6 +1426,68 @@ pub fn spawn_sandboxed_session(
         child,
         stream: supervisor,
         kill_interface: containment.path().join("cgroup.kill"),
+        temporary_storage: None,
+    })
+}
+
+/// Spawn a full-duplex session with its FUSE filesystem mounted inside the
+/// separated workload user+mount namespace.
+pub fn spawn_sandboxed_session_with_namespaced_temporary_storage(
+    helper: &Path,
+    plan: &LaunchPlan,
+    containment: &RunContainment,
+    mountpoint: &Path,
+    budget: TemporaryStorageBudget,
+    checkpoint: &Path,
+) -> Result<SandboxedSession, LaunchError> {
+    if plan.prompt_len().is_some() {
+        return Err(LaunchPlanError::PromptRejected.into());
+    }
+    FusePrerequisites::host_default()
+        .verify()
+        .map_err(|error| LaunchError::Io(io::Error::other(error.to_string())))?;
+    let plan = plan
+        .clone()
+        .with_namespaced_temporary_storage(mountpoint, budget)?;
+    let frame = plan.encode()?;
+    let (mut supervisor, workload) = UnixStream::pair()?;
+    supervisor.set_read_timeout(Some(NAMESPACED_HANDSHAKE_DEADLINE))?;
+    supervisor.set_write_timeout(Some(NAMESPACED_HANDSHAKE_DEADLINE))?;
+    let workload_stdin = workload.try_clone()?;
+    let workload_stdin: OwnedFd = workload_stdin.into();
+    let workload_stdout: OwnedFd = workload.into();
+    let mut child = Command::new(helper)
+        .env_clear()
+        .env(crate::CGROUP_DIR_ENV, containment.path())
+        .env(SESSION_STREAM_ENV, "1")
+        .env(crate::tempfs::NAMESPACED_CONTROL_ENV, "1")
+        .stdin(Stdio::from(workload_stdin))
+        .stdout(Stdio::from(workload_stdout))
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let setup = (|| -> Result<NamespacedMountedTempfs, LaunchError> {
+        supervisor.write_all(&frame)?;
+        let mounted =
+            receive_namespaced_tempfs(&mut supervisor, budget, nix::unistd::getuid().as_raw())
+                .map_err(|error| LaunchError::Io(io::Error::other(error.to_string())))?;
+        mounted.with_checkpoint(checkpoint).map_err(LaunchError::Io)
+    })();
+    let temporary_storage = match setup {
+        Ok(storage) => storage,
+        Err(error) => {
+            let _ = std::fs::write(containment.path().join("cgroup.kill"), b"1");
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    supervisor.set_read_timeout(None)?;
+    supervisor.set_write_timeout(None)?;
+    Ok(SandboxedSession {
+        child,
+        stream: supervisor,
+        kill_interface: containment.path().join("cgroup.kill"),
+        temporary_storage: Some(temporary_storage),
     })
 }
 
@@ -1396,9 +1548,6 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
             return Err("namespaced tempfs control marker malformed".to_owned());
         }
     };
-    if session_stream && namespaced_control {
-        return Err("session and namespaced tempfs controls cannot share stdin".to_owned());
-    }
     let frame = if session_stream || namespaced_control {
         read_session_launch_frame()?
     } else {

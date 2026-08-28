@@ -1003,7 +1003,8 @@ fn a_task_that_cannot_be_a_prompt_is_refused() {
 // --- the contained proof --------------------------------------------------
 
 fn sandbox_enforceable() -> bool {
-    HostCapabilities::probe()
+    let helper = locate_launch_helper();
+    HostCapabilities::probe_with_launch_helper(helper.as_deref())
         .select_mode(&automonique_daemon::execute::ENFORCED_PROPERTIES)
         .is_ok()
 }
@@ -1291,6 +1292,13 @@ fn a_contained_run_answers_through_the_real_lane() {
         )
         .expect("every run leaves its final temporary-storage checkpoint");
         assert_eq!(checkpoint.phase, automonique_runner::CheckpointPhase::Final);
+        assert!(
+            checkpoint
+                .mount_evidence
+                .starts_with("automonique.namespaced-tempfs/v1 "),
+            "production must use the private workload-namespace mount: {}",
+            checkpoint.mount_evidence
+        );
         let final_record = checkpoint
             .final_record
             .expect("a final checkpoint carries the readback taken at unmount");
@@ -1298,6 +1306,12 @@ fn a_contained_run_answers_through_the_real_lane() {
         assert!(!final_record.aborted, "the server answered the readback");
         assert_eq!(checkpoint.snapshot.refused_bytes, 0, "nothing was refused");
         assert_eq!(checkpoint.snapshot.refused_objects, 0);
+        assert_eq!(
+            automonique_runner::StatfsReadback::from_ledger(&checkpoint.snapshot).unwrap(),
+            final_record
+                .statfs_before_unmount
+                .expect("private mounts reconcile from the exact ledger")
+        );
         checkpoints += 1;
     }
     assert_eq!(checkpoints, 2, "one checkpoint per run");

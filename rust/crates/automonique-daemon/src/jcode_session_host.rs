@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use automonique_agents::{
@@ -30,7 +30,9 @@ use automonique_agents::{
 };
 use automonique_protocol::provenance::{CausationId, CorrelationId, Provenance, TraceId};
 use automonique_runner::{
-    LaunchPlan, LaunchPlanError, RunContainment, SandboxedSession, spawn_sandboxed_session,
+    LaunchPlan, LaunchPlanError, NamespacedMountError, NamespacedOutcome, RunContainment,
+    SandboxedSession, TemporaryStorageBudget, spawn_sandboxed_session,
+    spawn_sandboxed_session_with_namespaced_temporary_storage,
 };
 use automonique_store::provider_journal::{
     ApprovalDecision, ApprovalRecord, BindingRecord, CursorAdvance, FinishReason,
@@ -53,6 +55,7 @@ pub enum JcodeHostError {
     Io(std::io::Error),
     Protocol(JcodeProtocolError),
     Journal(ProviderJournalError),
+    TemporaryStorage(NamespacedMountError),
     Containment(automonique_runner::ContainmentError),
     ProviderRefused,
     ProviderEof { incomplete_frame: bool },
@@ -70,6 +73,7 @@ impl fmt::Display for JcodeHostError {
             Self::Io(error) => write!(formatter, "JCode I/O: {error}"),
             Self::Protocol(error) => write!(formatter, "JCode protocol: {error}"),
             Self::Journal(error) => write!(formatter, "JCode journal: {error}"),
+            Self::TemporaryStorage(error) => write!(formatter, "JCode temporary storage: {error}"),
             Self::Containment(error) => write!(formatter, "JCode containment: {error}"),
             Self::ProviderRefused => formatter.write_str("JCode refused a correlated request"),
             Self::ProviderEof { incomplete_frame } => {
@@ -109,6 +113,18 @@ impl From<ProviderJournalError> for JcodeHostError {
     fn from(value: ProviderJournalError) -> Self {
         Self::Journal(value)
     }
+}
+
+impl From<NamespacedMountError> for JcodeHostError {
+    fn from(value: NamespacedMountError) -> Self {
+        Self::TemporaryStorage(value)
+    }
+}
+
+struct NamespacedStorageLaunch {
+    mountpoint: PathBuf,
+    budget: TemporaryStorageBudget,
+    checkpoint: PathBuf,
 }
 
 /// The journal's reason for a request left pending when its host closed in the
@@ -237,6 +253,74 @@ impl JcodeSessionHost {
         now_ms: i64,
         startup_timeout: Duration,
     ) -> Result<Self, JcodeHostError> {
+        Self::spawn_inner(
+            helper,
+            plan,
+            containment,
+            journal_path,
+            logical_key,
+            working_dir,
+            resume_session_id,
+            model,
+            expected_server,
+            now_ms,
+            startup_timeout,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_namespaced_temporary_storage(
+        helper: &Path,
+        plan: &LaunchPlan,
+        containment: RunContainment,
+        journal_path: &Path,
+        logical_key: &str,
+        working_dir: &Path,
+        resume_session_id: Option<&str>,
+        model: Option<&str>,
+        expected_server: &str,
+        now_ms: i64,
+        startup_timeout: Duration,
+        mountpoint: &Path,
+        budget: TemporaryStorageBudget,
+        checkpoint: &Path,
+    ) -> Result<Self, JcodeHostError> {
+        Self::spawn_inner(
+            helper,
+            plan,
+            containment,
+            journal_path,
+            logical_key,
+            working_dir,
+            resume_session_id,
+            model,
+            expected_server,
+            now_ms,
+            startup_timeout,
+            Some(NamespacedStorageLaunch {
+                mountpoint: mountpoint.to_path_buf(),
+                budget,
+                checkpoint: checkpoint.to_path_buf(),
+            }),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_inner(
+        helper: &Path,
+        plan: &LaunchPlan,
+        containment: RunContainment,
+        journal_path: &Path,
+        logical_key: &str,
+        working_dir: &Path,
+        resume_session_id: Option<&str>,
+        model: Option<&str>,
+        expected_server: &str,
+        now_ms: i64,
+        startup_timeout: Duration,
+        temporary_storage: Option<NamespacedStorageLaunch>,
+    ) -> Result<Self, JcodeHostError> {
         validate_key(logical_key, "logical_key")?;
         if now_ms < 0 || !working_dir.is_absolute() {
             return Err(JcodeHostError::InvalidField("startup"));
@@ -267,8 +351,18 @@ impl JcodeSessionHost {
             &configuration_sha256,
             expected_server,
         )?;
-        let mut process = spawn_sandboxed_session(helper, &launch_plan, &containment)
-            .map_err(JcodeHostError::Launch)?;
+        let mut process = match temporary_storage {
+            Some(storage) => spawn_sandboxed_session_with_namespaced_temporary_storage(
+                helper,
+                &launch_plan,
+                &containment,
+                &storage.mountpoint,
+                storage.budget,
+                &storage.checkpoint,
+            ),
+            None => spawn_sandboxed_session(helper, &launch_plan, &containment),
+        }
+        .map_err(JcodeHostError::Launch)?;
         let stream = match process.try_clone_stream() {
             Ok(stream) => stream,
             Err(error) => {
@@ -423,6 +517,21 @@ impl JcodeSessionHost {
     #[must_use]
     pub fn operating_system_process_id(&self) -> u32 {
         self.process.id()
+    }
+
+    #[must_use]
+    pub fn temporary_storage_exceedance(&self) -> Option<automonique_runner::Exceedance> {
+        self.process.temporary_storage_exceedance()
+    }
+
+    #[must_use]
+    pub fn temporary_storage_readback(&self) -> Option<automonique_runner::StatfsReadback> {
+        self.process.temporary_storage_readback()
+    }
+
+    pub fn checkpoint_temporary_storage(&mut self) -> Result<(), JcodeHostError> {
+        self.process.checkpoint_temporary_storage()?;
+        Ok(())
     }
 
     /// The input-request capability the contained engine advertised.
@@ -841,12 +950,21 @@ impl JcodeSessionHost {
     /// its turn was over did not. `reason` is a bounded static spelling chosen
     /// by this crate, never caller or provider text.
     pub fn close_with_reason(
-        mut self,
+        self,
         now_ms: i64,
         reason: &'static str,
     ) -> Result<(), JcodeHostError> {
+        self.close_with_reason_and_temporary_storage(now_ms, reason)
+            .map(|_| ())
+    }
+
+    pub fn close_with_reason_and_temporary_storage(
+        mut self,
+        now_ms: i64,
+        reason: &'static str,
+    ) -> Result<Option<NamespacedOutcome>, JcodeHostError> {
         if self.closed {
-            return Ok(());
+            return Ok(None);
         }
         if let Some(pending) = self.pending.take() {
             self.abort_pending(pending, now_ms, reason)?;
@@ -860,6 +978,7 @@ impl JcodeSessionHost {
         self.session_revision = session.revision;
         let _ = self.process.kill();
         let _ = self.process.wait();
+        let temporary_storage = self.process.reconcile_temporary_storage();
         let process = self.journal.finish_process(ProcessExit {
             process_id: self.process_id,
             expected_revision: self.process_revision,
@@ -873,7 +992,7 @@ impl JcodeSessionHost {
                 .map_err(JcodeHostError::Containment)?;
         }
         self.closed = true;
-        Ok(())
+        Ok(temporary_storage?)
     }
 
     fn drive_one(&mut self, now_ms: i64) -> Result<JcodeTurnOutcome, JcodeHostError> {

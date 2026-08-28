@@ -162,21 +162,19 @@ use automonique_runner::admission::{
 use automonique_runner::backend::{
     CapturedFrame, DirectProcessBackend, ObservedSequence, PROGRESS_BUDGET_WARNING,
     PROGRESS_PREVIEW_RESERVE_BYTES, PROGRESS_TERMINAL_RESERVE_BYTES, PreparedRun, ProgressCapture,
-    ProgressPublisher, STARTED_PAYLOAD_PREFIX, TEMPORARY_STORAGE_READBACK_DEADLINE,
-    TERMINAL_CANCELLED, TERMINAL_COMPLETED, TERMINAL_FAILED, TERMINAL_TIMED_OUT,
-    TemporaryStorageWatch, temporary_storage_exceeded_frame,
+    ProgressPublisher, STARTED_PAYLOAD_PREFIX, TERMINAL_CANCELLED, TERMINAL_COMPLETED,
+    TERMINAL_FAILED, TERMINAL_TIMED_OUT, temporary_storage_exceeded_frame,
 };
 use automonique_runner::capability::{BoundaryProperty, HostCapabilities};
 use automonique_runner::control::{CancelDelivery, CancelSink, CancelSinkError};
 use automonique_runner::dispatch::RegistrationHandle;
 use automonique_runner::tempfs::{
-    CHECKPOINT_LEAF, DEFAULT_READBACK_DEADLINE, FusePrerequisites, MOUNT_LEAF, MountedTempfs,
-    reap_stale_mounts,
+    CHECKPOINT_LEAF, DEFAULT_READBACK_DEADLINE, FusePrerequisites, MOUNT_LEAF, reap_stale_mounts,
 };
 use automonique_runner::{
     AttemptWorkspaceRegistryId, Authority as SpoolAuthority, CancellationToken, ContainmentDomain,
-    Controller, EventKind as SpoolEventKind, Exceedance, LaunchPlan, PromptDeliveryPlan,
-    RunContainment, RunSpec, Spool, UnmountError,
+    Controller, EventKind as SpoolEventKind, Exceedance, LaunchPlan, NamespacedOutcome,
+    PromptDeliveryPlan, RunContainment, RunSpec, Spool, TemporaryStorageBudget,
 };
 use automonique_store::approval_requests::{
     ApprovalContext, ApprovalProposal, ApprovalRequests, ApprovalState, MAX_APPROVAL_REQUEST_PAGE,
@@ -243,6 +241,7 @@ pub const DAEMON_ATTEMPT_WORKSPACE_REGISTRY: &str = "automonique-daemon-scratch"
 /// document written for another backend is refused here rather than run by the
 /// wrong one.
 pub const DAEMON_BACKEND_ID: &str = "local-direct";
+const MAX_RECOVERED_TEMPFS_CHECKPOINTS: usize = 4096;
 
 /// The boundary properties this build's launch path enforces, and the exact
 /// set a host is measured against.
@@ -250,11 +249,12 @@ pub const DAEMON_BACKEND_ID: &str = "local-direct";
 /// One array, read by the daemon's startup measurement *and* by
 /// [`offered_host_features`], so what the status reports and what a document
 /// negotiates against cannot drift apart.
-pub const ENFORCED_PROPERTIES: [BoundaryProperty; 4] = [
+pub const ENFORCED_PROPERTIES: [BoundaryProperty; 5] = [
     BoundaryProperty::DescendantContainment,
     BoundaryProperty::FilesystemRestriction,
     BoundaryProperty::TcpDenial,
     BoundaryProperty::SyscallRestriction,
+    BoundaryProperty::UidSeparation,
 ];
 
 /// Domain separator for the implementation digest this daemon publishes.
@@ -296,7 +296,10 @@ pub const HOST_FEATURE_DOMAIN: &str = "automonique.host-feature.v1";
 /// business and this lane does not pretend to it.
 #[must_use]
 pub fn offered_host_features() -> Vec<HostFeature> {
-    let Ok(selection) = HostCapabilities::probe().select_mode(&ENFORCED_PROPERTIES) else {
+    let helper = locate_launch_helper();
+    let Ok(selection) = HostCapabilities::probe_with_launch_helper(helper.as_deref())
+        .select_mode(&ENFORCED_PROPERTIES)
+    else {
         // A host with no enforceable mode offers nothing, which is the same
         // answer `sandbox_enforceable` gives and refuses on first.
         return Vec::new();
@@ -697,6 +700,7 @@ impl ExecutionLane {
                 );
             }
         }
+        recover_private_temporary_storage_checkpoints(&state_dir.join(RUNS_DIRECTORY));
         Self {
             attempt_host,
             managed_sessions_path: state_dir.join(crate::MANAGED_SESSIONS_NAME),
@@ -990,31 +994,18 @@ impl ExecutionLane {
             )
             .map_err(registration_refusal)?;
 
-        // The per-run temporary-storage mount. Admission proved the host can
-        // enforce it (so `verified_fuse` is `Ok`) and produced the exact
-        // budget; the supervisor mounts a FUSE filesystem with those ceilings
-        // under the run's private directory, confirms it from the kernel, and
-        // attaches it to the plan as a read-write Landlock grant plus `TMPDIR`.
-        // It follows the registration so a duplicate attempt is refused before
-        // any `fusermount3` is spawned for it, and precedes the spool and the
-        // cgroup so the grant binds to the FUSE root inode the launch enforces.
-        // It lives exactly as long as the run: the `Attempt` owns it and
-        // reconciles it after execution, and a refusal below this line drops
-        // it, which detaches the mount.
-        let verified_fuse = verified_fuse.map_err(|_| ExecuteRefusal::ContainmentUnavailable)?;
+        // The scratch directory is an ordinary empty supervisor-owned
+        // directory here. The entry helper mounts the admitted filesystem over
+        // it only after entering the workload user+mount namespace; no
+        // supervisor-visible mount exists and no workload instruction runs
+        // before the exact FUSE handshake succeeds.
+        verified_fuse.map_err(|_| ExecuteRefusal::ContainmentUnavailable)?;
         let mountpoint = run_root.join(MOUNT_LEAF);
         private_directory(&mountpoint).map_err(|()| ExecuteRefusal::ExecutionUnavailable)?;
-        let temporary_storage = MountedTempfs::mount(
-            &verified_fuse,
-            &mountpoint,
-            admitted.temporary_storage_budget(),
-        )
-        .map_err(|_| ExecuteRefusal::ContainmentUnavailable)?
-        .with_checkpoint(run_root.join(CHECKPOINT_LEAF))
-        .map_err(|_| ExecuteRefusal::ExecutionUnavailable)?;
-        let temporary_storage_watch = temporary_storage.watch();
+        let temporary_storage_budget = admitted.temporary_storage_budget();
+        let temporary_storage_checkpoint = run_root.join(CHECKPOINT_LEAF);
         let admitted = admitted
-            .with_temporary_storage(&temporary_storage)
+            .with_namespaced_temporary_storage(&mountpoint)
             .map_err(|_| ExecuteRefusal::AdmissionRefused)?;
 
         let spool = Spool::open(&spool_root, run_id, admitted.spool_budget_bytes())
@@ -1042,7 +1033,11 @@ impl ExecutionLane {
                     session_capture: Arc::clone(&session_capture),
                     managed_sessions_path: self.managed_sessions_path.clone(),
                     controls: Arc::clone(&self.jcode_controls),
-                    temporary_storage: Some(temporary_storage_watch.clone()),
+                    temporary_storage: Some(NamespacedTemporaryStorage {
+                        mountpoint: mountpoint.clone(),
+                        budget: temporary_storage_budget,
+                        checkpoint: temporary_storage_checkpoint.clone(),
+                    }),
                     refused_destination,
                     approval: ProviderApprovalContext {
                         store_path: self.state_dir.join(crate::APPROVAL_REQUESTS_NAME),
@@ -1087,7 +1082,11 @@ impl ExecutionLane {
                 // supervision loop polls this watch and ends the workload on
                 // its first `ENOSPC`/`EDQUOT` with a typed budget outcome, and
                 // the spool records the refusal and the mount's readback.
-                .with_temporary_storage(temporary_storage_watch.clone());
+                .with_namespaced_temporary_storage(
+                    &mountpoint,
+                    temporary_storage_budget,
+                    &temporary_storage_checkpoint,
+                );
             // Capture only a stdout grammar the document explicitly selected.
             let prepared = if emits_normalized_stream(spec) {
                 match progress_capture(spec, run_id, &self.progress, Arc::clone(&session_capture)) {
@@ -1114,7 +1113,6 @@ impl ExecutionLane {
             progress: Arc::clone(&self.progress),
             attempt_host: Arc::clone(&self.attempt_host),
             broker,
-            temporary_storage,
             session_capture,
             managed_sessions_path: self.managed_sessions_path.clone(),
             approval_requests_path: self.state_dir.join(crate::APPROVAL_REQUESTS_NAME),
@@ -1369,6 +1367,41 @@ impl ExecutionLane {
     }
 }
 
+fn recover_private_temporary_storage_checkpoints(runs: &Path) {
+    let Ok(entries) = fs::read_dir(runs) else {
+        return;
+    };
+    for entry in entries.take(MAX_RECOVERED_TEMPFS_CHECKPOINTS).flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let Some(run_id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !is_containment_run_id(&run_id) {
+            continue;
+        }
+        let Ok(checkpoint) =
+            automonique_runner::Checkpoint::read(&entry.path().join(CHECKPOINT_LEAF))
+        else {
+            continue;
+        };
+        if checkpoint.phase == automonique_runner::CheckpointPhase::Live
+            && checkpoint
+                .mount_evidence
+                .starts_with("automonique.namespaced-tempfs/v1 ")
+        {
+            let _ = crate::structured_log::emit_temporary_storage_checkpoint_recovered(
+                &run_id,
+                &checkpoint,
+            );
+        }
+    }
+}
+
 /// A live claim, released when the worker thread's frame is dropped.
 struct LiveClaim {
     live: Arc<Mutex<BTreeSet<String>>>,
@@ -1404,10 +1437,12 @@ impl PreparedAttempt {
                 Ok(report) => AttemptExecution {
                     state: spool_state(report.status().state()),
                     last_sequence: report.status().last_sequence(),
+                    temporary_storage: report.namespaced_temporary_storage().cloned(),
                 },
                 Err(_) => AttemptExecution {
                     state: RunSpoolState::Failed,
                     last_sequence: 0,
+                    temporary_storage: None,
                 },
             },
             Self::Jcode(prepared) => prepared.execute(cancellation, timeout, draining),
@@ -1418,6 +1453,14 @@ impl PreparedAttempt {
 struct AttemptExecution {
     state: RunSpoolState,
     last_sequence: u64,
+    temporary_storage: Option<NamespacedOutcome>,
+}
+
+#[derive(Clone, Debug)]
+struct NamespacedTemporaryStorage {
+    mountpoint: PathBuf,
+    budget: TemporaryStorageBudget,
+    checkpoint: PathBuf,
 }
 
 struct JcodePreparedParts<'a> {
@@ -1437,9 +1480,8 @@ struct JcodePreparedParts<'a> {
     /// its session's active run before the turn starts.
     managed_sessions_path: PathBuf,
     controls: Arc<JcodeControlRegistry>,
-    /// The run's temporary-storage watch, when it has a mount. `None` only
-    /// for callers that run without one, such as tests of the protocol alone.
-    temporary_storage: Option<TemporaryStorageWatch>,
+    /// Private in-namespace scratch launch, absent only in protocol-only tests.
+    temporary_storage: Option<NamespacedTemporaryStorage>,
     /// The bounded target most recently refused by this run's own broker.
     refused_destination: Option<RefusedDestinationObserver>,
     approval: ProviderApprovalContext,
@@ -1508,7 +1550,7 @@ struct JcodePreparedRun {
     session_capture: Arc<Mutex<Option<String>>>,
     managed_sessions_path: PathBuf,
     controls: Arc<JcodeControlRegistry>,
-    temporary_storage: Option<TemporaryStorageWatch>,
+    temporary_storage: Option<NamespacedTemporaryStorage>,
     refused_destination: Option<RefusedDestinationObserver>,
     approval: ProviderApprovalContext,
     observed: ObservedSequence,
@@ -1594,25 +1636,45 @@ impl JcodePreparedRun {
         }
         let started_at = Instant::now();
         let now_ms = crate::unix_millis().unwrap_or(0);
-        let mut host = match JcodeSessionHost::spawn(
-            &helper,
-            &plan,
-            containment,
-            &journal_path,
-            &format!("{run_id}-attempt"),
-            answer_path.parent().unwrap_or_else(|| Path::new("/")),
-            resume_session_id.as_deref(),
-            None,
-            &expected_server,
-            now_ms,
-            Duration::from_secs(30),
-        ) {
+        let logical_key = format!("{run_id}-attempt");
+        let working_directory = answer_path.parent().unwrap_or_else(|| Path::new("/"));
+        let spawned = match temporary_storage {
+            Some(storage) => JcodeSessionHost::spawn_with_namespaced_temporary_storage(
+                &helper,
+                &plan,
+                containment,
+                &journal_path,
+                &logical_key,
+                working_directory,
+                resume_session_id.as_deref(),
+                None,
+                &expected_server,
+                now_ms,
+                Duration::from_secs(30),
+                &storage.mountpoint,
+                storage.budget,
+                &storage.checkpoint,
+            ),
+            None => JcodeSessionHost::spawn(
+                &helper,
+                &plan,
+                containment,
+                &journal_path,
+                &logical_key,
+                working_directory,
+                resume_session_id.as_deref(),
+                None,
+                &expected_server,
+                now_ms,
+                Duration::from_secs(30),
+            ),
+        };
+        let mut host = match spawned {
             Ok(host) => host,
             Err(_) => return writer.finish(RunSpoolState::Failed),
         };
         if writer.started(host.operating_system_process_id()).is_err() {
-            let _ = host.close(crate::unix_millis().unwrap_or(now_ms));
-            return writer.finish(RunSpoolState::Failed);
+            return finish_failed_jcode_host(host, writer, now_ms);
         }
         if let Ok(mut captured) = session_capture.lock() {
             *captured = Some(host.provider_session_id().to_owned());
@@ -1641,8 +1703,7 @@ impl JcodePreparedRun {
         let control = match controls.register(host.provider_session_id(), &run_id) {
             Ok(control) => control,
             Err(_) => {
-                let _ = host.close(crate::unix_millis().unwrap_or(now_ms));
-                return writer.finish(RunSpoolState::Failed);
+                return finish_failed_jcode_host(host, writer, now_ms);
             }
         };
         let mut pending_steers: BTreeMap<u64, SyncSender<Result<(), SteerRefusal>>> =
@@ -1654,11 +1715,11 @@ impl JcodePreparedRun {
             .start_turn(&format!("{run_id}-turn"), &prompt, now_ms)
             .is_err()
         {
-            let _ = host.close(crate::unix_millis().unwrap_or(now_ms));
-            return writer.finish(RunSpoolState::Failed);
+            return finish_failed_jcode_host(host, writer, now_ms);
         }
 
         let mut cancellation_sent = false;
+        let mut last_temporary_storage_checkpoint = Instant::now();
         let final_state = 'run: loop {
             loop {
                 match control.receiver.try_recv() {
@@ -1682,6 +1743,13 @@ impl JcodePreparedRun {
                 }
             }
             let elapsed = started_at.elapsed();
+            let temporary_storage = match poll_jcode_temporary_storage(
+                &mut host,
+                &mut last_temporary_storage_checkpoint,
+            ) {
+                Ok(storage) => storage,
+                Err(()) => break RunSpoolState::Failed,
+            };
             if cancellation.is_cancelled() && !cancellation_sent {
                 cancellation_sent = true;
                 let cancelled = host.cancel(
@@ -1712,15 +1780,13 @@ impl JcodePreparedRun {
             // is asked to cancel so it can leave cleanly, the refusal and the
             // mount's readback are recorded as the last word before the
             // terminal event, and closing the host below ends the tree.
-            if let Some(watch) = temporary_storage.as_ref()
-                && let Some(exceedance) = watch.first()
-            {
+            if let Some((exceedance, readback)) = temporary_storage {
                 let _ = host.cancel(
                     crate::unix_millis().unwrap_or(now_ms),
                     Duration::from_millis(100),
                 );
                 writer.project(&mut mapper, host.take_events());
-                writer.temporary_storage_exceeded(exceedance, watch);
+                writer.temporary_storage_exceeded(exceedance, readback);
                 break RunSpoolState::Failed;
             }
             let outcome = host.poll_turn(
@@ -1772,6 +1838,17 @@ impl JcodePreparedRun {
                         break 'run RunSpoolState::Failed;
                     }
                     loop {
+                        match poll_jcode_temporary_storage(
+                            &mut host,
+                            &mut last_temporary_storage_checkpoint,
+                        ) {
+                            Ok(Some((exceedance, readback))) => {
+                                writer.temporary_storage_exceeded(exceedance, readback);
+                                break 'run RunSpoolState::Failed;
+                            }
+                            Ok(None) => {}
+                            Err(()) => break 'run RunSpoolState::Failed,
+                        }
                         if draining.load(Ordering::Acquire) {
                             // The daemon is stopping and nobody is executing:
                             // this turn is waiting for a person. The request
@@ -1871,6 +1948,17 @@ impl JcodePreparedRun {
                         request.description(),
                     );
                     let (decision, forced_state) = loop {
+                        match poll_jcode_temporary_storage(
+                            &mut host,
+                            &mut last_temporary_storage_checkpoint,
+                        ) {
+                            Ok(Some((exceedance, readback))) => {
+                                writer.temporary_storage_exceeded(exceedance, readback);
+                                break 'run RunSpoolState::Failed;
+                            }
+                            Ok(None) => {}
+                            Err(()) => break 'run RunSpoolState::Failed,
+                        }
                         while let Ok(command) = control.receiver.try_recv() {
                             // Provider permission is a serialized protocol pause.
                             // Refuse concurrent steering immediately instead of
@@ -1965,16 +2053,48 @@ impl JcodePreparedRun {
             let _ = response.send(Err(SteerRefusal::SessionNotLive));
         }
         drop(control);
-        let final_state = if host
-            .close_with_reason(crate::unix_millis().unwrap_or(now_ms), close_reason)
-            .is_err()
-        {
-            RunSpoolState::Failed
-        } else {
-            final_state
+        let (final_state, temporary_storage) = match host.close_with_reason_and_temporary_storage(
+            crate::unix_millis().unwrap_or(now_ms),
+            close_reason,
+        ) {
+            Ok(outcome) => (final_state, outcome),
+            Err(_) => (RunSpoolState::Failed, None),
         };
-        writer.finish(final_state)
+        writer.finish_with_temporary_storage(final_state, temporary_storage)
     }
+}
+
+fn finish_failed_jcode_host(
+    host: JcodeSessionHost,
+    writer: JcodeSpoolWriter,
+    fallback_now_ms: i64,
+) -> AttemptExecution {
+    match host.close_with_reason_and_temporary_storage(
+        crate::unix_millis().unwrap_or(fallback_now_ms),
+        HOST_CLOSED_REASON,
+    ) {
+        Ok(temporary_storage) => {
+            writer.finish_with_temporary_storage(RunSpoolState::Failed, temporary_storage)
+        }
+        Err(_) => writer.finish(RunSpoolState::Failed),
+    }
+}
+
+fn poll_jcode_temporary_storage(
+    host: &mut JcodeSessionHost,
+    last_checkpoint: &mut Instant,
+) -> Result<Option<(Exceedance, Option<automonique_runner::StatfsReadback>)>, ()> {
+    if last_checkpoint.elapsed()
+        >= automonique_runner::backend::TEMPORARY_STORAGE_CHECKPOINT_INTERVAL
+    {
+        host.checkpoint_temporary_storage().map_err(|_| ())?;
+        *last_checkpoint = Instant::now();
+    }
+    let Some(exceedance) = host.temporary_storage_exceedance() else {
+        return Ok(None);
+    };
+    host.checkpoint_temporary_storage().map_err(|_| ())?;
+    Ok(Some((exceedance, host.temporary_storage_readback())))
 }
 
 struct JcodeSpoolWriter {
@@ -2194,9 +2314,9 @@ impl JcodeSpoolWriter {
     fn temporary_storage_exceeded(
         &mut self,
         exceedance: Exceedance,
-        watch: &TemporaryStorageWatch,
+        readback: Option<automonique_runner::StatfsReadback>,
     ) {
-        let readback = watch.readback(TEMPORARY_STORAGE_READBACK_DEADLINE);
+        let readback = readback.ok_or(automonique_runner::ReadbackError::ThreadUnavailable);
         if let Some(frame) = temporary_storage_exceeded_frame(exceedance, &readback) {
             let _ = self.append_frame_past_latch(&frame);
         }
@@ -2250,7 +2370,15 @@ impl JcodeSpoolWriter {
         Ok(())
     }
 
-    fn finish(mut self, state: RunSpoolState) -> AttemptExecution {
+    fn finish(self, state: RunSpoolState) -> AttemptExecution {
+        self.finish_with_temporary_storage(state, None)
+    }
+
+    fn finish_with_temporary_storage(
+        mut self,
+        state: RunSpoolState,
+        temporary_storage: Option<NamespacedOutcome>,
+    ) -> AttemptExecution {
         let payload = match state {
             RunSpoolState::Completed => TERMINAL_COMPLETED,
             RunSpoolState::Cancelled => TERMINAL_CANCELLED,
@@ -2271,6 +2399,7 @@ impl JcodeSpoolWriter {
             return AttemptExecution {
                 state: RunSpoolState::Failed,
                 last_sequence: self.observed.get(),
+                temporary_storage,
             };
         }
         let status = self.spool.status();
@@ -2278,6 +2407,7 @@ impl JcodeSpoolWriter {
         AttemptExecution {
             state,
             last_sequence: status.last_sequence(),
+            temporary_storage,
         }
     }
 }
@@ -2382,13 +2512,6 @@ struct Attempt {
     /// worker drops it, including a panic, and its drop stops the listener and
     /// tears down every tunnel still open.
     broker: Option<EgressBroker>,
-    /// This run's temporary-storage mount. Owning it here bounds its lifetime
-    /// to the run exactly as the broker is bounded: after the run tree is
-    /// disposed, the worker reconciles it — a bounded `statfs` readback (or a
-    /// connection abort if the server is stuck), a non-lazy unmount, and a
-    /// final ledger checkpoint — and its drop detaches it on any other path,
-    /// including a panic, so no writable scratch mount outlives the run.
-    temporary_storage: MountedTempfs,
     /// Exact provider session observed by the normalized stream.
     session_capture: Arc<Mutex<Option<String>>>,
     /// Where the session binding lives.  An independent durable connection is
@@ -2423,7 +2546,6 @@ impl Attempt {
             progress,
             attempt_host,
             broker,
-            temporary_storage,
             session_capture,
             managed_sessions_path,
             approval_requests_path,
@@ -2431,32 +2553,11 @@ impl Attempt {
         } = self;
 
         let report = prepared.execute(&cancellation, timeout, &draining);
-        // THE SCRATCH MOUNT OUTLIVES NO RUN.
-        //
-        // `execute` has disposed the run cgroup by here, so the workload tree
-        // is dead and holds no descriptor into the mount. The reconcile is
-        // therefore a non-lazy unmount that cannot refuse `EBUSY`: it takes a
-        // bounded `statfs` readback (aborting the FUSE connection if the server
-        // is stuck rather than hanging the worker), unmounts, and writes the
-        // final ledger checkpoint that preserves the consumed-budget record
-        // across a crash. Its own `Drop` detaches the mount on every other
-        // path, including a panic before this line. The outcome is the
-        // operator's to see: it lands in the native journal beside the run
-        // id, at warning priority when a ceiling refused anything, the
-        // readback had to be aborted, or the unmount was not confirmed.
-        match temporary_storage.reconcile(DEFAULT_READBACK_DEADLINE) {
-            Ok(outcome) => {
-                let _ = crate::structured_log::emit_temporary_storage_reconciled(
-                    &run_id,
-                    &crate::structured_log::TemporaryStorageReconciliation::from_outcome(&outcome),
-                );
-            }
-            Err(error) => {
-                let _ = crate::structured_log::emit_temporary_storage_unreconciled(
-                    &run_id,
-                    unmount_error_category(&error),
-                );
-            }
+        if let Some(outcome) = report.temporary_storage.as_ref() {
+            let _ = crate::structured_log::emit_temporary_storage_reconciled(
+                &run_id,
+                &crate::structured_log::TemporaryStorageReconciliation::from_namespaced(outcome),
+            );
         }
         // The spool's lock is free from here, so the durable record is readable
         // and strictly better than the window this hub was holding: complete,
@@ -2632,17 +2733,6 @@ fn progress_capture(
 const PROGRESS_SCOPE_TENANT: &str = "automonique";
 const PROGRESS_SCOPE_ACCOUNT: &str = "daemon";
 const PROGRESS_SCOPE_NAMESPACE: &str = "run-lane";
-
-/// The stable category the journal records for a temporary-storage reconcile
-/// that could not unmount, or could not confirm that it had.
-const fn unmount_error_category(error: &UnmountError) -> &'static str {
-    match error {
-        UnmountError::Spawn(_) => "fusermount_unavailable",
-        UnmountError::Refused { .. } => "unmount_refused",
-        UnmountError::MountTable(_) => "mount_table_unreadable",
-        UnmountError::StillMounted(_) => "still_mounted",
-    }
-}
 
 /// Translate one registration failure into the refusal that names it.
 ///

@@ -54,6 +54,7 @@ pub use launch::{
     MAX_LAUNCH_ENV_VALUE_BYTES, MAX_LAUNCH_NOFILE, MAX_LAUNCH_PROMPT_BYTES, MAX_PROGRAM_BYTES,
     MIN_LAUNCH_NOFILE, NamespacedSandboxedChild, SandboxedSession, SocketGrant, StdoutCapture,
     launch_entry_helper_main, spawn_sandboxed, spawn_sandboxed_session,
+    spawn_sandboxed_session_with_namespaced_temporary_storage,
     spawn_sandboxed_with_namespaced_temporary_storage, spawn_sandboxed_with_stdout,
 };
 pub use runner::{CancellationToken, ContainmentEvidence, Runner, RunnerError};

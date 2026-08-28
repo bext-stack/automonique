@@ -18,10 +18,14 @@ pub(crate) const RENEWAL_DEFERRED_MESSAGE_ID: &str = "0b1c7d5e2a9f4b6c8d3e1f7a5c
 pub(crate) const RENEWAL_DEFERRED_EVENT: &str = "lease_renewal_deferred";
 pub(crate) const TEMPFS_RECONCILED_MESSAGE_ID: &str = "db1313b593ad4bbe907a22f790c6b8f6";
 pub(crate) const TEMPFS_RECONCILED_EVENT: &str = "temporary_storage_reconciled";
-pub(crate) const TEMPFS_UNRECONCILED_MESSAGE_ID: &str = "d6ed31785c3e441b934c73311da99a03";
-pub(crate) const TEMPFS_UNRECONCILED_EVENT: &str = "temporary_storage_unreconciled";
+#[cfg(test)]
+const TEMPFS_UNRECONCILED_MESSAGE_ID: &str = "d6ed31785c3e441b934c73311da99a03";
+#[cfg(test)]
+const TEMPFS_UNRECONCILED_EVENT: &str = "temporary_storage_unreconciled";
 pub(crate) const TEMPFS_REAPED_MESSAGE_ID: &str = "37b70f59343543d4a52a9c6b2015c0f6";
 pub(crate) const TEMPFS_REAPED_EVENT: &str = "temporary_storage_mount_reaped";
+pub(crate) const TEMPFS_RECOVERED_MESSAGE_ID: &str = "3a576f63c0964a31947c4d7b9cc57261";
+pub(crate) const TEMPFS_RECOVERED_EVENT: &str = "temporary_storage_checkpoint_recovered";
 const JOURNAL_SOCKET: &str = "/run/systemd/journal/socket";
 const MAX_EVENT_BYTES: usize = 1_024;
 const MAX_CATEGORY_BYTES: usize = 64;
@@ -124,19 +128,16 @@ pub(crate) struct TemporaryStorageReconciliation {
 }
 
 impl TemporaryStorageReconciliation {
-    pub(crate) fn from_outcome(outcome: &automonique_runner::Outcome) -> Self {
+    pub(crate) fn from_namespaced(outcome: &automonique_runner::NamespacedOutcome) -> Self {
         Self {
-            ceiling_bytes: outcome.budget.bytes(),
-            ceiling_objects: outcome.budget.objects(),
+            ceiling_bytes: outcome.ledger.budget.bytes(),
+            ceiling_objects: outcome.ledger.budget.objects(),
             peak_bytes: outcome.ledger.peak_bytes,
             peak_objects: outcome.ledger.peak_objects,
             refused_bytes: outcome.ledger.refused_bytes,
             refused_objects: outcome.ledger.refused_objects,
-            statfs_used_bytes: outcome
-                .statfs_before_unmount
-                .as_ref()
-                .map(automonique_runner::StatfsReadback::used_bytes),
-            readback_aborted: outcome.aborted,
+            statfs_used_bytes: Some(outcome.statfs_from_ledger.used_bytes()),
+            readback_aborted: false,
             unmount_confirmed: outcome.unmount_confirmed,
         }
     }
@@ -164,6 +165,64 @@ pub(crate) fn emit_temporary_storage_reconciled(
         return Ok(());
     }
     emit_temporary_storage_reconciled_to(Path::new(JOURNAL_SOCKET), run_id, reconciliation)
+}
+
+/// A new daemon generation recovered exact usage from a live private-mount
+/// checkpoint left by a predecessor that did not write a final record.
+pub(crate) fn emit_temporary_storage_checkpoint_recovered(
+    run_id: &str,
+    checkpoint: &automonique_runner::Checkpoint,
+) -> io::Result<()> {
+    if std::env::var_os("JOURNAL_STREAM").is_none() {
+        return Ok(());
+    }
+    emit_temporary_storage_checkpoint_recovered_to(Path::new(JOURNAL_SOCKET), run_id, checkpoint)
+}
+
+fn emit_temporary_storage_checkpoint_recovered_to(
+    socket_path: &Path,
+    run_id: &str,
+    checkpoint: &automonique_runner::Checkpoint,
+) -> io::Result<()> {
+    if !stable_identifier(run_id)
+        || checkpoint.phase != automonique_runner::CheckpointPhase::Live
+        || !checkpoint
+            .mount_evidence
+            .starts_with("automonique.namespaced-tempfs/v1 ")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid private temporary-storage recovery",
+        ));
+    }
+    automonique_runner::StatfsReadback::from_ledger(&checkpoint.snapshot)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let event = format!(
+        "MESSAGE=Automonique recovered a live private temporary-storage checkpoint\n\
+         MESSAGE_ID={TEMPFS_RECOVERED_MESSAGE_ID}\n\
+         PRIORITY=4\n\
+         SYSLOG_IDENTIFIER=automonique\n\
+         AUTOMONIQUE_SCHEMA={READY_SCHEMA}\n\
+         AUTOMONIQUE_EVENT={TEMPFS_RECOVERED_EVENT}\n\
+         AUTOMONIQUE_RUN_ID={run_id}\n\
+         AUTOMONIQUE_TEMPFS_CHECKPOINT_SEQUENCE={}\n\
+         AUTOMONIQUE_TEMPFS_CEILING_BYTES={}\n\
+         AUTOMONIQUE_TEMPFS_USED_BYTES={}\n\
+         AUTOMONIQUE_TEMPFS_USED_OBJECTS={}\n\
+         AUTOMONIQUE_TEMPFS_PEAK_BYTES={}\n\
+         AUTOMONIQUE_TEMPFS_PEAK_OBJECTS={}\n\
+         AUTOMONIQUE_TEMPFS_REFUSED_BYTES={}\n\
+         AUTOMONIQUE_TEMPFS_REFUSED_OBJECTS={}\n",
+        checkpoint.sequence,
+        checkpoint.snapshot.budget.bytes(),
+        checkpoint.snapshot.used_bytes,
+        checkpoint.snapshot.used_objects,
+        checkpoint.snapshot.peak_bytes,
+        checkpoint.snapshot.peak_objects,
+        checkpoint.snapshot.refused_bytes,
+        checkpoint.snapshot.refused_objects,
+    );
+    emit_to(socket_path, &event)
 }
 
 fn emit_temporary_storage_reconciled_to(
@@ -213,13 +272,7 @@ fn emit_temporary_storage_reconciled_to(
 /// A run's temporary-storage mount could not be unmounted, or the unmount
 /// could not be confirmed, at reconcile. The mount's `Drop` still detaches it
 /// lazily; the category names what refused.
-pub(crate) fn emit_temporary_storage_unreconciled(run_id: &str, category: &str) -> io::Result<()> {
-    if std::env::var_os("JOURNAL_STREAM").is_none() {
-        return Ok(());
-    }
-    emit_temporary_storage_unreconciled_to(Path::new(JOURNAL_SOCKET), run_id, category)
-}
-
+#[cfg(test)]
 fn emit_temporary_storage_unreconciled_to(
     socket_path: &Path,
     run_id: &str,
@@ -424,6 +477,37 @@ fn emit_to(socket_path: &Path, event: &str) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    fn live_namespaced_checkpoint() -> automonique_runner::Checkpoint {
+        use automonique_runner::{
+            Checkpoint, CheckpointPhase, Ledger, STATFS_BLOCK_BYTES, StatfsReadback,
+            TemporaryStorageBudget,
+        };
+
+        let mut ledger = Ledger::new(
+            TemporaryStorageBudget::new(2 * STATFS_BLOCK_BYTES, 8).expect("valid budget"),
+        );
+        ledger.reserve_object().expect("object within budget");
+        ledger.reserve_bytes(17).expect("bytes within budget");
+        Checkpoint {
+            sequence: 9,
+            at_millis: 1_700_000_000_000,
+            phase: CheckpointPhase::Live,
+            snapshot: ledger.snapshot(),
+            mount_evidence: "automonique.namespaced-tempfs/v1 pid=321 uid=1234".to_owned(),
+            statfs_at_mount: StatfsReadback {
+                block_size: STATFS_BLOCK_BYTES,
+                fragment_size: STATFS_BLOCK_BYTES,
+                blocks: 2,
+                blocks_free: 2,
+                blocks_available: 2,
+                files: 8,
+                files_free: 8,
+                name_max: 255,
+            },
+            final_record: None,
+        }
+    }
+
     #[test]
     fn readiness_event_is_bounded_and_names_every_documented_field() {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -610,6 +694,65 @@ mod tests {
         }
         assert!(!event.contains("CONTENT="));
         assert!(!event.contains("TOKEN="));
+    }
+
+    #[test]
+    fn recovered_private_checkpoint_event_is_bounded_numeric_and_exact() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("journal.sock");
+        let receiver = UnixDatagram::bind(&path).expect("journal receiver");
+
+        emit_temporary_storage_checkpoint_recovered_to(
+            &path,
+            "run-7_a.1",
+            &live_namespaced_checkpoint(),
+        )
+        .expect("structured event");
+        let mut bytes = [0_u8; MAX_EVENT_BYTES + 1];
+        let count = receiver.recv(&mut bytes).expect("event datagram");
+        let event = std::str::from_utf8(&bytes[..count]).expect("UTF-8 event");
+
+        assert!(count <= MAX_EVENT_BYTES);
+        for field in [
+            "MESSAGE_ID=3a576f63c0964a31947c4d7b9cc57261",
+            "PRIORITY=4",
+            "AUTOMONIQUE_EVENT=temporary_storage_checkpoint_recovered",
+            "AUTOMONIQUE_RUN_ID=run-7_a.1",
+            "AUTOMONIQUE_TEMPFS_CHECKPOINT_SEQUENCE=9",
+            "AUTOMONIQUE_TEMPFS_CEILING_BYTES=8192",
+            "AUTOMONIQUE_TEMPFS_USED_BYTES=17",
+            "AUTOMONIQUE_TEMPFS_USED_OBJECTS=1",
+            "AUTOMONIQUE_TEMPFS_PEAK_BYTES=17",
+            "AUTOMONIQUE_TEMPFS_PEAK_OBJECTS=1",
+            "AUTOMONIQUE_TEMPFS_REFUSED_BYTES=0",
+            "AUTOMONIQUE_TEMPFS_REFUSED_OBJECTS=0",
+        ] {
+            assert!(event.lines().any(|line| line == field), "missing {field}");
+        }
+        assert!(!event.contains("CONTENT="));
+        assert!(!event.contains("TOKEN="));
+    }
+
+    #[test]
+    fn recovered_checkpoint_refuses_non_live_or_non_namespaced_evidence() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let absent = directory.path().join("absent");
+        let mut checkpoint = live_namespaced_checkpoint();
+        checkpoint.phase = automonique_runner::CheckpointPhase::Final;
+        assert_eq!(
+            emit_temporary_storage_checkpoint_recovered_to(&absent, "run-7", &checkpoint)
+                .expect_err("final checkpoint cannot be recovered as live")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        checkpoint.phase = automonique_runner::CheckpointPhase::Live;
+        checkpoint.mount_evidence = "fstype=fuse.automonique-tempfs".to_owned();
+        assert_eq!(
+            emit_temporary_storage_checkpoint_recovered_to(&absent, "run-7", &checkpoint)
+                .expect_err("legacy mount evidence cannot claim a private namespace")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]
