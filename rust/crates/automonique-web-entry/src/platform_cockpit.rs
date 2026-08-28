@@ -33,8 +33,9 @@ use automonique_protocol::platform_v2_review_api::{
 };
 use automonique_protocol::platform_v2_transport::{
     LifecycleCapabilities, LineageReadRequest, PlatformV2Request, PlatformV2Response,
-    ReviewActionTransportRequest, ReviewConfirmationDigest, ReviewReadRequest, ReviewReceiptLookup,
-    WorkspaceIntentLookup, WorkspaceIntentRequest,
+    ReviewActionTransportRequest, ReviewConfirmationDigest, ReviewReadRequest,
+    ReviewReceiptCorrelationDigest, ReviewReceiptLookup, WorkspaceIntentLookup,
+    WorkspaceIntentRequest,
 };
 use automonique_protocol::primitives::Revision;
 use serde::Deserialize;
@@ -1182,7 +1183,14 @@ fn rerun_check(
     confirmation_digest: &str,
     idempotency_key: &str,
 ) -> Result<Value, &'static str> {
-    let (context, check_id, expected_check_revision, advertised_confirmation) = rerun_confirmation(
+    let (
+        context,
+        check_id,
+        expected_check_revision,
+        workspace_revision,
+        advertised_confirmation,
+        receipt_correlation,
+    ) = rerun_confirmation(
         bridge,
         project_id,
         workspace_id,
@@ -1204,7 +1212,11 @@ fn rerun_check(
         },
         IdempotencyKey::new(idempotency_key.to_owned())
             .map_err(|_| "platform_cockpit_request_invalid")?,
-        Some(supplied_confirmation),
+        Some((
+            supplied_confirmation,
+            workspace_revision,
+            receipt_correlation,
+        )),
     )
 }
 
@@ -1216,7 +1228,14 @@ fn preview_rerun_check(
     check_id: &str,
     expected_check_revision: &str,
 ) -> Result<Value, &'static str> {
-    let (context, check_id, expected_check_revision, confirmation_digest) = rerun_confirmation(
+    let (
+        context,
+        check_id,
+        expected_check_revision,
+        workspace_revision,
+        confirmation_digest,
+        receipt_correlation,
+    ) = rerun_confirmation(
         bridge,
         project_id,
         workspace_id,
@@ -1233,6 +1252,8 @@ fn preview_rerun_check(
         "check_id": check_id.as_str(),
         "exact_check_revision": expected_check_revision.to_string(),
         "confirmation_digest": confirmation_digest.as_str()
+        ,"workspace_revision": workspace_revision.to_string()
+        ,"receipt_correlation_digest": receipt_correlation.as_str()
     }))
 }
 
@@ -1248,7 +1269,9 @@ fn rerun_confirmation(
         ReviewControlContext,
         ReviewCheckId,
         Revision,
+        Revision,
         ReviewConfirmationDigest,
+        ReviewReceiptCorrelationDigest,
     ),
     &'static str,
 > {
@@ -1286,9 +1309,14 @@ fn rerun_confirmation(
         context,
         check_id,
         expected_check_revision,
+        capabilities.workspace_revision(),
         advertised
             .expect("checked above")
             .confirmation_digest()
+            .clone(),
+        advertised
+            .expect("checked above")
+            .receipt_correlation_digest()
             .clone(),
     ))
 }
@@ -1298,24 +1326,34 @@ fn execute_review_action(
     context: ReviewControlContext,
     action: ReviewAction,
     idempotency_key: IdempotencyKey,
-    confirmation_digest: Option<ReviewConfirmationDigest>,
+    confirmation: Option<(
+        ReviewConfirmationDigest,
+        Revision,
+        ReviewReceiptCorrelationDigest,
+    )>,
 ) -> Result<Value, &'static str> {
-    if let Some(receipt) = existing_review_receipt(
-        bridge,
-        context.project.clone(),
-        context.workspace.clone(),
-        idempotency_key.clone(),
-    )? {
+    if confirmation.is_none()
+        && let Some(receipt) = existing_review_receipt(
+            bridge,
+            context.project.clone(),
+            context.workspace.clone(),
+            idempotency_key.clone(),
+        )?
+    {
         return action_receipt(&receipt);
     }
-    let request = match confirmation_digest {
-        Some(confirmation) => ReviewActionTransportRequest::new_confirmed(
-            context.workspace,
-            context.snapshot.revision(),
-            action,
-            idempotency_key,
-            confirmation,
-        ),
+    let request = match confirmation {
+        Some((confirmation, workspace_revision, receipt_correlation)) => {
+            ReviewActionTransportRequest::new_confirmed_correlated(
+                context.workspace,
+                context.snapshot.revision(),
+                action,
+                idempotency_key,
+                confirmation,
+                workspace_revision,
+                receipt_correlation,
+            )
+        }
         None => ReviewActionTransportRequest::new(
             context.workspace,
             context.snapshot.revision(),

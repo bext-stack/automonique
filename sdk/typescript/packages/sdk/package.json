@@ -19,7 +19,7 @@
       "automonique.platform/v2"
     ],
     "schemaDigest": "sha256:1c3f561d137a14321cee480b8035341dd70b526ca501f2d5efd7f817a6e4b845",
-    "aggregateSchemaDigest": "sha256:87550ac13d6ff091382a5fddeb9131db625c09352fccbf82874b9321d3315877"
+    "aggregateSchemaDigest": "sha256:a53e29a43931612aa388c3455fb9c057e748780a44560947979fa4650837f4eb"
   },
   "files": [
     "dist"

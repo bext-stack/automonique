@@ -1397,7 +1397,7 @@ mod tests {
                 RequestId::new(format!("mobile-review-denied-{index}")).unwrap(),
                 PlatformV2Request::ExecuteReviewAction(
                     if matches!(action, ReviewAction::RerunCheck { .. }) {
-                        ReviewActionTransportRequest::new_confirmed(
+                        ReviewActionTransportRequest::new_confirmed_correlated(
                             WorkContextIdentity::UserWorkspace(
                                 automonique_protocol::platform_v2::UserWorkspaceId::new(
                                     "workspace-test",
@@ -1411,6 +1411,8 @@ mod tests {
                                 "ab".repeat(32),
                             )
                             .unwrap(),
+                            Revision::FIRST,
+                            automonique_protocol::platform_v2_transport::ReviewReceiptCorrelationDigest::new("cd".repeat(32)).unwrap(),
                         )
                     } else {
                         ReviewActionTransportRequest::new(
@@ -1519,7 +1521,7 @@ mod tests {
         let rerun_request = PlatformV2RequestMessage::new(
             RequestId::new("mobile-review-rerun-exact-grant").unwrap(),
             PlatformV2Request::ExecuteReviewAction(
-                ReviewActionTransportRequest::new_confirmed(
+                ReviewActionTransportRequest::new_confirmed_correlated(
                     workspace,
                     Revision::FIRST,
                     ReviewAction::RerunCheck {
@@ -1531,6 +1533,8 @@ mod tests {
                         "ab".repeat(32),
                     )
                     .unwrap(),
+                    Revision::FIRST,
+                    automonique_protocol::platform_v2_transport::ReviewReceiptCorrelationDigest::new("cd".repeat(32)).unwrap(),
                 )
                 .unwrap(),
             ),

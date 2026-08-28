@@ -183,16 +183,19 @@ export interface ReviewReadRequest {
 }
 export type ReviewWorkspaceIdentity = Extract<WorkContextIdentity, {readonly kind: "user_workspace" | "attempt_workspace" | "session"}>;
 export type ReviewConfirmationDigest = string & {readonly __reviewConfirmationDigest: unique symbol};
+export type ReviewReceiptCorrelationDigest = string & {readonly __reviewReceiptCorrelationDigest: unique symbol};
 export interface ReviewCheckRerunCapability {
   readonly authority: ReviewAuthority;
   readonly check_id: string;
   readonly confirmation_digest: ReviewConfirmationDigest;
+  readonly receipt_correlation_digest: ReviewReceiptCorrelationDigest;
   readonly expected_check_revision: WorkContextRevisionValue;
 }
 export interface ReviewCapabilities {
   readonly project: ProjectIdValue;
   readonly workspace: ReviewWorkspaceIdentity;
   readonly snapshot_revision: WorkContextRevisionValue;
+  readonly workspace_revision: WorkContextRevisionValue;
   readonly rerunnable_checks: readonly ReviewCheckRerunCapability[];
   readonly schema: typeof PLATFORM_SCHEMA_V2;
 }
@@ -202,11 +205,14 @@ export interface ReviewActionTransportRequest {
   readonly action: ReviewAction;
   readonly idempotency_key: IdempotencyKeyValue;
   readonly confirmation_digest?: ReviewConfirmationDigest;
+  readonly expected_workspace_revision?: WorkContextRevisionValue;
+  readonly receipt_correlation_digest?: ReviewReceiptCorrelationDigest;
 }
 export interface ReviewReceiptLookup {
   readonly project: ProjectIdValue;
   readonly workspace: ReviewWorkspaceIdentity;
   readonly idempotency_key: IdempotencyKeyValue;
+  readonly receipt_correlation_digest?: ReviewReceiptCorrelationDigest;
 }
 export type AttentionSourceKind = "review" | "orchestration" | "provider_session";
 export type AttentionItemState = "needs_you" | "working" | "done" | "blocked";
@@ -373,13 +379,17 @@ export function ReviewConfirmationDigest(value: string): ReviewConfirmationDiges
   if (!/^[0-9a-f]{64}$/u.test(value)) throw new WireError("invalid_json_value", "review confirmation digest");
   return value as ReviewConfirmationDigest;
 }
+export function ReviewReceiptCorrelationDigest(value: string): ReviewReceiptCorrelationDigest {
+  if (!/^[0-9a-f]{64}$/.test(value)) throw new WireError("invalid_json_value", "review receipt correlation digest");
+  return value as ReviewReceiptCorrelationDigest;
+}
 function reviewCapabilities(value: JsonValue): ReviewCapabilities {
-  const body = fields(value, ["project", "rerunnable_checks", "schema", "snapshot_revision", "workspace"]);
+  const body = fields(value, ["project", "rerunnable_checks", "schema", "snapshot_revision", "workspace", "workspace_revision"]);
   if (stringField(body, "schema") !== PLATFORM_SCHEMA_V2) throw new WireError("invalid_json_value", "review capability schema");
   const rawChecks = valueField(body, "rerunnable_checks");
   if (rawChecks.kind !== "array" || rawChecks.items.length > 512) throw new WireError("invalid_json_value", "review capabilities");
   const checks = rawChecks.items.map((item): ReviewCheckRerunCapability => {
-    const check = fields(item, ["authority", "check_id", "confirmation_digest", "expected_check_revision"]);
+    const check = fields(item, ["authority", "check_id", "confirmation_digest", "expected_check_revision", "receipt_correlation_digest"]);
     const authorityValue = fields(valueField(check, "authority"), ["id", "kind"]);
     const authorityId = boundedRefusalString(stringField(authorityValue, "id"), 256);
     if (stringField(authorityValue, "kind") !== "ci") throw new WireError("invalid_json_value", "review capability authority");
@@ -387,6 +397,7 @@ function reviewCapabilities(value: JsonValue): ReviewCapabilities {
       authority: {id: authorityId, kind: "ci"},
       check_id: boundedRefusalString(stringField(check, "check_id"), 256),
       confirmation_digest: ReviewConfirmationDigest(stringField(check, "confirmation_digest")),
+      receipt_correlation_digest: ReviewReceiptCorrelationDigest(stringField(check, "receipt_correlation_digest")),
       expected_check_revision: WorkContextRevision(integerField(check, "expected_check_revision")),
     };
   });
@@ -396,6 +407,7 @@ function reviewCapabilities(value: JsonValue): ReviewCapabilities {
     rerunnable_checks: checks,
     schema: PLATFORM_SCHEMA_V2,
     snapshot_revision: WorkContextRevision(integerField(body, "snapshot_revision")),
+    workspace_revision: WorkContextRevision(integerField(body, "workspace_revision")),
     workspace: reviewWorkspace(plain(valueField(body, "workspace")) as WorkContextIdentity),
   };
 }
@@ -468,8 +480,8 @@ function requestBody(request: PlatformV2Request): JsonValue {
     case "get_review": return json({project:ProjectId(request.request.project),schema:PLATFORM_SCHEMA_V2,workspace:reviewWorkspace(request.request.workspace)});
     case "get_attention_source_snapshot": return json(attentionReadRequest(request.request));
     case "get_review_capabilities": return json({project:ProjectId(request.request.project),schema:PLATFORM_SCHEMA_V2,workspace:reviewWorkspace(request.request.workspace)});
-    case "execute_review_action": { const value=request.request; const action=validateReviewAction(value.action); const rerun=action.kind==="rerun_check"; if (rerun !== (value.confirmation_digest !== undefined)) throw new WireError("invalid_json_value", "review confirmation required"); const common={action,expected_revision:WorkContextRevision(value.expected_revision),idempotency_key:IdempotencyKey(value.idempotency_key),platform_version:BigInt(PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR),schema:PLATFORM_REVIEW_SCHEMA_V1,workspace:reviewWorkspace(value.workspace)}; return json(rerun?{...common,confirmation_digest:ReviewConfirmationDigest(value.confirmation_digest as string)}:common); }
-    case "get_review_receipt": return json({idempotency_key:IdempotencyKey(request.lookup.idempotency_key),project:ProjectId(request.lookup.project),schema:PLATFORM_SCHEMA_V2,workspace:reviewWorkspace(request.lookup.workspace)});
+    case "execute_review_action": { const value=request.request; const action=validateReviewAction(value.action); const rerun=action.kind==="rerun_check"; if (rerun !== (value.confirmation_digest !== undefined && value.expected_workspace_revision !== undefined && value.receipt_correlation_digest !== undefined)) throw new WireError("invalid_json_value", "review confirmation required"); const common={action,expected_revision:WorkContextRevision(value.expected_revision),idempotency_key:IdempotencyKey(value.idempotency_key),platform_version:BigInt(PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR),schema:PLATFORM_REVIEW_SCHEMA_V1,workspace:reviewWorkspace(value.workspace)}; return json(rerun?{...common,confirmation_digest:ReviewConfirmationDigest(value.confirmation_digest as string),expected_workspace_revision:WorkContextRevision(value.expected_workspace_revision as bigint),receipt_correlation_digest:ReviewReceiptCorrelationDigest(value.receipt_correlation_digest as string)}:common); }
+    case "get_review_receipt": { const common={idempotency_key:IdempotencyKey(request.lookup.idempotency_key),project:ProjectId(request.lookup.project),schema:PLATFORM_SCHEMA_V2,workspace:reviewWorkspace(request.lookup.workspace)}; return json(request.lookup.receipt_correlation_digest===undefined?common:{...common,receipt_correlation_digest:ReviewReceiptCorrelationDigest(request.lookup.receipt_correlation_digest)}); }
   }
 }
 export function encodePlatformV2Request(requestId: PlatformRequestIdValue, request: PlatformV2Request): Uint8Array {

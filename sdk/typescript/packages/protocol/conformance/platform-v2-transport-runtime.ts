@@ -9,6 +9,7 @@ import {
   PLATFORM_NEGOTIATION_PROTOCOL,
   PLATFORM_V2_MAJOR,
   ReviewConfirmationDigest,
+  ReviewReceiptCorrelationDigest,
   decodePlatformNegotiationRequest,
   decodePlatformNegotiationResponse,
   decodePlatformNegotiationResponseFrame,
@@ -196,6 +197,8 @@ encodePlatformV2Request(v2Id, {
   request: {
     action: {kind: "rerun_check", payload: {check_id: "check-1", expected_check_revision: 7n}},
     confirmation_digest: ReviewConfirmationDigest("ab".repeat(32)),
+    expected_workspace_revision: WorkContextRevision(4n),
+    receipt_correlation_digest: ReviewReceiptCorrelationDigest("cd".repeat(32)),
     expected_revision: WorkContextRevision(9n),
     idempotency_key: IdempotencyKey("review-rerun"),
     workspace: {kind: "user_workspace", id: UserWorkspaceId("workspace-1")},

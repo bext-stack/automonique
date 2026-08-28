@@ -44,7 +44,7 @@ use automonique_protocol::platform_v2_transport::{
     LIFECYCLE_CAPABILITY_EFFECT_KINDS, LifecycleCapabilities, LifecycleOperationCapability,
     PlatformV2Refusal, PlatformV2Request, PlatformV2Response, RawMutationApprovalDocument,
     RawMutationReceiptDocument, ReceiptLookupKey, ReviewCapabilities, ReviewCheckRerunCapability,
-    ReviewConfirmationDigest,
+    ReviewConfirmationDigest, ReviewReceiptCorrelationDigest,
 };
 use automonique_protocol::primitives::{EpochMillis, Revision};
 use automonique_protocol::wire::JsonValue;
@@ -92,6 +92,17 @@ fn review_confirmation_digest(digest: [u8; 32]) -> Result<ReviewConfirmationDige
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     ReviewConfirmationDigest::new(value).map_err(|_| "platform_v2_response_invalid")
+}
+fn review_receipt_correlation_digest(
+    digest: [u8; 32],
+) -> Result<ReviewReceiptCorrelationDigest, &'static str> {
+    ReviewReceiptCorrelationDigest::new(
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+    )
+    .map_err(|_| "platform_v2_response_invalid")
 }
 
 #[derive(Debug)]
@@ -1761,7 +1772,18 @@ impl PlatformV2Runtime {
             }
             PlatformV2Request::GetReviewCapabilities(value) => {
                 authorize_identity(&principal, value.project(), value.workspace())?;
-                self.validate_policy_mapping(&principal, value.workspace())?;
+                let scope = principal
+                    .workspaces
+                    .get(value.workspace())
+                    .ok_or("platform_v2_scope_denied")?;
+                let workspace_record = self
+                    .work_contexts
+                    .validate_policy_mapping(
+                        principal.actor.tenant(),
+                        &scope.project,
+                        value.workspace(),
+                    )
+                    .map_err(|_| "platform_v2_policy_incoherent")?;
                 let snapshot = self
                     .reviews
                     .snapshot(value.workspace())
@@ -1777,6 +1799,7 @@ impl PlatformV2Runtime {
                             value.project().clone(),
                             value.workspace().clone(),
                             snapshot.revision(),
+                            workspace_record.revision(),
                             Vec::new(),
                         )
                         .map_err(|_| "platform_v2_response_invalid")?,
@@ -1817,6 +1840,7 @@ impl PlatformV2Runtime {
                             value.workspace(),
                             &authority,
                             snapshot.revision(),
+                            workspace_record.revision(),
                             &action,
                             &plan,
                         )?;
@@ -1826,6 +1850,7 @@ impl PlatformV2Runtime {
                                 check.freshness().observed_revision(),
                                 authority.clone(),
                                 review_confirmation_digest(confirmation)?,
+                                review_receipt_correlation_digest(ProductionReviewEffectAdapter::github_receipt_correlation_digest(confirmation))?,
                             )
                             .map_err(|_| "platform_v2_response_invalid")?,
                         );
@@ -1836,6 +1861,7 @@ impl PlatformV2Runtime {
                         value.project().clone(),
                         value.workspace().clone(),
                         snapshot.revision(),
+                        workspace_record.revision(),
                         rerunnable,
                     )
                     .map_err(|_| "platform_v2_response_invalid")?,
@@ -1843,6 +1869,8 @@ impl PlatformV2Runtime {
             }
             PlatformV2Request::ExecuteReviewAction(value) => {
                 let confirmation_digest = value.confirmation_digest().cloned();
+                let expected_workspace_revision = value.expected_workspace_revision();
+                let receipt_correlation_digest = value.receipt_correlation_digest().cloned();
                 let scope = principal
                     .workspaces
                     .get(value.workspace())
@@ -1850,7 +1878,14 @@ impl PlatformV2Runtime {
                 if !principal.projects.contains(&scope.project) {
                     return Err("platform_v2_scope_denied");
                 }
-                self.validate_policy_mapping(&principal, value.workspace())?;
+                let workspace_record = self
+                    .work_contexts
+                    .validate_policy_mapping(
+                        principal.actor.tenant(),
+                        &scope.project,
+                        value.workspace(),
+                    )
+                    .map_err(|_| "platform_v2_policy_incoherent")?;
                 let authority = principal
                     .review_authorities
                     .get(&value.action().required_authority())
@@ -1871,6 +1906,11 @@ impl PlatformV2Runtime {
                 {
                     if confirmation_digest.is_none() {
                         return Err("platform_v2_review_confirmation_required");
+                    }
+                    if expected_workspace_revision != Some(workspace_record.revision())
+                        || receipt_correlation_digest.is_none()
+                    {
+                        return Err("platform_v2_review_confirmation_changed");
                     }
                     ApprovalPolicy::Required
                 } else {
@@ -1905,6 +1945,16 @@ impl PlatformV2Runtime {
                         return Ok(PlatformV2Response::ReviewReceipt(existing.receipt));
                     }
                     if plan.is_github_check_rerun() {
+                        let supplied = receipt_correlation_digest
+                            .as_ref()
+                            .ok_or("platform_v2_review_confirmation_required")?;
+                        let actual = plan
+                            .github_receipt_correlation_digest()
+                            .ok_or("platform_v2_review_confirmation_changed")?;
+                        if review_receipt_correlation_digest(actual)?.as_str() != supplied.as_str()
+                        {
+                            return Err("platform_v2_review_confirmation_changed");
+                        }
                         let existing =
                             self.approve_prepared_github_confirmation(&existing, now_ms)?;
                         let receipt =
@@ -2111,11 +2161,23 @@ impl PlatformV2Runtime {
                                 request.workspace(),
                                 request.authority(),
                                 request.expected_revision(),
+                                workspace_record.revision(),
                                 request.action(),
                                 &advertised_plan,
                             )?;
                         if confirmation_digest.as_ref().map(|value| value.as_str())
                             != Some(review_confirmation_digest(expected_confirmation)?.as_str())
+                        {
+                            return Err("platform_v2_review_confirmation_changed");
+                        }
+                        let expected_correlation =
+                            ProductionReviewEffectAdapter::github_receipt_correlation_digest(
+                                expected_confirmation,
+                            );
+                        if receipt_correlation_digest.as_ref().map(|v| v.as_str())
+                            != Some(
+                                review_receipt_correlation_digest(expected_correlation)?.as_str(),
+                            )
                         {
                             return Err("platform_v2_review_confirmation_changed");
                         }
@@ -2137,6 +2199,7 @@ impl PlatformV2Runtime {
                                 _ => return Err("platform_v2_review_plan_invalid"),
                             },
                             expected_check_revision,
+                            expected_correlation,
                         )
                         .map_err(review_store_category)?;
                         self.policy_fence.verify()?;
@@ -2189,6 +2252,16 @@ impl PlatformV2Runtime {
                     );
                     match external {
                         Ok(Some((action, plan))) => {
+                            if let Some(expected) = value.receipt_correlation_digest() {
+                                let Some(actual) = plan.github_receipt_correlation_digest() else {
+                                    continue;
+                                };
+                                if review_receipt_correlation_digest(actual)?.as_str()
+                                    != expected.as_str()
+                                {
+                                    continue;
+                                }
+                            }
                             if action.receipt.outcome()
                                 == automonique_protocol::platform_v2_review::ReviewReceiptOutcome::Accepted
                                 || action.receipt.outcome()
@@ -2250,6 +2323,9 @@ impl PlatformV2Runtime {
                         }
                         Ok(None) | Err(ReviewStoreError::Unauthorized) => {}
                         Err(_) => return Err("platform_v2_receipt_refused"),
+                    }
+                    if value.receipt_correlation_digest().is_some() {
+                        continue;
                     }
                     let receipt = self.reviews.receipt(
                         value.workspace(),
@@ -2529,6 +2605,8 @@ impl PlatformV2Runtime {
                 .cloned()
                 .ok_or("platform_v2_review_plan_invalid")?,
             expected_check_revision,
+            plan.github_receipt_correlation_digest()
+                .ok_or("platform_v2_review_plan_invalid")?,
         )
         .map_err(review_store_category)?;
         if reconstructed.digest() != plan.digest() {

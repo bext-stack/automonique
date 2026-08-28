@@ -12,9 +12,9 @@ use automonique_protocol::platform_v2_review_api::{
 };
 use automonique_protocol::primitives::Revision;
 use automonique_store::review_store::{
-    ApprovalPolicy, ReviewActionAdmission, ReviewApprovalDecision, ReviewApprovalDocument,
-    ReviewExternalEffectCustody, ReviewExternalEffectPlan, ReviewStore, ReviewStoreError,
-    ReviewWriteAdmission,
+    ApprovalPolicy, REVIEW_STORE_SCHEMA_VERSION, ReviewActionAdmission, ReviewApprovalDecision,
+    ReviewApprovalDocument, ReviewExternalEffectCustody, ReviewExternalEffectPlan, ReviewStore,
+    ReviewStoreError, ReviewWriteAdmission,
 };
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
@@ -220,6 +220,7 @@ fn github_external_plan_for(
         attempt,
         ReviewCheckId::new("check-1").unwrap(),
         revision(7),
+        [9; 32],
     )
     .expect("github effect plan")
 }
@@ -334,6 +335,7 @@ fn github_plan_rejects_every_successor_overflow_before_reservation() {
             u32::MAX,
             ReviewCheckId::new("check-1").unwrap(),
             revision(7),
+            [9; 32],
         )
         .is_err()
     );
@@ -350,6 +352,7 @@ fn github_plan_rejects_every_successor_overflow_before_reservation() {
             3,
             ReviewCheckId::new("check-1").unwrap(),
             revision(i64::MAX as u64),
+            [9; 32],
         )
         .is_err()
     );
@@ -405,6 +408,10 @@ fn github_check_plan_and_custody_survive_restart_without_reopening_write_admissi
         .unwrap()
         .unwrap();
     assert_eq!(restarted_plan.digest(), plan.digest());
+    assert_eq!(
+        restarted_plan.github_receipt_correlation_digest(),
+        Some([9; 32])
+    );
     assert_eq!(
         restarted_plan.github_custody(),
         Some(ReviewExternalEffectCustody::CustodyStarted)
@@ -481,6 +488,7 @@ fn github_check_external_plan_must_match_the_exact_action_target_revision() {
         3,
         ReviewCheckId::new("check-2").unwrap(),
         revision(7),
+        [9; 32],
     )
     .unwrap();
     assert!(matches!(
@@ -934,7 +942,7 @@ fn populated_review_v1_store_migrates_exactly_and_remains_non_actionable() {
     assert_eq!(
         raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .expect("version"),
-        4
+        REVIEW_STORE_SCHEMA_VERSION
     );
     let schema: String = raw
         .query_row("SELECT protocol_schema FROM review_snapshots", [], |row| {
@@ -990,7 +998,7 @@ fn mislabeled_authority_bearing_v1_document_is_transactionally_upgraded_to_v2() 
     assert_eq!(
         raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .expect("version"),
-        4
+        REVIEW_STORE_SCHEMA_VERSION
     );
     let protocol_schema: String = raw
         .query_row("SELECT protocol_schema FROM review_snapshots", [], |row| {
@@ -1028,7 +1036,7 @@ fn populated_v2_store_adds_external_plan_custody_transactionally() {
     assert_eq!(
         raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .unwrap(),
-        4
+        REVIEW_STORE_SCHEMA_VERSION
     );
     assert!(
         raw.query_row(
@@ -1074,7 +1082,7 @@ fn populated_real_v3_store_migrates_to_v4_without_losing_review_state() {
     assert_eq!(
         raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .unwrap(),
-        4
+        REVIEW_STORE_SCHEMA_VERSION
     );
     assert!(raw
         .query_row(
@@ -1083,6 +1091,24 @@ fn populated_real_v3_store_migrates_to_v4_without_losing_review_state() {
             |row| row.get::<_, bool>(0),
         )
         .unwrap());
+}
+
+#[test]
+fn v4_store_adds_nullable_receipt_correlation_transactionally() {
+    let private = PrivateStore::new();
+    drop(ReviewStore::open(private.path()).unwrap());
+    let raw = Connection::open(private.path()).unwrap();
+    raw.execute_batch("ALTER TABLE review_github_check_effect_plans DROP COLUMN receipt_correlation_digest; PRAGMA user_version=4;").unwrap();
+    drop(raw);
+    drop(ReviewStore::open(private.path()).expect("migrate v4"));
+    let raw = Connection::open(private.path()).unwrap();
+    assert_eq!(
+        raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .unwrap(),
+        REVIEW_STORE_SCHEMA_VERSION
+    );
+    let columns: i64 = raw.query_row("SELECT count(*) FROM pragma_table_info('review_github_check_effect_plans') WHERE name='receipt_correlation_digest'", [], |row| row.get(0)).unwrap();
+    assert_eq!(columns, 1);
 }
 
 #[test]

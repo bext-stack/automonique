@@ -444,6 +444,7 @@ impl ProductionReviewEffectAdapter {
         workspace: &WorkContextIdentity,
         authority: &ReviewAuthority,
         snapshot_revision: Revision,
+        workspace_revision: Revision,
         action: &ReviewAction,
         plan: &ReviewEffectPlan,
     ) -> Result<[u8; 32], &'static str> {
@@ -492,8 +493,19 @@ impl ProductionReviewEffectAdapter {
         push_confirmation_field(&mut document, &run_id.get().to_be_bytes());
         push_confirmation_field(&mut document, &observed_attempt.to_be_bytes());
         push_confirmation_field(&mut document, &snapshot_revision.get().to_be_bytes());
+        push_confirmation_field(&mut document, &workspace_revision.get().to_be_bytes());
         push_confirmation_field(&mut document, &expected_check_revision.get().to_be_bytes());
         Ok(*Sha256::digest(&document).as_bytes())
+    }
+
+    pub(crate) fn github_receipt_correlation_digest(confirmation: [u8; 32]) -> [u8; 32] {
+        let mut document = Vec::new();
+        push_confirmation_field(
+            &mut document,
+            b"automonique.review-rerun-receipt-correlation/v1",
+        );
+        push_confirmation_field(&mut document, &confirmation);
+        *Sha256::digest(&document).as_bytes()
     }
 
     fn verify_github_credential_generation(
@@ -1113,6 +1125,7 @@ mod tests {
                 &workspace,
                 &authority,
                 Revision::new(9).unwrap(),
+                Revision::new(3).unwrap(),
                 &action,
                 &plan,
             )
@@ -1126,6 +1139,7 @@ mod tests {
                     &workspace,
                     &authority,
                     Revision::new(9).unwrap(),
+                    Revision::new(3).unwrap(),
                     &action,
                     &plan,
                 )
@@ -1139,7 +1153,23 @@ mod tests {
                     &project,
                     &workspace,
                     &authority,
+                    Revision::new(9).unwrap(),
+                    Revision::new(4).unwrap(),
+                    &action,
+                    &plan
+                )
+                .unwrap()
+        );
+        assert_ne!(
+            baseline,
+            adapter
+                .github_confirmation_digest(
+                    &actor,
+                    &project,
+                    &workspace,
+                    &authority,
                     Revision::new(10).unwrap(),
+                    Revision::new(3).unwrap(),
                     &action,
                     &plan,
                 )
@@ -1163,6 +1193,7 @@ mod tests {
                     &workspace,
                     &authority,
                     Revision::new(9).unwrap(),
+                    Revision::new(3).unwrap(),
                     &action,
                     &changed_generation,
                 )

@@ -128,6 +128,34 @@ impl ReviewConfirmationDigest {
     }
 }
 
+/// Opaque, non-authorizing correlation proof for the exact advertised rerun.
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ReviewReceiptCorrelationDigest(BoundedString<64>);
+impl fmt::Debug for ReviewReceiptCorrelationDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ReviewReceiptCorrelationDigest([redacted])")
+    }
+}
+impl ReviewReceiptCorrelationDigest {
+    pub fn new(value: impl Into<String>) -> Result<Self, PlatformV2TransportError> {
+        let value = value.into();
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+        {
+            return Err(PlatformV2TransportError::InvalidBody);
+        }
+        Ok(Self(
+            BoundedString::new(value).map_err(|_| PlatformV2TransportError::InvalidBody)?,
+        ))
+    }
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlatformV2Refusal {
     category: PlatformV2RefusalCategory,
@@ -666,6 +694,7 @@ pub struct ReviewCheckRerunCapability {
     expected_check_revision: Revision,
     authority: ReviewAuthority,
     confirmation_digest: ReviewConfirmationDigest,
+    receipt_correlation_digest: ReviewReceiptCorrelationDigest,
 }
 
 impl ReviewCheckRerunCapability {
@@ -674,6 +703,7 @@ impl ReviewCheckRerunCapability {
         expected_check_revision: Revision,
         authority: ReviewAuthority,
         confirmation_digest: ReviewConfirmationDigest,
+        receipt_correlation_digest: ReviewReceiptCorrelationDigest,
     ) -> Result<Self, PlatformV2TransportError> {
         if authority.kind() != ReviewAuthorityKind::Ci {
             return Err(PlatformV2TransportError::InvalidBody);
@@ -683,6 +713,7 @@ impl ReviewCheckRerunCapability {
             expected_check_revision,
             authority,
             confirmation_digest,
+            receipt_correlation_digest,
         })
     }
     #[must_use]
@@ -701,6 +732,10 @@ impl ReviewCheckRerunCapability {
     pub const fn confirmation_digest(&self) -> &ReviewConfirmationDigest {
         &self.confirmation_digest
     }
+    #[must_use]
+    pub const fn receipt_correlation_digest(&self) -> &ReviewReceiptCorrelationDigest {
+        &self.receipt_correlation_digest
+    }
 }
 
 /// Revision-fenced mutation capabilities for exactly one project/workspace.
@@ -709,6 +744,7 @@ pub struct ReviewCapabilities {
     project: ProjectId,
     workspace: WorkContextIdentity,
     snapshot_revision: Revision,
+    workspace_revision: Revision,
     rerunnable_checks: Vec<ReviewCheckRerunCapability>,
 }
 
@@ -717,6 +753,7 @@ impl ReviewCapabilities {
         project: ProjectId,
         workspace: WorkContextIdentity,
         snapshot_revision: Revision,
+        workspace_revision: Revision,
         mut rerunnable_checks: Vec<ReviewCheckRerunCapability>,
     ) -> Result<Self, PlatformV2TransportError> {
         if !is_review_workspace(&workspace) || rerunnable_checks.len() > 512 {
@@ -734,6 +771,7 @@ impl ReviewCapabilities {
             project,
             workspace,
             snapshot_revision,
+            workspace_revision,
             rerunnable_checks,
         })
     }
@@ -750,6 +788,10 @@ impl ReviewCapabilities {
         self.snapshot_revision
     }
     #[must_use]
+    pub const fn workspace_revision(&self) -> Revision {
+        self.workspace_revision
+    }
+    #[must_use]
     pub fn rerunnable_checks(&self) -> &[ReviewCheckRerunCapability] {
         &self.rerunnable_checks
     }
@@ -760,6 +802,7 @@ pub struct ReviewReceiptLookup {
     project: ProjectId,
     workspace: WorkContextIdentity,
     idempotency_key: IdempotencyKey,
+    receipt_correlation_digest: Option<ReviewReceiptCorrelationDigest>,
 }
 
 /// Client-owned inputs for one review action.
@@ -773,6 +816,8 @@ pub struct ReviewActionTransportRequest {
     action: ReviewAction,
     idempotency_key: IdempotencyKey,
     confirmation_digest: Option<ReviewConfirmationDigest>,
+    expected_workspace_revision: Option<Revision>,
+    receipt_correlation_digest: Option<ReviewReceiptCorrelationDigest>,
 }
 impl ReviewActionTransportRequest {
     pub fn new(
@@ -793,14 +838,18 @@ impl ReviewActionTransportRequest {
             action,
             idempotency_key,
             confirmation_digest: None,
+            expected_workspace_revision: None,
+            receipt_correlation_digest: None,
         })
     }
-    pub fn new_confirmed(
+    pub fn new_confirmed_correlated(
         workspace: WorkContextIdentity,
         expected_revision: Revision,
         action: ReviewAction,
         idempotency_key: IdempotencyKey,
         confirmation_digest: ReviewConfirmationDigest,
+        expected_workspace_revision: Revision,
+        receipt_correlation_digest: ReviewReceiptCorrelationDigest,
     ) -> Result<Self, PlatformV2TransportError> {
         if !is_review_workspace(&workspace)
             || action.validate_client_shape().is_err()
@@ -814,6 +863,8 @@ impl ReviewActionTransportRequest {
             action,
             idempotency_key,
             confirmation_digest: Some(confirmation_digest),
+            expected_workspace_revision: Some(expected_workspace_revision),
+            receipt_correlation_digest: Some(receipt_correlation_digest),
         })
     }
     #[must_use]
@@ -836,6 +887,14 @@ impl ReviewActionTransportRequest {
     pub const fn confirmation_digest(&self) -> Option<&ReviewConfirmationDigest> {
         self.confirmation_digest.as_ref()
     }
+    #[must_use]
+    pub const fn expected_workspace_revision(&self) -> Option<Revision> {
+        self.expected_workspace_revision
+    }
+    #[must_use]
+    pub const fn receipt_correlation_digest(&self) -> Option<&ReviewReceiptCorrelationDigest> {
+        self.receipt_correlation_digest.as_ref()
+    }
 }
 impl ReviewReceiptLookup {
     pub fn new(
@@ -850,7 +909,18 @@ impl ReviewReceiptLookup {
             project,
             workspace,
             idempotency_key,
+            receipt_correlation_digest: None,
         })
+    }
+    pub fn new_correlated(
+        project: ProjectId,
+        workspace: WorkContextIdentity,
+        idempotency_key: IdempotencyKey,
+        digest: ReviewReceiptCorrelationDigest,
+    ) -> Result<Self, PlatformV2TransportError> {
+        let mut value = Self::new(project, workspace, idempotency_key)?;
+        value.receipt_correlation_digest = Some(digest);
+        Ok(value)
     }
     #[must_use]
     pub const fn project(&self) -> &ProjectId {
@@ -863,6 +933,10 @@ impl ReviewReceiptLookup {
     #[must_use]
     pub const fn idempotency_key(&self) -> &IdempotencyKey {
         &self.idempotency_key
+    }
+    #[must_use]
+    pub const fn receipt_correlation_digest(&self) -> Option<&ReviewReceiptCorrelationDigest> {
+        self.receipt_correlation_digest.as_ref()
     }
 }
 
@@ -1343,7 +1417,7 @@ fn lookup(
 }
 
 fn review_lookup_json(value: &ReviewReceiptLookup) -> JsonValue {
-    object(vec![
+    let mut fields = vec![
         (
             "idempotency_key",
             JsonValue::String(value.idempotency_key.as_str().to_owned()),
@@ -1354,7 +1428,14 @@ fn review_lookup_json(value: &ReviewReceiptLookup) -> JsonValue {
         ),
         ("schema", JsonValue::String(PLATFORM_SCHEMA_V2.to_owned())),
         ("workspace", identity_json(&value.workspace)),
-    ])
+    ];
+    if let Some(digest) = value.receipt_correlation_digest() {
+        fields.push((
+            "receipt_correlation_digest",
+            JsonValue::String(digest.as_str().to_owned()),
+        ));
+    }
+    object(fields)
 }
 
 fn review_capabilities_json(
@@ -1387,6 +1468,10 @@ fn review_capabilities_json(
                     JsonValue::String(capability.confirmation_digest().as_str().to_owned()),
                 ),
                 (
+                    "receipt_correlation_digest",
+                    JsonValue::String(capability.receipt_correlation_digest().as_str().to_owned()),
+                ),
+                (
                     "expected_check_revision",
                     JsonValue::Integer(
                         i64::try_from(capability.expected_check_revision().get())
@@ -1410,6 +1495,13 @@ fn review_capabilities_json(
                     .map_err(|_| PlatformV2TransportError::InvalidBody)?,
             ),
         ),
+        (
+            "workspace_revision",
+            JsonValue::Integer(
+                i64::try_from(value.workspace_revision().get())
+                    .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+            ),
+        ),
         ("workspace", identity_json(value.workspace())),
     ]))
 }
@@ -1423,6 +1515,7 @@ fn review_capabilities(value: &JsonValue) -> Result<ReviewCapabilities, Platform
             "schema",
             "snapshot_revision",
             "workspace",
+            "workspace_revision",
         ],
     )?;
     if string(value, "schema")? != PLATFORM_SCHEMA_V2 {
@@ -1443,6 +1536,7 @@ fn review_capabilities(value: &JsonValue) -> Result<ReviewCapabilities, Platform
                     "authority",
                     "check_id",
                     "confirmation_digest",
+                    "receipt_correlation_digest",
                     "expected_check_revision",
                 ],
             )?;
@@ -1470,6 +1564,9 @@ fn review_capabilities(value: &JsonValue) -> Result<ReviewCapabilities, Platform
                 revision,
                 authority,
                 ReviewConfirmationDigest::new(string(check, "confirmation_digest")?.to_owned())?,
+                ReviewReceiptCorrelationDigest::new(
+                    string(check, "receipt_correlation_digest")?.to_owned(),
+                )?,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1478,6 +1575,12 @@ fn review_capabilities(value: &JsonValue) -> Result<ReviewCapabilities, Platform
         .and_then(JsonValue::as_integer)
         .and_then(|value| u64::try_from(value).ok())
         .and_then(|value| Revision::new(value).ok())
+        .ok_or(PlatformV2TransportError::InvalidBody)?;
+    let workspace_revision = value
+        .get("workspace_revision")
+        .and_then(JsonValue::as_integer)
+        .and_then(|v| u64::try_from(v).ok())
+        .and_then(|v| Revision::new(v).ok())
         .ok_or(PlatformV2TransportError::InvalidBody)?;
     ReviewCapabilities::new(
         ProjectId::new(string(value, "project")?.to_owned())
@@ -1488,6 +1591,7 @@ fn review_capabilities(value: &JsonValue) -> Result<ReviewCapabilities, Platform
                 .ok_or(PlatformV2TransportError::InvalidBody)?,
         )?,
         snapshot_revision,
+        workspace_revision,
         checks,
     )
 }
@@ -1629,6 +1733,28 @@ fn request_body(value: &PlatformV2Request) -> Result<JsonValue, PlatformV2Transp
                 fields.push((
                     "confirmation_digest",
                     JsonValue::String(confirmation.as_str().to_owned()),
+                ));
+                fields.push((
+                    "expected_workspace_revision",
+                    JsonValue::Integer(
+                        i64::try_from(
+                            value
+                                .expected_workspace_revision()
+                                .ok_or(PlatformV2TransportError::InvalidBody)?
+                                .get(),
+                        )
+                        .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+                    ),
+                ));
+                fields.push((
+                    "receipt_correlation_digest",
+                    JsonValue::String(
+                        value
+                            .receipt_correlation_digest()
+                            .ok_or(PlatformV2TransportError::InvalidBody)?
+                            .as_str()
+                            .to_owned(),
+                    ),
                 ));
             }
             object(fields)
@@ -1799,9 +1925,11 @@ fn request_from_message(message: &Message) -> Result<PlatformV2Request, Platform
                     &[
                         "action",
                         "confirmation_digest",
+                        "expected_workspace_revision",
                         "expected_revision",
                         "idempotency_key",
                         "platform_version",
+                        "receipt_correlation_digest",
                         "schema",
                         "workspace",
                     ]
@@ -1841,13 +1969,23 @@ fn request_from_message(message: &Message) -> Result<PlatformV2Request, Platform
             let idempotency_key = IdempotencyKey::new(string(message.body(), "idempotency_key")?)
                 .map_err(|_| PlatformV2TransportError::InvalidBody)?;
             PlatformV2Request::ExecuteReviewAction(if confirmed {
-                ReviewActionTransportRequest::new_confirmed(
+                ReviewActionTransportRequest::new_confirmed_correlated(
                     workspace,
                     expected_revision,
                     decoded_action,
                     idempotency_key,
                     ReviewConfirmationDigest::new(
                         string(message.body(), "confirmation_digest")?.to_owned(),
+                    )?,
+                    message
+                        .body()
+                        .get("expected_workspace_revision")
+                        .and_then(JsonValue::as_integer)
+                        .and_then(|v| u64::try_from(v).ok())
+                        .and_then(|v| Revision::new(v).ok())
+                        .ok_or(PlatformV2TransportError::InvalidBody)?,
+                    ReviewReceiptCorrelationDigest::new(
+                        string(message.body(), "receipt_correlation_digest")?.to_owned(),
                     )?,
                 )?
             } else {
@@ -1860,25 +1998,46 @@ fn request_from_message(message: &Message) -> Result<PlatformV2Request, Platform
             })
         }
         "get_review_receipt" => {
+            let correlated = message.body().get("receipt_correlation_digest").is_some();
             exact_fields(
                 message.body(),
-                &["idempotency_key", "project", "schema", "workspace"],
+                if correlated {
+                    &[
+                        "idempotency_key",
+                        "project",
+                        "receipt_correlation_digest",
+                        "schema",
+                        "workspace",
+                    ]
+                } else {
+                    &["idempotency_key", "project", "schema", "workspace"]
+                },
             )?;
             if string(message.body(), "schema")? != PLATFORM_SCHEMA_V2 {
                 return Err(PlatformV2TransportError::InvalidBody);
             }
-            PlatformV2Request::GetReviewReceipt(ReviewReceiptLookup::new(
-                ProjectId::new(string(message.body(), "project")?)
-                    .map_err(|_| PlatformV2TransportError::InvalidBody)?,
-                identity(
-                    message
-                        .body()
-                        .get("workspace")
-                        .ok_or(PlatformV2TransportError::InvalidBody)?,
-                )?,
-                IdempotencyKey::new(string(message.body(), "idempotency_key")?)
-                    .map_err(|_| PlatformV2TransportError::InvalidBody)?,
-            )?)
+            let project = ProjectId::new(string(message.body(), "project")?)
+                .map_err(|_| PlatformV2TransportError::InvalidBody)?;
+            let workspace = identity(
+                message
+                    .body()
+                    .get("workspace")
+                    .ok_or(PlatformV2TransportError::InvalidBody)?,
+            )?;
+            let key = IdempotencyKey::new(string(message.body(), "idempotency_key")?)
+                .map_err(|_| PlatformV2TransportError::InvalidBody)?;
+            PlatformV2Request::GetReviewReceipt(if correlated {
+                ReviewReceiptLookup::new_correlated(
+                    project,
+                    workspace,
+                    key,
+                    ReviewReceiptCorrelationDigest::new(
+                        string(message.body(), "receipt_correlation_digest")?.to_owned(),
+                    )?,
+                )?
+            } else {
+                ReviewReceiptLookup::new(project, workspace, key)?
+            })
         }
         _ => return Err(PlatformV2TransportError::UnknownKind),
     })

@@ -52,7 +52,8 @@ use automonique_protocol::platform_v2_transport::{
     PlatformV2RequestMessage, PlatformV2Response, PlatformV2ResponseMessage,
     PlatformV2TransportError, RawMutationApprovalDocument, RawMutationReceiptDocument,
     ReceiptLookupKey, ReviewActionTransportRequest, ReviewCapabilities, ReviewConfirmationDigest,
-    ReviewReadRequest, ReviewReceiptLookup, WorkspaceIntentLookup, WorkspaceIntentRequest,
+    ReviewReadRequest, ReviewReceiptCorrelationDigest, ReviewReceiptLookup, WorkspaceIntentLookup,
+    WorkspaceIntentRequest,
 };
 use automonique_protocol::primitives::Revision;
 
@@ -692,14 +693,18 @@ impl<T> PlatformV2Client<T> {
         action: ReviewAction,
         idempotency_key: IdempotencyKey,
         confirmation_digest: ReviewConfirmationDigest,
+        expected_workspace_revision: Revision,
+        receipt_correlation_digest: ReviewReceiptCorrelationDigest,
     ) -> Result<ReviewReceiptResult, ClientError> {
         let expected_key = idempotency_key.clone();
-        let request = ReviewActionTransportRequest::new_confirmed(
+        let request = ReviewActionTransportRequest::new_confirmed_correlated(
             workspace,
             expected_revision,
             action,
             idempotency_key,
             confirmation_digest,
+            expected_workspace_revision,
+            receipt_correlation_digest,
         )
         .map_err(|_| ClientError::Protocol)?;
         match self.request(PlatformV2Request::ExecuteReviewAction(request))? {
@@ -722,6 +727,32 @@ impl<T> PlatformV2Client<T> {
         let expected_key = idempotency_key.clone();
         let lookup = ReviewReceiptLookup::new(project, workspace, idempotency_key)
             .map_err(|_| ClientError::Protocol)?;
+        match self.request(PlatformV2Request::GetReviewReceipt(lookup))? {
+            PlatformV2Response::ReviewReceipt(value)
+                if value.idempotency_key() == &expected_key =>
+            {
+                Ok(ReviewReceiptResult::Receipt(value))
+            }
+            PlatformV2Response::Refused(value) => Ok(ReviewReceiptResult::Refused(value)),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    pub fn get_correlated_review_receipt(
+        &mut self,
+        project: ProjectId,
+        workspace: WorkContextIdentity,
+        idempotency_key: IdempotencyKey,
+        receipt_correlation_digest: ReviewReceiptCorrelationDigest,
+    ) -> Result<ReviewReceiptResult, ClientError> {
+        let expected_key = idempotency_key.clone();
+        let lookup = ReviewReceiptLookup::new_correlated(
+            project,
+            workspace,
+            idempotency_key,
+            receipt_correlation_digest,
+        )
+        .map_err(|_| ClientError::Protocol)?;
         match self.request(PlatformV2Request::GetReviewReceipt(lookup))? {
             PlatformV2Response::ReviewReceipt(value)
                 if value.idempotency_key() == &expected_key =>

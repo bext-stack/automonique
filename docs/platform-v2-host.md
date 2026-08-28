@@ -300,7 +300,8 @@ group/world writable, and unknown JSON fields are rejected. The registry is
 private composition state: its coordinates are never returned by Platform v2
 and clients cannot supply paths, commands, provider targets, or credential
 references. `GetReviewCapabilities` returns only the exact project/workspace,
-snapshot revision, check id/revision, CI authority, and opaque confirmation
+snapshot revision, authoritative workspace revision, check id/revision, CI
+authority, opaque confirmation digest, and non-authorizing receipt-correlation
 digest for currently runnable checks. Advertisement performs a fresh typed
 GitHub workflow-run GET and emits
 the capability only when run ID, head SHA, observed attempt, and completed
@@ -326,11 +327,19 @@ skipped attempt, or changed head likewise never triggers a second mutation.
 
 Each advertised rerun capability also carries an opaque confirmation digest
 over the authenticated actor, project/workspace, snapshot/check revisions,
-provider target, and exact registry and credential generations. Cockpit first
+authoritative workspace revision, provider target, and exact registry and
+credential generations. Cockpit first
 renders that capability as an inert confirmation preview. Only an explicit
 confirm returns the digest with the action; the daemon recomputes it before
 persisting an approval and before provider custody. A changed or substituted
 preview fails closed.
+
+The correlation digest is persisted with the admitted provider plan before
+custody and survives restart. Rerun clients must use the correlated receipt
+lookup: the daemon returns a receipt only when the idempotency key and this
+exact digest select the same durable GitHub plan. A legacy uncorrelated lookup
+remains available for non-rerun review actions, but is not attribution evidence
+for a rerun; older, external, cross-action, and same-key mismatches fail closed.
 
 ## Private attention source registry
 
