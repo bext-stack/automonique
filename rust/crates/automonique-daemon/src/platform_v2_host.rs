@@ -621,6 +621,16 @@ impl PlatformV2Runtime {
             // keeping authority that no authenticated peer can exercise.
             return Err("platform_v2_policy_invalid");
         }
+        // Validate every private adapter registry before opening or updating a
+        // durable store. A malformed operator file must disable v2 without
+        // leaving partially refreshed grants behind.
+        let review_effects = ProductionReviewEffectAdapter::open(
+            &policy_path
+                .parent()
+                .ok_or("platform_v2_state_path_invalid")?
+                .join(crate::platform_v2_review_adapter::REVIEW_REGISTRY_FILE_NAME),
+            expected_uid,
+        )?;
         let work_contexts = WorkContextStore::open(work_context_path)
             .map_err(|_| "platform_v2_store_unavailable")?;
         for principal in principals.values() {
@@ -672,7 +682,7 @@ impl PlatformV2Runtime {
             work_contexts,
             lineage,
             reviews,
-            review_effects: ProductionReviewEffectAdapter,
+            review_effects,
             nonces: HostNonces::new()?,
             lifecycle_effects,
             clock,
@@ -1195,7 +1205,12 @@ impl PlatformV2Runtime {
                     value.action().clone(),
                 )
                 .map_err(|_| "platform_v2_request_invalid")?;
-                match self.review_effects.plan(request.action()) {
+                match self.review_effects.plan(
+                    &scope.project,
+                    request.workspace(),
+                    request.authority(),
+                    request.action(),
+                ) {
                     Ok(ReviewEffectPlan::LocalStore) => {
                         self.policy_fence.verify()?;
                         let receipt = self
