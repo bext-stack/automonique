@@ -47,33 +47,22 @@ existing terminal mappings. Delegated `run_compose` and `execute_brokered`
 proofs require `uid_separation` and reject a checkpoint that does not name the
 private namespace-mount schema.
 
-The typed `WorkloadIdentityTemporaryStorageConflict` still guards the legacy
-supervisor-visible attachment. The remaining crash gap is server ownership:
-the private FUSE server is a daemon thread, so its last checkpoint survives a
-daemon crash but the live FUSE connection does not. A durable adoptable owner
-must land before that legacy refusal is removed globally.
+The typed `WorkloadIdentityTemporaryStorageConflict` still guards only the
+legacy supervisor-visible attachment. Production private mounts transfer their
+FUSE and helper descriptors to `automonique-tempfs-owner.service`, a sibling
+outside the daemon service's kill domain. One private same-uid control socket
+binds each run to an unguessable adoption token, exact cgroup device/inode,
+sealed budget and next durable checkpoint sequence. A restarted daemon can
+therefore adopt the live ledger without receiving the FUSE descriptor back.
 
-That owner cannot truthfully be a detached thread or an ordinary child of the
-daemon service: both lose the `/dev/fuse` descriptor when the process or its
-systemd cgroup is killed. A production sidecar needs all of these as one
-coherent lifecycle, not a partial handoff:
-
-- an independently supervised, per-run process that owns the FUSE descriptor,
-  quota tree and checkpoint writer outside the daemon service's kill domain;
-- a private same-uid control socket with a persisted unguessable adoption token,
-  exact run/cgroup identity and monotonic checkpoint sequence, so a successor
-  cannot adopt the wrong filesystem or create two controllers;
-- a fenced handoff for checkpoint, exceedance, cancellation and final teardown,
-  including the cases where either daemon or sidecar dies during adoption; and
-- supervisor packaging and cleanup rules that prove the sidecar outlives a
-  daemon crash but never outlives its workload or becomes an orphan after a
-  host restart.
-
-The current launch-helper descriptor handshake is the correct kernel seam for
-such an owner, but making the receiver independently supervised changes service
-and custody architecture. Until that lifecycle and its crash matrix are proven,
-startup recovery deliberately reports only the validated last live ledger and
-does not claim the mount or workload was adopted.
+The owner acquires its singleton lock before inspecting restart state. When the
+owner itself restarts, the kernel descriptors are unrecoverable, so it
+exhaustively audits the bounded run inventory and converts every valid live
+custody record to a monotonic `Final` checkpoint with `aborted=true`. An
+unreadable or overfull inventory refuses owner startup before partial mutation;
+a second owner cannot alter custody held by the first. Normal reconciliation
+removes the token and custody record only after the final checkpoint is durable.
+The systemd installation and removal order is documented beside the units.
 
 ## Where the outcome is recorded
 

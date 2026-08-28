@@ -3,8 +3,8 @@
 //! Delegated proof for the bounded runner primitive that mounts temporary
 //! storage inside a separated workload's user+mount namespace.
 //!
-//! This does not remove the daemon admission conflict. It proves the composed
-//! kernel path that must replace the supervisor-owned mount first: the helper
+//! This proves the composed kernel path used by the daemon's production
+//! private-mount attachment: the helper
 //! opens `/dev/fuse` and mounts as namespace root, the supervisor serves the
 //! transferred descriptor, the switched workload writes and reads its TMPDIR,
 //! and restart readback comes from the filesystem ledger checkpoint.

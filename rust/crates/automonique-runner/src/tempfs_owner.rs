@@ -38,6 +38,7 @@ const OWNER_LOCK_LEAF: &str = "tempfs-owner.lock";
 const VERSION: &str = "automonique.tempfs-owner/v1";
 const MAX_REQUEST_BYTES: usize = 4096;
 const MAX_RUNS: usize = 8;
+const MAX_RECOVERY_ENTRIES: usize = 4096;
 const CHECKPOINT_INTERVAL: Duration = Duration::from_millis(200);
 const IDLE_TICK: Duration = Duration::from_millis(10);
 
@@ -393,8 +394,7 @@ pub fn owner_main() -> i32 {
         eprintln!("automonique temporary-storage owner refused: socket unavailable");
         return 1;
     };
-    abort_orphaned_live_checkpoints();
-    match serve(&path) {
+    match run_owner(&path) {
         Ok(never) => match never {},
         Err(error) => {
             eprintln!("automonique temporary-storage owner refused: {error}");
@@ -403,18 +403,44 @@ pub fn owner_main() -> i32 {
     }
 }
 
-fn abort_orphaned_live_checkpoints() {
-    let Some(state_home) = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from) else {
-        return;
-    };
-    abort_orphaned_live_checkpoints_at(&state_home.join("automonique/runs"));
+fn run_owner(path: &Path) -> Result<Never, OwnerError> {
+    let parent = path
+        .parent()
+        .ok_or(OwnerError::Refused("socket parent missing"))?;
+    private_directory(parent)?;
+    // The lock is the authority to declare prior custody orphaned. Acquiring it
+    // after recovery would let a second invocation mutate the live owner's
+    // checkpoint and adoption material before learning that it is not owner.
+    let owner_lock = owner_lock(parent)?;
+    abort_orphaned_live_checkpoints()?;
+    serve(path, owner_lock)
 }
 
-fn abort_orphaned_live_checkpoints_at(runs: &Path) {
-    let Ok(entries) = fs::read_dir(runs) else {
-        return;
+fn abort_orphaned_live_checkpoints() -> Result<(), OwnerError> {
+    let state_home = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .ok_or(OwnerError::Refused("state unavailable"))?;
+    abort_orphaned_live_checkpoints_at(&state_home.join("automonique/runs"))
+}
+
+fn abort_orphaned_live_checkpoints_at(runs: &Path) -> Result<(), OwnerError> {
+    let entries = match fs::read_dir(runs) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
     };
-    for entry in entries.take(64).flatten() {
+    // Collect before mutating so an overfull or unreadable inventory refuses
+    // startup without partially terminalizing an arbitrary prefix. Historical
+    // directories can therefore make startup fail closed, never crowd a live
+    // custody record out of reconciliation.
+    let mut bounded = Vec::new();
+    for entry in entries {
+        if bounded.len() == MAX_RECOVERY_ENTRIES {
+            return Err(OwnerError::Refused("recovery inventory exceeded"));
+        }
+        bounded.push(entry?);
+    }
+    for entry in bounded {
         let run = entry.path();
         if !entry
             .file_type()
@@ -449,16 +475,12 @@ fn abort_orphaned_live_checkpoints_at(runs: &Path) {
             cleanup_custody_state(&path);
         }
     }
+    Ok(())
 }
 
 enum Never {}
 
-fn serve(path: &Path) -> Result<Never, OwnerError> {
-    let parent = path
-        .parent()
-        .ok_or(OwnerError::Refused("socket parent missing"))?;
-    private_directory(parent)?;
-    let _owner_lock = owner_lock(parent)?;
+fn serve(path: &Path, _owner_lock: Flock<fs::File>) -> Result<Never, OwnerError> {
     if fs::symlink_metadata(path).is_ok() {
         secure_socket(path)?;
         if UnixStream::connect(path).is_ok() {
@@ -1272,7 +1294,48 @@ mod tests {
     }
 
     #[test]
-    fn owner_restart_turns_live_custody_into_an_aborted_final() {
+    fn owner_restart_finds_live_custody_after_more_than_sixty_four_historical_runs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let runs = temporary.path().join("runs");
+        private_directory_at(&runs);
+        for index in 0..80 {
+            private_directory_at(&runs.join(format!("historical-{index:03}")));
+        }
+        let run = runs.join("run-1");
+        private_directory_at(&run);
+        let cgroup = temporary.path().join("cgroup");
+        private_directory_at(&cgroup);
+        let checkpoint = run.join(crate::CHECKPOINT_LEAF);
+        live_checkpoint(&checkpoint, 7);
+        create_token(&run.join(OWNER_TOKEN_LEAF)).unwrap();
+        write_custody(
+            &run.join(OWNER_CUSTODY_LEAF),
+            &CustodyRecord {
+                run_id: "run-1".to_owned(),
+                socket: temporary.path().join("owner.sock"),
+                cgroup,
+                cgroup_dev: 1,
+                cgroup_ino: 2,
+                budget: TemporaryStorageBudget::new(8192, 8).unwrap(),
+                checkpoint: checkpoint.clone(),
+            },
+        )
+        .unwrap();
+
+        abort_orphaned_live_checkpoints_at(&runs).unwrap();
+
+        let final_checkpoint = Checkpoint::read(&checkpoint).unwrap();
+        assert_eq!(final_checkpoint.phase, CheckpointPhase::Final);
+        assert_eq!(final_checkpoint.sequence, 8);
+        let final_record = final_checkpoint.final_record.unwrap();
+        assert!(final_record.aborted);
+        assert!(!final_record.unmount_confirmed);
+        assert!(!run.join(OWNER_TOKEN_LEAF).exists());
+        assert!(!run.join(OWNER_CUSTODY_LEAF).exists());
+    }
+
+    #[test]
+    fn overfull_recovery_inventory_refuses_before_mutating_live_custody() {
         let temporary = tempfile::tempdir().unwrap();
         let runs = temporary.path().join("runs");
         private_directory_at(&runs);
@@ -1296,17 +1359,19 @@ mod tests {
             },
         )
         .unwrap();
+        for index in 0..MAX_RECOVERY_ENTRIES {
+            private_directory_at(&runs.join(format!("historical-{index:04}")));
+        }
 
-        abort_orphaned_live_checkpoints_at(&runs);
-
-        let final_checkpoint = Checkpoint::read(&checkpoint).unwrap();
-        assert_eq!(final_checkpoint.phase, CheckpointPhase::Final);
-        assert_eq!(final_checkpoint.sequence, 8);
-        let final_record = final_checkpoint.final_record.unwrap();
-        assert!(final_record.aborted);
-        assert!(!final_record.unmount_confirmed);
-        assert!(!run.join(OWNER_TOKEN_LEAF).exists());
-        assert!(!run.join(OWNER_CUSTODY_LEAF).exists());
+        assert!(matches!(
+            abort_orphaned_live_checkpoints_at(&runs),
+            Err(OwnerError::Refused("recovery inventory exceeded"))
+        ));
+        let unchanged = Checkpoint::read(&checkpoint).unwrap();
+        assert_eq!(unchanged.phase, CheckpointPhase::Live);
+        assert_eq!(unchanged.sequence, 7);
+        assert!(run.join(OWNER_TOKEN_LEAF).exists());
+        assert!(run.join(OWNER_CUSTODY_LEAF).exists());
     }
 
     #[test]

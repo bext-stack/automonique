@@ -1870,10 +1870,12 @@ impl JcodePreparedRun {
                 false,
             ) {
                 Ok(Some((exceedance, readback))) => {
-                    // Quota custody is already the authoritative terminal
-                    // fact, so retain provider events without correlating a
-                    // competing provider-refusal attribution.
-                    writer.project(&mut mapper, events);
+                    // Quota custody decides the final state, but it does not
+                    // erase an independently exact attribution for the
+                    // provider fault that preceded it. Correlate that one
+                    // fault to this request's refusal window, then append the
+                    // quota warning as the terminal-authoritative reason.
+                    writer.project_turn_outcome(&mut mapper, events, &outcome);
                     let _ = host.cancel(
                         crate::unix_millis().unwrap_or(now_ms),
                         Duration::from_millis(100),
@@ -3175,12 +3177,14 @@ fn is_containment_run_id(run_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        JcodeTemporaryStorageHost, MAX_PROVIDER_BINARY_BYTES, PROVIDER_APPROVAL_PROPOSER,
-        TokenCancelSink, admission_refusal, advance, describe_refused_destination,
-        expire_unanswered_approvals, is_containment_run_id, is_safe_segment, is_within_byte_limit,
-        poll_jcode_temporary_storage, provider_binary_digest, spool_state,
+        JcodeSpoolWriter, JcodeTemporaryStorageHost, MAX_PROVIDER_BINARY_BYTES, ObservedSequence,
+        PROVIDER_APPROVAL_PROPOSER, ProgressFrame, ProgressPublisher, TokenCancelSink,
+        admission_refusal, advance, describe_refused_destination, expire_unanswered_approvals,
+        is_containment_run_id, is_safe_segment, is_within_byte_limit, poll_jcode_temporary_storage,
+        provider_binary_digest, spool_state,
     };
     use crate::attempt_host::DaemonAttemptHost;
+    use crate::jcode_session_host::{JcodeHostError, JcodeTurnOutcome};
     use crate::progress::JcodeProgressMapper;
     use automonique_agents::JcodeEvent;
     use automonique_egress_broker::{BrokerConfig, EgressBroker};
@@ -3211,6 +3215,12 @@ mod tests {
         exceedance: Option<Exceedance>,
         checkpoint_count: usize,
         refuse_checkpoint: bool,
+    }
+
+    struct NoopPublisher;
+
+    impl ProgressPublisher for NoopPublisher {
+        fn publish(&self, _sequence: u64, _payload: &[u8]) {}
     }
 
     impl JcodeTemporaryStorageHost for FakeJcodeTemporaryStorage {
@@ -3688,6 +3698,62 @@ mod tests {
             true,
         );
         assert!(after_consumption.body.text().is_none());
+    }
+
+    #[test]
+    fn quota_keeps_correlated_provider_destination_while_remaining_terminal_authoritative() {
+        let broker = EgressBroker::start(BrokerConfig::default()).expect("deny-all broker starts");
+        let observer = broker.refused_destination_observer();
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let run_id = "quota-provider-correlation";
+        let mut writer = JcodeSpoolWriter {
+            spool: Spool::open(directory.path(), run_id, 64 * 1024).unwrap(),
+            frame_run_id: automonique_protocol::tools::RunId::new(run_id).unwrap(),
+            publisher: Box::new(NoopPublisher),
+            observed: ObservedSequence::default(),
+            progress_stopped: false,
+            refused_destination: Some(observer),
+            refused_destination_cursor: None,
+        };
+        writer.started(1).unwrap();
+        writer.begin_provider_request();
+        refuse_destination(&broker, "Quota.Example", 443);
+        let outcome: Result<JcodeTurnOutcome, JcodeHostError> =
+            Err(JcodeHostError::ProviderRefused);
+        writer.project_turn_outcome(
+            &mut JcodeProgressMapper::new(false),
+            vec![JcodeEvent::Error {
+                reply_to: Some(3),
+                code: "rejected".to_owned(),
+            }],
+            &outcome,
+        );
+        writer.temporary_storage_exceeded(byte_exceedance(), None);
+        let finished = writer.finish(RunSpoolState::Failed);
+        assert_eq!(finished.state, RunSpoolState::Failed);
+
+        let reopened = Spool::open(directory.path(), run_id, 64 * 1024).unwrap();
+        let events = reopened.events_after(0).unwrap();
+        let frames: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind() == EventKind::AdapterEvent)
+            .filter_map(|event| ProgressFrame::from_canonical_bytes(event.payload()).ok())
+            .collect();
+        assert_eq!(
+            frames[0].body().text().map(|text| text.as_str()),
+            Some("provider route refused destination quota.example:443")
+        );
+        assert!(
+            frames[1]
+                .body()
+                .text()
+                .is_some_and(|text| text.as_str().contains("temporary-storage budget exceeded"))
+        );
+        assert_eq!(
+            events.last().map(|event| event.payload()),
+            Some(b"failed".as_ref())
+        );
     }
 
     #[test]

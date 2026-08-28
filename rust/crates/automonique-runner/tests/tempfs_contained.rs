@@ -133,10 +133,10 @@ fn proof_or_not_proven(proof: &str) -> Option<Proof> {
 }
 
 #[test]
-fn a_contained_workload_that_overflows_its_budget_is_killed_with_a_typed_outcome() {
-    let Some(proof) = proof_or_not_proven(
-        "a_contained_workload_that_overflows_its_budget_is_killed_with_a_typed_outcome",
-    ) else {
+fn an_immediately_exiting_workload_keeps_a_typed_budget_outcome() {
+    let Some(proof) =
+        proof_or_not_proven("an_immediately_exiting_workload_keeps_a_typed_budget_outcome")
+    else {
         return;
     };
     let temp = TempDir::new("overflow");
@@ -151,12 +151,11 @@ fn a_contained_workload_that_overflows_its_budget_is_killed_with_a_typed_outcome
     let mnt = mountpoint;
 
     // The workload writes far past the ceiling into $TMPDIR — the grant and the
-    // variable are exactly what admission attaches — then sleeps, so it is
-    // still alive when the supervisor observes the first refusal and kills it.
-    // Without the sleep the workload could exit on its own before the poll and
-    // the outcome would be an ordinary failure rather than the budget one.
+    // variable are exactly what admission attaches — and exits immediately
+    // after `dd` receives ENOSPC. The final owner reconciliation must retain the
+    // typed quota outcome even when no live supervision poll observed it.
     let script = format!(
-        "{bb} dd if=/dev/zero of=\"$TMPDIR/fill\" bs=4096 count=64; {bb} sleep 30",
+        "{bb} dd if=/dev/zero of=\"$TMPDIR/fill\" bs=4096 count=64",
         bb = BUSYBOX
     );
     let plan = LaunchPlan::new(BUSYBOX, busybox_sha256())
