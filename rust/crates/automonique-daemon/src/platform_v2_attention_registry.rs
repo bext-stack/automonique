@@ -122,17 +122,39 @@ impl<'de> Deserialize<'de> for StrictJson {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct AttentionRegistry {
     installed: Option<InstalledRegistry>,
 }
 
-#[derive(Debug)]
 struct InstalledRegistry {
     path: PathBuf,
     expected_uid: u32,
     generation: FileGeneration,
     snapshots: Vec<AttentionSourceSnapshot>,
+}
+
+impl std::fmt::Debug for AttentionRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (state, snapshot_count) = self.installed.as_ref().map_or(("unavailable", 0), |value| {
+            ("installed", value.snapshots.len())
+        });
+        formatter
+            .debug_struct("AttentionRegistry")
+            .field("state", &state)
+            .field("snapshot_count", &snapshot_count)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for InstalledRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InstalledRegistry")
+            .field("state", &"installed")
+            .field("snapshot_count", &self.snapshots.len())
+            .finish()
+    }
 }
 
 impl AttentionRegistry {
@@ -367,6 +389,48 @@ mod tests {
     }
 
     #[test]
+    fn registry_debug_is_count_only_and_never_projects_private_coordinates() {
+        let directory = private_directory();
+        let path = directory.path().join("attention-secret-registry.json");
+        let mut snapshot = fixture();
+        snapshot["source"]["id"] = serde_json::json!("source-secret-value");
+        snapshot["project"] = serde_json::json!("project-secret-value");
+        snapshot["user_workspace"] = serde_json::json!("workspace-secret-value");
+        snapshot["items"][0]["id"] = serde_json::json!("item-secret-value");
+        snapshot["items"][0]["nested_agent_path"] = serde_json::json!(["agent-secret-value"]);
+        snapshot["items"][0]["platform_session"]["id"] = serde_json::json!("session-secret-value");
+        write_registry(&path, vec![snapshot], "attention-secret-generation");
+        let mut store = store(directory.path());
+        let registry = AttentionRegistry::open(&path, uid(), &mut store).unwrap();
+        assert_eq!(
+            format!("{registry:?}"),
+            "AttentionRegistry { state: \"installed\", snapshot_count: 1 }"
+        );
+        assert_eq!(
+            format!("{:?}", registry.installed.as_ref().unwrap()),
+            "InstalledRegistry { state: \"installed\", snapshot_count: 1 }"
+        );
+        for forbidden in [
+            "attention-secret-registry",
+            "attention-secret-generation",
+            "source-secret-value",
+            "project-secret-value",
+            "workspace-secret-value",
+            "item-secret-value",
+            "agent-secret-value",
+            "session-secret-value",
+        ] {
+            assert!(!format!("{registry:?}").contains(forbidden));
+            assert!(!format!("{:?}", registry.installed.as_ref().unwrap()).contains(forbidden));
+        }
+
+        assert_eq!(
+            format!("{:?}", AttentionRegistry::default()),
+            "AttentionRegistry { state: \"unavailable\", snapshot_count: 0 }"
+        );
+    }
+
+    #[test]
     fn installed_registry_persists_and_returns_only_the_exact_tuple() {
         let directory = private_directory();
         let path = directory.path().join("registry.json");
@@ -444,6 +508,7 @@ mod tests {
         current_a["project"] = serde_json::json!("project-a");
         let mut current_b = fixture();
         current_b["project"] = serde_json::json!("project-b");
+        current_b["source"]["id"] = serde_json::json!("provider-feed-2");
         write_registry(
             &path,
             vec![current_a.clone(), current_b.clone()],

@@ -23,7 +23,9 @@ absence from the next complete source snapshot. The Rust successor validator
 checks the source, project, workspace, predecessor, source revision,
 observation time, and surviving item revisions before a consumer replaces its
 current value. The durable host store additionally retains every previously
-issued item identity after removal and refuses later reuse.
+issued item identity after removal and refuses later reuse by that source in
+any project or `UserWorkspace` tuple. This lifetime custody does not widen
+tuple-scoped request authorization.
 
 Each item contains a closed `NeedsYou`, `Working`, `Done`, or `Blocked` state,
 a compatible closed reason, an explicit unread boolean, its observation time,

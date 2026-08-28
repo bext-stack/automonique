@@ -323,9 +323,12 @@ On startup, the complete validated registry generation is imported in one
 transaction into the tenant-bound `platform-v2-attention.sqlite3` store. The
 store accepts only an exact idempotent replay or a contract-validated
 successor, integrity-binds the canonical bytes, durably retains every issued
-item identity so a removed ID cannot be reused, and revalidates duplicated
+item identity across every project and `UserWorkspace` tuple owned by that
+source so a removed or moved ID cannot be reused, and revalidates duplicated
 scope/revision/time fields on every read. If any tuple conflicts, no tuple from
-that registry generation is committed. The host first authorizes the exact
+that registry generation is committed. Request authorization remains bound to
+the exact tuple and is not inferred from this source-lifetime identity custody.
+The host first authorizes the exact
 project and `UserWorkspace` through the current policy/work-context mapping,
 then requires the registry tuple and persisted document to remain
 byte-identical. Stale rows left by a removed registry entry are therefore

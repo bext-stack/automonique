@@ -51,14 +51,11 @@ CREATE TABLE attention_source_current (
 CREATE TABLE attention_item_history (
     source_kind TEXT NOT NULL,
     source_id TEXT NOT NULL,
-    project_id TEXT NOT NULL,
-    user_workspace_id TEXT NOT NULL,
     item_id TEXT NOT NULL CHECK (length(item_id) BETWEEN 1 AND 256),
+    first_project_id TEXT NOT NULL,
+    first_user_workspace_id TEXT NOT NULL,
     first_source_revision INTEGER NOT NULL CHECK (first_source_revision >= 1),
-    PRIMARY KEY (source_kind, source_id, project_id, user_workspace_id, item_id),
-    FOREIGN KEY (source_kind, source_id, project_id, user_workspace_id)
-      REFERENCES attention_source_current(source_kind, source_id, project_id, user_workspace_id)
-      ON DELETE RESTRICT
+    PRIMARY KEY (source_kind, source_id, item_id)
 ) STRICT;
 "#;
 
@@ -254,6 +251,11 @@ fn put_prepared_snapshot(
             return Err(AttentionStoreError::Conflict("source_revision"));
         }
     } else {
+        for item in snapshot.items() {
+            if item_identity_exists(transaction, snapshot, item.id().as_str())? {
+                return Err(AttentionStoreError::Conflict("item_identity_reused"));
+            }
+        }
         transaction.execute(
                 "INSERT INTO attention_source_current(source_kind,source_id,project_id,user_workspace_id,source_revision,observed_at_ms,snapshot_document,snapshot_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![snapshot.source().kind().as_str(), snapshot.source().id().as_str(), snapshot.project().as_str(), snapshot.user_workspace().as_str(), to_db(snapshot.revision().get())?, to_db(snapshot.observed_at_ms())?, document, document_digest.as_slice()],
@@ -313,8 +315,8 @@ fn insert_item_identity(
     item_id: &str,
 ) -> Stored<()> {
     transaction.execute(
-        "INSERT INTO attention_item_history(source_kind,source_id,project_id,user_workspace_id,item_id,first_source_revision) VALUES(?1,?2,?3,?4,?5,?6)",
-        params![snapshot.source().kind().as_str(), snapshot.source().id().as_str(), snapshot.project().as_str(), snapshot.user_workspace().as_str(), item_id, to_db(snapshot.revision().get())?],
+        "INSERT INTO attention_item_history(source_kind,source_id,item_id,first_project_id,first_user_workspace_id,first_source_revision) VALUES(?1,?2,?3,?4,?5,?6)",
+        params![snapshot.source().kind().as_str(), snapshot.source().id().as_str(), item_id, snapshot.project().as_str(), snapshot.user_workspace().as_str(), to_db(snapshot.revision().get())?],
     )?;
     Ok(())
 }
@@ -326,8 +328,8 @@ fn item_identity_exists(
 ) -> Stored<bool> {
     connection
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM attention_item_history WHERE source_kind=?1 AND source_id=?2 AND project_id=?3 AND user_workspace_id=?4 AND item_id=?5)",
-            params![snapshot.source().kind().as_str(), snapshot.source().id().as_str(), snapshot.project().as_str(), snapshot.user_workspace().as_str(), item_id],
+            "SELECT EXISTS(SELECT 1 FROM attention_item_history WHERE source_kind=?1 AND source_id=?2 AND item_id=?3)",
+            params![snapshot.source().kind().as_str(), snapshot.source().id().as_str(), item_id],
             |row| row.get(0),
         )
         .map_err(Into::into)
@@ -412,6 +414,27 @@ mod tests {
         state: AttentionItemState,
         with_item: bool,
     ) -> AttentionSourceSnapshot {
+        source_scoped_snapshot(
+            "review-source",
+            project,
+            "workspace",
+            revision_value,
+            previous,
+            state,
+            with_item,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn source_scoped_snapshot(
+        source_id: &str,
+        project: &str,
+        workspace: &str,
+        revision_value: u64,
+        previous: Option<u64>,
+        state: AttentionItemState,
+        with_item: bool,
+    ) -> AttentionSourceSnapshot {
         let reason = match state {
             AttentionItemState::NeedsYou => AttentionItemReason::ApprovalRequired,
             AttentionItemState::Working => AttentionItemReason::AgentWorking,
@@ -421,10 +444,10 @@ mod tests {
         AttentionSourceSnapshot::new(
             AttentionSource::new(
                 AttentionSourceKind::Review,
-                AttentionSourceId::new("review-source").unwrap(),
+                AttentionSourceId::new(source_id).unwrap(),
             ),
             ProjectId::new(project).unwrap(),
-            UserWorkspaceId::new("workspace").unwrap(),
+            UserWorkspaceId::new(workspace).unwrap(),
             Revision::new(revision_value).unwrap(),
             previous.map(|value| Revision::new(value).unwrap()),
             1_000 + revision_value,
@@ -571,15 +594,46 @@ mod tests {
     #[test]
     fn registry_batch_rolls_back_earlier_tuple_when_a_later_tuple_conflicts() {
         let (_directory, mut store) = store();
-        let current_a = scoped_snapshot("project-a", 1, None, AttentionItemState::Working, true);
-        let current_b = scoped_snapshot("project-b", 1, None, AttentionItemState::Working, true);
+        let current_a = source_scoped_snapshot(
+            "source-a",
+            "project-a",
+            "workspace-a",
+            1,
+            None,
+            AttentionItemState::Working,
+            true,
+        );
+        let current_b = source_scoped_snapshot(
+            "source-b",
+            "project-b",
+            "workspace-b",
+            1,
+            None,
+            AttentionItemState::Working,
+            true,
+        );
         store
             .put_snapshots(&[current_a.clone(), current_b.clone()])
             .unwrap();
 
-        let successor_a = scoped_snapshot("project-a", 2, Some(1), AttentionItemState::Done, true);
-        let wrong_predecessor_b =
-            scoped_snapshot("project-b", 3, Some(2), AttentionItemState::Done, true);
+        let successor_a = source_scoped_snapshot(
+            "source-a",
+            "project-a",
+            "workspace-a",
+            2,
+            Some(1),
+            AttentionItemState::Done,
+            true,
+        );
+        let wrong_predecessor_b = source_scoped_snapshot(
+            "source-b",
+            "project-b",
+            "workspace-b",
+            3,
+            Some(2),
+            AttentionItemState::Done,
+            true,
+        );
         assert!(matches!(
             store.put_snapshots(&[successor_a, wrong_predecessor_b]),
             Err(AttentionStoreError::Conflict("source_revision"))
@@ -604,5 +658,165 @@ mod tests {
                 .unwrap(),
             Some(current_b)
         );
+    }
+
+    #[test]
+    fn retired_item_identity_survives_absence_and_restart() {
+        let (directory, mut store) = store();
+        let first = snapshot(1, None, AttentionItemState::Working);
+        store.put_snapshot(&first).unwrap();
+        let removed = scoped_snapshot("project", 2, Some(1), AttentionItemState::Done, false);
+        store.put_snapshot(&removed).unwrap();
+        drop(store);
+
+        let mut reopened =
+            AttentionStore::open_scoped(directory.path().join("attention.sqlite3"), "tenant")
+                .unwrap();
+        let reused = scoped_snapshot("project", 3, Some(2), AttentionItemState::Done, true);
+        assert!(matches!(
+            reopened.put_snapshot(&reused),
+            Err(AttentionStoreError::Conflict("item_identity_reused"))
+        ));
+        assert_eq!(
+            reopened
+                .snapshot(
+                    removed.source(),
+                    removed.project(),
+                    removed.user_workspace(),
+                )
+                .unwrap(),
+            Some(removed)
+        );
+    }
+
+    #[test]
+    fn source_lifetime_identity_cannot_cross_project_or_workspace_tuples() {
+        let (_directory, mut store) = store();
+        let original = source_scoped_snapshot(
+            "shared-source",
+            "project-a",
+            "workspace-a",
+            1,
+            None,
+            AttentionItemState::Working,
+            true,
+        );
+        store.put_snapshot(&original).unwrap();
+        for foreign in [
+            source_scoped_snapshot(
+                "shared-source",
+                "project-b",
+                "workspace-a",
+                1,
+                None,
+                AttentionItemState::Working,
+                true,
+            ),
+            source_scoped_snapshot(
+                "shared-source",
+                "project-a",
+                "workspace-b",
+                1,
+                None,
+                AttentionItemState::Working,
+                true,
+            ),
+        ] {
+            assert!(matches!(
+                store.put_snapshot(&foreign),
+                Err(AttentionStoreError::Conflict("item_identity_reused"))
+            ));
+            assert!(
+                store
+                    .snapshot(
+                        foreign.source(),
+                        foreign.project(),
+                        foreign.user_workspace(),
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn cross_tuple_identity_reuse_rolls_back_an_earlier_batch_successor() {
+        let (_directory, mut store) = store();
+        let current = source_scoped_snapshot(
+            "independent-source",
+            "project-a",
+            "workspace-a",
+            1,
+            None,
+            AttentionItemState::Working,
+            true,
+        );
+        let identity_origin = source_scoped_snapshot(
+            "shared-source",
+            "project-origin",
+            "workspace-origin",
+            1,
+            None,
+            AttentionItemState::Working,
+            true,
+        );
+        store
+            .put_snapshots(&[current.clone(), identity_origin])
+            .unwrap();
+
+        for cross_tuple_reuse in [
+            source_scoped_snapshot(
+                "shared-source",
+                "project-foreign",
+                "workspace-origin",
+                1,
+                None,
+                AttentionItemState::Working,
+                true,
+            ),
+            source_scoped_snapshot(
+                "shared-source",
+                "project-origin",
+                "workspace-foreign",
+                1,
+                None,
+                AttentionItemState::Working,
+                true,
+            ),
+        ] {
+            let successor = source_scoped_snapshot(
+                "independent-source",
+                "project-a",
+                "workspace-a",
+                2,
+                Some(1),
+                AttentionItemState::Done,
+                true,
+            );
+            assert!(matches!(
+                store.put_snapshots(&[successor, cross_tuple_reuse.clone()]),
+                Err(AttentionStoreError::Conflict("item_identity_reused"))
+            ));
+            assert_eq!(
+                store
+                    .snapshot(
+                        current.source(),
+                        current.project(),
+                        current.user_workspace(),
+                    )
+                    .unwrap(),
+                Some(current.clone())
+            );
+            assert!(
+                store
+                    .snapshot(
+                        cross_tuple_reuse.source(),
+                        cross_tuple_reuse.project(),
+                        cross_tuple_reuse.user_workspace(),
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 }
