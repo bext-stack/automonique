@@ -42,13 +42,12 @@ struct FileGeneration {
     digest: Sha256Digest,
 }
 
-#[derive(Debug)]
 struct PrivateSnapshot {
     bytes: Vec<u8>,
     generation: FileGeneration,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RegistryDocument {
     version: u8,
@@ -57,7 +56,7 @@ struct RegistryDocument {
     bindings: Vec<RegistryBinding>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RegistryBinding {
     project: String,
@@ -68,7 +67,7 @@ struct RegistryBinding {
     target: RegistryTarget,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum RegistryTarget {
     LocalRepository {
@@ -100,17 +99,25 @@ pub(crate) enum ReviewEffectPlan {
 /// `None` is represented by an empty adapter and retains the previous
 /// fail-closed behavior. An installed malformed or insecure registry is an
 /// error so production never silently ignores an operator mistake.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct ProductionReviewEffectAdapter {
     installed: Option<InstalledRegistry>,
 }
 
-#[derive(Debug)]
 struct InstalledRegistry {
     path: PathBuf,
     expected_uid: u32,
     generation: FileGeneration,
     document: RegistryDocument,
+}
+
+impl std::fmt::Debug for ProductionReviewEffectAdapter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProductionReviewEffectAdapter")
+            .field("installed", &self.installed.is_some())
+            .finish()
+    }
 }
 
 impl ProductionReviewEffectAdapter {
@@ -398,7 +405,7 @@ fn validate_private_file_metadata(
     if !metadata.is_file()
         || metadata.uid() != expected_uid
         || metadata.nlink() != 1
-        || metadata.permissions().mode() & 0o777 != 0o600
+        || metadata.permissions().mode() & 0o7777 != 0o600
         || metadata.len() > MAX_REGISTRY_BYTES
     {
         return Err("platform_v2_review_registry_insecure");
@@ -533,6 +540,58 @@ mod tests {
             ProductionReviewEffectAdapter::open(&link, uid()),
             Err("platform_v2_review_registry_insecure")
         ));
+    }
+
+    #[test]
+    fn registry_rejects_every_special_permission_bit() {
+        let temporary = TempDir::new().unwrap();
+        let registry = temporary.path().join("registry.json");
+        write_registry(
+            &registry,
+            r#"{"version":1,"generation":"generation-1","bindings":[]}"#,
+        );
+        for mode in [0o4600, 0o2600, 0o1600] {
+            fs::set_permissions(&registry, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                fs::symlink_metadata(&registry)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                mode
+            );
+            assert!(matches!(
+                ProductionReviewEffectAdapter::open(&registry, uid()),
+                Err("platform_v2_review_registry_insecure")
+            ));
+        }
+    }
+
+    #[test]
+    fn adapter_debug_is_redacted_for_every_private_target_field() {
+        let temporary = TempDir::new().unwrap();
+        let registry = temporary.path().join("registry.json");
+        write_registry(
+            &registry,
+            r#"{"version":1,"generation":"sensitive-generation","bindings":[{"project":"project-sensitive","workspace_kind":"user_workspace","workspace_id":"workspace-sensitive","authority_kind":"ci","authority_id":"ci-sensitive","target":{"kind":"ci","provider":"provider-sensitive","target":"owner-sensitive/repository-sensitive","credential_reference":"credential-sensitive"}}]}"#,
+        );
+        let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
+        let rendered = format!("{adapter:?}");
+        assert_eq!(
+            rendered,
+            "ProductionReviewEffectAdapter { installed: true }"
+        );
+        for private in [
+            "sensitive-generation",
+            "project-sensitive",
+            "workspace-sensitive",
+            "ci-sensitive",
+            "provider-sensitive",
+            "owner-sensitive/repository-sensitive",
+            "credential-sensitive",
+        ] {
+            assert!(!rendered.contains(private));
+        }
     }
 
     #[test]
