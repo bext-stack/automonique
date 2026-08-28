@@ -27,6 +27,7 @@ import {
   type ProjectId,
   type ReceiptId,
   type ReviewAction,
+  type ReviewConfirmationDigest,
   type ReviewWorkspaceIdentity,
   type UserWorkspaceId,
   type WorkspaceIntent,
@@ -607,8 +608,25 @@ export class PlatformV2Client {
     return response;
   }
 
+  async getReviewCapabilities(project: ProjectId, workspace: ReviewWorkspaceIdentity, signal?: AbortSignal) {
+    const response = requireResponse(await this.#request({kind: "get_review_capabilities", request: {project, workspace}}, signal), ["review_capabilities"] as const);
+    if (response.kind === "review_capabilities"
+      && (response.capabilities.project !== project || !sameIdentity(response.capabilities.workspace, workspace))) {
+      throw new PlatformTransportError(502, "response_coordinate_mismatch");
+    }
+    return response;
+  }
+
   async executeReviewAction(workspace: ReviewWorkspaceIdentity, expectedRevision: WorkContextRevision, action: ReviewAction, idempotencyKey: IdempotencyKey, signal?: AbortSignal) {
     const response = requireResponse(await this.#request({kind: "execute_review_action", request: {workspace, expected_revision: expectedRevision, action, idempotency_key: idempotencyKey}}, signal), ["review_receipt"] as const);
+    if (response.kind === "review_receipt" && response.receipt.idempotency_key !== idempotencyKey) {
+      throw new PlatformTransportError(502, "response_idempotency_mismatch");
+    }
+    return response;
+  }
+
+  async executeConfirmedReviewAction(workspace: ReviewWorkspaceIdentity, expectedRevision: WorkContextRevision, action: ReviewAction, idempotencyKey: IdempotencyKey, confirmationDigest: ReviewConfirmationDigest, signal?: AbortSignal) {
+    const response = requireResponse(await this.#request({kind: "execute_review_action", request: {workspace, expected_revision: expectedRevision, action, idempotency_key: idempotencyKey, confirmation_digest: confirmationDigest}}, signal), ["review_receipt"] as const);
     if (response.kind === "review_receipt" && response.receipt.idempotency_key !== idempotencyKey) {
       throw new PlatformTransportError(502, "response_idempotency_mismatch");
     }

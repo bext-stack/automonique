@@ -65,6 +65,23 @@ test("preview is inert and confirmed controls persist their receipt before sendi
   expect(script).toContain('action: "get_review_receipt"');
 });
 
+test("check rerun requires a server preview followed by a distinct explicit confirm", () => {
+  const previewStart = script.indexOf("async function previewCockpitRerun()");
+  const previewEnd = script.indexOf("async function reconcileCockpitControl", previewStart);
+  const preview = script.slice(previewStart, previewEnd);
+  expect(preview).toContain('action: "preview_rerun_check"');
+  expect(preview).not.toContain("persistCockpitControl(handle)");
+  expect(html).toContain('id="cockpit-rerun-preview" hidden aria-live="polite"');
+  expect(html).toContain('id="cockpit-rerun-confirm" type="button"');
+  expect(script).toContain('byId("cockpit-rerun-check").addEventListener("click", previewCockpitRerun)');
+  expect(script).toContain('byId("cockpit-rerun-confirm").addEventListener("click", () => submitCockpitReview("rerunCheck"))');
+  const submitStart = script.indexOf("async function submitCockpitReview(action)");
+  const submitEnd = script.indexOf("async function previewCockpitRerun", submitStart);
+  const submit = script.slice(submitStart, submitEnd);
+  expect(submit).toContain("confirmation_digest: cockpitRerunPreview?.confirmation_digest");
+  expect(submit.indexOf("persistCockpitControl(handle)")).toBeLessThan(submit.indexOf('api("/api/platform/cockpit"'));
+});
+
 test("generic recovery remains secondary to the hosted workspace surface", () => {
   expect(html.indexOf('data-panel="sessions"')).toBeLessThan(html.indexOf('data-panel="chat"'));
   expect(html).toContain("SECONDARY / RECOVERY");

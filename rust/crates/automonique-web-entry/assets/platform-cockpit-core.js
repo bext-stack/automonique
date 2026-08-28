@@ -467,7 +467,10 @@
       const projectId = boundedText(target?.project_id, 256);
       const workspaceId = boundedText(target?.workspace_id, 256);
       const checkId = boundedText(target?.check_id, 256);
+      const confirmationDigest = typeof target?.confirmation_digest === "string"
+        && /^[0-9a-f]{64}$/.test(target.confirmation_digest) ? target.confirmation_digest : null;
       if (!projectId || !workspaceId || !checkId
+        || !confirmationDigest
         || !validDecimal(target?.exact_revision, false)
         || !validDecimal(target?.exact_check_revision, false)) return null;
       return Object.freeze({
@@ -476,6 +479,7 @@
         exact_revision: target.exact_revision,
         check_id: checkId,
         exact_check_revision: target.exact_check_revision,
+        confirmation_digest: confirmationDigest,
       });
     });
     const unique = new Set(targets.filter(Boolean).map((target) => target.check_id));

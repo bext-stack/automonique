@@ -292,6 +292,7 @@ function encodeV2FixtureResponse(requestId: string, response: PlatformV2Response
     case "workspace_intent_result": body = parseCanonical(encodeWorkspaceIntentOutcome(negotiatedV2, response.result)); break;
     case "review_result": body = parseCanonical(encodeReviewSnapshot(response.review)); break;
     case "attention_source_snapshot": body = json(response.snapshot); break;
+    case "review_capabilities": body = json(response.capabilities); break;
     case "review_receipt": body = parseCanonical(encodeReviewActionReceipt(response.receipt)); break;
     case "platform_v2_refused": body = json(response.refusal); break;
     default: {

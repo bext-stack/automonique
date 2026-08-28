@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use automonique_github_connector::{GitHubToken, RepoTarget, WorkflowRunId};
 use automonique_protocol::digest::{Sha256, Sha256Digest};
+use automonique_protocol::identity::Actor;
 use automonique_protocol::platform_v2::{
     ProjectId, WorkContextIdentity, WorkContextTargetKind, WorkSessionId,
 };
@@ -432,6 +433,69 @@ impl ProductionReviewEffectAdapter {
             .map_err(|_| "platform_v2_review_ci_preflight_refused")
     }
 
+    /// Commit an inert client confirmation to the exact actor, review
+    /// coordinate, provider target, and installed registry/credential
+    /// generations that were preflighted for advertisement.
+    #[allow(clippy::too_many_arguments)] // Every field is an independently fenced commitment input.
+    pub(crate) fn github_confirmation_digest(
+        &self,
+        actor: &Actor,
+        project: &ProjectId,
+        workspace: &WorkContextIdentity,
+        authority: &ReviewAuthority,
+        snapshot_revision: Revision,
+        action: &ReviewAction,
+        plan: &ReviewEffectPlan,
+    ) -> Result<[u8; 32], &'static str> {
+        let (
+            ReviewAction::RerunCheck {
+                check_id,
+                expected_check_revision,
+            },
+            ReviewEffectPlan::GitHubCheckRerun {
+                credential_reference,
+                repository,
+                run_id,
+                head_sha,
+                observed_attempt,
+                expected_check_revision: plan_check_revision,
+                registry_generation,
+                credential_generation,
+            },
+        ) = (action, plan)
+        else {
+            return Err("platform_v2_review_confirmation_invalid");
+        };
+        if expected_check_revision != plan_check_revision {
+            return Err("platform_v2_review_confirmation_invalid");
+        }
+        let mut document = Vec::new();
+        push_confirmation_field(&mut document, b"automonique.review-rerun-confirmation/v1");
+        for field in [
+            registry_generation.as_slice(),
+            credential_generation.as_slice(),
+            actor.tenant().as_bytes(),
+            actor.id().as_bytes(),
+            project.as_str().as_bytes(),
+            workspace.kind().as_str().as_bytes(),
+            workspace.id().as_bytes(),
+            authority.kind().as_str().as_bytes(),
+            authority.id().as_str().as_bytes(),
+            credential_reference.as_bytes(),
+            repository.owner().as_str().as_bytes(),
+            repository.repo().as_str().as_bytes(),
+            head_sha.as_bytes(),
+            check_id.as_str().as_bytes(),
+        ] {
+            push_confirmation_field(&mut document, field);
+        }
+        push_confirmation_field(&mut document, &run_id.get().to_be_bytes());
+        push_confirmation_field(&mut document, &observed_attempt.to_be_bytes());
+        push_confirmation_field(&mut document, &snapshot_revision.get().to_be_bytes());
+        push_confirmation_field(&mut document, &expected_check_revision.get().to_be_bytes());
+        Ok(*Sha256::digest(&document).as_bytes())
+    }
+
     fn verify_github_credential_generation(
         &self,
         expected: Option<[u8; 32]>,
@@ -452,6 +516,11 @@ impl ProductionReviewEffectAdapter {
         }
         Ok(())
     }
+}
+
+fn push_confirmation_field(document: &mut Vec<u8>, field: &[u8]) {
+    document.extend_from_slice(&(field.len() as u64).to_be_bytes());
+    document.extend_from_slice(field);
 }
 
 /// Reopen and validate the private registry immediately before an already
@@ -1016,6 +1085,89 @@ mod tests {
             _ => panic!("exact GitHub plan expected"),
         }
         assert!(!format!("{adapter:?}").contains("github_pat_fixture"));
+    }
+
+    #[test]
+    fn github_confirmation_binds_actor_revision_and_installed_generations() {
+        let temporary = TempDir::new().unwrap();
+        let registry = temporary.path().join("registry.json");
+        let credentials = temporary.path().join(REVIEW_GITHUB_CREDENTIALS_FILE_NAME);
+        write_registry(&registry, github_registry());
+        write_registry(
+            &credentials,
+            &github_credentials(true, "example-org/example-repo"),
+        );
+        let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
+        let project = ProjectId::new("project-1").unwrap();
+        let workspace = workspace();
+        let authority = ci_authority();
+        let action = rerun_action(7);
+        let plan = adapter
+            .plan(&project, &workspace, &authority, &action)
+            .unwrap();
+        let actor = Actor::new("tenant-1", "actor-1").unwrap();
+        let baseline = adapter
+            .github_confirmation_digest(
+                &actor,
+                &project,
+                &workspace,
+                &authority,
+                Revision::new(9).unwrap(),
+                &action,
+                &plan,
+            )
+            .unwrap();
+        assert_ne!(
+            baseline,
+            adapter
+                .github_confirmation_digest(
+                    &Actor::new("tenant-1", "actor-2").unwrap(),
+                    &project,
+                    &workspace,
+                    &authority,
+                    Revision::new(9).unwrap(),
+                    &action,
+                    &plan,
+                )
+                .unwrap()
+        );
+        assert_ne!(
+            baseline,
+            adapter
+                .github_confirmation_digest(
+                    &actor,
+                    &project,
+                    &workspace,
+                    &authority,
+                    Revision::new(10).unwrap(),
+                    &action,
+                    &plan,
+                )
+                .unwrap()
+        );
+        let mut changed_generation = plan.clone();
+        let ReviewEffectPlan::GitHubCheckRerun {
+            registry_generation,
+            ..
+        } = &mut changed_generation
+        else {
+            panic!("github plan expected")
+        };
+        registry_generation[0] ^= 1;
+        assert_ne!(
+            baseline,
+            adapter
+                .github_confirmation_digest(
+                    &actor,
+                    &project,
+                    &workspace,
+                    &authority,
+                    Revision::new(9).unwrap(),
+                    &action,
+                    &changed_generation,
+                )
+                .unwrap()
+        );
     }
 
     #[test]

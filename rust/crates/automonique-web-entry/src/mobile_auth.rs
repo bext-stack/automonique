@@ -203,7 +203,7 @@ pub enum MobilePlatformV2Action {
 }
 
 impl MobilePlatformV2Action {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::QueryWorkContexts,
         Self::GetLineage,
         Self::PrepareMutation,

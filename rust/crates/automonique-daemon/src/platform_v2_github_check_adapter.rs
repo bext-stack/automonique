@@ -509,12 +509,24 @@ fn reconcile(
         .observed_run_attempt
         .checked_add(1)
         .ok_or(GitHubCheckRerunError::InvalidPlan)?;
-    if run.run_attempt == next_attempt
-        && submission.custody != GitHubCheckRerunCustody::NotStarted
-        && submission.custody != GitHubCheckRerunCustody::Refused
-    {
-        submission.custody = GitHubCheckRerunCustody::Completed;
-        return Ok(submission.custody);
+    // A later GET has no provider-issued correlation token.  It can prove the
+    // result of our mutation only when this process previously received the
+    // 201 response for that exact POST.  In particular, a durable
+    // `CustodyStarted` record may represent a crash before the POST, and an
+    // `Ambiguous` record may be followed by another actor's rerun.  Treating
+    // either uncorrelated +1 attempt as ours would forge actor attribution.
+    if run.run_attempt == next_attempt {
+        if submission.custody == GitHubCheckRerunCustody::Accepted {
+            submission.custody = GitHubCheckRerunCustody::Completed;
+            return Ok(submission.custody);
+        }
+        if matches!(
+            submission.custody,
+            GitHubCheckRerunCustody::CustodyStarted | GitHubCheckRerunCustody::Ambiguous
+        ) {
+            submission.custody = GitHubCheckRerunCustody::Ambiguous;
+            return Ok(submission.custody);
+        }
     }
     if run.run_attempt != plan.observed_run_attempt {
         return Err(GitHubCheckRerunError::ResourceChanged);
@@ -861,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_post_stays_ambiguous_until_exactly_one_later_attempt_exists() {
+    fn ambiguous_post_stays_ambiguous_when_an_uncorrelated_next_attempt_exists() {
         let transport = FakeTransport::new(
             vec![accepted(run(3)), accepted(run(3)), accepted(run(4))],
             vec![Err(GitHubFailure::TimedOut)],
@@ -889,6 +901,36 @@ mod tests {
                 &mut submission,
             ),
             Ok(GitHubCheckRerunCustody::Ambiguous)
+        );
+        assert_eq!(
+            reconcile(
+                &transport,
+                "github-actions-mobile",
+                &target(),
+                &plan,
+                &mut submission,
+            ),
+            Ok(GitHubCheckRerunCustody::Ambiguous)
+        );
+        assert_eq!(transport.write_count.get(), 1);
+    }
+
+    #[test]
+    fn accepted_post_can_reconcile_its_exact_next_attempt() {
+        let transport =
+            FakeTransport::new(vec![accepted(run(3)), accepted(run(4))], vec![accepted(())]);
+        let plan = plan();
+        let mut submission = GitHubCheckRerunSubmission::new(&plan);
+        submission.begin_custody().unwrap();
+        assert_eq!(
+            submit(
+                &transport,
+                "github-actions-mobile",
+                &target(),
+                &plan,
+                &mut submission,
+            ),
+            Ok(GitHubCheckRerunCustody::Accepted)
         );
         assert_eq!(
             reconcile(
@@ -933,6 +975,29 @@ mod tests {
             ),
             Err(GitHubCheckRerunError::SubmissionState)
         );
+    }
+
+    #[test]
+    fn crash_before_post_never_claims_an_external_exact_next_attempt() {
+        let transport = FakeTransport::new(vec![accepted(run(4))], vec![]);
+        let plan = plan();
+        let mut submission = GitHubCheckRerunSubmission::restore(
+            &plan,
+            plan.digest(),
+            GitHubCheckRerunCustody::CustodyStarted,
+        )
+        .unwrap();
+        assert_eq!(
+            reconcile(
+                &transport,
+                "github-actions-mobile",
+                &target(),
+                &plan,
+                &mut submission,
+            ),
+            Ok(GitHubCheckRerunCustody::Ambiguous)
+        );
+        assert_eq!(transport.write_count.get(), 0);
     }
 
     #[test]

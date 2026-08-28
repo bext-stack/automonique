@@ -1396,7 +1396,24 @@ mod tests {
             let request = PlatformV2RequestMessage::new(
                 RequestId::new(format!("mobile-review-denied-{index}")).unwrap(),
                 PlatformV2Request::ExecuteReviewAction(
-                    ReviewActionTransportRequest::new(
+                    if matches!(action, ReviewAction::RerunCheck { .. }) {
+                        ReviewActionTransportRequest::new_confirmed(
+                            WorkContextIdentity::UserWorkspace(
+                                automonique_protocol::platform_v2::UserWorkspaceId::new(
+                                    "workspace-test",
+                                )
+                                .unwrap(),
+                            ),
+                            Revision::FIRST,
+                            action,
+                            IdempotencyKey::new(format!("mobile:review:denied:{index}")).unwrap(),
+                            automonique_protocol::platform_v2_transport::ReviewConfirmationDigest::new(
+                                "ab".repeat(32),
+                            )
+                            .unwrap(),
+                        )
+                    } else {
+                        ReviewActionTransportRequest::new(
                         WorkContextIdentity::UserWorkspace(
                             automonique_protocol::platform_v2::UserWorkspaceId::new(
                                 "workspace-test",
@@ -1407,6 +1424,7 @@ mod tests {
                         action,
                         IdempotencyKey::new(format!("mobile:review:denied:{index}")).unwrap(),
                     )
+                    }
                     .unwrap(),
                 ),
             );
@@ -1501,7 +1519,7 @@ mod tests {
         let rerun_request = PlatformV2RequestMessage::new(
             RequestId::new("mobile-review-rerun-exact-grant").unwrap(),
             PlatformV2Request::ExecuteReviewAction(
-                ReviewActionTransportRequest::new(
+                ReviewActionTransportRequest::new_confirmed(
                     workspace,
                     Revision::FIRST,
                     ReviewAction::RerunCheck {
@@ -1509,6 +1527,10 @@ mod tests {
                         expected_check_revision: Revision::FIRST,
                     },
                     IdempotencyKey::new("mobile:review:rerun:exact").unwrap(),
+                    automonique_protocol::platform_v2_transport::ReviewConfirmationDigest::new(
+                        "ab".repeat(32),
+                    )
+                    .unwrap(),
                 )
                 .unwrap(),
             ),

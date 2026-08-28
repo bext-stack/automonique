@@ -42,6 +42,7 @@ let cockpitControlHandle = (() => {
   }
 })();
 let cockpitControlBusy = false;
+let cockpitRerunPreview = null;
 let processFilter = "all";
 const expandedProcesses = new Set();
 let ticketFilter = "all";
@@ -2379,7 +2380,20 @@ function renderHostedCockpit(view) {
   byId("cockpit-rerun-check").disabled = !rerunCheck.available || unresolvedControl;
   byId("cockpit-add-comment").textContent = addComment.available ? "Add exact comment" : "Add comment unavailable";
   byId("cockpit-approve-review").textContent = approveReview.available ? "Approve review" : "Approve unavailable";
-  byId("cockpit-rerun-check").textContent = rerunCheck.available ? "Rerun exact check" : "Rerun unavailable";
+  byId("cockpit-rerun-check").textContent = rerunCheck.available ? "Preview exact rerun" : "Preview rerun unavailable";
+  const previewTarget = cockpitRerunPreview && (rerunCheck.targets || []).find((target) =>
+    target.check_id === cockpitRerunPreview.check_id
+      && target.exact_revision === cockpitRerunPreview.exact_revision
+      && target.exact_check_revision === cockpitRerunPreview.exact_check_revision
+      && target.confirmation_digest === cockpitRerunPreview.confirmation_digest);
+  if (cockpitRerunPreview && !previewTarget) cockpitRerunPreview = null;
+  const rerunPreview = byId("cockpit-rerun-preview");
+  rerunPreview.hidden = !cockpitRerunPreview;
+  byId("cockpit-rerun-preview-detail").textContent = cockpitRerunPreview
+    ? `${cockpitRerunPreview.check_id} · workspace revision ${cockpitRerunPreview.exact_revision} · check revision ${cockpitRerunPreview.exact_check_revision}`
+    : "";
+  byId("cockpit-rerun-confirm").disabled = !cockpitRerunPreview || unresolvedControl;
+  byId("cockpit-rerun-cancel").disabled = !cockpitRerunPreview || cockpitControlBusy;
   byId("cockpit-review-comment").disabled = !addComment.available || unresolvedControl;
   byId("cockpit-review-action-reason").textContent = unresolvedControl
     ? "An unresolved durable receipt is lookup-only. New writes are disabled."
@@ -3369,6 +3383,7 @@ async function submitCockpitIntent(preview) {
 async function submitCockpitReview(action) {
   const capability = cockpitPresentation?.reviewActions?.[action];
   if (!capability?.available || cockpitControlHandle || cockpitControlBusy) return;
+  if (action === "rerunCheck" && !cockpitRerunPreview) return;
   const idempotencyKey = newCockpitReceiptId("cockpit-review");
   const handle = globalThis.AutomoniquePlatformCockpit.prepareControlHandle(capability, action, idempotencyKey);
   if (!handle || !persistCockpitControl(handle)) {
@@ -3405,6 +3420,7 @@ async function submitCockpitReview(action) {
       expected_revision: target.exact_revision,
       check_id: target.check_id,
       expected_check_revision: target.exact_check_revision,
+      confirmation_digest: cockpitRerunPreview?.confirmation_digest,
       idempotency_key: idempotencyKey,
     } : null;
   })();
@@ -3418,6 +3434,7 @@ async function submitCockpitReview(action) {
     toast("A bounded comment body is required.", "error");
     return;
   }
+  if (action === "rerunCheck") cockpitRerunPreview = null;
   cockpitControlBusy = true;
   renderHostedCockpit(cockpitSnapshot || {});
   try {
@@ -3430,6 +3447,43 @@ async function submitCockpitReview(action) {
     cockpitState = globalThis.AutomoniquePlatformCockpit.reduce(cockpitState, { type: "receipt", receipt: {
       state: "ambiguous", id: idempotencyKey, outcome: "unknown", message: "Transmission was ambiguous. Only receipt lookup is allowed now.",
     } });
+  } finally {
+    cockpitControlBusy = false;
+    renderHostedCockpit(cockpitSnapshot || {});
+  }
+}
+
+async function previewCockpitRerun() {
+  const capability = cockpitPresentation?.reviewActions?.rerunCheck;
+  if (!capability?.available || cockpitControlHandle || cockpitControlBusy) return;
+  const checkId = byId("cockpit-rerun-check-target").value;
+  const target = (capability.targets || []).find((candidate) => candidate.check_id === checkId);
+  if (!target) return;
+  cockpitControlBusy = true;
+  try {
+    const preview = await api("/api/platform/cockpit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action: "preview_rerun_check",
+        project_id: target.project_id,
+        workspace_id: target.workspace_id,
+        expected_revision: target.exact_revision,
+        check_id: target.check_id,
+        expected_check_revision: target.exact_check_revision,
+      }),
+    });
+    if (preview?.state !== "confirmation_preview"
+      || preview.confirmation_digest !== target.confirmation_digest
+      || preview.check_id !== target.check_id
+      || preview.exact_revision !== target.exact_revision
+      || preview.exact_check_revision !== target.exact_check_revision) {
+      throw new Error("invalid rerun preview");
+    }
+    cockpitRerunPreview = Object.freeze(preview);
+  } catch (_error) {
+    cockpitRerunPreview = null;
+    toast("The exact rerun preview is unavailable; nothing was sent.", "error");
   } finally {
     cockpitControlBusy = false;
     renderHostedCockpit(cockpitSnapshot || {});
@@ -3473,7 +3527,12 @@ byId("cockpit-review-controls").addEventListener("submit", (event) => {
   submitCockpitReview("addComment");
 });
 byId("cockpit-approve-review").addEventListener("click", () => submitCockpitReview("approveReview"));
-byId("cockpit-rerun-check").addEventListener("click", () => submitCockpitReview("rerunCheck"));
+byId("cockpit-rerun-check").addEventListener("click", previewCockpitRerun);
+byId("cockpit-rerun-confirm").addEventListener("click", () => submitCockpitReview("rerunCheck"));
+byId("cockpit-rerun-cancel").addEventListener("click", () => {
+  cockpitRerunPreview = null;
+  renderHostedCockpit(cockpitSnapshot || {});
+});
 byId("cockpit-copy-link").addEventListener("click", async () => {
   const workspace = cockpitPresentation?.selectedWorkspace;
   if (!workspace) return;

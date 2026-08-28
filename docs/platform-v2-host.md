@@ -300,8 +300,9 @@ group/world writable, and unknown JSON fields are rejected. The registry is
 private composition state: its coordinates are never returned by Platform v2
 and clients cannot supply paths, commands, provider targets, or credential
 references. `GetReviewCapabilities` returns only the exact project/workspace,
-snapshot revision, check id/revision, and CI authority for currently runnable
-checks. Advertisement performs a fresh typed GitHub workflow-run GET and emits
+snapshot revision, check id/revision, CI authority, and opaque confirmation
+digest for currently runnable checks. Advertisement performs a fresh typed
+GitHub workflow-run GET and emits
 the capability only when run ID, head SHA, observed attempt, and completed
 status still match; missing, stale, unavailable, or incoherent provider or
 registry/credential state produces no advertised rerun capability. This read
@@ -316,10 +317,20 @@ concurrent confirmations cannot create two POST opportunities. Attempts and
 snapshot/check revisions whose next value cannot be represented are refused
 before reservation or custody.
 After a restart, `custody_started`, accepted, or ambiguous state is reconciled
-with the exact workflow-run GET and is never submitted again. Only the exact
-next attempt completes the receipt and advances the check projection to
-`running`; the old attempt, a skipped attempt, or changed head stays ambiguous
-or conflicts without a second mutation.
+with the exact workflow-run GET and is never submitted again. GitHub does not
+return a rerun correlation token, so an exact next attempt completes the
+receipt only when this process durably retained GitHub's 201 response for the
+exact POST. A crash-before-POST or transport-ambiguous mutation remains
+ambiguous even if another actor creates the next attempt; the old attempt, a
+skipped attempt, or changed head likewise never triggers a second mutation.
+
+Each advertised rerun capability also carries an opaque confirmation digest
+over the authenticated actor, project/workspace, snapshot/check revisions,
+provider target, and exact registry and credential generations. Cockpit first
+renders that capability as an inert confirmation preview. Only an explicit
+confirm returns the digest with the action; the daemon recomputes it before
+persisting an approval and before provider custody. A changed or substituted
+preview fails closed.
 
 ## Private attention source registry
 

@@ -52,7 +52,7 @@ fn mutation_intent() -> WorkContextMutationIntent {
     )
 }
 fn review_action() -> ReviewActionTransportRequest {
-    ReviewActionTransportRequest::new(
+    ReviewActionTransportRequest::new_confirmed(
         workspace(),
         Revision::FIRST,
         ReviewAction::RerunCheck {
@@ -60,6 +60,7 @@ fn review_action() -> ReviewActionTransportRequest {
             expected_check_revision: Revision::FIRST,
         },
         IdempotencyKey::new("review-action-1").unwrap(),
+        ReviewConfirmationDigest::new("ab".repeat(32)).unwrap(),
     )
     .unwrap()
 }
@@ -153,6 +154,49 @@ fn review_action_transport_rejects_the_same_invalid_batch_shapes_as_typescript()
             Err(PlatformV2TransportError::InvalidBody)
         );
     }
+}
+
+#[test]
+fn check_rerun_requires_an_exact_confirmation_digest_and_other_actions_refuse_it() {
+    let rerun = ReviewAction::RerunCheck {
+        check_id: OpaqueId::new("check-1").unwrap(),
+        expected_check_revision: Revision::FIRST,
+    };
+    assert!(
+        ReviewActionTransportRequest::new(
+            workspace(),
+            Revision::FIRST,
+            rerun.clone(),
+            IdempotencyKey::new("rerun-unconfirmed").unwrap(),
+        )
+        .is_err()
+    );
+    assert!(ReviewConfirmationDigest::new("AB".repeat(32)).is_err());
+    assert!(ReviewConfirmationDigest::new("ab".repeat(31)).is_err());
+    let digest = ReviewConfirmationDigest::new("ab".repeat(32)).unwrap();
+    assert!(!format!("{digest:?}").contains("abababab"));
+    assert!(
+        ReviewActionTransportRequest::new_confirmed(
+            workspace(),
+            Revision::FIRST,
+            ReviewAction::ApproveReview {
+                expected_review_revision: Revision::FIRST,
+            },
+            IdempotencyKey::new("approval-must-not-carry-rerun-confirmation").unwrap(),
+            digest.clone(),
+        )
+        .is_err()
+    );
+    assert!(
+        ReviewActionTransportRequest::new_confirmed(
+            workspace(),
+            Revision::FIRST,
+            rerun,
+            IdempotencyKey::new("rerun-confirmed").unwrap(),
+            digest,
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -543,6 +587,7 @@ fn response_documents_round_trip_and_review_envelope_fits_its_declared_ceiling()
                         ReviewCheckId::new("check-1").unwrap(),
                         Revision::new(7).unwrap(),
                         ci,
+                        ReviewConfirmationDigest::new("ab".repeat(32)).unwrap(),
                     )
                     .unwrap(),
                 ],
