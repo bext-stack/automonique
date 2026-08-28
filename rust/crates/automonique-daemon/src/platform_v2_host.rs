@@ -546,7 +546,16 @@ pub fn resolve_web_mobile_request_project(
             .get(value.workspace())
             .map(|scope| scope.project.clone())
             .ok_or("platform_v2_mobile_project_denied")?,
-        PlatformV2Request::GetReviewReceipt(value) => value.project().clone(),
+        PlatformV2Request::GetReviewReceipt(value) => {
+            if principal
+                .workspaces
+                .get(value.workspace())
+                .is_none_or(|scope| &scope.project != value.project())
+            {
+                return Err("platform_v2_mobile_project_denied");
+            }
+            value.project().clone()
+        }
     };
     if !principal.projects.contains(&project) || !roots.contains(&project) {
         return Err("platform_v2_mobile_project_denied");
@@ -2031,7 +2040,10 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    use automonique_protocol::platform_v2_transport::{LineageReadRequest, ReviewReadRequest};
+    use automonique_protocol::platform::IdempotencyKey;
+    use automonique_protocol::platform_v2_transport::{
+        LineageReadRequest, ReviewReadRequest, ReviewReceiptLookup,
+    };
 
     fn policy(inherited_tools: serde_json::Value) -> PolicyDocument {
         serde_json::from_value(serde_json::json!({
@@ -2340,8 +2352,11 @@ mod tests {
         );
 
         let mismatched_review = PlatformV2Request::GetReview(
-            ReviewReadRequest::new(project_b, WorkContextIdentity::UserWorkspace(workspace_a))
-                .unwrap(),
+            ReviewReadRequest::new(
+                project_b.clone(),
+                WorkContextIdentity::UserWorkspace(workspace_a.clone()),
+            )
+            .unwrap(),
         );
         assert_eq!(
             resolve_web_mobile_request_project(
@@ -2351,6 +2366,25 @@ mod tests {
                 "actor-test",
                 &roots,
                 &mismatched_review,
+            ),
+            Err("platform_v2_mobile_project_denied")
+        );
+        let mismatched_review_receipt = PlatformV2Request::GetReviewReceipt(
+            ReviewReceiptLookup::new(
+                project_b,
+                WorkContextIdentity::UserWorkspace(workspace_a),
+                IdempotencyKey::new("mobile:review:mismatched").unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            resolve_web_mobile_request_project(
+                &path,
+                uid,
+                "tenant-test",
+                "actor-test",
+                &roots,
+                &mismatched_review_receipt,
             ),
             Err("platform_v2_mobile_project_denied")
         );

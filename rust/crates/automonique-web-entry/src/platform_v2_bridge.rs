@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use automonique_protocol::codec::{LENGTH_PREFIX_BYTES, encode_frame_with_limit};
 use automonique_protocol::platform_v2::ProjectId;
+use automonique_protocol::platform_v2_review::ReviewAction;
 use automonique_protocol::platform_v2_transport::{
     MAX_PLATFORM_NEGOTIATION_REQUEST_CANONICAL_BYTES,
     MAX_PLATFORM_NEGOTIATION_RESPONSE_CANONICAL_BYTES, MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES,
@@ -213,33 +214,40 @@ impl PlatformV2Bridge {
                         Ok(project) => project,
                         Err(category) => return typed_v2_refusal(&request, category),
                     };
-                let receipt_key = match request.request() {
-                    automonique_protocol::platform_v2_transport::PlatformV2Request::GetMutationReceipt(lookup) => {
+                let custody = match request.request() {
+                    PlatformV2Request::GetMutationReceipt(lookup) => {
                         let ReceiptLookupKey::IdempotencyKey(idempotency_key) = lookup.key() else {
                             return typed_v2_refusal(
                                 &request,
                                 "platform_v2_mobile_receipt_custody_required",
                             );
                         };
-                        Some(idempotency_key.as_str())
+                        MobilePlatformV2ReceiptCustody::ReadMutation {
+                            project: &project,
+                            idempotency_key: idempotency_key.as_str(),
+                        }
                     }
-                    automonique_protocol::platform_v2_transport::PlatformV2Request::GetReviewReceipt(lookup) => {
-                        Some(lookup.idempotency_key().as_str())
+                    PlatformV2Request::GetReviewReceipt(lookup) => {
+                        MobilePlatformV2ReceiptCustody::ReadReview {
+                            project: &project,
+                            workspace: lookup.workspace(),
+                            idempotency_key: lookup.idempotency_key().as_str(),
+                        }
                     }
-                    _ => None,
-                };
-                let custody = if let Some(idempotency_key) = receipt_key {
-                    MobilePlatformV2ReceiptCustody::Read {
-                        project: &project,
-                        idempotency_key,
+                    PlatformV2Request::ExecuteReviewAction(value) => {
+                        MobilePlatformV2ReceiptCustody::BindReview {
+                            project: &project,
+                            workspace: value.workspace(),
+                            idempotency_key: value.idempotency_key().as_str(),
+                        }
                     }
-                } else if let Some(idempotency_key) = submit_idempotency_key.as_deref() {
-                    MobilePlatformV2ReceiptCustody::Bind {
-                        project: &project,
-                        idempotency_key,
-                    }
-                } else {
-                    MobilePlatformV2ReceiptCustody::None
+                    _ => match submit_idempotency_key.as_deref() {
+                        Some(idempotency_key) => MobilePlatformV2ReceiptCustody::BindMutation {
+                            project: &project,
+                            idempotency_key,
+                        },
+                        None => MobilePlatformV2ReceiptCustody::None,
+                    },
                 };
                 let custody_required = !matches!(&custody, MobilePlatformV2ReceiptCustody::None);
                 let lease = match authority.acquire_platform_v2_dispatch(
@@ -338,6 +346,14 @@ impl PlatformV2Bridge {
             }
         };
         if !authorization.allows(action) {
+            return Err("platform_v2_mobile_action_denied");
+        }
+        if let PlatformV2Request::ExecuteReviewAction(value) = request
+            && !matches!(
+                value.action(),
+                ReviewAction::AddComment { .. } | ReviewAction::ApproveReview { .. }
+            )
+        {
             return Err("platform_v2_mobile_action_denied");
         }
         let roots = authorization
@@ -728,7 +744,9 @@ mod tests {
     use automonique_protocol::platform_v2_lifecycle::{
         MutationPreviewDigest, MutationPreviewId, MutationPreviewRef,
     };
-    use automonique_protocol::platform_v2_review::ReviewAction;
+    use automonique_protocol::platform_v2_review::{
+        ConflictResolution, ReviewAction, ReviewCommentTarget, ReviewField,
+    };
     use automonique_protocol::platform_v2_transport::{
         MutationReceiptLookup, MutationSubmitRequest, PlatformNegotiationRequest,
         PlatformV2Request, ReviewActionTransportRequest, ReviewReceiptLookup,
@@ -743,8 +761,20 @@ mod tests {
                 "tenant": tenant,
                 "actor": actor,
                 "serving_authority": "automonique",
-                "projects": ["project-test"],
+                "projects": ["project-other", "project-test"],
                 "workspaces": [{
+                    "project": "project-other", "kind": "project", "id": "project-other",
+                    "inherited_authority": {
+                        "filesystem": [], "credentials": [], "network": [],
+                        "tools": [], "providers": [], "models": []
+                    }
+                }, {
+                    "project": "project-other", "kind": "user_workspace", "id": "workspace-other",
+                    "inherited_authority": {
+                        "filesystem": [], "credentials": [], "network": [],
+                        "tools": [], "providers": [], "models": []
+                    }
+                }, {
                     "project": "project-test", "kind": "project", "id": "project-test",
                     "inherited_authority": {
                         "filesystem": [], "credentials": [], "network": [],
@@ -752,6 +782,12 @@ mod tests {
                     }
                 }, {
                     "project": "project-test", "kind": "user_workspace", "id": "workspace-test",
+                    "inherited_authority": {
+                        "filesystem": [], "credentials": [], "network": [],
+                        "tools": [], "providers": [], "models": []
+                    }
+                }, {
+                    "project": "project-test", "kind": "user_workspace", "id": "workspace-sibling",
                     "inherited_authority": {
                         "filesystem": [], "credentials": [], "network": [],
                         "tools": [], "providers": [], "models": []
@@ -1019,7 +1055,10 @@ mod tests {
         .unwrap();
         let authorization = grant_mobile(
             &mut authority,
-            vec![MobilePlatformV2Action::GetReviewReceipt],
+            vec![
+                MobilePlatformV2Action::SubmitMutation,
+                MobilePlatformV2Action::GetReviewReceipt,
+            ],
             vec!["project-test"],
         );
         let request = PlatformV2RequestMessage::new(
@@ -1036,6 +1075,119 @@ mod tests {
                 .unwrap(),
             ),
         );
+        let cross_project = PlatformV2RequestMessage::new(
+            RequestId::new("mobile-review-receipt-cross-project").unwrap(),
+            PlatformV2Request::GetReviewReceipt(
+                ReviewReceiptLookup::new(
+                    ProjectId::new("project-test").unwrap(),
+                    WorkContextIdentity::UserWorkspace(
+                        automonique_protocol::platform_v2::UserWorkspaceId::new("workspace-other")
+                            .unwrap(),
+                    ),
+                    IdempotencyKey::new("mobile:review:cross-project").unwrap(),
+                )
+                .unwrap(),
+            ),
+        );
+        let response = bridge
+            .exchange_mobile(
+                PlatformV2Lane::V2,
+                &cross_project.to_canonical_bytes().unwrap(),
+                &authorization,
+                &mut authority,
+                1_002,
+            )
+            .unwrap();
+        let response =
+            PlatformV2ResponseMessage::from_canonical_bytes(&response, &cross_project).unwrap();
+        assert!(matches!(
+            response.response(),
+            PlatformV2Response::Refused(value)
+                if value.category().as_str() == "platform_v2_mobile_project_denied"
+        ));
+
+        authority
+            .bind_platform_v2_receipt_custody(
+                &authorization,
+                &ProjectId::new("project-test").unwrap(),
+                "mobile:review:mutation-reuse",
+                1_002,
+            )
+            .unwrap();
+        let mutation_reuse = PlatformV2RequestMessage::new(
+            RequestId::new("mobile-review-receipt-mutation-reuse").unwrap(),
+            PlatformV2Request::GetReviewReceipt(
+                ReviewReceiptLookup::new(
+                    ProjectId::new("project-test").unwrap(),
+                    WorkContextIdentity::UserWorkspace(
+                        automonique_protocol::platform_v2::UserWorkspaceId::new("workspace-test")
+                            .unwrap(),
+                    ),
+                    IdempotencyKey::new("mobile:review:mutation-reuse").unwrap(),
+                )
+                .unwrap(),
+            ),
+        );
+        let response = bridge
+            .exchange_mobile(
+                PlatformV2Lane::V2,
+                &mutation_reuse.to_canonical_bytes().unwrap(),
+                &authorization,
+                &mut authority,
+                1_002,
+            )
+            .unwrap();
+        let response =
+            PlatformV2ResponseMessage::from_canonical_bytes(&response, &mutation_reuse).unwrap();
+        assert!(matches!(
+            response.response(),
+            PlatformV2Response::Refused(value)
+                if value.category().as_str() == "platform_v2_mobile_receipt_custody_denied"
+        ));
+
+        authority
+            .bind_platform_v2_review_receipt_custody(
+                &authorization,
+                &ProjectId::new("project-test").unwrap(),
+                &WorkContextIdentity::UserWorkspace(
+                    automonique_protocol::platform_v2::UserWorkspaceId::new("workspace-sibling")
+                        .unwrap(),
+                ),
+                "mobile:review:workspace-reuse",
+                1_002,
+            )
+            .unwrap();
+        let workspace_reuse = PlatformV2RequestMessage::new(
+            RequestId::new("mobile-review-receipt-workspace-reuse").unwrap(),
+            PlatformV2Request::GetReviewReceipt(
+                ReviewReceiptLookup::new(
+                    ProjectId::new("project-test").unwrap(),
+                    WorkContextIdentity::UserWorkspace(
+                        automonique_protocol::platform_v2::UserWorkspaceId::new("workspace-test")
+                            .unwrap(),
+                    ),
+                    IdempotencyKey::new("mobile:review:workspace-reuse").unwrap(),
+                )
+                .unwrap(),
+            ),
+        );
+        let response = bridge
+            .exchange_mobile(
+                PlatformV2Lane::V2,
+                &workspace_reuse.to_canonical_bytes().unwrap(),
+                &authorization,
+                &mut authority,
+                1_002,
+            )
+            .unwrap();
+        let response =
+            PlatformV2ResponseMessage::from_canonical_bytes(&response, &workspace_reuse).unwrap();
+        assert!(matches!(
+            response.response(),
+            PlatformV2Response::Refused(value)
+                if value.category().as_str() == "platform_v2_mobile_receipt_custody_denied"
+        ));
+
         let response = bridge
             .exchange_mobile(
                 PlatformV2Lane::V2,
@@ -1104,18 +1256,17 @@ mod tests {
             vec!["project-test"],
         );
         let idempotency_key = "mobile:review:bound";
+        let workspace = WorkContextIdentity::UserWorkspace(
+            automonique_protocol::platform_v2::UserWorkspaceId::new("workspace-test").unwrap(),
+        );
         let request = PlatformV2RequestMessage::new(
             RequestId::new("mobile-review-bind-custody").unwrap(),
             PlatformV2Request::ExecuteReviewAction(
                 ReviewActionTransportRequest::new(
-                    WorkContextIdentity::UserWorkspace(
-                        automonique_protocol::platform_v2::UserWorkspaceId::new("workspace-test")
-                            .unwrap(),
-                    ),
+                    workspace.clone(),
                     Revision::FIRST,
-                    ReviewAction::RerunCheck {
-                        check_id: OpaqueId::new("check-test").unwrap(),
-                        expected_check_revision: Revision::FIRST,
+                    ReviewAction::ApproveReview {
+                        expected_review_revision: Revision::FIRST,
                     },
                     IdempotencyKey::new(idempotency_key).unwrap(),
                 )
@@ -1133,18 +1284,20 @@ mod tests {
             Err("platform_v2_bridge_unavailable")
         );
         authority
-            .authorize_platform_v2_receipt_custody(
+            .authorize_platform_v2_review_receipt_custody(
                 &authorization,
                 &ProjectId::new("project-test").unwrap(),
+                &workspace,
                 idempotency_key,
                 1_002,
             )
             .expect("review custody precedes socket exchange");
         assert!(
             authority
-                .authorize_platform_v2_receipt_custody(
+                .authorize_platform_v2_review_receipt_custody(
                     &authorization,
                     &ProjectId::new("project-test").unwrap(),
+                    &workspace,
                     "mobile:review:different",
                     1_002,
                 )
@@ -1158,14 +1311,120 @@ mod tests {
         );
         assert!(
             authority
-                .authorize_platform_v2_receipt_custody(
+                .authorize_platform_v2_review_receipt_custody(
                     &other_credential,
                     &ProjectId::new("project-test").unwrap(),
+                    &workspace,
                     idempotency_key,
                     1_002,
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn mobile_review_execution_refuses_every_non_local_action_before_the_socket() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = nix::unistd::geteuid().as_raw();
+        write_policy(root.path(), uid, "tenant-test", "actor-test");
+        let bridge = bridge(
+            root.path(),
+            root.path().join("absent.sock"),
+            "tenant-test",
+            "actor-test",
+        );
+        let mut authority = MobileCredentialAuthority::open_scoped(
+            root.path().join("mobile.sqlite3"),
+            "ops.example.test",
+            "tenant-test",
+            "actor-test",
+        )
+        .unwrap();
+        let authorization = grant_mobile(
+            &mut authority,
+            vec![MobilePlatformV2Action::ExecuteReviewAction],
+            vec!["project-test"],
+        );
+        let actions = vec![
+            ReviewAction::SendCommentToAgent {
+                comment_id: OpaqueId::new("comment-one").unwrap(),
+                expected_comment_revision: Revision::FIRST,
+            },
+            ReviewAction::BatchSendCommentsToAgent {
+                comments: vec![ReviewCommentTarget::new(
+                    OpaqueId::new("comment-one").unwrap(),
+                    Revision::FIRST,
+                )],
+            },
+            ReviewAction::Stage {
+                proposal_id: OpaqueId::new("proposal-stage").unwrap(),
+            },
+            ReviewAction::Unstage {
+                proposal_id: OpaqueId::new("proposal-unstage").unwrap(),
+            },
+            ReviewAction::Commit {
+                proposal_id: OpaqueId::new("proposal-commit").unwrap(),
+            },
+            ReviewAction::ResolveConflict {
+                proposal_id: OpaqueId::new("proposal-conflict").unwrap(),
+                file_id: OpaqueId::new("file-one").unwrap(),
+                resolution: ConflictResolution::KeepCurrent,
+            },
+            ReviewAction::RerunCheck {
+                check_id: OpaqueId::new("check-one").unwrap(),
+                expected_check_revision: Revision::FIRST,
+            },
+            ReviewAction::OpenPullRequest {
+                expected_pull_request_revision: Revision::FIRST,
+                title: ReviewField::new("Pull request").unwrap(),
+            },
+            ReviewAction::UpdatePullRequest {
+                pull_request_id: OpaqueId::new("pull-request-one").unwrap(),
+                expected_pull_request_revision: Revision::FIRST,
+                title: ReviewField::new("Updated pull request").unwrap(),
+            },
+            ReviewAction::MergePullRequest {
+                pull_request_id: OpaqueId::new("pull-request-one").unwrap(),
+                expected_pull_request_revision: Revision::FIRST,
+                expected_head_revision: ReviewField::new("0123456789abcdef").unwrap(),
+            },
+        ];
+        for (index, action) in actions.into_iter().enumerate() {
+            let request = PlatformV2RequestMessage::new(
+                RequestId::new(format!("mobile-review-denied-{index}")).unwrap(),
+                PlatformV2Request::ExecuteReviewAction(
+                    ReviewActionTransportRequest::new(
+                        WorkContextIdentity::UserWorkspace(
+                            automonique_protocol::platform_v2::UserWorkspaceId::new(
+                                "workspace-test",
+                            )
+                            .unwrap(),
+                        ),
+                        Revision::FIRST,
+                        action,
+                        IdempotencyKey::new(format!("mobile:review:denied:{index}")).unwrap(),
+                    )
+                    .unwrap(),
+                ),
+            );
+            let response = bridge
+                .exchange_mobile(
+                    PlatformV2Lane::V2,
+                    &request.to_canonical_bytes().unwrap(),
+                    &authorization,
+                    &mut authority,
+                    1_002,
+                )
+                .unwrap();
+            let response =
+                PlatformV2ResponseMessage::from_canonical_bytes(&response, &request).unwrap();
+            assert!(matches!(
+                response.response(),
+                PlatformV2Response::Refused(value)
+                    if value.category().as_str() == "platform_v2_mobile_action_denied"
+            ));
+        }
     }
 
     #[test]
@@ -1463,7 +1722,7 @@ mod tests {
         let lease = authority
             .acquire_platform_v2_dispatch(
                 &authorization,
-                MobilePlatformV2ReceiptCustody::Bind {
+                MobilePlatformV2ReceiptCustody::BindMutation {
                     project: &project,
                     idempotency_key,
                 },
