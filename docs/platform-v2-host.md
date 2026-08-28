@@ -524,8 +524,17 @@ the exact credential, delegation, and principal generation. Mobile receipt
 polling accepts only that idempotency coordinate and checks the binding before
 opening the socket; receipt-ID lookup is refused because no mobile-owned
 receipt-ID binding exists before an ambiguous response. The private SQLite
-custody is capped at 128 live entries per credential, survives process restart
-and same-delegation access-token rotation, and is deleted on delegation
+custody binds an operation family as well as the project and idempotency key;
+review custody additionally binds the exact workspace kind and ID. Mutation
+custody cannot admit a review lookup, and custody for one review workspace
+cannot admit another. Legacy custody rows without this complete coordinate fail
+closed after migration. Typed review-action submission and review-receipt
+lookup require their own independent mobile grants. The web bridge admits only
+local `add_comment` and `approve_review` actions for mobile execution;
+provider-session, Git/filesystem, CI, and pull-request action families are
+refused before the daemon socket even if their daemon adapters are installed
+later. Custody is capped at 128 live entries per credential, survives process
+restart and same-delegation access-token rotation, and is deleted on delegation
 regrant or credential revocation. Thus another same-project credential and a
 new delegation cannot read an older mutation receipt.
 
@@ -534,8 +543,7 @@ inside a SQLite `IMMEDIATE` transaction that also records a request-digest-bound
 ten-second dispatch lease. The transaction commits before the daemon socket is
 opened, so ambiguous or completed mutation dispatch can never precede durable
 mobile receipt custody. Submit custody also retains the exact canonical request
-digest: the same coordinate may be retried only by the identical request, while
-legacy custody without a digest remains readable but cannot admit a new submit.
+digest: the same coordinate may be retried only by the identical request.
 Refresh, regrant, and both revocation paths check the same lease table in their
 own write transactions and refuse while a dispatch lease is live; they
 therefore cannot commit between authorization and dispatch. Socket read and

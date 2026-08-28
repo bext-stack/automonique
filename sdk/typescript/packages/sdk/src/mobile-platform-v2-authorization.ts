@@ -34,6 +34,8 @@ export const MOBILE_PLATFORM_V2_ACTIONS = [
   "submit_workspace_intent",
   "get_workspace_intent",
   "get_review",
+  "execute_review_action",
+  "get_review_receipt",
 ] as const;
 
 export type MobilePlatformV2Action =
