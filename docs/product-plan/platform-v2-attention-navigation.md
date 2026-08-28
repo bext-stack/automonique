@@ -34,6 +34,18 @@ authority-qualified Platform v1 `session` coordinate on every item. Review and
 orchestration sources forbid that coordinate, so clients cannot infer a
 provider session from labels, chronology, or summaries.
 
+`unread` is authoritative producer state and notification eligibility, not a
+cross-client acknowledgement bit. Review projection preserves exactly
+`event.unread() > 0`. Orchestration projects `Working` as read, `Blocked` and
+`Done` as unread, and omits `Waiting`. Provider sessions project `Active`,
+`Preparing`, and `Running` as read; `Failed` and `Completed` as unread;
+`Archived`, `Cancelled`, and `Closed` as read; and omit `Hibernated`. A client
+that acknowledges or opens an item keeps that local read custody under the
+exact `(source, item, item_revision)` tuple. It may notify once when an
+authoritative unread item revision first appears, but must not rewrite the
+server snapshot. Exact replay cannot notify again; a removed item that later
+reappears has a new opaque identity and is independently eligible.
+
 The contract has no representation for client-local pane, tab, window,
 terminal, host path, or workspace-layout identifiers. ShellDeck consumes the
 project, `UserWorkspace`, and optional authority-qualified Platform session,

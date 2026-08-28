@@ -388,6 +388,14 @@ provider-session source ids equal the retained `WorkSession` id advertised by
 the same bounded work-context inventory. The host revalidates exact policy and
 lineage before every read, persists each complete replacement through the
 attention store, and never creates client-local pane or layout coordinates.
+Review unread state remains exactly `event.unread() > 0`. Orchestration marks
+`Blocked` and `Done` unread, marks `Working` read, and omits `Waiting`.
+Provider sessions mark `Failed` and `Completed` unread; mark `Active`,
+`Preparing`, `Running`, `Archived`, `Cancelled`, and `Closed` read; and omit
+`Hibernated`. This bit is authoritative notification eligibility rather than
+personal read custody. Consumers retain acknowledgements locally by exact
+`(source, item, item_revision)`, suppress notification on exact replay, and
+must treat a post-removal opaque item incarnation as new.
 Terminal retained sessions remain readable through a dedicated read-only
 lineage check so `Completed`, `Failed`, and `Cancelled` attention does not widen
 the active-session mutation or delivery gate. The private registry rejects an

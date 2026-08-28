@@ -3230,14 +3230,14 @@ fn orchestration_attention_items(
     records
         .iter()
         .filter_map(|record| {
-            let reason = match record.status() {
-                LineageStatus::Working => Some(AttentionItemReason::AgentWorking),
-                LineageStatus::Blocked(_) => Some(AttentionItemReason::ExternalBlocker),
+            let (reason, unread) = match record.status() {
+                LineageStatus::Working => Some((AttentionItemReason::AgentWorking, false)),
+                LineageStatus::Blocked(_) => Some((AttentionItemReason::ExternalBlocker, true)),
                 // Waiting does not say who or what is awaited. Projecting it
                 // as approval-required or externally blocked would invent a
                 // stronger condition than the durable lineage record.
                 LineageStatus::Waiting(_) => None,
-                LineageStatus::Done(_) => Some(AttentionItemReason::Complete),
+                LineageStatus::Done(_) => Some((AttentionItemReason::Complete, true)),
             }?;
             let prefix = runtime_attention_incarnation_prefix(
                 "orchestration",
@@ -3252,7 +3252,7 @@ fn orchestration_attention_items(
                             record.freshness().observed_at_ms(),
                             reason.state(),
                             reason,
-                            false,
+                            unread,
                             Vec::new(),
                             None,
                         )
@@ -3270,18 +3270,8 @@ fn retained_session_attention_items(
     observed_at_ms: u64,
     current: Option<&AttentionSourceSnapshot>,
 ) -> Result<Vec<AttentionItem>, &'static str> {
-    let reason = match session.lifecycle() {
-        WorkContextLifecycle::Active
-        | WorkContextLifecycle::Preparing
-        | WorkContextLifecycle::Running => Some(AttentionItemReason::AgentWorking),
-        WorkContextLifecycle::Completed
-        | WorkContextLifecycle::Archived
-        | WorkContextLifecycle::Cancelled
-        | WorkContextLifecycle::Closed => Some(AttentionItemReason::Complete),
-        WorkContextLifecycle::Failed => Some(AttentionItemReason::ExternalBlocker),
-        WorkContextLifecycle::Hibernated => None,
-    };
-    let Some(reason) = reason else {
+    let projection = retained_session_attention_projection(session.lifecycle());
+    let Some((reason, unread)) = projection else {
         return Ok(Vec::new());
     };
     let prefix =
@@ -3293,12 +3283,28 @@ fn retained_session_attention_items(
         observed_at_ms,
         reason.state(),
         reason,
-        false,
+        unread,
         Vec::new(),
         Some(platform_session),
     )
     .map(|item| vec![item])
     .map_err(|_| "platform_v2_attention_projection_invalid")
+}
+
+const fn retained_session_attention_projection(
+    lifecycle: WorkContextLifecycle,
+) -> Option<(AttentionItemReason, bool)> {
+    match lifecycle {
+        WorkContextLifecycle::Active
+        | WorkContextLifecycle::Preparing
+        | WorkContextLifecycle::Running => Some((AttentionItemReason::AgentWorking, false)),
+        WorkContextLifecycle::Completed => Some((AttentionItemReason::Complete, true)),
+        WorkContextLifecycle::Archived
+        | WorkContextLifecycle::Cancelled
+        | WorkContextLifecycle::Closed => Some((AttentionItemReason::Complete, false)),
+        WorkContextLifecycle::Failed => Some((AttentionItemReason::ExternalBlocker, true)),
+        WorkContextLifecycle::Hibernated => None,
+    }
 }
 
 fn runtime_attention_incarnation_prefix(domain: &str, components: &[&str]) -> String {
@@ -4312,6 +4318,13 @@ mod tests {
             review_items[0].id().as_str(),
             review.attention_events()[0].id().as_str()
         );
+        assert!(
+            review_items
+                .iter()
+                .zip(review.attention_events())
+                .all(|(item, event)| item.unread() == (event.unread() > 0)),
+            "review unread remains the exact durable event count projection"
+        );
 
         let orchestration = OrchestrationRecord::new_with_origin(
             OrchestrationIdentity::Worker(OrchestrationWorkerId::new("worker-1").unwrap()),
@@ -4339,6 +4352,7 @@ mod tests {
             orchestration_items[0].reason(),
             AttentionItemReason::AgentWorking
         );
+        assert!(!orchestration_items[0].unread());
         assert!(orchestration_items[0].nested_agent_path().is_empty());
 
         let platform_session = V1SessionRef::new(ResourceCoordinate::new(
@@ -4374,6 +4388,7 @@ mod tests {
                 .unwrap();
         assert_eq!(session_items[0].platform_session(), Some(&platform_session));
         assert_eq!(session_items[0].reason(), AttentionItemReason::AgentWorking);
+        assert!(!session_items[0].unread());
         assert!(session_items[0].id().as_str().ends_with("-i4"));
         assert_eq!(
             review_attention_items_from_snapshot(None, 2_001),
@@ -4395,19 +4410,168 @@ mod tests {
     }
 
     #[test]
+    fn runtime_attention_unread_policy_is_exhaustive() {
+        use automonique_protocol::platform_v2_lineage::{
+            LineageFreshness, LineageFreshnessState, LineageMessage, LineageOrigin,
+            OrchestrationIdentity, OrchestrationRunId,
+        };
+
+        let orchestration_record = |status| {
+            OrchestrationRecord::new_with_origin(
+                OrchestrationIdentity::Run(OrchestrationRunId::new("run-unread").unwrap()),
+                LineageOrigin::workspace_only(UserWorkspaceId::new("workspace-unread").unwrap()),
+                None,
+                None,
+                status,
+                LineageFreshness::new(1_000, 60_000, LineageFreshnessState::Fresh).unwrap(),
+                None,
+                Revision::FIRST,
+            )
+            .unwrap()
+        };
+        for (status, expected) in [
+            (
+                LineageStatus::Working,
+                Some((AttentionItemReason::AgentWorking, false)),
+            ),
+            (
+                LineageStatus::Blocked(LineageMessage::new("blocked").unwrap()),
+                Some((AttentionItemReason::ExternalBlocker, true)),
+            ),
+            (
+                LineageStatus::Done(LineageMessage::new("done").unwrap()),
+                Some((AttentionItemReason::Complete, true)),
+            ),
+            (
+                LineageStatus::Waiting(LineageMessage::new("waiting").unwrap()),
+                None,
+            ),
+        ] {
+            let items =
+                orchestration_attention_items(&[orchestration_record(status)], None).unwrap();
+            match expected {
+                Some((reason, unread)) => {
+                    assert_eq!(items.len(), 1);
+                    assert_eq!(items[0].reason(), reason);
+                    assert_eq!(items[0].state(), reason.state());
+                    assert_eq!(items[0].unread(), unread);
+                }
+                None => assert!(items.is_empty()),
+            }
+        }
+
+        let platform_session = V1SessionRef::new(ResourceCoordinate::new(
+            ResourceAuthority::Automonique,
+            ResourceKind::Session,
+            ResourceId::new("provider-session-unread").unwrap(),
+        ))
+        .unwrap();
+        let session_record = |lifecycle| {
+            WorkContextRecord::new(
+                WorkContextIdentity::Session(WorkSessionId::new("work-session-unread").unwrap()),
+                Revision::FIRST,
+                lifecycle,
+                WorkContextLabel::new("Retained session").unwrap(),
+                WorkContextAttributes::EMPTY,
+                vec![
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::SessionAttemptWorkspace,
+                        WorkContextIdentity::AttemptWorkspace(
+                            AttemptWorkspaceId::new("attempt-unread").unwrap(),
+                        ),
+                    )
+                    .unwrap(),
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::SessionPlatformSession,
+                        WorkContextIdentity::PlatformSession(platform_session.clone()),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap()
+        };
+        let lifecycle_policy = [
+            (
+                WorkContextLifecycle::Active,
+                Some((AttentionItemReason::AgentWorking, false)),
+            ),
+            (
+                WorkContextLifecycle::Preparing,
+                Some((AttentionItemReason::AgentWorking, false)),
+            ),
+            (
+                WorkContextLifecycle::Running,
+                Some((AttentionItemReason::AgentWorking, false)),
+            ),
+            (
+                WorkContextLifecycle::Failed,
+                Some((AttentionItemReason::ExternalBlocker, true)),
+            ),
+            (
+                WorkContextLifecycle::Completed,
+                Some((AttentionItemReason::Complete, true)),
+            ),
+            (
+                WorkContextLifecycle::Archived,
+                Some((AttentionItemReason::Complete, false)),
+            ),
+            (
+                WorkContextLifecycle::Cancelled,
+                Some((AttentionItemReason::Complete, false)),
+            ),
+            (
+                WorkContextLifecycle::Closed,
+                Some((AttentionItemReason::Complete, false)),
+            ),
+            (WorkContextLifecycle::Hibernated, None),
+        ];
+        for (lifecycle, expected) in lifecycle_policy {
+            assert_eq!(retained_session_attention_projection(lifecycle), expected);
+        }
+        for lifecycle in [
+            WorkContextLifecycle::Active,
+            WorkContextLifecycle::Failed,
+            WorkContextLifecycle::Completed,
+            WorkContextLifecycle::Cancelled,
+            WorkContextLifecycle::Hibernated,
+        ] {
+            let expected = retained_session_attention_projection(lifecycle);
+            let items = retained_session_attention_items(
+                &session_record(lifecycle),
+                platform_session.clone(),
+                1_000,
+                None,
+            )
+            .unwrap();
+            match expected {
+                Some((reason, unread)) => {
+                    assert_eq!(items.len(), 1);
+                    assert_eq!(items[0].reason(), reason);
+                    assert_eq!(items[0].state(), reason.state());
+                    assert_eq!(items[0].unread(), unread);
+                }
+                None => assert!(items.is_empty()),
+            }
+        }
+    }
+
+    #[test]
     fn terminal_provider_session_attention_uses_read_lineage_without_control_authority() {
-        for (lifecycle, reason) in [
+        for (lifecycle, reason, unread) in [
             (
                 WorkContextLifecycle::Completed,
                 AttentionItemReason::Complete,
+                true,
             ),
             (
                 WorkContextLifecycle::Failed,
                 AttentionItemReason::ExternalBlocker,
+                true,
             ),
             (
                 WorkContextLifecycle::Cancelled,
                 AttentionItemReason::Complete,
+                false,
             ),
         ] {
             let directory = tempfile::tempdir().unwrap();
@@ -4442,6 +4606,7 @@ mod tests {
             };
             assert_eq!(snapshot.items().len(), 1);
             assert_eq!(snapshot.items()[0].reason(), reason);
+            assert_eq!(snapshot.items()[0].unread(), unread);
             assert_eq!(
                 snapshot.items()[0]
                     .platform_session()
@@ -4663,11 +4828,9 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let mut store = AttentionStore::open_scoped(
-            directory.path().join("orchestration-attention.sqlite3"),
-            "tenant-test",
-        )
-        .unwrap();
+        let orchestration_store_path = directory.path().join("orchestration-attention.sqlite3");
+        let mut store =
+            AttentionStore::open_scoped(&orchestration_store_path, "tenant-test").unwrap();
         let request = AttentionReadRequest::new(
             AttentionSource::new(
                 AttentionSourceKind::Orchestration,
@@ -4696,6 +4859,7 @@ mod tests {
         let first =
             persist_runtime_attention_snapshot(&mut store, &request, first_items, 700).unwrap();
         let original_id = first.items()[0].id().clone();
+        assert!(!first.items()[0].unread());
         let unchanged_items =
             orchestration_attention_items(&[record(LineageStatus::Working, 8, 800)], Some(&first))
                 .unwrap();
@@ -4723,35 +4887,53 @@ mod tests {
             changed.items()[0].reason(),
             AttentionItemReason::ExternalBlocker
         );
+        assert!(changed.items()[0].unread());
 
-        let absent_items = orchestration_attention_items(
+        let done_items = orchestration_attention_items(
             &[record(
-                LineageStatus::Waiting(LineageMessage::new("idle").unwrap()),
+                LineageStatus::Done(LineageMessage::new("complete").unwrap()),
                 10,
                 1_000,
             )],
             Some(&changed),
         )
         .unwrap();
+        let done =
+            persist_runtime_attention_snapshot(&mut store, &request, done_items, 1_000).unwrap();
+        assert_eq!(done.items()[0].id(), &original_id);
+        assert_eq!(done.items()[0].revision(), Revision::new(3).unwrap());
+        assert_eq!(done.items()[0].reason(), AttentionItemReason::Complete);
+        assert!(done.items()[0].unread());
+
+        let absent_items = orchestration_attention_items(
+            &[record(
+                LineageStatus::Waiting(LineageMessage::new("idle").unwrap()),
+                11,
+                1_100,
+            )],
+            Some(&done),
+        )
+        .unwrap();
         let absent =
-            persist_runtime_attention_snapshot(&mut store, &request, absent_items, 1_000).unwrap();
+            persist_runtime_attention_snapshot(&mut store, &request, absent_items, 1_100).unwrap();
         assert!(absent.items().is_empty());
+        drop(store);
+        let mut store =
+            AttentionStore::open_scoped(&orchestration_store_path, "tenant-test").unwrap();
         let reappeared_items = orchestration_attention_items(
-            &[record(LineageStatus::Working, 11, 1_100)],
+            &[record(LineageStatus::Working, 12, 1_200)],
             Some(&absent),
         )
         .unwrap();
         let reappeared =
-            persist_runtime_attention_snapshot(&mut store, &request, reappeared_items, 1_100)
+            persist_runtime_attention_snapshot(&mut store, &request, reappeared_items, 1_200)
                 .unwrap();
         assert_ne!(reappeared.items()[0].id(), &original_id);
-        assert!(reappeared.items()[0].id().as_str().ends_with("-i11"));
+        assert!(!reappeared.items()[0].unread());
 
-        let mut session_store = AttentionStore::open_scoped(
-            directory.path().join("session-attention.sqlite3"),
-            "tenant-test",
-        )
-        .unwrap();
+        let session_store_path = directory.path().join("session-attention.sqlite3");
+        let mut session_store =
+            AttentionStore::open_scoped(&session_store_path, "tenant-test").unwrap();
         let session_request = AttentionReadRequest::new(
             AttentionSource::new(
                 AttentionSourceKind::ProviderSession,
@@ -4805,6 +4987,7 @@ mod tests {
         )
         .unwrap();
         let original_id = first.items()[0].id().clone();
+        assert!(!first.items()[0].unread());
         let unchanged_items = retained_session_attention_items(
             &session(WorkContextLifecycle::Active, 4),
             platform_session.clone(),
@@ -4836,6 +5019,7 @@ mod tests {
         .unwrap();
         assert_eq!(changed.items()[0].id(), &original_id);
         assert_eq!(changed.items()[0].reason(), AttentionItemReason::Complete);
+        assert!(changed.items()[0].unread());
         let absent_items = retained_session_attention_items(
             &session(WorkContextLifecycle::Hibernated, 6),
             platform_session.clone(),
@@ -4851,6 +5035,9 @@ mod tests {
         )
         .unwrap();
         assert!(absent.items().is_empty());
+        drop(session_store);
+        let mut session_store =
+            AttentionStore::open_scoped(&session_store_path, "tenant-test").unwrap();
         let reappeared_items = retained_session_attention_items(
             &session(WorkContextLifecycle::Active, 7),
             platform_session,
@@ -4866,7 +5053,7 @@ mod tests {
         )
         .unwrap();
         assert_ne!(reappeared.items()[0].id(), &original_id);
-        assert!(reappeared.items()[0].id().as_str().ends_with("-i7"));
+        assert!(!reappeared.items()[0].unread());
     }
 
     fn policy(inherited_tools: serde_json::Value) -> PolicyDocument {
