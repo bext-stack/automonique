@@ -47,6 +47,7 @@ pub enum GitHubCheckRerunError {
 pub struct GitHubCheckRerunPlan {
     digest: [u8; 32],
     registry_generation_digest: [u8; 32],
+    credential_generation_digest: [u8; 32],
     credential_reference: String,
     target: RepoTarget,
     run_id: WorkflowRunId,
@@ -68,6 +69,7 @@ impl GitHubCheckRerunPlan {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         registry_generation_digest: [u8; 32],
+        credential_generation_digest: [u8; 32],
         credential_reference: &str,
         target: RepoTarget,
         run_id: WorkflowRunId,
@@ -92,6 +94,7 @@ impl GitHubCheckRerunPlan {
         let mut plan = Self {
             digest: [0; 32],
             registry_generation_digest,
+            credential_generation_digest,
             credential_reference: credential_reference.to_owned(),
             target,
             run_id,
@@ -119,6 +122,16 @@ impl GitHubCheckRerunPlan {
     #[must_use]
     pub fn credential_reference(&self) -> &str {
         &self.credential_reference
+    }
+
+    #[must_use]
+    pub const fn registry_generation_digest(&self) -> [u8; 32] {
+        self.registry_generation_digest
+    }
+
+    #[must_use]
+    pub const fn credential_generation_digest(&self) -> [u8; 32] {
+        self.credential_generation_digest
     }
 
     #[must_use]
@@ -212,6 +225,21 @@ impl GitHubCheckRerunSubmission {
             plan_digest: plan.digest(),
             custody: GitHubCheckRerunCustody::NotStarted,
         }
+    }
+
+    /// Rehydrate the exact durable state after a process restart.
+    pub fn restore(
+        plan: &GitHubCheckRerunPlan,
+        plan_digest: [u8; 32],
+        custody: GitHubCheckRerunCustody,
+    ) -> Result<Self, GitHubCheckRerunError> {
+        if plan.digest() != plan_digest {
+            return Err(GitHubCheckRerunError::SubmissionState);
+        }
+        Ok(Self {
+            plan_digest,
+            custody,
+        })
     }
 
     /// Transition to the state that must be durably committed before `submit`.
@@ -500,6 +528,7 @@ fn plan_digest(plan: &GitHubCheckRerunPlan) -> [u8; 32] {
     let mut document = Vec::new();
     push_field(&mut document, b"automonique.github-check-rerun/v1");
     push_field(&mut document, &plan.registry_generation_digest);
+    push_field(&mut document, &plan.credential_generation_digest);
     for field in [
         plan.credential_reference.as_bytes(),
         plan.target.owner().as_str().as_bytes(),
@@ -618,6 +647,7 @@ mod tests {
     fn plan() -> GitHubCheckRerunPlan {
         GitHubCheckRerunPlan::new(
             [7; 32],
+            [8; 32],
             "github-actions-mobile",
             RepoTarget::parse("example-org", "example-repo").unwrap(),
             WorkflowRunId::new(91).unwrap(),
@@ -743,6 +773,38 @@ mod tests {
             Ok(GitHubCheckRerunCustody::Completed)
         );
         assert_eq!(transport.write_count.get(), 1);
+    }
+
+    #[test]
+    fn restored_custody_started_reconciles_by_get_and_never_posts() {
+        let transport = FakeTransport::new(vec![accepted(run(3))], vec![]);
+        let plan = plan();
+        let mut submission = GitHubCheckRerunSubmission::restore(
+            &plan,
+            plan.digest(),
+            GitHubCheckRerunCustody::CustodyStarted,
+        )
+        .unwrap();
+        assert_eq!(
+            reconcile(
+                &transport,
+                "github-actions-mobile",
+                &target(),
+                &plan,
+                &mut submission,
+            ),
+            Ok(GitHubCheckRerunCustody::Ambiguous)
+        );
+        assert_eq!(transport.read_count.get(), 1);
+        assert_eq!(transport.write_count.get(), 0);
+        assert_eq!(
+            GitHubCheckRerunSubmission::restore(
+                &plan,
+                [0; 32],
+                GitHubCheckRerunCustody::CustodyStarted,
+            ),
+            Err(GitHubCheckRerunError::SubmissionState)
+        );
     }
 
     #[test]

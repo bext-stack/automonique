@@ -13,7 +13,8 @@ use automonique_protocol::platform_v2_review_api::{
 use automonique_protocol::primitives::Revision;
 use automonique_store::review_store::{
     ApprovalPolicy, ReviewActionAdmission, ReviewApprovalDecision, ReviewApprovalDocument,
-    ReviewExternalEffectPlan, ReviewStore, ReviewStoreError, ReviewWriteAdmission,
+    ReviewExternalEffectCustody, ReviewExternalEffectPlan, ReviewStore, ReviewStoreError,
+    ReviewWriteAdmission,
 };
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
@@ -59,7 +60,7 @@ fn downgrade_review_store_to_v1(path: &Path) {
     let connection = Connection::open(path).expect("open v2 store for downgrade");
     connection
         .execute_batch(
-            "DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; ALTER TABLE review_snapshots DROP COLUMN protocol_schema; PRAGMA user_version=1;",
+            "DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; ALTER TABLE review_snapshots DROP COLUMN protocol_schema; PRAGMA user_version=1;",
         )
         .expect("construct historical v1 store");
 }
@@ -192,6 +193,159 @@ fn external_plan(request: &ReviewActionRequest, payload: &[u8]) -> ReviewExterna
         payload.to_vec(),
     )
     .expect("external plan")
+}
+
+fn github_external_plan(request: &ReviewActionRequest) -> ReviewExternalEffectPlan {
+    let request_digest =
+        ReviewStore::action_request_digest(request, ApprovalPolicy::NotRequired).expect("digest");
+    ReviewExternalEffectPlan::github_check_rerun(
+        request_digest,
+        [7; 32],
+        [8; 32],
+        "github-actions-mobile",
+        "example-org",
+        "example-repo",
+        91,
+        "0123456789abcdef0123456789abcdef01234567",
+        3,
+        ReviewCheckId::new("check-1").unwrap(),
+        revision(7),
+    )
+    .expect("github effect plan")
+}
+
+#[test]
+fn github_check_plan_and_custody_survive_restart_without_reopening_write_admission() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let request = seed(&mut store);
+    let plan = github_external_plan(&request);
+    let action = match store
+        .prepare_external_action(&request, ApprovalPolicy::NotRequired, &plan, 12)
+        .unwrap()
+    {
+        ReviewActionAdmission::New(action) => action,
+        ReviewActionAdmission::Replay(_) => panic!("new action expected"),
+    };
+    assert_eq!(
+        store
+            .external_action(
+                request.workspace(),
+                request.actor(),
+                request.authentication(),
+                request.authority(),
+                request.idempotency_key(),
+                13,
+            )
+            .unwrap()
+            .unwrap()
+            .1
+            .github_custody(),
+        Some(ReviewExternalEffectCustody::NotStarted)
+    );
+    assert!(matches!(
+        store
+            .start_write(&action.preview_id, action.request_digest, 13)
+            .unwrap(),
+        ReviewWriteAdmission::New(_)
+    ));
+    drop(store);
+
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let (restarted, restarted_plan) = store
+        .external_action(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            14,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(restarted_plan.digest(), plan.digest());
+    assert_eq!(
+        restarted_plan.github_custody(),
+        Some(ReviewExternalEffectCustody::CustodyStarted)
+    );
+    assert!(matches!(
+        store
+            .start_write(&restarted.preview_id, restarted.request_digest, 14)
+            .unwrap(),
+        ReviewWriteAdmission::Replay(_)
+    ));
+    let unknown = store
+        .settle_github_check_rerun(
+            &restarted.preview_id,
+            restarted.request_digest,
+            ReviewExternalEffectCustody::Ambiguous,
+            15,
+        )
+        .unwrap();
+    assert_eq!(unknown.outcome(), ReviewReceiptOutcome::Unknown);
+    drop(store);
+
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let (restarted, restarted_plan) = store
+        .external_action(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            16,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        restarted_plan.github_custody(),
+        Some(ReviewExternalEffectCustody::Ambiguous)
+    );
+    let completed = store
+        .settle_github_check_rerun(
+            &restarted.preview_id,
+            restarted.request_digest,
+            ReviewExternalEffectCustody::Completed,
+            16,
+        )
+        .unwrap();
+    assert_eq!(completed.outcome(), ReviewReceiptOutcome::Completed);
+    assert_eq!(completed.revision(), Some(revision(10)));
+    let snapshot = store.snapshot(request.workspace()).unwrap().unwrap();
+    let check = snapshot
+        .checks()
+        .iter()
+        .find(|check| check.id().as_str() == "check-1")
+        .unwrap();
+    assert_eq!(check.state(), CheckState::Running);
+    assert_eq!(check.freshness().observed_revision(), revision(8));
+}
+
+#[test]
+fn github_check_external_plan_must_match_the_exact_action_target_revision() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let request = seed(&mut store);
+    let request_digest =
+        ReviewStore::action_request_digest(&request, ApprovalPolicy::NotRequired).unwrap();
+    let wrong = ReviewExternalEffectPlan::github_check_rerun(
+        request_digest,
+        [7; 32],
+        [8; 32],
+        "github-actions-mobile",
+        "example-org",
+        "example-repo",
+        91,
+        "0123456789abcdef0123456789abcdef01234567",
+        3,
+        ReviewCheckId::new("check-2").unwrap(),
+        revision(7),
+    )
+    .unwrap();
+    assert!(matches!(
+        store.prepare_external_action(&request, ApprovalPolicy::NotRequired, &wrong, 12),
+        Err(ReviewStoreError::Conflict("external_effect_request"))
+    ));
 }
 fn seed(store: &mut ReviewStore) -> ReviewActionRequest {
     let snapshot = snapshot();
@@ -639,7 +793,7 @@ fn populated_review_v1_store_migrates_exactly_and_remains_non_actionable() {
     assert_eq!(
         raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .expect("version"),
-        3
+        4
     );
     let schema: String = raw
         .query_row("SELECT protocol_schema FROM review_snapshots", [], |row| {
@@ -695,7 +849,7 @@ fn mislabeled_authority_bearing_v1_document_is_transactionally_upgraded_to_v2() 
     assert_eq!(
         raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .expect("version"),
-        3
+        4
     );
     let protocol_schema: String = raw
         .query_row("SELECT protocol_schema FROM review_snapshots", [], |row| {
@@ -715,7 +869,7 @@ fn populated_v2_store_adds_external_plan_custody_transactionally() {
     }
     let raw = Connection::open(private.path()).expect("raw");
     raw.execute_batch(
-        "DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+        "DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
     )
         .expect("construct v2 store");
     drop(raw);
@@ -733,7 +887,7 @@ fn populated_v2_store_adds_external_plan_custody_transactionally() {
     assert_eq!(
         raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .unwrap(),
-        3
+        4
     );
     assert!(
         raw.query_row(
@@ -788,7 +942,7 @@ fn v2_migration_terminalizes_legacy_accepted_external_action_without_a_plan() {
     };
     let raw = Connection::open(private.path()).unwrap();
     raw.execute_batch(
-        "DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+        "DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
     )
     .unwrap();
     drop(raw);
@@ -961,7 +1115,7 @@ fn v2_migration_preserves_or_conservatively_terminalizes_every_external_outcome(
         };
         let raw = Connection::open(private.path()).unwrap();
         raw.execute_batch(
-            "DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+            "DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
         )
         .unwrap();
         drop(raw);
@@ -1037,7 +1191,7 @@ fn migration_tombstone_tampering_and_native_missing_plan_corruption_fail_closed(
     };
     let raw = Connection::open(private.path()).unwrap();
     raw.execute_batch(
-        "DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+        "DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
     )
     .unwrap();
     drop(raw);
@@ -1186,7 +1340,7 @@ fn migration_refuses_legacy_completed_external_receipt_without_exact_snapshot_ba
     )
     .unwrap();
     raw.execute_batch(
-        "DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+        "DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
     )
     .unwrap();
     drop(raw);

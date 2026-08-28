@@ -275,16 +275,41 @@ authority kind/id to one closed target variant:
 - `retained_session` contains the closed provider (`jcode`), opaque provider
   session id, and exact Platform v2 `work_session_id` whose authoritative
   relations must lead to the bound review workspace and provider session;
-- `ci` contains an opaque provider target and credential reference;
+- `ci` keeps its backward-compatible provider target and credential reference;
+  a GitHub rerun capability additionally requires an exact bounded `checks`
+  entry containing `check_id`, numeric `run_id`, 40/64-hex `head_sha`, positive
+  `observed_attempt`, and positive `observed_check_revision`;
 - `pull_request` contains an opaque provider repository and credential
   reference.
 
-Credential references are names, never secret material. Target variants must
+Credential references are names, never secret material in this registry. A
+GitHub rerun is enabled only when the separate private sibling
+`platform-v2-review-github-credentials.json` contains the same reference and
+repository, a header-safe token, and the explicit boolean
+`"actions_write": true`. That file has the same owner, mode, link, size,
+unknown-field, and generation-fence checks as the review registry. Its token
+is held only by the typed GitHub client, never rendered, and never sourced
+from `gh`, the process environment, or ambient host authentication.
+
+Target variants must
 match their authority family, duplicate bindings and overlapping repository
 roots are refused, repository and `.git` metadata cannot be symlinked or
 group/world writable, and unknown JSON fields are rejected. The registry is
-private composition state: it is never returned by Platform v2 and clients
-cannot supply paths, commands, provider targets, or credential references.
+private composition state: its coordinates are never returned by Platform v2
+and clients cannot supply paths, commands, provider targets, or credential
+references. `GetReviewCapabilities` returns only the exact project/workspace,
+snapshot revision, check id/revision, and CI authority for currently runnable
+checks; missing or incoherent registry/credential state produces no advertised
+rerun capability.
+
+`ExecuteReviewAction(rerun_check)` persists the immutable run/repository/head/
+attempt plan and custody in the review SQLite store before the one allowed
+POST. Only a brand-new write admission in the same process may issue that POST.
+After a restart, `custody_started`, accepted, or ambiguous state is reconciled
+with the exact workflow-run GET and is never submitted again. Only the exact
+next attempt completes the receipt and advances the check projection to
+`running`; the old attempt, a skipped attempt, or changed head stays ambiguous
+or conflicts without a second mutation.
 
 ## Private attention source registry
 

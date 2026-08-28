@@ -56,7 +56,7 @@ use crate::platform_v2_lineage_api::{
 };
 use crate::platform_v2_review::{
     PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR, PLATFORM_REVIEW_SCHEMA_V1, ReviewAction,
-    ReviewActionReceipt, ReviewSnapshot,
+    ReviewActionReceipt, ReviewAuthority, ReviewAuthorityKind, ReviewCheckId, ReviewSnapshot,
 };
 use crate::platform_v2_review_api::{
     MAX_REVIEW_SNAPSHOT_CANONICAL_BYTES, ReviewApiError, action, action_json,
@@ -628,6 +628,95 @@ impl ReviewReadRequest {
     }
 }
 
+/// One exact check-rerun capability proven by the server for one workspace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewCheckRerunCapability {
+    check_id: ReviewCheckId,
+    expected_check_revision: Revision,
+    authority: ReviewAuthority,
+}
+
+impl ReviewCheckRerunCapability {
+    pub fn new(
+        check_id: ReviewCheckId,
+        expected_check_revision: Revision,
+        authority: ReviewAuthority,
+    ) -> Result<Self, PlatformV2TransportError> {
+        if authority.kind() != ReviewAuthorityKind::Ci {
+            return Err(PlatformV2TransportError::InvalidBody);
+        }
+        Ok(Self {
+            check_id,
+            expected_check_revision,
+            authority,
+        })
+    }
+    #[must_use]
+    pub const fn check_id(&self) -> &ReviewCheckId {
+        &self.check_id
+    }
+    #[must_use]
+    pub const fn expected_check_revision(&self) -> Revision {
+        self.expected_check_revision
+    }
+    #[must_use]
+    pub const fn authority(&self) -> &ReviewAuthority {
+        &self.authority
+    }
+}
+
+/// Revision-fenced mutation capabilities for exactly one project/workspace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewCapabilities {
+    project: ProjectId,
+    workspace: WorkContextIdentity,
+    snapshot_revision: Revision,
+    rerunnable_checks: Vec<ReviewCheckRerunCapability>,
+}
+
+impl ReviewCapabilities {
+    pub fn new(
+        project: ProjectId,
+        workspace: WorkContextIdentity,
+        snapshot_revision: Revision,
+        mut rerunnable_checks: Vec<ReviewCheckRerunCapability>,
+    ) -> Result<Self, PlatformV2TransportError> {
+        if !is_review_workspace(&workspace) || rerunnable_checks.len() > 512 {
+            return Err(PlatformV2TransportError::InvalidBody);
+        }
+        rerunnable_checks
+            .sort_by(|left, right| left.check_id().as_str().cmp(right.check_id().as_str()));
+        if rerunnable_checks
+            .windows(2)
+            .any(|pair| pair[0].check_id() == pair[1].check_id())
+        {
+            return Err(PlatformV2TransportError::InvalidBody);
+        }
+        Ok(Self {
+            project,
+            workspace,
+            snapshot_revision,
+            rerunnable_checks,
+        })
+    }
+    #[must_use]
+    pub const fn project(&self) -> &ProjectId {
+        &self.project
+    }
+    #[must_use]
+    pub const fn workspace(&self) -> &WorkContextIdentity {
+        &self.workspace
+    }
+    #[must_use]
+    pub const fn snapshot_revision(&self) -> Revision {
+        self.snapshot_revision
+    }
+    #[must_use]
+    pub fn rerunnable_checks(&self) -> &[ReviewCheckRerunCapability] {
+        &self.rerunnable_checks
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReviewReceiptLookup {
     project: ProjectId,
@@ -1027,6 +1116,7 @@ pub enum PlatformV2Request {
     GetWorkspaceIntent(WorkspaceIntentLookup),
     GetReview(ReviewReadRequest),
     GetAttentionSourceSnapshot(AttentionReadRequest),
+    GetReviewCapabilities(ReviewReadRequest),
     ExecuteReviewAction(ReviewActionTransportRequest),
     GetReviewReceipt(ReviewReceiptLookup),
 }
@@ -1046,6 +1136,7 @@ pub enum PlatformV2Response {
     WorkspaceIntentResult(WorkspaceIntentOutcome),
     ReviewResult(ReviewSnapshot),
     AttentionSourceSnapshot(AttentionSourceSnapshot),
+    ReviewCapabilities(ReviewCapabilities),
     ReviewReceipt(ReviewActionReceipt),
     Refused(PlatformV2Refusal),
 }
@@ -1198,6 +1289,128 @@ fn review_lookup_json(value: &ReviewReceiptLookup) -> JsonValue {
     ])
 }
 
+fn review_capabilities_json(
+    value: &ReviewCapabilities,
+) -> Result<JsonValue, PlatformV2TransportError> {
+    let rerunnable_checks = value
+        .rerunnable_checks()
+        .iter()
+        .map(|capability| {
+            Ok(object(vec![
+                (
+                    "authority",
+                    object(vec![
+                        (
+                            "id",
+                            JsonValue::String(capability.authority().id().as_str().to_owned()),
+                        ),
+                        (
+                            "kind",
+                            JsonValue::String(capability.authority().kind().as_str().to_owned()),
+                        ),
+                    ]),
+                ),
+                (
+                    "check_id",
+                    JsonValue::String(capability.check_id().as_str().to_owned()),
+                ),
+                (
+                    "expected_check_revision",
+                    JsonValue::Integer(
+                        i64::try_from(capability.expected_check_revision().get())
+                            .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+                    ),
+                ),
+            ]))
+        })
+        .collect::<Result<Vec<_>, PlatformV2TransportError>>()?;
+    Ok(object(vec![
+        (
+            "project",
+            JsonValue::String(value.project().as_str().to_owned()),
+        ),
+        ("rerunnable_checks", JsonValue::Array(rerunnable_checks)),
+        ("schema", JsonValue::String(PLATFORM_SCHEMA_V2.to_owned())),
+        (
+            "snapshot_revision",
+            JsonValue::Integer(
+                i64::try_from(value.snapshot_revision().get())
+                    .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+            ),
+        ),
+        ("workspace", identity_json(value.workspace())),
+    ]))
+}
+
+fn review_capabilities(value: &JsonValue) -> Result<ReviewCapabilities, PlatformV2TransportError> {
+    exact_fields(
+        value,
+        &[
+            "project",
+            "rerunnable_checks",
+            "schema",
+            "snapshot_revision",
+            "workspace",
+        ],
+    )?;
+    if string(value, "schema")? != PLATFORM_SCHEMA_V2 {
+        return Err(PlatformV2TransportError::InvalidBody);
+    }
+    let JsonValue::Array(checks) = value
+        .get("rerunnable_checks")
+        .ok_or(PlatformV2TransportError::InvalidBody)?
+    else {
+        return Err(PlatformV2TransportError::InvalidBody);
+    };
+    let checks = checks
+        .iter()
+        .map(|check| {
+            exact_fields(check, &["authority", "check_id", "expected_check_revision"])?;
+            let authority = check
+                .get("authority")
+                .ok_or(PlatformV2TransportError::InvalidBody)?;
+            exact_fields(authority, &["id", "kind"])?;
+            let authority = ReviewAuthority::new(
+                ReviewAuthorityKind::parse(string(authority, "kind")?)
+                    .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+                crate::platform_v2_review::ReviewAuthorityId::new(
+                    string(authority, "id")?.to_owned(),
+                )
+                .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+            );
+            let revision = check
+                .get("expected_check_revision")
+                .and_then(JsonValue::as_integer)
+                .and_then(|value| u64::try_from(value).ok())
+                .and_then(|value| Revision::new(value).ok())
+                .ok_or(PlatformV2TransportError::InvalidBody)?;
+            ReviewCheckRerunCapability::new(
+                ReviewCheckId::new(string(check, "check_id")?.to_owned())
+                    .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+                revision,
+                authority,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let snapshot_revision = value
+        .get("snapshot_revision")
+        .and_then(JsonValue::as_integer)
+        .and_then(|value| u64::try_from(value).ok())
+        .and_then(|value| Revision::new(value).ok())
+        .ok_or(PlatformV2TransportError::InvalidBody)?;
+    ReviewCapabilities::new(
+        ProjectId::new(string(value, "project")?.to_owned())
+            .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+        identity(
+            value
+                .get("workspace")
+                .ok_or(PlatformV2TransportError::InvalidBody)?,
+        )?,
+        snapshot_revision,
+        checks,
+    )
+}
+
 fn request_kind(value: &PlatformV2Request) -> &'static str {
     match value {
         PlatformV2Request::GetLifecycleCapabilities => "get_lifecycle_capabilities",
@@ -1212,6 +1425,7 @@ fn request_kind(value: &PlatformV2Request) -> &'static str {
         PlatformV2Request::GetWorkspaceIntent(_) => "get_workspace_intent",
         PlatformV2Request::GetReview(_) => "get_review",
         PlatformV2Request::GetAttentionSourceSnapshot(_) => "get_attention_source_snapshot",
+        PlatformV2Request::GetReviewCapabilities(_) => "get_review_capabilities",
         PlatformV2Request::ExecuteReviewAction(_) => "execute_review_action",
         PlatformV2Request::GetReviewReceipt(_) => "get_review_receipt",
     }
@@ -1302,6 +1516,9 @@ fn request_body(value: &PlatformV2Request) -> Result<JsonValue, PlatformV2Transp
         PlatformV2Request::GetReview(value) => scope_json(&value.project, Some(&value.workspace)),
         PlatformV2Request::GetAttentionSourceSnapshot(value) => {
             document(encode_attention_read_request(value)?)?
+        }
+        PlatformV2Request::GetReviewCapabilities(value) => {
+            scope_json(&value.project, Some(&value.workspace))
         }
         PlatformV2Request::ExecuteReviewAction(value) => object(vec![
             ("action", action_json(&value.action)?),
@@ -1471,6 +1688,13 @@ fn request_from_message(message: &Message) -> Result<PlatformV2Request, Platform
         "get_attention_source_snapshot" => {
             PlatformV2Request::GetAttentionSourceSnapshot(decode_attention_read_request(&bytes)?)
         }
+        "get_review_capabilities" => {
+            let (project, workspace) = scope(message.body())?;
+            PlatformV2Request::GetReviewCapabilities(ReviewReadRequest::new(
+                project,
+                workspace.ok_or(PlatformV2TransportError::InvalidBody)?,
+            )?)
+        }
         "execute_review_action" => {
             exact_fields(
                 message.body(),
@@ -1615,6 +1839,7 @@ fn response_kind(value: &PlatformV2Response) -> &'static str {
         PlatformV2Response::WorkspaceIntentResult(_) => "workspace_intent_result",
         PlatformV2Response::ReviewResult(_) => "review_result",
         PlatformV2Response::AttentionSourceSnapshot(_) => "attention_source_snapshot",
+        PlatformV2Response::ReviewCapabilities(_) => "review_capabilities",
         PlatformV2Response::ReviewReceipt(_) => "review_receipt",
         PlatformV2Response::Refused(_) => "platform_v2_refused",
     }
@@ -1655,6 +1880,9 @@ fn response_answers_request(request: &PlatformV2Request, response: &PlatformV2Re
         ) | (
             PlatformV2Request::GetAttentionSourceSnapshot(_),
             PlatformV2Response::AttentionSourceSnapshot(_)
+        ) | (
+            PlatformV2Request::GetReviewCapabilities(_),
+            PlatformV2Response::ReviewCapabilities(_)
         ) | (
             PlatformV2Request::ExecuteReviewAction(_) | PlatformV2Request::GetReviewReceipt(_),
             PlatformV2Response::ReviewReceipt(_)
@@ -1727,6 +1955,7 @@ fn response_body(value: &PlatformV2Response) -> Result<JsonValue, PlatformV2Tran
         PlatformV2Response::AttentionSourceSnapshot(value) => {
             document(encode_attention_source_snapshot(value)?)?
         }
+        PlatformV2Response::ReviewCapabilities(value) => review_capabilities_json(value)?,
         PlatformV2Response::ReviewReceipt(value) => document(encode_review_action_receipt(value)?)?,
         PlatformV2Response::Refused(value) => refusal_json(value),
     })
@@ -1825,6 +2054,9 @@ fn response_from_message(
         "review_result" => PlatformV2Response::ReviewResult(decode_review_snapshot(&bytes)?),
         "attention_source_snapshot" => {
             PlatformV2Response::AttentionSourceSnapshot(decode_attention_source_snapshot(&bytes)?)
+        }
+        "review_capabilities" => {
+            PlatformV2Response::ReviewCapabilities(review_capabilities(message.body())?)
         }
         "review_receipt" => {
             PlatformV2Response::ReviewReceipt(decode_review_action_receipt(&bytes)?)

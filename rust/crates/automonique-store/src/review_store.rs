@@ -19,12 +19,12 @@ use std::path::{Path, PathBuf};
 use automonique_protocol::platform::{IdempotencyKey, ReceiptId};
 use automonique_protocol::platform_v2::WorkContextIdentity;
 use automonique_protocol::platform_v2_review::{
-    AttentionEvent, AttentionOrigin, AttentionOriginKind, AttentionReason, CheckState,
-    CommentAgentState, ConflictState, DeliveryState, PullRequestState, ReviewAction,
+    AttentionEvent, AttentionOrigin, AttentionOriginKind, AttentionReason, CheckProjection,
+    CheckState, CommentAgentState, ConflictState, DeliveryState, PullRequestState, ReviewAction,
     ReviewActionId, ReviewActionReceipt, ReviewActionRequest, ReviewActorId,
     ReviewAttentionEventId, ReviewAuthentication, ReviewAuthority, ReviewAuthorityId,
-    ReviewAuthorityKind, ReviewComment, ReviewCommentId, ReviewDecision, ReviewField,
-    ReviewFreshness, ReviewFreshnessState, ReviewReceiptOutcome, ReviewReconciliation,
+    ReviewAuthorityKind, ReviewCheckId, ReviewComment, ReviewCommentId, ReviewDecision,
+    ReviewField, ReviewFreshness, ReviewFreshnessState, ReviewReceiptOutcome, ReviewReconciliation,
     ReviewSchemaVersion, ReviewSnapshot, ReviewStatusProjection, ReviewText,
 };
 use automonique_protocol::platform_v2_review_api::{
@@ -38,7 +38,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{StoreError, validate_database_path};
 
-pub const REVIEW_STORE_SCHEMA_VERSION: u32 = 3;
+pub const REVIEW_STORE_SCHEMA_VERSION: u32 = 4;
 const MAX_PROVIDER_OBSERVATION_BYTES: usize = 4096;
 const MAX_REVIEW_EFFECT_PAYLOAD_BYTES: usize = 1_048_576;
 
@@ -238,6 +238,28 @@ CREATE TABLE review_external_effect_migration_tombstones (
     preview_id TEXT PRIMARY KEY REFERENCES review_action_previews(preview_id),
     outcome TEXT NOT NULL CHECK (outcome IN ('completed', 'refused', 'conflict')),
     receipt_digest BLOB NOT NULL CHECK (length(receipt_digest) = 32)
+) STRICT;
+"#;
+
+const ADD_GITHUB_CHECK_EFFECT_PLANS_V4: &str = r#"
+CREATE TABLE review_github_check_effect_plans (
+    preview_id TEXT PRIMARY KEY REFERENCES review_action_previews(preview_id),
+    request_digest BLOB NOT NULL CHECK (length(request_digest) = 32),
+    registry_generation_digest BLOB NOT NULL CHECK (length(registry_generation_digest) = 32),
+    credential_generation_digest BLOB NOT NULL CHECK (length(credential_generation_digest) = 32),
+    credential_reference TEXT NOT NULL,
+    repository_owner TEXT NOT NULL,
+    repository_name TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    head_sha TEXT NOT NULL,
+    observed_attempt INTEGER NOT NULL CHECK (observed_attempt >= 1),
+    check_id TEXT NOT NULL,
+    expected_check_revision INTEGER NOT NULL CHECK (expected_check_revision >= 1),
+    custody TEXT NOT NULL CHECK (custody IN ('not_started','custody_started','accepted','ambiguous','refused','completed')),
+    plan_document BLOB NOT NULL,
+    plan_digest BLOB NOT NULL CHECK (length(plan_digest) = 32),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms)
 ) STRICT;
 "#;
 
@@ -477,6 +499,56 @@ pub struct ReviewExternalEffectPlan {
     payload_digest: [u8; 32],
     document: Vec<u8>,
     digest: [u8; 32],
+    github_check: Option<GitHubCheckEffectPlan>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewExternalEffectCustody {
+    NotStarted,
+    CustodyStarted,
+    Accepted,
+    Ambiguous,
+    Refused,
+    Completed,
+}
+
+impl ReviewExternalEffectCustody {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotStarted => "not_started",
+            Self::CustodyStarted => "custody_started",
+            Self::Accepted => "accepted",
+            Self::Ambiguous => "ambiguous",
+            Self::Refused => "refused",
+            Self::Completed => "completed",
+        }
+    }
+
+    fn parse(value: &str) -> Stored<Self> {
+        match value {
+            "not_started" => Ok(Self::NotStarted),
+            "custody_started" => Ok(Self::CustodyStarted),
+            "accepted" => Ok(Self::Accepted),
+            "ambiguous" => Ok(Self::Ambiguous),
+            "refused" => Ok(Self::Refused),
+            "completed" => Ok(Self::Completed),
+            _ => Err(ReviewStoreError::Corrupt("github_check_custody")),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitHubCheckEffectPlan {
+    credential_generation_digest: [u8; 32],
+    credential_reference: String,
+    repository_owner: String,
+    repository_name: String,
+    run_id: u64,
+    head_sha: String,
+    observed_attempt: u32,
+    check_id: ReviewCheckId,
+    expected_check_revision: Revision,
+    custody: ReviewExternalEffectCustody,
 }
 
 impl ReviewExternalEffectPlan {
@@ -564,7 +636,172 @@ impl ReviewExternalEffectPlan {
             payload_digest,
             document,
             digest: plan_digest,
+            github_check: None,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn github_check_rerun(
+        request_digest: [u8; 32],
+        registry_generation_digest: [u8; 32],
+        credential_generation_digest: [u8; 32],
+        credential_reference: &str,
+        repository_owner: &str,
+        repository_name: &str,
+        run_id: u64,
+        head_sha: &str,
+        observed_attempt: u32,
+        check_id: ReviewCheckId,
+        expected_check_revision: Revision,
+    ) -> Stored<Self> {
+        if !safe_effect_coordinate(credential_reference)
+            || !safe_effect_coordinate(repository_owner)
+            || !safe_effect_coordinate(repository_name)
+            || run_id == 0
+            || observed_attempt == 0
+            || !valid_effect_head_sha(head_sha)
+        {
+            return Err(ReviewStoreError::InvalidField("external_effect_plan"));
+        }
+        let document = JsonValue::Object(vec![
+            (
+                "check_id".to_owned(),
+                JsonValue::String(check_id.as_str().to_owned()),
+            ),
+            (
+                "credential_generation_digest".to_owned(),
+                JsonValue::String(digest_token(&credential_generation_digest)),
+            ),
+            (
+                "credential_reference".to_owned(),
+                JsonValue::String(credential_reference.to_owned()),
+            ),
+            (
+                "effect_kind".to_owned(),
+                JsonValue::String("github_check_rerun".to_owned()),
+            ),
+            (
+                "expected_check_revision".to_owned(),
+                JsonValue::Integer(db_revision(expected_check_revision)?),
+            ),
+            (
+                "head_sha".to_owned(),
+                JsonValue::String(head_sha.to_owned()),
+            ),
+            (
+                "observed_attempt".to_owned(),
+                JsonValue::Integer(i64::from(observed_attempt)),
+            ),
+            (
+                "registry_generation_digest".to_owned(),
+                JsonValue::String(digest_token(&registry_generation_digest)),
+            ),
+            (
+                "repository_name".to_owned(),
+                JsonValue::String(repository_name.to_owned()),
+            ),
+            (
+                "repository_owner".to_owned(),
+                JsonValue::String(repository_owner.to_owned()),
+            ),
+            (
+                "request_digest".to_owned(),
+                JsonValue::String(digest_token(&request_digest)),
+            ),
+            ("run_id".to_owned(), JsonValue::String(run_id.to_string())),
+            (
+                "schema".to_owned(),
+                JsonValue::String("automonique.store/review-external-effect/v1".to_owned()),
+            ),
+        ])
+        .to_canonical_bytes();
+        let plan_digest = digest(&document);
+        Ok(Self {
+            request_digest,
+            registry_generation_digest,
+            provider: "github".to_owned(),
+            work_session_id: String::new(),
+            provider_session_id: String::new(),
+            work_session_revision: Revision::FIRST,
+            provider_session_revision: Revision::FIRST,
+            transport_key: String::new(),
+            payload: Vec::new(),
+            payload_digest: digest(&[]),
+            document,
+            digest: plan_digest,
+            github_check: Some(GitHubCheckEffectPlan {
+                credential_generation_digest,
+                credential_reference: credential_reference.to_owned(),
+                repository_owner: repository_owner.to_owned(),
+                repository_name: repository_name.to_owned(),
+                run_id,
+                head_sha: head_sha.to_owned(),
+                observed_attempt,
+                check_id,
+                expected_check_revision,
+                custody: ReviewExternalEffectCustody::NotStarted,
+            }),
+        })
+    }
+
+    #[must_use]
+    pub const fn is_github_check_rerun(&self) -> bool {
+        self.github_check.is_some()
+    }
+
+    #[must_use]
+    pub const fn github_custody(&self) -> Option<ReviewExternalEffectCustody> {
+        match &self.github_check {
+            Some(plan) => Some(plan.custody),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub fn github_credential_reference(&self) -> Option<&str> {
+        self.github_check
+            .as_ref()
+            .map(|p| p.credential_reference.as_str())
+    }
+    #[must_use]
+    pub fn github_repository_owner(&self) -> Option<&str> {
+        self.github_check
+            .as_ref()
+            .map(|p| p.repository_owner.as_str())
+    }
+    #[must_use]
+    pub fn github_repository_name(&self) -> Option<&str> {
+        self.github_check
+            .as_ref()
+            .map(|p| p.repository_name.as_str())
+    }
+    #[must_use]
+    pub fn github_run_id(&self) -> Option<u64> {
+        self.github_check.as_ref().map(|p| p.run_id)
+    }
+    #[must_use]
+    pub fn github_head_sha(&self) -> Option<&str> {
+        self.github_check.as_ref().map(|p| p.head_sha.as_str())
+    }
+    #[must_use]
+    pub fn github_observed_attempt(&self) -> Option<u32> {
+        self.github_check.as_ref().map(|p| p.observed_attempt)
+    }
+    #[must_use]
+    pub fn github_check_id(&self) -> Option<&ReviewCheckId> {
+        self.github_check.as_ref().map(|p| &p.check_id)
+    }
+    #[must_use]
+    pub fn github_expected_check_revision(&self) -> Option<Revision> {
+        self.github_check
+            .as_ref()
+            .map(|p| p.expected_check_revision)
+    }
+    #[must_use]
+    pub fn github_credential_generation_digest(&self) -> Option<[u8; 32]> {
+        self.github_check
+            .as_ref()
+            .map(|p| p.credential_generation_digest)
     }
 
     #[must_use]
@@ -890,13 +1127,29 @@ impl ReviewStore {
             request.action(),
             ReviewAction::SendCommentToAgent { .. } | ReviewAction::BatchSendCommentsToAgent { .. }
         );
-        if external_plan.is_some() && !retained_session_action {
+        if external_plan.is_some()
+            && !retained_session_action
+            && (!matches!(request.action(), ReviewAction::RerunCheck { .. })
+                || !external_plan.is_some_and(ReviewExternalEffectPlan::is_github_check_rerun))
+        {
             return Err(ReviewStoreError::InvalidField("external_effect_action"));
         }
         if retained_session_action && external_plan.is_none() {
             return Err(ReviewStoreError::InvalidField("external_effect_plan"));
         }
         if external_plan.is_some_and(|plan| plan.request_digest != request_digest) {
+            return Err(ReviewStoreError::Conflict("external_effect_request"));
+        }
+        if let (
+            ReviewAction::RerunCheck {
+                check_id,
+                expected_check_revision,
+            },
+            Some(plan),
+        ) = (request.action(), external_plan)
+            && (plan.github_check_id() != Some(check_id)
+                || plan.github_expected_check_revision() != Some(*expected_check_revision))
+        {
             return Err(ReviewStoreError::Conflict("external_effect_request"));
         }
         let (kind, id) = workspace_parts(request.workspace());
@@ -966,7 +1219,9 @@ impl ReviewStore {
             params![preview_id, kind, id, db_revision(request.expected_revision())?, request.actor().as_str(), request.authentication().as_str(), request.authority().kind().as_str(), request.authority().id().as_str(), request.idempotency_key().as_str(), request.action().kind().as_str(), action_id.as_str(), document, protocol_request_digest.as_slice(), preview_document, request_digest.as_slice(), approval.as_str(), i64::from(approval == ApprovalPolicy::Required), created_at_ms])?;
         if let Some(plan) = external_plan {
             insert_external_plan(&transaction, &preview_id, plan, created_at_ms)?;
-            reserve_external_targets(&transaction, &preview_id, request)?;
+            if retained_session_action {
+                reserve_external_targets(&transaction, &preview_id, request)?;
+            }
         }
         transaction.execute(
             "INSERT INTO review_action_receipts(receipt_id,preview_id,receipt_document,receipt_digest,request_digest,approval_digest,outcome,result_revision,current_revision,updated_at_ms) VALUES(?1,?2,?3,?4,?5,NULL,?6,NULL,NULL,?7)",
@@ -1314,6 +1569,12 @@ impl ReviewStore {
         }
         require_active_authority(&transaction, &action.request, now_ms)?;
         if action.write_admitted_at_ms.is_some() {
+            if let Some(plan) = read_external_plan(&transaction, preview_id)?
+                && plan.is_github_check_rerun()
+                && plan.github_custody() == Some(ReviewExternalEffectCustody::NotStarted)
+            {
+                return Err(ReviewStoreError::Corrupt("github_check_custody"));
+            }
             transaction.commit()?;
             return Ok(ReviewWriteAdmission::Replay(action));
         }
@@ -1333,6 +1594,20 @@ impl ReviewStore {
         )?;
         if changed != 1 {
             return Err(ReviewStoreError::Conflict("write_admission"));
+        }
+        let github_plan: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM review_github_check_effect_plans WHERE preview_id=?1)",
+            [preview_id],
+            |row| row.get(0),
+        )?;
+        if github_plan {
+            let changed = transaction.execute(
+                "UPDATE review_github_check_effect_plans SET custody='custody_started',updated_at_ms=?1 WHERE preview_id=?2 AND custody='not_started'",
+                params![now_ms, preview_id],
+            )?;
+            if changed != 1 {
+                return Err(ReviewStoreError::Conflict("github_check_custody"));
+            }
         }
         let result = read_action_by_preview(&transaction, preview_id)?
             .ok_or(ReviewStoreError::Corrupt("preview"))?;
@@ -1364,19 +1639,25 @@ impl ReviewStore {
             }
             return Err(ReviewStoreError::Conflict("terminal_receipt"));
         }
-        if action.external_effect_plan_digest.is_none()
-            || !matches!(
-                action.request.action(),
-                ReviewAction::SendCommentToAgent { .. }
-                    | ReviewAction::BatchSendCommentsToAgent { .. }
-            )
-        {
+        if action.external_effect_plan_digest.is_none() {
             return Err(ReviewStoreError::InvalidField("external_effect_action"));
         }
         if action.write_admitted_at_ms.is_some() {
             return Err(ReviewStoreError::Conflict("write_already_started"));
         }
-        release_external_plan_before_write(&transaction, preview_id)?;
+        let plan = read_external_plan(&transaction, preview_id)?
+            .ok_or(ReviewStoreError::Corrupt("external_effect_plan"))?;
+        if plan.is_github_check_rerun() {
+            let changed = transaction.execute(
+                "UPDATE review_github_check_effect_plans SET custody='refused',updated_at_ms=?1 WHERE preview_id=?2 AND custody='not_started'",
+                params![now_ms, preview_id],
+            )?;
+            if changed != 1 {
+                return Err(ReviewStoreError::Conflict("github_check_custody"));
+            }
+        } else {
+            release_external_plan_before_write(&transaction, preview_id)?;
+        }
         let refused = ReviewActionReceipt::new(
             action.receipt.receipt_id().clone(),
             action.receipt.idempotency_key().clone(),
@@ -1420,6 +1701,14 @@ impl ReviewStore {
             transaction.commit()?;
             return Ok(action.receipt);
         }
+        if read_external_plan(&transaction, preview_id)?
+            .is_some_and(|plan| plan.is_github_check_rerun())
+        {
+            transaction.execute(
+                "UPDATE review_github_check_effect_plans SET custody='ambiguous',updated_at_ms=?1 WHERE preview_id=?2 AND custody IN ('custody_started','accepted','ambiguous')",
+                params![now_ms, preview_id],
+            )?;
+        }
         let receipt = ReviewActionReceipt::new(
             action.receipt.receipt_id().clone(),
             action.receipt.idempotency_key().clone(),
@@ -1432,6 +1721,152 @@ impl ReviewStore {
         )
         .map_err(protocol)?;
         update_receipt(&transaction, preview_id, &receipt, now_ms)?;
+        transaction.commit()?;
+        Ok(receipt)
+    }
+
+    /// Persist the observed GitHub custody transition and its receipt in one
+    /// transaction. `Completed` means the exact next workflow attempt exists;
+    /// it advances the local check projection to `running` without claiming
+    /// that the new attempt itself has finished.
+    pub fn settle_github_check_rerun(
+        &mut self,
+        preview_id: &str,
+        request_digest: [u8; 32],
+        custody: ReviewExternalEffectCustody,
+        now_ms: i64,
+    ) -> Stored<ReviewActionReceipt> {
+        validate_time(now_ms)?;
+        if matches!(
+            custody,
+            ReviewExternalEffectCustody::NotStarted | ReviewExternalEffectCustody::CustodyStarted
+        ) {
+            return Err(ReviewStoreError::InvalidField("github_check_custody"));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let action =
+            read_action_by_preview(&transaction, preview_id)?.ok_or(ReviewStoreError::NotFound)?;
+        if action.request_digest != request_digest
+            || action.write_admitted_at_ms.is_none()
+            || !matches!(action.request.action(), ReviewAction::RerunCheck { .. })
+        {
+            return Err(ReviewStoreError::Conflict("external_effect_completion"));
+        }
+        let plan = read_external_plan(&transaction, preview_id)?
+            .ok_or(ReviewStoreError::Corrupt("external_effect_plan"))?;
+        if !plan.is_github_check_rerun() {
+            return Err(ReviewStoreError::Conflict("external_effect_completion"));
+        }
+        let current_custody = plan
+            .github_custody()
+            .ok_or(ReviewStoreError::Corrupt("github_check_custody"))?;
+        if matches!(
+            current_custody,
+            ReviewExternalEffectCustody::Refused | ReviewExternalEffectCustody::Completed
+        ) {
+            if current_custody == custody {
+                transaction.commit()?;
+                return Ok(action.receipt);
+            }
+            return Err(ReviewStoreError::Conflict("github_check_custody"));
+        }
+        let allowed = match custody {
+            ReviewExternalEffectCustody::Accepted => {
+                current_custody == ReviewExternalEffectCustody::CustodyStarted
+            }
+            ReviewExternalEffectCustody::Ambiguous => matches!(
+                current_custody,
+                ReviewExternalEffectCustody::CustodyStarted
+                    | ReviewExternalEffectCustody::Accepted
+                    | ReviewExternalEffectCustody::Ambiguous
+            ),
+            ReviewExternalEffectCustody::Refused => {
+                current_custody == ReviewExternalEffectCustody::CustodyStarted
+            }
+            ReviewExternalEffectCustody::Completed => matches!(
+                current_custody,
+                ReviewExternalEffectCustody::CustodyStarted
+                    | ReviewExternalEffectCustody::Accepted
+                    | ReviewExternalEffectCustody::Ambiguous
+            ),
+            ReviewExternalEffectCustody::NotStarted
+            | ReviewExternalEffectCustody::CustodyStarted => false,
+        };
+        if !allowed {
+            return Err(ReviewStoreError::Conflict("github_check_custody"));
+        }
+        let changed = transaction.execute(
+            "UPDATE review_github_check_effect_plans SET custody=?1,updated_at_ms=?2 WHERE preview_id=?3 AND custody=?4",
+            params![custody.as_str(), now_ms, preview_id, current_custody.as_str()],
+        )?;
+        if changed != 1 {
+            return Err(ReviewStoreError::Conflict("github_check_custody"));
+        }
+
+        let receipt = match custody {
+            ReviewExternalEffectCustody::Accepted => action.receipt.clone(),
+            ReviewExternalEffectCustody::Ambiguous => ReviewActionReceipt::new(
+                action.receipt.receipt_id().clone(),
+                action.receipt.idempotency_key().clone(),
+                action.receipt.action_id().clone(),
+                action.receipt.actor().clone(),
+                ReviewReceiptOutcome::Unknown,
+                None,
+                None,
+                ReviewReconciliation::PollReceipt,
+            )
+            .map_err(protocol)?,
+            ReviewExternalEffectCustody::Refused => ReviewActionReceipt::new(
+                action.receipt.receipt_id().clone(),
+                action.receipt.idempotency_key().clone(),
+                action.receipt.action_id().clone(),
+                action.receipt.actor().clone(),
+                ReviewReceiptOutcome::Refused,
+                None,
+                None,
+                ReviewReconciliation::Final,
+            )
+            .map_err(protocol)?,
+            ReviewExternalEffectCustody::Completed => {
+                let (kind, id) = workspace_parts(action.request.workspace());
+                let current = read_current_snapshot(&transaction, kind, id)?
+                    .ok_or(ReviewStoreError::Corrupt("current_snapshot"))?;
+                if current.revision() != action.request.expected_revision() {
+                    ReviewActionReceipt::new(
+                        action.receipt.receipt_id().clone(),
+                        action.receipt.idempotency_key().clone(),
+                        action.receipt.action_id().clone(),
+                        action.receipt.actor().clone(),
+                        ReviewReceiptOutcome::Conflict,
+                        None,
+                        Some(current.revision()),
+                        ReviewReconciliation::Final,
+                    )
+                    .map_err(protocol)?
+                } else {
+                    let next = github_check_rerun_snapshot(&current, &action.request, now_ms)?;
+                    persist_snapshot(&transaction, &next, now_ms)?;
+                    ReviewActionReceipt::new(
+                        action.receipt.receipt_id().clone(),
+                        action.receipt.idempotency_key().clone(),
+                        action.receipt.action_id().clone(),
+                        action.receipt.actor().clone(),
+                        ReviewReceiptOutcome::Completed,
+                        Some(next.revision()),
+                        None,
+                        ReviewReconciliation::Final,
+                    )
+                    .map_err(protocol)?
+                }
+            }
+            ReviewExternalEffectCustody::NotStarted
+            | ReviewExternalEffectCustody::CustodyStarted => unreachable!(),
+        };
+        if receipt != action.receipt {
+            update_receipt(&transaction, preview_id, &receipt, now_ms)?;
+        }
         transaction.commit()?;
         Ok(receipt)
     }
@@ -1909,14 +2344,19 @@ fn initialize(connection: &mut Connection) -> Stored<bool> {
         transaction.execute_batch(SCHEMA_V1)?;
         transaction.execute_batch(ADD_SNAPSHOT_PROTOCOL_SCHEMA_V2)?;
         transaction.execute_batch(ADD_EXTERNAL_EFFECT_PLANS_V3)?;
+        transaction.execute_batch(ADD_GITHUB_CHECK_EFFECT_PLANS_V4)?;
     } else if version == 1 {
         transaction.execute_batch(ADD_SNAPSHOT_PROTOCOL_SCHEMA_V2)?;
         migrate_review_v1_snapshots(&transaction)?;
         transaction.execute_batch(ADD_EXTERNAL_EFFECT_PLANS_V3)?;
+        transaction.execute_batch(ADD_GITHUB_CHECK_EFFECT_PLANS_V4)?;
         terminalize_legacy_external_actions(&transaction)?;
     } else if version == 2 {
         transaction.execute_batch(ADD_EXTERNAL_EFFECT_PLANS_V3)?;
+        transaction.execute_batch(ADD_GITHUB_CHECK_EFFECT_PLANS_V4)?;
         terminalize_legacy_external_actions(&transaction)?;
+    } else if version == 3 {
+        transaction.execute_batch(ADD_GITHUB_CHECK_EFFECT_PLANS_V4)?;
     } else {
         return Err(ReviewStoreError::SchemaVersion {
             found: version,
@@ -2165,7 +2605,7 @@ fn bind_authority_namespace(
         Some(_) => Ok(()),
         None => {
             let populated: bool = connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM review_current UNION ALL SELECT 1 FROM review_snapshots UNION ALL SELECT 1 FROM review_comments UNION ALL SELECT 1 FROM review_authority_grants UNION ALL SELECT 1 FROM review_authority_grant_events UNION ALL SELECT 1 FROM review_action_previews UNION ALL SELECT 1 FROM review_action_approvals UNION ALL SELECT 1 FROM review_action_receipts UNION ALL SELECT 1 FROM review_completion_evidence UNION ALL SELECT 1 FROM review_provider_observations UNION ALL SELECT 1 FROM review_external_effect_plans)",
+                "SELECT EXISTS(SELECT 1 FROM review_current UNION ALL SELECT 1 FROM review_snapshots UNION ALL SELECT 1 FROM review_comments UNION ALL SELECT 1 FROM review_authority_grants UNION ALL SELECT 1 FROM review_authority_grant_events UNION ALL SELECT 1 FROM review_action_previews UNION ALL SELECT 1 FROM review_action_approvals UNION ALL SELECT 1 FROM review_action_receipts UNION ALL SELECT 1 FROM review_completion_evidence UNION ALL SELECT 1 FROM review_provider_observations UNION ALL SELECT 1 FROM review_external_effect_plans UNION ALL SELECT 1 FROM review_github_check_effect_plans)",
                 [],
                 |row| row.get(0),
             )?;
@@ -2938,6 +3378,100 @@ fn release_external_plan_before_write(connection: &Connection, preview_id: &str)
     Ok(())
 }
 
+fn safe_effect_coordinate(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && !value.starts_with('-')
+        && !value.contains("..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn valid_effect_head_sha(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn github_check_rerun_snapshot(
+    current: &ReviewSnapshot,
+    request: &ReviewActionRequest,
+    recorded_at_ms: i64,
+) -> Stored<ReviewSnapshot> {
+    let ReviewAction::RerunCheck {
+        check_id,
+        expected_check_revision,
+    } = request.action()
+    else {
+        return Err(ReviewStoreError::InvalidField("external_effect_action"));
+    };
+    if current.schema() != ReviewSchemaVersion::V2
+        || current.workspace() != request.workspace()
+        || current.revision() != request.expected_revision()
+    {
+        return Err(ReviewStoreError::Conflict("external_effect_completion"));
+    }
+    let next_revision = Revision::new(
+        current
+            .revision()
+            .get()
+            .checked_add(1)
+            .ok_or(ReviewStoreError::InvalidField("revision"))?,
+    )
+    .map_err(|_| ReviewStoreError::InvalidField("revision"))?;
+    let next_check_revision = Revision::new(
+        expected_check_revision
+            .get()
+            .checked_add(1)
+            .ok_or(ReviewStoreError::InvalidField("revision"))?,
+    )
+    .map_err(|_| ReviewStoreError::InvalidField("revision"))?;
+    let observed_at_ms =
+        u64::try_from(recorded_at_ms).map_err(|_| ReviewStoreError::InvalidField("time"))?;
+    let mut checks = Vec::with_capacity(current.checks().len());
+    let mut found = false;
+    for check in current.checks() {
+        if check.id() == check_id {
+            if check.freshness().observed_revision() != *expected_check_revision {
+                return Err(ReviewStoreError::Conflict("external_effect_completion"));
+            }
+            checks.push(
+                CheckProjection::new(
+                    check.id().clone(),
+                    CheckState::Running,
+                    check.authority().clone(),
+                    ReviewFreshness::new(
+                        ReviewFreshnessState::Fresh,
+                        next_check_revision,
+                        observed_at_ms,
+                    )
+                    .map_err(protocol)?,
+                    check.required(),
+                )
+                .map_err(protocol)?,
+            );
+            found = true;
+        } else {
+            checks.push(check.clone());
+        }
+    }
+    if !found {
+        return Err(ReviewStoreError::Corrupt("external_effect_check"));
+    }
+    ReviewSnapshot::new(
+        current.workspace().clone(),
+        next_revision,
+        current.files().to_vec(),
+        current.comments().to_vec(),
+        current.proposals().to_vec(),
+        checks,
+        current.review().clone(),
+        current.pull_request().clone(),
+        current.delivery().clone(),
+        current.attention_events().to_vec(),
+    )
+    .map_err(protocol)
+}
+
 fn retained_session_delivery_snapshot(
     original: &ReviewSnapshot,
     current: &ReviewSnapshot,
@@ -3159,6 +3693,7 @@ fn validate_external_effect_custody(
         action.request.action(),
         ReviewAction::SendCommentToAgent { .. } | ReviewAction::BatchSendCommentsToAgent { .. }
     );
+    let github_action = plan.is_some_and(ReviewExternalEffectPlan::is_github_check_rerun);
     let rows: Vec<(String, i64, String, String, String)> = {
         let mut statement = connection.prepare(
             "SELECT comment_id,comment_revision,workspace_kind,workspace_id,disposition FROM review_external_effect_targets WHERE preview_id=?1 ORDER BY comment_id",
@@ -3175,6 +3710,44 @@ fn validate_external_effect_custody(
             })?
             .collect::<Result<_, _>>()?
     };
+    if github_action {
+        let Some(plan) = plan else {
+            return Err(ReviewStoreError::Corrupt("external_effect_custody"));
+        };
+        let Some(custody) = plan.github_custody() else {
+            return Err(ReviewStoreError::Corrupt("external_effect_custody"));
+        };
+        if !rows.is_empty() {
+            return Err(ReviewStoreError::Corrupt("external_effect_custody"));
+        }
+        let exact = match action.receipt.outcome() {
+            ReviewReceiptOutcome::Accepted => {
+                if action.write_admitted_at_ms.is_some() {
+                    matches!(
+                        custody,
+                        ReviewExternalEffectCustody::CustodyStarted
+                            | ReviewExternalEffectCustody::Accepted
+                    )
+                } else {
+                    custody == ReviewExternalEffectCustody::NotStarted
+                }
+            }
+            ReviewReceiptOutcome::Unknown => {
+                action.write_admitted_at_ms.is_some()
+                    && custody == ReviewExternalEffectCustody::Ambiguous
+            }
+            ReviewReceiptOutcome::Refused => custody == ReviewExternalEffectCustody::Refused,
+            ReviewReceiptOutcome::Completed | ReviewReceiptOutcome::Conflict => {
+                action.write_admitted_at_ms.is_some()
+                    && custody == ReviewExternalEffectCustody::Completed
+            }
+        };
+        return if exact {
+            Ok(())
+        } else {
+            Err(ReviewStoreError::Corrupt("external_effect_custody"))
+        };
+    }
     if !retained_action {
         return if plan.is_none() && rows.is_empty() {
             Ok(())
@@ -3263,6 +3836,42 @@ fn validate_completed_basis(connection: &Connection, action: &StoredReviewAction
         );
     }
     if action.external_effect_plan_digest.is_some() {
+        if matches!(action.request.action(), ReviewAction::RerunCheck { .. }) {
+            let result = action
+                .receipt
+                .revision()
+                .ok_or(ReviewStoreError::Corrupt("completion_basis"))?;
+            let (kind, id) = workspace_parts(action.request.workspace());
+            let completed = read_snapshot_revision(connection, kind, id, result)?
+                .ok_or(ReviewStoreError::Corrupt("completion_basis"))?;
+            let ReviewAction::RerunCheck {
+                check_id,
+                expected_check_revision,
+            } = action.request.action()
+            else {
+                unreachable!()
+            };
+            let check = completed
+                .checks()
+                .iter()
+                .find(|check| check.id() == check_id)
+                .ok_or(ReviewStoreError::Corrupt("completion_basis"))?;
+            let expected = Revision::new(
+                expected_check_revision
+                    .get()
+                    .checked_add(1)
+                    .ok_or(ReviewStoreError::Corrupt("completion_basis"))?,
+            )
+            .map_err(|_| ReviewStoreError::Corrupt("completion_basis"))?;
+            return if check.state() == CheckState::Running
+                && check.freshness().state() == ReviewFreshnessState::Fresh
+                && check.freshness().observed_revision() == expected
+            {
+                Ok(())
+            } else {
+                Err(ReviewStoreError::Corrupt("completion_basis"))
+            };
+        }
         let result = action
             .receipt
             .revision()
@@ -3577,6 +4186,29 @@ fn insert_external_plan(
     plan: &ReviewExternalEffectPlan,
     created_at_ms: i64,
 ) -> Stored<()> {
+    if let Some(github) = &plan.github_check {
+        transaction.execute(
+            "INSERT INTO review_github_check_effect_plans(preview_id,request_digest,registry_generation_digest,credential_generation_digest,credential_reference,repository_owner,repository_name,run_id,head_sha,observed_attempt,check_id,expected_check_revision,custody,plan_document,plan_digest,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'not_started',?13,?14,?15,?15)",
+            params![
+                preview_id,
+                plan.request_digest.as_slice(),
+                plan.registry_generation_digest.as_slice(),
+                github.credential_generation_digest.as_slice(),
+                github.credential_reference,
+                github.repository_owner,
+                github.repository_name,
+                github.run_id.to_string(),
+                github.head_sha,
+                i64::from(github.observed_attempt),
+                github.check_id.as_str(),
+                db_revision(github.expected_check_revision)?,
+                plan.document,
+                plan.digest.as_slice(),
+                created_at_ms,
+            ],
+        )?;
+        return Ok(());
+    }
     transaction.execute(
         "INSERT INTO review_external_effect_plans(preview_id,request_digest,effect_kind,registry_generation_digest,provider,work_session_id,provider_session_id,work_session_revision,provider_session_revision,transport_key,payload,payload_digest,plan_document,plan_digest,created_at_ms) VALUES(?1,?2,'retained_session',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
         params![
@@ -3647,6 +4279,13 @@ fn require_exact_external_plan(
     match (stored.as_ref(), expected) {
         (None, None) => Ok(()),
         (Some(stored), Some(expected)) if stored == expected => Ok(()),
+        (Some(stored), Some(expected))
+            if stored.is_github_check_rerun()
+                && expected.is_github_check_rerun()
+                && stored.digest() == expected.digest() =>
+        {
+            Ok(())
+        }
         _ => Err(ReviewStoreError::Conflict("external_effect_plan")),
     }
 }
@@ -3655,6 +4294,17 @@ fn read_external_plan(
     connection: &Connection,
     preview_id: &str,
 ) -> Stored<Option<ReviewExternalEffectPlan>> {
+    let (retained_exists, github_exists): (bool, bool) = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM review_external_effect_plans WHERE preview_id=?1),EXISTS(SELECT 1 FROM review_github_check_effect_plans WHERE preview_id=?1)",
+        [preview_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if retained_exists && github_exists {
+        return Err(ReviewStoreError::Corrupt("external_effect_plan"));
+    }
+    if github_exists {
+        return read_github_check_plan(connection, preview_id);
+    }
     type Raw = (
         Vec<u8>,
         Vec<u8>,
@@ -3728,6 +4378,92 @@ fn read_external_plan(
     {
         return Err(ReviewStoreError::Corrupt("external_effect_plan"));
     }
+    Ok(Some(plan))
+}
+
+fn read_github_check_plan(
+    connection: &Connection,
+    preview_id: &str,
+) -> Stored<Option<ReviewExternalEffectPlan>> {
+    type Raw = (
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        i64,
+        String,
+        Vec<u8>,
+        Vec<u8>,
+    );
+    let raw: Option<Raw> = connection.query_row(
+        "SELECT request_digest,registry_generation_digest,credential_generation_digest,credential_reference,repository_owner,repository_name,run_id,head_sha,observed_attempt,check_id,expected_check_revision,custody,plan_document,plan_digest FROM review_github_check_effect_plans WHERE preview_id=?1",
+        [preview_id],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?)),
+    ).optional()?;
+    let Some((
+        request_digest,
+        registry_digest,
+        credential_digest,
+        credential_reference,
+        owner,
+        repository,
+        run_id,
+        head_sha,
+        observed_attempt,
+        check_id,
+        expected_revision,
+        custody,
+        document,
+        stored_digest,
+    )) = raw
+    else {
+        return Ok(None);
+    };
+    let request_digest: [u8; 32] = request_digest
+        .try_into()
+        .map_err(|_| ReviewStoreError::Corrupt("external_effect_request_digest"))?;
+    let registry_digest: [u8; 32] = registry_digest
+        .try_into()
+        .map_err(|_| ReviewStoreError::Corrupt("external_effect_registry_digest"))?;
+    let credential_digest: [u8; 32] = credential_digest
+        .try_into()
+        .map_err(|_| ReviewStoreError::Corrupt("external_effect_credential_digest"))?;
+    let stored_digest: [u8; 32] = stored_digest
+        .try_into()
+        .map_err(|_| ReviewStoreError::Corrupt("external_effect_plan_digest"))?;
+    let run_id = run_id
+        .parse::<u64>()
+        .map_err(|_| ReviewStoreError::Corrupt("external_effect_plan"))?;
+    let observed_attempt = u32::try_from(observed_attempt)
+        .map_err(|_| ReviewStoreError::Corrupt("external_effect_plan"))?;
+    let check_id = ReviewCheckId::new(check_id)
+        .map_err(|_| ReviewStoreError::Corrupt("external_effect_plan"))?;
+    let mut plan = ReviewExternalEffectPlan::github_check_rerun(
+        request_digest,
+        registry_digest,
+        credential_digest,
+        &credential_reference,
+        &owner,
+        &repository,
+        run_id,
+        &head_sha,
+        observed_attempt,
+        check_id,
+        parse_revision(expected_revision)?,
+    )?;
+    if plan.document != document || plan.digest != stored_digest {
+        return Err(ReviewStoreError::Corrupt("external_effect_plan"));
+    }
+    plan.github_check
+        .as_mut()
+        .ok_or(ReviewStoreError::Corrupt("external_effect_plan"))?
+        .custody = ReviewExternalEffectCustody::parse(&custody)?;
     Ok(Some(plan))
 }
 

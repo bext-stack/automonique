@@ -51,8 +51,8 @@ use automonique_protocol::platform_v2_transport::{
     PlatformNegotiationResponseMessage, PlatformV2Refusal, PlatformV2Request,
     PlatformV2RequestMessage, PlatformV2Response, PlatformV2ResponseMessage,
     PlatformV2TransportError, RawMutationApprovalDocument, RawMutationReceiptDocument,
-    ReceiptLookupKey, ReviewActionTransportRequest, ReviewReadRequest, ReviewReceiptLookup,
-    WorkspaceIntentLookup, WorkspaceIntentRequest,
+    ReceiptLookupKey, ReviewActionTransportRequest, ReviewCapabilities, ReviewReadRequest,
+    ReviewReceiptLookup, WorkspaceIntentLookup, WorkspaceIntentRequest,
 };
 use automonique_protocol::primitives::Revision;
 
@@ -306,6 +306,12 @@ pub enum ReviewReadResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AttentionReadResult {
     Snapshot(Box<AttentionSourceSnapshot>),
+    Refused(PlatformV2Refusal),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReviewCapabilitiesResult {
+    Capabilities(ReviewCapabilities),
     Refused(PlatformV2Refusal),
 }
 
@@ -623,6 +629,27 @@ impl<T> PlatformV2Client<T> {
                 Ok(AttentionReadResult::Snapshot(Box::new(value)))
             }
             PlatformV2Response::Refused(value) => Ok(AttentionReadResult::Refused(value)),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    pub fn get_review_capabilities(
+        &mut self,
+        project: ProjectId,
+        workspace: WorkContextIdentity,
+    ) -> Result<ReviewCapabilitiesResult, ClientError> {
+        let expected_project = project.clone();
+        let expected_workspace = workspace.clone();
+        let request =
+            ReviewReadRequest::new(project, workspace).map_err(|_| ClientError::Protocol)?;
+        match self.request(PlatformV2Request::GetReviewCapabilities(request))? {
+            PlatformV2Response::ReviewCapabilities(value)
+                if value.project() == &expected_project
+                    && value.workspace() == &expected_workspace =>
+            {
+                Ok(ReviewCapabilitiesResult::Capabilities(value))
+            }
+            PlatformV2Response::Refused(value) => Ok(ReviewCapabilitiesResult::Refused(value)),
             _ => Err(ClientError::Protocol),
         }
     }

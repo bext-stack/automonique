@@ -16,17 +16,24 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use automonique_github_connector::{GitHubToken, RepoTarget, WorkflowRunId};
 use automonique_protocol::digest::{Sha256, Sha256Digest};
 use automonique_protocol::platform_v2::{
     ProjectId, WorkContextIdentity, WorkContextTargetKind, WorkSessionId,
 };
 use automonique_protocol::platform_v2_review::{
-    ReviewAction, ReviewAuthority, ReviewAuthorityId, ReviewAuthorityKind,
+    ReviewAction, ReviewAuthority, ReviewAuthorityId, ReviewAuthorityKind, ReviewCheckId,
+};
+use automonique_protocol::primitives::Revision;
+
+use crate::platform_v2_github_check_adapter::{
+    GitHubActionsWriteCapability, GitHubCheckRerunAdapter,
 };
 use nix::libc;
 use serde::Deserialize;
 
 pub const REVIEW_REGISTRY_FILE_NAME: &str = "platform-v2-review-registry.json";
+pub const REVIEW_GITHUB_CREDENTIALS_FILE_NAME: &str = "platform-v2-review-github-credentials.json";
 
 const MAX_REGISTRY_BYTES: u64 = 512 * 1024;
 const MAX_BINDINGS: usize = 4096;
@@ -70,6 +77,16 @@ struct RegistryBinding {
 }
 
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistryCiCheck {
+    check_id: String,
+    run_id: u64,
+    head_sha: String,
+    observed_attempt: u32,
+    observed_check_revision: u64,
+}
+
+#[derive(Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum RegistryTarget {
     LocalRepository {
@@ -84,12 +101,32 @@ enum RegistryTarget {
         provider: String,
         target: String,
         credential_reference: String,
+        #[serde(default)]
+        checks: Vec<RegistryCiCheck>,
     },
     PullRequest {
         provider: String,
         repository: String,
         credential_reference: String,
     },
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitHubCredentialDocument {
+    version: u8,
+    generation: String,
+    #[serde(default)]
+    credentials: Vec<GitHubCredential>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitHubCredential {
+    reference: String,
+    repository: String,
+    actions_write: bool,
+    token: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -101,6 +138,16 @@ pub(crate) enum ReviewEffectPlan {
         work_session_id: WorkSessionId,
         registry_generation: [u8; 32],
     },
+    GitHubCheckRerun {
+        credential_reference: String,
+        repository: RepoTarget,
+        run_id: WorkflowRunId,
+        head_sha: String,
+        observed_attempt: u32,
+        expected_check_revision: Revision,
+        registry_generation: [u8; 32],
+        credential_generation: [u8; 32],
+    },
 }
 
 /// Registry-fenced review adapter composition.
@@ -111,6 +158,7 @@ pub(crate) enum ReviewEffectPlan {
 #[derive(Default)]
 pub(crate) struct ProductionReviewEffectAdapter {
     installed: Option<InstalledRegistry>,
+    github_credentials: Option<InstalledGitHubCredentials>,
 }
 
 struct InstalledRegistry {
@@ -118,6 +166,13 @@ struct InstalledRegistry {
     expected_uid: u32,
     generation: FileGeneration,
     document: RegistryDocument,
+}
+
+struct InstalledGitHubCredentials {
+    path: PathBuf,
+    expected_uid: u32,
+    generation: FileGeneration,
+    document: GitHubCredentialDocument,
 }
 
 impl std::fmt::Debug for ProductionReviewEffectAdapter {
@@ -131,8 +186,29 @@ impl std::fmt::Debug for ProductionReviewEffectAdapter {
 
 impl ProductionReviewEffectAdapter {
     pub(crate) fn open(path: &Path, expected_uid: u32) -> Result<Self, &'static str> {
+        let credential_path = path
+            .parent()
+            .ok_or("platform_v2_review_registry_invalid")?
+            .join(REVIEW_GITHUB_CREDENTIALS_FILE_NAME);
+        let github_credentials = match read_private_file(&credential_path, expected_uid)? {
+            Some(snapshot) => {
+                let document: GitHubCredentialDocument = serde_json::from_slice(&snapshot.bytes)
+                    .map_err(|_| "platform_v2_review_github_credentials_invalid")?;
+                validate_github_credentials(&document)?;
+                Some(InstalledGitHubCredentials {
+                    path: credential_path,
+                    expected_uid,
+                    generation: snapshot.generation,
+                    document,
+                })
+            }
+            None => None,
+        };
         let Some(snapshot) = read_private_file(path, expected_uid)? else {
-            return Ok(Self::default());
+            return Ok(Self {
+                installed: None,
+                github_credentials,
+            });
         };
         let document: RegistryDocument = serde_json::from_slice(&snapshot.bytes)
             .map_err(|_| "platform_v2_review_registry_invalid")?;
@@ -144,6 +220,7 @@ impl ProductionReviewEffectAdapter {
                 generation: snapshot.generation,
                 document,
             }),
+            github_credentials,
         })
     }
 
@@ -200,6 +277,61 @@ impl ProductionReviewEffectAdapter {
                 registry_generation: *installed.generation.digest.as_bytes(),
             });
         }
+        if let (
+            ReviewAction::RerunCheck {
+                check_id,
+                expected_check_revision,
+            },
+            Some(installed),
+            Some(RegistryBinding {
+                target:
+                    RegistryTarget::Ci {
+                        provider,
+                        target,
+                        credential_reference,
+                        checks,
+                    },
+                ..
+            }),
+        ) = (action, &self.installed, binding)
+        {
+            if provider != "github" {
+                return Err("platform_v2_review_ci_provider_unavailable");
+            }
+            let check = checks
+                .iter()
+                .find(|candidate| candidate.check_id == check_id.as_str())
+                .ok_or("platform_v2_review_ci_check_unavailable")?;
+            let check_revision = Revision::new(check.observed_check_revision)
+                .map_err(|_| "platform_v2_review_registry_incoherent")?;
+            if check_revision != *expected_check_revision {
+                return Err("platform_v2_review_ci_check_changed");
+            }
+            let credentials = self
+                .github_credentials
+                .as_ref()
+                .ok_or("platform_v2_review_ci_credential_unavailable")?;
+            let credential = credentials
+                .document
+                .credentials
+                .iter()
+                .find(|candidate| candidate.reference == *credential_reference)
+                .ok_or("platform_v2_review_ci_credential_unavailable")?;
+            if !credential.actions_write || credential.repository != *target {
+                return Err("platform_v2_review_ci_credential_incoherent");
+            }
+            return Ok(ReviewEffectPlan::GitHubCheckRerun {
+                credential_reference: credential_reference.clone(),
+                repository: parse_repository(target)?,
+                run_id: WorkflowRunId::new(check.run_id)
+                    .map_err(|_| "platform_v2_review_registry_incoherent")?,
+                head_sha: check.head_sha.clone(),
+                observed_attempt: check.observed_attempt,
+                expected_check_revision: check_revision,
+                registry_generation: *installed.generation.digest.as_bytes(),
+                credential_generation: *credentials.generation.digest.as_bytes(),
+            });
+        }
         Err(unavailable_category(action))
     }
 
@@ -211,6 +343,59 @@ impl ProductionReviewEffectAdapter {
             .ok_or("platform_v2_review_registry_changed")?;
         if current.generation != installed.generation {
             return Err("platform_v2_review_registry_changed");
+        }
+        self.verify_github_credential_generation(None)
+    }
+
+    pub(crate) fn github_adapter(
+        &self,
+        credential_reference: &str,
+        repository: &RepoTarget,
+        expected_generation: [u8; 32],
+    ) -> Result<GitHubCheckRerunAdapter, &'static str> {
+        self.verify_github_credential_generation(Some(expected_generation))?;
+        let installed = self
+            .github_credentials
+            .as_ref()
+            .ok_or("platform_v2_review_ci_credential_unavailable")?;
+        let coordinate = repository.to_string();
+        let credential = installed
+            .document
+            .credentials
+            .iter()
+            .find(|candidate| candidate.reference == credential_reference)
+            .ok_or("platform_v2_review_ci_credential_unavailable")?;
+        if !credential.actions_write || credential.repository != coordinate {
+            return Err("platform_v2_review_ci_credential_incoherent");
+        }
+        let token = GitHubToken::new(credential.token.as_bytes().to_vec())
+            .map_err(|_| "platform_v2_review_ci_credential_invalid")?;
+        let capability = GitHubActionsWriteCapability::production(
+            credential_reference,
+            repository.clone(),
+            token,
+        )
+        .map_err(|_| "platform_v2_review_ci_credential_invalid")?;
+        Ok(GitHubCheckRerunAdapter::new(capability))
+    }
+
+    fn verify_github_credential_generation(
+        &self,
+        expected: Option<[u8; 32]>,
+    ) -> Result<(), &'static str> {
+        let Some(installed) = &self.github_credentials else {
+            return if expected.is_none() {
+                Ok(())
+            } else {
+                Err("platform_v2_review_ci_credentials_changed")
+            };
+        };
+        let current = read_private_file(&installed.path, installed.expected_uid)?
+            .ok_or("platform_v2_review_ci_credentials_changed")?;
+        if current.generation != installed.generation
+            || expected.is_some_and(|digest| current.generation.digest.as_bytes() != &digest)
+        {
+            return Err("platform_v2_review_ci_credentials_changed");
         }
         Ok(())
     }
@@ -350,12 +535,27 @@ fn validate_registry(document: &RegistryDocument, expected_uid: u32) -> Result<(
                 provider,
                 target,
                 credential_reference,
+                checks,
             } => {
                 if !safe_token(provider)
                     || !safe_coordinate(target)
-                    || !safe_token(credential_reference)
+                    || !safe_github_reference(credential_reference)
+                    || checks.len() > MAX_BINDINGS
+                    || (provider == "github" && parse_repository(target).is_err())
                 {
                     return Err("platform_v2_review_registry_invalid");
+                }
+                let mut check_ids = BTreeSet::new();
+                for check in checks {
+                    if ReviewCheckId::new(check.check_id.clone()).is_err()
+                        || !check_ids.insert(&check.check_id)
+                        || WorkflowRunId::new(check.run_id).is_err()
+                        || check.observed_attempt == 0
+                        || Revision::new(check.observed_check_revision).is_err()
+                        || !valid_head_sha(&check.head_sha)
+                    {
+                        return Err("platform_v2_review_registry_invalid");
+                    }
                 }
             }
             RegistryTarget::PullRequest {
@@ -380,6 +580,40 @@ fn validate_registry(document: &RegistryDocument, expected_uid: u32) -> Result<(
         }
     }
     Ok(())
+}
+
+fn validate_github_credentials(document: &GitHubCredentialDocument) -> Result<(), &'static str> {
+    if document.version != 1
+        || !safe_token(&document.generation)
+        || document.credentials.len() > MAX_BINDINGS
+    {
+        return Err("platform_v2_review_github_credentials_invalid");
+    }
+    let mut references = BTreeSet::new();
+    for credential in &document.credentials {
+        if !safe_github_reference(&credential.reference)
+            || !references.insert(&credential.reference)
+            || parse_repository(&credential.repository).is_err()
+            || GitHubToken::new(credential.token.as_bytes().to_vec()).is_err()
+        {
+            return Err("platform_v2_review_github_credentials_invalid");
+        }
+    }
+    Ok(())
+}
+
+fn parse_repository(value: &str) -> Result<RepoTarget, &'static str> {
+    let (owner, repository) = value
+        .split_once('/')
+        .ok_or("platform_v2_review_registry_invalid")?;
+    if repository.contains('/') {
+        return Err("platform_v2_review_registry_invalid");
+    }
+    RepoTarget::parse(owner, repository).map_err(|_| "platform_v2_review_registry_invalid")
+}
+
+fn valid_head_sha(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn validate_private_repository(path: &Path, expected_uid: u32) -> Result<PathBuf, &'static str> {
@@ -496,6 +730,16 @@ fn safe_coordinate(value: &str) -> bool {
     safe_token(value) && value.contains('/')
 }
 
+fn safe_github_reference(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_TOKEN_BYTES
+        && !value.starts_with('-')
+        && !value.contains("..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,6 +797,30 @@ mod tests {
             comment_id: ReviewCommentId::new("comment-1").unwrap(),
             expected_comment_revision: Revision::FIRST,
         }
+    }
+
+    fn ci_authority() -> ReviewAuthority {
+        ReviewAuthority::new(
+            ReviewAuthorityKind::Ci,
+            ReviewAuthorityId::new("ci-1").unwrap(),
+        )
+    }
+
+    fn rerun_action(revision: u64) -> ReviewAction {
+        ReviewAction::RerunCheck {
+            check_id: ReviewCheckId::new("check-1").unwrap(),
+            expected_check_revision: Revision::new(revision).unwrap(),
+        }
+    }
+
+    fn github_registry() -> &'static str {
+        r#"{"version":1,"generation":"generation-1","bindings":[{"project":"project-1","workspace_kind":"user_workspace","workspace_id":"workspace-1","authority_kind":"ci","authority_id":"ci-1","target":{"kind":"ci","provider":"github","target":"example-org/example-repo","credential_reference":"github-actions-mobile","checks":[{"check_id":"check-1","run_id":91,"head_sha":"0123456789abcdef0123456789abcdef01234567","observed_attempt":3,"observed_check_revision":7}]}}]}"#
+    }
+
+    fn github_credentials(actions_write: bool, repository: &str) -> String {
+        format!(
+            r#"{{"version":1,"generation":"credential-generation-1","credentials":[{{"reference":"github-actions-mobile","repository":"{repository}","actions_write":{actions_write},"token":"github_pat_fixture"}}]}}"#
+        )
     }
 
     #[test]
@@ -622,8 +890,171 @@ mod tests {
                 assert_eq!(work_session_id.as_str(), "work-session-1");
                 assert_ne!(registry_generation, [0; 32]);
             }
-            ReviewEffectPlan::LocalStore => panic!("external action became local"),
+            ReviewEffectPlan::LocalStore | ReviewEffectPlan::GitHubCheckRerun { .. } => {
+                panic!("external action became another effect")
+            }
         }
+    }
+
+    #[test]
+    fn exact_github_check_and_actions_write_credential_advertise_one_closed_plan() {
+        let temporary = TempDir::new().unwrap();
+        let registry = temporary.path().join("registry.json");
+        let credentials = temporary.path().join(REVIEW_GITHUB_CREDENTIALS_FILE_NAME);
+        write_registry(&registry, github_registry());
+        write_registry(
+            &credentials,
+            &github_credentials(true, "example-org/example-repo"),
+        );
+        let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
+        let plan = adapter
+            .plan(
+                &ProjectId::new("project-1").unwrap(),
+                &workspace(),
+                &ci_authority(),
+                &rerun_action(7),
+            )
+            .unwrap();
+        match plan {
+            ReviewEffectPlan::GitHubCheckRerun {
+                credential_reference,
+                repository,
+                run_id,
+                head_sha,
+                observed_attempt,
+                expected_check_revision,
+                registry_generation,
+                credential_generation,
+            } => {
+                assert_eq!(credential_reference, "github-actions-mobile");
+                assert_eq!(repository.to_string(), "example-org/example-repo");
+                assert_eq!(run_id.get(), 91);
+                assert_eq!(head_sha, "0123456789abcdef0123456789abcdef01234567");
+                assert_eq!(observed_attempt, 3);
+                assert_eq!(expected_check_revision, Revision::new(7).unwrap());
+                assert_ne!(registry_generation, [0; 32]);
+                assert_ne!(credential_generation, [0; 32]);
+            }
+            _ => panic!("exact GitHub plan expected"),
+        }
+        assert!(!format!("{adapter:?}").contains("github_pat_fixture"));
+    }
+
+    #[test]
+    fn github_capability_fails_closed_for_legacy_stale_or_underprivileged_records() {
+        let temporary = TempDir::new().unwrap();
+        let registry = temporary.path().join("registry.json");
+        let credentials = temporary.path().join(REVIEW_GITHUB_CREDENTIALS_FILE_NAME);
+        write_registry(
+            &registry,
+            r#"{"version":1,"generation":"generation-1","bindings":[{"project":"project-1","workspace_kind":"user_workspace","workspace_id":"workspace-1","authority_kind":"ci","authority_id":"ci-1","target":{"kind":"ci","provider":"github","target":"example-org/example-repo","credential_reference":"github-actions-mobile"}}]}"#,
+        );
+        write_registry(
+            &credentials,
+            &github_credentials(true, "example-org/example-repo"),
+        );
+        let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
+        assert_eq!(
+            adapter.plan(
+                &ProjectId::new("project-1").unwrap(),
+                &workspace(),
+                &ci_authority(),
+                &rerun_action(7)
+            ),
+            Err("platform_v2_review_ci_check_unavailable")
+        );
+
+        write_registry(&registry, github_registry());
+        fs::remove_file(&credentials).unwrap();
+        let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
+        assert_eq!(
+            adapter.plan(
+                &ProjectId::new("project-1").unwrap(),
+                &workspace(),
+                &ci_authority(),
+                &rerun_action(7)
+            ),
+            Err("platform_v2_review_ci_credential_unavailable")
+        );
+
+        write_registry(
+            &credentials,
+            &github_credentials(false, "example-org/example-repo"),
+        );
+        let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
+        assert_eq!(
+            adapter.plan(
+                &ProjectId::new("project-1").unwrap(),
+                &workspace(),
+                &ci_authority(),
+                &rerun_action(7)
+            ),
+            Err("platform_v2_review_ci_credential_incoherent")
+        );
+
+        write_registry(
+            &credentials,
+            &github_credentials(true, "example-org/other-repo"),
+        );
+        let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
+        assert_eq!(
+            adapter.plan(
+                &ProjectId::new("project-1").unwrap(),
+                &workspace(),
+                &ci_authority(),
+                &rerun_action(7)
+            ),
+            Err("platform_v2_review_ci_credential_incoherent")
+        );
+
+        write_registry(
+            &credentials,
+            &github_credentials(true, "example-org/example-repo"),
+        );
+        let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
+        assert_eq!(
+            adapter.plan(
+                &ProjectId::new("project-1").unwrap(),
+                &workspace(),
+                &ci_authority(),
+                &rerun_action(8)
+            ),
+            Err("platform_v2_review_ci_check_changed")
+        );
+        write_registry(
+            &credentials,
+            &github_credentials(true, "example-org/example-repo-rotated"),
+        );
+        assert_eq!(
+            adapter.verify_generation(),
+            Err("platform_v2_review_ci_credentials_changed")
+        );
+    }
+
+    #[test]
+    fn malformed_or_insecure_github_credentials_never_install() {
+        let temporary = TempDir::new().unwrap();
+        let registry = temporary.path().join("registry.json");
+        let credentials = temporary.path().join(REVIEW_GITHUB_CREDENTIALS_FILE_NAME);
+        write_registry(&registry, github_registry());
+        write_registry(
+            &credentials,
+            &github_credentials(true, "example-org/example-repo"),
+        );
+        fs::set_permissions(&credentials, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(matches!(
+            ProductionReviewEffectAdapter::open(&registry, uid()),
+            Err("platform_v2_review_registry_insecure")
+        ));
+        fs::set_permissions(&credentials, fs::Permissions::from_mode(0o600)).unwrap();
+        write_registry(
+            &credentials,
+            r#"{"version":1,"generation":"g","credentials":[{"reference":"github-actions-mobile","repository":"example-org/example-repo","actions_write":true,"token":"token with spaces"}]}"#,
+        );
+        assert!(matches!(
+            ProductionReviewEffectAdapter::open(&registry, uid()),
+            Err("platform_v2_review_github_credentials_invalid")
+        ));
     }
 
     #[test]
