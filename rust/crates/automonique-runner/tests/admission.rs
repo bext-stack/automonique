@@ -38,7 +38,9 @@ use automonique_protocol::sandbox::{
     SandboxSpec, SandboxSpecParts, ToolWorkloadEgress, WorkspaceContextHash,
 };
 use automonique_protocol::tools::{CredentialAudiences, RunId};
-use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
+use automonique_protocol::workspace::{
+    AttemptWorkspaceRegistration, AttemptWorkspaceToken, IsolationKind,
+};
 use automonique_runner::admission::{
     AdmissionContext, AdmissionContextParts, AdmissionRefusal, AdmittedLaunch, BrokeredDestination,
     BrokeredScope, INFORMATIONAL_FIELDS, PromptSource, ProviderIdentityBinding,
@@ -49,14 +51,14 @@ use automonique_runner::admission::{
 use automonique_runner::filesystem::PathIntent;
 use automonique_runner::{
     AdmissionFields, AdmissionFieldsParts, ArtifactGrantBinding, ArtifactGrantBindings,
-    ArtifactGrantDigest, ArtifactGrantId, BackendPromptSession, ContainmentDomain,
-    ContainmentError, ContainmentLimits, Controller, CredentialBinding, CwdToken,
-    ExecutionPlanDigest, ExtensionSetDigest, FallbackEligibility, IntegrationMode, IoReservation,
-    LaunchPlan, LaunchPlanError, ModelRoutingDigest, PersonaDigest, PortabilityPolicy,
-    ProfileDigest, PromptDeliveryPlan, ProtectedPromptReference, RemoteAttestationPolicy,
-    RequiredCapabilities, RunContainment, RunCoordinates, RunOrigin, RunSpec, RunSpecParts,
-    RunnerEventDialect, SchedulerDecisionDigest, SchedulerReservationBinding,
-    SchedulerReservationId, SkillsetDigest, ToolsetDigest, WorkspaceRegistryId,
+    ArtifactGrantDigest, ArtifactGrantId, AttemptWorkspaceRegistryId, BackendPromptSession,
+    ContainmentDomain, ContainmentError, ContainmentLimits, Controller, CredentialBinding,
+    CwdToken, ExecutionPlanDigest, ExtensionSetDigest, FallbackEligibility, IntegrationMode,
+    IoReservation, LaunchPlan, LaunchPlanError, ModelRoutingDigest, PersonaDigest,
+    PortabilityPolicy, ProfileDigest, PromptDeliveryPlan, ProtectedPromptReference,
+    RemoteAttestationPolicy, RequiredCapabilities, RunContainment, RunCoordinates, RunOrigin,
+    RunSpec, RunSpecParts, RunnerEventDialect, SchedulerDecisionDigest,
+    SchedulerReservationBinding, SchedulerReservationId, SkillsetDigest, ToolsetDigest,
     WorkspaceReservation,
 };
 use sha2::{Digest as _, Sha256};
@@ -238,14 +240,15 @@ fn spec_parts() -> RunSpecParts {
         prompt: PromptDeliveryPlan::ProtectedReference(
             ProtectedPromptReference::new(PROMPT_SLOT).unwrap(),
         ),
-        workspace_registry_id: WorkspaceRegistryId::new("workspace-registry-1").unwrap(),
-        workspace: WorkspaceRegistration::new(
+        attempt_workspace_registry_id: AttemptWorkspaceRegistryId::new("workspace-registry-1")
+            .unwrap(),
+        attempt_workspace: AttemptWorkspaceRegistration::new(
             "acme",
             "source-1",
             Revision::new(7).unwrap(),
             "snapshot-1",
             IsolationKind::AttemptCopy,
-            WorkspaceToken::new("workspace-token-1").unwrap(),
+            AttemptWorkspaceToken::new("workspace-token-1").unwrap(),
         )
         .unwrap(),
         provider_binary: provider_binary(),
@@ -262,8 +265,9 @@ fn mappable_spec() -> RunSpec {
 fn context_parts(root: &Path) -> AdmissionContextParts {
     AdmissionContextParts {
         backend: ExecutionBackendId::new("local-direct").unwrap(),
-        workspace_registry_id: WorkspaceRegistryId::new("workspace-registry-1").unwrap(),
-        workspace_root: root.to_path_buf(),
+        attempt_workspace_registry_id: AttemptWorkspaceRegistryId::new("workspace-registry-1")
+            .unwrap(),
+        attempt_workspace_root: root.to_path_buf(),
         working_directory: root.to_path_buf(),
         observed_provider_binary: provider_binary(),
         host_features: vec![HostFeature::new("process_boundary", implementation()).unwrap()],
@@ -492,13 +496,13 @@ fn a_read_only_snapshot_workspace_is_granted_read_only() {
     )
     .unwrap();
     let mut parts = spec_parts();
-    parts.workspace = WorkspaceRegistration::new(
+    parts.attempt_workspace = AttemptWorkspaceRegistration::new(
         "acme",
         "source-1",
         Revision::new(7).unwrap(),
         "snapshot-1",
         IsolationKind::ReadOnlySnapshot,
-        WorkspaceToken::new("workspace-token-1").unwrap(),
+        AttemptWorkspaceToken::new("workspace-token-1").unwrap(),
     )
     .unwrap();
     parts.sandbox = SandboxSpec::compile(sandbox).unwrap();
@@ -768,7 +772,8 @@ fn the_context_must_bind_to_the_spec_it_resolves() {
     );
 
     let error = admit_with_context(root, |context| {
-        context.workspace_registry_id = WorkspaceRegistryId::new("workspace-registry-2").unwrap();
+        context.attempt_workspace_registry_id =
+            AttemptWorkspaceRegistryId::new("workspace-registry-2").unwrap();
     })
     .unwrap_err();
     assert!(
@@ -1405,7 +1410,7 @@ fn a_context_resolution_must_be_absolute_canonical_and_inside_the_workspace() {
 
     // A relative workspace root is not a resolution.
     let mut parts = context_parts(root);
-    parts.workspace_root = PathBuf::from("relative/workspace");
+    parts.attempt_workspace_root = PathBuf::from("relative/workspace");
     parts.working_directory = PathBuf::from("relative/workspace");
     let error = AdmissionContext::new(parts).unwrap_err();
     assert!(

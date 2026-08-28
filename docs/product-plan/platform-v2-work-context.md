@@ -56,11 +56,14 @@ under their original issuer's policy.
 | `Session` | Durable work-context session relating one attempt workspace and one existing Platform v1 session identity | `active ↔ hibernated → completed/failed/cancelled` | Retained at least as long as canonical session history and receipts |
 | `Pane` | Presentation/terminal subdivision relating exactly one session; it never owns execution or control | `active → closed` | Closed panes remain while the owning session is retained; focus is client-local and is not lifecycle authority |
 
-The existing internal execution type named `Workspace` remains an
-implementation detail. It is not a `UserWorkspace`. When that implementation
-is exposed in product or protocol language it is qualified as an
+The internal execution types are explicitly named
+`AttemptWorkspaceRegistration`, `AttemptWorkspaceToken`, and
+`AttemptWorkspaceRegistryId`. None is a `UserWorkspace`. When an execution
+registration is projected into this graph, it is always represented as an
 `AttemptWorkspace`; no alias or conversion grants broader filesystem,
-credential, network, provider, or model authority.
+credential, network, tool, provider, or model authority. RunSpec v1 retains
+its exact historical JSON keys (`workspace`, `workspace_registry_id`, and
+`workspace_token`) as wire compatibility vocabulary only.
 
 ## Structured relation graph
 
@@ -396,3 +399,22 @@ remain independent. Any selected-workspace refusal, incomplete attention
 coverage, or unknown freshness is rendered as partial rather than fully
 capable. Canonical stale freshness is called out explicitly and the cockpit
 remains read-only.
+
+## Issue #166 closure evidence
+
+- [x] Internal run-execution identities are qualified as attempt-workspace
+  registrations, tokens, and registry IDs; RunSpec v1 wire keys remain pinned
+  by `run_spec_v1_golden` and the strict decoder suites.
+- [x] An installed Platform v1 adapter negotiates v1, decodes every checked-in
+  canonical request, and re-encodes the exact same bytes in
+  `installed_v1_adapter_fixture_negotiates_and_decodes_without_v2_projection`.
+- [x] One project relates two repositories, local and SSH host setups, and user
+  workspaces backed by both a git worktree and an authorized folder in
+  `one_project_spans_repositories_hosts_and_both_authorized_workspace_kinds`.
+- [x] Attempt creation and resume refuse cross-workspace identity substitution
+  and widening on each filesystem, credential, network, tool, provider, and
+  model axis in
+  `attempt_create_and_resume_cannot_widen_identity_or_any_authority_axis`.
+- [x] A 640-record authorized inventory round-trips its query and all five
+  bounded 128-item pages, with cursor resynchronization after inventory drift,
+  in `authorized_query_remains_functional_beyond_v1s_512_resource_ceiling`.

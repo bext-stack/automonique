@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use automonique_daemon::execute::{DAEMON_WORKSPACE_REGISTRY, offered_host_features};
+use automonique_daemon::execute::{DAEMON_ATTEMPT_WORKSPACE_REGISTRY, offered_host_features};
 use automonique_daemon::{Daemon, DaemonConfig, DaemonError};
 use automonique_protocol::admin::{AdminRequest, AdminResponse, SubmittedRunSpec};
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
@@ -41,14 +41,16 @@ use automonique_protocol::sandbox::{
     SandboxProfile, SandboxSpec, SandboxSpecParts, ToolWorkloadEgress, WorkspaceContextHash,
 };
 use automonique_protocol::tools::RunId;
-use automonique_protocol::workspace::{IsolationKind, WorkspaceRegistration, WorkspaceToken};
+use automonique_protocol::workspace::{
+    AttemptWorkspaceRegistration, AttemptWorkspaceToken, IsolationKind,
+};
 use automonique_runner::{
-    AdmissionFields, AdmissionFieldsParts, ArtifactGrantBindings, CwdToken, ExecutionPlanDigest,
-    ExtensionSetDigest, FallbackEligibility, IntegrationMode, IoReservation, ModelRoutingDigest,
-    PersonaDigest, PortabilityPolicy, ProfileDigest, PromptDeliveryPlan, ProtectedPromptReference,
-    RemoteAttestationPolicy, RequiredCapabilities, RunCoordinates, RunOrigin, RunSpec,
-    RunSpecParts, RunnerEventDialect, SchedulerDecisionDigest, SchedulerReservationBinding,
-    SchedulerReservationId, SkillsetDigest, ToolsetDigest, WorkspaceRegistryId,
+    AdmissionFields, AdmissionFieldsParts, ArtifactGrantBindings, AttemptWorkspaceRegistryId,
+    CwdToken, ExecutionPlanDigest, ExtensionSetDigest, FallbackEligibility, IntegrationMode,
+    IoReservation, ModelRoutingDigest, PersonaDigest, PortabilityPolicy, ProfileDigest,
+    PromptDeliveryPlan, ProtectedPromptReference, RemoteAttestationPolicy, RequiredCapabilities,
+    RunCoordinates, RunOrigin, RunSpec, RunSpecParts, RunnerEventDialect, SchedulerDecisionDigest,
+    SchedulerReservationBinding, SchedulerReservationId, SkillsetDigest, ToolsetDigest,
     WorkspaceReservation,
 };
 use nix::sys::signal::kill;
@@ -744,15 +746,17 @@ pub fn run_spec(run: &str, script: &str) -> RunSpec {
         prompt: PromptDeliveryPlan::ProtectedReference(
             ProtectedPromptReference::new(PROMPT_SLOT).expect("slot"),
         ),
-        workspace_registry_id: WorkspaceRegistryId::new(DAEMON_WORKSPACE_REGISTRY)
-            .expect("registry"),
-        workspace: WorkspaceRegistration::new(
+        attempt_workspace_registry_id: AttemptWorkspaceRegistryId::new(
+            DAEMON_ATTEMPT_WORKSPACE_REGISTRY,
+        )
+        .expect("registry"),
+        attempt_workspace: AttemptWorkspaceRegistration::new(
             "acme",
             "source-1",
             Revision::new(7).expect("revision"),
             "snapshot-1",
             IsolationKind::AttemptCopy,
-            WorkspaceToken::new("workspace-token-1").expect("token"),
+            AttemptWorkspaceToken::new("workspace-token-1").expect("token"),
         )
         .expect("registered workspace"),
         provider_binary: provider_binary(),

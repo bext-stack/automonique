@@ -1,24 +1,26 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Workspace registrations, locks and content-addressed artifacts.
+//! Attempt-workspace registrations, locks and content-addressed artifacts.
 //!
 //! Two things must be impossible here rather than merely rejected: a caller
 //! supplying a host path, and an artifact existing without a retention class.
 //!
-//! A workspace is reached through an opaque token the host resolves. There is
-//! no constructor taking a path, so an API client cannot name one:
+//! An execution attempt workspace is reached through an opaque token the host
+//! resolves. This is the internal counterpart of Platform v2's
+//! `AttemptWorkspace`, never its durable `UserWorkspace`. There is no
+//! constructor taking a path, so an API client cannot name one:
 //!
 //! ```
-//! use automonique_protocol::workspace::WorkspaceToken;
-//! let token = WorkspaceToken::new("wt-3f9a").unwrap();
+//! use automonique_protocol::workspace::AttemptWorkspaceToken;
+//! let token = AttemptWorkspaceToken::new("wt-3f9a").unwrap();
 //! assert_eq!(token.as_str(), "wt-3f9a");
 //! ```
 //!
 //! ```compile_fail
-//! use automonique_protocol::workspace::WorkspaceToken;
+//! use automonique_protocol::workspace::AttemptWorkspaceToken;
 //! use std::path::PathBuf;
 //! // There is no path-shaped constructor.
-//! let token = WorkspaceToken::from_path(PathBuf::from("/srv/work")).unwrap();
+//! let token = AttemptWorkspaceToken::from_path(PathBuf::from("/srv/work")).unwrap();
 //! ```
 //!
 //! Digests reuse [`crate::release::ArtifactDigest`], so the weakened-algorithm
@@ -30,7 +32,7 @@ use std::error::Error;
 use crate::primitives::{Revision, ValueError};
 use crate::release::ArtifactDigest;
 
-/// Maximum UTF-8 byte length of a workspace or artifact identifier.
+/// Maximum UTF-8 byte length of an attempt-workspace or artifact identifier.
 pub const MAX_WORKSPACE_FIELD_BYTES: usize = 256;
 
 /// Why a workspace, lock or artifact operation was refused.
@@ -121,14 +123,14 @@ impl fmt::Display for WorkspaceError {
 
 impl Error for WorkspaceError {}
 
-/// An opaque handle the host resolves to a working directory.
+/// An opaque handle the host resolves to one attempt's working directory.
 ///
 /// Deliberately not a path. A value that looks like one is refused, so a
 /// caller cannot smuggle a host location through the token field.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct WorkspaceToken(String);
+pub struct AttemptWorkspaceToken(String);
 
-impl WorkspaceToken {
+impl AttemptWorkspaceToken {
     /// Validate and construct a token.
     ///
     /// # Errors
@@ -156,7 +158,7 @@ impl WorkspaceToken {
     }
 }
 
-/// How a workspace is isolated for a run.
+/// How an attempt workspace is isolated for a run.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum IsolationKind {
     /// Read-only view of an immutable snapshot.
@@ -188,19 +190,19 @@ impl IsolationKind {
     }
 }
 
-/// A registered workspace at one immutable base.
+/// A registered attempt workspace at one immutable base.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WorkspaceRegistration {
+pub struct AttemptWorkspaceRegistration {
     tenant: String,
     canonical_source: String,
     base_revision: Revision,
     snapshot: String,
     isolation: IsolationKind,
-    token: WorkspaceToken,
+    token: AttemptWorkspaceToken,
 }
 
-impl WorkspaceRegistration {
-    /// Register a workspace.
+impl AttemptWorkspaceRegistration {
+    /// Register an attempt workspace.
     ///
     /// # Errors
     ///
@@ -211,7 +213,7 @@ impl WorkspaceRegistration {
         base_revision: Revision,
         snapshot: &str,
         isolation: IsolationKind,
-        token: WorkspaceToken,
+        token: AttemptWorkspaceToken,
     ) -> Result<Self, WorkspaceError> {
         bounded(tenant, "tenant")?;
         bounded(canonical_source, "canonical_source")?;
@@ -258,7 +260,7 @@ impl WorkspaceRegistration {
 
     /// The opaque token a host resolves.
     #[must_use]
-    pub const fn token(&self) -> &WorkspaceToken {
+    pub const fn token(&self) -> &AttemptWorkspaceToken {
         &self.token
     }
 
@@ -268,7 +270,7 @@ impl WorkspaceRegistration {
     ///
     /// Always returns [`WorkspaceError::BaseIsImmutable`]. Producing a changed
     /// base means registering a new revision with
-    /// [`WorkspaceRegistration::at_new_base`], so evidence attached to the old
+    /// [`AttemptWorkspaceRegistration::at_new_base`], so evidence attached to the old
     /// base stays true.
     pub const fn set_base_revision(&self, _revision: Revision) -> Result<(), WorkspaceError> {
         Err(WorkspaceError::BaseIsImmutable {
@@ -276,7 +278,7 @@ impl WorkspaceRegistration {
         })
     }
 
-    /// Register a new workspace at a different base.
+    /// Register a new attempt workspace at a different base.
     ///
     /// # Errors
     ///
@@ -285,7 +287,7 @@ impl WorkspaceRegistration {
         &self,
         base_revision: Revision,
         snapshot: &str,
-        token: WorkspaceToken,
+        token: AttemptWorkspaceToken,
     ) -> Result<Self, WorkspaceError> {
         Self::new(
             &self.tenant,
