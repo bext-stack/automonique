@@ -344,6 +344,41 @@ fn a_refusal_cursor_excludes_stale_events_and_accepts_repeated_coordinates() {
 }
 
 #[test]
+fn a_cursor_is_bound_to_its_originating_broker_and_cannot_be_replayed() {
+    let first = EgressBroker::start(BrokerConfig::default()).expect("first deny-all broker starts");
+    let second =
+        EgressBroker::start(BrokerConfig::default()).expect("second deny-all broker starts");
+    let first_observer = first.refused_destination_observer();
+    let second_observer = second.refused_destination_observer();
+    let mut first_cursor = first_observer.cursor().expect("first broker cursor");
+    assert_eq!(
+        format!("{first_cursor:?}"),
+        "RefusedDestinationCursor { state: \"bound\" }"
+    );
+
+    refuse_destination(&second, "second.example", 443);
+    assert_eq!(
+        second_observer.take_since(&mut first_cursor),
+        RefusedDestinationWindow::Ambiguous,
+        "a numerically valid cursor from another broker must fail closed"
+    );
+
+    refuse_destination(&first, "first.example", 443);
+    let RefusedDestinationWindow::Unambiguous(refused) =
+        first_observer.take_since(&mut first_cursor)
+    else {
+        panic!("the cursor must remain usable only with its originating broker")
+    };
+    assert_eq!(refused.host().to_string(), "first.example");
+    assert_eq!(refused.port(), 443);
+    assert_eq!(
+        first_observer.take_since(&mut first_cursor),
+        RefusedDestinationWindow::Empty,
+        "an advanced cursor cannot replay an already consumed refusal"
+    );
+}
+
+#[test]
 fn concurrent_different_refusals_are_ambiguous_whatever_arrival_order_wins() {
     let broker =
         Arc::new(EgressBroker::start(BrokerConfig::default()).expect("deny-all broker starts"));

@@ -166,9 +166,25 @@ pub struct RefusedDestination {
     port: u16,
 }
 
-/// A monotonic position in one broker's destination-refusal stream.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RefusedDestinationCursor(u64);
+/// A monotonic position bound to the one broker stream that issued it.
+///
+/// The stream reference is private and the cursor is deliberately neither
+/// cloneable nor copyable. A caller can advance the one cursor it received,
+/// but cannot forge a numeric position, replay a copied position, or apply a
+/// position from another run's broker to this one.
+pub struct RefusedDestinationCursor {
+    state: Arc<Mutex<RefusedDestinationState>>,
+    sequence: u64,
+}
+
+impl fmt::Debug for RefusedDestinationCursor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RefusedDestinationCursor")
+            .field("state", &"bound")
+            .finish()
+    }
+}
 
 /// What one bounded interval of the refusal stream proves.
 #[derive(Clone, Eq, PartialEq)]
@@ -220,8 +236,8 @@ impl RefusedDestinationState {
 
     fn take_since(&self, cursor: &mut RefusedDestinationCursor) -> RefusedDestinationWindow {
         let end = self.sequence;
-        let start = cursor.0;
-        cursor.0 = end;
+        let start = cursor.sequence;
+        cursor.sequence = end;
         if self.history_lost || start > end {
             return RefusedDestinationWindow::Ambiguous;
         }
@@ -286,7 +302,11 @@ impl RefusedDestinationObserver {
     /// Snapshot the current monotonic position before a provider request.
     #[must_use]
     pub fn cursor(&self) -> Option<RefusedDestinationCursor> {
-        Some(RefusedDestinationCursor(self.state.lock().ok()?.sequence))
+        let sequence = self.state.lock().ok()?.sequence;
+        Some(RefusedDestinationCursor {
+            state: Arc::clone(&self.state),
+            sequence,
+        })
     }
 
     /// Consume the bounded refusal interval after `cursor` and advance it.
@@ -295,6 +315,9 @@ impl RefusedDestinationObserver {
     /// coordinates, lost history, a poisoned observer, or an invalid cursor
     /// all fail closed as [`RefusedDestinationWindow::Ambiguous`].
     pub fn take_since(&self, cursor: &mut RefusedDestinationCursor) -> RefusedDestinationWindow {
+        if !Arc::ptr_eq(&self.state, &cursor.state) {
+            return RefusedDestinationWindow::Ambiguous;
+        }
         self.state
             .lock()
             .map_or(RefusedDestinationWindow::Ambiguous, |state| {
