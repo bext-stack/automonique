@@ -4350,7 +4350,7 @@ impl WorkContextNonceSource for HostNonces {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use automonique_github_connector::{
@@ -4393,6 +4393,7 @@ mod tests {
 
     struct CountingGitHubTransport {
         counts: Arc<ProviderCallCounts>,
+        attempt: Arc<AtomicU32>,
     }
 
     impl GitHubActionsTransport for CountingGitHubTransport {
@@ -4406,7 +4407,7 @@ mod tests {
                 GitHubOutcome::Accepted(GitHubWorkflowRun {
                     id: WorkflowRunId::new(91).unwrap(),
                     head_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
-                    run_attempt: 3,
+                    run_attempt: self.attempt.load(Ordering::SeqCst),
                     status: WorkflowRunStatus::Completed,
                 }),
             ))
@@ -4432,6 +4433,7 @@ mod tests {
         review_path: PathBuf,
         uid: u32,
         counts: Arc<ProviderCallCounts>,
+        attempt: Arc<AtomicU32>,
         transport: SharedGitHubActionsTransport,
     }
 
@@ -4588,9 +4590,11 @@ mod tests {
                 fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
             }
             let counts = Arc::new(ProviderCallCounts::default());
+            let attempt = Arc::new(AtomicU32::new(3));
             let transport: SharedGitHubActionsTransport =
                 Arc::new(Mutex::new(Box::new(CountingGitHubTransport {
                     counts: Arc::clone(&counts),
+                    attempt: Arc::clone(&attempt),
                 })));
             Self {
                 _directory: directory,
@@ -4600,6 +4604,7 @@ mod tests {
                 review_path,
                 uid,
                 counts,
+                attempt,
                 transport,
             }
         }
@@ -4667,6 +4672,10 @@ mod tests {
         fn reset_counts(&self) {
             self.counts.reads.store(0, Ordering::SeqCst);
             self.counts.writes.store(0, Ordering::SeqCst);
+        }
+
+        fn set_attempt(&self, attempt: u32) {
+            self.attempt.store(attempt, Ordering::SeqCst);
         }
 
         fn calls(&self) -> (usize, usize) {
@@ -6044,13 +6053,82 @@ mod tests {
             let mut restarted = fixture.open();
             fixture.reset_counts();
             let response = restarted.handle(fixture.uid, &correlated_lookup(&key, correlation), 20);
+            let expected_outcome = if custody == Some(ReviewExternalEffectCustody::Accepted) {
+                ReviewReceiptOutcome::Accepted
+            } else {
+                ReviewReceiptOutcome::Unknown
+            };
             assert!(matches!(
                 response,
                 PlatformV2Response::ReviewReceipt(receipt)
-                    if receipt.outcome() == ReviewReceiptOutcome::Unknown
+                    if receipt.outcome() == expected_outcome
             ));
             assert_eq!(fixture.calls(), (1, 0), "phase {suffix}");
         }
+    }
+
+    #[test]
+    fn github_accepted_restart_recovery_preserves_attribution_until_exact_next_attempt() {
+        let fixture = GitHubRecoveryFixture::new();
+        let key = "github-accepted-baseline-then-next";
+        let mut host = fixture.open();
+        let (prepared, plan, correlation) = seed_github_recovery_action(&mut host, key);
+        let started = approve_and_start_github_action(&mut host, &prepared, &plan);
+        let PlatformV2Host::Enabled(runtime) = &mut host else {
+            panic!("enabled host required")
+        };
+        runtime
+            .reviews
+            .settle_github_check_rerun(
+                &started.preview_id,
+                started.request_digest,
+                ReviewExternalEffectCustody::Accepted,
+                13,
+            )
+            .unwrap();
+        drop(host);
+
+        fixture.reset_counts();
+        let mut first_restart = fixture.open();
+        let first = first_restart.handle(
+            fixture.uid,
+            &correlated_lookup(key, correlation.clone()),
+            20,
+        );
+        assert!(matches!(
+            first,
+            PlatformV2Response::ReviewReceipt(receipt)
+                if receipt.outcome() == ReviewReceiptOutcome::Accepted
+        ));
+        assert_eq!(fixture.calls(), (1, 0), "one GET and no POST per poll");
+        drop(first_restart);
+
+        let raw = rusqlite::Connection::open(&fixture.review_path).unwrap();
+        let custody: String = raw
+            .query_row(
+                "SELECT custody FROM review_github_check_effect_plans
+                 WHERE preview_id=(SELECT preview_id FROM review_action_previews
+                                   WHERE idempotency_key=?1)",
+                [key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(custody, "accepted", "the baseline poll stays durable");
+        drop(raw);
+
+        fixture.set_attempt(4);
+        let mut second_restart = fixture.open();
+        let second = second_restart.handle(fixture.uid, &correlated_lookup(key, correlation), 21);
+        assert!(matches!(
+            second,
+            PlatformV2Response::ReviewReceipt(receipt)
+                if receipt.outcome() == ReviewReceiptOutcome::Completed
+        ));
+        assert_eq!(
+            fixture.calls(),
+            (2, 0),
+            "each poll performs one GET and restart recovery never posts"
+        );
     }
 
     #[test]

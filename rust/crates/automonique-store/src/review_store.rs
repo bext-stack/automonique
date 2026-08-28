@@ -1862,7 +1862,11 @@ impl ReviewStore {
         }
         let allowed = match custody {
             ReviewExternalEffectCustody::Accepted => {
-                current_custody == ReviewExternalEffectCustody::CustodyStarted
+                matches!(
+                    current_custody,
+                    ReviewExternalEffectCustody::CustodyStarted
+                        | ReviewExternalEffectCustody::Accepted
+                )
             }
             ReviewExternalEffectCustody::Ambiguous => matches!(
                 current_custody,

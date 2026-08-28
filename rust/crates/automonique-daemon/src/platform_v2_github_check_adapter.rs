@@ -599,9 +599,13 @@ fn reconcile(
         GitHubCheckRerunCustody::NotStarted => GitHubCheckRerunCustody::NotStarted,
         GitHubCheckRerunCustody::Refused => GitHubCheckRerunCustody::Refused,
         GitHubCheckRerunCustody::Completed => GitHubCheckRerunCustody::Completed,
-        GitHubCheckRerunCustody::CustodyStarted
-        | GitHubCheckRerunCustody::Accepted
-        | GitHubCheckRerunCustody::Ambiguous => GitHubCheckRerunCustody::Ambiguous,
+        // GitHub can acknowledge the POST before the next attempt becomes
+        // visible to a GET.  Preserve that provider-issued attribution so a
+        // later exact +1 observation can still complete this receipt.
+        GitHubCheckRerunCustody::Accepted => GitHubCheckRerunCustody::Accepted,
+        GitHubCheckRerunCustody::CustodyStarted | GitHubCheckRerunCustody::Ambiguous => {
+            GitHubCheckRerunCustody::Ambiguous
+        }
     };
     Ok(submission.custody)
 }
@@ -980,9 +984,11 @@ mod tests {
     }
 
     #[test]
-    fn accepted_post_can_reconcile_its_exact_next_attempt() {
-        let transport =
-            FakeTransport::new(vec![accepted(run(3)), accepted(run(4))], vec![accepted(())]);
+    fn accepted_post_survives_a_baseline_poll_then_reconciles_its_exact_next_attempt() {
+        let transport = FakeTransport::new(
+            vec![accepted(run(3)), accepted(run(3)), accepted(run(4))],
+            vec![accepted(())],
+        );
         let plan = plan();
         let mut submission = GitHubCheckRerunSubmission::new(&plan);
         submission.begin_custody().unwrap();
@@ -1004,9 +1010,26 @@ mod tests {
                 &plan,
                 &mut submission,
             ),
+            Ok(GitHubCheckRerunCustody::Accepted)
+        );
+        assert_eq!(
+            (transport.read_count.get(), transport.write_count.get()),
+            (2, 1)
+        );
+        assert_eq!(
+            reconcile(
+                &transport,
+                "github-actions-mobile",
+                &target(),
+                &plan,
+                &mut submission,
+            ),
             Ok(GitHubCheckRerunCustody::Completed)
         );
-        assert_eq!(transport.write_count.get(), 1);
+        assert_eq!(
+            (transport.read_count.get(), transport.write_count.get()),
+            (3, 1)
+        );
     }
 
     #[test]
