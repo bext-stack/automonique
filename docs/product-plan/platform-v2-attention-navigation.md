@@ -62,7 +62,10 @@ review snapshot exists; absence refuses rather than becoming an empty review.
 Orchestration projection overflow remains explicitly unavailable. A retained
 session read revalidates the exact session-to-attempt-to-workspace lineage and
 copies only its authority-qualified Platform session coordinate. It never
-derives a pane, tab, label, or local layout target.
+derives a pane, tab, label, or local layout target. Its read-only lineage gate
+admits valid terminal `Completed`, `Failed`, and `Cancelled` session records;
+the separate mutation and review-delivery gate remains limited to active or
+hibernated retained sessions.
 
 Runtime snapshots pass through the same atomic attention store. A semantically
 unchanged observation replays the exact durable document. A changed complete
@@ -74,7 +77,11 @@ changes. A `Waiting` orchestration record or `Hibernated` session removes that
 item atomically; a later reappearance mints a new incarnation instead of
 reusing the retired id. A restart therefore cannot reset a source or reuse a
 removed item id. The hosted cockpit discovers only those deterministic source
-ids from its bounded authorized work-context inventory and renders
-`get_attention_source_snapshot` results; it does not substitute review summary
-attention. Desktop and mobile consumers and cross-client live acceptance remain
-separate milestones.
+ids from its bounded authorized work-context inventory. Review-source discovery
+uses only the typed existence of a durable review snapshot, so an absent review
+does not hide valid orchestration or session attention. The cockpit renders
+`get_attention_source_snapshot` results and does not substitute review summary
+attention. Runtime-owned tuples are rejected from the private bootstrap
+registry before its atomic import, including after restart, so bootstrap and
+runtime custody cannot shadow each other. Desktop and mobile consumers and
+cross-client live acceptance remain separate milestones.

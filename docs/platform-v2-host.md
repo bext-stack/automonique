@@ -388,8 +388,16 @@ provider-session source ids equal the retained `WorkSession` id advertised by
 the same bounded work-context inventory. The host revalidates exact policy and
 lineage before every read, persists each complete replacement through the
 attention store, and never creates client-local pane or layout coordinates.
-`monique.1clic.pro` consumes these snapshots directly. Registry hot reload,
-desktop/mobile consumers, and cross-client acceptance remain outstanding.
+Terminal retained sessions remain readable through a dedicated read-only
+lineage check so `Completed`, `Failed`, and `Cancelled` attention does not widen
+the active-session mutation or delivery gate. The private registry rejects an
+authorized tuple claimed by these runtime conventions before importing any
+snapshot; the same collision remains rejected after restart. The hosted
+cockpit probes durable review existence and requests that attention source only
+when the review exists, while still consuming orchestration and retained-session
+sources for workspaces without review state. `monique.1clic.pro` consumes these
+snapshots directly. Registry hot reload, desktop/mobile consumers, and
+cross-client acceptance remain outstanding.
 
 ## Private lifecycle selector registry
 

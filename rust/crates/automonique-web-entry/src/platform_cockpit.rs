@@ -1528,44 +1528,14 @@ fn bounded_attention_sources(
     let WorkContextIdentity::UserWorkspace(workspace_id) = workspace.identity() else {
         return unavailable_attention("platform_cockpit_selection_invalid");
     };
-    let Ok(workspace_source_id) = AttentionSourceId::new(workspace_id.as_str().to_owned()) else {
-        return unavailable_attention("platform_v2_attention_source_exceeds_bound");
+    let review_exists = match review_attention_source_exists(bridge, &project, workspace) {
+        Ok(value) => value,
+        Err(category) => return unavailable_attention(&category),
     };
-    let mut sources = vec![
-        AttentionSource::new(AttentionSourceKind::Review, workspace_source_id.clone()),
-        AttentionSource::new(AttentionSourceKind::Orchestration, workspace_source_id),
-    ];
-    let attempts: std::collections::BTreeSet<_> = records
-        .iter()
-        .filter(|record| record.kind() == WorkContextKind::AttemptWorkspace)
-        .filter(|record| {
-            relation(record, WorkContextRelationKind::AttemptUserWorkspace).as_ref()
-                == Some(workspace.identity())
-        })
-        .map(|record| record.identity().id().to_owned())
-        .collect();
-    for session in records
-        .iter()
-        .filter(|record| record.kind() == WorkContextKind::Session)
-    {
-        if relation(session, WorkContextRelationKind::SessionAttemptWorkspace)
-            .is_some_and(|attempt| attempts.contains(attempt.id()))
-        {
-            let Ok(id) = AttentionSourceId::new(session.identity().id().to_owned()) else {
-                return unavailable_attention("platform_v2_attention_source_exceeds_bound");
-            };
-            sources.push(AttentionSource::new(
-                AttentionSourceKind::ProviderSession,
-                id,
-            ));
-        }
-    }
-    if sources.len() > MAX_ATTENTION_SOURCES_PER_WORKSPACE {
-        return unavailable_attention("platform_v2_attention_source_inventory_exceeds_bound");
-    }
-    if !attention_sources_unique(&sources) {
-        return unavailable_attention("platform_v2_attention_source_inventory_duplicate");
-    }
+    let sources = match authoritative_attention_sources(records, workspace, review_exists) {
+        Ok(sources) => sources,
+        Err(category) => return unavailable_attention(category),
+    };
 
     let mut snapshots = Vec::new();
     for source in sources {
@@ -1593,6 +1563,95 @@ fn bounded_attention_sources(
         observation: json!({ "state": "available", "value": state, "category": Value::Null }),
         inbox,
     }
+}
+
+fn review_attention_source_exists(
+    bridge: &PlatformV2Bridge,
+    project: &ProjectId,
+    workspace: &WorkContextRecord,
+) -> Result<bool, String> {
+    let request = ReviewReadRequest::new(project.clone(), workspace.identity().clone())
+        .map_err(|_| String::from("platform_v2_response_invalid"))?;
+    review_attention_source_presence(
+        bridge.request_with_timeout(
+            PlatformV2Request::GetReview(request),
+            ATTENTION_READ_TIMEOUT,
+        ),
+        workspace.identity(),
+    )
+}
+
+fn review_attention_source_presence(
+    response: Result<PlatformV2Response, &'static str>,
+    workspace: &WorkContextIdentity,
+) -> Result<bool, String> {
+    match response {
+        Ok(PlatformV2Response::ReviewResult(review)) if review.workspace() == workspace => Ok(true),
+        Ok(PlatformV2Response::Refused(value))
+            if value.category().as_str() == "platform_v2_not_found" =>
+        {
+            Ok(false)
+        }
+        Ok(PlatformV2Response::Refused(value)) => Err(value.category().as_str().to_owned()),
+        Ok(_) => Err(String::from("platform_v2_response_invalid")),
+        Err(category) => Err(category.to_owned()),
+    }
+}
+
+fn authoritative_attention_sources(
+    records: &[WorkContextRecord],
+    workspace: &WorkContextRecord,
+    review_exists: bool,
+) -> Result<Vec<AttentionSource>, &'static str> {
+    let WorkContextIdentity::UserWorkspace(workspace_id) = workspace.identity() else {
+        return Err("platform_cockpit_selection_invalid");
+    };
+    let Ok(workspace_source_id) = AttentionSourceId::new(workspace_id.as_str().to_owned()) else {
+        return Err("platform_v2_attention_source_exceeds_bound");
+    };
+    let mut sources = Vec::new();
+    if review_exists {
+        sources.push(AttentionSource::new(
+            AttentionSourceKind::Review,
+            workspace_source_id.clone(),
+        ));
+    }
+    sources.push(AttentionSource::new(
+        AttentionSourceKind::Orchestration,
+        workspace_source_id,
+    ));
+    let attempts: std::collections::BTreeSet<_> = records
+        .iter()
+        .filter(|record| record.kind() == WorkContextKind::AttemptWorkspace)
+        .filter(|record| {
+            relation(record, WorkContextRelationKind::AttemptUserWorkspace).as_ref()
+                == Some(workspace.identity())
+        })
+        .map(|record| record.identity().id().to_owned())
+        .collect();
+    for session in records
+        .iter()
+        .filter(|record| record.kind() == WorkContextKind::Session)
+    {
+        if relation(session, WorkContextRelationKind::SessionAttemptWorkspace)
+            .is_some_and(|attempt| attempts.contains(attempt.id()))
+        {
+            let Ok(id) = AttentionSourceId::new(session.identity().id().to_owned()) else {
+                return Err("platform_v2_attention_source_exceeds_bound");
+            };
+            sources.push(AttentionSource::new(
+                AttentionSourceKind::ProviderSession,
+                id,
+            ));
+        }
+    }
+    if sources.len() > MAX_ATTENTION_SOURCES_PER_WORKSPACE {
+        return Err("platform_v2_attention_source_inventory_exceeds_bound");
+    }
+    if !attention_sources_unique(&sources) {
+        return Err("platform_v2_attention_source_inventory_duplicate");
+    }
+    Ok(sources)
 }
 
 fn attention_sources_unique(sources: &[AttentionSource]) -> bool {
@@ -2130,6 +2189,7 @@ fn refused(category: &str, explanation: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use automonique_protocol::platform_v2_transport::PlatformV2Refusal;
 
     #[test]
     fn cockpit_control_documents_reject_unknown_or_generic_execution_fields() {
@@ -2390,6 +2450,74 @@ mod tests {
         );
         assert!(attention_sources_unique(&[review.clone(), orchestration]));
         assert!(!attention_sources_unique(&[review.clone(), review]));
+    }
+
+    #[test]
+    fn workspace_without_review_discovers_existing_orchestration_without_review_inference() {
+        use automonique_protocol::platform_v2::{
+            WorkContextAttributes, WorkContextLabel, WorkContextRelation, WorkContextTargetKind,
+        };
+
+        let workspace = WorkContextRecord::new(
+            WorkContextIdentity::UserWorkspace(UserWorkspaceId::new("workspace-1").unwrap()),
+            Revision::FIRST,
+            WorkContextLifecycle::Active,
+            WorkContextLabel::new("Workspace").unwrap(),
+            WorkContextAttributes::EMPTY,
+            vec![
+                WorkContextRelation::new(
+                    WorkContextRelationKind::UserWorkspaceProject,
+                    WorkContextIdentity::Project(ProjectId::new("project-1").unwrap()),
+                )
+                .unwrap(),
+                WorkContextRelation::new(
+                    WorkContextRelationKind::UserWorkspaceCheckout,
+                    WorkContextIdentity::parse_local(WorkContextTargetKind::Checkout, "checkout-1")
+                        .unwrap(),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let absent_review =
+            authoritative_attention_sources(std::slice::from_ref(&workspace), &workspace, false)
+                .unwrap();
+        assert_eq!(absent_review.len(), 1);
+        assert_eq!(absent_review[0].kind(), AttentionSourceKind::Orchestration);
+        let present_review =
+            authoritative_attention_sources(std::slice::from_ref(&workspace), &workspace, true)
+                .unwrap();
+        assert_eq!(
+            present_review
+                .iter()
+                .map(AttentionSource::kind)
+                .collect::<Vec<_>>(),
+            vec![
+                AttentionSourceKind::Review,
+                AttentionSourceKind::Orchestration
+            ]
+        );
+        assert_eq!(
+            review_attention_source_presence(
+                Ok(PlatformV2Response::Refused(
+                    PlatformV2Refusal::new("platform_v2_not_found", "absent").unwrap(),
+                )),
+                workspace.identity(),
+            ),
+            Ok(false),
+            "typed producer absence is source discovery, not workspace failure"
+        );
+        assert_eq!(
+            review_attention_source_presence(
+                Ok(PlatformV2Response::Refused(
+                    PlatformV2Refusal::new("platform_v2_scope_denied", "denied").unwrap(),
+                )),
+                workspace.identity(),
+            ),
+            Err(String::from("platform_v2_scope_denied")),
+            "authorization failures must not be reclassified as absence"
+        );
     }
 
     #[test]
