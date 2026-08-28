@@ -5909,7 +5909,7 @@ mod tests {
                 .remove("expected_workspace_revision")
                 .is_some()
         );
-        let document = serde_json::to_vec(&document).unwrap();
+        let document = crate::agent_harness::canonical_json_bytes(&document);
         let digest = Sha256::digest(&document);
         connection
             .execute(
@@ -5982,7 +5982,7 @@ mod tests {
                 .remove("expected_workspace_revision")
                 .is_some()
         );
-        let document = serde_json::to_vec(&document).unwrap();
+        let document = crate::agent_harness::canonical_json_bytes(&document);
         let digest = Sha256::digest(&document);
         connection
             .execute(
