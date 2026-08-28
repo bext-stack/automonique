@@ -164,21 +164,54 @@ filesystem effects, preserving the previous fail-closed behavior. An installed
 registry enables only `create_host_setup` and `create_checkout`; SSH and remote
 runtime setup kinds remain typed, explicit refusals.
 
-Workspace resume intents prove the task's server-stored workspace against the
-requested project's bounded policy set and recheck the active workspace and
-exact revision, then refuse before custody because this adapter cannot perform
-a truthful workspace lifecycle transition. Task create likewise remains
-unavailable. Cancellations of already-existing durable pending intents remain
-immediate and final. Polling an older non-final receipt for which no compatible
-adapter is installed returns a typed recovery refusal instead of repeating an
-`accepted` receipt indefinitely.
+When `task_selectors` is non-empty, the production adapter supports the narrow
+task-workspace lifecycle that the current lineage model can represent without
+inventing a filesystem or provider effect. A create intent adopts one exact,
+already operator-authorized local checkout as the task's daemon-custodied
+`UserWorkspace`. The registry entry must match the project, workspace,
+checkout, task, external-work coordinate, and both opaque base and branch
+selectors. The lineage index independently proves that the task and external
+item are already bound to that same workspace. The authoritative WorkContext
+record must also be active and relate that workspace to exactly the same
+checkout identity; another checkout or root in the same project is refused.
+Create validates a Git worktree at the configured immutable base commit and
+exact branch. Resume requires the requested live workspace revision and the
+prior adoption, but permits the exact branch HEAD to advance normally when the
+configured base remains an ancestor. It still proves the canonical repository
+common directory, registered worktree, worktree root, symbolic branch and
+branch-to-HEAD identity. Neither operation creates a directory, changes a ref,
+starts a provider, or creates an attempt/session.
 
-The current lineage schema binds an orchestration task to an existing
-`UserWorkspace` before it can accept a workspace intent. Treating validation of
-that existing directory as a successful `create` would fabricate a lifecycle
-effect, so this release does not do so. Issuing a genuinely new task workspace
-requires a future lineage schema that can hold an unbound task without
-weakening its foreign-key authority.
+Workspace effects use a prepared/completed/unknown journal record bound to the
+full registry file generation and a digest of the full policy file generation. The
+workspace adoption, its live revision, the intent digest and completed state
+install in one atomic journal rewrite. On open, every completed create must
+have exactly one matching adopted workspace with the same intent and digest;
+a completed-only or mismatched row fails closed.
+After restart a prepared record is therefore provably not completed and may be
+completed only after the exact bindings revalidate; a completed record is an
+idempotent receipt. Unknown create custody becomes completed only when the
+same intent's adoption mapping is present. Otherwise it is durably reconciled
+as not started and a later poll may submit it again; it is never replayed in
+the reconciliation call. A changed policy or registry generation cannot
+complete an older accepted effect. Cancellation removes only prepared or
+verified-not-started unknown custody and refuses once completed adoption is
+visible. An accepted intent for which the adapter has no prepared custody is
+provably cancellable even if its mutable selector or root has since
+disappeared; cancellation still consults the installed journal adapter to
+fence a concurrent or ambiguous completion. Exact final lineage receipts are
+authorized from their stored workspace scope and replay before mutable adapter
+preflight, so later selector or root drift cannot erase a truthful final
+outcome. Polling a non-final receipt without a compatible adapter returns a
+typed recovery refusal.
+
+The current lineage schema still cannot create a previously unknown workspace:
+an orchestration task is authority-bound to an existing logical
+`UserWorkspace` before intent admission. `created` therefore means that the
+exact pre-authorized logical workspace was newly adopted into runtime custody,
+not that Automonique synthesized a path or repository. Creating an unbound
+identity remains future schema work.
+
 Review actions validate the server-selected role, exact authority identity,
 current snapshot revision, target revision, lifecycle, and freshness. Anchored
 `add_comment` and `approve_review` effects are store-owned: the next canonical
@@ -290,7 +323,18 @@ required to be uid-owned and non-group/world-writable.
     "checkout": "wc2_checkout_00000000000000000000000000000003",
     "canonical_root": "/srv/automonique/worktrees/issue-166"
   }],
-  "task_selectors": []
+  "task_selectors": [{
+    "base_selector": "base-issue-166",
+    "branch_selector": "branch-issue-166",
+    "project": "project-example",
+    "workspace": "wc2_user_workspace_00000000000000000000000000000004",
+    "checkout": "wc2_checkout_00000000000000000000000000000003",
+    "task": "task-issue-166",
+    "external_provider": "github",
+    "external_authority": "installation-example",
+    "external_scope": "owner/repository",
+    "external_key": "issue-166"
+  }]
 }
 ```
 
@@ -313,8 +357,10 @@ was not started, or leaves it ambiguous; it never guesses and replays a partial
 effect. A prepared validation-only local-host or authorized-folder operation
 whose binding becomes invalid is durably tombstoned as not started, releasing
 its selector custody. Completed host/checkout mappings retain only opaque identities and path
-digests. Logical archive changes do not delete operator files or git
-worktrees.
+digests. Task-workspace entries additionally retain the adopting intent and
+opaque workspace/checkout relation; their effect entries retain the exact
+registry-generation record and policy-generation digest. Logical archive
+changes do not delete operator files or git worktrees.
 
 ## Offline production bootstrap
 

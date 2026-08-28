@@ -208,6 +208,17 @@ binding or a conflict; it never creates a second workspace. Moved and closed
 sources do not silently retarget. Cancellation is terminal for that exact
 create intent, while a new authorized intent requires a new identity.
 
+The production local adapter implements only adoption of a pre-existing,
+active logical user workspace. Its authoritative workspace record must have
+an active current revision (and resume must match its expected revision) plus
+exactly one checkout relation matching the private registry's project,
+checkout and canonical root. Git adoption pins the
+configured base and branch; resume allows later commits only on that same
+registered worktree and branch with the configured base as an ancestor.
+Durable completed-create custody is bound to the unique adopting workspace and
+intent digest, while an accepted request with no prepared custody remains
+cancellable without relying on mutable selector availability.
+
 The shared synthetic corpus
 `rust/crates/automonique-protocol/fixtures/platform-v2-lineage-v1.json` covers
 those boundaries and mixed-version behavior. Offers such as `[1,2,3]` still
@@ -256,9 +267,9 @@ projection for one exact `UserWorkspaceId` after restart. The embedding daemon
 must pass its authorization decision through the authority-scoped projection
 seam. It stores neither provider payloads nor host paths.
 
-External-provider ingestion, workspace create/resume execution, authorization
-and selector registries, daemon routes, SDK client ergonomics, and UI
-projection remain separate runtime work. The contract and index do not claim
+External-provider ingestion, remote workspace execution, SDK client
+ergonomics, and UI projection remain separate runtime work. The contract and
+index do not claim
 that a provider item was fetched, a worker is live, or a workspace was created.
 
 Before submission, the server produces a bounded preview of the exact current

@@ -23,10 +23,11 @@ use automonique_protocol::platform::{
 };
 use automonique_protocol::platform_api::{PlatformRequestMessage, PlatformResponseMessage};
 use automonique_protocol::platform_v2::{
-    AttemptWorkspaceId, CheckoutKind, HostSetupKind, PaneId, PlatformVersion, PlatformVersionOffer,
-    ProjectId, UserWorkspaceId, V1RepositoryRef, V1SessionRef, WorkContextAttributes,
-    WorkContextIdentity, WorkContextLabel, WorkContextLifecycle, WorkContextRecord,
-    WorkContextRelation, WorkContextRelationKind, WorkContextTargetKind, WorkSessionId,
+    AttemptWorkspaceId, CheckoutId, CheckoutKind, HostSetupKind, PaneId, PlatformVersion,
+    PlatformVersionOffer, ProjectId, UserWorkspaceId, V1RepositoryRef, V1SessionRef,
+    WorkContextAttributes, WorkContextIdentity, WorkContextLabel, WorkContextLifecycle,
+    WorkContextRecord, WorkContextRelation, WorkContextRelationKind, WorkContextTargetKind,
+    WorkSessionId,
 };
 use automonique_protocol::platform_v2_lifecycle::{
     AuthorityGrantId, CreateAttemptWorkspaceIntent, CreateCheckoutIntent,
@@ -40,10 +41,11 @@ use automonique_protocol::platform_v2_lifecycle_api::{
 };
 use automonique_protocol::platform_v2_lineage::{
     BaseSelectorId, BranchSelectorId, ExternalWorkAuthorityId, ExternalWorkIdentity,
-    ExternalWorkKey, ExternalWorkProvider, ExternalWorkScope, LineageFreshness,
-    LineageFreshnessState, LineageStatus, OrchestrationIdentity, OrchestrationRecord,
-    OrchestrationRunId, OrchestrationTaskId, WorkspaceCreateIntent, WorkspaceIntent,
-    WorkspaceIntentId, WorkspaceResumeIntent,
+    ExternalWorkItem, ExternalWorkKey, ExternalWorkProvider, ExternalWorkScope, ExternalWorkState,
+    LineageFreshness, LineageFreshnessState, LineageStatus, OrchestrationIdentity,
+    OrchestrationRecord, OrchestrationRunId, OrchestrationTaskId, WorkspaceCancelIntent,
+    WorkspaceCreateIntent, WorkspaceIntent, WorkspaceIntentId, WorkspaceIntentOutcome,
+    WorkspaceResumeIntent,
 };
 use automonique_protocol::platform_v2_review::{
     ReviewAction, ReviewCommentId, ReviewReceiptOutcome, ReviewText,
@@ -1133,6 +1135,514 @@ fn configured_v2_uses_kernel_principal_scope_and_durable_idempotency() {
     serving.shutdown(&config);
 }
 
+#[test]
+fn production_workspace_effect_adopts_resumes_and_reopens_exact_local_binding() {
+    let _guard = full_daemon_test_guard();
+    let (root, config) = fixture();
+    configure_v2(&config);
+    let workspace_root = root.path().join("workspace-effect");
+    std::fs::create_dir(&workspace_root).unwrap();
+    std::fs::set_permissions(&workspace_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let external = ExternalWorkIdentity::new(
+        ExternalWorkProvider::GitHub,
+        ExternalWorkAuthorityId::new("authority-workspace-live").unwrap(),
+        ExternalWorkScope::new("scope-workspace-live").unwrap(),
+        ExternalWorkKey::new("work-workspace-live").unwrap(),
+    );
+    let freshness =
+        LineageFreshness::new(1_800_000_000_100, 30_000, LineageFreshnessState::Fresh).unwrap();
+    let workspace = UserWorkspaceId::new("workspace-live").unwrap();
+    let mut lineage = LineageIndex::open(config.platform_v2_lineage_path()).unwrap();
+    lineage
+        .intake_external(
+            "tenant-live",
+            &ExternalWorkItem::new(
+                external.clone(),
+                workspace.clone(),
+                Revision::FIRST,
+                ExternalWorkState::Open,
+                None,
+                freshness,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    lineage
+        .record_orchestration(
+            "tenant-live",
+            &OrchestrationRecord::new(
+                OrchestrationIdentity::Task(
+                    OrchestrationTaskId::new("task-workspace-live").unwrap(),
+                ),
+                workspace.clone(),
+                Some(external.clone()),
+                Some(OrchestrationIdentity::Run(
+                    OrchestrationRunId::new("run-live").unwrap(),
+                )),
+                LineageStatus::Working,
+                freshness,
+                None,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+    drop(lineage);
+
+    let registry = serde_json::json!({
+        "version": 1,
+        "generation": "workspace-live-generation-one",
+        "host_setups": [{
+            "selector": "host-live-selector", "host_setup": "host-live",
+            "project": "project-live", "setup_kind": "local",
+            "canonical_root": workspace_root
+        }],
+        "checkouts": [{
+            "selector": "checkout-live-selector", "checkout": "checkout-live",
+            "project": "project-live", "host_setup": "host-live",
+            "repository_authority": "github", "repository": "repo-live",
+            "checkout_kind": "authorized_folder", "canonical_root": workspace_root,
+            "repository_root": null, "base_commit": null, "branch_ref": null
+        }],
+        "workspaces": [{
+            "workspace": "workspace-live", "project": "project-live",
+            "checkout": "checkout-live", "canonical_root": workspace_root
+        }],
+        "task_selectors": [{
+            "base_selector": "base-workspace-live",
+            "branch_selector": "branch-workspace-live",
+            "project": "project-live", "workspace": "workspace-live",
+            "checkout": "checkout-live", "task": "task-workspace-live",
+            "external_provider": "github",
+            "external_authority": "authority-workspace-live",
+            "external_scope": "scope-workspace-live",
+            "external_key": "work-workspace-live"
+        }]
+    });
+    let registry_path = config
+        .state_dir()
+        .join(automonique_daemon::platform_v2_lifecycle_adapter::LIFECYCLE_REGISTRY_FILE_NAME);
+    std::fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
+    std::fs::set_permissions(&registry_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let create = WorkspaceIntent::Create(WorkspaceCreateIntent::new(
+        WorkspaceIntentId::new("intent-workspace-live-create").unwrap(),
+        OrchestrationTaskId::new("task-workspace-live").unwrap(),
+        external,
+        BaseSelectorId::new("base-workspace-live").unwrap(),
+        BranchSelectorId::new("branch-workspace-live").unwrap(),
+    ));
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-production-workspace-create",
+            PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(
+                ProjectId::new("project-live").unwrap(),
+                create.clone(),
+            )),
+        ),
+        PlatformV2Response::WorkspaceIntentResult(WorkspaceIntentOutcome::Created(value))
+            if value == workspace
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-production-workspace-create-replay",
+            PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(
+                ProjectId::new("project-live").unwrap(),
+                create.clone(),
+            )),
+        ),
+        PlatformV2Response::WorkspaceIntentResult(WorkspaceIntentOutcome::Created(value))
+            if value == workspace
+    ));
+    let resume = WorkspaceIntent::Resume(WorkspaceResumeIntent::new(
+        WorkspaceIntentId::new("intent-workspace-live-resume").unwrap(),
+        OrchestrationTaskId::new("task-workspace-live").unwrap(),
+        workspace.clone(),
+        Revision::FIRST,
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-production-workspace-resume",
+            PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(
+                ProjectId::new("project-live").unwrap(),
+                resume.clone(),
+            )),
+        ),
+        PlatformV2Response::WorkspaceIntentResult(WorkspaceIntentOutcome::Resumed(value))
+            if value == workspace
+    ));
+
+    // Simulate a crash after the adapter atomically completed its effects but
+    // before either lineage receipt transaction committed.
+    let lineage_connection = rusqlite::Connection::open(config.platform_v2_lineage_path()).unwrap();
+    lineage_connection
+        .execute_batch("PRAGMA foreign_keys=OFF;")
+        .unwrap();
+    lineage_connection
+        .execute_batch(
+            "CREATE TEMP TABLE saved_workspace_task AS
+             SELECT * FROM lineage_orchestration
+             WHERE tenant='tenant-live'
+               AND orchestration_kind='task'
+               AND orchestration_id='task-workspace-live';",
+        )
+        .unwrap();
+    assert_eq!(
+        lineage_connection
+            .execute(
+                "UPDATE lineage_workspace_intents
+                 SET revision=1,outcome_kind='accepted',outcome_conflict=NULL,
+                     outcome_workspace_id=NULL,reconciliation='poll_receipt'
+                 WHERE tenant='tenant-live' AND intent_id IN (
+                     'intent-workspace-live-create',
+                     'intent-workspace-live-resume'
+                 )",
+                [],
+            )
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        lineage_connection
+            .execute(
+                "UPDATE lineage_orchestration
+                 SET workspace_id='wc_user_1'
+                 WHERE tenant='tenant-live'
+                   AND orchestration_kind='task'
+                   AND orchestration_id='task-workspace-live'",
+                [],
+            )
+            .unwrap(),
+        1
+    );
+    let mut work_contexts = WorkContextStore::open(config.platform_v2_work_context_path()).unwrap();
+    let project = ProjectId::new("project-live").unwrap();
+    let workspace_identity = WorkContextIdentity::UserWorkspace(workspace.clone());
+    let active = work_contexts
+        .validate_policy_mapping("tenant-live", &project, &workspace_identity)
+        .unwrap();
+    let archived = WorkContextRecord::new(
+        workspace_identity,
+        Revision::new(active.revision().get() + 1).unwrap(),
+        WorkContextLifecycle::Archived,
+        active.label().clone(),
+        active.attributes(),
+        active.relations().to_vec(),
+    )
+    .unwrap();
+    work_contexts
+        .put_authoritative_record("tenant-live", &archived)
+        .unwrap();
+    drop(work_contexts);
+    let mut drifted_registry = registry.clone();
+    drifted_registry["task_selectors"] = serde_json::json!([]);
+    std::fs::write(
+        &registry_path,
+        serde_json::to_vec(&drifted_registry).unwrap(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&workspace_root, std::fs::Permissions::from_mode(0o770)).unwrap();
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-production-workspace-create-read-after-lineage-drift",
+            PlatformV2Request::GetWorkspaceIntent(WorkspaceIntentLookup::new(
+                ProjectId::new("project-live").unwrap(),
+                create.intent_id().clone(),
+            )),
+        ),
+        PlatformV2Response::WorkspaceIntentResult(WorkspaceIntentOutcome::Created(value))
+            if value == workspace
+    ));
+    assert_eq!(
+        lineage_connection
+            .execute(
+                "DELETE FROM lineage_orchestration
+                 WHERE tenant='tenant-live'
+                   AND orchestration_kind='task'
+                   AND orchestration_id='task-workspace-live'",
+                [],
+            )
+            .unwrap(),
+        1
+    );
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-production-workspace-resume-final-after-work-context-drift",
+            PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(
+                ProjectId::new("project-live").unwrap(),
+                resume.clone(),
+            )),
+        ),
+        PlatformV2Response::WorkspaceIntentResult(WorkspaceIntentOutcome::Resumed(value))
+            if value == workspace
+    ));
+    assert_eq!(
+        lineage_connection
+            .execute(
+                "INSERT INTO lineage_orchestration
+                 SELECT * FROM saved_workspace_task",
+                [],
+            )
+            .unwrap(),
+        1
+    );
+    drop(lineage_connection);
+    std::fs::set_permissions(&workspace_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
+    std::fs::set_permissions(&registry_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    serving.shutdown(&config);
+
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-production-workspace-resume-after-restart",
+            PlatformV2Request::GetWorkspaceIntent(WorkspaceIntentLookup::new(
+                ProjectId::new("project-live").unwrap(),
+                resume.intent_id().clone(),
+            )),
+        ),
+        PlatformV2Response::WorkspaceIntentResult(WorkspaceIntentOutcome::Resumed(value))
+            if value == workspace
+    ));
+    serving.shutdown(&config);
+
+    let mut narrowed_policy: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config.platform_v2_policy_path()).unwrap()).unwrap();
+    narrowed_policy["principals"][0]["workspaces"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|entry| {
+            !matches!(
+                entry["id"].as_str(),
+                Some("workspace-live" | "attempt-live" | "session-live" | "pane-live")
+            )
+        });
+    std::fs::write(
+        config.platform_v2_policy_path(),
+        serde_json::to_vec(&narrowed_policy).unwrap(),
+    )
+    .unwrap();
+    let serving = serve(&config);
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-production-workspace-receipt-does-not-widen-authority",
+            PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(
+                ProjectId::new("project-live").unwrap(),
+                create,
+            )),
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_scope_denied"
+    ));
+    serving.shutdown(&config);
+}
+
+struct CrashBeforeWorkspaceCustodyAdapter {
+    cancellations: Arc<AtomicUsize>,
+}
+
+impl automonique_daemon::platform_v2_host::PlatformV2LifecycleEffectAdapter
+    for CrashBeforeWorkspaceCustodyAdapter
+{
+    fn supported_effect_kinds(&self) -> BTreeSet<String> {
+        BTreeSet::new()
+    }
+
+    fn workspace_intents_supported(&self) -> bool {
+        true
+    }
+
+    fn workspace_intent_custody_installed(&self) -> bool {
+        true
+    }
+
+    fn preflight_workspace_intent(
+        &self,
+        _intent: &WorkspaceIntent,
+        _project: &ProjectId,
+        _workspace: &UserWorkspaceId,
+        _checkout: &CheckoutId,
+        _workspace_revision: Revision,
+        _policy_generation: automonique_protocol::digest::Sha256Digest,
+    ) -> Result<(), &'static str> {
+        Ok(())
+    }
+
+    fn execute_workspace_intent(
+        &mut self,
+        _intent: &WorkspaceIntent,
+        _project: &ProjectId,
+        _workspace: &UserWorkspaceId,
+        _checkout: &CheckoutId,
+        _workspace_revision: Revision,
+        _policy_generation: automonique_protocol::digest::Sha256Digest,
+    ) -> Result<WorkspaceIntentOutcome, &'static str> {
+        Err("platform_v2_test_crash_before_workspace_prepare")
+    }
+
+    fn cancel_workspace_intent(
+        &mut self,
+        _target: &WorkspaceIntent,
+        _project: &ProjectId,
+        _workspace: &UserWorkspaceId,
+        _policy_generation: automonique_protocol::digest::Sha256Digest,
+    ) -> Result<(), &'static str> {
+        self.cancellations.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn execute(
+        &mut self,
+        _intent: &WorkContextMutationIntent,
+        _resulting_identity: &WorkContextIdentity,
+        _idempotency_key: &IdempotencyKey,
+    ) -> automonique_daemon::platform_v2_host::PlatformV2EffectExecution {
+        automonique_daemon::platform_v2_host::PlatformV2EffectExecution::NotStarted
+    }
+
+    fn reconcile(
+        &mut self,
+        _intent: &WorkContextMutationIntent,
+        _resulting_identity: &WorkContextIdentity,
+        _idempotency_key: &IdempotencyKey,
+    ) -> automonique_daemon::platform_v2_host::PlatformV2EffectReconciliation {
+        automonique_daemon::platform_v2_host::PlatformV2EffectReconciliation::VerifiedNotStarted(
+            b"test adapter owns no work-context effect custody".to_vec(),
+        )
+    }
+}
+
+#[test]
+fn accepted_workspace_intent_without_effect_custody_remains_cancellable() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let external = ExternalWorkIdentity::new(
+        ExternalWorkProvider::GitHub,
+        ExternalWorkAuthorityId::new("authority-no-custody").unwrap(),
+        ExternalWorkScope::new("scope-no-custody").unwrap(),
+        ExternalWorkKey::new("work-no-custody").unwrap(),
+    );
+    let freshness =
+        LineageFreshness::new(1_800_000_000_000, 30_000, LineageFreshnessState::Fresh).unwrap();
+    let workspace = UserWorkspaceId::new("workspace-live").unwrap();
+    let mut lineage = LineageIndex::open(config.platform_v2_lineage_path()).unwrap();
+    lineage
+        .intake_external(
+            "tenant-live",
+            &ExternalWorkItem::new(
+                external.clone(),
+                workspace.clone(),
+                Revision::FIRST,
+                ExternalWorkState::Open,
+                None,
+                freshness,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    lineage
+        .record_orchestration(
+            "tenant-live",
+            &OrchestrationRecord::new(
+                OrchestrationIdentity::Task(OrchestrationTaskId::new("task-no-custody").unwrap()),
+                workspace.clone(),
+                Some(external.clone()),
+                Some(OrchestrationIdentity::Run(
+                    OrchestrationRunId::new("run-live").unwrap(),
+                )),
+                LineageStatus::Working,
+                freshness,
+                None,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+    drop(lineage);
+    let cancellations = Arc::new(AtomicUsize::new(0));
+    let uid = nix::unistd::geteuid().as_raw();
+    let mut host =
+        automonique_daemon::platform_v2_host::PlatformV2Host::open_with_lifecycle_adapter(
+            &config.platform_v2_policy_path(),
+            &config.platform_v2_work_context_path(),
+            &config.platform_v2_lineage_path(),
+            &config.platform_v2_review_path(),
+            uid,
+            Box::new(CrashBeforeWorkspaceCustodyAdapter {
+                cancellations: Arc::clone(&cancellations),
+            }),
+        );
+    let create = WorkspaceIntent::Create(WorkspaceCreateIntent::new(
+        WorkspaceIntentId::new("intent-accepted-no-custody").unwrap(),
+        OrchestrationTaskId::new("task-no-custody").unwrap(),
+        external,
+        BaseSelectorId::new("base-no-custody").unwrap(),
+        BranchSelectorId::new("branch-no-custody").unwrap(),
+    ));
+    let response = host.handle(
+        uid,
+        &PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(
+            ProjectId::new("project-live").unwrap(),
+            create.clone(),
+        )),
+        1_800_000_000_000,
+    );
+    assert!(
+        matches!(
+            &response,
+            PlatformV2Response::Refused(refusal)
+                if refusal.category().as_str() == "platform_v2_test_crash_before_workspace_prepare"
+        ),
+        "{response:?}"
+    );
+    assert!(matches!(
+        host.handle(
+            uid,
+            &PlatformV2Request::GetWorkspaceIntent(WorkspaceIntentLookup::new(
+                ProjectId::new("project-live").unwrap(),
+                create.intent_id().clone(),
+            )),
+            1_800_000_000_001,
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_test_crash_before_workspace_prepare"
+    ));
+    let cancel = WorkspaceIntent::Cancel(
+        WorkspaceCancelIntent::new(
+            WorkspaceIntentId::new("intent-cancel-no-custody").unwrap(),
+            create.intent_id().clone(),
+            workspace,
+            Revision::FIRST,
+        )
+        .unwrap(),
+    );
+    assert!(matches!(
+        host.handle(
+            uid,
+            &PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(
+                ProjectId::new("project-live").unwrap(),
+                cancel,
+            )),
+            1_800_000_000_002,
+        ),
+        PlatformV2Response::WorkspaceIntentResult(WorkspaceIntentOutcome::Cancelled(value))
+            if value == *create.intent_id()
+    ));
+    assert_eq!(cancellations.load(Ordering::SeqCst), 1);
+}
+
 struct RecoveringLifecycleAdapter {
     executions: Arc<AtomicUsize>,
     reconciliations: Arc<AtomicUsize>,
@@ -1553,6 +2063,42 @@ fn resume_requires_live_durable_workspace_before_intent_custody() {
             PlatformV2Request::GetWorkspaceIntent(WorkspaceIntentLookup::new(
                 ProjectId::new("project-live").unwrap(),
                 intent.intent_id().clone(),
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_not_found"
+    ));
+    let create = WorkspaceIntent::Create(WorkspaceCreateIntent::new(
+        WorkspaceIntentId::new("intent-create-archived").unwrap(),
+        OrchestrationTaskId::new("task-live").unwrap(),
+        ExternalWorkIdentity::new(
+            ExternalWorkProvider::GitHub,
+            ExternalWorkAuthorityId::new("authority-archived").unwrap(),
+            ExternalWorkScope::new("scope-archived").unwrap(),
+            ExternalWorkKey::new("work-archived").unwrap(),
+        ),
+        BaseSelectorId::new("base-archived").unwrap(),
+        BranchSelectorId::new("branch-archived").unwrap(),
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-create-archived",
+            PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(
+                ProjectId::new("project-live").unwrap(),
+                create.clone(),
+            ))
+        ),
+        PlatformV2Response::Refused(refusal)
+            if refusal.category().as_str() == "platform_v2_workspace_not_active"
+    ));
+    assert!(matches!(
+        platform_v2(
+            &config,
+            "v2-archived-create-not-stored",
+            PlatformV2Request::GetWorkspaceIntent(WorkspaceIntentLookup::new(
+                ProjectId::new("project-live").unwrap(),
+                create.intent_id().clone(),
             ))
         ),
         PlatformV2Response::Refused(refusal)
