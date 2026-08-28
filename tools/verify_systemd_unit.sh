@@ -20,6 +20,7 @@ mkdir -p "$ag_ui_bin/src"
 mkdir -p "$tunnel_bin"
 mkdir -p "$unit_dir"
 cp /bin/true "$daemon_bin/automonique"
+cp /bin/true "$daemon_bin/automonique-launch-enter"
 cp /bin/true "$worker_bin/automonique-manage-worker"
 cp /bin/true "$web_entry_bin/automonique-web-entry"
 cp /bin/true "$ag_ui_bin/src/main.ts"
@@ -49,6 +50,7 @@ sed "s|^ExecStart=%h/.bun/bin/bun |ExecStart=/bin/true |" "$ag_ui_unit" >"$verif
 # by unit name and bypass the temporary executable substitution.
 for unit in \
     automonique.socket \
+    automonique-tempfs-owner.service \
     automonique.service \
     automonique-manage-worker.service \
     automonique-web-entry.service \
@@ -61,6 +63,7 @@ done
 
 XDG_STATE_HOME="$verify_state" systemd-analyze --user verify \
     "$unit_dir/automonique.socket" \
+    "$unit_dir/automonique-tempfs-owner.service" \
     "$unit_dir/automonique.service" \
     "$unit_dir/automonique-manage-worker.service" \
     "$unit_dir/automonique-web-entry.service" \
