@@ -315,6 +315,7 @@ pub enum WriteAdmission {
 pub struct StoredWorkspaceIntent {
     pub request_digest: [u8; 32],
     pub revision: Revision,
+    pub workspace: UserWorkspaceId,
     pub intent: WorkspaceIntent,
     pub outcome: WorkspaceIntentOutcome,
 }
@@ -1535,6 +1536,8 @@ impl IntentFingerprint {
             request_digest: self.request_digest,
             revision: Revision::new(from_db(self.revision, "intent_revision")?)
                 .map_err(|_| LineageIndexError::Corrupt("intent_revision"))?,
+            workspace: UserWorkspaceId::new(self.workspace)
+                .map_err(|_| LineageIndexError::Corrupt("intent_workspace"))?,
             intent,
             outcome,
         })
