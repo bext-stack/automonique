@@ -1985,11 +1985,9 @@ impl JcodePreparedRun {
                                             .send(Err(SteerRefusal::ProviderRefused));
                                         break 'run RunSpoolState::Failed;
                                     }
-                                    Ok(None) => writer.project_turn_outcome(
-                                        &mut mapper,
-                                        events,
-                                        &response,
-                                    ),
+                                    Ok(None) => {
+                                        writer.project_turn_outcome(&mut mapper, events, &response)
+                                    }
                                     Err(()) => {
                                         let _ = command
                                             .response
@@ -3179,8 +3177,8 @@ mod tests {
     use super::{
         JcodeTemporaryStorageHost, MAX_PROVIDER_BINARY_BYTES, PROVIDER_APPROVAL_PROPOSER,
         TokenCancelSink, admission_refusal, advance, describe_refused_destination,
-        expire_unanswered_approvals, is_containment_run_id, is_safe_segment,
-        is_within_byte_limit, poll_jcode_temporary_storage, provider_binary_digest, spool_state,
+        expire_unanswered_approvals, is_containment_run_id, is_safe_segment, is_within_byte_limit,
+        poll_jcode_temporary_storage, provider_binary_digest, spool_state,
     };
     use crate::attempt_host::DaemonAttemptHost;
     use crate::progress::JcodeProgressMapper;
