@@ -11,9 +11,9 @@ use automonique_protocol::identity::Actor;
 use automonique_protocol::platform::{IdempotencyKey, ResourceAuthority};
 use automonique_protocol::platform_v2::{
     NegotiatedPlatform, PLATFORM_SCHEMA_V2, PlatformVersion, PlatformVersionOffer, ProjectId,
-    WorkContextAttributes, WorkContextAvailability, WorkContextCursor, WorkContextIdentity,
-    WorkContextKind, WorkContextLabel, WorkContextLifecycle, WorkContextPage, WorkContextQuery,
-    WorkContextRecord, WorkContextResync,
+    UserWorkspaceId, WorkContextAttributes, WorkContextAvailability, WorkContextCursor,
+    WorkContextIdentity, WorkContextKind, WorkContextLabel, WorkContextLifecycle, WorkContextPage,
+    WorkContextQuery, WorkContextRecord, WorkContextResync,
 };
 use automonique_protocol::platform_v2_attention::{
     AttentionSource, AttentionSourceId, AttentionSourceKind,
