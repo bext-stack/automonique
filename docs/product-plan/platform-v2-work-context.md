@@ -23,6 +23,16 @@ inside `ResourceRecord.summary`, invent a new v1 `ResourceKind`, or imply that a
 v1 client received structured work context. No overlap is an explicit
 compatibility refusal.
 
+The attempt-workspace terminology is an intentional Rust source break:
+execution-only values use `AttemptWorkspaceRegistration`,
+`AttemptWorkspaceToken`, and `AttemptWorkspaceRegistryId`, while the v2 graph
+keeps `UserWorkspaceId` and `AttemptWorkspaceId` distinct. The affected Rust
+crates are `publish = false`, so no published Rust API compatibility is
+claimed and misleading aliases are not retained. This source rename does not
+rename the installed wire contract: Platform v1 keeps
+`automonique.platform/v1`, and RunSpec v1 keeps the exact JSON fields
+`workspace`, `workspace_registry_id`, and `workspace_token`.
+
 ## Identity, authority, revision, and retention
 
 Every new work-context identity is opaque and meaningful only within the
@@ -405,9 +415,13 @@ remains read-only.
 - [x] Internal run-execution identities are qualified as attempt-workspace
   registrations, tokens, and registry IDs; RunSpec v1 wire keys remain pinned
   by `run_spec_v1_golden` and the strict decoder suites.
-- [x] An installed Platform v1 adapter negotiates v1, decodes every checked-in
-  canonical request, and re-encodes the exact same bytes in
-  `installed_v1_adapter_fixture_negotiates_and_decodes_without_v2_projection`.
+- [x] A literal installed-client v1-only offer negotiates v1 with the current
+  server; five immutable current-server response transcripts remain
+  byte-identical; and an independently authored strict v1-only decoder accepts
+  them while refusing v2 and additive shapes in
+  `platform_v1_installed_acceptance`. The decoder imports no Automonique
+  protocol types. Fixture provenance and limits are recorded beside the
+  corpus without claiming historical extraction or an unavailable executable.
 - [x] One project relates two repositories, local and SSH host setups, and user
   workspaces backed by both a git worktree and an authorized folder in
   `one_project_spans_repositories_hosts_and_both_authorized_workspace_kinds`.
