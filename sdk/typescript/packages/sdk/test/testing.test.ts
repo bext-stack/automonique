@@ -14,10 +14,39 @@ import {
   AmbiguousMutationFixtureError,
   DeterministicFixtureError,
   DeterministicPlatformAdapter,
+  createRenderConformanceCorpus,
   createDeterministicSdkFixture,
+  normalizeRenderConformanceCorpus,
 } from "../src/testing.ts";
 
 describe("deterministic SDK testing fixtures", () => {
+  test("exports the shared render corpus with BigInt-safe immutable revisions", async () => {
+    const raw = JSON.parse(await Bun.file(new URL(
+      "../../../../../rust/crates/automonique-protocol/fixtures/platform-v2-render-conformance-v1.json",
+      import.meta.url,
+    )).text());
+    const shared = normalizeRenderConformanceCorpus(raw);
+    const exported = createRenderConformanceCorpus();
+
+    expect(exported).toEqual(shared);
+    expect(exported.cases.map(({id}) => id)).toEqual([
+      "idle", "needs_you", "working", "blocked", "done",
+    ]);
+    expect(typeof exported.cases[0]?.input.revision).toBe("bigint");
+    expect(exported.cases[0]?.input.revision).toBe(9_007_199_254_741_001n);
+    expect(Object.isFrozen(exported.cases)).toBe(true);
+    expect(() => normalizeRenderConformanceCorpus({
+      ...raw,
+      cases: [{...raw.cases[0], input: {...raw.cases[0].input, revision: 9_007_199_254_741_001}}],
+    })).toThrow("not a canonical revision");
+    expect(() => normalizeRenderConformanceCorpus({
+      ...raw,
+      cases: raw.cases.map((item: typeof raw.cases[number]) => item.id === "done"
+        ? {...item, expected: {...item.expected, delivery: {...item.expected.delivery, semantic_key: "delivery.pending"}}}
+        : item),
+    })).toThrow("does not match canonical v1 semantics");
+  });
+
   test("models exact duplicates, conflicting duplicates, gaps, and stale revisions", () => {
     const fixture = createDeterministicSdkFixture();
     const initial = reduceSnapshot(emptyPlatformView(), fixture.projection.snapshot);

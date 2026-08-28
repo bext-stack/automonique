@@ -6,6 +6,12 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const asset = (name) => readFile(`${root}assets/${name}`, "utf8");
+const renderCorpus = JSON.parse(await readFile(
+  `${root}../automonique-protocol/fixtures/platform-v2-render-conformance-v1.json`,
+  "utf8",
+));
+const freshCockpitReview = structuredClone(renderCorpus.cases.find(({ id }) => id === "needs_you").input);
+freshCockpitReview.checks[0].freshness.state = "fresh";
 
 const cockpit = {
   schema: "automonique.dashboard.cockpit/v2",
@@ -48,7 +54,7 @@ const cockpit = {
   ],
   selected: { workspace: "workspace-1" },
   lineage: { state: "available", document: { workspace: "workspace-1", external_work_items: [], orchestration: [] } },
-  review: { state: "available", document: { files: [], checks: [], review: { freshness: { state: "fresh" } }, delivery: { freshness: { state: "fresh" } } } },
+  review: { state: "available", document: freshCockpitReview },
   attention: { state: "available", known_workspaces: "2", total_workspaces: "2" },
   actions: {
     lifecycle: { available: false, category: "platform_v2_lifecycle_adapter_pending" },
@@ -102,6 +108,32 @@ test("workspace projection is accessible and lifecycle controls fail closed", as
   await page.getByRole("tab", { name: "Files & review" }).focus();
   await page.keyboard.press("ArrowRight");
   await expect(page.getByRole("tab", { name: "Activity" })).toBeFocused();
+});
+
+test("shared corpus renders exact review semantics and lossless source revisions", async ({ page }) => {
+  const previous = cockpit.review.document;
+  cockpit.review.document = structuredClone(renderCorpus.cases.find(({ id }) => id === "needs_you").input);
+  try {
+    await page.reload();
+    await expect(page.locator("#cockpit-files-state")).toContainText(
+      "text · sanitized · source revision 9007199254741011",
+    );
+    await expect(page.locator("#cockpit-files-state")).toHaveAttribute("data-semantic-key", "preview.text.sanitized");
+    await expect(page.locator("#cockpit-review-state")).toContainText(
+      "needs you · review requested · pending · fresh · source revision 9007199254741003",
+    );
+    await expect(page.locator("#cockpit-review-state")).toContainText(
+      "open · blocked · fresh · source revision 9007199254741005",
+    );
+    await expect(page.locator("#cockpit-checks-state")).toContainText(
+      "failed · required · stale · source revision 9007199254741004",
+    );
+    await expect(page.locator("#cockpit-delivery-state")).toHaveText(
+      "pending · fresh · source revision 9007199254741006",
+    );
+  } finally {
+    cockpit.review.document = previous;
+  }
 });
 
 test("installed local adapter is visible without enabling task or session actions", async ({ page }) => {

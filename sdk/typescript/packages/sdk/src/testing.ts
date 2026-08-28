@@ -69,6 +69,26 @@ import type {
 } from "./platform-client.js";
 import {PlatformV2CanonicalTestingTransport} from "./testing/internal.js";
 
+export {
+  createRenderConformanceCorpus,
+  normalizeRenderConformanceCorpus,
+  type RenderAttentionState,
+  type RenderCheckState,
+  type RenderConformanceCase,
+  type RenderConformanceCorpus,
+  type RenderConformanceExpected,
+  type RenderConformanceFreshSemantic,
+  type RenderConformanceFreshness,
+  type RenderConformanceInput,
+  type RenderConformanceSemantic,
+  type RenderDeliveryState,
+  type RenderFreshnessState,
+  type RenderMergeReadiness,
+  type RenderPreviewKind,
+  type RenderPullRequestState,
+  type RenderReviewDecision,
+} from "./render-conformance.js";
+
 export class DeterministicFixtureError extends Error {
   readonly category: "aborted" | "script_exhausted" | "unexpected_request";
 

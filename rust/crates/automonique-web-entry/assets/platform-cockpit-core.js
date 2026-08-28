@@ -10,6 +10,19 @@
   const CONTROL_FAMILIES = Object.freeze(["workspace_intent", "review_action"]);
   const LINK_KEYS = Object.freeze(["workspace", "session", "pane", "file", "hunk", "side", "line"]);
   const MAX_LINEAGE_RECORDS = 128;
+  const REVIEW_DECISIONS = Object.freeze(["pending", "approved", "changes_requested", "dismissed"]);
+  const CHECK_STATES = Object.freeze(["queued", "running", "passed", "failed", "cancelled", "unavailable"]);
+  const PULL_REQUEST_STATES = Object.freeze(["absent", "draft", "open", "closed", "merged"]);
+  const MERGE_READINESS_STATES = Object.freeze(["unknown", "blocked", "ready", "stale"]);
+  const DELIVERY_STATES = Object.freeze(["not_delivered", "pending", "delivered", "failed"]);
+  const PREVIEW_KINDS = Object.freeze(["none", "text", "binary", "image", "html"]);
+  const FRESHNESS_STATES = Object.freeze(["fresh", "stale", "unknown"]);
+  const ATTENTION_REASON_STATES = Object.freeze({
+    review_requested: "needs_you", comment_reply: "needs_you", approval_required: "needs_you",
+    check_running: "working", delivery_pending: "working",
+    check_failed: "blocked", conflict: "blocked", external_blocker: "blocked",
+    complete: "done",
+  });
 
   function validDecimal(value, allowZero = true) {
     return typeof value === "string"
@@ -47,6 +60,96 @@
       id: boundedText(value?.id, 256),
       message: boundedText(value?.message, 512),
       outcome: boundedText(value?.outcome, 64),
+    });
+  }
+
+  function semanticFreshness(value, rootRevision) {
+    const state = explicitEnum(value?.state, FRESHNESS_STATES);
+    const sourceRevision = validDecimal(value?.observed_revision, false) ? value.observed_revision : null;
+    if (!state || !sourceRevision || decimalGreater(sourceRevision, rootRevision)) return null;
+    return Object.freeze({ freshness_key: `freshness.${state}`, source_revision: sourceRevision });
+  }
+
+  /** Pure, lossless projection from the server-owned review document to render semantics. */
+  function projectReviewSemantics(document) {
+    const rootRevision = validDecimal(document?.revision, false) ? document.revision : null;
+    if (!rootRevision || !Array.isArray(document?.checks) || document.checks.length > 128
+      || !Array.isArray(document?.files) || document.files.length > 128) return null;
+
+    const attentionState = explicitEnum(document?.attention?.state, WORKSPACE_ATTENTION_STATES);
+    const attentionReason = document?.attention?.reason === null ? null : boundedText(document?.attention?.reason, 64);
+    const attentionSource = document?.attention?.source_revision === null
+      ? null : (validDecimal(document?.attention?.source_revision, false) ? document.attention.source_revision : null);
+    const unread = validDecimal(document?.attention?.unread) ? document.attention.unread : null;
+    const idleAttention = attentionState === "idle" && attentionReason === null && attentionSource === null && unread === "0";
+    const activeAttention = attentionState && attentionState !== "idle" && attentionReason
+      && ATTENTION_REASON_STATES[attentionReason] === attentionState && attentionSource
+      && !decimalGreater(attentionSource, rootRevision) && unread !== null;
+    if (!idleAttention && !activeAttention) return null;
+    const attention = Object.freeze({
+      semantic_key: `attention.${attentionState}`,
+      reason_key: attentionReason ? `attention_reason.${attentionReason}` : null,
+      source_revision: attentionSource,
+    });
+
+    const reviewState = explicitEnum(document?.review?.decision, REVIEW_DECISIONS);
+    const reviewFreshness = semanticFreshness(document?.review?.freshness, rootRevision);
+    if (!reviewState || !reviewFreshness) return null;
+    const review = Object.freeze({ semantic_key: `review.${reviewState}`, ...reviewFreshness });
+
+    const checkIds = new Set();
+    const checks = document.checks.map((value) => {
+      const id = boundedText(value?.id, 256);
+      const state = explicitEnum(value?.state, CHECK_STATES);
+      const freshness = semanticFreshness(value?.freshness, rootRevision);
+      if (!id || checkIds.has(id) || !state || typeof value?.required !== "boolean" || !freshness) return null;
+      checkIds.add(id);
+      return Object.freeze({
+        id,
+        semantic_key: `check.${state}.${value.required ? "required" : "optional"}`,
+        ...freshness,
+      });
+    });
+    if (checks.some((value) => value === null)) return null;
+
+    const pullRequestState = explicitEnum(document?.pull_request?.state, PULL_REQUEST_STATES);
+    const readiness = explicitEnum(document?.pull_request?.readiness, MERGE_READINESS_STATES);
+    const pullRequestFreshness = semanticFreshness(document?.pull_request?.freshness, rootRevision);
+    if (!pullRequestState || !readiness || !pullRequestFreshness) return null;
+    const pullRequest = Object.freeze({
+      semantic_key: `pull_request.${pullRequestState}.${readiness}`,
+      ...pullRequestFreshness,
+    });
+
+    const deliveryState = explicitEnum(document?.delivery?.state, DELIVERY_STATES);
+    const deliveryFreshness = semanticFreshness(document?.delivery?.freshness, rootRevision);
+    if (!deliveryState || !deliveryFreshness) return null;
+    const delivery = Object.freeze({ semantic_key: `delivery.${deliveryState}`, ...deliveryFreshness });
+
+    const fileIds = new Set();
+    const previews = document.files.map((value) => {
+      const id = boundedText(value?.id, 256);
+      const kind = explicitEnum(value?.preview?.kind, PREVIEW_KINDS);
+      const sanitized = value?.preview?.sanitized;
+      const coherent = kind === "none" || kind === "binary" ? sanitized === false : sanitized === true;
+      if (!id || fileIds.has(id) || !kind || !coherent) return null;
+      fileIds.add(id);
+      return Object.freeze({
+        id,
+        semantic_key: `preview.${kind}.${sanitized ? "sanitized" : "raw"}`,
+        source_revision: rootRevision,
+      });
+    });
+    if (previews.some((value) => value === null)) return null;
+
+    return Object.freeze({
+      source_revision: rootRevision,
+      attention,
+      review,
+      checks: Object.freeze(checks),
+      pull_request: pullRequest,
+      delivery,
+      previews: Object.freeze(previews),
     });
   }
 
@@ -373,6 +476,8 @@
     const resume = controlCapability(document, "workspace_intent", "resume_attempt_workspace");
     const addComment = controlCapability(document, "review_action", "add_comment");
     const approveReview = controlCapability(document, "review_action", "approve_review");
+    const reviewDocument = document?.review?.state === "available" ? document?.review?.document : null;
+    const reviewSemantics = projectReviewSemantics(reviewDocument);
     return Object.freeze({
       mode,
       degradation,
@@ -399,7 +504,9 @@
         files: Array.isArray(document?.review?.document?.files) ? document.review.document.files : null,
         review: document?.review?.document?.review && typeof document.review.document.review === "object" ? document.review.document.review : null,
         checks: Array.isArray(document?.review?.document?.checks) ? document.review.document.checks : null,
+        pullRequest: document?.review?.document?.pull_request && typeof document.review.document.pull_request === "object" ? document.review.document.pull_request : null,
         delivery: document?.review?.document?.delivery && typeof document.review.document.delivery === "object" ? document.review.document.delivery : null,
+        semantics: reviewSemantics,
       }),
     });
   }
@@ -541,6 +648,7 @@
     lifecycleStatus,
     parseControlHandle,
     parseDeepLink,
+    projectReviewSemantics,
     receiptDirective,
     prepareControlHandle,
     reduce,
