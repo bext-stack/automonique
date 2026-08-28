@@ -1278,8 +1278,8 @@ fn production_workspace_effect_adopts_resumes_and_reopens_exact_local_binding() 
             if value == workspace
     ));
 
-    // Simulate a crash after the adapter atomically completed adoption but
-    // before the lineage receipt transaction committed.
+    // Simulate a crash after the adapter atomically completed its effects but
+    // before either lineage receipt transaction committed.
     let lineage_connection = rusqlite::Connection::open(config.platform_v2_lineage_path()).unwrap();
     assert_eq!(
         lineage_connection
@@ -1287,13 +1287,35 @@ fn production_workspace_effect_adopts_resumes_and_reopens_exact_local_binding() 
                 "UPDATE lineage_workspace_intents
                  SET revision=1,outcome_kind='accepted',outcome_conflict=NULL,
                      outcome_workspace_id=NULL,reconciliation='poll_receipt'
-                 WHERE tenant='tenant-live' AND intent_id='intent-workspace-live-create'",
+                 WHERE tenant='tenant-live' AND intent_id IN (
+                     'intent-workspace-live-create',
+                     'intent-workspace-live-resume'
+                 )",
                 [],
             )
             .unwrap(),
-        1
+        2
     );
     drop(lineage_connection);
+    let mut work_contexts = WorkContextStore::open(config.platform_v2_work_context_path()).unwrap();
+    let project = ProjectId::new("project-live").unwrap();
+    let workspace_identity = WorkContextIdentity::UserWorkspace(workspace.clone());
+    let active = work_contexts
+        .validate_policy_mapping("tenant-live", &project, &workspace_identity)
+        .unwrap();
+    let archived = WorkContextRecord::new(
+        workspace_identity,
+        Revision::new(active.revision().get() + 1).unwrap(),
+        WorkContextLifecycle::Archived,
+        active.label().clone(),
+        active.attributes(),
+        active.relations().to_vec(),
+    )
+    .unwrap();
+    work_contexts
+        .put_authoritative_record("tenant-live", &archived)
+        .unwrap();
+    drop(work_contexts);
     let mut drifted_registry = registry.clone();
     drifted_registry["task_selectors"] = serde_json::json!([]);
     std::fs::write(
@@ -1305,7 +1327,7 @@ fn production_workspace_effect_adopts_resumes_and_reopens_exact_local_binding() 
     assert!(matches!(
         platform_v2(
             &config,
-            "v2-production-workspace-create-final-after-selector-root-drift",
+            "v2-production-workspace-create-final-after-work-context-drift",
             PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(
                 ProjectId::new("project-live").unwrap(),
                 create.clone(),
@@ -1317,7 +1339,7 @@ fn production_workspace_effect_adopts_resumes_and_reopens_exact_local_binding() 
     assert!(matches!(
         platform_v2(
             &config,
-            "v2-production-workspace-resume-final-after-selector-root-drift",
+            "v2-production-workspace-resume-final-after-work-context-drift",
             PlatformV2Request::SubmitWorkspaceIntent(WorkspaceIntentRequest::new(
                 ProjectId::new("project-live").unwrap(),
                 resume.clone(),

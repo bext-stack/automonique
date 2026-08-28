@@ -174,8 +174,6 @@ pub trait PlatformV2LifecycleEffectAdapter: Send {
         _intent: &WorkspaceIntent,
         _project: &ProjectId,
         _workspace: &UserWorkspaceId,
-        _checkout: &CheckoutId,
-        _workspace_revision: Revision,
     ) -> Result<Option<WorkspaceIntentOutcome>, &'static str> {
         Ok(None)
     }
@@ -1197,6 +1195,26 @@ impl PlatformV2Runtime {
                         ));
                     }
                 }
+                if let Some(stored) = stored.as_ref()
+                    && let Some(outcome) = self.lifecycle_effects.replay_workspace_intent_receipt(
+                        value.intent(),
+                        value.project(),
+                        &workspace,
+                    )?
+                {
+                    self.policy_fence.verify()?;
+                    self.lineage
+                        .reconcile_intent(
+                            principal.actor.tenant(),
+                            &WorkspaceIntentExecutionReceipt {
+                                intent_id: value.intent().intent_id().clone(),
+                                request_digest: stored.request_digest,
+                                outcome: outcome.clone(),
+                            },
+                        )
+                        .map_err(|_| "platform_v2_intent_refused")?;
+                    return Ok(PlatformV2Response::WorkspaceIntentResult(outcome));
+                }
                 let workspace_record = self
                     .work_contexts
                     .validate_policy_mapping(
@@ -1215,28 +1233,6 @@ impl PlatformV2Runtime {
                     && intent.expected_revision() != workspace_revision
                 {
                     return Err("platform_v2_resume_stale_revision");
-                }
-                if let Some(stored) = stored.as_ref()
-                    && let Some(outcome) = self.lifecycle_effects.replay_workspace_intent_receipt(
-                        value.intent(),
-                        value.project(),
-                        &workspace,
-                        &checkout,
-                        workspace_revision,
-                    )?
-                {
-                    self.policy_fence.verify()?;
-                    self.lineage
-                        .reconcile_intent(
-                            principal.actor.tenant(),
-                            &WorkspaceIntentExecutionReceipt {
-                                intent_id: value.intent().intent_id().clone(),
-                                request_digest: stored.request_digest,
-                                outcome: outcome.clone(),
-                            },
-                        )
-                        .map_err(|_| "platform_v2_intent_refused")?;
-                    return Ok(PlatformV2Response::WorkspaceIntentResult(outcome));
                 }
                 if !self.lifecycle_effects.workspace_intents_supported() {
                     return Err(match value.intent() {
@@ -1342,34 +1338,11 @@ impl PlatformV2Runtime {
                             return Ok(PlatformV2Response::WorkspaceIntentResult(stored.outcome));
                         }
                     };
-                    let workspace_record = self
-                        .work_contexts
-                        .validate_policy_mapping(
-                            principal.actor.tenant(),
-                            value.project(),
-                            &WorkContextIdentity::UserWorkspace(workspace.clone()),
-                        )
-                        .map_err(|_| "platform_v2_policy_incoherent")?;
-                    let (checkout, workspace_revision) = active_workspace_binding(&workspace_record)
-                        .map_err(|category| match &stored.intent {
-                            WorkspaceIntent::Create(_) => category,
-                            WorkspaceIntent::Resume(_) => "platform_v2_resume_not_resumable",
-                            WorkspaceIntent::Cancel(_) => unreachable!("handled above"),
-                        })?;
-                    if let WorkspaceIntent::Resume(intent) = &stored.intent
-                        && intent.expected_revision() != workspace_revision
-                    {
-                        return Err("platform_v2_resume_stale_revision");
-                    }
-                    if let Some(outcome) =
-                        self.lifecycle_effects.replay_workspace_intent_receipt(
-                            &stored.intent,
-                            value.project(),
-                            &workspace,
-                            &checkout,
-                            workspace_revision,
-                        )?
-                    {
+                    if let Some(outcome) = self.lifecycle_effects.replay_workspace_intent_receipt(
+                        &stored.intent,
+                        value.project(),
+                        &workspace,
+                    )? {
                         self.policy_fence.verify()?;
                         self.lineage
                             .reconcile_intent(
@@ -1392,6 +1365,25 @@ impl PlatformV2Runtime {
                             .map_err(|_| "platform_v2_store_refused")?
                             .ok_or("platform_v2_not_found")?;
                         return Ok(PlatformV2Response::WorkspaceIntentResult(refreshed.outcome));
+                    }
+                    let workspace_record = self
+                        .work_contexts
+                        .validate_policy_mapping(
+                            principal.actor.tenant(),
+                            value.project(),
+                            &WorkContextIdentity::UserWorkspace(workspace.clone()),
+                        )
+                        .map_err(|_| "platform_v2_policy_incoherent")?;
+                    let (checkout, workspace_revision) = active_workspace_binding(&workspace_record)
+                        .map_err(|category| match &stored.intent {
+                            WorkspaceIntent::Create(_) => category,
+                            WorkspaceIntent::Resume(_) => "platform_v2_resume_not_resumable",
+                            WorkspaceIntent::Cancel(_) => unreachable!("handled above"),
+                        })?;
+                    if let WorkspaceIntent::Resume(intent) = &stored.intent
+                        && intent.expected_revision() != workspace_revision
+                    {
+                        return Err("platform_v2_resume_stale_revision");
                     }
                     if !self.lifecycle_effects.workspace_intents_supported() {
                         return Err("platform_v2_workspace_intent_recovery_unavailable");
