@@ -70,6 +70,22 @@ import type {
 import {PlatformV2CanonicalTestingTransport} from "./testing/internal.js";
 
 export {
+  createAttentionConformanceCorpus,
+  normalizeAttentionConformanceCorpus,
+  type AttentionConformanceCase,
+  type AttentionConformanceCorpus,
+  type AttentionConformanceExpectation,
+  type AttentionConformanceMode,
+  type AttentionConformanceOutcome,
+  type AttentionConformanceRead,
+  type AttentionConformanceRefusal,
+  type AttentionConformanceSnapshotRead,
+  type AttentionConformanceTarget,
+  type AttentionConformanceUnavailable,
+  type AttentionConformanceUnavailableReason,
+} from "./attention-conformance.js";
+
+export {
   createRenderConformanceCorpus,
   normalizeRenderConformanceCorpus,
   type RenderAttentionState,
