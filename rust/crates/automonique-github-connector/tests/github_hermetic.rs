@@ -25,17 +25,19 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use automonique_github_connector::{
-    Attribution, ChecklistItem, CommentId, CommentRequest, CreateIssueRequest, EntityTag,
-    GITHUB_ACCEPT, GITHUB_API_VERSION, GITHUB_USER_AGENT, GetCommentsRequest,
-    GetIssueCommentRequest, GetIssueRequest, GetRepositoryRequest, GetWorkflowRunRequest,
-    GitHubBase, GitHubClient, GitHubFailure, GitHubOperation, GitHubToken, IssueBodyText,
-    IssueFilter, IssueListState, IssueNumber, IssuePriority, IssueSource, IssueState, IssueStatus,
-    IssueTitle, Label, LabelColor, ListIssuesRequest, ListLabelsRequest, MAX_GITHUB_RESPONSE_BYTES,
-    ManagementName, ManagementRequest, Page, RejectionKind, ReplaceLabelsRequest, RepoMap,
+    Attribution, BranchName, ChecklistItem, CommentId, CommentRequest, CreateIssueRequest,
+    CreatePullRequestRequest, EntityTag, GITHUB_ACCEPT, GITHUB_API_VERSION, GITHUB_USER_AGENT,
+    GetBranchRequest, GetCommentsRequest, GetIssueCommentRequest, GetIssueRequest,
+    GetPullRequestRequest, GetRepositoryRequest, GetWorkflowRunRequest, GitHubBase, GitHubClient,
+    GitHubFailure, GitHubOperation, GitHubToken, HeadRevision, IssueBodyText, IssueFilter,
+    IssueListState, IssueNumber, IssuePriority, IssueSource, IssueState, IssueStatus, IssueTitle,
+    Label, LabelColor, ListIssuesRequest, ListLabelsRequest, ListPullRequestsRequest,
+    MAX_GITHUB_RESPONSE_BYTES, ManagementName, ManagementRequest, MergePullRequestRequest, Page,
+    PullRequestLifecycle, PullRequestMergeability, RejectionKind, ReplaceLabelsRequest, RepoMap,
     RepoRule, RepoTarget, RerunWorkflowRequest, SearchIssuesRequest, SetStateRequest, Since,
     SiteId, TenantId, TenantIssue, ThreadId, TicketDraft, TicketExchange, UpdateIssueBodyRequest,
-    UpdateIssueCommentRequest, WorkflowRunId, WorkflowRunStatus, body_carries_marker,
-    marker_thread_id, ticket_labels,
+    UpdateIssueCommentRequest, UpdatePullRequestRequest, WorkflowRunId, WorkflowRunStatus,
+    body_carries_marker, marker_thread_id, ticket_labels,
 };
 
 /// Bound on every server-side wait. A test that would otherwise hang fails here.
@@ -320,6 +322,18 @@ fn workflow_run_json(attempt: u32, status: &str) -> String {
     )
 }
 
+const HEAD_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+const OTHER_SHA: &str = "89abcdef0123456789abcdef0123456789abcdef";
+
+fn pull_request_json(state: &str, merged: bool, mergeable: &str) -> String {
+    format!(
+        "{{\"number\":77,\"title\":\"Proposer le correctif\",\"state\":\"{state}\",\
+         \"draft\":false,\"merged\":{merged},\"mergeable\":{mergeable},\
+         \"head\":{{\"ref\":\"agent-work\",\"sha\":\"{HEAD_SHA}\"}},\
+         \"base\":{{\"ref\":\"main\",\"sha\":\"{OTHER_SHA}\"}}}}"
+    )
+}
+
 fn comment_json(body: &str) -> String {
     format!(
         "{{\"id\":9001,\"user\":{{\"login\":\"octocat\"}},\"body\":{},\
@@ -449,6 +463,253 @@ fn workflow_rerun_refuses_unexpected_success_shapes() {
             Some(GitHubFailure::InvalidResponse)
         );
     }
+}
+
+#[test]
+fn a_branch_read_is_exactly_repository_and_branch_scoped() {
+    let fake = FakeGitHub::spawn(vec![Canned::json(&format!(
+        "{{\"name\":\"agent-work\",\"commit\":{{\"sha\":\"{HEAD_SHA}\"}}}}"
+    ))]);
+    let client = github_client(&fake);
+    let request = GetBranchRequest::new(target(), BranchName::new("agent-work").expect("branch"));
+
+    let branch = client
+        .get_branch(&request)
+        .expect("call")
+        .accepted()
+        .cloned()
+        .expect("accepted branch");
+    assert_eq!(branch.name, "agent-work");
+    assert_eq!(branch.commit_sha, HEAD_SHA);
+
+    let captured = fake.only_request();
+    assert_wire_shape(
+        &captured,
+        "GET",
+        "/repos/example-org/example-repo/branches/agent-work",
+    );
+    assert!(captured.body.is_empty());
+}
+
+#[test]
+fn a_pull_request_read_carries_only_the_fields_a_capability_is_proven_from() {
+    let fake = FakeGitHub::spawn(vec![Canned::json(&pull_request_json(
+        "open", false, "true",
+    ))]);
+    let client = github_client(&fake);
+    let request = GetPullRequestRequest::new(target(), IssueNumber::new(77).expect("number"));
+
+    let pull = client
+        .get_pull_request(&request)
+        .expect("call")
+        .accepted()
+        .cloned()
+        .expect("accepted pull request");
+    assert_eq!(pull.number.get(), 77);
+    assert_eq!(pull.state, PullRequestLifecycle::Open);
+    assert!(!pull.merged);
+    assert!(!pull.draft);
+    assert_eq!(pull.mergeable, PullRequestMergeability::Mergeable);
+    assert_eq!(pull.head_ref, "agent-work");
+    assert_eq!(pull.head_sha, HEAD_SHA);
+    assert_eq!(pull.base_ref, "main");
+
+    let captured = fake.only_request();
+    assert_wire_shape(&captured, "GET", "/repos/example-org/example-repo/pulls/77");
+}
+
+#[test]
+fn a_null_mergeable_is_read_as_unknown_rather_than_as_a_refusal() {
+    let fake = FakeGitHub::spawn(vec![Canned::json(&pull_request_json(
+        "open", false, "null",
+    ))]);
+    let client = github_client(&fake);
+    let request = GetPullRequestRequest::new(target(), IssueNumber::new(77).expect("number"));
+    let pull = client
+        .get_pull_request(&request)
+        .expect("call")
+        .accepted()
+        .cloned()
+        .expect("accepted pull request");
+    assert_eq!(pull.mergeable, PullRequestMergeability::Unknown);
+}
+
+#[test]
+fn the_open_pull_request_listing_is_pinned_to_one_owner_qualified_head_and_base() {
+    let fake = FakeGitHub::spawn(vec![Canned::json("[]")]);
+    let client = github_client(&fake);
+    let request = ListPullRequestsRequest::new(
+        target(),
+        BranchName::new("agent-work").expect("head"),
+        BranchName::new("main").expect("base"),
+    );
+
+    let matches = client
+        .list_pull_requests(&request)
+        .expect("call")
+        .accepted()
+        .cloned()
+        .expect("accepted listing");
+    assert!(
+        matches.is_empty(),
+        "an empty listing is the proof that opening will not be refused as a duplicate"
+    );
+
+    let captured = fake.only_request();
+    assert_wire_shape(
+        &captured,
+        "GET",
+        "/repos/example-org/example-repo/pulls?state=open&head=example-org%3Aagent-work&base=main&per_page=2&page=1",
+    );
+}
+
+#[test]
+fn opening_a_pull_request_sends_exactly_title_head_and_base() {
+    let fake = FakeGitHub::spawn(vec![Canned::status(
+        201,
+        &pull_request_json("open", false, "null"),
+    )]);
+    let client = github_client(&fake);
+    let request = CreatePullRequestRequest::new(
+        target(),
+        IssueTitle::new("Proposer le correctif").expect("title"),
+        BranchName::new("agent-work").expect("head"),
+        BranchName::new("main").expect("base"),
+    );
+    let operation = GitHubOperation::CreatePullRequest(request.clone());
+    assert!(operation.is_external_effect());
+
+    let opened = client
+        .create_pull_request(&request)
+        .expect("call")
+        .accepted()
+        .cloned()
+        .expect("accepted pull request");
+    assert_eq!(opened.number.get(), 77);
+    assert_eq!(opened.head_sha, HEAD_SHA);
+
+    let captured = fake.only_request();
+    assert_wire_shape(&captured, "POST", "/repos/example-org/example-repo/pulls");
+    assert_eq!(
+        captured.body,
+        "{\"title\":\"Proposer le correctif\",\"head\":\"agent-work\",\"base\":\"main\"}",
+        "an open must name no body, no draft flag, no reviewer and no label"
+    );
+}
+
+#[test]
+fn updating_a_pull_request_can_say_nothing_but_its_title() {
+    let fake = FakeGitHub::spawn(vec![Canned::json(&pull_request_json(
+        "open", false, "true",
+    ))]);
+    let client = github_client(&fake);
+    let request = UpdatePullRequestRequest::new(
+        target(),
+        IssueNumber::new(77).expect("number"),
+        IssueTitle::new("Proposer le correctif").expect("title"),
+    );
+    assert!(GitHubOperation::UpdatePullRequest(request.clone()).is_external_effect());
+
+    client.update_pull_request(&request).expect("call");
+    let captured = fake.only_request();
+    assert_wire_shape(
+        &captured,
+        "PATCH",
+        "/repos/example-org/example-repo/pulls/77",
+    );
+    assert_eq!(
+        captured.body, "{\"title\":\"Proposer le correctif\"}",
+        "an update must not be able to close, retarget or undraft a pull request"
+    );
+}
+
+#[test]
+fn a_merge_always_fences_on_the_exact_head_it_was_preflighted_against() {
+    let fake = FakeGitHub::spawn(vec![Canned::json(&format!(
+        "{{\"merged\":true,\"sha\":\"{OTHER_SHA}\"}}"
+    ))]);
+    let client = github_client(&fake);
+    let request = MergePullRequestRequest::new(
+        target(),
+        IssueNumber::new(77).expect("number"),
+        HeadRevision::new(HEAD_SHA).expect("head"),
+    );
+    assert!(GitHubOperation::MergePullRequest(request.clone()).is_external_effect());
+
+    let receipt = client
+        .merge_pull_request(&request)
+        .expect("call")
+        .accepted()
+        .cloned()
+        .expect("accepted merge");
+    assert!(receipt.merged);
+    assert_eq!(receipt.merge_commit_sha.as_deref(), Some(OTHER_SHA));
+
+    let captured = fake.only_request();
+    assert_wire_shape(
+        &captured,
+        "PUT",
+        "/repos/example-org/example-repo/pulls/77/merge",
+    );
+    assert_eq!(
+        captured.body,
+        format!("{{\"sha\":\"{HEAD_SHA}\",\"merge_method\":\"merge\"}}"),
+        "the sha fence and the merge strategy are both fixed, never caller-chosen"
+    );
+}
+
+#[test]
+fn a_merge_that_github_declined_is_read_as_not_merged_rather_than_as_success() {
+    let fake = FakeGitHub::spawn(vec![Canned::json(
+        "{\"merged\":false,\"sha\":null,\"message\":\"Pull Request is not mergeable\"}",
+    )]);
+    let client = github_client(&fake);
+    let request = MergePullRequestRequest::new(
+        target(),
+        IssueNumber::new(77).expect("number"),
+        HeadRevision::new(HEAD_SHA).expect("head"),
+    );
+    let receipt = client
+        .merge_pull_request(&request)
+        .expect("call")
+        .accepted()
+        .cloned()
+        .expect("accepted merge");
+    assert!(!receipt.merged);
+    assert_eq!(receipt.merge_commit_sha, None);
+}
+
+#[test]
+fn a_branch_name_cannot_add_a_path_segment_or_open_a_query() {
+    for hostile in [
+        "../../admin",
+        "main/../other",
+        "feat/thing",
+        "main?x=1",
+        "main#frag",
+        "main%2f..",
+        "-main",
+        ".hidden",
+        "main.lock",
+        "",
+    ] {
+        assert!(
+            BranchName::new(hostile).is_err(),
+            "a branch name must never be able to spell {hostile:?}"
+        );
+    }
+    assert!(BranchName::new("agent-work_2.1").is_ok());
+}
+
+#[test]
+fn a_merge_cannot_be_fenced_on_anything_that_is_not_a_commit_id() {
+    for hostile in ["", "HEAD", "main", "0123456789abcdef", &"z".repeat(40)] {
+        assert!(
+            HeadRevision::new(hostile).is_err(),
+            "a merge fence must never accept {hostile:?}"
+        );
+    }
+    assert!(HeadRevision::new(HEAD_SHA).is_ok());
 }
 
 #[test]

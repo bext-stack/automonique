@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! The sixteen operations, and the exact method, path and body each renders.
+//! The twenty-two operations, and the exact method, path and body each renders.
 //!
 //! [`GitHubOperation`] is the second half of the target lock (the first is the
 //! origin in `target`). A path is never a caller string: it is assembled here
@@ -15,7 +15,8 @@
 //! a protocol one: it lets a test assert one exact captured request instead of
 //! a set of permutations.
 
-use crate::target::{CommentId, IssueNumber, Label, RepoTarget, WorkflowRunId};
+use crate::response::MAX_PULL_REQUEST_MATCHES;
+use crate::target::{BranchName, CommentId, IssueNumber, Label, RepoTarget, WorkflowRunId};
 use crate::ticket::{IssueBodyText, IssueTitle};
 use crate::{
     EntityTag, GitHubRefusal, IssueState, MAX_ISSUE_LABELS, MAX_PER_PAGE, MAX_SEARCH_QUERY_BYTES,
@@ -801,6 +802,281 @@ impl SearchIssuesRequest {
     }
 }
 
+/// A validated commit id a merge may be fenced on.
+///
+/// GitHub's merge endpoint accepts a `sha` and refuses the merge with `409`
+/// when the pull request's head has moved off it. That is the only
+/// provider-side exactly-once fence this connector has for a merge, so the
+/// value is typed rather than passed as a string: an empty or malformed one
+/// would be dropped from the body by a lenient encoder and silently turn a
+/// fenced merge into an unfenced one.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HeadRevision(String);
+
+impl HeadRevision {
+    /// Validate one commit id.
+    ///
+    /// SHA-1 and SHA-256 widths are both admitted so a repository hash
+    /// migration cannot silently disable the fence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GitHubRefusal::HeadRevision`] for anything that is not 40 or
+    /// 64 lowercase-insensitive hexadecimal digits.
+    pub fn new(value: &str) -> Result<Self, GitHubRefusal> {
+        if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(GitHubRefusal::HeadRevision);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// The exact commit id.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Read one exact branch, for its tip commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GetBranchRequest {
+    target: RepoTarget,
+    branch: BranchName,
+}
+
+impl GetBranchRequest {
+    /// Bind one validated repository and branch.
+    #[must_use]
+    pub const fn new(target: RepoTarget, branch: BranchName) -> Self {
+        Self { target, branch }
+    }
+
+    /// The repository.
+    #[must_use]
+    pub const fn target(&self) -> &RepoTarget {
+        &self.target
+    }
+
+    /// The branch.
+    #[must_use]
+    pub const fn branch(&self) -> &BranchName {
+        &self.branch
+    }
+}
+
+/// Read one exact pull request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GetPullRequestRequest {
+    target: RepoTarget,
+    number: IssueNumber,
+}
+
+impl GetPullRequestRequest {
+    /// Bind one validated repository and pull-request number.
+    #[must_use]
+    pub const fn new(target: RepoTarget, number: IssueNumber) -> Self {
+        Self { target, number }
+    }
+
+    /// The repository.
+    #[must_use]
+    pub const fn target(&self) -> &RepoTarget {
+        &self.target
+    }
+
+    /// The pull-request number.
+    #[must_use]
+    pub const fn number(&self) -> IssueNumber {
+        self.number
+    }
+}
+
+/// List the open pull requests for one exact head/base pair.
+///
+/// This is the only listing in the pull-request surface, and it is filtered
+/// down to one branch pair rather than paged over a repository. It exists to
+/// answer one question — is a pull request for this exact pair already open —
+/// so nothing about it needs to be a general query. `state` is fixed to
+/// `open`, because a closed or merged pull request does not stop GitHub
+/// accepting a new one for the same pair and so must not stop this connector
+/// either.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListPullRequestsRequest {
+    target: RepoTarget,
+    head: BranchName,
+    base: BranchName,
+}
+
+impl ListPullRequestsRequest {
+    /// Bind one validated repository and head/base pair.
+    #[must_use]
+    pub const fn new(target: RepoTarget, head: BranchName, base: BranchName) -> Self {
+        Self { target, head, base }
+    }
+
+    /// The repository.
+    #[must_use]
+    pub const fn target(&self) -> &RepoTarget {
+        &self.target
+    }
+
+    /// The head branch.
+    #[must_use]
+    pub const fn head(&self) -> &BranchName {
+        &self.head
+    }
+
+    /// The base branch.
+    #[must_use]
+    pub const fn base(&self) -> &BranchName {
+        &self.base
+    }
+}
+
+/// Open one pull request from an exact head branch onto an exact base branch.
+///
+/// The head and base are operator-owned coordinates, never client strings, and
+/// this type carries no body, no draft flag, no reviewer, no label and no
+/// maintainer-can-modify switch. A caller holding one of these cannot widen it
+/// into a different proposal than the one that was preflighted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreatePullRequestRequest {
+    target: RepoTarget,
+    title: IssueTitle,
+    head: BranchName,
+    base: BranchName,
+}
+
+impl CreatePullRequestRequest {
+    /// Bind one validated repository, title, and head/base pair.
+    #[must_use]
+    pub const fn new(
+        target: RepoTarget,
+        title: IssueTitle,
+        head: BranchName,
+        base: BranchName,
+    ) -> Self {
+        Self {
+            target,
+            title,
+            head,
+            base,
+        }
+    }
+
+    /// The repository.
+    #[must_use]
+    pub const fn target(&self) -> &RepoTarget {
+        &self.target
+    }
+
+    /// The title.
+    #[must_use]
+    pub const fn title(&self) -> &IssueTitle {
+        &self.title
+    }
+
+    /// The head branch.
+    #[must_use]
+    pub const fn head(&self) -> &BranchName {
+        &self.head
+    }
+
+    /// The base branch.
+    #[must_use]
+    pub const fn base(&self) -> &BranchName {
+        &self.base
+    }
+}
+
+/// Retitle one exact pull request.
+///
+/// Title is the only field spelled, because it is the only field the review
+/// contract's update action carries. In particular this cannot close a pull
+/// request, retarget its base, or convert it out of draft: those are separate
+/// powers that would need separate proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdatePullRequestRequest {
+    target: RepoTarget,
+    number: IssueNumber,
+    title: IssueTitle,
+}
+
+impl UpdatePullRequestRequest {
+    /// Bind one validated repository, pull-request number, and title.
+    #[must_use]
+    pub const fn new(target: RepoTarget, number: IssueNumber, title: IssueTitle) -> Self {
+        Self {
+            target,
+            number,
+            title,
+        }
+    }
+
+    /// The repository.
+    #[must_use]
+    pub const fn target(&self) -> &RepoTarget {
+        &self.target
+    }
+
+    /// The pull-request number.
+    #[must_use]
+    pub const fn number(&self) -> IssueNumber {
+        self.number
+    }
+
+    /// The title.
+    #[must_use]
+    pub const fn title(&self) -> &IssueTitle {
+        &self.title
+    }
+}
+
+/// Merge one exact pull request at one exact head commit.
+///
+/// The `sha` fence is not optional here, unlike in GitHub's own API. Without
+/// it a merge is a request to land whatever the branch happens to point at
+/// when the request arrives, which is precisely the write this connector must
+/// never be able to spell. The strategy is fixed to a merge commit: a squash
+/// or rebase rewrites the commits being landed, so the head this call was
+/// preflighted against would no longer be the head that lands.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MergePullRequestRequest {
+    target: RepoTarget,
+    number: IssueNumber,
+    expected_head: HeadRevision,
+}
+
+impl MergePullRequestRequest {
+    /// Bind one validated repository, pull-request number, and head commit.
+    #[must_use]
+    pub const fn new(target: RepoTarget, number: IssueNumber, expected_head: HeadRevision) -> Self {
+        Self {
+            target,
+            number,
+            expected_head,
+        }
+    }
+
+    /// The repository.
+    #[must_use]
+    pub const fn target(&self) -> &RepoTarget {
+        &self.target
+    }
+
+    /// The pull-request number.
+    #[must_use]
+    pub const fn number(&self) -> IssueNumber {
+        self.number
+    }
+
+    /// The head commit the merge is fenced on.
+    #[must_use]
+    pub const fn expected_head(&self) -> &HeadRevision {
+        &self.expected_head
+    }
+}
+
 /// One validated operation, ready to be rendered onto the wire.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GitHubOperation {
@@ -832,6 +1108,18 @@ pub enum GitHubOperation {
     GetWorkflowRun(GetWorkflowRunRequest),
     /// `POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun`
     RerunWorkflow(RerunWorkflowRequest),
+    /// `GET /repos/{owner}/{repo}/branches/{branch}`
+    GetBranch(GetBranchRequest),
+    /// `GET /repos/{owner}/{repo}/pulls/{number}`
+    GetPullRequest(GetPullRequestRequest),
+    /// `GET /repos/{owner}/{repo}/pulls` for one exact head/base pair
+    ListPullRequests(ListPullRequestsRequest),
+    /// `POST /repos/{owner}/{repo}/pulls`
+    CreatePullRequest(CreatePullRequestRequest),
+    /// `PATCH /repos/{owner}/{repo}/pulls/{number}`
+    UpdatePullRequest(UpdatePullRequestRequest),
+    /// `PUT /repos/{owner}/{repo}/pulls/{number}/merge`
+    MergePullRequest(MergePullRequestRequest),
     /// `GET /search/issues`
     SearchIssues(SearchIssuesRequest),
     /// `GET /user`
@@ -843,11 +1131,15 @@ impl GitHubOperation {
     #[must_use]
     pub const fn method(&self) -> HttpMethod {
         match self {
-            Self::CreateIssue(_) | Self::Comment(_) | Self::RerunWorkflow(_) => HttpMethod::Post,
-            Self::SetState(_) | Self::UpdateIssueBody(_) | Self::UpdateIssueComment(_) => {
-                HttpMethod::Patch
-            }
-            Self::ReplaceLabels(_) => HttpMethod::Put,
+            Self::CreateIssue(_)
+            | Self::Comment(_)
+            | Self::RerunWorkflow(_)
+            | Self::CreatePullRequest(_) => HttpMethod::Post,
+            Self::SetState(_)
+            | Self::UpdateIssueBody(_)
+            | Self::UpdateIssueComment(_)
+            | Self::UpdatePullRequest(_) => HttpMethod::Patch,
+            Self::ReplaceLabels(_) | Self::MergePullRequest(_) => HttpMethod::Put,
             Self::GetIssue(_)
             | Self::GetComments(_)
             | Self::GetIssueComment(_)
@@ -855,6 +1147,9 @@ impl GitHubOperation {
             | Self::ListIssues(_)
             | Self::GetRepository(_)
             | Self::GetWorkflowRun(_)
+            | Self::GetBranch(_)
+            | Self::GetPullRequest(_)
+            | Self::ListPullRequests(_)
             | Self::SearchIssues(_)
             | Self::Whoami => HttpMethod::Get,
         }
@@ -875,6 +1170,9 @@ impl GitHubOperation {
                 | Self::UpdateIssueBody(_)
                 | Self::UpdateIssueComment(_)
                 | Self::RerunWorkflow(_)
+                | Self::CreatePullRequest(_)
+                | Self::UpdatePullRequest(_)
+                | Self::MergePullRequest(_)
         )
     }
 
@@ -966,6 +1264,42 @@ impl GitHubOperation {
                     workflow_run_path(request.target(), request.run_id())
                 )
             }
+            Self::GetBranch(request) => {
+                format!(
+                    "{}/branches/{}",
+                    repository_path(request.target()),
+                    request.branch().as_str()
+                )
+            }
+            Self::GetPullRequest(request) => pull_request_path(request.target(), request.number()),
+            Self::ListPullRequests(request) => {
+                // `head` is qualified with the owner exactly as GitHub
+                // documents, so a fork whose branch shares a name cannot
+                // answer for this repository's branch.
+                let mut path = format!("{}?state=open&head=", pulls_path(request.target()));
+                push_query_encoded(
+                    &mut path,
+                    &format!(
+                        "{}:{}",
+                        request.target().owner().as_str(),
+                        request.head().as_str()
+                    ),
+                );
+                path.push_str("&base=");
+                push_query_encoded(&mut path, request.base().as_str());
+                path.push_str(&format!("&per_page={MAX_PULL_REQUEST_MATCHES}&page=1"));
+                path
+            }
+            Self::CreatePullRequest(request) => pulls_path(request.target()),
+            Self::UpdatePullRequest(request) => {
+                pull_request_path(request.target(), request.number())
+            }
+            Self::MergePullRequest(request) => {
+                format!(
+                    "{}/merge",
+                    pull_request_path(request.target(), request.number())
+                )
+            }
             Self::SearchIssues(request) => {
                 let page = request.page();
                 let mut path = String::from("/search/issues?q=");
@@ -1022,6 +1356,31 @@ impl GitHubOperation {
             }
             Self::UpdateIssueBody(request) => Some(body_json(request.body())),
             Self::UpdateIssueComment(request) => Some(body_json(request.body())),
+            Self::CreatePullRequest(request) => {
+                let mut body = String::from("{\"title\":");
+                push_json_string(&mut body, request.title().as_str());
+                body.push_str(",\"head\":");
+                push_json_string(&mut body, request.head().as_str());
+                body.push_str(",\"base\":");
+                push_json_string(&mut body, request.base().as_str());
+                body.push('}');
+                Some(body)
+            }
+            Self::UpdatePullRequest(request) => {
+                let mut body = String::from("{\"title\":");
+                push_json_string(&mut body, request.title().as_str());
+                body.push('}');
+                Some(body)
+            }
+            Self::MergePullRequest(request) => {
+                let mut body = String::from("{\"sha\":");
+                push_json_string(&mut body, request.expected_head().as_str());
+                // Fixed strategy: a squash or rebase rewrites what lands, so
+                // the head this request was fenced on would not be the head
+                // that reaches the base branch.
+                body.push_str(",\"merge_method\":\"merge\"}");
+                Some(body)
+            }
             Self::GetIssue(_)
             | Self::GetComments(_)
             | Self::GetIssueComment(_)
@@ -1030,6 +1389,9 @@ impl GitHubOperation {
             | Self::GetRepository(_)
             | Self::GetWorkflowRun(_)
             | Self::RerunWorkflow(_)
+            | Self::GetBranch(_)
+            | Self::GetPullRequest(_)
+            | Self::ListPullRequests(_)
             | Self::SearchIssues(_)
             | Self::Whoami => None,
         }
@@ -1058,6 +1420,16 @@ fn repository_path(target: &RepoTarget) -> String {
         target.owner().as_str(),
         target.repo().as_str()
     )
+}
+
+/// `/repos/{owner}/{repo}/pulls`, the pull-request collection.
+fn pulls_path(target: &RepoTarget) -> String {
+    format!("{}/pulls", repository_path(target))
+}
+
+/// One exact repository-scoped pull-request endpoint.
+fn pull_request_path(target: &RepoTarget, number: IssueNumber) -> String {
+    format!("{}/{number}", pulls_path(target))
 }
 
 /// One exact repository-scoped GitHub Actions workflow-run endpoint.

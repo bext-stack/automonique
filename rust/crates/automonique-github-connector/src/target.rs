@@ -28,6 +28,11 @@ pub const MAX_LABEL_BYTES: usize = 50;
 /// No repository has come close; the bound exists so a number is always a
 /// short, bounded path segment.
 pub const MAX_ISSUE_NUMBER: u32 = 9_999_999;
+/// Longest branch name accepted.
+///
+/// Well under any git or filesystem limit: this bounds what may become a path
+/// segment, not what a repository may contain.
+pub const MAX_BRANCH_BYTES: usize = 128;
 
 /// A validated GitHub API origin.
 ///
@@ -290,6 +295,47 @@ impl IssueNumber {
     #[must_use]
     pub const fn get(self) -> u32 {
         self.0
+    }
+}
+
+/// A validated git branch name usable as one path segment or query value.
+///
+/// The grammar is deliberately narrower than git's own: no slash, so a branch
+/// can never add a path segment or escape the `/branches/` endpoint, and
+/// neither `?`, `#`, `%` nor a `..` pair, so it can open no query and be read
+/// as no relative traversal. A hierarchical branch (`feat/thing`) is therefore
+/// refused rather than escaped, because a connector that silently percent
+/// encodes a separator is one whose captured requests stop matching its paths.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BranchName(String);
+
+impl BranchName {
+    /// Validate one branch name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GitHubRefusal::BranchName`] for anything outside the grammar.
+    pub fn new(value: &str) -> Result<Self, GitHubRefusal> {
+        if value.is_empty()
+            || value.len() > MAX_BRANCH_BYTES
+            || value.starts_with('-')
+            || value.starts_with('.')
+            || value.ends_with('.')
+            || value.ends_with(".lock")
+            || value.contains("..")
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(GitHubRefusal::BranchName);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// The exact path segment.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Bounded, refusing decoders for the issue and Actions read operations.
+//! Bounded, refusing decoders for the issue, Actions and pull-request reads.
 //!
 //! Each decoder takes the accepted response bytes and returns either the
 //! operation's typed payload or a [`GitHubFailure`]. Nothing panics on hostile
@@ -50,6 +50,13 @@ pub const MAX_COMMENT_COUNT: u64 = 100_000;
 
 /// Highest search total retained.
 pub const MAX_SEARCH_TOTAL: u64 = 100_000_000;
+
+/// Most pull requests retained from one exact head/base listing.
+///
+/// GitHub allows at most one open pull request per head/base pair, so a second
+/// row is a contract break rather than a page to follow. Two are read so that
+/// break is visible instead of being truncated away.
+pub const MAX_PULL_REQUEST_MATCHES: u32 = 2;
 
 /// One answer from GitHub: the rate-limit window it reported, and either the
 /// payload or its classified refusal.
@@ -214,6 +221,86 @@ pub struct GitHubWorkflowRun {
     pub head_sha: String,
     pub run_attempt: u32,
     pub status: WorkflowRunStatus,
+}
+
+/// Whether a pull request is open or closed, as GitHub spells it.
+///
+/// `merged` is deliberately not a state here, because GitHub does not report
+/// it as one: a merged pull request is `closed` with `merged: true`, and
+/// folding the two would make an unmerged close indistinguishable from a
+/// landed one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PullRequestLifecycle {
+    Open,
+    Closed,
+}
+
+impl PullRequestLifecycle {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "open" => Some(Self::Open),
+            "closed" => Some(Self::Closed),
+            _ => None,
+        }
+    }
+}
+
+/// GitHub's own read of whether a pull request can be merged right now.
+///
+/// `Unknown` is the honest value for GitHub's `null`, which it returns while
+/// it is still computing the merge commit in the background. It is a distinct
+/// value rather than a false, because "not yet computed" and "conflicted" call
+/// for different answers: the first means ask again, the second means the
+/// capability must not be advertised at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PullRequestMergeability {
+    Unknown,
+    Mergeable,
+    Conflicted,
+}
+
+/// The exact pull-request fields the review capability surface is proven from.
+///
+/// Nothing here is a description, a diff, a reviewer, or a label: this carries
+/// only what an open, an update or a merge must be fenced on. `head_sha` is
+/// the fence that survives the round trip — it is bound into the confirmation
+/// digest a client must return, and sent again as the merge `sha`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitHubPullRequest {
+    pub number: IssueNumber,
+    pub title: String,
+    pub state: PullRequestLifecycle,
+    pub draft: bool,
+    pub merged: bool,
+    pub mergeable: PullRequestMergeability,
+    pub head_ref: String,
+    pub head_sha: String,
+    pub base_ref: String,
+}
+
+/// The minimum identity of a pull request a write returned or a listing named.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitHubPullRequestRef {
+    pub number: IssueNumber,
+    pub head_sha: String,
+}
+
+/// One branch tip.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitHubBranch {
+    pub name: String,
+    pub commit_sha: String,
+}
+
+/// What GitHub answered a merge with.
+///
+/// `merged` is required rather than assumed from the status, because GitHub
+/// answers `200` with `merged: false` and a message when it declines to merge
+/// a pull request it nonetheless accepted the request for.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitHubMergeReceipt {
+    pub merged: bool,
+    pub merge_commit_sha: Option<String>,
 }
 
 /// One comment on an issue.
@@ -464,6 +551,135 @@ pub fn decode_workflow_run(bytes: &[u8]) -> Result<GitHubWorkflowRun, GitHubFail
         head_sha,
         run_attempt,
         status,
+    })
+}
+
+/// Decode the exact pull-request fields a capability is proven from.
+///
+/// Every retained field is required and bounded, except `mergeable`, whose
+/// `null` is GitHub's documented "still computing" and is decoded as
+/// [`PullRequestMergeability::Unknown`] rather than refused.
+pub fn decode_pull_request(bytes: &[u8]) -> Result<GitHubPullRequest, GitHubFailure> {
+    let object = envelope(bytes)?;
+    pull_request_from(&object)
+}
+
+fn pull_request_from(object: &Map<String, Value>) -> Result<GitHubPullRequest, GitHubFailure> {
+    let number = u32::try_from(identifier(object, "number")?)
+        .ok()
+        .and_then(|value| IssueNumber::new(value).ok())
+        .ok_or(GitHubFailure::FieldOutOfBounds)?;
+    let state = PullRequestLifecycle::parse(required_str(object, "state")?)
+        .ok_or(GitHubFailure::FieldOutOfBounds)?;
+    let mergeable = match object.get("mergeable") {
+        None | Some(Value::Null) => PullRequestMergeability::Unknown,
+        Some(Value::Bool(true)) => PullRequestMergeability::Mergeable,
+        Some(Value::Bool(false)) => PullRequestMergeability::Conflicted,
+        Some(_) => return Err(GitHubFailure::FieldOutOfBounds),
+    };
+    let head = branch_ref(object, "head")?;
+    let base = branch_ref(object, "base")?;
+    Ok(GitHubPullRequest {
+        number,
+        title: bounded(object, "title", MAX_ISSUE_TITLE_BYTES)?,
+        state,
+        draft: match object.get("draft") {
+            // A pull request read back from a listing may omit `draft`; the
+            // absence means the same thing GitHub's default does.
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return Err(GitHubFailure::FieldOutOfBounds),
+        },
+        merged: match object.get("merged") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return Err(GitHubFailure::FieldOutOfBounds),
+        },
+        mergeable,
+        head_ref: head.0,
+        head_sha: head.1,
+        base_ref: base.0,
+    })
+}
+
+/// Read the `ref` and `sha` off a pull request's `head` or `base` object.
+fn branch_ref(object: &Map<String, Value>, key: &str) -> Result<(String, String), GitHubFailure> {
+    let Some(Value::Object(side)) = object.get(key) else {
+        return Err(GitHubFailure::MissingField);
+    };
+    let name = nonempty(side, "ref", crate::MAX_BRANCH_BYTES)?;
+    let sha = commit_sha(side, "sha")?;
+    Ok((name, sha))
+}
+
+/// A required commit id, at one of the two widths git uses.
+fn commit_sha(object: &Map<String, Value>, key: &str) -> Result<String, GitHubFailure> {
+    let value = nonempty(object, key, 64)?;
+    if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(GitHubFailure::FieldOutOfBounds);
+    }
+    Ok(value)
+}
+
+/// Decode the identity a pull-request write returned.
+pub fn decode_pull_request_ref(bytes: &[u8]) -> Result<GitHubPullRequestRef, GitHubFailure> {
+    let object = envelope(bytes)?;
+    let number = u32::try_from(identifier(&object, "number")?)
+        .ok()
+        .and_then(|value| IssueNumber::new(value).ok())
+        .ok_or(GitHubFailure::FieldOutOfBounds)?;
+    let (_, head_sha) = branch_ref(&object, "head")?;
+    Ok(GitHubPullRequestRef { number, head_sha })
+}
+
+/// Decode the pull requests one exact head/base listing named.
+///
+/// An empty array is the answer that proves no pull request is open for the
+/// pair, and is not an error. More than [`MAX_PULL_REQUEST_MATCHES`] rows is,
+/// because GitHub permits at most one.
+pub fn decode_pull_request_matches(
+    bytes: &[u8],
+) -> Result<Vec<GitHubPullRequestRef>, GitHubFailure> {
+    let rows = array(bytes, MAX_PULL_REQUEST_MATCHES)?;
+    let mut matches = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let Value::Object(row) = row else {
+            return Err(GitHubFailure::InvalidResponse);
+        };
+        let number = u32::try_from(identifier(row, "number")?)
+            .ok()
+            .and_then(|value| IssueNumber::new(value).ok())
+            .ok_or(GitHubFailure::FieldOutOfBounds)?;
+        let (_, head_sha) = branch_ref(row, "head")?;
+        matches.push(GitHubPullRequestRef { number, head_sha });
+    }
+    Ok(matches)
+}
+
+/// Decode one branch tip.
+pub fn decode_branch(bytes: &[u8]) -> Result<GitHubBranch, GitHubFailure> {
+    let object = envelope(bytes)?;
+    let name = nonempty(&object, "name", crate::MAX_BRANCH_BYTES)?;
+    let Some(Value::Object(commit)) = object.get("commit") else {
+        return Err(GitHubFailure::MissingField);
+    };
+    Ok(GitHubBranch {
+        name,
+        commit_sha: commit_sha(commit, "sha")?,
+    })
+}
+
+/// Decode what GitHub answered a merge with.
+pub fn decode_merge_receipt(bytes: &[u8]) -> Result<GitHubMergeReceipt, GitHubFailure> {
+    let object = envelope(bytes)?;
+    let merge_commit_sha = match object.get("sha") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(_)) => Some(commit_sha(&object, "sha")?),
+        Some(_) => return Err(GitHubFailure::FieldOutOfBounds),
+    };
+    Ok(GitHubMergeReceipt {
+        merged: boolean(&object, "merged")?,
+        merge_commit_sha,
     })
 }
 
