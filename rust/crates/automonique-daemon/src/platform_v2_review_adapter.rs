@@ -1093,7 +1093,8 @@ mod tests {
 
     use automonique_protocol::platform_v2::{ProjectId, UserWorkspaceId};
     use automonique_protocol::platform_v2_review::{
-        PullRequestId, ReviewAuthorityId, ReviewCommentId, ReviewField, ReviewProposalId,
+        ConflictResolution, PullRequestId, ReviewAuthorityId, ReviewCommentId, ReviewField,
+        ReviewFileId, ReviewProposalId,
     };
     use automonique_protocol::primitives::Revision;
     use tempfile::TempDir;
@@ -1185,6 +1186,44 @@ mod tests {
         );
     }
 
+    /// Pins a deliberate gap, and pins why it is not closed the way the
+    /// pull-request and agent-delivery families were.
+    ///
+    /// The registry admits and validates a `local_repository` target: an
+    /// absolute canonical root, owned by the daemon uid, not group or other
+    /// writable, with a real `.git` that is not a symlink. An operator can
+    /// install a complete, secure binding today. `plan` still has no arm that
+    /// consumes it, so no staging action reaches a worktree.
+    ///
+    /// This family got no capability field, while the pull-request family
+    /// got three. That asymmetry is the point of this test.
+    ///
+    /// A capability is only worth advertising if the server can commit to
+    /// what it observed, and the commitment has to name the mutable thing the
+    /// action depends on. For a rerun that is the run attempt and head SHA.
+    /// For a merge it is the pull-request id, its observed revision and the
+    /// observed head, all of which `resolve_action` already names, which is
+    /// why those field sets were derivable before their adapter existed.
+    ///
+    /// Staging is different in kind. `resolve_action` fences the proposal id,
+    /// its kind, its authority, and refuses a proposal whose files are in
+    /// unresolved conflict. None of that pins the worktree. HEAD and the
+    /// index are mutable substrate that any other process sharing the
+    /// checkout can move between advertisement and execution, and the review
+    /// snapshot's revision only tracks what the projection observed, not what
+    /// the repository is. So a staging confirmation digest would have to
+    /// commit to the HEAD object id and the index state, and neither exists
+    /// in any projection this crate can read today.
+    ///
+    /// Inventing that field set now would be guessing, and a digest that
+    /// commits to the wrong facts is worse than none: it reads as a fence and
+    /// holds nothing. So the honest answer is no wire field until the git
+    /// adapter can supply a real observation, and the client keeps learning
+    /// the truth from `platform_v2_review_git_adapter_unavailable`.
+    ///
+    /// A plan arm added here without that observation is the failure this
+    /// pins. It is meant to fail when the adapter lands, and to be replaced
+    /// deliberately rather than deleted quietly.
     #[test]
     fn secure_exact_binding_does_not_fabricate_a_capability() {
         let temporary = TempDir::new().unwrap();
@@ -1196,15 +1235,84 @@ mod tests {
         let registry = temporary.path().join("registry.json");
         write_registry(&registry, &git_binding(&repository));
         let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
-        assert_eq!(
-            adapter.plan(
-                &ProjectId::new("project-1").unwrap(),
-                &workspace(),
-                &git_authority(),
-                &action()
-            ),
-            Err("platform_v2_review_git_adapter_unavailable")
-        );
+
+        // Every action in the family, not just staging. A future arm is as
+        // likely to be added for committing as for staging, and committing is
+        // the one that writes history.
+        let staging_actions = [
+            ReviewAction::Stage {
+                proposal_id: ReviewProposalId::new("proposal-1").unwrap(),
+            },
+            ReviewAction::Unstage {
+                proposal_id: ReviewProposalId::new("proposal-1").unwrap(),
+            },
+            ReviewAction::Commit {
+                proposal_id: ReviewProposalId::new("proposal-1").unwrap(),
+            },
+            ReviewAction::ResolveConflict {
+                proposal_id: ReviewProposalId::new("proposal-1").unwrap(),
+                file_id: ReviewFileId::new("file-1").unwrap(),
+                resolution: ConflictResolution::KeepCurrent,
+            },
+        ];
+        for action in staging_actions {
+            assert_eq!(
+                adapter.plan(
+                    &ProjectId::new("project-1").unwrap(),
+                    &workspace(),
+                    &git_authority(),
+                    &action,
+                ),
+                Err("platform_v2_review_git_adapter_unavailable"),
+                "{:?} must stay unavailable until a git adapter can observe the worktree",
+                action.kind(),
+            );
+        }
+    }
+
+    /// No staging action can borrow another family's confirmation.
+    ///
+    /// The confirmation digest is the only thing binding an advertised
+    /// preview to a real server adapter. `github_confirmation_digest` is
+    /// shaped for a check rerun and refuses anything else, so a staging
+    /// action cannot acquire a commitment by reaching for the one lane that
+    /// mints them. That has to stay true independently of `plan`, because the
+    /// two could be closed separately.
+    #[test]
+    fn no_staging_action_can_borrow_the_check_rerun_confirmation() {
+        let temporary = TempDir::new().unwrap();
+        let repository = temporary.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        fs::create_dir(repository.join(".git")).unwrap();
+        fs::set_permissions(&repository, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(repository.join(".git"), fs::Permissions::from_mode(0o700)).unwrap();
+        let registry = temporary.path().join("registry.json");
+        write_registry(&registry, &git_binding(&repository));
+        let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
+        for action in [
+            ReviewAction::Stage {
+                proposal_id: ReviewProposalId::new("proposal-1").unwrap(),
+            },
+            ReviewAction::Commit {
+                proposal_id: ReviewProposalId::new("proposal-1").unwrap(),
+            },
+        ] {
+            assert_eq!(
+                adapter.github_confirmation_digest(
+                    &Actor::new("tenant-1", "actor-1").unwrap(),
+                    &ProjectId::new("project-1").unwrap(),
+                    &workspace(),
+                    &git_authority(),
+                    Revision::FIRST,
+                    Revision::FIRST,
+                    &action,
+                    &ReviewEffectPlan::LocalStore,
+                ),
+                Err("platform_v2_review_confirmation_invalid"),
+                "{:?} must not mint a confirmation",
+                action.kind(),
+            );
+        }
     }
 
     #[test]
