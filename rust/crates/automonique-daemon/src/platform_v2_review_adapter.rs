@@ -167,6 +167,29 @@ struct GitHubCredential {
     reference: String,
     repository: String,
     actions_write: bool,
+    /// Authority to open and update pull requests, held separately from
+    /// `actions_write`.
+    ///
+    /// Re-running a workflow re-executes something a maintainer already
+    /// approved onto a ref that already exists. Writing a pull request
+    /// proposes new code. They are different powers, so installing one must
+    /// never confer the other, and an operator who wants CI reruns from a
+    /// phone must not get repository writes as a side effect.
+    ///
+    /// Defaulted rather than required so an installed credential document
+    /// keeps parsing across the upgrade. Migration is silent and grants
+    /// nothing: an existing document has neither flag, so it can do exactly
+    /// what it could before.
+    #[serde(default)]
+    pull_request_write: bool,
+    /// Authority to merge a pull request, held separately again.
+    ///
+    /// This is the only credential scope whose use can move code into a
+    /// protected branch and trigger a deploy, so it is never implied by
+    /// `pull_request_write`. A deployment that wants an agent to propose
+    /// changes but never land them installs the write scope alone.
+    #[serde(default)]
+    pull_request_merge: bool,
     token: SecretString,
 }
 
@@ -174,10 +197,23 @@ struct InstalledGitHubCredentialDocument {
     credentials: Vec<InstalledGitHubCredential>,
 }
 
+/// The pull-request powers one installed credential carries.
+///
+/// Two independent flags rather than a level, because they are withheld
+/// independently: a deployment that wants an agent to propose changes but
+/// never land them installs `write` alone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GitHubPullRequestScopes {
+    pub write: bool,
+    pub merge: bool,
+}
+
 struct InstalledGitHubCredential {
     reference: String,
     repository: String,
     actions_write: bool,
+    pull_request_write: bool,
+    pull_request_merge: bool,
     token: Zeroizing<Vec<u8>>,
 }
 
@@ -397,7 +433,59 @@ impl ProductionReviewEffectAdapter {
                 credential_generation: *credentials.generation.digest.as_bytes(),
             });
         }
+        // Pull-request actions still reach no provider, and this arm does not
+        // change that: every path below returns an error. What it adds is a
+        // precise reason, so an operator can tell an incomplete credential
+        // from the missing adapter, and so the merge scope is observably
+        // withheld today rather than only declared.
+        //
+        // An installed binding is not authority. Scopes are a configuration
+        // fact, and proving a pull request can actually be written needs a
+        // provider preflight that does not exist yet, which is why the last
+        // refusal here is unconditional.
+        if matches!(
+            action,
+            ReviewAction::OpenPullRequest { .. }
+                | ReviewAction::UpdatePullRequest { .. }
+                | ReviewAction::MergePullRequest { .. }
+        ) && let Some(RegistryBinding {
+            target:
+                RegistryTarget::PullRequest {
+                    provider,
+                    repository,
+                    credential_reference,
+                },
+            ..
+        }) = binding
+        {
+            if provider != "github" {
+                return Err("platform_v2_review_pull_request_provider_unavailable");
+            }
+            let scopes = self
+                .github_pull_request_scopes(credential_reference)
+                .ok_or("platform_v2_review_pull_request_credential_unavailable")?;
+            if !self.github_credential_matches_repository(credential_reference, repository) {
+                return Err("platform_v2_review_pull_request_credential_incoherent");
+            }
+            if !scopes.write {
+                return Err("platform_v2_review_pull_request_credential_unavailable");
+            }
+            // Merging is withheld on its own. A credential that may propose
+            // changes must not be able to land them, and that has to be true
+            // before the adapter exists, not after.
+            if matches!(action, ReviewAction::MergePullRequest { .. }) && !scopes.merge {
+                return Err("platform_v2_review_pull_request_merge_unavailable");
+            }
+        }
         Err(unavailable_category(action))
+    }
+
+    fn github_credential_matches_repository(&self, reference: &str, repository: &str) -> bool {
+        self.github_credentials.as_ref().is_some_and(|installed| {
+            installed.document.credentials.iter().any(|candidate| {
+                candidate.reference == reference && candidate.repository == repository
+            })
+        })
     }
 
     pub(crate) fn verify_generation(&self) -> Result<(), &'static str> {
@@ -561,6 +649,31 @@ impl ProductionReviewEffectAdapter {
         push_confirmation_field(&mut document, &workspace_revision.get().to_be_bytes());
         push_confirmation_field(&mut document, &expected_check_revision.get().to_be_bytes());
         Ok(*Sha256::digest(&document).as_bytes())
+    }
+
+    /// Read the pull-request scopes an installed credential carries.
+    ///
+    /// This is the seam a future pull-request adapter consumes, and it
+    /// deliberately answers a question rather than granting anything. Holding
+    /// a scope is a configuration fact; it is not proof that a pull request
+    /// can be opened or merged, which is why no capability is minted from it
+    /// alone. The provider preflight that would supply that proof does not
+    /// exist yet, so today nothing reads this except the tests that pin the
+    /// split.
+    pub(crate) fn github_pull_request_scopes(
+        &self,
+        credential_reference: &str,
+    ) -> Option<GitHubPullRequestScopes> {
+        self.github_credentials
+            .as_ref()?
+            .document
+            .credentials
+            .iter()
+            .find(|candidate| candidate.reference == credential_reference)
+            .map(|credential| GitHubPullRequestScopes {
+                write: credential.pull_request_write,
+                merge: credential.pull_request_merge,
+            })
     }
 
     pub(crate) fn github_receipt_correlation_digest(confirmation: [u8; 32]) -> [u8; 32] {
@@ -815,11 +928,20 @@ fn parse_github_credentials(
         {
             return Err("platform_v2_review_github_credentials_invalid");
         }
+        // Merging is a strictly stronger power than writing, so a document
+        // granting merge without write is incoherent rather than a shorthand
+        // for both. Refusing it keeps the two flags independently meaningful
+        // and stops an operator from believing they withheld the write scope.
+        if credential.pull_request_merge && !credential.pull_request_write {
+            return Err("platform_v2_review_github_credentials_invalid");
+        }
         let token = credential.token.take_bytes();
         credentials.push(InstalledGitHubCredential {
             reference: credential.reference.clone(),
             repository: credential.repository.clone(),
             actions_write: credential.actions_write,
+            pull_request_write: credential.pull_request_write,
+            pull_request_merge: credential.pull_request_merge,
             token,
         });
     }
@@ -971,7 +1093,8 @@ mod tests {
 
     use automonique_protocol::platform_v2::{ProjectId, UserWorkspaceId};
     use automonique_protocol::platform_v2_review::{
-        PullRequestId, ReviewAuthorityId, ReviewCommentId, ReviewField, ReviewProposalId,
+        ConflictResolution, PullRequestId, ReviewAuthorityId, ReviewCommentId, ReviewField,
+        ReviewFileId, ReviewProposalId,
     };
     use automonique_protocol::primitives::Revision;
     use tempfile::TempDir;
@@ -1063,6 +1186,44 @@ mod tests {
         );
     }
 
+    /// Pins a deliberate gap, and pins why it is not closed the way the
+    /// pull-request and agent-delivery families were.
+    ///
+    /// The registry admits and validates a `local_repository` target: an
+    /// absolute canonical root, owned by the daemon uid, not group or other
+    /// writable, with a real `.git` that is not a symlink. An operator can
+    /// install a complete, secure binding today. `plan` still has no arm that
+    /// consumes it, so no staging action reaches a worktree.
+    ///
+    /// This family got no capability field, while the pull-request family
+    /// got three. That asymmetry is the point of this test.
+    ///
+    /// A capability is only worth advertising if the server can commit to
+    /// what it observed, and the commitment has to name the mutable thing the
+    /// action depends on. For a rerun that is the run attempt and head SHA.
+    /// For a merge it is the pull-request id, its observed revision and the
+    /// observed head, all of which `resolve_action` already names, which is
+    /// why those field sets were derivable before their adapter existed.
+    ///
+    /// Staging is different in kind. `resolve_action` fences the proposal id,
+    /// its kind, its authority, and refuses a proposal whose files are in
+    /// unresolved conflict. None of that pins the worktree. HEAD and the
+    /// index are mutable substrate that any other process sharing the
+    /// checkout can move between advertisement and execution, and the review
+    /// snapshot's revision only tracks what the projection observed, not what
+    /// the repository is. So a staging confirmation digest would have to
+    /// commit to the HEAD object id and the index state, and neither exists
+    /// in any projection this crate can read today.
+    ///
+    /// Inventing that field set now would be guessing, and a digest that
+    /// commits to the wrong facts is worse than none: it reads as a fence and
+    /// holds nothing. So the honest answer is no wire field until the git
+    /// adapter can supply a real observation, and the client keeps learning
+    /// the truth from `platform_v2_review_git_adapter_unavailable`.
+    ///
+    /// A plan arm added here without that observation is the failure this
+    /// pins. It is meant to fail when the adapter lands, and to be replaced
+    /// deliberately rather than deleted quietly.
     #[test]
     fn secure_exact_binding_does_not_fabricate_a_capability() {
         let temporary = TempDir::new().unwrap();
@@ -1074,15 +1235,84 @@ mod tests {
         let registry = temporary.path().join("registry.json");
         write_registry(&registry, &git_binding(&repository));
         let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
-        assert_eq!(
-            adapter.plan(
-                &ProjectId::new("project-1").unwrap(),
-                &workspace(),
-                &git_authority(),
-                &action()
-            ),
-            Err("platform_v2_review_git_adapter_unavailable")
-        );
+
+        // Every action in the family, not just staging. A future arm is as
+        // likely to be added for committing as for staging, and committing is
+        // the one that writes history.
+        let staging_actions = [
+            ReviewAction::Stage {
+                proposal_id: ReviewProposalId::new("proposal-1").unwrap(),
+            },
+            ReviewAction::Unstage {
+                proposal_id: ReviewProposalId::new("proposal-1").unwrap(),
+            },
+            ReviewAction::Commit {
+                proposal_id: ReviewProposalId::new("proposal-1").unwrap(),
+            },
+            ReviewAction::ResolveConflict {
+                proposal_id: ReviewProposalId::new("proposal-1").unwrap(),
+                file_id: ReviewFileId::new("file-1").unwrap(),
+                resolution: ConflictResolution::KeepCurrent,
+            },
+        ];
+        for action in staging_actions {
+            assert_eq!(
+                adapter.plan(
+                    &ProjectId::new("project-1").unwrap(),
+                    &workspace(),
+                    &git_authority(),
+                    &action,
+                ),
+                Err("platform_v2_review_git_adapter_unavailable"),
+                "{:?} must stay unavailable until a git adapter can observe the worktree",
+                action.kind(),
+            );
+        }
+    }
+
+    /// No staging action can borrow another family's confirmation.
+    ///
+    /// The confirmation digest is the only thing binding an advertised
+    /// preview to a real server adapter. `github_confirmation_digest` is
+    /// shaped for a check rerun and refuses anything else, so a staging
+    /// action cannot acquire a commitment by reaching for the one lane that
+    /// mints them. That has to stay true independently of `plan`, because the
+    /// two could be closed separately.
+    #[test]
+    fn no_staging_action_can_borrow_the_check_rerun_confirmation() {
+        let temporary = TempDir::new().unwrap();
+        let repository = temporary.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        fs::create_dir(repository.join(".git")).unwrap();
+        fs::set_permissions(&repository, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(repository.join(".git"), fs::Permissions::from_mode(0o700)).unwrap();
+        let registry = temporary.path().join("registry.json");
+        write_registry(&registry, &git_binding(&repository));
+        let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
+        for action in [
+            ReviewAction::Stage {
+                proposal_id: ReviewProposalId::new("proposal-1").unwrap(),
+            },
+            ReviewAction::Commit {
+                proposal_id: ReviewProposalId::new("proposal-1").unwrap(),
+            },
+        ] {
+            assert_eq!(
+                adapter.github_confirmation_digest(
+                    &Actor::new("tenant-1", "actor-1").unwrap(),
+                    &ProjectId::new("project-1").unwrap(),
+                    &workspace(),
+                    &git_authority(),
+                    Revision::FIRST,
+                    Revision::FIRST,
+                    &action,
+                    &ReviewEffectPlan::LocalStore,
+                ),
+                Err("platform_v2_review_confirmation_invalid"),
+                "{:?} must not mint a confirmation",
+                action.kind(),
+            );
+        }
     }
 
     #[test]
@@ -1615,23 +1845,118 @@ mod tests {
         ]
     }
 
-    /// Pins a deliberate gap rather than a finished behavior.
+    fn write_credentials(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn credential_document(scopes: &str) -> String {
+        format!(
+            r#"{{"version":1,"generation":"generation-1","credentials":[{{"reference":"github-pull-request-mobile","repository":"example-org/example-repo","actions_write":false,{scopes}"token":"ghp_000000000000000000000000000000000000"}}]}}"#
+        )
+    }
+
+    /// Pull-request authority is its own credential scope, and merging is its
+    /// own scope again.
     ///
-    /// The registry already admits a `pull_request` target and validates one,
-    /// so an operator can install a complete binding today. `plan` still has
-    /// no arm that consumes it, so no pull-request action reaches a provider
-    /// and no confirmation digest is ever minted for one. That is the seam a
-    /// half implementation would slip through: a plan arm added without the
-    /// preflight observation and the confirmation digest would hand a client
-    /// an unconfirmed, uncorrelated write. Closing this gap means making the
-    /// whole path real, so this test is meant to fail then and be replaced
-    /// deliberately, not deleted quietly.
+    /// `actions_write` re-runs a workflow a maintainer already approved, onto
+    /// a ref that already exists. Writing a pull request proposes new code,
+    /// and merging one moves that code into a protected branch where it can
+    /// trigger a deploy. Three different powers, so installing one must never
+    /// confer another. An operator who wants CI reruns from a phone must not
+    /// discover they also handed out repository writes.
     #[test]
-    fn an_installed_pull_request_binding_still_refuses_every_pull_request_action() {
+    fn pull_request_scopes_are_withheld_independently_of_actions_write() {
         let temporary = TempDir::new().unwrap();
         let registry = temporary.path().join("registry.json");
         write_registry(&registry, pull_request_registry());
+        let credentials = temporary.path().join(REVIEW_GITHUB_CREDENTIALS_FILE_NAME);
+
+        // The scope an existing deployment already has on disk: no
+        // pull-request keys at all, because they did not exist when it was
+        // installed. It must keep parsing, and it must gain nothing.
+        write_credentials(&credentials, &credential_document(""));
         let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
+        assert_eq!(
+            adapter.github_pull_request_scopes("github-pull-request-mobile"),
+            Some(GitHubPullRequestScopes {
+                write: false,
+                merge: false,
+            }),
+            "an installed document that predates the split grants neither scope",
+        );
+
+        // Proposing changes without being able to land them is the useful
+        // middle state, and it has to be expressible.
+        write_credentials(
+            &credentials,
+            &credential_document(r#""pull_request_write":true,"#),
+        );
+        let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
+        assert_eq!(
+            adapter.github_pull_request_scopes("github-pull-request-mobile"),
+            Some(GitHubPullRequestScopes {
+                write: true,
+                merge: false,
+            }),
+            "write must not imply merge",
+        );
+
+        write_credentials(
+            &credentials,
+            &credential_document(r#""pull_request_write":true,"pull_request_merge":true,"#),
+        );
+        let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
+        assert_eq!(
+            adapter.github_pull_request_scopes("github-pull-request-mobile"),
+            Some(GitHubPullRequestScopes {
+                write: true,
+                merge: true,
+            }),
+        );
+
+        // Merge without write is incoherent rather than shorthand for both.
+        // Accepting it would let an operator believe they withheld the write
+        // scope while handing out the strictly stronger one.
+        write_credentials(
+            &credentials,
+            &credential_document(r#""pull_request_merge":true,"#),
+        );
+        assert_eq!(
+            ProductionReviewEffectAdapter::open(&registry, uid()).err(),
+            Some("platform_v2_review_github_credentials_invalid"),
+        );
+    }
+
+    /// Holding every pull-request scope still mints no capability.
+    ///
+    /// This is the rule the whole capability surface rests on: an
+    /// advertisement means the server proved the write would be admitted, not
+    /// that an operator installed something. A scope is a configuration fact.
+    /// The provider preflight that would turn it into proof does not exist
+    /// yet, so `plan` still has no arm for a pull-request target and no
+    /// confirmation digest is minted for one.
+    ///
+    /// This test is meant to fail when that adapter lands, and to be replaced
+    /// deliberately rather than deleted quietly.
+    #[test]
+    fn a_fully_scoped_pull_request_credential_still_advertises_nothing() {
+        let temporary = TempDir::new().unwrap();
+        let registry = temporary.path().join("registry.json");
+        write_registry(&registry, pull_request_registry());
+        write_credentials(
+            &temporary.path().join(REVIEW_GITHUB_CREDENTIALS_FILE_NAME),
+            &credential_document(r#""pull_request_write":true,"pull_request_merge":true,"#),
+        );
+        let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
+        assert_eq!(
+            adapter.github_pull_request_scopes("github-pull-request-mobile"),
+            Some(GitHubPullRequestScopes {
+                write: true,
+                merge: true,
+            }),
+            "the scopes really are installed, so the refusals below are the plan's",
+        );
         for action in pull_request_actions() {
             assert_eq!(
                 adapter.plan(
@@ -1642,6 +1967,95 @@ mod tests {
                 ),
                 Err("platform_v2_review_pull_request_adapter_unavailable"),
                 "{:?} must stay unavailable until a real adapter exists",
+                action.kind(),
+            );
+        }
+    }
+
+    /// Pins a deliberate gap rather than a finished behavior.
+    ///
+    /// The registry already admits a `pull_request` target and validates one,
+    /// so an operator can install a complete binding today. `plan` still
+    /// reaches no provider for one, and no confirmation digest is ever minted
+    /// for a pull-request action. That is the seam a half implementation
+    /// would slip through: a plan arm added without the preflight observation
+    /// and the confirmation digest would hand a client an unconfirmed,
+    /// uncorrelated write.
+    ///
+    /// The refusal is now specific about *why*, so an operator can tell an
+    /// incomplete credential from the missing adapter. That is a strictly
+    /// finer answer, not a weaker one: every action here is still refused,
+    /// and the assertion checks the exact category rather than merely that an
+    /// error came back. Closing this gap means making the whole path real, so
+    /// this test is meant to fail then and be replaced deliberately, not
+    /// deleted quietly.
+    #[test]
+    fn an_installed_pull_request_binding_still_refuses_every_pull_request_action() {
+        let temporary = TempDir::new().unwrap();
+        let registry = temporary.path().join("registry.json");
+        write_registry(&registry, pull_request_registry());
+        let credentials = temporary.path().join(REVIEW_GITHUB_CREDENTIALS_FILE_NAME);
+
+        // A complete binding whose credential was never installed. The
+        // binding alone confers nothing.
+        let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
+        for action in pull_request_actions() {
+            assert_eq!(
+                adapter.plan(
+                    &ProjectId::new("project-1").unwrap(),
+                    &workspace(),
+                    &pull_request_authority(),
+                    &action,
+                ),
+                Err("platform_v2_review_pull_request_credential_unavailable"),
+                "{:?} must stay unavailable until a real adapter exists",
+                action.kind(),
+            );
+        }
+
+        // The credential exists but carries no pull-request scope, which is
+        // every credential installed before the scopes were split out.
+        write_credentials(&credentials, &credential_document(""));
+        let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
+        for action in pull_request_actions() {
+            assert_eq!(
+                adapter.plan(
+                    &ProjectId::new("project-1").unwrap(),
+                    &workspace(),
+                    &pull_request_authority(),
+                    &action,
+                ),
+                Err("platform_v2_review_pull_request_credential_unavailable"),
+                "{:?} must not be conferred by an unscoped credential",
+                action.kind(),
+            );
+        }
+
+        // Write without merge. This is the state a deployment lands in when
+        // it wants an agent to propose changes but never land them, and it is
+        // the one that has to hold before the adapter exists rather than
+        // after: opening and updating reach the adapter gap, while merging is
+        // stopped one step earlier by the withheld scope.
+        write_credentials(
+            &credentials,
+            &credential_document(r#""pull_request_write":true,"#),
+        );
+        let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
+        for action in pull_request_actions() {
+            let expected = if matches!(action, ReviewAction::MergePullRequest { .. }) {
+                "platform_v2_review_pull_request_merge_unavailable"
+            } else {
+                "platform_v2_review_pull_request_adapter_unavailable"
+            };
+            assert_eq!(
+                adapter.plan(
+                    &ProjectId::new("project-1").unwrap(),
+                    &workspace(),
+                    &pull_request_authority(),
+                    &action,
+                ),
+                Err(expected),
+                "{:?} must be refused for its own reason",
                 action.kind(),
             );
         }

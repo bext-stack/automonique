@@ -706,6 +706,41 @@ fn review_actions(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let deliverable_comments = exact
+        .zip(capabilities)
+        .map(|((workspace, project, snapshot), capabilities)| {
+            capabilities
+                .agent_deliverable_comments()
+                .iter()
+                .filter_map(|capability| {
+                    // Only project a note the snapshot still agrees is at the
+                    // advertised revision, so a stale capability read cannot
+                    // render a control the daemon would refuse.
+                    let comment = snapshot.comments().iter().find(|comment| {
+                        comment.id() == capability.comment_id()
+                            && comment.revision() == capability.expected_comment_revision()
+                    })?;
+                    Some(json!({
+                        "project_id": project.as_str(),
+                        "workspace_id": workspace.identity().id(),
+                        "exact_revision": snapshot.revision().to_string(),
+                        "comment_id": comment.id().as_str(),
+                        "exact_comment_revision": capability.expected_comment_revision().to_string()
+                    }))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let agent_delivery_available = !deliverable_comments.is_empty();
+    let agent_delivery = |execute: &str| {
+        json!({
+            "available": agent_delivery_available,
+            "category": if agent_delivery_available { Value::Null } else { json!("platform_cockpit_review_family_unavailable") },
+            "execute_operation": if agent_delivery_available { json!(execute) } else { Value::Null },
+            "receipt_operation": if agent_delivery_available { json!("get_review_receipt") } else { Value::Null },
+            "targets": deliverable_comments.clone()
+        })
+    };
     let rerun_available = !rerunnable_checks.is_empty();
     let rerun = json!({
         "available": rerun_available,
@@ -720,8 +755,8 @@ fn review_actions(
         "operations": {
             "add_comment": action(fresh, REVIEW_ADAPTER_PENDING),
             "approve_review": action(approve, if fresh { "platform_v2_review_not_pending" } else { REVIEW_ADAPTER_PENDING }),
-            "send_comment_to_agent": action(false, "platform_cockpit_review_family_unavailable"),
-            "batch_send_comments_to_agent": action(false, "platform_cockpit_review_family_unavailable"),
+            "send_comment_to_agent": agent_delivery("send_comment_to_agent"),
+            "batch_send_comments_to_agent": agent_delivery("batch_send_comments_to_agent"),
             "stage": action(false, "platform_cockpit_git_family_unavailable"),
             "unstage": action(false, "platform_cockpit_git_family_unavailable"),
             "commit": action(false, "platform_cockpit_git_family_unavailable"),

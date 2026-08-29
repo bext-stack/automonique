@@ -312,7 +312,10 @@ pub enum AttentionReadResult {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReviewCapabilitiesResult {
-    Capabilities(ReviewCapabilities),
+    // Boxed like the attention snapshot above: the capability document grew a
+    // pull-request slot per grant, so carrying it inline would make every
+    // refusal pay for the largest success.
+    Capabilities(Box<ReviewCapabilities>),
     Refused(PlatformV2Refusal),
 }
 
@@ -690,7 +693,7 @@ impl<T> PlatformV2Client<T> {
                 if value.project() == &expected_project
                     && value.workspace() == &expected_workspace =>
             {
-                Ok(ReviewCapabilitiesResult::Capabilities(value))
+                Ok(ReviewCapabilitiesResult::Capabilities(Box::new(value)))
             }
             PlatformV2Response::Refused(value) => Ok(ReviewCapabilitiesResult::Refused(value)),
             _ => Err(ClientError::Protocol),

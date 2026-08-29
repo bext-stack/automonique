@@ -99,6 +99,7 @@ import {
   type WorkContextRevision as WorkContextRevisionValue,
 } from "./work-context.js";
 import {
+  MAX_REVIEW_COMMENTS,
   PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR,
   PLATFORM_REVIEW_SCHEMA_V1,
   decodeReviewActionReceipt,
@@ -191,12 +192,46 @@ export interface ReviewCheckRerunCapability {
   readonly receipt_correlation_digest: ReviewReceiptCorrelationDigest;
   readonly expected_check_revision: WorkContextRevisionValue;
 }
+export interface ReviewAgentDeliveryCapability {
+  readonly authority: ReviewAuthority;
+  readonly comment_id: string;
+  readonly expected_comment_revision: WorkContextRevisionValue;
+}
+export interface ReviewPullRequestOpenCapability {
+  readonly authority: ReviewAuthority;
+  readonly confirmation_digest: ReviewConfirmationDigest;
+  readonly expected_pull_request_revision: WorkContextRevisionValue;
+  readonly receipt_correlation_digest: ReviewReceiptCorrelationDigest;
+}
+export interface ReviewPullRequestUpdateCapability {
+  readonly authority: ReviewAuthority;
+  readonly confirmation_digest: ReviewConfirmationDigest;
+  readonly expected_pull_request_revision: WorkContextRevisionValue;
+  readonly pull_request_id: string;
+  readonly receipt_correlation_digest: ReviewReceiptCorrelationDigest;
+}
+export interface ReviewPullRequestMergeCapability {
+  readonly authority: ReviewAuthority;
+  readonly confirmation_digest: ReviewConfirmationDigest;
+  readonly expected_head_revision: string;
+  readonly expected_pull_request_revision: WorkContextRevisionValue;
+  readonly pull_request_id: string;
+  readonly readiness: "ready";
+  readonly receipt_correlation_digest: ReviewReceiptCorrelationDigest;
+}
 export interface ReviewCapabilities {
   readonly project: ProjectIdValue;
   readonly workspace: ReviewWorkspaceIdentity;
   readonly snapshot_revision: WorkContextRevisionValue;
   readonly workspace_revision: WorkContextRevisionValue;
   readonly rerunnable_checks: readonly ReviewCheckRerunCapability[];
+  readonly agent_deliverable_comments: readonly ReviewAgentDeliveryCapability[];
+  // Three independently withheld grants. `null` is the honest fail-closed
+  // answer and is what the server returns today for all three: no provider
+  // adapter can yet preflight a pull-request write, so nothing is claimed.
+  readonly open_pull_request: ReviewPullRequestOpenCapability | null;
+  readonly update_pull_request: ReviewPullRequestUpdateCapability | null;
+  readonly merge_pull_request: ReviewPullRequestMergeCapability | null;
   readonly schema: typeof PLATFORM_SCHEMA_V2;
 }
 export interface ReviewActionTransportRequest {
@@ -384,7 +419,7 @@ export function ReviewReceiptCorrelationDigest(value: string): ReviewReceiptCorr
   return value as ReviewReceiptCorrelationDigest;
 }
 function reviewCapabilities(value: JsonValue): ReviewCapabilities {
-  const body = fields(value, ["project", "rerunnable_checks", "schema", "snapshot_revision", "workspace", "workspace_revision"]);
+  const body = fields(value, ["agent_deliverable_comments", "merge_pull_request", "open_pull_request", "project", "rerunnable_checks", "schema", "snapshot_revision", "workspace", "workspace_revision", "update_pull_request"]);
   if (stringField(body, "schema") !== PLATFORM_SCHEMA_V2) throw new WireError("invalid_json_value", "review capability schema");
   const rawChecks = valueField(body, "rerunnable_checks");
   if (rawChecks.kind !== "array" || rawChecks.items.length > 512) throw new WireError("invalid_json_value", "review capabilities");
@@ -402,7 +437,68 @@ function reviewCapabilities(value: JsonValue): ReviewCapabilities {
     };
   });
   if (new Set(checks.map((check) => check.check_id)).size !== checks.length) throw new WireError("invalid_json_value", "duplicate review capability");
+  const rawDeliverable = valueField(body, "agent_deliverable_comments");
+  if (rawDeliverable.kind !== "array" || rawDeliverable.items.length > MAX_REVIEW_COMMENTS) throw new WireError("invalid_json_value", "review capabilities");
+  const deliverable = rawDeliverable.items.map((item): ReviewAgentDeliveryCapability => {
+    const comment = fields(item, ["authority", "comment_id", "expected_comment_revision"]);
+    const authorityValue = fields(valueField(comment, "authority"), ["id", "kind"]);
+    const authorityId = boundedRefusalString(stringField(authorityValue, "id"), 256);
+    if (stringField(authorityValue, "kind") !== "review") throw new WireError("invalid_json_value", "review capability authority");
+    return {
+      authority: {id: authorityId, kind: "review"},
+      comment_id: boundedRefusalString(stringField(comment, "comment_id"), 256),
+      expected_comment_revision: WorkContextRevision(integerField(comment, "expected_comment_revision")),
+    };
+  });
+  if (new Set(deliverable.map((comment) => comment.comment_id)).size !== deliverable.length) throw new WireError("invalid_json_value", "duplicate review capability");
+  const pullRequestAuthority = (slot: Map<string, JsonValue>): ReviewAuthority => {
+    const authorityValue = fields(valueField(slot, "authority"), ["id", "kind"]);
+    if (stringField(authorityValue, "kind") !== "pull_request") throw new WireError("invalid_json_value", "review capability authority");
+    return {id: boundedRefusalString(stringField(authorityValue, "id"), 256), kind: "pull_request"};
+  };
+  const slot = (name: string, names: readonly string[]): Map<string, JsonValue> | null => {
+    const raw = valueField(body, name);
+    if (raw.kind === "null") return null;
+    return fields(raw, names);
+  };
+  const openSlot = slot("open_pull_request", ["authority", "confirmation_digest", "expected_pull_request_revision", "receipt_correlation_digest"]);
+  const open_pull_request = openSlot === null ? null : {
+    authority: pullRequestAuthority(openSlot),
+    confirmation_digest: ReviewConfirmationDigest(stringField(openSlot, "confirmation_digest")),
+    expected_pull_request_revision: WorkContextRevision(integerField(openSlot, "expected_pull_request_revision")),
+    receipt_correlation_digest: ReviewReceiptCorrelationDigest(stringField(openSlot, "receipt_correlation_digest")),
+  };
+  const updateSlot = slot("update_pull_request", ["authority", "confirmation_digest", "expected_pull_request_revision", "pull_request_id", "receipt_correlation_digest"]);
+  const update_pull_request = updateSlot === null ? null : {
+    authority: pullRequestAuthority(updateSlot),
+    confirmation_digest: ReviewConfirmationDigest(stringField(updateSlot, "confirmation_digest")),
+    expected_pull_request_revision: WorkContextRevision(integerField(updateSlot, "expected_pull_request_revision")),
+    pull_request_id: boundedRefusalString(stringField(updateSlot, "pull_request_id"), 256),
+    receipt_correlation_digest: ReviewReceiptCorrelationDigest(stringField(updateSlot, "receipt_correlation_digest")),
+  };
+  const mergeSlot = slot("merge_pull_request", ["authority", "confirmation_digest", "expected_head_revision", "expected_pull_request_revision", "pull_request_id", "readiness", "receipt_correlation_digest"]);
+  // A merge is only ever advertised for a pull request the server observed as
+  // ready, so any other readiness on the wire is a refusal rather than a
+  // control the client renders and the daemon then rejects.
+  if (mergeSlot !== null && stringField(mergeSlot, "readiness") !== "ready") throw new WireError("invalid_json_value", "review merge capability readiness");
+  const merge_pull_request = mergeSlot === null ? null : {
+    authority: pullRequestAuthority(mergeSlot),
+    confirmation_digest: ReviewConfirmationDigest(stringField(mergeSlot, "confirmation_digest")),
+    expected_head_revision: boundedRefusalString(stringField(mergeSlot, "expected_head_revision"), 256),
+    expected_pull_request_revision: WorkContextRevision(integerField(mergeSlot, "expected_pull_request_revision")),
+    pull_request_id: boundedRefusalString(stringField(mergeSlot, "pull_request_id"), 256),
+    readiness: "ready" as const,
+    receipt_correlation_digest: ReviewReceiptCorrelationDigest(stringField(mergeSlot, "receipt_correlation_digest")),
+  };
+  // Absent and open are mutually exclusive observations of one projection, so
+  // a response claiming both was read from two different snapshots.
+  if (open_pull_request !== null && (update_pull_request !== null || merge_pull_request !== null)) throw new WireError("invalid_json_value", "review pull request capabilities");
+  if (update_pull_request !== null && merge_pull_request !== null && (update_pull_request.pull_request_id !== merge_pull_request.pull_request_id || update_pull_request.expected_pull_request_revision !== merge_pull_request.expected_pull_request_revision)) throw new WireError("invalid_json_value", "review pull request capabilities");
   return {
+    agent_deliverable_comments: deliverable,
+    merge_pull_request,
+    open_pull_request,
+    update_pull_request,
     project: ProjectId(stringField(body, "project")),
     rerunnable_checks: checks,
     schema: PLATFORM_SCHEMA_V2,

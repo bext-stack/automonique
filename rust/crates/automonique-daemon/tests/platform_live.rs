@@ -68,7 +68,7 @@ use automonique_protocol::platform_v2_transport::{
     MutationSubmitRequest, PlatformNegotiationRequest, PlatformNegotiationRequestMessage,
     PlatformNegotiationResponse, PlatformNegotiationResponseMessage, PlatformV2Request,
     PlatformV2RequestMessage, PlatformV2Response, PlatformV2ResponseMessage, ReceiptLookupKey,
-    ReviewActionTransportRequest, ReviewConfirmationDigest, ReviewReceiptLookup,
+    ReviewActionTransportRequest, ReviewConfirmationDigest, ReviewReadRequest, ReviewReceiptLookup,
     WorkspaceIntentLookup, WorkspaceIntentRequest,
 };
 use automonique_protocol::primitives::{EpochMillis, Revision};
@@ -1845,6 +1845,259 @@ fn retained_review_escaping_heavy_envelope_refuses_before_write_and_replays_term
             .unwrap(),
         0,
         "an oversized envelope must never enter scheduler custody"
+    );
+}
+
+/// Agent delivery is advertised only when a send would really be admitted,
+/// and the advertisement retracts itself once the note has been delivered.
+///
+/// This is the whole argument for shipping batch-send without a confirmation
+/// digest. A rerun needs one because the effect fires in a system the daemon
+/// does not own. Here the target is registry-owned rather than client-named,
+/// and exactly-once falls out of the domain state machine instead: settling a
+/// delivery bumps both the snapshot revision and the delivered note's
+/// revision, and moves the note out of the sendable agent states. So a second
+/// send of the same batch cannot be constructed from the advertisement that
+/// authorized the first one, whatever idempotency key it carries.
+///
+/// The final replay is what gives that claim teeth. It reuses the exact
+/// advertised revision under a fresh idempotency key, which is precisely the
+/// request a duplicate-delivery bug would have to make, and it is refused as
+/// stale rather than accepted.
+#[test]
+fn advertised_agent_delivery_is_admitted_once_and_then_withdrawn() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let snapshot = configure_retained_review_delivery(&config);
+    let _serving = serve(&config);
+    let comment = &snapshot.comments()[0];
+
+    let read = || {
+        let response = platform_v2(
+            &config,
+            "v2-review-agent-capabilities",
+            PlatformV2Request::GetReviewCapabilities(
+                ReviewReadRequest::new(
+                    ProjectId::new("project-live").unwrap(),
+                    snapshot.workspace().clone(),
+                )
+                .unwrap(),
+            ),
+        );
+        match response {
+            PlatformV2Response::ReviewCapabilities(capabilities) => capabilities,
+            other => panic!("expected review capabilities, got {other:?}"),
+        }
+    };
+
+    let advertised = read();
+    let deliverable = advertised.agent_deliverable_comments();
+    assert_eq!(
+        deliverable.len(),
+        1,
+        "the seeded not_sent note is the only deliverable one"
+    );
+    assert_eq!(deliverable[0].comment_id(), comment.id());
+    assert_eq!(
+        deliverable[0].expected_comment_revision(),
+        comment.revision()
+    );
+    assert_eq!(
+        deliverable[0].authority().kind(),
+        ReviewAuthorityKind::Review,
+        "delivery is advertised under the review authority the snapshot names"
+    );
+    assert_eq!(advertised.snapshot_revision(), snapshot.revision());
+
+    // Send exactly what was advertised, and nothing the client invented.
+    let batch = ReviewAction::BatchSendCommentsToAgent {
+        comments: vec![ReviewCommentTarget::new(
+            deliverable[0].comment_id().clone(),
+            deliverable[0].expected_comment_revision(),
+        )],
+    };
+    let action = ReviewActionTransportRequest::new(
+        snapshot.workspace().clone(),
+        advertised.snapshot_revision(),
+        batch.clone(),
+        IdempotencyKey::new("advertised-batch-once").unwrap(),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            platform_v2(
+                &config,
+                "v2-review-agent-batch",
+                PlatformV2Request::ExecuteReviewAction(action.clone()),
+            ),
+            PlatformV2Response::ReviewReceipt(ref receipt)
+                if receipt.outcome() == ReviewReceiptOutcome::Accepted
+        ),
+        "the advertised batch is admitted"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let response = platform_v2(
+            &config,
+            "v2-review-agent-batch-lookup",
+            PlatformV2Request::GetReviewReceipt(
+                ReviewReceiptLookup::new(
+                    ProjectId::new("project-live").unwrap(),
+                    snapshot.workspace().clone(),
+                    action.idempotency_key().clone(),
+                )
+                .unwrap(),
+            ),
+        );
+        if let PlatformV2Response::ReviewReceipt(receipt) = response
+            && matches!(
+                receipt.outcome(),
+                ReviewReceiptOutcome::Completed
+                    | ReviewReceiptOutcome::Refused
+                    | ReviewReceiptOutcome::Unknown
+            )
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "retained delivery did not settle"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Settling moved the snapshot on. Whatever the provider decided, the
+    // exact advertisement that authorized the first send is gone: a delivered
+    // note leaves the sendable states entirely, and a refused one is only
+    // re-offered at a strictly higher revision.
+    let after = read();
+    assert!(
+        after.snapshot_revision() > advertised.snapshot_revision(),
+        "settling a delivery advances the snapshot revision"
+    );
+    assert!(
+        after.agent_deliverable_comments().iter().all(|capability| {
+            capability.comment_id() != comment.id()
+                || capability.expected_comment_revision() > comment.revision()
+        }),
+        "the settled note is never re-advertised at the revision already sent"
+    );
+
+    // The request a duplicate-delivery bug would have to make: the same
+    // batch, at the same advertised revision, under a key the store has never
+    // seen. Without a confirmation digest anywhere in sight, it is still
+    // refused, because the revision fence alone is sufficient.
+    let replay = ReviewActionTransportRequest::new(
+        snapshot.workspace().clone(),
+        advertised.snapshot_revision(),
+        batch,
+        IdempotencyKey::new("advertised-batch-duplicate").unwrap(),
+    )
+    .unwrap();
+    let refusal = platform_v2(
+        &config,
+        "v2-review-agent-batch-duplicate",
+        PlatformV2Request::ExecuteReviewAction(replay),
+    );
+    let PlatformV2Response::Refused(refusal) = refusal else {
+        panic!("a second delivery of an already sent batch must be refused, got {refusal:?}");
+    };
+    assert_eq!(refusal.category().as_str(), "platform_v2_review_stale");
+}
+
+/// An installed registry binding is not, by itself, a capability.
+///
+/// This is the rule that keeps the advertisement honest: the client is told a
+/// send will be admitted, so the server has to have proven it, not merely
+/// found an operator's binding on disk. The check-rerun path earns that right
+/// with a mutation-free provider observation before it advertises; the
+/// retained-session path earns it by resolving the session lineage and
+/// probing the bound target.
+///
+/// Here the binding is complete and valid but names a provider session that
+/// was never observed, which is what an operator typo or a session that has
+/// since gone looks like. Advertising it would hand the client a control that
+/// always refuses, which is strictly worse than the fail-closed refusal it
+/// already gets. The response must still be a well-formed capability
+/// document, because an unreachable agent is not a broken workspace: the
+/// rerun family and the read itself keep working.
+#[test]
+fn an_unreachable_retained_session_advertises_nothing_and_still_answers() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let snapshot = configure_retained_review_delivery(&config);
+
+    // Same operator binding, valid in every structural way, pointing at a
+    // session the daemon has never seen.
+    let registry = serde_json::json!({
+        "version": 1,
+        "generation": "review-live-generation-1",
+        "bindings": [{
+            "project": "project-live",
+            "workspace_kind": "user_workspace",
+            "workspace_id": "review-workspace-live",
+            "authority_kind": "review",
+            "authority_id": "authority-1",
+            "target": {
+                "kind": "retained_session",
+                "provider": "jcode",
+                "session_id": "review-provider-session-absent",
+                "work_session_id": "review-session-live"
+            }
+        }]
+    });
+    let registry_path = config.state_dir().join("platform-v2-review-registry.json");
+    std::fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
+    std::fs::set_permissions(&registry_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let _serving = serve(&config);
+    let response = platform_v2(
+        &config,
+        "v2-review-agent-unreachable",
+        PlatformV2Request::GetReviewCapabilities(
+            ReviewReadRequest::new(
+                ProjectId::new("project-live").unwrap(),
+                snapshot.workspace().clone(),
+            )
+            .unwrap(),
+        ),
+    );
+    let PlatformV2Response::ReviewCapabilities(capabilities) = response else {
+        panic!("an unreachable agent session must not break the capability read, got {response:?}");
+    };
+    assert!(
+        capabilities.agent_deliverable_comments().is_empty(),
+        "an installed binding whose session cannot be resolved advertises nothing"
+    );
+    assert_eq!(capabilities.snapshot_revision(), snapshot.revision());
+
+    // And the client's own fail-closed path still tells it the truth if it
+    // sends anyway, which is why the empty list needs no explanation.
+    let comment = &snapshot.comments()[0];
+    let refusal = platform_v2(
+        &config,
+        "v2-review-agent-unreachable-send",
+        PlatformV2Request::ExecuteReviewAction(
+            ReviewActionTransportRequest::new(
+                snapshot.workspace().clone(),
+                snapshot.revision(),
+                ReviewAction::BatchSendCommentsToAgent {
+                    comments: vec![ReviewCommentTarget::new(
+                        comment.id().clone(),
+                        comment.revision(),
+                    )],
+                },
+                IdempotencyKey::new("unreachable-batch").unwrap(),
+            )
+            .unwrap(),
+        ),
+    );
+    assert!(
+        matches!(refusal, PlatformV2Response::Refused(_)),
+        "an unadvertised send is refused, got {refusal:?}"
     );
 }
 

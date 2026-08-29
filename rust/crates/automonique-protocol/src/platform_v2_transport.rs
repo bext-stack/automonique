@@ -55,8 +55,9 @@ use crate::platform_v2_lineage_api::{
     encode_workspace_intent_outcome,
 };
 use crate::platform_v2_review::{
-    PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR, PLATFORM_REVIEW_SCHEMA_V1, ReviewAction,
-    ReviewActionReceipt, ReviewAuthority, ReviewAuthorityKind, ReviewCheckId, ReviewSnapshot,
+    MAX_REVIEW_COMMENTS, MergeReadiness, PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR,
+    PLATFORM_REVIEW_SCHEMA_V1, PullRequestId, ReviewAction, ReviewActionReceipt, ReviewAuthority,
+    ReviewAuthorityKind, ReviewCheckId, ReviewCommentId, ReviewField, ReviewSnapshot,
 };
 use crate::platform_v2_review_api::{
     MAX_REVIEW_SNAPSHOT_CANONICAL_BYTES, ReviewApiError, action, action_json,
@@ -738,6 +739,274 @@ impl ReviewCheckRerunCapability {
     }
 }
 
+/// One exact review note the server has proven it can deliver to the bound
+/// retained agent session.
+///
+/// This deliberately carries no confirmation digest and no receipt
+/// correlation, unlike [`ReviewCheckRerunCapability`]. A rerun needs both
+/// because the client names the target and the effect fires in a system the
+/// daemon does not own, so only a digest can bind the executed write to the
+/// preflighted plan. Delivery to a retained session is a different risk class
+/// on every axis that motivated the digest:
+///
+/// * The target is not on the wire. Provider and session identity come from
+///   the operator-owned registry, keyed by the review coordinate, so a client
+///   can neither name nor redirect the session it reaches.
+/// * The snapshot revision is already fenced twice, by the store's current
+///   revision check and again by `ReviewSnapshot::resolve_action`.
+/// * The note set is already fenced by the batch arm of `resolve_action`,
+///   which requires every comment to exist at exactly the advertised revision
+///   and to still be in `not_sent` or `refused`.
+///
+/// Exactly-once therefore falls out of the domain state machine rather than a
+/// digest: a delivered comment leaves `not_sent`/`refused` and bumps the
+/// snapshot revision, so a replay under a fresh idempotency key fails the
+/// revision fence, and a replay under the same key is the intended recovery
+/// lane, deduplicated by external-effect custody.
+///
+/// Minting a receipt correlation here would be worse than redundant. The
+/// host's receipt lookup skips a retained action whenever the request carries
+/// a correlation digest, so advertising one would hand a client a token that
+/// makes its own receipt unfindable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewAgentDeliveryCapability {
+    comment_id: ReviewCommentId,
+    expected_comment_revision: Revision,
+    authority: ReviewAuthority,
+}
+
+impl ReviewAgentDeliveryCapability {
+    pub fn new(
+        comment_id: ReviewCommentId,
+        expected_comment_revision: Revision,
+        authority: ReviewAuthority,
+    ) -> Result<Self, PlatformV2TransportError> {
+        if authority.kind() != ReviewAuthorityKind::Review {
+            return Err(PlatformV2TransportError::InvalidBody);
+        }
+        Ok(Self {
+            comment_id,
+            expected_comment_revision,
+            authority,
+        })
+    }
+    #[must_use]
+    pub const fn comment_id(&self) -> &ReviewCommentId {
+        &self.comment_id
+    }
+    #[must_use]
+    pub const fn expected_comment_revision(&self) -> Revision {
+        self.expected_comment_revision
+    }
+    #[must_use]
+    pub const fn authority(&self) -> &ReviewAuthority {
+        &self.authority
+    }
+}
+
+/// Authority to open a pull request for exactly one workspace.
+///
+/// Opening, updating and merging are three separate capabilities rather than
+/// one pull-request grant, because they are three separate risks and a
+/// deployment must be able to withhold merge while allowing the other two. A
+/// merge moves code into a protected branch and can trigger deploys; opening
+/// a draft does not.
+///
+/// The field set is derived from what `ReviewSnapshot::resolve_action` proves
+/// for this action and no more: the pull request must be absent, at the exact
+/// observed revision. There is no pull-request id to commit to, because there
+/// is no pull request yet. The title stays client-owned and unfenced, since
+/// it names nothing the server must agree about.
+///
+/// Unlike [`ReviewAgentDeliveryCapability`], this carries a confirmation
+/// digest and a receipt correlation. The effect lands in a repository the
+/// daemon does not own, so only a digest binds the executed write to the plan
+/// the server preflighted, and only a correlation lets a receipt be recovered
+/// against that exact plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewPullRequestOpenCapability {
+    expected_pull_request_revision: Revision,
+    authority: ReviewAuthority,
+    confirmation_digest: ReviewConfirmationDigest,
+    receipt_correlation_digest: ReviewReceiptCorrelationDigest,
+}
+
+impl ReviewPullRequestOpenCapability {
+    pub fn new(
+        expected_pull_request_revision: Revision,
+        authority: ReviewAuthority,
+        confirmation_digest: ReviewConfirmationDigest,
+        receipt_correlation_digest: ReviewReceiptCorrelationDigest,
+    ) -> Result<Self, PlatformV2TransportError> {
+        if authority.kind() != ReviewAuthorityKind::PullRequest {
+            return Err(PlatformV2TransportError::InvalidBody);
+        }
+        Ok(Self {
+            expected_pull_request_revision,
+            authority,
+            confirmation_digest,
+            receipt_correlation_digest,
+        })
+    }
+    #[must_use]
+    pub const fn expected_pull_request_revision(&self) -> Revision {
+        self.expected_pull_request_revision
+    }
+    #[must_use]
+    pub const fn authority(&self) -> &ReviewAuthority {
+        &self.authority
+    }
+    #[must_use]
+    pub const fn confirmation_digest(&self) -> &ReviewConfirmationDigest {
+        &self.confirmation_digest
+    }
+    #[must_use]
+    pub const fn receipt_correlation_digest(&self) -> &ReviewReceiptCorrelationDigest {
+        &self.receipt_correlation_digest
+    }
+}
+
+/// Authority to update an existing pull request for exactly one workspace.
+///
+/// Held separately from opening and from merging. The field set is what
+/// `resolve_action` proves for an update: the exact pull-request id at the
+/// exact observed revision, in a state that still accepts an update. The
+/// state itself is not repeated on the wire, because the revision already
+/// commits to the projection the server checked it in.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewPullRequestUpdateCapability {
+    pull_request_id: PullRequestId,
+    expected_pull_request_revision: Revision,
+    authority: ReviewAuthority,
+    confirmation_digest: ReviewConfirmationDigest,
+    receipt_correlation_digest: ReviewReceiptCorrelationDigest,
+}
+
+impl ReviewPullRequestUpdateCapability {
+    pub fn new(
+        pull_request_id: PullRequestId,
+        expected_pull_request_revision: Revision,
+        authority: ReviewAuthority,
+        confirmation_digest: ReviewConfirmationDigest,
+        receipt_correlation_digest: ReviewReceiptCorrelationDigest,
+    ) -> Result<Self, PlatformV2TransportError> {
+        if authority.kind() != ReviewAuthorityKind::PullRequest {
+            return Err(PlatformV2TransportError::InvalidBody);
+        }
+        Ok(Self {
+            pull_request_id,
+            expected_pull_request_revision,
+            authority,
+            confirmation_digest,
+            receipt_correlation_digest,
+        })
+    }
+    #[must_use]
+    pub const fn pull_request_id(&self) -> &PullRequestId {
+        &self.pull_request_id
+    }
+    #[must_use]
+    pub const fn expected_pull_request_revision(&self) -> Revision {
+        self.expected_pull_request_revision
+    }
+    #[must_use]
+    pub const fn authority(&self) -> &ReviewAuthority {
+        &self.authority
+    }
+    #[must_use]
+    pub const fn confirmation_digest(&self) -> &ReviewConfirmationDigest {
+        &self.confirmation_digest
+    }
+    #[must_use]
+    pub const fn receipt_correlation_digest(&self) -> &ReviewReceiptCorrelationDigest {
+        &self.receipt_correlation_digest
+    }
+}
+
+/// Authority to merge a pull request for exactly one workspace.
+///
+/// This is the strongest grant in the review surface and the reason the
+/// pull-request family is split into three: a merge moves code into a
+/// protected branch and can trigger deploys, so it must stay withholdable on
+/// its own while opening and updating are allowed.
+///
+/// It carries two fences the other two do not, both taken from what
+/// `resolve_action` proves for a merge. `expected_head_revision` is the exact
+/// head the server observed, so a merge cannot land on a branch that moved
+/// after it was advertised. `readiness` is carried explicitly because a
+/// client must be able to see that the server observed a mergeable pull
+/// request, not merely an open one, and refuse to offer the control
+/// otherwise.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewPullRequestMergeCapability {
+    pull_request_id: PullRequestId,
+    expected_pull_request_revision: Revision,
+    expected_head_revision: ReviewField,
+    readiness: MergeReadiness,
+    authority: ReviewAuthority,
+    confirmation_digest: ReviewConfirmationDigest,
+    receipt_correlation_digest: ReviewReceiptCorrelationDigest,
+}
+
+impl ReviewPullRequestMergeCapability {
+    pub fn new(
+        pull_request_id: PullRequestId,
+        expected_pull_request_revision: Revision,
+        expected_head_revision: ReviewField,
+        readiness: MergeReadiness,
+        authority: ReviewAuthority,
+        confirmation_digest: ReviewConfirmationDigest,
+        receipt_correlation_digest: ReviewReceiptCorrelationDigest,
+    ) -> Result<Self, PlatformV2TransportError> {
+        // A merge is only ever advertised for a pull request the server
+        // observed as ready. Anything else would offer a control that the
+        // action contract refuses, which is the failure mode this whole
+        // capability surface exists to prevent.
+        if authority.kind() != ReviewAuthorityKind::PullRequest
+            || readiness != MergeReadiness::Ready
+        {
+            return Err(PlatformV2TransportError::InvalidBody);
+        }
+        Ok(Self {
+            pull_request_id,
+            expected_pull_request_revision,
+            expected_head_revision,
+            readiness,
+            authority,
+            confirmation_digest,
+            receipt_correlation_digest,
+        })
+    }
+    #[must_use]
+    pub const fn pull_request_id(&self) -> &PullRequestId {
+        &self.pull_request_id
+    }
+    #[must_use]
+    pub const fn expected_pull_request_revision(&self) -> Revision {
+        self.expected_pull_request_revision
+    }
+    #[must_use]
+    pub const fn expected_head_revision(&self) -> &ReviewField {
+        &self.expected_head_revision
+    }
+    #[must_use]
+    pub const fn readiness(&self) -> MergeReadiness {
+        self.readiness
+    }
+    #[must_use]
+    pub const fn authority(&self) -> &ReviewAuthority {
+        &self.authority
+    }
+    #[must_use]
+    pub const fn confirmation_digest(&self) -> &ReviewConfirmationDigest {
+        &self.confirmation_digest
+    }
+    #[must_use]
+    pub const fn receipt_correlation_digest(&self) -> &ReviewReceiptCorrelationDigest {
+        &self.receipt_correlation_digest
+    }
+}
+
 /// Revision-fenced mutation capabilities for exactly one project/workspace.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReviewCapabilities {
@@ -746,6 +1015,10 @@ pub struct ReviewCapabilities {
     snapshot_revision: Revision,
     workspace_revision: Revision,
     rerunnable_checks: Vec<ReviewCheckRerunCapability>,
+    agent_deliverable_comments: Vec<ReviewAgentDeliveryCapability>,
+    open_pull_request: Option<ReviewPullRequestOpenCapability>,
+    update_pull_request: Option<ReviewPullRequestUpdateCapability>,
+    merge_pull_request: Option<ReviewPullRequestMergeCapability>,
 }
 
 impl ReviewCapabilities {
@@ -755,8 +1028,13 @@ impl ReviewCapabilities {
         snapshot_revision: Revision,
         workspace_revision: Revision,
         mut rerunnable_checks: Vec<ReviewCheckRerunCapability>,
+        mut agent_deliverable_comments: Vec<ReviewAgentDeliveryCapability>,
+        pull_request: ReviewPullRequestCapabilities,
     ) -> Result<Self, PlatformV2TransportError> {
-        if !is_review_workspace(&workspace) || rerunnable_checks.len() > 512 {
+        if !is_review_workspace(&workspace)
+            || rerunnable_checks.len() > 512
+            || agent_deliverable_comments.len() > MAX_REVIEW_COMMENTS
+        {
             return Err(PlatformV2TransportError::InvalidBody);
         }
         rerunnable_checks
@@ -767,12 +1045,40 @@ impl ReviewCapabilities {
         {
             return Err(PlatformV2TransportError::InvalidBody);
         }
+        agent_deliverable_comments
+            .sort_by(|left, right| left.comment_id().as_str().cmp(right.comment_id().as_str()));
+        if agent_deliverable_comments
+            .windows(2)
+            .any(|pair| pair[0].comment_id() == pair[1].comment_id())
+        {
+            return Err(PlatformV2TransportError::InvalidBody);
+        }
+        // Opening and merging are mutually exclusive observations of one
+        // projection: a pull request cannot be absent and open at once. A
+        // response claiming both would mean the server read two different
+        // snapshots, so refuse rather than let a client pick.
+        if pull_request.open.is_some()
+            && (pull_request.update.is_some() || pull_request.merge.is_some())
+        {
+            return Err(PlatformV2TransportError::InvalidBody);
+        }
+        if let (Some(update), Some(merge)) = (&pull_request.update, &pull_request.merge)
+            && (update.pull_request_id() != merge.pull_request_id()
+                || update.expected_pull_request_revision()
+                    != merge.expected_pull_request_revision())
+        {
+            return Err(PlatformV2TransportError::InvalidBody);
+        }
         Ok(Self {
             project,
             workspace,
             snapshot_revision,
             workspace_revision,
             rerunnable_checks,
+            agent_deliverable_comments,
+            open_pull_request: pull_request.open,
+            update_pull_request: pull_request.update,
+            merge_pull_request: pull_request.merge,
         })
     }
     #[must_use]
@@ -795,6 +1101,56 @@ impl ReviewCapabilities {
     pub fn rerunnable_checks(&self) -> &[ReviewCheckRerunCapability] {
         &self.rerunnable_checks
     }
+    /// Review notes the server has proven it can deliver to the bound retained
+    /// agent session, at the exact revisions the delivery will be accepted at.
+    ///
+    /// Empty is the honest fail-closed answer: no registry binding, no live
+    /// delivery adapter, no fresh review, or no note currently in a sendable
+    /// state. A client must not attempt a send that is not listed here.
+    #[must_use]
+    pub fn agent_deliverable_comments(&self) -> &[ReviewAgentDeliveryCapability] {
+        &self.agent_deliverable_comments
+    }
+    /// Authority to open a pull request, held independently of updating and
+    /// merging.
+    ///
+    /// `None` is the honest fail-closed answer and is what the server returns
+    /// today for every workspace: no provider adapter can yet preflight a
+    /// pull-request write, so nothing can be proven and nothing is claimed.
+    #[must_use]
+    pub const fn open_pull_request(&self) -> Option<&ReviewPullRequestOpenCapability> {
+        self.open_pull_request.as_ref()
+    }
+    /// Authority to update a pull request, held independently of opening and
+    /// merging. `None` until a provider adapter can preflight the write.
+    #[must_use]
+    pub const fn update_pull_request(&self) -> Option<&ReviewPullRequestUpdateCapability> {
+        self.update_pull_request.as_ref()
+    }
+    /// Authority to merge a pull request, held independently of opening and
+    /// updating so a deployment can withhold exactly this one.
+    ///
+    /// `None` until a provider adapter can preflight the write. This is the
+    /// only review capability whose effect can move code into a protected
+    /// branch, so it is never implied by holding either of the other two.
+    #[must_use]
+    pub const fn merge_pull_request(&self) -> Option<&ReviewPullRequestMergeCapability> {
+        self.merge_pull_request.as_ref()
+    }
+}
+
+/// The three independently withheld pull-request grants for one workspace.
+///
+/// This is a grouping for construction only, never a single grant: each field
+/// is minted separately from its own preflight, and holding one says nothing
+/// about the others. It exists so `ReviewCapabilities::new` cannot silently
+/// acquire a fourth positional boolean-shaped argument every time the family
+/// grows.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReviewPullRequestCapabilities {
+    pub open: Option<ReviewPullRequestOpenCapability>,
+    pub update: Option<ReviewPullRequestUpdateCapability>,
+    pub merge: Option<ReviewPullRequestMergeCapability>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1481,13 +1837,136 @@ fn review_capabilities_json(
             ]))
         })
         .collect::<Result<Vec<_>, PlatformV2TransportError>>()?;
+    let agent_deliverable_comments = value
+        .agent_deliverable_comments()
+        .iter()
+        .map(|capability| {
+            Ok(object(vec![
+                (
+                    "authority",
+                    object(vec![
+                        (
+                            "id",
+                            JsonValue::String(capability.authority().id().as_str().to_owned()),
+                        ),
+                        (
+                            "kind",
+                            JsonValue::String(capability.authority().kind().as_str().to_owned()),
+                        ),
+                    ]),
+                ),
+                (
+                    "comment_id",
+                    JsonValue::String(capability.comment_id().as_str().to_owned()),
+                ),
+                (
+                    "expected_comment_revision",
+                    JsonValue::Integer(
+                        i64::try_from(capability.expected_comment_revision().get())
+                            .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+                    ),
+                ),
+            ]))
+        })
+        .collect::<Result<Vec<_>, PlatformV2TransportError>>()?;
+    let authority_json = |authority: &ReviewAuthority| {
+        object(vec![
+            ("id", JsonValue::String(authority.id().as_str().to_owned())),
+            (
+                "kind",
+                JsonValue::String(authority.kind().as_str().to_owned()),
+            ),
+        ])
+    };
+    let revision_json = |revision: Revision| {
+        i64::try_from(revision.get())
+            .map(JsonValue::Integer)
+            .map_err(|_| PlatformV2TransportError::InvalidBody)
+    };
+    let open_pull_request = match value.open_pull_request() {
+        None => JsonValue::Null,
+        Some(capability) => object(vec![
+            ("authority", authority_json(capability.authority())),
+            (
+                "confirmation_digest",
+                JsonValue::String(capability.confirmation_digest().as_str().to_owned()),
+            ),
+            (
+                "expected_pull_request_revision",
+                revision_json(capability.expected_pull_request_revision())?,
+            ),
+            (
+                "receipt_correlation_digest",
+                JsonValue::String(capability.receipt_correlation_digest().as_str().to_owned()),
+            ),
+        ]),
+    };
+    let update_pull_request = match value.update_pull_request() {
+        None => JsonValue::Null,
+        Some(capability) => object(vec![
+            ("authority", authority_json(capability.authority())),
+            (
+                "confirmation_digest",
+                JsonValue::String(capability.confirmation_digest().as_str().to_owned()),
+            ),
+            (
+                "expected_pull_request_revision",
+                revision_json(capability.expected_pull_request_revision())?,
+            ),
+            (
+                "pull_request_id",
+                JsonValue::String(capability.pull_request_id().as_str().to_owned()),
+            ),
+            (
+                "receipt_correlation_digest",
+                JsonValue::String(capability.receipt_correlation_digest().as_str().to_owned()),
+            ),
+        ]),
+    };
+    let merge_pull_request = match value.merge_pull_request() {
+        None => JsonValue::Null,
+        Some(capability) => object(vec![
+            ("authority", authority_json(capability.authority())),
+            (
+                "confirmation_digest",
+                JsonValue::String(capability.confirmation_digest().as_str().to_owned()),
+            ),
+            (
+                "expected_head_revision",
+                JsonValue::String(capability.expected_head_revision().as_str().to_owned()),
+            ),
+            (
+                "expected_pull_request_revision",
+                revision_json(capability.expected_pull_request_revision())?,
+            ),
+            (
+                "pull_request_id",
+                JsonValue::String(capability.pull_request_id().as_str().to_owned()),
+            ),
+            (
+                "readiness",
+                JsonValue::String(capability.readiness().as_str().to_owned()),
+            ),
+            (
+                "receipt_correlation_digest",
+                JsonValue::String(capability.receipt_correlation_digest().as_str().to_owned()),
+            ),
+        ]),
+    };
     Ok(object(vec![
+        (
+            "agent_deliverable_comments",
+            JsonValue::Array(agent_deliverable_comments),
+        ),
+        ("merge_pull_request", merge_pull_request),
+        ("open_pull_request", open_pull_request),
         (
             "project",
             JsonValue::String(value.project().as_str().to_owned()),
         ),
         ("rerunnable_checks", JsonValue::Array(rerunnable_checks)),
         ("schema", JsonValue::String(PLATFORM_SCHEMA_V2.to_owned())),
+        ("update_pull_request", update_pull_request),
         (
             "snapshot_revision",
             JsonValue::Integer(
@@ -1510,12 +1989,16 @@ fn review_capabilities(value: &JsonValue) -> Result<ReviewCapabilities, Platform
     exact_fields(
         value,
         &[
+            "agent_deliverable_comments",
+            "merge_pull_request",
+            "open_pull_request",
             "project",
             "rerunnable_checks",
             "schema",
             "snapshot_revision",
             "workspace",
             "workspace_revision",
+            "update_pull_request",
         ],
     )?;
     if string(value, "schema")? != PLATFORM_SCHEMA_V2 {
@@ -1570,6 +2053,46 @@ fn review_capabilities(value: &JsonValue) -> Result<ReviewCapabilities, Platform
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let JsonValue::Array(deliverable) = value
+        .get("agent_deliverable_comments")
+        .ok_or(PlatformV2TransportError::InvalidBody)?
+    else {
+        return Err(PlatformV2TransportError::InvalidBody);
+    };
+    let deliverable = deliverable
+        .iter()
+        .map(|comment| {
+            exact_fields(
+                comment,
+                &["authority", "comment_id", "expected_comment_revision"],
+            )?;
+            let authority = comment
+                .get("authority")
+                .ok_or(PlatformV2TransportError::InvalidBody)?;
+            exact_fields(authority, &["id", "kind"])?;
+            let authority = ReviewAuthority::new(
+                ReviewAuthorityKind::parse(string(authority, "kind")?)
+                    .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+                crate::platform_v2_review::ReviewAuthorityId::new(
+                    string(authority, "id")?.to_owned(),
+                )
+                .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+            );
+            let revision = comment
+                .get("expected_comment_revision")
+                .and_then(JsonValue::as_integer)
+                .and_then(|value| u64::try_from(value).ok())
+                .and_then(|value| Revision::new(value).ok())
+                .ok_or(PlatformV2TransportError::InvalidBody)?;
+            ReviewAgentDeliveryCapability::new(
+                ReviewCommentId::new(string(comment, "comment_id")?.to_owned())
+                    .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+                revision,
+                authority,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let pull_request = review_pull_request_capabilities(value)?;
     let snapshot_revision = value
         .get("snapshot_revision")
         .and_then(JsonValue::as_integer)
@@ -1593,7 +2116,134 @@ fn review_capabilities(value: &JsonValue) -> Result<ReviewCapabilities, Platform
         snapshot_revision,
         workspace_revision,
         checks,
+        deliverable,
+        pull_request,
     )
+}
+
+fn pull_request_slot<'a>(
+    value: &'a JsonValue,
+    field: &'static str,
+    fields: &[&str],
+) -> Result<Option<&'a JsonValue>, PlatformV2TransportError> {
+    match value.get(field) {
+        Some(JsonValue::Null) => Ok(None),
+        Some(slot) => {
+            exact_fields(slot, fields)?;
+            Ok(Some(slot))
+        }
+        None => Err(PlatformV2TransportError::InvalidBody),
+    }
+}
+
+fn pull_request_authority(value: &JsonValue) -> Result<ReviewAuthority, PlatformV2TransportError> {
+    let authority = value
+        .get("authority")
+        .ok_or(PlatformV2TransportError::InvalidBody)?;
+    exact_fields(authority, &["id", "kind"])?;
+    Ok(ReviewAuthority::new(
+        ReviewAuthorityKind::parse(string(authority, "kind")?)
+            .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+        crate::platform_v2_review::ReviewAuthorityId::new(string(authority, "id")?.to_owned())
+            .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+    ))
+}
+
+fn pull_request_revision(
+    value: &JsonValue,
+    field: &'static str,
+) -> Result<Revision, PlatformV2TransportError> {
+    value
+        .get(field)
+        .and_then(JsonValue::as_integer)
+        .and_then(|value| u64::try_from(value).ok())
+        .and_then(|value| Revision::new(value).ok())
+        .ok_or(PlatformV2TransportError::InvalidBody)
+}
+
+fn review_pull_request_capabilities(
+    value: &JsonValue,
+) -> Result<ReviewPullRequestCapabilities, PlatformV2TransportError> {
+    let open = pull_request_slot(
+        value,
+        "open_pull_request",
+        &[
+            "authority",
+            "confirmation_digest",
+            "expected_pull_request_revision",
+            "receipt_correlation_digest",
+        ],
+    )?
+    .map(|slot| {
+        ReviewPullRequestOpenCapability::new(
+            pull_request_revision(slot, "expected_pull_request_revision")?,
+            pull_request_authority(slot)?,
+            ReviewConfirmationDigest::new(string(slot, "confirmation_digest")?.to_owned())?,
+            ReviewReceiptCorrelationDigest::new(
+                string(slot, "receipt_correlation_digest")?.to_owned(),
+            )?,
+        )
+    })
+    .transpose()?;
+    let update = pull_request_slot(
+        value,
+        "update_pull_request",
+        &[
+            "authority",
+            "confirmation_digest",
+            "expected_pull_request_revision",
+            "pull_request_id",
+            "receipt_correlation_digest",
+        ],
+    )?
+    .map(|slot| {
+        ReviewPullRequestUpdateCapability::new(
+            PullRequestId::new(string(slot, "pull_request_id")?.to_owned())
+                .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+            pull_request_revision(slot, "expected_pull_request_revision")?,
+            pull_request_authority(slot)?,
+            ReviewConfirmationDigest::new(string(slot, "confirmation_digest")?.to_owned())?,
+            ReviewReceiptCorrelationDigest::new(
+                string(slot, "receipt_correlation_digest")?.to_owned(),
+            )?,
+        )
+    })
+    .transpose()?;
+    let merge = pull_request_slot(
+        value,
+        "merge_pull_request",
+        &[
+            "authority",
+            "confirmation_digest",
+            "expected_head_revision",
+            "expected_pull_request_revision",
+            "pull_request_id",
+            "readiness",
+            "receipt_correlation_digest",
+        ],
+    )?
+    .map(|slot| {
+        ReviewPullRequestMergeCapability::new(
+            PullRequestId::new(string(slot, "pull_request_id")?.to_owned())
+                .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+            pull_request_revision(slot, "expected_pull_request_revision")?,
+            ReviewField::new(string(slot, "expected_head_revision")?.to_owned())
+                .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+            MergeReadiness::parse(string(slot, "readiness")?)
+                .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+            pull_request_authority(slot)?,
+            ReviewConfirmationDigest::new(string(slot, "confirmation_digest")?.to_owned())?,
+            ReviewReceiptCorrelationDigest::new(
+                string(slot, "receipt_correlation_digest")?.to_owned(),
+            )?,
+        )
+    })
+    .transpose()?;
+    Ok(ReviewPullRequestCapabilities {
+        open,
+        update,
+        merge,
+    })
 }
 
 fn request_kind(value: &PlatformV2Request) -> &'static str {
