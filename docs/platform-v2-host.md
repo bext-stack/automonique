@@ -700,8 +700,17 @@ reads, check reruns, and review-receipt lookup require independent
 limited to local `add_comment` and `approve_review`; it never grants a rerun. A
 rerun grant accepts only the typed `rerun_check` action, and the web cockpit
 shows it only when the exact live-preflighted check/revision capability matches
-its fresh review snapshot. Provider-session, Git/filesystem, and pull-request
-action families remain refused before the daemon socket. Custody is capped at
+its fresh review snapshot. Pull-request open, update and merge require three
+further independent grants, `open_pull_request`, `update_pull_request` and
+`merge_pull_request`. They are three because merge is withheld on its own: a
+delegation may propose changes without being able to land them. None is
+conferred by the historical execute grant or by any broader grant, and there is
+no default set, so an operator confers each one deliberately. A held grant is
+not sufficient on its own: the installed GitHub credential must separately
+carry `pull_request_write`, and a merge `pull_request_merge` on top, and
+neither fence can be satisfied by the other. Provider-session and
+Git/filesystem action families remain refused before the daemon socket.
+Custody is capped at
 128 live entries per credential, survives process
 restart and same-delegation access-token rotation, and is deleted on delegation
 regrant or credential revocation. Thus another same-project credential and a

@@ -5358,7 +5358,7 @@ mod tests {
     }
 
     impl PullRequestFixture {
-        fn new(projection: PullRequestProjection, merge_scope: bool) -> Self {
+        fn new(projection: PullRequestProjection, write_scope: bool, merge_scope: bool) -> Self {
             let directory = tempfile::tempdir().unwrap();
             fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
             let uid = nix::unistd::geteuid().as_raw();
@@ -5425,7 +5425,7 @@ mod tests {
                 "version":1,"generation":"pull-request-credentials-test",
                 "credentials":[{"reference":"github-pull-request-mobile",
                     "repository":"example-org/example-repo","actions_write":false,
-                    "pull_request_write":true,"pull_request_merge":merge_scope,
+                    "pull_request_write":write_scope,"pull_request_merge":merge_scope,
                     "token":"github_pat_test_only_not_a_secret"}]
             });
             for (path, document) in [
@@ -5467,6 +5467,10 @@ mod tests {
         }
 
         fn absent() -> Self {
+            Self::absent_scoped(true)
+        }
+
+        fn absent_scoped(write_scope: bool) -> Self {
             Self::new(
                 PullRequestProjection::new(
                     None,
@@ -5482,11 +5486,16 @@ mod tests {
                     .unwrap(),
                 )
                 .unwrap(),
+                write_scope,
                 false,
             )
         }
 
         fn open(readiness: MergeReadiness, merge_scope: bool) -> Self {
+            Self::open_scoped(readiness, true, merge_scope)
+        }
+
+        fn open_scoped(readiness: MergeReadiness, write_scope: bool, merge_scope: bool) -> Self {
             Self::new(
                 PullRequestProjection::new(
                     Some(PullRequestId::new("77").unwrap()),
@@ -5502,6 +5511,7 @@ mod tests {
                     .unwrap(),
                 )
                 .unwrap(),
+                write_scope,
                 merge_scope,
             )
         }
@@ -5775,6 +5785,105 @@ mod tests {
             "platform_v2_review_pull_request_merge_unavailable"
         );
         assert_eq!(withheld.writes.load(Ordering::SeqCst), 0);
+    }
+
+    /// The credential scope is a second fence, not a restatement of the first.
+    ///
+    /// A mobile delegation can now carry `open_pull_request`,
+    /// `update_pull_request` and `merge_pull_request`, and the bridge lets a
+    /// request holding one through. This pins what it is let through *into*:
+    /// the installed GitHub credential must separately carry
+    /// `pull_request_write`, and a merge `pull_request_merge` on top. The two
+    /// fences are held by different parties on different media — a delegation
+    /// in the mobile credential database, a scope in a uid-private credential
+    /// document the daemon reads — and neither can supply the other.
+    ///
+    /// The call is made with the confirmation and correlation a *fully
+    /// scoped* deployment minted, so the caller presents the strongest token
+    /// this surface ever issues. It is still refused, and refused for the
+    /// credential's own reason rather than a generic denial, so an operator
+    /// reading the category learns which fence answered. Nothing reaches the
+    /// provider.
+    #[test]
+    fn a_delegated_pull_request_family_still_needs_its_credential_scope() {
+        let scoped = PullRequestFixture::open(MergeReadiness::Ready, true);
+        let capabilities = scoped.capabilities();
+        let update = capabilities.update_pull_request().expect("update").clone();
+        let merge = capabilities.merge_pull_request().expect("merge").clone();
+        let opener = PullRequestFixture::absent();
+        let open = opener
+            .capabilities()
+            .open_pull_request()
+            .expect("open")
+            .clone();
+
+        // An unscoped credential advertises nothing, so a client that asked
+        // honestly would never construct these calls at all.
+        let unscoped_open = PullRequestFixture::absent_scoped(false);
+        let unscoped = PullRequestFixture::open_scoped(MergeReadiness::Ready, false, false);
+        assert_eq!(
+            unscoped_open.capabilities().open_pull_request(),
+            None,
+            "an unscoped credential must advertise no open",
+        );
+        assert_eq!(
+            unscoped.capabilities().update_pull_request(),
+            None,
+            "an unscoped credential must advertise no update",
+        );
+        assert_eq!(
+            unscoped.capabilities().merge_pull_request(),
+            None,
+            "an unscoped credential must advertise no merge",
+        );
+
+        assert_eq!(
+            refusal_category(&unscoped_open.execute(
+                ReviewAction::OpenPullRequest {
+                    expected_pull_request_revision: Revision::new(8).unwrap(),
+                    title: ReviewField::new("Proposer le correctif").unwrap(),
+                },
+                "open-unscoped",
+                open.confirmation_digest(),
+                open.receipt_correlation_digest(),
+                2_100,
+            )),
+            "platform_v2_review_pull_request_credential_unavailable",
+        );
+        assert_eq!(
+            refusal_category(&unscoped.execute(
+                ReviewAction::UpdatePullRequest {
+                    pull_request_id: PullRequestId::new("77").unwrap(),
+                    expected_pull_request_revision: Revision::new(8).unwrap(),
+                    title: ReviewField::new("Proposer le correctif").unwrap(),
+                },
+                "update-unscoped",
+                update.confirmation_digest(),
+                update.receipt_correlation_digest(),
+                2_100,
+            )),
+            "platform_v2_review_pull_request_credential_unavailable",
+        );
+        // Merge on an unscoped credential is stopped by the missing write
+        // scope, which is the outer of the two credential fences. The inner
+        // one, a write-scoped credential without merge, is
+        // `a_withheld_merge_scope_refuses_before_any_provider_call`.
+        assert_eq!(
+            refusal_category(&unscoped.execute(
+                ReviewAction::MergePullRequest {
+                    pull_request_id: PullRequestId::new("77").unwrap(),
+                    expected_pull_request_revision: Revision::new(8).unwrap(),
+                    expected_head_revision: ReviewField::new(PULL_REQUEST_HEAD).unwrap(),
+                },
+                "merge-unscoped",
+                merge.confirmation_digest(),
+                merge.receipt_correlation_digest(),
+                2_100,
+            )),
+            "platform_v2_review_pull_request_credential_unavailable",
+        );
+        assert_eq!(unscoped_open.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(unscoped.writes.load(Ordering::SeqCst), 0);
     }
 
     #[derive(Default)]

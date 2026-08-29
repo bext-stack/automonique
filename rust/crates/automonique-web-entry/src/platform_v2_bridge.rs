@@ -354,6 +354,14 @@ impl PlatformV2Bridge {
                     MobilePlatformV2Action::ExecuteReviewAction
                 }
                 ReviewAction::RerunCheck { .. } => MobilePlatformV2Action::RerunCheck,
+                // Three arms, never one, and never folded into
+                // `ExecuteReviewAction`. Each family is checked against its
+                // own grant below, so a delegation that may open and update a
+                // pull request still cannot land one, and the broad
+                // review-execution grant confers none of the three.
+                ReviewAction::OpenPullRequest { .. } => MobilePlatformV2Action::OpenPullRequest,
+                ReviewAction::UpdatePullRequest { .. } => MobilePlatformV2Action::UpdatePullRequest,
+                ReviewAction::MergePullRequest { .. } => MobilePlatformV2Action::MergePullRequest,
                 _ => return Err("platform_v2_mobile_action_denied"),
             },
             PlatformV2Request::GetReviewReceipt(_) => MobilePlatformV2Action::GetReviewReceipt,
@@ -1330,6 +1338,16 @@ mod tests {
         );
     }
 
+    /// The generic review-execution grant reaches only the two local actions.
+    ///
+    /// Every other action in the list is refused for one of two distinct
+    /// reasons, and the shared category hides the difference, so it is worth
+    /// naming. The git and agent-delivery families have no delegation member
+    /// at all and so cannot be reached from a phone by any grant. The three
+    /// pull-request families do have members now, and are refused here only
+    /// because this delegation does not hold them;
+    /// `mobile_pull_request_families_are_three_separately_withheld_grants`
+    /// pins that boundary per family.
     #[test]
     fn mobile_review_execution_refuses_every_non_local_action_before_the_socket() {
         let root = tempfile::tempdir().unwrap();
@@ -2146,37 +2164,47 @@ mod tests {
         server.join().unwrap();
     }
 
-    /// Pins a deliberate gap rather than a finished behavior.
+    /// Pins the boundary the three pull-request grants now draw.
     ///
-    /// `mobile_review_execution_refuses_every_non_local_action_before_the_socket`
-    /// already shows pull-request actions refused while the client holds only
-    /// the generic `ExecuteReviewAction` grant. This pins the stronger claim
-    /// that gap depends on: holding *every* action the delegation vocabulary
-    /// has still buys no pull-request authority.
+    /// This replaces `holding_every_mobile_action_still_buys_no_pull_request_authority`,
+    /// which pinned the opposite claim: that no delegation, however broad,
+    /// bought any pull-request authority, because the bridge mapped no
+    /// request onto the three members. That gap was deliberate and it is now
+    /// deliberately closed. A delegated mobile credential can open, update
+    /// and merge pull requests where it could not before, so this test exists
+    /// to say exactly how narrow the new permission is. Anyone loosening it
+    /// should trip an assertion that explains what it protected.
     ///
-    /// That claim used to rest on the vocabulary being unable to name the
-    /// power at all. It no longer does. `MobilePlatformV2Action` now carries
-    /// `OpenPullRequest`, `UpdatePullRequest` and `MergePullRequest` as three
-    /// separate members, so a deployment can express withholding merge while
-    /// allowing the other two, and `ALL` has widened accordingly. The test
-    /// still passes, and that is the point: naming a power is not granting
-    /// it. The bridge maps no request onto any of the three, so they are
-    /// vocabulary without reach.
+    /// Three claims, one per property the split exists for.
     ///
-    /// Wiring that mapping is the deliberate step that turns them into live
-    /// grants, and it belongs with the adapter that can actually perform the
-    /// write. When someone does it, this test breaks, which is the intent.
+    /// 1. Each family needs its own grant. A delegation holding every other
+    ///    action the vocabulary has, the broad `ExecuteReviewAction` and the
+    ///    two neighbouring pull-request families included, is still refused
+    ///    the one family it withheld.
+    /// 2. Merge is withholdable on its own. Open-and-update is the state a
+    ///    deployment lands in when it wants proposals from a phone but never
+    ///    a landing, and it must refuse a merge while carrying the other two.
+    /// 3. The broad review-execution grant confers none of the three. It is
+    ///    the grant an existing deployment already holds, so a pull-request
+    ///    write must not arrive as a side effect of an upgrade.
     ///
-    /// The approved action at the end gives the assertion its teeth: on the
-    /// same grant, workspace, and absent socket it reaches the daemon and
-    /// reports `platform_v2_bridge_unavailable`, so the refusals above are
-    /// the action mapping's and not an artifact of the missing socket.
+    /// A held grant is not the last fence, only the first. It carries the
+    /// request past the bridge and no further: the socket is absent here, so
+    /// a permitted family reports `platform_v2_bridge_unavailable`. Behind
+    /// the bridge stands the installed GitHub credential's own
+    /// `pull_request_write` and `pull_request_merge` scopes, pinned in the
+    /// daemon by `a_withheld_merge_scope_refuses_before_any_provider_call`,
+    /// `a_delegated_pull_request_family_still_needs_its_credential_scope` and
+    /// `a_fully_scoped_pull_request_credential_still_proves_nothing_by_itself`.
+    /// Neither fence subsumes the other: a delegation grant cannot supply a
+    /// credential scope, and a fully scoped credential cannot supply a grant.
     ///
-    /// Closing this gap is not an enum addition. It is the first delegated
-    /// authority that writes outside the daemon's trust boundary, and merging
-    /// must stay separately withholdable from opening and updating.
+    /// The assertions rest on `platform_v2_mobile_action_denied` being only
+    /// ever the bridge's answer. Reaching `platform_v2_bridge_unavailable` on
+    /// the same workspace and absent socket proves a refusal is the action
+    /// mapping's and not an artifact of the missing socket.
     #[test]
-    fn holding_every_mobile_action_still_buys_no_pull_request_authority() {
+    fn mobile_pull_request_families_are_three_separately_withheld_grants() {
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let uid = nix::unistd::geteuid().as_raw();
@@ -2194,20 +2222,19 @@ mod tests {
             "actor-test",
         )
         .unwrap();
-        let authorization = grant_mobile(
-            &mut authority,
-            MobilePlatformV2Action::ALL.to_vec(),
-            vec!["project-test"],
-        );
         let workspace = WorkContextIdentity::UserWorkspace(
             automonique_protocol::platform_v2::UserWorkspaceId::new("workspace-test").unwrap(),
         );
-        let mut refusal_category = |action: ReviewAction, key: &str| {
-            // A pull-request action can only be spelled with a confirmation
-            // now that the daemon can mint one. The digests here are
-            // fabricated on purpose: the bridge must deny the action before
-            // anything is in a position to check them.
-            let key = key.to_owned();
+
+        let send = |authority: &mut MobileCredentialAuthority,
+                    authorization: &MobilePlatformV2Authorization,
+                    action: ReviewAction,
+                    key: &str|
+         -> Result<String, &'static str> {
+            // The digests below are fabricated on purpose. The bridge must
+            // answer before anything is in a position to check them, so a
+            // request that got as far as a digest check would be evidence the
+            // grant fence had already been passed.
             let transport = if action.requires_confirmation() {
                 ReviewActionTransportRequest::new_confirmed_correlated(
                     workspace.clone(),
@@ -2240,8 +2267,8 @@ mod tests {
             let response = bridge.exchange_mobile(
                 PlatformV2Lane::V2,
                 &request.to_canonical_bytes().unwrap(),
-                &authorization,
-                &mut authority,
+                authorization,
+                authority,
                 1_002,
             )?;
             let response =
@@ -2252,46 +2279,148 @@ mod tests {
             }
         };
 
-        for (index, action) in [
-            ReviewAction::OpenPullRequest {
+        let family_action = |family: MobilePlatformV2Action| match family {
+            MobilePlatformV2Action::OpenPullRequest => ReviewAction::OpenPullRequest {
                 expected_pull_request_revision: Revision::FIRST,
                 title: ReviewField::new("Title").unwrap(),
             },
-            ReviewAction::UpdatePullRequest {
-                pull_request_id: PullRequestId::new("pull-request-1").unwrap(),
+            MobilePlatformV2Action::UpdatePullRequest => ReviewAction::UpdatePullRequest {
+                pull_request_id: PullRequestId::new("77").unwrap(),
                 expected_pull_request_revision: Revision::FIRST,
                 title: ReviewField::new("Title").unwrap(),
             },
-            ReviewAction::MergePullRequest {
-                pull_request_id: PullRequestId::new("pull-request-1").unwrap(),
+            MobilePlatformV2Action::MergePullRequest => ReviewAction::MergePullRequest {
+                pull_request_id: PullRequestId::new("77").unwrap(),
                 expected_pull_request_revision: Revision::FIRST,
                 expected_head_revision: ReviewField::new(
                     "0123456789abcdef0123456789abcdef01234567",
                 )
                 .unwrap(),
             },
+            other => panic!("{other:?} is not a pull-request family"),
+        };
+        let families = [
+            MobilePlatformV2Action::OpenPullRequest,
+            MobilePlatformV2Action::UpdatePullRequest,
+            MobilePlatformV2Action::MergePullRequest,
+        ];
+
+        // 1. Withholding one family denies exactly that family, on a
+        //    delegation holding literally everything else.
+        for (index, withheld) in families.into_iter().enumerate() {
+            let authorization = grant_mobile(
+                &mut authority,
+                MobilePlatformV2Action::ALL
+                    .into_iter()
+                    .filter(|action| *action != withheld)
+                    .collect(),
+                vec!["project-test"],
+            );
+            assert_eq!(
+                send(
+                    &mut authority,
+                    &authorization,
+                    family_action(withheld),
+                    &format!("withheld-{index}"),
+                )
+                .as_deref(),
+                Ok("platform_v2_mobile_action_denied"),
+                "{withheld:?} must need its own grant, never a broader one",
+            );
+            for (held_index, held) in families
+                .into_iter()
+                .enumerate()
+                .filter(|(_, held)| *held != withheld)
+            {
+                assert_eq!(
+                    send(
+                        &mut authority,
+                        &authorization,
+                        family_action(held),
+                        &format!("held-{index}-{held_index}"),
+                    ),
+                    Err("platform_v2_bridge_unavailable"),
+                    "{held:?} must still reach the daemon on the same delegation",
+                );
+            }
+        }
+
+        // 2. Open and update without merge: the proposer delegation.
+        let proposer = grant_mobile(
+            &mut authority,
+            vec![
+                MobilePlatformV2Action::OpenPullRequest,
+                MobilePlatformV2Action::UpdatePullRequest,
+            ],
+            vec!["project-test"],
+        );
+        for (index, held) in [
+            MobilePlatformV2Action::OpenPullRequest,
+            MobilePlatformV2Action::UpdatePullRequest,
         ]
         .into_iter()
         .enumerate()
         {
-            let kind = action.kind();
             assert_eq!(
-                refusal_category(action, &index.to_string()).as_deref(),
-                Ok("platform_v2_mobile_action_denied"),
-                "{kind:?} must be denied by the action mapping",
+                send(
+                    &mut authority,
+                    &proposer,
+                    family_action(held),
+                    &format!("proposer-{index}"),
+                ),
+                Err("platform_v2_bridge_unavailable"),
+                "{held:?} must be reachable on the proposer delegation",
             );
         }
-
-        // The same grant, workspace, and absent socket carry an approved
-        // action past the mapping, so the refusals above are the mapping's.
         assert_eq!(
-            refusal_category(
+            send(
+                &mut authority,
+                &proposer,
+                family_action(MobilePlatformV2Action::MergePullRequest),
+                "proposer-merge",
+            )
+            .as_deref(),
+            Ok("platform_v2_mobile_action_denied"),
+            "a delegation that may propose changes must never land them",
+        );
+
+        // 3. The grant an existing deployment already holds reaches none of
+        //    the three, so no pull-request write arrives by upgrade.
+        let broad = grant_mobile(
+            &mut authority,
+            vec![
+                MobilePlatformV2Action::GetReviewCapabilities,
+                MobilePlatformV2Action::ExecuteReviewAction,
+                MobilePlatformV2Action::RerunCheck,
+                MobilePlatformV2Action::GetReviewReceipt,
+            ],
+            vec!["project-test"],
+        );
+        for (index, family) in families.into_iter().enumerate() {
+            assert_eq!(
+                send(
+                    &mut authority,
+                    &broad,
+                    family_action(family),
+                    &format!("broad-{index}"),
+                )
+                .as_deref(),
+                Ok("platform_v2_mobile_action_denied"),
+                "{family:?} must not ride in on the broad review-execution grant",
+            );
+        }
+        // The same delegation, workspace and absent socket carry an approval
+        // past the mapping, so the refusals above are the mapping's.
+        assert_eq!(
+            send(
+                &mut authority,
+                &broad,
                 ReviewAction::ApproveReview {
                     expected_review_revision: Revision::FIRST,
                 },
-                "approved",
+                "broad-approve",
             ),
-            Err("platform_v2_bridge_unavailable")
+            Err("platform_v2_bridge_unavailable"),
         );
     }
 }

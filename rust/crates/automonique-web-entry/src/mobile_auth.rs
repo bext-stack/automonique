@@ -209,11 +209,19 @@ pub enum MobilePlatformV2Action {
     // trigger a deploy, so a delegation that may open and update a pull
     // request must still be unable to land it.
     //
-    // Adding these to the vocabulary does not make them reachable: the bridge
-    // maps no request onto them, so a delegation holding all three still buys
-    // no pull-request authority today. Wiring that mapping is the deliberate
-    // step that turns these into live grants, and it belongs with the adapter
-    // that can actually perform the write.
+    // These are live grants: `authorize_mobile_request` maps each
+    // pull-request review action onto its own member here, so a delegation
+    // carrying one of them can drive that write from a phone. They are the
+    // first delegated authority that writes outside the daemon's trust
+    // boundary, and nothing confers them implicitly — `admit_platform_v2_scope`
+    // takes exactly the set an operator named, there is no default and no
+    // "everything" shorthand, and the broader `ExecuteReviewAction` grant
+    // reaches none of the three.
+    //
+    // Holding one is still not enough to write. The installed GitHub
+    // credential must separately carry `pull_request_write`, and a merge
+    // needs `pull_request_merge` on top; that fence lives in the daemon and
+    // neither side subsumes the other.
     OpenPullRequest,
     UpdatePullRequest,
     MergePullRequest,
@@ -2656,6 +2664,16 @@ mod tests {
         );
     }
 
+    /// The whole vocabulary is grantable at once, and it goes out in exactly
+    /// this order under exactly these names.
+    ///
+    /// The order is a wire contract, not a formatting detail. A delegation's
+    /// actions are sorted by this enum's declaration order, and the SDK's
+    /// `MOBILE_PLATFORM_V2_ACTIONS` reproduces that ordering by index to
+    /// decide whether a server document is validly sorted. Reordering a
+    /// member here, or inserting one anywhere but the end, makes documents
+    /// this server mints undecodable by clients that have not moved in
+    /// lockstep, so the names are spelled out rather than derived.
     #[test]
     fn every_platform_v2_action_remains_grantable_together() {
         let (_root, mut auth) = authority();
@@ -2671,6 +2689,28 @@ mod tests {
             )
             .expect("complete Platform v2 grant");
         assert_eq!(descriptor.actions, MobilePlatformV2Action::ALL.to_vec());
+        assert_eq!(
+            serde_json::to_value(&descriptor.actions).expect("action wire"),
+            serde_json::json!([
+                "query_work_contexts",
+                "get_lineage",
+                "prepare_mutation",
+                "decide_mutation",
+                "submit_mutation",
+                "get_mutation_receipt",
+                "submit_workspace_intent",
+                "get_workspace_intent",
+                "get_review",
+                "get_attention_source_snapshot",
+                "get_review_capabilities",
+                "execute_review_action",
+                "rerun_check",
+                "get_review_receipt",
+                "open_pull_request",
+                "update_pull_request",
+                "merge_pull_request"
+            ]),
+        );
     }
 
     #[test]

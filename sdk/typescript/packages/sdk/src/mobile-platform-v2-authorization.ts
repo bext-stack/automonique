@@ -24,6 +24,19 @@ export const MOBILE_PLATFORM_V2_AUTHORIZATION_MEDIA_TYPE =
   "application/vnd.automonique.mobile-platform-v2-authorization.v1+json" as const;
 export const MAX_MOBILE_V2_PROJECT_ROOTS = 32;
 
+// Order is load-bearing, not cosmetic. The server sorts a delegation's
+// actions by the declaration order of its `MobilePlatformV2Action` enum, and
+// both the encoder and the decoder here reproduce that ordering by index into
+// this array. A member inserted anywhere but the end, or in a different order
+// than the Rust enum, silently makes valid server documents undecodable.
+//
+// The three pull-request members are the only ones that can write outside the
+// daemon's trust boundary. They are three, not one, because they are withheld
+// independently: a delegation may carry open and update while merge stays
+// refused. Naming one here is not holding it -- an operator names the exact
+// set in the grant request, and the installed GitHub credential must
+// separately carry the matching `pull_request_write` / `pull_request_merge`
+// scope before any of them can write.
 export const MOBILE_PLATFORM_V2_ACTIONS = [
   "query_work_contexts",
   "get_lineage",
@@ -39,6 +52,9 @@ export const MOBILE_PLATFORM_V2_ACTIONS = [
   "execute_review_action",
   "rerun_check",
   "get_review_receipt",
+  "open_pull_request",
+  "update_pull_request",
+  "merge_pull_request",
 ] as const;
 
 export type MobilePlatformV2Action =

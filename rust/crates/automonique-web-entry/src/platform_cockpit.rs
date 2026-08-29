@@ -25,15 +25,16 @@ use automonique_protocol::platform_v2_lineage::{
 use automonique_protocol::platform_v2_lineage_api::encode_lineage_projection;
 use automonique_protocol::platform_v2_lineage_api::encode_workspace_intent_outcome;
 use automonique_protocol::platform_v2_review::{
-    DiffSide, ReviewAction, ReviewActionReceipt, ReviewAnchor, ReviewCheckId, ReviewCommentId,
-    ReviewDecision, ReviewFileId, ReviewFreshnessState, ReviewHunkId, ReviewSnapshot, ReviewText,
+    DiffSide, MergeReadiness, PullRequestState, ReviewAction, ReviewActionReceipt, ReviewAnchor,
+    ReviewCheckId, ReviewCommentId, ReviewDecision, ReviewFileId, ReviewFreshnessState,
+    ReviewHunkId, ReviewSnapshot, ReviewText,
 };
 use automonique_protocol::platform_v2_review_api::{
     encode_review_action_receipt, encode_review_snapshot,
 };
 use automonique_protocol::platform_v2_transport::{
     LifecycleCapabilities, LineageReadRequest, PlatformV2Request, PlatformV2Response,
-    ReviewActionTransportRequest, ReviewConfirmationDigest, ReviewReadRequest,
+    ReviewActionTransportRequest, ReviewCapabilities, ReviewConfirmationDigest, ReviewReadRequest,
     ReviewReceiptCorrelationDigest, ReviewReceiptLookup, WorkspaceIntentLookup,
     WorkspaceIntentRequest,
 };
@@ -630,11 +631,153 @@ fn external_work_json(value: &ExternalWorkIdentity) -> Value {
     })
 }
 
+/// Project whichever of the three pull-request controls the server proved.
+///
+/// This replaces a hardcoded `false`, the way PR #221 replaced one for agent
+/// delivery. The daemon can now mint `open_pull_request`,
+/// `update_pull_request` and `merge_pull_request` slots, but only from a live,
+/// mutation-free provider read, so a permanent `false` here would have kept
+/// controls unreachable that the server was already willing to prove.
+///
+/// Three independent projections, never one pull-request block, because the
+/// powers are withheld independently. A workspace whose installed credential
+/// carries `pull_request_write` but not `pull_request_merge` legitimately
+/// offers open or update while `merge_pull_request` stays empty, and the
+/// cockpit has to render exactly that rather than a single family toggle.
+///
+/// Every slot is filtered against the snapshot the browser is looking at, not
+/// trusted on its own. The capability was minted against some revision of the
+/// pull-request projection; if the projection has moved since, the control
+/// would be refused by `resolve_action` on arrival, so it is not offered. This
+/// is the same rule the rerun and delivery projections apply, and it is the
+/// only thing keeping a stale capability read from rendering a button that
+/// always fails.
+fn pull_request_controls(
+    exact: Option<(&WorkContextRecord, &ProjectId, &ReviewSnapshot)>,
+    capabilities: Option<&ReviewCapabilities>,
+) -> (Value, Value, Value) {
+    let (open, update, merge) = match exact.zip(capabilities) {
+        Some(((workspace, project, snapshot), capabilities)) => {
+            let projection = snapshot.pull_request();
+            let observed = projection.freshness().observed_revision();
+            let coordinate = || {
+                json!({
+                    "project_id": project.as_str(),
+                    "workspace_id": workspace.identity().id(),
+                    "exact_revision": snapshot.revision().to_string(),
+                    "exact_pull_request_revision": observed.to_string()
+                })
+            };
+            let with = |extra: Vec<(&str, Value)>,
+                        confirmation: &ReviewConfirmationDigest,
+                        correlation: &ReviewReceiptCorrelationDigest| {
+                let mut target = coordinate();
+                let object = target.as_object_mut().expect("object target");
+                for (key, value) in extra {
+                    object.insert(key.to_owned(), value);
+                }
+                object.insert(
+                    "confirmation_digest".to_owned(),
+                    json!(confirmation.as_str()),
+                );
+                object.insert(
+                    "receipt_correlation_digest".to_owned(),
+                    json!(correlation.as_str()),
+                );
+                target
+            };
+            // An open is offered only while the snapshot still says there is
+            // nothing to open onto. A pull request that appeared since the
+            // capability was minted must not be silently reopened.
+            let open = capabilities
+                .open_pull_request()
+                .filter(|capability| {
+                    projection.state() == PullRequestState::Absent
+                        && capability.expected_pull_request_revision() == observed
+                })
+                .map(|capability| {
+                    with(
+                        Vec::new(),
+                        capability.confirmation_digest(),
+                        capability.receipt_correlation_digest(),
+                    )
+                });
+            let update = capabilities
+                .update_pull_request()
+                .filter(|capability| {
+                    matches!(
+                        projection.state(),
+                        PullRequestState::Draft | PullRequestState::Open
+                    ) && projection.id() == Some(capability.pull_request_id())
+                        && capability.expected_pull_request_revision() == observed
+                })
+                .map(|capability| {
+                    with(
+                        vec![(
+                            "pull_request_id",
+                            json!(capability.pull_request_id().as_str()),
+                        )],
+                        capability.confirmation_digest(),
+                        capability.receipt_correlation_digest(),
+                    )
+                });
+            // Merge carries two fences the other two do not, and both are
+            // re-checked here: the head the server pinned must still be the
+            // head the snapshot shows, and the snapshot must still call the
+            // pull request open and ready. A merge offered against a moved
+            // head is the failure this whole surface exists to prevent.
+            let merge = capabilities
+                .merge_pull_request()
+                .filter(|capability| {
+                    projection.state() == PullRequestState::Open
+                        && projection.readiness() == MergeReadiness::Ready
+                        && projection.id() == Some(capability.pull_request_id())
+                        && projection.head_revision() == Some(capability.expected_head_revision())
+                        && capability.expected_pull_request_revision() == observed
+                })
+                .map(|capability| {
+                    with(
+                        vec![
+                            (
+                                "pull_request_id",
+                                json!(capability.pull_request_id().as_str()),
+                            ),
+                            (
+                                "expected_head_revision",
+                                json!(capability.expected_head_revision().as_str()),
+                            ),
+                            ("readiness", json!(capability.readiness().as_str())),
+                        ],
+                        capability.confirmation_digest(),
+                        capability.receipt_correlation_digest(),
+                    )
+                });
+            (open, update, merge)
+        }
+        None => (None, None, None),
+    };
+    let control = |operation: &str, target: Option<Value>| {
+        let available = target.is_some();
+        json!({
+            "available": available,
+            "category": if available { Value::Null } else { json!("platform_cockpit_pull_request_family_unavailable") },
+            "execute_operation": if available { json!(operation) } else { Value::Null },
+            "receipt_operation": if available { json!("get_review_receipt") } else { Value::Null },
+            "targets": target.map(|value| vec![value]).unwrap_or_default()
+        })
+    };
+    (
+        control("open_pull_request", open),
+        control("update_pull_request", update),
+        control("merge_pull_request", merge),
+    )
+}
+
 fn review_actions(
     selected: Option<&WorkContextRecord>,
     selected_project: Option<&WorkContextIdentity>,
     snapshot: Option<&ReviewSnapshot>,
-    capabilities: Option<&automonique_protocol::platform_v2_transport::ReviewCapabilities>,
+    capabilities: Option<&ReviewCapabilities>,
 ) -> Value {
     let exact = selected.zip(snapshot).and_then(|(workspace, snapshot)| {
         let WorkContextIdentity::Project(project) = selected_project? else {
@@ -741,6 +884,8 @@ fn review_actions(
             "targets": deliverable_comments.clone()
         })
     };
+    let (open_pull_request, update_pull_request, merge_pull_request) =
+        pull_request_controls(exact, capabilities);
     let rerun_available = !rerunnable_checks.is_empty();
     let rerun = json!({
         "available": rerun_available,
@@ -762,9 +907,9 @@ fn review_actions(
             "commit": action(false, "platform_cockpit_git_family_unavailable"),
             "resolve_conflict": action(false, "platform_cockpit_git_family_unavailable"),
             "rerun_check": rerun,
-            "open_pull_request": action(false, "platform_cockpit_pull_request_family_unavailable"),
-            "update_pull_request": action(false, "platform_cockpit_pull_request_family_unavailable"),
-            "merge_pull_request": action(false, "platform_cockpit_pull_request_family_unavailable")
+            "open_pull_request": open_pull_request,
+            "update_pull_request": update_pull_request,
+            "merge_pull_request": merge_pull_request
         }
     })
 }
@@ -3039,5 +3184,212 @@ mod tests {
             projection["sources"]["review"]["category"],
             "review_refused"
         );
+    }
+
+    /// The cockpit offers a pull-request control only when the server proved
+    /// it and the snapshot still agrees, per family.
+    ///
+    /// Before this, all three families were a hardcoded `false`, which was
+    /// honest while nothing could prove them and would have become a lie the
+    /// moment the daemon could. The risk on the other side is the opposite
+    /// one: projecting a capability the snapshot has since outrun renders a
+    /// control that always refuses, and for a merge that control is the most
+    /// consequential in the surface.
+    ///
+    /// So this pins both directions. A withheld merge scope shows up here as
+    /// update-without-merge rather than as a pull-request family that is
+    /// wholly on or wholly off, and a capability minted against a pull
+    /// request, head or revision the snapshot no longer shows is dropped
+    /// rather than rendered.
+    #[test]
+    fn pull_request_controls_are_projected_per_family_and_filtered_by_the_snapshot() {
+        use automonique_protocol::platform_v2::{
+            WorkContextAttributes, WorkContextLabel, WorkContextRelation, WorkContextTargetKind,
+        };
+        use automonique_protocol::platform_v2_review::{
+            PullRequestId, ReviewAuthority, ReviewAuthorityId, ReviewAuthorityKind, ReviewField,
+        };
+        use automonique_protocol::platform_v2_review_api::decode_review_snapshot;
+        use automonique_protocol::platform_v2_transport::{
+            ReviewPullRequestCapabilities, ReviewPullRequestMergeCapability,
+            ReviewPullRequestOpenCapability, ReviewPullRequestUpdateCapability,
+        };
+
+        let project = ProjectId::new("project-1").unwrap();
+        let record = WorkContextRecord::new(
+            WorkContextIdentity::UserWorkspace(UserWorkspaceId::new("wc_user_1").unwrap()),
+            Revision::FIRST,
+            WorkContextLifecycle::Active,
+            WorkContextLabel::new("Workspace").unwrap(),
+            WorkContextAttributes::EMPTY,
+            vec![
+                WorkContextRelation::new(
+                    WorkContextRelationKind::UserWorkspaceProject,
+                    WorkContextIdentity::Project(project.clone()),
+                )
+                .unwrap(),
+                WorkContextRelation::new(
+                    WorkContextRelationKind::UserWorkspaceCheckout,
+                    WorkContextIdentity::parse_local(WorkContextTargetKind::Checkout, "checkout-1")
+                        .unwrap(),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        // The fixture carries an open, ready pull request `pr-1` observed at
+        // revision 8 on head `0123456789abcdef`.
+        let snapshot = decode_review_snapshot(&canonical_json_bytes(
+            &serde_json::from_slice::<Value>(include_bytes!(
+                "../../automonique-protocol/fixtures/platform-v2-review-v2.json"
+            ))
+            .unwrap(),
+        ))
+        .unwrap();
+        let observed = snapshot.pull_request().freshness().observed_revision();
+        let authority = ReviewAuthority::new(
+            ReviewAuthorityKind::PullRequest,
+            ReviewAuthorityId::new("authority-1").unwrap(),
+        );
+        let confirmation = ReviewConfirmationDigest::new("ab".repeat(32)).unwrap();
+        let correlation = ReviewReceiptCorrelationDigest::new("cd".repeat(32)).unwrap();
+        let update = |id: &str, revision: Revision| {
+            ReviewPullRequestUpdateCapability::new(
+                PullRequestId::new(id).unwrap(),
+                revision,
+                authority.clone(),
+                confirmation.clone(),
+                correlation.clone(),
+            )
+            .unwrap()
+        };
+        let merge = |id: &str, revision: Revision, head: &str| {
+            ReviewPullRequestMergeCapability::new(
+                PullRequestId::new(id).unwrap(),
+                revision,
+                ReviewField::new(head).unwrap(),
+                MergeReadiness::Ready,
+                authority.clone(),
+                confirmation.clone(),
+                correlation.clone(),
+            )
+            .unwrap()
+        };
+        let controls = |capabilities: ReviewPullRequestCapabilities| {
+            let capabilities = ReviewCapabilities::new(
+                project.clone(),
+                WorkContextIdentity::UserWorkspace(UserWorkspaceId::new("wc_user_1").unwrap()),
+                snapshot.revision(),
+                Revision::FIRST,
+                Vec::new(),
+                Vec::new(),
+                capabilities,
+            )
+            .unwrap();
+            let (open, update, merge) =
+                pull_request_controls(Some((&record, &project, &snapshot)), Some(&capabilities));
+            json!({ "open": open, "update": update, "merge": merge })
+        };
+
+        // Nothing selected and nothing proved: three unavailable controls,
+        // each carrying its own reason and no targets.
+        let (open, update_control, merge_control) = pull_request_controls(None, None);
+        for control in [&open, &update_control, &merge_control] {
+            assert_eq!(control["available"], false);
+            assert_eq!(
+                control["category"],
+                "platform_cockpit_pull_request_family_unavailable"
+            );
+            assert_eq!(control["targets"].as_array().unwrap().len(), 0);
+            assert!(control["execute_operation"].is_null());
+        }
+
+        // The fully scoped deployment: update and merge are both proved and
+        // both agree with the snapshot, so both are offered under their own
+        // operation names.
+        let full = controls(ReviewPullRequestCapabilities {
+            open: None,
+            update: Some(update("pr-1", observed)),
+            merge: Some(merge("pr-1", observed, "0123456789abcdef")),
+        });
+        assert_eq!(full["update"]["available"], true);
+        assert_eq!(full["update"]["execute_operation"], "update_pull_request");
+        assert_eq!(full["update"]["receipt_operation"], "get_review_receipt");
+        assert_eq!(full["update"]["targets"][0]["pull_request_id"], "pr-1");
+        assert_eq!(
+            full["update"]["targets"][0]["exact_pull_request_revision"],
+            observed.to_string()
+        );
+        assert_eq!(
+            full["update"]["targets"][0]["confirmation_digest"],
+            "ab".repeat(32)
+        );
+        assert_eq!(full["merge"]["available"], true);
+        assert_eq!(full["merge"]["execute_operation"], "merge_pull_request");
+        assert_eq!(
+            full["merge"]["targets"][0]["expected_head_revision"],
+            "0123456789abcdef"
+        );
+        assert_eq!(full["merge"]["targets"][0]["readiness"], "ready");
+        // An open was never proved, and a pull request that is already open
+        // is not a thing to open, so it stays unavailable regardless.
+        assert_eq!(full["open"]["available"], false);
+
+        // The proposer deployment: the credential withheld the merge scope,
+        // so the server minted no merge slot. The cockpit must render that as
+        // update-yes / merge-no rather than as one pull-request toggle.
+        let proposer = controls(ReviewPullRequestCapabilities {
+            open: None,
+            update: Some(update("pr-1", observed)),
+            merge: None,
+        });
+        assert_eq!(proposer["update"]["available"], true);
+        assert_eq!(proposer["merge"]["available"], false);
+        assert_eq!(
+            proposer["merge"]["category"],
+            "platform_cockpit_pull_request_family_unavailable"
+        );
+
+        // Stale reads, one per fence the snapshot re-checks: a different pull
+        // request, a head that moved, a revision that moved. Each is dropped
+        // rather than rendered as a control the daemon would refuse.
+        for stale in [
+            ReviewPullRequestCapabilities {
+                open: None,
+                update: Some(update("pr-2", observed)),
+                merge: Some(merge("pr-2", observed, "0123456789abcdef")),
+            },
+            ReviewPullRequestCapabilities {
+                open: None,
+                update: Some(update("pr-1", observed)),
+                merge: Some(merge("pr-1", observed, "fedcba9876543210")),
+            },
+            ReviewPullRequestCapabilities {
+                open: None,
+                update: Some(update("pr-1", Revision::FIRST)),
+                merge: Some(merge("pr-1", Revision::FIRST, "0123456789abcdef")),
+            },
+        ] {
+            let moved = controls(stale);
+            assert_eq!(moved["merge"]["available"], false, "{moved}");
+        }
+
+        // An open advertised against a pull request the snapshot already
+        // shows open is the same class of mistake, and is dropped the same
+        // way rather than proposing a duplicate.
+        let duplicate = controls(ReviewPullRequestCapabilities {
+            open: Some(
+                ReviewPullRequestOpenCapability::new(
+                    observed,
+                    authority.clone(),
+                    confirmation.clone(),
+                    correlation.clone(),
+                )
+                .unwrap(),
+            ),
+            update: None,
+            merge: None,
+        });
+        assert_eq!(duplicate["open"]["available"], false);
     }
 }
