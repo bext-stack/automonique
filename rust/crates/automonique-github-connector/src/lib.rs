@@ -16,6 +16,16 @@
 //! workflow run and re-run that exact workflow run. It cannot dispatch a new
 //! workflow, cancel one, select a branch, or name an arbitrary API path.
 //!
+//! The **pull-request surface** is six repository-scoped operations, three
+//! reads and three writes: read one branch, read one pull request, list the
+//! open pull requests for one exact head/base pair, open a pull request,
+//! retitle one, and merge one. It cannot close a pull request, push a branch,
+//! request a review, edit a description, choose a squash or rebase strategy,
+//! or merge without naming the exact head commit it was preflighted against.
+//! Every write is repository-fixed by [`RepoTarget`] and branch-fixed by
+//! [`BranchName`], so a caller that holds one of these requests cannot steer
+//! it at another repository or another branch.
+//!
 //! The **work-management surface** is thirty-seven typed mutations, one per
 //! [`ManagementRequest`] constructor, sent through
 //! [`GitHubClient::manage`]: labels and milestones (create, update, delete),
@@ -132,23 +142,28 @@ pub use repo_map::{
     MAX_REPO_RULES, MAX_SCOPE_IDENTIFIER_BYTES, RepoMap, RepoRule, SiteId, TenantId,
 };
 pub use request::{
-    CommentRequest, CreateIssueRequest, GetCommentsRequest, GetIssueCommentRequest,
-    GetIssueRequest, GetRepositoryRequest, GetWorkflowRunRequest, GitHubOperation, HttpMethod,
-    IssueFilter, IssueListState, ListIssuesRequest, ListLabelsRequest, MAX_LIST_PAGE,
-    MAX_SEARCH_PAGE, Page, ReplaceLabelsRequest, RerunWorkflowRequest, SearchIssuesRequest,
-    SetStateRequest, Since, UpdateIssueBodyRequest, UpdateIssueCommentRequest,
+    CommentRequest, CreateIssueRequest, CreatePullRequestRequest, GetBranchRequest,
+    GetCommentsRequest, GetIssueCommentRequest, GetIssueRequest, GetPullRequestRequest,
+    GetRepositoryRequest, GetWorkflowRunRequest, GitHubOperation, HeadRevision, HttpMethod,
+    IssueFilter, IssueListState, ListIssuesRequest, ListLabelsRequest, ListPullRequestsRequest,
+    MAX_LIST_PAGE, MAX_SEARCH_PAGE, MergePullRequestRequest, Page, ReplaceLabelsRequest,
+    RerunWorkflowRequest, SearchIssuesRequest, SetStateRequest, Since, UpdateIssueBodyRequest,
+    UpdateIssueCommentRequest, UpdatePullRequestRequest,
 };
 pub use response::{
-    CommentRef, GitHubComment, GitHubIssue, GitHubReply, GitHubRepository, GitHubWorkflowRun,
-    IssueListPage, IssueSearchPage, MAX_COMMENT_COUNT, MAX_SEARCH_TOTAL, Viewer, WorkflowRunStatus,
+    CommentRef, GitHubBranch, GitHubComment, GitHubIssue, GitHubMergeReceipt, GitHubPullRequest,
+    GitHubPullRequestRef, GitHubReply, GitHubRepository, GitHubWorkflowRun, IssueListPage,
+    IssueSearchPage, MAX_COMMENT_COUNT, MAX_PULL_REQUEST_MATCHES, MAX_SEARCH_TOTAL,
+    PullRequestLifecycle, PullRequestMergeability, Viewer, WorkflowRunStatus, decode_branch,
     decode_comment, decode_comment_ref, decode_comments, decode_error_message, decode_issue,
-    decode_issue_list, decode_issue_ref, decode_labels, decode_repository,
+    decode_issue_list, decode_issue_ref, decode_labels, decode_merge_receipt, decode_pull_request,
+    decode_pull_request_matches, decode_pull_request_ref, decode_repository,
     decode_repository_labels, decode_search, decode_viewer, decode_workflow_run,
 };
 pub use target::{
-    CommentId, GITHUB_API_ORIGIN, GitHubBase, IssueLocator, IssueNumber, IssueState, Label,
-    MAX_ISSUE_NUMBER, MAX_LABEL_BYTES, MAX_OWNER_BYTES, MAX_REPO_BYTES, Owner, Repo, RepoTarget,
-    WorkflowRunId,
+    BranchName, CommentId, GITHUB_API_ORIGIN, GitHubBase, IssueLocator, IssueNumber, IssueState,
+    Label, MAX_BRANCH_BYTES, MAX_ISSUE_NUMBER, MAX_LABEL_BYTES, MAX_OWNER_BYTES, MAX_REPO_BYTES,
+    Owner, Repo, RepoTarget, WorkflowRunId,
 };
 pub use ticket::{
     CommentKind, CommentVisibility, GithubLink, IssueBodyText, IssueComment, IssuePriority,
@@ -259,6 +274,10 @@ pub enum GitHubRefusal {
     Management,
     /// A workflow-run identifier is zero.
     WorkflowRunId,
+    /// A branch name is empty, over-long, or outside the accepted grammar.
+    BranchName,
+    /// A merge names a head revision that is not a commit id.
+    HeadRevision,
 }
 
 impl GitHubRefusal {
@@ -287,6 +306,8 @@ impl GitHubRefusal {
             Self::EntityTag => "entity_tag",
             Self::Management => "management",
             Self::WorkflowRunId => "workflow_run_id",
+            Self::BranchName => "branch_name",
+            Self::HeadRevision => "head_revision",
         }
     }
 }

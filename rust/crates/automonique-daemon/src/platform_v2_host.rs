@@ -14,7 +14,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use automonique_github_connector::{RepoTarget, WorkflowRunId};
+use automonique_github_connector::{BranchName, IssueNumber, RepoTarget, WorkflowRunId};
 use automonique_protocol::digest::{Sha256, Sha256Digest};
 use automonique_protocol::identity::Actor;
 use automonique_protocol::platform::{ReceiptId, ResourceAuthority};
@@ -36,17 +36,19 @@ use automonique_protocol::platform_v2_lineage::{
     LineageStatus, OrchestrationRecord, WorkspaceIntent, WorkspaceIntentOutcome,
 };
 use automonique_protocol::platform_v2_review::{
-    AttentionReason as ReviewAttentionReason, CheckState, CommentAgentState, ReviewAction,
-    ReviewActionReceipt, ReviewActionRequest, ReviewActorId, ReviewAuthentication, ReviewAuthority,
-    ReviewAuthorityId, ReviewAuthorityKind, ReviewCommentTarget, ReviewFreshnessState,
-    ReviewReceiptOutcome, ReviewSnapshot,
+    AttentionReason as ReviewAttentionReason, CheckState, CommentAgentState, MergeReadiness,
+    PullRequestState, ReviewAction, ReviewActionReceipt, ReviewActionRequest, ReviewActorId,
+    ReviewAuthentication, ReviewAuthority, ReviewAuthorityId, ReviewAuthorityKind,
+    ReviewCommentTarget, ReviewField, ReviewFreshnessState, ReviewReceiptOutcome, ReviewSnapshot,
 };
 use automonique_protocol::platform_v2_transport::{
     LIFECYCLE_CAPABILITY_EFFECT_KINDS, LifecycleCapabilities, LifecycleOperationCapability,
     PlatformV2Refusal, PlatformV2Request, PlatformV2Response, RawMutationApprovalDocument,
     RawMutationReceiptDocument, ReceiptLookupKey, ReviewAgentDeliveryCapability,
     ReviewCapabilities, ReviewCheckRerunCapability, ReviewConfirmationDigest,
-    ReviewPullRequestCapabilities, ReviewReceiptCorrelationDigest,
+    ReviewPullRequestCapabilities, ReviewPullRequestMergeCapability,
+    ReviewPullRequestOpenCapability, ReviewPullRequestUpdateCapability,
+    ReviewReceiptCorrelationDigest,
 };
 use automonique_protocol::primitives::{EpochMillis, Revision};
 use automonique_protocol::wire::JsonValue;
@@ -55,8 +57,8 @@ use automonique_store::lineage_index::WorkspaceIntentExecutionReceipt;
 use automonique_store::lineage_index::{IntentAuthorizationScope, LineageIndex};
 use automonique_store::review_store::{
     ApprovalPolicy, ReviewActionAdmission, ReviewApprovalDecision, ReviewApprovalDocument,
-    ReviewExternalEffectCustody, ReviewExternalEffectPlan, ReviewStore, ReviewStoreError,
-    ReviewWriteAdmission, StoredReviewAction,
+    ReviewExternalEffectCustody, ReviewExternalEffectPlan, ReviewPullRequestFamily, ReviewStore,
+    ReviewStoreError, ReviewWriteAdmission, StoredReviewAction,
 };
 use automonique_store::work_context_store::{
     ApprovalPolicyDecision, ExternalEffectCompletionPolicy, ExternalEffectExecutorPolicy,
@@ -72,7 +74,14 @@ use crate::platform_v2_github_check_adapter::{
     GitHubCheckRerunCustody, GitHubCheckRerunError, GitHubCheckRerunPlan,
     GitHubCheckRerunSubmission,
 };
-use crate::platform_v2_review_adapter::{ProductionReviewEffectAdapter, ReviewEffectPlan};
+use crate::platform_v2_github_pull_request_adapter::{
+    GitHubPullRequestCustody, GitHubPullRequestError, GitHubPullRequestFamily,
+    GitHubPullRequestPlan, GitHubPullRequestReviewBinding, GitHubPullRequestSubmission,
+    GitHubPullRequestTarget,
+};
+use crate::platform_v2_review_adapter::{
+    ProductionReviewEffectAdapter, PullRequestCapabilityTarget, ReviewEffectPlan,
+};
 
 pub const POLICY_FILE_NAME: &str = "platform-v2-policy.json";
 pub const WORK_CONTEXT_STORE_NAME: &str = "platform-v2-work-context.sqlite3";
@@ -1869,6 +1878,17 @@ impl PlatformV2Runtime {
                     &snapshot,
                     review_delivery,
                 );
+                // Pull-request authority is independent of CI authority, so
+                // this is resolved before the CI early return rather than
+                // after it. A deployment that grants one and not the other
+                // must still see the capabilities it does hold.
+                let pull_request = self.pull_request_capabilities(
+                    &principal,
+                    value.project(),
+                    value.workspace(),
+                    &snapshot,
+                    workspace_record.revision(),
+                );
                 let Some(authority) = principal
                     .review_authorities
                     .get(&ReviewAuthorityKind::Ci)
@@ -1882,7 +1902,7 @@ impl PlatformV2Runtime {
                             workspace_record.revision(),
                             Vec::new(),
                             agent_deliverable,
-                            ReviewPullRequestCapabilities::default(),
+                            pull_request,
                         )
                         .map_err(|_| "platform_v2_response_invalid")?,
                     ));
@@ -1946,7 +1966,7 @@ impl PlatformV2Runtime {
                         workspace_record.revision(),
                         rerunnable,
                         agent_deliverable,
-                        ReviewPullRequestCapabilities::default(),
+                        pull_request,
                     )
                     .map_err(|_| "platform_v2_response_invalid")?,
                 ))
@@ -2337,6 +2357,91 @@ impl PlatformV2Runtime {
                         )?;
                         Ok(PlatformV2Response::ReviewReceipt(receipt))
                     }
+                    Ok(advertised_plan @ ReviewEffectPlan::GitHubPullRequest { .. }) => {
+                        if expected_workspace_revision != Some(workspace_record.revision()) {
+                            return Err("platform_v2_review_confirmation_changed");
+                        }
+                        // Re-read the provider now. The confirmation the
+                        // client returns was minted over an observation, so a
+                        // branch that moved since produces a different digest
+                        // and this refuses instead of landing a change nobody
+                        // saw.
+                        let observation = self
+                            .review_effects
+                            .preflight_github_pull_request_capability(&advertised_plan)?;
+                        let expected_confirmation = self
+                            .review_effects
+                            .github_pull_request_confirmation_digest(
+                                &principal.actor,
+                                &scope.project,
+                                request.workspace(),
+                                request.authority(),
+                                request.expected_revision(),
+                                workspace_record.revision(),
+                                &advertised_plan,
+                                &observation,
+                            )?;
+                        if confirmation_digest.as_ref().map(|value| value.as_str())
+                            != Some(review_confirmation_digest(expected_confirmation)?.as_str())
+                        {
+                            return Err("platform_v2_review_confirmation_changed");
+                        }
+                        let expected_correlation =
+                            ProductionReviewEffectAdapter::github_pull_request_receipt_correlation_digest(
+                                expected_confirmation,
+                            );
+                        if receipt_correlation_digest.as_ref().map(|v| v.as_str())
+                            != Some(
+                                review_receipt_correlation_digest(expected_correlation)?.as_str(),
+                            )
+                        {
+                            return Err("platform_v2_review_confirmation_changed");
+                        }
+                        let request_digest =
+                            ReviewStore::action_request_digest(&request, ApprovalPolicy::Required)
+                                .map_err(review_store_category)?;
+                        let external_plan = github_pull_request_effect_plan(
+                            request_digest,
+                            &advertised_plan,
+                            request.action(),
+                            observation.head_sha(),
+                            workspace_record.revision(),
+                            expected_correlation,
+                        )?;
+                        self.policy_fence.verify()?;
+                        self.review_effects.verify_generation()?;
+                        self.validate_workspace_revision(
+                            &principal,
+                            request.workspace(),
+                            workspace_record.revision(),
+                        )?;
+                        let admitted = self
+                            .reviews
+                            .prepare_external_action(
+                                &request,
+                                ApprovalPolicy::Required,
+                                &external_plan,
+                                now_ms,
+                            )
+                            .map_err(review_store_category)?;
+                        let action = match admitted {
+                            ReviewActionAdmission::New(action)
+                            | ReviewActionAdmission::Replay(action) => action,
+                        };
+                        let action = self.approve_prepared_github_confirmation(
+                            &principal,
+                            &action,
+                            &external_plan,
+                            now_ms,
+                        )?;
+                        let receipt = self.drive_github_pull_request(
+                            &principal,
+                            &action,
+                            &external_plan,
+                            now_ms,
+                        )?;
+                        Ok(PlatformV2Response::ReviewReceipt(receipt))
+                    }
                     Err(category) => {
                         // Resolve the exact grant, revision, freshness and
                         // target before exposing an adapter capability reason.
@@ -2363,7 +2468,12 @@ impl PlatformV2Runtime {
                     );
                     match external {
                         Ok(Some((action, plan))) => {
-                            if plan.is_github_check_rerun() {
+                            // Every GitHub family is recovered on the same
+                            // terms. A correlation is required for all of
+                            // them and rejected for everything else, so a
+                            // pull-request receipt can no more be found by a
+                            // bare idempotency key than a rerun receipt can.
+                            if plan.is_github_effect() {
                                 let Ok((_, stored_correlation)) =
                                     require_native_github_recovery_identity(&plan)
                                 else {
@@ -2383,7 +2493,7 @@ impl PlatformV2Runtime {
                             } else if value.receipt_correlation_digest().is_some() {
                                 continue;
                             }
-                            if plan.is_github_check_rerun() {
+                            if plan.is_github_effect() {
                                 if stored_github_recovery_phase(&action, &plan)?
                                     == GitHubRecoveryPhase::Terminal
                                 {
@@ -2392,8 +2502,15 @@ impl PlatformV2Runtime {
                                 let action = self.approve_prepared_github_confirmation(
                                     &principal, &action, &plan, now_ms,
                                 )?;
-                                let receipt = self
-                                    .drive_github_check_rerun(&principal, &action, &plan, now_ms)?;
+                                let receipt = if plan.is_github_pull_request() {
+                                    self.drive_github_pull_request(
+                                        &principal, &action, &plan, now_ms,
+                                    )?
+                                } else {
+                                    self.drive_github_check_rerun(
+                                        &principal, &action, &plan, now_ms,
+                                    )?
+                                };
                                 return Ok(PlatformV2Response::ReviewReceipt(receipt));
                             }
                             if action.receipt.outcome() == ReviewReceiptOutcome::Accepted
@@ -2491,6 +2608,158 @@ impl PlatformV2Runtime {
                     .map_err(|_| category)
             }
         }
+    }
+
+    /// Mint whichever pull-request slots a live provider read can prove.
+    ///
+    /// Nothing here is inferred. An installed credential carrying
+    /// `pull_request_write` is a configuration fact; a slot is minted only
+    /// from an observation the provider answered, and every failure along the
+    /// way leaves the slot empty rather than advertising a control that would
+    /// refuse. That is why this returns a value rather than an error: a
+    /// refusal to advertise is the correct answer, not a failed request.
+    ///
+    /// The snapshot decides which family is even eligible, so the three are
+    /// mutually consistent by construction: a pull request that is absent can
+    /// only be opened, and one that is open can be updated and — when GitHub
+    /// itself calls it mergeable at the head the snapshot pinned — merged.
+    fn pull_request_capabilities(
+        &self,
+        principal: &PrincipalPolicy,
+        project: &ProjectId,
+        workspace: &WorkContextIdentity,
+        snapshot: &ReviewSnapshot,
+        workspace_revision: Revision,
+    ) -> ReviewPullRequestCapabilities {
+        let mut capabilities = ReviewPullRequestCapabilities::default();
+        let Some(authority) = principal
+            .review_authorities
+            .get(&ReviewAuthorityKind::PullRequest)
+            .cloned()
+        else {
+            return capabilities;
+        };
+        let projection = snapshot.pull_request();
+        if projection.authority() != &authority
+            || projection.freshness().state() != ReviewFreshnessState::Fresh
+        {
+            return capabilities;
+        }
+        let observed = projection.freshness().observed_revision();
+        let mint = |family, number, head: Option<&ReviewField>| {
+            let plan = self
+                .review_effects
+                .pull_request_effect_plan(
+                    project,
+                    workspace,
+                    &authority,
+                    PullRequestCapabilityTarget {
+                        family,
+                        number,
+                        expected_head_revision: head,
+                        expected_pull_request_revision: observed,
+                    },
+                )
+                .ok()?;
+            let observation = self
+                .review_effects
+                .preflight_github_pull_request_capability(&plan)
+                .ok()?;
+            let confirmation = self
+                .review_effects
+                .github_pull_request_confirmation_digest(
+                    &principal.actor,
+                    project,
+                    workspace,
+                    &authority,
+                    snapshot.revision(),
+                    workspace_revision,
+                    &plan,
+                    &observation,
+                )
+                .ok()?;
+            let correlation =
+                ProductionReviewEffectAdapter::github_pull_request_receipt_correlation_digest(
+                    confirmation,
+                );
+            Some((
+                observation,
+                review_confirmation_digest(confirmation).ok()?,
+                review_receipt_correlation_digest(correlation).ok()?,
+            ))
+        };
+        match projection.state() {
+            PullRequestState::Absent => {
+                if let Some((_, confirmation, correlation)) =
+                    mint(GitHubPullRequestFamily::Open, None, None)
+                {
+                    capabilities.open = ReviewPullRequestOpenCapability::new(
+                        observed,
+                        authority.clone(),
+                        confirmation,
+                        correlation,
+                    )
+                    .ok();
+                }
+            }
+            PullRequestState::Draft | PullRequestState::Open => {
+                // The projection's id is the GitHub number in decimal. A
+                // workspace whose id is not one is not GitHub-backed, and
+                // guessing a number for it would advertise a control aimed at
+                // some other repository's pull request.
+                let (Some(id), Some(number)) = (
+                    projection.id().cloned(),
+                    projection
+                        .id()
+                        .and_then(|id| id.as_str().parse::<u32>().ok())
+                        .and_then(|value| IssueNumber::new(value).ok()),
+                ) else {
+                    return capabilities;
+                };
+                if let Some((_, confirmation, correlation)) =
+                    mint(GitHubPullRequestFamily::Update, Some(number), None)
+                {
+                    capabilities.update = ReviewPullRequestUpdateCapability::new(
+                        id.clone(),
+                        observed,
+                        authority.clone(),
+                        confirmation,
+                        correlation,
+                    )
+                    .ok();
+                }
+                // Merge needs everything update needs and three things more:
+                // the snapshot must already call it open and ready, it must
+                // pin a head, and the provider must agree at that exact head.
+                if projection.state() != PullRequestState::Open
+                    || projection.readiness() != MergeReadiness::Ready
+                {
+                    return capabilities;
+                }
+                let Some(head) = projection.head_revision() else {
+                    return capabilities;
+                };
+                if let Some((observation, confirmation, correlation)) =
+                    mint(GitHubPullRequestFamily::Merge, Some(number), Some(head))
+                    && observation.mergeable()
+                {
+                    capabilities.merge = ReviewPullRequestMergeCapability::new(
+                        id,
+                        observed,
+                        head.clone(),
+                        MergeReadiness::Ready,
+                        authority,
+                        confirmation,
+                        correlation,
+                    )
+                    .ok();
+                }
+            }
+            // A closed or merged pull request is not a thing any of the three
+            // families acts on.
+            PullRequestState::Closed | PullRequestState::Merged => {}
+        }
+        capabilities
     }
 
     fn drive_github_check_rerun(
@@ -2652,6 +2921,275 @@ impl PlatformV2Runtime {
             .map_err(review_store_category)
     }
 
+    /// Drive one pull-request write to a settled receipt.
+    ///
+    /// Structurally identical to [`Self::drive_github_check_rerun`], and
+    /// deliberately so: the write differs, the custody argument does not. Two
+    /// things are specific to this family. An open carries a provider-issued
+    /// number out of `submit`, which must reach the durable row with the
+    /// accepted custody or the pull request becomes uncorrelatable. And an
+    /// accepted state is never downgraded to ambiguous on a later error,
+    /// because that acknowledgement is the only attribution this process will
+    /// ever hold.
+    fn drive_github_pull_request(
+        &mut self,
+        principal: &PrincipalPolicy,
+        action: &StoredReviewAction,
+        plan: &ReviewExternalEffectPlan,
+        now_ms: i64,
+    ) -> Result<ReviewActionReceipt, &'static str> {
+        require_native_github_recovery_identity(plan)?;
+        let scope = principal
+            .workspaces
+            .get(action.request.workspace())
+            .ok_or("platform_v2_scope_denied")?;
+        let phase = stored_github_recovery_phase(action, plan)?;
+        if phase == GitHubRecoveryPhase::Terminal {
+            return Ok(action.receipt.clone());
+        }
+        let mut may_submit = false;
+        let mut refresh_plan = false;
+        let action = if phase == GitHubRecoveryPhase::NeverStarted {
+            if self
+                .validate_github_pull_request_execution_fence(principal, action, plan)
+                .is_err()
+            {
+                return self
+                    .reviews
+                    .refuse_external_action_not_started(
+                        &action.preview_id,
+                        action.request_digest,
+                        now_ms,
+                    )
+                    .map_err(review_store_category);
+            }
+            let write = self
+                .reviews
+                .start_write(&action.preview_id, action.request_digest, now_ms)
+                .map_err(review_store_category)?;
+            match write {
+                ReviewWriteAdmission::New(action) => {
+                    may_submit = true;
+                    refresh_plan = true;
+                    action
+                }
+                ReviewWriteAdmission::Replay(action) => {
+                    refresh_plan = true;
+                    action
+                }
+            }
+        } else {
+            action.clone()
+        };
+        let refreshed_plan;
+        let plan = if refresh_plan {
+            let (stored, refreshed) = self
+                .reviews
+                .external_action(
+                    action.request.workspace(),
+                    action.request.actor(),
+                    action.request.authentication(),
+                    action.request.authority(),
+                    action.request.idempotency_key(),
+                    now_ms,
+                )
+                .map_err(review_store_category)?
+                .ok_or("platform_v2_review_plan_missing")?;
+            if stored.preview_id != action.preview_id
+                || stored.request_digest != action.request_digest
+            {
+                return Err("platform_v2_review_plan_invalid");
+            }
+            refreshed_plan = refreshed;
+            &refreshed_plan
+        } else {
+            plan
+        };
+        if may_submit
+            && self
+                .validate_github_pull_request_execution_fence(principal, &action, plan)
+                .is_err()
+        {
+            return self
+                .reviews
+                .settle_github_pull_request(
+                    &action.preview_id,
+                    action.request_digest,
+                    ReviewExternalEffectCustody::Refused,
+                    None,
+                    now_ms,
+                )
+                .map_err(review_store_category);
+        }
+        let provider_plan =
+            github_pull_request_provider_plan(principal, &scope.project, &action.request, plan)?;
+        let repository = github_repository(plan)?;
+        let credential_reference = plan
+            .github_credential_reference()
+            .ok_or("platform_v2_review_plan_invalid")?;
+        let credential_generation = plan
+            .github_credential_generation_digest()
+            .ok_or("platform_v2_review_plan_invalid")?;
+        let merge = plan.github_pull_request_family() == Some(ReviewPullRequestFamily::Merge);
+        let adapter = match self.review_effects.github_pull_request_adapter(
+            credential_reference,
+            &repository,
+            provider_plan.base_branch(),
+            provider_plan.head_branch(),
+            merge,
+            credential_generation,
+        ) {
+            Ok(adapter) => adapter,
+            Err(category) if may_submit => {
+                return self
+                    .reviews
+                    .settle_github_pull_request(
+                        &action.preview_id,
+                        action.request_digest,
+                        ReviewExternalEffectCustody::Refused,
+                        None,
+                        now_ms,
+                    )
+                    .map_err(|_| category);
+            }
+            Err(category) => return Err(category),
+        };
+        let custody = map_store_pull_request_custody(
+            plan.github_custody()
+                .ok_or("platform_v2_review_plan_invalid")?,
+        );
+        let opened = plan
+            .github_pull_request_opened_number()
+            .map(|value| IssueNumber::new(value).map_err(|_| "platform_v2_review_plan_invalid"))
+            .transpose()?;
+        let mut submission = GitHubPullRequestSubmission::restore(
+            &provider_plan,
+            provider_plan.digest(),
+            custody,
+            opened,
+        )
+        .map_err(github_pull_request_category)?;
+        if let Err(category) = self.policy_fence.verify() {
+            if may_submit {
+                return self
+                    .reviews
+                    .settle_github_pull_request(
+                        &action.preview_id,
+                        action.request_digest,
+                        ReviewExternalEffectCustody::Refused,
+                        None,
+                        now_ms,
+                    )
+                    .map_err(|_| category);
+            }
+            return Err(category);
+        }
+        let result = if may_submit {
+            adapter.submit(&provider_plan, &mut submission)
+        } else {
+            adapter.reconcile(&provider_plan, &mut submission)
+        };
+        self.policy_fence.verify()?;
+        let settled = match result {
+            Ok(custody) => map_pull_request_store_custody(custody),
+            Err(error) => match submission.custody() {
+                GitHubPullRequestCustody::Refused => ReviewExternalEffectCustody::Refused,
+                // An acknowledged write keeps its acknowledgement. It is the
+                // only attribution this process holds, and discarding it would
+                // strand the effect as permanently unattributable.
+                GitHubPullRequestCustody::Accepted => ReviewExternalEffectCustody::Accepted,
+                GitHubPullRequestCustody::Ambiguous | GitHubPullRequestCustody::CustodyStarted => {
+                    ReviewExternalEffectCustody::Ambiguous
+                }
+                GitHubPullRequestCustody::Completed => ReviewExternalEffectCustody::Completed,
+                GitHubPullRequestCustody::NotStarted => {
+                    return Err(github_pull_request_category(error));
+                }
+            },
+        };
+        self.reviews
+            .settle_github_pull_request(
+                &action.preview_id,
+                action.request_digest,
+                settled,
+                submission.opened_number().map(IssueNumber::get),
+                now_ms,
+            )
+            .map_err(review_store_category)
+    }
+
+    /// Re-derive the pull-request plan from the operator registry and prove
+    /// the provider still admits it, immediately before custody may begin.
+    fn validate_github_pull_request_execution_fence(
+        &self,
+        principal: &PrincipalPolicy,
+        action: &StoredReviewAction,
+        plan: &ReviewExternalEffectPlan,
+    ) -> Result<(), &'static str> {
+        self.policy_fence.verify()?;
+        let scope = principal
+            .workspaces
+            .get(action.request.workspace())
+            .ok_or("platform_v2_scope_denied")?;
+        let workspace_record = self
+            .work_contexts
+            .validate_policy_mapping(
+                principal.actor.tenant(),
+                &scope.project,
+                action.request.workspace(),
+            )
+            .map_err(|_| "platform_v2_review_workspace_changed")?;
+        let expected_workspace_revision = plan
+            .github_expected_workspace_revision()
+            .ok_or("platform_v2_review_workspace_changed")?;
+        if workspace_record.revision() != expected_workspace_revision {
+            return Err("platform_v2_review_workspace_changed");
+        }
+        let current = self.review_effects.plan(
+            &scope.project,
+            action.request.workspace(),
+            action.request.authority(),
+            action.request.action(),
+        )?;
+        if !matches!(current, ReviewEffectPlan::GitHubPullRequest { .. }) {
+            return Err("platform_v2_review_registry_changed");
+        }
+        // The stored plan must still be the plan the registry produces. A
+        // registry edited between admission and execution retargets nothing:
+        // the digests stop matching and the write is refused.
+        let reconstructed = github_pull_request_effect_plan(
+            plan.request_digest(),
+            &current,
+            action.request.action(),
+            plan.github_pull_request_observed_head_sha()
+                .ok_or("platform_v2_review_plan_invalid")?,
+            expected_workspace_revision,
+            plan.github_receipt_correlation_digest()
+                .ok_or("platform_v2_review_plan_invalid")?,
+        )?;
+        if reconstructed.digest() != plan.digest() {
+            return Err("platform_v2_review_registry_changed");
+        }
+        let provider_plan =
+            github_pull_request_provider_plan(principal, &scope.project, &action.request, plan)?;
+        let merge = plan.github_pull_request_family() == Some(ReviewPullRequestFamily::Merge);
+        self.review_effects
+            .github_pull_request_adapter(
+                plan.github_credential_reference()
+                    .ok_or("platform_v2_review_plan_invalid")?,
+                &github_repository(plan)?,
+                provider_plan.base_branch(),
+                provider_plan.head_branch(),
+                merge,
+                plan.github_credential_generation_digest()
+                    .ok_or("platform_v2_review_plan_invalid")?,
+            )?
+            .preflight(&provider_plan)
+            .map_err(github_pull_request_category)?;
+        self.policy_fence.verify()?;
+        self.review_effects.verify_generation()
+    }
+
     fn approve_prepared_github_confirmation(
         &mut self,
         principal: &PrincipalPolicy,
@@ -2661,7 +3199,13 @@ impl PlatformV2Runtime {
     ) -> Result<StoredReviewAction, &'static str> {
         require_native_github_recovery_identity(plan)?;
         if action.approval_policy != ApprovalPolicy::Required
-            || !matches!(action.request.action(), ReviewAction::RerunCheck { .. })
+            || !matches!(
+                action.request.action(),
+                ReviewAction::RerunCheck { .. }
+                    | ReviewAction::OpenPullRequest { .. }
+                    | ReviewAction::UpdatePullRequest { .. }
+                    | ReviewAction::MergePullRequest { .. }
+            )
         {
             return Err("platform_v2_review_confirmation_required");
         }
@@ -3792,6 +4336,168 @@ fn github_provider_plan(
     .map_err(github_rerun_category)
 }
 
+/// Build the durable pull-request plan from the registry plan and the action.
+///
+/// The title is taken from the action rather than the registry plan: it is
+/// client-owned and unfenced by design, which is also why it is absent from
+/// the confirmation digest. Every coordinate that decides *where* the write
+/// lands comes from the registry-derived plan instead.
+fn github_pull_request_effect_plan(
+    request_digest: [u8; 32],
+    plan: &ReviewEffectPlan,
+    action: &ReviewAction,
+    observed_head_sha: &str,
+    expected_workspace_revision: Revision,
+    receipt_correlation_digest: [u8; 32],
+) -> Result<ReviewExternalEffectPlan, &'static str> {
+    let ReviewEffectPlan::GitHubPullRequest {
+        family,
+        credential_reference,
+        repository,
+        base_branch,
+        head_branch,
+        number,
+        expected_pull_request_revision,
+        registry_generation,
+        credential_generation,
+        ..
+    } = plan
+    else {
+        return Err("platform_v2_review_plan_invalid");
+    };
+    let (stored_family, title) = match (family, action) {
+        (GitHubPullRequestFamily::Open, ReviewAction::OpenPullRequest { title, .. }) => {
+            (ReviewPullRequestFamily::Open, Some(title.as_str()))
+        }
+        (GitHubPullRequestFamily::Update, ReviewAction::UpdatePullRequest { title, .. }) => {
+            (ReviewPullRequestFamily::Update, Some(title.as_str()))
+        }
+        (GitHubPullRequestFamily::Merge, ReviewAction::MergePullRequest { .. }) => {
+            (ReviewPullRequestFamily::Merge, None)
+        }
+        _ => return Err("platform_v2_review_plan_invalid"),
+    };
+    ReviewExternalEffectPlan::github_pull_request(
+        request_digest,
+        *registry_generation,
+        *credential_generation,
+        credential_reference,
+        (repository.owner().as_str(), repository.repo().as_str()),
+        stored_family,
+        (base_branch.as_str(), head_branch.as_str()),
+        number.map(IssueNumber::get),
+        observed_head_sha,
+        title,
+        *expected_pull_request_revision,
+        expected_workspace_revision,
+        receipt_correlation_digest,
+    )
+    .map_err(review_store_category)
+}
+
+fn github_pull_request_provider_plan(
+    principal: &PrincipalPolicy,
+    project: &ProjectId,
+    request: &ReviewActionRequest,
+    plan: &ReviewExternalEffectPlan,
+) -> Result<GitHubPullRequestPlan, &'static str> {
+    let family = match plan
+        .github_pull_request_family()
+        .ok_or("platform_v2_review_plan_invalid")?
+    {
+        ReviewPullRequestFamily::Open => GitHubPullRequestFamily::Open,
+        ReviewPullRequestFamily::Update => GitHubPullRequestFamily::Update,
+        ReviewPullRequestFamily::Merge => GitHubPullRequestFamily::Merge,
+    };
+    let branch = |value: Option<&str>| {
+        BranchName::new(value.ok_or("platform_v2_review_plan_invalid")?)
+            .map_err(|_| "platform_v2_review_plan_invalid")
+    };
+    GitHubPullRequestPlan::new(
+        plan.registry_generation_digest(),
+        plan.github_credential_generation_digest()
+            .ok_or("platform_v2_review_plan_invalid")?,
+        plan.github_credential_reference()
+            .ok_or("platform_v2_review_plan_invalid")?,
+        GitHubPullRequestTarget {
+            target: github_repository(plan)?,
+            family,
+            base_branch: branch(plan.github_pull_request_base_branch())?,
+            head_branch: branch(plan.github_pull_request_head_branch())?,
+            number: plan
+                .github_pull_request_number()
+                .map(|value| IssueNumber::new(value).map_err(|_| "platform_v2_review_plan_invalid"))
+                .transpose()?,
+            observed_head_sha: plan
+                .github_pull_request_observed_head_sha()
+                .ok_or("platform_v2_review_plan_invalid")?
+                .to_owned(),
+            title: plan.github_pull_request_title().map(str::to_owned),
+        },
+        &principal.actor,
+        GitHubPullRequestReviewBinding {
+            project: project.clone(),
+            workspace: request.workspace().clone(),
+            authority: request.authority().clone(),
+            idempotency_key: request.idempotency_key().clone(),
+            expected_snapshot_revision: request.expected_revision(),
+            expected_pull_request_revision: plan
+                .github_pull_request_expected_revision()
+                .ok_or("platform_v2_review_plan_invalid")?,
+        },
+    )
+    .map_err(github_pull_request_category)
+}
+
+const fn map_store_pull_request_custody(
+    value: ReviewExternalEffectCustody,
+) -> GitHubPullRequestCustody {
+    match value {
+        ReviewExternalEffectCustody::NotStarted => GitHubPullRequestCustody::NotStarted,
+        ReviewExternalEffectCustody::CustodyStarted => GitHubPullRequestCustody::CustodyStarted,
+        ReviewExternalEffectCustody::Accepted => GitHubPullRequestCustody::Accepted,
+        ReviewExternalEffectCustody::Ambiguous => GitHubPullRequestCustody::Ambiguous,
+        ReviewExternalEffectCustody::Refused => GitHubPullRequestCustody::Refused,
+        ReviewExternalEffectCustody::Completed => GitHubPullRequestCustody::Completed,
+    }
+}
+
+const fn map_pull_request_store_custody(
+    value: GitHubPullRequestCustody,
+) -> ReviewExternalEffectCustody {
+    match value {
+        GitHubPullRequestCustody::NotStarted => ReviewExternalEffectCustody::NotStarted,
+        GitHubPullRequestCustody::CustodyStarted => ReviewExternalEffectCustody::CustodyStarted,
+        GitHubPullRequestCustody::Accepted => ReviewExternalEffectCustody::Accepted,
+        GitHubPullRequestCustody::Ambiguous => ReviewExternalEffectCustody::Ambiguous,
+        GitHubPullRequestCustody::Refused => ReviewExternalEffectCustody::Refused,
+        GitHubPullRequestCustody::Completed => ReviewExternalEffectCustody::Completed,
+    }
+}
+
+const fn github_pull_request_category(error: GitHubPullRequestError) -> &'static str {
+    match error {
+        GitHubPullRequestError::InvalidPlan | GitHubPullRequestError::SubmissionState => {
+            "platform_v2_review_plan_invalid"
+        }
+        GitHubPullRequestError::CapabilityMismatch => {
+            "platform_v2_review_pull_request_credential_incoherent"
+        }
+        // Its own category, so a withheld merge stays observably a withheld
+        // merge rather than a generic capability mismatch.
+        GitHubPullRequestError::MergeWithheld => {
+            "platform_v2_review_pull_request_merge_unavailable"
+        }
+        GitHubPullRequestError::ProviderUnavailable => {
+            "platform_v2_review_pull_request_provider_unavailable"
+        }
+        GitHubPullRequestError::ProviderRefused => {
+            "platform_v2_review_pull_request_provider_refused"
+        }
+        GitHubPullRequestError::ResourceChanged => "platform_v2_review_pull_request_changed",
+    }
+}
+
 const fn map_store_github_custody(value: ReviewExternalEffectCustody) -> GitHubCheckRerunCustody {
     match value {
         ReviewExternalEffectCustody::NotStarted => GitHubCheckRerunCustody::NotStarted,
@@ -4464,8 +5170,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use automonique_github_connector::{
-        GetWorkflowRunRequest, GitHubFailure, GitHubOutcome, GitHubReply, GitHubWorkflowRun,
-        RateLimit, RerunWorkflowRequest, WorkflowRunStatus,
+        CreatePullRequestRequest, GetBranchRequest, GetPullRequestRequest, GetWorkflowRunRequest,
+        GitHubBranch, GitHubFailure, GitHubMergeReceipt, GitHubOutcome, GitHubPullRequest,
+        GitHubPullRequestRef, GitHubReply, GitHubWorkflowRun, ListPullRequestsRequest,
+        MergePullRequestRequest, PullRequestLifecycle, PullRequestMergeability, RateLimit,
+        RerunWorkflowRequest, UpdatePullRequestRequest, WorkflowRunStatus,
     };
     use automonique_protocol::platform::{
         IdempotencyKey, ResourceCoordinate, ResourceId, ResourceKind,
@@ -4480,10 +5189,12 @@ mod tests {
     use automonique_protocol::platform_v2_lifecycle::{
         ExpectedWorkContext, ExternalParentResolution,
     };
-    use automonique_protocol::platform_v2_review::{ReviewCheckId, ReviewReceiptOutcome};
+    use automonique_protocol::platform_v2_review::{
+        PullRequestId, PullRequestProjection, ReviewCheckId, ReviewFreshness, ReviewReceiptOutcome,
+    };
     use automonique_protocol::platform_v2_review_api::decode_review_snapshot;
     use automonique_protocol::platform_v2_transport::{
-        LineageReadRequest, ReviewReadRequest, ReviewReceiptLookup,
+        LineageReadRequest, ReviewActionTransportRequest, ReviewReadRequest, ReviewReceiptLookup,
     };
     use automonique_store::review_store::ReviewActionAdmission;
     use rusqlite::params;
@@ -4491,9 +5202,580 @@ mod tests {
     use crate::platform_v2_github_check_adapter::{
         GitHubActionsTransport, SharedGitHubActionsTransport,
     };
+    use crate::platform_v2_github_pull_request_adapter::{
+        GitHubPullRequestTransport, SharedGitHubPullRequestTransport,
+    };
 
     const GITHUB_RECOVERY_REVIEW_SNAPSHOT: &[u8] =
         include_bytes!("../../automonique-protocol/fixtures/platform-v2-review-v2.json");
+
+    const PULL_REQUEST_HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+    const PULL_REQUEST_MOVED: &str = "89abcdef0123456789abcdef0123456789abcdef";
+
+    /// What the fake provider will answer, so a test can move the branch, make
+    /// the pull request unmergeable, or make it already exist.
+    #[derive(Clone)]
+    struct FakeProviderState {
+        head_sha: String,
+        already_open: bool,
+        mergeable: PullRequestMergeability,
+        state: PullRequestLifecycle,
+        merged: bool,
+    }
+
+    impl Default for FakeProviderState {
+        fn default() -> Self {
+            Self {
+                head_sha: PULL_REQUEST_HEAD.to_owned(),
+                already_open: false,
+                mergeable: PullRequestMergeability::Mergeable,
+                state: PullRequestLifecycle::Open,
+                merged: false,
+            }
+        }
+    }
+
+    struct FakePullRequestTransport {
+        state: Arc<Mutex<FakeProviderState>>,
+        writes: Arc<AtomicUsize>,
+    }
+
+    impl GitHubPullRequestTransport for FakePullRequestTransport {
+        fn get_branch(
+            &self,
+            request: &GetBranchRequest,
+        ) -> Result<GitHubReply<GitHubBranch>, GitHubFailure> {
+            let state = self.state.lock().unwrap().clone();
+            Ok(GitHubReply::new(
+                RateLimit::new(None, None, None),
+                GitHubOutcome::Accepted(GitHubBranch {
+                    name: request.branch().as_str().to_owned(),
+                    // Only the head branch is the one a plan is fenced on; the
+                    // base is read to prove it exists.
+                    commit_sha: if request.branch().as_str() == "agent-work" {
+                        state.head_sha
+                    } else {
+                        PULL_REQUEST_MOVED.to_owned()
+                    },
+                }),
+            ))
+        }
+
+        fn get_pull_request(
+            &self,
+            _: &GetPullRequestRequest,
+        ) -> Result<GitHubReply<GitHubPullRequest>, GitHubFailure> {
+            let state = self.state.lock().unwrap().clone();
+            Ok(GitHubReply::new(
+                RateLimit::new(None, None, None),
+                GitHubOutcome::Accepted(GitHubPullRequest {
+                    number: IssueNumber::new(77).unwrap(),
+                    title: "Proposer le correctif".to_owned(),
+                    state: state.state,
+                    draft: false,
+                    merged: state.merged,
+                    mergeable: state.mergeable,
+                    head_ref: "agent-work".to_owned(),
+                    head_sha: state.head_sha,
+                    base_ref: "main".to_owned(),
+                }),
+            ))
+        }
+
+        fn list_pull_requests(
+            &self,
+            _: &ListPullRequestsRequest,
+        ) -> Result<GitHubReply<Vec<GitHubPullRequestRef>>, GitHubFailure> {
+            let state = self.state.lock().unwrap().clone();
+            let rows = if state.already_open {
+                vec![GitHubPullRequestRef {
+                    number: IssueNumber::new(77).unwrap(),
+                    head_sha: state.head_sha,
+                }]
+            } else {
+                Vec::new()
+            };
+            Ok(GitHubReply::new(
+                RateLimit::new(None, None, None),
+                GitHubOutcome::Accepted(rows),
+            ))
+        }
+
+        fn create_pull_request(
+            &self,
+            _: &CreatePullRequestRequest,
+        ) -> Result<GitHubReply<GitHubPullRequestRef>, GitHubFailure> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            let state = self.state.lock().unwrap().clone();
+            Ok(GitHubReply::new(
+                RateLimit::new(None, None, None),
+                GitHubOutcome::Accepted(GitHubPullRequestRef {
+                    number: IssueNumber::new(77).unwrap(),
+                    head_sha: state.head_sha,
+                }),
+            ))
+        }
+
+        fn update_pull_request(
+            &self,
+            _: &UpdatePullRequestRequest,
+        ) -> Result<GitHubReply<GitHubPullRequest>, GitHubFailure> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.get_pull_request(&GetPullRequestRequest::new(
+                RepoTarget::parse("example-org", "example-repo").unwrap(),
+                IssueNumber::new(77).unwrap(),
+            ))
+        }
+
+        fn merge_pull_request(
+            &self,
+            _: &MergePullRequestRequest,
+        ) -> Result<GitHubReply<GitHubMergeReceipt>, GitHubFailure> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            let mut state = self.state.lock().unwrap();
+            state.merged = true;
+            state.state = PullRequestLifecycle::Closed;
+            Ok(GitHubReply::new(
+                RateLimit::new(None, None, None),
+                GitHubOutcome::Accepted(GitHubMergeReceipt {
+                    merged: true,
+                    merge_commit_sha: Some(PULL_REQUEST_MOVED.to_owned()),
+                }),
+            ))
+        }
+    }
+
+    struct PullRequestFixture {
+        _directory: tempfile::TempDir,
+        policy_path: PathBuf,
+        work_context_path: PathBuf,
+        lineage_path: PathBuf,
+        review_path: PathBuf,
+        uid: u32,
+        state: Arc<Mutex<FakeProviderState>>,
+        writes: Arc<AtomicUsize>,
+        transport: SharedGitHubPullRequestTransport,
+    }
+
+    impl PullRequestFixture {
+        fn new(projection: PullRequestProjection, merge_scope: bool) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let uid = nix::unistd::geteuid().as_raw();
+            let policy_path = directory.path().join(POLICY_FILE_NAME);
+            let work_context_path = directory.path().join(WORK_CONTEXT_STORE_NAME);
+            let lineage_path = directory.path().join(LINEAGE_STORE_NAME);
+            let review_path = directory.path().join(REVIEW_STORE_NAME);
+            let empty = serde_json::json!({
+                "filesystem": [], "credentials": [], "network": [],
+                "tools": [], "providers": [], "models": []
+            });
+            let policy = serde_json::json!({
+                "version": 1,
+                "principals": [{
+                    "uid": uid,
+                    "tenant": "tenant-test",
+                    "actor": "actor-test",
+                    "serving_authority": "automonique",
+                    "projects": ["project-test"],
+                    "workspaces": [
+                        {"project":"project-test","kind":"project","id":"project-test","inherited_authority":empty.clone()},
+                        {"project":"project-test","kind":"host_setup","id":"host-test","inherited_authority":empty.clone()},
+                        {"project":"project-test","kind":"checkout","id":"checkout-test","inherited_authority":empty.clone()},
+                        {"project":"project-test","kind":"user_workspace","id":"wc_user_1","inherited_authority":empty.clone()}
+                    ],
+                    "authority": empty,
+                    "review_authorities": {"pull_request":"authority-1"}
+                }]
+            });
+            write_generation_policy(&policy_path, &policy);
+            GitHubRecoveryFixture::seed_work_contexts(&work_context_path);
+
+            let base = decode_review_snapshot(GITHUB_RECOVERY_REVIEW_SNAPSHOT).unwrap();
+            let snapshot = ReviewSnapshot::new(
+                base.workspace().clone(),
+                base.revision(),
+                base.files().to_vec(),
+                base.comments().to_vec(),
+                base.proposals().to_vec(),
+                base.checks().to_vec(),
+                base.review().clone(),
+                projection,
+                base.delivery().clone(),
+                vec![],
+            )
+            .unwrap();
+            ReviewStore::open_scoped(&review_path, "tenant-test")
+                .unwrap()
+                .put_snapshot(&snapshot, 1)
+                .unwrap();
+
+            let registry = serde_json::json!({
+                "version":1,"generation":"pull-request-test",
+                "bindings":[{
+                    "project":"project-test","workspace_kind":"user_workspace","workspace_id":"wc_user_1",
+                    "authority_kind":"pull_request","authority_id":"authority-1",
+                    "target":{"kind":"pull_request","provider":"github",
+                        "repository":"example-org/example-repo",
+                        "credential_reference":"github-pull-request-mobile",
+                        "base_branch":"main","head_branch":"agent-work"}
+                }]
+            });
+            let credentials = serde_json::json!({
+                "version":1,"generation":"pull-request-credentials-test",
+                "credentials":[{"reference":"github-pull-request-mobile",
+                    "repository":"example-org/example-repo","actions_write":false,
+                    "pull_request_write":true,"pull_request_merge":merge_scope,
+                    "token":"github_pat_test_only_not_a_secret"}]
+            });
+            for (path, document) in [
+                (
+                    directory
+                        .path()
+                        .join(crate::platform_v2_review_adapter::REVIEW_REGISTRY_FILE_NAME),
+                    registry,
+                ),
+                (
+                    directory.path().join(
+                        crate::platform_v2_review_adapter::REVIEW_GITHUB_CREDENTIALS_FILE_NAME,
+                    ),
+                    credentials,
+                ),
+            ] {
+                fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+
+            let state = Arc::new(Mutex::new(FakeProviderState::default()));
+            let writes = Arc::new(AtomicUsize::new(0));
+            let transport: SharedGitHubPullRequestTransport =
+                Arc::new(Mutex::new(Box::new(FakePullRequestTransport {
+                    state: Arc::clone(&state),
+                    writes: Arc::clone(&writes),
+                })));
+            Self {
+                _directory: directory,
+                policy_path,
+                work_context_path,
+                lineage_path,
+                review_path,
+                uid,
+                state,
+                writes,
+                transport,
+            }
+        }
+
+        fn absent() -> Self {
+            Self::new(
+                PullRequestProjection::new(
+                    None,
+                    PullRequestState::Absent,
+                    MergeReadiness::Unknown,
+                    None,
+                    pull_request_authority(),
+                    ReviewFreshness::new(
+                        ReviewFreshnessState::Fresh,
+                        Revision::new(8).unwrap(),
+                        1_800_000_000_000,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+                false,
+            )
+        }
+
+        fn open(readiness: MergeReadiness, merge_scope: bool) -> Self {
+            Self::new(
+                PullRequestProjection::new(
+                    Some(PullRequestId::new("77").unwrap()),
+                    PullRequestState::Open,
+                    readiness,
+                    Some(ReviewField::new(PULL_REQUEST_HEAD).unwrap()),
+                    pull_request_authority(),
+                    ReviewFreshness::new(
+                        ReviewFreshnessState::Fresh,
+                        Revision::new(8).unwrap(),
+                        1_800_000_000_000,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+                merge_scope,
+            )
+        }
+
+        fn host(&self) -> PlatformV2Host {
+            let mut host = PlatformV2Host::open(
+                &self.policy_path,
+                &self.work_context_path,
+                &self.lineage_path,
+                &self.review_path,
+                self.uid,
+            );
+            let PlatformV2Host::Enabled(runtime) = &mut host else {
+                panic!("pull-request fixture host unavailable: {host:?}");
+            };
+            runtime
+                .review_effects
+                .set_github_pull_request_test_transport(Arc::clone(&self.transport));
+            host
+        }
+
+        fn capabilities(&self) -> ReviewCapabilities {
+            let mut host = self.host();
+            let response = host.handle(
+                self.uid,
+                &PlatformV2Request::GetReviewCapabilities(
+                    ReviewReadRequest::new(
+                        ProjectId::new("project-test").unwrap(),
+                        WorkContextIdentity::UserWorkspace(
+                            UserWorkspaceId::new("wc_user_1").unwrap(),
+                        ),
+                    )
+                    .unwrap(),
+                ),
+                2_000,
+            );
+            match response {
+                PlatformV2Response::ReviewCapabilities(value) => value,
+                other => panic!("unexpected response {other:?}"),
+            }
+        }
+
+        fn execute(
+            &self,
+            action: ReviewAction,
+            key: &str,
+            confirmation: &ReviewConfirmationDigest,
+            correlation: &ReviewReceiptCorrelationDigest,
+            now_ms: i64,
+        ) -> PlatformV2Response {
+            let mut host = self.host();
+            host.handle(
+                self.uid,
+                &PlatformV2Request::ExecuteReviewAction(
+                    ReviewActionTransportRequest::new_confirmed_correlated(
+                        WorkContextIdentity::UserWorkspace(
+                            UserWorkspaceId::new("wc_user_1").unwrap(),
+                        ),
+                        Revision::new(9).unwrap(),
+                        action,
+                        IdempotencyKey::new(key).unwrap(),
+                        confirmation.clone(),
+                        Revision::FIRST,
+                        correlation.clone(),
+                    )
+                    .unwrap(),
+                ),
+                now_ms,
+            )
+        }
+    }
+
+    fn refusal_category(response: &PlatformV2Response) -> &str {
+        match response {
+            PlatformV2Response::Refused(refusal) => refusal.category().as_str(),
+            other => panic!("refusal expected, got {other:?}"),
+        }
+    }
+
+    fn pull_request_authority() -> ReviewAuthority {
+        ReviewAuthority::new(
+            ReviewAuthorityKind::PullRequest,
+            ReviewAuthorityId::new("authority-1").unwrap(),
+        )
+    }
+
+    /// The three slots are minted only from what a live read proved.
+    ///
+    /// A pull request the snapshot calls absent yields exactly one control,
+    /// and it yields it only because the provider answered that both branches
+    /// exist and nothing is already proposed for the pair.
+    #[test]
+    fn an_absent_pull_request_advertises_open_and_nothing_else() {
+        let fixture = PullRequestFixture::absent();
+        let capabilities = fixture.capabilities();
+        let open = capabilities
+            .open_pull_request()
+            .expect("open must be advertised");
+        assert_eq!(
+            open.expected_pull_request_revision(),
+            Revision::new(8).unwrap()
+        );
+        assert_eq!(open.authority(), &pull_request_authority());
+        assert!(capabilities.update_pull_request().is_none());
+        assert!(capabilities.merge_pull_request().is_none());
+        assert_eq!(
+            fixture.writes.load(Ordering::SeqCst),
+            0,
+            "advertising a control must never write anything",
+        );
+    }
+
+    /// A configuration fact is not a capability.
+    ///
+    /// The credential, the registry binding and the branches are all installed
+    /// and correct here; the provider simply disagrees that a pull request can
+    /// be opened. Nothing may be advertised from that.
+    #[test]
+    fn a_pull_request_github_already_has_advertises_nothing() {
+        let fixture = PullRequestFixture::absent();
+        fixture.state.lock().unwrap().already_open = true;
+        let capabilities = fixture.capabilities();
+        assert!(capabilities.open_pull_request().is_none());
+        assert!(capabilities.update_pull_request().is_none());
+        assert!(capabilities.merge_pull_request().is_none());
+    }
+
+    /// Merge is withheld on its own, and withholding it costs the other two
+    /// nothing.
+    #[test]
+    fn a_write_only_credential_advertises_update_and_never_merge() {
+        let fixture = PullRequestFixture::open(MergeReadiness::Ready, false);
+        let capabilities = fixture.capabilities();
+        assert!(capabilities.open_pull_request().is_none());
+        let update = capabilities
+            .update_pull_request()
+            .expect("update must be advertised");
+        assert_eq!(update.pull_request_id().as_str(), "77");
+        assert!(
+            capabilities.merge_pull_request().is_none(),
+            "a credential that may propose changes must never be able to land them",
+        );
+    }
+
+    /// Merge is advertised only when the snapshot and the provider agree.
+    #[test]
+    fn merge_is_advertised_only_when_github_itself_calls_it_mergeable() {
+        let ready = PullRequestFixture::open(MergeReadiness::Ready, true);
+        let capabilities = ready.capabilities();
+        let merge = capabilities
+            .merge_pull_request()
+            .expect("merge must be advertised");
+        assert_eq!(merge.pull_request_id().as_str(), "77");
+        assert_eq!(merge.expected_head_revision().as_str(), PULL_REQUEST_HEAD);
+        assert_eq!(merge.readiness(), MergeReadiness::Ready);
+        assert!(capabilities.update_pull_request().is_some());
+
+        // GitHub has not finished computing the merge. That is not a yes.
+        let unknown = PullRequestFixture::open(MergeReadiness::Ready, true);
+        unknown.state.lock().unwrap().mergeable = PullRequestMergeability::Unknown;
+        let capabilities = unknown.capabilities();
+        assert!(capabilities.merge_pull_request().is_none());
+        assert!(
+            capabilities.update_pull_request().is_some(),
+            "an unmergeable pull request can still be retitled",
+        );
+
+        // The local projection has not caught up with the provider.
+        let blocked = PullRequestFixture::open(MergeReadiness::Blocked, true);
+        assert!(blocked.capabilities().merge_pull_request().is_none());
+    }
+
+    /// The head the slot was minted over is the head the write is bound to.
+    #[test]
+    fn a_branch_that_moved_after_advertisement_invalidates_the_confirmation() {
+        let fixture = PullRequestFixture::absent();
+        let capabilities = fixture.capabilities();
+        let open = capabilities.open_pull_request().expect("open").clone();
+
+        // The head branch advances between advertisement and execution.
+        fixture.state.lock().unwrap().head_sha = PULL_REQUEST_MOVED.to_owned();
+
+        let response = fixture.execute(
+            ReviewAction::OpenPullRequest {
+                expected_pull_request_revision: Revision::new(8).unwrap(),
+                title: ReviewField::new("Proposer le correctif").unwrap(),
+            },
+            "open-moved",
+            open.confirmation_digest(),
+            open.receipt_correlation_digest(),
+            2_100,
+        );
+        assert_eq!(
+            refusal_category(&response),
+            "platform_v2_review_confirmation_changed"
+        );
+        assert_eq!(
+            fixture.writes.load(Ordering::SeqCst),
+            0,
+            "a refused confirmation must never reach the provider",
+        );
+    }
+
+    /// The advertised confirmation actually executes, exactly once.
+    #[test]
+    fn an_advertised_open_executes_once_and_replays_without_writing_again() {
+        let fixture = PullRequestFixture::absent();
+        let capabilities = fixture.capabilities();
+        let open = capabilities.open_pull_request().expect("open").clone();
+        let action = || ReviewAction::OpenPullRequest {
+            expected_pull_request_revision: Revision::new(8).unwrap(),
+            title: ReviewField::new("Proposer le correctif").unwrap(),
+        };
+        let first = fixture.execute(
+            action(),
+            "open-once",
+            open.confirmation_digest(),
+            open.receipt_correlation_digest(),
+            2_100,
+        );
+        let PlatformV2Response::ReviewReceipt(first) = first else {
+            panic!("receipt expected, got {first:?}")
+        };
+        assert!(matches!(
+            first.outcome(),
+            ReviewReceiptOutcome::Accepted
+                | ReviewReceiptOutcome::Completed
+                | ReviewReceiptOutcome::Unknown
+        ));
+        assert_eq!(fixture.writes.load(Ordering::SeqCst), 1);
+
+        fixture.execute(
+            action(),
+            "open-once",
+            open.confirmation_digest(),
+            open.receipt_correlation_digest(),
+            2_200,
+        );
+        assert_eq!(
+            fixture.writes.load(Ordering::SeqCst),
+            1,
+            "a replay under the same idempotency key must not write twice",
+        );
+    }
+
+    /// A merge with a write-only credential is refused for its own reason, and
+    /// never reaches the provider.
+    #[test]
+    fn a_withheld_merge_scope_refuses_before_any_provider_call() {
+        let advertised = PullRequestFixture::open(MergeReadiness::Ready, true);
+        let merge = advertised
+            .capabilities()
+            .merge_pull_request()
+            .expect("merge")
+            .clone();
+
+        let withheld = PullRequestFixture::open(MergeReadiness::Ready, false);
+        let response = withheld.execute(
+            ReviewAction::MergePullRequest {
+                pull_request_id: PullRequestId::new("77").unwrap(),
+                expected_pull_request_revision: Revision::new(8).unwrap(),
+                expected_head_revision: ReviewField::new(PULL_REQUEST_HEAD).unwrap(),
+            },
+            "merge-withheld",
+            merge.confirmation_digest(),
+            merge.receipt_correlation_digest(),
+            2_100,
+        );
+        assert_eq!(
+            refusal_category(&response),
+            "platform_v2_review_pull_request_merge_unavailable"
+        );
+        assert_eq!(withheld.writes.load(Ordering::SeqCst), 0);
+    }
 
     #[derive(Default)]
     struct ProviderCallCounts {
@@ -4580,81 +5862,8 @@ mod tests {
             });
             write_generation_policy(&policy_path, &policy);
 
-            let project = WorkContextRecord::new(
-                WorkContextIdentity::Project(ProjectId::new("project-test").unwrap()),
-                Revision::FIRST,
-                WorkContextLifecycle::Active,
-                WorkContextLabel::new("Project test").unwrap(),
-                WorkContextAttributes::EMPTY,
-                Vec::new(),
-            )
-            .unwrap();
-            let host = WorkContextRecord::new(
-                WorkContextIdentity::parse_local(WorkContextTargetKind::HostSetup, "host-test")
-                    .unwrap(),
-                Revision::FIRST,
-                WorkContextLifecycle::Active,
-                WorkContextLabel::new("Host test").unwrap(),
-                WorkContextAttributes::host_setup(HostSetupKind::Local),
-                vec![
-                    WorkContextRelation::new(
-                        WorkContextRelationKind::HostSetupProject,
-                        project.identity().clone(),
-                    )
-                    .unwrap(),
-                ],
-            )
-            .unwrap();
-            let repository = WorkContextIdentity::Repository(
-                V1RepositoryRef::new(ResourceCoordinate::new(
-                    ResourceAuthority::GitHub,
-                    ResourceKind::Repository,
-                    ResourceId::new("repository-test").unwrap(),
-                ))
-                .unwrap(),
-            );
-            let checkout = WorkContextRecord::new(
-                WorkContextIdentity::parse_local(WorkContextTargetKind::Checkout, "checkout-test")
-                    .unwrap(),
-                Revision::FIRST,
-                WorkContextLifecycle::Active,
-                WorkContextLabel::new("Checkout test").unwrap(),
-                WorkContextAttributes::checkout(CheckoutKind::AuthorizedFolder),
-                vec![
-                    WorkContextRelation::new(
-                        WorkContextRelationKind::CheckoutProject,
-                        project.identity().clone(),
-                    )
-                    .unwrap(),
-                    WorkContextRelation::new(
-                        WorkContextRelationKind::CheckoutHostSetup,
-                        host.identity().clone(),
-                    )
-                    .unwrap(),
-                    WorkContextRelation::new(
-                        WorkContextRelationKind::CheckoutRepository,
-                        repository.clone(),
-                    )
-                    .unwrap(),
-                ],
-            )
-            .unwrap();
-            let workspace = Self::workspace_record(Revision::FIRST, WorkContextLifecycle::Active);
-            let mut contexts = WorkContextStore::open(&work_context_path).unwrap();
-            contexts
-                .put_external_snapshot(
-                    "tenant-test",
-                    &ExpectedWorkContext::new(repository, Revision::FIRST),
-                    ExternalParentResolution::Available,
-                    Some(&ProjectId::new("project-test").unwrap()),
-                )
-                .unwrap();
-            for record in [project, host, checkout, workspace] {
-                contexts
-                    .put_authoritative_record("tenant-test", &record)
-                    .unwrap();
-            }
-            drop(contexts);
+            Self::seed_work_contexts(&work_context_path);
+
             ReviewStore::open_scoped(&review_path, "tenant-test")
                 .unwrap()
                 .put_snapshot(
@@ -4716,6 +5925,86 @@ mod tests {
                 counts,
                 attempt,
                 transport,
+            }
+        }
+
+        /// Build the project/host/checkout/workspace topology both GitHub
+        /// fixtures need. Shared rather than copied, so the pull-request tests
+        /// cannot silently drift onto a different workspace shape.
+        fn seed_work_contexts(work_context_path: &Path) {
+            let project = WorkContextRecord::new(
+                WorkContextIdentity::Project(ProjectId::new("project-test").unwrap()),
+                Revision::FIRST,
+                WorkContextLifecycle::Active,
+                WorkContextLabel::new("Project test").unwrap(),
+                WorkContextAttributes::EMPTY,
+                Vec::new(),
+            )
+            .unwrap();
+            let host = WorkContextRecord::new(
+                WorkContextIdentity::parse_local(WorkContextTargetKind::HostSetup, "host-test")
+                    .unwrap(),
+                Revision::FIRST,
+                WorkContextLifecycle::Active,
+                WorkContextLabel::new("Host test").unwrap(),
+                WorkContextAttributes::host_setup(HostSetupKind::Local),
+                vec![
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::HostSetupProject,
+                        project.identity().clone(),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+            let repository = WorkContextIdentity::Repository(
+                V1RepositoryRef::new(ResourceCoordinate::new(
+                    ResourceAuthority::GitHub,
+                    ResourceKind::Repository,
+                    ResourceId::new("repository-test").unwrap(),
+                ))
+                .unwrap(),
+            );
+            let checkout = WorkContextRecord::new(
+                WorkContextIdentity::parse_local(WorkContextTargetKind::Checkout, "checkout-test")
+                    .unwrap(),
+                Revision::FIRST,
+                WorkContextLifecycle::Active,
+                WorkContextLabel::new("Checkout test").unwrap(),
+                WorkContextAttributes::checkout(CheckoutKind::AuthorizedFolder),
+                vec![
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::CheckoutProject,
+                        project.identity().clone(),
+                    )
+                    .unwrap(),
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::CheckoutHostSetup,
+                        host.identity().clone(),
+                    )
+                    .unwrap(),
+                    WorkContextRelation::new(
+                        WorkContextRelationKind::CheckoutRepository,
+                        repository.clone(),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+            let workspace = Self::workspace_record(Revision::FIRST, WorkContextLifecycle::Active);
+            let mut contexts = WorkContextStore::open(work_context_path).unwrap();
+            contexts
+                .put_external_snapshot(
+                    "tenant-test",
+                    &ExpectedWorkContext::new(repository, Revision::FIRST),
+                    ExternalParentResolution::Available,
+                    Some(&ProjectId::new("project-test").unwrap()),
+                )
+                .unwrap();
+            for record in [project, host, checkout, workspace] {
+                contexts
+                    .put_authoritative_record("tenant-test", &record)
+                    .unwrap();
             }
         }
 

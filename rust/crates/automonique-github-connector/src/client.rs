@@ -28,19 +28,23 @@ use ureq::tls::{RootCerts, TlsConfig};
 
 use crate::request::HttpMethod;
 use crate::response::{
-    CommentRef, GitHubComment, GitHubIssue, GitHubReply, GitHubRepository, GitHubWorkflowRun,
-    IssueListPage, IssueSearchPage, Viewer, decode_comment, decode_comment_ref, decode_comments,
+    CommentRef, GitHubBranch, GitHubComment, GitHubIssue, GitHubMergeReceipt, GitHubPullRequest,
+    GitHubPullRequestRef, GitHubReply, GitHubRepository, GitHubWorkflowRun, IssueListPage,
+    IssueSearchPage, Viewer, decode_branch, decode_comment, decode_comment_ref, decode_comments,
     decode_error_message, decode_issue, decode_issue_list, decode_issue_ref, decode_labels,
-    decode_repository, decode_repository_labels, decode_search, decode_viewer, decode_workflow_run,
+    decode_merge_receipt, decode_pull_request, decode_pull_request_matches,
+    decode_pull_request_ref, decode_repository, decode_repository_labels, decode_search,
+    decode_viewer, decode_workflow_run,
 };
 use crate::{
-    CommentRequest, CreateIssueRequest, EntityTag, GITHUB_REQUEST_TIMEOUT_SECONDS,
-    GetCommentsRequest, GetIssueCommentRequest, GetIssueRequest, GetRepositoryRequest,
-    GetWorkflowRunRequest, GitHubBase, GitHubFailure, GitHubOperation, GitHubOutcome,
-    GitHubRejection, GitHubToken, ListIssuesRequest, ListLabelsRequest, MAX_GITHUB_RESPONSE_BYTES,
-    ManagementReceipt, ManagementRequest, RateLimit, ReplaceLabelsRequest, RerunWorkflowRequest,
-    SearchIssuesRequest, SetStateRequest, UpdateIssueBodyRequest, UpdateIssueCommentRequest,
-    Versioned,
+    CommentRequest, CreateIssueRequest, CreatePullRequestRequest, EntityTag,
+    GITHUB_REQUEST_TIMEOUT_SECONDS, GetBranchRequest, GetCommentsRequest, GetIssueCommentRequest,
+    GetIssueRequest, GetPullRequestRequest, GetRepositoryRequest, GetWorkflowRunRequest,
+    GitHubBase, GitHubFailure, GitHubOperation, GitHubOutcome, GitHubRejection, GitHubToken,
+    ListIssuesRequest, ListLabelsRequest, ListPullRequestsRequest, MAX_GITHUB_RESPONSE_BYTES,
+    ManagementReceipt, ManagementRequest, MergePullRequestRequest, RateLimit, ReplaceLabelsRequest,
+    RerunWorkflowRequest, SearchIssuesRequest, SetStateRequest, UpdateIssueBodyRequest,
+    UpdateIssueCommentRequest, UpdatePullRequestRequest, Versioned,
 };
 
 /// The API version every request pins.
@@ -358,6 +362,106 @@ impl GitHubClient {
         request: &RerunWorkflowRequest,
     ) -> Result<GitHubReply<()>, GitHubFailure> {
         self.call_empty(&GitHubOperation::RerunWorkflow(request.clone()), 201)
+    }
+
+    /// Read one exact branch, for the commit its tip points at.
+    ///
+    /// # Errors
+    ///
+    /// As [`GitHubClient::create_issue`], for this operation's contract.
+    pub fn get_branch(
+        &self,
+        request: &GetBranchRequest,
+    ) -> Result<GitHubReply<GitHubBranch>, GitHubFailure> {
+        self.call(&GitHubOperation::GetBranch(request.clone()), decode_branch)
+    }
+
+    /// Read one exact pull request.
+    ///
+    /// # Errors
+    ///
+    /// As [`GitHubClient::create_issue`], for this operation's contract.
+    pub fn get_pull_request(
+        &self,
+        request: &GetPullRequestRequest,
+    ) -> Result<GitHubReply<GitHubPullRequest>, GitHubFailure> {
+        self.call(
+            &GitHubOperation::GetPullRequest(request.clone()),
+            decode_pull_request,
+        )
+    }
+
+    /// List the open pull requests for one exact head/base pair.
+    ///
+    /// An empty answer is the proof that opening a pull request for the pair
+    /// will not be refused as a duplicate.
+    ///
+    /// # Errors
+    ///
+    /// As [`GitHubClient::create_issue`], for this operation's contract.
+    pub fn list_pull_requests(
+        &self,
+        request: &ListPullRequestsRequest,
+    ) -> Result<GitHubReply<Vec<GitHubPullRequestRef>>, GitHubFailure> {
+        self.call(
+            &GitHubOperation::ListPullRequests(request.clone()),
+            decode_pull_request_matches,
+        )
+    }
+
+    /// Open one pull request.
+    ///
+    /// GitHub documents a `201 Created` carrying the new pull request. The
+    /// endpoint has no idempotency key, so a caller must persist its
+    /// submission state before calling and must never blindly replay an
+    /// ambiguous result. The returned number is the only correlation this
+    /// process will ever hold for the pull request it opened.
+    ///
+    /// # Errors
+    ///
+    /// As [`GitHubClient::create_issue`], for this operation's contract.
+    pub fn create_pull_request(
+        &self,
+        request: &CreatePullRequestRequest,
+    ) -> Result<GitHubReply<GitHubPullRequestRef>, GitHubFailure> {
+        self.call(
+            &GitHubOperation::CreatePullRequest(request.clone()),
+            decode_pull_request_ref,
+        )
+    }
+
+    /// Retitle one exact pull request.
+    ///
+    /// # Errors
+    ///
+    /// As [`GitHubClient::create_issue`], for this operation's contract.
+    pub fn update_pull_request(
+        &self,
+        request: &UpdatePullRequestRequest,
+    ) -> Result<GitHubReply<GitHubPullRequest>, GitHubFailure> {
+        self.call(
+            &GitHubOperation::UpdatePullRequest(request.clone()),
+            decode_pull_request,
+        )
+    }
+
+    /// Merge one exact pull request at one exact head commit.
+    ///
+    /// GitHub refuses with `409` when the head has moved off the `sha` this
+    /// request names, which is the provider-side half of the exactly-once
+    /// fence: a replay after the branch advanced cannot land a second merge.
+    ///
+    /// # Errors
+    ///
+    /// As [`GitHubClient::create_issue`], for this operation's contract.
+    pub fn merge_pull_request(
+        &self,
+        request: &MergePullRequestRequest,
+    ) -> Result<GitHubReply<GitHubMergeReceipt>, GitHubFailure> {
+        self.call(
+            &GitHubOperation::MergePullRequest(request.clone()),
+            decode_merge_receipt,
+        )
     }
 
     /// Search issues across repositories.

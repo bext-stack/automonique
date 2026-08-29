@@ -1402,7 +1402,7 @@ mod tests {
             let request = PlatformV2RequestMessage::new(
                 RequestId::new(format!("mobile-review-denied-{index}")).unwrap(),
                 PlatformV2Request::ExecuteReviewAction(
-                    if matches!(action, ReviewAction::RerunCheck { .. }) {
+                    if action.requires_confirmation() {
                         ReviewActionTransportRequest::new_confirmed_correlated(
                             WorkContextIdentity::UserWorkspace(
                                 automonique_protocol::platform_v2::UserWorkspaceId::new(
@@ -2203,17 +2203,39 @@ mod tests {
             automonique_protocol::platform_v2::UserWorkspaceId::new("workspace-test").unwrap(),
         );
         let mut refusal_category = |action: ReviewAction, key: &str| {
-            let request = PlatformV2RequestMessage::new(
-                RequestId::new(format!("mobile-pull-request-{key}")).unwrap(),
-                PlatformV2Request::ExecuteReviewAction(
-                    ReviewActionTransportRequest::new(
-                        workspace.clone(),
-                        Revision::FIRST,
-                        action,
-                        IdempotencyKey::new(format!("mobile:pull-request:{key}")).unwrap(),
+            // A pull-request action can only be spelled with a confirmation
+            // now that the daemon can mint one. The digests here are
+            // fabricated on purpose: the bridge must deny the action before
+            // anything is in a position to check them.
+            let key = key.to_owned();
+            let transport = if action.requires_confirmation() {
+                ReviewActionTransportRequest::new_confirmed_correlated(
+                    workspace.clone(),
+                    Revision::FIRST,
+                    action,
+                    IdempotencyKey::new(format!("mobile:pull-request:{key}")).unwrap(),
+                    automonique_protocol::platform_v2_transport::ReviewConfirmationDigest::new(
+                        "ab".repeat(32),
                     )
                     .unwrap(),
-                ),
+                    Revision::FIRST,
+                    automonique_protocol::platform_v2_transport::ReviewReceiptCorrelationDigest::new(
+                        "cd".repeat(32),
+                    )
+                    .unwrap(),
+                )
+            } else {
+                ReviewActionTransportRequest::new(
+                    workspace.clone(),
+                    Revision::FIRST,
+                    action,
+                    IdempotencyKey::new(format!("mobile:pull-request:{key}")).unwrap(),
+                )
+            }
+            .unwrap();
+            let request = PlatformV2RequestMessage::new(
+                RequestId::new(format!("mobile-pull-request-{key}")).unwrap(),
+                PlatformV2Request::ExecuteReviewAction(transport),
             );
             let response = bridge.exchange_mobile(
                 PlatformV2Lane::V2,

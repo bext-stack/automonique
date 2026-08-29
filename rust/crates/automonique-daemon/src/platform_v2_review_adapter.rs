@@ -18,14 +18,17 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Arc;
 
-use automonique_github_connector::{GitHubToken, RepoTarget, WorkflowRunId};
+use automonique_github_connector::{
+    BranchName, GitHubToken, IssueNumber, RepoTarget, WorkflowRunId,
+};
 use automonique_protocol::digest::{Sha256, Sha256Digest};
 use automonique_protocol::identity::Actor;
 use automonique_protocol::platform_v2::{
     ProjectId, WorkContextIdentity, WorkContextTargetKind, WorkSessionId,
 };
 use automonique_protocol::platform_v2_review::{
-    ReviewAction, ReviewAuthority, ReviewAuthorityId, ReviewAuthorityKind, ReviewCheckId,
+    PullRequestId, ReviewAction, ReviewAuthority, ReviewAuthorityId, ReviewAuthorityKind,
+    ReviewCheckId, ReviewField,
 };
 use automonique_protocol::primitives::Revision;
 
@@ -33,6 +36,12 @@ use automonique_protocol::primitives::Revision;
 use crate::platform_v2_github_check_adapter::SharedGitHubActionsTransport;
 use crate::platform_v2_github_check_adapter::{
     GitHubActionsWriteCapability, GitHubCheckRerunAdapter,
+};
+#[cfg(test)]
+use crate::platform_v2_github_pull_request_adapter::SharedGitHubPullRequestTransport;
+use crate::platform_v2_github_pull_request_adapter::{
+    GitHubPullRequestAdapter, GitHubPullRequestFamily, GitHubPullRequestObservation,
+    GitHubPullRequestWriteCapability,
 };
 use nix::libc;
 use serde::Deserialize;
@@ -115,6 +124,20 @@ enum RegistryTarget {
         provider: String,
         repository: String,
         credential_reference: String,
+        /// The branch a pull request lands onto. Operator-owned, never a
+        /// client string: a review action names no branch, so a client can
+        /// neither retarget a proposal nor point one at a protected branch it
+        /// was not granted.
+        #[serde(default)]
+        base_branch: Option<String>,
+        /// The branch a pull request proposes from, on the same terms.
+        ///
+        /// Both are optional so a document installed before the pull-request
+        /// adapter existed keeps parsing. Migration grants nothing: a binding
+        /// without them can plan no pull-request action at all, which is
+        /// exactly what it could do before.
+        #[serde(default)]
+        head_branch: Option<String>,
     },
 }
 
@@ -197,6 +220,22 @@ struct InstalledGitHubCredentialDocument {
     credentials: Vec<InstalledGitHubCredential>,
 }
 
+/// What the capability surface already knows about one pull request.
+///
+/// A grouping for one call, never a grant: every field here came from the
+/// server-owned review snapshot, and none of it is proof the provider would
+/// admit anything.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PullRequestCapabilityTarget<'a> {
+    pub family: GitHubPullRequestFamily,
+    /// Absent exactly when the family is `Open`.
+    pub number: Option<IssueNumber>,
+    /// Present only for a merge, which is the one family the snapshot pins a
+    /// head for.
+    pub expected_head_revision: Option<&'a ReviewField>,
+    pub expected_pull_request_revision: Revision,
+}
+
 /// The pull-request powers one installed credential carries.
 ///
 /// Two independent flags rather than a level, because they are withheld
@@ -236,6 +275,40 @@ pub(crate) enum ReviewEffectPlan {
         registry_generation: [u8; 32],
         credential_generation: [u8; 32],
     },
+    /// One of the three independently withheld pull-request writes.
+    ///
+    /// Everything here is either operator-owned (repository, branches,
+    /// credential) or already fenced by the server-owned review snapshot
+    /// (`number`, `expected_head_revision`, `expected_pull_request_revision`).
+    /// No client string appears at all. The title an open or an update carries
+    /// is deliberately absent: it names nothing the server must agree about,
+    /// so it stays client-owned and unfenced, and a plan can therefore be
+    /// built for advertisement before any client has chosen one.
+    ///
+    /// A plan is not yet a capability. It says a write *could* be addressed;
+    /// only [`ProductionReviewEffectAdapter::preflight_github_pull_request_capability`]
+    /// can say the provider would admit one.
+    GitHubPullRequest {
+        family: GitHubPullRequestFamily,
+        credential_reference: String,
+        repository: RepoTarget,
+        base_branch: BranchName,
+        head_branch: BranchName,
+        /// The GitHub pull-request number, absent only for an open.
+        number: Option<IssueNumber>,
+        /// The head the review snapshot pinned, for a merge only. The other
+        /// two families learn their head from the preflight instead, because
+        /// the snapshot has none to pin for an open and an update is not
+        /// head-sensitive.
+        expected_head_revision: Option<String>,
+        /// Whether the installed credential also carries the merge scope.
+        /// Carried into the capability so the adapter refuses a merge on its
+        /// own account, independently of this module's own check.
+        merge_allowed: bool,
+        expected_pull_request_revision: Revision,
+        registry_generation: [u8; 32],
+        credential_generation: [u8; 32],
+    },
 }
 
 /// Registry-fenced review adapter composition.
@@ -249,6 +322,8 @@ pub(crate) struct ProductionReviewEffectAdapter {
     github_credentials: Option<InstalledGitHubCredentials>,
     #[cfg(test)]
     github_test_transport: Option<SharedGitHubActionsTransport>,
+    #[cfg(test)]
+    github_pull_request_test_transport: Option<SharedGitHubPullRequestTransport>,
 }
 
 struct InstalledRegistry {
@@ -298,6 +373,8 @@ impl ProductionReviewEffectAdapter {
                 github_credentials,
                 #[cfg(test)]
                 github_test_transport: None,
+                #[cfg(test)]
+                github_pull_request_test_transport: None,
             });
         };
         let document: RegistryDocument = serde_json::from_slice(&snapshot.bytes)
@@ -313,6 +390,8 @@ impl ProductionReviewEffectAdapter {
             github_credentials,
             #[cfg(test)]
             github_test_transport: None,
+            #[cfg(test)]
+            github_pull_request_test_transport: None,
         })
     }
 
@@ -433,30 +512,30 @@ impl ProductionReviewEffectAdapter {
                 credential_generation: *credentials.generation.digest.as_bytes(),
             });
         }
-        // Pull-request actions still reach no provider, and this arm does not
-        // change that: every path below returns an error. What it adds is a
-        // precise reason, so an operator can tell an incomplete credential
-        // from the missing adapter, and so the merge scope is observably
-        // withheld today rather than only declared.
-        //
-        // An installed binding is not authority. Scopes are a configuration
-        // fact, and proving a pull request can actually be written needs a
-        // provider preflight that does not exist yet, which is why the last
-        // refusal here is unconditional.
+        // A pull-request action now reaches a provider plan, but a plan is
+        // still not authority. Every refusal below stays specific, so an
+        // operator can tell an incomplete credential from a binding that
+        // names no branches, and the merge scope stays observably withheld on
+        // its own rather than only declared.
         if matches!(
             action,
             ReviewAction::OpenPullRequest { .. }
                 | ReviewAction::UpdatePullRequest { .. }
                 | ReviewAction::MergePullRequest { .. }
-        ) && let Some(RegistryBinding {
-            target:
-                RegistryTarget::PullRequest {
-                    provider,
-                    repository,
-                    credential_reference,
-                },
-            ..
-        }) = binding
+        ) && let (
+            Some(installed),
+            Some(RegistryBinding {
+                target:
+                    RegistryTarget::PullRequest {
+                        provider,
+                        repository,
+                        credential_reference,
+                        base_branch,
+                        head_branch,
+                    },
+                ..
+            }),
+        ) = (&self.installed, binding)
         {
             if provider != "github" {
                 return Err("platform_v2_review_pull_request_provider_unavailable");
@@ -471,11 +550,82 @@ impl ProductionReviewEffectAdapter {
                 return Err("platform_v2_review_pull_request_credential_unavailable");
             }
             // Merging is withheld on its own. A credential that may propose
-            // changes must not be able to land them, and that has to be true
-            // before the adapter exists, not after.
+            // changes must not be able to land them, and that stays true
+            // now that the adapter exists rather than only before it.
             if matches!(action, ReviewAction::MergePullRequest { .. }) && !scopes.merge {
                 return Err("platform_v2_review_pull_request_merge_unavailable");
             }
+            // A binding installed before the adapter existed names no
+            // branches. It can plan nothing, which is exactly what it could
+            // do before, and it says so rather than guessing a default branch.
+            let (Some(base_branch), Some(head_branch)) = (base_branch, head_branch) else {
+                return Err("platform_v2_review_pull_request_branches_unavailable");
+            };
+            let base_branch = BranchName::new(base_branch)
+                .map_err(|_| "platform_v2_review_registry_incoherent")?;
+            let head_branch = BranchName::new(head_branch)
+                .map_err(|_| "platform_v2_review_registry_incoherent")?;
+            if base_branch == head_branch {
+                return Err("platform_v2_review_registry_incoherent");
+            }
+            let credentials = self
+                .github_credentials
+                .as_ref()
+                .ok_or("platform_v2_review_pull_request_credential_unavailable")?;
+            let (family, number, expected_head_revision, expected_pull_request_revision) =
+                match action {
+                    ReviewAction::OpenPullRequest {
+                        expected_pull_request_revision,
+                        ..
+                    } => (
+                        GitHubPullRequestFamily::Open,
+                        None,
+                        None,
+                        *expected_pull_request_revision,
+                    ),
+                    ReviewAction::UpdatePullRequest {
+                        pull_request_id,
+                        expected_pull_request_revision,
+                        ..
+                    } => (
+                        GitHubPullRequestFamily::Update,
+                        Some(github_pull_request_number(pull_request_id)?),
+                        None,
+                        *expected_pull_request_revision,
+                    ),
+                    ReviewAction::MergePullRequest {
+                        pull_request_id,
+                        expected_pull_request_revision,
+                        expected_head_revision,
+                    } => (
+                        GitHubPullRequestFamily::Merge,
+                        Some(github_pull_request_number(pull_request_id)?),
+                        Some(github_head_revision(expected_head_revision)?),
+                        *expected_pull_request_revision,
+                    ),
+                    _ => return Err("platform_v2_review_plan_invalid"),
+                };
+            if expected_pull_request_revision
+                .get()
+                .checked_add(1)
+                .and_then(|next| Revision::new(next).ok())
+                .is_none()
+            {
+                return Err("platform_v2_review_registry_incoherent");
+            }
+            return Ok(ReviewEffectPlan::GitHubPullRequest {
+                family,
+                credential_reference: credential_reference.clone(),
+                repository: parse_repository(repository)?,
+                base_branch,
+                head_branch,
+                number,
+                expected_head_revision,
+                merge_allowed: scopes.merge,
+                expected_pull_request_revision,
+                registry_generation: *installed.generation.digest.as_bytes(),
+                credential_generation: *credentials.generation.digest.as_bytes(),
+            });
         }
         Err(unavailable_category(action))
     }
@@ -556,9 +706,337 @@ impl ProductionReviewEffectAdapter {
         Ok(GitHubCheckRerunAdapter::new(capability))
     }
 
+    /// Build the plan for one pull-request family without an action.
+    ///
+    /// The capability surface must decide whether to advertise a control
+    /// *before* any client has named a title, so this takes only what the
+    /// server already owns: the review coordinate, the family, and the
+    /// identity the snapshot pinned. `plan` is the same computation reached
+    /// from an action; both funnel through the identical binding, scope and
+    /// branch checks, so a control can never be advertised on a looser test
+    /// than the one the write is admitted under.
+    pub(crate) fn pull_request_effect_plan(
+        &self,
+        project: &ProjectId,
+        workspace: &WorkContextIdentity,
+        authority: &ReviewAuthority,
+        target: PullRequestCapabilityTarget<'_>,
+    ) -> Result<ReviewEffectPlan, &'static str> {
+        let PullRequestCapabilityTarget {
+            family,
+            number,
+            expected_head_revision,
+            expected_pull_request_revision,
+        } = target;
+        // Reaching the same arm as an action does keeps the two paths honest:
+        // a placeholder title is never sent anywhere, because the plan does
+        // not carry one.
+        let probe = match family {
+            GitHubPullRequestFamily::Open => ReviewAction::OpenPullRequest {
+                expected_pull_request_revision,
+                title: ReviewField::new("capability-probe")
+                    .map_err(|_| "platform_v2_review_plan_invalid")?,
+            },
+            GitHubPullRequestFamily::Update => ReviewAction::UpdatePullRequest {
+                pull_request_id: PullRequestId::new(
+                    number
+                        .ok_or("platform_v2_review_pull_request_identity_invalid")?
+                        .get()
+                        .to_string(),
+                )
+                .map_err(|_| "platform_v2_review_pull_request_identity_invalid")?,
+                expected_pull_request_revision,
+                title: ReviewField::new("capability-probe")
+                    .map_err(|_| "platform_v2_review_plan_invalid")?,
+            },
+            GitHubPullRequestFamily::Merge => ReviewAction::MergePullRequest {
+                pull_request_id: PullRequestId::new(
+                    number
+                        .ok_or("platform_v2_review_pull_request_identity_invalid")?
+                        .get()
+                        .to_string(),
+                )
+                .map_err(|_| "platform_v2_review_pull_request_identity_invalid")?,
+                expected_pull_request_revision,
+                expected_head_revision: expected_head_revision
+                    .ok_or("platform_v2_review_pull_request_identity_invalid")?
+                    .clone(),
+            },
+        };
+        self.plan(project, workspace, authority, &probe)
+    }
+
+    /// Mint the fixed-origin pull-request capability for one exact plan.
+    ///
+    /// The credential is re-read and re-verified here, not trusted from the
+    /// plan: a credential document swapped between planning and execution must
+    /// invalidate the write rather than silently perform it with a different
+    /// token.
+    pub(crate) fn github_pull_request_adapter(
+        &self,
+        credential_reference: &str,
+        repository: &RepoTarget,
+        base_branch: &BranchName,
+        head_branch: &BranchName,
+        require_merge: bool,
+        expected_generation: [u8; 32],
+    ) -> Result<GitHubPullRequestAdapter, &'static str> {
+        self.verify_github_credential_generation(Some(expected_generation))
+            .map_err(|_| "platform_v2_review_pull_request_credentials_changed")?;
+        let installed = self
+            .github_credentials
+            .as_ref()
+            .ok_or("platform_v2_review_pull_request_credential_unavailable")?;
+        let coordinate = repository.to_string();
+        let credential = installed
+            .document
+            .credentials
+            .iter()
+            .find(|candidate| candidate.reference == credential_reference)
+            .ok_or("platform_v2_review_pull_request_credential_unavailable")?;
+        if !credential.pull_request_write || credential.repository != coordinate {
+            return Err("platform_v2_review_pull_request_credential_incoherent");
+        }
+        // Merge is checked here as well as in `plan`. A credential that may
+        // propose changes must not be able to land them however the caller
+        // reached this point.
+        if require_merge && !credential.pull_request_merge {
+            return Err("platform_v2_review_pull_request_merge_unavailable");
+        }
+        // The typed connector owns this one short-lived copy. The installed
+        // credential remains in its zeroizing container and is never Clone or
+        // Debug; the client copy is scrubbed by GitHubToken on drop.
+        #[cfg(test)]
+        let capability = if let Some(transport) = &self.github_pull_request_test_transport {
+            GitHubPullRequestWriteCapability::testing(
+                credential_reference,
+                repository.clone(),
+                base_branch.clone(),
+                head_branch.clone(),
+                credential.pull_request_merge,
+                Arc::clone(transport),
+            )
+            .map_err(|_| "platform_v2_review_pull_request_credential_invalid")?
+        } else {
+            let token = GitHubToken::new(credential.token.to_vec())
+                .map_err(|_| "platform_v2_review_pull_request_credential_invalid")?;
+            GitHubPullRequestWriteCapability::production(
+                credential_reference,
+                repository.clone(),
+                base_branch.clone(),
+                head_branch.clone(),
+                credential.pull_request_merge,
+                token,
+            )
+            .map_err(|_| "platform_v2_review_pull_request_credential_invalid")?
+        };
+        #[cfg(not(test))]
+        let capability = {
+            let token = GitHubToken::new(credential.token.to_vec())
+                .map_err(|_| "platform_v2_review_pull_request_credential_invalid")?;
+            GitHubPullRequestWriteCapability::production(
+                credential_reference,
+                repository.clone(),
+                base_branch.clone(),
+                head_branch.clone(),
+                credential.pull_request_merge,
+                token,
+            )
+            .map_err(|_| "platform_v2_review_pull_request_credential_invalid")?
+        };
+        Ok(GitHubPullRequestAdapter::new(capability))
+    }
+
+    /// Advertise a pull-request write only after a fresh, mutation-free
+    /// provider read proves the exact thing the write depends on.
+    ///
+    /// The returned observation is the only thing a capability slot may be
+    /// minted from, and it is what the confirmation digest commits to. What
+    /// each family's read proves is documented on
+    /// [`GitHubPullRequestAdapter::preflight_observation`]; in one line each:
+    /// an open proves both branches exist, pins the head commit it would
+    /// propose, and proves nothing is already open for the pair; an update
+    /// proves the numbered pull request is open on that exact pair; a merge
+    /// proves all of that plus that GitHub itself calls it mergeable at the
+    /// head the snapshot pinned.
+    pub(crate) fn preflight_github_pull_request_capability(
+        &self,
+        plan: &ReviewEffectPlan,
+    ) -> Result<GitHubPullRequestObservation, &'static str> {
+        let ReviewEffectPlan::GitHubPullRequest {
+            family,
+            credential_reference,
+            repository,
+            base_branch,
+            head_branch,
+            number,
+            expected_head_revision,
+            merge_allowed,
+            credential_generation,
+            ..
+        } = plan
+        else {
+            return Err("platform_v2_review_pull_request_adapter_unavailable");
+        };
+        let merge = *family == GitHubPullRequestFamily::Merge;
+        if merge && !*merge_allowed {
+            return Err("platform_v2_review_pull_request_merge_unavailable");
+        }
+        let adapter = self.github_pull_request_adapter(
+            credential_reference,
+            repository,
+            base_branch,
+            head_branch,
+            merge,
+            *credential_generation,
+        )?;
+        adapter
+            .preflight_observation(
+                repository,
+                *family,
+                *number,
+                expected_head_revision.as_deref(),
+            )
+            .map_err(|_| "platform_v2_review_pull_request_preflight_refused")
+    }
+
+    /// Commit an inert client confirmation to the exact actor, review
+    /// coordinate, provider target, live observation, and installed
+    /// registry/credential generations that were preflighted.
+    ///
+    /// The observation is part of the digest, which is what makes this
+    /// revision-binding rather than merely authenticated: a branch that moves
+    /// between advertisement and execution produces a different digest, so the
+    /// client's confirmation stops matching and the write is refused instead
+    /// of landing a change nobody saw.
+    ///
+    /// The title is deliberately not committed to. It is client-owned and
+    /// names nothing the server must agree about; the repository, the branch
+    /// pair and the pull request are all operator- or server-owned and every
+    /// one of them is committed to here. Fencing the title would also make a
+    /// slot unadvertisable, since the server must decide whether the control
+    /// exists before any client has chosen one.
+    #[allow(clippy::too_many_arguments)] // Every field is an independently fenced commitment input.
+    pub(crate) fn github_pull_request_confirmation_digest(
+        &self,
+        actor: &Actor,
+        project: &ProjectId,
+        workspace: &WorkContextIdentity,
+        authority: &ReviewAuthority,
+        snapshot_revision: Revision,
+        workspace_revision: Revision,
+        plan: &ReviewEffectPlan,
+        observation: &GitHubPullRequestObservation,
+    ) -> Result<[u8; 32], &'static str> {
+        let ReviewEffectPlan::GitHubPullRequest {
+            family,
+            credential_reference,
+            repository,
+            base_branch,
+            head_branch,
+            number,
+            expected_head_revision,
+            expected_pull_request_revision,
+            registry_generation,
+            credential_generation,
+            ..
+        } = plan
+        else {
+            return Err("platform_v2_review_confirmation_invalid");
+        };
+        // The observation must be of the thing the plan names. A digest minted
+        // over a read of some other pull request would commit to nothing.
+        if observation.family() != *family || observation.number() != *number {
+            return Err("platform_v2_review_confirmation_invalid");
+        }
+        if *family == GitHubPullRequestFamily::Merge
+            && (!observation.mergeable()
+                || expected_head_revision.as_deref() != Some(observation.head_sha()))
+        {
+            return Err("platform_v2_review_confirmation_invalid");
+        }
+        let mut document = Vec::new();
+        push_confirmation_field(
+            &mut document,
+            b"automonique.review-pull-request-confirmation/v1",
+        );
+        for field in [
+            registry_generation.as_slice(),
+            credential_generation.as_slice(),
+            actor.tenant().as_bytes(),
+            actor.id().as_bytes(),
+            project.as_str().as_bytes(),
+            workspace.kind().as_str().as_bytes(),
+            workspace.id().as_bytes(),
+            authority.kind().as_str().as_bytes(),
+            authority.id().as_str().as_bytes(),
+            credential_reference.as_bytes(),
+            repository.owner().as_str().as_bytes(),
+            repository.repo().as_str().as_bytes(),
+            family.as_str().as_bytes(),
+            base_branch.as_str().as_bytes(),
+            head_branch.as_str().as_bytes(),
+            // The live head, not one an operator declared. This is the field
+            // that makes the digest expire when the branch moves.
+            observation.head_sha().as_bytes(),
+            expected_head_revision
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+        ] {
+            push_confirmation_field(&mut document, field);
+        }
+        push_confirmation_field(
+            &mut document,
+            &number
+                .map(IssueNumber::get)
+                .unwrap_or_default()
+                .to_be_bytes(),
+        );
+        push_confirmation_field(
+            &mut document,
+            &[
+                u8::from(number.is_some()),
+                u8::from(expected_head_revision.is_some()),
+                u8::from(observation.mergeable()),
+            ],
+        );
+        push_confirmation_field(&mut document, &snapshot_revision.get().to_be_bytes());
+        push_confirmation_field(&mut document, &workspace_revision.get().to_be_bytes());
+        push_confirmation_field(
+            &mut document,
+            &expected_pull_request_revision.get().to_be_bytes(),
+        );
+        Ok(*Sha256::digest(&document).as_bytes())
+    }
+
+    /// The receipt correlation for one pull-request confirmation.
+    ///
+    /// Domain-separated from the check-rerun correlation so a receipt minted
+    /// for one family can never be recovered against the other.
+    pub(crate) fn github_pull_request_receipt_correlation_digest(
+        confirmation: [u8; 32],
+    ) -> [u8; 32] {
+        let mut document = Vec::new();
+        push_confirmation_field(
+            &mut document,
+            b"automonique.review-pull-request-receipt-correlation/v1",
+        );
+        push_confirmation_field(&mut document, &confirmation);
+        *Sha256::digest(&document).as_bytes()
+    }
+
     #[cfg(test)]
     pub(crate) fn set_github_test_transport(&mut self, transport: SharedGitHubActionsTransport) {
         self.github_test_transport = Some(transport);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_github_pull_request_test_transport(
+        &mut self,
+        transport: SharedGitHubPullRequestTransport,
+    ) {
+        self.github_pull_request_test_transport = Some(transport);
     }
 
     /// Advertise a rerun only after a fresh, mutation-free provider GET proves
@@ -706,6 +1184,44 @@ impl ProductionReviewEffectAdapter {
         }
         Ok(())
     }
+}
+
+/// Read the GitHub pull-request number out of a review projection id.
+///
+/// For a GitHub-backed workspace the review contract's opaque
+/// [`PullRequestId`] *is* the pull-request number in decimal. That is a
+/// projection convention rather than an inference from client input: the id
+/// reaching here came from the server-owned review snapshot, and
+/// `ReviewSnapshot::resolve_action` has already refused any action whose id is
+/// not the one the snapshot holds. A client therefore cannot name a pull
+/// request the server did not itself observe, and the operator registry pins
+/// which repository the number is read in.
+///
+/// The grammar is strict on purpose: an id with a leading zero or a sign would
+/// be a second spelling of the same pull request, and two spellings of one
+/// coordinate is two rows in every fence keyed on it.
+fn github_pull_request_number(id: &PullRequestId) -> Result<IssueNumber, &'static str> {
+    let value = id.as_str();
+    if value.is_empty()
+        || value.len() > 7
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        return Err("platform_v2_review_pull_request_identity_invalid");
+    }
+    value
+        .parse::<u32>()
+        .ok()
+        .and_then(|number| IssueNumber::new(number).ok())
+        .ok_or("platform_v2_review_pull_request_identity_invalid")
+}
+
+/// Read a commit id out of a review projection head revision.
+fn github_head_revision(value: &ReviewField) -> Result<String, &'static str> {
+    if !valid_head_sha(value.as_str()) {
+        return Err("platform_v2_review_pull_request_identity_invalid");
+    }
+    Ok(value.as_str().to_owned())
 }
 
 fn push_confirmation_field(document: &mut Vec<u8>, field: &[u8]) {
@@ -884,10 +1400,28 @@ fn validate_registry(document: &RegistryDocument, expected_uid: u32) -> Result<(
                 provider,
                 repository,
                 credential_reference,
+                base_branch,
+                head_branch,
             } => {
                 if !safe_token(provider)
                     || !safe_coordinate(repository)
                     || !safe_token(credential_reference)
+                    || (provider == "github" && parse_repository(repository).is_err())
+                {
+                    return Err("platform_v2_review_registry_invalid");
+                }
+                // Branches are optional, so a document written before the
+                // pull-request adapter existed still parses. Present ones are
+                // validated all the way to the connector's own grammar, and a
+                // binding naming one branch twice would propose a pull
+                // request from a branch onto itself.
+                for branch in [base_branch, head_branch].into_iter().flatten() {
+                    if BranchName::new(branch).is_err() {
+                        return Err("platform_v2_review_registry_invalid");
+                    }
+                }
+                if let (Some(base), Some(head)) = (base_branch, head_branch)
+                    && base == head
                 {
                     return Err("platform_v2_review_registry_invalid");
                 }
@@ -1344,7 +1878,9 @@ mod tests {
                 assert_eq!(work_session_id.as_str(), "work-session-1");
                 assert_ne!(registry_generation, [0; 32]);
             }
-            ReviewEffectPlan::LocalStore | ReviewEffectPlan::GitHubCheckRerun { .. } => {
+            ReviewEffectPlan::LocalStore
+            | ReviewEffectPlan::GitHubCheckRerun { .. }
+            | ReviewEffectPlan::GitHubPullRequest { .. } => {
                 panic!("external action became another effect")
             }
         }
@@ -1820,7 +2356,80 @@ mod tests {
     }
 
     fn pull_request_registry() -> &'static str {
+        r#"{"version":1,"generation":"generation-1","bindings":[{"project":"project-1","workspace_kind":"user_workspace","workspace_id":"workspace-1","authority_kind":"pull_request","authority_id":"pull-request-1","target":{"kind":"pull_request","provider":"github","repository":"example-org/example-repo","credential_reference":"github-pull-request-mobile","base_branch":"main","head_branch":"agent-work"}}]}"#
+    }
+
+    /// The shape every deployment installed before the adapter existed.
+    fn branchless_pull_request_registry() -> &'static str {
         r#"{"version":1,"generation":"generation-1","bindings":[{"project":"project-1","workspace_kind":"user_workspace","workspace_id":"workspace-1","authority_kind":"pull_request","authority_id":"pull-request-1","target":{"kind":"pull_request","provider":"github","repository":"example-org/example-repo","credential_reference":"github-pull-request-mobile"}}]}"#
+    }
+
+    /// A provider that answers every read with a refusal, so a preflight can
+    /// prove nothing and no slot may be minted.
+    fn refusing_transport() -> SharedGitHubPullRequestTransport {
+        use crate::platform_v2_github_pull_request_adapter::GitHubPullRequestTransport;
+        use automonique_github_connector::{
+            CreatePullRequestRequest, GetBranchRequest, GetPullRequestRequest, GitHubBranch,
+            GitHubFailure, GitHubMergeReceipt, GitHubOutcome, GitHubPullRequest,
+            GitHubPullRequestRef, GitHubRejection, GitHubReply, ListPullRequestsRequest,
+            MergePullRequestRequest, RateLimit, ServerMessage, UpdatePullRequestRequest,
+        };
+
+        struct Refusing;
+
+        fn refused<T>() -> Result<GitHubReply<T>, GitHubFailure> {
+            let rate = RateLimit::new(None, None, None);
+            Ok(GitHubReply::new(
+                rate,
+                GitHubOutcome::Rejected(GitHubRejection::new(
+                    404,
+                    ServerMessage::sanitized("not found"),
+                    &rate,
+                    None,
+                )),
+            ))
+        }
+
+        impl GitHubPullRequestTransport for Refusing {
+            fn get_branch(
+                &self,
+                _: &GetBranchRequest,
+            ) -> Result<GitHubReply<GitHubBranch>, GitHubFailure> {
+                refused()
+            }
+            fn get_pull_request(
+                &self,
+                _: &GetPullRequestRequest,
+            ) -> Result<GitHubReply<GitHubPullRequest>, GitHubFailure> {
+                refused()
+            }
+            fn list_pull_requests(
+                &self,
+                _: &ListPullRequestsRequest,
+            ) -> Result<GitHubReply<Vec<GitHubPullRequestRef>>, GitHubFailure> {
+                refused()
+            }
+            fn create_pull_request(
+                &self,
+                _: &CreatePullRequestRequest,
+            ) -> Result<GitHubReply<GitHubPullRequestRef>, GitHubFailure> {
+                panic!("a preflight must never write")
+            }
+            fn update_pull_request(
+                &self,
+                _: &UpdatePullRequestRequest,
+            ) -> Result<GitHubReply<GitHubPullRequest>, GitHubFailure> {
+                panic!("a preflight must never write")
+            }
+            fn merge_pull_request(
+                &self,
+                _: &MergePullRequestRequest,
+            ) -> Result<GitHubReply<GitHubMergeReceipt>, GitHubFailure> {
+                panic!("a preflight must never write")
+            }
+        }
+
+        Arc::new(std::sync::Mutex::new(Box::new(Refusing)))
     }
 
     fn pull_request_actions() -> Vec<ReviewAction> {
@@ -1830,12 +2439,12 @@ mod tests {
                 title: ReviewField::new("Title").unwrap(),
             },
             ReviewAction::UpdatePullRequest {
-                pull_request_id: PullRequestId::new("pull-request-1").unwrap(),
+                pull_request_id: PullRequestId::new("77").unwrap(),
                 expected_pull_request_revision: Revision::FIRST,
                 title: ReviewField::new("Title").unwrap(),
             },
             ReviewAction::MergePullRequest {
-                pull_request_id: PullRequestId::new("pull-request-1").unwrap(),
+                pull_request_id: PullRequestId::new("77").unwrap(),
                 expected_pull_request_revision: Revision::FIRST,
                 expected_head_revision: ReviewField::new(
                     "0123456789abcdef0123456789abcdef01234567",
@@ -1930,17 +2539,17 @@ mod tests {
 
     /// Holding every pull-request scope still mints no capability.
     ///
-    /// This is the rule the whole capability surface rests on: an
-    /// advertisement means the server proved the write would be admitted, not
-    /// that an operator installed something. A scope is a configuration fact.
-    /// The provider preflight that would turn it into proof does not exist
-    /// yet, so `plan` still has no arm for a pull-request target and no
-    /// confirmation digest is minted for one.
+    /// This is the rule the whole capability surface rests on, and it survives
+    /// the adapter landing rather than being retired by it. `plan` now returns
+    /// a plan, because the registry and the credential together say *where* a
+    /// write would go. That is still not authority: only a live provider read
+    /// can say the write would be admitted, and nothing is advertised until
+    /// one has answered.
     ///
-    /// This test is meant to fail when that adapter lands, and to be replaced
-    /// deliberately rather than deleted quietly.
+    /// This replaces the earlier version of this test, which pinned the same
+    /// rule against a `plan` that had no pull-request arm at all.
     #[test]
-    fn a_fully_scoped_pull_request_credential_still_advertises_nothing() {
+    fn a_fully_scoped_pull_request_credential_still_proves_nothing_by_itself() {
         let temporary = TempDir::new().unwrap();
         let registry = temporary.path().join("registry.json");
         write_registry(&registry, pull_request_registry());
@@ -1955,8 +2564,61 @@ mod tests {
                 write: true,
                 merge: true,
             }),
-            "the scopes really are installed, so the refusals below are the plan's",
+            "the scopes really are installed, so what follows is not about them",
         );
+        for action in pull_request_actions() {
+            let plan = adapter
+                .plan(
+                    &ProjectId::new("project-1").unwrap(),
+                    &workspace(),
+                    &pull_request_authority(),
+                    &action,
+                )
+                .expect("a fully scoped binding addresses a plan");
+            assert!(matches!(plan, ReviewEffectPlan::GitHubPullRequest { .. }));
+        }
+
+        // A provider that refuses every read proves nothing, so nothing is
+        // advertised. Fail-closed is the whole point: an empty slot is an
+        // honest answer, an advertised control that refuses is not.
+        let mut adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
+        adapter.set_github_pull_request_test_transport(refusing_transport());
+        for action in pull_request_actions() {
+            let plan = adapter
+                .plan(
+                    &ProjectId::new("project-1").unwrap(),
+                    &workspace(),
+                    &pull_request_authority(),
+                    &action,
+                )
+                .unwrap();
+            assert_eq!(
+                adapter
+                    .preflight_github_pull_request_capability(&plan)
+                    .err(),
+                Some("platform_v2_review_pull_request_preflight_refused"),
+                "{:?} must not be advertised on a provider that refuses",
+                action.kind(),
+            );
+        }
+    }
+
+    /// A binding installed before the adapter existed names no branches, and
+    /// a pull request cannot be proposed from a branch nobody named.
+    ///
+    /// This is the migration state every deployment is in today. It confers
+    /// exactly what it conferred before — nothing — and says so precisely,
+    /// rather than guessing a default branch on the operator's behalf.
+    #[test]
+    fn a_branchless_pull_request_binding_can_address_nothing() {
+        let temporary = TempDir::new().unwrap();
+        let registry = temporary.path().join("registry.json");
+        write_registry(&registry, branchless_pull_request_registry());
+        write_credentials(
+            &temporary.path().join(REVIEW_GITHUB_CREDENTIALS_FILE_NAME),
+            &credential_document(r#""pull_request_write":true,"pull_request_merge":true,"#),
+        );
+        let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
         for action in pull_request_actions() {
             assert_eq!(
                 adapter.plan(
@@ -1965,32 +2627,20 @@ mod tests {
                     &pull_request_authority(),
                     &action,
                 ),
-                Err("platform_v2_review_pull_request_adapter_unavailable"),
-                "{:?} must stay unavailable until a real adapter exists",
+                Err("platform_v2_review_pull_request_branches_unavailable"),
+                "{:?} must name no branch it was not given",
                 action.kind(),
             );
         }
     }
 
-    /// Pins a deliberate gap rather than a finished behavior.
+    /// Every step before the provider is still a separate, named refusal.
     ///
-    /// The registry already admits a `pull_request` target and validates one,
-    /// so an operator can install a complete binding today. `plan` still
-    /// reaches no provider for one, and no confirmation digest is ever minted
-    /// for a pull-request action. That is the seam a half implementation
-    /// would slip through: a plan arm added without the preflight observation
-    /// and the confirmation digest would hand a client an unconfirmed,
-    /// uncorrelated write.
-    ///
-    /// The refusal is now specific about *why*, so an operator can tell an
-    /// incomplete credential from the missing adapter. That is a strictly
-    /// finer answer, not a weaker one: every action here is still refused,
-    /// and the assertion checks the exact category rather than merely that an
-    /// error came back. Closing this gap means making the whole path real, so
-    /// this test is meant to fail then and be replaced deliberately, not
-    /// deleted quietly.
+    /// An operator must be able to tell a missing credential from an unscoped
+    /// one from a withheld merge, and merging must stay refused on its own
+    /// account now that the adapter exists rather than only before it.
     #[test]
-    fn an_installed_pull_request_binding_still_refuses_every_pull_request_action() {
+    fn an_installed_pull_request_binding_refuses_each_missing_piece_for_its_own_reason() {
         let temporary = TempDir::new().unwrap();
         let registry = temporary.path().join("registry.json");
         write_registry(&registry, pull_request_registry());
@@ -2008,7 +2658,7 @@ mod tests {
                     &action,
                 ),
                 Err("platform_v2_review_pull_request_credential_unavailable"),
-                "{:?} must stay unavailable until a real adapter exists",
+                "{:?} must not be conferred by a binding alone",
                 action.kind(),
             );
         }
@@ -2032,32 +2682,34 @@ mod tests {
         }
 
         // Write without merge. This is the state a deployment lands in when
-        // it wants an agent to propose changes but never land them, and it is
-        // the one that has to hold before the adapter exists rather than
-        // after: opening and updating reach the adapter gap, while merging is
-        // stopped one step earlier by the withheld scope.
+        // it wants an agent to propose changes but never land them: opening
+        // and updating now reach a plan, while merging is stopped by the
+        // withheld scope before any provider is addressed.
         write_credentials(
             &credentials,
             &credential_document(r#""pull_request_write":true,"#),
         );
         let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
         for action in pull_request_actions() {
-            let expected = if matches!(action, ReviewAction::MergePullRequest { .. }) {
-                "platform_v2_review_pull_request_merge_unavailable"
-            } else {
-                "platform_v2_review_pull_request_adapter_unavailable"
-            };
-            assert_eq!(
-                adapter.plan(
-                    &ProjectId::new("project-1").unwrap(),
-                    &workspace(),
-                    &pull_request_authority(),
-                    &action,
-                ),
-                Err(expected),
-                "{:?} must be refused for its own reason",
-                action.kind(),
+            let planned = adapter.plan(
+                &ProjectId::new("project-1").unwrap(),
+                &workspace(),
+                &pull_request_authority(),
+                &action,
             );
+            if matches!(action, ReviewAction::MergePullRequest { .. }) {
+                assert_eq!(
+                    planned,
+                    Err("platform_v2_review_pull_request_merge_unavailable"),
+                    "a credential that may propose changes must never land them",
+                );
+            } else {
+                assert!(
+                    matches!(planned, Ok(ReviewEffectPlan::GitHubPullRequest { .. })),
+                    "{:?} must reach a plan on a write-scoped credential",
+                    action.kind(),
+                );
+            }
         }
     }
 

@@ -13,8 +13,8 @@ use automonique_protocol::platform_v2_review_api::{
 use automonique_protocol::primitives::Revision;
 use automonique_store::review_store::{
     ApprovalPolicy, REVIEW_STORE_SCHEMA_VERSION, ReviewActionAdmission, ReviewApprovalDecision,
-    ReviewApprovalDocument, ReviewExternalEffectCustody, ReviewExternalEffectPlan, ReviewStore,
-    ReviewStoreError, ReviewWriteAdmission,
+    ReviewApprovalDocument, ReviewExternalEffectCustody, ReviewExternalEffectPlan,
+    ReviewPullRequestFamily, ReviewStore, ReviewStoreError, ReviewWriteAdmission,
 };
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
@@ -60,7 +60,7 @@ fn downgrade_review_store_to_v1(path: &Path) {
     let connection = Connection::open(path).expect("open v2 store for downgrade");
     connection
         .execute_batch(
-            "DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; ALTER TABLE review_snapshots DROP COLUMN protocol_schema; PRAGMA user_version=1;",
+            "DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; ALTER TABLE review_snapshots DROP COLUMN protocol_schema; PRAGMA user_version=1;",
         )
         .expect("construct historical v1 store");
 }
@@ -565,6 +565,733 @@ fn seed(store: &mut ReviewStore) -> ReviewActionRequest {
         )
         .expect("authority grant");
     request
+}
+
+const PR_HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// A snapshot whose pull-request projection is in one exact state, with an id
+/// spelled the way a GitHub-backed workspace spells one: the decimal number.
+fn pull_request_snapshot(
+    state: PullRequestState,
+    readiness: MergeReadiness,
+    id: Option<&str>,
+    head: Option<&str>,
+) -> ReviewSnapshot {
+    let base = snapshot();
+    let projection = PullRequestProjection::new(
+        id.map(|value| PullRequestId::new(value).expect("pull request id")),
+        state,
+        readiness,
+        head.map(|value| ReviewField::new(value).expect("head")),
+        base.pull_request().authority().clone(),
+        ReviewFreshness::new(ReviewFreshnessState::Fresh, revision(8), 1_800_000_000_000)
+            .expect("freshness"),
+    )
+    .expect("pull request projection");
+    ReviewSnapshot::new(
+        base.workspace().clone(),
+        base.revision(),
+        base.files().to_vec(),
+        base.comments().to_vec(),
+        base.proposals().to_vec(),
+        base.checks().to_vec(),
+        base.review().clone(),
+        projection,
+        base.delivery().clone(),
+        vec![],
+    )
+    .expect("pull request snapshot")
+}
+
+fn pull_request_request(key: &str, actor: &str, action: ReviewAction) -> ReviewActionRequest {
+    let base = request();
+    ReviewActionRequest::new(
+        base.workspace().clone(),
+        revision(9),
+        ReviewActorId::new(actor).expect("actor"),
+        base.authentication(),
+        ReviewAuthority::new(
+            ReviewAuthorityKind::PullRequest,
+            ReviewAuthorityId::new("authority-1").expect("authority"),
+        ),
+        IdempotencyKey::new(key).expect("key"),
+        action,
+    )
+    .expect("request")
+}
+
+fn seed_pull_request(store: &mut ReviewStore, snapshot: &ReviewSnapshot) {
+    store.put_snapshot(snapshot, 10).expect("snapshot");
+    store
+        .grant_authority(
+            snapshot.workspace(),
+            &ReviewActorId::new("actor-1").expect("actor"),
+            ReviewAuthentication::UserSession,
+            &ReviewAuthority::new(
+                ReviewAuthorityKind::PullRequest,
+                ReviewAuthorityId::new("authority-1").expect("authority"),
+            ),
+            11,
+        )
+        .expect("authority grant");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pull_request_plan(
+    request: &ReviewActionRequest,
+    family: ReviewPullRequestFamily,
+    number: Option<u32>,
+    head: &str,
+    title: Option<&str>,
+    owner: &str,
+    repository: &str,
+) -> ReviewExternalEffectPlan {
+    let request_digest =
+        ReviewStore::action_request_digest(request, ApprovalPolicy::NotRequired).expect("digest");
+    ReviewExternalEffectPlan::github_pull_request(
+        request_digest,
+        [7; 32],
+        [8; 32],
+        "github-pull-request-mobile",
+        (owner, repository),
+        family,
+        ("main", "agent-work"),
+        number,
+        head,
+        title,
+        revision(8),
+        revision(11),
+        [9; 32],
+    )
+    .expect("pull request effect plan")
+}
+
+fn admit(store: &mut ReviewStore, request: &ReviewActionRequest, plan: &ReviewExternalEffectPlan) {
+    store
+        .prepare_external_action(request, ApprovalPolicy::NotRequired, plan, 12)
+        .expect("prepare");
+    let preview = store
+        .external_action(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            13,
+        )
+        .expect("read back")
+        .expect("action")
+        .0
+        .preview_id;
+    store
+        .start_write(&preview, plan.request_digest(), 14)
+        .expect("start write");
+}
+
+fn preview_of(store: &ReviewStore, request: &ReviewActionRequest) -> String {
+    store
+        .external_action(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            15,
+        )
+        .expect("read back")
+        .expect("action")
+        .0
+        .preview_id
+}
+
+/// Completing an open adopts the pull request the provider actually issued.
+///
+/// The number is not in the plan, because it did not exist when the plan was
+/// sealed. It reaches the projection only from the create's own response, so
+/// this also pins that a completion without one is refused rather than
+/// inventing an identity.
+#[test]
+fn a_completed_open_adopts_the_provider_issued_number_and_never_claims_readiness() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let snapshot = pull_request_snapshot(
+        PullRequestState::Absent,
+        MergeReadiness::Unknown,
+        None,
+        None,
+    );
+    seed_pull_request(&mut store, &snapshot);
+    let request = pull_request_request(
+        "open-1",
+        "actor-1",
+        ReviewAction::OpenPullRequest {
+            expected_pull_request_revision: revision(8),
+            title: ReviewField::new("Proposer le correctif").unwrap(),
+        },
+    );
+    let plan = pull_request_plan(
+        &request,
+        ReviewPullRequestFamily::Open,
+        None,
+        PR_HEAD,
+        Some("Proposer le correctif"),
+        "example-org",
+        "example-repo",
+    );
+    admit(&mut store, &request, &plan);
+    let preview = preview_of(&store, &request);
+
+    assert!(
+        matches!(
+            store.settle_github_pull_request(
+                &preview,
+                plan.request_digest(),
+                ReviewExternalEffectCustody::Completed,
+                None,
+                16,
+            ),
+            Err(ReviewStoreError::InvalidField("github_pull_request_number"))
+        ),
+        "an open cannot complete without the number the provider issued",
+    );
+
+    let receipt = store
+        .settle_github_pull_request(
+            &preview,
+            plan.request_digest(),
+            ReviewExternalEffectCustody::Completed,
+            Some(91),
+            17,
+        )
+        .expect("settle");
+    assert_eq!(receipt.outcome(), ReviewReceiptOutcome::Completed);
+    let next = store
+        .snapshot(request.workspace())
+        .expect("snapshot")
+        .expect("present");
+    assert_eq!(next.revision(), revision(10));
+    assert_eq!(next.pull_request().state(), PullRequestState::Open);
+    assert_eq!(
+        next.pull_request().id().map(PullRequestId::as_str),
+        Some("91")
+    );
+    assert_eq!(
+        next.pull_request().head_revision().map(ReviewField::as_str),
+        Some(PR_HEAD)
+    );
+    assert_eq!(
+        next.pull_request().readiness(),
+        MergeReadiness::Unknown,
+        "opening a pull request says nothing about whether GitHub will merge it",
+    );
+    assert_eq!(
+        next.pull_request().freshness().observed_revision(),
+        revision(9)
+    );
+}
+
+/// Completing a merge retires the readiness it was advertised on.
+#[test]
+fn a_completed_merge_lands_the_projection_and_stops_calling_it_ready() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let snapshot = pull_request_snapshot(
+        PullRequestState::Open,
+        MergeReadiness::Ready,
+        Some("91"),
+        Some(PR_HEAD),
+    );
+    seed_pull_request(&mut store, &snapshot);
+    let request = pull_request_request(
+        "merge-1",
+        "actor-1",
+        ReviewAction::MergePullRequest {
+            pull_request_id: PullRequestId::new("91").unwrap(),
+            expected_pull_request_revision: revision(8),
+            expected_head_revision: ReviewField::new(PR_HEAD).unwrap(),
+        },
+    );
+    let plan = pull_request_plan(
+        &request,
+        ReviewPullRequestFamily::Merge,
+        Some(91),
+        PR_HEAD,
+        None,
+        "example-org",
+        "example-repo",
+    );
+    admit(&mut store, &request, &plan);
+    let preview = preview_of(&store, &request);
+    let receipt = store
+        .settle_github_pull_request(
+            &preview,
+            plan.request_digest(),
+            ReviewExternalEffectCustody::Completed,
+            None,
+            16,
+        )
+        .expect("settle");
+    assert_eq!(receipt.outcome(), ReviewReceiptOutcome::Completed);
+    let next = store
+        .snapshot(request.workspace())
+        .expect("snapshot")
+        .expect("present");
+    assert_eq!(next.pull_request().state(), PullRequestState::Merged);
+    assert_eq!(
+        next.pull_request().readiness(),
+        MergeReadiness::Unknown,
+        "a merged pull request is not ready to merge",
+    );
+    assert_eq!(
+        next.pull_request().id().map(PullRequestId::as_str),
+        Some("91")
+    );
+}
+
+/// A retitle changes nothing the projection carries but its revision, which is
+/// the honest answer: the review projection holds no title.
+#[test]
+fn a_completed_update_moves_only_the_revision() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let snapshot = pull_request_snapshot(
+        PullRequestState::Draft,
+        MergeReadiness::Blocked,
+        Some("91"),
+        Some(PR_HEAD),
+    );
+    seed_pull_request(&mut store, &snapshot);
+    let request = pull_request_request(
+        "update-1",
+        "actor-1",
+        ReviewAction::UpdatePullRequest {
+            pull_request_id: PullRequestId::new("91").unwrap(),
+            expected_pull_request_revision: revision(8),
+            title: ReviewField::new("Titre revu").unwrap(),
+        },
+    );
+    let plan = pull_request_plan(
+        &request,
+        ReviewPullRequestFamily::Update,
+        Some(91),
+        PR_HEAD,
+        Some("Titre revu"),
+        "example-org",
+        "example-repo",
+    );
+    admit(&mut store, &request, &plan);
+    let preview = preview_of(&store, &request);
+    store
+        .settle_github_pull_request(
+            &preview,
+            plan.request_digest(),
+            ReviewExternalEffectCustody::Completed,
+            None,
+            16,
+        )
+        .expect("settle");
+    let next = store
+        .snapshot(request.workspace())
+        .expect("snapshot")
+        .expect("present");
+    assert_eq!(next.pull_request().state(), PullRequestState::Draft);
+    assert_eq!(next.pull_request().readiness(), MergeReadiness::Blocked);
+    assert_eq!(
+        next.pull_request().freshness().observed_revision(),
+        revision(9)
+    );
+    assert_eq!(next.revision(), revision(10));
+}
+
+/// The cross-actor fence, the analogue of the check table's run/attempt fence.
+///
+/// Two actors merging the same pull request at the same head are one effect,
+/// however differently they spelled the request. The second is refused at
+/// admission rather than at the provider.
+#[test]
+fn one_merge_per_pull_request_per_exact_head_is_reserved_across_actors() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let snapshot = pull_request_snapshot(
+        PullRequestState::Open,
+        MergeReadiness::Ready,
+        Some("91"),
+        Some(PR_HEAD),
+    );
+    seed_pull_request(&mut store, &snapshot);
+    for actor in ["actor-1", "actor-2"] {
+        store
+            .grant_authority(
+                snapshot.workspace(),
+                &ReviewActorId::new(actor).unwrap(),
+                ReviewAuthentication::UserSession,
+                &ReviewAuthority::new(
+                    ReviewAuthorityKind::PullRequest,
+                    ReviewAuthorityId::new("authority-1").unwrap(),
+                ),
+                11,
+            )
+            .expect("authority grant");
+    }
+    let merge = |key: &str, actor: &str| {
+        pull_request_request(
+            key,
+            actor,
+            ReviewAction::MergePullRequest {
+                pull_request_id: PullRequestId::new("91").unwrap(),
+                expected_pull_request_revision: revision(8),
+                expected_head_revision: ReviewField::new(PR_HEAD).unwrap(),
+            },
+        )
+    };
+    let first = merge("merge-left", "actor-1");
+    let plan = pull_request_plan(
+        &first,
+        ReviewPullRequestFamily::Merge,
+        Some(91),
+        PR_HEAD,
+        None,
+        "example-org",
+        "example-repo",
+    );
+    store
+        .prepare_external_action(&first, ApprovalPolicy::NotRequired, &plan, 12)
+        .expect("first merge admitted");
+
+    let second = merge("merge-right", "actor-2");
+    let rival = pull_request_plan(
+        &second,
+        ReviewPullRequestFamily::Merge,
+        Some(91),
+        PR_HEAD,
+        None,
+        // Case differs, and the fence is case-insensitive on the repository
+        // exactly as the check-rerun one is.
+        "Example-Org",
+        "Example-Repo",
+    );
+    assert!(
+        matches!(
+            store.prepare_external_action(&second, ApprovalPolicy::NotRequired, &rival, 13),
+            Err(ReviewStoreError::Conflict("github_pull_request_effect"))
+        ),
+        "two actors merging one pull request at one head are one effect",
+    );
+
+    // The fence is per effect, not per pull request. Retitling the same pull
+    // request is a different write and must still be admissible alongside the
+    // reserved merge.
+    let update = pull_request_request(
+        "update-alongside",
+        "actor-2",
+        ReviewAction::UpdatePullRequest {
+            pull_request_id: PullRequestId::new("91").unwrap(),
+            expected_pull_request_revision: revision(8),
+            title: ReviewField::new("Titre revu").unwrap(),
+        },
+    );
+    let update_plan = pull_request_plan(
+        &update,
+        ReviewPullRequestFamily::Update,
+        Some(91),
+        PR_HEAD,
+        Some("Titre revu"),
+        "example-org",
+        "example-repo",
+    );
+    store
+        .prepare_external_action(&update, ApprovalPolicy::NotRequired, &update_plan, 14)
+        .expect("a retitle is not the reserved merge");
+}
+
+/// A merge at a head the branch has since moved to is a different landing, and
+/// the reservation must not swallow it.
+#[test]
+fn a_merge_at_a_different_head_is_a_different_reserved_effect() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let moved = "89abcdef0123456789abcdef0123456789abcdef";
+    let first = pull_request_snapshot(
+        PullRequestState::Open,
+        MergeReadiness::Ready,
+        Some("91"),
+        Some(PR_HEAD),
+    );
+    seed_pull_request(&mut store, &first);
+    let merge_at_head = pull_request_request(
+        "merge-head",
+        "actor-1",
+        ReviewAction::MergePullRequest {
+            pull_request_id: PullRequestId::new("91").unwrap(),
+            expected_pull_request_revision: revision(8),
+            expected_head_revision: ReviewField::new(PR_HEAD).unwrap(),
+        },
+    );
+    let plan = pull_request_plan(
+        &merge_at_head,
+        ReviewPullRequestFamily::Merge,
+        Some(91),
+        PR_HEAD,
+        None,
+        "example-org",
+        "example-repo",
+    );
+    store
+        .prepare_external_action(&merge_at_head, ApprovalPolicy::NotRequired, &plan, 12)
+        .expect("first merge admitted");
+
+    // The branch advanced, so the workspace observed a new snapshot.
+    let advanced = ReviewSnapshot::new(
+        first.workspace().clone(),
+        revision(10),
+        first.files().to_vec(),
+        first.comments().to_vec(),
+        first.proposals().to_vec(),
+        first.checks().to_vec(),
+        first.review().clone(),
+        PullRequestProjection::new(
+            Some(PullRequestId::new("91").unwrap()),
+            PullRequestState::Open,
+            MergeReadiness::Ready,
+            Some(ReviewField::new(moved).unwrap()),
+            first.pull_request().authority().clone(),
+            ReviewFreshness::new(ReviewFreshnessState::Fresh, revision(9), 1_800_000_000_001)
+                .unwrap(),
+        )
+        .unwrap(),
+        first.delivery().clone(),
+        vec![],
+    )
+    .unwrap();
+    store
+        .put_snapshot(&advanced, 13)
+        .expect("advanced snapshot");
+
+    let base = request();
+    let merge_at_moved = ReviewActionRequest::new(
+        base.workspace().clone(),
+        revision(10),
+        ReviewActorId::new("actor-1").unwrap(),
+        base.authentication(),
+        ReviewAuthority::new(
+            ReviewAuthorityKind::PullRequest,
+            ReviewAuthorityId::new("authority-1").unwrap(),
+        ),
+        IdempotencyKey::new("merge-moved").unwrap(),
+        ReviewAction::MergePullRequest {
+            pull_request_id: PullRequestId::new("91").unwrap(),
+            expected_pull_request_revision: revision(9),
+            expected_head_revision: ReviewField::new(moved).unwrap(),
+        },
+    )
+    .unwrap();
+    let request_digest =
+        ReviewStore::action_request_digest(&merge_at_moved, ApprovalPolicy::NotRequired).unwrap();
+    let moved_plan = ReviewExternalEffectPlan::github_pull_request(
+        request_digest,
+        [7; 32],
+        [8; 32],
+        "github-pull-request-mobile",
+        ("example-org", "example-repo"),
+        ReviewPullRequestFamily::Merge,
+        ("main", "agent-work"),
+        Some(91),
+        moved,
+        None,
+        revision(9),
+        revision(11),
+        [9; 32],
+    )
+    .unwrap();
+    store
+        .prepare_external_action(
+            &merge_at_moved,
+            ApprovalPolicy::NotRequired,
+            &moved_plan,
+            14,
+        )
+        .expect("a merge at a different head is a different effect");
+}
+
+/// A plan and the action it was prepared for must be the same write.
+#[test]
+fn a_pull_request_plan_that_disagrees_with_its_action_is_refused_at_admission() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let snapshot = pull_request_snapshot(
+        PullRequestState::Open,
+        MergeReadiness::Ready,
+        Some("91"),
+        Some(PR_HEAD),
+    );
+    seed_pull_request(&mut store, &snapshot);
+    let request = pull_request_request(
+        "update-mismatch",
+        "actor-1",
+        ReviewAction::UpdatePullRequest {
+            pull_request_id: PullRequestId::new("91").unwrap(),
+            expected_pull_request_revision: revision(8),
+            title: ReviewField::new("Titre revu").unwrap(),
+        },
+    );
+    // The plan names a different pull request than the action does.
+    let plan = pull_request_plan(
+        &request,
+        ReviewPullRequestFamily::Update,
+        Some(92),
+        PR_HEAD,
+        Some("Titre revu"),
+        "example-org",
+        "example-repo",
+    );
+    assert!(matches!(
+        store.prepare_external_action(&request, ApprovalPolicy::NotRequired, &plan, 12),
+        Err(ReviewStoreError::Conflict("external_effect_request"))
+    ),);
+    // So does a plan that names a different title.
+    let retitled = pull_request_plan(
+        &request,
+        ReviewPullRequestFamily::Update,
+        Some(91),
+        PR_HEAD,
+        Some("Autre titre"),
+        "example-org",
+        "example-repo",
+    );
+    assert!(matches!(
+        store.prepare_external_action(&request, ApprovalPolicy::NotRequired, &retitled, 13),
+        Err(ReviewStoreError::Conflict("external_effect_request"))
+    ),);
+    // And so does a plan for a different family entirely.
+    let merge = pull_request_plan(
+        &request,
+        ReviewPullRequestFamily::Merge,
+        Some(91),
+        PR_HEAD,
+        None,
+        "example-org",
+        "example-repo",
+    );
+    assert!(matches!(
+        store.prepare_external_action(&request, ApprovalPolicy::NotRequired, &merge, 14),
+        Err(ReviewStoreError::Conflict("external_effect_request"))
+    ),);
+}
+
+/// The opened number is write-once. The pull request this process created
+/// cannot change identity between a crash and a reconciliation.
+#[test]
+fn an_opened_number_cannot_be_rewritten_by_a_later_settlement() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let snapshot = pull_request_snapshot(
+        PullRequestState::Absent,
+        MergeReadiness::Unknown,
+        None,
+        None,
+    );
+    seed_pull_request(&mut store, &snapshot);
+    let request = pull_request_request(
+        "open-once",
+        "actor-1",
+        ReviewAction::OpenPullRequest {
+            expected_pull_request_revision: revision(8),
+            title: ReviewField::new("Proposer le correctif").unwrap(),
+        },
+    );
+    let plan = pull_request_plan(
+        &request,
+        ReviewPullRequestFamily::Open,
+        None,
+        PR_HEAD,
+        Some("Proposer le correctif"),
+        "example-org",
+        "example-repo",
+    );
+    admit(&mut store, &request, &plan);
+    let preview = preview_of(&store, &request);
+    store
+        .settle_github_pull_request(
+            &preview,
+            plan.request_digest(),
+            ReviewExternalEffectCustody::Accepted,
+            Some(91),
+            16,
+        )
+        .expect("accept");
+    assert!(matches!(
+        store.settle_github_pull_request(
+            &preview,
+            plan.request_digest(),
+            ReviewExternalEffectCustody::Completed,
+            Some(92),
+            17,
+        ),
+        Err(ReviewStoreError::Conflict("github_pull_request_number"))
+    ),);
+    let (_, stored) = store
+        .external_action(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            18,
+        )
+        .expect("read back")
+        .expect("action");
+    assert_eq!(stored.github_pull_request_opened_number(), Some(91));
+    assert!(stored.is_github_pull_request());
+    assert!(stored.is_github_effect());
+    assert!(!stored.is_github_check_rerun());
+}
+
+/// A store that has never seen a pull-request write migrates into one that can
+/// hold them, without touching anything it already held.
+#[test]
+fn v6_store_gains_pull_request_custody_without_disturbing_check_reruns() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let request = seed(&mut store);
+    let plan = github_external_plan(&request);
+    store
+        .prepare_external_action(&request, ApprovalPolicy::NotRequired, &plan, 12)
+        .unwrap();
+    drop(store);
+    let raw = Connection::open(private.path()).unwrap();
+    raw.execute_batch("DROP TABLE review_github_pull_request_effect_plans; PRAGMA user_version=6;")
+        .unwrap();
+    drop(raw);
+
+    let store = ReviewStore::open(private.path()).expect("migrate v6");
+    let (_, migrated) = store
+        .external_action(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            13,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(migrated.is_github_check_rerun());
+    assert_eq!(migrated.github_pull_request_family(), None);
+    drop(store);
+    let raw = Connection::open(private.path()).unwrap();
+    assert_eq!(
+        raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .unwrap(),
+        REVIEW_STORE_SCHEMA_VERSION
+    );
+    let tables: i64 = raw
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='review_github_pull_request_effect_plans'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 1);
 }
 
 #[test]
@@ -1086,7 +1813,7 @@ fn populated_v2_store_adds_external_plan_custody_transactionally() {
     }
     let raw = Connection::open(private.path()).expect("raw");
     raw.execute_batch(
-        "DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+        "DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
     )
         .expect("construct v2 store");
     drop(raw);
@@ -1135,7 +1862,7 @@ fn populated_real_v3_store_migrates_to_v4_without_losing_review_state() {
             .unwrap();
     }
     let raw = Connection::open(private.path()).unwrap();
-    raw.execute_batch("DROP TABLE review_github_check_effect_plans; PRAGMA user_version=3;")
+    raw.execute_batch("DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; PRAGMA user_version=3;")
         .unwrap();
     drop(raw);
 
@@ -1167,7 +1894,8 @@ fn v4_store_adds_nullable_receipt_correlation_transactionally() {
     drop(ReviewStore::open(private.path()).unwrap());
     let raw = Connection::open(private.path()).unwrap();
     raw.execute_batch(
-        "ALTER TABLE review_github_check_effect_plans DROP COLUMN receipt_correlation_digest;
+        "DROP TABLE review_github_pull_request_effect_plans;
+         ALTER TABLE review_github_check_effect_plans DROP COLUMN receipt_correlation_digest;
          ALTER TABLE review_github_check_effect_plans DROP COLUMN expected_workspace_revision;
          PRAGMA user_version=4;",
     )
@@ -1214,7 +1942,8 @@ fn v5_store_adds_nullable_workspace_revision_and_preserves_legacy_as_unbound() {
     )
     .unwrap();
     raw.execute_batch(
-        "ALTER TABLE review_github_check_effect_plans DROP COLUMN expected_workspace_revision;
+        "DROP TABLE review_github_pull_request_effect_plans;
+         ALTER TABLE review_github_check_effect_plans DROP COLUMN expected_workspace_revision;
          PRAGMA user_version=5;",
     )
     .unwrap();
@@ -1263,7 +1992,7 @@ fn failed_populated_v3_to_v4_migration_rolls_back_version_and_preserves_data() {
     }
     let raw = Connection::open(private.path()).unwrap();
     raw.execute_batch(
-        "DROP TABLE review_github_check_effect_plans; CREATE TABLE review_github_check_effect_plans(marker TEXT) STRICT; PRAGMA user_version=3;",
+        "DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; CREATE TABLE review_github_check_effect_plans(marker TEXT) STRICT; PRAGMA user_version=3;",
     )
     .unwrap();
     drop(raw);
@@ -1340,7 +2069,7 @@ fn v2_migration_terminalizes_legacy_accepted_external_action_without_a_plan() {
     };
     let raw = Connection::open(private.path()).unwrap();
     raw.execute_batch(
-        "DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+        "DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
     )
     .unwrap();
     drop(raw);
@@ -1513,7 +2242,7 @@ fn v2_migration_preserves_or_conservatively_terminalizes_every_external_outcome(
         };
         let raw = Connection::open(private.path()).unwrap();
         raw.execute_batch(
-            "DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+            "DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
         )
         .unwrap();
         drop(raw);
@@ -1589,7 +2318,7 @@ fn migration_tombstone_tampering_and_native_missing_plan_corruption_fail_closed(
     };
     let raw = Connection::open(private.path()).unwrap();
     raw.execute_batch(
-        "DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+        "DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
     )
     .unwrap();
     drop(raw);
@@ -1738,7 +2467,7 @@ fn migration_refuses_legacy_completed_external_receipt_without_exact_snapshot_ba
     )
     .unwrap();
     raw.execute_batch(
-        "DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+        "DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
     )
     .unwrap();
     drop(raw);
