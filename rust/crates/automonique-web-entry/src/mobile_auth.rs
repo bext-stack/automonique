@@ -2664,6 +2664,16 @@ mod tests {
         );
     }
 
+    /// The whole vocabulary is grantable at once, and it goes out in exactly
+    /// this order under exactly these names.
+    ///
+    /// The order is a wire contract, not a formatting detail. A delegation's
+    /// actions are sorted by this enum's declaration order, and the SDK's
+    /// `MOBILE_PLATFORM_V2_ACTIONS` reproduces that ordering by index to
+    /// decide whether a server document is validly sorted. Reordering a
+    /// member here, or inserting one anywhere but the end, makes documents
+    /// this server mints undecodable by clients that have not moved in
+    /// lockstep, so the names are spelled out rather than derived.
     #[test]
     fn every_platform_v2_action_remains_grantable_together() {
         let (_root, mut auth) = authority();
@@ -2679,6 +2689,28 @@ mod tests {
             )
             .expect("complete Platform v2 grant");
         assert_eq!(descriptor.actions, MobilePlatformV2Action::ALL.to_vec());
+        assert_eq!(
+            serde_json::to_value(&descriptor.actions).expect("action wire"),
+            serde_json::json!([
+                "query_work_contexts",
+                "get_lineage",
+                "prepare_mutation",
+                "decide_mutation",
+                "submit_mutation",
+                "get_mutation_receipt",
+                "submit_workspace_intent",
+                "get_workspace_intent",
+                "get_review",
+                "get_attention_source_snapshot",
+                "get_review_capabilities",
+                "execute_review_action",
+                "rerun_check",
+                "get_review_receipt",
+                "open_pull_request",
+                "update_pull_request",
+                "merge_pull_request"
+            ]),
+        );
     }
 
     #[test]

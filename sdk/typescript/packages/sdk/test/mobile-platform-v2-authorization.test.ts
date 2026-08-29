@@ -105,4 +105,55 @@ describe("mobile Platform v2 delegated authorization", () => {
     );
     expect(encoded).not.toContain("/");
   });
+
+  test("carries the three pull-request families as separately withheld grants", () => {
+    // The proposer delegation: may open and update a pull request, may not
+    // land one. This is the state a deployment lands in when it wants
+    // proposals from a phone but never a merge, and the client has to be able
+    // to both request it and read it back.
+    const proposer = {
+      ...descriptor,
+      actions: ["open_pull_request", "update_pull_request"],
+    } as const;
+    expect(
+      decodeMobilePlatformV2Authorization(
+        parseCanonical(new TextEncoder().encode(JSON.stringify(proposer))),
+      ).actions,
+    ).toEqual(["open_pull_request", "update_pull_request"]);
+
+    // The server sorts by the declaration order of its own action enum, which
+    // appends the three families in this order. Reproducing that order is the
+    // whole reason the vocabulary is an ordered array rather than a set.
+    expect(
+      new TextDecoder().decode(
+        toCanonicalBytes(
+          encodeMobilePlatformV2GrantRequest({
+            actions: [
+              "merge_pull_request",
+              "open_pull_request",
+              "execute_review_action",
+            ],
+            credential_id: MobileCredentialId(`mc_${"A".repeat(43)}`),
+            project_roots: [ProjectId("project-a")],
+          }),
+        ),
+      ),
+    ).toBe(
+      `{"actions":["execute_review_action","open_pull_request","merge_pull_request"],"credential_id":"mc_${"A".repeat(43)}","project_roots":["project-a"]}`,
+    );
+
+    // A document out of that order is one no server minted.
+    expect(() =>
+      decodeMobilePlatformV2Authorization(
+        parseCanonical(
+          new TextEncoder().encode(
+            JSON.stringify({
+              ...descriptor,
+              actions: ["merge_pull_request", "open_pull_request"],
+            }),
+          ),
+        ),
+      ),
+    ).toThrow();
+  });
 });
