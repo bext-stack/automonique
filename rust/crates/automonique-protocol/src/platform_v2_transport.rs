@@ -55,9 +55,11 @@ use crate::platform_v2_lineage_api::{
     encode_workspace_intent_outcome,
 };
 use crate::platform_v2_review::{
-    MAX_REVIEW_COMMENTS, MergeReadiness, PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR,
-    PLATFORM_REVIEW_SCHEMA_V1, PullRequestId, ReviewAction, ReviewActionReceipt, ReviewAuthority,
-    ReviewAuthorityKind, ReviewCheckId, ReviewCommentId, ReviewField, ReviewSnapshot,
+    ConflictResolution, MAX_REVIEW_COMMENTS, MAX_REVIEW_PROPOSAL_FILES, MAX_REVIEW_PROPOSALS,
+    MergeReadiness, PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR, PLATFORM_REVIEW_SCHEMA_V1,
+    PullRequestId, ReviewAction, ReviewActionReceipt, ReviewAuthority, ReviewAuthorityKind,
+    ReviewCheckId, ReviewCommentId, ReviewField, ReviewFileId, ReviewProposalId,
+    ReviewProposalKind, ReviewSnapshot,
 };
 use crate::platform_v2_review_api::{
     MAX_REVIEW_SNAPSHOT_CANONICAL_BYTES, ReviewApiError, action, action_json,
@@ -1007,6 +1009,249 @@ impl ReviewPullRequestMergeCapability {
     }
 }
 
+/// Opaque SHA-256 commitment to the exact index the server observed.
+///
+/// Not a secret and not redacted, unlike [`ReviewConfirmationDigest`]: it is a
+/// public observation a client is meant to compare against, so a cockpit
+/// holding two capability documents can tell whether they were minted against
+/// the same index rather than having to trust that they were.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ReviewIndexDigest(BoundedString<64>);
+
+impl ReviewIndexDigest {
+    pub fn new(value: impl Into<String>) -> Result<Self, PlatformV2TransportError> {
+        let value = value.into();
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(PlatformV2TransportError::InvalidBody);
+        }
+        Ok(Self(
+            BoundedString::new(value).map_err(|_| PlatformV2TransportError::InvalidBody)?,
+        ))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+/// Authority to perform one exact index-level staging proposal.
+///
+/// Unlike every capability above it, the effect lands on a filesystem the
+/// daemon owns rather than in a provider. That does not make it safer, and it
+/// is the reason this carries two fences none of the others do.
+///
+/// A worktree is *shared* substrate. Any other process running as the daemon
+/// uid — the agent working in the checkout, a scheduled job, a second review
+/// action — can move `HEAD` and rewrite the index between the moment this
+/// capability is advertised and the moment the action arrives. The review
+/// snapshot's revision does not help: it tracks what the projection observed,
+/// not what the repository now is. So the capability names both mutable things
+/// the write depends on, and the confirmation digest commits to them:
+///
+/// * `expected_head_revision` is the commit `HEAD` resolved to during the
+///   preflight, read from the repository rather than declared by an operator.
+/// * `expected_index_digest` is a digest over the whole index — every entry's
+///   mode, object id, stage and path — as the preflight read it.
+///
+/// The index is fenced whole, not per file, even for a stage that names one
+/// file. A commit writes the entire index, so an index that moved between
+/// advertisement and execution would commit changes nobody reviewed; holding
+/// the three kinds to one rule keeps the fence one sentence long rather than
+/// three, and the client's recovery is the same in every case: re-read the
+/// snapshot and take the fresh capability.
+///
+/// The three kinds share one type because they share one field set exactly.
+/// They do not share a grant: the operator registry withholds committing
+/// separately from index writes, so a commit can be absent from this list
+/// while stage and unstage are present.
+///
+/// There is no hunk granularity here because there is none in the contract:
+/// [`crate::platform_v2_review::ReviewProposal`] lists file ids, and a staging
+/// action names a proposal. Advertising a hunk control would be advertising
+/// something no action can express.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewStagingCapability {
+    proposal_id: ReviewProposalId,
+    kind: ReviewProposalKind,
+    expected_head_revision: ReviewField,
+    expected_index_digest: ReviewIndexDigest,
+    authority: ReviewAuthority,
+    confirmation_digest: ReviewConfirmationDigest,
+    receipt_correlation_digest: ReviewReceiptCorrelationDigest,
+}
+
+impl ReviewStagingCapability {
+    pub fn new(
+        proposal_id: ReviewProposalId,
+        kind: ReviewProposalKind,
+        expected_head_revision: ReviewField,
+        expected_index_digest: ReviewIndexDigest,
+        authority: ReviewAuthority,
+        confirmation_digest: ReviewConfirmationDigest,
+        receipt_correlation_digest: ReviewReceiptCorrelationDigest,
+    ) -> Result<Self, PlatformV2TransportError> {
+        // Conflict resolution has its own capability, because it names a file
+        // and a side and writes worktree bytes rather than index entries.
+        if authority.kind() != ReviewAuthorityKind::Git
+            || kind == ReviewProposalKind::ResolveConflict
+            || !valid_commit_id(expected_head_revision.as_str())
+        {
+            return Err(PlatformV2TransportError::InvalidBody);
+        }
+        Ok(Self {
+            proposal_id,
+            kind,
+            expected_head_revision,
+            expected_index_digest,
+            authority,
+            confirmation_digest,
+            receipt_correlation_digest,
+        })
+    }
+    #[must_use]
+    pub const fn proposal_id(&self) -> &ReviewProposalId {
+        &self.proposal_id
+    }
+    #[must_use]
+    pub const fn kind(&self) -> ReviewProposalKind {
+        self.kind
+    }
+    /// The commit `HEAD` resolved to when the server read the repository.
+    #[must_use]
+    pub const fn expected_head_revision(&self) -> &ReviewField {
+        &self.expected_head_revision
+    }
+    /// The index the server read, digested whole.
+    #[must_use]
+    pub const fn expected_index_digest(&self) -> &ReviewIndexDigest {
+        &self.expected_index_digest
+    }
+    #[must_use]
+    pub const fn authority(&self) -> &ReviewAuthority {
+        &self.authority
+    }
+    #[must_use]
+    pub const fn confirmation_digest(&self) -> &ReviewConfirmationDigest {
+        &self.confirmation_digest
+    }
+    #[must_use]
+    pub const fn receipt_correlation_digest(&self) -> &ReviewReceiptCorrelationDigest {
+        &self.receipt_correlation_digest
+    }
+}
+
+/// Authority to collapse one unmerged path to one side git already recorded.
+///
+/// Held apart from [`ReviewStagingCapability`] because it is a different
+/// power, not a fourth kind of the same one: staging moves index entries and
+/// leaves every byte on disk alone, while this overwrites a file in the
+/// working tree. What it may write is therefore stated exactly, and the type
+/// is what states it — the only thing a client can name is a `resolution`,
+/// which selects between the two blobs git itself is already holding as
+/// stage 2 (`keep_current`) and stage 3 (`keep_incoming`) for this one path.
+/// No content crosses this wire, so no content can be written.
+///
+/// One entry is advertised per admissible side, not one per file with the side
+/// left to the client. The side decides which bytes land, so it has to be
+/// inside the confirmation digest, and a digest cannot commit to a choice the
+/// client has not made yet.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewConflictResolutionCapability {
+    proposal_id: ReviewProposalId,
+    file_id: ReviewFileId,
+    resolution: ConflictResolution,
+    expected_head_revision: ReviewField,
+    expected_index_digest: ReviewIndexDigest,
+    authority: ReviewAuthority,
+    confirmation_digest: ReviewConfirmationDigest,
+    receipt_correlation_digest: ReviewReceiptCorrelationDigest,
+}
+
+impl ReviewConflictResolutionCapability {
+    #[allow(clippy::too_many_arguments)] // Every field is an independently fenced commitment input.
+    pub fn new(
+        proposal_id: ReviewProposalId,
+        file_id: ReviewFileId,
+        resolution: ConflictResolution,
+        expected_head_revision: ReviewField,
+        expected_index_digest: ReviewIndexDigest,
+        authority: ReviewAuthority,
+        confirmation_digest: ReviewConfirmationDigest,
+        receipt_correlation_digest: ReviewReceiptCorrelationDigest,
+    ) -> Result<Self, PlatformV2TransportError> {
+        if authority.kind() != ReviewAuthorityKind::Git
+            || !valid_commit_id(expected_head_revision.as_str())
+        {
+            return Err(PlatformV2TransportError::InvalidBody);
+        }
+        Ok(Self {
+            proposal_id,
+            file_id,
+            resolution,
+            expected_head_revision,
+            expected_index_digest,
+            authority,
+            confirmation_digest,
+            receipt_correlation_digest,
+        })
+    }
+    #[must_use]
+    pub const fn proposal_id(&self) -> &ReviewProposalId {
+        &self.proposal_id
+    }
+    #[must_use]
+    pub const fn file_id(&self) -> &ReviewFileId {
+        &self.file_id
+    }
+    /// Which of the two blobs git is already holding for this path would be
+    /// written. Nothing else can be.
+    #[must_use]
+    pub const fn resolution(&self) -> ConflictResolution {
+        self.resolution
+    }
+    #[must_use]
+    pub const fn expected_head_revision(&self) -> &ReviewField {
+        &self.expected_head_revision
+    }
+    #[must_use]
+    pub const fn expected_index_digest(&self) -> &ReviewIndexDigest {
+        &self.expected_index_digest
+    }
+    #[must_use]
+    pub const fn authority(&self) -> &ReviewAuthority {
+        &self.authority
+    }
+    #[must_use]
+    pub const fn confirmation_digest(&self) -> &ReviewConfirmationDigest {
+        &self.confirmation_digest
+    }
+    #[must_use]
+    pub const fn receipt_correlation_digest(&self) -> &ReviewReceiptCorrelationDigest {
+        &self.receipt_correlation_digest
+    }
+}
+
+/// The git-staging grants for one workspace, grouped for construction only.
+///
+/// Never a single grant: an operator withholds committing separately from
+/// index writes and conflict resolution separately again, and each entry is
+/// minted from its own preflight of the repository on disk.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReviewGitStagingCapabilities {
+    pub staging: Vec<ReviewStagingCapability>,
+    pub conflict_resolutions: Vec<ReviewConflictResolutionCapability>,
+}
+
+/// A git object id, in either of the two widths git itself uses.
+fn valid_commit_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// Revision-fenced mutation capabilities for exactly one project/workspace.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReviewCapabilities {
@@ -1019,9 +1264,12 @@ pub struct ReviewCapabilities {
     open_pull_request: Option<ReviewPullRequestOpenCapability>,
     update_pull_request: Option<ReviewPullRequestUpdateCapability>,
     merge_pull_request: Option<ReviewPullRequestMergeCapability>,
+    staging: Vec<ReviewStagingCapability>,
+    conflict_resolutions: Vec<ReviewConflictResolutionCapability>,
 }
 
 impl ReviewCapabilities {
+    #[allow(clippy::too_many_arguments)] // Each family is minted and withheld on its own.
     pub fn new(
         project: ProjectId,
         workspace: WorkContextIdentity,
@@ -1030,10 +1278,74 @@ impl ReviewCapabilities {
         mut rerunnable_checks: Vec<ReviewCheckRerunCapability>,
         mut agent_deliverable_comments: Vec<ReviewAgentDeliveryCapability>,
         pull_request: ReviewPullRequestCapabilities,
+        git: ReviewGitStagingCapabilities,
     ) -> Result<Self, PlatformV2TransportError> {
+        let ReviewGitStagingCapabilities {
+            mut staging,
+            mut conflict_resolutions,
+        } = git;
         if !is_review_workspace(&workspace)
             || rerunnable_checks.len() > 512
             || agent_deliverable_comments.len() > MAX_REVIEW_COMMENTS
+            || staging.len() > MAX_REVIEW_PROPOSALS
+            || conflict_resolutions.len() > MAX_REVIEW_PROPOSAL_FILES * 2
+        {
+            return Err(PlatformV2TransportError::InvalidBody);
+        }
+        staging.sort_by(|left, right| {
+            left.proposal_id()
+                .as_str()
+                .cmp(right.proposal_id().as_str())
+        });
+        // A proposal id is unique across kinds in the snapshot, so one id
+        // appearing twice here is two capabilities for one proposal rather
+        // than a stage and an unstage of the same files.
+        if staging
+            .windows(2)
+            .any(|pair| pair[0].proposal_id() == pair[1].proposal_id())
+        {
+            return Err(PlatformV2TransportError::InvalidBody);
+        }
+        conflict_resolutions.sort_by(|left, right| {
+            (
+                left.proposal_id().as_str(),
+                left.file_id().as_str(),
+                left.resolution().as_str(),
+            )
+                .cmp(&(
+                    right.proposal_id().as_str(),
+                    right.file_id().as_str(),
+                    right.resolution().as_str(),
+                ))
+        });
+        if conflict_resolutions.windows(2).any(|pair| {
+            pair[0].proposal_id() == pair[1].proposal_id()
+                && pair[0].file_id() == pair[1].file_id()
+                && pair[0].resolution() == pair[1].resolution()
+        }) {
+            return Err(PlatformV2TransportError::InvalidBody);
+        }
+        // Every git entry was minted from one read of one repository, so they
+        // must all name the same `HEAD` and the same index. Two spellings mean
+        // the server read the worktree twice and it moved in between, which is
+        // exactly the condition these fences exist to catch — refuse rather
+        // than let a client pick whichever pairing suits it.
+        let mut observed = staging
+            .iter()
+            .map(|capability| {
+                (
+                    capability.expected_head_revision(),
+                    capability.expected_index_digest(),
+                )
+            })
+            .chain(conflict_resolutions.iter().map(|capability| {
+                (
+                    capability.expected_head_revision(),
+                    capability.expected_index_digest(),
+                )
+            }));
+        if let Some(first) = observed.next()
+            && !observed.all(|entry| entry == first)
         {
             return Err(PlatformV2TransportError::InvalidBody);
         }
@@ -1079,6 +1391,8 @@ impl ReviewCapabilities {
             open_pull_request: pull_request.open,
             update_pull_request: pull_request.update,
             merge_pull_request: pull_request.merge,
+            staging,
+            conflict_resolutions,
         })
     }
     #[must_use]
@@ -1136,6 +1450,23 @@ impl ReviewCapabilities {
     #[must_use]
     pub const fn merge_pull_request(&self) -> Option<&ReviewPullRequestMergeCapability> {
         self.merge_pull_request.as_ref()
+    }
+    /// Staging proposals the server proved it can perform against the exact
+    /// `HEAD` and index each entry names.
+    ///
+    /// Empty is the honest fail-closed answer, and it is what an operator sees
+    /// for every workspace whose registry binding withholds the grant, whose
+    /// repository the preflight could not read, or whose worktree is in a
+    /// state no staging write can be fenced against.
+    #[must_use]
+    pub fn staging(&self) -> &[ReviewStagingCapability] {
+        &self.staging
+    }
+    /// Conflicted files the server proved it can collapse to one side git is
+    /// already holding, listed once per admissible side.
+    #[must_use]
+    pub fn conflict_resolutions(&self) -> &[ReviewConflictResolutionCapability] {
+        &self.conflict_resolutions
     }
 }
 
@@ -1953,10 +2284,84 @@ fn review_capabilities_json(
             ),
         ]),
     };
+    let staging = value
+        .staging()
+        .iter()
+        .map(|capability| {
+            Ok(object(vec![
+                ("authority", authority_json(capability.authority())),
+                (
+                    "confirmation_digest",
+                    JsonValue::String(capability.confirmation_digest().as_str().to_owned()),
+                ),
+                (
+                    "expected_head_revision",
+                    JsonValue::String(capability.expected_head_revision().as_str().to_owned()),
+                ),
+                (
+                    "expected_index_digest",
+                    JsonValue::String(capability.expected_index_digest().as_str().to_owned()),
+                ),
+                (
+                    "kind",
+                    JsonValue::String(capability.kind().as_str().to_owned()),
+                ),
+                (
+                    "proposal_id",
+                    JsonValue::String(capability.proposal_id().as_str().to_owned()),
+                ),
+                (
+                    "receipt_correlation_digest",
+                    JsonValue::String(capability.receipt_correlation_digest().as_str().to_owned()),
+                ),
+            ]))
+        })
+        .collect::<Result<Vec<_>, PlatformV2TransportError>>()?;
+    let conflict_resolutions = value
+        .conflict_resolutions()
+        .iter()
+        .map(|capability| {
+            Ok(object(vec![
+                ("authority", authority_json(capability.authority())),
+                (
+                    "confirmation_digest",
+                    JsonValue::String(capability.confirmation_digest().as_str().to_owned()),
+                ),
+                (
+                    "expected_head_revision",
+                    JsonValue::String(capability.expected_head_revision().as_str().to_owned()),
+                ),
+                (
+                    "expected_index_digest",
+                    JsonValue::String(capability.expected_index_digest().as_str().to_owned()),
+                ),
+                (
+                    "file_id",
+                    JsonValue::String(capability.file_id().as_str().to_owned()),
+                ),
+                (
+                    "proposal_id",
+                    JsonValue::String(capability.proposal_id().as_str().to_owned()),
+                ),
+                (
+                    "receipt_correlation_digest",
+                    JsonValue::String(capability.receipt_correlation_digest().as_str().to_owned()),
+                ),
+                (
+                    "resolution",
+                    JsonValue::String(capability.resolution().as_str().to_owned()),
+                ),
+            ]))
+        })
+        .collect::<Result<Vec<_>, PlatformV2TransportError>>()?;
     Ok(object(vec![
         (
             "agent_deliverable_comments",
             JsonValue::Array(agent_deliverable_comments),
+        ),
+        (
+            "conflict_resolutions",
+            JsonValue::Array(conflict_resolutions),
         ),
         ("merge_pull_request", merge_pull_request),
         ("open_pull_request", open_pull_request),
@@ -1966,6 +2371,7 @@ fn review_capabilities_json(
         ),
         ("rerunnable_checks", JsonValue::Array(rerunnable_checks)),
         ("schema", JsonValue::String(PLATFORM_SCHEMA_V2.to_owned())),
+        ("staging", JsonValue::Array(staging)),
         ("update_pull_request", update_pull_request),
         (
             "snapshot_revision",
@@ -1990,12 +2396,14 @@ fn review_capabilities(value: &JsonValue) -> Result<ReviewCapabilities, Platform
         value,
         &[
             "agent_deliverable_comments",
+            "conflict_resolutions",
             "merge_pull_request",
             "open_pull_request",
             "project",
             "rerunnable_checks",
             "schema",
             "snapshot_revision",
+            "staging",
             "workspace",
             "workspace_revision",
             "update_pull_request",
@@ -2093,6 +2501,7 @@ fn review_capabilities(value: &JsonValue) -> Result<ReviewCapabilities, Platform
         })
         .collect::<Result<Vec<_>, _>>()?;
     let pull_request = review_pull_request_capabilities(value)?;
+    let git = review_git_staging_capabilities(value)?;
     let snapshot_revision = value
         .get("snapshot_revision")
         .and_then(JsonValue::as_integer)
@@ -2118,7 +2527,120 @@ fn review_capabilities(value: &JsonValue) -> Result<ReviewCapabilities, Platform
         checks,
         deliverable,
         pull_request,
+        git,
     )
+}
+
+/// Decode the two git-staging lists, refusing anything the server could not
+/// have minted.
+///
+/// The authority kind, the commit-id grammar and the index digest are all
+/// checked here rather than only in the constructor, so a body claiming a
+/// staging control fenced against something that is not a git object id never
+/// reaches a client that would render it.
+fn review_git_staging_capabilities(
+    value: &JsonValue,
+) -> Result<ReviewGitStagingCapabilities, PlatformV2TransportError> {
+    let JsonValue::Array(staging) = value
+        .get("staging")
+        .ok_or(PlatformV2TransportError::InvalidBody)?
+    else {
+        return Err(PlatformV2TransportError::InvalidBody);
+    };
+    if staging.len() > MAX_REVIEW_PROPOSALS {
+        return Err(PlatformV2TransportError::InvalidBody);
+    }
+    let staging = staging
+        .iter()
+        .map(|slot| {
+            exact_fields(
+                slot,
+                &[
+                    "authority",
+                    "confirmation_digest",
+                    "expected_head_revision",
+                    "expected_index_digest",
+                    "kind",
+                    "proposal_id",
+                    "receipt_correlation_digest",
+                ],
+            )?;
+            ReviewStagingCapability::new(
+                ReviewProposalId::new(string(slot, "proposal_id")?.to_owned())
+                    .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+                ReviewProposalKind::parse(string(slot, "kind")?)
+                    .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+                ReviewField::new(string(slot, "expected_head_revision")?.to_owned())
+                    .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+                ReviewIndexDigest::new(string(slot, "expected_index_digest")?.to_owned())?,
+                git_authority(slot)?,
+                ReviewConfirmationDigest::new(string(slot, "confirmation_digest")?.to_owned())?,
+                ReviewReceiptCorrelationDigest::new(
+                    string(slot, "receipt_correlation_digest")?.to_owned(),
+                )?,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let JsonValue::Array(conflicts) = value
+        .get("conflict_resolutions")
+        .ok_or(PlatformV2TransportError::InvalidBody)?
+    else {
+        return Err(PlatformV2TransportError::InvalidBody);
+    };
+    if conflicts.len() > MAX_REVIEW_PROPOSAL_FILES * 2 {
+        return Err(PlatformV2TransportError::InvalidBody);
+    }
+    let conflict_resolutions = conflicts
+        .iter()
+        .map(|slot| {
+            exact_fields(
+                slot,
+                &[
+                    "authority",
+                    "confirmation_digest",
+                    "expected_head_revision",
+                    "expected_index_digest",
+                    "file_id",
+                    "proposal_id",
+                    "receipt_correlation_digest",
+                    "resolution",
+                ],
+            )?;
+            ReviewConflictResolutionCapability::new(
+                ReviewProposalId::new(string(slot, "proposal_id")?.to_owned())
+                    .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+                ReviewFileId::new(string(slot, "file_id")?.to_owned())
+                    .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+                ConflictResolution::parse(string(slot, "resolution")?)
+                    .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+                ReviewField::new(string(slot, "expected_head_revision")?.to_owned())
+                    .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+                ReviewIndexDigest::new(string(slot, "expected_index_digest")?.to_owned())?,
+                git_authority(slot)?,
+                ReviewConfirmationDigest::new(string(slot, "confirmation_digest")?.to_owned())?,
+                ReviewReceiptCorrelationDigest::new(
+                    string(slot, "receipt_correlation_digest")?.to_owned(),
+                )?,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ReviewGitStagingCapabilities {
+        staging,
+        conflict_resolutions,
+    })
+}
+
+fn git_authority(value: &JsonValue) -> Result<ReviewAuthority, PlatformV2TransportError> {
+    let authority = value
+        .get("authority")
+        .ok_or(PlatformV2TransportError::InvalidBody)?;
+    exact_fields(authority, &["id", "kind"])?;
+    Ok(ReviewAuthority::new(
+        ReviewAuthorityKind::parse(string(authority, "kind")?)
+            .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+        crate::platform_v2_review::ReviewAuthorityId::new(string(authority, "id")?.to_owned())
+            .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+    ))
 }
 
 fn pull_request_slot<'a>(

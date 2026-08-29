@@ -46,7 +46,7 @@ use automonique_protocol::platform_v2_transport::{
     PlatformV2Refusal, PlatformV2Request, PlatformV2Response, RawMutationApprovalDocument,
     RawMutationReceiptDocument, ReceiptLookupKey, ReviewAgentDeliveryCapability,
     ReviewCapabilities, ReviewCheckRerunCapability, ReviewConfirmationDigest,
-    ReviewPullRequestCapabilities, ReviewPullRequestMergeCapability,
+    ReviewGitStagingCapabilities, ReviewPullRequestCapabilities, ReviewPullRequestMergeCapability,
     ReviewPullRequestOpenCapability, ReviewPullRequestUpdateCapability,
     ReviewReceiptCorrelationDigest,
 };
@@ -1903,6 +1903,7 @@ impl PlatformV2Runtime {
                             Vec::new(),
                             agent_deliverable,
                             pull_request,
+                            ReviewGitStagingCapabilities::default(),
                         )
                         .map_err(|_| "platform_v2_response_invalid")?,
                     ));
@@ -1967,6 +1968,7 @@ impl PlatformV2Runtime {
                         rerunnable,
                         agent_deliverable,
                         pull_request,
+                        ReviewGitStagingCapabilities::default(),
                     )
                     .map_err(|_| "platform_v2_response_invalid")?,
                 ))
