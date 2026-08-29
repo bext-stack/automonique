@@ -2703,18 +2703,24 @@ impl PlatformV2Runtime {
                 }
             }
             PullRequestState::Draft | PullRequestState::Open => {
-                let Some(number) = projection
-                    .id()
-                    .and_then(|id| id.as_str().parse::<u32>().ok())
-                    .and_then(|value| IssueNumber::new(value).ok())
-                else {
+                // The projection's id is the GitHub number in decimal. A
+                // workspace whose id is not one is not GitHub-backed, and
+                // guessing a number for it would advertise a control aimed at
+                // some other repository's pull request.
+                let (Some(id), Some(number)) = (
+                    projection.id().cloned(),
+                    projection
+                        .id()
+                        .and_then(|id| id.as_str().parse::<u32>().ok())
+                        .and_then(|value| IssueNumber::new(value).ok()),
+                ) else {
                     return capabilities;
                 };
                 if let Some((_, confirmation, correlation)) =
                     mint(GitHubPullRequestFamily::Update, Some(number), None)
                 {
                     capabilities.update = ReviewPullRequestUpdateCapability::new(
-                        projection.id().cloned().unwrap_or_else(|| unreachable!()),
+                        id.clone(),
                         observed,
                         authority.clone(),
                         confirmation,
@@ -2738,7 +2744,7 @@ impl PlatformV2Runtime {
                     && observation.mergeable()
                 {
                     capabilities.merge = ReviewPullRequestMergeCapability::new(
-                        projection.id().cloned().unwrap_or_else(|| unreachable!()),
+                        id,
                         observed,
                         head.clone(),
                         MergeReadiness::Ready,
