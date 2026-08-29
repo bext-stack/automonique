@@ -36,19 +36,21 @@ use automonique_protocol::platform_v2_lineage::{
     LineageStatus, OrchestrationRecord, WorkspaceIntent, WorkspaceIntentOutcome,
 };
 use automonique_protocol::platform_v2_review::{
-    AttentionReason as ReviewAttentionReason, CheckState, CommentAgentState, MergeReadiness,
-    PullRequestState, ReviewAction, ReviewActionReceipt, ReviewActionRequest, ReviewActorId,
-    ReviewAuthentication, ReviewAuthority, ReviewAuthorityId, ReviewAuthorityKind,
-    ReviewCommentTarget, ReviewField, ReviewFreshnessState, ReviewReceiptOutcome, ReviewSnapshot,
+    AttentionReason as ReviewAttentionReason, CheckState, CommentAgentState, ConflictResolution,
+    MergeReadiness, PullRequestState, ReviewAction, ReviewActionReceipt, ReviewActionRequest,
+    ReviewActorId, ReviewAuthentication, ReviewAuthority, ReviewAuthorityId, ReviewAuthorityKind,
+    ReviewCommentTarget, ReviewField, ReviewFileId, ReviewFreshnessState, ReviewProposalId,
+    ReviewProposalKind, ReviewReceiptOutcome, ReviewSnapshot,
 };
 use automonique_protocol::platform_v2_transport::{
     LIFECYCLE_CAPABILITY_EFFECT_KINDS, LifecycleCapabilities, LifecycleOperationCapability,
     PlatformV2Refusal, PlatformV2Request, PlatformV2Response, RawMutationApprovalDocument,
     RawMutationReceiptDocument, ReceiptLookupKey, ReviewAgentDeliveryCapability,
     ReviewCapabilities, ReviewCheckRerunCapability, ReviewConfirmationDigest,
-    ReviewGitStagingCapabilities, ReviewPullRequestCapabilities, ReviewPullRequestMergeCapability,
+    ReviewConflictResolutionCapability, ReviewGitStagingCapabilities, ReviewIndexDigest,
+    ReviewPullRequestCapabilities, ReviewPullRequestMergeCapability,
     ReviewPullRequestOpenCapability, ReviewPullRequestUpdateCapability,
-    ReviewReceiptCorrelationDigest,
+    ReviewReceiptCorrelationDigest, ReviewStagingCapability,
 };
 use automonique_protocol::primitives::{EpochMillis, Revision};
 use automonique_protocol::wire::JsonValue;
@@ -57,8 +59,9 @@ use automonique_store::lineage_index::WorkspaceIntentExecutionReceipt;
 use automonique_store::lineage_index::{IntentAuthorizationScope, LineageIndex};
 use automonique_store::review_store::{
     ApprovalPolicy, ReviewActionAdmission, ReviewApprovalDecision, ReviewApprovalDocument,
-    ReviewExternalEffectCustody, ReviewExternalEffectPlan, ReviewPullRequestFamily, ReviewStore,
-    ReviewStoreError, ReviewWriteAdmission, StoredReviewAction,
+    ReviewExternalEffectCustody, ReviewExternalEffectPlan, ReviewGitStagingFamily,
+    ReviewPullRequestFamily, ReviewStore, ReviewStoreError, ReviewWriteAdmission,
+    StoredReviewAction,
 };
 use automonique_store::work_context_store::{
     ApprovalPolicyDecision, ExternalEffectCompletionPolicy, ExternalEffectExecutorPolicy,
@@ -70,6 +73,11 @@ use automonique_store::work_context_store::{
 use serde::Deserialize;
 
 use crate::platform_v2_attention_registry::AttentionRegistry;
+use crate::platform_v2_git_worktree_adapter::{
+    ConflictSide, GitStagingCustody, GitStagingFamily, GitStagingGrants, GitStagingPlan,
+    GitStagingReviewBinding, GitStagingSubmission, GitStagingTarget, GitWorktreeError,
+    GitWorktreeObservation, ObjectId, RepositoryFile,
+};
 use crate::platform_v2_github_check_adapter::{
     GitHubCheckRerunCustody, GitHubCheckRerunError, GitHubCheckRerunPlan,
     GitHubCheckRerunSubmission,
@@ -80,7 +88,8 @@ use crate::platform_v2_github_pull_request_adapter::{
     GitHubPullRequestTarget,
 };
 use crate::platform_v2_review_adapter::{
-    ProductionReviewEffectAdapter, PullRequestCapabilityTarget, ReviewEffectPlan,
+    GitStagingCapabilityTarget, ProductionReviewEffectAdapter, PullRequestCapabilityTarget,
+    ReviewEffectPlan,
 };
 
 pub const POLICY_FILE_NAME: &str = "platform-v2-policy.json";
@@ -131,25 +140,39 @@ fn github_recovery_phase(
     }
 }
 
-fn stored_github_recovery_phase(
+/// The recovery phase of any confirmed write, whatever family it is.
+///
+/// The custody machine is one machine, so this reads whichever family's
+/// custody column the plan carries rather than naming a provider. A family it
+/// did not know how to read would otherwise be treated as carrying no custody
+/// at all.
+fn stored_recovery_phase(
     action: &StoredReviewAction,
     plan: &ReviewExternalEffectPlan,
 ) -> Result<GitHubRecoveryPhase, &'static str> {
-    require_native_github_recovery_identity(plan)?;
+    require_native_recovery_identity(plan)?;
     github_recovery_phase(
         action.receipt.outcome(),
         action.write_admitted_at_ms.is_some(),
         plan.github_custody()
+            .or_else(|| plan.git_staging_custody())
             .ok_or("platform_v2_review_plan_invalid")?,
     )
 }
 
-fn require_native_github_recovery_identity(
+/// The workspace revision and receipt correlation a confirmed write must carry
+/// to be recoverable at all.
+///
+/// A plan missing either is deliberately invisible to receipt lookup rather
+/// than falling through to the generic index, whichever family it is.
+fn require_native_recovery_identity(
     plan: &ReviewExternalEffectPlan,
 ) -> Result<(Revision, [u8; 32]), &'static str> {
     match (
-        plan.github_expected_workspace_revision(),
-        plan.github_receipt_correlation_digest(),
+        plan.github_expected_workspace_revision()
+            .or_else(|| plan.git_staging_expected_workspace_revision()),
+        plan.github_receipt_correlation_digest()
+            .or_else(|| plan.git_staging_receipt_correlation_digest()),
     ) {
         (Some(workspace_revision), Some(receipt_correlation)) => {
             Ok((workspace_revision, receipt_correlation))
@@ -1889,6 +1912,15 @@ impl PlatformV2Runtime {
                     &snapshot,
                     workspace_record.revision(),
                 );
+                // Git authority is independent again, so a deployment that
+                // grants staging and nothing else still sees its controls.
+                let git = self.git_staging_capabilities(
+                    &principal,
+                    value.project(),
+                    value.workspace(),
+                    &snapshot,
+                    workspace_record.revision(),
+                );
                 let Some(authority) = principal
                     .review_authorities
                     .get(&ReviewAuthorityKind::Ci)
@@ -1903,7 +1935,7 @@ impl PlatformV2Runtime {
                             Vec::new(),
                             agent_deliverable,
                             pull_request,
-                            ReviewGitStagingCapabilities::default(),
+                            git,
                         )
                         .map_err(|_| "platform_v2_response_invalid")?,
                     ));
@@ -1968,7 +2000,7 @@ impl PlatformV2Runtime {
                         rerunnable,
                         agent_deliverable,
                         pull_request,
-                        ReviewGitStagingCapabilities::default(),
+                        git,
                     )
                     .map_err(|_| "platform_v2_response_invalid")?,
                 ))
@@ -2061,8 +2093,7 @@ impl PlatformV2Runtime {
                         {
                             return Err("platform_v2_review_confirmation_changed");
                         }
-                        if stored_github_recovery_phase(&existing, &plan)?
-                            == GitHubRecoveryPhase::Terminal
+                        if stored_recovery_phase(&existing, &plan)? == GitHubRecoveryPhase::Terminal
                         {
                             return Ok(PlatformV2Response::ReviewReceipt(existing.receipt));
                         }
@@ -2359,6 +2390,111 @@ impl PlatformV2Runtime {
                         )?;
                         Ok(PlatformV2Response::ReviewReceipt(receipt))
                     }
+                    Ok(advertised_plan @ ReviewEffectPlan::GitStaging { .. }) => {
+                        if expected_workspace_revision != Some(workspace_record.revision()) {
+                            return Err("platform_v2_review_confirmation_changed");
+                        }
+                        // The files, the conflict target and the commit
+                        // subject all come from the server-owned snapshot the
+                        // action was resolved against, never from the client.
+                        let snapshot = self
+                            .reviews
+                            .snapshot(request.workspace())
+                            .map_err(review_store_category)?
+                            .ok_or("platform_v2_not_found")?;
+                        if snapshot.revision() != request.expected_revision() {
+                            return Err("platform_v2_review_snapshot_changed");
+                        }
+                        let target = git_staging_target_files(&snapshot, request.action())?;
+                        // Re-read the repository now. The confirmation the
+                        // client returns was minted over an observation, so a
+                        // worktree that moved since produces a different digest
+                        // and this refuses instead of writing against a state
+                        // nobody saw.
+                        let observation = self.review_effects.preflight_git_staging_capability(
+                            &advertised_plan,
+                            &target.paths,
+                            target.conflict.as_ref().map(|(_, _, side)| *side),
+                        )?;
+                        let expected_confirmation =
+                            self.review_effects.git_staging_confirmation_digest(
+                                &principal.actor,
+                                &scope.project,
+                                request.workspace(),
+                                request.authority(),
+                                request.expected_revision(),
+                                workspace_record.revision(),
+                                &advertised_plan,
+                                target.conflict.as_ref().map(|(file_id, _, side)| {
+                                    (
+                                        file_id,
+                                        match side {
+                                            ConflictSide::Ours => ConflictResolution::KeepCurrent,
+                                            ConflictSide::Theirs => {
+                                                ConflictResolution::KeepIncoming
+                                            }
+                                        },
+                                    )
+                                }),
+                                &observation,
+                            )?;
+                        if confirmation_digest.as_ref().map(|value| value.as_str())
+                            != Some(review_confirmation_digest(expected_confirmation)?.as_str())
+                        {
+                            return Err("platform_v2_review_confirmation_changed");
+                        }
+                        let expected_correlation =
+                            ProductionReviewEffectAdapter::git_staging_receipt_correlation_digest(
+                                expected_confirmation,
+                            );
+                        if receipt_correlation_digest.as_ref().map(|v| v.as_str())
+                            != Some(
+                                review_receipt_correlation_digest(expected_correlation)?.as_str(),
+                            )
+                        {
+                            return Err("platform_v2_review_confirmation_changed");
+                        }
+                        let request_digest =
+                            ReviewStore::action_request_digest(&request, ApprovalPolicy::Required)
+                                .map_err(review_store_category)?;
+                        let external_plan = git_staging_effect_plan(
+                            request_digest,
+                            &advertised_plan,
+                            &target,
+                            &observation,
+                            workspace_record.revision(),
+                            expected_correlation,
+                        )?;
+                        self.policy_fence.verify()?;
+                        self.review_effects.verify_generation()?;
+                        self.validate_workspace_revision(
+                            &principal,
+                            request.workspace(),
+                            workspace_record.revision(),
+                        )?;
+                        let admitted = self
+                            .reviews
+                            .prepare_external_action(
+                                &request,
+                                ApprovalPolicy::Required,
+                                &external_plan,
+                                now_ms,
+                            )
+                            .map_err(review_store_category)?;
+                        let action = match admitted {
+                            ReviewActionAdmission::New(action)
+                            | ReviewActionAdmission::Replay(action) => action,
+                        };
+                        let action = self.approve_prepared_github_confirmation(
+                            &principal,
+                            &action,
+                            &external_plan,
+                            now_ms,
+                        )?;
+                        let receipt =
+                            self.drive_git_staging(&principal, &action, &external_plan, now_ms)?;
+                        Ok(PlatformV2Response::ReviewReceipt(receipt))
+                    }
                     Ok(advertised_plan @ ReviewEffectPlan::GitHubPullRequest { .. }) => {
                         if expected_workspace_revision != Some(workspace_record.revision()) {
                             return Err("platform_v2_review_confirmation_changed");
@@ -2475,9 +2611,9 @@ impl PlatformV2Runtime {
                             // them and rejected for everything else, so a
                             // pull-request receipt can no more be found by a
                             // bare idempotency key than a rerun receipt can.
-                            if plan.is_github_effect() {
+                            if plan.is_correlated_effect() {
                                 let Ok((_, stored_correlation)) =
-                                    require_native_github_recovery_identity(&plan)
+                                    require_native_recovery_identity(&plan)
                                 else {
                                     // A migrated or otherwise partial GitHub
                                     // plan has no complete native recovery
@@ -2495,8 +2631,8 @@ impl PlatformV2Runtime {
                             } else if value.receipt_correlation_digest().is_some() {
                                 continue;
                             }
-                            if plan.is_github_effect() {
-                                if stored_github_recovery_phase(&action, &plan)?
+                            if plan.is_correlated_effect() {
+                                if stored_recovery_phase(&action, &plan)?
                                     == GitHubRecoveryPhase::Terminal
                                 {
                                     return Ok(PlatformV2Response::ReviewReceipt(action.receipt));
@@ -2508,6 +2644,14 @@ impl PlatformV2Runtime {
                                     self.drive_github_pull_request(
                                         &principal, &action, &plan, now_ms,
                                     )?
+                                } else if plan.is_git_staging() {
+                                    // The only lane a staging receipt can be
+                                    // polled through. Re-sending the action
+                                    // cannot serve as one: its confirmation was
+                                    // minted over an observation the write
+                                    // itself invalidated, so a poll has to be
+                                    // a poll.
+                                    self.drive_git_staging(&principal, &action, &plan, now_ms)?
                                 } else {
                                     self.drive_github_check_rerun(
                                         &principal, &action, &plan, now_ms,
@@ -2610,6 +2754,209 @@ impl PlatformV2Runtime {
                     .map_err(|_| category)
             }
         }
+    }
+
+    /// Mint whichever staging slots one repository read can prove.
+    ///
+    /// Nothing here is inferred. A registry binding carrying a grant is a
+    /// configuration fact; a slot is minted only from an observation of the
+    /// repository, and every failure along the way leaves the slot out rather
+    /// than advertising a control that would refuse. That is why this returns
+    /// a value rather than an error: declining to advertise is the correct
+    /// answer, not a failed request.
+    ///
+    /// The repository is read once, for every path any eligible proposal
+    /// names, and every slot is derived from that one read. So each control in
+    /// a response names the same `HEAD` and the same index by construction
+    /// rather than by a check after the fact — which matters, because a client
+    /// that acts on two of them is acting against one worktree.
+    fn git_staging_capabilities(
+        &self,
+        principal: &PrincipalPolicy,
+        project: &ProjectId,
+        workspace: &WorkContextIdentity,
+        snapshot: &ReviewSnapshot,
+        workspace_revision: Revision,
+    ) -> ReviewGitStagingCapabilities {
+        let mut capabilities = ReviewGitStagingCapabilities::default();
+        let Some(authority) = principal
+            .review_authorities
+            .get(&ReviewAuthorityKind::Git)
+            .cloned()
+        else {
+            return capabilities;
+        };
+        // Only proposals this principal's own git authority owns. A proposal
+        // carrying some other authority is not this actor's to perform.
+        let eligible = snapshot
+            .proposals()
+            .iter()
+            .filter(|proposal| proposal.authority() == Some(&authority))
+            .collect::<Vec<_>>();
+        if eligible.is_empty() {
+            return capabilities;
+        }
+        // Every action any eligible proposal admits, paired with the files it
+        // would touch. A resolution admits one per file per side, because the
+        // side decides which bytes land and therefore has to be inside the
+        // digest before the client chooses.
+        let mut candidates = Vec::new();
+        for proposal in &eligible {
+            match proposal.kind() {
+                ReviewProposalKind::ResolveConflict => {
+                    for file_id in proposal.files() {
+                        for resolution in [
+                            ConflictResolution::KeepCurrent,
+                            ConflictResolution::KeepIncoming,
+                        ] {
+                            candidates.push((
+                                *proposal,
+                                ReviewAction::ResolveConflict {
+                                    proposal_id: proposal.id().clone(),
+                                    file_id: file_id.clone(),
+                                    resolution,
+                                },
+                            ));
+                        }
+                    }
+                }
+                ReviewProposalKind::Stage => candidates.push((
+                    *proposal,
+                    ReviewAction::Stage {
+                        proposal_id: proposal.id().clone(),
+                    },
+                )),
+                ReviewProposalKind::Unstage => candidates.push((
+                    *proposal,
+                    ReviewAction::Unstage {
+                        proposal_id: proposal.id().clone(),
+                    },
+                )),
+                ReviewProposalKind::Commit => candidates.push((
+                    *proposal,
+                    ReviewAction::Commit {
+                        proposal_id: proposal.id().clone(),
+                    },
+                )),
+            }
+        }
+        let mut prepared = Vec::with_capacity(candidates.len());
+        let mut union = BTreeSet::new();
+        for (proposal, action) in candidates {
+            let Ok(target) = git_staging_target_files(snapshot, &action) else {
+                continue;
+            };
+            let conflict = target
+                .conflict
+                .as_ref()
+                .map(|(file_id, _, side)| (file_id.clone(), *side));
+            let Ok(plan) = self.review_effects.git_staging_effect_plan(
+                project,
+                workspace,
+                &authority,
+                GitStagingCapabilityTarget {
+                    proposal_id: proposal.id(),
+                    kind: proposal.kind(),
+                    file_id: conflict.as_ref().map(|(file_id, _)| file_id),
+                    resolution: conflict.as_ref().map(|(_, side)| match side {
+                        ConflictSide::Ours => ConflictResolution::KeepCurrent,
+                        ConflictSide::Theirs => ConflictResolution::KeepIncoming,
+                    }),
+                },
+            ) else {
+                // A withheld grant, or a binding this workspace does not have.
+                continue;
+            };
+            union.extend(target.paths.iter().cloned());
+            prepared.push((proposal.id().clone(), proposal.kind(), plan, target));
+        }
+        let paths = union.into_iter().collect::<Vec<_>>();
+        if paths.is_empty() {
+            return capabilities;
+        }
+        let Some(state) = prepared
+            .iter()
+            .find_map(|(_, _, plan, _)| self.review_effects.git_worktree_state(plan, &paths).ok())
+        else {
+            return capabilities;
+        };
+        for (proposal_id, kind, plan, target) in &prepared {
+            let side = target.conflict.as_ref().map(|(_, _, side)| *side);
+            let Ok(observation) =
+                self.review_effects
+                    .observe_git_staging(plan, &state, &target.paths, side)
+            else {
+                continue;
+            };
+            let conflict = target.conflict.as_ref().map(|(file_id, _, side)| {
+                (
+                    file_id,
+                    match side {
+                        ConflictSide::Ours => ConflictResolution::KeepCurrent,
+                        ConflictSide::Theirs => ConflictResolution::KeepIncoming,
+                    },
+                )
+            });
+            let Ok(confirmation) = self.review_effects.git_staging_confirmation_digest(
+                &principal.actor,
+                project,
+                workspace,
+                &authority,
+                snapshot.revision(),
+                workspace_revision,
+                plan,
+                conflict,
+                &observation,
+            ) else {
+                continue;
+            };
+            let correlation =
+                ProductionReviewEffectAdapter::git_staging_receipt_correlation_digest(confirmation);
+            let (Ok(head), Ok(index), Ok(confirmation), Ok(correlation)) = (
+                ReviewField::new(observation.head().commit().as_str()),
+                ReviewIndexDigest::new(
+                    observation
+                        .index_digest()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>(),
+                ),
+                review_confirmation_digest(confirmation),
+                review_receipt_correlation_digest(correlation),
+            ) else {
+                continue;
+            };
+            match conflict {
+                Some((file_id, resolution)) => {
+                    if let Ok(capability) = ReviewConflictResolutionCapability::new(
+                        proposal_id.clone(),
+                        file_id.clone(),
+                        resolution,
+                        head,
+                        index,
+                        authority.clone(),
+                        confirmation,
+                        correlation,
+                    ) {
+                        capabilities.conflict_resolutions.push(capability);
+                    }
+                }
+                None => {
+                    if let Ok(capability) = ReviewStagingCapability::new(
+                        proposal_id.clone(),
+                        *kind,
+                        head,
+                        index,
+                        authority.clone(),
+                        confirmation,
+                        correlation,
+                    ) {
+                        capabilities.staging.push(capability);
+                    }
+                }
+            }
+        }
+        capabilities
     }
 
     /// Mint whichever pull-request slots a live provider read can prove.
@@ -2771,12 +3118,12 @@ impl PlatformV2Runtime {
         plan: &ReviewExternalEffectPlan,
         now_ms: i64,
     ) -> Result<ReviewActionReceipt, &'static str> {
-        require_native_github_recovery_identity(plan)?;
+        require_native_recovery_identity(plan)?;
         let scope = principal
             .workspaces
             .get(action.request.workspace())
             .ok_or("platform_v2_scope_denied")?;
-        let phase = stored_github_recovery_phase(action, plan)?;
+        let phase = stored_recovery_phase(action, plan)?;
         if phase == GitHubRecoveryPhase::Terminal {
             return Ok(action.receipt.clone());
         }
@@ -2940,12 +3287,12 @@ impl PlatformV2Runtime {
         plan: &ReviewExternalEffectPlan,
         now_ms: i64,
     ) -> Result<ReviewActionReceipt, &'static str> {
-        require_native_github_recovery_identity(plan)?;
+        require_native_recovery_identity(plan)?;
         let scope = principal
             .workspaces
             .get(action.request.workspace())
             .ok_or("platform_v2_scope_denied")?;
-        let phase = stored_github_recovery_phase(action, plan)?;
+        let phase = stored_recovery_phase(action, plan)?;
         if phase == GitHubRecoveryPhase::Terminal {
             return Ok(action.receipt.clone());
         }
@@ -3120,6 +3467,305 @@ impl PlatformV2Runtime {
             .map_err(review_store_category)
     }
 
+    /// Perform, or reconcile, one admitted local staging write.
+    ///
+    /// The shape is the pull-request adapter's, because the custody argument
+    /// is the same one: nothing may be submitted unless this call is the one
+    /// that admitted the write, and everything else reconciles by reading.
+    /// What differs is only where the write lands.
+    fn drive_git_staging(
+        &mut self,
+        principal: &PrincipalPolicy,
+        action: &StoredReviewAction,
+        plan: &ReviewExternalEffectPlan,
+        now_ms: i64,
+    ) -> Result<ReviewActionReceipt, &'static str> {
+        require_native_recovery_identity(plan)?;
+        let scope = principal
+            .workspaces
+            .get(action.request.workspace())
+            .ok_or("platform_v2_scope_denied")?;
+        let phase = stored_recovery_phase(action, plan)?;
+        if phase == GitHubRecoveryPhase::Terminal {
+            return Ok(action.receipt.clone());
+        }
+        let mut may_submit = false;
+        let mut refresh_plan = false;
+        let action = if phase == GitHubRecoveryPhase::NeverStarted {
+            if self
+                .validate_git_staging_execution_fence(principal, action, plan)
+                .is_err()
+            {
+                return self
+                    .reviews
+                    .refuse_external_action_not_started(
+                        &action.preview_id,
+                        action.request_digest,
+                        now_ms,
+                    )
+                    .map_err(review_store_category);
+            }
+            let write = self
+                .reviews
+                .start_write(&action.preview_id, action.request_digest, now_ms)
+                .map_err(review_store_category)?;
+            match write {
+                ReviewWriteAdmission::New(action) => {
+                    may_submit = true;
+                    refresh_plan = true;
+                    action
+                }
+                ReviewWriteAdmission::Replay(action) => {
+                    refresh_plan = true;
+                    action
+                }
+            }
+        } else {
+            action.clone()
+        };
+        let refreshed_plan;
+        let plan = if refresh_plan {
+            let (stored, refreshed) = self
+                .reviews
+                .external_action(
+                    action.request.workspace(),
+                    action.request.actor(),
+                    action.request.authentication(),
+                    action.request.authority(),
+                    action.request.idempotency_key(),
+                    now_ms,
+                )
+                .map_err(review_store_category)?
+                .ok_or("platform_v2_review_plan_missing")?;
+            if stored.preview_id != action.preview_id
+                || stored.request_digest != action.request_digest
+            {
+                return Err("platform_v2_review_plan_invalid");
+            }
+            refreshed_plan = refreshed;
+            &refreshed_plan
+        } else {
+            plan
+        };
+        // The fence is re-checked immediately before custody may be used. A
+        // worktree that moved between the two reads refuses here, and because
+        // no command has run yet it is a proved-not-started refusal rather
+        // than an ambiguous one.
+        if may_submit
+            && self
+                .validate_git_staging_execution_fence(principal, &action, plan)
+                .is_err()
+        {
+            return self
+                .reviews
+                .settle_git_staging(
+                    &action.preview_id,
+                    action.request_digest,
+                    ReviewExternalEffectCustody::Refused,
+                    None,
+                    now_ms,
+                )
+                .map_err(review_store_category);
+        }
+        let provider_plan =
+            git_staging_provider_plan(principal, &scope.project, &action.request, plan)?;
+        let grants = self.git_staging_grants(plan)?;
+        let adapter = match self.review_effects.git_worktree_adapter(
+            provider_plan.canonical_root(),
+            grants,
+            plan.registry_generation_digest(),
+        ) {
+            Ok(adapter) => adapter,
+            Err(category) if may_submit => {
+                return self
+                    .reviews
+                    .settle_git_staging(
+                        &action.preview_id,
+                        action.request_digest,
+                        ReviewExternalEffectCustody::Refused,
+                        None,
+                        now_ms,
+                    )
+                    .map_err(|_| category);
+            }
+            Err(category) => return Err(category),
+        };
+        let custody = map_store_git_staging_custody(
+            plan.git_staging_custody()
+                .ok_or("platform_v2_review_plan_invalid")?,
+        );
+        let recorded = plan
+            .git_staging_resulting_head()
+            .map(|value| ObjectId::new(value).map_err(|_| "platform_v2_review_plan_invalid"))
+            .transpose()?;
+        let mut submission = GitStagingSubmission::restore(
+            &provider_plan,
+            provider_plan.digest(),
+            custody,
+            recorded,
+        )
+        .map_err(git_staging_category)?;
+        if let Err(category) = self.policy_fence.verify() {
+            if may_submit {
+                return self
+                    .reviews
+                    .settle_git_staging(
+                        &action.preview_id,
+                        action.request_digest,
+                        ReviewExternalEffectCustody::Refused,
+                        None,
+                        now_ms,
+                    )
+                    .map_err(|_| category);
+            }
+            return Err(category);
+        }
+        let result = if may_submit {
+            adapter.submit(&provider_plan, &mut submission)
+        } else {
+            adapter.reconcile(&provider_plan, &mut submission)
+        };
+        self.policy_fence.verify()?;
+        let settled = match result {
+            Ok(custody) => map_git_staging_store_custody(custody),
+            Err(error) => match submission.custody() {
+                GitStagingCustody::Refused => ReviewExternalEffectCustody::Refused,
+                // An acknowledged write keeps its acknowledgement. It is the
+                // only attribution this process holds, and discarding it would
+                // strand the effect as permanently unattributable.
+                GitStagingCustody::Accepted => ReviewExternalEffectCustody::Accepted,
+                GitStagingCustody::Ambiguous | GitStagingCustody::CustodyStarted => {
+                    ReviewExternalEffectCustody::Ambiguous
+                }
+                GitStagingCustody::Completed => ReviewExternalEffectCustody::Completed,
+                GitStagingCustody::NotStarted => return Err(git_staging_category(error)),
+            },
+        };
+        self.reviews
+            .settle_git_staging(
+                &action.preview_id,
+                action.request_digest,
+                settled,
+                submission.resulting_head().map(ObjectId::as_str),
+                now_ms,
+            )
+            .map_err(review_store_category)
+    }
+
+    /// The grants the operator registry carries for this plan's repository,
+    /// read fresh rather than taken from the sealed row.
+    ///
+    /// A registry narrowed between admission and execution narrows the write:
+    /// the adapter re-reads the document and refuses when the grants it finds
+    /// are not the ones the plan was built under.
+    fn git_staging_grants(
+        &self,
+        plan: &ReviewExternalEffectPlan,
+    ) -> Result<GitStagingGrants, &'static str> {
+        let family = plan
+            .git_staging_family()
+            .ok_or("platform_v2_review_plan_invalid")?;
+        Ok(match family {
+            ReviewGitStagingFamily::Stage | ReviewGitStagingFamily::Unstage => GitStagingGrants {
+                index_write: true,
+                ..GitStagingGrants::default()
+            },
+            ReviewGitStagingFamily::Commit => GitStagingGrants {
+                commit: true,
+                ..GitStagingGrants::default()
+            },
+            ReviewGitStagingFamily::ResolveConflict => GitStagingGrants {
+                conflict_resolution: true,
+                ..GitStagingGrants::default()
+            },
+        })
+    }
+
+    /// Re-derive the staging plan from the operator registry and prove the
+    /// repository still holds the exact observation, immediately before
+    /// custody may begin.
+    fn validate_git_staging_execution_fence(
+        &self,
+        principal: &PrincipalPolicy,
+        action: &StoredReviewAction,
+        plan: &ReviewExternalEffectPlan,
+    ) -> Result<(), &'static str> {
+        self.policy_fence.verify()?;
+        let scope = principal
+            .workspaces
+            .get(action.request.workspace())
+            .ok_or("platform_v2_scope_denied")?;
+        let workspace_record = self
+            .work_contexts
+            .validate_policy_mapping(
+                principal.actor.tenant(),
+                &scope.project,
+                action.request.workspace(),
+            )
+            .map_err(|_| "platform_v2_review_workspace_changed")?;
+        let expected_workspace_revision = plan
+            .git_staging_expected_workspace_revision()
+            .ok_or("platform_v2_review_workspace_changed")?;
+        if workspace_record.revision() != expected_workspace_revision {
+            return Err("platform_v2_review_workspace_changed");
+        }
+        let current = self.review_effects.plan(
+            &scope.project,
+            action.request.workspace(),
+            action.request.authority(),
+            action.request.action(),
+        )?;
+        if !matches!(current, ReviewEffectPlan::GitStaging { .. }) {
+            return Err("platform_v2_review_registry_changed");
+        }
+        // The stored plan must still be the plan the registry produces. A
+        // registry edited between admission and execution retargets nothing:
+        // the digests stop matching and the write is refused.
+        let snapshot = self
+            .reviews
+            .snapshot(action.request.workspace())
+            .map_err(review_store_category)?
+            .ok_or("platform_v2_not_found")?;
+        if snapshot.revision() != action.request.expected_revision() {
+            return Err("platform_v2_review_snapshot_changed");
+        }
+        let target = git_staging_target_files(&snapshot, action.request.action())?;
+        let observation = self.review_effects.preflight_git_staging_capability(
+            &current,
+            &target.paths,
+            target.conflict.as_ref().map(|(_, _, side)| *side),
+        )?;
+        let reconstructed = git_staging_effect_plan(
+            plan.request_digest(),
+            &current,
+            &target,
+            &observation,
+            expected_workspace_revision,
+            plan.git_staging_receipt_correlation_digest()
+                .ok_or("platform_v2_review_plan_invalid")?,
+        )?;
+        if reconstructed.digest() != plan.digest() {
+            return Err("platform_v2_review_registry_changed");
+        }
+        // And the repository itself must still hold the exact observation the
+        // plan was sealed over. This is the fence: `preflight` recomputes the
+        // observation digest and refuses when HEAD, the index, or any named
+        // file's objects, conflict stages or working-tree stat identity have
+        // moved.
+        let provider_plan =
+            git_staging_provider_plan(principal, &scope.project, &action.request, plan)?;
+        self.review_effects
+            .git_worktree_adapter(
+                provider_plan.canonical_root(),
+                self.git_staging_grants(plan)?,
+                plan.registry_generation_digest(),
+            )?
+            .preflight(&provider_plan)
+            .map_err(git_staging_category)?;
+        self.policy_fence.verify()?;
+        self.review_effects.verify_generation()
+    }
+
     /// Re-derive the pull-request plan from the operator registry and prove
     /// the provider still admits it, immediately before custody may begin.
     fn validate_github_pull_request_execution_fence(
@@ -3199,7 +3845,7 @@ impl PlatformV2Runtime {
         plan: &ReviewExternalEffectPlan,
         now_ms: i64,
     ) -> Result<StoredReviewAction, &'static str> {
-        require_native_github_recovery_identity(plan)?;
+        require_native_recovery_identity(plan)?;
         if action.approval_policy != ApprovalPolicy::Required
             || !matches!(
                 action.request.action(),
@@ -3207,16 +3853,20 @@ impl PlatformV2Runtime {
                     | ReviewAction::OpenPullRequest { .. }
                     | ReviewAction::UpdatePullRequest { .. }
                     | ReviewAction::MergePullRequest { .. }
+                    | ReviewAction::Stage { .. }
+                    | ReviewAction::Unstage { .. }
+                    | ReviewAction::Commit { .. }
+                    | ReviewAction::ResolveConflict { .. }
             )
         {
             return Err("platform_v2_review_confirmation_required");
         }
-        let phase = stored_github_recovery_phase(action, plan)?;
+        let phase = stored_recovery_phase(action, plan)?;
         if phase == GitHubRecoveryPhase::Terminal {
             return Ok(action.clone());
         }
         if phase == GitHubRecoveryPhase::NeverStarted {
-            self.validate_github_workspace_revision(principal, action, plan)?;
+            self.validate_confirmed_workspace_revision(principal, action, plan)?;
         }
         if action.approval.is_some() {
             return Ok(action.clone());
@@ -3323,7 +3973,13 @@ impl PlatformV2Runtime {
         self.review_effects.verify_generation()
     }
 
-    fn validate_github_workspace_revision(
+    /// The workspace revision any confirmed write was sealed against.
+    ///
+    /// Reads whichever family's column the plan carries, for the reason the
+    /// recovery phase does: the approval gate is one gate, and a family it did
+    /// not know how to read would look like a plan with no workspace fence at
+    /// all.
+    fn validate_confirmed_workspace_revision(
         &self,
         principal: &PrincipalPolicy,
         action: &StoredReviewAction,
@@ -3331,6 +3987,7 @@ impl PlatformV2Runtime {
     ) -> Result<(), &'static str> {
         let expected = plan
             .github_expected_workspace_revision()
+            .or_else(|| plan.git_staging_expected_workspace_revision())
             .ok_or("platform_v2_review_workspace_changed")?;
         self.validate_workspace_revision(principal, action.request.workspace(), expected)
     }
@@ -4531,6 +5188,294 @@ const fn github_rerun_category(error: GitHubCheckRerunError) -> &'static str {
         GitHubCheckRerunError::ProviderUnavailable => "platform_v2_review_ci_provider_unavailable",
         GitHubCheckRerunError::ProviderRefused => "platform_v2_review_ci_provider_refused",
         GitHubCheckRerunError::ResourceChanged => "platform_v2_review_ci_check_changed",
+    }
+}
+
+/// The exact files, conflict target and subject one staging proposal names.
+///
+/// Every field is read from the server-owned review snapshot, never from the
+/// client: the action carries a proposal id, and `resolve_action` has already
+/// refused any id the snapshot does not hold at the kind the action claims.
+/// The paths are then narrowed from the contract's display path to the
+/// adapter's [`RepositoryFile`], which is a second, stricter grammar — so a
+/// projection carrying a path this process will not touch is refused here
+/// rather than reaching a command line.
+struct GitStagingTargetFiles {
+    paths: Vec<RepositoryFile>,
+    conflict: Option<(ReviewFileId, RepositoryFile, ConflictSide)>,
+    subject: Option<String>,
+}
+
+fn git_staging_target_files(
+    snapshot: &ReviewSnapshot,
+    action: &ReviewAction,
+) -> Result<GitStagingTargetFiles, &'static str> {
+    let (proposal_id, kind) = match action {
+        ReviewAction::Stage { proposal_id } => (proposal_id, ReviewProposalKind::Stage),
+        ReviewAction::Unstage { proposal_id } => (proposal_id, ReviewProposalKind::Unstage),
+        ReviewAction::Commit { proposal_id } => (proposal_id, ReviewProposalKind::Commit),
+        ReviewAction::ResolveConflict { proposal_id, .. } => {
+            (proposal_id, ReviewProposalKind::ResolveConflict)
+        }
+        _ => return Err("platform_v2_review_plan_invalid"),
+    };
+    let proposal = snapshot
+        .proposals()
+        .iter()
+        .find(|proposal| proposal.id() == proposal_id && proposal.kind() == kind)
+        .ok_or("platform_v2_review_git_proposal_unavailable")?;
+    let path_of = |file_id: &ReviewFileId| {
+        snapshot
+            .files()
+            .iter()
+            .find(|file| file.id() == file_id)
+            .ok_or("platform_v2_review_git_proposal_unavailable")
+            .and_then(|file| {
+                RepositoryFile::new(file.path().as_str())
+                    .map_err(|_| "platform_v2_review_git_path_invalid")
+            })
+    };
+    // A resolution writes exactly the one path its action names, so that is
+    // the whole of what its plan describes. Every other family writes the
+    // proposal's files.
+    let mut paths = match action {
+        ReviewAction::ResolveConflict { file_id, .. } => {
+            if !proposal.files().contains(file_id) {
+                return Err("platform_v2_review_git_proposal_unavailable");
+            }
+            vec![path_of(file_id)?]
+        }
+        _ => proposal
+            .files()
+            .iter()
+            .map(path_of)
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    paths.sort();
+    // Two file ids resolving to one path would make the plan's file list a
+    // different set from the proposal's, and every fence keyed on it would be
+    // fencing something else.
+    if paths.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("platform_v2_review_git_proposal_unavailable");
+    }
+    let conflict = match action {
+        ReviewAction::ResolveConflict {
+            file_id,
+            resolution,
+            ..
+        } => Some((
+            file_id.clone(),
+            path_of(file_id)?,
+            ConflictSide::from_resolution(*resolution),
+        )),
+        _ => None,
+    };
+    let subject = match kind {
+        ReviewProposalKind::Commit => Some(
+            proposal
+                .subject()
+                .ok_or("platform_v2_review_plan_invalid")?
+                .as_str()
+                .to_owned(),
+        ),
+        _ => None,
+    };
+    Ok(GitStagingTargetFiles {
+        paths,
+        conflict,
+        subject,
+    })
+}
+
+/// Seal one staging plan into the durable custody store.
+fn git_staging_effect_plan(
+    request_digest: [u8; 32],
+    plan: &ReviewEffectPlan,
+    target: &GitStagingTargetFiles,
+    observation: &GitWorktreeObservation,
+    expected_workspace_revision: Revision,
+    receipt_correlation_digest: [u8; 32],
+) -> Result<ReviewExternalEffectPlan, &'static str> {
+    let ReviewEffectPlan::GitStaging {
+        family,
+        canonical_root,
+        proposal_id,
+        ..
+    } = plan
+    else {
+        return Err("platform_v2_review_plan_invalid");
+    };
+    let stored_family = match family {
+        GitStagingFamily::Stage => ReviewGitStagingFamily::Stage,
+        GitStagingFamily::Unstage => ReviewGitStagingFamily::Unstage,
+        GitStagingFamily::Commit => ReviewGitStagingFamily::Commit,
+        GitStagingFamily::ResolveConflict => ReviewGitStagingFamily::ResolveConflict,
+    };
+    let root = canonical_root
+        .to_str()
+        .ok_or("platform_v2_review_git_repository_unavailable")?;
+    let paths = target
+        .paths
+        .iter()
+        .map(|path| path.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let conflict = target.conflict.as_ref().map(|(_, path, side)| {
+        (
+            path.as_str(),
+            match side {
+                ConflictSide::Ours => ConflictResolution::KeepCurrent.as_str(),
+                ConflictSide::Theirs => ConflictResolution::KeepIncoming.as_str(),
+            },
+        )
+    });
+    ReviewExternalEffectPlan::git_staging(
+        request_digest,
+        *plan_registry_generation(plan)?,
+        root,
+        stored_family,
+        proposal_id.as_str(),
+        &paths,
+        conflict,
+        target.subject.as_deref(),
+        (
+            observation.digest(),
+            observation.head().commit().as_str(),
+            observation.index_digest(),
+        ),
+        expected_workspace_revision,
+        receipt_correlation_digest,
+    )
+    .map_err(review_store_category)
+}
+
+const fn plan_registry_generation(plan: &ReviewEffectPlan) -> Result<&[u8; 32], &'static str> {
+    match plan {
+        ReviewEffectPlan::GitStaging {
+            registry_generation,
+            ..
+        } => Ok(registry_generation),
+        _ => Err("platform_v2_review_plan_invalid"),
+    }
+}
+
+/// Rebuild the adapter's own plan from the sealed durable one.
+///
+/// The provider plan is never stored: it is re-derived from the durable row
+/// every time, so a row that no longer describes a coherent write cannot be
+/// executed at all.
+fn git_staging_provider_plan(
+    principal: &PrincipalPolicy,
+    project: &ProjectId,
+    request: &ReviewActionRequest,
+    plan: &ReviewExternalEffectPlan,
+) -> Result<GitStagingPlan, &'static str> {
+    let family = match plan
+        .git_staging_family()
+        .ok_or("platform_v2_review_plan_invalid")?
+    {
+        ReviewGitStagingFamily::Stage => GitStagingFamily::Stage,
+        ReviewGitStagingFamily::Unstage => GitStagingFamily::Unstage,
+        ReviewGitStagingFamily::Commit => GitStagingFamily::Commit,
+        ReviewGitStagingFamily::ResolveConflict => GitStagingFamily::ResolveConflict,
+    };
+    let paths = plan
+        .git_staging_paths()
+        .ok_or("platform_v2_review_plan_invalid")?
+        .iter()
+        .map(|path| RepositoryFile::new(path).map_err(|_| "platform_v2_review_git_path_invalid"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let conflict_path = plan
+        .git_staging_conflict_path()
+        .map(|path| RepositoryFile::new(path).map_err(|_| "platform_v2_review_git_path_invalid"))
+        .transpose()?;
+    let side = plan
+        .git_staging_resolution()
+        .map(|value| match value {
+            "keep_current" => Ok(ConflictSide::Ours),
+            "keep_incoming" => Ok(ConflictSide::Theirs),
+            _ => Err("platform_v2_review_plan_invalid"),
+        })
+        .transpose()?;
+    GitStagingPlan::new(
+        plan.registry_generation_digest(),
+        GitStagingTarget {
+            canonical_root: PathBuf::from(
+                plan.git_staging_canonical_root()
+                    .ok_or("platform_v2_review_plan_invalid")?,
+            ),
+            family,
+            proposal_id: ReviewProposalId::new(
+                plan.git_staging_proposal_id()
+                    .ok_or("platform_v2_review_plan_invalid")?,
+            )
+            .map_err(|_| "platform_v2_review_plan_invalid")?,
+            files: paths,
+            conflict_path,
+            side,
+            subject: plan.git_staging_subject().map(str::to_owned),
+            observation_digest: plan
+                .git_staging_observation_digest()
+                .ok_or("platform_v2_review_plan_invalid")?,
+            observed_head: ObjectId::new(
+                plan.git_staging_observed_head()
+                    .ok_or("platform_v2_review_plan_invalid")?,
+            )
+            .map_err(|_| "platform_v2_review_plan_invalid")?,
+            observed_index_digest: plan
+                .git_staging_observed_index_digest()
+                .ok_or("platform_v2_review_plan_invalid")?,
+        },
+        &principal.actor,
+        GitStagingReviewBinding {
+            project: project.clone(),
+            workspace: request.workspace().clone(),
+            authority: request.authority().clone(),
+            idempotency_key: request.idempotency_key().clone(),
+            expected_snapshot_revision: request.expected_revision(),
+        },
+    )
+    .map_err(git_staging_category)
+}
+
+const fn map_store_git_staging_custody(value: ReviewExternalEffectCustody) -> GitStagingCustody {
+    match value {
+        ReviewExternalEffectCustody::NotStarted => GitStagingCustody::NotStarted,
+        ReviewExternalEffectCustody::CustodyStarted => GitStagingCustody::CustodyStarted,
+        ReviewExternalEffectCustody::Accepted => GitStagingCustody::Accepted,
+        ReviewExternalEffectCustody::Ambiguous => GitStagingCustody::Ambiguous,
+        ReviewExternalEffectCustody::Refused => GitStagingCustody::Refused,
+        ReviewExternalEffectCustody::Completed => GitStagingCustody::Completed,
+    }
+}
+
+const fn map_git_staging_store_custody(value: GitStagingCustody) -> ReviewExternalEffectCustody {
+    match value {
+        GitStagingCustody::NotStarted => ReviewExternalEffectCustody::NotStarted,
+        GitStagingCustody::CustodyStarted => ReviewExternalEffectCustody::CustodyStarted,
+        GitStagingCustody::Accepted => ReviewExternalEffectCustody::Accepted,
+        GitStagingCustody::Ambiguous => ReviewExternalEffectCustody::Ambiguous,
+        GitStagingCustody::Refused => ReviewExternalEffectCustody::Refused,
+        GitStagingCustody::Completed => ReviewExternalEffectCustody::Completed,
+    }
+}
+
+const fn git_staging_category(error: GitWorktreeError) -> &'static str {
+    match error {
+        GitWorktreeError::InvalidPlan | GitWorktreeError::SubmissionState => {
+            "platform_v2_review_plan_invalid"
+        }
+        GitWorktreeError::CapabilityMismatch => "platform_v2_review_git_index_write_unavailable",
+        // Each withheld grant keeps its own category, so an operator can tell
+        // a withheld commit from a withheld conflict resolution rather than
+        // reading a generic mismatch.
+        GitWorktreeError::CommitWithheld => "platform_v2_review_git_commit_unavailable",
+        GitWorktreeError::ConflictResolutionWithheld => {
+            "platform_v2_review_git_conflict_resolution_unavailable"
+        }
+        GitWorktreeError::RepositoryUnavailable => "platform_v2_review_git_repository_unavailable",
+        GitWorktreeError::RepositoryUnsafe => "platform_v2_review_git_repository_unsafe",
+        GitWorktreeError::WorktreeChanged => "platform_v2_review_git_worktree_changed",
+        GitWorktreeError::WriteRefused => "platform_v2_review_git_write_refused",
     }
 }
 

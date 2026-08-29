@@ -58,7 +58,8 @@ use automonique_protocol::platform_v2_lineage::{
 use automonique_protocol::platform_v2_review::{
     CommentAgentState, ReviewAction, ReviewActionRequest, ReviewActorId, ReviewAuthentication,
     ReviewAuthority, ReviewAuthorityId, ReviewAuthorityKind, ReviewComment, ReviewCommentId,
-    ReviewCommentTarget, ReviewReceiptOutcome, ReviewSnapshot, ReviewText,
+    ReviewCommentTarget, ReviewFile, ReviewProposal, ReviewProposalId, ReviewProposalKind,
+    ReviewReceiptOutcome, ReviewSnapshot, ReviewText, WorktreeFileState,
 };
 use automonique_protocol::platform_v2_review_api::{
     decode_review_action_request, decode_review_snapshot,
@@ -1864,6 +1865,298 @@ fn retained_review_escaping_heavy_envelope_refuses_before_write_and_replays_term
 /// advertised revision under a fresh idempotency key, which is precisely the
 /// request a duplicate-delivery bug would have to make, and it is refused as
 /// stale rather than accepted.
+/// Seed a real private repository, a review projection describing it, and a
+/// registry binding that grants index writes and nothing else.
+fn configure_git_staging_review(config: &DaemonConfig) -> (ReviewSnapshot, PathBuf) {
+    let policy_path = config.platform_v2_policy_path();
+    let mut policy: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&policy_path).unwrap()).unwrap();
+    policy["principals"][0]["workspaces"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "project": "project-live",
+            "kind": "user_workspace",
+            "id": "git-workspace-live",
+            "inherited_authority": {
+                "filesystem": [], "credentials": [], "network": [],
+                "tools": [], "providers": [], "models": []
+            }
+        }));
+    policy["principals"][0]["review_authorities"]["git"] =
+        serde_json::Value::String("authority-1".to_owned());
+    std::fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
+
+    let workspace =
+        WorkContextIdentity::UserWorkspace(UserWorkspaceId::new("git-workspace-live").unwrap());
+    let mut contexts = WorkContextStore::open(config.platform_v2_work_context_path()).unwrap();
+    contexts
+        .put_authoritative_record(
+            "tenant-live",
+            &live_workspace(
+                "git-workspace-live",
+                Revision::FIRST,
+                WorkContextLifecycle::Active,
+            ),
+        )
+        .unwrap();
+    drop(contexts);
+
+    // A real repository, in the exact private shape the registry admits.
+    let repository = config.state_root.join("git-staging-live");
+    std::fs::create_dir_all(&repository).unwrap();
+    std::fs::set_permissions(&repository, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let run = |arguments: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(arguments)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run(&["init", "--quiet", "--initial-branch=main", "."]);
+    run(&["config", "user.email", "review@example.invalid"]);
+    run(&["config", "user.name", "Review"]);
+    std::fs::create_dir_all(repository.join("src")).unwrap();
+    std::fs::write(repository.join("src/review.rs"), "base\n").unwrap();
+    run(&["add", "--", "src/review.rs"]);
+    run(&["commit", "--quiet", "-m", "base"]);
+    // The change the projection describes, left unstaged so a stage proposal
+    // has something to perform.
+    std::fs::write(repository.join("src/review.rs"), "reviewed\n").unwrap();
+    std::fs::set_permissions(
+        repository.join(".git"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let canonical = std::fs::canonicalize(&repository).unwrap();
+
+    let base = decode_review_snapshot(REVIEW_SNAPSHOT).unwrap();
+    let original = &base.files()[0];
+    let file = ReviewFile::new(
+        original.id().clone(),
+        original.path().clone(),
+        original.change(),
+        WorktreeFileState::Unstaged,
+        original.preview().clone(),
+        original.conflict(),
+        original.hunks().to_vec(),
+    )
+    .unwrap();
+    let proposal = ReviewProposal::new(
+        ReviewProposalId::new("proposal-stage-live").unwrap(),
+        ReviewProposalKind::Stage,
+        ReviewAuthority::new(
+            ReviewAuthorityKind::Git,
+            ReviewAuthorityId::new("authority-1").unwrap(),
+        ),
+        vec![file.id().clone()],
+        None,
+    )
+    .unwrap();
+    let snapshot = ReviewSnapshot::new(
+        workspace,
+        base.revision(),
+        vec![file],
+        Vec::new(),
+        vec![proposal],
+        base.checks().to_vec(),
+        base.review().clone(),
+        base.pull_request().clone(),
+        base.delivery().clone(),
+        base.attention_events().to_vec(),
+    )
+    .unwrap();
+    ReviewStore::open_scoped(config.platform_v2_review_path(), "tenant-live")
+        .unwrap()
+        .put_snapshot(&snapshot, 20)
+        .unwrap();
+
+    let registry = serde_json::json!({
+        "version": 1,
+        "generation": "git-live-generation-1",
+        "bindings": [{
+            "project": "project-live",
+            "workspace_kind": "user_workspace",
+            "workspace_id": "git-workspace-live",
+            "authority_kind": "git",
+            "authority_id": "authority-1",
+            "target": {
+                "kind": "local_repository",
+                "canonical_root": canonical,
+                // Index writes only. Committing and conflict resolution stay
+                // withheld, and the response has to show that.
+                "index_write": true
+            }
+        }]
+    });
+    let registry_path = config.state_dir().join("platform-v2-review-registry.json");
+    std::fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
+    std::fs::set_permissions(&registry_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    (snapshot, canonical)
+}
+
+/// The whole staging vertical, against a repository that really exists.
+///
+/// This is what PR #221 could not have: the server reads the worktree, mints a
+/// control fenced on what it read, admits exactly that control once, performs
+/// it with git, and then stops advertising it because the repository no longer
+/// supports it.
+#[test]
+fn advertised_git_staging_is_earned_from_a_read_admitted_once_and_then_withdrawn() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let (snapshot, repository) = configure_git_staging_review(&config);
+    let _serving = serve(&config);
+
+    let read = || {
+        let response = platform_v2(
+            &config,
+            "v2-review-git-capabilities",
+            PlatformV2Request::GetReviewCapabilities(
+                ReviewReadRequest::new(
+                    ProjectId::new("project-live").unwrap(),
+                    snapshot.workspace().clone(),
+                )
+                .unwrap(),
+            ),
+        );
+        match response {
+            PlatformV2Response::ReviewCapabilities(capabilities) => capabilities,
+            other => panic!("expected review capabilities, got {other:?}"),
+        }
+    };
+
+    let advertised = read();
+    let staging = advertised.staging();
+    assert_eq!(
+        staging.len(),
+        1,
+        "one proposal, one grant, one control: {staging:?}"
+    );
+    let control = &staging[0];
+    assert_eq!(control.proposal_id().as_str(), "proposal-stage-live");
+    assert_eq!(control.kind(), ReviewProposalKind::Stage);
+    assert_eq!(control.authority().kind(), ReviewAuthorityKind::Git);
+    assert!(
+        advertised.conflict_resolutions().is_empty(),
+        "nothing is conflicted, so nothing may be resolved",
+    );
+    // The fence is what the server read, not what an operator declared.
+    let head = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repository)
+        .args(["rev-parse", "HEAD"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap();
+    assert_eq!(
+        control.expected_head_revision().as_str(),
+        String::from_utf8(head.stdout).unwrap().trim(),
+        "the advertised head is the commit the repository is really on",
+    );
+
+    // Send exactly what was advertised. Nothing here is a client string: the
+    // files, the paths and the observation all came from the server.
+    let action = ReviewActionTransportRequest::new_confirmed_correlated(
+        snapshot.workspace().clone(),
+        advertised.snapshot_revision(),
+        ReviewAction::Stage {
+            proposal_id: control.proposal_id().clone(),
+        },
+        IdempotencyKey::new("advertised-stage-once").unwrap(),
+        control.confirmation_digest().clone(),
+        advertised.workspace_revision(),
+        control.receipt_correlation_digest().clone(),
+    )
+    .unwrap();
+    let receipt = match platform_v2(
+        &config,
+        "v2-review-git-stage",
+        PlatformV2Request::ExecuteReviewAction(action.clone()),
+    ) {
+        PlatformV2Response::ReviewReceipt(receipt) => receipt,
+        other => panic!("expected a receipt, got {other:?}"),
+    };
+    assert_eq!(
+        receipt.outcome(),
+        ReviewReceiptOutcome::Accepted,
+        "the write is acknowledged before it is reconciled",
+    );
+
+    // The repository really moved: the file is staged.
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repository)
+        .args(["status", "--porcelain=v2", "--", "src/review.rs"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap();
+    let status = String::from_utf8(status.stdout).unwrap();
+    assert!(
+        status.starts_with("1 M."),
+        "the named file must be staged and clean in the worktree: {status:?}",
+    );
+
+    // The receipt is polled through its correlation, never by re-sending the
+    // action: the action's confirmation was minted over an observation the
+    // write itself invalidated.
+    let polled = match platform_v2(
+        &config,
+        "v2-review-git-receipt",
+        PlatformV2Request::GetReviewReceipt(
+            ReviewReceiptLookup::new_correlated(
+                ProjectId::new("project-live").unwrap(),
+                snapshot.workspace().clone(),
+                IdempotencyKey::new("advertised-stage-once").unwrap(),
+                control.receipt_correlation_digest().clone(),
+            )
+            .unwrap(),
+        ),
+    ) {
+        PlatformV2Response::ReviewReceipt(receipt) => receipt,
+        other => panic!("expected a receipt, got {other:?}"),
+    };
+    assert_eq!(
+        polled.outcome(),
+        ReviewReceiptOutcome::Completed,
+        "reconciling an acknowledged write against the effect it produced completes it",
+    );
+
+    // And the control is gone, because the repository no longer supports it:
+    // there is nothing left to stage.
+    let after = read();
+    assert!(
+        after.staging().is_empty(),
+        "a performed proposal must not still be advertised: {:?}",
+        after.staging(),
+    );
+
+    // Replaying the original confirmation is refused rather than performed
+    // twice. The worktree it was minted over is gone.
+    assert!(
+        matches!(
+            platform_v2(
+                &config,
+                "v2-review-git-stage-replay",
+                PlatformV2Request::ExecuteReviewAction(action),
+            ),
+            PlatformV2Response::Refused(_)
+        ),
+        "a confirmation outlives neither its snapshot nor its worktree",
+    );
+}
+
 #[test]
 fn advertised_agent_delivery_is_admitted_once_and_then_withdrawn() {
     let _guard = full_daemon_test_guard();

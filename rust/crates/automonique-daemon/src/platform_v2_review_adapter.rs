@@ -27,11 +27,16 @@ use automonique_protocol::platform_v2::{
     ProjectId, WorkContextIdentity, WorkContextTargetKind, WorkSessionId,
 };
 use automonique_protocol::platform_v2_review::{
-    PullRequestId, ReviewAction, ReviewAuthority, ReviewAuthorityId, ReviewAuthorityKind,
-    ReviewCheckId, ReviewField,
+    ConflictResolution, PullRequestId, ReviewAction, ReviewAuthority, ReviewAuthorityId,
+    ReviewAuthorityKind, ReviewCheckId, ReviewField, ReviewFileId, ReviewProposalId,
+    ReviewProposalKind,
 };
 use automonique_protocol::primitives::Revision;
 
+use crate::platform_v2_git_worktree_adapter::{
+    ConflictSide, GitStagingFamily, GitStagingGrants, GitWorktreeAdapter, GitWorktreeObservation,
+    GitWorktreeState, GitWorktreeWriteCapability, RepositoryFile,
+};
 #[cfg(test)]
 use crate::platform_v2_github_check_adapter::SharedGitHubActionsTransport;
 use crate::platform_v2_github_check_adapter::{
@@ -107,6 +112,31 @@ struct RegistryCiCheck {
 enum RegistryTarget {
     LocalRepository {
         canonical_root: PathBuf,
+        /// Authority to move index entries: staging and unstaging.
+        ///
+        /// The two are one grant because they are each other's inverse on the
+        /// same surface — anyone who can stage a file can unstage it — so
+        /// splitting them would fence nothing.
+        #[serde(default)]
+        index_write: bool,
+        /// Authority to record the index as a commit, held separately.
+        ///
+        /// This is the only local write that creates an object and moves a
+        /// ref, the only one whose effect a push, a pull-request head or a CI
+        /// trigger can observe, and the only one the review surface cannot
+        /// undo. A deployment that wants an agent preparing changes from a
+        /// phone but never recording them installs `index_write` alone.
+        #[serde(default)]
+        commit: bool,
+        /// Authority to collapse an unmerged path to a side git recorded,
+        /// held separately again because it is the only local write that
+        /// overwrites working-tree bytes.
+        ///
+        /// All three default to false, so a binding installed before this
+        /// existed keeps parsing and grants exactly what it granted before:
+        /// nothing.
+        #[serde(default)]
+        conflict_resolution: bool,
     },
     RetainedSession {
         provider: String,
@@ -236,6 +266,21 @@ pub(crate) struct PullRequestCapabilityTarget<'a> {
     pub expected_pull_request_revision: Revision,
 }
 
+/// What the capability surface already knows about one staging proposal.
+///
+/// A grouping for one call, never a grant: every field came from the
+/// server-owned review snapshot, and none of it is proof the repository is in
+/// a state where the write can be performed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GitStagingCapabilityTarget<'a> {
+    pub proposal_id: &'a ReviewProposalId,
+    pub kind: ReviewProposalKind,
+    /// Present exactly when the kind is `ResolveConflict`.
+    pub file_id: Option<&'a ReviewFileId>,
+    /// Present exactly when the kind is `ResolveConflict`.
+    pub resolution: Option<ConflictResolution>,
+}
+
 /// The pull-request powers one installed credential carries.
 ///
 /// Two independent flags rather than a level, because they are withheld
@@ -308,6 +353,27 @@ pub(crate) enum ReviewEffectPlan {
         expected_pull_request_revision: Revision,
         registry_generation: [u8; 32],
         credential_generation: [u8; 32],
+    },
+    /// One of the three independently withheld local repository writes.
+    ///
+    /// Everything here is operator-owned — the canonical root and the grants
+    /// come from the registry — or server-owned: the proposal id reaching this
+    /// point came from the review snapshot, and `ReviewSnapshot::resolve_action`
+    /// has already refused any id the snapshot does not hold at the kind the
+    /// action claims. No client string appears at all.
+    ///
+    /// Deliberately absent: the files. A plan says a write *could* be
+    /// addressed to this repository; it does not carry what the write would
+    /// touch, because that is read from the repository by
+    /// [`ProductionReviewEffectAdapter::observe_git_staging`] rather than
+    /// declared. A registry binding and an installed grant prove a
+    /// configuration, never a worktree.
+    GitStaging {
+        family: GitStagingFamily,
+        canonical_root: PathBuf,
+        grants: GitStagingGrants,
+        proposal_id: ReviewProposalId,
+        registry_generation: [u8; 32],
     },
 }
 
@@ -510,6 +576,60 @@ impl ProductionReviewEffectAdapter {
                 expected_check_revision: check_revision,
                 registry_generation: *installed.generation.digest.as_bytes(),
                 credential_generation: *credentials.generation.digest.as_bytes(),
+            });
+        }
+        // A staging action now reaches a repository plan. The plan carries the
+        // operator's canonical root and grants and nothing else: it says which
+        // repository a write would be addressed to, never that the repository
+        // is in a state where the write can be performed. Only
+        // `observe_git_staging`, reading the worktree, can say that.
+        if let (
+            Some(installed),
+            Some(RegistryBinding {
+                target:
+                    RegistryTarget::LocalRepository {
+                        canonical_root,
+                        index_write,
+                        commit,
+                        conflict_resolution,
+                    },
+                ..
+            }),
+        ) = (&self.installed, binding)
+            && let Some((family, proposal_id)) = staging_family(action)
+        {
+            let grants = GitStagingGrants {
+                index_write: *index_write,
+                commit: *commit,
+                conflict_resolution: *conflict_resolution,
+            };
+            // A binding installed before the grants existed carries none. It
+            // can plan nothing, which is exactly what it could do before, and
+            // it says so rather than assuming an operator meant to allow
+            // everything they had no way to spell.
+            if !grants.any() {
+                return Err("platform_v2_review_git_grants_unavailable");
+            }
+            // Each grant is refused on its own account, so an operator can
+            // tell a withheld commit from a withheld conflict resolution and
+            // from a binding that grants nothing at all.
+            if !grants.allows(family) {
+                return Err(match family {
+                    GitStagingFamily::Commit => "platform_v2_review_git_commit_unavailable",
+                    GitStagingFamily::ResolveConflict => {
+                        "platform_v2_review_git_conflict_resolution_unavailable"
+                    }
+                    GitStagingFamily::Stage | GitStagingFamily::Unstage => {
+                        "platform_v2_review_git_index_write_unavailable"
+                    }
+                });
+            }
+            return Ok(ReviewEffectPlan::GitStaging {
+                family,
+                canonical_root: canonical_root.clone(),
+                grants,
+                proposal_id: proposal_id.clone(),
+                registry_generation: *installed.generation.digest.as_bytes(),
             });
         }
         // A pull-request action now reaches a provider plan, but a plan is
@@ -1129,6 +1249,253 @@ impl ProductionReviewEffectAdapter {
         Ok(*Sha256::digest(&document).as_bytes())
     }
 
+    /// Build the plan for one staging proposal without an action.
+    ///
+    /// The capability surface must decide whether to advertise a control from
+    /// what the snapshot already holds — a proposal id, its kind, and for a
+    /// conflict resolution the file and side. `plan` is the same computation
+    /// reached from an action; both funnel through the identical binding and
+    /// grant checks, so a control can never be advertised on a looser test
+    /// than the write is admitted under.
+    pub(crate) fn git_staging_effect_plan(
+        &self,
+        project: &ProjectId,
+        workspace: &WorkContextIdentity,
+        authority: &ReviewAuthority,
+        target: GitStagingCapabilityTarget<'_>,
+    ) -> Result<ReviewEffectPlan, &'static str> {
+        self.plan(project, workspace, authority, &staging_probe(target)?)
+    }
+
+    /// Mint the fixed-root capability for one exact plan.
+    ///
+    /// The registry is re-read and re-verified here, not trusted from the
+    /// plan: a registry swapped between planning and execution must invalidate
+    /// the write rather than silently perform it against a different
+    /// repository. The capability itself then re-validates the root on disk,
+    /// because a directory can be replaced after a registry was read.
+    pub(crate) fn git_worktree_adapter(
+        &self,
+        canonical_root: &Path,
+        grants: GitStagingGrants,
+        expected_generation: [u8; 32],
+    ) -> Result<GitWorktreeAdapter, &'static str> {
+        let installed = self
+            .installed
+            .as_ref()
+            .ok_or("platform_v2_review_git_adapter_unavailable")?;
+        verify_registry_generation(&installed.path, installed.expected_uid, expected_generation)?;
+        // The grants are re-read from the freshly verified document rather
+        // than taken from the plan, so a binding whose grants were narrowed
+        // between advertisement and execution narrows the write too.
+        let installed_grants = installed
+            .document
+            .bindings
+            .iter()
+            .find_map(|binding| match &binding.target {
+                RegistryTarget::LocalRepository {
+                    canonical_root: root,
+                    index_write,
+                    commit,
+                    conflict_resolution,
+                } if root == canonical_root => Some(GitStagingGrants {
+                    index_write: *index_write,
+                    commit: *commit,
+                    conflict_resolution: *conflict_resolution,
+                }),
+                _ => None,
+            })
+            .ok_or("platform_v2_review_git_repository_unavailable")?;
+        if installed_grants != grants {
+            return Err("platform_v2_review_git_grants_changed");
+        }
+        let capability = GitWorktreeWriteCapability::production(
+            canonical_root,
+            installed.expected_uid,
+            installed_grants,
+        )
+        .map_err(|_| "platform_v2_review_git_repository_unavailable")?;
+        Ok(GitWorktreeAdapter::new(capability))
+    }
+
+    /// Take the one mutation-free repository read every staging capability in
+    /// a response is minted from.
+    ///
+    /// Taken once for every path a snapshot names, so each control the
+    /// response carries names the same `HEAD` and the same index by
+    /// construction rather than by a check after the fact.
+    pub(crate) fn git_worktree_state(
+        &self,
+        plan: &ReviewEffectPlan,
+        paths: &[RepositoryFile],
+    ) -> Result<GitWorktreeState, &'static str> {
+        let ReviewEffectPlan::GitStaging {
+            canonical_root,
+            grants,
+            registry_generation,
+            ..
+        } = plan
+        else {
+            return Err("platform_v2_review_git_adapter_unavailable");
+        };
+        self.git_worktree_adapter(canonical_root, *grants, *registry_generation)?
+            .read(paths)
+            .map_err(|_| "platform_v2_review_git_repository_unavailable")
+    }
+
+    /// Advertise a staging write only after that read proves the exact thing
+    /// the write depends on.
+    ///
+    /// The returned observation is the only thing a capability slot may be
+    /// minted from, and it is what the confirmation digest commits to. What
+    /// each family's read proves is documented on
+    /// [`GitWorktreeAdapter::observe`]; in one line each: a stage proves every
+    /// named file has changes the index does not hold; an unstage proves every
+    /// named file's index entry differs from `HEAD`; a commit proves the whole
+    /// index is exactly the proposal, on an attached branch, in a repository
+    /// that is in no multi-step operation and names a committer; and a
+    /// conflict resolution proves the one named path is unmerged with the
+    /// requested side actually recorded.
+    pub(crate) fn observe_git_staging(
+        &self,
+        plan: &ReviewEffectPlan,
+        state: &GitWorktreeState,
+        paths: &[RepositoryFile],
+        side: Option<ConflictSide>,
+    ) -> Result<GitWorktreeObservation, &'static str> {
+        let ReviewEffectPlan::GitStaging {
+            family,
+            canonical_root,
+            grants,
+            registry_generation,
+            ..
+        } = plan
+        else {
+            return Err("platform_v2_review_git_adapter_unavailable");
+        };
+        self.git_worktree_adapter(canonical_root, *grants, *registry_generation)?
+            .observe(state, *family, paths, side)
+            .map_err(|_| "platform_v2_review_git_preflight_refused")
+    }
+
+    /// Read and observe in one step, for the execution path where exactly one
+    /// proposal is in play.
+    pub(crate) fn preflight_git_staging_capability(
+        &self,
+        plan: &ReviewEffectPlan,
+        paths: &[RepositoryFile],
+        side: Option<ConflictSide>,
+    ) -> Result<GitWorktreeObservation, &'static str> {
+        let state = self.git_worktree_state(plan, paths)?;
+        self.observe_git_staging(plan, &state, paths, side)
+    }
+
+    /// Commit an inert client confirmation to the exact actor, review
+    /// coordinate, repository, grants, live observation, and installed
+    /// registry generation that were preflighted.
+    ///
+    /// The observation is part of the digest, which is what makes this
+    /// worktree-binding rather than merely authenticated. It carries the
+    /// commit `HEAD` resolved to, the branch it is attached to, the whole
+    /// index, and each named file's objects, conflict stages and working-tree
+    /// stat identity — so a repository that moves between advertisement and
+    /// execution produces a different digest, the client's confirmation stops
+    /// matching, and the write is refused instead of landing against a state
+    /// nobody saw.
+    ///
+    /// This is the field set PR #221 recorded as unavailable. It is not
+    /// derived from the proposal or from the snapshot revision, neither of
+    /// which pins a worktree; it is read from the repository.
+    #[allow(clippy::too_many_arguments)] // Every field is an independently fenced commitment input.
+    pub(crate) fn git_staging_confirmation_digest(
+        &self,
+        actor: &Actor,
+        project: &ProjectId,
+        workspace: &WorkContextIdentity,
+        authority: &ReviewAuthority,
+        snapshot_revision: Revision,
+        workspace_revision: Revision,
+        plan: &ReviewEffectPlan,
+        conflict: Option<(&ReviewFileId, ConflictResolution)>,
+        observation: &GitWorktreeObservation,
+    ) -> Result<[u8; 32], &'static str> {
+        let ReviewEffectPlan::GitStaging {
+            family,
+            canonical_root,
+            grants,
+            proposal_id,
+            registry_generation,
+        } = plan
+        else {
+            return Err("platform_v2_review_confirmation_invalid");
+        };
+        // The observation must be of the thing the plan names, and a
+        // resolution's side must be the one the client will send. A digest
+        // minted over a read of some other family, or of the other side of the
+        // conflict, would commit to nothing.
+        if observation.family() != *family
+            || observation.side()
+                != conflict.map(|(_, resolution)| ConflictSide::from_resolution(resolution))
+            || (*family == GitStagingFamily::ResolveConflict) != conflict.is_some()
+        {
+            return Err("platform_v2_review_confirmation_invalid");
+        }
+        let mut document = Vec::new();
+        push_confirmation_field(
+            &mut document,
+            b"automonique.review-git-staging-confirmation/v1",
+        );
+        push_confirmation_field(&mut document, registry_generation.as_slice());
+        push_confirmation_field(&mut document, canonical_root.as_os_str().as_encoded_bytes());
+        for field in [
+            actor.tenant().as_bytes(),
+            actor.id().as_bytes(),
+            project.as_str().as_bytes(),
+            workspace.kind().as_str().as_bytes(),
+            workspace.id().as_bytes(),
+            authority.kind().as_str().as_bytes(),
+            authority.id().as_str().as_bytes(),
+            family.as_str().as_bytes(),
+            proposal_id.as_str().as_bytes(),
+            conflict.map_or("", |(file, _)| file.as_str()).as_bytes(),
+            conflict
+                .map_or("", |(_, resolution)| resolution.as_str())
+                .as_bytes(),
+        ] {
+            push_confirmation_field(&mut document, field);
+        }
+        // The grants are inside the digest, so a control advertised under one
+        // set cannot be executed after an operator narrowed them.
+        push_confirmation_field(
+            &mut document,
+            &[
+                u8::from(grants.index_write),
+                u8::from(grants.commit),
+                u8::from(grants.conflict_resolution),
+            ],
+        );
+        // The live worktree, not one an operator declared. This is the field
+        // that makes the digest expire when HEAD or the index moves.
+        push_confirmation_field(&mut document, &observation.digest());
+        push_confirmation_field(&mut document, &snapshot_revision.get().to_be_bytes());
+        push_confirmation_field(&mut document, &workspace_revision.get().to_be_bytes());
+        Ok(*Sha256::digest(&document).as_bytes())
+    }
+
+    /// The receipt correlation for one staging confirmation.
+    ///
+    /// Domain-separated from the other families' correlations so a receipt
+    /// minted for one can never be recovered against another.
+    pub(crate) fn git_staging_receipt_correlation_digest(confirmation: [u8; 32]) -> [u8; 32] {
+        let mut document = Vec::new();
+        push_confirmation_field(
+            &mut document,
+            b"automonique.review-git-staging-receipt-correlation/v1",
+        );
+        push_confirmation_field(&mut document, &confirmation);
+        *Sha256::digest(&document).as_bytes()
+    }
+
     /// Read the pull-request scopes an installed credential carries.
     ///
     /// This is the seam a future pull-request adapter consumes, and it
@@ -1222,6 +1589,44 @@ fn github_head_revision(value: &ReviewField) -> Result<String, &'static str> {
         return Err("platform_v2_review_pull_request_identity_invalid");
     }
     Ok(value.as_str().to_owned())
+}
+
+/// The staging family and proposal one review action names, if it is one.
+const fn staging_family(action: &ReviewAction) -> Option<(GitStagingFamily, &ReviewProposalId)> {
+    match action {
+        ReviewAction::Stage { proposal_id } => Some((GitStagingFamily::Stage, proposal_id)),
+        ReviewAction::Unstage { proposal_id } => Some((GitStagingFamily::Unstage, proposal_id)),
+        ReviewAction::Commit { proposal_id } => Some((GitStagingFamily::Commit, proposal_id)),
+        ReviewAction::ResolveConflict { proposal_id, .. } => {
+            Some((GitStagingFamily::ResolveConflict, proposal_id))
+        }
+        _ => None,
+    }
+}
+
+/// The action one staging capability probe reaches `plan` through.
+///
+/// Reaching the same arm an action does keeps advertisement and admission on
+/// one test. The probe is never sent anywhere: `plan` reads only the family
+/// and the proposal id from it, both of which the snapshot already owns.
+fn staging_probe(target: GitStagingCapabilityTarget<'_>) -> Result<ReviewAction, &'static str> {
+    let GitStagingCapabilityTarget {
+        proposal_id,
+        kind,
+        file_id,
+        resolution,
+    } = target;
+    let proposal_id = proposal_id.clone();
+    Ok(match kind {
+        ReviewProposalKind::Stage => ReviewAction::Stage { proposal_id },
+        ReviewProposalKind::Unstage => ReviewAction::Unstage { proposal_id },
+        ReviewProposalKind::Commit => ReviewAction::Commit { proposal_id },
+        ReviewProposalKind::ResolveConflict => ReviewAction::ResolveConflict {
+            proposal_id,
+            file_id: file_id.ok_or("platform_v2_review_plan_invalid")?.clone(),
+            resolution: resolution.ok_or("platform_v2_review_plan_invalid")?,
+        },
+    })
 }
 
 fn push_confirmation_field(document: &mut Vec<u8>, field: &[u8]) {
@@ -1340,7 +1745,7 @@ fn validate_registry(document: &RegistryDocument, expected_uid: u32) -> Result<(
             return Err("platform_v2_review_registry_invalid");
         }
         match &binding.target {
-            RegistryTarget::LocalRepository { canonical_root } => {
+            RegistryTarget::LocalRepository { canonical_root, .. } => {
                 let root = validate_private_repository(canonical_root, expected_uid)?;
                 if !repository_roots.insert(root) {
                     return Err("platform_v2_review_registry_invalid");
@@ -1642,6 +2047,14 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
+    /// A `local_repository` binding carrying exactly the named grants.
+    fn git_binding_with(root: &Path, grants: &str) -> String {
+        format!(
+            r#"{{"version":1,"generation":"generation-1","bindings":[{{"project":"project-1","workspace_kind":"user_workspace","workspace_id":"workspace-1","authority_kind":"git","authority_id":"git-1","target":{{"kind":"local_repository","canonical_root":{},{grants}}}}}]}}"#,
+            serde_json::to_string(root).unwrap()
+        )
+    }
+
     fn git_binding(root: &Path) -> String {
         format!(
             r#"{{"version":1,"generation":"generation-1","bindings":[{{"project":"project-1","workspace_kind":"user_workspace","workspace_id":"workspace-1","authority_kind":"git","authority_id":"git-1","target":{{"kind":"local_repository","canonical_root":{}}}}}]}}"#,
@@ -1720,46 +2133,30 @@ mod tests {
         );
     }
 
-    /// Pins a deliberate gap, and pins why it is not closed the way the
-    /// pull-request and agent-delivery families were.
+    /// Replaces the pin PR #221 left here, on the terms it set.
     ///
-    /// The registry admits and validates a `local_repository` target: an
-    /// absolute canonical root, owned by the daemon uid, not group or other
-    /// writable, with a real `.git` that is not a symlink. An operator can
-    /// install a complete, secure binding today. `plan` still has no arm that
-    /// consumes it, so no staging action reaches a worktree.
+    /// That pin said a staging capability could not be minted because a
+    /// confirmation digest would have to commit to the HEAD object id and the
+    /// index state, and no projection this crate could read carried either. It
+    /// was meant to fail when a git adapter landed, and to be replaced rather
+    /// than deleted.
     ///
-    /// This family got no capability field, while the pull-request family
-    /// got three. That asymmetry is the point of this test.
+    /// What replaces it fails closed for everything the preflight still cannot
+    /// prove. A binding that grants nothing plans nothing, and each grant is
+    /// refused on its own account, so an operator reads a withheld commit as a
+    /// withheld commit rather than as a generic unavailability. Committing is
+    /// separate from index writes for the reason merging is separate from
+    /// opening a pull request: it is the only local write whose effect is
+    /// visible outside the checkout and the only one this surface cannot undo.
+    /// Conflict resolution is separate again, because it is the only one that
+    /// overwrites working-tree bytes.
     ///
-    /// A capability is only worth advertising if the server can commit to
-    /// what it observed, and the commitment has to name the mutable thing the
-    /// action depends on. For a rerun that is the run attempt and head SHA.
-    /// For a merge it is the pull-request id, its observed revision and the
-    /// observed head, all of which `resolve_action` already names, which is
-    /// why those field sets were derivable before their adapter existed.
-    ///
-    /// Staging is different in kind. `resolve_action` fences the proposal id,
-    /// its kind, its authority, and refuses a proposal whose files are in
-    /// unresolved conflict. None of that pins the worktree. HEAD and the
-    /// index are mutable substrate that any other process sharing the
-    /// checkout can move between advertisement and execution, and the review
-    /// snapshot's revision only tracks what the projection observed, not what
-    /// the repository is. So a staging confirmation digest would have to
-    /// commit to the HEAD object id and the index state, and neither exists
-    /// in any projection this crate can read today.
-    ///
-    /// Inventing that field set now would be guessing, and a digest that
-    /// commits to the wrong facts is worse than none: it reads as a fence and
-    /// holds nothing. So the honest answer is no wire field until the git
-    /// adapter can supply a real observation, and the client keeps learning
-    /// the truth from `platform_v2_review_git_adapter_unavailable`.
-    ///
-    /// A plan arm added here without that observation is the failure this
-    /// pins. It is meant to fail when the adapter lands, and to be replaced
-    /// deliberately rather than deleted quietly.
+    /// What the pin asked for now exists: `plan` consumes the binding, and
+    /// `observe_git_staging` reads HEAD and the whole index off the repository
+    /// so the digest commits to them. What is still refused here is everything
+    /// short of that.
     #[test]
-    fn secure_exact_binding_does_not_fabricate_a_capability() {
+    fn a_binding_grants_only_the_staging_families_it_names() {
         let temporary = TempDir::new().unwrap();
         let repository = temporary.path().join("repository");
         fs::create_dir(&repository).unwrap();
@@ -1767,41 +2164,174 @@ mod tests {
         fs::set_permissions(&repository, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(repository.join(".git"), fs::Permissions::from_mode(0o700)).unwrap();
         let registry = temporary.path().join("registry.json");
-        write_registry(&registry, &git_binding(&repository));
-        let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
-
-        // Every action in the family, not just staging. A future arm is as
-        // likely to be added for committing as for staging, and committing is
-        // the one that writes history.
-        let staging_actions = [
-            ReviewAction::Stage {
-                proposal_id: ReviewProposalId::new("proposal-1").unwrap(),
-            },
-            ReviewAction::Unstage {
-                proposal_id: ReviewProposalId::new("proposal-1").unwrap(),
-            },
-            ReviewAction::Commit {
-                proposal_id: ReviewProposalId::new("proposal-1").unwrap(),
-            },
-            ReviewAction::ResolveConflict {
-                proposal_id: ReviewProposalId::new("proposal-1").unwrap(),
-                file_id: ReviewFileId::new("file-1").unwrap(),
-                resolution: ConflictResolution::KeepCurrent,
-            },
-        ];
-        for action in staging_actions {
-            assert_eq!(
-                adapter.plan(
+        let plan_for = |body: &str, action: &ReviewAction| {
+            write_registry(&registry, body);
+            ProductionReviewEffectAdapter::open(&registry, uid())
+                .unwrap()
+                .plan(
                     &ProjectId::new("project-1").unwrap(),
                     &workspace(),
                     &git_authority(),
-                    &action,
-                ),
-                Err("platform_v2_review_git_adapter_unavailable"),
-                "{:?} must stay unavailable until a git adapter can observe the worktree",
+                    action,
+                )
+        };
+        let stage = ReviewAction::Stage {
+            proposal_id: ReviewProposalId::new("proposal-1").unwrap(),
+        };
+        let unstage = ReviewAction::Unstage {
+            proposal_id: ReviewProposalId::new("proposal-1").unwrap(),
+        };
+        let commit = ReviewAction::Commit {
+            proposal_id: ReviewProposalId::new("proposal-1").unwrap(),
+        };
+        let resolve = ReviewAction::ResolveConflict {
+            proposal_id: ReviewProposalId::new("proposal-1").unwrap(),
+            file_id: ReviewFileId::new("file-1").unwrap(),
+            resolution: ConflictResolution::KeepCurrent,
+        };
+
+        // A binding written before the grants existed carries none, so it can
+        // plan nothing -- exactly what it could do before, and it says so
+        // rather than assuming an operator meant to allow what they had no way
+        // to spell.
+        for action in [&stage, &unstage, &commit, &resolve] {
+            assert_eq!(
+                plan_for(&git_binding(&repository), action),
+                Err("platform_v2_review_git_grants_unavailable"),
+                "{:?} must stay unavailable for a binding that grants nothing",
                 action.kind(),
             );
         }
+
+        // Index writes alone: staging and unstaging plan, committing and
+        // resolving do not, and each says which grant it wanted.
+        let index_only = git_binding_with(&repository, r#""index_write":true"#);
+        assert!(matches!(
+            plan_for(&index_only, &stage),
+            Ok(ReviewEffectPlan::GitStaging {
+                family: GitStagingFamily::Stage,
+                ..
+            })
+        ));
+        assert!(matches!(
+            plan_for(&index_only, &unstage),
+            Ok(ReviewEffectPlan::GitStaging {
+                family: GitStagingFamily::Unstage,
+                ..
+            })
+        ));
+        assert_eq!(
+            plan_for(&index_only, &commit),
+            Err("platform_v2_review_git_commit_unavailable"),
+            "a grant to move index entries must never imply recording them",
+        );
+        assert_eq!(
+            plan_for(&index_only, &resolve),
+            Err("platform_v2_review_git_conflict_resolution_unavailable"),
+        );
+
+        // And the reverse: committing does not imply index writes, and
+        // resolving is not implied by either.
+        let commit_only = git_binding_with(&repository, r#""commit":true"#);
+        assert!(matches!(
+            plan_for(&commit_only, &commit),
+            Ok(ReviewEffectPlan::GitStaging {
+                family: GitStagingFamily::Commit,
+                ..
+            })
+        ));
+        assert_eq!(
+            plan_for(&commit_only, &stage),
+            Err("platform_v2_review_git_index_write_unavailable"),
+        );
+        let resolve_only = git_binding_with(&repository, r#""conflict_resolution":true"#);
+        assert!(matches!(
+            plan_for(&resolve_only, &resolve),
+            Ok(ReviewEffectPlan::GitStaging {
+                family: GitStagingFamily::ResolveConflict,
+                ..
+            })
+        ));
+        assert_eq!(
+            plan_for(&resolve_only, &stage),
+            Err("platform_v2_review_git_index_write_unavailable"),
+        );
+    }
+
+    /// A plan is still not a capability, and the digest still refuses
+    /// everything it was not minted over.
+    ///
+    /// This is the other half of the replaced pin. `plan` now consumes the
+    /// binding, so the thing that must stay true is narrower and sharper: a
+    /// plan says a write could be addressed to a repository, and only an
+    /// observation of that repository can say the write is performable. A
+    /// confirmation minted over another family, or over the other side of a
+    /// conflict, commits to nothing and is refused.
+    #[test]
+    fn a_staging_confirmation_is_refused_for_anything_it_was_not_minted_over() {
+        let temporary = TempDir::new().unwrap();
+        let repository = temporary.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        fs::create_dir(repository.join(".git")).unwrap();
+        fs::set_permissions(&repository, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(repository.join(".git"), fs::Permissions::from_mode(0o700)).unwrap();
+        let registry = temporary.path().join("registry.json");
+        write_registry(
+            &registry,
+            &git_binding_with(
+                &repository,
+                r#""index_write":true,"commit":true,"conflict_resolution":true"#,
+            ),
+        );
+        let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
+        let project = ProjectId::new("project-1").unwrap();
+        let actor = Actor::new("tenant-1", "actor-1").unwrap();
+        let plan = adapter
+            .plan(
+                &project,
+                &workspace(),
+                &git_authority(),
+                &ReviewAction::Stage {
+                    proposal_id: ReviewProposalId::new("proposal-1").unwrap(),
+                },
+            )
+            .unwrap();
+
+        // A registry binding and an installed grant are configuration. The
+        // repository here has a `.git` directory and no repository in it, so
+        // there is nothing to observe and nothing may be minted.
+        assert!(
+            adapter
+                .preflight_git_staging_capability(
+                    &plan,
+                    &[RepositoryFile::new("src/review.rs").unwrap()],
+                    None,
+                )
+                .is_err(),
+            "a binding proves a configuration, never a worktree",
+        );
+
+        // A staging plan cannot borrow another family's confirmation lane, and
+        // the staging lane refuses a plan that is not a staging plan.
+        assert_eq!(
+            adapter.github_confirmation_digest(
+                &actor,
+                &project,
+                &workspace(),
+                &git_authority(),
+                Revision::FIRST,
+                Revision::FIRST,
+                &ReviewAction::Stage {
+                    proposal_id: ReviewProposalId::new("proposal-1").unwrap(),
+                },
+                &plan,
+            ),
+            Err("platform_v2_review_confirmation_invalid"),
+        );
+        assert_eq!(
+            adapter.git_worktree_state(&ReviewEffectPlan::LocalStore, &[]),
+            Err("platform_v2_review_git_adapter_unavailable"),
+        );
     }
 
     /// No staging action can borrow another family's confirmation.
@@ -1880,7 +2410,8 @@ mod tests {
             }
             ReviewEffectPlan::LocalStore
             | ReviewEffectPlan::GitHubCheckRerun { .. }
-            | ReviewEffectPlan::GitHubPullRequest { .. } => {
+            | ReviewEffectPlan::GitHubPullRequest { .. }
+            | ReviewEffectPlan::GitStaging { .. } => {
                 panic!("external action became another effect")
             }
         }
