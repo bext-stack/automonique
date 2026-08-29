@@ -971,7 +971,7 @@ mod tests {
 
     use automonique_protocol::platform_v2::{ProjectId, UserWorkspaceId};
     use automonique_protocol::platform_v2_review::{
-        ReviewAuthorityId, ReviewCommentId, ReviewProposalId,
+        PullRequestId, ReviewAuthorityId, ReviewCommentId, ReviewField, ReviewProposalId,
     };
     use automonique_protocol::primitives::Revision;
     use tempfile::TempDir;
@@ -1580,5 +1580,103 @@ mod tests {
             ProductionReviewEffectAdapter::open(&registry, uid()),
             Err("platform_v2_review_registry_invalid")
         ));
+    }
+
+    fn pull_request_authority() -> ReviewAuthority {
+        ReviewAuthority::new(
+            ReviewAuthorityKind::PullRequest,
+            ReviewAuthorityId::new("pull-request-1").unwrap(),
+        )
+    }
+
+    fn pull_request_registry() -> &'static str {
+        r#"{"version":1,"generation":"generation-1","bindings":[{"project":"project-1","workspace_kind":"user_workspace","workspace_id":"workspace-1","authority_kind":"pull_request","authority_id":"pull-request-1","target":{"kind":"pull_request","provider":"github","repository":"example-org/example-repo","credential_reference":"github-pull-request-mobile"}}]}"#
+    }
+
+    fn pull_request_actions() -> Vec<ReviewAction> {
+        vec![
+            ReviewAction::OpenPullRequest {
+                expected_pull_request_revision: Revision::FIRST,
+                title: ReviewField::new("Title").unwrap(),
+            },
+            ReviewAction::UpdatePullRequest {
+                pull_request_id: PullRequestId::new("pull-request-1").unwrap(),
+                expected_pull_request_revision: Revision::FIRST,
+                title: ReviewField::new("Title").unwrap(),
+            },
+            ReviewAction::MergePullRequest {
+                pull_request_id: PullRequestId::new("pull-request-1").unwrap(),
+                expected_pull_request_revision: Revision::FIRST,
+                expected_head_revision: ReviewField::new(
+                    "0123456789abcdef0123456789abcdef01234567",
+                )
+                .unwrap(),
+            },
+        ]
+    }
+
+    /// Pins a deliberate gap rather than a finished behavior.
+    ///
+    /// The registry already admits a `pull_request` target and validates one,
+    /// so an operator can install a complete binding today. `plan` still has
+    /// no arm that consumes it, so no pull-request action reaches a provider
+    /// and no confirmation digest is ever minted for one. That is the seam a
+    /// half implementation would slip through: a plan arm added without the
+    /// preflight observation and the confirmation digest would hand a client
+    /// an unconfirmed, uncorrelated write. Closing this gap means making the
+    /// whole path real, so this test is meant to fail then and be replaced
+    /// deliberately, not deleted quietly.
+    #[test]
+    fn an_installed_pull_request_binding_still_refuses_every_pull_request_action() {
+        let temporary = TempDir::new().unwrap();
+        let registry = temporary.path().join("registry.json");
+        write_registry(&registry, pull_request_registry());
+        let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
+        for action in pull_request_actions() {
+            assert_eq!(
+                adapter.plan(
+                    &ProjectId::new("project-1").unwrap(),
+                    &workspace(),
+                    &pull_request_authority(),
+                    &action,
+                ),
+                Err("platform_v2_review_pull_request_adapter_unavailable"),
+                "{:?} must stay unavailable until a real adapter exists",
+                action.kind(),
+            );
+        }
+    }
+
+    /// No pull-request plan means no server-minted confirmation, and that
+    /// confirmation is the only thing binding a preview to a real adapter.
+    #[test]
+    fn no_pull_request_action_can_borrow_the_check_rerun_confirmation() {
+        let temporary = TempDir::new().unwrap();
+        let registry = temporary.path().join("registry.json");
+        write_registry(&registry, pull_request_registry());
+        let adapter = ProductionReviewEffectAdapter::open(&registry, uid()).unwrap();
+        // Only a check-rerun plan reaches a provider observation, so a
+        // pull-request action cannot acquire one by accident.
+        assert_eq!(
+            adapter.preflight_github_capability(&ReviewEffectPlan::LocalStore),
+            Err("platform_v2_review_ci_check_unavailable")
+        );
+        for action in pull_request_actions() {
+            assert_eq!(
+                adapter.github_confirmation_digest(
+                    &Actor::new("tenant-1", "actor-1").unwrap(),
+                    &ProjectId::new("project-1").unwrap(),
+                    &workspace(),
+                    &pull_request_authority(),
+                    Revision::FIRST,
+                    Revision::FIRST,
+                    &action,
+                    &ReviewEffectPlan::LocalStore,
+                ),
+                Err("platform_v2_review_confirmation_invalid"),
+                "{:?} must not mint a confirmation",
+                action.kind(),
+            );
+        }
     }
 }

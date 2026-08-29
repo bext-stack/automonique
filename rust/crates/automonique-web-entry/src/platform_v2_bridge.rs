@@ -753,7 +753,7 @@ mod tests {
         MutationPreviewDigest, MutationPreviewId, MutationPreviewRef,
     };
     use automonique_protocol::platform_v2_review::{
-        ConflictResolution, ReviewAction, ReviewCommentTarget, ReviewField,
+        ConflictResolution, PullRequestId, ReviewAction, ReviewCommentTarget, ReviewField,
     };
     use automonique_protocol::platform_v2_transport::{
         MutationReceiptLookup, MutationSubmitRequest, PlatformNegotiationRequest,
@@ -2144,5 +2144,122 @@ mod tests {
         assert!(elapsed >= Duration::from_millis(70), "elapsed {elapsed:?}");
         assert!(elapsed < Duration::from_millis(500), "elapsed {elapsed:?}");
         server.join().unwrap();
+    }
+
+    /// Pins a deliberate gap rather than a finished behavior.
+    ///
+    /// `mobile_review_execution_refuses_every_non_local_action_before_the_socket`
+    /// already shows pull-request actions refused while the client holds only
+    /// the generic `ExecuteReviewAction` grant. This pins the stronger claim
+    /// that gap depends on: `MobilePlatformV2Action` has no pull-request
+    /// member, so the delegation vocabulary cannot express pull-request write
+    /// authority at all, and holding *every* action it does have still does
+    /// not buy one. A future `MobilePlatformV2Action::MergePullRequest` would
+    /// widen `ALL` and break this test, which is the intent.
+    ///
+    /// The approved action at the end gives the assertion its teeth: on the
+    /// same grant, workspace, and absent socket it reaches the daemon and
+    /// reports `platform_v2_bridge_unavailable`, so the refusals above are
+    /// the action mapping's and not an artifact of the missing socket.
+    ///
+    /// Closing this gap is not an enum addition. It is the first delegated
+    /// authority that writes outside the daemon's trust boundary, and merging
+    /// must stay separately withholdable from opening and updating.
+    #[test]
+    fn holding_every_mobile_action_still_buys_no_pull_request_authority() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = nix::unistd::geteuid().as_raw();
+        write_policy(root.path(), uid, "tenant-test", "actor-test");
+        let bridge = bridge(
+            root.path(),
+            root.path().join("absent.sock"),
+            "tenant-test",
+            "actor-test",
+        );
+        let mut authority = MobileCredentialAuthority::open_scoped(
+            root.path().join("mobile.sqlite3"),
+            "ops.example.test",
+            "tenant-test",
+            "actor-test",
+        )
+        .unwrap();
+        let authorization = grant_mobile(
+            &mut authority,
+            MobilePlatformV2Action::ALL.to_vec(),
+            vec!["project-test"],
+        );
+        let workspace = WorkContextIdentity::UserWorkspace(
+            automonique_protocol::platform_v2::UserWorkspaceId::new("workspace-test").unwrap(),
+        );
+        let mut refusal_category = |action: ReviewAction, key: &str| {
+            let request = PlatformV2RequestMessage::new(
+                RequestId::new(format!("mobile-pull-request-{key}")).unwrap(),
+                PlatformV2Request::ExecuteReviewAction(
+                    ReviewActionTransportRequest::new(
+                        workspace.clone(),
+                        Revision::FIRST,
+                        action,
+                        IdempotencyKey::new(format!("mobile:pull-request:{key}")).unwrap(),
+                    )
+                    .unwrap(),
+                ),
+            );
+            let response = bridge.exchange_mobile(
+                PlatformV2Lane::V2,
+                &request.to_canonical_bytes().unwrap(),
+                &authorization,
+                &mut authority,
+                1_002,
+            )?;
+            let response =
+                PlatformV2ResponseMessage::from_canonical_bytes(&response, &request).unwrap();
+            match response.response() {
+                PlatformV2Response::Refused(value) => Ok(value.category().as_str().to_owned()),
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        };
+
+        for (index, action) in [
+            ReviewAction::OpenPullRequest {
+                expected_pull_request_revision: Revision::FIRST,
+                title: ReviewField::new("Title").unwrap(),
+            },
+            ReviewAction::UpdatePullRequest {
+                pull_request_id: PullRequestId::new("pull-request-1").unwrap(),
+                expected_pull_request_revision: Revision::FIRST,
+                title: ReviewField::new("Title").unwrap(),
+            },
+            ReviewAction::MergePullRequest {
+                pull_request_id: PullRequestId::new("pull-request-1").unwrap(),
+                expected_pull_request_revision: Revision::FIRST,
+                expected_head_revision: ReviewField::new(
+                    "0123456789abcdef0123456789abcdef01234567",
+                )
+                .unwrap(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let kind = action.kind();
+            assert_eq!(
+                refusal_category(action, &index.to_string()).as_deref(),
+                Ok("platform_v2_mobile_action_denied"),
+                "{kind:?} must be denied by the action mapping",
+            );
+        }
+
+        // The same grant, workspace, and absent socket carry an approved
+        // action past the mapping, so the refusals above are the mapping's.
+        assert_eq!(
+            refusal_category(
+                ReviewAction::ApproveReview {
+                    expected_review_revision: Revision::FIRST,
+                },
+                "approved",
+            ),
+            Err("platform_v2_bridge_unavailable")
+        );
     }
 }
