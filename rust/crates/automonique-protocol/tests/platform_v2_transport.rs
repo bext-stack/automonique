@@ -211,6 +211,152 @@ fn check_rerun_requires_an_exact_confirmation_digest_and_other_actions_refuse_it
     );
 }
 
+/// Agent delivery is advertised without a confirmation lane, on purpose.
+///
+/// A rerun needs a confirmation digest because the client names the target and
+/// the effect fires in a system the daemon does not own. Delivery to a
+/// retained session is a different risk class: the session comes from the
+/// operator registry rather than the wire, and the revision and note set are
+/// already fenced by the store and by `resolve_action`. Minting a receipt
+/// correlation would be actively harmful, because the host's receipt lookup
+/// skips a retained action whenever the request carries one.
+///
+/// So the capability carries no digest, and a client must not be able to
+/// smuggle an agent send into the confirmed lane that exists for reruns.
+#[test]
+fn agent_delivery_is_advertised_without_a_confirmation_lane() {
+    let review = ReviewAuthority::new(
+        ReviewAuthorityKind::Review,
+        ReviewAuthorityId::new("review-1").unwrap(),
+    );
+    let capability = ReviewAgentDeliveryCapability::new(
+        ReviewCommentId::new("comment-1").unwrap(),
+        Revision::new(3).unwrap(),
+        review.clone(),
+    )
+    .unwrap();
+    assert_eq!(capability.comment_id().as_str(), "comment-1");
+    assert_eq!(
+        capability.expected_comment_revision(),
+        Revision::new(3).unwrap()
+    );
+
+    // The advertisement is bound to the review authority. A capability minted
+    // under any other authority would name a lane `resolve_action` refuses.
+    for kind in [
+        ReviewAuthorityKind::Ci,
+        ReviewAuthorityKind::Git,
+        ReviewAuthorityKind::PullRequest,
+        ReviewAuthorityKind::Filesystem,
+        ReviewAuthorityKind::Delivery,
+    ] {
+        assert!(
+            ReviewAgentDeliveryCapability::new(
+                ReviewCommentId::new("comment-1").unwrap(),
+                Revision::new(3).unwrap(),
+                ReviewAuthority::new(kind, ReviewAuthorityId::new("other-1").unwrap()),
+            )
+            .is_err(),
+            "{kind:?} must not mint an agent delivery capability",
+        );
+    }
+
+    // The confirmed lane stays exclusive to reruns: an agent send offered a
+    // digest is refused rather than quietly accepted without one being checked.
+    let batch = ReviewAction::BatchSendCommentsToAgent {
+        comments: vec![ReviewCommentTarget::new(
+            ReviewCommentId::new("comment-1").unwrap(),
+            Revision::new(3).unwrap(),
+        )],
+    };
+    assert!(
+        ReviewActionTransportRequest::new_confirmed_correlated(
+            workspace(),
+            Revision::FIRST,
+            batch.clone(),
+            IdempotencyKey::new("batch-must-not-borrow-rerun-confirmation").unwrap(),
+            ReviewConfirmationDigest::new("ab".repeat(32)).unwrap(),
+            Revision::new(4).unwrap(),
+            ReviewReceiptCorrelationDigest::new("cd".repeat(32)).unwrap(),
+        )
+        .is_err()
+    );
+    // And the unconfirmed lane, which is the one it belongs in, accepts it.
+    assert!(
+        ReviewActionTransportRequest::new(
+            workspace(),
+            Revision::FIRST,
+            batch,
+            IdempotencyKey::new("batch-unconfirmed").unwrap(),
+        )
+        .is_ok()
+    );
+}
+
+/// The advertised set is a set: one entry per note, no duplicates.
+///
+/// A duplicated note would double it in the delivered payload, which is the
+/// one thing exactly-once custody cannot catch, because both copies belong to
+/// the same admitted action.
+#[test]
+fn agent_delivery_capabilities_are_deduplicated_and_bounded() {
+    let review = ReviewAuthority::new(
+        ReviewAuthorityKind::Review,
+        ReviewAuthorityId::new("review-1").unwrap(),
+    );
+    let entry = |id: &str, revision: u64| {
+        ReviewAgentDeliveryCapability::new(
+            ReviewCommentId::new(id).unwrap(),
+            Revision::new(revision).unwrap(),
+            review.clone(),
+        )
+        .unwrap()
+    };
+    assert!(
+        ReviewCapabilities::new(
+            project(),
+            workspace(),
+            Revision::new(9).unwrap(),
+            Revision::new(4).unwrap(),
+            Vec::new(),
+            vec![entry("comment-1", 3), entry("comment-1", 4)],
+        )
+        .is_err()
+    );
+    // Advertisement is order-independent: the server sorts, so a client sees
+    // one stable order regardless of snapshot iteration.
+    let capabilities = ReviewCapabilities::new(
+        project(),
+        workspace(),
+        Revision::new(9).unwrap(),
+        Revision::new(4).unwrap(),
+        Vec::new(),
+        vec![entry("comment-2", 3), entry("comment-1", 4)],
+    )
+    .unwrap();
+    assert_eq!(
+        capabilities
+            .agent_deliverable_comments()
+            .iter()
+            .map(|value| value.comment_id().as_str())
+            .collect::<Vec<_>>(),
+        vec!["comment-1", "comment-2"],
+    );
+    assert!(
+        ReviewCapabilities::new(
+            project(),
+            workspace(),
+            Revision::new(9).unwrap(),
+            Revision::new(4).unwrap(),
+            Vec::new(),
+            (0..=MAX_REVIEW_COMMENTS)
+                .map(|index| entry(&format!("comment-{index}"), 1))
+                .collect(),
+        )
+        .is_err()
+    );
+}
+
 #[test]
 fn rust_transport_encoding_matches_the_shared_typescript_corpus() {
     let fixture = include_str!("../fixtures/platform-v2-transport-v1.txt")
@@ -602,6 +748,17 @@ fn response_documents_round_trip_and_review_envelope_fits_its_declared_ceiling()
                         ci,
                         ReviewConfirmationDigest::new("ab".repeat(32)).unwrap(),
                         automonique_protocol::platform_v2_transport::ReviewReceiptCorrelationDigest::new("cd".repeat(32)).unwrap(),
+                    )
+                    .unwrap(),
+                ],
+                vec![
+                    ReviewAgentDeliveryCapability::new(
+                        ReviewCommentId::new("comment-1").unwrap(),
+                        Revision::new(3).unwrap(),
+                        ReviewAuthority::new(
+                            ReviewAuthorityKind::Review,
+                            ReviewAuthorityId::new("review-1").unwrap(),
+                        ),
                     )
                     .unwrap(),
                 ],

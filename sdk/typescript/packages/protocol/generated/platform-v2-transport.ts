@@ -99,6 +99,7 @@ import {
   type WorkContextRevision as WorkContextRevisionValue,
 } from "./work-context.js";
 import {
+  MAX_REVIEW_COMMENTS,
   PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR,
   PLATFORM_REVIEW_SCHEMA_V1,
   decodeReviewActionReceipt,
@@ -191,12 +192,18 @@ export interface ReviewCheckRerunCapability {
   readonly receipt_correlation_digest: ReviewReceiptCorrelationDigest;
   readonly expected_check_revision: WorkContextRevisionValue;
 }
+export interface ReviewAgentDeliveryCapability {
+  readonly authority: ReviewAuthority;
+  readonly comment_id: string;
+  readonly expected_comment_revision: WorkContextRevisionValue;
+}
 export interface ReviewCapabilities {
   readonly project: ProjectIdValue;
   readonly workspace: ReviewWorkspaceIdentity;
   readonly snapshot_revision: WorkContextRevisionValue;
   readonly workspace_revision: WorkContextRevisionValue;
   readonly rerunnable_checks: readonly ReviewCheckRerunCapability[];
+  readonly agent_deliverable_comments: readonly ReviewAgentDeliveryCapability[];
   readonly schema: typeof PLATFORM_SCHEMA_V2;
 }
 export interface ReviewActionTransportRequest {
@@ -384,7 +391,7 @@ export function ReviewReceiptCorrelationDigest(value: string): ReviewReceiptCorr
   return value as ReviewReceiptCorrelationDigest;
 }
 function reviewCapabilities(value: JsonValue): ReviewCapabilities {
-  const body = fields(value, ["project", "rerunnable_checks", "schema", "snapshot_revision", "workspace", "workspace_revision"]);
+  const body = fields(value, ["agent_deliverable_comments", "project", "rerunnable_checks", "schema", "snapshot_revision", "workspace", "workspace_revision"]);
   if (stringField(body, "schema") !== PLATFORM_SCHEMA_V2) throw new WireError("invalid_json_value", "review capability schema");
   const rawChecks = valueField(body, "rerunnable_checks");
   if (rawChecks.kind !== "array" || rawChecks.items.length > 512) throw new WireError("invalid_json_value", "review capabilities");
@@ -402,7 +409,22 @@ function reviewCapabilities(value: JsonValue): ReviewCapabilities {
     };
   });
   if (new Set(checks.map((check) => check.check_id)).size !== checks.length) throw new WireError("invalid_json_value", "duplicate review capability");
+  const rawDeliverable = valueField(body, "agent_deliverable_comments");
+  if (rawDeliverable.kind !== "array" || rawDeliverable.items.length > MAX_REVIEW_COMMENTS) throw new WireError("invalid_json_value", "review capabilities");
+  const deliverable = rawDeliverable.items.map((item): ReviewAgentDeliveryCapability => {
+    const comment = fields(item, ["authority", "comment_id", "expected_comment_revision"]);
+    const authorityValue = fields(valueField(comment, "authority"), ["id", "kind"]);
+    const authorityId = boundedRefusalString(stringField(authorityValue, "id"), 256);
+    if (stringField(authorityValue, "kind") !== "review") throw new WireError("invalid_json_value", "review capability authority");
+    return {
+      authority: {id: authorityId, kind: "review"},
+      comment_id: boundedRefusalString(stringField(comment, "comment_id"), 256),
+      expected_comment_revision: WorkContextRevision(integerField(comment, "expected_comment_revision")),
+    };
+  });
+  if (new Set(deliverable.map((comment) => comment.comment_id)).size !== deliverable.length) throw new WireError("invalid_json_value", "duplicate review capability");
   return {
+    agent_deliverable_comments: deliverable,
     project: ProjectId(stringField(body, "project")),
     rerunnable_checks: checks,
     schema: PLATFORM_SCHEMA_V2,

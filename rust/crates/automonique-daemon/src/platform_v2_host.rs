@@ -36,15 +36,17 @@ use automonique_protocol::platform_v2_lineage::{
     LineageStatus, OrchestrationRecord, WorkspaceIntent, WorkspaceIntentOutcome,
 };
 use automonique_protocol::platform_v2_review::{
-    AttentionReason as ReviewAttentionReason, CheckState, ReviewAction, ReviewActionReceipt,
-    ReviewActionRequest, ReviewActorId, ReviewAuthentication, ReviewAuthority, ReviewAuthorityId,
-    ReviewAuthorityKind, ReviewFreshnessState, ReviewReceiptOutcome, ReviewSnapshot,
+    AttentionReason as ReviewAttentionReason, CheckState, CommentAgentState, ReviewAction,
+    ReviewActionReceipt, ReviewActionRequest, ReviewActorId, ReviewAuthentication, ReviewAuthority,
+    ReviewAuthorityId, ReviewAuthorityKind, ReviewCommentTarget, ReviewFreshnessState,
+    ReviewReceiptOutcome, ReviewSnapshot,
 };
 use automonique_protocol::platform_v2_transport::{
     LIFECYCLE_CAPABILITY_EFFECT_KINDS, LifecycleCapabilities, LifecycleOperationCapability,
     PlatformV2Refusal, PlatformV2Request, PlatformV2Response, RawMutationApprovalDocument,
-    RawMutationReceiptDocument, ReceiptLookupKey, ReviewCapabilities, ReviewCheckRerunCapability,
-    ReviewConfirmationDigest, ReviewReceiptCorrelationDigest,
+    RawMutationReceiptDocument, ReceiptLookupKey, ReviewAgentDeliveryCapability,
+    ReviewCapabilities, ReviewCheckRerunCapability, ReviewConfirmationDigest,
+    ReviewReceiptCorrelationDigest,
 };
 use automonique_protocol::primitives::{EpochMillis, Revision};
 use automonique_protocol::wire::JsonValue;
@@ -1860,6 +1862,13 @@ impl PlatformV2Runtime {
                     .snapshot(value.workspace())
                     .map_err(|_| "platform_v2_store_refused")?
                     .ok_or("platform_v2_not_found")?;
+                let agent_deliverable = self.agent_deliverable_comments(
+                    &principal,
+                    &scope.project,
+                    value.workspace(),
+                    &snapshot,
+                    review_delivery,
+                );
                 let Some(authority) = principal
                     .review_authorities
                     .get(&ReviewAuthorityKind::Ci)
@@ -1872,6 +1881,7 @@ impl PlatformV2Runtime {
                             snapshot.revision(),
                             workspace_record.revision(),
                             Vec::new(),
+                            agent_deliverable,
                         )
                         .map_err(|_| "platform_v2_response_invalid")?,
                     ));
@@ -1934,6 +1944,7 @@ impl PlatformV2Runtime {
                         snapshot.revision(),
                         workspace_record.revision(),
                         rerunnable,
+                        agent_deliverable,
                     )
                     .map_err(|_| "platform_v2_response_invalid")?,
                 ))
@@ -2912,6 +2923,103 @@ impl PlatformV2Runtime {
     /// and prove it still names the exact durable fence. This runs immediately
     /// before write admission and again after admission, immediately before a
     /// scheduler submission that reconciliation proved has not started.
+    /// Advertise agent delivery only for notes a send would actually be
+    /// admitted for, and only once a mutation-free probe has proven the bound
+    /// retained session is reachable.
+    ///
+    /// Every filter here mirrors a fence the execute path applies anyway, so
+    /// an advertised note is one `resolve_action` and
+    /// `validate_retained_review_execution_fence` will both accept: the
+    /// caller holds the review authority the snapshot names, the review is
+    /// fresh, and the note is still in a sendable agent state. The registry
+    /// plan and the two reads that follow it are the analogue of the rerun's
+    /// provider preflight -- an installed binding alone must not advertise a
+    /// capability, because a workspace whose delivery adapter is absent would
+    /// otherwise advertise a send that always refuses.
+    ///
+    /// An empty result is the honest answer and needs no explanation on the
+    /// wire: the client already learns the exact category from the
+    /// fail-closed refusal if it sends anyway.
+    fn agent_deliverable_comments(
+        &self,
+        principal: &PrincipalPolicy,
+        project: &ProjectId,
+        workspace: &WorkContextIdentity,
+        snapshot: &ReviewSnapshot,
+        delivery: &dyn PlatformV2ReviewDelivery,
+    ) -> Vec<ReviewAgentDeliveryCapability> {
+        let Some(authority) = principal
+            .review_authorities
+            .get(&ReviewAuthorityKind::Review)
+        else {
+            return Vec::new();
+        };
+        if authority != snapshot.review().authority()
+            || snapshot.review().freshness().state() != ReviewFreshnessState::Fresh
+        {
+            return Vec::new();
+        }
+        let eligible: Vec<&automonique_protocol::platform_v2_review::ReviewComment> = snapshot
+            .comments()
+            .iter()
+            .filter(|comment| {
+                matches!(
+                    comment.agent_state(),
+                    CommentAgentState::NotSent | CommentAgentState::Refused
+                )
+            })
+            .collect();
+        if eligible.is_empty() {
+            return Vec::new();
+        }
+        // Probe with the exact action a client would send, so the advertised
+        // set and the planned effect cannot diverge.
+        let action = ReviewAction::BatchSendCommentsToAgent {
+            comments: eligible
+                .iter()
+                .map(|comment| ReviewCommentTarget::new(comment.id().clone(), comment.revision()))
+                .collect(),
+        };
+        let Ok(ReviewEffectPlan::RetainedSession {
+            provider,
+            provider_session_id,
+            work_session_id,
+            ..
+        }) = self
+            .review_effects
+            .plan(project, workspace, authority, &action)
+        else {
+            return Vec::new();
+        };
+        if self
+            .work_contexts
+            .validate_retained_session_lineage(
+                principal.actor.tenant(),
+                project,
+                workspace,
+                &work_session_id,
+                &provider_session_id,
+            )
+            .is_err()
+            || delivery
+                .inspect_target(&provider, &provider_session_id)
+                .is_err()
+        {
+            return Vec::new();
+        }
+        eligible
+            .into_iter()
+            .filter_map(|comment| {
+                ReviewAgentDeliveryCapability::new(
+                    comment.id().clone(),
+                    comment.revision(),
+                    authority.clone(),
+                )
+                .ok()
+            })
+            .collect()
+    }
+
     fn validate_retained_review_execution_fence(
         &self,
         principal: &PrincipalPolicy,

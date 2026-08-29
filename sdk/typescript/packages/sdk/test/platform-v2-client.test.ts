@@ -512,6 +512,10 @@ describe("canonical HTTPS Platform v2 client", () => {
         snapshot_revision: WorkContextRevision(9n),
         workspace_revision: WorkContextRevision(4n),
         rerunnable_checks: [{authority: {id: "ci-1", kind: "ci"}, check_id: "check-1", confirmation_digest: confirmation, receipt_correlation_digest: correlation, expected_check_revision: WorkContextRevision(7n)}],
+        // Agent delivery is advertised without a digest: unlike a rerun, the
+        // session is registry-owned rather than client-named, and the note
+        // set is already fenced by the snapshot revision it is read at.
+        agent_deliverable_comments: [{authority: {id: "review-1", kind: "review"}, comment_id: "comment-1", expected_comment_revision: WorkContextRevision(3n)}],
         schema: PLATFORM_SCHEMA_V2,
       }}},
       {lane: "v2", request: {kind: "execute_review_action", request: {
@@ -529,6 +533,8 @@ describe("canonical HTTPS Platform v2 client", () => {
     const capabilities = await client.getReviewCapabilities(project, workspace);
     expect(capabilities.kind).toBe("review_capabilities");
     expect((capabilities.kind === "review_capabilities" ? capabilities.capabilities.rerunnable_checks[0]?.confirmation_digest : null)).toBe(confirmation);
+    expect((capabilities.kind === "review_capabilities" ? capabilities.capabilities.agent_deliverable_comments[0]?.comment_id : null)).toBe("comment-1");
+    expect(capabilities.kind === "review_capabilities" ? Object.keys(capabilities.capabilities.agent_deliverable_comments[0] ?? {}).sort() : []).toEqual(["authority", "comment_id", "expected_comment_revision"]);
     expect((await client.executeConfirmedReviewAction(workspace, WorkContextRevision(9n), action, key, confirmation, WorkContextRevision(4n), correlation)).kind).toBe("platform_v2_refused");
   });
 

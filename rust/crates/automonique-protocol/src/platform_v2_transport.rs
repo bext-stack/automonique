@@ -55,8 +55,9 @@ use crate::platform_v2_lineage_api::{
     encode_workspace_intent_outcome,
 };
 use crate::platform_v2_review::{
-    PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR, PLATFORM_REVIEW_SCHEMA_V1, ReviewAction,
-    ReviewActionReceipt, ReviewAuthority, ReviewAuthorityKind, ReviewCheckId, ReviewSnapshot,
+    MAX_REVIEW_COMMENTS, PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR, PLATFORM_REVIEW_SCHEMA_V1,
+    ReviewAction, ReviewActionReceipt, ReviewAuthority, ReviewAuthorityKind, ReviewCheckId,
+    ReviewCommentId, ReviewSnapshot,
 };
 use crate::platform_v2_review_api::{
     MAX_REVIEW_SNAPSHOT_CANONICAL_BYTES, ReviewApiError, action, action_json,
@@ -738,6 +739,71 @@ impl ReviewCheckRerunCapability {
     }
 }
 
+/// One exact review note the server has proven it can deliver to the bound
+/// retained agent session.
+///
+/// This deliberately carries no confirmation digest and no receipt
+/// correlation, unlike [`ReviewCheckRerunCapability`]. A rerun needs both
+/// because the client names the target and the effect fires in a system the
+/// daemon does not own, so only a digest can bind the executed write to the
+/// preflighted plan. Delivery to a retained session is a different risk class
+/// on every axis that motivated the digest:
+///
+/// * The target is not on the wire. Provider and session identity come from
+///   the operator-owned registry, keyed by the review coordinate, so a client
+///   can neither name nor redirect the session it reaches.
+/// * The snapshot revision is already fenced twice, by the store's current
+///   revision check and again by `ReviewSnapshot::resolve_action`.
+/// * The note set is already fenced by the batch arm of `resolve_action`,
+///   which requires every comment to exist at exactly the advertised revision
+///   and to still be in `not_sent` or `refused`.
+///
+/// Exactly-once therefore falls out of the domain state machine rather than a
+/// digest: a delivered comment leaves `not_sent`/`refused` and bumps the
+/// snapshot revision, so a replay under a fresh idempotency key fails the
+/// revision fence, and a replay under the same key is the intended recovery
+/// lane, deduplicated by external-effect custody.
+///
+/// Minting a receipt correlation here would be worse than redundant. The
+/// host's receipt lookup skips a retained action whenever the request carries
+/// a correlation digest, so advertising one would hand a client a token that
+/// makes its own receipt unfindable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewAgentDeliveryCapability {
+    comment_id: ReviewCommentId,
+    expected_comment_revision: Revision,
+    authority: ReviewAuthority,
+}
+
+impl ReviewAgentDeliveryCapability {
+    pub fn new(
+        comment_id: ReviewCommentId,
+        expected_comment_revision: Revision,
+        authority: ReviewAuthority,
+    ) -> Result<Self, PlatformV2TransportError> {
+        if authority.kind() != ReviewAuthorityKind::Review {
+            return Err(PlatformV2TransportError::InvalidBody);
+        }
+        Ok(Self {
+            comment_id,
+            expected_comment_revision,
+            authority,
+        })
+    }
+    #[must_use]
+    pub const fn comment_id(&self) -> &ReviewCommentId {
+        &self.comment_id
+    }
+    #[must_use]
+    pub const fn expected_comment_revision(&self) -> Revision {
+        self.expected_comment_revision
+    }
+    #[must_use]
+    pub const fn authority(&self) -> &ReviewAuthority {
+        &self.authority
+    }
+}
+
 /// Revision-fenced mutation capabilities for exactly one project/workspace.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReviewCapabilities {
@@ -746,6 +812,7 @@ pub struct ReviewCapabilities {
     snapshot_revision: Revision,
     workspace_revision: Revision,
     rerunnable_checks: Vec<ReviewCheckRerunCapability>,
+    agent_deliverable_comments: Vec<ReviewAgentDeliveryCapability>,
 }
 
 impl ReviewCapabilities {
@@ -755,8 +822,12 @@ impl ReviewCapabilities {
         snapshot_revision: Revision,
         workspace_revision: Revision,
         mut rerunnable_checks: Vec<ReviewCheckRerunCapability>,
+        mut agent_deliverable_comments: Vec<ReviewAgentDeliveryCapability>,
     ) -> Result<Self, PlatformV2TransportError> {
-        if !is_review_workspace(&workspace) || rerunnable_checks.len() > 512 {
+        if !is_review_workspace(&workspace)
+            || rerunnable_checks.len() > 512
+            || agent_deliverable_comments.len() > MAX_REVIEW_COMMENTS
+        {
             return Err(PlatformV2TransportError::InvalidBody);
         }
         rerunnable_checks
@@ -767,12 +838,21 @@ impl ReviewCapabilities {
         {
             return Err(PlatformV2TransportError::InvalidBody);
         }
+        agent_deliverable_comments
+            .sort_by(|left, right| left.comment_id().as_str().cmp(right.comment_id().as_str()));
+        if agent_deliverable_comments
+            .windows(2)
+            .any(|pair| pair[0].comment_id() == pair[1].comment_id())
+        {
+            return Err(PlatformV2TransportError::InvalidBody);
+        }
         Ok(Self {
             project,
             workspace,
             snapshot_revision,
             workspace_revision,
             rerunnable_checks,
+            agent_deliverable_comments,
         })
     }
     #[must_use]
@@ -794,6 +874,16 @@ impl ReviewCapabilities {
     #[must_use]
     pub fn rerunnable_checks(&self) -> &[ReviewCheckRerunCapability] {
         &self.rerunnable_checks
+    }
+    /// Review notes the server has proven it can deliver to the bound retained
+    /// agent session, at the exact revisions the delivery will be accepted at.
+    ///
+    /// Empty is the honest fail-closed answer: no registry binding, no live
+    /// delivery adapter, no fresh review, or no note currently in a sendable
+    /// state. A client must not attempt a send that is not listed here.
+    #[must_use]
+    pub fn agent_deliverable_comments(&self) -> &[ReviewAgentDeliveryCapability] {
+        &self.agent_deliverable_comments
     }
 }
 
@@ -1481,7 +1571,43 @@ fn review_capabilities_json(
             ]))
         })
         .collect::<Result<Vec<_>, PlatformV2TransportError>>()?;
+    let agent_deliverable_comments = value
+        .agent_deliverable_comments()
+        .iter()
+        .map(|capability| {
+            Ok(object(vec![
+                (
+                    "authority",
+                    object(vec![
+                        (
+                            "id",
+                            JsonValue::String(capability.authority().id().as_str().to_owned()),
+                        ),
+                        (
+                            "kind",
+                            JsonValue::String(capability.authority().kind().as_str().to_owned()),
+                        ),
+                    ]),
+                ),
+                (
+                    "comment_id",
+                    JsonValue::String(capability.comment_id().as_str().to_owned()),
+                ),
+                (
+                    "expected_comment_revision",
+                    JsonValue::Integer(
+                        i64::try_from(capability.expected_comment_revision().get())
+                            .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+                    ),
+                ),
+            ]))
+        })
+        .collect::<Result<Vec<_>, PlatformV2TransportError>>()?;
     Ok(object(vec![
+        (
+            "agent_deliverable_comments",
+            JsonValue::Array(agent_deliverable_comments),
+        ),
         (
             "project",
             JsonValue::String(value.project().as_str().to_owned()),
@@ -1510,6 +1636,7 @@ fn review_capabilities(value: &JsonValue) -> Result<ReviewCapabilities, Platform
     exact_fields(
         value,
         &[
+            "agent_deliverable_comments",
             "project",
             "rerunnable_checks",
             "schema",
@@ -1570,6 +1697,45 @@ fn review_capabilities(value: &JsonValue) -> Result<ReviewCapabilities, Platform
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let JsonValue::Array(deliverable) = value
+        .get("agent_deliverable_comments")
+        .ok_or(PlatformV2TransportError::InvalidBody)?
+    else {
+        return Err(PlatformV2TransportError::InvalidBody);
+    };
+    let deliverable = deliverable
+        .iter()
+        .map(|comment| {
+            exact_fields(
+                comment,
+                &["authority", "comment_id", "expected_comment_revision"],
+            )?;
+            let authority = comment
+                .get("authority")
+                .ok_or(PlatformV2TransportError::InvalidBody)?;
+            exact_fields(authority, &["id", "kind"])?;
+            let authority = ReviewAuthority::new(
+                ReviewAuthorityKind::parse(string(authority, "kind")?)
+                    .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+                crate::platform_v2_review::ReviewAuthorityId::new(
+                    string(authority, "id")?.to_owned(),
+                )
+                .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+            );
+            let revision = comment
+                .get("expected_comment_revision")
+                .and_then(JsonValue::as_integer)
+                .and_then(|value| u64::try_from(value).ok())
+                .and_then(|value| Revision::new(value).ok())
+                .ok_or(PlatformV2TransportError::InvalidBody)?;
+            ReviewAgentDeliveryCapability::new(
+                ReviewCommentId::new(string(comment, "comment_id")?.to_owned())
+                    .map_err(|_| PlatformV2TransportError::InvalidBody)?,
+                revision,
+                authority,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let snapshot_revision = value
         .get("snapshot_revision")
         .and_then(JsonValue::as_integer)
@@ -1593,6 +1759,7 @@ fn review_capabilities(value: &JsonValue) -> Result<ReviewCapabilities, Platform
         snapshot_revision,
         workspace_revision,
         checks,
+        deliverable,
     )
 }
 
