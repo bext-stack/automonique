@@ -1492,6 +1492,61 @@ fn platform_receipt_view(
     }
 }
 
+/// A platform refusal, kept whole enough to explain itself.
+///
+/// `category` is the fixed token a caller branches on. `explanation` is the
+/// authority's own reason for refusing, which is the single fact that explains
+/// the failure and the one this projection used to drop on the floor.
+#[derive(Debug)]
+struct PlatformFailure {
+    category: &'static str,
+    explanation: Option<String>,
+}
+
+impl From<&'static str> for PlatformFailure {
+    fn from(category: &'static str) -> Self {
+        Self {
+            category,
+            explanation: None,
+        }
+    }
+}
+
+/// Stands in for a refusal explanation that is not a bare category token.
+const NON_CATEGORY_EXPLANATION: &str = "non_category_text_withheld";
+
+/// Admit a refusal explanation only when it is a bare category token.
+///
+/// A refusal explanation is free-form text up to `MAX_PLATFORM_FIELD_BYTES`,
+/// so an authority may describe live work in it. A token like
+/// `snapshot_too_large` is what a caller needs and is safe to journal and to
+/// return; anything else is withheld rather than reproduced into a log line or
+/// an HTTP body that a narrower audience reads.
+fn refusal_category(explanation: &str) -> String {
+    let admissible = (1..=64).contains(&explanation.len())
+        && explanation
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
+    if admissible {
+        explanation.to_owned()
+    } else {
+        String::from(NON_CATEGORY_EXPLANATION)
+    }
+}
+
+/// Record one bounded line naming what the platform authority refused.
+///
+/// Until this existed a refusal left no trace an operator could find: the
+/// reason reached `inventory.explanation` and nowhere else, so a permanently
+/// degraded projection had to be diagnosed by counting database rows against a
+/// protocol constant.
+fn log_platform_refusal(request: &'static str, explanation: &str) {
+    eprintln!(
+        "automonique web entry: platform {request} refused: {}",
+        refusal_category(explanation)
+    );
+}
+
 fn platform_session_coordinate(session_id: String) -> Result<ResourceCoordinate, &'static str> {
     let id = ResourceId::new(session_id).map_err(|_| "platform_session_request_invalid")?;
     Ok(ResourceCoordinate::new(
@@ -2082,17 +2137,20 @@ impl WebIntegration {
         })
     }
 
-    fn platform(&self) -> Result<PlatformProjectionView, &'static str> {
+    fn platform(&self) -> Result<PlatformProjectionView, PlatformFailure> {
         let mut client = self
             .platform
             .lock()
-            .map_err(|_| "platform_client_unavailable")?;
-        let capabilities = client.capabilities().map_err(|_| "platform_unavailable")?;
+            .map_err(|_| PlatformFailure::from("platform_client_unavailable"))?;
+        let capabilities = client
+            .capabilities()
+            .map_err(|_| PlatformFailure::from("platform_unavailable"))?;
         let (health, inventory, cursor, resources) = match client
             .request(PlatformRequest::Snapshot(
-                SnapshotRequest::new(Vec::new()).map_err(|_| "platform_request_invalid")?,
+                SnapshotRequest::new(Vec::new())
+                    .map_err(|_| PlatformFailure::from("platform_request_invalid"))?,
             ))
-            .map_err(|_| "platform_unavailable")?
+            .map_err(|_| PlatformFailure::from("platform_unavailable"))?
         {
             PlatformResponse::Snapshot(snapshot) => (
                 "operational",
@@ -2103,27 +2161,38 @@ impl WebIntegration {
                 Some(snapshot.cursor.into()),
                 snapshot.resources.into_iter().map(Into::into).collect(),
             ),
-            PlatformResponse::Refused { explanation, .. } => (
-                "degraded",
-                PlatformInventoryView {
-                    state: "refused",
-                    explanation: Some(explanation.into_inner()),
-                },
-                None,
-                Vec::new(),
-            ),
-            _ => return Err("platform_protocol_invalid"),
+            PlatformResponse::Refused { explanation, .. } => {
+                let explanation = explanation.into_inner();
+                log_platform_refusal("snapshot", &explanation);
+                (
+                    "degraded",
+                    PlatformInventoryView {
+                        state: "refused",
+                        explanation: Some(refusal_category(&explanation)),
+                    },
+                    None,
+                    Vec::new(),
+                )
+            }
+            _ => return Err(PlatformFailure::from("platform_protocol_invalid")),
         };
         let sessions = match client
             .request(PlatformRequest::ListSessions(ListSessionsRequest {
                 authority: ResourceAuthority::Automonique,
                 cursor: None,
             }))
-            .map_err(|_| "platform_unavailable")?
+            .map_err(|_| PlatformFailure::from("platform_unavailable"))?
         {
             PlatformResponse::Sessions(sessions) => sessions,
-            PlatformResponse::Refused { .. } => return Err("platform_sessions_refused"),
-            _ => return Err("platform_protocol_invalid"),
+            PlatformResponse::Refused { explanation, .. } => {
+                let explanation = explanation.into_inner();
+                log_platform_refusal("list_sessions", &explanation);
+                return Err(PlatformFailure {
+                    category: "platform_sessions_refused",
+                    explanation: Some(refusal_category(&explanation)),
+                });
+            }
+            _ => return Err(PlatformFailure::from("platform_protocol_invalid")),
         };
         Ok(PlatformProjectionView {
             schema: "automonique.dashboard.platform/v2",
@@ -5979,7 +6048,7 @@ fn api_response(
         Route::ApiOperations => json_response("200 OK", &integration.operations()),
         Route::ApiPlatform => match integration.platform() {
             Ok(view) => json_response("200 OK", &view),
-            Err(category) => json_error("503 Service Unavailable", category),
+            Err(failure) => json_refusal("503 Service Unavailable", &failure),
         },
         Route::ApiPlatformCockpit => {
             match serde_json::from_slice::<platform_cockpit::CockpitRequest>(body) {
@@ -6241,11 +6310,30 @@ fn mobile_platform_v2_error(status: &'static str, category: &'static str) -> Res
 }
 
 fn json_error(status: &'static str, category: &'static str) -> Response {
+    json_refusal(status, &PlatformFailure::from(category))
+}
+
+/// An error body that also names why the platform authority refused, when it
+/// gave a reason.
+///
+/// [`json_error`]'s `&'static str` category can only ever carry this crate's
+/// own label for a failure, never the authority's explanation of it, which is
+/// the fact an operator actually needs. `explanation` is a bare category token
+/// or it is absent; free-form text never reaches here.
+fn json_refusal(status: &'static str, failure: &PlatformFailure) -> Response {
     #[derive(Serialize)]
-    struct ErrorBody {
-        error: &'static str,
+    struct ErrorBody<'a> {
+        error: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        explanation: Option<&'a str>,
     }
-    json_response(status, &ErrorBody { error: category })
+    json_response(
+        status,
+        &ErrorBody {
+            error: failure.category,
+            explanation: failure.explanation.as_deref(),
+        },
+    )
 }
 
 fn manage_chat_turn_error(category: &'static str) -> Response {
@@ -7001,6 +7089,27 @@ mod tests {
                 route(&parse_request(bytes.as_bytes()).unwrap(), &fixture_hosts())
             );
         }
+    }
+
+    #[test]
+    fn refusal_explanations_are_admitted_only_as_bare_category_tokens() {
+        assert_eq!(refusal_category("snapshot_too_large"), "snapshot_too_large");
+        assert_eq!(refusal_category("resync_required"), "resync_required");
+        for leaky in [
+            "",
+            "Snapshot Too Large",
+            "refused: /home/operator/work/secret-client",
+            "session 42 for acme corp is still running",
+            "token=abcdef",
+        ] {
+            assert_eq!(
+                refusal_category(leaky),
+                NON_CATEGORY_EXPLANATION,
+                "free-form text must never reach a journal or an HTTP body"
+            );
+        }
+        assert_eq!(refusal_category(&"a".repeat(64)), "a".repeat(64));
+        assert_eq!(refusal_category(&"a".repeat(65)), NON_CATEGORY_EXPLANATION);
     }
 
     #[test]
