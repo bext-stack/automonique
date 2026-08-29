@@ -38,6 +38,7 @@ use automonique_daemon::run_lane::SocketRunLane;
 use automonique_daemon::slack::SlackHost;
 use automonique_daemon::telegram_bridge::{QuestionProfile, RunFailure, RunLane, SlackSurface};
 use automonique_daemon::{
+    CURRENT_NODE_ALIAS,
     manage_config::{ManageConfig, ManagePlatformConfig, ManageProfileApp},
     mcp_client::{McpCallResult, McpRegistry, McpToolDescriptor},
     site_inventory::{NGINX_SITES_ENABLED, enabled_hosts, manage_profiles, prism_sites},
@@ -49,10 +50,10 @@ use automonique_platform_client::{
 use automonique_protocol::codec::RequestId;
 use automonique_protocol::platform::{
     AttachRequest, Capabilities, ClientId, DetachRequest, IdempotencyKey, ListSessionsRequest,
-    PlatformAction, PlatformCursor, PlatformParameter, PlatformRequest, PlatformResponse,
-    PlatformTransport, ReceiptOutcome, ResourceAuthority, ResourceCoordinate, ResourceId,
-    ResourceKind, ResourceRecord, SessionCommandState, SessionFollowUpRequest, SessionHistoryEvent,
-    SessionHistoryPage, SessionHistoryResync, SessionRecord, SnapshotRequest,
+    MAX_SNAPSHOT_RESOURCES, PlatformAction, PlatformCursor, PlatformParameter, PlatformRequest,
+    PlatformResponse, PlatformTransport, ReceiptOutcome, ResourceAuthority, ResourceCoordinate,
+    ResourceId, ResourceKind, ResourceRecord, SessionCommandState, SessionFollowUpRequest,
+    SessionHistoryEvent, SessionHistoryPage, SessionHistoryResync, SessionRecord, SnapshotRequest,
 };
 use automonique_protocol::platform_api::{
     MAX_PLATFORM_REQUEST_CANONICAL_BYTES, PlatformRequestMessage, PlatformResponseMessage,
@@ -1053,8 +1054,16 @@ struct PlatformProjectionView {
 #[derive(Serialize)]
 struct PlatformInventoryView {
     state: &'static str,
+    /// How much of the authority's inventory this projection asked for. A
+    /// reader who sees a short `resources` list needs to know the list is a
+    /// deliberately named subset and not a truncated or broken whole.
+    scope: &'static str,
     explanation: Option<String>,
 }
+
+/// The only scope the shared projection ever requests. Named here so the
+/// response says so rather than leaving a caller to infer it from a length.
+const PLATFORM_INVENTORY_SCOPE: &str = "named";
 
 #[derive(Serialize)]
 struct PlatformCapabilitiesView {
@@ -1545,6 +1554,67 @@ fn log_platform_refusal(request: &'static str, explanation: &str) {
         "automonique web entry: platform {request} refused: {}",
         refusal_category(explanation)
     );
+}
+
+/// The coordinates the shared projection names, instead of asking for
+/// everything.
+///
+/// A snapshot request carrying no coordinates means *the whole inventory*, and
+/// the authority answers that with `snapshot_too_large` as soon as the
+/// inventory outgrows `MAX_SNAPSHOT_RESOURCES`. That inventory is dominated by
+/// run records and only grows, so an unscoped request is not occasionally
+/// unlucky but permanently refused once a deployment has done enough work, and
+/// the projection then reports `degraded` with nothing in it forever.
+///
+/// Naming coordinates removes the cliff structurally rather than by raising a
+/// number: the store answers a named request with at most one record per
+/// coordinate, and `SnapshotRequest::new` already bounds the request itself, so
+/// the response cannot exceed the bound however large the inventory grows.
+fn platform_projection_scope(sessions: &[SessionRecord]) -> Vec<ResourceCoordinate> {
+    let mut scope = Vec::new();
+    // The serving node, under the alias the authority resolves to whichever
+    // generation currently holds the lease. Naming a concrete instance id
+    // would blind the projection at every daemon restart.
+    if let Ok(id) = ResourceId::new(CURRENT_NODE_ALIAS) {
+        scope.push(ResourceCoordinate::new(
+            ResourceAuthority::Automonique,
+            ResourceKind::Node,
+            id,
+        ));
+    }
+    // The action catalogue, asked for as the protocol's complete action list
+    // rather than as whichever subset this authority happens to publish. One
+    // that publishes fewer simply returns fewer records, so the projection
+    // stays correct against an older or a newer peer without depending on its
+    // internals.
+    for action in PlatformAction::ALL {
+        if let Ok(id) = ResourceId::new(format!("platform-action-{}", action.as_str())) {
+            scope.push(ResourceCoordinate::new(
+                ResourceAuthority::Automonique,
+                ResourceKind::Client,
+                id,
+            ));
+        }
+    }
+    // The run behind each listed session. This is the part that carries live
+    // work, and it rides on the session listing, which pages: the projection
+    // shows the runs an operator can currently see rather than every run the
+    // node has ever executed.
+    let room = MAX_SNAPSHOT_RESOURCES.saturating_sub(scope.len());
+    let mut runs: Vec<ResourceCoordinate> = Vec::new();
+    for session in sessions {
+        let Some(run) = session.run.clone() else {
+            continue;
+        };
+        if runs.len() >= room {
+            break;
+        }
+        if !runs.contains(&run) {
+            runs.push(run);
+        }
+    }
+    scope.extend(runs);
+    scope
 }
 
 fn platform_session_coordinate(session_id: String) -> Result<ResourceCoordinate, &'static str> {
@@ -2145,37 +2215,9 @@ impl WebIntegration {
         let capabilities = client
             .capabilities()
             .map_err(|_| PlatformFailure::from("platform_unavailable"))?;
-        let (health, inventory, cursor, resources) = match client
-            .request(PlatformRequest::Snapshot(
-                SnapshotRequest::new(Vec::new())
-                    .map_err(|_| PlatformFailure::from("platform_request_invalid"))?,
-            ))
-            .map_err(|_| PlatformFailure::from("platform_unavailable"))?
-        {
-            PlatformResponse::Snapshot(snapshot) => (
-                "operational",
-                PlatformInventoryView {
-                    state: "available",
-                    explanation: None,
-                },
-                Some(snapshot.cursor.into()),
-                snapshot.resources.into_iter().map(Into::into).collect(),
-            ),
-            PlatformResponse::Refused { explanation, .. } => {
-                let explanation = explanation.into_inner();
-                log_platform_refusal("snapshot", &explanation);
-                (
-                    "degraded",
-                    PlatformInventoryView {
-                        state: "refused",
-                        explanation: Some(refusal_category(&explanation)),
-                    },
-                    None,
-                    Vec::new(),
-                )
-            }
-            _ => return Err(PlatformFailure::from("platform_protocol_invalid")),
-        };
+        // The session listing runs before the snapshot because it names the
+        // runs the snapshot then asks for. Reversing the two would leave the
+        // snapshot with nothing live to scope itself to.
         let sessions = match client
             .request(PlatformRequest::ListSessions(ListSessionsRequest {
                 authority: ResourceAuthority::Automonique,
@@ -2191,6 +2233,44 @@ impl WebIntegration {
                     category: "platform_sessions_refused",
                     explanation: Some(refusal_category(&explanation)),
                 });
+            }
+            _ => return Err(PlatformFailure::from("platform_protocol_invalid")),
+        };
+        let scope = platform_projection_scope(&sessions.sessions);
+        let (health, inventory, cursor, resources) = match client
+            .request(PlatformRequest::Snapshot(
+                SnapshotRequest::new(scope)
+                    .map_err(|_| PlatformFailure::from("platform_request_invalid"))?,
+            ))
+            .map_err(|_| PlatformFailure::from("platform_unavailable"))?
+        {
+            PlatformResponse::Snapshot(snapshot) => (
+                "operational",
+                PlatformInventoryView {
+                    state: "available",
+                    scope: PLATFORM_INVENTORY_SCOPE,
+                    explanation: None,
+                },
+                Some(snapshot.cursor.into()),
+                snapshot.resources.into_iter().map(Into::into).collect(),
+            ),
+            // A named request cannot outgrow the response bound, so this arm
+            // no longer covers the inventory having grown. It stays because a
+            // refusal is still the authority's to give, and #162 established
+            // that degrading honestly beats failing the whole projection.
+            PlatformResponse::Refused { explanation, .. } => {
+                let explanation = explanation.into_inner();
+                log_platform_refusal("snapshot", &explanation);
+                (
+                    "degraded",
+                    PlatformInventoryView {
+                        state: "refused",
+                        scope: PLATFORM_INVENTORY_SCOPE,
+                        explanation: Some(refusal_category(&explanation)),
+                    },
+                    None,
+                    Vec::new(),
+                )
             }
             _ => return Err(PlatformFailure::from("platform_protocol_invalid")),
         };
@@ -2421,13 +2501,14 @@ impl WebIntegration {
 
     /// The sessions a pairing offer can be scoped to, and nothing else.
     ///
-    /// Separate from [`Self::platform`] on purpose. That projection opens with a
-    /// snapshot of *everything*, and `SnapshotRequest` carries no cursor, so a
-    /// deployment whose resource inventory has grown past
-    /// `MAX_SNAPSHOT_RESOURCES` has its whole platform view refused —
-    /// permanently, since the inventory only grows. Listing sessions is its own
-    /// request with its own cursor, so the pairing panel stays usable on a
-    /// deployment where the projection is not.
+    /// Separate from [`Self::platform`] on purpose. Listing sessions is its own
+    /// request with its own cursor, so the pairing panel stays usable however
+    /// the shared projection is faring. That mattered acutely while
+    /// [`Self::platform`] asked for a snapshot of *everything*: a deployment
+    /// whose inventory had grown past `MAX_SNAPSHOT_RESOURCES` had its whole
+    /// platform view refused, permanently, since the inventory only grows.
+    /// That projection now names the coordinates it needs, but keeping the two
+    /// reads independent still means one cannot take the other down.
     fn platform_sessions(&self) -> Result<PlatformSessionsView, &'static str> {
         let mut client = self
             .platform
@@ -7091,6 +7172,180 @@ mod tests {
         }
     }
 
+    /// The projection must name the coordinates it wants, never ask for the
+    /// whole inventory.
+    ///
+    /// This is the regression that cost a database row count to diagnose. The
+    /// projection opened with `SnapshotRequest::new(Vec::new())`, which means
+    /// *everything*; the deployment's inventory had grown past
+    /// `MAX_SNAPSHOT_RESOURCES` and only grows; so every hosted cockpit served
+    /// zero resources behind a bare `refused`, permanently. The fake authority
+    /// here refuses an unscoped request exactly as production does, so a
+    /// projection that ever asks for everything again fails here instead.
+    #[test]
+    fn platform_projection_names_its_inventory_instead_of_asking_for_everything() {
+        let state_dir = tempfile::tempdir().expect("temporary state");
+        let runtime_dir = tempfile::tempdir().expect("temporary runtime");
+        std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private state");
+        std::fs::set_permissions(runtime_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private runtime");
+
+        let run = ResourceCoordinate::new(
+            ResourceAuthority::Automonique,
+            ResourceKind::Run,
+            ResourceId::new("run-behind-a-live-session").unwrap(),
+        );
+        let node = ResourceCoordinate::new(
+            ResourceAuthority::Automonique,
+            ResourceKind::Node,
+            ResourceId::new(CURRENT_NODE_ALIAS).unwrap(),
+        );
+        let listener = UnixListener::bind(runtime_dir.path().join("admin.sock"))
+            .expect("fixture platform socket");
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let served_run = run.clone();
+        let served_node = node.clone();
+        let platform_server = thread::spawn(move || {
+            for expected in ["capabilities", "list_sessions", "snapshot"] {
+                let (mut stream, _) = listener.accept().expect("platform connection");
+                let mut prefix = [0_u8; 4];
+                stream.read_exact(&mut prefix).expect("platform prefix");
+                let length = usize::try_from(u32::from_be_bytes(prefix)).unwrap();
+                let mut payload = vec![0_u8; length];
+                stream.read_exact(&mut payload).expect("platform request");
+                let request = PlatformRequestMessage::from_canonical_bytes(&payload)
+                    .expect("canonical platform request");
+                let response = match (expected, request.request()) {
+                    ("capabilities", PlatformRequest::Capabilities) => {
+                        PlatformResponse::Capabilities(Capabilities::platform_v1())
+                    }
+                    ("list_sessions", PlatformRequest::ListSessions(_)) => {
+                        PlatformResponse::Sessions(
+                            SessionList::new(
+                                vec![SessionRecord {
+                                    session: ResourceRecord {
+                                        resource: ResourceCoordinate::new(
+                                            ResourceAuthority::Automonique,
+                                            ResourceKind::Session,
+                                            ResourceId::new("session-with-a-run").unwrap(),
+                                        ),
+                                        freshness: Freshness {
+                                            state: FreshnessState::Fresh,
+                                            observed_at: EpochMillis::from_millis(11),
+                                            revision: Revision::new(11).unwrap(),
+                                        },
+                                        summary: PlatformText::new("working").unwrap(),
+                                    },
+                                    run: Some(served_run.clone()),
+                                    attachable: true,
+                                    controllable: true,
+                                }],
+                                PlatformCursor {
+                                    authority: ResourceAuthority::Automonique,
+                                    topic: CursorTopic::new("sessions").unwrap(),
+                                    sequence: Revision::new(11).unwrap(),
+                                },
+                            )
+                            .unwrap(),
+                        )
+                    }
+                    ("snapshot", PlatformRequest::Snapshot(snapshot)) => {
+                        observed_tx
+                            .send(snapshot.resources.clone())
+                            .expect("observer");
+                        if snapshot.resources.is_empty() {
+                            // Exactly what the deployment answers a request
+                            // for everything with.
+                            PlatformResponse::Refused {
+                                outcome: ReceiptOutcome::Rejected,
+                                explanation: PlatformText::new("snapshot_too_large").unwrap(),
+                            }
+                        } else {
+                            let record =
+                                |resource: ResourceCoordinate, summary: &str| ResourceRecord {
+                                    resource,
+                                    freshness: Freshness {
+                                        state: FreshnessState::Fresh,
+                                        observed_at: EpochMillis::from_millis(12),
+                                        revision: Revision::new(12).unwrap(),
+                                    },
+                                    summary: PlatformText::new(summary).unwrap(),
+                                };
+                            PlatformResponse::Snapshot(Snapshot {
+                                resources: vec![
+                                    record(served_node.clone(), "daemon ready"),
+                                    record(served_run.clone(), "run active"),
+                                ],
+                                cursor: PlatformCursor {
+                                    authority: ResourceAuthority::Automonique,
+                                    topic: CursorTopic::new("resources").unwrap(),
+                                    sequence: Revision::new(12).unwrap(),
+                                },
+                            })
+                        }
+                    }
+                    _ => panic!("unexpected {expected} request: {:?}", request.request()),
+                };
+                let body = PlatformResponseMessage::new(request.request_id().clone(), response)
+                    .to_message()
+                    .unwrap()
+                    .to_canonical_bytes();
+                stream
+                    .write_all(&u32::try_from(body.len()).unwrap().to_be_bytes())
+                    .unwrap();
+                stream.write_all(&body).unwrap();
+            }
+        });
+
+        let integration = WebIntegration::open(
+            IntegrationConfig {
+                tenant: String::from("operator"),
+                actor: String::from("operator:platform-scoped"),
+                hosts: fixture_hosts(),
+            },
+            state_dir.path(),
+            runtime_dir.path(),
+        )
+        .expect("web integration");
+        let response = api_response(
+            Route::ApiPlatform,
+            &[],
+            &integration,
+            &AppState::new(fixture_status()),
+            None,
+            None,
+            None,
+        );
+        platform_server.join().expect("platform server");
+
+        let requested = observed_rx
+            .recv()
+            .expect("the projection asked for a snapshot");
+        assert!(
+            !requested.is_empty(),
+            "an empty coordinate list asks for the whole inventory, which the authority refuses"
+        );
+        assert!(requested.len() <= MAX_SNAPSHOT_RESOURCES);
+        assert!(
+            requested.contains(&node),
+            "the projection must name the serving node under its alias"
+        );
+        assert!(
+            requested.contains(&run),
+            "the projection must name the run behind each listed session"
+        );
+
+        assert_eq!(response.status, "200 OK");
+        let body: Value = serde_json::from_slice(&response.body).expect("platform projection JSON");
+        assert_eq!(body["health"], "operational");
+        assert_eq!(body["inventory"]["state"], "available");
+        assert_eq!(body["inventory"]["scope"], "named");
+        assert_eq!(body["resources"].as_array().map(Vec::len), Some(2));
+        assert_eq!(body["resources"][1]["resource"]["id"], run.id.as_str());
+        assert_eq!(body["sessions"].as_array().map(Vec::len), Some(1));
+    }
+
     #[test]
     fn refusal_explanations_are_admitted_only_as_bare_category_tokens() {
         assert_eq!(refusal_category("snapshot_too_large"), "snapshot_too_large");
@@ -7134,7 +7389,7 @@ mod tests {
                 topic: CursorTopic::new("sessions").unwrap(),
                 sequence: Revision::new(7).unwrap(),
             };
-            for expected in ["capabilities", "snapshot", "list_sessions"] {
+            for expected in ["capabilities", "list_sessions", "snapshot"] {
                 let (mut stream, _) = platform_listener.accept().expect("platform connection");
                 let mut prefix = [0_u8; 4];
                 stream.read_exact(&mut prefix).expect("platform prefix");
@@ -7148,7 +7403,10 @@ mod tests {
                         PlatformResponse::Capabilities(Capabilities::platform_v1())
                     }
                     ("snapshot", PlatformRequest::Snapshot(snapshot)) => {
-                        assert!(snapshot.resources.is_empty());
+                        // The fail-soft is still reachable, but only because
+                        // an authority may refuse a named request too. It is
+                        // no longer reachable by the inventory growing.
+                        assert!(!snapshot.resources.is_empty());
                         PlatformResponse::Refused {
                             outcome: ReceiptOutcome::Rejected,
                             explanation: PlatformText::new("snapshot_too_large").unwrap(),
@@ -7239,6 +7497,7 @@ mod tests {
         assert_eq!(body["schema"], "automonique.dashboard.platform/v2");
         assert_eq!(body["cursor"], Value::Null);
         assert_eq!(body["inventory"]["state"], "refused");
+        assert_eq!(body["inventory"]["scope"], "named");
         assert_eq!(
             body["inventory"]["explanation"],
             Value::String(String::from("snapshot_too_large"))

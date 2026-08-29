@@ -29,6 +29,13 @@ build, so a guessed one would make the report fiction.
 | `hosted_attention_corpus_available` | derived | The deployment actually serves resources, so the cross-client comparison has something to compare. |
 | `deployed_build_attribution` | local | Every probed build's running binary appears in a release manifest, so the record can name the revision it accepted. |
 
+`inventory.state` on that projection means a scoped read succeeded, not that
+the whole inventory fit in one response. The projection names the coordinates
+it needs (the serving node, the action catalogue, and the run behind each
+listed session) because an unscoped request means *everything* and is refused
+with `snapshot_too_large` once the inventory outgrows one response. The
+projection says so in `inventory.scope`, which reads `named`.
+
 ## Reaching the gate
 
 The hosted entry is fronted by Cloudflare, which answers 403 to the standard
