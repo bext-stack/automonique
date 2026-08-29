@@ -27,6 +27,9 @@ use automonique_protocol::platform_v2_review::{
     ReviewField, ReviewFreshness, ReviewFreshnessState, ReviewReceiptOutcome, ReviewReconciliation,
     ReviewSchemaVersion, ReviewSnapshot, ReviewStatusProjection, ReviewText,
 };
+use automonique_protocol::platform_v2_review::{
+    MergeReadiness, PullRequestId, PullRequestProjection,
+};
 use automonique_protocol::platform_v2_review_api::{
     decode_review_action_receipt, decode_review_action_request, decode_review_snapshot,
     encode_review_action_receipt, encode_review_action_request, encode_review_snapshot,
@@ -38,7 +41,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{StoreError, validate_database_path};
 
-pub const REVIEW_STORE_SCHEMA_VERSION: u32 = 6;
+pub const REVIEW_STORE_SCHEMA_VERSION: u32 = 7;
 const MAX_PROVIDER_OBSERVATION_BYTES: usize = 4096;
 const MAX_REVIEW_EFFECT_PAYLOAD_BYTES: usize = 1_048_576;
 
@@ -270,6 +273,56 @@ ALTER TABLE review_github_check_effect_plans ADD COLUMN receipt_correlation_dige
 "#;
 const ADD_GITHUB_WORKSPACE_REVISION_V6: &str = r#"
 ALTER TABLE review_github_check_effect_plans ADD COLUMN expected_workspace_revision INTEGER CHECK (expected_workspace_revision IS NULL OR expected_workspace_revision >= 1);
+"#;
+
+// A separate table rather than more nullable columns on the check-rerun one.
+// The two share a custody vocabulary and nothing else: a rerun is keyed on a
+// run and an attempt, a pull-request write on a branch pair, a number and the
+// exact head it was fenced on. Folding them would make every check constraint
+// on that table conditional, which is how a fence stops being one.
+//
+// `natural_key` is the cross-actor exactly-once fence, the analogue of the
+// check table's UNIQUE(run_id, observed_attempt). It is built in Rust so each
+// family can state its own identity: one open per exact head commit on the
+// head branch, one retitle per pull request per title, one merge per pull
+// request per exact head.
+//
+// `opened_pull_request_number` is write-once and exists only for an open. A
+// created pull request has an identity that did not exist before the write,
+// and a later read cannot tell ours from anyone else's, so the number GitHub
+// returned must be durable or the effect becomes permanently uncorrelatable.
+const ADD_GITHUB_PULL_REQUEST_EFFECT_PLANS_V7: &str = r#"
+CREATE TABLE review_github_pull_request_effect_plans (
+    preview_id TEXT PRIMARY KEY REFERENCES review_action_previews(preview_id),
+    request_digest BLOB NOT NULL CHECK (length(request_digest) = 32),
+    registry_generation_digest BLOB NOT NULL CHECK (length(registry_generation_digest) = 32),
+    credential_generation_digest BLOB NOT NULL CHECK (length(credential_generation_digest) = 32),
+    credential_reference TEXT NOT NULL,
+    repository_owner TEXT NOT NULL,
+    repository_name TEXT NOT NULL,
+    repository_owner_normalized TEXT NOT NULL CHECK(repository_owner_normalized = lower(repository_owner)),
+    repository_name_normalized TEXT NOT NULL CHECK(repository_name_normalized = lower(repository_name)),
+    family TEXT NOT NULL CHECK (family IN ('open','update','merge')),
+    base_branch TEXT NOT NULL,
+    head_branch TEXT NOT NULL CHECK (head_branch <> base_branch),
+    pull_request_number INTEGER CHECK (pull_request_number IS NULL OR pull_request_number >= 1),
+    observed_head_sha TEXT NOT NULL,
+    title TEXT,
+    expected_pull_request_revision INTEGER NOT NULL CHECK (expected_pull_request_revision >= 1),
+    natural_key TEXT NOT NULL,
+    custody TEXT NOT NULL CHECK (custody IN ('not_started','custody_started','accepted','ambiguous','refused','completed')),
+    opened_pull_request_number INTEGER CHECK (opened_pull_request_number IS NULL OR opened_pull_request_number >= 1),
+    plan_document BLOB NOT NULL,
+    plan_digest BLOB NOT NULL CHECK (length(plan_digest) = 32),
+    receipt_correlation_digest BLOB NOT NULL CHECK (length(receipt_correlation_digest) = 32),
+    expected_workspace_revision INTEGER NOT NULL CHECK (expected_workspace_revision >= 1),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+    CHECK ((family = 'open') = (pull_request_number IS NULL)),
+    CHECK ((family = 'merge') = (title IS NULL)),
+    CHECK (family = 'open' OR opened_pull_request_number IS NULL),
+    UNIQUE(repository_owner_normalized,repository_name_normalized,natural_key)
+) STRICT;
 "#;
 
 #[derive(Debug)]
@@ -509,6 +562,35 @@ pub struct ReviewExternalEffectPlan {
     document: Vec<u8>,
     digest: [u8; 32],
     github_check: Option<GitHubCheckEffectPlan>,
+    github_pull_request: Option<GitHubPullRequestEffectPlan>,
+}
+
+/// Which independently withheld pull-request write a stored plan is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewPullRequestFamily {
+    Open,
+    Update,
+    Merge,
+}
+
+impl ReviewPullRequestFamily {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Update => "update",
+            Self::Merge => "merge",
+        }
+    }
+
+    fn parse(value: &str) -> Stored<Self> {
+        match value {
+            "open" => Ok(Self::Open),
+            "update" => Ok(Self::Update),
+            "merge" => Ok(Self::Merge),
+            _ => Err(ReviewStoreError::Corrupt("github_pull_request_family")),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -560,6 +642,27 @@ struct GitHubCheckEffectPlan {
     check_id: ReviewCheckId,
     expected_check_revision: Revision,
     custody: ReviewExternalEffectCustody,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitHubPullRequestEffectPlan {
+    receipt_correlation_digest: [u8; 32],
+    expected_workspace_revision: Revision,
+    credential_generation_digest: [u8; 32],
+    credential_reference: String,
+    repository_owner: String,
+    repository_name: String,
+    family: ReviewPullRequestFamily,
+    base_branch: String,
+    head_branch: String,
+    number: Option<u32>,
+    observed_head_sha: String,
+    title: Option<String>,
+    expected_pull_request_revision: Revision,
+    custody: ReviewExternalEffectCustody,
+    /// The provider-issued number an accepted open returned. Write-once, and
+    /// only ever set for an open.
+    opened_number: Option<u32>,
 }
 
 impl ReviewExternalEffectPlan {
@@ -648,6 +751,7 @@ impl ReviewExternalEffectPlan {
             document,
             digest: plan_digest,
             github_check: None,
+            github_pull_request: None,
         })
     }
 
@@ -806,6 +910,201 @@ impl ReviewExternalEffectPlan {
                 expected_check_revision,
                 custody: ReviewExternalEffectCustody::NotStarted,
             }),
+            github_pull_request: None,
+        })
+    }
+
+    /// Build the durable plan for one pull-request write.
+    ///
+    /// Every coordinate here was either fixed by the operator registry or
+    /// already fenced by the server-owned review snapshot before it reached
+    /// this constructor, and `observed_head_sha` is the commit a live provider
+    /// read proved rather than one anybody declared.
+    #[allow(clippy::too_many_arguments)]
+    pub fn github_pull_request(
+        request_digest: [u8; 32],
+        registry_generation_digest: [u8; 32],
+        credential_generation_digest: [u8; 32],
+        credential_reference: &str,
+        repository: (&str, &str),
+        family: ReviewPullRequestFamily,
+        branches: (&str, &str),
+        number: Option<u32>,
+        observed_head_sha: &str,
+        title: Option<&str>,
+        expected_pull_request_revision: Revision,
+        expected_workspace_revision: Revision,
+        receipt_correlation_digest: [u8; 32],
+    ) -> Stored<Self> {
+        if receipt_correlation_digest == [0; 32] {
+            return Err(ReviewStoreError::InvalidField("receipt_correlation_digest"));
+        }
+        Self::github_pull_request_stored(
+            request_digest,
+            registry_generation_digest,
+            credential_generation_digest,
+            credential_reference,
+            repository,
+            family,
+            branches,
+            number,
+            observed_head_sha,
+            title,
+            expected_pull_request_revision,
+            expected_workspace_revision,
+            receipt_correlation_digest,
+            ReviewExternalEffectCustody::NotStarted,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn github_pull_request_stored(
+        request_digest: [u8; 32],
+        registry_generation_digest: [u8; 32],
+        credential_generation_digest: [u8; 32],
+        credential_reference: &str,
+        repository: (&str, &str),
+        family: ReviewPullRequestFamily,
+        branches: (&str, &str),
+        number: Option<u32>,
+        observed_head_sha: &str,
+        title: Option<&str>,
+        expected_pull_request_revision: Revision,
+        expected_workspace_revision: Revision,
+        receipt_correlation_digest: [u8; 32],
+        custody: ReviewExternalEffectCustody,
+        opened_number: Option<u32>,
+    ) -> Stored<Self> {
+        let (repository_owner, repository_name) = repository;
+        let (base_branch, head_branch) = branches;
+        let shape = match family {
+            ReviewPullRequestFamily::Open => number.is_none() && title.is_some(),
+            ReviewPullRequestFamily::Update => number.is_some() && title.is_some(),
+            ReviewPullRequestFamily::Merge => number.is_some() && title.is_none(),
+        };
+        if !safe_effect_coordinate(credential_reference)
+            || !safe_effect_coordinate(repository_owner)
+            || !safe_effect_coordinate(repository_name)
+            || !shape
+            || !safe_effect_branch(base_branch)
+            || !safe_effect_branch(head_branch)
+            || base_branch == head_branch
+            || number.is_some_and(|value| value == 0)
+            || !valid_effect_head_sha(observed_head_sha)
+            || title.is_some_and(|value| !safe_effect_title(value))
+            || revision_successor(expected_pull_request_revision).is_err()
+            || (family != ReviewPullRequestFamily::Open && opened_number.is_some())
+        {
+            return Err(ReviewStoreError::InvalidField("external_effect_plan"));
+        }
+        let mut fields = vec![
+            (
+                "base_branch".to_owned(),
+                JsonValue::String(base_branch.to_owned()),
+            ),
+            (
+                "credential_generation_digest".to_owned(),
+                JsonValue::String(digest_token(&credential_generation_digest)),
+            ),
+            (
+                "credential_reference".to_owned(),
+                JsonValue::String(credential_reference.to_owned()),
+            ),
+            (
+                "effect_kind".to_owned(),
+                JsonValue::String("github_pull_request".to_owned()),
+            ),
+            (
+                "expected_pull_request_revision".to_owned(),
+                JsonValue::Integer(db_revision(expected_pull_request_revision)?),
+            ),
+            (
+                "expected_workspace_revision".to_owned(),
+                JsonValue::Integer(db_revision(expected_workspace_revision)?),
+            ),
+            (
+                "family".to_owned(),
+                JsonValue::String(family.as_str().to_owned()),
+            ),
+            (
+                "head_branch".to_owned(),
+                JsonValue::String(head_branch.to_owned()),
+            ),
+            (
+                "observed_head_sha".to_owned(),
+                JsonValue::String(observed_head_sha.to_owned()),
+            ),
+            (
+                "receipt_correlation_digest".to_owned(),
+                JsonValue::String(digest_token(&receipt_correlation_digest)),
+            ),
+            (
+                "registry_generation_digest".to_owned(),
+                JsonValue::String(digest_token(&registry_generation_digest)),
+            ),
+            (
+                "repository_name".to_owned(),
+                JsonValue::String(repository_name.to_owned()),
+            ),
+            (
+                "repository_owner".to_owned(),
+                JsonValue::String(repository_owner.to_owned()),
+            ),
+            (
+                "request_digest".to_owned(),
+                JsonValue::String(digest_token(&request_digest)),
+            ),
+            (
+                "schema".to_owned(),
+                JsonValue::String("automonique.store/review-external-effect/v1".to_owned()),
+            ),
+        ];
+        if let Some(number) = number {
+            fields.push((
+                "pull_request_number".to_owned(),
+                JsonValue::String(number.to_string()),
+            ));
+        }
+        if let Some(title) = title {
+            fields.push(("title".to_owned(), JsonValue::String(title.to_owned())));
+        }
+        // The opened number is deliberately outside the plan document. It is
+        // learned after the plan is sealed, so folding it in would change the
+        // plan digest of an in-flight write.
+        let document = JsonValue::Object(fields).to_canonical_bytes();
+        let plan_digest = digest(&document);
+        Ok(Self {
+            request_digest,
+            registry_generation_digest,
+            provider: "github".to_owned(),
+            work_session_id: String::new(),
+            provider_session_id: String::new(),
+            work_session_revision: Revision::FIRST,
+            provider_session_revision: Revision::FIRST,
+            transport_key: String::new(),
+            payload: Vec::new(),
+            payload_digest: digest(&[]),
+            document,
+            digest: plan_digest,
+            github_check: None,
+            github_pull_request: Some(GitHubPullRequestEffectPlan {
+                receipt_correlation_digest,
+                expected_workspace_revision,
+                credential_generation_digest,
+                credential_reference: credential_reference.to_owned(),
+                repository_owner: repository_owner.to_owned(),
+                repository_name: repository_name.to_owned(),
+                family,
+                base_branch: base_branch.to_owned(),
+                head_branch: head_branch.to_owned(),
+                number,
+                observed_head_sha: observed_head_sha.to_owned(),
+                title: title.map(str::to_owned),
+                expected_pull_request_revision,
+                custody,
+                opened_number,
+            }),
         })
     }
 
@@ -815,30 +1114,110 @@ impl ReviewExternalEffectPlan {
     }
 
     #[must_use]
+    pub const fn is_github_pull_request(&self) -> bool {
+        self.github_pull_request.is_some()
+    }
+
+    /// Whether this plan is any GitHub effect.
+    ///
+    /// The custody machine, the recovery phase and the receipt correlation are
+    /// identical for a rerun and a pull-request write; only the write itself
+    /// and the projection it advances differ. Everything generic keys on this
+    /// rather than on one family, so adding a family cannot leave a shared
+    /// path silently treating it as a retained-session delivery.
+    #[must_use]
+    pub const fn is_github_effect(&self) -> bool {
+        self.github_check.is_some() || self.github_pull_request.is_some()
+    }
+
+    #[must_use]
+    pub fn github_pull_request_family(&self) -> Option<ReviewPullRequestFamily> {
+        self.github_pull_request.as_ref().map(|plan| plan.family)
+    }
+
+    #[must_use]
+    pub fn github_pull_request_base_branch(&self) -> Option<&str> {
+        self.github_pull_request
+            .as_ref()
+            .map(|plan| plan.base_branch.as_str())
+    }
+
+    #[must_use]
+    pub fn github_pull_request_head_branch(&self) -> Option<&str> {
+        self.github_pull_request
+            .as_ref()
+            .map(|plan| plan.head_branch.as_str())
+    }
+
+    #[must_use]
+    pub fn github_pull_request_number(&self) -> Option<u32> {
+        self.github_pull_request
+            .as_ref()
+            .and_then(|plan| plan.number)
+    }
+
+    #[must_use]
+    pub fn github_pull_request_observed_head_sha(&self) -> Option<&str> {
+        self.github_pull_request
+            .as_ref()
+            .map(|plan| plan.observed_head_sha.as_str())
+    }
+
+    #[must_use]
+    pub fn github_pull_request_title(&self) -> Option<&str> {
+        self.github_pull_request
+            .as_ref()
+            .and_then(|plan| plan.title.as_deref())
+    }
+
+    #[must_use]
+    pub fn github_pull_request_expected_revision(&self) -> Option<Revision> {
+        self.github_pull_request
+            .as_ref()
+            .map(|plan| plan.expected_pull_request_revision)
+    }
+
+    /// The provider-issued number an accepted open returned, if one was
+    /// durably recorded.
+    #[must_use]
+    pub fn github_pull_request_opened_number(&self) -> Option<u32> {
+        self.github_pull_request
+            .as_ref()
+            .and_then(|plan| plan.opened_number)
+    }
+
+    #[must_use]
     pub const fn github_custody(&self) -> Option<ReviewExternalEffectCustody> {
-        match &self.github_check {
-            Some(plan) => Some(plan.custody),
-            None => None,
+        match (&self.github_check, &self.github_pull_request) {
+            (Some(plan), _) => Some(plan.custody),
+            (_, Some(plan)) => Some(plan.custody),
+            _ => None,
         }
     }
 
     #[must_use]
     pub fn github_credential_reference(&self) -> Option<&str> {
-        self.github_check
-            .as_ref()
-            .map(|p| p.credential_reference.as_str())
+        match (&self.github_check, &self.github_pull_request) {
+            (Some(plan), _) => Some(plan.credential_reference.as_str()),
+            (_, Some(plan)) => Some(plan.credential_reference.as_str()),
+            _ => None,
+        }
     }
     #[must_use]
     pub fn github_repository_owner(&self) -> Option<&str> {
-        self.github_check
-            .as_ref()
-            .map(|p| p.repository_owner.as_str())
+        match (&self.github_check, &self.github_pull_request) {
+            (Some(plan), _) => Some(plan.repository_owner.as_str()),
+            (_, Some(plan)) => Some(plan.repository_owner.as_str()),
+            _ => None,
+        }
     }
     #[must_use]
     pub fn github_repository_name(&self) -> Option<&str> {
-        self.github_check
-            .as_ref()
-            .map(|p| p.repository_name.as_str())
+        match (&self.github_check, &self.github_pull_request) {
+            (Some(plan), _) => Some(plan.repository_name.as_str()),
+            (_, Some(plan)) => Some(plan.repository_name.as_str()),
+            _ => None,
+        }
     }
     #[must_use]
     pub fn github_run_id(&self) -> Option<u64> {
@@ -864,22 +1243,29 @@ impl ReviewExternalEffectPlan {
     }
     #[must_use]
     pub fn github_credential_generation_digest(&self) -> Option<[u8; 32]> {
-        self.github_check
-            .as_ref()
-            .map(|p| p.credential_generation_digest)
+        match (&self.github_check, &self.github_pull_request) {
+            (Some(plan), _) => Some(plan.credential_generation_digest),
+            (_, Some(plan)) => Some(plan.credential_generation_digest),
+            _ => None,
+        }
     }
     #[must_use]
     pub fn github_receipt_correlation_digest(&self) -> Option<[u8; 32]> {
-        self.github_check.as_ref().and_then(|p| {
-            (p.receipt_correlation_digest != [0; 32]).then_some(p.receipt_correlation_digest)
-        })
+        let digest = match (&self.github_check, &self.github_pull_request) {
+            (Some(plan), _) => plan.receipt_correlation_digest,
+            (_, Some(plan)) => plan.receipt_correlation_digest,
+            _ => return None,
+        };
+        (digest != [0; 32]).then_some(digest)
     }
 
     #[must_use]
     pub fn github_expected_workspace_revision(&self) -> Option<Revision> {
-        self.github_check
-            .as_ref()
-            .and_then(|plan| plan.expected_workspace_revision)
+        match (&self.github_check, &self.github_pull_request) {
+            (Some(plan), _) => plan.expected_workspace_revision,
+            (_, Some(plan)) => Some(plan.expected_workspace_revision),
+            _ => None,
+        }
     }
 
     #[must_use]
@@ -1205,11 +1591,22 @@ impl ReviewStore {
             request.action(),
             ReviewAction::SendCommentToAgent { .. } | ReviewAction::BatchSendCommentsToAgent { .. }
         );
-        if external_plan.is_some()
-            && !retained_session_action
-            && (!matches!(request.action(), ReviewAction::RerunCheck { .. })
-                || !external_plan.is_some_and(ReviewExternalEffectPlan::is_github_check_rerun))
-        {
+        let pull_request_action = matches!(
+            request.action(),
+            ReviewAction::OpenPullRequest { .. }
+                | ReviewAction::UpdatePullRequest { .. }
+                | ReviewAction::MergePullRequest { .. }
+        );
+        let plan_matches_action = match request.action() {
+            ReviewAction::RerunCheck { .. } => {
+                external_plan.is_some_and(ReviewExternalEffectPlan::is_github_check_rerun)
+            }
+            _ if pull_request_action => {
+                external_plan.is_some_and(ReviewExternalEffectPlan::is_github_pull_request)
+            }
+            _ => false,
+        };
+        if external_plan.is_some() && !retained_session_action && !plan_matches_action {
             return Err(ReviewStoreError::InvalidField("external_effect_action"));
         }
         if retained_session_action && external_plan.is_none() {
@@ -1238,6 +1635,58 @@ impl ReviewStore {
             } = request.action()
             {
                 revision_successor(*expected_check_revision)?;
+            }
+        }
+        // The stored plan must describe the exact action it was prepared for.
+        // A plan and a request that disagree about which pull request, which
+        // title or which head is being written would let a confirmed preview
+        // execute a different write than the one it was confirmed for.
+        if let Some(plan) = external_plan.filter(|plan| plan.is_github_pull_request()) {
+            revision_successor(request.expected_revision())?;
+            let coherent = match request.action() {
+                ReviewAction::OpenPullRequest {
+                    expected_pull_request_revision,
+                    title,
+                } => {
+                    plan.github_pull_request_family() == Some(ReviewPullRequestFamily::Open)
+                        && plan.github_pull_request_number().is_none()
+                        && plan.github_pull_request_title() == Some(title.as_str())
+                        && plan.github_pull_request_expected_revision()
+                            == Some(*expected_pull_request_revision)
+                }
+                ReviewAction::UpdatePullRequest {
+                    pull_request_id,
+                    expected_pull_request_revision,
+                    title,
+                } => {
+                    plan.github_pull_request_family() == Some(ReviewPullRequestFamily::Update)
+                        && plan.github_pull_request_number()
+                            == pull_request_number(pull_request_id).ok()
+                        && plan.github_pull_request_title() == Some(title.as_str())
+                        && plan.github_pull_request_expected_revision()
+                            == Some(*expected_pull_request_revision)
+                }
+                ReviewAction::MergePullRequest {
+                    pull_request_id,
+                    expected_pull_request_revision,
+                    expected_head_revision,
+                } => {
+                    plan.github_pull_request_family() == Some(ReviewPullRequestFamily::Merge)
+                        && plan.github_pull_request_number()
+                            == pull_request_number(pull_request_id).ok()
+                        && plan.github_pull_request_title().is_none()
+                        && plan.github_pull_request_observed_head_sha()
+                            == Some(expected_head_revision.as_str())
+                        && plan.github_pull_request_expected_revision()
+                            == Some(*expected_pull_request_revision)
+                }
+                _ => false,
+            };
+            if !coherent {
+                return Err(ReviewStoreError::Conflict("external_effect_request"));
+            }
+            if let Some(revision) = plan.github_pull_request_expected_revision() {
+                revision_successor(revision)?;
             }
         }
         let (kind, id) = workspace_parts(request.workspace());
@@ -1658,7 +2107,7 @@ impl ReviewStore {
         require_active_authority(&transaction, &action.request, now_ms)?;
         if action.write_admitted_at_ms.is_some() {
             if let Some(plan) = read_external_plan(&transaction, preview_id)?
-                && plan.is_github_check_rerun()
+                && plan.is_github_effect()
                 && plan.github_custody() == Some(ReviewExternalEffectCustody::NotStarted)
             {
                 return Err(ReviewStoreError::Corrupt("github_check_custody"));
@@ -1683,18 +2132,23 @@ impl ReviewStore {
         if changed != 1 {
             return Err(ReviewStoreError::Conflict("write_admission"));
         }
-        let github_plan: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM review_github_check_effect_plans WHERE preview_id=?1)",
-            [preview_id],
-            |row| row.get(0),
-        )?;
-        if github_plan {
+        for table in GITHUB_EFFECT_TABLES {
+            let present: bool = transaction.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE preview_id=?1)"),
+                [preview_id],
+                |row| row.get(0),
+            )?;
+            if !present {
+                continue;
+            }
             let changed = transaction.execute(
-                "UPDATE review_github_check_effect_plans SET custody='custody_started',updated_at_ms=?1 WHERE preview_id=?2 AND custody='not_started'",
+                &format!(
+                    "UPDATE {table} SET custody='custody_started',updated_at_ms=?1 WHERE preview_id=?2 AND custody='not_started'"
+                ),
                 params![now_ms, preview_id],
             )?;
             if changed != 1 {
-                return Err(ReviewStoreError::Conflict("github_check_custody"));
+                return Err(ReviewStoreError::Conflict("github_effect_custody"));
             }
         }
         let result = read_action_by_preview(&transaction, preview_id)?
@@ -1735,13 +2189,16 @@ impl ReviewStore {
         }
         let plan = read_external_plan(&transaction, preview_id)?
             .ok_or(ReviewStoreError::Corrupt("external_effect_plan"))?;
-        if plan.is_github_check_rerun() {
+        if plan.is_github_effect() {
+            let table = github_effect_table(&plan);
             let changed = transaction.execute(
-                "UPDATE review_github_check_effect_plans SET custody='refused',updated_at_ms=?1 WHERE preview_id=?2 AND custody='not_started'",
+                &format!(
+                    "UPDATE {table} SET custody='refused',updated_at_ms=?1 WHERE preview_id=?2 AND custody='not_started'"
+                ),
                 params![now_ms, preview_id],
             )?;
             if changed != 1 {
-                return Err(ReviewStoreError::Conflict("github_check_custody"));
+                return Err(ReviewStoreError::Conflict("github_effect_custody"));
             }
         } else {
             release_external_plan_before_write(&transaction, preview_id)?;
@@ -1789,11 +2246,14 @@ impl ReviewStore {
             transaction.commit()?;
             return Ok(action.receipt);
         }
-        if read_external_plan(&transaction, preview_id)?
-            .is_some_and(|plan| plan.is_github_check_rerun())
+        if let Some(plan) =
+            read_external_plan(&transaction, preview_id)?.filter(|plan| plan.is_github_effect())
         {
+            let table = github_effect_table(&plan);
             transaction.execute(
-                "UPDATE review_github_check_effect_plans SET custody='ambiguous',updated_at_ms=?1 WHERE preview_id=?2 AND custody IN ('custody_started','accepted','ambiguous')",
+                &format!(
+                    "UPDATE {table} SET custody='ambiguous',updated_at_ms=?1 WHERE preview_id=?2 AND custody IN ('custody_started','accepted','ambiguous')"
+                ),
                 params![now_ms, preview_id],
             )?;
         }
@@ -1939,6 +2399,206 @@ impl ReviewStore {
                     .map_err(protocol)?
                 } else {
                     let next = github_check_rerun_snapshot(&current, &action.request, now_ms)?;
+                    persist_snapshot(&transaction, &next, now_ms)?;
+                    ReviewActionReceipt::new(
+                        action.receipt.receipt_id().clone(),
+                        action.receipt.idempotency_key().clone(),
+                        action.receipt.action_id().clone(),
+                        action.receipt.actor().clone(),
+                        ReviewReceiptOutcome::Completed,
+                        Some(next.revision()),
+                        None,
+                        ReviewReconciliation::Final,
+                    )
+                    .map_err(protocol)?
+                }
+            }
+            ReviewExternalEffectCustody::NotStarted
+            | ReviewExternalEffectCustody::CustodyStarted => unreachable!(),
+        };
+        if receipt != action.receipt {
+            update_receipt(&transaction, preview_id, &receipt, now_ms)?;
+        }
+        transaction.commit()?;
+        Ok(receipt)
+    }
+
+    /// Persist the observed GitHub custody transition for one pull-request
+    /// write and its receipt, in one transaction.
+    ///
+    /// `opened_number` is the provider-issued number a create returned. It is
+    /// required exactly when an open reaches `Accepted` or `Completed`, and it
+    /// is write-once: a second call naming a different number is a conflict
+    /// rather than an update, because the pull request this process opened
+    /// cannot change identity.
+    ///
+    /// `Completed` advances the local pull-request projection. It claims only
+    /// what the write did: an open becomes an open pull request at the head it
+    /// proposed, a retitle changes nothing observable but the revision, and a
+    /// merge becomes merged with its readiness reset, because "ready to merge"
+    /// is not a thing a merged pull request can be.
+    pub fn settle_github_pull_request(
+        &mut self,
+        preview_id: &str,
+        request_digest: [u8; 32],
+        custody: ReviewExternalEffectCustody,
+        opened_number: Option<u32>,
+        now_ms: i64,
+    ) -> Stored<ReviewActionReceipt> {
+        validate_time(now_ms)?;
+        if matches!(
+            custody,
+            ReviewExternalEffectCustody::NotStarted | ReviewExternalEffectCustody::CustodyStarted
+        ) {
+            return Err(ReviewStoreError::InvalidField(
+                "github_pull_request_custody",
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let action =
+            read_action_by_preview(&transaction, preview_id)?.ok_or(ReviewStoreError::NotFound)?;
+        if action.request_digest != request_digest
+            || action.write_admitted_at_ms.is_none()
+            || !matches!(
+                action.request.action(),
+                ReviewAction::OpenPullRequest { .. }
+                    | ReviewAction::UpdatePullRequest { .. }
+                    | ReviewAction::MergePullRequest { .. }
+            )
+        {
+            return Err(ReviewStoreError::Conflict("external_effect_completion"));
+        }
+        let plan = read_external_plan(&transaction, preview_id)?
+            .ok_or(ReviewStoreError::Corrupt("external_effect_plan"))?;
+        if !plan.is_github_pull_request() {
+            return Err(ReviewStoreError::Conflict("external_effect_completion"));
+        }
+        let family = plan
+            .github_pull_request_family()
+            .ok_or(ReviewStoreError::Corrupt("github_pull_request_family"))?;
+        let current_custody = plan
+            .github_custody()
+            .ok_or(ReviewStoreError::Corrupt("github_pull_request_custody"))?;
+        // Only an open ever carries a provider-issued number, and an open that
+        // reached an acknowledged state must carry one: without it the pull
+        // request this process created can never be named again.
+        let number_required = family == ReviewPullRequestFamily::Open
+            && matches!(
+                custody,
+                ReviewExternalEffectCustody::Accepted | ReviewExternalEffectCustody::Completed
+            );
+        if (family != ReviewPullRequestFamily::Open && opened_number.is_some())
+            || (number_required && opened_number.is_none())
+            || opened_number.is_some_and(|value| value == 0)
+        {
+            return Err(ReviewStoreError::InvalidField("github_pull_request_number"));
+        }
+        let stored_number = plan.github_pull_request_opened_number();
+        if let (Some(stored), Some(supplied)) = (stored_number, opened_number)
+            && stored != supplied
+        {
+            return Err(ReviewStoreError::Conflict("github_pull_request_number"));
+        }
+        let effective_number = opened_number.or(stored_number);
+        if matches!(
+            current_custody,
+            ReviewExternalEffectCustody::Refused | ReviewExternalEffectCustody::Completed
+        ) {
+            if current_custody == custody {
+                transaction.commit()?;
+                return Ok(action.receipt);
+            }
+            return Err(ReviewStoreError::Conflict("github_pull_request_custody"));
+        }
+        let allowed = match custody {
+            ReviewExternalEffectCustody::Accepted => matches!(
+                current_custody,
+                ReviewExternalEffectCustody::CustodyStarted | ReviewExternalEffectCustody::Accepted
+            ),
+            ReviewExternalEffectCustody::Ambiguous => matches!(
+                current_custody,
+                ReviewExternalEffectCustody::CustodyStarted
+                    | ReviewExternalEffectCustody::Accepted
+                    | ReviewExternalEffectCustody::Ambiguous
+            ),
+            ReviewExternalEffectCustody::Refused => {
+                current_custody == ReviewExternalEffectCustody::CustodyStarted
+            }
+            ReviewExternalEffectCustody::Completed => matches!(
+                current_custody,
+                ReviewExternalEffectCustody::CustodyStarted
+                    | ReviewExternalEffectCustody::Accepted
+                    | ReviewExternalEffectCustody::Ambiguous
+            ),
+            ReviewExternalEffectCustody::NotStarted
+            | ReviewExternalEffectCustody::CustodyStarted => false,
+        };
+        if !allowed {
+            return Err(ReviewStoreError::Conflict("github_pull_request_custody"));
+        }
+        let changed = transaction.execute(
+            "UPDATE review_github_pull_request_effect_plans SET custody=?1,opened_pull_request_number=?2,updated_at_ms=?3 WHERE preview_id=?4 AND custody=?5 AND (opened_pull_request_number IS NULL OR opened_pull_request_number=?2)",
+            params![
+                custody.as_str(),
+                effective_number.map(i64::from),
+                now_ms,
+                preview_id,
+                current_custody.as_str()
+            ],
+        )?;
+        if changed != 1 {
+            return Err(ReviewStoreError::Conflict("github_pull_request_custody"));
+        }
+        let receipt = match custody {
+            ReviewExternalEffectCustody::Accepted => action.receipt.clone(),
+            ReviewExternalEffectCustody::Ambiguous => ReviewActionReceipt::new(
+                action.receipt.receipt_id().clone(),
+                action.receipt.idempotency_key().clone(),
+                action.receipt.action_id().clone(),
+                action.receipt.actor().clone(),
+                ReviewReceiptOutcome::Unknown,
+                None,
+                None,
+                ReviewReconciliation::PollReceipt,
+            )
+            .map_err(protocol)?,
+            ReviewExternalEffectCustody::Refused => ReviewActionReceipt::new(
+                action.receipt.receipt_id().clone(),
+                action.receipt.idempotency_key().clone(),
+                action.receipt.action_id().clone(),
+                action.receipt.actor().clone(),
+                ReviewReceiptOutcome::Refused,
+                None,
+                None,
+                ReviewReconciliation::Final,
+            )
+            .map_err(protocol)?,
+            ReviewExternalEffectCustody::Completed => {
+                let (kind, id) = workspace_parts(action.request.workspace());
+                let current = read_current_snapshot(&transaction, kind, id)?
+                    .ok_or(ReviewStoreError::Corrupt("current_snapshot"))?;
+                if current.revision() != action.request.expected_revision() {
+                    ReviewActionReceipt::new(
+                        action.receipt.receipt_id().clone(),
+                        action.receipt.idempotency_key().clone(),
+                        action.receipt.action_id().clone(),
+                        action.receipt.actor().clone(),
+                        ReviewReceiptOutcome::Conflict,
+                        None,
+                        Some(current.revision()),
+                        ReviewReconciliation::Final,
+                    )
+                    .map_err(protocol)?
+                } else {
+                    let next = github_pull_request_snapshot(
+                        &current,
+                        &action.request,
+                        &plan,
+                        effective_number,
+                        now_ms,
+                    )?;
                     persist_snapshot(&transaction, &next, now_ms)?;
                     ReviewActionReceipt::new(
                         action.receipt.receipt_id().clone(),
@@ -2478,6 +3138,7 @@ fn initialize(connection: &mut Connection) -> Stored<bool> {
         transaction.execute_batch(ADD_GITHUB_CHECK_EFFECT_PLANS_V4)?;
         transaction.execute_batch(ADD_REVIEW_RECEIPT_CORRELATION_V5)?;
         transaction.execute_batch(ADD_GITHUB_WORKSPACE_REVISION_V6)?;
+        transaction.execute_batch(ADD_GITHUB_PULL_REQUEST_EFFECT_PLANS_V7)?;
     } else if version == 1 {
         transaction.execute_batch(ADD_SNAPSHOT_PROTOCOL_SCHEMA_V2)?;
         migrate_review_v1_snapshots(&transaction)?;
@@ -2485,22 +3146,29 @@ fn initialize(connection: &mut Connection) -> Stored<bool> {
         transaction.execute_batch(ADD_GITHUB_CHECK_EFFECT_PLANS_V4)?;
         transaction.execute_batch(ADD_REVIEW_RECEIPT_CORRELATION_V5)?;
         transaction.execute_batch(ADD_GITHUB_WORKSPACE_REVISION_V6)?;
+        transaction.execute_batch(ADD_GITHUB_PULL_REQUEST_EFFECT_PLANS_V7)?;
         terminalize_legacy_external_actions(&transaction)?;
     } else if version == 2 {
         transaction.execute_batch(ADD_EXTERNAL_EFFECT_PLANS_V3)?;
         transaction.execute_batch(ADD_GITHUB_CHECK_EFFECT_PLANS_V4)?;
         transaction.execute_batch(ADD_REVIEW_RECEIPT_CORRELATION_V5)?;
         transaction.execute_batch(ADD_GITHUB_WORKSPACE_REVISION_V6)?;
+        transaction.execute_batch(ADD_GITHUB_PULL_REQUEST_EFFECT_PLANS_V7)?;
         terminalize_legacy_external_actions(&transaction)?;
     } else if version == 3 {
         transaction.execute_batch(ADD_GITHUB_CHECK_EFFECT_PLANS_V4)?;
         transaction.execute_batch(ADD_REVIEW_RECEIPT_CORRELATION_V5)?;
         transaction.execute_batch(ADD_GITHUB_WORKSPACE_REVISION_V6)?;
+        transaction.execute_batch(ADD_GITHUB_PULL_REQUEST_EFFECT_PLANS_V7)?;
     } else if version == 4 {
         transaction.execute_batch(ADD_REVIEW_RECEIPT_CORRELATION_V5)?;
         transaction.execute_batch(ADD_GITHUB_WORKSPACE_REVISION_V6)?;
+        transaction.execute_batch(ADD_GITHUB_PULL_REQUEST_EFFECT_PLANS_V7)?;
     } else if version == 5 {
         transaction.execute_batch(ADD_GITHUB_WORKSPACE_REVISION_V6)?;
+        transaction.execute_batch(ADD_GITHUB_PULL_REQUEST_EFFECT_PLANS_V7)?;
+    } else if version == 6 {
+        transaction.execute_batch(ADD_GITHUB_PULL_REQUEST_EFFECT_PLANS_V7)?;
     } else {
         return Err(ReviewStoreError::SchemaVersion {
             found: version,
@@ -2749,7 +3417,7 @@ fn bind_authority_namespace(
         Some(_) => Ok(()),
         None => {
             let populated: bool = connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM review_current UNION ALL SELECT 1 FROM review_snapshots UNION ALL SELECT 1 FROM review_comments UNION ALL SELECT 1 FROM review_authority_grants UNION ALL SELECT 1 FROM review_authority_grant_events UNION ALL SELECT 1 FROM review_action_previews UNION ALL SELECT 1 FROM review_action_approvals UNION ALL SELECT 1 FROM review_action_receipts UNION ALL SELECT 1 FROM review_completion_evidence UNION ALL SELECT 1 FROM review_provider_observations UNION ALL SELECT 1 FROM review_external_effect_plans UNION ALL SELECT 1 FROM review_github_check_effect_plans)",
+                "SELECT EXISTS(SELECT 1 FROM review_current UNION ALL SELECT 1 FROM review_snapshots UNION ALL SELECT 1 FROM review_comments UNION ALL SELECT 1 FROM review_authority_grants UNION ALL SELECT 1 FROM review_authority_grant_events UNION ALL SELECT 1 FROM review_action_previews UNION ALL SELECT 1 FROM review_action_approvals UNION ALL SELECT 1 FROM review_action_receipts UNION ALL SELECT 1 FROM review_completion_evidence UNION ALL SELECT 1 FROM review_provider_observations UNION ALL SELECT 1 FROM review_external_effect_plans UNION ALL SELECT 1 FROM review_github_check_effect_plans UNION ALL SELECT 1 FROM review_github_pull_request_effect_plans)",
                 [],
                 |row| row.get(0),
             )?;
@@ -3531,6 +4199,70 @@ fn release_external_plan_before_write(connection: &Connection, preview_id: &str)
     Ok(())
 }
 
+/// Every table one GitHub effect plan may live in.
+const GITHUB_EFFECT_TABLES: [&str; 2] = [
+    "review_github_check_effect_plans",
+    "review_github_pull_request_effect_plans",
+];
+
+/// The one table this plan lives in.
+///
+/// Only ever called for a plan that already answered yes to
+/// `is_github_effect`, so the check-rerun table is the correct fallback
+/// rather than a guess.
+fn github_effect_table(plan: &ReviewExternalEffectPlan) -> &'static str {
+    if plan.is_github_pull_request() {
+        GITHUB_EFFECT_TABLES[1]
+    } else {
+        GITHUB_EFFECT_TABLES[0]
+    }
+}
+
+/// Read the pull-request number out of a review projection id.
+///
+/// The review contract's opaque id *is* the GitHub number in decimal for a
+/// GitHub-backed workspace, and the grammar is strict so one pull request has
+/// exactly one spelling: two spellings of a coordinate is two rows in every
+/// fence keyed on it.
+fn pull_request_number(id: &PullRequestId) -> Stored<u32> {
+    let value = id.as_str();
+    if value.is_empty()
+        || value.len() > 7
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        return Err(ReviewStoreError::InvalidField("pull_request_id"));
+    }
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|number| *number > 0)
+        .ok_or(ReviewStoreError::InvalidField("pull_request_id"))
+}
+
+/// The branch grammar the connector accepts, restated so a stored plan cannot
+/// hold a branch the connector would refuse to address.
+fn safe_effect_branch(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.starts_with('-')
+        && !value.starts_with('.')
+        && !value.ends_with('.')
+        && !value.ends_with(".lock")
+        && !value.contains("..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn safe_effect_title(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && value.len() <= 256
+        && trimmed == value
+        && !value.chars().any(char::is_control)
+}
+
 fn safe_effect_coordinate(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256
@@ -3619,6 +4351,143 @@ fn github_check_rerun_snapshot(
         checks,
         current.review().clone(),
         current.pull_request().clone(),
+        current.delivery().clone(),
+        current.attention_events().to_vec(),
+    )
+    .map_err(protocol)
+}
+
+fn github_pull_request_snapshot(
+    current: &ReviewSnapshot,
+    request: &ReviewActionRequest,
+    plan: &ReviewExternalEffectPlan,
+    opened_number: Option<u32>,
+    recorded_at_ms: i64,
+) -> Stored<ReviewSnapshot> {
+    if current.schema() != ReviewSchemaVersion::V2
+        || current.workspace() != request.workspace()
+        || current.revision() != request.expected_revision()
+    {
+        return Err(ReviewStoreError::Conflict("external_effect_completion"));
+    }
+    let family = plan
+        .github_pull_request_family()
+        .ok_or(ReviewStoreError::Corrupt("github_pull_request_family"))?;
+    let expected_pull_request_revision = plan
+        .github_pull_request_expected_revision()
+        .ok_or(ReviewStoreError::Corrupt("external_effect_plan"))?;
+    let observed_head_sha = plan
+        .github_pull_request_observed_head_sha()
+        .ok_or(ReviewStoreError::Corrupt("external_effect_plan"))?;
+    let projection = current.pull_request();
+    if projection.freshness().observed_revision() != expected_pull_request_revision {
+        return Err(ReviewStoreError::Conflict("external_effect_completion"));
+    }
+    let next_revision = Revision::new(
+        current
+            .revision()
+            .get()
+            .checked_add(1)
+            .ok_or(ReviewStoreError::InvalidField("revision"))?,
+    )
+    .map_err(|_| ReviewStoreError::InvalidField("revision"))?;
+    let next_pull_request_revision = Revision::new(
+        expected_pull_request_revision
+            .get()
+            .checked_add(1)
+            .ok_or(ReviewStoreError::InvalidField("revision"))?,
+    )
+    .map_err(|_| ReviewStoreError::InvalidField("revision"))?;
+    let observed_at_ms =
+        u64::try_from(recorded_at_ms).map_err(|_| ReviewStoreError::InvalidField("time"))?;
+    let head_revision =
+        ReviewField::new(observed_head_sha).map_err(|_| ReviewStoreError::InvalidField("head"))?;
+    let next_pull_request = match family {
+        ReviewPullRequestFamily::Open => {
+            // The projection must still say absent. Anything else means the
+            // workspace learned about a pull request between admission and
+            // completion, and adopting a second one would overwrite it.
+            if projection.state() != PullRequestState::Absent {
+                return Err(ReviewStoreError::Conflict("external_effect_completion"));
+            }
+            let number =
+                opened_number.ok_or(ReviewStoreError::Corrupt("github_pull_request_number"))?;
+            PullRequestProjection::new(
+                Some(
+                    PullRequestId::new(number.to_string())
+                        .map_err(|_| ReviewStoreError::InvalidField("pull_request_id"))?,
+                ),
+                PullRequestState::Open,
+                // Nothing about opening a pull request says GitHub will merge
+                // it. Readiness is what a later observation reports, never
+                // what this write assumed.
+                MergeReadiness::Unknown,
+                Some(head_revision),
+                projection.authority().clone(),
+                ReviewFreshness::new(
+                    ReviewFreshnessState::Fresh,
+                    next_pull_request_revision,
+                    observed_at_ms,
+                )
+                .map_err(protocol)?,
+            )
+            .map_err(protocol)?
+        }
+        ReviewPullRequestFamily::Update | ReviewPullRequestFamily::Merge => {
+            let number = plan
+                .github_pull_request_number()
+                .ok_or(ReviewStoreError::Corrupt("github_pull_request_number"))?;
+            let expected_id = PullRequestId::new(number.to_string())
+                .map_err(|_| ReviewStoreError::InvalidField("pull_request_id"))?;
+            if projection.id() != Some(&expected_id) {
+                return Err(ReviewStoreError::Conflict("external_effect_completion"));
+            }
+            let (state, readiness) = if family == ReviewPullRequestFamily::Merge {
+                if projection.state() != PullRequestState::Open
+                    || projection.head_revision().map(ReviewField::as_str)
+                        != Some(observed_head_sha)
+                {
+                    return Err(ReviewStoreError::Conflict("external_effect_completion"));
+                }
+                // A merged pull request is not "ready to merge", so the
+                // readiness the merge was advertised on is retired with it.
+                (PullRequestState::Merged, MergeReadiness::Unknown)
+            } else {
+                if !matches!(
+                    projection.state(),
+                    PullRequestState::Draft | PullRequestState::Open
+                ) {
+                    return Err(ReviewStoreError::Conflict("external_effect_completion"));
+                }
+                // A retitle changes nothing the projection carries. The
+                // revision still moves, because the pull request was written.
+                (projection.state(), projection.readiness())
+            };
+            PullRequestProjection::new(
+                Some(expected_id),
+                state,
+                readiness,
+                projection.head_revision().cloned(),
+                projection.authority().clone(),
+                ReviewFreshness::new(
+                    ReviewFreshnessState::Fresh,
+                    next_pull_request_revision,
+                    observed_at_ms,
+                )
+                .map_err(protocol)?,
+            )
+            .map_err(protocol)?
+        }
+    };
+    ReviewSnapshot::new(
+        current.workspace().clone(),
+        next_revision,
+        current.files().to_vec(),
+        current.comments().to_vec(),
+        current.proposals().to_vec(),
+        current.checks().to_vec(),
+        current.review().clone(),
+        next_pull_request,
         current.delivery().clone(),
         current.attention_events().to_vec(),
     )
@@ -3846,7 +4715,7 @@ fn validate_external_effect_custody(
         action.request.action(),
         ReviewAction::SendCommentToAgent { .. } | ReviewAction::BatchSendCommentsToAgent { .. }
     );
-    let github_action = plan.is_some_and(ReviewExternalEffectPlan::is_github_check_rerun);
+    let github_action = plan.is_some_and(ReviewExternalEffectPlan::is_github_effect);
     let rows: Vec<(String, i64, String, String, String)> = {
         let mut statement = connection.prepare(
             "SELECT comment_id,comment_revision,workspace_kind,workspace_id,disposition FROM review_external_effect_targets WHERE preview_id=?1 ORDER BY comment_id",
@@ -4383,6 +5252,53 @@ fn insert_external_plan(
         })?;
         return Ok(());
     }
+    if let Some(github) = &plan.github_pull_request {
+        let owner_normalized = github.repository_owner.to_ascii_lowercase();
+        let repository_normalized = github.repository_name.to_ascii_lowercase();
+        let natural_key = pull_request_natural_key(github);
+        let reserved: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM review_github_pull_request_effect_plans WHERE repository_owner_normalized=?1 AND repository_name_normalized=?2 AND natural_key=?3)",
+            params![owner_normalized, repository_normalized, natural_key],
+            |row| row.get(0),
+        )?;
+        if reserved {
+            return Err(ReviewStoreError::Conflict("github_pull_request_effect"));
+        }
+        transaction.execute(
+            "INSERT INTO review_github_pull_request_effect_plans(preview_id,request_digest,registry_generation_digest,credential_generation_digest,credential_reference,repository_owner,repository_name,repository_owner_normalized,repository_name_normalized,family,base_branch,head_branch,pull_request_number,observed_head_sha,title,expected_pull_request_revision,natural_key,custody,opened_pull_request_number,plan_document,plan_digest,receipt_correlation_digest,expected_workspace_revision,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,'not_started',NULL,?18,?19,?20,?21,?22,?22)",
+            params![
+                preview_id,
+                plan.request_digest.as_slice(),
+                plan.registry_generation_digest.as_slice(),
+                github.credential_generation_digest.as_slice(),
+                github.credential_reference,
+                github.repository_owner,
+                github.repository_name,
+                owner_normalized,
+                repository_normalized,
+                github.family.as_str(),
+                github.base_branch,
+                github.head_branch,
+                github.number.map(i64::from),
+                github.observed_head_sha,
+                github.title,
+                db_revision(github.expected_pull_request_revision)?,
+                natural_key,
+                plan.document,
+                plan.digest.as_slice(),
+                github.receipt_correlation_digest.as_slice(),
+                db_revision(github.expected_workspace_revision)?,
+                created_at_ms,
+            ],
+        )
+        .map_err(|error| match &error {
+            rusqlite::Error::SqliteFailure(code, _) if matches!(code.extended_code, 1555 | 2067) => {
+                ReviewStoreError::Conflict("github_pull_request_effect")
+            }
+            _ => ReviewStoreError::Sqlite(error),
+        })?;
+        return Ok(());
+    }
     transaction.execute(
         "INSERT INTO review_external_effect_plans(preview_id,request_digest,effect_kind,registry_generation_digest,provider,work_session_id,provider_session_id,work_session_revision,provider_session_revision,transport_key,payload,payload_digest,plan_document,plan_digest,created_at_ms) VALUES(?1,?2,'retained_session',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
         params![
@@ -4453,9 +5369,12 @@ fn require_exact_external_plan(
     match (stored.as_ref(), expected) {
         (None, None) => Ok(()),
         (Some(stored), Some(expected)) if stored == expected => Ok(()),
+        // A stored GitHub plan carries live custody and, for an open, the
+        // provider-issued number it earned. Neither is part of the sealed plan
+        // document, so identity is the plan digest rather than field equality.
         (Some(stored), Some(expected))
-            if stored.is_github_check_rerun()
-                && expected.is_github_check_rerun()
+            if stored.is_github_effect()
+                && expected.is_github_effect()
                 && stored.digest() == expected.digest() =>
         {
             Ok(())
@@ -4468,16 +5387,28 @@ fn read_external_plan(
     connection: &Connection,
     preview_id: &str,
 ) -> Stored<Option<ReviewExternalEffectPlan>> {
-    let (retained_exists, github_exists): (bool, bool) = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM review_external_effect_plans WHERE preview_id=?1),EXISTS(SELECT 1 FROM review_github_check_effect_plans WHERE preview_id=?1)",
-        [preview_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    if retained_exists && github_exists {
+    let (retained_exists, github_exists, pull_request_exists): (bool, bool, bool) = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM review_external_effect_plans WHERE preview_id=?1),EXISTS(SELECT 1 FROM review_github_check_effect_plans WHERE preview_id=?1),EXISTS(SELECT 1 FROM review_github_pull_request_effect_plans WHERE preview_id=?1)",
+            [preview_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    // One preview owns at most one plan. Two would mean two different writes
+    // share a custody row, which is the state the whole exactly-once argument
+    // assumes cannot exist.
+    if [retained_exists, github_exists, pull_request_exists]
+        .iter()
+        .filter(|present| **present)
+        .count()
+        > 1
+    {
         return Err(ReviewStoreError::Corrupt("external_effect_plan"));
     }
     if github_exists {
         return read_github_check_plan(connection, preview_id);
+    }
+    if pull_request_exists {
+        return read_github_pull_request_plan(connection, preview_id);
     }
     type Raw = (
         Vec<u8>,
@@ -4660,6 +5591,169 @@ fn read_github_check_plan(
         .ok_or(ReviewStoreError::Corrupt("external_effect_plan"))?
         .custody = ReviewExternalEffectCustody::parse(&custody)?;
     Ok(Some(plan))
+}
+
+fn read_github_pull_request_plan(
+    connection: &Connection,
+    preview_id: &str,
+) -> Stored<Option<ReviewExternalEffectPlan>> {
+    type Raw = (
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<i64>,
+        String,
+        Option<String>,
+        i64,
+        String,
+        String,
+        Option<i64>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+    );
+    let raw: Option<Raw> = connection
+        .query_row(
+            "SELECT request_digest,registry_generation_digest,credential_generation_digest,credential_reference,repository_owner,repository_name,repository_owner_normalized,repository_name_normalized,family,base_branch,head_branch,pull_request_number,observed_head_sha,title,expected_pull_request_revision,natural_key,custody,opened_pull_request_number,plan_document,plan_digest,receipt_correlation_digest,expected_workspace_revision FROM review_github_pull_request_effect_plans WHERE preview_id=?1",
+            [preview_id],
+            |row| {
+                Ok((
+                    row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
+                    row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
+                    row.get(10)?, row.get(11)?, row.get(12)?, row.get(13)?, row.get(14)?,
+                    row.get(15)?, row.get(16)?, row.get(17)?, row.get(18)?, row.get(19)?,
+                    row.get(20)?, row.get(21)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        request_digest,
+        registry_digest,
+        credential_digest,
+        credential_reference,
+        owner,
+        repository,
+        owner_normalized,
+        repository_normalized,
+        family,
+        base_branch,
+        head_branch,
+        number,
+        observed_head_sha,
+        title,
+        expected_revision,
+        natural_key,
+        custody,
+        opened_number,
+        document,
+        stored_digest,
+        correlation_digest,
+        expected_workspace_revision,
+    )) = raw
+    else {
+        return Ok(None);
+    };
+    if owner.to_ascii_lowercase() != owner_normalized
+        || repository.to_ascii_lowercase() != repository_normalized
+    {
+        return Err(ReviewStoreError::Corrupt("external_effect_reservation"));
+    }
+    let request_digest: [u8; 32] = request_digest
+        .try_into()
+        .map_err(|_| ReviewStoreError::Corrupt("external_effect_request_digest"))?;
+    let registry_digest: [u8; 32] = registry_digest
+        .try_into()
+        .map_err(|_| ReviewStoreError::Corrupt("external_effect_registry_digest"))?;
+    let credential_digest: [u8; 32] = credential_digest
+        .try_into()
+        .map_err(|_| ReviewStoreError::Corrupt("external_effect_credential_digest"))?;
+    let stored_digest: [u8; 32] = stored_digest
+        .try_into()
+        .map_err(|_| ReviewStoreError::Corrupt("external_effect_plan_digest"))?;
+    let correlation_digest: [u8; 32] = correlation_digest
+        .try_into()
+        .map_err(|_| ReviewStoreError::Corrupt("receipt_correlation_digest"))?;
+    let number = number
+        .map(|value| {
+            u32::try_from(value).map_err(|_| ReviewStoreError::Corrupt("external_effect_plan"))
+        })
+        .transpose()?;
+    let opened_number = opened_number
+        .map(|value| {
+            u32::try_from(value).map_err(|_| ReviewStoreError::Corrupt("external_effect_plan"))
+        })
+        .transpose()?;
+    let family = ReviewPullRequestFamily::parse(&family)?;
+    let plan = ReviewExternalEffectPlan::github_pull_request_stored(
+        request_digest,
+        registry_digest,
+        credential_digest,
+        &credential_reference,
+        (&owner, &repository),
+        family,
+        (&base_branch, &head_branch),
+        number,
+        &observed_head_sha,
+        title.as_deref(),
+        parse_revision(expected_revision)?,
+        parse_revision(expected_workspace_revision)?,
+        correlation_digest,
+        ReviewExternalEffectCustody::parse(&custody)?,
+        opened_number,
+    )?;
+    if plan.document != document || plan.digest != stored_digest {
+        return Err(ReviewStoreError::Corrupt("external_effect_plan"));
+    }
+    // The natural key is the cross-actor fence, so a row whose stored key does
+    // not re-derive from its own coordinates is a fence that stopped fencing.
+    let Some(stored_plan) = plan.github_pull_request.as_ref() else {
+        return Err(ReviewStoreError::Corrupt("external_effect_plan"));
+    };
+    if pull_request_natural_key(stored_plan) != natural_key {
+        return Err(ReviewStoreError::Corrupt("github_pull_request_effect"));
+    }
+    Ok(Some(plan))
+}
+
+/// The cross-actor exactly-once key for one pull-request write.
+///
+/// Each family states its own identity, and each is the narrowest thing that
+/// is genuinely the same effect twice:
+///
+/// * an open is one pull request per exact head commit on the head branch, so
+///   a branch that advanced is a different proposal;
+/// * a retitle is one title per pull request, because setting the same title
+///   twice is one effect and a different title is a different one;
+/// * a merge is one landing per pull request per exact head, which is also
+///   what GitHub's own `sha` fence enforces on the other side.
+fn pull_request_natural_key(plan: &GitHubPullRequestEffectPlan) -> String {
+    match plan.family {
+        ReviewPullRequestFamily::Open => {
+            format!("open:{}:{}", plan.head_branch, plan.observed_head_sha)
+        }
+        ReviewPullRequestFamily::Update => format!(
+            "update:{}:{}",
+            plan.number.unwrap_or_default(),
+            digest_token(&digest(
+                plan.title.as_deref().unwrap_or_default().as_bytes()
+            ))
+        ),
+        ReviewPullRequestFamily::Merge => format!(
+            "merge:{}:{}",
+            plan.number.unwrap_or_default(),
+            plan.observed_head_sha
+        ),
+    }
 }
 
 fn read_action_by_preview_in_scope(
