@@ -353,6 +353,34 @@ impl AttentionSourceSnapshot {
         })
     }
 
+    /// Verify that `next` may replace this snapshot as an authenticated
+    /// complete baseline.
+    ///
+    /// A baseline is what a client reads when it has lost the chain: it may
+    /// begin above revision one and may bridge a predecessor it never saw. It
+    /// still may not rewind. `next` must advance the revision and must not
+    /// claim a predecessor older than what is already retained, because a
+    /// baseline built on an earlier point is describing a different history
+    /// rather than resynchronizing this one. Retained items may not regress.
+    ///
+    /// Only a snapshot an authenticated read returned directly may be admitted
+    /// here. A cached, synthesized, or locally assembled snapshot must go
+    /// through [`Self::validate_successor`].
+    pub fn validate_baseline(&self, next: &Self) -> Result<(), AttentionContractError> {
+        if next.source != self.source
+            || next.project != self.project
+            || next.user_workspace != self.user_workspace
+            || next.revision <= self.revision
+            || next
+                .previous_revision
+                .is_none_or(|previous| previous < self.revision)
+            || next.observed_at_ms < self.observed_at_ms
+        {
+            return Err(AttentionContractError::BaselineInvalid);
+        }
+        self.validate_item_custody(next, AttentionContractError::BaselineInvalid)
+    }
+
     /// Verify that `next` is a monotone, atomic replacement of this snapshot.
     pub fn validate_successor(&self, next: &Self) -> Result<(), AttentionContractError> {
         if next.source != self.source
@@ -364,13 +392,24 @@ impl AttentionSourceSnapshot {
         {
             return Err(AttentionContractError::SuccessorInvalid);
         }
+        self.validate_item_custody(next, AttentionContractError::SuccessorInvalid)
+    }
+
+    /// No retained item may go backwards, and an item republished at its own
+    /// revision must be identical. This holds for both replacement lanes, and
+    /// each reports the failure as its own lane's refusal.
+    fn validate_item_custody(
+        &self,
+        next: &Self,
+        refusal: AttentionContractError,
+    ) -> Result<(), AttentionContractError> {
         for next_item in &next.items {
             if let Some(current) = self.items.iter().find(|item| item.id() == next_item.id())
                 && (next_item.revision() < current.revision()
                     || next_item.observed_at_ms() < current.observed_at_ms()
                     || (next_item.revision() == current.revision() && next_item != current))
             {
-                return Err(AttentionContractError::SuccessorInvalid);
+                return Err(refusal);
             }
         }
         Ok(())
@@ -417,6 +456,7 @@ pub enum AttentionContractError {
     ItemInvalid,
     SnapshotInvalid,
     SuccessorInvalid,
+    BaselineInvalid,
 }
 
 impl From<ValueError> for AttentionContractError {

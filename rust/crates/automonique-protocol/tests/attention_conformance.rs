@@ -188,11 +188,13 @@ fn every_corpus_snapshot_is_wire_valid_and_targets_the_declared_workspace() {
     }
 }
 
-/// The corpus records what a retaining client must conclude. For a continuous
-/// read the contract itself already decides acceptance, so the two must agree:
-/// a recorded `invalid_successor` is exactly a `validate_successor` refusal.
+/// The corpus records what a retaining client must conclude. Once a snapshot is
+/// retained the contract itself decides acceptance on both lanes, so the two
+/// must agree: a recorded `invalid_successor` is exactly a `validate_successor`
+/// refusal, and a recorded `baseline_invalid` is exactly a `validate_baseline`
+/// refusal.
 #[test]
-fn recorded_continuous_outcomes_agree_with_the_contract_successor_rule() {
+fn recorded_outcomes_agree_with_the_contract_replacement_rules() {
     let corpus = corpus();
     let mut checked = 0_usize;
     for case in items(&corpus, "cases") {
@@ -213,10 +215,13 @@ fn recorded_continuous_outcomes_agree_with_the_contract_successor_rule() {
             );
 
             if let Some(current) = &retained
-                && mode == "continuous"
                 && current.revision() != candidate.revision()
             {
-                let valid = current.validate_successor(&candidate).is_ok();
+                let valid = if mode == "continuous" {
+                    current.validate_successor(&candidate).is_ok()
+                } else {
+                    current.validate_baseline(&candidate).is_ok()
+                };
                 assert_eq!(
                     valid,
                     accepted,
@@ -240,9 +245,47 @@ fn recorded_continuous_outcomes_agree_with_the_contract_successor_rule() {
         }
     }
     assert!(
-        checked > 0,
-        "the corpus exercises no continuous succession at all"
+        checked > 1,
+        "the corpus exercises neither replacement lane against a retained snapshot"
     );
+}
+
+/// The two lanes are not the same rule. A baseline exists precisely so a client
+/// that lost the chain can resynchronize, so it must accept a read the
+/// continuous lane has to refuse.
+#[test]
+fn the_baseline_lane_admits_a_bridged_gap_a_successor_lane_refuses() {
+    let corpus = corpus();
+    let mut bridged = 0_usize;
+    for case in items(&corpus, "cases") {
+        let mut retained: Option<AttentionSourceSnapshot> = None;
+        for read in items(case, "reads") {
+            if text(read, "kind") != "snapshot" {
+                continue;
+            }
+            let candidate = snapshot_of(field(read, "snapshot"));
+            let outcome = text(read, "outcome");
+            if let Some(current) = &retained
+                && text(read, "mode") == "baseline"
+                && outcome == "replaced"
+                && current.validate_successor(&candidate).is_err()
+            {
+                assert!(
+                    current.validate_baseline(&candidate).is_ok(),
+                    "case {} bridges a gap the baseline lane also refuses",
+                    text(case, "id")
+                );
+                bridged += 1;
+            }
+            if matches!(
+                outcome,
+                "inserted" | "replaced" | "exact_replay" | "availability_restored"
+            ) {
+                retained = Some(candidate);
+            }
+        }
+    }
+    assert!(bridged > 0, "the corpus never bridges a retention gap");
 }
 
 /// A case's expected visible set must be exactly the items of whatever snapshot
