@@ -2151,11 +2151,21 @@ mod tests {
     /// `mobile_review_execution_refuses_every_non_local_action_before_the_socket`
     /// already shows pull-request actions refused while the client holds only
     /// the generic `ExecuteReviewAction` grant. This pins the stronger claim
-    /// that gap depends on: `MobilePlatformV2Action` has no pull-request
-    /// member, so the delegation vocabulary cannot express pull-request write
-    /// authority at all, and holding *every* action it does have still does
-    /// not buy one. A future `MobilePlatformV2Action::MergePullRequest` would
-    /// widen `ALL` and break this test, which is the intent.
+    /// that gap depends on: holding *every* action the delegation vocabulary
+    /// has still buys no pull-request authority.
+    ///
+    /// That claim used to rest on the vocabulary being unable to name the
+    /// power at all. It no longer does. `MobilePlatformV2Action` now carries
+    /// `OpenPullRequest`, `UpdatePullRequest` and `MergePullRequest` as three
+    /// separate members, so a deployment can express withholding merge while
+    /// allowing the other two, and `ALL` has widened accordingly. The test
+    /// still passes, and that is the point: naming a power is not granting
+    /// it. The bridge maps no request onto any of the three, so they are
+    /// vocabulary without reach.
+    ///
+    /// Wiring that mapping is the deliberate step that turns them into live
+    /// grants, and it belongs with the adapter that can actually perform the
+    /// write. When someone does it, this test breaks, which is the intent.
     ///
     /// The approved action at the end gives the assertion its teeth: on the
     /// same grant, workspace, and absent socket it reaches the daemon and

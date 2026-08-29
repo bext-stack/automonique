@@ -516,6 +516,12 @@ describe("canonical HTTPS Platform v2 client", () => {
         // session is registry-owned rather than client-named, and the note
         // set is already fenced by the snapshot revision it is read at.
         agent_deliverable_comments: [{authority: {id: "review-1", kind: "review"}, comment_id: "comment-1", expected_comment_revision: WorkContextRevision(3n)}],
+        // The three pull-request grants ship empty until their adapter can
+        // preflight a write. Explicit nulls, so a client can tell "the server
+        // considered this and has nothing" from "this peer predates the field".
+        open_pull_request: null,
+        update_pull_request: null,
+        merge_pull_request: null,
         schema: PLATFORM_SCHEMA_V2,
       }}},
       {lane: "v2", request: {kind: "execute_review_action", request: {
@@ -535,6 +541,11 @@ describe("canonical HTTPS Platform v2 client", () => {
     expect((capabilities.kind === "review_capabilities" ? capabilities.capabilities.rerunnable_checks[0]?.confirmation_digest : null)).toBe(confirmation);
     expect((capabilities.kind === "review_capabilities" ? capabilities.capabilities.agent_deliverable_comments[0]?.comment_id : null)).toBe("comment-1");
     expect(capabilities.kind === "review_capabilities" ? Object.keys(capabilities.capabilities.agent_deliverable_comments[0] ?? {}).sort() : []).toEqual(["authority", "comment_id", "expected_comment_revision"]);
+    // Merging stays withheld independently of opening and updating, and today
+    // all three are withheld because nothing can preflight the write.
+    expect(capabilities.kind === "review_capabilities" ? capabilities.capabilities.merge_pull_request : undefined).toBeNull();
+    expect(capabilities.kind === "review_capabilities" ? capabilities.capabilities.open_pull_request : undefined).toBeNull();
+    expect(capabilities.kind === "review_capabilities" ? capabilities.capabilities.update_pull_request : undefined).toBeNull();
     expect((await client.executeConfirmedReviewAction(workspace, WorkContextRevision(9n), action, key, confirmation, WorkContextRevision(4n), correlation)).kind).toBe("platform_v2_refused");
   });
 

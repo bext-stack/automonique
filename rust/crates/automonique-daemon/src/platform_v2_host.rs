@@ -46,7 +46,7 @@ use automonique_protocol::platform_v2_transport::{
     PlatformV2Refusal, PlatformV2Request, PlatformV2Response, RawMutationApprovalDocument,
     RawMutationReceiptDocument, ReceiptLookupKey, ReviewAgentDeliveryCapability,
     ReviewCapabilities, ReviewCheckRerunCapability, ReviewConfirmationDigest,
-    ReviewReceiptCorrelationDigest,
+    ReviewPullRequestCapabilities, ReviewReceiptCorrelationDigest,
 };
 use automonique_protocol::primitives::{EpochMillis, Revision};
 use automonique_protocol::wire::JsonValue;
@@ -1882,6 +1882,7 @@ impl PlatformV2Runtime {
                             workspace_record.revision(),
                             Vec::new(),
                             agent_deliverable,
+                            ReviewPullRequestCapabilities::default(),
                         )
                         .map_err(|_| "platform_v2_response_invalid")?,
                     ));
@@ -1945,6 +1946,7 @@ impl PlatformV2Runtime {
                         workspace_record.revision(),
                         rerunnable,
                         agent_deliverable,
+                        ReviewPullRequestCapabilities::default(),
                     )
                     .map_err(|_| "platform_v2_response_invalid")?,
                 ))

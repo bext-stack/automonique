@@ -320,6 +320,7 @@ fn agent_delivery_capabilities_are_deduplicated_and_bounded() {
             Revision::new(4).unwrap(),
             Vec::new(),
             vec![entry("comment-1", 3), entry("comment-1", 4)],
+            ReviewPullRequestCapabilities::default(),
         )
         .is_err()
     );
@@ -332,6 +333,7 @@ fn agent_delivery_capabilities_are_deduplicated_and_bounded() {
         Revision::new(4).unwrap(),
         Vec::new(),
         vec![entry("comment-2", 3), entry("comment-1", 4)],
+        ReviewPullRequestCapabilities::default(),
     )
     .unwrap();
     assert_eq!(
@@ -352,9 +354,214 @@ fn agent_delivery_capabilities_are_deduplicated_and_bounded() {
             (0..=MAX_REVIEW_COMMENTS)
                 .map(|index| entry(&format!("comment-{index}"), 1))
                 .collect(),
+            ReviewPullRequestCapabilities::default(),
         )
         .is_err()
     );
+}
+
+/// Opening, updating and merging are three grants, not one.
+///
+/// A merge moves code into a protected branch and can trigger a deploy, so a
+/// deployment has to be able to allow proposing changes while refusing to let
+/// them land. Modelling the family as one pull-request capability would make
+/// that impossible to express, which is why these are three separate slots
+/// that are minted, carried and read independently.
+#[test]
+fn pull_request_grants_are_three_independently_held_capabilities() {
+    let authority = ReviewAuthority::new(
+        ReviewAuthorityKind::PullRequest,
+        ReviewAuthorityId::new("pull-request-1").unwrap(),
+    );
+    let confirmation = ReviewConfirmationDigest::new("ab".repeat(32)).unwrap();
+    let correlation = ReviewReceiptCorrelationDigest::new("cd".repeat(32)).unwrap();
+
+    // Update alone: the client may revise the pull request and not land it.
+    let update = ReviewPullRequestUpdateCapability::new(
+        PullRequestId::new("pull-request-1").unwrap(),
+        Revision::new(5).unwrap(),
+        authority.clone(),
+        confirmation.clone(),
+        correlation.clone(),
+    )
+    .unwrap();
+    let capabilities = ReviewCapabilities::new(
+        project(),
+        workspace(),
+        Revision::new(9).unwrap(),
+        Revision::new(4).unwrap(),
+        Vec::new(),
+        Vec::new(),
+        ReviewPullRequestCapabilities {
+            update: Some(update.clone()),
+            ..ReviewPullRequestCapabilities::default()
+        },
+    )
+    .unwrap();
+    assert!(capabilities.update_pull_request().is_some());
+    assert!(
+        capabilities.merge_pull_request().is_none(),
+        "holding update must never imply merge"
+    );
+    assert!(capabilities.open_pull_request().is_none());
+
+    // A merge is only ever advertised for a pull request the server observed
+    // as ready. Any other readiness would offer a control the action contract
+    // refuses, so it cannot be constructed at all.
+    for readiness in [
+        MergeReadiness::Unknown,
+        MergeReadiness::Blocked,
+        MergeReadiness::Stale,
+    ] {
+        assert!(
+            ReviewPullRequestMergeCapability::new(
+                PullRequestId::new("pull-request-1").unwrap(),
+                Revision::new(5).unwrap(),
+                ReviewField::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+                readiness,
+                authority.clone(),
+                confirmation.clone(),
+                correlation.clone(),
+            )
+            .is_err(),
+            "{readiness:?} must not mint a merge capability",
+        );
+    }
+
+    // Every slot is bound to the pull-request authority. A capability minted
+    // under any other one would name a lane `resolve_action` refuses.
+    let review = ReviewAuthority::new(
+        ReviewAuthorityKind::Review,
+        ReviewAuthorityId::new("review-1").unwrap(),
+    );
+    assert!(
+        ReviewPullRequestOpenCapability::new(
+            Revision::new(5).unwrap(),
+            review.clone(),
+            confirmation.clone(),
+            correlation.clone(),
+        )
+        .is_err()
+    );
+    assert!(
+        ReviewPullRequestUpdateCapability::new(
+            PullRequestId::new("pull-request-1").unwrap(),
+            Revision::new(5).unwrap(),
+            review,
+            confirmation.clone(),
+            correlation.clone(),
+        )
+        .is_err()
+    );
+
+    // Absent and open are mutually exclusive observations of one projection.
+    // A response claiming both was read from two different snapshots, so a
+    // client must never be left to pick between them.
+    let open = ReviewPullRequestOpenCapability::new(
+        Revision::new(5).unwrap(),
+        authority.clone(),
+        confirmation.clone(),
+        correlation.clone(),
+    )
+    .unwrap();
+    assert!(
+        ReviewCapabilities::new(
+            project(),
+            workspace(),
+            Revision::new(9).unwrap(),
+            Revision::new(4).unwrap(),
+            Vec::new(),
+            Vec::new(),
+            ReviewPullRequestCapabilities {
+                open: Some(open),
+                update: Some(update.clone()),
+                merge: None,
+            },
+        )
+        .is_err()
+    );
+
+    // Update and merge may be held together, but only for the same pull
+    // request at the same observed revision. Disagreeing there would mean the
+    // two were minted from different reads.
+    let merge = ReviewPullRequestMergeCapability::new(
+        PullRequestId::new("pull-request-2").unwrap(),
+        Revision::new(5).unwrap(),
+        ReviewField::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+        MergeReadiness::Ready,
+        authority,
+        confirmation,
+        correlation,
+    )
+    .unwrap();
+    assert!(
+        ReviewCapabilities::new(
+            project(),
+            workspace(),
+            Revision::new(9).unwrap(),
+            Revision::new(4).unwrap(),
+            Vec::new(),
+            Vec::new(),
+            ReviewPullRequestCapabilities {
+                open: None,
+                update: Some(update),
+                merge: Some(merge),
+            },
+        )
+        .is_err()
+    );
+}
+
+/// The pull-request slots ship empty, and the wire says so explicitly.
+///
+/// No provider adapter can preflight a pull-request write yet, so the server
+/// populates none of the three. That absence is carried as an explicit null
+/// rather than an omitted field, because a strict decoder must be able to
+/// tell "the server considered this and has nothing" from "this response came
+/// from a peer that does not know the field exists".
+#[test]
+fn absent_pull_request_capabilities_round_trip_as_explicit_nulls() {
+    let capabilities = ReviewCapabilities::new(
+        project(),
+        workspace(),
+        Revision::new(9).unwrap(),
+        Revision::new(4).unwrap(),
+        Vec::new(),
+        Vec::new(),
+        ReviewPullRequestCapabilities::default(),
+    )
+    .unwrap();
+    assert!(capabilities.open_pull_request().is_none());
+    assert!(capabilities.update_pull_request().is_none());
+    assert!(capabilities.merge_pull_request().is_none());
+
+    let request = PlatformV2RequestMessage::new(
+        request_id("pull-request-capability-nulls"),
+        PlatformV2Request::GetReviewCapabilities(
+            ReviewReadRequest::new(project(), workspace()).unwrap(),
+        ),
+    );
+    let response = PlatformV2ResponseMessage::for_request(
+        &request,
+        PlatformV2Response::ReviewCapabilities(capabilities.clone()),
+    )
+    .unwrap();
+    let bytes = response.to_canonical_bytes().unwrap();
+    assert_eq!(
+        PlatformV2ResponseMessage::from_canonical_bytes(&bytes, &request).unwrap(),
+        response
+    );
+    let encoded = String::from_utf8(bytes).unwrap();
+    for field in [
+        "open_pull_request",
+        "update_pull_request",
+        "merge_pull_request",
+    ] {
+        assert!(
+            encoded.contains(&format!("\"{field}\":null")),
+            "{field} must be carried as an explicit null",
+        );
+    }
 }
 
 #[test]
@@ -762,6 +969,7 @@ fn response_documents_round_trip_and_review_envelope_fits_its_declared_ceiling()
                     )
                     .unwrap(),
                 ],
+                ReviewPullRequestCapabilities::default(),
             )
             .unwrap(),
         ),

@@ -204,10 +204,23 @@ pub enum MobilePlatformV2Action {
     ExecuteReviewAction,
     RerunCheck,
     GetReviewReceipt,
+    // Three members, not one pull-request member, because they are withheld
+    // independently. A merge moves code into a protected branch and can
+    // trigger a deploy, so a delegation that may open and update a pull
+    // request must still be unable to land it.
+    //
+    // Adding these to the vocabulary does not make them reachable: the bridge
+    // maps no request onto them, so a delegation holding all three still buys
+    // no pull-request authority today. Wiring that mapping is the deliberate
+    // step that turns these into live grants, and it belongs with the adapter
+    // that can actually perform the write.
+    OpenPullRequest,
+    UpdatePullRequest,
+    MergePullRequest,
 }
 
 impl MobilePlatformV2Action {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 17] = [
         Self::QueryWorkContexts,
         Self::GetLineage,
         Self::PrepareMutation,
@@ -222,6 +235,9 @@ impl MobilePlatformV2Action {
         Self::ExecuteReviewAction,
         Self::RerunCheck,
         Self::GetReviewReceipt,
+        Self::OpenPullRequest,
+        Self::UpdatePullRequest,
+        Self::MergePullRequest,
     ];
 }
 
