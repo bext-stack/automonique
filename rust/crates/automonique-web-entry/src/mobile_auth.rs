@@ -209,11 +209,19 @@ pub enum MobilePlatformV2Action {
     // trigger a deploy, so a delegation that may open and update a pull
     // request must still be unable to land it.
     //
-    // Adding these to the vocabulary does not make them reachable: the bridge
-    // maps no request onto them, so a delegation holding all three still buys
-    // no pull-request authority today. Wiring that mapping is the deliberate
-    // step that turns these into live grants, and it belongs with the adapter
-    // that can actually perform the write.
+    // These are live grants: `authorize_mobile_request` maps each
+    // pull-request review action onto its own member here, so a delegation
+    // carrying one of them can drive that write from a phone. They are the
+    // first delegated authority that writes outside the daemon's trust
+    // boundary, and nothing confers them implicitly — `admit_platform_v2_scope`
+    // takes exactly the set an operator named, there is no default and no
+    // "everything" shorthand, and the broader `ExecuteReviewAction` grant
+    // reaches none of the three.
+    //
+    // Holding one is still not enough to write. The installed GitHub
+    // credential must separately carry `pull_request_write`, and a merge
+    // needs `pull_request_merge` on top; that fence lives in the daemon and
+    // neither side subsumes the other.
     OpenPullRequest,
     UpdatePullRequest,
     MergePullRequest,
