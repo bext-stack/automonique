@@ -28,7 +28,7 @@ use automonique_protocol::platform_v2_review::{
     ReviewSchemaVersion, ReviewSnapshot, ReviewStatusProjection, ReviewText,
 };
 use automonique_protocol::platform_v2_review::{
-    MergeReadiness, PullRequestId, PullRequestProjection,
+    MergeReadiness, PullRequestId, PullRequestProjection, ReviewProposalId, ReviewProposalKind,
 };
 use automonique_protocol::platform_v2_review_api::{
     decode_review_action_receipt, decode_review_action_request, decode_review_snapshot,
@@ -41,7 +41,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{StoreError, validate_database_path};
 
-pub const REVIEW_STORE_SCHEMA_VERSION: u32 = 7;
+pub const REVIEW_STORE_SCHEMA_VERSION: u32 = 8;
 const MAX_PROVIDER_OBSERVATION_BYTES: usize = 4096;
 const MAX_REVIEW_EFFECT_PAYLOAD_BYTES: usize = 1_048_576;
 
@@ -325,6 +325,61 @@ CREATE TABLE review_github_pull_request_effect_plans (
 ) STRICT;
 "#;
 
+// A third table, for the same reason there is a second one: a local staging
+// write shares the custody vocabulary and nothing else. It is keyed on a
+// canonical repository root and an observation of that repository, not on a
+// provider coordinate, and it has no credential at all -- the authority is a
+// registry binding and a uid, which is why there is no credential generation
+// digest here.
+//
+// `natural_key` is the cross-actor exactly-once fence. It is
+// `<family>:<observation digest>`, and that is the narrowest thing that is
+// genuinely the same effect twice: the observation digest already commits to
+// HEAD, to the whole index, to every named path's objects, conflict stages and
+// working-tree stat identity, and -- for a resolution -- to which side would be
+// written. Two actors who advertised the same observation and both act are
+// performing one write, and the second is refused rather than replayed.
+//
+// The commit subject is deliberately outside that key. Two subjects over one
+// parent and one index are still one commit's worth of effect, and only one of
+// them can land: the second finds HEAD moved.
+//
+// `resulting_head` is write-once and exists only for a commit, on exactly the
+// terms the pull-request table's opened number does. A commit creates an
+// identity that did not exist before the write, and a later read cannot tell
+// ours from anyone else's without it.
+const ADD_GIT_STAGING_EFFECT_PLANS_V8: &str = r#"
+CREATE TABLE review_git_staging_effect_plans (
+    preview_id TEXT PRIMARY KEY REFERENCES review_action_previews(preview_id),
+    request_digest BLOB NOT NULL CHECK (length(request_digest) = 32),
+    registry_generation_digest BLOB NOT NULL CHECK (length(registry_generation_digest) = 32),
+    canonical_root TEXT NOT NULL,
+    family TEXT NOT NULL CHECK (family IN ('stage','unstage','commit','resolve_conflict')),
+    proposal_id TEXT NOT NULL,
+    paths TEXT NOT NULL,
+    conflict_path TEXT,
+    resolution TEXT CHECK (resolution IS NULL OR resolution IN ('keep_current','keep_incoming')),
+    subject TEXT,
+    observation_digest BLOB NOT NULL CHECK (length(observation_digest) = 32),
+    observed_head TEXT NOT NULL,
+    observed_index_digest BLOB NOT NULL CHECK (length(observed_index_digest) = 32),
+    natural_key TEXT NOT NULL,
+    custody TEXT NOT NULL CHECK (custody IN ('not_started','custody_started','accepted','ambiguous','refused','completed')),
+    resulting_head TEXT,
+    plan_document BLOB NOT NULL,
+    plan_digest BLOB NOT NULL CHECK (length(plan_digest) = 32),
+    receipt_correlation_digest BLOB NOT NULL CHECK (length(receipt_correlation_digest) = 32),
+    expected_workspace_revision INTEGER NOT NULL CHECK (expected_workspace_revision >= 1),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+    CHECK ((family = 'resolve_conflict') = (conflict_path IS NOT NULL)),
+    CHECK ((family = 'resolve_conflict') = (resolution IS NOT NULL)),
+    CHECK ((family = 'commit') = (subject IS NOT NULL)),
+    CHECK (family = 'commit' OR resulting_head IS NULL),
+    UNIQUE(canonical_root,natural_key)
+) STRICT;
+"#;
+
 #[derive(Debug)]
 pub enum ReviewStoreError {
     InsecurePath(String),
@@ -563,6 +618,7 @@ pub struct ReviewExternalEffectPlan {
     digest: [u8; 32],
     github_check: Option<GitHubCheckEffectPlan>,
     github_pull_request: Option<GitHubPullRequestEffectPlan>,
+    git_staging: Option<GitStagingEffectPlan>,
 }
 
 /// Which independently withheld pull-request write a stored plan is.
@@ -589,6 +645,37 @@ impl ReviewPullRequestFamily {
             "update" => Ok(Self::Update),
             "merge" => Ok(Self::Merge),
             _ => Err(ReviewStoreError::Corrupt("github_pull_request_family")),
+        }
+    }
+}
+
+/// Which independently withheld local repository write a stored plan is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewGitStagingFamily {
+    Stage,
+    Unstage,
+    Commit,
+    ResolveConflict,
+}
+
+impl ReviewGitStagingFamily {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stage => "stage",
+            Self::Unstage => "unstage",
+            Self::Commit => "commit",
+            Self::ResolveConflict => "resolve_conflict",
+        }
+    }
+
+    fn parse(value: &str) -> Stored<Self> {
+        match value {
+            "stage" => Ok(Self::Stage),
+            "unstage" => Ok(Self::Unstage),
+            "commit" => Ok(Self::Commit),
+            "resolve_conflict" => Ok(Self::ResolveConflict),
+            _ => Err(ReviewStoreError::Corrupt("git_staging_family")),
         }
     }
 }
@@ -663,6 +750,26 @@ struct GitHubPullRequestEffectPlan {
     /// The provider-issued number an accepted open returned. Write-once, and
     /// only ever set for an open.
     opened_number: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitStagingEffectPlan {
+    receipt_correlation_digest: [u8; 32],
+    expected_workspace_revision: Revision,
+    canonical_root: String,
+    family: ReviewGitStagingFamily,
+    proposal_id: String,
+    paths: Vec<String>,
+    conflict_path: Option<String>,
+    resolution: Option<String>,
+    subject: Option<String>,
+    observation_digest: [u8; 32],
+    observed_head: String,
+    observed_index_digest: [u8; 32],
+    custody: ReviewExternalEffectCustody,
+    /// The commit an accepted commit produced. Write-once, and only ever set
+    /// for a commit.
+    resulting_head: Option<String>,
 }
 
 impl ReviewExternalEffectPlan {
@@ -752,6 +859,7 @@ impl ReviewExternalEffectPlan {
             digest: plan_digest,
             github_check: None,
             github_pull_request: None,
+            git_staging: None,
         })
     }
 
@@ -896,6 +1004,7 @@ impl ReviewExternalEffectPlan {
             payload_digest: digest(&[]),
             document,
             digest: plan_digest,
+            git_staging: None,
             github_check: Some(GitHubCheckEffectPlan {
                 receipt_correlation_digest,
                 expected_workspace_revision,
@@ -1088,6 +1197,7 @@ impl ReviewExternalEffectPlan {
             document,
             digest: plan_digest,
             github_check: None,
+            git_staging: None,
             github_pull_request: Some(GitHubPullRequestEffectPlan {
                 receipt_correlation_digest,
                 expected_workspace_revision,
@@ -1106,6 +1216,306 @@ impl ReviewExternalEffectPlan {
                 opened_number,
             }),
         })
+    }
+
+    /// Seal one local staging write.
+    ///
+    /// Everything sealed here is either operator-owned (the canonical root),
+    /// server-owned (the proposal, its files, the commit subject the snapshot
+    /// carried) or observed (the head, the index, the observation digest). No
+    /// client string is admitted, and the paths are re-validated against this
+    /// crate's own grammar rather than trusted from the caller: a store that
+    /// accepted a path the adapter would refuse would be a second, looser
+    /// spelling of the same fence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn git_staging(
+        request_digest: [u8; 32],
+        registry_generation_digest: [u8; 32],
+        canonical_root: &str,
+        family: ReviewGitStagingFamily,
+        proposal_id: &str,
+        paths: &[String],
+        conflict: Option<(&str, &str)>,
+        subject: Option<&str>,
+        observation: ([u8; 32], &str, [u8; 32]),
+        expected_workspace_revision: Revision,
+        receipt_correlation_digest: [u8; 32],
+    ) -> Stored<Self> {
+        if receipt_correlation_digest == [0; 32] {
+            return Err(ReviewStoreError::InvalidField("receipt_correlation_digest"));
+        }
+        Self::git_staging_stored(
+            request_digest,
+            registry_generation_digest,
+            canonical_root,
+            family,
+            proposal_id,
+            paths,
+            conflict,
+            subject,
+            observation,
+            expected_workspace_revision,
+            receipt_correlation_digest,
+            ReviewExternalEffectCustody::NotStarted,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn git_staging_stored(
+        request_digest: [u8; 32],
+        registry_generation_digest: [u8; 32],
+        canonical_root: &str,
+        family: ReviewGitStagingFamily,
+        proposal_id: &str,
+        paths: &[String],
+        conflict: Option<(&str, &str)>,
+        subject: Option<&str>,
+        observation: ([u8; 32], &str, [u8; 32]),
+        expected_workspace_revision: Revision,
+        receipt_correlation_digest: [u8; 32],
+        custody: ReviewExternalEffectCustody,
+        resulting_head: Option<&str>,
+    ) -> Stored<Self> {
+        let (observation_digest, observed_head, observed_index_digest) = observation;
+        let shape = match family {
+            ReviewGitStagingFamily::Stage | ReviewGitStagingFamily::Unstage => {
+                conflict.is_none() && subject.is_none()
+            }
+            ReviewGitStagingFamily::Commit => conflict.is_none() && subject.is_some(),
+            // A resolution names exactly one of the proposal's own files, and
+            // the side it would write.
+            ReviewGitStagingFamily::ResolveConflict => {
+                subject.is_none()
+                    && conflict.is_some_and(|(path, resolution)| {
+                        paths.iter().any(|candidate| candidate == path)
+                            && matches!(resolution, "keep_current" | "keep_incoming")
+                    })
+            }
+        };
+        let ordered = paths.windows(2).all(|pair| pair[0] < pair[1]);
+        if !shape
+            || !safe_effect_canonical_root(canonical_root)
+            || !safe_effect_coordinate(proposal_id)
+            || paths.is_empty()
+            || paths.len() > 128
+            || !ordered
+            || !paths.iter().all(|path| safe_effect_path(path))
+            || !valid_effect_head_sha(observed_head)
+            || observation_digest == [0; 32]
+            || subject.is_some_and(|value| !safe_effect_title(value))
+            || (family != ReviewGitStagingFamily::Commit && resulting_head.is_some())
+            || resulting_head.is_some_and(|value| !valid_effect_head_sha(value))
+        {
+            return Err(ReviewStoreError::InvalidField("external_effect_plan"));
+        }
+        let mut fields = vec![
+            (
+                "canonical_root".to_owned(),
+                JsonValue::String(canonical_root.to_owned()),
+            ),
+            (
+                "effect_kind".to_owned(),
+                JsonValue::String("git_staging".to_owned()),
+            ),
+            (
+                "expected_workspace_revision".to_owned(),
+                JsonValue::Integer(db_revision(expected_workspace_revision)?),
+            ),
+            (
+                "family".to_owned(),
+                JsonValue::String(family.as_str().to_owned()),
+            ),
+            (
+                "observation_digest".to_owned(),
+                JsonValue::String(digest_token(&observation_digest)),
+            ),
+            (
+                "observed_head".to_owned(),
+                JsonValue::String(observed_head.to_owned()),
+            ),
+            (
+                "observed_index_digest".to_owned(),
+                JsonValue::String(digest_token(&observed_index_digest)),
+            ),
+            (
+                "paths".to_owned(),
+                JsonValue::Array(
+                    paths
+                        .iter()
+                        .map(|path| JsonValue::String(path.clone()))
+                        .collect(),
+                ),
+            ),
+            (
+                "proposal_id".to_owned(),
+                JsonValue::String(proposal_id.to_owned()),
+            ),
+            (
+                "receipt_correlation_digest".to_owned(),
+                JsonValue::String(digest_token(&receipt_correlation_digest)),
+            ),
+            (
+                "registry_generation_digest".to_owned(),
+                JsonValue::String(digest_token(&registry_generation_digest)),
+            ),
+            (
+                "request_digest".to_owned(),
+                JsonValue::String(digest_token(&request_digest)),
+            ),
+            (
+                "schema".to_owned(),
+                JsonValue::String("automonique.store/review-external-effect/v1".to_owned()),
+            ),
+        ];
+        if let Some((path, resolution)) = conflict {
+            fields.push((
+                "conflict_path".to_owned(),
+                JsonValue::String(path.to_owned()),
+            ));
+            fields.push((
+                "resolution".to_owned(),
+                JsonValue::String(resolution.to_owned()),
+            ));
+        }
+        if let Some(subject) = subject {
+            fields.push(("subject".to_owned(), JsonValue::String(subject.to_owned())));
+        }
+        // The resulting head is deliberately outside the plan document. It is
+        // learned after the plan is sealed, so folding it in would change the
+        // plan digest of an in-flight write.
+        let document = JsonValue::Object(fields).to_canonical_bytes();
+        let plan_digest = digest(&document);
+        Ok(Self {
+            request_digest,
+            registry_generation_digest,
+            provider: "git".to_owned(),
+            work_session_id: String::new(),
+            provider_session_id: String::new(),
+            work_session_revision: Revision::FIRST,
+            provider_session_revision: Revision::FIRST,
+            transport_key: String::new(),
+            payload: Vec::new(),
+            payload_digest: digest(&[]),
+            document,
+            digest: plan_digest,
+            github_check: None,
+            github_pull_request: None,
+            git_staging: Some(GitStagingEffectPlan {
+                receipt_correlation_digest,
+                expected_workspace_revision,
+                canonical_root: canonical_root.to_owned(),
+                family,
+                proposal_id: proposal_id.to_owned(),
+                paths: paths.to_vec(),
+                conflict_path: conflict.map(|(path, _)| path.to_owned()),
+                resolution: conflict.map(|(_, resolution)| resolution.to_owned()),
+                subject: subject.map(str::to_owned),
+                observation_digest,
+                observed_head: observed_head.to_owned(),
+                observed_index_digest,
+                custody,
+                resulting_head: resulting_head.map(str::to_owned),
+            }),
+        })
+    }
+
+    #[must_use]
+    pub const fn is_git_staging(&self) -> bool {
+        self.git_staging.is_some()
+    }
+
+    #[must_use]
+    pub fn git_staging_family(&self) -> Option<ReviewGitStagingFamily> {
+        self.git_staging.as_ref().map(|plan| plan.family)
+    }
+
+    #[must_use]
+    pub fn git_staging_canonical_root(&self) -> Option<&str> {
+        self.git_staging
+            .as_ref()
+            .map(|plan| plan.canonical_root.as_str())
+    }
+
+    #[must_use]
+    pub fn git_staging_proposal_id(&self) -> Option<&str> {
+        self.git_staging
+            .as_ref()
+            .map(|plan| plan.proposal_id.as_str())
+    }
+
+    #[must_use]
+    pub fn git_staging_paths(&self) -> Option<&[String]> {
+        self.git_staging.as_ref().map(|plan| plan.paths.as_slice())
+    }
+
+    #[must_use]
+    pub fn git_staging_conflict_path(&self) -> Option<&str> {
+        self.git_staging
+            .as_ref()
+            .and_then(|plan| plan.conflict_path.as_deref())
+    }
+
+    #[must_use]
+    pub fn git_staging_resolution(&self) -> Option<&str> {
+        self.git_staging
+            .as_ref()
+            .and_then(|plan| plan.resolution.as_deref())
+    }
+
+    #[must_use]
+    pub fn git_staging_subject(&self) -> Option<&str> {
+        self.git_staging
+            .as_ref()
+            .and_then(|plan| plan.subject.as_deref())
+    }
+
+    #[must_use]
+    pub fn git_staging_observation_digest(&self) -> Option<[u8; 32]> {
+        self.git_staging
+            .as_ref()
+            .map(|plan| plan.observation_digest)
+    }
+
+    #[must_use]
+    pub fn git_staging_observed_head(&self) -> Option<&str> {
+        self.git_staging
+            .as_ref()
+            .map(|plan| plan.observed_head.as_str())
+    }
+
+    #[must_use]
+    pub fn git_staging_observed_index_digest(&self) -> Option<[u8; 32]> {
+        self.git_staging
+            .as_ref()
+            .map(|plan| plan.observed_index_digest)
+    }
+
+    #[must_use]
+    pub fn git_staging_custody(&self) -> Option<ReviewExternalEffectCustody> {
+        self.git_staging.as_ref().map(|plan| plan.custody)
+    }
+
+    /// The commit an accepted commit produced.
+    #[must_use]
+    pub fn git_staging_resulting_head(&self) -> Option<&str> {
+        self.git_staging
+            .as_ref()
+            .and_then(|plan| plan.resulting_head.as_deref())
+    }
+
+    #[must_use]
+    pub fn git_staging_receipt_correlation_digest(&self) -> Option<[u8; 32]> {
+        self.git_staging
+            .as_ref()
+            .map(|plan| plan.receipt_correlation_digest)
+    }
+
+    #[must_use]
+    pub fn git_staging_expected_workspace_revision(&self) -> Option<Revision> {
+        self.git_staging
+            .as_ref()
+            .map(|plan| plan.expected_workspace_revision)
     }
 
     #[must_use]
@@ -1128,6 +1538,19 @@ impl ReviewExternalEffectPlan {
     #[must_use]
     pub const fn is_github_effect(&self) -> bool {
         self.github_check.is_some() || self.github_pull_request.is_some()
+    }
+
+    /// Whether this plan's receipt is recovered by a correlation digest rather
+    /// than by a bare idempotency key.
+    ///
+    /// Every confirmed write is: the correlation is minted with the
+    /// confirmation and is the only thing that names the exact advertised
+    /// plan. Keying on this rather than on a provider keeps a local staging
+    /// receipt as unfindable-without-its-correlation as a GitHub one, instead
+    /// of letting it fall through to the generic receipt index.
+    #[must_use]
+    pub const fn is_correlated_effect(&self) -> bool {
+        self.is_github_effect() || self.git_staging.is_some()
     }
 
     #[must_use]
@@ -1597,12 +2020,22 @@ impl ReviewStore {
                 | ReviewAction::UpdatePullRequest { .. }
                 | ReviewAction::MergePullRequest { .. }
         );
+        let staging_action = matches!(
+            request.action(),
+            ReviewAction::Stage { .. }
+                | ReviewAction::Unstage { .. }
+                | ReviewAction::Commit { .. }
+                | ReviewAction::ResolveConflict { .. }
+        );
         let plan_matches_action = match request.action() {
             ReviewAction::RerunCheck { .. } => {
                 external_plan.is_some_and(ReviewExternalEffectPlan::is_github_check_rerun)
             }
             _ if pull_request_action => {
                 external_plan.is_some_and(ReviewExternalEffectPlan::is_github_pull_request)
+            }
+            _ if staging_action => {
+                external_plan.is_some_and(ReviewExternalEffectPlan::is_git_staging)
             }
             _ => false,
         };
@@ -1687,6 +2120,49 @@ impl ReviewStore {
             }
             if let Some(revision) = plan.github_pull_request_expected_revision() {
                 revision_successor(revision)?;
+            }
+        }
+        // The stored plan must describe the exact staging action it was
+        // prepared for. A plan and a request that disagree about which
+        // proposal, which file or which side is being written would let a
+        // confirmed preview perform a different write than the one it was
+        // confirmed for.
+        if let Some(plan) = external_plan.filter(|plan| plan.is_git_staging()) {
+            revision_successor(request.expected_revision())?;
+            let named = |id: &ReviewProposalId, family| {
+                plan.git_staging_family() == Some(family)
+                    && plan.git_staging_proposal_id() == Some(id.as_str())
+            };
+            let coherent = match request.action() {
+                ReviewAction::Stage { proposal_id } => {
+                    named(proposal_id, ReviewGitStagingFamily::Stage)
+                        && plan.git_staging_conflict_path().is_none()
+                        && plan.git_staging_subject().is_none()
+                }
+                ReviewAction::Unstage { proposal_id } => {
+                    named(proposal_id, ReviewGitStagingFamily::Unstage)
+                        && plan.git_staging_conflict_path().is_none()
+                        && plan.git_staging_subject().is_none()
+                }
+                ReviewAction::Commit { proposal_id } => {
+                    named(proposal_id, ReviewGitStagingFamily::Commit)
+                        && plan.git_staging_conflict_path().is_none()
+                        && plan.git_staging_subject().is_some()
+                }
+                ReviewAction::ResolveConflict {
+                    proposal_id,
+                    resolution,
+                    ..
+                } => {
+                    named(proposal_id, ReviewGitStagingFamily::ResolveConflict)
+                        && plan.git_staging_conflict_path().is_some()
+                        && plan.git_staging_resolution() == Some(resolution.as_str())
+                        && plan.git_staging_subject().is_none()
+                }
+                _ => false,
+            };
+            if !coherent {
+                return Err(ReviewStoreError::Conflict("external_effect_request"));
             }
         }
         let (kind, id) = workspace_parts(request.workspace());
@@ -2107,10 +2583,11 @@ impl ReviewStore {
         require_active_authority(&transaction, &action.request, now_ms)?;
         if action.write_admitted_at_ms.is_some() {
             if let Some(plan) = read_external_plan(&transaction, preview_id)?
-                && plan.is_github_effect()
-                && plan.github_custody() == Some(ReviewExternalEffectCustody::NotStarted)
+                && plan.is_correlated_effect()
+                && plan.github_custody().or_else(|| plan.git_staging_custody())
+                    == Some(ReviewExternalEffectCustody::NotStarted)
             {
-                return Err(ReviewStoreError::Corrupt("github_check_custody"));
+                return Err(ReviewStoreError::Corrupt("external_effect_custody"));
             }
             transaction.commit()?;
             return Ok(ReviewWriteAdmission::Replay(action));
@@ -2132,7 +2609,7 @@ impl ReviewStore {
         if changed != 1 {
             return Err(ReviewStoreError::Conflict("write_admission"));
         }
-        for table in GITHUB_EFFECT_TABLES {
+        for table in CORRELATED_EFFECT_TABLES {
             let present: bool = transaction.query_row(
                 &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE preview_id=?1)"),
                 [preview_id],
@@ -2148,7 +2625,7 @@ impl ReviewStore {
                 params![now_ms, preview_id],
             )?;
             if changed != 1 {
-                return Err(ReviewStoreError::Conflict("github_effect_custody"));
+                return Err(ReviewStoreError::Conflict("external_effect_custody"));
             }
         }
         let result = read_action_by_preview(&transaction, preview_id)?
@@ -2189,8 +2666,8 @@ impl ReviewStore {
         }
         let plan = read_external_plan(&transaction, preview_id)?
             .ok_or(ReviewStoreError::Corrupt("external_effect_plan"))?;
-        if plan.is_github_effect() {
-            let table = github_effect_table(&plan);
+        if plan.is_correlated_effect() {
+            let table = correlated_effect_table(&plan);
             let changed = transaction.execute(
                 &format!(
                     "UPDATE {table} SET custody='refused',updated_at_ms=?1 WHERE preview_id=?2 AND custody='not_started'"
@@ -2198,7 +2675,7 @@ impl ReviewStore {
                 params![now_ms, preview_id],
             )?;
             if changed != 1 {
-                return Err(ReviewStoreError::Conflict("github_effect_custody"));
+                return Err(ReviewStoreError::Conflict("external_effect_custody"));
             }
         } else {
             release_external_plan_before_write(&transaction, preview_id)?;
@@ -2246,10 +2723,10 @@ impl ReviewStore {
             transaction.commit()?;
             return Ok(action.receipt);
         }
-        if let Some(plan) =
-            read_external_plan(&transaction, preview_id)?.filter(|plan| plan.is_github_effect())
+        if let Some(plan) = read_external_plan(&transaction, preview_id)?
+            .filter(ReviewExternalEffectPlan::is_correlated_effect)
         {
-            let table = github_effect_table(&plan);
+            let table = correlated_effect_table(&plan);
             transaction.execute(
                 &format!(
                     "UPDATE {table} SET custody='ambiguous',updated_at_ms=?1 WHERE preview_id=?2 AND custody IN ('custody_started','accepted','ambiguous')"
@@ -2599,6 +3076,193 @@ impl ReviewStore {
                         effective_number,
                         now_ms,
                     )?;
+                    persist_snapshot(&transaction, &next, now_ms)?;
+                    ReviewActionReceipt::new(
+                        action.receipt.receipt_id().clone(),
+                        action.receipt.idempotency_key().clone(),
+                        action.receipt.action_id().clone(),
+                        action.receipt.actor().clone(),
+                        ReviewReceiptOutcome::Completed,
+                        Some(next.revision()),
+                        None,
+                        ReviewReconciliation::Final,
+                    )
+                    .map_err(protocol)?
+                }
+            }
+            ReviewExternalEffectCustody::NotStarted
+            | ReviewExternalEffectCustody::CustodyStarted => unreachable!(),
+        };
+        if receipt != action.receipt {
+            update_receipt(&transaction, preview_id, &receipt, now_ms)?;
+        }
+        transaction.commit()?;
+        Ok(receipt)
+    }
+
+    /// Settle one local staging write's custody, on the same state machine the
+    /// provider families use.
+    ///
+    /// `resulting_head` is the commit an accepted commit produced. It is
+    /// write-once and admitted only for a commit, for the reason the
+    /// pull-request family's opened number is: a commit creates an identity
+    /// that did not exist before the write, and a later read cannot tell ours
+    /// from another actor's in the same shared checkout without it.
+    pub fn settle_git_staging(
+        &mut self,
+        preview_id: &str,
+        request_digest: [u8; 32],
+        custody: ReviewExternalEffectCustody,
+        resulting_head: Option<&str>,
+        now_ms: i64,
+    ) -> Stored<ReviewActionReceipt> {
+        validate_time(now_ms)?;
+        if matches!(
+            custody,
+            ReviewExternalEffectCustody::NotStarted | ReviewExternalEffectCustody::CustodyStarted
+        ) {
+            return Err(ReviewStoreError::InvalidField("git_staging_custody"));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let action =
+            read_action_by_preview(&transaction, preview_id)?.ok_or(ReviewStoreError::NotFound)?;
+        if action.request_digest != request_digest
+            || action.write_admitted_at_ms.is_none()
+            || !matches!(
+                action.request.action(),
+                ReviewAction::Stage { .. }
+                    | ReviewAction::Unstage { .. }
+                    | ReviewAction::Commit { .. }
+                    | ReviewAction::ResolveConflict { .. }
+            )
+        {
+            return Err(ReviewStoreError::Conflict("external_effect_completion"));
+        }
+        let plan = read_external_plan(&transaction, preview_id)?
+            .ok_or(ReviewStoreError::Corrupt("external_effect_plan"))?;
+        if !plan.is_git_staging() {
+            return Err(ReviewStoreError::Conflict("external_effect_completion"));
+        }
+        let family = plan
+            .git_staging_family()
+            .ok_or(ReviewStoreError::Corrupt("git_staging_family"))?;
+        let current_custody = plan
+            .git_staging_custody()
+            .ok_or(ReviewStoreError::Corrupt("git_staging_custody"))?;
+        // Only a commit ever produces a head, and a commit that reached an
+        // acknowledged state must carry one: without it the commit this
+        // process created can never be told from anybody else's.
+        let head_required = family == ReviewGitStagingFamily::Commit
+            && matches!(
+                custody,
+                ReviewExternalEffectCustody::Accepted | ReviewExternalEffectCustody::Completed
+            );
+        if (family != ReviewGitStagingFamily::Commit && resulting_head.is_some())
+            || (head_required && resulting_head.is_none())
+            || resulting_head.is_some_and(|value| !valid_effect_head_sha(value))
+        {
+            return Err(ReviewStoreError::InvalidField("git_staging_head"));
+        }
+        let stored_head = plan.git_staging_resulting_head();
+        if let (Some(stored), Some(supplied)) = (stored_head, resulting_head)
+            && stored != supplied
+        {
+            return Err(ReviewStoreError::Conflict("git_staging_head"));
+        }
+        let effective_head = resulting_head.or(stored_head).map(str::to_owned);
+        if matches!(
+            current_custody,
+            ReviewExternalEffectCustody::Refused | ReviewExternalEffectCustody::Completed
+        ) {
+            if current_custody == custody {
+                transaction.commit()?;
+                return Ok(action.receipt);
+            }
+            return Err(ReviewStoreError::Conflict("git_staging_custody"));
+        }
+        let allowed = match custody {
+            ReviewExternalEffectCustody::Accepted => matches!(
+                current_custody,
+                ReviewExternalEffectCustody::CustodyStarted | ReviewExternalEffectCustody::Accepted
+            ),
+            ReviewExternalEffectCustody::Ambiguous => matches!(
+                current_custody,
+                ReviewExternalEffectCustody::CustodyStarted
+                    | ReviewExternalEffectCustody::Accepted
+                    | ReviewExternalEffectCustody::Ambiguous
+            ),
+            ReviewExternalEffectCustody::Refused => {
+                current_custody == ReviewExternalEffectCustody::CustodyStarted
+            }
+            ReviewExternalEffectCustody::Completed => matches!(
+                current_custody,
+                ReviewExternalEffectCustody::CustodyStarted
+                    | ReviewExternalEffectCustody::Accepted
+                    | ReviewExternalEffectCustody::Ambiguous
+            ),
+            ReviewExternalEffectCustody::NotStarted
+            | ReviewExternalEffectCustody::CustodyStarted => false,
+        };
+        if !allowed {
+            return Err(ReviewStoreError::Conflict("git_staging_custody"));
+        }
+        let changed = transaction.execute(
+            "UPDATE review_git_staging_effect_plans SET custody=?1,resulting_head=?2,updated_at_ms=?3 WHERE preview_id=?4 AND custody=?5 AND (resulting_head IS NULL OR resulting_head=?2)",
+            params![
+                custody.as_str(),
+                effective_head,
+                now_ms,
+                preview_id,
+                current_custody.as_str()
+            ],
+        )?;
+        if changed != 1 {
+            return Err(ReviewStoreError::Conflict("git_staging_custody"));
+        }
+        let receipt = match custody {
+            ReviewExternalEffectCustody::Accepted => action.receipt.clone(),
+            ReviewExternalEffectCustody::Ambiguous => ReviewActionReceipt::new(
+                action.receipt.receipt_id().clone(),
+                action.receipt.idempotency_key().clone(),
+                action.receipt.action_id().clone(),
+                action.receipt.actor().clone(),
+                ReviewReceiptOutcome::Unknown,
+                None,
+                None,
+                ReviewReconciliation::PollReceipt,
+            )
+            .map_err(protocol)?,
+            ReviewExternalEffectCustody::Refused => ReviewActionReceipt::new(
+                action.receipt.receipt_id().clone(),
+                action.receipt.idempotency_key().clone(),
+                action.receipt.action_id().clone(),
+                action.receipt.actor().clone(),
+                ReviewReceiptOutcome::Refused,
+                None,
+                None,
+                ReviewReconciliation::Final,
+            )
+            .map_err(protocol)?,
+            ReviewExternalEffectCustody::Completed => {
+                let (kind, id) = workspace_parts(action.request.workspace());
+                let current = read_current_snapshot(&transaction, kind, id)?
+                    .ok_or(ReviewStoreError::Corrupt("current_snapshot"))?;
+                if current.revision() != action.request.expected_revision() {
+                    ReviewActionReceipt::new(
+                        action.receipt.receipt_id().clone(),
+                        action.receipt.idempotency_key().clone(),
+                        action.receipt.action_id().clone(),
+                        action.receipt.actor().clone(),
+                        ReviewReceiptOutcome::Conflict,
+                        None,
+                        Some(current.revision()),
+                        ReviewReconciliation::Final,
+                    )
+                    .map_err(protocol)?
+                } else {
+                    let next = git_staging_snapshot(&current, &action.request, &plan)?;
                     persist_snapshot(&transaction, &next, now_ms)?;
                     ReviewActionReceipt::new(
                         action.receipt.receipt_id().clone(),
@@ -3139,6 +3803,7 @@ fn initialize(connection: &mut Connection) -> Stored<bool> {
         transaction.execute_batch(ADD_REVIEW_RECEIPT_CORRELATION_V5)?;
         transaction.execute_batch(ADD_GITHUB_WORKSPACE_REVISION_V6)?;
         transaction.execute_batch(ADD_GITHUB_PULL_REQUEST_EFFECT_PLANS_V7)?;
+        transaction.execute_batch(ADD_GIT_STAGING_EFFECT_PLANS_V8)?;
     } else if version == 1 {
         transaction.execute_batch(ADD_SNAPSHOT_PROTOCOL_SCHEMA_V2)?;
         migrate_review_v1_snapshots(&transaction)?;
@@ -3147,6 +3812,7 @@ fn initialize(connection: &mut Connection) -> Stored<bool> {
         transaction.execute_batch(ADD_REVIEW_RECEIPT_CORRELATION_V5)?;
         transaction.execute_batch(ADD_GITHUB_WORKSPACE_REVISION_V6)?;
         transaction.execute_batch(ADD_GITHUB_PULL_REQUEST_EFFECT_PLANS_V7)?;
+        transaction.execute_batch(ADD_GIT_STAGING_EFFECT_PLANS_V8)?;
         terminalize_legacy_external_actions(&transaction)?;
     } else if version == 2 {
         transaction.execute_batch(ADD_EXTERNAL_EFFECT_PLANS_V3)?;
@@ -3154,21 +3820,28 @@ fn initialize(connection: &mut Connection) -> Stored<bool> {
         transaction.execute_batch(ADD_REVIEW_RECEIPT_CORRELATION_V5)?;
         transaction.execute_batch(ADD_GITHUB_WORKSPACE_REVISION_V6)?;
         transaction.execute_batch(ADD_GITHUB_PULL_REQUEST_EFFECT_PLANS_V7)?;
+        transaction.execute_batch(ADD_GIT_STAGING_EFFECT_PLANS_V8)?;
         terminalize_legacy_external_actions(&transaction)?;
     } else if version == 3 {
         transaction.execute_batch(ADD_GITHUB_CHECK_EFFECT_PLANS_V4)?;
         transaction.execute_batch(ADD_REVIEW_RECEIPT_CORRELATION_V5)?;
         transaction.execute_batch(ADD_GITHUB_WORKSPACE_REVISION_V6)?;
         transaction.execute_batch(ADD_GITHUB_PULL_REQUEST_EFFECT_PLANS_V7)?;
+        transaction.execute_batch(ADD_GIT_STAGING_EFFECT_PLANS_V8)?;
     } else if version == 4 {
         transaction.execute_batch(ADD_REVIEW_RECEIPT_CORRELATION_V5)?;
         transaction.execute_batch(ADD_GITHUB_WORKSPACE_REVISION_V6)?;
         transaction.execute_batch(ADD_GITHUB_PULL_REQUEST_EFFECT_PLANS_V7)?;
+        transaction.execute_batch(ADD_GIT_STAGING_EFFECT_PLANS_V8)?;
     } else if version == 5 {
         transaction.execute_batch(ADD_GITHUB_WORKSPACE_REVISION_V6)?;
         transaction.execute_batch(ADD_GITHUB_PULL_REQUEST_EFFECT_PLANS_V7)?;
+        transaction.execute_batch(ADD_GIT_STAGING_EFFECT_PLANS_V8)?;
     } else if version == 6 {
         transaction.execute_batch(ADD_GITHUB_PULL_REQUEST_EFFECT_PLANS_V7)?;
+        transaction.execute_batch(ADD_GIT_STAGING_EFFECT_PLANS_V8)?;
+    } else if version == 7 {
+        transaction.execute_batch(ADD_GIT_STAGING_EFFECT_PLANS_V8)?;
     } else {
         return Err(ReviewStoreError::SchemaVersion {
             found: version,
@@ -4199,22 +4872,30 @@ fn release_external_plan_before_write(connection: &Connection, preview_id: &str)
     Ok(())
 }
 
-/// Every table one GitHub effect plan may live in.
-const GITHUB_EFFECT_TABLES: [&str; 2] = [
+/// Every table one custody-bearing effect plan may live in.
+///
+/// The three share the custody vocabulary and the custody state machine, and
+/// nothing else. Keying the shared paths on this list rather than on one
+/// family is what stops a new family from silently being treated as a
+/// retained-session delivery.
+const CORRELATED_EFFECT_TABLES: [&str; 3] = [
     "review_github_check_effect_plans",
     "review_github_pull_request_effect_plans",
+    "review_git_staging_effect_plans",
 ];
 
 /// The one table this plan lives in.
 ///
 /// Only ever called for a plan that already answered yes to
-/// `is_github_effect`, so the check-rerun table is the correct fallback
+/// `is_correlated_effect`, so the check-rerun table is the correct fallback
 /// rather than a guess.
-fn github_effect_table(plan: &ReviewExternalEffectPlan) -> &'static str {
+fn correlated_effect_table(plan: &ReviewExternalEffectPlan) -> &'static str {
     if plan.is_github_pull_request() {
-        GITHUB_EFFECT_TABLES[1]
+        CORRELATED_EFFECT_TABLES[1]
+    } else if plan.is_git_staging() {
+        CORRELATED_EFFECT_TABLES[2]
     } else {
-        GITHUB_EFFECT_TABLES[0]
+        CORRELATED_EFFECT_TABLES[0]
     }
 }
 
@@ -4275,6 +4956,43 @@ fn safe_effect_coordinate(value: &str) -> bool {
 
 fn valid_effect_head_sha(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// A repository-relative path this store will seal into a plan.
+///
+/// Deliberately the same grammar the git adapter enforces, restated here
+/// rather than trusted from the caller. A store that accepted a path the
+/// adapter would refuse would be a second, looser spelling of the same fence,
+/// and the looser one is the one a recovered plan would replay through.
+fn safe_effect_path(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 1024
+        || value.starts_with('/')
+        || value.starts_with('-')
+        || value.contains('\\')
+        || value.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+        || value
+            .bytes()
+            .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']' | b':'))
+    {
+        return false;
+    }
+    value.split('/').all(|component| {
+        !component.is_empty()
+            && component != "."
+            && component != ".."
+            && !component.eq_ignore_ascii_case(".git")
+            && component == component.trim()
+    })
+}
+
+/// The operator-owned repository root a staging plan is sealed against.
+fn safe_effect_canonical_root(value: &str) -> bool {
+    value.starts_with('/')
+        && value.len() <= 4096
+        && !value.contains("/../")
+        && !value.ends_with("/..")
+        && !value.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
 }
 
 fn github_check_rerun_snapshot(
@@ -4349,6 +5067,84 @@ fn github_check_rerun_snapshot(
         current.comments().to_vec(),
         current.proposals().to_vec(),
         checks,
+        current.review().clone(),
+        current.pull_request().clone(),
+        current.delivery().clone(),
+        current.attention_events().to_vec(),
+    )
+    .map_err(protocol)
+}
+
+/// Advance the projection by exactly what this store observed: the write.
+///
+/// The performed proposal is removed, because a proposal that has been carried
+/// out is no longer a proposal, and the revision moves so a replay's fence
+/// fails and a poll sees a settled receipt.
+///
+/// Nothing else changes, and that is deliberate. The pull-request families
+/// advance a single scalar projection whose post-state the store knows exactly
+/// — a merged pull request is merged. A staging write changes file-level state
+/// this store did not read: whether an unstaged path became untracked, whether
+/// a committed path left the change set entirely, whether a resolved file now
+/// matches its index. Re-asserting any of that would be the projection
+/// claiming an observation nobody made, and a file list that lies is worse
+/// than one that is a moment behind. The next projection pass reports the
+/// truth; until then every control derived from the stale states fails its own
+/// preflight, which is the fail-closed direction.
+fn git_staging_snapshot(
+    current: &ReviewSnapshot,
+    request: &ReviewActionRequest,
+    plan: &ReviewExternalEffectPlan,
+) -> Stored<ReviewSnapshot> {
+    if current.schema() != ReviewSchemaVersion::V2
+        || current.workspace() != request.workspace()
+        || current.revision() != request.expected_revision()
+    {
+        return Err(ReviewStoreError::Conflict("external_effect_completion"));
+    }
+    let family = plan
+        .git_staging_family()
+        .ok_or(ReviewStoreError::Corrupt("git_staging_family"))?;
+    let proposal_id = plan
+        .git_staging_proposal_id()
+        .ok_or(ReviewStoreError::Corrupt("external_effect_plan"))?;
+    let expected_kind = match family {
+        ReviewGitStagingFamily::Stage => ReviewProposalKind::Stage,
+        ReviewGitStagingFamily::Unstage => ReviewProposalKind::Unstage,
+        ReviewGitStagingFamily::Commit => ReviewProposalKind::Commit,
+        ReviewGitStagingFamily::ResolveConflict => ReviewProposalKind::ResolveConflict,
+    };
+    // The proposal must still be the one that was written. Anything else means
+    // the projection was replaced between admission and completion, and
+    // removing some other proposal would discard work nobody performed.
+    if !current
+        .proposals()
+        .iter()
+        .any(|proposal| proposal.id().as_str() == proposal_id && proposal.kind() == expected_kind)
+    {
+        return Err(ReviewStoreError::Conflict("external_effect_completion"));
+    }
+    let next_revision = Revision::new(
+        current
+            .revision()
+            .get()
+            .checked_add(1)
+            .ok_or(ReviewStoreError::InvalidField("revision"))?,
+    )
+    .map_err(|_| ReviewStoreError::InvalidField("revision"))?;
+    let proposals = current
+        .proposals()
+        .iter()
+        .filter(|proposal| proposal.id().as_str() != proposal_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    ReviewSnapshot::new(
+        current.workspace().clone(),
+        next_revision,
+        current.files().to_vec(),
+        current.comments().to_vec(),
+        proposals,
+        current.checks().to_vec(),
         current.review().clone(),
         current.pull_request().clone(),
         current.delivery().clone(),
@@ -4715,7 +5511,16 @@ fn validate_external_effect_custody(
         action.request.action(),
         ReviewAction::SendCommentToAgent { .. } | ReviewAction::BatchSendCommentsToAgent { .. }
     );
-    let github_action = plan.is_some_and(ReviewExternalEffectPlan::is_github_effect);
+    // Every confirmed write shares one custody machine, so the coherence rule
+    // is stated once over whichever family's custody column the plan carries.
+    // A family whose custody this function did not know how to read would fall
+    // through to the "no plan at all" branch below and be called corrupt, so
+    // this reads the custody rather than the provider.
+    let correlated_custody = plan.and_then(|plan| {
+        plan.github_custody()
+            .or_else(|| plan.git_staging_custody())
+            .map(|custody| (plan, custody))
+    });
     let rows: Vec<(String, i64, String, String, String)> = {
         let mut statement = connection.prepare(
             "SELECT comment_id,comment_revision,workspace_kind,workspace_id,disposition FROM review_external_effect_targets WHERE preview_id=?1 ORDER BY comment_id",
@@ -4732,13 +5537,10 @@ fn validate_external_effect_custody(
             })?
             .collect::<Result<_, _>>()?
     };
-    if github_action {
-        let Some(plan) = plan else {
+    if let Some((plan, custody)) = correlated_custody {
+        if !plan.is_correlated_effect() {
             return Err(ReviewStoreError::Corrupt("external_effect_custody"));
-        };
-        let Some(custody) = plan.github_custody() else {
-            return Err(ReviewStoreError::Corrupt("external_effect_custody"));
-        };
+        }
         if !rows.is_empty() {
             return Err(ReviewStoreError::Corrupt("external_effect_custody"));
         }
@@ -4892,6 +5694,39 @@ fn validate_completed_basis(connection: &Connection, action: &StoredReviewAction
                 Ok(())
             } else {
                 Err(ReviewStoreError::Corrupt("completion_basis"))
+            };
+        }
+        // A completed local staging write asserts exactly two things, and both
+        // are checked against the snapshot it produced: the revision advanced
+        // by one, and the proposal it carried out is gone. It deliberately
+        // asserts nothing about file states, because the store observed the
+        // write and not the worktree.
+        if let Some(proposal_id) = staging_proposal_id(action.request.action()) {
+            let result = action
+                .receipt
+                .revision()
+                .ok_or(ReviewStoreError::Corrupt("completion_basis"))?;
+            let expected = action
+                .request
+                .expected_revision()
+                .get()
+                .checked_add(1)
+                .and_then(|value| Revision::new(value).ok())
+                .ok_or(ReviewStoreError::Corrupt("completion_basis"))?;
+            if result != expected {
+                return Err(ReviewStoreError::Corrupt("completion_basis"));
+            }
+            let (kind, id) = workspace_parts(action.request.workspace());
+            let completed = read_snapshot_revision(connection, kind, id, result)?
+                .ok_or(ReviewStoreError::Corrupt("completion_basis"))?;
+            return if completed
+                .proposals()
+                .iter()
+                .any(|proposal| proposal.id() == proposal_id)
+            {
+                Err(ReviewStoreError::Corrupt("completion_basis"))
+            } else {
+                Ok(())
             };
         }
         let result = action
@@ -5299,6 +6134,42 @@ fn insert_external_plan(
         })?;
         return Ok(());
     }
+    if let Some(staging) = &plan.git_staging {
+        transaction
+            .execute(
+                "INSERT INTO review_git_staging_effect_plans(preview_id,request_digest,registry_generation_digest,canonical_root,family,proposal_id,paths,conflict_path,resolution,subject,observation_digest,observed_head,observed_index_digest,natural_key,custody,resulting_head,plan_document,plan_digest,receipt_correlation_digest,expected_workspace_revision,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'not_started',NULL,?15,?16,?17,?18,?19,?19)",
+                params![
+                    preview_id,
+                    plan.request_digest.as_slice(),
+                    plan.registry_generation_digest.as_slice(),
+                    staging.canonical_root,
+                    staging.family.as_str(),
+                    staging.proposal_id,
+                    encode_staging_paths(&staging.paths),
+                    staging.conflict_path,
+                    staging.resolution,
+                    staging.subject,
+                    staging.observation_digest.as_slice(),
+                    staging.observed_head,
+                    staging.observed_index_digest.as_slice(),
+                    git_staging_natural_key(staging),
+                    plan.document,
+                    plan.digest.as_slice(),
+                    staging.receipt_correlation_digest.as_slice(),
+                    db_revision(staging.expected_workspace_revision)?,
+                    created_at_ms,
+                ],
+            )
+            .map_err(|error| match &error {
+                rusqlite::Error::SqliteFailure(code, _)
+                    if matches!(code.extended_code, 1555 | 2067) =>
+                {
+                    ReviewStoreError::Conflict("git_staging_effect")
+                }
+                _ => ReviewStoreError::Sqlite(error),
+            })?;
+        return Ok(());
+    }
     transaction.execute(
         "INSERT INTO review_external_effect_plans(preview_id,request_digest,effect_kind,registry_generation_digest,provider,work_session_id,provider_session_id,work_session_revision,provider_session_revision,transport_key,payload,payload_digest,plan_document,plan_digest,created_at_ms) VALUES(?1,?2,'retained_session',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
         params![
@@ -5319,6 +6190,17 @@ fn insert_external_plan(
         ],
     )?;
     Ok(())
+}
+
+/// The proposal one local staging action names, if it is one.
+const fn staging_proposal_id(action: &ReviewAction) -> Option<&ReviewProposalId> {
+    match action {
+        ReviewAction::Stage { proposal_id }
+        | ReviewAction::Unstage { proposal_id }
+        | ReviewAction::Commit { proposal_id }
+        | ReviewAction::ResolveConflict { proposal_id, .. } => Some(proposal_id),
+        _ => None,
+    }
 }
 
 fn external_action_targets(request: &ReviewActionRequest) -> Stored<Vec<(&str, Revision)>> {
@@ -5387,19 +6269,28 @@ fn read_external_plan(
     connection: &Connection,
     preview_id: &str,
 ) -> Stored<Option<ReviewExternalEffectPlan>> {
-    let (retained_exists, github_exists, pull_request_exists): (bool, bool, bool) = connection
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM review_external_effect_plans WHERE preview_id=?1),EXISTS(SELECT 1 FROM review_github_check_effect_plans WHERE preview_id=?1),EXISTS(SELECT 1 FROM review_github_pull_request_effect_plans WHERE preview_id=?1)",
-            [preview_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
+    let (retained_exists, github_exists, pull_request_exists, staging_exists): (
+        bool,
+        bool,
+        bool,
+        bool,
+    ) = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM review_external_effect_plans WHERE preview_id=?1),EXISTS(SELECT 1 FROM review_github_check_effect_plans WHERE preview_id=?1),EXISTS(SELECT 1 FROM review_github_pull_request_effect_plans WHERE preview_id=?1),EXISTS(SELECT 1 FROM review_git_staging_effect_plans WHERE preview_id=?1)",
+        [preview_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
     // One preview owns at most one plan. Two would mean two different writes
     // share a custody row, which is the state the whole exactly-once argument
     // assumes cannot exist.
-    if [retained_exists, github_exists, pull_request_exists]
-        .iter()
-        .filter(|present| **present)
-        .count()
+    if [
+        retained_exists,
+        github_exists,
+        pull_request_exists,
+        staging_exists,
+    ]
+    .iter()
+    .filter(|present| **present)
+    .count()
         > 1
     {
         return Err(ReviewStoreError::Corrupt("external_effect_plan"));
@@ -5409,6 +6300,9 @@ fn read_external_plan(
     }
     if pull_request_exists {
         return read_github_pull_request_plan(connection, preview_id);
+    }
+    if staging_exists {
+        return read_git_staging_plan(connection, preview_id);
     }
     type Raw = (
         Vec<u8>,
@@ -5721,6 +6615,161 @@ fn read_github_pull_request_plan(
     };
     if pull_request_natural_key(stored_plan) != natural_key {
         return Err(ReviewStoreError::Corrupt("github_pull_request_effect"));
+    }
+    Ok(Some(plan))
+}
+
+/// Paths are stored as one NUL-free, newline-separated column rather than a
+/// child table.
+///
+/// A plan's file list is sealed with the plan and never queried on its own, so
+/// a table would add a join and a second thing to keep in step with the plan
+/// digest. The grammar already refuses control bytes, so the separator cannot
+/// appear inside a path.
+fn encode_staging_paths(paths: &[String]) -> String {
+    paths.join("\n")
+}
+
+fn decode_staging_paths(value: &str) -> Stored<Vec<String>> {
+    let paths = value.split('\n').map(str::to_owned).collect::<Vec<_>>();
+    if paths.iter().any(|path| !safe_effect_path(path)) {
+        return Err(ReviewStoreError::Corrupt("git_staging_effect"));
+    }
+    Ok(paths)
+}
+
+/// The cross-actor exactly-once key for one local staging write.
+///
+/// `<family>:<observation digest>`, which is the narrowest thing that is
+/// genuinely the same effect twice. The observation digest already commits to
+/// HEAD, to the whole index, to every named path's objects, conflict stages
+/// and working-tree stat identity, and -- for a resolution -- to which side
+/// would be written, so two plans sharing it are two spellings of one write
+/// against one state of one repository.
+///
+/// The commit subject is deliberately not in it: two subjects over one parent
+/// and one index are still one commit's worth of effect, and only one of them
+/// can land because the second finds HEAD moved.
+fn git_staging_natural_key(plan: &GitStagingEffectPlan) -> String {
+    format!(
+        "{}:{}",
+        plan.family.as_str(),
+        digest_token(&plan.observation_digest)
+    )
+}
+
+fn read_git_staging_plan(
+    connection: &Connection,
+    preview_id: &str,
+) -> Stored<Option<ReviewExternalEffectPlan>> {
+    type Raw = (
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Vec<u8>,
+        String,
+        Vec<u8>,
+        String,
+        String,
+        Option<String>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+    );
+    let raw: Option<Raw> = connection
+        .query_row(
+            "SELECT request_digest,registry_generation_digest,canonical_root,family,proposal_id,paths,conflict_path,resolution,subject,observation_digest,observed_head,observed_index_digest,natural_key,custody,resulting_head,plan_document,plan_digest,receipt_correlation_digest,expected_workspace_revision FROM review_git_staging_effect_plans WHERE preview_id=?1",
+            [preview_id],
+            |row| {
+                Ok((
+                    row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
+                    row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
+                    row.get(10)?, row.get(11)?, row.get(12)?, row.get(13)?, row.get(14)?,
+                    row.get(15)?, row.get(16)?, row.get(17)?, row.get(18)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        request_digest,
+        registry_digest,
+        canonical_root,
+        family,
+        proposal_id,
+        paths,
+        conflict_path,
+        resolution,
+        subject,
+        observation_digest,
+        observed_head,
+        observed_index_digest,
+        natural_key,
+        custody,
+        resulting_head,
+        document,
+        stored_digest,
+        correlation_digest,
+        expected_workspace_revision,
+    )) = raw
+    else {
+        return Ok(None);
+    };
+    let request_digest: [u8; 32] = request_digest
+        .try_into()
+        .map_err(|_| ReviewStoreError::Corrupt("external_effect_request_digest"))?;
+    let registry_digest: [u8; 32] = registry_digest
+        .try_into()
+        .map_err(|_| ReviewStoreError::Corrupt("external_effect_registry_digest"))?;
+    let observation_digest: [u8; 32] = observation_digest
+        .try_into()
+        .map_err(|_| ReviewStoreError::Corrupt("git_staging_effect"))?;
+    let observed_index_digest: [u8; 32] = observed_index_digest
+        .try_into()
+        .map_err(|_| ReviewStoreError::Corrupt("git_staging_effect"))?;
+    let stored_digest: [u8; 32] = stored_digest
+        .try_into()
+        .map_err(|_| ReviewStoreError::Corrupt("external_effect_plan_digest"))?;
+    let correlation_digest: [u8; 32] = correlation_digest
+        .try_into()
+        .map_err(|_| ReviewStoreError::Corrupt("receipt_correlation_digest"))?;
+    let paths = decode_staging_paths(&paths)?;
+    let conflict = match (conflict_path.as_deref(), resolution.as_deref()) {
+        (Some(path), Some(resolution)) => Some((path, resolution)),
+        (None, None) => None,
+        _ => return Err(ReviewStoreError::Corrupt("git_staging_effect")),
+    };
+    let plan = ReviewExternalEffectPlan::git_staging_stored(
+        request_digest,
+        registry_digest,
+        &canonical_root,
+        ReviewGitStagingFamily::parse(&family)?,
+        &proposal_id,
+        &paths,
+        conflict,
+        subject.as_deref(),
+        (observation_digest, &observed_head, observed_index_digest),
+        parse_revision(expected_workspace_revision)?,
+        correlation_digest,
+        ReviewExternalEffectCustody::parse(&custody)?,
+        resulting_head.as_deref(),
+    )?;
+    if plan.document != document || plan.digest != stored_digest {
+        return Err(ReviewStoreError::Corrupt("external_effect_plan"));
+    }
+    // The natural key is the cross-actor fence, so a row whose stored key does
+    // not re-derive from its own coordinates is a fence that stopped fencing.
+    let Some(stored_plan) = plan.git_staging.as_ref() else {
+        return Err(ReviewStoreError::Corrupt("external_effect_plan"));
+    };
+    if git_staging_natural_key(stored_plan) != natural_key {
+        return Err(ReviewStoreError::Corrupt("git_staging_effect"));
     }
     Ok(Some(plan))
 }

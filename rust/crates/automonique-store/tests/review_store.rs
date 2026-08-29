@@ -14,7 +14,8 @@ use automonique_protocol::primitives::Revision;
 use automonique_store::review_store::{
     ApprovalPolicy, REVIEW_STORE_SCHEMA_VERSION, ReviewActionAdmission, ReviewApprovalDecision,
     ReviewApprovalDocument, ReviewExternalEffectCustody, ReviewExternalEffectPlan,
-    ReviewPullRequestFamily, ReviewStore, ReviewStoreError, ReviewWriteAdmission,
+    ReviewGitStagingFamily, ReviewPullRequestFamily, ReviewStore, ReviewStoreError,
+    ReviewWriteAdmission,
 };
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
@@ -60,7 +61,7 @@ fn downgrade_review_store_to_v1(path: &Path) {
     let connection = Connection::open(path).expect("open v2 store for downgrade");
     connection
         .execute_batch(
-            "DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; ALTER TABLE review_snapshots DROP COLUMN protocol_schema; PRAGMA user_version=1;",
+            "DROP TABLE review_git_staging_effect_plans; DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; ALTER TABLE review_snapshots DROP COLUMN protocol_schema; PRAGMA user_version=1;",
         )
         .expect("construct historical v1 store");
 }
@@ -1259,7 +1260,7 @@ fn v6_store_gains_pull_request_custody_without_disturbing_check_reruns() {
         .unwrap();
     drop(store);
     let raw = Connection::open(private.path()).unwrap();
-    raw.execute_batch("DROP TABLE review_github_pull_request_effect_plans; PRAGMA user_version=6;")
+    raw.execute_batch("DROP TABLE review_git_staging_effect_plans; DROP TABLE review_github_pull_request_effect_plans; PRAGMA user_version=6;")
         .unwrap();
     drop(raw);
 
@@ -1287,6 +1288,541 @@ fn v6_store_gains_pull_request_custody_without_disturbing_check_reruns() {
     let tables: i64 = raw
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='review_github_pull_request_effect_plans'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 1);
+}
+
+const STAGING_ROOT: &str = "/srv/automonique/repositories/workspace-1";
+const STAGING_HEAD: &str = "89abcdef0123456789abcdef0123456789abcdef";
+
+fn staging_request(key: &str, actor: &str, action: ReviewAction) -> ReviewActionRequest {
+    let base = request();
+    ReviewActionRequest::new(
+        base.workspace().clone(),
+        revision(9),
+        ReviewActorId::new(actor).expect("actor"),
+        base.authentication(),
+        ReviewAuthority::new(
+            ReviewAuthorityKind::Git,
+            ReviewAuthorityId::new("authority-1").expect("authority"),
+        ),
+        IdempotencyKey::new(key).expect("key"),
+        action,
+    )
+    .expect("request")
+}
+
+fn seed_staging(store: &mut ReviewStore, snapshot: &ReviewSnapshot) {
+    store.put_snapshot(snapshot, 10).expect("snapshot");
+    store
+        .grant_authority(
+            snapshot.workspace(),
+            &ReviewActorId::new("actor-1").expect("actor"),
+            ReviewAuthentication::UserSession,
+            &ReviewAuthority::new(
+                ReviewAuthorityKind::Git,
+                ReviewAuthorityId::new("authority-1").expect("authority"),
+            ),
+            11,
+        )
+        .expect("authority grant");
+    store
+        .grant_authority(
+            snapshot.workspace(),
+            &ReviewActorId::new("actor-2").expect("actor"),
+            ReviewAuthentication::UserSession,
+            &ReviewAuthority::new(
+                ReviewAuthorityKind::Git,
+                ReviewAuthorityId::new("authority-1").expect("authority"),
+            ),
+            11,
+        )
+        .expect("authority grant");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn staging_plan(
+    request: &ReviewActionRequest,
+    family: ReviewGitStagingFamily,
+    proposal: &str,
+    paths: &[&str],
+    conflict: Option<(&str, &str)>,
+    subject: Option<&str>,
+    observation: [u8; 32],
+    root: &str,
+) -> ReviewExternalEffectPlan {
+    let request_digest =
+        ReviewStore::action_request_digest(request, ApprovalPolicy::NotRequired).expect("digest");
+    let paths = paths
+        .iter()
+        .map(|path| (*path).to_owned())
+        .collect::<Vec<_>>();
+    ReviewExternalEffectPlan::git_staging(
+        request_digest,
+        [7; 32],
+        root,
+        family,
+        proposal,
+        &paths,
+        conflict,
+        subject,
+        (observation, STAGING_HEAD, [5; 32]),
+        revision(11),
+        [9; 32],
+    )
+    .expect("git staging effect plan")
+}
+
+/// A completed staging write advances the projection by exactly what the store
+/// observed: the write.
+///
+/// The performed proposal is gone, because a proposal that has been carried
+/// out is no longer one. Every file state is untouched, because this store
+/// read the write and not the worktree, and a projection that re-asserted
+/// states nobody observed would be lying about a repository it did not look
+/// at.
+#[test]
+fn a_completed_staging_write_removes_its_proposal_and_asserts_no_new_file_state() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let snapshot = action_snapshot(false);
+    seed_staging(&mut store, &snapshot);
+    let request = staging_request(
+        "stage-1",
+        "actor-1",
+        ReviewAction::Stage {
+            proposal_id: ReviewProposalId::new("proposal-stage").unwrap(),
+        },
+    );
+    let plan = staging_plan(
+        &request,
+        ReviewGitStagingFamily::Stage,
+        "proposal-stage",
+        &["src/review.rs"],
+        None,
+        None,
+        [1; 32],
+        STAGING_ROOT,
+    );
+    admit(&mut store, &request, &plan);
+    let preview = preview_of(&store, &request);
+    let receipt = store
+        .settle_git_staging(
+            &preview,
+            plan.request_digest(),
+            ReviewExternalEffectCustody::Accepted,
+            None,
+            16,
+        )
+        .expect("accept");
+    assert_eq!(receipt.outcome(), ReviewReceiptOutcome::Accepted);
+    let receipt = store
+        .settle_git_staging(
+            &preview,
+            plan.request_digest(),
+            ReviewExternalEffectCustody::Completed,
+            None,
+            17,
+        )
+        .expect("complete");
+    assert_eq!(receipt.outcome(), ReviewReceiptOutcome::Completed);
+    assert_eq!(receipt.revision(), Some(revision(10)));
+
+    let next = store.snapshot(snapshot.workspace()).unwrap().unwrap();
+    assert_eq!(next.revision(), revision(10));
+    assert!(
+        !next
+            .proposals()
+            .iter()
+            .any(|proposal| proposal.id().as_str() == "proposal-stage"),
+        "a proposal that has been performed is no longer a proposal",
+    );
+    assert_eq!(
+        next.proposals().len(),
+        snapshot.proposals().len() - 1,
+        "no other proposal may be discarded",
+    );
+    assert_eq!(
+        next.files(),
+        snapshot.files(),
+        "the store observed the write, not the worktree",
+    );
+    assert_eq!(next.comments(), snapshot.comments());
+}
+
+/// One write per repository per observation, across actors.
+///
+/// The natural key is `<family>:<observation digest>`, and the observation
+/// digest already commits to HEAD, the whole index and every named path. Two
+/// actors holding the same advertisement are holding one write, so the second
+/// is refused rather than replayed. A different observation of the same
+/// repository is a different write and reserves separately.
+#[test]
+fn one_staging_write_per_repository_per_observation_is_reserved_across_actors() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let snapshot = action_snapshot(false);
+    seed_staging(&mut store, &snapshot);
+    let action = || ReviewAction::Stage {
+        proposal_id: ReviewProposalId::new("proposal-stage").unwrap(),
+    };
+    let first = staging_request("stage-first", "actor-1", action());
+    let second = staging_request("stage-second", "actor-2", action());
+    let plan = staging_plan(
+        &first,
+        ReviewGitStagingFamily::Stage,
+        "proposal-stage",
+        &["src/review.rs"],
+        None,
+        None,
+        [1; 32],
+        STAGING_ROOT,
+    );
+    store
+        .prepare_external_action(&first, ApprovalPolicy::NotRequired, &plan, 12)
+        .expect("first admission");
+
+    let same_observation = staging_plan(
+        &second,
+        ReviewGitStagingFamily::Stage,
+        "proposal-stage",
+        &["src/review.rs"],
+        None,
+        None,
+        [1; 32],
+        STAGING_ROOT,
+    );
+    assert!(
+        matches!(
+            store.prepare_external_action(
+                &second,
+                ApprovalPolicy::NotRequired,
+                &same_observation,
+                13
+            ),
+            Err(ReviewStoreError::Conflict("git_staging_effect"))
+        ),
+        "two actors advertised one observation, so they hold one write",
+    );
+
+    // A repository that moved is a different observation and therefore a
+    // different write.
+    let moved = staging_plan(
+        &second,
+        ReviewGitStagingFamily::Stage,
+        "proposal-stage",
+        &["src/review.rs"],
+        None,
+        None,
+        [2; 32],
+        STAGING_ROOT,
+    );
+    store
+        .prepare_external_action(&second, ApprovalPolicy::NotRequired, &moved, 14)
+        .expect("a moved worktree is a different effect");
+
+    // And the key is per repository: the same observation in another checkout
+    // is not the same write.
+    let elsewhere = staging_request("stage-elsewhere", "actor-1", action());
+    let other_root = staging_plan(
+        &elsewhere,
+        ReviewGitStagingFamily::Stage,
+        "proposal-stage",
+        &["src/review.rs"],
+        None,
+        None,
+        [1; 32],
+        "/srv/automonique/repositories/workspace-2",
+    );
+    store
+        .prepare_external_action(&elsewhere, ApprovalPolicy::NotRequired, &other_root, 15)
+        .expect("another repository is another effect");
+}
+
+/// A sealed plan must describe the exact action it was prepared for.
+#[test]
+fn a_staging_plan_that_disagrees_with_its_action_is_refused_at_admission() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let snapshot = action_snapshot(false);
+    seed_staging(&mut store, &snapshot);
+    let request = staging_request(
+        "stage-mismatch",
+        "actor-1",
+        ReviewAction::Stage {
+            proposal_id: ReviewProposalId::new("proposal-stage").unwrap(),
+        },
+    );
+    // A plan for another proposal.
+    let other_proposal = staging_plan(
+        &request,
+        ReviewGitStagingFamily::Stage,
+        "proposal-unstage",
+        &["src/review.rs"],
+        None,
+        None,
+        [1; 32],
+        STAGING_ROOT,
+    );
+    assert!(matches!(
+        store.prepare_external_action(&request, ApprovalPolicy::NotRequired, &other_proposal, 12),
+        Err(ReviewStoreError::Conflict("external_effect_request"))
+    ));
+    // A plan for another family.
+    let other_family = staging_plan(
+        &request,
+        ReviewGitStagingFamily::Commit,
+        "proposal-stage",
+        &["src/review.rs"],
+        None,
+        Some("record it"),
+        [1; 32],
+        STAGING_ROOT,
+    );
+    assert!(matches!(
+        store.prepare_external_action(&request, ApprovalPolicy::NotRequired, &other_family, 12),
+        Err(ReviewStoreError::Conflict("external_effect_request"))
+    ));
+
+    // And a resolution's side must be the one the action carries, because it
+    // decides which bytes land.
+    let conflicted = action_snapshot(true);
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    seed_staging(&mut store, &conflicted);
+    let request = staging_request(
+        "resolve-mismatch",
+        "actor-1",
+        ReviewAction::ResolveConflict {
+            proposal_id: ReviewProposalId::new("proposal-resolve").unwrap(),
+            file_id: conflicted.files()[0].id().clone(),
+            resolution: ConflictResolution::KeepCurrent,
+        },
+    );
+    let other_side = staging_plan(
+        &request,
+        ReviewGitStagingFamily::ResolveConflict,
+        "proposal-resolve",
+        &["src/review.rs"],
+        Some(("src/review.rs", "keep_incoming")),
+        None,
+        [1; 32],
+        STAGING_ROOT,
+    );
+    assert!(matches!(
+        store.prepare_external_action(&request, ApprovalPolicy::NotRequired, &other_side, 12),
+        Err(ReviewStoreError::Conflict("external_effect_request"))
+    ));
+}
+
+/// A shape its family cannot have is unsealable, and a head only a commit can
+/// produce cannot be recorded against anything else or rewritten afterwards.
+#[test]
+fn a_staging_plan_refuses_a_shape_or_a_head_its_family_cannot_own() {
+    let base = staging_request(
+        "shape",
+        "actor-1",
+        ReviewAction::Stage {
+            proposal_id: ReviewProposalId::new("proposal-stage").unwrap(),
+        },
+    );
+    let digest =
+        ReviewStore::action_request_digest(&base, ApprovalPolicy::NotRequired).expect("digest");
+    let seal = |family, conflict, subject, paths: Vec<String>, root: &str| {
+        ReviewExternalEffectPlan::git_staging(
+            digest,
+            [7; 32],
+            root,
+            family,
+            "proposal-stage",
+            &paths,
+            conflict,
+            subject,
+            ([1; 32], STAGING_HEAD, [5; 32]),
+            revision(11),
+            [9; 32],
+        )
+    };
+    let one = || vec!["src/review.rs".to_owned()];
+    // Only a commit carries a subject; only a resolution carries a side.
+    assert!(
+        seal(
+            ReviewGitStagingFamily::Stage,
+            None,
+            Some("a stage records nothing"),
+            one(),
+            STAGING_ROOT
+        )
+        .is_err()
+    );
+    assert!(
+        seal(
+            ReviewGitStagingFamily::Commit,
+            None,
+            None,
+            one(),
+            STAGING_ROOT
+        )
+        .is_err()
+    );
+    // A resolution names one of the proposal's own files.
+    assert!(
+        seal(
+            ReviewGitStagingFamily::ResolveConflict,
+            Some(("src/other.rs", "keep_current")),
+            None,
+            one(),
+            STAGING_ROOT
+        )
+        .is_err()
+    );
+    // The path grammar is restated here rather than trusted from the caller.
+    for hostile in ["../escape", ".git/config", "src/*.rs", "/absolute"] {
+        assert!(
+            seal(
+                ReviewGitStagingFamily::Stage,
+                None,
+                None,
+                vec![hostile.to_owned()],
+                STAGING_ROOT
+            )
+            .is_err(),
+            "{hostile:?} must not be sealable",
+        );
+    }
+    // A root that is not an absolute path is not a canonical root.
+    assert!(seal(ReviewGitStagingFamily::Stage, None, None, one(), "relative").is_err());
+
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let snapshot = action_snapshot(false);
+    seed_staging(&mut store, &snapshot);
+    let request = staging_request(
+        "commit-head",
+        "actor-1",
+        ReviewAction::Commit {
+            proposal_id: ReviewProposalId::new("proposal-commit").unwrap(),
+        },
+    );
+    let plan = staging_plan(
+        &request,
+        ReviewGitStagingFamily::Commit,
+        "proposal-commit",
+        &["src/review.rs"],
+        None,
+        Some("record the reviewed change"),
+        [3; 32],
+        STAGING_ROOT,
+    );
+    admit(&mut store, &request, &plan);
+    let preview = preview_of(&store, &request);
+    // A commit that reached an acknowledged state must name the commit it
+    // produced, or it can never be told from anybody else's.
+    assert!(
+        store
+            .settle_git_staging(
+                &preview,
+                plan.request_digest(),
+                ReviewExternalEffectCustody::Accepted,
+                None,
+                16,
+            )
+            .is_err()
+    );
+    let landed = "1111111111111111111111111111111111111111";
+    store
+        .settle_git_staging(
+            &preview,
+            plan.request_digest(),
+            ReviewExternalEffectCustody::Accepted,
+            Some(landed),
+            16,
+        )
+        .expect("accept");
+    // Write-once: a later settlement cannot rename the commit that landed.
+    assert!(matches!(
+        store.settle_git_staging(
+            &preview,
+            plan.request_digest(),
+            ReviewExternalEffectCustody::Completed,
+            Some("2222222222222222222222222222222222222222"),
+            17,
+        ),
+        Err(ReviewStoreError::Conflict("git_staging_head"))
+    ));
+    store
+        .settle_git_staging(
+            &preview,
+            plan.request_digest(),
+            ReviewExternalEffectCustody::Completed,
+            Some(landed),
+            17,
+        )
+        .expect("complete");
+    let (_, stored) = store
+        .external_action(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            18,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.git_staging_resulting_head(), Some(landed));
+    assert_eq!(
+        stored.git_staging_custody(),
+        Some(ReviewExternalEffectCustody::Completed)
+    );
+    assert!(stored.is_correlated_effect());
+}
+
+/// A store written before local staging existed gains its custody table and
+/// keeps every other family exactly as it was.
+#[test]
+fn v7_store_gains_git_staging_custody_without_disturbing_the_other_families() {
+    let private = PrivateStore::new();
+    let mut store = ReviewStore::open(private.path()).unwrap();
+    let request = seed(&mut store);
+    let plan = github_external_plan(&request);
+    store
+        .prepare_external_action(&request, ApprovalPolicy::NotRequired, &plan, 12)
+        .unwrap();
+    drop(store);
+    let raw = Connection::open(private.path()).unwrap();
+    raw.execute_batch("DROP TABLE review_git_staging_effect_plans; PRAGMA user_version=7;")
+        .unwrap();
+    drop(raw);
+
+    let store = ReviewStore::open(private.path()).expect("migrate v7");
+    let (_, migrated) = store
+        .external_action(
+            request.workspace(),
+            request.actor(),
+            request.authentication(),
+            request.authority(),
+            request.idempotency_key(),
+            13,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(migrated.is_github_check_rerun());
+    assert!(!migrated.is_git_staging());
+    assert_eq!(migrated.git_staging_family(), None);
+    drop(store);
+    let raw = Connection::open(private.path()).unwrap();
+    assert_eq!(
+        raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .unwrap(),
+        REVIEW_STORE_SCHEMA_VERSION
+    );
+    let tables: i64 = raw
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='review_git_staging_effect_plans'",
             [],
             |row| row.get(0),
         )
@@ -1813,7 +2349,7 @@ fn populated_v2_store_adds_external_plan_custody_transactionally() {
     }
     let raw = Connection::open(private.path()).expect("raw");
     raw.execute_batch(
-        "DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+        "DROP TABLE review_git_staging_effect_plans; DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
     )
         .expect("construct v2 store");
     drop(raw);
@@ -1862,7 +2398,7 @@ fn populated_real_v3_store_migrates_to_v4_without_losing_review_state() {
             .unwrap();
     }
     let raw = Connection::open(private.path()).unwrap();
-    raw.execute_batch("DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; PRAGMA user_version=3;")
+    raw.execute_batch("DROP TABLE review_git_staging_effect_plans; DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; PRAGMA user_version=3;")
         .unwrap();
     drop(raw);
 
@@ -1894,7 +2430,7 @@ fn v4_store_adds_nullable_receipt_correlation_transactionally() {
     drop(ReviewStore::open(private.path()).unwrap());
     let raw = Connection::open(private.path()).unwrap();
     raw.execute_batch(
-        "DROP TABLE review_github_pull_request_effect_plans;
+        "DROP TABLE review_git_staging_effect_plans; DROP TABLE review_github_pull_request_effect_plans;
          ALTER TABLE review_github_check_effect_plans DROP COLUMN receipt_correlation_digest;
          ALTER TABLE review_github_check_effect_plans DROP COLUMN expected_workspace_revision;
          PRAGMA user_version=4;",
@@ -1942,7 +2478,7 @@ fn v5_store_adds_nullable_workspace_revision_and_preserves_legacy_as_unbound() {
     )
     .unwrap();
     raw.execute_batch(
-        "DROP TABLE review_github_pull_request_effect_plans;
+        "DROP TABLE review_git_staging_effect_plans; DROP TABLE review_github_pull_request_effect_plans;
          ALTER TABLE review_github_check_effect_plans DROP COLUMN expected_workspace_revision;
          PRAGMA user_version=5;",
     )
@@ -1992,7 +2528,7 @@ fn failed_populated_v3_to_v4_migration_rolls_back_version_and_preserves_data() {
     }
     let raw = Connection::open(private.path()).unwrap();
     raw.execute_batch(
-        "DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; CREATE TABLE review_github_check_effect_plans(marker TEXT) STRICT; PRAGMA user_version=3;",
+        "DROP TABLE review_git_staging_effect_plans; DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; CREATE TABLE review_github_check_effect_plans(marker TEXT) STRICT; PRAGMA user_version=3;",
     )
     .unwrap();
     drop(raw);
@@ -2069,7 +2605,7 @@ fn v2_migration_terminalizes_legacy_accepted_external_action_without_a_plan() {
     };
     let raw = Connection::open(private.path()).unwrap();
     raw.execute_batch(
-        "DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+        "DROP TABLE review_git_staging_effect_plans; DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
     )
     .unwrap();
     drop(raw);
@@ -2242,7 +2778,7 @@ fn v2_migration_preserves_or_conservatively_terminalizes_every_external_outcome(
         };
         let raw = Connection::open(private.path()).unwrap();
         raw.execute_batch(
-            "DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+            "DROP TABLE review_git_staging_effect_plans; DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
         )
         .unwrap();
         drop(raw);
@@ -2318,7 +2854,7 @@ fn migration_tombstone_tampering_and_native_missing_plan_corruption_fail_closed(
     };
     let raw = Connection::open(private.path()).unwrap();
     raw.execute_batch(
-        "DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+        "DROP TABLE review_git_staging_effect_plans; DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
     )
     .unwrap();
     drop(raw);
@@ -2467,7 +3003,7 @@ fn migration_refuses_legacy_completed_external_receipt_without_exact_snapshot_ba
     )
     .unwrap();
     raw.execute_batch(
-        "DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
+        "DROP TABLE review_git_staging_effect_plans; DROP TABLE review_github_pull_request_effect_plans; DROP TABLE review_github_check_effect_plans; DROP TABLE review_external_effect_targets; DROP TABLE review_external_effect_plans; DROP TABLE review_external_effect_migration_tombstones; PRAGMA user_version=2;",
     )
     .unwrap();
     drop(raw);
