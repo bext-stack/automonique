@@ -1,0 +1,29 @@
+{
+  "schema": "automonique.attention-live-acceptance-signoff/v1",
+  "operator": null,
+  "signed_at": null,
+  "signed_off_ids": [],
+  "_this_is_a_template": [
+    "Copy this file, fill it in, and pass it to",
+    "run_attention_live_acceptance.py --operator-signoff.",
+    "As shipped it signs nothing off, and the harness refuses it: that is",
+    "deliberate, so a template left in place can never read as a sign-off.",
+    "Set `operator` to the person who watched the screens, `signed_at` to the",
+    "RFC 3339 UTC instant the last step was observed, and `signed_off_ids` to",
+    "the steps that person actually verified.",
+    "The harness records the file's sha256, so the report names the exact",
+    "sign-off it read."
+  ],
+  "_step_ids_this_harness_defines": {
+    "LIVE-GUI-1": "ShellDeck re-resolves the attention coordinate to an authorized pane",
+    "LIVE-GUI-2": "the hosted cockpit renders the same source and generation",
+    "LIVE-GUI-3": "the phone lands on the same session and refuses a superseded generation",
+    "LIVE-GUI-4": "all three clients converge after the item is retired"
+  },
+  "_unknown_ids_are_refused": [
+    "A file naming an id this harness does not define is rejected outright,",
+    "because that is how a sign-off written against an older checklist",
+    "silently passes a newer one."
+  ],
+  "_everything_prefixed_with_underscore_is_ignored": true
+}
