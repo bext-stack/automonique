@@ -522,6 +522,11 @@ describe("canonical HTTPS Platform v2 client", () => {
         open_pull_request: null,
         update_pull_request: null,
         merge_pull_request: null,
+        // Git staging is withheld separately again, and its absence is an
+        // explicit empty list rather than a missing field, for the same
+        // reason the pull-request slots carry explicit nulls.
+        staging: [],
+        conflict_resolutions: [],
         schema: PLATFORM_SCHEMA_V2,
       }}},
       {lane: "v2", request: {kind: "execute_review_action", request: {
@@ -546,6 +551,10 @@ describe("canonical HTTPS Platform v2 client", () => {
     expect(capabilities.kind === "review_capabilities" ? capabilities.capabilities.merge_pull_request : undefined).toBeNull();
     expect(capabilities.kind === "review_capabilities" ? capabilities.capabilities.open_pull_request : undefined).toBeNull();
     expect(capabilities.kind === "review_capabilities" ? capabilities.capabilities.update_pull_request : undefined).toBeNull();
+    // Git staging ships empty here for the same reason: this fixture's server
+    // proved nothing about a worktree, so it claims nothing about one.
+    expect(capabilities.kind === "review_capabilities" ? capabilities.capabilities.staging : undefined).toEqual([]);
+    expect(capabilities.kind === "review_capabilities" ? capabilities.capabilities.conflict_resolutions : undefined).toEqual([]);
     expect((await client.executeConfirmedReviewAction(workspace, WorkContextRevision(9n), action, key, confirmation, WorkContextRevision(4n), correlation)).kind).toBe("platform_v2_refused");
   });
 

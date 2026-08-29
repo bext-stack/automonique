@@ -321,6 +321,7 @@ fn agent_delivery_capabilities_are_deduplicated_and_bounded() {
             Vec::new(),
             vec![entry("comment-1", 3), entry("comment-1", 4)],
             ReviewPullRequestCapabilities::default(),
+            ReviewGitStagingCapabilities::default(),
         )
         .is_err()
     );
@@ -334,6 +335,7 @@ fn agent_delivery_capabilities_are_deduplicated_and_bounded() {
         Vec::new(),
         vec![entry("comment-2", 3), entry("comment-1", 4)],
         ReviewPullRequestCapabilities::default(),
+        ReviewGitStagingCapabilities::default(),
     )
     .unwrap();
     assert_eq!(
@@ -355,6 +357,7 @@ fn agent_delivery_capabilities_are_deduplicated_and_bounded() {
                 .map(|index| entry(&format!("comment-{index}"), 1))
                 .collect(),
             ReviewPullRequestCapabilities::default(),
+            ReviewGitStagingCapabilities::default(),
         )
         .is_err()
     );
@@ -396,6 +399,7 @@ fn pull_request_grants_are_three_independently_held_capabilities() {
             update: Some(update.clone()),
             ..ReviewPullRequestCapabilities::default()
         },
+        ReviewGitStagingCapabilities::default(),
     )
     .unwrap();
     assert!(capabilities.update_pull_request().is_some());
@@ -477,6 +481,7 @@ fn pull_request_grants_are_three_independently_held_capabilities() {
                 update: Some(update.clone()),
                 merge: None,
             },
+            ReviewGitStagingCapabilities::default(),
         )
         .is_err()
     );
@@ -507,6 +512,7 @@ fn pull_request_grants_are_three_independently_held_capabilities() {
                 update: Some(update),
                 merge: Some(merge),
             },
+            ReviewGitStagingCapabilities::default(),
         )
         .is_err()
     );
@@ -529,6 +535,7 @@ fn absent_pull_request_capabilities_round_trip_as_explicit_nulls() {
         Vec::new(),
         Vec::new(),
         ReviewPullRequestCapabilities::default(),
+        ReviewGitStagingCapabilities::default(),
     )
     .unwrap();
     assert!(capabilities.open_pull_request().is_none());
@@ -560,6 +567,287 @@ fn absent_pull_request_capabilities_round_trip_as_explicit_nulls() {
         assert!(
             encoded.contains(&format!("\"{field}\":null")),
             "{field} must be carried as an explicit null",
+        );
+    }
+}
+
+fn git_authority() -> ReviewAuthority {
+    ReviewAuthority::new(
+        ReviewAuthorityKind::Git,
+        ReviewAuthorityId::new("git-1").unwrap(),
+    )
+}
+
+fn observed_head() -> ReviewField {
+    ReviewField::new("0123456789abcdef0123456789abcdef01234567").unwrap()
+}
+
+fn observed_index() -> ReviewIndexDigest {
+    ReviewIndexDigest::new("ef".repeat(32)).unwrap()
+}
+
+fn staging_capability(id: &str, kind: ReviewProposalKind) -> ReviewStagingCapability {
+    ReviewStagingCapability::new(
+        ReviewProposalId::new(id).unwrap(),
+        kind,
+        observed_head(),
+        observed_index(),
+        git_authority(),
+        ReviewConfirmationDigest::new("ab".repeat(32)).unwrap(),
+        ReviewReceiptCorrelationDigest::new("cd".repeat(32)).unwrap(),
+    )
+    .unwrap()
+}
+
+/// A staging capability cannot be spelled without the two things it depends
+/// on, and cannot be spelled for the family that is not staging.
+///
+/// The fences are in the type rather than in a check upstream of it: a
+/// `HEAD` that is not a git object id, an authority that is not git, and the
+/// conflict-resolution kind are all unconstructable, so no code path can
+/// forget them.
+#[test]
+fn a_staging_capability_cannot_be_built_without_a_head_and_a_git_authority() {
+    assert!(
+        ReviewStagingCapability::new(
+            ReviewProposalId::new("proposal-1").unwrap(),
+            ReviewProposalKind::ResolveConflict,
+            observed_head(),
+            observed_index(),
+            git_authority(),
+            ReviewConfirmationDigest::new("ab".repeat(32)).unwrap(),
+            ReviewReceiptCorrelationDigest::new("cd".repeat(32)).unwrap(),
+        )
+        .is_err(),
+        "conflict resolution writes worktree bytes and has its own capability",
+    );
+    assert!(
+        ReviewStagingCapability::new(
+            ReviewProposalId::new("proposal-1").unwrap(),
+            ReviewProposalKind::Stage,
+            // A branch name, a ref, or an abbreviation is not an observation.
+            ReviewField::new("refs/heads/main").unwrap(),
+            observed_index(),
+            git_authority(),
+            ReviewConfirmationDigest::new("ab".repeat(32)).unwrap(),
+            ReviewReceiptCorrelationDigest::new("cd".repeat(32)).unwrap(),
+        )
+        .is_err(),
+        "the fence is the commit HEAD resolved to, never a name that can move",
+    );
+    for kind in [
+        ReviewAuthorityKind::Filesystem,
+        ReviewAuthorityKind::Ci,
+        ReviewAuthorityKind::PullRequest,
+        ReviewAuthorityKind::Review,
+        ReviewAuthorityKind::Delivery,
+    ] {
+        assert!(
+            ReviewStagingCapability::new(
+                ReviewProposalId::new("proposal-1").unwrap(),
+                ReviewProposalKind::Stage,
+                observed_head(),
+                observed_index(),
+                ReviewAuthority::new(kind, ReviewAuthorityId::new("authority-1").unwrap()),
+                ReviewConfirmationDigest::new("ab".repeat(32)).unwrap(),
+                ReviewReceiptCorrelationDigest::new("cd".repeat(32)).unwrap(),
+            )
+            .is_err(),
+            "{kind:?} must not be able to carry a git staging grant",
+        );
+    }
+    assert!(ReviewIndexDigest::new("nothex".repeat(10)).is_err());
+}
+
+/// Every git capability in one document was minted from one read.
+///
+/// Two spellings of `HEAD` or of the index mean the server read the worktree
+/// twice and it moved in between — which is precisely what these fences exist
+/// to catch. Letting a client choose between the pairings would hand it back
+/// the race the digest is supposed to close, so the document is refused.
+#[test]
+fn git_capabilities_must_all_name_the_same_head_and_index() {
+    let moved = ReviewStagingCapability::new(
+        ReviewProposalId::new("proposal-2").unwrap(),
+        ReviewProposalKind::Unstage,
+        ReviewField::new("89abcdef0123456789abcdef0123456789abcdef").unwrap(),
+        observed_index(),
+        git_authority(),
+        ReviewConfirmationDigest::new("ab".repeat(32)).unwrap(),
+        ReviewReceiptCorrelationDigest::new("cd".repeat(32)).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        ReviewCapabilities::new(
+            project(),
+            workspace(),
+            Revision::new(9).unwrap(),
+            Revision::new(4).unwrap(),
+            Vec::new(),
+            Vec::new(),
+            ReviewPullRequestCapabilities::default(),
+            ReviewGitStagingCapabilities {
+                staging: vec![
+                    staging_capability("proposal-1", ReviewProposalKind::Stage),
+                    moved
+                ],
+                conflict_resolutions: Vec::new(),
+            },
+        )
+        .is_err()
+    );
+    // One proposal, advertised twice, is two grants for one thing.
+    assert!(
+        ReviewCapabilities::new(
+            project(),
+            workspace(),
+            Revision::new(9).unwrap(),
+            Revision::new(4).unwrap(),
+            Vec::new(),
+            Vec::new(),
+            ReviewPullRequestCapabilities::default(),
+            ReviewGitStagingCapabilities {
+                staging: vec![
+                    staging_capability("proposal-1", ReviewProposalKind::Stage),
+                    staging_capability("proposal-1", ReviewProposalKind::Commit),
+                ],
+                conflict_resolutions: Vec::new(),
+            },
+        )
+        .is_err()
+    );
+}
+
+/// Committing is advertised independently of staging, and both round-trip.
+///
+/// The list is what carries the withholding: an operator who granted index
+/// writes and withheld committing produces a document with stage and unstage
+/// present and commit absent, and a client can read that difference directly
+/// rather than discovering it by attempting the write.
+#[test]
+fn git_staging_capabilities_are_independently_held_and_round_trip() {
+    let conflict = |resolution| {
+        ReviewConflictResolutionCapability::new(
+            ReviewProposalId::new("proposal-3").unwrap(),
+            ReviewFileId::new("file-1").unwrap(),
+            resolution,
+            observed_head(),
+            observed_index(),
+            git_authority(),
+            ReviewConfirmationDigest::new("ab".repeat(32)).unwrap(),
+            ReviewReceiptCorrelationDigest::new("cd".repeat(32)).unwrap(),
+        )
+        .unwrap()
+    };
+    let capabilities = ReviewCapabilities::new(
+        project(),
+        workspace(),
+        Revision::new(9).unwrap(),
+        Revision::new(4).unwrap(),
+        Vec::new(),
+        Vec::new(),
+        ReviewPullRequestCapabilities::default(),
+        ReviewGitStagingCapabilities {
+            // Deliberately unordered and deliberately without a commit: this
+            // is the shape an operator who withheld committing produces.
+            staging: vec![
+                staging_capability("proposal-2", ReviewProposalKind::Unstage),
+                staging_capability("proposal-1", ReviewProposalKind::Stage),
+            ],
+            conflict_resolutions: vec![
+                conflict(ConflictResolution::KeepIncoming),
+                conflict(ConflictResolution::KeepCurrent),
+            ],
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        capabilities
+            .staging()
+            .iter()
+            .map(|entry| (entry.proposal_id().as_str(), entry.kind()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("proposal-1", ReviewProposalKind::Stage),
+            ("proposal-2", ReviewProposalKind::Unstage),
+        ],
+    );
+    assert!(
+        !capabilities
+            .staging()
+            .iter()
+            .any(|entry| entry.kind() == ReviewProposalKind::Commit),
+        "a withheld commit grant must be visibly absent, not implied by staging",
+    );
+    // One entry per admissible side, in a stable order, because the side is
+    // inside the confirmation digest and cannot be chosen after the fact.
+    assert_eq!(
+        capabilities
+            .conflict_resolutions()
+            .iter()
+            .map(ReviewConflictResolutionCapability::resolution)
+            .collect::<Vec<_>>(),
+        vec![
+            ConflictResolution::KeepCurrent,
+            ConflictResolution::KeepIncoming,
+        ],
+    );
+
+    let request = PlatformV2RequestMessage::new(
+        request_id("git-staging-capabilities"),
+        PlatformV2Request::GetReviewCapabilities(
+            ReviewReadRequest::new(project(), workspace()).unwrap(),
+        ),
+    );
+    let response = PlatformV2ResponseMessage::for_request(
+        &request,
+        PlatformV2Response::ReviewCapabilities(capabilities),
+    )
+    .unwrap();
+    let bytes = response.to_canonical_bytes().unwrap();
+    assert_eq!(
+        PlatformV2ResponseMessage::from_canonical_bytes(&bytes, &request).unwrap(),
+        response
+    );
+    let encoded = String::from_utf8(bytes).unwrap();
+    assert!(encoded.contains("\"expected_index_digest\""));
+    assert!(encoded.contains("\"expected_head_revision\""));
+}
+
+/// An empty git list is carried explicitly, the way the pull-request nulls
+/// are, so "the server proved nothing" is distinguishable from "this peer
+/// does not know the field".
+#[test]
+fn absent_git_staging_capabilities_round_trip_as_explicit_empty_lists() {
+    let capabilities = ReviewCapabilities::new(
+        project(),
+        workspace(),
+        Revision::new(9).unwrap(),
+        Revision::new(4).unwrap(),
+        Vec::new(),
+        Vec::new(),
+        ReviewPullRequestCapabilities::default(),
+        ReviewGitStagingCapabilities::default(),
+    )
+    .unwrap();
+    assert!(capabilities.staging().is_empty());
+    assert!(capabilities.conflict_resolutions().is_empty());
+    let request = PlatformV2RequestMessage::new(
+        request_id("git-staging-capability-empty"),
+        PlatformV2Request::GetReviewCapabilities(
+            ReviewReadRequest::new(project(), workspace()).unwrap(),
+        ),
+    );
+    let response = PlatformV2ResponseMessage::for_request(
+        &request,
+        PlatformV2Response::ReviewCapabilities(capabilities),
+    )
+    .unwrap();
+    let encoded = String::from_utf8(response.to_canonical_bytes().unwrap()).unwrap();
+    for field in ["staging", "conflict_resolutions"] {
+        assert!(
+            encoded.contains(&format!("\"{field}\":[]")),
+            "{field} must be carried as an explicit empty list",
         );
     }
 }
@@ -970,6 +1258,7 @@ fn response_documents_round_trip_and_review_envelope_fits_its_declared_ceiling()
                     .unwrap(),
                 ],
                 ReviewPullRequestCapabilities::default(),
+                ReviewGitStagingCapabilities::default(),
             )
             .unwrap(),
         ),

@@ -100,6 +100,8 @@ import {
 } from "./work-context.js";
 import {
   MAX_REVIEW_COMMENTS,
+  MAX_REVIEW_PROPOSAL_FILES,
+  MAX_REVIEW_PROPOSALS,
   PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR,
   PLATFORM_REVIEW_SCHEMA_V1,
   decodeReviewActionReceipt,
@@ -219,6 +221,40 @@ export interface ReviewPullRequestMergeCapability {
   readonly readiness: "ready";
   readonly receipt_correlation_digest: ReviewReceiptCorrelationDigest;
 }
+// One index-level staging proposal the server proved it can perform against
+// the exact HEAD and index named here. Both are carried because a worktree is
+// shared substrate: any other process running as the daemon uid can move HEAD
+// or rewrite the index between advertisement and execution, and the snapshot
+// revision only tracks what the projection observed. A client that has since
+// read a snapshot disagreeing with either must not offer the control.
+//
+// There is no hunk field because there is no hunk in the contract: a proposal
+// lists file ids and a staging action names a proposal.
+export interface ReviewStagingCapability {
+  readonly authority: ReviewAuthority;
+  readonly confirmation_digest: ReviewConfirmationDigest;
+  readonly expected_head_revision: string;
+  readonly expected_index_digest: string;
+  readonly kind: "stage" | "unstage" | "commit";
+  readonly proposal_id: string;
+  readonly receipt_correlation_digest: ReviewReceiptCorrelationDigest;
+}
+// One conflicted file the server proved it can collapse to one side git is
+// already holding. `resolution` selects between stage 2 (keep_current) and
+// stage 3 (keep_incoming) of that path's own index entry, so the only bytes
+// this control can ever write are bytes git recorded during the merge. No
+// content crosses this wire, and one entry is advertised per admissible side
+// because the side is inside the confirmation digest.
+export interface ReviewConflictResolutionCapability {
+  readonly authority: ReviewAuthority;
+  readonly confirmation_digest: ReviewConfirmationDigest;
+  readonly expected_head_revision: string;
+  readonly expected_index_digest: string;
+  readonly file_id: string;
+  readonly proposal_id: string;
+  readonly receipt_correlation_digest: ReviewReceiptCorrelationDigest;
+  readonly resolution: "keep_current" | "keep_incoming";
+}
 export interface ReviewCapabilities {
   readonly project: ProjectIdValue;
   readonly workspace: ReviewWorkspaceIdentity;
@@ -232,6 +268,12 @@ export interface ReviewCapabilities {
   readonly open_pull_request: ReviewPullRequestOpenCapability | null;
   readonly update_pull_request: ReviewPullRequestUpdateCapability | null;
   readonly merge_pull_request: ReviewPullRequestMergeCapability | null;
+  // Git staging, withheld separately again: an operator grants index writes,
+  // committing and conflict resolution independently, so an empty list is the
+  // honest answer for a grant that was not installed as well as for a
+  // repository the preflight could not read.
+  readonly staging: readonly ReviewStagingCapability[];
+  readonly conflict_resolutions: readonly ReviewConflictResolutionCapability[];
   readonly schema: typeof PLATFORM_SCHEMA_V2;
 }
 export interface ReviewActionTransportRequest {
@@ -419,7 +461,7 @@ export function ReviewReceiptCorrelationDigest(value: string): ReviewReceiptCorr
   return value as ReviewReceiptCorrelationDigest;
 }
 function reviewCapabilities(value: JsonValue): ReviewCapabilities {
-  const body = fields(value, ["agent_deliverable_comments", "merge_pull_request", "open_pull_request", "project", "rerunnable_checks", "schema", "snapshot_revision", "workspace", "workspace_revision", "update_pull_request"]);
+  const body = fields(value, ["agent_deliverable_comments", "conflict_resolutions", "merge_pull_request", "open_pull_request", "project", "rerunnable_checks", "schema", "snapshot_revision", "staging", "workspace", "workspace_revision", "update_pull_request"]);
   if (stringField(body, "schema") !== PLATFORM_SCHEMA_V2) throw new WireError("invalid_json_value", "review capability schema");
   const rawChecks = valueField(body, "rerunnable_checks");
   if (rawChecks.kind !== "array" || rawChecks.items.length > 512) throw new WireError("invalid_json_value", "review capabilities");
@@ -494,10 +536,67 @@ function reviewCapabilities(value: JsonValue): ReviewCapabilities {
   // a response claiming both was read from two different snapshots.
   if (open_pull_request !== null && (update_pull_request !== null || merge_pull_request !== null)) throw new WireError("invalid_json_value", "review pull request capabilities");
   if (update_pull_request !== null && merge_pull_request !== null && (update_pull_request.pull_request_id !== merge_pull_request.pull_request_id || update_pull_request.expected_pull_request_revision !== merge_pull_request.expected_pull_request_revision)) throw new WireError("invalid_json_value", "review pull request capabilities");
+  const gitAuthority = (slot: Map<string, JsonValue>): ReviewAuthority => {
+    const authorityValue = fields(valueField(slot, "authority"), ["id", "kind"]);
+    if (stringField(authorityValue, "kind") !== "git") throw new WireError("invalid_json_value", "review capability authority");
+    return {id: boundedRefusalString(stringField(authorityValue, "id"), 256), kind: "git"};
+  };
+  const commitId = (value: string): string => {
+    if (!/^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/.test(value)) throw new WireError("invalid_json_value", "review staging head revision");
+    return value;
+  };
+  const indexDigest = (value: string): string => {
+    if (!/^[0-9a-f]{64}$/.test(value)) throw new WireError("invalid_json_value", "review staging index digest");
+    return value;
+  };
+  const rawStaging = valueField(body, "staging");
+  if (rawStaging.kind !== "array" || rawStaging.items.length > MAX_REVIEW_PROPOSALS) throw new WireError("invalid_json_value", "review capabilities");
+  const staging = rawStaging.items.map((item): ReviewStagingCapability => {
+    const entry = fields(item, ["authority", "confirmation_digest", "expected_head_revision", "expected_index_digest", "kind", "proposal_id", "receipt_correlation_digest"]);
+    const kind = stringField(entry, "kind");
+    // Conflict resolution is a different capability with a different field
+    // set, so its kind must never appear in this list.
+    if (kind !== "stage" && kind !== "unstage" && kind !== "commit") throw new WireError("invalid_json_value", "review staging kind");
+    return {
+      authority: gitAuthority(entry),
+      confirmation_digest: ReviewConfirmationDigest(stringField(entry, "confirmation_digest")),
+      expected_head_revision: commitId(stringField(entry, "expected_head_revision")),
+      expected_index_digest: indexDigest(stringField(entry, "expected_index_digest")),
+      kind,
+      proposal_id: boundedRefusalString(stringField(entry, "proposal_id"), 256),
+      receipt_correlation_digest: ReviewReceiptCorrelationDigest(stringField(entry, "receipt_correlation_digest")),
+    };
+  });
+  if (new Set(staging.map((entry) => entry.proposal_id)).size !== staging.length) throw new WireError("invalid_json_value", "duplicate review capability");
+  const rawConflicts = valueField(body, "conflict_resolutions");
+  if (rawConflicts.kind !== "array" || rawConflicts.items.length > MAX_REVIEW_PROPOSAL_FILES * 2) throw new WireError("invalid_json_value", "review capabilities");
+  const conflict_resolutions = rawConflicts.items.map((item): ReviewConflictResolutionCapability => {
+    const entry = fields(item, ["authority", "confirmation_digest", "expected_head_revision", "expected_index_digest", "file_id", "proposal_id", "receipt_correlation_digest", "resolution"]);
+    const resolution = stringField(entry, "resolution");
+    if (resolution !== "keep_current" && resolution !== "keep_incoming") throw new WireError("invalid_json_value", "review conflict resolution");
+    return {
+      authority: gitAuthority(entry),
+      confirmation_digest: ReviewConfirmationDigest(stringField(entry, "confirmation_digest")),
+      expected_head_revision: commitId(stringField(entry, "expected_head_revision")),
+      expected_index_digest: indexDigest(stringField(entry, "expected_index_digest")),
+      file_id: boundedRefusalString(stringField(entry, "file_id"), 256),
+      proposal_id: boundedRefusalString(stringField(entry, "proposal_id"), 256),
+      receipt_correlation_digest: ReviewReceiptCorrelationDigest(stringField(entry, "receipt_correlation_digest")),
+      resolution,
+    };
+  });
+  if (new Set(conflict_resolutions.map((entry) => `${entry.proposal_id} ${entry.file_id} ${entry.resolution}`)).size !== conflict_resolutions.length) throw new WireError("invalid_json_value", "duplicate review capability");
+  // Every git entry was minted from one read of one repository. Two spellings
+  // of HEAD or of the index mean the server read the worktree twice and it
+  // moved in between, which is the condition these fences exist to catch.
+  const observed = [...staging, ...conflict_resolutions].map((entry) => `${entry.expected_head_revision} ${entry.expected_index_digest}`);
+  if (new Set(observed).size > 1) throw new WireError("invalid_json_value", "review staging capabilities");
   return {
     agent_deliverable_comments: deliverable,
+    conflict_resolutions,
     merge_pull_request,
     open_pull_request,
+    staging,
     update_pull_request,
     project: ProjectId(stringField(body, "project")),
     rerunnable_checks: checks,
@@ -576,7 +675,7 @@ function requestBody(request: PlatformV2Request): JsonValue {
     case "get_review": return json({project:ProjectId(request.request.project),schema:PLATFORM_SCHEMA_V2,workspace:reviewWorkspace(request.request.workspace)});
     case "get_attention_source_snapshot": return json(attentionReadRequest(request.request));
     case "get_review_capabilities": return json({project:ProjectId(request.request.project),schema:PLATFORM_SCHEMA_V2,workspace:reviewWorkspace(request.request.workspace)});
-    case "execute_review_action": { const value=request.request; const action=validateReviewAction(value.action); const rerun=action.kind==="rerun_check"; if (rerun !== (value.confirmation_digest !== undefined && value.expected_workspace_revision !== undefined && value.receipt_correlation_digest !== undefined)) throw new WireError("invalid_json_value", "review confirmation required"); const common={action,expected_revision:WorkContextRevision(value.expected_revision),idempotency_key:IdempotencyKey(value.idempotency_key),platform_version:BigInt(PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR),schema:PLATFORM_REVIEW_SCHEMA_V1,workspace:reviewWorkspace(value.workspace)}; return json(rerun?{...common,confirmation_digest:ReviewConfirmationDigest(value.confirmation_digest as string),expected_workspace_revision:WorkContextRevision(value.expected_workspace_revision as bigint),receipt_correlation_digest:ReviewReceiptCorrelationDigest(value.receipt_correlation_digest as string)}:common); }
+    case "execute_review_action": { const value=request.request; const action=validateReviewAction(value.action); const rerun=["rerun_check","open_pull_request","update_pull_request","merge_pull_request","stage","unstage","commit","resolve_conflict"].includes(action.kind); if (rerun !== (value.confirmation_digest !== undefined && value.expected_workspace_revision !== undefined && value.receipt_correlation_digest !== undefined)) throw new WireError("invalid_json_value", "review confirmation required"); const common={action,expected_revision:WorkContextRevision(value.expected_revision),idempotency_key:IdempotencyKey(value.idempotency_key),platform_version:BigInt(PLATFORM_REVIEW_REQUIRES_PLATFORM_MAJOR),schema:PLATFORM_REVIEW_SCHEMA_V1,workspace:reviewWorkspace(value.workspace)}; return json(rerun?{...common,confirmation_digest:ReviewConfirmationDigest(value.confirmation_digest as string),expected_workspace_revision:WorkContextRevision(value.expected_workspace_revision as bigint),receipt_correlation_digest:ReviewReceiptCorrelationDigest(value.receipt_correlation_digest as string)}:common); }
     case "get_review_receipt": { const common={idempotency_key:IdempotencyKey(request.lookup.idempotency_key),project:ProjectId(request.lookup.project),schema:PLATFORM_SCHEMA_V2,workspace:reviewWorkspace(request.lookup.workspace)}; return json(request.lookup.receipt_correlation_digest===undefined?common:{...common,receipt_correlation_digest:ReviewReceiptCorrelationDigest(request.lookup.receipt_correlation_digest)}); }
   }
 }

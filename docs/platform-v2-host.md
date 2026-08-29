@@ -221,15 +221,48 @@ expose an accepted local write, and an exact idempotency replay returns the
 same terminal receipt without advancing the snapshot again. The policy file is
 fenced immediately before and after this transaction.
 
-Stage/unstage/commit/conflict resolution, CI reruns, and pull-request
-open/update/merge remain unavailable. After full authority and target
-validation they refuse before custody as `platform_v2_review_git_adapter_unavailable`,
-`platform_v2_review_ci_adapter_unavailable`, or
-`platform_v2_review_pull_request_adapter_unavailable`. No request text becomes
-a path, command, provider payload, or credential. Git still lacks a
-server-owned snapshot-to-blob/index/HEAD provenance document, while CI and
-pull-request providers lack typed credential consumers plus read-after-write
-reconciliation.
+Stage, unstage, commit and conflict resolution are available for an exact
+`local_repository` binding that also carries the matching grant. The binding
+withholds three powers independently: `index_write` covers staging and
+unstaging, `commit` covers recording the index, and `conflict_resolution`
+covers collapsing an unmerged path. A binding written before those existed
+carries none and plans nothing. Each refusal is its own category, so an
+operator reads a withheld commit as `platform_v2_review_git_commit_unavailable`
+rather than as a generic unavailability.
+
+A staging control is minted only from one mutation-free read of the repository,
+never from the binding. That read proves the working tree is the bound one,
+resolves `HEAD` to a commit, digests the whole index relative to it, records
+which multi-step operation is in progress, and captures each named path's
+object in `HEAD`, its object in the index, the conflict stages git recorded,
+and its working-tree stat identity. The confirmation digest commits to all of
+it, so a repository that moves between advertisement and execution invalidates
+the client's confirmation and the write is refused before any command runs. The
+capability carries the observed `HEAD` and index digest on the wire too, so a
+client that has since read a disagreeing snapshot can decline to offer the
+control at all.
+
+A commit is admitted only when the whole index-versus-`HEAD` change set is
+exactly the proposal's files, because `git commit` writes the index rather than
+a file list; and only on an attached branch, in a repository in no merge,
+rebase, cherry-pick, revert or bisect, that names a committer in its own local
+configuration. A conflict resolution writes exactly the blob git already holds
+as stage 2 or stage 3 for the one named path: git writes the working-tree bytes
+via `checkout-index`, and the index entry is then set to the object the
+preflight observed rather than to whatever is on disk. No request text becomes
+a path, command, provider payload, or credential, and no content crosses the
+wire at all. Paths reach git as `:(literal,top)` pathspecs after a `--`, from a
+grammar that admits no absolute path, no `..`, no `.git` component and none of
+git's pathspec magic.
+
+There is no hunk granularity, because the contract has none: a proposal lists
+file ids and a staging action names a proposal. Advertising a hunk control
+would advertise something no action can express.
+
+CI reruns and pull-request open/update/merge are available for their own exact
+bindings and credential scopes. Anything without one refuses before custody as
+`platform_v2_review_ci_adapter_unavailable` or
+`platform_v2_review_pull_request_adapter_unavailable`.
 
 Single and batch comment delivery is available only for an exact `jcode`
 `retained_session` binding. The host proves the work-session -> attempt ->

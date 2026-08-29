@@ -3211,8 +3211,9 @@ mod tests {
         };
         use automonique_protocol::platform_v2_review_api::decode_review_snapshot;
         use automonique_protocol::platform_v2_transport::{
-            ReviewPullRequestCapabilities, ReviewPullRequestMergeCapability,
-            ReviewPullRequestOpenCapability, ReviewPullRequestUpdateCapability,
+            ReviewGitStagingCapabilities, ReviewPullRequestCapabilities,
+            ReviewPullRequestMergeCapability, ReviewPullRequestOpenCapability,
+            ReviewPullRequestUpdateCapability,
         };
 
         let project = ProjectId::new("project-1").unwrap();
@@ -3284,6 +3285,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 capabilities,
+                ReviewGitStagingCapabilities::default(),
             )
             .unwrap();
             let (open, update, merge) =

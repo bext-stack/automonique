@@ -1691,11 +1691,20 @@ impl ReviewAction {
     /// Whether this action may only be sent with a server-minted
     /// confirmation and receipt correlation.
     ///
-    /// Exactly the actions whose effect lands in a system the daemon does not
-    /// own. For those, the digest is the only thing binding the executed write
-    /// to the plan the server preflighted, and the correlation is the only way
-    /// to recover a receipt against that exact plan. Every other action's
-    /// exactly-once falls out of the local state machine instead.
+    /// Exactly the actions whose effect lands somewhere the daemon does not
+    /// exclusively control. For those, the digest is the only thing binding
+    /// the executed write to the plan the server preflighted, and the
+    /// correlation is the only way to recover a receipt against that exact
+    /// plan. Every other action's exactly-once falls out of the local state
+    /// machine instead.
+    ///
+    /// The four staging actions are here even though a worktree is a
+    /// filesystem the daemon owns, because owning it is not the same as being
+    /// alone in it. Any other process running as the daemon uid can move HEAD
+    /// and rewrite the index between a control being advertised and the action
+    /// arriving, and the snapshot revision does not help: it tracks what the
+    /// projection observed, not what the repository now is. Only a digest over
+    /// what a preflight read off the repository fences that.
     ///
     /// The transport uses this in both directions, so an unconfirmed spelling
     /// of one of these is not merely refused later: it cannot be constructed
@@ -1708,6 +1717,10 @@ impl ReviewAction {
                 | Self::OpenPullRequest { .. }
                 | Self::UpdatePullRequest { .. }
                 | Self::MergePullRequest { .. }
+                | Self::Stage { .. }
+                | Self::Unstage { .. }
+                | Self::Commit { .. }
+                | Self::ResolveConflict { .. }
         )
     }
 

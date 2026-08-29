@@ -2174,12 +2174,12 @@ where
         .map_err(|_| after("platform_v2_lifecycle_journal_io"))
 }
 
-struct BoundedOutput {
-    status: ExitStatus,
-    stdout: Vec<u8>,
+pub(crate) struct BoundedOutput {
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: Vec<u8>,
 }
 
-fn bounded_output(command: &mut Command) -> Result<BoundedOutput, &'static str> {
+pub(crate) fn bounded_output(command: &mut Command) -> Result<BoundedOutput, &'static str> {
     bounded_output_with_timeout(command, GIT_TIMEOUT)
 }
 
@@ -2328,7 +2328,15 @@ fn kill_process_group(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-fn safe_git_command(path: &Path) -> Result<Command, &'static str> {
+/// One hardened invocation of the operator's git, rooted at `path`.
+///
+/// Shared with [`crate::platform_v2_git_worktree_adapter`] rather than copied
+/// there. Everything this does is security-relevant — system and global
+/// configuration disabled, `include`/`includeIf` refused outright, hooks
+/// pointed at `/dev/null`, every configured clean/smudge filter neutralised,
+/// the file transport refused — and a second copy of it is a second thing to
+/// forget to fix.
+pub(crate) fn safe_git_command(path: &Path) -> Result<Command, &'static str> {
     let mut query = Command::new(GIT_PROGRAM);
     query
         .args([
