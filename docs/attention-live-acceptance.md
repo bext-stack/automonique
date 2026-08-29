@@ -29,6 +29,13 @@ build, so a guessed one would make the report fiction.
 | `hosted_attention_corpus_available` | derived | The deployment actually serves resources, so the cross-client comparison has something to compare. |
 | `deployed_build_attribution` | local | Every probed build's running binary appears in a release manifest, so the record can name the revision it accepted. |
 
+`inventory.state` on that projection means a scoped read succeeded, not that
+the whole inventory fit in one response. The projection names the coordinates
+it needs (the serving node, the action catalogue, and the run behind each
+listed session) because an unscoped request means *everything* and is refused
+with `snapshot_too_large` once the inventory outgrows one response. The
+projection says so in `inventory.scope`, which reads `named`.
+
 ## Reaching the gate
 
 The hosted entry is fronted by Cloudflare, which answers 403 to the standard
@@ -69,7 +76,9 @@ else about it.
 Only allow-listed fields of the types the web entry serializes, gated at every
 depth. Free text the daemon supplies (`summary`, `explanation`) and live work
 coordinates (`id`) are not on the list; `explanation` is admitted only when it
-is a bare category token such as `snapshot_too_large`. Identical list
+is a bare category token such as `snapshot_too_large`. The web entry now
+applies that same rule at the source, so a refusal reaching this report has
+already been reduced to a token or withheld once. Identical list
 projections collapse — redaction removes what made them distinct — with the true
 length under `observed_counts` and the collapsed length under
 `<name>.distinct_projections`. The operator's home directory is written as
