@@ -226,6 +226,7 @@ pub mod parity_trace;
 mod platform_v2_attention_registry;
 pub mod platform_v2_bootstrap;
 pub mod platform_v2_github_check_adapter;
+pub mod platform_v2_github_pull_request_adapter;
 pub mod platform_v2_host;
 pub mod platform_v2_lifecycle_adapter;
 mod platform_v2_review_adapter;

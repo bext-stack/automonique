@@ -1688,6 +1688,29 @@ impl ReviewAction {
         }
     }
 
+    /// Whether this action may only be sent with a server-minted
+    /// confirmation and receipt correlation.
+    ///
+    /// Exactly the actions whose effect lands in a system the daemon does not
+    /// own. For those, the digest is the only thing binding the executed write
+    /// to the plan the server preflighted, and the correlation is the only way
+    /// to recover a receipt against that exact plan. Every other action's
+    /// exactly-once falls out of the local state machine instead.
+    ///
+    /// The transport uses this in both directions, so an unconfirmed spelling
+    /// of one of these is not merely refused later: it cannot be constructed
+    /// or decoded at all.
+    #[must_use]
+    pub const fn requires_confirmation(&self) -> bool {
+        matches!(
+            self,
+            Self::RerunCheck { .. }
+                | Self::OpenPullRequest { .. }
+                | Self::UpdatePullRequest { .. }
+                | Self::MergePullRequest { .. }
+        )
+    }
+
     /// Validate only the client-owned shape of an action.
     ///
     /// Authentication, actor identity, authority, workspace scope, and the

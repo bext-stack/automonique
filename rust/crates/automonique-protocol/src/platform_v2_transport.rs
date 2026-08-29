@@ -1184,7 +1184,7 @@ impl ReviewActionTransportRequest {
     ) -> Result<Self, PlatformV2TransportError> {
         if !is_review_workspace(&workspace)
             || action.validate_client_shape().is_err()
-            || matches!(action, ReviewAction::RerunCheck { .. })
+            || action.requires_confirmation()
         {
             return Err(PlatformV2TransportError::InvalidBody);
         }
@@ -1209,7 +1209,7 @@ impl ReviewActionTransportRequest {
     ) -> Result<Self, PlatformV2TransportError> {
         if !is_review_workspace(&workspace)
             || action.validate_client_shape().is_err()
-            || !matches!(action, ReviewAction::RerunCheck { .. })
+            || !action.requires_confirmation()
         {
             return Err(PlatformV2TransportError::InvalidBody);
         }
@@ -2568,7 +2568,7 @@ fn request_from_message(message: &Message) -> Result<PlatformV2Request, Platform
                     .get("action")
                     .ok_or(PlatformV2TransportError::InvalidBody)?,
             )?;
-            let confirmed = matches!(decoded_action, ReviewAction::RerunCheck { .. });
+            let confirmed = decoded_action.requires_confirmation();
             exact_fields(
                 message.body(),
                 if confirmed {
