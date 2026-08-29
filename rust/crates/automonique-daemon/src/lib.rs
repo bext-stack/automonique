@@ -225,6 +225,7 @@ pub mod model_inventory;
 pub mod parity_trace;
 mod platform_v2_attention_registry;
 pub mod platform_v2_bootstrap;
+pub mod platform_v2_git_worktree_adapter;
 pub mod platform_v2_github_check_adapter;
 pub mod platform_v2_github_pull_request_adapter;
 pub mod platform_v2_host;
