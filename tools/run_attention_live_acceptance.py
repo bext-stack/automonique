@@ -830,6 +830,11 @@ def check_attention_corpus(projection: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def bounded_reason(value: str) -> str:
+    """Bound a reason the browser check wrote, and say so when it was cut."""
+    return value if len(value) <= SCALAR_LIMIT else value[: SCALAR_LIMIT - 1] + "\u2026"
+
+
 def evidence_token(value: Any) -> str | None:
     """Admit an evidence value only as an enumeration token or a decimal."""
     if not isinstance(value, str):
@@ -886,6 +891,20 @@ def check_cockpit_render(
             intent,
             "neither bunx nor npx is on PATH, so the browser check could not be "
             "started and the cockpit render was not observed",
+            origin=origin.key,
+            endpoint=endpoint,
+        )
+    # Without the pinned runner installed beside the check, `bunx` would fetch
+    # whatever version it can reach and drive a browser this crate never
+    # measured against. That is a different check, so it is refused rather than
+    # run: `bun install && bunx playwright install chromium` in the crate first.
+    if not (crate / "node_modules" / "@playwright" / "test").is_dir():
+        return blocked(
+            name,
+            intent,
+            "the pinned browser test toolchain is not installed in the crate "
+            "(bun install && bunx playwright install chromium), so the cockpit "
+            "render was not observed",
             origin=origin.key,
             endpoint=endpoint,
         )
@@ -1032,7 +1051,7 @@ def check_cockpit_render(
         reason = declared.get("reason")
         result["state"] = "blocked"
         result["reason"] = (
-            redacted(reason)[:SCALAR_LIMIT]
+            bounded_reason(redacted(reason))
             if isinstance(reason, str) and reason
             else "the browser check recorded that it could not observe the render"
         )

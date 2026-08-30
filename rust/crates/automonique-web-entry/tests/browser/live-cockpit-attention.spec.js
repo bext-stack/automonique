@@ -402,8 +402,8 @@ test.describe("hosted cockpit attention render", () => {
     if (!proofPath && !raw) {
       evidence.state = "blocked";
       evidence.reason =
-        `no operator credential in $${environment.credentialEnv}; the hosted cockpit could not be signed into `
-        + "from this host, so nothing about its render was observed";
+        `no operator credential in $${environment.credentialEnv}; the cockpit was not signed into, `
+        + "so its render was not observed";
       await write();
       test.skip(true, evidence.reason);
       return;
@@ -477,7 +477,7 @@ test.describe("hosted cockpit attention render", () => {
         evidence.reason =
           "the deployment served no attention item"
           + (served?.inbox?.state ? ` (inbox ${served.inbox.state})` : "")
-          + ", so there is nothing for this surface to render and nothing to compare with the other clients";
+          + ", so this surface has nothing to render and nothing to compare across clients";
         await write();
         test.skip(true, evidence.reason);
         return;
