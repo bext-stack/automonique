@@ -159,6 +159,39 @@ A delegated mobile credential cannot list: mobile grants are authorized per
 project, a v1 coordinate has no project, so the request is denied at the web
 bridge beside `get_work_context` and `get_lifecycle_capabilities`.
 
+The hosted cockpit is the first consumer. Its `/api/platform/cockpit`
+projection walks the listing once per read -- one query with `after` absent,
+then continuations of it -- and renders the result as its own `resources`
+collection. The walk sends no class filter, so `resource_reads` is the only
+thing deciding what that collection holds: with no entry at all the walk is
+refused and the collection reads `platform_v2_scope_denied`; with entries it
+holds exactly the granted classes. A deployment that grants nothing therefore
+gets a shipped feature that shows nothing, which is why the grant belongs in
+the same change as the projection.
+
+What is worth granting is what a targeted v1 snapshot can never name, because
+the web entry cannot spell those identifiers:
+
+```json
+"resource_reads": [
+  {"authority": "automonique", "kind": "approval"},
+  {"authority": "provider", "kind": "model"}
+]
+```
+
+`{"authority": "automonique", "kind": "run"}` is deliberately not part of that:
+run records dominate the store and only grow, the cockpit discards a walk past
+its own bound rather than publishing a prefix of an inventory as the inventory,
+and the runs behind the sessions an operator can currently see already reach
+the same document through the retained v1 projection. Deriving the grant from
+`serving_authority` would be worse still: it would hand every mapped principal
+the whole `automonique` authority, sessions, sandboxes and credentials
+included.
+
+A refused or interrupted walk degrades only that one collection. The rest of
+the cockpit -- projects, workspaces, lineage, review, attention -- is unaffected
+by a policy that grants no listing.
+
 When enabled, startup opens three private sibling SQLite stores for work
 contexts/lifecycle custody, lineage, and review custody. Inventory decodes only
 the bounded visible identity set, cursor state is actor-scoped and bounded,

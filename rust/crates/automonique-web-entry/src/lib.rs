@@ -1089,8 +1089,14 @@ struct PlatformCoordinateView {
     id: String,
 }
 
+/// One resource record as the browser reads it.
+///
+/// Shared with the cockpit's own resource listing rather than respelled there:
+/// a document that carries the same record twice, once under `retained_v1` and
+/// once under the paginated listing, must carry it in the same shape both
+/// times.
 #[derive(Serialize)]
-struct PlatformResourceView {
+pub(crate) struct PlatformResourceView {
     resource: PlatformCoordinateView,
     freshness: &'static str,
     observed_at_ms: String,
