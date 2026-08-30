@@ -25,9 +25,9 @@ use automonique_protocol::platform_v2_lineage::{
 use automonique_protocol::platform_v2_lineage_api::encode_lineage_projection;
 use automonique_protocol::platform_v2_lineage_api::encode_workspace_intent_outcome;
 use automonique_protocol::platform_v2_review::{
-    DiffSide, MergeReadiness, PullRequestState, ReviewAction, ReviewActionReceipt, ReviewAnchor,
-    ReviewCheckId, ReviewCommentId, ReviewDecision, ReviewFileId, ReviewFreshnessState,
-    ReviewHunkId, ReviewSnapshot, ReviewText,
+    DiffSide, ReviewAction, ReviewActionKind, ReviewActionReceipt, ReviewAnchor, ReviewCheckId,
+    ReviewCommentId, ReviewDecision, ReviewFileId, ReviewFreshnessState, ReviewHunkId,
+    ReviewSnapshot, ReviewText,
 };
 use automonique_protocol::platform_v2_review_api::{
     encode_review_action_receipt, encode_review_snapshot,
@@ -631,148 +631,29 @@ fn external_work_json(value: &ExternalWorkIdentity) -> Value {
     })
 }
 
-/// Project whichever of the three pull-request controls the server proved.
+/// Project the review families this cockpit can actually execute.
 ///
-/// This replaces a hardcoded `false`, the way PR #221 replaced one for agent
-/// delivery. The daemon can now mint `open_pull_request`,
-/// `update_pull_request` and `merge_pull_request` slots, but only from a live,
-/// mutation-free provider read, so a permanent `false` here would have kept
-/// controls unreachable that the server was already willing to prove.
+/// `operations` is a command surface, not an inventory of the review contract.
+/// A family belongs there only once a `CockpitRequest` variant carries it and
+/// `platform-cockpit-core.js` reads it back; everything else the contract
+/// knows is named in `families_without_browser_command`, an array of strings
+/// rather than an operation object, so nothing can mistake it for a control.
 ///
-/// Three independent projections, never one pull-request block, because the
-/// powers are withheld independently. A workspace whose installed credential
-/// carries `pull_request_write` but not `pull_request_merge` legitimately
-/// offers open or update while `merge_pull_request` stays empty, and the
-/// cockpit has to render exactly that rather than a single family toggle.
+/// That array is derived from `ReviewActionKind` -- the review contract's own
+/// roll of families -- rather than restated here, because a contract copied
+/// beside the code is exactly what went wrong: this projection advertised
+/// `send_comment_to_agent`, its batch form and the three pull-request families
+/// with an `execute_operation` no `CockpitRequest` variant could carry. Nothing
+/// rendered them, so nobody saw a lie; the first reader to trust the projection
+/// would have built a control that always refuses (issue #224).
 ///
-/// Every slot is filtered against the snapshot the browser is looking at, not
-/// trusted on its own. The capability was minted against some revision of the
-/// pull-request projection; if the projection has moved since, the control
-/// would be refused by `resolve_action` on arrival, so it is not offered. This
-/// is the same rule the rerun and delivery projections apply, and it is the
-/// only thing keeping a stale capability read from rendering a button that
-/// always fails.
-fn pull_request_controls(
-    exact: Option<(&WorkContextRecord, &ProjectId, &ReviewSnapshot)>,
-    capabilities: Option<&ReviewCapabilities>,
-) -> (Value, Value, Value) {
-    let (open, update, merge) = match exact.zip(capabilities) {
-        Some(((workspace, project, snapshot), capabilities)) => {
-            let projection = snapshot.pull_request();
-            let observed = projection.freshness().observed_revision();
-            let coordinate = || {
-                json!({
-                    "project_id": project.as_str(),
-                    "workspace_id": workspace.identity().id(),
-                    "exact_revision": snapshot.revision().to_string(),
-                    "exact_pull_request_revision": observed.to_string()
-                })
-            };
-            let with = |extra: Vec<(&str, Value)>,
-                        confirmation: &ReviewConfirmationDigest,
-                        correlation: &ReviewReceiptCorrelationDigest| {
-                let mut target = coordinate();
-                let object = target.as_object_mut().expect("object target");
-                for (key, value) in extra {
-                    object.insert(key.to_owned(), value);
-                }
-                object.insert(
-                    "confirmation_digest".to_owned(),
-                    json!(confirmation.as_str()),
-                );
-                object.insert(
-                    "receipt_correlation_digest".to_owned(),
-                    json!(correlation.as_str()),
-                );
-                target
-            };
-            // An open is offered only while the snapshot still says there is
-            // nothing to open onto. A pull request that appeared since the
-            // capability was minted must not be silently reopened.
-            let open = capabilities
-                .open_pull_request()
-                .filter(|capability| {
-                    projection.state() == PullRequestState::Absent
-                        && capability.expected_pull_request_revision() == observed
-                })
-                .map(|capability| {
-                    with(
-                        Vec::new(),
-                        capability.confirmation_digest(),
-                        capability.receipt_correlation_digest(),
-                    )
-                });
-            let update = capabilities
-                .update_pull_request()
-                .filter(|capability| {
-                    matches!(
-                        projection.state(),
-                        PullRequestState::Draft | PullRequestState::Open
-                    ) && projection.id() == Some(capability.pull_request_id())
-                        && capability.expected_pull_request_revision() == observed
-                })
-                .map(|capability| {
-                    with(
-                        vec![(
-                            "pull_request_id",
-                            json!(capability.pull_request_id().as_str()),
-                        )],
-                        capability.confirmation_digest(),
-                        capability.receipt_correlation_digest(),
-                    )
-                });
-            // Merge carries two fences the other two do not, and both are
-            // re-checked here: the head the server pinned must still be the
-            // head the snapshot shows, and the snapshot must still call the
-            // pull request open and ready. A merge offered against a moved
-            // head is the failure this whole surface exists to prevent.
-            let merge = capabilities
-                .merge_pull_request()
-                .filter(|capability| {
-                    projection.state() == PullRequestState::Open
-                        && projection.readiness() == MergeReadiness::Ready
-                        && projection.id() == Some(capability.pull_request_id())
-                        && projection.head_revision() == Some(capability.expected_head_revision())
-                        && capability.expected_pull_request_revision() == observed
-                })
-                .map(|capability| {
-                    with(
-                        vec![
-                            (
-                                "pull_request_id",
-                                json!(capability.pull_request_id().as_str()),
-                            ),
-                            (
-                                "expected_head_revision",
-                                json!(capability.expected_head_revision().as_str()),
-                            ),
-                            ("readiness", json!(capability.readiness().as_str())),
-                        ],
-                        capability.confirmation_digest(),
-                        capability.receipt_correlation_digest(),
-                    )
-                });
-            (open, update, merge)
-        }
-        None => (None, None, None),
-    };
-    let control = |operation: &str, target: Option<Value>| {
-        let available = target.is_some();
-        json!({
-            "available": available,
-            "category": if available { Value::Null } else { json!("platform_cockpit_pull_request_family_unavailable") },
-            "execute_operation": if available { json!(operation) } else { Value::Null },
-            "receipt_operation": if available { json!("get_review_receipt") } else { Value::Null },
-            "targets": target.map(|value| vec![value]).unwrap_or_default()
-        })
-    };
-    (
-        control("open_pull_request", open),
-        control("update_pull_request", update),
-        control("merge_pull_request", merge),
-    )
-}
-
+/// The capabilities no longer read here are not unused. `ReviewCapabilities` is
+/// minted per preflight for every Platform v2 client, and ShellDeck and the
+/// mobile client execute agent delivery, staging and the pull-request families
+/// from that same contract. What is deliberately absent is a *browser* command
+/// for them: letting a hosted, internet-facing cockpit merge a pull request is
+/// an authority expansion for the repository owner to decide, not a projection
+/// detail to settle while fixing a drift.
 fn review_actions(
     selected: Option<&WorkContextRecord>,
     selected_project: Option<&WorkContextIdentity>,
@@ -849,43 +730,6 @@ fn review_actions(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let deliverable_comments = exact
-        .zip(capabilities)
-        .map(|((workspace, project, snapshot), capabilities)| {
-            capabilities
-                .agent_deliverable_comments()
-                .iter()
-                .filter_map(|capability| {
-                    // Only project a note the snapshot still agrees is at the
-                    // advertised revision, so a stale capability read cannot
-                    // render a control the daemon would refuse.
-                    let comment = snapshot.comments().iter().find(|comment| {
-                        comment.id() == capability.comment_id()
-                            && comment.revision() == capability.expected_comment_revision()
-                    })?;
-                    Some(json!({
-                        "project_id": project.as_str(),
-                        "workspace_id": workspace.identity().id(),
-                        "exact_revision": snapshot.revision().to_string(),
-                        "comment_id": comment.id().as_str(),
-                        "exact_comment_revision": capability.expected_comment_revision().to_string()
-                    }))
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let agent_delivery_available = !deliverable_comments.is_empty();
-    let agent_delivery = |execute: &str| {
-        json!({
-            "available": agent_delivery_available,
-            "category": if agent_delivery_available { Value::Null } else { json!("platform_cockpit_review_family_unavailable") },
-            "execute_operation": if agent_delivery_available { json!(execute) } else { Value::Null },
-            "receipt_operation": if agent_delivery_available { json!("get_review_receipt") } else { Value::Null },
-            "targets": deliverable_comments.clone()
-        })
-    };
-    let (open_pull_request, update_pull_request, merge_pull_request) =
-        pull_request_controls(exact, capabilities);
     let rerun_available = !rerunnable_checks.is_empty();
     let rerun = json!({
         "available": rerun_available,
@@ -894,23 +738,26 @@ fn review_actions(
         "receipt_operation": if rerun_available { json!("get_review_receipt") } else { Value::Null },
         "targets": rerunnable_checks
     });
+    let operations = json!({
+        "add_comment": action(fresh, REVIEW_ADAPTER_PENDING),
+        "approve_review": action(approve, if fresh { "platform_v2_review_not_pending" } else { REVIEW_ADAPTER_PENDING }),
+        "rerun_check": rerun
+    });
+    // Whatever the contract knows and this projection did not command is named
+    // rather than silently missing, so a client can tell "this browser has no
+    // command for it" apart from "this family does not exist". A family the
+    // contract grows tomorrow lands here on its own.
+    let families_without_browser_command = ReviewActionKind::ALL
+        .iter()
+        .map(|kind| kind.as_str())
+        .filter(|family| operations.get(*family).is_none())
+        .map(Value::from)
+        .collect::<Vec<_>>();
     json!({
         "available": fresh,
         "category": if fresh { Value::Null } else { json!(REVIEW_ADAPTER_PENDING) },
-        "operations": {
-            "add_comment": action(fresh, REVIEW_ADAPTER_PENDING),
-            "approve_review": action(approve, if fresh { "platform_v2_review_not_pending" } else { REVIEW_ADAPTER_PENDING }),
-            "send_comment_to_agent": agent_delivery("send_comment_to_agent"),
-            "batch_send_comments_to_agent": agent_delivery("batch_send_comments_to_agent"),
-            "stage": action(false, "platform_cockpit_git_family_unavailable"),
-            "unstage": action(false, "platform_cockpit_git_family_unavailable"),
-            "commit": action(false, "platform_cockpit_git_family_unavailable"),
-            "resolve_conflict": action(false, "platform_cockpit_git_family_unavailable"),
-            "rerun_check": rerun,
-            "open_pull_request": open_pull_request,
-            "update_pull_request": update_pull_request,
-            "merge_pull_request": merge_pull_request
-        }
+        "operations": operations,
+        "families_without_browser_command": families_without_browser_command
     })
 }
 
@@ -2435,6 +2282,7 @@ fn refused(category: &str, explanation: &str) -> Value {
 mod tests {
     use super::*;
     use automonique_protocol::platform_v2_transport::PlatformV2Refusal;
+    use std::collections::BTreeSet;
 
     fn canonical_json_bytes(value: &Value) -> Vec<u8> {
         fn write(value: &Value, output: &mut Vec<u8>) {
@@ -3201,24 +3049,80 @@ mod tests {
     /// wholly on or wholly off, and a capability minted against a pull
     /// request, head or revision the snapshot no longer shows is dropped
     /// rather than rendered.
+    /// The cockpit's own command surface, asked of the type that defines it.
+    ///
+    /// `CockpitRequest` is an internally tagged enum, so serde already holds
+    /// every action the browser may send and names them all when it is handed
+    /// one it does not know. Reading the surface back out of the type is the
+    /// whole point of this fence: a list of action names written out here by
+    /// hand would be a second copy of a contract kept beside the code, which is
+    /// the defect the fence exists to catch.
+    fn cockpit_command_surface() -> BTreeSet<String> {
+        const UNDECLARED: &str = "not-a-cockpit-action";
+        let refusal = serde_json::from_value::<CockpitRequest>(json!({ "action": UNDECLARED }))
+            .expect_err("an action nobody declared is never accepted")
+            .to_string();
+        let (_, listed) = refusal
+            .split_once("expected one of ")
+            .expect("serde names the variants it knows when it refuses one it does not");
+        let surface: BTreeSet<String> = listed
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect();
+        // Should serde ever reword that refusal, the parse above degrades into
+        // nonsense rather than into a smaller surface, and a fence that reads
+        // nonsense passes everything. So check the harvest against the decoder
+        // itself: every name taken out of the message must be an action the
+        // decoder recognises, and there must be more than one of them.
+        assert!(
+            surface.len() > 1,
+            "no command surface parsed from: {refusal}"
+        );
+        for action in &surface {
+            let refusal = serde_json::from_value::<CockpitRequest>(json!({ "action": action }))
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
+            assert!(
+                !refusal.contains("unknown variant"),
+                "`{action}` was harvested as an action the cockpit accepts: {refusal}"
+            );
+        }
+        assert!(!surface.contains(UNDECLARED));
+        surface
+    }
+
+    /// The fence for issue #224.
+    ///
+    /// A family is projected as executable only if the cockpit can execute it,
+    /// and both halves of that sentence are derived: the families from
+    /// `ReviewActionKind`, the command surface from `CockpitRequest`. Neither
+    /// is restated here, so a family added to the review contract, or a
+    /// `CockpitRequest` variant added to the browser, moves this projection on
+    /// its own or fails this test rather than drifting quietly apart from it.
     #[test]
-    fn pull_request_controls_are_projected_per_family_and_filtered_by_the_snapshot() {
+    fn review_projection_advertises_only_families_the_cockpit_can_execute() {
         use automonique_protocol::platform_v2::{
             WorkContextAttributes, WorkContextLabel, WorkContextRelation, WorkContextTargetKind,
         };
         use automonique_protocol::platform_v2_review::{
-            PullRequestId, ReviewAuthority, ReviewAuthorityId, ReviewAuthorityKind, ReviewField,
+            MergeReadiness, PullRequestId, ReviewAuthority, ReviewAuthorityId, ReviewAuthorityKind,
+            ReviewField,
         };
         use automonique_protocol::platform_v2_review_api::decode_review_snapshot;
         use automonique_protocol::platform_v2_transport::{
+            ReviewAgentDeliveryCapability, ReviewCheckRerunCapability,
             ReviewGitStagingCapabilities, ReviewPullRequestCapabilities,
-            ReviewPullRequestMergeCapability, ReviewPullRequestOpenCapability,
-            ReviewPullRequestUpdateCapability,
+            ReviewPullRequestMergeCapability, ReviewPullRequestUpdateCapability,
         };
 
         let project = ProjectId::new("project-1").unwrap();
+        let workspace =
+            WorkContextIdentity::UserWorkspace(UserWorkspaceId::new("wc_user_1").unwrap());
         let record = WorkContextRecord::new(
-            WorkContextIdentity::UserWorkspace(UserWorkspaceId::new("wc_user_1").unwrap()),
+            workspace.clone(),
             Revision::FIRST,
             WorkContextLifecycle::Active,
             WorkContextLabel::new("Workspace").unwrap(),
@@ -3238,8 +3142,8 @@ mod tests {
             ],
         )
         .unwrap();
-        // The fixture carries an open, ready pull request `pr-1` observed at
-        // revision 8 on head `0123456789abcdef`.
+        // The fixture carries a fresh snapshot: one rerunnable check, one
+        // comment, and an open, ready pull request `pr-1`.
         let snapshot = decode_review_snapshot(&canonical_json_bytes(
             &serde_json::from_slice::<Value>(include_bytes!(
                 "../../automonique-protocol/fixtures/platform-v2-review-v2.json"
@@ -3248,150 +3152,160 @@ mod tests {
         ))
         .unwrap();
         let observed = snapshot.pull_request().freshness().observed_revision();
-        let authority = ReviewAuthority::new(
+        let comment = snapshot.comments().first().expect("fixture comment");
+        let check = snapshot.checks().first().expect("fixture check");
+        // Two digests, so the assertions below can tell the confirmation the
+        // browser may spend from the ones minted for other clients.
+        let spendable = ReviewConfirmationDigest::new("ab".repeat(32)).unwrap();
+        let spendable_correlation = ReviewReceiptCorrelationDigest::new("cd".repeat(32)).unwrap();
+        let elsewhere = ReviewConfirmationDigest::new("ef".repeat(32)).unwrap();
+        let elsewhere_correlation = ReviewReceiptCorrelationDigest::new("ba".repeat(32)).unwrap();
+        let pull_request_authority = ReviewAuthority::new(
             ReviewAuthorityKind::PullRequest,
             ReviewAuthorityId::new("authority-1").unwrap(),
         );
-        let confirmation = ReviewConfirmationDigest::new("ab".repeat(32)).unwrap();
-        let correlation = ReviewReceiptCorrelationDigest::new("cd".repeat(32)).unwrap();
-        let update = |id: &str, revision: Revision| {
-            ReviewPullRequestUpdateCapability::new(
-                PullRequestId::new(id).unwrap(),
-                revision,
-                authority.clone(),
-                confirmation.clone(),
-                correlation.clone(),
-            )
-            .unwrap()
-        };
-        let merge = |id: &str, revision: Revision, head: &str| {
-            ReviewPullRequestMergeCapability::new(
-                PullRequestId::new(id).unwrap(),
-                revision,
-                ReviewField::new(head).unwrap(),
-                MergeReadiness::Ready,
-                authority.clone(),
-                confirmation.clone(),
-                correlation.clone(),
-            )
-            .unwrap()
-        };
-        let controls = |capabilities: ReviewPullRequestCapabilities| {
-            let capabilities = ReviewCapabilities::new(
-                project.clone(),
-                WorkContextIdentity::UserWorkspace(UserWorkspaceId::new("wc_user_1").unwrap()),
-                snapshot.revision(),
-                Revision::FIRST,
-                Vec::new(),
-                Vec::new(),
-                capabilities,
-                ReviewGitStagingCapabilities::default(),
-            )
-            .unwrap();
-            let (open, update, merge) =
-                pull_request_controls(Some((&record, &project, &snapshot)), Some(&capabilities));
-            json!({ "open": open, "update": update, "merge": merge })
-        };
-
-        // Nothing selected and nothing proved: three unavailable controls,
-        // each carrying its own reason and no targets.
-        let (open, update_control, merge_control) = pull_request_controls(None, None);
-        for control in [&open, &update_control, &merge_control] {
-            assert_eq!(control["available"], false);
-            assert_eq!(
-                control["category"],
-                "platform_cockpit_pull_request_family_unavailable"
-            );
-            assert_eq!(control["targets"].as_array().unwrap().len(), 0);
-            assert!(control["execute_operation"].is_null());
-        }
-
-        // The fully scoped deployment: update and merge are both proved and
-        // both agree with the snapshot, so both are offered under their own
-        // operation names.
-        let full = controls(ReviewPullRequestCapabilities {
-            open: None,
-            update: Some(update("pr-1", observed)),
-            merge: Some(merge("pr-1", observed, "0123456789abcdef")),
-        });
-        assert_eq!(full["update"]["available"], true);
-        assert_eq!(full["update"]["execute_operation"], "update_pull_request");
-        assert_eq!(full["update"]["receipt_operation"], "get_review_receipt");
-        assert_eq!(full["update"]["targets"][0]["pull_request_id"], "pr-1");
-        assert_eq!(
-            full["update"]["targets"][0]["exact_pull_request_revision"],
-            observed.to_string()
-        );
-        assert_eq!(
-            full["update"]["targets"][0]["confirmation_digest"],
-            "ab".repeat(32)
-        );
-        assert_eq!(full["merge"]["available"], true);
-        assert_eq!(full["merge"]["execute_operation"], "merge_pull_request");
-        assert_eq!(
-            full["merge"]["targets"][0]["expected_head_revision"],
-            "0123456789abcdef"
-        );
-        assert_eq!(full["merge"]["targets"][0]["readiness"], "ready");
-        // An open was never proved, and a pull request that is already open
-        // is not a thing to open, so it stays unavailable regardless.
-        assert_eq!(full["open"]["available"], false);
-
-        // The proposer deployment: the credential withheld the merge scope,
-        // so the server minted no merge slot. The cockpit must render that as
-        // update-yes / merge-no rather than as one pull-request toggle.
-        let proposer = controls(ReviewPullRequestCapabilities {
-            open: None,
-            update: Some(update("pr-1", observed)),
-            merge: None,
-        });
-        assert_eq!(proposer["update"]["available"], true);
-        assert_eq!(proposer["merge"]["available"], false);
-        assert_eq!(
-            proposer["merge"]["category"],
-            "platform_cockpit_pull_request_family_unavailable"
-        );
-
-        // Stale reads, one per fence the snapshot re-checks: a different pull
-        // request, a head that moved, a revision that moved. Each is dropped
-        // rather than rendered as a control the daemon would refuse.
-        for stale in [
-            ReviewPullRequestCapabilities {
-                open: None,
-                update: Some(update("pr-2", observed)),
-                merge: Some(merge("pr-2", observed, "0123456789abcdef")),
-            },
-            ReviewPullRequestCapabilities {
-                open: None,
-                update: Some(update("pr-1", observed)),
-                merge: Some(merge("pr-1", observed, "fedcba9876543210")),
-            },
-            ReviewPullRequestCapabilities {
-                open: None,
-                update: Some(update("pr-1", Revision::FIRST)),
-                merge: Some(merge("pr-1", Revision::FIRST, "0123456789abcdef")),
-            },
-        ] {
-            let moved = controls(stale);
-            assert_eq!(moved["merge"]["available"], false, "{moved}");
-        }
-
-        // An open advertised against a pull request the snapshot already
-        // shows open is the same class of mistake, and is dropped the same
-        // way rather than proposing a duplicate.
-        let duplicate = controls(ReviewPullRequestCapabilities {
-            open: Some(
-                ReviewPullRequestOpenCapability::new(
-                    observed,
-                    authority.clone(),
-                    confirmation.clone(),
-                    correlation.clone(),
+        // Every review power the server can prove for this exact snapshot is
+        // minted: the check rerun the cockpit commands, and the agent delivery,
+        // update and merge it does not.
+        let capabilities = ReviewCapabilities::new(
+            project.clone(),
+            workspace.clone(),
+            snapshot.revision(),
+            Revision::FIRST,
+            vec![
+                ReviewCheckRerunCapability::new(
+                    check.id().clone(),
+                    check.freshness().observed_revision(),
+                    check.authority().clone(),
+                    spendable.clone(),
+                    spendable_correlation.clone(),
                 )
                 .unwrap(),
-            ),
-            update: None,
-            merge: None,
-        });
-        assert_eq!(duplicate["open"]["available"], false);
+            ],
+            vec![
+                ReviewAgentDeliveryCapability::new(
+                    comment.id().clone(),
+                    comment.revision(),
+                    ReviewAuthority::new(
+                        ReviewAuthorityKind::Review,
+                        ReviewAuthorityId::new("authority-1").unwrap(),
+                    ),
+                )
+                .unwrap(),
+            ],
+            ReviewPullRequestCapabilities {
+                open: None,
+                update: Some(
+                    ReviewPullRequestUpdateCapability::new(
+                        PullRequestId::new("pr-1").unwrap(),
+                        observed,
+                        pull_request_authority.clone(),
+                        elsewhere.clone(),
+                        elsewhere_correlation.clone(),
+                    )
+                    .unwrap(),
+                ),
+                merge: Some(
+                    ReviewPullRequestMergeCapability::new(
+                        PullRequestId::new("pr-1").unwrap(),
+                        observed,
+                        ReviewField::new("0123456789abcdef").unwrap(),
+                        MergeReadiness::Ready,
+                        pull_request_authority,
+                        elsewhere.clone(),
+                        elsewhere_correlation.clone(),
+                    )
+                    .unwrap(),
+                ),
+            },
+            ReviewGitStagingCapabilities::default(),
+        )
+        .unwrap();
+
+        let projection = review_actions(
+            Some(&record),
+            Some(&WorkContextIdentity::Project(project)),
+            Some(&snapshot),
+            Some(&capabilities),
+        );
+        let surface = cockpit_command_surface();
+        let operations = projection["operations"]
+            .as_object()
+            .expect("the review projection always carries an operations object");
+        // Which families are commanded is a fact about this browser, not about
+        // what the server proved for a workspace, so a projection built from
+        // nothing at all names exactly the same two lists. Checking one
+        // projection therefore checks every projection.
+        let empty = review_actions(None, None, None, None);
+        assert_eq!(
+            empty["operations"]
+                .as_object()
+                .expect("an operations object")
+                .keys()
+                .collect::<Vec<_>>(),
+            operations.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            empty["families_without_browser_command"],
+            projection["families_without_browser_command"]
+        );
+        for (family, control) in operations {
+            assert!(
+                surface.contains(family.as_str()),
+                "`{family}` is projected as an operation the cockpit cannot execute: add the \
+                 `CockpitRequest` variant and its reader, or stop projecting it"
+            );
+            assert!(
+                control.get("execute_operation").is_some(),
+                "`{family}` sits in `operations` without an execute field: it is not an operation"
+            );
+        }
+        let uncommanded: Vec<&str> = projection["families_without_browser_command"]
+            .as_array()
+            .expect("the uncommanded families are always named")
+            .iter()
+            .map(|family| family.as_str().expect("family names are strings"))
+            .collect();
+        for family in &uncommanded {
+            assert!(
+                !surface.contains(*family),
+                "`{family}` now has a `CockpitRequest` variant: project it as an operation with a \
+                 reader rather than leaving it listed as uncommanded"
+            );
+        }
+        // The contract's own roll of families is accounted for exactly once,
+        // so neither list can quietly lose one or claim one twice.
+        for kind in ReviewActionKind::ALL {
+            let family = kind.as_str();
+            assert!(
+                operations.contains_key(family) != uncommanded.contains(&family),
+                "`{family}` is neither commanded nor named as uncommanded"
+            );
+        }
+        assert!(uncommanded.contains(&"send_comment_to_agent"));
+        assert!(uncommanded.contains(&"batch_send_comments_to_agent"));
+        assert!(uncommanded.contains(&"merge_pull_request"));
+
+        // The server proved delivery, an update and a merge against this exact
+        // snapshot, and none of it reaches the browser as something to press:
+        // no operation, and no confirmation it could not spend.
+        let rendered = projection.to_string();
+        assert!(
+            !rendered.contains(elsewhere.as_str())
+                && !rendered.contains(elsewhere_correlation.as_str()),
+            "a confirmation minted for another client reached the browser: {rendered}"
+        );
+        // And the fence is not passing because the projection went empty: the
+        // one family the cockpit does command is still offered in full.
+        assert_eq!(operations["rerun_check"]["available"], true);
+        assert_eq!(
+            operations["rerun_check"]["targets"][0]["confirmation_digest"],
+            spendable.as_str()
+        );
+        assert_eq!(operations["add_comment"]["available"], true);
+        assert_eq!(
+            operations["add_comment"]["execute_operation"],
+            "execute_review_action"
+        );
     }
 }
