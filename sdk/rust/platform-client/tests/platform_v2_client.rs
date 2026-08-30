@@ -5,7 +5,7 @@ use automonique_platform_client::platform_v2_client::testing::{
 };
 use automonique_platform_client::platform_v2_client::{
     AttentionReadResult, NegotiationResult, PlatformV2Client, PlatformV2ClientError as ClientError,
-    ReviewActionConfirmation, ReviewReceiptResult, WorkContextGetResult,
+    ResourceListingResult, ReviewActionConfirmation, ReviewReceiptResult, WorkContextGetResult,
 };
 use automonique_protocol::identity::Actor;
 use automonique_protocol::platform::{IdempotencyKey, ResourceAuthority};
@@ -19,6 +19,9 @@ use automonique_protocol::platform_v2_attention::{
     AttentionSource, AttentionSourceId, AttentionSourceKind,
 };
 use automonique_protocol::platform_v2_attention_api::decode_attention_source_snapshot;
+use automonique_protocol::platform_v2_inventory::{
+    ResourceListingCursor, ResourceListingPage, ResourceListingQuery, ResourceListingResync,
+};
 use automonique_protocol::platform_v2_lifecycle::{
     CreateProjectIntent, MutationApproval, MutationApprovalDecision, MutationApprovalId,
     MutationApprovalRequirement, MutationPreview, MutationPreviewId, MutationPreviewRef,
@@ -471,6 +474,90 @@ fn rejects_a_mutation_approval_that_reverses_the_requested_decision() {
             preview.preview().clone(),
             digest,
             MutationApprovalDecision::Granted,
+        ),
+        Err(ClientError::Protocol)
+    );
+}
+
+fn listing_cursor(offset: usize) -> ResourceListingCursor {
+    ResourceListingCursor::new(format!(
+        "rl2.{}.{}.{offset}",
+        "a".repeat(64),
+        "b".repeat(64)
+    ))
+    .unwrap()
+}
+
+#[test]
+fn a_listing_answer_must_carry_the_bound_this_caller_asked_to_be_held_to() {
+    // Asking for more than the server's ceiling is admissible, and the answer
+    // is the server's page. A client that accepted any `granted_limit` would
+    // have no way to tell that page apart from a truncation.
+    let asked = ResourceListingQuery::new(vec![], vec![], None, 4_096).unwrap();
+    let honest = ResourceListingPage::new(4_096, 128, None, None, false, vec![]).unwrap();
+    let transport = DeterministicPlatformV2Transport::new([
+        v2_negotiation(),
+        DeterministicPlatformV2Step::V2(Box::new(PlatformV2Response::ResourceListingPage(honest))),
+    ]);
+    let mut client = PlatformV2Client::new_testing(transport);
+    client
+        .negotiate(PlatformVersionOffer::new(vec![2]).unwrap())
+        .unwrap();
+    assert!(matches!(
+        client.list_resources(asked.clone()).unwrap(),
+        ResourceListingResult::Page(_)
+    ));
+
+    // The same page answering a request for four is a bound nobody asked for.
+    let transport = DeterministicPlatformV2Transport::new([
+        v2_negotiation(),
+        DeterministicPlatformV2Step::V2(Box::new(PlatformV2Response::ResourceListingPage(
+            ResourceListingPage::new(4_096, 128, None, None, false, vec![]).unwrap(),
+        ))),
+    ]);
+    let mut client = PlatformV2Client::new_testing(transport);
+    client
+        .negotiate(PlatformVersionOffer::new(vec![2]).unwrap())
+        .unwrap();
+    assert_eq!(
+        client.list_resources(ResourceListingQuery::new(vec![], vec![], None, 4).unwrap()),
+        Err(ClientError::Protocol)
+    );
+}
+
+#[test]
+fn a_listing_resync_must_name_the_cursor_this_caller_presented() {
+    let presented = listing_cursor(4);
+    let transport = DeterministicPlatformV2Transport::new([
+        v2_negotiation(),
+        DeterministicPlatformV2Step::V2(Box::new(PlatformV2Response::ResourceListingResync(
+            ResourceListingResync::new(presented.clone()),
+        ))),
+    ]);
+    let mut client = PlatformV2Client::new_testing(transport);
+    client
+        .negotiate(PlatformVersionOffer::new(vec![2]).unwrap())
+        .unwrap();
+    assert!(matches!(
+        client
+            .list_resources(ResourceListingQuery::new(vec![], vec![], Some(presented), 8).unwrap())
+            .unwrap(),
+        ResourceListingResult::Resync(_)
+    ));
+
+    let transport = DeterministicPlatformV2Transport::new([
+        v2_negotiation(),
+        DeterministicPlatformV2Step::V2(Box::new(PlatformV2Response::ResourceListingResync(
+            ResourceListingResync::new(listing_cursor(9)),
+        ))),
+    ]);
+    let mut client = PlatformV2Client::new_testing(transport);
+    client
+        .negotiate(PlatformVersionOffer::new(vec![2]).unwrap())
+        .unwrap();
+    assert_eq!(
+        client.list_resources(
+            ResourceListingQuery::new(vec![], vec![], Some(listing_cursor(4)), 8).unwrap()
         ),
         Err(ClientError::Protocol)
     );

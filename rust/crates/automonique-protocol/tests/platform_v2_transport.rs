@@ -858,7 +858,7 @@ fn rust_transport_encoding_matches_the_shared_typescript_corpus() {
         .trim_end()
         .lines()
         .collect::<Vec<_>>();
-    assert_eq!(fixture.len(), 4);
+    assert_eq!(fixture.len(), 6);
 
     let negotiation = PlatformNegotiationRequestMessage::new(
         request_id("transport-negotiate"),
@@ -882,6 +882,63 @@ fn rust_transport_encoding_matches_the_shared_typescript_corpus() {
     assert_eq!(
         capabilities.to_canonical_bytes().unwrap(),
         fixture[2].as_bytes()
+    );
+
+    // The bounded listing, both halves. A request naming one class and asking
+    // for more than the server's ceiling, and the page that answers it: it
+    // carries the caller's 512 and the server's 128 side by side, so the clamp
+    // is a fact on the wire rather than a convention the two languages happen
+    // to share.
+    let listing = PlatformV2RequestMessage::new(
+        request_id("transport-listing"),
+        PlatformV2Request::ListResources(
+            automonique_protocol::platform_v2_inventory::ResourceListingQuery::new(
+                vec![ResourceAuthority::Automonique],
+                vec![ResourceKind::Approval],
+                None,
+                512,
+            )
+            .unwrap(),
+        ),
+    );
+    assert_eq!(listing.to_canonical_bytes().unwrap(), fixture[4].as_bytes());
+    let listing_page = PlatformV2ResponseMessage::for_request(
+        &listing,
+        PlatformV2Response::ResourceListingPage(
+            automonique_protocol::platform_v2_inventory::ResourceListingPage::new(
+                512,
+                128,
+                None,
+                Some(
+                    automonique_protocol::platform_v2_inventory::ResourceListingCursor::new(
+                        format!("rl2.{}.{}.1", "a".repeat(64), "b".repeat(64)),
+                    )
+                    .unwrap(),
+                ),
+                true,
+                vec![automonique_protocol::platform::ResourceRecord {
+                    resource: ResourceCoordinate::new(
+                        ResourceAuthority::Automonique,
+                        ResourceKind::Approval,
+                        ResourceId::new("approval-1").unwrap(),
+                    ),
+                    freshness: automonique_protocol::platform::Freshness {
+                        state: automonique_protocol::platform::FreshnessState::Fresh,
+                        observed_at: automonique_protocol::primitives::EpochMillis::from_millis(
+                            1_700_000_000_000,
+                        ),
+                        revision: Revision::FIRST,
+                    },
+                    summary: automonique_protocol::platform::PlatformText::new("open").unwrap(),
+                }],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        listing_page.to_canonical_bytes().unwrap(),
+        fixture[5].as_bytes()
     );
 
     let capability_response = PlatformV2ResponseMessage::for_request(
@@ -1040,6 +1097,15 @@ fn every_platform_v2_request_kind_round_trips_without_server_owned_inputs() {
     let requests = vec![
         PlatformV2Request::GetLifecycleCapabilities,
         PlatformV2Request::QueryWorkContexts(query),
+        PlatformV2Request::ListResources(
+            automonique_protocol::platform_v2_inventory::ResourceListingQuery::new(
+                vec![ResourceAuthority::Automonique],
+                vec![ResourceKind::Approval],
+                None,
+                8,
+            )
+            .unwrap(),
+        ),
         PlatformV2Request::GetWorkContext(workspace()),
         PlatformV2Request::PrepareMutation(MutationPrepareRequest::new(
             IdempotencyKey::new("mutation-1").unwrap(),
@@ -1372,6 +1438,64 @@ fn response_documents_round_trip_and_review_envelope_fits_its_declared_ceiling()
         ),
         Err(PlatformV2TransportError::ResponseMismatch)
     );
+    // Both answers to a listing correlate to the listing request, and neither
+    // answers anything else.
+    let listing_request = PlatformV2RequestMessage::new(
+        request_id("listing-response"),
+        PlatformV2Request::ListResources(
+            automonique_protocol::platform_v2_inventory::ResourceListingQuery::new(
+                vec![],
+                vec![],
+                None,
+                4,
+            )
+            .unwrap(),
+        ),
+    );
+    let expired = automonique_protocol::platform_v2_inventory::ResourceListingCursor::new(format!(
+        "rl2.{}.{}.4",
+        "a".repeat(64),
+        "b".repeat(64)
+    ))
+    .unwrap();
+    for answer in [
+        PlatformV2Response::ResourceListingPage(
+            automonique_protocol::platform_v2_inventory::ResourceListingPage::new(
+                4,
+                4,
+                None,
+                None,
+                false,
+                vec![],
+            )
+            .unwrap(),
+        ),
+        PlatformV2Response::ResourceListingResync(
+            automonique_protocol::platform_v2_inventory::ResourceListingResync::new(
+                expired.clone(),
+            ),
+        ),
+    ] {
+        let listing_response =
+            PlatformV2ResponseMessage::for_request(&listing_request, answer.clone()).unwrap();
+        let listing_bytes = listing_response.to_canonical_bytes().unwrap();
+        assert_eq!(
+            PlatformV2ResponseMessage::from_canonical_bytes(&listing_bytes, &listing_request)
+                .unwrap(),
+            listing_response
+        );
+        assert_eq!(
+            PlatformV2ResponseMessage::for_request(
+                &PlatformV2RequestMessage::new(
+                    request_id("listing-response"),
+                    PlatformV2Request::GetWorkContext(workspace()),
+                ),
+                answer,
+            ),
+            Err(PlatformV2TransportError::ResponseMismatch)
+        );
+    }
+
     assert_eq!(
         MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES,
         automonique_protocol::platform_v2_review_api::MAX_REVIEW_SNAPSHOT_CANONICAL_BYTES

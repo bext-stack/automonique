@@ -1254,17 +1254,57 @@ fn encode_bound_cursor(
     inventory: &str,
     offset: usize,
 ) -> Result<WorkContextCursor, WorkContextError> {
-    WorkContextCursor::new(format!("wc2.{filter}.{inventory}.{offset}"))
-        .map_err(WorkContextError::Field)
+    WorkContextCursor::new(encode_bound_cursor_parts(
+        WORK_CONTEXT_CURSOR_PREFIX,
+        filter,
+        inventory,
+        offset,
+    ))
+    .map_err(WorkContextError::Field)
 }
 
 fn decode_bound_cursor(cursor: &WorkContextCursor) -> Option<(&str, &str, usize)> {
-    let mut parts = cursor.as_str().split('.');
-    let prefix = parts.next()?;
+    decode_bound_cursor_parts(cursor.as_str(), WORK_CONTEXT_CURSOR_PREFIX)
+}
+
+/// Cursor prefix for the work-context listing. Every v2 listing has its own, so
+/// a cursor minted against one corpus cannot be replayed as an offset into
+/// another.
+const WORK_CONTEXT_CURSOR_PREFIX: &str = "wc2";
+
+/// Render one opaque continuation cursor.
+///
+/// This grammar is shared by every bounded v2 listing — the work-context query
+/// here and the resource listing in [`crate::platform_v2_inventory`] — so the
+/// rule that a cursor binds a filter fingerprint, an inventory-generation
+/// fingerprint and an offset has exactly one spelling. Adding a second listing
+/// adds a prefix, not a second grammar.
+pub(crate) fn encode_bound_cursor_parts(
+    prefix: &str,
+    filter: &str,
+    inventory: &str,
+    offset: usize,
+) -> String {
+    format!("{prefix}.{filter}.{inventory}.{offset}")
+}
+
+/// Read one opaque continuation cursor back, or refuse it.
+///
+/// A cursor that does not parse is not an error: the caller answers with a
+/// resync, which is also what a cursor that parses but names another generation
+/// gets. The decoder is strict about the shape — exact prefix, two lowercase
+/// 64-character hex fingerprints, a canonical decimal offset — so a hand-edited
+/// value cannot become a valid offset into a listing by accident.
+pub(crate) fn decode_bound_cursor_parts<'a>(
+    cursor: &'a str,
+    prefix: &str,
+) -> Option<(&'a str, &'a str, usize)> {
+    let mut parts = cursor.split('.');
+    let observed_prefix = parts.next()?;
     let filter = parts.next()?;
     let inventory = parts.next()?;
     let offset = parts.next()?;
-    if prefix != "wc2"
+    if observed_prefix != prefix
         || filter.len() != 64
         || inventory.len() != 64
         || parts.next().is_some()
@@ -1285,7 +1325,7 @@ fn strictly_increasing<T: Ord>(values: &[T]) -> bool {
     !values.is_empty() && values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
-fn strictly_increasing_or_empty<T: Ord>(values: &[T]) -> bool {
+pub(crate) fn strictly_increasing_or_empty<T: Ord>(values: &[T]) -> bool {
     values.is_empty() || strictly_increasing(values)
 }
 

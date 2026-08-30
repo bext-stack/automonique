@@ -12,6 +12,7 @@ import {
   decodePlatformV2Response,
   encodePlatformNegotiationRequest,
   encodePlatformV2Request,
+  grantedResourceListingLimit,
   parseCanonical,
   type IdempotencyKey,
   type AttentionSource,
@@ -26,6 +27,7 @@ import {
   type PlatformVersionOffer,
   type ProjectId,
   type ReceiptId,
+  type ResourceListingQuery,
   type ReviewAction,
   type ReviewConfirmationDigest,
   type ReviewReceiptCorrelationDigest,
@@ -530,6 +532,32 @@ export class PlatformV2Client {
     }
     if (
       response.kind === "work_context_resync"
+      && (query.after === null || response.resync.expired_after !== query.after)
+    ) {
+      throw new PlatformTransportError(502, "response_coordinate_mismatch");
+    }
+    return response;
+  }
+
+  /// List the bounded resource inventory, one page at a time.
+  ///
+  /// A caller may ask for a page larger than the server's ceiling; the answer
+  /// is the server's page, and `granted_limit` is what says which bound was
+  /// applied. It is re-derived here rather than trusted, so a page claiming a
+  /// bound the server would not have applied is a coordinate mismatch rather
+  /// than a truncation this client would silently report.
+  async listResources(query: ResourceListingQuery, signal?: AbortSignal) {
+    const response = requireResponse(await this.#request({kind: "list_resources", query}, signal), ["resource_listing_page", "resource_listing_resync"] as const);
+    if (
+      response.kind === "resource_listing_page"
+      && (response.page.requested_limit !== query.requested_limit
+        || response.page.granted_limit !== grantedResourceListingLimit(query.requested_limit)
+        || response.page.after !== query.after)
+    ) {
+      throw new PlatformTransportError(502, "response_coordinate_mismatch");
+    }
+    if (
+      response.kind === "resource_listing_resync"
       && (query.after === null || response.resync.expired_after !== query.after)
     ) {
       throw new PlatformTransportError(502, "response_coordinate_mismatch");

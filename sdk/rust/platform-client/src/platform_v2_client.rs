@@ -35,6 +35,9 @@ use automonique_protocol::platform_v2::{
 use automonique_protocol::platform_v2_attention::{
     AttentionReadRequest, AttentionSource, AttentionSourceSnapshot,
 };
+use automonique_protocol::platform_v2_inventory::{
+    ResourceListingPage, ResourceListingQuery, ResourceListingResync, granted_page_limit,
+};
 use automonique_protocol::platform_v2_lifecycle::{
     MutationApprovalDecision, MutationApprovalId, MutationPreview, MutationPreviewDigest,
     MutationPreviewRef, MutationRefusal, WorkContextMutationIntent,
@@ -256,6 +259,19 @@ pub enum NegotiationResult {
 pub enum WorkContextQueryResult {
     Page(WorkContextPage),
     Resync(WorkContextResync),
+    Refused(PlatformV2Refusal),
+}
+
+/// The two answers a bounded resource listing can have, plus the transport
+/// refusal every request shares.
+///
+/// A resync is its own variant rather than an empty page, because the one way
+/// a listing can skip or duplicate a record is by resuming a cursor the server
+/// no longer recognises.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResourceListingResult {
+    Page(Box<ResourceListingPage>),
+    Resync(ResourceListingResync),
     Refused(PlatformV2Refusal),
 }
 
@@ -485,6 +501,38 @@ impl<T> PlatformV2Client<T> {
                 Ok(WorkContextQueryResult::Resync(value))
             }
             PlatformV2Response::Refused(value) => Ok(WorkContextQueryResult::Refused(value)),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    /// List the bounded resource inventory, one page at a time.
+    ///
+    /// The answer is checked against the request before it is returned: the
+    /// page must echo the limit this caller asked for, must carry the server's
+    /// own clamp of it, and must continue from the cursor that was presented.
+    /// A caller may ask for a page larger than the server's ceiling and will
+    /// receive the server's — that is the contract, not a truncation, and
+    /// `granted_limit` is what a caller reads to know which it got.
+    pub fn list_resources(
+        &mut self,
+        query: ResourceListingQuery,
+    ) -> Result<ResourceListingResult, ClientError> {
+        let expected_after = query.after().cloned();
+        let expected_limit = query.requested_limit();
+        match self.request(PlatformV2Request::ListResources(query))? {
+            PlatformV2Response::ResourceListingPage(value)
+                if value.requested_limit() == expected_limit
+                    && value.granted_limit() == granted_page_limit(expected_limit)
+                    && value.after() == expected_after.as_ref() =>
+            {
+                Ok(ResourceListingResult::Page(Box::new(value)))
+            }
+            PlatformV2Response::ResourceListingResync(value)
+                if expected_after.as_ref() == Some(value.expired_after()) =>
+            {
+                Ok(ResourceListingResult::Resync(value))
+            }
+            PlatformV2Response::Refused(value) => Ok(ResourceListingResult::Refused(value)),
             _ => Err(ClientError::Protocol),
         }
     }

@@ -2408,6 +2408,48 @@ fn platform_v2_transport_module() -> GeneratedModule {
                     crate::platform_v2_transport::MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES,
                 ),
             },
+            Constant {
+                name: "PLATFORM_INVENTORY_SCHEMA_V1".to_owned(),
+                doc: "Stable schema identifier for the bounded resource listing.".to_owned(),
+                value: ConstantValue::Text(
+                    crate::platform_v2_inventory::PLATFORM_INVENTORY_SCHEMA_V1.to_owned(),
+                ),
+            },
+            Constant {
+                name: "PLATFORM_INVENTORY_REQUIRES_PLATFORM_MAJOR".to_owned(),
+                doc: "The negotiated Platform major the resource listing requires.".to_owned(),
+                value: ConstantValue::Count(usize::from(
+                    crate::platform_v2_inventory::PLATFORM_INVENTORY_REQUIRES_PLATFORM_MAJOR,
+                )),
+            },
+            Constant {
+                name: "MAX_RESOURCE_LISTING_CURSOR_BYTES".to_owned(),
+                doc: "Maximum bytes in one opaque resource-listing cursor.".to_owned(),
+                value: ConstantValue::Count(
+                    crate::platform_v2_inventory::MAX_RESOURCE_LISTING_CURSOR_BYTES,
+                ),
+            },
+            Constant {
+                name: "MAX_RESOURCE_LISTING_PAGE_ITEMS".to_owned(),
+                doc: "The server's page ceiling; a larger request is clamped to it.".to_owned(),
+                value: ConstantValue::Count(
+                    crate::platform_v2_inventory::MAX_RESOURCE_LISTING_PAGE_ITEMS,
+                ),
+            },
+            Constant {
+                name: "MAX_RESOURCE_LISTING_QUERY_CANONICAL_BYTES".to_owned(),
+                doc: "Maximum canonical resource-listing query bytes.".to_owned(),
+                value: ConstantValue::Count(
+                    crate::platform_v2_inventory_api::MAX_RESOURCE_LISTING_QUERY_CANONICAL_BYTES,
+                ),
+            },
+            Constant {
+                name: "MAX_RESOURCE_LISTING_PAGE_CANONICAL_BYTES".to_owned(),
+                doc: "Maximum canonical resource-listing page bytes.".to_owned(),
+                value: ConstantValue::Count(
+                    crate::platform_v2_inventory_api::MAX_RESOURCE_LISTING_PAGE_CANONICAL_BYTES,
+                ),
+            },
         ],
         implementation: Some(GeneratedImplementation::PlatformV2Transport),
         ..GeneratedModule::default()

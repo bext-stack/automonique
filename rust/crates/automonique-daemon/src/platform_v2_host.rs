@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use automonique_github_connector::{BranchName, IssueNumber, RepoTarget, WorkflowRunId};
 use automonique_protocol::digest::{Sha256, Sha256Digest};
 use automonique_protocol::identity::Actor;
-use automonique_protocol::platform::{ReceiptId, ResourceAuthority};
+use automonique_protocol::platform::{ReceiptId, ResourceAuthority, ResourceKind, ResourceRecord};
 use automonique_protocol::platform_v2::{
     CheckoutId, NegotiatedPlatform, PlatformVersionOffer, ProjectId, UserWorkspaceId, V1SessionRef,
     WorkContextIdentity, WorkContextLifecycle, WorkContextQueryResult, WorkContextRecord,
@@ -26,6 +26,9 @@ use automonique_protocol::platform_v2::{
 use automonique_protocol::platform_v2_attention::{
     AttentionItem, AttentionItemId, AttentionItemReason, AttentionReadRequest, AttentionSourceKind,
     AttentionSourceSnapshot,
+};
+use automonique_protocol::platform_v2_inventory::{
+    AuthorizedResourceRecord, ResourceListingResult, page_authorized_resources,
 };
 use automonique_protocol::platform_v2_lifecycle::{
     AuthorityGrantId, MutationApprovalId, MutationApprovalRequirement, MutationExplanation,
@@ -464,6 +467,34 @@ impl PlatformV2ReviewDelivery for UnavailableReviewDelivery {
     }
 }
 
+/// The daemon-owned Platform v1 resource projection, read for one v2 listing.
+///
+/// The v2 host holds policy and durable work-context state; the v1 resource
+/// inventory lives in the daemon's platform store. This is the same boundary
+/// shape as [`PlatformV2ReviewDelivery`]: the adapter returns records and
+/// decides nothing. Every authorization decision stays on this side, where the
+/// principal is, and it is applied to one record at a time.
+pub trait PlatformV2ResourceInventory {
+    /// Every projected resource the daemon currently holds, with no coordinate
+    /// repeated.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable refusal category when the projection cannot be read.
+    fn resources(&mut self, now_ms: i64) -> Result<Vec<ResourceRecord>, &'static str>;
+}
+
+/// The answer when no daemon supplied a projection — a unit test, or a host
+/// built without one. A listing is refused rather than answered empty, because
+/// an empty page would claim the inventory is empty.
+pub struct UnavailableResourceInventory;
+
+impl PlatformV2ResourceInventory for UnavailableResourceInventory {
+    fn resources(&mut self, _: i64) -> Result<Vec<ResourceRecord>, &'static str> {
+        Err("platform_v2_resource_inventory_unavailable")
+    }
+}
+
 /// Typed external-effect boundary. It receives only the closed lifecycle
 /// intent and server-issued identities; paths and commands are never accepted.
 pub trait PlatformV2LifecycleEffectAdapter: Send {
@@ -696,6 +727,16 @@ struct PrincipalPolicy {
     workspaces: BTreeMap<WorkContextIdentity, ScopePolicy>,
     authority: WorkContextAuthority,
     review_authorities: BTreeMap<ReviewAuthorityKind, ReviewAuthority>,
+    /// The `(authority, kind)` resource classes this principal may see in a v2
+    /// listing, and nothing wider.
+    ///
+    /// Absent from an installed policy this is empty, so an existing
+    /// deployment gains no read it did not already hold: the listing is a new
+    /// grant an operator writes, never a widening of `serving_authority` or of
+    /// the project set. The predicate is evaluated once per record in
+    /// [`PlatformV2Runtime::handle`], so the listing can never surface a
+    /// resource a targeted read of the same class would refuse.
+    resource_reads: BTreeSet<(ResourceAuthority, ResourceKind)>,
 }
 
 #[derive(Clone, Debug)]
@@ -722,6 +763,17 @@ struct PrincipalDocument {
     workspaces: Vec<WorkspaceDocument>,
     authority: AuthorityDocument,
     review_authorities: BTreeMap<String, String>,
+    /// Optional, and empty when absent: a policy written before the v2 listing
+    /// existed grants no listing.
+    #[serde(default)]
+    resource_reads: Vec<ResourceReadDocument>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResourceReadDocument {
+    authority: String,
+    kind: String,
 }
 
 #[derive(Deserialize)]
@@ -832,6 +884,28 @@ impl PlatformV2Host {
         }
     }
 
+    /// Whether this peer's principal could be answered a resource listing at
+    /// all.
+    ///
+    /// The daemon asks before it refreshes every projected class, so a request
+    /// that is going to be refused does not first do the work of answering it.
+    /// This reports the same predicate the listing handler refuses on — see
+    /// [`PrincipalPolicy::lists_resources`] — and never which classes are
+    /// granted.
+    #[must_use]
+    pub fn lists_resources(&self, uid: u32) -> bool {
+        match self {
+            Self::Disabled(_) => false,
+            Self::Enabled(runtime) => {
+                runtime.policy_fence.verify().is_ok()
+                    && runtime
+                        .principals
+                        .get(&uid)
+                        .is_some_and(PrincipalPolicy::lists_resources)
+            }
+        }
+    }
+
     pub fn handle(
         &mut self,
         uid: u32,
@@ -848,9 +922,28 @@ impl PlatformV2Host {
         now_ms: i64,
         review_delivery: &mut dyn PlatformV2ReviewDelivery,
     ) -> PlatformV2Response {
+        self.handle_with_adapters(
+            uid,
+            request,
+            now_ms,
+            review_delivery,
+            &mut UnavailableResourceInventory,
+        )
+    }
+
+    /// Dispatch with every daemon-owned boundary supplied. A caller that omits
+    /// one is not refused wholesale: the requests that need it are.
+    pub fn handle_with_adapters(
+        &mut self,
+        uid: u32,
+        request: &PlatformV2Request,
+        now_ms: i64,
+        review_delivery: &mut dyn PlatformV2ReviewDelivery,
+        resource_inventory: &mut dyn PlatformV2ResourceInventory,
+    ) -> PlatformV2Response {
         match self {
             Self::Enabled(runtime) => runtime
-                .handle(uid, request, now_ms, review_delivery)
+                .handle(uid, request, now_ms, review_delivery, resource_inventory)
                 .unwrap_or_else(refused),
             Self::Disabled(category) => refused(category),
         }
@@ -918,6 +1011,13 @@ pub fn resolve_web_mobile_request_project(
                 return Err("platform_v2_mobile_project_denied");
             }
             project.clone()
+        }
+        // A v1 resource coordinate has no v2 project, so a delegated mobile
+        // credential — which is authorized per project — has nothing to be
+        // checked against. Denied here rather than mapped onto some project the
+        // listing does not actually respect.
+        PlatformV2Request::ListResources(_) => {
+            return Err("platform_v2_mobile_action_denied");
         }
         PlatformV2Request::GetWorkContext(identity) => principal
             .workspaces
@@ -1174,6 +1274,7 @@ impl PlatformV2Runtime {
         request: &PlatformV2Request,
         now_ms: i64,
         review_delivery: &mut dyn PlatformV2ReviewDelivery,
+        resource_inventory: &mut dyn PlatformV2ResourceInventory,
     ) -> Result<PlatformV2Response, &'static str> {
         self.policy_fence.verify()?;
         let principal = self
@@ -1243,6 +1344,39 @@ impl PlatformV2Runtime {
                     }
                     WorkContextQueryResult::Resync(value) => {
                         Ok(PlatformV2Response::WorkContextResync(value))
+                    }
+                }
+            }
+            PlatformV2Request::ListResources(query) => {
+                // A principal with no resource-read grant is refused rather
+                // than answered with an empty page: an empty page is a claim
+                // about the inventory, and this is a claim about the policy.
+                if !principal.lists_resources() {
+                    return Err("platform_v2_scope_denied");
+                }
+                let authorized: Vec<AuthorizedResourceRecord> = resource_inventory
+                    .resources(now_ms)?
+                    .into_iter()
+                    // Per record, never per page. The query's own class filter
+                    // is applied afterwards, inside the paging primitive, over
+                    // this already-authorized set — so naming a class the
+                    // policy withholds returns nothing rather than proving the
+                    // class is populated.
+                    .filter(|record| {
+                        principal
+                            .resource_reads
+                            .contains(&(record.resource.authority, record.resource.kind))
+                    })
+                    .map(AuthorizedResourceRecord::new)
+                    .collect();
+                match page_authorized_resources(query, &authorized)
+                    .map_err(|_| "platform_v2_response_invalid")?
+                {
+                    ResourceListingResult::Page(page) => {
+                        Ok(PlatformV2Response::ResourceListingPage(page))
+                    }
+                    ResourceListingResult::Resync(value) => {
+                        Ok(PlatformV2Response::ResourceListingResync(value))
                     }
                 }
             }
@@ -5720,6 +5854,14 @@ fn required_policy_parent(kind: WorkContextTargetKind) -> Option<WorkContextTarg
 }
 
 impl PrincipalPolicy {
+    /// Whether this principal holds any resource-read grant at all.
+    ///
+    /// One spelling, two callers: the listing handler refuses without it, and
+    /// the daemon skips the refresh it would otherwise do to answer.
+    fn lists_resources(&self) -> bool {
+        !self.resource_reads.is_empty()
+    }
+
     fn read_policy(
         &self,
         project: Option<ProjectId>,
@@ -5852,6 +5994,24 @@ fn parse_policy(document: PolicyDocument) -> Result<BTreeMap<u32, PrincipalPolic
                 return Err("platform_v2_policy_invalid");
             }
         }
+        // A grant repeated in the document is an operator mistake about what
+        // was granted, so it is refused rather than folded into a set.
+        if raw.resource_reads.len()
+            > ResourceAuthority::ALL
+                .len()
+                .saturating_mul(ResourceKind::ALL.len())
+        {
+            return Err("platform_v2_policy_invalid");
+        }
+        let mut resource_reads = BTreeSet::new();
+        for read in raw.resource_reads {
+            let authority = ResourceAuthority::parse(&read.authority)
+                .map_err(|_| "platform_v2_policy_invalid")?;
+            let kind = ResourceKind::parse(&read.kind).map_err(|_| "platform_v2_policy_invalid")?;
+            if !resource_reads.insert((authority, kind)) {
+                return Err("platform_v2_policy_invalid");
+            }
+        }
         if result
             .insert(
                 raw.uid,
@@ -5862,6 +6022,7 @@ fn parse_policy(document: PolicyDocument) -> Result<BTreeMap<u32, PrincipalPolic
                     workspaces,
                     authority,
                     review_authorities,
+                    resource_reads,
                 },
             )
             .is_some()
@@ -9072,6 +9233,332 @@ mod tests {
                 &mismatched_review_receipt,
             ),
             Err("platform_v2_mobile_project_denied")
+        );
+    }
+    /// A fake v1 projection. It answers with whatever the test seeded and
+    /// records how many times it was read, so a test can prove the host asks
+    /// once and filters after.
+    struct FakeResourceInventory {
+        records: Vec<ResourceRecord>,
+        reads: usize,
+    }
+
+    impl PlatformV2ResourceInventory for FakeResourceInventory {
+        fn resources(&mut self, _: i64) -> Result<Vec<ResourceRecord>, &'static str> {
+            self.reads += 1;
+            Ok(self.records.clone())
+        }
+    }
+
+    fn listed_resource(
+        authority: ResourceAuthority,
+        kind: ResourceKind,
+        id: &str,
+    ) -> ResourceRecord {
+        ResourceRecord {
+            resource: ResourceCoordinate::new(authority, kind, ResourceId::new(id).unwrap()),
+            freshness: automonique_protocol::platform::Freshness {
+                state: automonique_protocol::platform::FreshnessState::Fresh,
+                observed_at: EpochMillis::from_millis(1_700_000_000_000),
+                revision: Revision::FIRST,
+            },
+            summary: automonique_protocol::platform::PlatformText::new("open").unwrap(),
+        }
+    }
+
+    /// One enabled runtime whose policy carries exactly the resource-read
+    /// grants a test names.
+    fn listing_host(uid: u32, grants: serde_json::Value) -> (tempfile::TempDir, PlatformV2Host) {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let empty = serde_json::json!({
+            "filesystem": [], "credentials": [], "network": [],
+            "tools": [], "providers": [], "models": []
+        });
+        let policy_path = directory.path().join(POLICY_FILE_NAME);
+        write_generation_policy(
+            &policy_path,
+            &serde_json::json!({
+                "version": 1,
+                "principals": [{
+                    "uid": uid,
+                    "tenant": "tenant-test",
+                    "actor": "actor-test",
+                    "serving_authority": "automonique",
+                    "projects": ["project-test"],
+                    "workspaces": [{
+                        "project": "project-test", "kind": "project", "id": "project-test",
+                        "inherited_authority": empty.clone()
+                    }],
+                    "authority": empty,
+                    "review_authorities": {},
+                    "resource_reads": grants
+                }]
+            }),
+        );
+        let work_context_path = directory.path().join(WORK_CONTEXT_STORE_NAME);
+        let mut work_contexts = WorkContextStore::open(&work_context_path).unwrap();
+        work_contexts
+            .put_authoritative_record(
+                "tenant-test",
+                &WorkContextRecord::new(
+                    WorkContextIdentity::Project(ProjectId::new("project-test").unwrap()),
+                    Revision::FIRST,
+                    WorkContextLifecycle::Active,
+                    WorkContextLabel::new("Project").unwrap(),
+                    WorkContextAttributes::EMPTY,
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        drop(work_contexts);
+        let host = PlatformV2Host::open_with_lifecycle_adapter(
+            &policy_path,
+            &work_context_path,
+            &directory.path().join(LINEAGE_STORE_NAME),
+            &directory.path().join(REVIEW_STORE_NAME),
+            uid,
+            Box::new(UnavailableLifecycleEffectAdapter),
+        );
+        (directory, host)
+    }
+
+    fn listing_request(kinds: Vec<ResourceKind>, limit: u16) -> PlatformV2Request {
+        PlatformV2Request::ListResources(
+            automonique_protocol::platform_v2_inventory::ResourceListingQuery::new(
+                Vec::new(),
+                kinds,
+                None,
+                limit,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_principal_without_a_resource_read_grant_is_refused_rather_than_told_the_inventory_is_empty()
+     {
+        let uid = nix::unistd::geteuid().as_raw();
+        let (_directory, mut host) = listing_host(uid, serde_json::json!([]));
+        let mut inventory = FakeResourceInventory {
+            records: vec![listed_resource(
+                ResourceAuthority::Automonique,
+                ResourceKind::Approval,
+                "approval-1",
+            )],
+            reads: 0,
+        };
+        let response = host.handle_with_adapters(
+            uid,
+            &listing_request(Vec::new(), 10),
+            1_700_000_000_000,
+            &mut UnavailableReviewDelivery,
+            &mut inventory,
+        );
+        assert!(
+            matches!(&response, PlatformV2Response::Refused(refusal)
+                if refusal.category().as_str() == "platform_v2_scope_denied"),
+            "unexpected answer: {response:?}"
+        );
+        assert_eq!(
+            inventory.reads, 0,
+            "an ungranted principal never reaches the projection"
+        );
+    }
+
+    #[test]
+    fn a_listing_carries_only_the_classes_the_policy_granted() {
+        let uid = nix::unistd::geteuid().as_raw();
+        let (_directory, mut host) = listing_host(
+            uid,
+            serde_json::json!([{"authority": "automonique", "kind": "approval"}]),
+        );
+        let mut inventory = FakeResourceInventory {
+            records: vec![
+                listed_resource(
+                    ResourceAuthority::Automonique,
+                    ResourceKind::Approval,
+                    "approval-1",
+                ),
+                listed_resource(
+                    ResourceAuthority::Automonique,
+                    ResourceKind::Credential,
+                    "credential-1",
+                ),
+                listed_resource(ResourceAuthority::Provider, ResourceKind::Model, "model-1"),
+            ],
+            reads: 0,
+        };
+        let PlatformV2Response::ResourceListingPage(page) = host.handle_with_adapters(
+            uid,
+            &listing_request(Vec::new(), 10),
+            1_700_000_000_000,
+            &mut UnavailableReviewDelivery,
+            &mut inventory,
+        ) else {
+            panic!("expected a listing page");
+        };
+        assert_eq!(page.items().len(), 1);
+        assert_eq!(page.items()[0].resource.kind, ResourceKind::Approval);
+
+        // Naming an ungranted class proves nothing about whether it is
+        // populated: the answer is the same empty page either way.
+        let PlatformV2Response::ResourceListingPage(page) = host.handle_with_adapters(
+            uid,
+            &listing_request(vec![ResourceKind::Credential], 10),
+            1_700_000_000_000,
+            &mut UnavailableReviewDelivery,
+            &mut inventory,
+        ) else {
+            panic!("expected a listing page");
+        };
+        assert!(page.items().is_empty());
+        assert!(!page.has_more());
+    }
+
+    #[test]
+    fn a_listing_walks_past_the_v1_snapshot_ceiling_one_bounded_page_at_a_time() {
+        let uid = nix::unistd::geteuid().as_raw();
+        let (_directory, mut host) = listing_host(
+            uid,
+            serde_json::json!([{"authority": "automonique", "kind": "approval"}]),
+        );
+        let total = automonique_protocol::platform::MAX_SNAPSHOT_RESOURCES + 11;
+        let mut inventory = FakeResourceInventory {
+            records: (0..total)
+                .map(|index| {
+                    listed_resource(
+                        ResourceAuthority::Automonique,
+                        ResourceKind::Approval,
+                        &format!("approval-{index:04}"),
+                    )
+                })
+                .collect(),
+            reads: 0,
+        };
+        let mut seen = 0usize;
+        let mut after = None;
+        for _ in 0..16 {
+            let request = PlatformV2Request::ListResources(
+                automonique_protocol::platform_v2_inventory::ResourceListingQuery::new(
+                    Vec::new(),
+                    Vec::new(),
+                    after.clone(),
+                    64,
+                )
+                .unwrap(),
+            );
+            let PlatformV2Response::ResourceListingPage(page) = host.handle_with_adapters(
+                uid,
+                &request,
+                1_700_000_000_000,
+                &mut UnavailableReviewDelivery,
+                &mut inventory,
+            ) else {
+                panic!("expected a listing page");
+            };
+            seen += page.items().len();
+            match page.next_cursor() {
+                Some(cursor) => after = Some(cursor.clone()),
+                None => break,
+            }
+        }
+        assert_eq!(seen, total, "the whole inventory, never one refusal");
+    }
+
+    #[test]
+    fn a_host_without_a_projection_refuses_a_listing_instead_of_answering_it_empty() {
+        let uid = nix::unistd::geteuid().as_raw();
+        let (_directory, mut host) = listing_host(
+            uid,
+            serde_json::json!([{"authority": "automonique", "kind": "approval"}]),
+        );
+        let response = host.handle(uid, &listing_request(Vec::new(), 10), 1_700_000_000_000);
+        assert!(
+            matches!(&response, PlatformV2Response::Refused(refusal)
+                if refusal.category().as_str() == "platform_v2_resource_inventory_unavailable"),
+            "unexpected answer: {response:?}"
+        );
+    }
+
+    #[test]
+    fn a_repeated_resource_read_grant_is_an_invalid_policy() {
+        let document: Result<PolicyDocument, _> = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "principals": [{
+                "uid": 7, "tenant": "tenant-test", "actor": "actor-test",
+                "serving_authority": "automonique", "projects": ["project-test"],
+                "workspaces": [{"project": "project-test", "kind": "project", "id": "project-test",
+                    "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []}}],
+                "authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []},
+                "review_authorities": {},
+                "resource_reads": [
+                    {"authority": "automonique", "kind": "approval"},
+                    {"authority": "automonique", "kind": "approval"}
+                ]
+            }]
+        }));
+        assert!(parse_policy(document.unwrap()).is_err());
+    }
+
+    #[test]
+    fn a_policy_written_before_the_listing_existed_grants_no_listing() {
+        let parsed = parse_policy(policy(serde_json::json!([]))).unwrap();
+        assert!(!parsed.get(&7).unwrap().lists_resources());
+    }
+
+    #[test]
+    fn the_refresh_predicate_and_the_refusal_predicate_are_the_same_one() {
+        // The daemon asks before it refreshes every projected class. If this
+        // could answer `true` where the handler refuses, an ungranted request
+        // would still do the work of answering itself.
+        let uid = nix::unistd::geteuid().as_raw();
+        let (_ungranted_dir, ungranted) = listing_host(uid, serde_json::json!([]));
+        assert!(!ungranted.lists_resources(uid));
+        let (_granted_dir, granted) = listing_host(
+            uid,
+            serde_json::json!([{"authority": "automonique", "kind": "approval"}]),
+        );
+        assert!(granted.lists_resources(uid));
+        assert!(
+            !granted.lists_resources(uid.wrapping_add(1)),
+            "an unmapped peer holds no grant"
+        );
+        assert!(!PlatformV2Host::Disabled("platform_v2_unavailable").lists_resources(uid));
+    }
+
+    #[test]
+    fn a_delegated_mobile_credential_cannot_list_the_inventory() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = nix::unistd::geteuid().as_raw();
+        let path = directory.path().join(POLICY_FILE_NAME);
+        write_generation_policy(
+            &path,
+            &serde_json::json!({
+                "version": 1,
+                "principals": [{
+                    "uid": uid, "tenant": "tenant-test", "actor": "actor-test",
+                    "serving_authority": "automonique", "projects": ["project-test"],
+                    "workspaces": [{"project": "project-test", "kind": "project", "id": "project-test",
+                        "inherited_authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []}}],
+                    "authority": {"filesystem": [], "credentials": [], "network": [], "tools": [], "providers": [], "models": []},
+                    "review_authorities": {},
+                    "resource_reads": [{"authority": "automonique", "kind": "approval"}]
+                }]
+            }),
+        );
+        assert_eq!(
+            resolve_web_mobile_request_project(
+                &path,
+                uid,
+                "tenant-test",
+                "actor-test",
+                &BTreeSet::from([ProjectId::new("project-test").unwrap()]),
+                &listing_request(Vec::new(), 10),
+            ),
+            Err("platform_v2_mobile_action_denied")
         );
     }
 }

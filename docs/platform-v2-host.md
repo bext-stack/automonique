@@ -93,7 +93,11 @@ The file has this bounded shape:
     "review_authorities": {
       "git": "git-example",
       "review": "review-example"
-    }
+    },
+    "resource_reads": [
+      {"authority": "automonique", "kind": "approval"},
+      {"authority": "provider", "kind": "model"}
+    ]
   }]
 }
 ```
@@ -116,6 +120,44 @@ Review authority keys use the six review axes (`filesystem`, `git`, `ci`,
 `pull_request`, `review`, and `delivery`). Neither the v2 request envelope nor
 its domain documents can replace the actor, tenant, project bindings, six
 lifecycle grant axes, authentication kind, or review authority selected here.
+
+## Bounded resource listing
+
+`resource_reads` is optional and empty when absent, so a policy written before
+this existed grants no listing. Each entry names one `(authority, kind)` class
+of the Platform v1 resource vocabulary. A repeated entry is a policy error
+rather than a set union: a repeat is a mistake about what was granted.
+
+`list_resources` answers with one bounded page and an opaque cursor. It exists
+because Platform v1 has no listing primitive — its untargeted snapshot *was*
+the listing, and it refuses rather than paginates once the inventory outgrows
+`MAX_SNAPSHOT_RESOURCES`. A caller may ask for a page larger than the server's
+ceiling and receives the server's; the page carries both the requested and the
+granted limit so that clamp is provable rather than asserted.
+
+The grant is evaluated once per record, before the record reaches the paging
+primitive, so a listing can never surface a resource a targeted read of the
+same class would have withheld. The query's own `authorities`/`kinds` filters
+are applied afterwards, over the already-authorized set: naming a class the
+policy withholds returns an empty page rather than proving that class is
+populated. A principal holding no `resource_reads` entry at all is refused with
+`platform_v2_scope_denied` — an empty page would be a claim about the
+inventory, and that is a claim about the policy.
+
+The cursor binds a fingerprint of the class filter and of the exact authorized
+inventory generation it was minted against. A hand-edited cursor, one minted
+against a different authorized set, and one whose offset was moved all fail
+that comparison and are answered with `resync_required` rather than a page: the
+offset only ever indexes the presenting caller's own authorized, filtered list.
+Adding, removing or revising an authorized resource expires every outstanding
+cursor for the same reason — resuming across a changed inventory is the one way
+a listing can skip or duplicate a record. The freshness observation time is
+deliberately outside the fingerprint, because the daemon rewrites it on every
+refresh and a cursor that expired on every poll would never reach page two.
+
+A delegated mobile credential cannot list: mobile grants are authorized per
+project, a v1 coordinate has no project, so the request is denied at the web
+bridge beside `get_work_context` and `get_lifecycle_capabilities`.
 
 When enabled, startup opens three private sibling SQLite stores for work
 contexts/lifecycle custody, lineage, and review custody. Inventory decodes only

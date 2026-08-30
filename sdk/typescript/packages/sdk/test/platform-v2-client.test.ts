@@ -13,6 +13,7 @@ import {
   MutationApprovalId,
   PlatformVersionNumber,
   ProjectId,
+  ResourceListingCursor,
   ReviewConfirmationDigest,
   ReviewReceiptCorrelationDigest,
   UserWorkspaceId,
@@ -590,6 +591,53 @@ describe("canonical HTTPS Platform v2 client", () => {
     const resyncClient = new PlatformV2Client(wrongResync);
     await resyncClient.negotiate(offer);
     await expect(resyncClient.queryWorkContexts(query)).rejects.toMatchObject({category: "response_coordinate_mismatch"});
+  });
+
+  test("holds a resource listing to the bound this caller asked to be held to", async () => {
+    // 4096 is over the server's ceiling. Asking is admissible and the answer is
+    // the server's page, so the client accepts a granted limit of 128 for that
+    // request and nothing else.
+    const query = {after: null, authorities: [], kinds: [], requested_limit: 4096n};
+    const honest = new DeterministicPlatformV2Adapter([
+      {lane: "negotiation", result: {kind: "negotiated", negotiated: negotiatedBody(2n)}},
+      {lane: "v2", request: {kind: "list_resources", query}, result: {kind: "resource_listing_page", page: {
+        after: null, granted_limit: 128n, has_more: false, items: [], next_cursor: null, requested_limit: 4096n,
+      }}},
+    ]);
+    const honestClient = new PlatformV2Client(honest);
+    await honestClient.negotiate(offer);
+    expect((await honestClient.listResources(query)).kind).toBe("resource_listing_page");
+
+    const truncated = new DeterministicPlatformV2Adapter([
+      {lane: "negotiation", result: {kind: "negotiated", negotiated: negotiatedBody(2n)}},
+      {lane: "v2", request: {kind: "list_resources", query: {...query, requested_limit: 64n}}, result: {kind: "resource_listing_page", page: {
+        after: null, granted_limit: 128n, has_more: false, items: [], next_cursor: null, requested_limit: 4096n,
+      }}},
+    ]);
+    const truncatedClient = new PlatformV2Client(truncated);
+    await truncatedClient.negotiate(offer);
+    await expect(truncatedClient.listResources({...query, requested_limit: 64n})).rejects.toMatchObject({category: "response_coordinate_mismatch"});
+  });
+
+  test("refuses a listing resync that names a cursor this caller never presented", async () => {
+    const presented = ResourceListingCursor(`rl2.${"a".repeat(64)}.${"b".repeat(64)}.4`);
+    const other = ResourceListingCursor(`rl2.${"a".repeat(64)}.${"b".repeat(64)}.9`);
+    const query = {after: presented, authorities: [], kinds: [], requested_limit: 8n};
+    const matching = new DeterministicPlatformV2Adapter([
+      {lane: "negotiation", result: {kind: "negotiated", negotiated: negotiatedBody(2n)}},
+      {lane: "v2", request: {kind: "list_resources", query}, result: {kind: "resource_listing_resync", resync: {expired_after: presented}}},
+    ]);
+    const matchingClient = new PlatformV2Client(matching);
+    await matchingClient.negotiate(offer);
+    expect((await matchingClient.listResources(query)).kind).toBe("resource_listing_resync");
+
+    const mismatched = new DeterministicPlatformV2Adapter([
+      {lane: "negotiation", result: {kind: "negotiated", negotiated: negotiatedBody(2n)}},
+      {lane: "v2", request: {kind: "list_resources", query}, result: {kind: "resource_listing_resync", resync: {expired_after: other}}},
+    ]);
+    const mismatchedClient = new PlatformV2Client(mismatched);
+    await mismatchedClient.negotiate(offer);
+    await expect(mismatchedClient.listResources(query)).rejects.toMatchObject({category: "response_coordinate_mismatch"});
   });
 
   test("binds mutation previews to the exact submitted intent", async () => {

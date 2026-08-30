@@ -368,6 +368,14 @@ impl PlatformV2Bridge {
             PlatformV2Request::GetWorkContext(_) => {
                 return Err("platform_v2_mobile_action_denied");
             }
+            // No mobile grant lists the v1 resource inventory. A delegated
+            // credential is authorized per project and a v1 coordinate has no
+            // project, so there is nothing here for `allows_project` to check —
+            // and widening the grant vocabulary to invent one would hand a
+            // phone a read the delegation model cannot bound.
+            PlatformV2Request::ListResources(_) => {
+                return Err("platform_v2_mobile_action_denied");
+            }
         };
         if !authorization.allows(action) {
             return Err("platform_v2_mobile_action_denied");
