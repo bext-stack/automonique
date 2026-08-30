@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Elastic-2.0
+#
+# Rendered by `tools/run_attention_live_parity.py` into a scratch directory.
+#
+# The ShellDeck checkout and the protocol revision it pins are substituted at
+# run time, because the claim under test is about the ShellDeck a user runs.
+# Hard-coding either here would let this driver drift from the desktop build and
+# still pass.
+#
+# `[workspace]` detaches this package from whatever workspace its scratch
+# directory happens to sit under.
+
+[workspace]
+
+[package]
+name = "shelldeck-live-replay"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "shelldeck-live-replay"
+path = "@DRIVER_SOURCE@"
+
+[dependencies]
+shelldeck-core = { path = "@SHELLDECK_CORE@" }
+automonique-protocol = { git = "@PROTOCOL_GIT@", rev = "@PROTOCOL_REV@" }
+automonique-platform-client = { git = "@PROTOCOL_GIT@", rev = "@PROTOCOL_REV@" }
+base64 = "0.22"
+serde_json = "1"

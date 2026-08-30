@@ -201,11 +201,13 @@ class AuthorizedReadTest(unittest.TestCase):
         self.assertIn("predates", result["reason"])
 
 
-class AttentionCorpusTest(unittest.TestCase):
-    """An empty corpus is not something the GUI steps can be run against."""
+class ResourceInventoryTest(unittest.TestCase):
+    """The v1 projection says what it says, and no longer more than that."""
 
-    def corpus(self, inventory: dict[str, object], resources: int) -> dict[str, object]:
-        return live.check_attention_corpus(
+    def inventory(
+        self, inventory: dict[str, object], resources: int
+    ) -> dict[str, object]:
+        return live.check_resource_inventory(
             {
                 "name": "hosted_attention_projection",
                 "state": "passed",
@@ -216,21 +218,114 @@ class AttentionCorpusTest(unittest.TestCase):
         )
 
     def test_a_refused_inventory_blocks_and_names_the_category(self) -> None:
-        result = self.corpus(
+        result = self.inventory(
             {"state": "refused", "explanation": "snapshot_too_large"}, 0
         )
         self.assertEqual(result["state"], "blocked")
         self.assertEqual(result["inventory_refusal"], "snapshot_too_large")
 
     def test_an_available_but_empty_inventory_still_blocks(self) -> None:
-        self.assertEqual(self.corpus({"state": "available"}, 0)["state"], "blocked")
+        self.assertEqual(self.inventory({"state": "available"}, 0)["state"], "blocked")
 
     def test_an_available_populated_inventory_passes(self) -> None:
-        self.assertEqual(self.corpus({"state": "available"}, 12)["state"], "passed")
+        self.assertEqual(self.inventory({"state": "available"}, 12)["state"], "passed")
 
-    def test_an_unread_projection_leaves_the_corpus_unknown(self) -> None:
-        result = live.check_attention_corpus({"name": "x", "state": "blocked"})
+    def test_an_unread_projection_leaves_the_inventory_unknown(self) -> None:
+        result = live.check_resource_inventory({"name": "x", "state": "blocked"})
         self.assertEqual(result["state"], "blocked")
+
+    def test_a_populated_v1_inventory_no_longer_claims_an_attention_corpus(
+        self,
+    ) -> None:
+        """The regression this rename exists for.
+
+        A deployment serving 48 Platform v1 resources and refusing every
+        Platform v2 attention read used to pass a check named
+        `hosted_attention_corpus_available`. The v1 observation must now answer
+        only for v1, and it must not be the thing that names the corpus.
+        """
+        result = self.inventory({"state": "available"}, 48)
+        self.assertEqual(result["name"], "hosted_v1_resource_inventory_available")
+        self.assertNotIn("attention", result["intent"].split("This says")[0])
+
+
+class AttentionCorpusTest(unittest.TestCase):
+    """An empty corpus is not something the GUI steps can be run against."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = pathlib.Path(self.temporary.name)
+
+    def report(self, document: object) -> pathlib.Path:
+        path = self.root / "parity.json"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        return path
+
+    def parity(self, lane: dict[str, object]) -> dict[str, object]:
+        return {
+            "schema": live.PARITY_SCHEMA,
+            "checks": [dict({"name": "live_attention_lane"}, **lane)],
+        }
+
+    def test_without_a_parity_report_the_question_was_never_asked(self) -> None:
+        result = live.check_attention_corpus(None)
+        self.assertEqual(result["state"], "blocked")
+        self.assertIn("never established", result["reason"])
+
+    def test_a_served_attention_lane_passes(self) -> None:
+        path = self.report(
+            self.parity({"state": "passed", "observed": {"state": "negotiated"}})
+        )
+        self.assertEqual(live.check_attention_corpus(path)["state"], "passed")
+
+    def test_a_refused_attention_lane_blocks_and_names_the_category(self) -> None:
+        path = self.report(
+            self.parity(
+                {
+                    "state": "blocked",
+                    "observed": {
+                        "state": "refused",
+                        "category": "platform_v2_web_binding_unavailable",
+                    },
+                }
+            )
+        )
+        result = live.check_attention_corpus(path)
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(
+            result["observed"]["category"], "platform_v2_web_binding_unavailable"
+        )
+
+    def test_a_report_under_another_schema_is_refused(self) -> None:
+        path = self.report({"schema": "something.else/v1", "checks": []})
+        result = live.check_attention_corpus(path)
+        self.assertEqual(result["state"], "blocked")
+        self.assertIn("does not declare", result["reason"])
+
+    def test_a_report_without_the_lane_observation_blocks(self) -> None:
+        path = self.report({"schema": live.PARITY_SCHEMA, "checks": []})
+        result = live.check_attention_corpus(path)
+        self.assertEqual(result["state"], "blocked")
+        self.assertIn("records no attention lane", result["reason"])
+
+    def test_an_unreadable_report_blocks_rather_than_raising(self) -> None:
+        result = live.check_attention_corpus(self.root / "absent.json")
+        self.assertEqual(result["state"], "blocked")
+
+    def test_free_text_in_a_category_is_withheld(self) -> None:
+        path = self.report(
+            self.parity(
+                {
+                    "state": "blocked",
+                    "observed": {"state": "refused", "category": "workspace acme/prod"},
+                }
+            )
+        )
+        result = live.check_attention_corpus(path)
+        self.assertEqual(
+            result["observed"]["category"], "<non_category_text_withheld>"
+        )
 
 
 class BuildAttributionTest(unittest.TestCase):
@@ -470,16 +565,28 @@ class SignOffTest(unittest.TestCase):
 class ReportTest(unittest.TestCase):
     """`passed` is never true while anything is unproven."""
 
-    def report(self, checks: list[dict[str, object]]) -> dict[str, object]:
+    def report(
+        self,
+        checks: list[dict[str, object]],
+        attention_corpus: str = "blocked",
+    ) -> dict[str, object]:
         args = live.parse_args([])
+        corpus = {
+            "name": "hosted_attention_corpus_available",
+            "state": attention_corpus,
+            "reason": "stubbed",
+        }
         with unittest.mock.patch.object(live, "build_origins", return_value=([], checks)):
             with unittest.mock.patch.object(
                 live, "check_build_attribution", return_value={"name": "b", "state": "passed"}
             ):
                 with unittest.mock.patch.object(
-                    live, "repository", return_value={"state": "unavailable"}
+                    live, "check_attention_corpus", return_value=corpus
                 ):
-                    return live.run(args)
+                    with unittest.mock.patch.object(
+                        live, "repository", return_value={"state": "unavailable"}
+                    ):
+                        return live.run(args)
 
     def test_a_blocked_check_prevents_passing(self) -> None:
         report = self.report([{"name": "a", "state": "blocked", "reason": "no credential"}])
@@ -493,9 +600,34 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(report["live_verification"]["state"], "failed")
 
     def test_all_automated_checks_passing_is_still_not_a_pass(self) -> None:
-        report = self.report([{"name": "a", "state": "passed"}])
+        report = self.report(
+            [{"name": "a", "state": "passed"}], attention_corpus="passed"
+        )
         self.assertFalse(report["passed"])
         self.assertEqual(report["live_verification"]["state"], "automated_only")
+
+    def test_an_unestablished_attention_corpus_blocks_the_whole_report(self) -> None:
+        """Without a live attention item, the GUI steps have nothing to look at.
+
+        Reporting `automated_only` here would tell an operator to go and compare
+        three screens against attention that does not exist.
+        """
+        report = self.report([{"name": "a", "state": "passed"}])
+        self.assertEqual(report["live_verification"]["state"], "blocked")
+        self.assertIn("hosted_attention_corpus_available", report["live_verification"]["reason"])
+
+    def test_the_checklist_names_the_residue_without_shrinking(self) -> None:
+        report = self.report(
+            [{"name": "a", "state": "passed"}], attention_corpus="passed"
+        )
+        steps = report["operator_checklist"]["steps"]
+        self.assertEqual(
+            [step["id"] for step in steps],
+            ["LIVE-GUI-1", "LIVE-GUI-2", "LIVE-GUI-3", "LIVE-GUI-4"],
+        )
+        for step in steps:
+            self.assertEqual(step["state"], "awaiting_operator")
+            self.assertTrue(step["residue_after_automation"].strip())
 
 
 if __name__ == "__main__":

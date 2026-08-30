@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+# The acceptance and parity harnesses under `tools/` carry their own tests, and
+# those tests hold promises no green run makes visible: that no live work
+# coordinate reaches a report, that a check reports `passed` only for an
+# observation it made, and that no automated result can mark an operator step
+# satisfied. Until this workflow existed those tests were never run by CI, which
+# is exactly the shape of defect they are written to catch.
+
+name: tools
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  harness-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      # `-v` prints one line per test, so a run that silently collected fewer
+      # tests than the tree defines is visible in the log rather than hidden
+      # behind a green tick.
+      - name: Harness tests
+        run: python3 -m unittest discover --start-directory tools --pattern 'test_*.py' --top-level-directory . --verbose

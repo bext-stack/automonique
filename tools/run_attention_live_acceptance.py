@@ -68,6 +68,9 @@ from typing import Any
 
 SCHEMA = "automonique.attention-live-acceptance-report/v1"
 SIGNOFF_SCHEMA = "automonique.attention-live-acceptance-signoff/v1"
+# Written by `tools/run_attention_live_parity.py`, the only harness that reads
+# the deployment's Platform v2 attention lane.
+PARITY_SCHEMA = "automonique.attention-live-parity-report/v1"
 
 DEFAULT_HOSTED_ORIGIN = "https://monique.1clic.pro"
 DEFAULT_HOSTED_HOST = "monique.1clic.pro"
@@ -197,12 +200,20 @@ class Authorized:
 
 @dataclass(frozen=True)
 class ManualStep:
-    """A step no probe can establish, to be signed off by a named operator."""
+    """A step no probe can establish, to be signed off by a named operator.
+
+    `residue` names what is left of the step once everything a machine can
+    check against the deployment has been subtracted. It is documentation, not
+    a discount: the step is satisfied only by a sign-off naming an operator,
+    whatever `residue` says. `run_attention_live_parity.py` is what does the
+    subtracting, and it can never do the signing.
+    """
 
     identifier: str
     surface: str
     instruction: str
     evidence_required: str
+    residue: str
 
 
 @dataclass
@@ -311,6 +322,14 @@ MANUAL_STEPS = (
             "screenshot of the resolved pane, plus the workspace and session "
             "identity it resolved to"
         ),
+        residue=(
+            "Re-resolution against the desktop's live pane and session "
+            "catalogues, which exist only inside a running GUI process. "
+            "run_attention_live_parity.py checks that ShellDeck's real board "
+            "derives the same source inventory, generation and item set as the "
+            "other two clients from the deployment's own graph; it never "
+            "starts a desktop and never sees a pane."
+        ),
     ),
     ManualStep(
         identifier="LIVE-GUI-2",
@@ -321,6 +340,13 @@ MANUAL_STEPS = (
             "no review state the source did not assert."
         ),
         evidence_required="screenshot showing the source and the generation",
+        residue=(
+            "The browser rendering that projection for a signed-in operator. "
+            "run_attention_live_parity.py reads the deployed cockpit's own "
+            "attention projection and checks it names the same source and "
+            "generation as the other two clients, so what is left is whether "
+            "the page shows what the deployment computed."
+        ),
     ),
     ManualStep(
         identifier="LIVE-GUI-3",
@@ -332,6 +358,13 @@ MANUAL_STEPS = (
             "generation."
         ),
         evidence_required="screenshot of the deep-link landing and of the refusal",
+        residue=(
+            "All of it. Pairing, deep-link admission and the refusal of a "
+            "superseded generation run through the phone's own catalogues and "
+            "its paired credential. run_attention_live_parity.py checks "
+            "Mobile's board and projection agree with the other two clients "
+            "about the live read, which is not this step."
+        ),
     ),
     ManualStep(
         identifier="LIVE-GUI-4",
@@ -342,6 +375,14 @@ MANUAL_STEPS = (
             "as an explicit resynchronization rather than a partial page."
         ),
         evidence_required="screenshots of all three clients after convergence",
+        residue=(
+            "Retiring an item from a client, and 'without a manual refresh'. "
+            "run_attention_live_parity.py can replay successive live reads "
+            "through all three reducers and assert convergence and the "
+            "retention-gap rule when the deployment moves during a run, but it "
+            "only reads: it never causes the retirement, and it never observes "
+            "three running clients refreshing themselves."
+        ),
     ),
 )
 MANUAL_IDS = frozenset(step.identifier for step in MANUAL_STEPS)
@@ -743,26 +784,35 @@ def check_authorized(
     return result
 
 
-def check_attention_corpus(projection: dict[str, Any]) -> dict[str, Any]:
-    """Decide whether the deployment has a live attention corpus to compare.
+def check_resource_inventory(projection: dict[str, Any]) -> dict[str, Any]:
+    """Decide whether the deployment serves its Platform v1 resource inventory.
 
     Derived from the projection already read, not a second request. A refused
     inventory is the deployment behaving as `WebIntegration::platform()` says it
     should when a snapshot of everything no longer fits — the surface stays
-    truthful instead of hanging. It is still not a corpus: with no resources,
-    the cross-client GUI steps have nothing to agree about, and saying otherwise
-    would be the whole failure this harness exists to prevent.
+    truthful instead of hanging.
+
+    This check used to be called `hosted_attention_corpus_available` and used to
+    say a populated resource inventory meant the cross-client GUI steps had
+    something to compare. It does not. `/api/platform` is the Platform *v1*
+    projection: nodes, clients, runs and sessions. Attention lives on the
+    Platform v2 lane, which this projection does not touch, so a deployment
+    serving 48 v1 resources and refusing every attention read passed this check
+    while serving no attention at all — which is exactly what
+    `run_attention_live_parity.py` found on 2026-08-30. The corpus question is
+    now asked where it can be answered; see `check_attention_corpus` below.
     """
     intent = (
-        "the deployed build actually serves an attention corpus, so the "
-        "cross-client comparison has something to compare"
+        "the deployed build serves its Platform v1 resource inventory, which "
+        "the cockpit enriches its projection from. This says nothing about "
+        "attention: attention is a Platform v2 read."
     )
-    name = "hosted_attention_corpus_available"
+    name = "hosted_v1_resource_inventory_available"
     if projection.get("state") != "passed":
         return blocked(
             name,
             intent,
-            "the attention projection was not read, so its corpus is unknown",
+            "the platform projection was not read, so its inventory is unknown",
         )
     observed = projection.get("observed", {})
     inventory = observed.get("inventory", {})
@@ -787,16 +837,96 @@ def check_attention_corpus(projection: dict[str, Any]) -> dict[str, Any]:
     if inventory_state == "available":
         result["state"] = "blocked"
         result["reason"] = (
-            "the inventory is available but empty, so there is no live attention "
-            "item for the cross-client steps to agree about"
+            "the inventory is available but empty, so the cockpit has no v1 "
+            "resource to enrich its projection from"
         )
         return result
     result["state"] = "blocked"
     result["reason"] = (
         "the deployed build refuses its resource inventory"
         + (f" ({explanation})" if explanation else "")
-        + " and serves no resources, so no live attention item exists to compare "
-        "across clients"
+        + " and serves no resources"
+    )
+    return result
+
+
+ATTENTION_CORPUS_INTENT = (
+    "the deployed build actually serves an attention corpus, so the "
+    "cross-client GUI steps have a live attention item to agree about"
+)
+
+
+def check_attention_corpus(parity_report: Path | None) -> dict[str, Any]:
+    """Ask whether the deployment serves attention, where that can be answered.
+
+    Nothing this harness probes over HTTP answers it. `/api/platform` is a
+    Platform v1 read and the attention lane is Platform v2, whose canonical
+    envelopes cannot be built here without a second implementation of the codec.
+    `run_attention_live_parity.py` builds them with the production client and
+    records the answer, so this check reads that record rather than guessing
+    from an adjacent surface — which is how the previous version of this check
+    came to pass against a deployment serving no attention at all.
+
+    No parity report means the question was not asked. That is `blocked`, and it
+    is the honest state: an operator cannot run LIVE-GUI-1..4 against attention
+    nobody has established exists.
+    """
+    name = "hosted_attention_corpus_available"
+    if parity_report is None:
+        return blocked(
+            name,
+            ATTENTION_CORPUS_INTENT,
+            "no --attention-parity-report supplied, so whether the deployment "
+            "serves any attention at all was never established",
+        )
+    try:
+        declared = json.loads(parity_report.read_bytes().decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError) as error:
+        return blocked(
+            name,
+            ATTENTION_CORPUS_INTENT,
+            f"the parity report could not be read: {type(error).__name__}",
+            source=redacted_path(parity_report),
+        )
+    if not isinstance(declared, dict) or declared.get("schema") != PARITY_SCHEMA:
+        return blocked(
+            name,
+            ATTENTION_CORPUS_INTENT,
+            f"the named file does not declare {PARITY_SCHEMA!r}",
+            source=redacted_path(parity_report),
+        )
+    checks = declared.get("checks")
+    checks = checks if isinstance(checks, list) else []
+    lane = next(
+        (
+            entry
+            for entry in checks
+            if isinstance(entry, dict) and entry.get("name") == "live_attention_lane"
+        ),
+        None,
+    )
+    result: dict[str, Any] = {
+        "name": name,
+        "intent": ATTENTION_CORPUS_INTENT,
+        "source": redacted_path(parity_report),
+        "derived_from": "live_attention_lane",
+    }
+    if lane is None:
+        result["state"] = "blocked"
+        result["reason"] = "the parity report records no attention lane observation"
+        return result
+    observed = lane.get("observed") if isinstance(lane.get("observed"), dict) else {}
+    result["observed"] = {
+        "state": observed.get("state"),
+        "category": refusal_category(observed.get("category")),
+    }
+    if lane.get("state") == "passed":
+        result["state"] = "passed"
+        return result
+    result["state"] = "blocked"
+    result["reason"] = (
+        "the deployment does not serve its Platform v2 attention lane, so no "
+        "live attention item exists for the cross-client steps to agree about"
     )
     return result
 
@@ -1090,6 +1220,7 @@ def operator_checklist(signoff_path: Path | None) -> dict[str, Any]:
             "surface": step.surface,
             "instruction": step.instruction,
             "evidence_required": step.evidence_required,
+            "residue_after_automation": step.residue,
             "state": "awaiting_operator",
         }
         for step in MANUAL_STEPS
@@ -1099,6 +1230,13 @@ def operator_checklist(signoff_path: Path | None) -> dict[str, Any]:
             "These are claims about two GUIs rendering the same thing. No HTTP "
             "probe from this harness establishes them, so the harness does not "
             "pretend to."
+        ),
+        "residue_note": (
+            "`residue_after_automation` names what is left of each step once "
+            "everything tools/run_attention_live_parity.py checks against the "
+            "deployment is subtracted. Subtracting is not signing: every step "
+            "stays `awaiting_operator` until a sign-off names an operator, and "
+            "no automated check ever moves one."
         ),
         "signoff_schema": SIGNOFF_SCHEMA,
         "steps": steps,
@@ -1280,6 +1418,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--operator-signoff", type=Path, default=None)
+    parser.add_argument(
+        "--attention-parity-report",
+        type=Path,
+        default=None,
+        help=(
+            "report written by tools/run_attention_live_parity.py. It is the "
+            "only thing that establishes whether the deployment serves an "
+            "attention corpus at all; without it that question is `blocked`."
+        ),
+    )
     parser.add_argument("--timeout", type=float, default=30.0)
     return parser.parse_args(argv)
 
@@ -1315,7 +1463,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         None,
     )
     if projection is not None:
-        checks.append(check_attention_corpus(projection))
+        checks.append(check_resource_inventory(projection))
+    checks.append(check_attention_corpus(args.attention_parity_report))
 
     builds = build_identity(args.hosted_web_entry_root, args.nonprod_web_entry_root)
     checks.append(check_build_attribution(builds))
