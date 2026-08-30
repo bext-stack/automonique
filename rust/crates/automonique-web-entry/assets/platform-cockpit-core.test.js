@@ -237,6 +237,72 @@ test("typed workspace and review controls require exact server operations and fr
   expect(stale.create.reason).toBe("platform_cockpit_projection_incomplete_or_stale");
 });
 
+// The other half of issue #224. The server no longer projects a family this
+// browser cannot execute; this holds the client to the same rule from its own
+// side, so a projection that regrew one could still not conjure a control.
+test("the browser review surface stays closed against families it has no reader for", () => {
+  const controlled = structuredClone(fixture);
+  controlled.actions.review = {
+    available: true,
+    operations: {
+      add_comment: {
+        available: true,
+        execute_operation: "execute_review_action",
+        receipt_operation: "get_review_receipt",
+        project_id: "project-1",
+        workspace_id: "workspace-1",
+        exact_revision: "7",
+      },
+    },
+    families_without_browser_command: [
+      "send_comment_to_agent", "batch_send_comments_to_agent", "stage", "unstage",
+      "commit", "resolve_conflict", "open_pull_request", "update_pull_request",
+      "merge_pull_request",
+    ],
+  };
+  const commanded = Object.keys(cockpit.derivePresentation(controlled).reviewActions);
+  expect(commanded).toContain("addComment");
+
+  // A server advertising the uncommanded families anyway - the projection this
+  // cockpit carried until #224 - changes nothing here: no control appears, and
+  // no confirmation it could never spend reaches the read model.
+  const advertised = structuredClone(controlled);
+  advertised.actions.review.families_without_browser_command = [];
+  advertised.actions.review.operations.merge_pull_request = {
+    available: true,
+    execute_operation: "merge_pull_request",
+    receipt_operation: "get_review_receipt",
+    targets: [{
+      project_id: "project-1",
+      workspace_id: "workspace-1",
+      exact_revision: "7",
+      pull_request_id: "pr-1",
+      expected_head_revision: "0123456789abcdef",
+      readiness: "ready",
+      confirmation_digest: "ef".repeat(32),
+      receipt_correlation_digest: "ba".repeat(32),
+    }],
+  };
+  advertised.actions.review.operations.send_comment_to_agent = {
+    available: true,
+    execute_operation: "send_comment_to_agent",
+    receipt_operation: "get_review_receipt",
+    targets: [{
+      project_id: "project-1",
+      workspace_id: "workspace-1",
+      exact_revision: "7",
+      comment_id: "comment-1",
+      exact_comment_revision: "2",
+    }],
+  };
+  const view = cockpit.derivePresentation(advertised);
+  expect(Object.keys(view.reviewActions)).toEqual(commanded);
+  const rendered = JSON.stringify(view);
+  expect(rendered).not.toContain("merge_pull_request");
+  expect(rendered).not.toContain("send_comment_to_agent");
+  expect(rendered).not.toContain("ef".repeat(32));
+});
+
 test("v1 degrades explicitly and never infers workspace state from summaries", () => {
   const view = cockpit.derivePresentation({ sessions: [{ summary: "Working on branch secret with 9 unread" }] });
   expect(view.mode).toBe("v1");
