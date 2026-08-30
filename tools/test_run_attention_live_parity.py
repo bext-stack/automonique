@@ -149,7 +149,7 @@ class ComparisonTest(unittest.TestCase):
         other = projection("mobile")
         other["sources"]["review:workspace-conformance"]["generation"] = "1"
         found = parity.disagreements({"a": projection("shelldeck"), "b": other})
-        self.assertEqual([entry["dimension"] for entry in found], ["sources"])
+        self.assertEqual([entry["dimension"] for entry in found], ["items"])
 
     def test_a_different_item_set_is_a_disagreement(self) -> None:
         other = projection("mobile")
@@ -171,6 +171,77 @@ class ComparisonTest(unittest.TestCase):
             "item-a",
         ]
         self.assertTrue(parity.disagreements({"a": projection("shelldeck"), "b": other}))
+
+
+class HostedAsymmetryTest(unittest.TestCase):
+    """A dimension a client cannot express never takes part in a comparison."""
+
+    def hosted(self, **overrides: object) -> dict[str, object]:
+        document = projection(
+            "hosted",
+            inventory={"state": "observed", "sources": ["review:workspace-conformance"]},
+        )
+        document.update(overrides)
+        return document
+
+    def test_the_cockpit_does_not_speak_for_the_source_inventory(self) -> None:
+        """Its wire shape is an inbox of items, not a source set.
+
+        A source it inventoried, read, and found empty is indistinguishable from
+        one it never had, so comparing its source set against a replayed
+        client's would report a disagreement about the cockpit's wire shape and
+        call it a disagreement about attention.
+        """
+        reduced = parity.comparable(self.hosted())
+        self.assertIsNone(reduced["inventory"])
+        self.assertIsNone(reduced["status"])
+
+    def test_an_idle_source_is_not_a_disagreement_with_the_cockpit(self) -> None:
+        replayed = projection("shelldeck")
+        replayed["inventory"]["sources"].append("orchestration:workspace-conformance")
+        replayed["sources"]["orchestration:workspace-conformance"] = {
+            "status": {"kind": "available"},
+            "generation": "9",
+            "visible_items": [],
+        }
+        self.assertEqual(
+            parity.disagreements({"hosted": self.hosted(), "shelldeck": replayed}), []
+        )
+
+    def test_the_cockpit_still_speaks_for_items_and_generations(self) -> None:
+        other = self.hosted()
+        other["sources"]["review:workspace-conformance"]["generation"] = "1"
+        found = parity.disagreements({"hosted": other, "shelldeck": projection("shelldeck")})
+        self.assertEqual([entry["dimension"] for entry in found], ["items"])
+
+    def test_two_replayed_clients_still_compare_their_inventories(self) -> None:
+        other = projection("mobile")
+        other["inventory"] = {"state": "derived", "sources": []}
+        other["sources"] = {}
+        found = parity.disagreements({"a": projection("shelldeck"), "b": other})
+        self.assertIn("inventory", [entry["dimension"] for entry in found])
+
+    def test_the_scope_names_who_took_part_in_each_dimension(self) -> None:
+        scope = parity.comparison_scope(
+            {
+                "hosted": self.hosted(),
+                "shelldeck": projection("shelldeck"),
+                "mobile": projection("mobile"),
+            }
+        )
+        self.assertEqual(scope["inventory"], ["mobile", "shelldeck"])
+        self.assertEqual(scope["items"], ["hosted", "mobile", "shelldeck"])
+        self.assertEqual(
+            scope["presents_attention"], ["hosted", "mobile", "shelldeck"]
+        )
+
+    def test_a_dimension_only_one_client_speaks_to_is_not_agreement(self) -> None:
+        """One speaker is not a comparison, and must not read as one."""
+        scope = parity.comparison_scope({"hosted": self.hosted()})
+        self.assertEqual(scope["inventory"], [])
+        self.assertEqual(
+            parity.disagreements({"hosted": self.hosted()}), []
+        )
 
 
 class ControlTest(unittest.TestCase):

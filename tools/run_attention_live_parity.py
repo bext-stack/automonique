@@ -540,50 +540,103 @@ def salted_projection(document: dict[str, Any], salt: Salt) -> dict[str, Any]:
 
 
 def comparable(projection: dict[str, Any]) -> dict[str, Any]:
-    """The part of a projection the clients are required to agree about.
+    """The part of a projection its client is required to agree about.
 
-    Source-inventory order is not in it: the inventory is a set of coordinates
-    and each client is free to hold it in its own order. Global visible-item
-    order is not in it either, for the same reason the shared corpus states its
-    expectation per source rather than across the board. What is in it is what
-    the corpus fixes — which sources exist, whether each is available, which
-    generation each is at, and which items each shows, in order.
+    A dimension a client cannot express is `None`, not an empty value, and a
+    `None` never takes part in a comparison. That distinction is the whole
+    correctness of this function.
+
+    The hosted cockpit is the case that forces it. Its live answer is an inbox
+    of *items*, so a source it inventoried and read and found empty is
+    indistinguishable, from outside, from a source it never had. Comparing its
+    source set against a replayed client's would report a disagreement every
+    time a workspace held an idle source, which is a fact about what the
+    cockpit's wire shape can say and not about attention. So `inventory` and
+    per-source `status` are `None` for it, and the item sets and generations it
+    *can* state are compared against everyone.
+
+    Two things are deliberately not compared for anyone. Source-inventory order
+    is a client's own business: ShellDeck holds the set by source kind and
+    Mobile alphabetically. Global visible-item order across sources is not
+    fixed by the shared corpus either, which states its expectation per source.
+    Per-source item order is compared, because the corpus does fix that.
     """
+    expresses_inventory = (projection.get("inventory") or {}).get("state") == "derived"
+    sources = projection.get("sources") or {}
     return {
-        "inventory": sorted((projection.get("inventory") or {}).get("sources") or []),
-        "sources": {
+        "inventory": (
+            sorted((projection.get("inventory") or {}).get("sources") or [])
+            if expresses_inventory
+            else None
+        ),
+        "status": (
+            {name: entry.get("status") for name, entry in sources.items()}
+            if expresses_inventory
+            else None
+        ),
+        # Restricted to sources this projection shows items for, which is the
+        # only shape every client can state. A source with no items contributes
+        # nothing here for anyone, so the restriction removes no evidence.
+        "items": {
             name: {
-                "status": entry.get("status"),
                 "generation": entry.get("generation"),
                 "visible_items": entry.get("visible_items"),
             }
-            for name, entry in (projection.get("sources") or {}).items()
+            for name, entry in sources.items()
+            if entry.get("visible_items")
         },
         "presents_attention": projection.get("presents_attention"),
     }
 
 
+DIMENSIONS = ("inventory", "status", "items", "presents_attention")
+
+
 def disagreements(projections: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
-    """Name every dimension on which the clients do not agree."""
-    names = sorted(projections)
-    if len(names) < 2:
-        return []
-    reference = names[0]
-    baseline = comparable(projections[reference])
-    found = []
-    for name in names[1:]:
-        other = comparable(projections[name])
-        for dimension in ("inventory", "sources", "presents_attention"):
-            if baseline[dimension] != other[dimension]:
+    """Name every dimension on which the clients that can speak do not agree.
+
+    Each dimension is compared only across the clients whose projection carries
+    it. A dimension only one client expresses is not a comparison and is not
+    reported as agreement either; `participants` on each finding, and
+    `compared_by` from `comparison_scope`, say who took part.
+    """
+    reduced = {name: comparable(value) for name, value in projections.items()}
+    found: list[dict[str, Any]] = []
+    for dimension in DIMENSIONS:
+        speakers = sorted(
+            name for name, value in reduced.items() if value[dimension] is not None
+        )
+        if len(speakers) < 2:
+            continue
+        reference = speakers[0]
+        for name in speakers[1:]:
+            if reduced[reference][dimension] != reduced[name][dimension]:
                 found.append(
                     {
                         "dimension": dimension,
                         "between": [reference, name],
-                        reference: baseline[dimension],
-                        name: other[dimension],
+                        "participants": speakers,
+                        reference: reduced[reference][dimension],
+                        name: reduced[name][dimension],
                     }
                 )
     return found
+
+
+def comparison_scope(projections: dict[str, dict[str, Any]]) -> dict[str, list[str]]:
+    """Record which clients took part in each dimension.
+
+    A dimension no two clients could speak to was not compared. Saying so is
+    the difference between `passed` meaning "they agreed" and `passed` meaning
+    "nobody was asked".
+    """
+    reduced = {name: comparable(value) for name, value in projections.items()}
+    return {
+        dimension: sorted(
+            name for name, value in reduced.items() if value[dimension] is not None
+        )
+        for dimension in DIMENSIONS
+    }
 
 
 # --- checks ----------------------------------------------------------------
@@ -926,6 +979,7 @@ class Run:
                     "the drivers agree about the control, so a live agreement is "
                     "a fact about the deployment rather than about the harness",
                     "failed" if found else "passed",
+                    compared_by=comparison_scope(projections),
                     **({"disagreements": found} if found else {}),
                 )
             )
@@ -1325,16 +1379,33 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
                 )
             else:
                 found_disagreements = disagreements(projections)
+                scope = comparison_scope(projections)
+                compared = [
+                    dimension for dimension, who in scope.items() if len(who) >= 2
+                ]
                 run.checks.append(
                     check(
                         "live_projection_parity",
                         live_intent_projection,
-                        "failed" if found_disagreements else "passed",
+                        "failed"
+                        if found_disagreements
+                        else ("passed" if compared else "not_exercised"),
                         clients=sorted(projections),
+                        compared_by=scope,
                         **(
                             {"disagreements": found_disagreements}
                             if found_disagreements
                             else {}
+                        ),
+                        **(
+                            {}
+                            if compared
+                            else {
+                                "reason": (
+                                    "no dimension was expressed by two clients, so "
+                                    "nothing was compared"
+                                )
+                            }
                         ),
                     )
                 )
@@ -1423,12 +1494,21 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             ),
         },
         "known_asymmetry": {
-            "hosted": (
+            "hosted_has_no_succession": (
                 "The hosted cockpit reads attention fresh per request and retains "
                 "nothing across requests, so it has no succession to compare. Its "
                 "parity is over the projection only, and this harness compares it "
                 "as such rather than inventing a history for it."
-            )
+            ),
+            "hosted_states_items_not_sources": (
+                "The cockpit's live answer is an inbox of items, so a source it "
+                "inventoried, read and found empty looks from outside exactly "
+                "like a source it never had. It therefore takes part in the item "
+                "and generation comparison and not in the source-inventory or "
+                "per-source status comparison, which is between ShellDeck and "
+                "Mobile. `compared_by` on each verdict names who took part in "
+                "each dimension."
+            ),
         },
         "redaction": (
             "Identifiers observed live — projects, workspaces, attention sources "

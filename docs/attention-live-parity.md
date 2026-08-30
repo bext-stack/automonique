@@ -75,6 +75,17 @@ expectation per source and does not fix either, so neither is a parity claim
 here. ShellDeck orders sources by kind and Mobile alphabetically; that is a
 presentation choice, not a disagreement about authority.
 
+Each dimension is compared only across the clients that can express it, and
+`compared_by` on every verdict names who took part. The hosted cockpit is why:
+its live answer is an inbox of *items*, so a source it inventoried, read and
+found empty looks from outside exactly like a source it never had. It therefore
+takes part in the item and generation comparison and not in the source-inventory
+or per-source status comparison, which is between ShellDeck and Mobile.
+Comparing its source set against theirs would report a disagreement about the
+cockpit's wire shape every time a workspace held an idle source, and call it a
+disagreement about attention. A dimension no two clients can speak to is
+`not_exercised`, not agreement.
+
 ## What `not_exercised` means
 
 `live_succession_parity` compares successive live reads. If the deployment
