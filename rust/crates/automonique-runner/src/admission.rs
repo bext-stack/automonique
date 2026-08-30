@@ -1557,16 +1557,25 @@ fn map_temporary_storage(
         .map_err(|_| AdmissionRefusal::QuotaRejected("sandbox.budgets.temporary_storage"))
 }
 
-/// The one rule that keeps the two features apart while the kernel forces a
-/// choice, shared by every place a temporary-storage mount could reach an
-/// identity-separated plan.
+/// The one rule that keeps a *supervisor-visible* mount away from an
+/// identity-separated plan, shared by every place the two could meet.
 ///
-/// Nothing in the RunSpec vocabulary can request identity separation yet, so
-/// through [`admit`] this can never fire; it guards the composition seam so
-/// that when a document field arrives — or a caller composes a plan directly —
-/// the combination is a typed refusal, not a workload that discovers `EACCES`
-/// on its own scratch directory. See `docs/operations/workload-identity.md`
-/// for the kernel measurement behind it.
+/// A document can ask for identity separation: `sandbox.required_features`
+/// names `uid_separation`, and [`admit`] maps it onto
+/// `LaunchPlan::separate_workload_identity`. So this is reachable in
+/// principle. What makes it unreachable in production is the attachment
+/// production uses — [`AdmittedLaunch::with_namespaced_temporary_storage`],
+/// which mounts inside the workload's own user and mount namespaces and
+/// requires the separation rather than refusing it.
+///
+/// What this still guards is the legacy
+/// [`AdmittedLaunch::with_temporary_storage`] seam. A workload in a child user
+/// namespace cannot reach a filesystem the supervisor mounted — this kernel's
+/// `fuse_permission` answers `EACCES` whatever the uid and whatever the mode —
+/// so a caller that composes the two directly gets a typed refusal instead of
+/// a workload that discovers that on its own scratch directory. See
+/// `docs/operations/workload-identity.md` for the kernel measurement behind
+/// it.
 pub fn refuse_identity_temporary_storage_conflict(
     plan: &LaunchPlan,
 ) -> Result<(), AdmissionRefusal> {
