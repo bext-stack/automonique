@@ -5413,14 +5413,22 @@ impl Daemon {
         peer_uid: u32,
     ) -> Result<(), DaemonError> {
         let now_ms = unix_millis()?;
+        // Refresh every projected class, not the classes a request happens to
+        // name. Naming was the v1 trap: a caller that could not spell an
+        // approval or a provider model never saw one refreshed, so the
+        // inventory it listed was the inventory it already knew (#220).
+        //
+        // Only when a listing starts, and only for a principal a listing could
+        // answer. Refreshing on a continuation page would give a long walk a
+        // fresh chance to move the inventory under its own cursor on every
+        // page, and refreshing for a principal holding no grant would do the
+        // work of answering a request that is about to be refused.
         if matches!(
             message.request(),
-            automonique_protocol::platform_v2_transport::PlatformV2Request::ListResources(_)
-        ) {
-            // Refresh every projected class, not the classes a request happens
-            // to name. Naming was the v1 trap: a caller that could not spell an
-            // approval or a provider model never saw one refreshed, so the
-            // inventory it listed was the inventory it already knew (#220).
+            automonique_protocol::platform_v2_transport::PlatformV2Request::ListResources(query)
+                if query.after().is_none()
+        ) && self.platform_v2.lists_resources(peer_uid)
+        {
             self.refresh_platform_sessions(now_ms)?;
             self.refresh_platform_resources(&[], now_ms)?;
         }

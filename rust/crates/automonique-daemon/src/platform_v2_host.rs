@@ -884,6 +884,28 @@ impl PlatformV2Host {
         }
     }
 
+    /// Whether this peer's principal could be answered a resource listing at
+    /// all.
+    ///
+    /// The daemon asks before it refreshes every projected class, so a request
+    /// that is going to be refused does not first do the work of answering it.
+    /// This reports the same predicate the listing handler refuses on — see
+    /// [`PrincipalPolicy::lists_resources`] — and never which classes are
+    /// granted.
+    #[must_use]
+    pub fn lists_resources(&self, uid: u32) -> bool {
+        match self {
+            Self::Disabled(_) => false,
+            Self::Enabled(runtime) => {
+                runtime.policy_fence.verify().is_ok()
+                    && runtime
+                        .principals
+                        .get(&uid)
+                        .is_some_and(PrincipalPolicy::lists_resources)
+            }
+        }
+    }
+
     pub fn handle(
         &mut self,
         uid: u32,
@@ -1329,7 +1351,7 @@ impl PlatformV2Runtime {
                 // A principal with no resource-read grant is refused rather
                 // than answered with an empty page: an empty page is a claim
                 // about the inventory, and this is a claim about the policy.
-                if principal.resource_reads.is_empty() {
+                if !principal.lists_resources() {
                     return Err("platform_v2_scope_denied");
                 }
                 let authorized: Vec<AuthorizedResourceRecord> = resource_inventory
@@ -5832,6 +5854,14 @@ fn required_policy_parent(kind: WorkContextTargetKind) -> Option<WorkContextTarg
 }
 
 impl PrincipalPolicy {
+    /// Whether this principal holds any resource-read grant at all.
+    ///
+    /// One spelling, two callers: the listing handler refuses without it, and
+    /// the daemon skips the refresh it would otherwise do to answer.
+    fn lists_resources(&self) -> bool {
+        !self.resource_reads.is_empty()
+    }
+
     fn read_policy(
         &self,
         project: Option<ProjectId>,
@@ -9475,7 +9505,27 @@ mod tests {
     #[test]
     fn a_policy_written_before_the_listing_existed_grants_no_listing() {
         let parsed = parse_policy(policy(serde_json::json!([]))).unwrap();
-        assert!(parsed.get(&7).unwrap().resource_reads.is_empty());
+        assert!(!parsed.get(&7).unwrap().lists_resources());
+    }
+
+    #[test]
+    fn the_refresh_predicate_and_the_refusal_predicate_are_the_same_one() {
+        // The daemon asks before it refreshes every projected class. If this
+        // could answer `true` where the handler refuses, an ungranted request
+        // would still do the work of answering itself.
+        let uid = nix::unistd::geteuid().as_raw();
+        let (_ungranted_dir, ungranted) = listing_host(uid, serde_json::json!([]));
+        assert!(!ungranted.lists_resources(uid));
+        let (_granted_dir, granted) = listing_host(
+            uid,
+            serde_json::json!([{"authority": "automonique", "kind": "approval"}]),
+        );
+        assert!(granted.lists_resources(uid));
+        assert!(
+            !granted.lists_resources(uid.wrapping_add(1)),
+            "an unmapped peer holds no grant"
+        );
+        assert!(!PlatformV2Host::Disabled("platform_v2_unavailable").lists_resources(uid));
     }
 
     #[test]
