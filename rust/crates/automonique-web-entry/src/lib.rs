@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use automonique_build_identity::{BUILD_IDENTITY_SCHEMA, BuildIdentity};
+use automonique_build_identity::BuildIdentity;
 use automonique_core::conversation::{
     is_current_time_question, is_deferred_placeholder_answer, is_pm2_process_question,
     is_site_profile_question, utc_rfc3339_from_unix_millis,
@@ -6022,7 +6022,7 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
             cache_control: "no-store",
             location: None,
             retry_after: None,
-            body: build_identity_document(&BuildIdentity::current()),
+            body: BuildIdentity::current().to_json_document(),
         },
         Route::ApiMemory
         | Route::ApiMemorySearch
@@ -6406,27 +6406,6 @@ fn mobile_platform_v2_error(status: &'static str, category: &'static str) -> Res
         error: &'static str,
     }
     mobile_platform_v2_response(status, &ErrorBody { error: category })
-}
-
-/// Serialize what this build says about itself.
-///
-/// The revision is `null` rather than absent when the build cannot name one, so
-/// a reader is told "this build does not know" instead of being left to decide
-/// whether a missing key means unknown or means the field was never sent.
-///
-/// Public because `--build-identity --json` on the executable and `/api/build`
-/// over the network must be the same bytes. A host with no credential to hand
-/// and a harness holding one are asking the same question, and two renderings
-/// of it would eventually answer differently.
-#[must_use]
-pub fn build_identity_document(identity: &BuildIdentity) -> Vec<u8> {
-    serde_json::to_vec(&serde_json::json!({
-        "schema": BUILD_IDENTITY_SCHEMA,
-        "source_revision": identity.source_revision(),
-        "provenance": identity.provenance().as_str(),
-        "build_target": identity.build_target(),
-    }))
-    .unwrap_or_else(|_| b"{}".to_vec())
 }
 
 fn json_error(status: &'static str, category: &'static str) -> Response {
@@ -6931,6 +6910,7 @@ pub fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use automonique_build_identity::BUILD_IDENTITY_SCHEMA;
     use automonique_github_connector::IssueLocator;
     use automonique_protocol::platform::{
         ActionReceipt, Attachment, ControlLease, ControlLeaseId, CursorTopic, Freshness,
@@ -10817,7 +10797,7 @@ mod tests {
     #[test]
     fn a_build_identity_document_never_invents_a_revision() {
         let document: serde_json::Value =
-            serde_json::from_slice(&build_identity_document(&BuildIdentity::current()))
+            serde_json::from_slice(&BuildIdentity::current().to_json_document())
                 .expect("JSON document");
         assert_eq!(document["schema"], BUILD_IDENTITY_SCHEMA);
         match document["source_revision"].as_str() {

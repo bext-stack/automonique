@@ -9,22 +9,17 @@ use std::process::ExitCode;
 /// The same three facts `/api/build` serves, for a caller standing on the host.
 ///
 /// `--json` renders the identical document the HTTP surface returns, byte for
-/// byte, so an operator with shell access and a harness with a credential are
-/// never comparing two different renderings of one build.
+/// byte, because both come from the same method on the identity. An operator
+/// with shell access and a harness with a credential are never comparing two
+/// renderings of one build.
 fn build_identity_report(json: bool) -> Vec<u8> {
     let identity = automonique_build_identity::BuildIdentity::current();
     if json {
-        let mut document = automonique_web_entry::build_identity_document(&identity);
+        let mut document = identity.to_json_document();
         document.push(b'\n');
         return document;
     }
-    format!(
-        "automonique web entry build identity\n  source revision: {}\n  provenance: {}\n  build target: {}\n",
-        identity.source_revision().unwrap_or("unknown"),
-        identity.provenance().as_str(),
-        identity.build_target(),
-    )
-    .into_bytes()
+    identity.to_report("automonique web entry").into_bytes()
 }
 
 fn main() -> ExitCode {
@@ -42,14 +37,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // answerable about which revision it is *without* the configuration,
     // sockets and state directories a serving run needs, because the moment
     // that question matters is usually the moment one of those is in doubt.
+    //
+    // A mode rather than a flag: it is recognised only as the first argument,
+    // and only `--json` may follow it. A serving invocation whose value
+    // happened to be this string can then never be diverted into printing an
+    // identity and exiting instead of binding.
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    if arguments
+    match arguments
         .iter()
-        .any(|argument| argument == "--build-identity")
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
     {
-        let json = arguments.iter().any(|argument| argument == "--json");
-        std::io::Write::write_all(&mut std::io::stdout(), &build_identity_report(json))?;
-        return Ok(());
+        ["--build-identity", rest @ ..] if rest.is_empty() || rest == ["--json"] => {
+            let report = build_identity_report(rest == ["--json"]);
+            std::io::Write::write_all(&mut std::io::stdout(), &report)?;
+            return Ok(());
+        }
+        _ => {}
     }
     let mut bind = IpAddr::from([127, 0, 0, 1]);
     let mut port = 18_082_u16;

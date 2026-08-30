@@ -8,11 +8,13 @@ license.workspace = true
 publish.workspace = true
 build = "build.rs"
 
-# Deliberately empty. A build that has to read a file, open a socket or link a
-# crate before it can name itself is a build whose attribution can be made to
-# disagree with the bytes it was compiled from. Everything this crate reports is
-# a literal placed by `build.rs` at compile time.
+# Nothing here participates in *establishing* the identity — every value this
+# crate reports is a literal placed by `build.rs` at compile time, so no file,
+# socket or library can make a build disagree with the bytes it was compiled
+# from. `serde_json` is here only to render that identity, once, for the two
+# surfaces that publish it; it is already in the graph of every consumer.
 [dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

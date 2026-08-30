@@ -2,7 +2,7 @@
 
 //! Closed product command dispatch and bounded local synthetic intake.
 
-use automonique_build_identity::{BUILD_IDENTITY_SCHEMA, BuildIdentity, Provenance};
+use automonique_build_identity::{BuildIdentity, Provenance};
 use automonique_protocol::{
     CheckStatus, DoctorCheck, DoctorReason, DoctorReportError, DoctorReportV1, FindingCode,
     FindingMessage,
@@ -694,7 +694,7 @@ where
         }
         Command::BuildIdentity { json } => {
             let rendered = render_build_identity(&BuildIdentity::current(), json);
-            return u8::from(stdout.write_all(rendered.as_bytes()).is_err());
+            return u8::from(stdout.write_all(&rendered).is_err());
         }
         Command::Doctor { json } => json,
     };
@@ -1926,27 +1926,21 @@ fn render_json(report: &DoctorReportV1) -> String {
 
 /// Render what this build says about itself.
 ///
+/// Both renderings come from the build-identity crate rather than being spelled
+/// again here, so this verb and the web entry's `/api/build` cannot drift into
+/// describing the same build differently.
+///
 /// The exit status is success whichever answer comes back. `unknown` is a
 /// successful report about a build with no revision, and turning it into a
 /// failure would teach a caller to treat the honest answer as a malfunction and
 /// go looking for a more confident one.
-fn render_build_identity(identity: &BuildIdentity, json: bool) -> String {
-    let provenance = identity.provenance().as_str();
-    let revision = identity.source_revision();
+fn render_build_identity(identity: &BuildIdentity, json: bool) -> Vec<u8> {
     if json {
-        let document = serde_json::json!({
-            "schema": BUILD_IDENTITY_SCHEMA,
-            "source_revision": revision,
-            "provenance": provenance,
-            "build_target": identity.build_target(),
-        });
-        return format!("{document}\n");
+        let mut document = identity.to_json_document();
+        document.push(b'\n');
+        return document;
     }
-    format!(
-        "automonique build identity\n  source revision: {}\n  provenance: {provenance}\n  build target: {}\n",
-        revision.unwrap_or("unknown"),
-        identity.build_target(),
-    )
+    identity.to_report("automonique").into_bytes()
 }
 
 fn render_human(report: &DoctorReportV1) -> String {

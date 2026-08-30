@@ -30,17 +30,27 @@
 //! declaration variable changes — which covers every way a *commit* changes
 //! under a build.
 //!
-//! It does not cover one case: editing a tracked file without touching the
-//! index, after a build script run that observed a clean tree. That build
-//! carries a stale `committed` claim. Closing it would mean invalidating this
-//! crate — and therefore every crate that depends on it — on every source edit
-//! in the workspace, which is a large, permanent cost on every developer build
-//! and every CI job to correct a claim no release path can reach: a release is
-//! built by `release_builder`, in a fresh worktree with a fresh target
-//! directory, and declares its revision outright. The residual hole is
-//! therefore local to a developer's incremental build, and it is why
-//! `automonique doctor` verifies the *digest of the running executable*
-//! against the manifest rather than trusting either side's revision alone.
+//! One case is not covered: editing a tracked file without touching the index,
+//! after a run that observed a clean tree. That build carries a stale
+//! `committed` claim, because nothing invalidated the observation. Closing it
+//! inside cargo would mean invalidating this crate — and therefore every crate
+//! that depends on it — on every source edit anywhere in the workspace, which
+//! is a large permanent cost on every developer iteration and every CI job.
+//!
+//! It is closed outside cargo instead, at the two points where the claim is
+//! load-bearing. A release built by `release_builder` runs in a fresh worktree
+//! with a fresh target directory and declares its revision outright, so it is
+//! `declared` and immune. A deployment performed by hand runs the recipe in
+//! `packaging/systemd/README.md`, which refuses a tree with uncommitted changes
+//! before it builds and declares the revision too — and a tree that is clean at
+//! build time cannot carry a stale `committed` claim for a *different* commit,
+//! because every way of returning a tree to a clean state writes the index.
+//!
+//! What is left is a developer's incremental build over their own uncommitted
+//! edits, where the binary never leaves the machine. Even there the claim is
+//! not load-bearing: `automonique doctor` compares the digest of the running
+//! executable against the manifest, which is true or false independently of
+//! what either side says about revisions.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

@@ -145,6 +145,43 @@ impl BuildIdentity {
         self.build_target
     }
 
+    /// Render this identity as the one document every surface publishes.
+    ///
+    /// One renderer rather than one per surface. `automonique build-identity
+    /// --json`, the web entry's `--build-identity --json` and its
+    /// `GET /api/build` all call this, so a field added for one of them cannot
+    /// be missing from the others, and a reader written against either is a
+    /// reader written against all of them.
+    ///
+    /// A revision that could not be established is `null`, never an omitted
+    /// key: a reader has to be told that the build does not know, not left to
+    /// decide whether the field was dropped in transit.
+    #[must_use]
+    pub fn to_json_document(&self) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema": BUILD_IDENTITY_SCHEMA,
+            "source_revision": self.revision,
+            "provenance": self.provenance.as_str(),
+            "build_target": self.build_target,
+        }))
+        .unwrap_or_else(|_| b"{}".to_vec())
+    }
+
+    /// Render this identity as the one report a caller on the host reads.
+    ///
+    /// The same three facts as [`BuildIdentity::to_json_document`], in the same
+    /// order, spelled for a person. A build with no revision prints `unknown`
+    /// here for the same reason the document carries `null`.
+    #[must_use]
+    pub fn to_report(&self, subject: &str) -> String {
+        format!(
+            "{subject} build identity\n  source revision: {}\n  provenance: {}\n  build target: {}\n",
+            self.revision.unwrap_or("unknown"),
+            self.provenance.as_str(),
+            self.build_target,
+        )
+    }
+
     /// Reduce a revision and a provenance to the answer they jointly support.
     ///
     /// Two independent literals can disagree — a malformed revision under a
@@ -179,7 +216,7 @@ fn is_revision(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{BuildIdentity, Provenance, is_revision};
+    use super::{BUILD_IDENTITY_SCHEMA, BuildIdentity, Provenance, is_revision};
 
     const REVISION: &str = "39747eaf63f32ad43e3cb045b36bd6fbaed46cf6";
 
@@ -213,6 +250,51 @@ mod tests {
         let identity = observed(REVISION, Provenance::Modified);
         assert_eq!(identity.source_revision(), Some(REVISION));
         assert_eq!(identity.attributable_revision(), None);
+    }
+
+    #[test]
+    fn the_document_and_the_report_carry_the_same_four_facts() {
+        let identity = observed(REVISION, Provenance::Committed);
+
+        let document: serde_json::Value =
+            serde_json::from_slice(&identity.to_json_document()).expect("JSON document");
+        assert_eq!(document["schema"], BUILD_IDENTITY_SCHEMA);
+        assert_eq!(document["source_revision"], REVISION);
+        assert_eq!(document["provenance"], "committed");
+        assert_eq!(document["build_target"], "x86_64-unknown-linux-gnu");
+
+        let report = identity.to_report("automonique");
+        assert!(
+            report.starts_with("automonique build identity\n"),
+            "{report}"
+        );
+        for fact in [
+            REVISION,
+            "provenance: committed",
+            "build target: x86_64-unknown-linux-gnu",
+        ] {
+            assert!(report.contains(fact), "{report}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_build_publishes_a_null_revision_and_prints_unknown() {
+        let identity = observed("", Provenance::Unknown);
+
+        let document: serde_json::Value =
+            serde_json::from_slice(&identity.to_json_document()).expect("JSON document");
+        // Null, not absent. A reader must be told the build does not know,
+        // rather than left to guess whether the field went missing in transit.
+        assert!(document["source_revision"].is_null(), "{document}");
+        assert_eq!(document["provenance"], "unknown");
+
+        assert!(
+            identity
+                .to_report("automonique")
+                .contains("source revision: unknown"),
+            "{}",
+            identity.to_report("automonique")
+        );
     }
 
     #[test]
