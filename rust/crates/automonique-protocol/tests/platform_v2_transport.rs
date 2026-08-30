@@ -1414,7 +1414,9 @@ fn response_documents_round_trip_and_review_envelope_fits_its_declared_ceiling()
             .unwrap(),
         ),
         PlatformV2Response::ResourceListingResync(
-            automonique_protocol::platform_v2_inventory::ResourceListingResync::new(expired.clone()),
+            automonique_protocol::platform_v2_inventory::ResourceListingResync::new(
+                expired.clone(),
+            ),
         ),
     ] {
         let listing_response =

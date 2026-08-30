@@ -2033,6 +2033,25 @@ struct DaemonReviewDelivery<'a> {
     database_path: &'a Path,
 }
 
+/// The v1 projection, read for one v2 listing.
+///
+/// `platform_resources` is keyed by the whole coordinate and the durable store
+/// already returns it in `(authority, kind, id)` order with no coordinate
+/// repeated, which is exactly the ordering and uniqueness the paging primitive
+/// requires — so this adapter reads and hands over, and normalises nothing.
+struct DaemonResourceInventory<'a> {
+    platform: &'a PlatformStore,
+}
+
+impl platform_v2_host::PlatformV2ResourceInventory for DaemonResourceInventory<'_> {
+    fn resources(&mut self, _now_ms: i64) -> Result<Vec<ResourceRecord>, &'static str> {
+        self.platform
+            .snapshot(&[], "resources")
+            .map(|(records, _)| records)
+            .map_err(|_| "platform_v2_resource_inventory_unavailable")
+    }
+}
+
 impl platform_v2_host::PlatformV2ReviewDelivery for DaemonReviewDelivery<'_> {
     fn inspect_target(
         &self,
@@ -5394,17 +5413,32 @@ impl Daemon {
         peer_uid: u32,
     ) -> Result<(), DaemonError> {
         let now_ms = unix_millis()?;
+        if matches!(
+            message.request(),
+            automonique_protocol::platform_v2_transport::PlatformV2Request::ListResources(_)
+        ) {
+            // Refresh every projected class, not the classes a request happens
+            // to name. Naming was the v1 trap: a caller that could not spell an
+            // approval or a provider model never saw one refreshed, so the
+            // inventory it listed was the inventory it already knew (#220).
+            self.refresh_platform_sessions(now_ms)?;
+            self.refresh_platform_resources(&[], now_ms)?;
+        }
         let database_path = self.state_dir.join(DATABASE_NAME);
         let mut review_delivery = DaemonReviewDelivery {
             store: &mut self.store,
             managed_sessions: &self.managed_sessions,
             database_path: &database_path,
         };
-        let response = self.platform_v2.handle_with_review_delivery(
+        let mut resource_inventory = DaemonResourceInventory {
+            platform: &self.platform,
+        };
+        let response = self.platform_v2.handle_with_adapters(
             peer_uid,
             message.request(),
             now_ms,
             &mut review_delivery,
+            &mut resource_inventory,
         );
         let frame = PlatformV2ResponseMessage::for_request(message, response)
             .and_then(|response| response.to_frame())

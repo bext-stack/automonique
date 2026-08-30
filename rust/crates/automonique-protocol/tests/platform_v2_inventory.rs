@@ -34,7 +34,14 @@ fn authorized(records: &[ResourceRecord]) -> Vec<AuthorizedResourceRecord> {
 
 fn inventory(count: usize) -> Vec<ResourceRecord> {
     (0..count)
-        .map(|index| record(ResourceKind::Approval, &format!("approval-{index:04}"), 1, "open"))
+        .map(|index| {
+            record(
+                ResourceKind::Approval,
+                &format!("approval-{index:04}"),
+                1,
+                "open",
+            )
+        })
         .collect()
 }
 
@@ -198,13 +205,8 @@ fn a_cursor_minted_against_another_authorized_set_expires() {
 fn a_cursor_bound_to_one_filter_does_not_resume_another() {
     let records = inventory(10);
     let all = authorized(&records);
-    let scoped = ResourceListingQuery::new(
-        Vec::new(),
-        vec![ResourceKind::Approval],
-        None,
-        4,
-    )
-    .unwrap();
+    let scoped =
+        ResourceListingQuery::new(Vec::new(), vec![ResourceKind::Approval], None, 4).unwrap();
     let cursor = page(page_authorized_resources(&scoped, &all).unwrap())
         .next_cursor()
         .unwrap()
@@ -226,7 +228,10 @@ fn a_changed_inventory_is_fenced_rather_than_silently_resumed() {
         // A record added ahead of the cursor would shift every later offset.
         {
             let mut moved = records.clone();
-            moved.insert(0, record(ResourceKind::Approval, "approval-0000a", 1, "open"));
+            moved.insert(
+                0,
+                record(ResourceKind::Approval, "approval-0000a", 1, "open"),
+            );
             moved
         },
         // A record removed would skip its successor.
@@ -326,9 +331,7 @@ fn class_filters_narrow_the_authorized_set_and_never_widen_it() {
     .unwrap();
     // Only the approval is authorized, so asking for models proves nothing
     // about whether a model exists.
-    let listed = page(
-        page_authorized_resources(&only_models, &authorized(&records[..1])).unwrap(),
-    );
+    let listed = page(page_authorized_resources(&only_models, &authorized(&records[..1])).unwrap());
     assert!(listed.items().is_empty());
     assert!(!listed.has_more());
     let listed = page(page_authorized_resources(&only_models, &authorized(&records)).unwrap());
@@ -341,7 +344,10 @@ fn a_query_round_trips_through_its_canonical_document() {
     let asked = ResourceListingQuery::new(
         vec![ResourceAuthority::Automonique, ResourceAuthority::Provider],
         vec![ResourceKind::Approval, ResourceKind::Model],
-        Some(ResourceListingCursor::new(format!("rl2.{}.{}.4", "a".repeat(64), "b".repeat(64))).unwrap()),
+        Some(
+            ResourceListingCursor::new(format!("rl2.{}.{}.4", "a".repeat(64), "b".repeat(64)))
+                .unwrap(),
+        ),
         512,
     )
     .unwrap();
@@ -354,9 +360,8 @@ fn a_query_round_trips_through_its_canonical_document() {
 
 #[test]
 fn a_page_round_trips_through_its_canonical_document() {
-    let listed = page(
-        page_authorized_resources(&query(4, None), &authorized(&inventory(9))).unwrap(),
-    );
+    let listed =
+        page(page_authorized_resources(&query(4, None), &authorized(&inventory(9))).unwrap());
     let bytes = encode_resource_listing_page(&listed).unwrap();
     assert_eq!(decode_resource_listing_page(&bytes).unwrap(), listed);
 }
@@ -368,9 +373,11 @@ fn a_resync_round_trips_through_its_canonical_document() {
     );
     let bytes = encode_resource_listing_resync(&resync).unwrap();
     assert_eq!(decode_resource_listing_resync(&bytes).unwrap(), resync);
-    assert!(String::from_utf8(bytes)
-        .unwrap()
-        .contains("\"outcome\":\"resync_required\""));
+    assert!(
+        String::from_utf8(bytes)
+            .unwrap()
+            .contains("\"outcome\":\"resync_required\"")
+    );
 }
 
 #[test]
@@ -379,7 +386,10 @@ fn a_document_that_is_not_exactly_this_body_is_refused() {
     let bytes = encode_resource_listing_query(&asked).unwrap();
     let text = String::from_utf8(bytes).unwrap();
     for hostile in [
-        text.replace("automonique.platform/inventory/v1", "automonique.platform/v2"),
+        text.replace(
+            "automonique.platform/inventory/v1",
+            "automonique.platform/v2",
+        ),
         text.replace("\"version\":2", "\"version\":1"),
         text.replacen('{', "{\"project\":\"project-1\",", 1),
         text.replace("\"requested_limit\":4,", ""),
@@ -393,9 +403,8 @@ fn a_document_that_is_not_exactly_this_body_is_refused() {
 
 #[test]
 fn a_page_body_whose_two_limits_disagree_is_refused_by_the_decoder() {
-    let listed = page(
-        page_authorized_resources(&query(4, None), &authorized(&inventory(9))).unwrap(),
-    );
+    let listed =
+        page(page_authorized_resources(&query(4, None), &authorized(&inventory(9))).unwrap());
     let text = String::from_utf8(encode_resource_listing_page(&listed).unwrap()).unwrap();
     let hostile = text.replace("\"granted_limit\":4", "\"granted_limit\":2");
     assert_ne!(hostile, text);

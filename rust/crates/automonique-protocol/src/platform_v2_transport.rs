@@ -2826,9 +2826,7 @@ fn request_body(value: &PlatformV2Request) -> Result<JsonValue, PlatformV2Transp
             }
             document(encode_work_context_query(value)?)?
         }
-        PlatformV2Request::ListResources(value) => {
-            document(encode_resource_listing_query(value)?)?
-        }
+        PlatformV2Request::ListResources(value) => document(encode_resource_listing_query(value)?)?,
         PlatformV2Request::GetWorkContext(value) => identity_json(value),
         PlatformV2Request::PrepareMutation(value) => object(vec![
             (
@@ -2981,7 +2979,9 @@ fn request_from_message(message: &Message) -> Result<PlatformV2Request, Platform
             }
             PlatformV2Request::QueryWorkContexts(value)
         }
-        "list_resources" => PlatformV2Request::ListResources(decode_resource_listing_query(&bytes)?),
+        "list_resources" => {
+            PlatformV2Request::ListResources(decode_resource_listing_query(&bytes)?)
+        }
         "get_work_context" => PlatformV2Request::GetWorkContext(identity(message.body())?),
         "prepare_mutation" => {
             exact_fields(message.body(), &["idempotency_key", "intent", "schema"])?;

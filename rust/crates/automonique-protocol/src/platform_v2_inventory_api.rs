@@ -51,7 +51,10 @@ impl fmt::Display for ResourceListingApiError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Codec(error) => {
-                write!(formatter, "resource listing codec refused document: {error}")
+                write!(
+                    formatter,
+                    "resource listing codec refused document: {error}"
+                )
             }
             Self::Listing(error) => write!(formatter, "resource listing value refused: {error}"),
             Self::Record(error) => write!(formatter, "listed resource record refused: {error}"),
@@ -419,7 +422,8 @@ pub fn decode_resource_listing_resync(
         return Err(ResourceListingApiError::InvalidBody);
     }
     Ok(ResourceListingResync::new(
-        ResourceListingCursor::new(string(&value, "expired_after")?.to_owned())
-            .map_err(|error| ResourceListingApiError::Listing(ResourceListingError::Field(error)))?,
+        ResourceListingCursor::new(string(&value, "expired_after")?.to_owned()).map_err(
+            |error| ResourceListingApiError::Listing(ResourceListingError::Field(error)),
+        )?,
     ))
 }
