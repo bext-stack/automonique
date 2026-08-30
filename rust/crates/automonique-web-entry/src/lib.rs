@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use automonique_build_identity::{BUILD_IDENTITY_SCHEMA, BuildIdentity};
 use automonique_core::conversation::{
     is_current_time_question, is_deferred_placeholder_answer, is_pm2_process_question,
     is_site_profile_question, utc_rfc3339_from_unix_millis,
@@ -133,6 +134,7 @@ pub enum Route {
     Favicon,
     Robots,
     ApiStatus,
+    ApiBuild,
     ApiMemory,
     ApiMemorySearch,
     ApiConfiguration,
@@ -5524,6 +5526,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 "/robots.txt" => Route::Robots,
                 "/.well-known/automonique-mobile" => Route::MobileDiscovery,
                 "/api/status" => Route::ApiStatus,
+                "/api/build" => Route::ApiBuild,
                 "/api/memory" => Route::ApiMemory,
                 "/api/memory/search" => Route::ApiMemorySearch,
                 "/api/configuration" => Route::ApiConfiguration,
@@ -6006,6 +6009,21 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
             retry_after: None,
             body: serde_json::to_vec(&state.snapshot()).unwrap_or_else(|_| b"{}".to_vec()),
         },
+        // Behind the operator gate with every other `/api/` route, and
+        // deliberately not beside `/healthz`. A build identity is not a secret,
+        // but it is a precise statement of which revision is deployed, and an
+        // anonymous caller has no business collecting that from a public
+        // origin. An operator who can already read the dashboard learns nothing
+        // new about their reach by reading it, and gains the one fact that lets
+        // an acceptance record name what answered.
+        Route::ApiBuild => Response {
+            status: "200 OK",
+            content_type: Some("application/json; charset=utf-8"),
+            cache_control: "no-store",
+            location: None,
+            retry_after: None,
+            body: build_identity_document(&BuildIdentity::current()),
+        },
         Route::ApiMemory
         | Route::ApiMemorySearch
         | Route::ApiConfiguration
@@ -6388,6 +6406,27 @@ fn mobile_platform_v2_error(status: &'static str, category: &'static str) -> Res
         error: &'static str,
     }
     mobile_platform_v2_response(status, &ErrorBody { error: category })
+}
+
+/// Serialize what this build says about itself.
+///
+/// The revision is `null` rather than absent when the build cannot name one, so
+/// a reader is told "this build does not know" instead of being left to decide
+/// whether a missing key means unknown or means the field was never sent.
+///
+/// Public because `--build-identity --json` on the executable and `/api/build`
+/// over the network must be the same bytes. A host with no credential to hand
+/// and a harness holding one are asking the same question, and two renderings
+/// of it would eventually answer differently.
+#[must_use]
+pub fn build_identity_document(identity: &BuildIdentity) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schema": BUILD_IDENTITY_SCHEMA,
+        "source_revision": identity.source_revision(),
+        "provenance": identity.provenance().as_str(),
+        "build_target": identity.build_target(),
+    }))
+    .unwrap_or_else(|_| b"{}".to_vec())
 }
 
 fn json_error(status: &'static str, category: &'static str) -> Response {
@@ -7116,6 +7155,7 @@ mod tests {
             ),
             ("/assets/qrcode.js", Route::QrCodeScript),
             ("/api/status?fresh=1", Route::ApiStatus),
+            ("/api/build", Route::ApiBuild),
             ("/api/operations", Route::ApiOperations),
             ("/api/platform", Route::ApiPlatform),
             ("/api/chat/history", Route::ApiChatHistory),
@@ -10730,6 +10770,72 @@ mod tests {
             "POST /api/platform HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nContent-Type: {PLATFORM_CONTENT_TYPE}\r\nAccept: first\r\nAccept: second\r\nContent-Length: 2\r\n\r\n{{}}"
         );
         assert!(parse_request(v1_duplicate_accept.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn the_build_identity_surface_is_operator_gated_and_names_this_build() {
+        let anonymous = String::from_utf8(exchange_without_integration(&format!(
+            "GET /api/build HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nX-Forwarded-Proto: https\r\nConnection: close\r\n\r\n"
+        ).into_bytes()))
+        .expect("HTTP response");
+        assert!(
+            anonymous.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+            "anonymous build probe: {anonymous:?}"
+        );
+        assert!(anonymous.contains("WWW-Authenticate: Basic"));
+        // The refusal must not be a leak. A 401 that still carries the
+        // revision would make the gate decorative.
+        assert!(!anonymous.contains(BUILD_IDENTITY_SCHEMA), "{anonymous:?}");
+
+        let authorized = String::from_utf8(exchange_without_integration(&authorized_request(
+            "GET",
+            "/api/build",
+            CANONICAL_HOST,
+        )))
+        .expect("HTTP response");
+        assert!(
+            authorized.starts_with("HTTP/1.1 200 OK\r\n"),
+            "operator build probe: {authorized:?}"
+        );
+        let identity = BuildIdentity::current();
+        let document: serde_json::Value =
+            serde_json::from_str(authorized.split_once("\r\n\r\n").expect("a body").1)
+                .expect("JSON body");
+        assert_eq!(document["schema"], BUILD_IDENTITY_SCHEMA);
+        assert_eq!(document["provenance"], identity.provenance().as_str());
+        assert_eq!(
+            document["source_revision"].as_str(),
+            identity.source_revision()
+        );
+        // The one thing this surface must never do is fill an unknown revision
+        // in with something that reads like an answer.
+        if identity.source_revision().is_none() {
+            assert!(document["source_revision"].is_null(), "{document}");
+        }
+    }
+
+    #[test]
+    fn a_build_identity_document_never_invents_a_revision() {
+        let document: serde_json::Value =
+            serde_json::from_slice(&build_identity_document(&BuildIdentity::current()))
+                .expect("JSON document");
+        assert_eq!(document["schema"], BUILD_IDENTITY_SCHEMA);
+        match document["source_revision"].as_str() {
+            Some(revision) => {
+                assert_eq!(revision.len(), 40, "{document}");
+                assert!(
+                    revision
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                    "{document}"
+                );
+                assert_ne!(document["provenance"], "unknown", "{document}");
+            }
+            None => {
+                assert!(document["source_revision"].is_null(), "{document}");
+                assert_eq!(document["provenance"], "unknown", "{document}");
+            }
+        }
     }
 
     #[test]

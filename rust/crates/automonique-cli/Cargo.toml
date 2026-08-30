@@ -8,6 +8,10 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# A build's own account of the revision it came from, embedded at compile time.
+# `doctor` compares it against whatever manifest a host laid down beside the
+# binary, which is the only way to catch a manifest that describes another build.
+automonique-build-identity = { path = "../automonique-build-identity" }
 # The client's peer check is the daemon's, and both read it from here rather
 # than each spelling the same predicate.
 automonique-policy = { path = "../automonique-policy" }
@@ -17,6 +21,9 @@ automonique-runner = { path = "../automonique-runner" }
 automonique-store = { path = "../automonique-store" }
 nix.workspace = true
 serde_json.workspace = true
+# Digesting the running image is the comparison that distinguishes a manifest
+# describing this binary from one describing another.
+sha2.workspace = true
 
 [dev-dependencies]
 # The audit-verify tests tamper with a chain database behind the store API's

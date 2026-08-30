@@ -7,6 +7,17 @@
 //! compatibility algebra live in `automonique_protocol::release`; this module
 //! deliberately does not construct one, because a partial observation must not
 //! be presentable as a validated release description.
+//!
+//! Two questions are asked of the same file, and they are not the same
+//! question. [`inspect_release_manifest_structure`] asks whether a document is
+//! a complete, well-formed manifest of the typed shape.
+//! [`inspect_release_attribution`] asks the narrower question a deployment
+//! actually turns on — *which binary and which revision does this document
+//! name* — and answers it for any of the manifest shapes this repository
+//! writes, without requiring the rest of a manifest to be present.
+//!
+//! Both read through the same bounded, symlink-refusing, no-modification path,
+//! so neither can reach a file the other would refuse.
 
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, OpenHow, ResolveFlag, openat2};
@@ -135,37 +146,167 @@ impl ReleaseInspection {
     }
 }
 
+/// What a manifest says about which build it describes.
+///
+/// Every field is optional because this is an observation, not a validation: a
+/// manifest that records a binary digest but no revision is a real thing to
+/// find on a host, and reporting it as unreadable would hide the half that is
+/// there.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct InspectedAttribution {
+    /// The manifest's own schema token, when it declares one.
+    pub schema: Option<String>,
+    /// Digest of the binary this manifest describes.
+    pub binary_sha256: Option<String>,
+    /// Source revision this manifest attributes that binary to.
+    pub source_revision: Option<String>,
+}
+
+/// Outcome of reading a manifest for what build it describes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AttributionInspection {
+    Observed(InspectedAttribution),
+    Finding(ReleaseIssue),
+    Unavailable(ReleaseIssue),
+}
+
+impl AttributionInspection {
+    #[must_use]
+    pub const fn issue(&self) -> Option<ReleaseIssue> {
+        match self {
+            Self::Observed(_) => None,
+            Self::Finding(issue) | Self::Unavailable(issue) => Some(*issue),
+        }
+    }
+}
+
+/// Read which build a manifest describes, across every manifest shape written here.
+///
+/// The revision is taken from `source_revision`, `source_sha` or `git_revision`
+/// — the spellings used by the typed manifest, by the code and web-entry
+/// release manifests, and by the structural inspection above. A manifest
+/// carrying two of them that disagree is refused rather than resolved by
+/// precedence: a document that names two revisions has not named one.
+#[must_use]
+pub fn inspect_release_attribution(path: &Path) -> AttributionInspection {
+    let bytes = match read_manifest(path) {
+        Ok(bytes) => bytes,
+        Err(refusal) => return refusal.into_attribution(),
+    };
+    let document: Value = match serde_json::from_slice(&bytes) {
+        Ok(document) => document,
+        Err(_) => return AttributionInspection::Finding(ReleaseIssue::MalformedJson),
+    };
+    let Value::Object(object) = document else {
+        return AttributionInspection::Finding(ReleaseIssue::NonObjectJson);
+    };
+    let source_revision = match attributed_revision(&object) {
+        Ok(revision) => revision,
+        Err(issue) => return AttributionInspection::Finding(issue),
+    };
+    AttributionInspection::Observed(InspectedAttribution {
+        schema: optional_schema(&object),
+        binary_sha256: optional_digest(&object, "binary_sha256"),
+        source_revision,
+    })
+}
+
+/// The one revision a manifest attributes its binary to, if it names one.
+fn attributed_revision(object: &Map<String, Value>) -> Result<Option<String>, ReleaseIssue> {
+    let mut found: Option<String> = None;
+    for name in ["source_revision", "source_sha", "git_revision"] {
+        let Some(revision) = optional_revision(object, name) else {
+            continue;
+        };
+        match &found {
+            Some(existing) if *existing != revision => {
+                return Err(ReleaseIssue::RequiredFieldInvalid);
+            }
+            _ => found = Some(revision),
+        }
+    }
+    Ok(found)
+}
+
+fn optional_schema(object: &Map<String, Value>) -> Option<String> {
+    let value = object.get("schema")?.as_str()?;
+    if value.is_empty()
+        || value.len() > MAX_PUBLIC_VALUE_BYTES
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-' | b'/')
+        })
+    {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
+fn optional_digest(object: &Map<String, Value>, name: &str) -> Option<String> {
+    let value = object.get(name)?.as_str()?;
+    let value = value.strip_prefix("sha256:").unwrap_or(value);
+    (value.len() == 64 && is_lowercase_hex(value)).then(|| value.to_owned())
+}
+
+fn optional_revision(object: &Map<String, Value>, name: &str) -> Option<String> {
+    let value = object.get(name)?.as_str()?;
+    (matches!(value.len(), 40 | 64) && is_lowercase_hex(value)).then(|| value.to_owned())
+}
+
+fn is_lowercase_hex(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// Inspect an explicit manifest's bounded structure without claiming compatibility.
 #[must_use]
 pub fn inspect_release_manifest_structure(path: &Path) -> ReleaseInspection {
-    let before = match inspect_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(outcome) => return outcome.into_inspection(),
-    };
+    match read_manifest(path) {
+        Ok(bytes) => parse_manifest(&bytes),
+        Err(refusal) => refusal.into_inspection(),
+    }
+}
+
+/// Read a manifest's bytes under the whole safety envelope, or say why not.
+///
+/// One reader for both public questions, so a path one of them would refuse
+/// cannot become readable by asking the other one. The ownership, mode, size,
+/// symlink and read-stability rules are all here and are applied before any
+/// byte is interpreted.
+fn read_manifest(path: &Path) -> Result<Vec<u8>, ManifestRefusal> {
+    let before = inspect_metadata(path)?;
     if !before.is_file() {
-        return ReleaseInspection::Finding(ReleaseIssue::NotRegular);
+        return Err(ManifestRefusal::Finding(ReleaseIssue::NotRegular));
     }
     if before.uid() != Uid::effective().as_raw() {
-        return ReleaseInspection::Finding(ReleaseIssue::WrongOwner);
+        return Err(ManifestRefusal::Finding(ReleaseIssue::WrongOwner));
     }
     if before.mode() & 0o077 != 0 {
-        return ReleaseInspection::Finding(ReleaseIssue::PermissiveMode);
+        return Err(ManifestRefusal::Finding(ReleaseIssue::PermissiveMode));
     }
     if before.len() > MAX_RELEASE_MANIFEST_BYTES as u64 {
-        return ReleaseInspection::Finding(ReleaseIssue::TooLarge);
+        return Err(ManifestRefusal::Finding(ReleaseIssue::TooLarge));
     }
 
     let descriptor = match open_without_links(path) {
         Ok(descriptor) => descriptor,
         Err(Errno::ELOOP) => {
-            return ReleaseInspection::Finding(ReleaseIssue::SymlinkForbidden);
+            return Err(ManifestRefusal::Finding(ReleaseIssue::SymlinkForbidden));
         }
-        Err(Errno::ENOENT) => return ReleaseInspection::Unavailable(ReleaseIssue::Missing),
-        Err(_) => return ReleaseInspection::Unavailable(ReleaseIssue::OpenUnavailable),
+        Err(Errno::ENOENT) => {
+            return Err(ManifestRefusal::Unavailable(ReleaseIssue::Missing));
+        }
+        Err(_) => {
+            return Err(ManifestRefusal::Unavailable(ReleaseIssue::OpenUnavailable));
+        }
     };
     let opened = match fstat(descriptor.raw()) {
         Ok(stat) => stat,
-        Err(_) => return ReleaseInspection::Unavailable(ReleaseIssue::MetadataUnavailable),
+        Err(_) => {
+            return Err(ManifestRefusal::Unavailable(
+                ReleaseIssue::MetadataUnavailable,
+            ));
+        }
     };
     if opened.st_dev != before.dev()
         || opened.st_ino != before.ino()
@@ -173,45 +314,66 @@ pub fn inspect_release_manifest_structure(path: &Path) -> ReleaseInspection {
         || opened.st_mode != before.mode()
         || opened.st_size != before.len() as i64
     {
-        return ReleaseInspection::Unavailable(ReleaseIssue::ChangedDuringRead);
+        return Err(ManifestRefusal::Unavailable(
+            ReleaseIssue::ChangedDuringRead,
+        ));
     }
 
     let bytes = match read_bounded(descriptor.raw()) {
         Ok(bytes) => bytes,
-        Err(issue) => return ReleaseInspection::Unavailable(issue),
+        Err(issue) => return Err(ManifestRefusal::Unavailable(issue)),
     };
     let after = match inspect_metadata(path) {
         Ok(metadata) => metadata,
-        Err(_) => return ReleaseInspection::Unavailable(ReleaseIssue::ChangedDuringRead),
+        Err(_) => {
+            return Err(ManifestRefusal::Unavailable(
+                ReleaseIssue::ChangedDuringRead,
+            ));
+        }
     };
     if !same_snapshot(&before, &after) {
-        return ReleaseInspection::Unavailable(ReleaseIssue::ChangedDuringRead);
+        return Err(ManifestRefusal::Unavailable(
+            ReleaseIssue::ChangedDuringRead,
+        ));
     }
 
-    parse_manifest(&bytes)
+    Ok(bytes)
 }
 
+/// Why a manifest could not be read, at the severity the reader assigned.
+///
+/// Deliberately not a [`ReleaseInspection`]: that type carries a parsed
+/// manifest in its success arm, and returning it as an error would make every
+/// refusal as large as a whole manifest. Both readers above convert this into
+/// their own vocabulary.
 #[derive(Clone, Copy)]
-enum MetadataOutcome {
+enum ManifestRefusal {
     Finding(ReleaseIssue),
     Unavailable(ReleaseIssue),
 }
 
-impl MetadataOutcome {
+impl ManifestRefusal {
     const fn into_inspection(self) -> ReleaseInspection {
         match self {
             Self::Finding(issue) => ReleaseInspection::Finding(issue),
             Self::Unavailable(issue) => ReleaseInspection::Unavailable(issue),
         }
     }
+
+    const fn into_attribution(self) -> AttributionInspection {
+        match self {
+            Self::Finding(issue) => AttributionInspection::Finding(issue),
+            Self::Unavailable(issue) => AttributionInspection::Unavailable(issue),
+        }
+    }
 }
 
-fn inspect_metadata(path: &Path) -> Result<std::fs::Metadata, MetadataOutcome> {
+fn inspect_metadata(path: &Path) -> Result<std::fs::Metadata, ManifestRefusal> {
     if !path.is_absolute()
         || path.as_os_str().as_bytes().len() > MAX_PATH_BYTES
         || path == Path::new("/")
     {
-        return Err(MetadataOutcome::Finding(ReleaseIssue::PathInvalid));
+        return Err(ManifestRefusal::Finding(ReleaseIssue::PathInvalid));
     }
 
     let mut current = PathBuf::new();
@@ -221,31 +383,31 @@ fn inspect_metadata(path: &Path) -> Result<std::fs::Metadata, MetadataOutcome> {
         match component {
             Component::RootDir | Component::Normal(_) => {}
             Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
-                return Err(MetadataOutcome::Finding(ReleaseIssue::PathInvalid));
+                return Err(ManifestRefusal::Finding(ReleaseIssue::PathInvalid));
             }
         }
         components += 1;
         if components > MAX_PATH_COMPONENTS {
-            return Err(MetadataOutcome::Finding(ReleaseIssue::PathInvalid));
+            return Err(ManifestRefusal::Finding(ReleaseIssue::PathInvalid));
         }
         current.push(component.as_os_str());
         let metadata = match std::fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(MetadataOutcome::Unavailable(ReleaseIssue::Missing));
+                return Err(ManifestRefusal::Unavailable(ReleaseIssue::Missing));
             }
             Err(_) => {
-                return Err(MetadataOutcome::Unavailable(
+                return Err(ManifestRefusal::Unavailable(
                     ReleaseIssue::MetadataUnavailable,
                 ));
             }
         };
         if metadata.file_type().is_symlink() {
-            return Err(MetadataOutcome::Finding(ReleaseIssue::SymlinkForbidden));
+            return Err(ManifestRefusal::Finding(ReleaseIssue::SymlinkForbidden));
         }
         final_metadata = Some(metadata);
     }
-    final_metadata.ok_or(MetadataOutcome::Finding(ReleaseIssue::PathInvalid))
+    final_metadata.ok_or(ManifestRefusal::Finding(ReleaseIssue::PathInvalid))
 }
 
 fn open_without_links(path: &Path) -> Result<Descriptor, Errno> {

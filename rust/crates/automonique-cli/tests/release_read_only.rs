@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 use automonique_cli::{
-    MAX_RELEASE_MANIFEST_BYTES, ReleaseInspection, ReleaseInspectionStatus, ReleaseIssue,
-    inspect_release_manifest_structure,
+    AttributionInspection, MAX_RELEASE_MANIFEST_BYTES, ReleaseInspection, ReleaseInspectionStatus,
+    ReleaseIssue, inspect_release_attribution, inspect_release_manifest_structure,
 };
 use std::os::unix::fs::PermissionsExt;
 
@@ -170,5 +170,139 @@ fn wrong_type_and_permissive_mode_are_findings_without_repair() {
             .mode()
             & 0o777,
         0o644
+    );
+}
+
+/// A digest and a revision, in the spellings the deployed manifests use.
+const WEB_ENTRY: &str = r#"{
+  "schema": "automonique.web-entry-release/v1",
+  "source_sha": "39747eaf63f32ad43e3cb045b36bd6fbaed46cf6",
+  "binary_sha256": "9f78792990ccb0ab4dd416a9912ebcf8511cdbdf02b7b06778cb08ff28136503"
+}"#;
+
+fn observed(path: &std::path::Path) -> automonique_cli::InspectedAttribution {
+    match inspect_release_attribution(path) {
+        AttributionInspection::Observed(observed) => observed,
+        other => panic!("expected an observation, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_deployed_manifest_names_its_binary_and_revision() {
+    let (_directory, path) = manifest(WEB_ENTRY.as_bytes());
+
+    let attribution = observed(&path);
+
+    assert_eq!(
+        attribution.schema.as_deref(),
+        Some("automonique.web-entry-release/v1")
+    );
+    assert_eq!(
+        attribution.binary_sha256.as_deref(),
+        Some("9f78792990ccb0ab4dd416a9912ebcf8511cdbdf02b7b06778cb08ff28136503")
+    );
+    assert_eq!(
+        attribution.source_revision.as_deref(),
+        Some("39747eaf63f32ad43e3cb045b36bd6fbaed46cf6")
+    );
+}
+
+#[test]
+fn the_typed_manifest_shape_is_read_for_attribution_too() {
+    // The strict structural manifest spells the revision `git_revision`. The
+    // attribution reader understands every spelling this repository writes, so
+    // a host is never told "no attribution" merely because it laid down the
+    // other kind of manifest.
+    let (_directory, path) = manifest(VALID.as_bytes());
+
+    let attribution = observed(&path);
+
+    assert_eq!(
+        attribution.source_revision.as_deref(),
+        Some("0123456789abcdef0123456789abcdef01234567")
+    );
+    assert_eq!(attribution.binary_sha256, None);
+    assert_eq!(
+        inspect_release_manifest_structure(&path).status(),
+        ReleaseInspectionStatus::Structured
+    );
+}
+
+#[test]
+fn a_manifest_naming_two_different_revisions_has_named_none() {
+    let contradictory = br#"{
+      "source_sha": "39747eaf63f32ad43e3cb045b36bd6fbaed46cf6",
+      "git_revision": "d5666f9c85080609f58f2d201dbe15ae1b8fcbb3"
+    }"#;
+    let (_directory, path) = manifest(contradictory);
+
+    assert_eq!(
+        inspect_release_attribution(&path).issue(),
+        Some(ReleaseIssue::RequiredFieldInvalid)
+    );
+
+    // The same revision under two spellings is one revision, not a conflict.
+    let agreeing = br#"{
+      "source_sha": "39747eaf63f32ad43e3cb045b36bd6fbaed46cf6",
+      "git_revision": "39747eaf63f32ad43e3cb045b36bd6fbaed46cf6"
+    }"#;
+    let (_directory, path) = manifest(agreeing);
+    assert_eq!(
+        observed(&path).source_revision.as_deref(),
+        Some("39747eaf63f32ad43e3cb045b36bd6fbaed46cf6")
+    );
+}
+
+#[test]
+fn a_malformed_digest_or_revision_is_absent_rather_than_believed() {
+    let sloppy = br#"{
+      "schema": "automonique.web-entry-release/v1",
+      "source_sha": "c0ffee",
+      "binary_sha256": "9F78792990CCB0AB4DD416A9912EBCF8511CDBDF02B7B06778CB08FF28136503"
+    }"#;
+    let (_directory, path) = manifest(sloppy);
+
+    let attribution = observed(&path);
+
+    assert_eq!(attribution.source_revision, None);
+    assert_eq!(attribution.binary_sha256, None);
+}
+
+#[test]
+fn a_prefixed_digest_is_read_without_its_algorithm_label() {
+    let prefixed = br#"{
+      "binary_sha256": "sha256:9f78792990ccb0ab4dd416a9912ebcf8511cdbdf02b7b06778cb08ff28136503"
+    }"#;
+    let (_directory, path) = manifest(prefixed);
+
+    assert_eq!(
+        observed(&path).binary_sha256.as_deref(),
+        Some("9f78792990ccb0ab4dd416a9912ebcf8511cdbdf02b7b06778cb08ff28136503")
+    );
+}
+
+#[test]
+fn attribution_refuses_every_path_the_structural_reader_refuses() {
+    // One reader underneath both, so a manifest that is world-readable, a
+    // symlink, or absent is refused identically whichever question is asked.
+    let (directory, path) = manifest(WEB_ENTRY.as_bytes());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+        .expect("permissive fixture");
+    assert_eq!(
+        inspect_release_attribution(&path).issue(),
+        Some(ReleaseIssue::PermissiveMode)
+    );
+
+    let link_root = tempfile::tempdir().expect("link root");
+    let linked_directory = link_root.path().join("release");
+    std::os::unix::fs::symlink(directory.path(), &linked_directory).expect("directory symlink");
+    assert_eq!(
+        inspect_release_attribution(&linked_directory.join("manifest.json")).issue(),
+        Some(ReleaseIssue::SymlinkForbidden)
+    );
+
+    assert_eq!(
+        inspect_release_attribution(&link_root.path().join("absent.json")).issue(),
+        Some(ReleaseIssue::Missing)
     );
 }

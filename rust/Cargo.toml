@@ -5,6 +5,7 @@ members = [
     "crates/automonique-acp",
     "crates/automonique-agents",
     "crates/automonique-backup",
+    "crates/automonique-build-identity",
     "crates/automonique",
     "crates/automonique-cli",
     "crates/automonique-chat-provider",

@@ -223,6 +223,26 @@ curl --fail --silent --header "Authorization: Bearer $adapter_token" \
 unset adapter_token
 ```
 
+### Declaring the revision a build is of
+
+Every deployment recipe below exports `AUTOMONIQUE_SOURCE_REVISION` before it
+builds. The build embeds that revision in the binary, so the installed artifact
+answers `--build-identity` for itself and needs no file beside it to be
+attributed to a commit. Read it from the checkout being built rather than
+typing it, and refuse to deploy a tree with uncommitted changes, because a
+binary built over one is not the commit it sits on and will say so:
+
+```sh
+test -z "$(git status --porcelain)" || { echo "uncommitted changes"; exit 1; }
+export AUTOMONIQUE_SOURCE_REVISION="$(git rev-parse HEAD)"
+```
+
+Without that variable a build still names itself, from `git` in the checkout,
+and marks the answer `committed` or `modified` accordingly. Exporting it makes
+the answer `declared`: the pipeline stated the revision rather than the build
+host inferring one. A build with no git metadata at all answers `unknown`, and
+that is a supported answer — it never invents a revision to fill the gap.
+
 The dashboard deliberately uses a direct binary install. It does not use a
 content-addressed release builder or a `current` symlink. Build it,
 stage one replacement beside the installed binary, retain one previous binary,
@@ -239,9 +259,24 @@ install -m 0700 target/release/automonique-web-entry \
   "$XDG_STATE_HOME/automonique/web-entry/bin/automonique-web-entry.next"
 mv "$XDG_STATE_HOME/automonique/web-entry/bin/automonique-web-entry.next" \
   "$XDG_STATE_HOME/automonique/web-entry/bin/automonique-web-entry"
+"$XDG_STATE_HOME/automonique/web-entry/bin/automonique-web-entry" --build-identity
 systemctl --user restart automonique-web-entry.service
 curl --fail --silent http://localhost:18082/healthz
 ```
+
+The `--build-identity` line prints and exits without binding anything, and it
+is what makes the installed binary attributable: it must name
+`$AUTOMONIQUE_SOURCE_REVISION` under provenance `declared`. Anything else means
+the file that was installed is not the file that was just built. The same
+document is served, behind the operator gate, at `GET /api/build`, so the
+deployment can be attributed from off the host as well as on it.
+
+Stale `current` and `releases/` entries may still exist under
+`$XDG_STATE_HOME/automonique/web-entry/` from an earlier content-addressed
+layout. They are not part of this procedure and describe whatever build they
+described when they were written — `automonique doctor` reports a manifest that
+names another binary as `release.describes-another-build` rather than believing
+it. Removing them is a separately authorized cleanup.
 
 Rollback installs `automonique-web-entry.previous` through the same `.next`
 and rename sequence, then restarts and checks the service. Old dashboard
@@ -273,6 +308,7 @@ mv "$XDG_STATE_HOME/automonique/bin/automonique-launch-enter.next" \
   "$XDG_STATE_HOME/automonique/bin/automonique-launch-enter"
 mv "$XDG_STATE_HOME/automonique/bin/automonique.next" \
   "$XDG_STATE_HOME/automonique/bin/automonique"
+"$XDG_STATE_HOME/automonique/bin/automonique" build-identity
 systemctl --user restart automonique-tempfs-owner.service
 systemctl --user restart automonique.service
 systemctl --user is-active --quiet automonique-tempfs-owner.service

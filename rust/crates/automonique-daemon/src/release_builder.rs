@@ -12,6 +12,8 @@ use std::process::{Command, Output};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use automonique_build_identity::DECLARED_REVISION_VARIABLE;
+
 use crate::release_activation::ReleaseKind;
 
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
@@ -138,9 +140,15 @@ fn build_code_release(
     kind: ReleaseKind,
     skill_manifest_digest: Option<&str>,
 ) -> Result<BuiltRelease, ReleaseBuildError> {
+    // Every compilation below is told which commit it is building, so the
+    // binaries carry that revision themselves rather than depending on the
+    // manifest beside them staying attached. The worktree's `HEAD` was already
+    // checked against `candidate_sha` above, so this declares a fact rather
+    // than overriding one.
     let output = bounded_output(
         Command::new("cargo")
             .current_dir(worktree.join("rust"))
+            .env(DECLARED_REVISION_VARIABLE, candidate_sha)
             .args(["build", "--release", "--locked", "-p", "automonique"]),
     )?;
     if !output.status.success() {
@@ -149,6 +157,7 @@ fn build_code_release(
     let launch_helper_output = bounded_output(
         Command::new("cargo")
             .current_dir(worktree.join("rust"))
+            .env(DECLARED_REVISION_VARIABLE, candidate_sha)
             .args([
                 "build",
                 "--release",
@@ -167,6 +176,7 @@ fn build_code_release(
         Command::new("cargo")
             .current_dir(worktree.join("rust"))
             .env("CARGO_TARGET_DIR", &chat_provider_target)
+            .env(DECLARED_REVISION_VARIABLE, candidate_sha)
             .args([
                 "rustc",
                 "--release",

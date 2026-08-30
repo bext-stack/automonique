@@ -6,6 +6,27 @@ use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+/// The same three facts `/api/build` serves, for a caller standing on the host.
+///
+/// `--json` renders the identical document the HTTP surface returns, byte for
+/// byte, so an operator with shell access and a harness with a credential are
+/// never comparing two different renderings of one build.
+fn build_identity_report(json: bool) -> Vec<u8> {
+    let identity = automonique_build_identity::BuildIdentity::current();
+    if json {
+        let mut document = automonique_web_entry::build_identity_document(&identity);
+        document.push(b'\n');
+        return document;
+    }
+    format!(
+        "automonique web entry build identity\n  source revision: {}\n  provenance: {}\n  build target: {}\n",
+        identity.source_revision().unwrap_or("unknown"),
+        identity.provenance().as_str(),
+        identity.build_target(),
+    )
+    .into_bytes()
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -17,6 +38,19 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything is parsed or opened. A deployed binary has to be
+    // answerable about which revision it is *without* the configuration,
+    // sockets and state directories a serving run needs, because the moment
+    // that question matters is usually the moment one of those is in doubt.
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments
+        .iter()
+        .any(|argument| argument == "--build-identity")
+    {
+        let json = arguments.iter().any(|argument| argument == "--json");
+        std::io::Write::write_all(&mut std::io::stdout(), &build_identity_report(json))?;
+        return Ok(());
+    }
     let mut bind = IpAddr::from([127, 0, 0, 1]);
     let mut port = 18_082_u16;
     let mut auth_config = None;

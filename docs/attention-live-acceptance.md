@@ -27,7 +27,32 @@ build, so a guessed one would make the report fiction.
 | `<origin>_attention_projection` | `GET /api/platform` authorized | The attention projection the clients consume, under `automonique.dashboard.platform/v2`. |
 | `<origin>_retained_session_read` | `GET /api/mobile/pairing-sessions` authorized | `WebIntegration::platform_sessions()`, under `automonique.dashboard.pairing-sessions/v2` — an authority-qualified session cursor rather than a partial page. |
 | `hosted_attention_corpus_available` | derived | The deployment actually serves resources, so the cross-client comparison has something to compare. |
-| `deployed_build_attribution` | local | Every probed build's running binary appears in a release manifest, so the record can name the revision it accepted. |
+| `<origin>_build_identity` | `GET /api/build` authorized | The deployment names, over its own authenticated surface, the source revision it was compiled from, under `automonique.build-identity/v1`. A 404 means the deployed build predates intrinsic self-attribution. |
+| `deployed_build_attribution` | local | Every probed build can be attributed to a source revision, and the two accounts of it agree. |
+
+### How a deployed build is attributed
+
+The build is asked twice, because the two answers fail differently.
+
+The binary is asked what it was built from — `--build-identity --json` on the
+deployed executable, which prints and exits before the entry parses its
+configuration or binds anything. That answer is a literal compiled into the
+artifact, so no file laid down beside it, and no deployment procedure that
+forgets to update one, can make it wrong. It is `unknown` on a build with no
+git metadata and `modified` on a build made over uncommitted changes, and
+neither of those is treated as a revision the deployment can be signed off
+against.
+
+Then every `manifest.json` under the release root is searched for the digest of
+the running binary. That is the only check that says whether this host's release
+metadata is still attached to the binary serving traffic — a release directory
+whose `bin/` was replaced without moving `current` leaves a manifest that is
+internally consistent about a build which is not running.
+
+Either answer resolves attribution on its own. The two disagreeing does not: a
+manifest recording these exact bytes while naming another revision is recorded
+as `contradicted` and fails, because a well-sourced wrong answer is worse than
+no answer.
 
 `inventory.state` on that projection means a scoped read succeeded, not that
 the whole inventory fit in one response. The projection names the coordinates

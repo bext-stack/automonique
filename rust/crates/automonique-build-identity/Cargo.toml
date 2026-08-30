@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+[package]
+name = "automonique-build-identity"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+# Deliberately empty. A build that has to read a file, open a socket or link a
+# crate before it can name itself is a build whose attribution can be made to
+# disagree with the bytes it was compiled from. Everything this crate reports is
+# a literal placed by `build.rs` at compile time.
+[dependencies]
+
+[lints]
+workspace = true

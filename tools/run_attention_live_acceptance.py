@@ -24,10 +24,14 @@ Three things are true about this flow, and the report says all three.
    Those steps are enumerated as an operator checklist and stay
    `awaiting_operator` until a sign-off file names every one of them.
 
-3. The deployed build may not be attributable to a source revision. When the
-   running binary's digest appears in no release manifest under the release
-   root, the honest record is the running digest plus an explicit `unresolved`
-   attribution, not a revision the harness cannot prove.
+3. The deployed build may not be attributable to a source revision. It is asked
+   twice — the binary is asked what it was built from, and every release
+   manifest under the release root is searched for its digest — and either
+   answer resolves it. When neither does, the honest record is the running
+   digest plus an explicit `unresolved` attribution, not a revision the harness
+   cannot prove. When both answer and disagree, that is recorded as
+   `contradicted` and fails, because a well-sourced wrong answer is worse than
+   no answer.
 
 Every path this harness probes is derived from the route table in
 `automonique-web-entry` (`route()` in `src/lib.rs`), and every schema it asserts
@@ -133,9 +137,25 @@ OBSERVABLE_KEYS = frozenset(
         "actions",
         "actor",
         "session_scope",
+        # `BuildIdentity` as `/api/build` serializes it. A revision is not a
+        # secret and is the whole point of that surface; withholding it here
+        # would leave the report unable to name what answered.
+        "source_revision",
+        "provenance",
+        "build_target",
     }
 )
 SECRET_MARKERS = ("token", "secret", "password", "credential", "authorization", "cookie")
+
+# `automonique_build_identity::BUILD_IDENTITY_SCHEMA`. The same document is
+# served by `/api/build` over the network and printed by `--build-identity
+# --json` on the host, so one token covers both.
+BUILD_IDENTITY_SCHEMA = "automonique.build-identity/v1"
+# `Provenance::Declared` and `Provenance::Committed`. A `modified` build names
+# the commit its uncommitted changes sat on, which is worth recording and is not
+# a revision the build can be signed off against.
+ATTRIBUTABLE_PROVENANCE = frozenset({"declared", "committed"})
+BUILD_IDENTITY_TIMEOUT = 10.0
 CATEGORY_TOKEN = re.compile(r"\A[a-z0-9_]{1,64}\Z")
 SCALAR_LIMIT = 128
 LIST_LIMIT = 16
@@ -255,6 +275,16 @@ AUTHORIZED = (
         intent=(
             "an authorized read returns the attention projection the clients "
             "consume, under the schema the deployed build advertises"
+        ),
+    ),
+    Authorized(
+        name="build_identity",
+        path="/api/build",
+        schema=BUILD_IDENTITY_SCHEMA,
+        intent=(
+            "the deployed build names, over its own authenticated surface, the "
+            "source revision it was compiled from, so this record can say which "
+            "revision answered rather than only that something answered"
         ),
     ),
     Authorized(
@@ -817,13 +847,88 @@ def discover_mobile_origin(
     return None, f"no canonical host recorded in {redacted_path(config)}"
 
 
+def self_reported_build(binary: Path) -> dict[str, Any]:
+    """Ask the deployed binary itself which revision it was built from.
+
+    This is the answer that survives a deployment procedure replacing a binary
+    and leaving the manifest beside it untouched, because nothing outside the
+    artifact is consulted. `--build-identity` prints and exits before the entry
+    parses its configuration or binds anything, so asking is not starting the
+    service.
+
+    A binary that predates the flag refuses it. That refusal is recorded as
+    `unavailable` with the reason, never smoothed over: a deployment that cannot
+    answer this question is exactly the condition being reported on.
+    """
+    try:
+        result = subprocess.run(
+            [str(binary), "--build-identity", "--json"],
+            check=False,
+            capture_output=True,
+            timeout=BUILD_IDENTITY_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return {
+            "state": "unavailable",
+            "reason": f"the binary could not be asked: {type(error).__name__}",
+        }
+    if result.returncode != 0:
+        return {
+            "state": "unavailable",
+            "reason": (
+                "the deployed binary does not answer --build-identity, so it "
+                "predates intrinsic build attribution and can only be named by "
+                "a manifest"
+            ),
+        }
+    try:
+        declared = json.loads(result.stdout.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return {
+            "state": "unavailable",
+            "reason": "the binary answered --build-identity with something that is not JSON",
+        }
+    if not isinstance(declared, dict):
+        return {
+            "state": "unavailable",
+            "reason": "the binary answered --build-identity with a non-object document",
+        }
+    if declared.get("schema") != BUILD_IDENTITY_SCHEMA:
+        return {
+            "state": "unavailable",
+            "reason": (
+                f"the binary answered under a schema this harness does not read; "
+                f"only {BUILD_IDENTITY_SCHEMA!r} is accepted"
+            ),
+        }
+    provenance = declared.get("provenance")
+    revision = declared.get("source_revision")
+    provenance = provenance if isinstance(provenance, str) else None
+    revision = revision if isinstance(revision, str) else None
+    return {
+        "state": "recorded",
+        "source_revision": revision,
+        "provenance": provenance,
+        # The build's own rule, restated where the report can be read without
+        # the crate to hand: only a declared or committed build corresponds to
+        # exactly one revision.
+        "attributable": provenance in ATTRIBUTABLE_PROVENANCE and revision is not None,
+    }
+
+
 def describe_build(root: Path | None, label: str) -> dict[str, Any]:
     """Name the build that is running, or say it cannot be named.
 
-    A release manifest is evidence only when it describes the binary on disk.
-    This walks every manifest under the release root looking for the running
-    digest; when none records it, the running build is not attributable to a
-    revision and the report says so instead of quoting the manifest anyway.
+    Two independent answers are collected, because they fail in different ways.
+    The binary is asked what it was built from, which no external file can make
+    wrong. Then every manifest under the release root is searched for the
+    running digest, which is the only thing that says whether the release
+    metadata on this host is still attached to the binary serving traffic.
+
+    Either one alone resolves attribution. The two disagreeing does not: a
+    manifest that describes these exact bytes while naming another revision is a
+    contradiction on the host, and it is reported as one rather than settled by
+    preferring whichever source this harness happens to trust.
     """
     if root is None:
         return {
@@ -832,15 +937,18 @@ def describe_build(root: Path | None, label: str) -> dict[str, Any]:
         }
     binary = root / "bin" / "automonique-web-entry"
     running = digest(binary)
+    reported = self_reported_build(binary)
     entry: dict[str, Any] = {
         "state": "recorded",
         "release_root": redacted_path(root),
         "binary": redacted_path(binary),
         "binary_sha256": running,
+        "self_reported": reported,
     }
-    # `inspect_local_release()` in `automonique-cli` resolves the manifest as
-    # `<executable>/../../manifest.json`, so for a binary deployed at
-    # `<root>/bin/` that is `<root>/manifest.json`.
+    # `inspect_local_release()` in `automonique-cli` looks beside the binary, at
+    # the release root, and through the `current` pointer. This records the
+    # release-root candidate, which is the one a deployment is expected to write
+    # for a binary installed at `<root>/bin/`.
     doctor_manifest = root / "manifest.json"
     entry["doctor_manifest"] = redacted_path(doctor_manifest)
     entry["doctor_manifest_present"] = doctor_manifest.is_file()
@@ -873,15 +981,35 @@ def describe_build(root: Path | None, label: str) -> dict[str, Any]:
                 }
             )
     entry["release_manifests_inspected"] = manifests
-    if matches:
+    intrinsic = reported.get("source_revision") if reported.get("attributable") else None
+    contradicted = [
+        match
+        for match in matches
+        if intrinsic is not None
+        and isinstance(match.get("source_sha"), str)
+        and match["source_sha"] != intrinsic
+    ]
+    if contradicted:
+        entry["source_attribution"] = "contradicted"
+        entry["contradicted_by"] = contradicted[:LIST_LIMIT]
+        entry["reason"] = (
+            "a release manifest records the digest of the running binary but "
+            "attributes it to a revision the binary does not report for itself, "
+            "so the two accounts of this deployment disagree"
+        )
+        return entry
+    if intrinsic is not None or matches:
         entry["source_attribution"] = "resolved"
-        entry["attributed_by"] = matches[:LIST_LIMIT]
+        if intrinsic is not None:
+            entry["source_revision"] = intrinsic
+        if matches:
+            entry["attributed_by"] = matches[:LIST_LIMIT]
         return entry
     entry["source_attribution"] = "unresolved"
     entry["reason"] = (
-        f"no release manifest under {redacted_path(root)} records the digest of "
-        "the binary that is running, so the deployed build cannot be attributed "
-        "to a source revision"
+        "the running binary does not report the revision it was built from, and "
+        f"no release manifest under {redacted_path(root)} records its digest, so "
+        "the deployed build cannot be attributed to a source revision"
     )
     return entry
 
@@ -913,19 +1041,35 @@ def check_build_attribution(builds: dict[str, Any]) -> dict[str, Any]:
         for name in ("hosted", "nonprod_mobile")
         if builds.get(name, {}).get("source_attribution") == "unresolved"
     ]
+    contradicted = [
+        name
+        for name in ("hosted", "nonprod_mobile")
+        if builds.get(name, {}).get("source_attribution") == "contradicted"
+    ]
     unavailable = [
         name
         for name in ("hosted", "nonprod_mobile")
         if builds.get(name, {}).get("state") == "unavailable"
     ]
     result: dict[str, Any] = {"name": "deployed_build_attribution", "intent": intent}
+    if contradicted:
+        # Worse than an unattributed build, and reported ahead of one: here two
+        # sources both claim to name the deployment and name different things,
+        # so a record written from either would look well-sourced and be wrong.
+        result["state"] = "failed"
+        result["reason"] = (
+            "a release manifest and the binary itself disagree about which "
+            "revision is deployed for " + ", ".join(contradicted)
+        )
+        return result
     if unresolved:
         result["state"] = "failed"
         result["reason"] = (
             "the running binary of "
             + ", ".join(unresolved)
-            + " appears in no release manifest, so this record cannot name the "
-            "revision it accepted"
+            + " neither reports the revision it was built from nor appears in "
+            "any release manifest, so this record cannot name the revision it "
+            "accepted"
         )
         return result
     if unavailable:

@@ -235,6 +235,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "automonique-build-identity"
+version = "0.1.0"
+
+[[package]]
 name = "automonique-chat-provider"
 version = "0.1.0"
 dependencies = [
@@ -250,6 +254,7 @@ dependencies = [
 name = "automonique-cli"
 version = "0.1.0"
 dependencies = [
+ "automonique-build-identity",
  "automonique-policy",
  "automonique-protocol",
  "automonique-runner",
@@ -257,6 +262,7 @@ dependencies = [
  "nix 0.29.0",
  "rusqlite",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -278,6 +284,7 @@ name = "automonique-daemon"
 version = "0.1.0"
 dependencies = [
  "automonique-agents",
+ "automonique-build-identity",
  "automonique-core",
  "automonique-egress-broker",
  "automonique-github-connector",
@@ -453,6 +460,7 @@ dependencies = [
 name = "automonique-web-entry"
 version = "0.1.0"
 dependencies = [
+ "automonique-build-identity",
  "automonique-cli",
  "automonique-core",
  "automonique-daemon",

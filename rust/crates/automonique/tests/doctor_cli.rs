@@ -115,12 +115,75 @@ fn doctor_json_mode_uses_the_versioned_schema() {
     );
 }
 
+/// The revision must come out of the binary, not out of anything beside it.
+///
+/// `run()` hands the child an isolated runtime directory and strips every
+/// product environment variable, and the binary is invoked from cargo's target
+/// directory where no manifest exists. Anything it reports here it is carrying
+/// itself.
+#[test]
+fn build_identity_names_this_build_without_reading_anything_beside_it() {
+    let runtime = private_runtime();
+    let output = run(runtime.path(), &["build-identity", "--json"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
+    assert!(
+        stdout.contains("\"schema\":\"automonique.build-identity/v1\""),
+        "{stdout}"
+    );
+    // The build environment of a test run is not fixed — a clean checkout, a
+    // modified worktree and a source tree with no git metadata are all
+    // legitimate — so what is pinned is the coherence of the pair, which is the
+    // property the whole surface exists for. A build that cannot name a
+    // revision says so with an explicit null; it never fills the gap.
+    if stdout.contains("\"provenance\":\"unknown\"") {
+        assert!(stdout.contains("\"source_revision\":null"), "{stdout}");
+    } else {
+        assert!(!stdout.contains("\"source_revision\":null"), "{stdout}");
+        assert!(
+            ["\"declared\"", "\"committed\"", "\"modified\""]
+                .iter()
+                .any(|provenance| stdout.contains(&format!("\"provenance\":{provenance}"))),
+            "{stdout}"
+        );
+    }
+
+    let human = run(runtime.path(), &["build-identity"]);
+    assert_eq!(human.status.code(), Some(0));
+    let human = String::from_utf8(human.stdout).expect("UTF-8 output");
+    assert!(human.contains("source revision: "), "{human}");
+    assert!(human.contains("provenance: "), "{human}");
+    assert!(human.contains("build target: "), "{human}");
+}
+
+/// The report carries the build's own account of itself beside the manifest one.
+///
+/// Two checks rather than one, because they fail independently: a host can have
+/// no manifest and a perfectly attributable binary, or a manifest describing
+/// some other build entirely. Collapsing them would hide whichever half is
+/// still standing.
+#[test]
+fn doctor_reports_build_identity_and_manifest_attribution_separately() {
+    let runtime = private_runtime();
+    let output = run(runtime.path(), &["doctor"]);
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
+
+    assert!(stdout.contains("release.build-identity"), "{stdout}");
+    assert!(stdout.contains("release.manifest-structure"), "{stdout}");
+    // Cargo's target directory holds no release manifest, and the check says so
+    // rather than reporting a healthy release it never found.
+    assert!(stdout.contains("release.missing"), "{stdout}");
+}
+
 #[test]
 fn unsupported_argv_is_usage_error_without_doctor_output() {
     let runtime = private_runtime();
     for args in [
         &[][..],
         &["doctor", "--fix"][..],
+        &["build-identity", "--verbose"][..],
         &["shutdown", "--force"][..],
     ] {
         let output = run(runtime.path(), args);
