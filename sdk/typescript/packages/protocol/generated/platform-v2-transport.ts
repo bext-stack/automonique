@@ -65,8 +65,6 @@ import {
   PLATFORM_PROTOCOL,
   PlatformRequestId,
   ReceiptId,
-  ResourceAuthority_VALUES,
-  ResourceKind_VALUES,
   decodeDecodedResourceRecord,
   type DecodedResourceRecord,
   type IdempotencyKey as IdempotencyKeyValue,
@@ -81,6 +79,8 @@ import {
   MutationPreviewId,
   MAX_MUTATION_CANONICAL_BYTES,
   PLATFORM_SCHEMA_V2,
+  V1_RESOURCE_AUTHORITY_WIRE_ORDER,
+  V1_RESOURCE_KIND_WIRE_ORDER,
   ProjectId,
   SupportedPlatformVersionNumber,
   UserWorkspaceId,
@@ -690,7 +690,10 @@ function attentionReadRequest(value: AttentionReadRequest): unknown {
   if (!(value.source.kind==="review"||value.source.kind==="orchestration"||value.source.kind==="provider_session")) throw new WireError("invalid_json_value","attention source kind");
   return {project:ProjectId(value.project),schema:"automonique.platform/attention/v1",source:{id:attentionOpaque(value.source.id,"attention source id"),kind:value.source.kind},user_workspace:UserWorkspaceId(value.user_workspace)};
 }
-function attentionIdOrder(left: string, right: string): number {
+// Compare two strings the way Rust compares `String`: by UTF-8 bytes.
+// JavaScript's `<` compares UTF-16 code units, which disagrees above the
+// basic plane, so ordering rules this file shares with Rust go through here.
+function canonicalUtf8Order(left: string, right: string): number {
   const a=new TextEncoder().encode(left);const b=new TextEncoder().encode(right);const length=Math.min(a.length,b.length);
   for(let index=0;index<length;index+=1){if(a[index]!==b[index])return a[index]!<b[index]!?-1:1;}
   return a.length-b.length;
@@ -705,7 +708,7 @@ function attentionSnapshot(value: JsonValue): AttentionSourceSnapshot {
   const source=attentionSource(valueField(body,"source"));const rawItems=valueField(body,"items");if(rawItems.kind!=="array"||rawItems.items.length>256)throw new WireError("invalid_json_value","attention items");
   const reasonState:Readonly<Record<AttentionItemReason,AttentionItemState>>={review_requested:"needs_you",comment_reply:"needs_you",approval_required:"needs_you",agent_working:"working",check_running:"working",delivery_pending:"working",complete:"done",conflict:"blocked",check_failed:"blocked",external_blocker:"blocked"};
   const items=rawItems.items.map((raw):AttentionItem=>{const item=fields(raw,["id","nested_agent_path","observed_at_ms","platform_session","reason","revision","state","unread"]);const id=attentionOpaque(stringField(item,"id"),"attention item id");const itemRevision=WorkContextRevision(integerField(item,"revision"));const itemObserved=integerField(item,"observed_at_ms");if(itemRevision>revision||itemObserved<0n||itemObserved>observed)throw new WireError("invalid_json_value","attention item revision");const reason=stringField(item,"reason") as AttentionItemReason;const state=stringField(item,"state") as AttentionItemState;if(reasonState[reason]!==state)throw new WireError("invalid_json_value","attention state reason");const unread=valueField(item,"unread");if(unread.kind!=="bool")throw new WireError("invalid_json_value","attention unread");const path=valueField(item,"nested_agent_path");if(path.kind!=="array"||path.items.length>16)throw new WireError("invalid_json_value","attention agent path");const nested=path.items.map((part)=>{if(part.kind!=="string")throw new WireError("invalid_json_value","attention agent path");return attentionOpaque(part.value,"attention agent id")});if(new Set(nested).size!==nested.length)throw new WireError("invalid_json_value","attention agent cycle");const coordinate=valueField(item,"platform_session");let session:AttentionPlatformSession|null=null;if(coordinate.kind!=="null"){const sessionFields=fields(coordinate,["authority","id","kind"]);const authority=stringField(sessionFields,"authority");if(!(authority==="ai_operations"||authority==="automonique"||authority==="github"||authority==="provider")||stringField(sessionFields,"kind")!=="session")throw new WireError("invalid_json_value","attention session");session={authority,id:attentionOpaque(stringField(sessionFields,"id"),"attention session id"),kind:"session"};}if((source.kind==="provider_session")!==(session!==null))throw new WireError("invalid_json_value","attention source session");return{id,nested_agent_path:nested,observed_at_ms:itemObserved,platform_session:session,reason,revision:itemRevision,state,unread:unread.value};});
-  if(items.some((item,index)=>index>0&&attentionIdOrder(items[index-1]!.id,item.id)>=0))throw new WireError("invalid_json_value","attention item ordering");
+  if(items.some((item,index)=>index>0&&canonicalUtf8Order(items[index-1]!.id,item.id)>=0))throw new WireError("invalid_json_value","attention item ordering");
   return{items,observed_at_ms:observed,previous_revision:previous,project:ProjectId(stringField(body,"project")),revision,schema:"automonique.platform/attention/v1",semantics:"atomic_replace",source,user_workspace:UserWorkspaceId(stringField(body,"user_workspace"))};
 }
 
@@ -725,6 +728,16 @@ function listingCursorOrNull(body: Map<string, JsonValue>, name: string): Resour
   if (value.kind !== "string") throw new WireError("invalid_json_value", name);
   return ResourceListingCursor(value.value);
 }
+// Both v1 vocabularies order by declaration, not alphabetically — `client`
+// follows `provider` and `approval` follows `session`. Comparing their wire
+// spellings as text would order a page the server built as unordered, so every
+// listing order in this file goes through the ordinal of the wire-order
+// constant the work-context module already carries.
+function listingOrdinal(vocabulary: readonly string[], value: string): string {
+  const index = vocabulary.indexOf(value);
+  if (index < 0) throw new WireError("invalid_json_value", "resource listing vocabulary");
+  return index.toString().padStart(2, "0");
+}
 function strictlyOrderedListingFilter(values: readonly string[], vocabulary: readonly string[]): boolean {
   let previous = -1;
   for (const value of values) {
@@ -734,10 +747,13 @@ function strictlyOrderedListingFilter(values: readonly string[], vocabulary: rea
   }
   return true;
 }
+function listingOrderKey(item: DecodedResourceRecord): string {
+  return `${listingOrdinal(V1_RESOURCE_AUTHORITY_WIRE_ORDER, item.resource.authority)}\u0000${listingOrdinal(V1_RESOURCE_KIND_WIRE_ORDER, item.resource.kind)}\u0000${item.resource.id}`;
+}
 function resourceListingQueryJson(query: ResourceListingQuery): JsonValue {
   if (query.requested_limit < 1n || query.requested_limit > 65535n) throw new WireError("invalid_json_value", "resource listing limit");
-  if (query.authorities.length > ResourceAuthority_VALUES.length || !strictlyOrderedListingFilter(query.authorities, ResourceAuthority_VALUES)) throw new WireError("invalid_json_value", "resource listing authorities");
-  if (query.kinds.length > ResourceKind_VALUES.length || !strictlyOrderedListingFilter(query.kinds, ResourceKind_VALUES)) throw new WireError("invalid_json_value", "resource listing kinds");
+  if (query.authorities.length > V1_RESOURCE_AUTHORITY_WIRE_ORDER.length || !strictlyOrderedListingFilter(query.authorities, V1_RESOURCE_AUTHORITY_WIRE_ORDER)) throw new WireError("invalid_json_value", "resource listing authorities");
+  if (query.kinds.length > V1_RESOURCE_KIND_WIRE_ORDER.length || !strictlyOrderedListingFilter(query.kinds, V1_RESOURCE_KIND_WIRE_ORDER)) throw new WireError("invalid_json_value", "resource listing kinds");
   const body = json({
     after: query.after === null ? null : ResourceListingCursor(query.after),
     authorities: [...query.authorities],
@@ -761,8 +777,7 @@ function resourceListingPage(value: JsonValue, bytes: Uint8Array): ResourceListi
   const rawItems = valueField(body, "items");
   if (rawItems.kind !== "array" || rawItems.items.length > MAX_RESOURCE_LISTING_PAGE_ITEMS || BigInt(rawItems.items.length) > granted_limit) throw new WireError("invalid_json_value", "resource listing page items");
   const items = rawItems.items.map(decodeDecodedResourceRecord);
-  const order = (item: DecodedResourceRecord): string => `${item.resource.authority}\u0000${item.resource.kind}\u0000${item.resource.id}`;
-  if (items.some((item, index) => index > 0 && order(items[index - 1]!) >= order(item))) throw new WireError("invalid_json_value", "resource listing page order");
+  if (items.some((item, index) => index > 0 && canonicalUtf8Order(listingOrderKey(items[index - 1]!), listingOrderKey(item)) >= 0)) throw new WireError("invalid_json_value", "resource listing page order");
   const has_more = valueField(body, "has_more");
   if (has_more.kind !== "bool") throw new WireError("invalid_json_value", "resource listing has_more");
   const after = listingCursorOrNull(body, "after");

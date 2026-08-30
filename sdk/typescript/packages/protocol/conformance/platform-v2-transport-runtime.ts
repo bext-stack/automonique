@@ -20,8 +20,17 @@ import {
   encodePlatformNegotiationRequestFrame,
   encodePlatformV2Request,
   encodePlatformV2RequestFrame,
+  encodeResourceListingPage,
 } from "../generated/platform-v2-transport.ts";
-import {IdempotencyKey, PLATFORM_PROTOCOL, PlatformRequestId} from "../generated/platform.ts";
+import {
+  IdempotencyKey,
+  PLATFORM_PROTOCOL,
+  PlatformEpochMillis,
+  PlatformRequestId,
+  PlatformRevision,
+  PlatformText,
+  ResourceId,
+} from "../generated/platform.ts";
 import {
   PLATFORM_NEGOTIATION_SCHEMA_V1,
   PLATFORM_SCHEMA_V2,
@@ -259,6 +268,40 @@ expectWireRefusal("listing page answering another request", () => decodePlatform
   listingPageMessage,
   listingId,
   "get_work_context",
+));
+
+// Ordering follows the v1 declaration order, not the spelling: `client` comes
+// after `github`, and `approval` after `session`. A decoder comparing wire
+// spellings as text would refuse this page, which the Rust pager emits.
+const declarationOrdered = encodeResourceListingPage({
+  after: null,
+  granted_limit: 8n,
+  has_more: false,
+  next_cursor: null,
+  requested_limit: 8n,
+  items: [
+    {freshness: {observed_at: PlatformEpochMillis(1n), revision: PlatformRevision(1n), state: "fresh"}, resource: {authority: "automonique", id: ResourceId("session-1"), kind: "session"}, summary: PlatformText("open")},
+    {freshness: {observed_at: PlatformEpochMillis(1n), revision: PlatformRevision(1n), state: "fresh"}, resource: {authority: "automonique", id: ResourceId("approval-1"), kind: "approval"}, summary: PlatformText("open")},
+    {freshness: {observed_at: PlatformEpochMillis(1n), revision: PlatformRevision(1n), state: "fresh"}, resource: {authority: "github", id: ResourceId("repo-1"), kind: "repository"}, summary: PlatformText("open")},
+    {freshness: {observed_at: PlatformEpochMillis(1n), revision: PlatformRevision(1n), state: "fresh"}, resource: {authority: "client", id: ResourceId("client-1"), kind: "client"}, summary: PlatformText("open")},
+  ],
+});
+const declarationDecoded = decodePlatformV2Response(
+  responsePayload(listingId, "resource_listing_page", declarationOrdered),
+  listingId,
+  "list_resources",
+);
+if (declarationDecoded.kind !== "resource_listing_page" || declarationDecoded.page.items.length !== 4) {
+  throw new Error("declaration-ordered listing page");
+}
+expectWireRefusal("listing page ordered by spelling", () => decodePlatformV2Response(
+  responsePayload(listingId, "resource_listing_page", encoder.encode(
+    new TextDecoder().decode(declarationOrdered)
+      .replace('{"freshness":{"observed_at":1,"revision":1,"state":"fresh"},"resource":{"authority":"automonique","id":"session-1","kind":"session"},"summary":"open"},{"freshness":{"observed_at":1,"revision":1,"state":"fresh"},"resource":{"authority":"automonique","id":"approval-1","kind":"approval"},"summary":"open"}',
+        '{"freshness":{"observed_at":1,"revision":1,"state":"fresh"},"resource":{"authority":"automonique","id":"approval-1","kind":"approval"},"summary":"open"},{"freshness":{"observed_at":1,"revision":1,"state":"fresh"},"resource":{"authority":"automonique","id":"session-1","kind":"session"},"summary":"open"}'),
+  )),
+  listingId,
+  "list_resources",
 ));
 
 const attentionId = PlatformRequestId("transport-attention");

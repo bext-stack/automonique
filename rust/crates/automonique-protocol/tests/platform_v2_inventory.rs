@@ -410,3 +410,72 @@ fn a_page_body_whose_two_limits_disagree_is_refused_by_the_decoder() {
     assert_ne!(hostile, text);
     assert!(decode_resource_listing_page(hostile.as_bytes()).is_err());
 }
+
+#[test]
+fn coordinates_order_by_declaration_and_not_by_their_spelling() {
+    // `client` follows `github` in the v1 authority vocabulary and precedes it
+    // alphabetically; `approval` follows `session` in the kind vocabulary and
+    // precedes it alphabetically. A page ordered by the wire spellings would be
+    // ordered wrongly, and a decoder that checked the spellings would reject a
+    // page the server built correctly.
+    let github = ResourceRecord {
+        resource: ResourceCoordinate::new(
+            ResourceAuthority::GitHub,
+            ResourceKind::Repository,
+            ResourceId::new("repo-1").unwrap(),
+        ),
+        ..record(ResourceKind::Approval, "unused", 1, "open")
+    };
+    let client = ResourceRecord {
+        resource: ResourceCoordinate::new(
+            ResourceAuthority::Client,
+            ResourceKind::Client,
+            ResourceId::new("client-1").unwrap(),
+        ),
+        ..record(ResourceKind::Approval, "unused", 1, "open")
+    };
+    assert!(github.resource < client.resource);
+    assert!(
+        ResourceListingPage::new(
+            4,
+            4,
+            None,
+            None,
+            false,
+            vec![github.clone(), client.clone()],
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        ResourceListingPage::new(
+            4,
+            4,
+            None,
+            None,
+            false,
+            vec![client.clone(), github.clone()]
+        ),
+        Err(ResourceListingError::PageOrderInvalid)
+    );
+
+    let session = record(ResourceKind::Session, "session-1", 1, "open");
+    let approval = record(ResourceKind::Approval, "approval-1", 1, "open");
+    assert!(session.resource < approval.resource);
+
+    // And the pager emits that order, so the two agree by construction.
+    let listed = page(
+        page_authorized_resources(
+            &query(8, None),
+            &authorized(&[client, approval, session, github]),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        listed
+            .items()
+            .iter()
+            .map(|item| item.resource.id.as_str().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["session-1", "approval-1", "repo-1", "client-1"],
+    );
+}
