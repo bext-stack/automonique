@@ -101,16 +101,32 @@ pub fn candidate_manifests(executable: &Path) -> Vec<PathBuf> {
         return candidates;
     };
     candidates.push(root.join("manifest.json"));
-    if let Ok(target) = std::fs::read_link(root.join("current")) {
-        let resolved = if target.is_absolute() {
-            target
-        } else {
-            root.join(target)
-        };
-        candidates.push(resolved.join("manifest.json"));
-    }
+    push_through_current(&mut candidates, root);
+    // The daemon activates its own releases under `improvement-code/`, not at
+    // the state root, so a daemon installed into `<root>/bin` is described by a
+    // manifest one level deeper than the three paths above reach. Without this
+    // the check reports `release.missing` for every daemon deployment, which
+    // reads as "no manifest exists" when one does and is being honoured.
+    push_through_current(&mut candidates, &root.join("improvement-code"));
     candidates.dedup();
     candidates
+}
+
+/// Add the manifest reached through `<root>/current`, when that link exists.
+///
+/// The link is read, never traversed: the manifest reader refuses a symlinked
+/// path, so resolving it here and handing over the resolved directory is what
+/// lets a release still be found through its selector.
+fn push_through_current(candidates: &mut Vec<PathBuf>, root: &Path) {
+    let Ok(target) = std::fs::read_link(root.join("current")) else {
+        return;
+    };
+    let resolved = if target.is_absolute() {
+        target
+    } else {
+        root.join(target)
+    };
+    candidates.push(resolved.join("manifest.json"));
 }
 
 /// Compare every reachable manifest against the running image.
@@ -217,6 +233,34 @@ mod tests {
                 root.path().join("manifest.json"),
                 root.path().join("releases/one/manifest.json"),
             ]
+        );
+    }
+
+    #[test]
+    fn a_daemon_release_is_found_through_its_improvement_code_selector() {
+        // The daemon activates under `improvement-code/`, so its manifest sits
+        // one level deeper than a web entry's. Reached in the live layout this
+        // is the difference between doctor validating the deployment and
+        // reporting `release.missing` while a manifest is being honoured.
+        let root = tempfile::tempdir().expect("root");
+        let executable = root.path().join("bin/automonique");
+        std::fs::create_dir_all(executable.parent().expect("bin")).expect("bin");
+        std::fs::create_dir_all(root.path().join("improvement-code")).expect("activation root");
+        std::os::unix::fs::symlink(
+            "releases/9ec663ba",
+            root.path().join("improvement-code/current"),
+        )
+        .expect("pointer");
+
+        let candidates = candidate_manifests(&executable);
+
+        assert!(
+            candidates.contains(
+                &root
+                    .path()
+                    .join("improvement-code/releases/9ec663ba/manifest.json")
+            ),
+            "the daemon's activated release must be reachable, got {candidates:?}"
         );
     }
 
