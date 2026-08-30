@@ -8,6 +8,7 @@ import {
   PLATFORM_NEGOTIATION_MAJOR,
   PLATFORM_NEGOTIATION_PROTOCOL,
   PLATFORM_V2_MAJOR,
+  ResourceListingCursor,
   ReviewConfirmationDigest,
   ReviewReceiptCorrelationDigest,
   decodePlatformNegotiationRequest,
@@ -75,7 +76,7 @@ const fixture = readFileSync(
   "../../../../rust/crates/automonique-protocol/fixtures/platform-v2-transport-v1.txt",
   "utf8",
 ).trimEnd().split("\n");
-if (fixture.length !== 4) throw new Error("transport fixture line count");
+if (fixture.length !== 6) throw new Error("transport fixture line count");
 
 const offer: PlatformVersionOffer = {
   schema: PLATFORM_NEGOTIATION_SCHEMA_V1,
@@ -204,6 +205,61 @@ encodePlatformV2Request(v2Id, {
     workspace: {kind: "user_workspace", id: UserWorkspaceId("workspace-1")},
   },
 });
+
+// The bounded resource listing, held to the same Rust bytes as everything
+// else on this wire. The request asks for 512, over the server's ceiling; the
+// page answers with the server's 128 beside the caller's 512, and the decoder
+// re-derives the clamp rather than believing it.
+const listingId = PlatformRequestId("transport-listing");
+const listingQuery = {
+  after: null,
+  authorities: ["automonique"] as const,
+  kinds: ["approval"] as const,
+  requested_limit: 512n,
+};
+const listingRequest = encodePlatformV2Request(listingId, {kind: "list_resources", query: listingQuery});
+if (new TextDecoder().decode(listingRequest) !== fixture[4]) throw new Error("listing request bytes drifted from Rust");
+const listingPageMessage = encoder.encode(fixture[5]!);
+const decodedListing = decodePlatformV2Response(listingPageMessage, listingId, "list_resources");
+if (decodedListing.kind !== "resource_listing_page"
+  || decodedListing.page.requested_limit !== 512n
+  || decodedListing.page.granted_limit !== 128n
+  || decodedListing.page.items.length !== 1
+  || decodedListing.page.items[0]?.resource.id !== "approval-1"
+  || decodedListing.page.next_cursor === null) {
+  throw new Error("listing page response");
+}
+const listingText = fixture[5]!;
+for (const [label, hostile] of [
+  // A bound the server would never have applied to this request.
+  ["listing clamp disagreement", listingText.replace('"granted_limit":128', '"granted_limit":64')],
+  // More records than the page says it granted.
+  ["listing page over its bound", listingText.replace('"granted_limit":128', '"granted_limit":0')],
+  // `has_more` and the cursor must agree.
+  ["listing continuation incoherent", listingText.replace('"has_more":true', '"has_more":false')],
+  ["listing unknown field", listingText.replace('"after":null,', '"after":null,"project":"project-1",')],
+  ["listing wrong schema", listingText.replace("automonique.platform/inventory/v1", "automonique.platform/v2")],
+] as const) {
+  expectWireRefusal(label, () => decodePlatformV2Response(encoder.encode(hostile), listingId, "list_resources"));
+}
+// A resync is its own answer to the same request, and it names the cursor that
+// expired rather than an empty page.
+const expiredCursor = ResourceListingCursor(`rl2.${"a".repeat(64)}.${"b".repeat(64)}.1`);
+const listingResync = responsePayload(listingId, "resource_listing_resync", encoder.encode(JSON.stringify({
+  expired_after: expiredCursor,
+  outcome: "resync_required",
+  schema: "automonique.platform/inventory/v1",
+  version: 2,
+})));
+const decodedResync = decodePlatformV2Response(listingResync, listingId, "list_resources");
+if (decodedResync.kind !== "resource_listing_resync" || decodedResync.resync.expired_after !== expiredCursor) {
+  throw new Error("listing resync response");
+}
+expectWireRefusal("listing page answering another request", () => decodePlatformV2Response(
+  listingPageMessage,
+  listingId,
+  "get_work_context",
+));
 
 const attentionId = PlatformRequestId("transport-attention");
 const attentionRequest = encodePlatformV2Request(attentionId, {

@@ -729,6 +729,36 @@ function resourceListingResync(value: JsonValue): ResourceListingResync {
   return {expired_after: ResourceListingCursor(stringField(body, "expired_after"))};
 }
 
+// Rendering a listing answer is the server's half of the contract, exported so
+// a deterministic fixture builds the same bytes the daemon would rather than a
+// hand-written approximation of them. Both validate before they render: a
+// fixture that could emit a page the decoder refuses would be testing nothing.
+export function encodeResourceListingPage(page: ResourceListingPage): Uint8Array {
+  if (page.granted_limit !== grantedResourceListingLimit(page.requested_limit) || page.requested_limit < 1n || page.requested_limit > 65535n) throw new WireError("invalid_json_value", "resource listing page bound");
+  if (BigInt(page.items.length) > page.granted_limit) throw new WireError("invalid_json_value", "resource listing page items");
+  if (page.has_more !== (page.next_cursor !== null) || (page.has_more && page.items.length === 0) || (page.after !== null && page.after === page.next_cursor)) throw new WireError("invalid_json_value", "resource listing page cursor");
+  const bytes = bodyBytes(json({
+    after: page.after === null ? null : ResourceListingCursor(page.after),
+    granted_limit: page.granted_limit,
+    has_more: page.has_more,
+    items: page.items.map((item) => ({freshness: {observed_at: item.freshness.observed_at, revision: item.freshness.revision, state: item.freshness.state}, resource: {authority: item.resource.authority, id: item.resource.id, kind: item.resource.kind}, summary: item.summary})),
+    next_cursor: page.next_cursor === null ? null : ResourceListingCursor(page.next_cursor),
+    requested_limit: page.requested_limit,
+    schema: PLATFORM_INVENTORY_SCHEMA_V1,
+    version: BigInt(PLATFORM_INVENTORY_REQUIRES_PLATFORM_MAJOR),
+  }));
+  if (bytes.length > MAX_RESOURCE_LISTING_PAGE_CANONICAL_BYTES) throw new WireError("frame_too_large", `maximum is ${MAX_RESOURCE_LISTING_PAGE_CANONICAL_BYTES}`);
+  return bytes;
+}
+export function encodeResourceListingResync(resync: ResourceListingResync): Uint8Array {
+  return bodyBytes(json({
+    expired_after: ResourceListingCursor(resync.expired_after),
+    outcome: "resync_required",
+    schema: PLATFORM_INVENTORY_SCHEMA_V1,
+    version: BigInt(PLATFORM_INVENTORY_REQUIRES_PLATFORM_MAJOR),
+  }));
+}
+
 export function encodePlatformNegotiationRequest(requestId: PlatformRequestIdValue, request: PlatformNegotiationRequest): Uint8Array {
   if (request.kind !== "negotiate") throw new WireError("invalid_json_value", "negotiation kind");
   return message(PLATFORM_NEGOTIATION_PROTOCOL, PLATFORM_NEGOTIATION_MAJOR, requestId, request.kind, document(encodePlatformVersionOffer(request.offer)), MAX_PLATFORM_NEGOTIATION_REQUEST_CANONICAL_BYTES);

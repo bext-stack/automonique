@@ -34,6 +34,8 @@ import {
   encodeNegotiatedPlatform,
   encodePlatformNegotiationRequest,
   encodePlatformV2Request as encodePlatformV2FixtureRequest,
+  encodeResourceListingPage,
+  encodeResourceListingResync,
   encodeReviewActionReceipt,
   encodeReviewSnapshot,
   encodeWorkContextMutationPreview,
@@ -300,6 +302,8 @@ function encodeV2FixtureResponse(requestId: string, response: PlatformV2Response
     case "lifecycle_capabilities": body = json(response.capabilities); break;
     case "work_context_page": body = parseCanonical(encodeWorkContextPage(response.page)); break;
     case "work_context_resync": body = parseCanonical(encodeWorkContextResync(response.resync)); break;
+    case "resource_listing_page": body = parseCanonical(encodeResourceListingPage(response.page)); break;
+    case "resource_listing_resync": body = parseCanonical(encodeResourceListingResync(response.resync)); break;
     case "work_context_record": body = json(validateWorkContextRecord(response.record)); break;
     case "mutation_preview": body = parseCanonical(encodeWorkContextMutationPreview(response.preview)); break;
     case "mutation_approval": case "mutation_receipt": body = parseCanonical(response.kind === "mutation_approval" ? response.approval.canonical : response.receipt.canonical); break;
