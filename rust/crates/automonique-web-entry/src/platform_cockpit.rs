@@ -3282,6 +3282,9 @@ mod tests {
                 "`{family}` is neither commanded nor named as uncommanded"
             );
         }
+        // The three families #224 was opened about, named here as the
+        // regression rather than as the fence: the rules above are what hold
+        // the projection, and they hold it for families nobody has written yet.
         assert!(uncommanded.contains(&"send_comment_to_agent"));
         assert!(uncommanded.contains(&"batch_send_comments_to_agent"));
         assert!(uncommanded.contains(&"merge_pull_request"));
