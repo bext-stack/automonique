@@ -243,7 +243,11 @@ fn configure_v2(config: &DaemonConfig) {
                 "filesystem": [], "credentials": [], "network": [],
                 "tools": [], "providers": [], "models": []
             },
-            "review_authorities": {"ci": "authority-1", "review": "authority-1"}
+            "review_authorities": {"ci": "authority-1", "review": "authority-1"},
+            "resource_reads": [
+                {"authority": "automonique", "kind": "client"},
+                {"authority": "automonique", "kind": "node"}
+            ]
         }]
     });
     let path = config.platform_v2_policy_path();
@@ -5386,5 +5390,119 @@ fn managed_request_worker_reconciles_a_typed_provider_refusal() {
             .as_str(),
         "run_not_configured"
     );
+    serving.shutdown(&config);
+}
+
+#[test]
+fn a_live_listing_pages_the_granted_classes_and_withholds_the_rest() {
+    // End to end over the real socket: the daemon refreshes every projected
+    // class, the policy grant decides per record what this principal sees, and
+    // the walk is bounded by the server rather than by what the caller could
+    // name. This is the primitive Platform v1 never had (#220).
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    configure_v2(&config);
+    let serving = serve(&config);
+
+    let mut seen: Vec<automonique_protocol::platform::ResourceCoordinate> = Vec::new();
+    let mut after = None;
+    let mut pages = 0_usize;
+    for index in 0..16 {
+        let request = automonique_protocol::platform_v2_inventory::ResourceListingQuery::new(
+            Vec::new(),
+            Vec::new(),
+            after.clone(),
+            2,
+        )
+        .unwrap();
+        let PlatformV2Response::ResourceListingPage(page) = platform_v2(
+            &config,
+            &format!("v2-listing-{index}"),
+            PlatformV2Request::ListResources(request),
+        ) else {
+            panic!("expected a bounded listing page");
+        };
+        pages += 1;
+        assert_eq!(page.requested_limit(), 2);
+        assert_eq!(
+            page.granted_limit(),
+            2,
+            "under the ceiling nothing is clamped"
+        );
+        assert!(page.items().len() <= 2);
+        seen.extend(page.items().iter().map(|item| item.resource.clone()));
+        match page.next_cursor() {
+            Some(cursor) => after = Some(cursor.clone()),
+            None => break,
+        }
+    }
+    assert!(pages > 1, "a bounded page walked rather than one snapshot");
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), seen.len(), "no record was served twice");
+    assert!(
+        seen.iter()
+            .any(|resource| resource.kind == automonique_protocol::platform::ResourceKind::Node),
+        "the refresh ran for a class the caller never named"
+    );
+    assert!(
+        seen.iter()
+            .any(|resource| resource.kind == automonique_protocol::platform::ResourceKind::Client),
+        "the action catalogue is a granted class"
+    );
+    assert!(
+        seen.iter().all(|resource| resource.authority
+            == automonique_protocol::platform::ResourceAuthority::Automonique
+            && matches!(
+                resource.kind,
+                automonique_protocol::platform::ResourceKind::Client
+                    | automonique_protocol::platform::ResourceKind::Node
+            )),
+        "an ungranted class reached the page: {seen:?}"
+    );
+
+    // A class the policy withholds answers with nothing, which is the same
+    // answer as a granted class that happens to be empty.
+    let PlatformV2Response::ResourceListingPage(withheld) = platform_v2(
+        &config,
+        "v2-listing-withheld",
+        PlatformV2Request::ListResources(
+            automonique_protocol::platform_v2_inventory::ResourceListingQuery::new(
+                Vec::new(),
+                vec![automonique_protocol::platform::ResourceKind::Approval],
+                None,
+                8,
+            )
+            .unwrap(),
+        ),
+    ) else {
+        panic!("expected a bounded listing page");
+    };
+    assert!(withheld.items().is_empty());
+    assert!(!withheld.has_more());
+
+    // Over the ceiling is admissible and answered with the server's page.
+    let PlatformV2Response::ResourceListingPage(clamped) = platform_v2(
+        &config,
+        "v2-listing-clamped",
+        PlatformV2Request::ListResources(
+            automonique_protocol::platform_v2_inventory::ResourceListingQuery::new(
+                Vec::new(),
+                Vec::new(),
+                None,
+                4_096,
+            )
+            .unwrap(),
+        ),
+    ) else {
+        panic!("expected a bounded listing page");
+    };
+    assert_eq!(clamped.requested_limit(), 4_096);
+    assert_eq!(
+        usize::from(clamped.granted_limit()),
+        automonique_protocol::platform_v2_inventory::MAX_RESOURCE_LISTING_PAGE_ITEMS,
+    );
+
     serving.shutdown(&config);
 }
