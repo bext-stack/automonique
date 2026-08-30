@@ -14,6 +14,11 @@ publish.workspace = true
 # cannot own a normalizer, and the daemon is the composition root that holds
 # both. See `progress`. No third-party crate enters the graph with it.
 automonique-agents = { path = "../automonique-agents" }
+# The release builder tells each compilation which commit it is building, using
+# the same variable name the build script that reads it is compiled from. One
+# constant rather than two literals: a rename that reached only one of them
+# would silently return releases to guessing their own revision.
+automonique-build-identity = { path = "../automonique-build-identity" }
 automonique-core = { path = "../automonique-core" }
 # The execution lane starts one loopback CONNECT broker per run that needs
 # egress, so the daemon composes the broker rather than merely describing one.

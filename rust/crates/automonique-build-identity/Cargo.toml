@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Elastic-2.0
+
+[package]
+name = "automonique-build-identity"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+# Nothing here participates in *establishing* the identity — every value this
+# crate reports is a literal placed by `build.rs` at compile time, so no file,
+# socket or library can make a build disagree with the bytes it was compiled
+# from. `serde_json` is here only to render that identity, once, for the two
+# surfaces that publish it; it is already in the graph of every consumer.
+[dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

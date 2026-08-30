@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import shlex
 import tempfile
 import unittest
 import unittest.mock
@@ -283,6 +284,119 @@ class BuildAttributionTest(unittest.TestCase):
     def test_no_release_root_blocks_rather_than_failing(self) -> None:
         result = live.check_build_attribution(live.build_identity(None, None))
         self.assertEqual(result["state"], "blocked")
+
+
+class SelfReportedBuildTest(unittest.TestCase):
+    """A binary that names itself is attributable with no manifest at all."""
+
+    REVISION = "39747eaf63f32ad43e3cb045b36bd6fbaed46cf6"
+    OTHER = "d5666f9c85080609f58f2d201dbe15ae1b8fcbb3"
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.temporary.name)
+        self.binary = self.root / "bin" / "automonique-web-entry"
+        self.binary.parent.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def install(self, script: str) -> None:
+        """Stand in for the deployed entry, answering only the identity flag."""
+        self.binary.write_text("#!/bin/sh\n" + script + "\n", encoding="utf-8")
+        self.binary.chmod(0o700)
+        self.digest = live.digest(self.binary)
+
+    def answering(self, revision: str | None, provenance: str) -> None:
+        document = json.dumps(
+            {
+                "schema": live.BUILD_IDENTITY_SCHEMA,
+                "source_revision": revision,
+                "provenance": provenance,
+                "build_target": "x86_64-unknown-linux-gnu",
+            }
+        )
+        self.install("printf '%s' " + shlex.quote(document))
+
+    def manifest(self, relative: str, binary_sha256: str, source_sha: str) -> None:
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": "automonique.web-entry-release/v1",
+                    "source_sha": source_sha,
+                    "binary_sha256": binary_sha256,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_a_committed_build_resolves_itself_without_any_manifest(self) -> None:
+        self.answering(self.REVISION, "committed")
+        described = live.describe_build(self.root, "hosted")
+        self.assertEqual(described["source_attribution"], "resolved")
+        self.assertEqual(described["source_revision"], self.REVISION)
+        self.assertEqual(described["release_manifests_inspected"], 0)
+
+    def test_a_modified_build_names_nothing_it_can_be_signed_off_against(self) -> None:
+        self.answering(self.REVISION, "modified")
+        described = live.describe_build(self.root, "hosted")
+        self.assertFalse(described["self_reported"]["attributable"])
+        self.assertEqual(described["source_attribution"], "unresolved")
+        # The head it sat on is still recorded. It is just not an attribution.
+        self.assertEqual(described["self_reported"]["source_revision"], self.REVISION)
+
+    def test_an_unknown_build_is_unresolved_rather_than_guessed_at(self) -> None:
+        self.answering(None, "unknown")
+        described = live.describe_build(self.root, "hosted")
+        self.assertEqual(described["source_attribution"], "unresolved")
+        self.assertIsNone(described["self_reported"]["source_revision"])
+
+    def test_a_binary_predating_the_flag_says_so_instead_of_failing_silently(
+        self,
+    ) -> None:
+        self.install("exit 64")
+        described = live.describe_build(self.root, "hosted")
+        self.assertEqual(described["self_reported"]["state"], "unavailable")
+        self.assertIn("predates", described["self_reported"]["reason"])
+        self.assertEqual(described["source_attribution"], "unresolved")
+
+    def test_a_non_json_or_foreign_schema_answer_is_not_believed(self) -> None:
+        self.install("echo not-json")
+        self.assertEqual(live.self_reported_build(self.binary)["state"], "unavailable")
+        self.install("printf '%s' " + shlex.quote('{"schema":"something.else/v1"}'))
+        self.assertEqual(live.self_reported_build(self.binary)["state"], "unavailable")
+
+    def test_a_manifest_naming_another_revision_for_these_bytes_contradicts(
+        self,
+    ) -> None:
+        self.answering(self.REVISION, "committed")
+        self.manifest("manifest.json", self.digest, self.OTHER)
+        described = live.describe_build(self.root, "hosted")
+        self.assertEqual(described["source_attribution"], "contradicted")
+        result = live.check_build_attribution({"hosted": described})
+        self.assertEqual(result["state"], "failed")
+        self.assertIn("disagree", result["reason"])
+
+    def test_a_manifest_agreeing_with_the_binary_resolves_without_complaint(
+        self,
+    ) -> None:
+        self.answering(self.REVISION, "committed")
+        self.manifest("manifest.json", self.digest, self.REVISION)
+        described = live.describe_build(self.root, "hosted")
+        self.assertEqual(described["source_attribution"], "resolved")
+        self.assertEqual(described["source_revision"], self.REVISION)
+
+    def test_a_stale_manifest_for_other_bytes_does_not_contradict(self) -> None:
+        # The live defect: `bin/` replaced, the release pointer never moved. The
+        # manifest describes another binary, so it says nothing about this one,
+        # and the binary's own answer stands.
+        self.answering(self.REVISION, "committed")
+        self.manifest("releases/a/manifest.json", "00" * 32, self.OTHER)
+        described = live.describe_build(self.root, "hosted")
+        self.assertEqual(described["source_attribution"], "resolved")
+        self.assertEqual(described["source_revision"], self.REVISION)
 
 
 class SignOffTest(unittest.TestCase):

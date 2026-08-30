@@ -8,6 +8,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The web entry answers `/api/build` from a literal compiled into it, so a
+# deployed entry can name its own revision without a file beside it.
+automonique-build-identity = { path = "../automonique-build-identity" }
 automonique-cli = { path = "../automonique-cli" }
 automonique-core = { path = "../automonique-core" }
 automonique-daemon = { path = "../automonique-daemon" }

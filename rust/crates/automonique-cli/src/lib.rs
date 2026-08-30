@@ -2,6 +2,7 @@
 
 //! Closed product command dispatch and bounded local synthetic intake.
 
+use automonique_build_identity::{BuildIdentity, Provenance};
 use automonique_protocol::{
     CheckStatus, DoctorCheck, DoctorReason, DoctorReportError, DoctorReportV1, FindingCode,
     FindingMessage,
@@ -14,6 +15,7 @@ use std::time::{Duration, Instant};
 mod admin_client;
 mod approval;
 mod attempt;
+mod attribution;
 mod audit;
 mod automation;
 mod batch;
@@ -29,6 +31,7 @@ mod runs;
 mod sandbox_probe;
 mod supervisor;
 
+pub use attribution::{ReleaseAttribution, attribute_release, candidate_manifests};
 pub use diagnostics::{
     inspect_admin_socket, inspect_control_plane, inspect_process_control, inspect_state_filesystem,
 };
@@ -38,8 +41,9 @@ pub use kernel::{
     inspect_cgroup_v2_enabled_controllers, inspect_landlock_support, inspect_max_user_namespaces,
 };
 pub use release::{
-    InspectedRelease, InspectedVersionRange, MAX_RELEASE_MANIFEST_BYTES, ReleaseInspection,
-    ReleaseInspectionStatus, ReleaseIssue, inspect_release_manifest_structure,
+    AttributionInspection, InspectedAttribution, InspectedRelease, InspectedVersionRange,
+    MAX_RELEASE_MANIFEST_BYTES, ReleaseInspection, ReleaseInspectionStatus, ReleaseIssue,
+    inspect_release_attribution, inspect_release_manifest_structure,
 };
 pub use sandbox_probe::{inspect_sandbox_enforcement, sandbox_probe_child};
 pub use supervisor::inspect_supervisor_adapter;
@@ -51,13 +55,16 @@ use std::os::unix::fs::MetadataExt;
 
 const MAX_RUNTIME_PATH_BYTES: usize = 4_096;
 const MAX_RUNTIME_COMPONENTS: usize = 256;
-const USAGE: &str = "usage: automonique doctor [--json]\n       automonique status [--json]\n       automonique metrics\n       automonique generations\n       automonique reload <sha256:manifest-digest> [--wait]\n       automonique rollback [--wait]\n       automonique reload-status <reload-id>\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique run submit <idempotency-key> < run-spec.bin\n       automonique runs list [--state <state>]... [--cursor <submission-id>] [--page <size>]\n       automonique runs detail <run-id>\n       automonique runs tail <spool-root> <run-id> [cursor]\n       automonique automation register <automation-id> <actor> --schedule <once@ms|every@ms|hourly> --scope <scope> --prompt <text>\n           (every@ms is at least 1000; pausing an automation skips a queued instant for good, so a once@ job paused before it starts is consumed)\n       automonique automation pause <automation-id> <revision> <actor> <cause>\n       automonique automation resume <automation-id> <revision> <actor>\n       automonique automation archive <automation-id> <revision> <actor> <cause>\n       automonique automation list [--state <state>]... [--cursor <entry-id>] [--page <size>]\n       automonique automation detail <automation-id>\n       automonique approval record <approval-key> <subject> <granted|denied> <decider>\n       automonique approval list [--cursor <entry-id>] [--page <size>]\n       automonique approval detail <approval-key>\n       automonique approval by-subject <subject> [--cursor <entry-id>] [--page <size>]\n       automonique batch register <batch-id> [--label <label>] [--sequential | --parallel <ceiling>] <member-key>...\n       automonique batch advance <batch-id> <member-key> <revision> <state> <last-sequence>\n       automonique batch list [--cursor <entry-id>] [--page <size>]\n       automonique batch detail <batch-id>\n       automonique parity compare <database> <scope> [--registry <path>] [--category <category>]\n       automonique parity score <database> <scope>\n       automonique parity gate <database> <scope> <decision-key> <decider> [--registry <path>]\n       automonique audit verify <database>\n       automonique cancel <run-id> <request-ref> [observed-sequence]\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique progress subscribe <socket-path> <run-id> [cursor]\n       automonique shutdown\n";
+const USAGE: &str = "usage: automonique doctor [--json]\n       automonique build-identity [--json]\n       automonique status [--json]\n       automonique metrics\n       automonique generations\n       automonique reload <sha256:manifest-digest> [--wait]\n       automonique rollback [--wait]\n       automonique reload-status <reload-id>\n       automonique submit <scope> <idempotency-key> < task.txt\n       automonique reconcile inspect <run-id>\n       automonique reconcile fail <run-id> <generation-id> <epoch> <revision> <decision-key>\n       automonique outbox inspect <outbox-id>\n       automonique outbox reconcile <delivered|dead-letter> <outbox-id> <generation-id> <epoch> <attempt> <revision> < receipt-or-reason.txt\n       automonique run submit <idempotency-key> < run-spec.bin\n       automonique runs list [--state <state>]... [--cursor <submission-id>] [--page <size>]\n       automonique runs detail <run-id>\n       automonique runs tail <spool-root> <run-id> [cursor]\n       automonique automation register <automation-id> <actor> --schedule <once@ms|every@ms|hourly> --scope <scope> --prompt <text>\n           (every@ms is at least 1000; pausing an automation skips a queued instant for good, so a once@ job paused before it starts is consumed)\n       automonique automation pause <automation-id> <revision> <actor> <cause>\n       automonique automation resume <automation-id> <revision> <actor>\n       automonique automation archive <automation-id> <revision> <actor> <cause>\n       automonique automation list [--state <state>]... [--cursor <entry-id>] [--page <size>]\n       automonique automation detail <automation-id>\n       automonique approval record <approval-key> <subject> <granted|denied> <decider>\n       automonique approval list [--cursor <entry-id>] [--page <size>]\n       automonique approval detail <approval-key>\n       automonique approval by-subject <subject> [--cursor <entry-id>] [--page <size>]\n       automonique batch register <batch-id> [--label <label>] [--sequential | --parallel <ceiling>] <member-key>...\n       automonique batch advance <batch-id> <member-key> <revision> <state> <last-sequence>\n       automonique batch list [--cursor <entry-id>] [--page <size>]\n       automonique batch detail <batch-id>\n       automonique parity compare <database> <scope> [--registry <path>] [--category <category>]\n       automonique parity score <database> <scope>\n       automonique parity gate <database> <scope> <decision-key> <decider> [--registry <path>]\n       automonique audit verify <database>\n       automonique cancel <run-id> <request-ref> [observed-sequence]\n       automonique attempt heartbeat <socket-path>\n       automonique attempt inspect <socket-path> <attempt-id>\n       automonique attempt events <socket-path> <attempt-id> [cursor]\n       automonique attempt cancel <socket-path> <attempt-id> <request-ref>\n       automonique progress subscribe <socket-path> <run-id> [cursor]\n       automonique shutdown\n";
 const RELOAD_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 const RELOAD_WAIT_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 enum Command {
     Doctor {
+        json: bool,
+    },
+    BuildIdentity {
         json: bool,
     },
     Status {
@@ -149,6 +156,14 @@ where
         (Some(command), None, None, None) if command == "doctor" => Command::Doctor { json: false },
         (Some(command), Some(flag), None, None) if command == "doctor" && flag == "--json" => {
             Command::Doctor { json: true }
+        }
+        (Some(command), None, None, None) if command == "build-identity" => {
+            Command::BuildIdentity { json: false }
+        }
+        (Some(command), Some(flag), None, None)
+            if command == "build-identity" && flag == "--json" =>
+        {
+            Command::BuildIdentity { json: true }
         }
         (Some(command), None, None, None) if command == "status" => Command::Status { json: false },
         (Some(command), Some(flag), None, None) if command == "status" && flag == "--json" => {
@@ -676,6 +691,10 @@ where
         }
         Command::Progress(operation) => {
             return progress::run(&operation, &mut stdout, &mut stderr);
+        }
+        Command::BuildIdentity { json } => {
+            let rendered = render_build_identity(&BuildIdentity::current(), json);
+            return u8::from(stdout.write_all(&rendered).is_err());
         }
         Command::Doctor { json } => json,
     };
@@ -1509,18 +1528,54 @@ fn inspect_doctor(runtime: Option<&OsStr>) -> Result<DoctorReportV1, DoctorRepor
         inspect_sandbox_enforcement(),
         inspect_max_user_namespaces(Path::new("/proc/sys/user/max_user_namespaces")),
         inspect_local_release(),
+        inspect_build_identity(),
         inspect_supervisor_adapter(runtime),
         inspect_structured_journal(runtime),
     ])
 }
 
+/// Report what this build says it was made from.
+///
+/// Separate from the manifest check on purpose: this one is answerable on a
+/// host with no release manifest at all, because nothing it reads lives outside
+/// the binary. It is the check that stays true when a deployment procedure
+/// replaces an executable and forgets everything around it.
+///
+/// A build over a modified tree is a finding rather than a note. It is the
+/// exact condition under which an acceptance record cannot name what it
+/// accepted, and a host that is serving one should say so out loud.
+fn inspect_build_identity() -> DoctorCheck {
+    match BuildIdentity::current().provenance() {
+        Provenance::Declared | Provenance::Committed => healthy_check("release.build-identity"),
+        Provenance::Modified => typed_check(
+            "release.build-identity",
+            CheckStatus::Finding,
+            "release.build-uncommitted-tree",
+            "This build was made over uncommitted changes and is no source revision",
+        ),
+        Provenance::Unknown => typed_check(
+            "release.build-identity",
+            CheckStatus::Unavailable,
+            "release.build-revision-unknown",
+            "This build carries no source revision; run `automonique build-identity`",
+        ),
+    }
+}
+
+/// Report whether a release manifest on this host describes the running binary.
+///
+/// The comparison is a digest, not a parse. A structurally perfect manifest
+/// that describes a different build is worse than no manifest at all, because
+/// it is believed, and that is the case this check exists to name.
+///
+/// The structural reading this check used to perform is still available and
+/// still tested — [`inspect_release_manifest_structure`] — but it is not the
+/// question a host needs answered. "Is this document a well-formed manifest"
+/// and "is this document about the binary in front of me" have different
+/// answers on a host where a deployment replaced one and not the other, and
+/// only the second one distinguishes a live release from a stale pointer.
 fn inspect_local_release() -> DoctorCheck {
-    let Some(path) = std::env::current_exe().ok().and_then(|executable| {
-        executable
-            .parent()?
-            .parent()
-            .map(|root| root.join("manifest.json"))
-    }) else {
+    let Ok(executable) = std::env::current_exe() else {
         return typed_check(
             "release.manifest-structure",
             CheckStatus::Unavailable,
@@ -1528,26 +1583,64 @@ fn inspect_local_release() -> DoctorCheck {
             "Release manifest location is unavailable",
         );
     };
-    match inspect_release_manifest_structure(&path) {
-        ReleaseInspection::Structured(_) => DoctorCheck::new(
-            FindingCode::new("release.manifest-structure").expect("constant check code is valid"),
-            CheckStatus::Healthy,
-            None,
-        )
-        .expect("constant healthy check is coherent"),
-        ReleaseInspection::Finding(issue) => typed_check(
+    let identity = BuildIdentity::current();
+    let attribution = attribute_release(
+        &candidate_manifests(&executable),
+        attribution::running_image_digest().as_deref(),
+        identity.attributable_revision(),
+    );
+    match attribution {
+        ReleaseAttribution::Confirmed => healthy_check("release.manifest-structure"),
+        ReleaseAttribution::DescribesAnotherBuild => typed_check(
             "release.manifest-structure",
             CheckStatus::Finding,
-            issue.code(),
-            issue.message(),
+            "release.describes-another-build",
+            "Release manifest describes a binary that is not the one running",
         ),
-        ReleaseInspection::Unavailable(issue) => typed_check(
+        ReleaseAttribution::RevisionDisagrees => typed_check(
+            "release.manifest-structure",
+            CheckStatus::Finding,
+            "release.revision-disagrees",
+            "Release manifest attributes this binary to a revision it was not built from",
+        ),
+        ReleaseAttribution::DigestUnrecorded => typed_check(
+            "release.manifest-structure",
+            CheckStatus::Finding,
+            "release.binary-digest-unrecorded",
+            "Release manifest records no binary digest, so it describes no particular build",
+        ),
+        ReleaseAttribution::Absent => typed_check(
             "release.manifest-structure",
             CheckStatus::Unavailable,
+            ReleaseIssue::Missing.code(),
+            ReleaseIssue::Missing.message(),
+        ),
+        ReleaseAttribution::Unreadable { issue, finding } => typed_check(
+            "release.manifest-structure",
+            if finding {
+                CheckStatus::Finding
+            } else {
+                CheckStatus::Unavailable
+            },
             issue.code(),
             issue.message(),
         ),
+        ReleaseAttribution::BinaryUnreadable => typed_check(
+            "release.manifest-structure",
+            CheckStatus::Unavailable,
+            "release.running-image-unreadable",
+            "The running image could not be read, so no manifest can be checked against it",
+        ),
     }
+}
+
+fn healthy_check(check_code: &str) -> DoctorCheck {
+    DoctorCheck::new(
+        FindingCode::new(check_code).expect("constant check code is valid"),
+        CheckStatus::Healthy,
+        None,
+    )
+    .expect("constant healthy check is coherent")
 }
 
 fn typed_check(
@@ -1829,6 +1922,25 @@ fn render_json(report: &DoctorReportV1) -> String {
         "checks": checks,
     });
     format!("{document}\n")
+}
+
+/// Render what this build says about itself.
+///
+/// Both renderings come from the build-identity crate rather than being spelled
+/// again here, so this verb and the web entry's `/api/build` cannot drift into
+/// describing the same build differently.
+///
+/// The exit status is success whichever answer comes back. `unknown` is a
+/// successful report about a build with no revision, and turning it into a
+/// failure would teach a caller to treat the honest answer as a malfunction and
+/// go looking for a more confident one.
+fn render_build_identity(identity: &BuildIdentity, json: bool) -> Vec<u8> {
+    if json {
+        let mut document = identity.to_json_document();
+        document.push(b'\n');
+        return document;
+    }
+    identity.to_report("automonique").into_bytes()
 }
 
 fn render_human(report: &DoctorReportV1) -> String {

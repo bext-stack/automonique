@@ -6,6 +6,22 @@ use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+/// The same three facts `/api/build` serves, for a caller standing on the host.
+///
+/// `--json` renders the identical document the HTTP surface returns, byte for
+/// byte, because both come from the same method on the identity. An operator
+/// with shell access and a harness with a credential are never comparing two
+/// renderings of one build.
+fn build_identity_report(json: bool) -> Vec<u8> {
+    let identity = automonique_build_identity::BuildIdentity::current();
+    if json {
+        let mut document = identity.to_json_document();
+        document.push(b'\n');
+        return document;
+    }
+    identity.to_report("automonique web entry").into_bytes()
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -17,6 +33,29 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything is parsed or opened. A deployed binary has to be
+    // answerable about which revision it is *without* the configuration,
+    // sockets and state directories a serving run needs, because the moment
+    // that question matters is usually the moment one of those is in doubt.
+    //
+    // A mode rather than a flag: it is recognised only as the first argument,
+    // and only `--json` may follow it. A serving invocation whose value
+    // happened to be this string can then never be diverted into printing an
+    // identity and exiting instead of binding.
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    match arguments
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["--build-identity", rest @ ..] if rest.is_empty() || rest == ["--json"] => {
+            let report = build_identity_report(rest == ["--json"]);
+            std::io::Write::write_all(&mut std::io::stdout(), &report)?;
+            return Ok(());
+        }
+        _ => {}
+    }
     let mut bind = IpAddr::from([127, 0, 0, 1]);
     let mut port = 18_082_u16;
     let mut auth_config = None;
