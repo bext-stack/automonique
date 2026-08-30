@@ -4,11 +4,23 @@
 from __future__ import annotations
 
 import json
+import shutil
 import unittest
 
 from tools import provider_inventory
 
 CAPTURE_DATE = "2026-08-16"
+
+# `capture_document` shells out to every provider CLI in `PROBES` and refuses
+# the whole capture when one is missing, which is right for an operator running
+# an inventory and wrong for a CI runner that has none of them installed. The
+# precondition is declared here so a runner without the CLIs reports a named
+# skip rather than an error, and so the skip is visible in a `--verbose` log
+# instead of being carved out of the discovery pattern where nobody would see
+# it.
+MISSING_PROVIDER_CLIS = sorted(
+    {probe.argv[0] for probe in provider_inventory.PROBES if shutil.which(probe.argv[0]) is None}
+)
 
 
 class ProviderInventoryTests(unittest.TestCase):
@@ -47,6 +59,10 @@ class ProviderInventoryTests(unittest.TestCase):
         clean = provider_inventory.sanitized(raw)
         self.assertEqual(b"probe\n<REDACTED_PATH>\n", clean)
 
+    @unittest.skipIf(
+        MISSING_PROVIDER_CLIS,
+        f"provider CLIs not installed on this host: {', '.join(MISSING_PROVIDER_CLIS)}",
+    )
     def test_manifest_digests_match_sanitized_artifacts(self) -> None:
         document, files = provider_inventory.capture_document(CAPTURE_DATE)
         self.assertEqual(provider_inventory.SCHEMA, document["schema"])
