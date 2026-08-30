@@ -77,6 +77,26 @@ const MAX_STDERR_BYTES: usize = 4096;
 pub const DEFAULT_READBACK_DEADLINE: Duration = Duration::from_secs(5);
 /// How long a bounded session join waits before detaching the worker thread.
 const SESSION_JOIN_DEADLINE: Duration = Duration::from_secs(5);
+/// How many times a reconcile asks for a non-lazy detach before giving up.
+///
+/// Not superstition, and not a way to turn a red test green. FUSE answers
+/// `RELEASE` asynchronously: the kernel returns from `close(2)` without
+/// waiting for the server's reply, so `umount2(2)` can refuse a mount whose
+/// last descriptor was closed microseconds earlier. That window is narrow and
+/// never opened on an idle host here — 2800 close-then-detach cycles, 2400 of
+/// them starved onto a single core, produced no refusal at all — but on a
+/// loaded CI runner it opened often enough to fail
+/// `tempfs_mount::sequential_writes_each_land_whole_or_fail_whole` roughly
+/// once a week, always after every assertion in that test had already passed.
+///
+/// This cannot hide a real failure. Every attempt re-reads the mount table, so
+/// the retry ends in success only where the mount is genuinely gone, and a
+/// refusal that outlives the budget is returned carrying the diagnostic
+/// `fusermount3` gave for it.
+const UNMOUNT_ATTEMPTS: usize = 5;
+/// Pause between detach attempts. Four of these is the entire cost the retry
+/// adds to a detach that was going to fail anyway.
+const UNMOUNT_RETRY_PAUSE: Duration = Duration::from_millis(20);
 
 /// Why the host cannot mount at all, decided before anything is tried.
 #[derive(Debug)]
@@ -796,7 +816,7 @@ impl MountedTempfs {
             }
         };
         if !already_gone {
-            run_unmount(&self.fusermount, &self.mountpoint, false).or_else(|error| {
+            unmount_with_retry(&self.fusermount, &self.mountpoint).or_else(|error| {
                 // A non-lazy unmount can refuse EBUSY if a descriptor is still
                 // open; on the abort path the connection is already dead, so a
                 // lazy detach is correct and cannot leave a writable mount.
@@ -1414,9 +1434,17 @@ fn receive_descriptor(socket: &UnixStream) -> io::Result<Option<OwnedFd>> {
     Ok(None)
 }
 
+/// Ask `fusermount3` to detach `mountpoint`, and keep whatever it says.
+///
+/// Deliberately without `-q`. The helper's stderr is captured into the error
+/// returned here and never printed, so `-q` bought nothing and cost the
+/// diagnosis: under it `fusermount3` exits 1 with an empty stderr for *every*
+/// failure it has, leaving "not a mountpoint", "not found in /etc/mtab" and
+/// "busy" indistinguishable. [`UnmountError::Refused`] says its stderr is the
+/// reason; that is only true while this stays off.
 fn run_unmount(fusermount: &Path, mountpoint: &Path, lazy: bool) -> Result<(), UnmountError> {
     let mut command = Command::new(fusermount);
-    command.arg("-u").arg("-q");
+    command.arg("-u");
     if lazy {
         command.arg("-z");
     }
@@ -1438,6 +1466,33 @@ fn run_unmount(fusermount: &Path, mountpoint: &Path, lazy: bool) -> Result<(), U
     })
 }
 
+/// Detach `mountpoint` without `MNT_DETACH`, retrying while it is still there.
+///
+/// See [`UNMOUNT_ATTEMPTS`] for why the retry exists and why it cannot turn a
+/// genuine refusal into a success.
+fn unmount_with_retry(fusermount: &Path, mountpoint: &Path) -> Result<(), UnmountError> {
+    let mut attempt = 1;
+    loop {
+        let refusal = match run_unmount(fusermount, mountpoint, false) {
+            Ok(()) => return Ok(()),
+            Err(refusal) => refusal,
+        };
+        // A refusal that left nothing mounted is not one: the mount went away
+        // between the caller's check and this attempt, which is the outcome
+        // being asked for. A mount table that cannot be read counts as still
+        // mounted, so an unreadable table keeps the refusal rather than
+        // inventing a success out of ignorance.
+        if matches!(mount_evidence(mountpoint), Ok(None)) {
+            return Ok(());
+        }
+        if attempt >= UNMOUNT_ATTEMPTS {
+            return Err(refusal);
+        }
+        attempt += 1;
+        std::thread::sleep(UNMOUNT_RETRY_PAUSE);
+    }
+}
+
 fn status_code(status: ExitStatus) -> Option<i32> {
     status.code()
 }
@@ -1451,6 +1506,117 @@ fn bounded_stderr(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// A stand-in `fusermount3` that always refuses, says why on stderr, and
+    /// records every call. It never detaches anything, so a proof may point it
+    /// at a real mountpoint without putting that mount at risk.
+    fn refusing_helper(directory: &Path, log: &Path) -> PathBuf {
+        let helper = directory.join("fusermount3-refusing-stub");
+        fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\necho call >> '{}'\necho 'stub: entry for the mountpoint not found' >&2\nexit 1\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+        helper
+    }
+
+    fn calls(log: &Path) -> usize {
+        fs::read_to_string(log)
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// The retry must not report a detach that never happened, and the reason
+    /// must reach the caller. Both halves of the fix are on trial here: a
+    /// refusal that never clears still fails, and it fails saying why.
+    #[test]
+    fn a_detach_that_keeps_being_refused_spends_its_budget_and_reports_the_reason() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("calls");
+        let helper = refusing_helper(directory.path(), &log);
+        // `/proc` stands in for nothing but "a path the mount table shows as
+        // mounted", so the retry takes its still-mounted branch. The helper is
+        // the stub above; nothing is ever asked to detach anything.
+        let mountpoint = Path::new("/proc");
+        assert!(
+            matches!(mount_evidence(mountpoint), Ok(Some(_))),
+            "this proof needs a path the mount table shows as mounted"
+        );
+
+        let error = unmount_with_retry(&helper, mountpoint)
+            .expect_err("a refusal that never clears must not be reported as a detach");
+
+        let UnmountError::Refused { status, stderr } = error else {
+            panic!("expected the helper's refusal, got {error:?}");
+        };
+        assert_eq!(status, Some(1));
+        assert!(
+            stderr.contains("entry for the mountpoint not found"),
+            "the caller must receive the helper's reason, not an empty string: {stderr:?}"
+        );
+        assert_eq!(
+            calls(&log),
+            UNMOUNT_ATTEMPTS,
+            "the retry must spend exactly its budget, and no more"
+        );
+    }
+
+    /// The other direction: the retry stops the moment the mount table says
+    /// the mount is gone, so a refusal that has nothing left to detach costs
+    /// one attempt rather than the whole budget.
+    #[test]
+    fn a_refusal_that_left_nothing_mounted_is_not_a_refusal() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("calls");
+        let helper = refusing_helper(directory.path(), &log);
+        let mountpoint = directory.path().join("never-mounted");
+        fs::create_dir(&mountpoint).unwrap();
+
+        unmount_with_retry(&helper, &mountpoint)
+            .expect("a mountpoint that is not mounted is already detached");
+
+        assert_eq!(
+            calls(&log),
+            1,
+            "the mount table settles it after one attempt"
+        );
+    }
+
+    /// The regression guard for dropping `-q`: a real refusal from the real
+    /// helper has to arrive carrying its diagnostic. Under `-q` this answered
+    /// `status: Some(1), stderr: ""`, which is exactly what made a week of CI
+    /// failures undiagnosable.
+    #[test]
+    fn a_real_fusermount3_refusal_carries_its_diagnostic() {
+        let fusermount = Path::new(DEFAULT_FUSERMOUNT3);
+        if !fusermount.is_file() {
+            eprintln!(
+                "[tempfs] NOT PROVEN a_real_fusermount3_refusal_carries_its_diagnostic: \
+                 no helper at {DEFAULT_FUSERMOUNT3}"
+            );
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        // Nothing is mounted here, so the helper refuses whatever uid asks.
+        let mountpoint = directory.path().join("never-mounted");
+        fs::create_dir(&mountpoint).unwrap();
+
+        let error = run_unmount(fusermount, &mountpoint, false)
+            .expect_err("detaching what is not mounted must be refused");
+
+        let UnmountError::Refused { status, stderr } = error else {
+            panic!("expected a refusal from fusermount3, got {error:?}");
+        };
+        assert_eq!(status, Some(1));
+        assert!(
+            !stderr.trim().is_empty(),
+            "fusermount3 must be left able to say why it refused"
+        );
+    }
 
     #[test]
     fn a_missing_dev_fuse_is_refused_before_anything_is_mounted() {
