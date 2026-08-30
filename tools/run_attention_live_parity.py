@@ -1158,6 +1158,12 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
                     if len(usable) == len(CLIENTS)
                     else {"reason": "not every client could be asked"}
                 ),
+                target=(
+                    "nominal: the deployment named no user workspace, because it "
+                    "served no record graph. The record set fed to each client is "
+                    "the one the deployment served, which is empty; the target is "
+                    "a placeholder for a coordinate the deployment did not give."
+                ),
                 note=(
                     "The three clients refuse in their own vocabulary — the "
                     "hosted cockpit names the Platform v2 category, the two "
