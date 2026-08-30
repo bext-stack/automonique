@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Deploy an automonique daemon through its own release machinery, without a restart.
 #
 #   automonique-deploy-daemon.sh --state-dir DIR --unit UNIT --worktree DIR

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Deploy an automonique web entry so the running binary can name its revision.
 #
 #   automonique-deploy-web-entry.sh --root DIR --service UNIT --binary FILE \
