@@ -21,6 +21,24 @@ export const MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES = 524800;
 /** Maximum canonical Platform v2 response bytes. */
 export const MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES = 8389120;
 
+/** Maximum bytes in one opaque resource-listing cursor. */
+export const MAX_RESOURCE_LISTING_CURSOR_BYTES = 256;
+
+/** Maximum canonical resource-listing page bytes. */
+export const MAX_RESOURCE_LISTING_PAGE_CANONICAL_BYTES = 262144;
+
+/** The server's page ceiling; a larger request is clamped to it. */
+export const MAX_RESOURCE_LISTING_PAGE_ITEMS = 128;
+
+/** Maximum canonical resource-listing query bytes. */
+export const MAX_RESOURCE_LISTING_QUERY_CANONICAL_BYTES = 8192;
+
+/** The negotiated Platform major the resource listing requires. */
+export const PLATFORM_INVENTORY_REQUIRES_PLATFORM_MAJOR = 2;
+
+/** Stable schema identifier for the bounded resource listing. */
+export const PLATFORM_INVENTORY_SCHEMA_V1 = "automonique.platform/inventory/v1";
+
 /** Negotiation protocol major. */
 export const PLATFORM_NEGOTIATION_MAJOR = 1;
 
@@ -47,9 +65,15 @@ import {
   PLATFORM_PROTOCOL,
   PlatformRequestId,
   ReceiptId,
+  ResourceAuthority_VALUES,
+  ResourceKind_VALUES,
+  decodeDecodedResourceRecord,
+  type DecodedResourceRecord,
   type IdempotencyKey as IdempotencyKeyValue,
   type PlatformRequestId as PlatformRequestIdValue,
   type ReceiptId as ReceiptIdValue,
+  type ResourceAuthority,
+  type ResourceKind,
 } from "./platform.js";
 import {
   MutationApprovalId,
@@ -319,9 +343,51 @@ export interface AttentionSourceSnapshot {
   readonly user_workspace: UserWorkspaceIdValue;
 }
 
+// One opaque, server-minted continuation coordinate. Clients treat it as an
+// identifier, never as structure: its grammar is the server's, and a client
+// that reconstructed one would be building a promise the server never made.
+export type ResourceListingCursor = string & {readonly __resourceListingCursor: unique symbol};
+export function ResourceListingCursor(value: string): ResourceListingCursor {
+  if (!isWellFormedUnicode(value) || byteLength(value) === 0 || byteLength(value) > MAX_RESOURCE_LISTING_CURSOR_BYTES || /\p{Cc}/u.test(value)) throw new WireError("invalid_json_value", "resource listing cursor");
+  return value as ResourceListingCursor;
+}
+// The server's page ceiling, applied to what a caller asked for. This is the
+// TypeScript half of one rule: a caller asking for a larger page receives the
+// server's, is never refused for asking, and never receives the larger page.
+// The page decoder below re-derives it rather than trusting `granted_limit`.
+export function grantedResourceListingLimit(requested_limit: bigint): bigint {
+  const ceiling = BigInt(MAX_RESOURCE_LISTING_PAGE_ITEMS);
+  return requested_limit > ceiling ? ceiling : requested_limit;
+}
+// An empty `authorities` or `kinds` list means no filter on that axis. That is
+// safe here in a way it was not in Platform v1, whose untargeted snapshot was
+// the listing primitive: this answer is one bounded page and a cursor.
+export interface ResourceListingQuery {
+  readonly after: ResourceListingCursor | null;
+  readonly authorities: readonly ResourceAuthority[];
+  readonly kinds: readonly ResourceKind[];
+  readonly requested_limit: bigint;
+}
+export interface ResourceListingPage {
+  readonly after: ResourceListingCursor | null;
+  readonly granted_limit: bigint;
+  readonly has_more: boolean;
+  readonly items: readonly DecodedResourceRecord[];
+  readonly next_cursor: ResourceListingCursor | null;
+  readonly requested_limit: bigint;
+}
+// The cursor no longer names a live listing: the filter changed, the caller's
+// authorization changed, or the inventory did. A resync is its own answer and
+// not an empty page, because resuming an expired cursor is the one way a
+// listing can skip or duplicate a record.
+export interface ResourceListingResync {
+  readonly expired_after: ResourceListingCursor;
+}
+
 export type PlatformV2Request =
   | {readonly kind: "get_lifecycle_capabilities"}
   | {readonly kind: "query_work_contexts"; readonly query: WorkContextQuery & {readonly project: ProjectIdValue}}
+  | {readonly kind: "list_resources"; readonly query: ResourceListingQuery}
   | {readonly kind: "get_work_context"; readonly identity: WorkContextIdentity}
   | {readonly kind: "prepare_mutation"; readonly request: MutationPrepareRequest}
   | {readonly kind: "decide_mutation"; readonly request: MutationDecisionRequest}
@@ -342,6 +408,8 @@ export type PlatformV2Response =
   | {readonly kind: "lifecycle_capabilities"; readonly capabilities: LifecycleCapabilities}
   | {readonly kind: "work_context_page"; readonly page: WorkContextPage}
   | {readonly kind: "work_context_resync"; readonly resync: WorkContextResync}
+  | {readonly kind: "resource_listing_page"; readonly page: ResourceListingPage}
+  | {readonly kind: "resource_listing_resync"; readonly resync: ResourceListingResync}
   | {readonly kind: "work_context_record"; readonly record: WorkContextRecord}
   | {readonly kind: "mutation_preview"; readonly preview: MutationPreview}
   | {readonly kind: "mutation_approval"; readonly approval: RawMutationApprovalDocument}
@@ -641,6 +709,74 @@ function attentionSnapshot(value: JsonValue): AttentionSourceSnapshot {
   return{items,observed_at_ms:observed,previous_revision:previous,project:ProjectId(stringField(body,"project")),revision,schema:"automonique.platform/attention/v1",semantics:"atomic_replace",source,user_workspace:UserWorkspaceId(stringField(body,"user_workspace"))};
 }
 
+const RESOURCE_LISTING_PAGE_FIELDS = ["after", "granted_limit", "has_more", "items", "next_cursor", "requested_limit", "schema", "version"] as const;
+const RESOURCE_LISTING_RESYNC_FIELDS = ["expired_after", "outcome", "schema", "version"] as const;
+function listingSchema(body: Map<string, JsonValue>): void {
+  if (stringField(body, "schema") !== PLATFORM_INVENTORY_SCHEMA_V1 || integerField(body, "version") !== BigInt(PLATFORM_INVENTORY_REQUIRES_PLATFORM_MAJOR)) throw new WireError("invalid_json_value", "resource listing schema");
+}
+function listingLimit(body: Map<string, JsonValue>, name: string): bigint {
+  const value = integerField(body, name);
+  if (value < 1n || value > 65535n) throw new WireError("invalid_json_value", name);
+  return value;
+}
+function listingCursorOrNull(body: Map<string, JsonValue>, name: string): ResourceListingCursor | null {
+  const value = valueField(body, name);
+  if (value.kind === "null") return null;
+  if (value.kind !== "string") throw new WireError("invalid_json_value", name);
+  return ResourceListingCursor(value.value);
+}
+function strictlyOrderedListingFilter(values: readonly string[], vocabulary: readonly string[]): boolean {
+  let previous = -1;
+  for (const value of values) {
+    const index = vocabulary.indexOf(value);
+    if (index < 0 || index <= previous) return false;
+    previous = index;
+  }
+  return true;
+}
+function resourceListingQueryJson(query: ResourceListingQuery): JsonValue {
+  if (query.requested_limit < 1n || query.requested_limit > 65535n) throw new WireError("invalid_json_value", "resource listing limit");
+  if (query.authorities.length > ResourceAuthority_VALUES.length || !strictlyOrderedListingFilter(query.authorities, ResourceAuthority_VALUES)) throw new WireError("invalid_json_value", "resource listing authorities");
+  if (query.kinds.length > ResourceKind_VALUES.length || !strictlyOrderedListingFilter(query.kinds, ResourceKind_VALUES)) throw new WireError("invalid_json_value", "resource listing kinds");
+  const body = json({
+    after: query.after === null ? null : ResourceListingCursor(query.after),
+    authorities: [...query.authorities],
+    kinds: [...query.kinds],
+    requested_limit: query.requested_limit,
+    schema: PLATFORM_INVENTORY_SCHEMA_V1,
+    version: BigInt(PLATFORM_INVENTORY_REQUIRES_PLATFORM_MAJOR),
+  });
+  if (bodyBytes(body).length > MAX_RESOURCE_LISTING_QUERY_CANONICAL_BYTES) throw new WireError("frame_too_large", `maximum is ${MAX_RESOURCE_LISTING_QUERY_CANONICAL_BYTES}`);
+  return body;
+}
+function resourceListingPage(value: JsonValue, bytes: Uint8Array): ResourceListingPage {
+  if (bytes.length > MAX_RESOURCE_LISTING_PAGE_CANONICAL_BYTES) throw new WireError("frame_too_large", `maximum is ${MAX_RESOURCE_LISTING_PAGE_CANONICAL_BYTES}`);
+  const body = fields(value, RESOURCE_LISTING_PAGE_FIELDS);
+  listingSchema(body);
+  const requested_limit = listingLimit(body, "requested_limit");
+  const granted_limit = listingLimit(body, "granted_limit");
+  // Re-derived, never trusted: this is what makes the server's bound provable
+  // from the page rather than a number the page merely asserts.
+  if (granted_limit !== grantedResourceListingLimit(requested_limit)) throw new WireError("invalid_json_value", "resource listing page bound");
+  const rawItems = valueField(body, "items");
+  if (rawItems.kind !== "array" || rawItems.items.length > MAX_RESOURCE_LISTING_PAGE_ITEMS || BigInt(rawItems.items.length) > granted_limit) throw new WireError("invalid_json_value", "resource listing page items");
+  const items = rawItems.items.map(decodeDecodedResourceRecord);
+  const order = (item: DecodedResourceRecord): string => `${item.resource.authority}\u0000${item.resource.kind}\u0000${item.resource.id}`;
+  if (items.some((item, index) => index > 0 && order(items[index - 1]!) >= order(item))) throw new WireError("invalid_json_value", "resource listing page order");
+  const has_more = valueField(body, "has_more");
+  if (has_more.kind !== "bool") throw new WireError("invalid_json_value", "resource listing has_more");
+  const after = listingCursorOrNull(body, "after");
+  const next_cursor = listingCursorOrNull(body, "next_cursor");
+  if (has_more.value !== (next_cursor !== null) || (has_more.value && items.length === 0) || (after !== null && after === next_cursor)) throw new WireError("invalid_json_value", "resource listing page cursor");
+  return {after, granted_limit, has_more: has_more.value, items, next_cursor, requested_limit};
+}
+function resourceListingResync(value: JsonValue): ResourceListingResync {
+  const body = fields(value, RESOURCE_LISTING_RESYNC_FIELDS);
+  listingSchema(body);
+  if (stringField(body, "outcome") !== "resync_required") throw new WireError("invalid_json_value", "resource listing outcome");
+  return {expired_after: ResourceListingCursor(stringField(body, "expired_after"))};
+}
+
 export function encodePlatformNegotiationRequest(requestId: PlatformRequestIdValue, request: PlatformNegotiationRequest): Uint8Array {
   if (request.kind !== "negotiate") throw new WireError("invalid_json_value", "negotiation kind");
   return message(PLATFORM_NEGOTIATION_PROTOCOL, PLATFORM_NEGOTIATION_MAJOR, requestId, request.kind, document(encodePlatformVersionOffer(request.offer)), MAX_PLATFORM_NEGOTIATION_REQUEST_CANONICAL_BYTES);
@@ -664,6 +800,7 @@ function requestBody(request: PlatformV2Request): JsonValue {
   switch (request.kind) {
     case "get_lifecycle_capabilities": return json({schema: PLATFORM_SCHEMA_V2});
     case "query_work_contexts": { if (request.query.project === null) throw new WireError("invalid_json_value", "project scope"); return document(encodeWorkContextQuery(request.query)); }
+    case "list_resources": return resourceListingQueryJson(request.query);
     case "get_work_context": return json(validateWorkContextIdentity(request.identity));
     case "prepare_mutation": return json({idempotency_key: IdempotencyKey(request.request.idempotency_key), intent: validateWorkContextMutationIntent(request.request.intent), schema: PLATFORM_SCHEMA_V2});
     case "decide_mutation": { const value=request.request; if (value.decision!=="granted"&&value.decision!=="denied") throw new WireError("invalid_json_value", "decision"); return json({decision:value.decision,preview:previewRef(value.preview),preview_digest:MutationPreviewDigest(value.preview_digest),schema:PLATFORM_SCHEMA_V2}); }
@@ -684,7 +821,7 @@ export function encodePlatformV2Request(requestId: PlatformRequestIdValue, reque
 }
 
 const responseKinds: Readonly<Record<PlatformV2Request["kind"], readonly string[]>> = {
-  get_lifecycle_capabilities:["lifecycle_capabilities"],query_work_contexts:["work_context_page","work_context_resync"],get_work_context:["work_context_record"],prepare_mutation:["mutation_preview","mutation_refused"],decide_mutation:["mutation_approval","mutation_refused"],submit_mutation:["mutation_receipt","mutation_refused"],get_mutation_receipt:["mutation_receipt","mutation_refused"],get_lineage:["lineage_result"],submit_workspace_intent:["workspace_intent_result"],get_workspace_intent:["workspace_intent_result"],get_review:["review_result"],get_attention_source_snapshot:["attention_source_snapshot"],get_review_capabilities:["review_capabilities"],execute_review_action:["review_receipt"],get_review_receipt:["review_receipt"],
+  get_lifecycle_capabilities:["lifecycle_capabilities"],query_work_contexts:["work_context_page","work_context_resync"],list_resources:["resource_listing_page","resource_listing_resync"],get_work_context:["work_context_record"],prepare_mutation:["mutation_preview","mutation_refused"],decide_mutation:["mutation_approval","mutation_refused"],submit_mutation:["mutation_receipt","mutation_refused"],get_mutation_receipt:["mutation_receipt","mutation_refused"],get_lineage:["lineage_result"],submit_workspace_intent:["workspace_intent_result"],get_workspace_intent:["workspace_intent_result"],get_review:["review_result"],get_attention_source_snapshot:["attention_source_snapshot"],get_review_capabilities:["review_capabilities"],execute_review_action:["review_receipt"],get_review_receipt:["review_receipt"],
 };
 export function decodePlatformV2Response(payload: Uint8Array, requestId: PlatformRequestIdValue, requestKind: PlatformV2Request["kind"]): PlatformV2Response {
   const decoded = admitted(payload, MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES, PLATFORM_PROTOCOL, PLATFORM_V2_MAJOR);
@@ -696,6 +833,8 @@ export function decodePlatformV2Response(payload: Uint8Array, requestId: Platfor
     case "lifecycle_capabilities":return {kind:"lifecycle_capabilities",capabilities:lifecycleCapabilities(decoded.body)};
     case "work_context_page":return {kind:"work_context_page",page:decodeWorkContextPage(bytes)};
     case "work_context_resync":return {kind:"work_context_resync",resync:decodeWorkContextResync(bytes)};
+    case "resource_listing_page":return {kind:"resource_listing_page",page:resourceListingPage(decoded.body,bytes)};
+    case "resource_listing_resync":return {kind:"resource_listing_resync",resync:resourceListingResync(decoded.body)};
     case "work_context_record":return {kind:"work_context_record",record:validateWorkContextRecord(plain(decoded.body) as WorkContextRecord)};
     case "mutation_preview":return {kind:"mutation_preview",preview:decodeWorkContextMutationPreview(bytes)};
     case "mutation_approval":return {kind:"mutation_approval",approval:{canonical:rawMutationDocument(decoded.body,bytes,MUTATION_APPROVAL_FIELDS)}};

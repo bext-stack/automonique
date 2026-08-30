@@ -343,7 +343,13 @@ fn freshness(value: &JsonValue) -> Result<Freshness, PlatformApiError> {
     })
 }
 
-fn record_json(value: &ResourceRecord) -> Result<JsonValue, PlatformApiError> {
+/// Render one resource projection.
+///
+/// Visible to the crate rather than to this module alone: the Platform v2
+/// resource listing carries the same record on the wire, and a second spelling
+/// of this object is exactly the drift this codebase keeps paying for. The v1
+/// *frames* remain frozen; only this nested body is shared.
+pub(crate) fn record_json(value: &ResourceRecord) -> Result<JsonValue, PlatformApiError> {
     Ok(object(vec![
         ("freshness", freshness_json(value.freshness)?),
         ("resource", coordinate_json(&value.resource)),
@@ -354,7 +360,9 @@ fn record_json(value: &ResourceRecord) -> Result<JsonValue, PlatformApiError> {
     ]))
 }
 
-fn record(value: &JsonValue) -> Result<ResourceRecord, PlatformApiError> {
+/// Read one resource projection back. See [`record_json`] for why this is
+/// shared with the Platform v2 listing rather than restated there.
+pub(crate) fn record(value: &JsonValue) -> Result<ResourceRecord, PlatformApiError> {
     exact_fields(value, &["freshness", "resource", "summary"])?;
     Ok(ResourceRecord {
         resource: coordinate(value.get("resource").ok_or(PlatformApiError::InvalidBody)?)?,

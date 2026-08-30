@@ -34,6 +34,14 @@ use crate::platform_v2_attention_api::{
     decode_attention_source_snapshot, encode_attention_read_request,
     encode_attention_source_snapshot,
 };
+use crate::platform_v2_inventory::{
+    ResourceListingPage, ResourceListingQuery, ResourceListingResync,
+};
+use crate::platform_v2_inventory_api::{
+    MAX_RESOURCE_LISTING_PAGE_CANONICAL_BYTES, ResourceListingApiError,
+    decode_resource_listing_page, decode_resource_listing_query, decode_resource_listing_resync,
+    encode_resource_listing_page, encode_resource_listing_query, encode_resource_listing_resync,
+};
 use crate::platform_v2_lifecycle::{
     MAX_MUTATION_CANONICAL_BYTES, MutationApproval, MutationApprovalDecision, MutationApprovalId,
     MutationPreview, MutationPreviewDigest, MutationPreviewRef, MutationReceipt, MutationRefusal,
@@ -93,6 +101,10 @@ const _: () = assert!(
 );
 const _: () = assert!(
     MAX_ATTENTION_SNAPSHOT_CANONICAL_BYTES + PLATFORM_V2_ENVELOPE_OVERHEAD_BYTES
+        <= MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES
+);
+const _: () = assert!(
+    MAX_RESOURCE_LISTING_PAGE_CANONICAL_BYTES + PLATFORM_V2_ENVELOPE_OVERHEAD_BYTES
         <= MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES
 );
 const _: () = assert!(MAX_PLATFORM_V2_RESPONSE_CANONICAL_BYTES <= u32::MAX as usize);
@@ -192,6 +204,7 @@ pub enum PlatformV2TransportError {
     Lineage(LineageApiError),
     Review(ReviewApiError),
     Attention(AttentionApiError),
+    ResourceListing(ResourceListingApiError),
     InvalidBody,
     CorrelationMismatch,
     NegotiationMismatch,
@@ -217,6 +230,7 @@ impl PlatformV2TransportError {
                 AttentionApiError::InvalidBody => "attention_invalid_body",
                 AttentionApiError::FrameTooLarge => "frame_too_large",
             },
+            Self::ResourceListing(value) => value.category(),
             Self::InvalidBody => "platform_v2_invalid_body",
             Self::CorrelationMismatch => "platform_v2_correlation_mismatch",
             Self::NegotiationMismatch => "platform_negotiation_mismatch",
@@ -260,6 +274,11 @@ impl From<ReviewApiError> for PlatformV2TransportError {
 impl From<AttentionApiError> for PlatformV2TransportError {
     fn from(value: AttentionApiError) -> Self {
         Self::Attention(value)
+    }
+}
+impl From<ResourceListingApiError> for PlatformV2TransportError {
+    fn from(value: ResourceListingApiError) -> Self {
+        Self::ResourceListing(value)
     }
 }
 
@@ -1935,6 +1954,11 @@ fn validate_negotiation_response(
 pub enum PlatformV2Request {
     GetLifecycleCapabilities,
     QueryWorkContexts(WorkContextQuery),
+    /// Bounded, cursor-paginated listing of the v1 resource inventory. Platform
+    /// v1 had no listing primitive: its untargeted snapshot *was* the listing,
+    /// and it refused rather than paginated once the inventory outgrew one
+    /// frame. This is the additive replacement (#220).
+    ListResources(ResourceListingQuery),
     GetWorkContext(WorkContextIdentity),
     PrepareMutation(MutationPrepareRequest),
     DecideMutation(MutationDecisionRequest),
@@ -1956,6 +1980,8 @@ pub enum PlatformV2Response {
     LifecycleCapabilities(LifecycleCapabilities),
     WorkContextPage(WorkContextPage),
     WorkContextResync(WorkContextResync),
+    ResourceListingPage(ResourceListingPage),
+    ResourceListingResync(ResourceListingResync),
     WorkContextRecord(WorkContextRecord),
     MutationPreview(MutationPreview),
     MutationApproval(RawMutationApprovalDocument),
@@ -2772,6 +2798,7 @@ fn request_kind(value: &PlatformV2Request) -> &'static str {
     match value {
         PlatformV2Request::GetLifecycleCapabilities => "get_lifecycle_capabilities",
         PlatformV2Request::QueryWorkContexts(_) => "query_work_contexts",
+        PlatformV2Request::ListResources(_) => "list_resources",
         PlatformV2Request::GetWorkContext(_) => "get_work_context",
         PlatformV2Request::PrepareMutation(_) => "prepare_mutation",
         PlatformV2Request::DecideMutation(_) => "decide_mutation",
@@ -2798,6 +2825,9 @@ fn request_body(value: &PlatformV2Request) -> Result<JsonValue, PlatformV2Transp
                 return Err(PlatformV2TransportError::InvalidBody);
             }
             document(encode_work_context_query(value)?)?
+        }
+        PlatformV2Request::ListResources(value) => {
+            document(encode_resource_listing_query(value)?)?
         }
         PlatformV2Request::GetWorkContext(value) => identity_json(value),
         PlatformV2Request::PrepareMutation(value) => object(vec![
@@ -2951,6 +2981,7 @@ fn request_from_message(message: &Message) -> Result<PlatformV2Request, Platform
             }
             PlatformV2Request::QueryWorkContexts(value)
         }
+        "list_resources" => PlatformV2Request::ListResources(decode_resource_listing_query(&bytes)?),
         "get_work_context" => PlatformV2Request::GetWorkContext(identity(message.body())?),
         "prepare_mutation" => {
             exact_fields(message.body(), &["idempotency_key", "intent", "schema"])?;
@@ -3279,6 +3310,8 @@ fn response_kind(value: &PlatformV2Response) -> &'static str {
         PlatformV2Response::LifecycleCapabilities(_) => "lifecycle_capabilities",
         PlatformV2Response::WorkContextPage(_) => "work_context_page",
         PlatformV2Response::WorkContextResync(_) => "work_context_resync",
+        PlatformV2Response::ResourceListingPage(_) => "resource_listing_page",
+        PlatformV2Response::ResourceListingResync(_) => "resource_listing_resync",
         PlatformV2Response::WorkContextRecord(_) => "work_context_record",
         PlatformV2Response::MutationPreview(_) => "mutation_preview",
         PlatformV2Response::MutationApproval(_) => "mutation_approval",
@@ -3305,6 +3338,10 @@ fn response_answers_request(request: &PlatformV2Request, response: &PlatformV2Re
         ) | (
             PlatformV2Request::QueryWorkContexts(_),
             PlatformV2Response::WorkContextPage(_) | PlatformV2Response::WorkContextResync(_)
+        ) | (
+            PlatformV2Request::ListResources(_),
+            PlatformV2Response::ResourceListingPage(_)
+                | PlatformV2Response::ResourceListingResync(_)
         ) | (
             PlatformV2Request::GetWorkContext(_),
             PlatformV2Response::WorkContextRecord(_)
@@ -3384,6 +3421,12 @@ fn response_body(value: &PlatformV2Response) -> Result<JsonValue, PlatformV2Tran
         PlatformV2Response::WorkContextPage(value) => document(encode_work_context_page(value)?)?,
         PlatformV2Response::WorkContextResync(value) => {
             document(encode_work_context_resync(value)?)?
+        }
+        PlatformV2Response::ResourceListingPage(value) => {
+            document(encode_resource_listing_page(value)?)?
+        }
+        PlatformV2Response::ResourceListingResync(value) => {
+            document(encode_resource_listing_resync(value)?)?
         }
         PlatformV2Response::WorkContextRecord(value) => record_json(value)?,
         PlatformV2Response::MutationPreview(value) => {
@@ -3477,6 +3520,12 @@ fn response_from_message(
         }
         "work_context_page" => {
             PlatformV2Response::WorkContextPage(decode_work_context_page(&bytes)?)
+        }
+        "resource_listing_page" => {
+            PlatformV2Response::ResourceListingPage(decode_resource_listing_page(&bytes)?)
+        }
+        "resource_listing_resync" => {
+            PlatformV2Response::ResourceListingResync(decode_resource_listing_resync(&bytes)?)
         }
         "work_context_resync" => {
             PlatformV2Response::WorkContextResync(decode_work_context_resync(&bytes)?)
