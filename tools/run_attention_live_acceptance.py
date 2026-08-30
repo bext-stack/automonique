@@ -22,7 +22,11 @@ Three things are true about this flow, and the report says all three.
 2. Part of it is not. "The desktop app shows the same attention state as the
    phone" is a claim about two GUIs rendering, and no HTTP probe establishes it.
    Those steps are enumerated as an operator checklist and stay
-   `awaiting_operator` until a sign-off file names every one of them.
+   `awaiting_operator` until a sign-off file names every one of them. One of
+   them, LIVE-GUI-2, does have a machine half: `--cockpit-render-check` drives a
+   browser into the deployed cockpit and asserts what it renders against the
+   deployment's own projection. That is a check in `checks`, not a signature; it
+   narrows what the operator still has to look at, and does not sign for them.
 
 3. The deployed build may not be attributable to a source revision. It is asked
    twice — the binary is asked what it was built from, and every release
@@ -55,6 +59,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import ssl
 import subprocess
@@ -162,6 +167,30 @@ LIST_LIMIT = 16
 BODY_LIMIT = 262144
 
 HOME_PLACEHOLDER = "$HOME"
+
+# `tests/browser/live-cockpit-attention.spec.js` in `automonique-web-entry`
+# signs a real browser into the deployed cockpit and asserts, against the
+# `/api/platform/cockpit` document that deployment answered with during the very
+# page load it is looking at, that the attention item renders with that source
+# and that generation, and that no review state the document did not assert
+# appears. It is the only check here that observes a GUI rather than a response
+# body, and it is the automated half of LIVE-GUI-2.
+#
+# Its verdict is read from the evidence document it writes, never from the
+# runner's exit status alone: a skipped browser test exits zero, and an
+# unobserved render must not read as an observed one.
+COCKPIT_RENDER_EVIDENCE_SCHEMA = "automonique.cockpit-render-evidence/v1"
+COCKPIT_RENDER_EVIDENCE_FILE = "live-cockpit-attention.json"
+COCKPIT_RENDER_PROJECT = "live-cockpit"
+COCKPIT_RENDER_TIMEOUT = 600.0
+COCKPIT_RENDER_LOG = "runner.log"
+# Values lifted out of the browser evidence are held to one of two shapes: a
+# bare enumeration token, or a canonical decimal string. That is stricter than
+# the response allow-list above, and it is what keeps a rendered free-text
+# summary or a work coordinate out of this report even though the evidence file
+# beside the screenshot carries them for cross-client correlation.
+ENUM_TOKEN = re.compile(r"\A[a-z0-9_]{1,64}(\.[a-z0-9_]{1,64}){0,3}\Z")
+DECIMAL_TOKEN = re.compile(r"\A(0|[1-9][0-9]*)\Z")
 
 
 @dataclass(frozen=True)
@@ -801,6 +830,231 @@ def check_attention_corpus(projection: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def evidence_token(value: Any) -> str | None:
+    """Admit an evidence value only as an enumeration token or a decimal."""
+    if not isinstance(value, str):
+        return None
+    return value if ENUM_TOKEN.fullmatch(value) or DECIMAL_TOKEN.fullmatch(value) else None
+
+
+def evidence_tokens(values: Any, keys: tuple[str, ...]) -> dict[str, str]:
+    if not isinstance(values, dict):
+        return {}
+    admitted = {}
+    for key in keys:
+        token = evidence_token(values.get(key))
+        if token is not None:
+            admitted[key] = token
+    return admitted
+
+
+def check_cockpit_render(
+    origin: Origin,
+    crate: Path | None,
+    evidence_dir: Path | None,
+    credential_env: str | None,
+    timeout: float,
+) -> dict[str, Any]:
+    """Drive the browser check against the deployed cockpit and fold in its verdict.
+
+    This is the one place in this harness where a claim about a rendered GUI is
+    established rather than enumerated for an operator. It is opt-in, because it
+    needs a browser toolchain this host may not have, and because a run that
+    could not start one must not quietly become the reason a report says
+    `blocked` for every other invocation.
+    """
+    intent = (
+        "the deployed cockpit renders the attention item its own authorized "
+        "projection carries, with that source and that generation, and asserts "
+        "no review state that projection did not (epic #163 LIVE-GUI-2)"
+    )
+    name = f"{origin.key}_cockpit_attention_render"
+    endpoint = redacted(origin.url.rstrip("/") + "/#sessions")
+    if crate is None or not (crate / "playwright.config.js").is_file():
+        return blocked(
+            name,
+            intent,
+            "no automonique-web-entry crate with a browser test configuration was "
+            "found on this host, so the cockpit render was not observed",
+            origin=origin.key,
+            endpoint=endpoint,
+        )
+    runner = shutil.which("bunx") or shutil.which("npx")
+    if runner is None:
+        return blocked(
+            name,
+            intent,
+            "neither bunx nor npx is on PATH, so the browser check could not be "
+            "started and the cockpit render was not observed",
+            origin=origin.key,
+            endpoint=endpoint,
+        )
+    evidence_dir = evidence_dir or crate / "test-results" / "live-cockpit-evidence"
+    evidence_path = evidence_dir / COCKPIT_RENDER_EVIDENCE_FILE
+    try:
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        evidence_path.unlink(missing_ok=True)
+    except OSError as error:
+        return blocked(
+            name,
+            intent,
+            f"the evidence directory is not writable: {type(error).__name__}",
+            origin=origin.key,
+            endpoint=endpoint,
+        )
+    environment = dict(os.environ)
+    environment["AUTOMONIQUE_LIVE_COCKPIT_ORIGIN"] = origin.url
+    environment["AUTOMONIQUE_LIVE_COCKPIT_EVIDENCE_DIR"] = str(evidence_dir)
+    environment.pop("AUTOMONIQUE_LIVE_COCKPIT_PROOF_DOCUMENT", None)
+    environment.pop("AUTOMONIQUE_LIVE_COCKPIT_PROOF_MUTATION", None)
+    if credential_env:
+        environment["AUTOMONIQUE_LIVE_COCKPIT_CREDENTIAL_ENV"] = credential_env
+    try:
+        completed = subprocess.run(
+            [
+                runner,
+                "playwright",
+                "test",
+                f"--project={COCKPIT_RENDER_PROJECT}",
+                "--reporter=line",
+            ],
+            cwd=crate,
+            env=environment,
+            check=False,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return blocked(
+            name,
+            intent,
+            f"the browser check did not finish within {timeout:.0f}s",
+            origin=origin.key,
+            endpoint=endpoint,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return blocked(
+            name,
+            intent,
+            f"the browser check could not be run: {type(error).__name__}",
+            origin=origin.key,
+            endpoint=endpoint,
+        )
+
+    # The runner's own output is diagnostic free text, so it is written beside
+    # the evidence rather than into this report.
+    log = evidence_dir / COCKPIT_RENDER_LOG
+    try:
+        log.write_bytes(completed.stdout + completed.stderr)
+        log_recorded: str | None = redacted_path(log)
+    except OSError:
+        log_recorded = None
+
+    result: dict[str, Any] = {
+        "name": name,
+        "intent": intent,
+        "origin": origin.key,
+        "endpoint": endpoint,
+        "evidence": redacted_path(evidence_path),
+        "runner_exit_code": completed.returncode,
+    }
+    if log_recorded is not None:
+        result["runner_log"] = log_recorded
+    try:
+        raw = evidence_path.read_bytes()
+    except OSError:
+        result["state"] = "blocked"
+        result["reason"] = (
+            "the browser check wrote no evidence document, so nothing about the "
+            "deployed cockpit's render was observed; the runner's own output is "
+            "beside it"
+        )
+        return result
+    result["evidence_sha256"] = hashlib.sha256(raw).hexdigest()
+    try:
+        declared = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        result["state"] = "failed"
+        result["reason"] = "the browser check wrote an evidence document that is not JSON"
+        return result
+    if not isinstance(declared, dict) or declared.get("schema") != COCKPIT_RENDER_EVIDENCE_SCHEMA:
+        result["state"] = "failed"
+        result["reason"] = (
+            f"the evidence document does not declare {COCKPIT_RENDER_EVIDENCE_SCHEMA!r}"
+        )
+        return result
+    if declared.get("mode") != "live" or declared.get("origin") != origin.url:
+        result["state"] = "failed"
+        result["reason"] = (
+            "the evidence document was not written by a live run against this "
+            "origin, so it says nothing about the deployment this report names"
+        )
+        return result
+    for key in ("screenshot", "review_screenshot"):
+        shot = declared.get(key)
+        if isinstance(shot, str) and shot and "/" not in shot and "\\" not in shot:
+            result[key] = redacted_path(evidence_dir / shot)
+    items = declared.get("attention_items")
+    if isinstance(items, list):
+        result["attention_items"] = [
+            admitted
+            for admitted in (
+                evidence_tokens(
+                    item,
+                    ("source_kind", "source_revision", "item_revision", "state", "reason", "unread"),
+                )
+                for item in items[:LIST_LIMIT]
+            )
+            if admitted
+        ]
+    review = declared.get("review")
+    if isinstance(review, dict):
+        keys = review.get("semantic_keys")
+        admitted_review = evidence_tokens(review, ("source_state", "source_revision", "derived"))
+        if isinstance(keys, dict):
+            semantic = {}
+            for element, value in keys.items():
+                if not isinstance(element, str) or not ENUM_TOKEN.fullmatch(element.replace("-", "_")):
+                    continue
+                if value is None:
+                    semantic[element] = None
+                    continue
+                tokens = value.split(" ") if isinstance(value, str) else []
+                if tokens and all(ENUM_TOKEN.fullmatch(token) for token in tokens):
+                    semantic[element] = tokens
+            if semantic:
+                admitted_review["semantic_keys"] = semantic
+        if admitted_review:
+            result["review"] = admitted_review
+
+    state = declared.get("state")
+    if state == "blocked":
+        reason = declared.get("reason")
+        result["state"] = "blocked"
+        result["reason"] = (
+            redacted(reason)[:SCALAR_LIMIT]
+            if isinstance(reason, str) and reason
+            else "the browser check recorded that it could not observe the render"
+        )
+        return result
+    if state != "asserted":
+        result["state"] = "failed"
+        result["reason"] = (
+            "the browser check did not record an asserted render; the cockpit "
+            "contradicted what the deployment's own projection carries"
+        )
+        return result
+    if completed.returncode != 0:
+        result["state"] = "failed"
+        result["reason"] = (
+            "the browser check recorded an asserted render but exited non-zero, "
+            "so its own assertions did not all hold"
+        )
+        return result
+    result["state"] = "passed"
+    return result
+
+
 def discover_mobile_origin(
     override: str | None, nonprod_root: Path | None
 ) -> tuple[Origin | None, str]:
@@ -1279,6 +1533,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "credential. The value never enters the report."
         ),
     )
+    parser.add_argument(
+        "--cockpit-render-check",
+        action="store_true",
+        help=(
+            "drive the automonique-web-entry browser check against the hosted "
+            "cockpit and fold its verdict in as the automated half of "
+            "LIVE-GUI-2. Needs a browser toolchain on this host; without the "
+            "flag no such check is recorded at all."
+        ),
+    )
+    parser.add_argument(
+        "--web-entry-crate",
+        type=Path,
+        default=script_root / "rust" / "crates" / "automonique-web-entry",
+        help="crate holding the cockpit browser check",
+    )
+    parser.add_argument(
+        "--cockpit-render-evidence",
+        type=Path,
+        default=None,
+        help=(
+            "directory the cockpit browser check writes its screenshot and "
+            "machine-readable evidence into"
+        ),
+    )
     parser.add_argument("--operator-signoff", type=Path, default=None)
     parser.add_argument("--timeout", type=float, default=30.0)
     return parser.parse_args(argv)
@@ -1316,6 +1595,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     if projection is not None:
         checks.append(check_attention_corpus(projection))
+
+    if args.cockpit_render_check:
+        hosted = next((origin for origin in origins if origin.key == "hosted"), None)
+        if hosted is not None:
+            checks.append(
+                check_cockpit_render(
+                    hosted,
+                    args.web_entry_crate.resolve() if args.web_entry_crate else None,
+                    args.cockpit_render_evidence,
+                    hosted.credential_env,
+                    COCKPIT_RENDER_TIMEOUT,
+                )
+            )
 
     builds = build_identity(args.hosted_web_entry_root, args.nonprod_web_entry_root)
     checks.append(check_build_attribution(builds))

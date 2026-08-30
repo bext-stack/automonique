@@ -1,0 +1,201 @@
+{
+  "actions": {
+    "lifecycle": {
+      "available": false,
+      "category": "platform_v2_lifecycle_adapter_pending"
+    },
+    "review": {
+      "available": false,
+      "category": "platform_v2_review_adapter_pending"
+    }
+  },
+  "activities": {
+    "items": [],
+    "omitted": "0",
+    "sources": {
+      "lineage": {
+        "state": "available"
+      },
+      "review": {
+        "state": "available"
+      }
+    },
+    "state": "complete",
+    "total": "0"
+  },
+  "attention": {
+    "known_workspaces": "1",
+    "state": "available",
+    "total_workspaces": "1"
+  },
+  "degradation": null,
+  "hosts": [
+    {
+      "id": "host-1",
+      "kind": "local",
+      "label": "Local host",
+      "lifecycle": "active",
+      "project_id": "project-1",
+      "revision": "1"
+    }
+  ],
+  "inbox": {
+    "items": [
+      {
+        "id": "provider_session:provider-feed-1:attention-1",
+        "item_revision": "5",
+        "link": {
+          "session": "session-1",
+          "workspace": "workspace-1"
+        },
+        "observed_at_ms": "1990",
+        "reason": "approval_required",
+        "source_id": "provider-feed-1",
+        "source_kind": "provider_session",
+        "source_revision": "7",
+        "state": "needs_you",
+        "unread": "1"
+      }
+    ],
+    "omitted": "0",
+    "sources": {
+      "attention": {
+        "state": "available"
+      }
+    },
+    "state": "complete",
+    "total": "1"
+  },
+  "lineage": {
+    "document": {
+      "external_work_items": [],
+      "orchestration": [],
+      "workspace": "workspace-1"
+    },
+    "state": "available"
+  },
+  "mode": "v2",
+  "projects": [
+    {
+      "id": "project-1",
+      "label": "Automonique",
+      "lifecycle": "active",
+      "revision": "1"
+    }
+  ],
+  "retained_v1": {
+    "health": "operational",
+    "inventory": {
+      "state": "available"
+    },
+    "sessions": [
+      {
+        "attachable": true,
+        "controllable": false,
+        "run": null,
+        "session": {
+          "freshness": "fresh",
+          "resource": {
+            "authority": "automonique",
+            "id": "session-1",
+            "kind": "session"
+          },
+          "revision": "4",
+          "summary": "Retained cockpit work"
+        }
+      }
+    ],
+    "sessions_cursor": {
+      "authority": "automonique",
+      "sequence": "4",
+      "topic": "sessions"
+    }
+  },
+  "review": {
+    "document": {
+      "attention": {
+        "reason": "review_requested",
+        "source_revision": "9007199254741002",
+        "state": "needs_you",
+        "unread": "2"
+      },
+      "checks": [
+        {
+          "freshness": {
+            "observed_revision": "9007199254741004",
+            "state": "stale"
+          },
+          "id": "check-failed",
+          "required": true,
+          "state": "failed"
+        }
+      ],
+      "delivery": {
+        "freshness": {
+          "observed_revision": "9007199254741006",
+          "state": "fresh"
+        },
+        "state": "pending"
+      },
+      "files": [
+        {
+          "id": "file-text",
+          "preview": {
+            "kind": "text",
+            "sanitized": true
+          }
+        }
+      ],
+      "pull_request": {
+        "freshness": {
+          "observed_revision": "9007199254741005",
+          "state": "fresh"
+        },
+        "readiness": "blocked",
+        "state": "open"
+      },
+      "review": {
+        "decision": "pending",
+        "freshness": {
+          "observed_revision": "9007199254741003",
+          "state": "fresh"
+        }
+      },
+      "revision": "9007199254741011"
+    },
+    "state": "available"
+  },
+  "schema": "automonique.dashboard.cockpit/v2",
+  "selected": {
+    "workspace": "workspace-1"
+  },
+  "workspaces": [
+    {
+      "attempts": [
+        {
+          "id": "attempt-1",
+          "label": "Attempt 1",
+          "lifecycle": "running",
+          "revision": "2",
+          "sessions": [
+            {
+              "id": "runtime-session-1",
+              "label": "Session 1",
+              "lifecycle": "active",
+              "panes": [],
+              "platform_session_id": "session-1",
+              "revision": "3"
+            }
+          ]
+        }
+      ],
+      "attention": "needs_you",
+      "host_id": "host-1",
+      "id": "workspace-1",
+      "label": "Cockpit",
+      "lifecycle": "active",
+      "project_id": "project-1",
+      "revision": "9007199254741011"
+    }
+  ]
+}
