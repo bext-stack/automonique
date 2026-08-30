@@ -36,7 +36,7 @@ use automonique_protocol::platform_v2_attention::{
     AttentionReadRequest, AttentionSource, AttentionSourceSnapshot,
 };
 use automonique_protocol::platform_v2_inventory::{
-    ResourceListingPage, ResourceListingQuery, ResourceListingResync, granted_page_limit,
+    ResourceListingPage, ResourceListingQuery, ResourceListingResync,
 };
 use automonique_protocol::platform_v2_lifecycle::{
     MutationApprovalDecision, MutationApprovalId, MutationPreview, MutationPreviewDigest,
@@ -517,19 +517,17 @@ impl<T> PlatformV2Client<T> {
         &mut self,
         query: ResourceListingQuery,
     ) -> Result<ResourceListingResult, ClientError> {
-        let expected_after = query.after().cloned();
-        let expected_limit = query.requested_limit();
+        // The correlation predicate is the contract's, not this client's:
+        // `answers` re-derives the server's clamp instead of believing the
+        // page, and `expires` refuses a resync for a walk that presented no
+        // cursor. Restating either here would be a second copy of a rule that
+        // grows in the protocol crate.
+        let expected = query.clone();
         match self.request(PlatformV2Request::ListResources(query))? {
-            PlatformV2Response::ResourceListingPage(value)
-                if value.requested_limit() == expected_limit
-                    && value.granted_limit() == granted_page_limit(expected_limit)
-                    && value.after() == expected_after.as_ref() =>
-            {
+            PlatformV2Response::ResourceListingPage(value) if value.answers(&expected) => {
                 Ok(ResourceListingResult::Page(Box::new(value)))
             }
-            PlatformV2Response::ResourceListingResync(value)
-                if expected_after.as_ref() == Some(value.expired_after()) =>
-            {
+            PlatformV2Response::ResourceListingResync(value) if value.expires(&expected) => {
                 Ok(ResourceListingResult::Resync(value))
             }
             PlatformV2Response::Refused(value) => Ok(ResourceListingResult::Refused(value)),

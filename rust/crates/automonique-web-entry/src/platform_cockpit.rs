@@ -2,10 +2,10 @@
 
 //! Bounded, server-owned browser projection over the authenticated Platform v2 bridge.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use automonique_protocol::platform::IdempotencyKey;
+use automonique_protocol::platform::{IdempotencyKey, ResourceCoordinate, ResourceRecord};
 use automonique_protocol::platform_v2::{
     PlatformVersion, ProjectId, UserWorkspaceId, WorkContextCursor, WorkContextIdentity,
     WorkContextKind, WorkContextLifecycle, WorkContextQuery, WorkContextRecord,
@@ -14,6 +14,9 @@ use automonique_protocol::platform_v2::{
 use automonique_protocol::platform_v2_attention::{
     AttentionItemState, AttentionReadRequest, AttentionSource, AttentionSourceId,
     AttentionSourceKind, AttentionSourceSnapshot,
+};
+use automonique_protocol::platform_v2_inventory::{
+    ResourceListingCursor, ResourceListingQuery, granted_page_limit,
 };
 use automonique_protocol::platform_v2_lineage::{
     BaseSelectorId, BranchSelectorId, ExternalWorkAuthorityId, ExternalWorkIdentity,
@@ -42,6 +45,7 @@ use automonique_protocol::primitives::Revision;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::PlatformResourceView;
 use crate::platform_v2_bridge::PlatformV2Bridge;
 
 const SCHEMA: &str = "automonique.dashboard.cockpit/v2";
@@ -54,6 +58,15 @@ const MAX_COCKPIT_WORK_CONTEXTS: usize = 1024;
 const MAX_COCKPIT_ACTIVITIES: usize = 256;
 const MAX_COCKPIT_INBOX_ITEMS: usize = 256;
 const WORK_CONTEXT_PAGE_LIMIT: u16 = 128;
+const MAX_COCKPIT_RESOURCES: usize = 1024;
+/// The page the cockpit asks `list_resources` for.
+///
+/// Not a number repeated here. Asking for more than the server grants is
+/// explicitly not an error -- the server answers with its own ceiling -- so
+/// asking for the largest limit the wire can carry and letting the contract's
+/// own clamp name the answer means this walk uses the fewest pages the server
+/// allows, and keeps doing so if that ceiling ever moves.
+const RESOURCE_LISTING_PAGE_LIMIT: u16 = granted_page_limit(u16::MAX);
 const ATTENTION_READ_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
@@ -402,6 +415,13 @@ fn read(
         review_capabilities.as_ref(),
     );
     let attention = attention_inventory(bridge, &records, selected_identity.as_ref());
+    // The Platform v1 resource inventory, walked rather than snapshotted. It
+    // degrades on its own: a deployment whose policy grants no listing keeps
+    // every other panel of this cockpit rather than losing all of it to one
+    // refused enrichment.
+    let resources = resource_inventory_projection(walk_resource_inventory(|query| {
+        bridge.request(PlatformV2Request::ListResources(query))
+    }));
     let activity_items = cockpit_activities(lineage_projection.as_ref(), review_snapshot.as_ref());
     let activities = collection_projection(
         activity_items,
@@ -423,6 +443,7 @@ fn read(
         "lineage": lineage,
         "review": review,
         "attention": attention.coverage,
+        "resources": resources,
         "activities": activities,
         "inbox": inbox,
         "actions": {
@@ -487,6 +508,128 @@ fn verify_inventory_capacity(current: usize, incoming: usize) -> Result<(), Stri
     } else {
         Ok(())
     }
+}
+
+/// The outcome of one walk over `list_resources`.
+///
+/// A walk has exactly two ends and only one of them carries records. The
+/// listing contract makes a resync a *variant* rather than an empty page,
+/// because a consumer that read "no more results" out of an expired cursor
+/// would render a silently short inventory. This type carries that same
+/// distinction one layer up, where the equivalent mistake is rendering the
+/// pages a walk did manage to collect: `Discarded` has no field a partial
+/// inventory could be read out of, so nothing downstream can render one by
+/// accident.
+#[derive(Debug)]
+enum ResourceInventoryWalk {
+    /// Every page of one uninterrupted walk, in coordinate order.
+    Complete(Vec<ResourceRecord>),
+    /// The walk did not reach the end of the listing, and the records it had
+    /// already collected are gone with it.
+    Discarded { category: String },
+}
+
+/// Walk `list_resources` to the end of the authorized inventory.
+///
+/// This is what the shared projection could not do. A v1 snapshot either names
+/// coordinates or asks for everything, so the classes the web entry cannot
+/// spell -- approvals, provider models -- were never in it and were never even
+/// refreshed (#162, #220). The daemon refreshes every projected class when a
+/// walk *starts*, and only then: so this is one loop with exactly one
+/// `after: None` turn. Restarting the walk on a later page would buy a full
+/// refresh per page and hand the inventory a fresh chance to move under the
+/// cursor every time.
+///
+/// No class filter is sent. `resource_reads` is where a deployment decides
+/// what this projection may see, one `(authority, kind)` class at a time;
+/// asking for everything this principal is authorized for keeps that decision
+/// in the operator's policy rather than duplicating it as a list of kinds
+/// compiled into a browser projection. An empty filter is bounded here in a
+/// way it never was in v1: the answer is one page and a cursor.
+fn walk_resource_inventory(
+    mut list: impl FnMut(ResourceListingQuery) -> Result<PlatformV2Response, &'static str>,
+) -> ResourceInventoryWalk {
+    fn discarded(category: &str) -> ResourceInventoryWalk {
+        ResourceInventoryWalk::Discarded {
+            category: category.to_owned(),
+        }
+    }
+    let mut records: Vec<ResourceRecord> = Vec::new();
+    let mut seen: BTreeSet<ResourceCoordinate> = BTreeSet::new();
+    let mut after: Option<ResourceListingCursor> = None;
+    loop {
+        let Ok(query) =
+            ResourceListingQuery::new(Vec::new(), Vec::new(), after, RESOURCE_LISTING_PAGE_LIMIT)
+        else {
+            return discarded("platform_cockpit_query_invalid");
+        };
+        // `answers` and `expires` are the contract's own correlation
+        // predicates. Re-deriving the server's clamp here, or deciding here
+        // what a resync may correlate to, would be a copy of a rule that lives
+        // in the protocol crate and grows there.
+        let page = match list(query.clone()) {
+            Ok(PlatformV2Response::ResourceListingPage(page)) if page.answers(&query) => page,
+            Ok(PlatformV2Response::ResourceListingResync(resync)) if resync.expires(&query) => {
+                // Not the end of the listing, and not an empty page. The
+                // authorized inventory moved while this walk was in flight, so
+                // every offset the walk holds now names a different record.
+                // The pages already collected are dropped rather than rendered
+                // as an inventory; the next read starts a fresh walk.
+                return discarded("platform_v2_resource_listing_resync_required");
+            }
+            Ok(PlatformV2Response::Refused(value)) => return discarded(value.category().as_str()),
+            Ok(_) => return discarded("platform_v2_response_invalid"),
+            Err(category) => return discarded(category),
+        };
+        if records.len().saturating_add(page.items().len()) > MAX_COCKPIT_RESOURCES {
+            // Truncating here would publish a prefix of the inventory as the
+            // inventory. A walk that cannot finish has nothing to show.
+            return discarded("platform_v2_resource_inventory_exceeds_bound");
+        }
+        for record in page.items() {
+            if !seen.insert(record.resource.clone()) {
+                return discarded("platform_v2_resource_inventory_duplicate");
+            }
+            records.push(record.clone());
+        }
+        let Some(next) = page.next_cursor().cloned() else {
+            return ResourceInventoryWalk::Complete(records);
+        };
+        after = Some(next);
+    }
+}
+
+/// Render one walked inventory as the cockpit's `resources` collection.
+///
+/// The records are rendered through the same view the shared v1 projection
+/// uses, so one document never carries the same record in two shapes. A
+/// discarded walk renders as an unavailable collection naming why: an operator
+/// reading `platform_v2_scope_denied` there is being told the policy grants no
+/// listing, which is a different fact from an inventory that is genuinely
+/// empty.
+fn resource_inventory_projection(walk: ResourceInventoryWalk) -> Value {
+    let empty = BoundedCockpitItems {
+        items: Vec::new(),
+        total: 0,
+    };
+    let (source, bounded) = match walk {
+        ResourceInventoryWalk::Complete(records) => {
+            let total = records.len();
+            match records
+                .into_iter()
+                .map(|record| serde_json::to_value(PlatformResourceView::from(record)))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(items) => (
+                    json!({ "state": "available", "category": Value::Null }),
+                    BoundedCockpitItems { items, total },
+                ),
+                Err(_) => (unavailable("platform_cockpit_projection_invalid"), empty),
+            }
+        }
+        ResourceInventoryWalk::Discarded { category } => (unavailable(&category), empty),
+    };
+    collection_projection(bounded, &[("inventory", &source)])
 }
 
 fn lifecycle_actions(
@@ -2243,6 +2386,12 @@ fn v1_fallback(retained_v1: Value, category: &str) -> Value {
                 "review": { "state": "unavailable", "category": category }
             }
         },
+        "resources": {
+            "state": "unavailable", "items": [], "total": "0", "omitted": "0",
+            "sources": {
+                "inventory": { "state": "unavailable", "category": category }
+            }
+        },
         "selected": { "workspace": Value::Null },
         "lineage": unavailable("platform_v2_unavailable"),
         "review": unavailable("platform_v2_unavailable"),
@@ -2280,6 +2429,16 @@ fn refused(category: &str, explanation: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use automonique_protocol::platform::{
+        Freshness, FreshnessState, MAX_SNAPSHOT_RESOURCES, PlatformText, ResourceAuthority,
+        ResourceId, ResourceKind,
+    };
+    use automonique_protocol::platform_v2_inventory::{
+        AuthorizedResourceRecord, MAX_RESOURCE_LISTING_PAGE_ITEMS, ResourceListingPage,
+        ResourceListingResult, page_authorized_resources,
+    };
+    use automonique_protocol::primitives::EpochMillis;
+
     use super::*;
     use automonique_protocol::platform_v2_transport::PlatformV2Refusal;
     use std::collections::BTreeSet;
@@ -2594,6 +2753,343 @@ mod tests {
         );
         assert_eq!(projection["state"], "unavailable");
         assert_eq!(projection["items"], json!([]));
+    }
+
+    /// One authorized inventory, paged by the server's own pager.
+    ///
+    /// The fake here is the transport, never the pagination: every page these
+    /// tests answer with comes out of `page_authorized_resources`, so the walk
+    /// is exercised against the cursor grammar and the clamp the daemon
+    /// actually applies rather than against a second implementation of them
+    /// written to agree with it.
+    struct ListingServer {
+        authorized: Vec<AuthorizedResourceRecord>,
+        seen: Vec<ResourceListingQuery>,
+    }
+
+    impl ListingServer {
+        fn new(records: &[ResourceRecord]) -> Self {
+            Self {
+                authorized: records
+                    .iter()
+                    .cloned()
+                    .map(AuthorizedResourceRecord::new)
+                    .collect(),
+                seen: Vec::new(),
+            }
+        }
+
+        fn answer(
+            &mut self,
+            query: ResourceListingQuery,
+        ) -> Result<PlatformV2Response, &'static str> {
+            self.seen.push(query.clone());
+            match page_authorized_resources(&query, &self.authorized).unwrap() {
+                ResourceListingResult::Page(page) => {
+                    Ok(PlatformV2Response::ResourceListingPage(page))
+                }
+                ResourceListingResult::Resync(value) => {
+                    Ok(PlatformV2Response::ResourceListingResync(value))
+                }
+            }
+        }
+    }
+
+    fn listed_record(authority: ResourceAuthority, kind: ResourceKind, id: &str) -> ResourceRecord {
+        ResourceRecord {
+            resource: ResourceCoordinate::new(authority, kind, ResourceId::new(id).unwrap()),
+            freshness: Freshness {
+                state: FreshnessState::Fresh,
+                observed_at: EpochMillis::from_millis(1_700_000_000_000),
+                revision: Revision::FIRST,
+            },
+            summary: PlatformText::new("open").unwrap(),
+        }
+    }
+
+    fn listed_inventory(count: usize) -> Vec<ResourceRecord> {
+        let mut records: Vec<ResourceRecord> = (0..count)
+            .map(|index| {
+                listed_record(
+                    ResourceAuthority::Automonique,
+                    ResourceKind::Approval,
+                    &format!("approval-{index:04}"),
+                )
+            })
+            .collect();
+        records.sort_by(|left, right| left.resource.cmp(&right.resource));
+        records
+    }
+
+    fn walked(walk: &ResourceInventoryWalk) -> &[ResourceRecord] {
+        match walk {
+            ResourceInventoryWalk::Complete(records) => records,
+            ResourceInventoryWalk::Discarded { category } => {
+                panic!("expected a complete walk, discarded as {category}")
+            }
+        }
+    }
+
+    fn discarded_as(walk: &ResourceInventoryWalk) -> &str {
+        match walk {
+            ResourceInventoryWalk::Discarded { category } => category,
+            ResourceInventoryWalk::Complete(records) => {
+                panic!(
+                    "expected a discarded walk, completed with {} records",
+                    records.len()
+                )
+            }
+        }
+    }
+
+    /// The point of #231, as a test.
+    ///
+    /// More resources than one v1 snapshot may carry, listed without naming a
+    /// single coordinate, and reaching the projection whole -- including the
+    /// two classes the web entry has never been able to spell, an approval and
+    /// a provider model. The walk starts exactly once, which is the whole of
+    /// the refresh contract on this side: the daemon refreshes every projected
+    /// class when `after` is absent and only then, so a walk that restarted
+    /// per page would buy a full refresh per page.
+    #[test]
+    fn the_cockpit_walks_the_whole_authorized_inventory_in_one_walk() {
+        let mut records = listed_inventory(MAX_SNAPSHOT_RESOURCES + 7);
+        records.push(listed_record(
+            ResourceAuthority::Provider,
+            ResourceKind::Model,
+            "model-sonnet",
+        ));
+        records.sort_by(|left, right| left.resource.cmp(&right.resource));
+        let mut server = ListingServer::new(&records);
+        let walk = walk_resource_inventory(|query| server.answer(query));
+
+        let expected: Vec<ResourceCoordinate> = records
+            .iter()
+            .map(|record| record.resource.clone())
+            .collect();
+        let seen: Vec<ResourceCoordinate> = walked(&walk)
+            .iter()
+            .map(|record| record.resource.clone())
+            .collect();
+        assert_eq!(seen, expected);
+        // The classes a named v1 snapshot could not ask for, present by name.
+        assert!(
+            seen.iter()
+                .any(|coordinate| coordinate.kind == ResourceKind::Approval)
+        );
+        assert!(seen.iter().any(|coordinate| {
+            coordinate.authority == ResourceAuthority::Provider
+                && coordinate.kind == ResourceKind::Model
+        }));
+
+        // One walk start, and every later page a continuation of it.
+        assert!(server.seen[0].after().is_none());
+        assert!(server.seen[1..].iter().all(|query| query.after().is_some()));
+        assert_eq!(
+            server.seen.len(),
+            records
+                .len()
+                .div_ceil(usize::from(RESOURCE_LISTING_PAGE_LIMIT))
+        );
+        // No class filter: which classes this projection may see is the
+        // operator's `resource_reads` grant to decide, not a list of kinds
+        // compiled in here.
+        assert!(
+            server
+                .seen
+                .iter()
+                .all(|query| query.authorities().is_empty() && query.kinds().is_empty())
+        );
+
+        let projection = resource_inventory_projection(walk);
+        assert_eq!(projection["state"], "complete");
+        assert_eq!(projection["total"], records.len().to_string());
+        assert_eq!(projection["omitted"], "0");
+        assert_eq!(projection["sources"]["inventory"]["state"], "available");
+        assert_eq!(projection["items"].as_array().unwrap().len(), records.len());
+    }
+
+    /// The cockpit asks for the server's bound, spelled by the server.
+    ///
+    /// Asking above the ceiling is explicitly not an error, so the walk asks
+    /// for the largest limit the wire carries and lets `granted_page_limit`
+    /// name the answer. A page answering some other query is refused rather
+    /// than spliced into the walk, and that predicate is the contract's own.
+    #[test]
+    fn the_walk_takes_the_servers_bound_and_refuses_a_page_answering_another_query() {
+        assert_eq!(RESOURCE_LISTING_PAGE_LIMIT, granted_page_limit(u16::MAX));
+        assert_eq!(
+            usize::from(RESOURCE_LISTING_PAGE_LIMIT),
+            MAX_RESOURCE_LISTING_PAGE_ITEMS
+        );
+
+        let records = listed_inventory(3);
+        let authorized: Vec<AuthorizedResourceRecord> = records
+            .iter()
+            .cloned()
+            .map(AuthorizedResourceRecord::new)
+            .collect();
+        // A well-formed page, but one that answers a query for a smaller page
+        // than the walk asked for.
+        let narrower = ResourceListingQuery::new(
+            Vec::new(),
+            Vec::new(),
+            None,
+            RESOURCE_LISTING_PAGE_LIMIT - 1,
+        )
+        .unwrap();
+        let ResourceListingResult::Page(page) =
+            page_authorized_resources(&narrower, &authorized).unwrap()
+        else {
+            panic!("a fresh query is answered with a page")
+        };
+        let walk =
+            walk_resource_inventory(|_| Ok(PlatformV2Response::ResourceListingPage(page.clone())));
+        assert_eq!(discarded_as(&walk), "platform_v2_response_invalid");
+    }
+
+    /// The parity rule of #224's sibling fence, applied to the new way of
+    /// being partial.
+    ///
+    /// A resync is not the end of the listing and not an empty page: the
+    /// authorized inventory moved under the walk, so every offset it holds
+    /// names a different record now. The pages already collected are dropped.
+    /// A consumer that rendered them would publish a silently short inventory
+    /// as a whole one, which is exactly what
+    /// `retention_gap_or_source_refusal_discards_partial_attention_aggregation`
+    /// forbids for the attention aggregation.
+    #[test]
+    fn a_resync_mid_walk_discards_the_pages_already_collected() {
+        let records = listed_inventory(MAX_SNAPSHOT_RESOURCES + 7);
+        let mut server = ListingServer::new(&records);
+        let mut pages = 0_usize;
+        let walk = walk_resource_inventory(|query| {
+            pages += 1;
+            if pages > 1 {
+                // The inventory moved: one authorized record was revoked
+                // between page one and page two.
+                server.authorized.pop();
+            }
+            server.answer(query)
+        });
+
+        assert!(pages > 1, "the fixture must reach a continuation page");
+        assert_eq!(
+            discarded_as(&walk),
+            "platform_v2_resource_listing_resync_required"
+        );
+        let projection = resource_inventory_projection(walk);
+        assert_eq!(projection["state"], "unavailable");
+        assert_eq!(projection["items"], json!([]));
+        assert_eq!(projection["total"], "0");
+        assert_eq!(
+            projection["sources"]["inventory"]["category"],
+            "platform_v2_resource_listing_resync_required"
+        );
+    }
+
+    /// A walk that cannot finish shows nothing, rather than a prefix.
+    #[test]
+    fn a_walk_past_the_cockpit_bound_is_discarded_rather_than_truncated() {
+        let records = listed_inventory(MAX_COCKPIT_RESOURCES + 1);
+        let mut server = ListingServer::new(&records);
+        let walk = walk_resource_inventory(|query| server.answer(query));
+        assert_eq!(
+            discarded_as(&walk),
+            "platform_v2_resource_inventory_exceeds_bound"
+        );
+        let projection = resource_inventory_projection(walk);
+        assert_eq!(projection["state"], "unavailable");
+        assert_eq!(projection["items"], json!([]));
+        assert_eq!(projection["total"], "0");
+    }
+
+    /// A record served twice across pages ends the walk rather than the list.
+    #[test]
+    fn a_coordinate_repeated_across_pages_discards_the_walk() {
+        let records = listed_inventory(MAX_RESOURCE_LISTING_PAGE_ITEMS + 1);
+        let mut server = ListingServer::new(&records);
+        let mut first: Option<ResourceListingPage> = None;
+        let walk = walk_resource_inventory(|query| {
+            // The continuation replays page one's records under the cursor the
+            // walk presented, so the page correlates but the inventory it
+            // carries does not.
+            if let Some(page) = first.clone() {
+                return Ok(PlatformV2Response::ResourceListingPage(
+                    ResourceListingPage::new(
+                        query.requested_limit(),
+                        query.granted_limit(),
+                        query.after().cloned(),
+                        None,
+                        false,
+                        page.items().to_vec(),
+                    )
+                    .unwrap(),
+                ));
+            }
+            let response = server.answer(query)?;
+            if let PlatformV2Response::ResourceListingPage(page) = &response {
+                first = Some(page.clone());
+            }
+            Ok(response)
+        });
+        assert_eq!(
+            discarded_as(&walk),
+            "platform_v2_resource_inventory_duplicate"
+        );
+    }
+
+    /// A refusal is a claim about the policy; an empty page is a claim about
+    /// the inventory. The projection must not conflate them.
+    ///
+    /// This is the operator-visible half of #231: a deployment whose
+    /// `resource_reads` grant is absent is refused `platform_v2_scope_denied`,
+    /// and the cockpit says so rather than rendering an empty, complete-looking
+    /// inventory that would make the feature look shipped and broken.
+    #[test]
+    fn a_refused_listing_names_the_policy_and_an_empty_one_names_the_inventory() {
+        let refused = walk_resource_inventory(|_| {
+            Ok(PlatformV2Response::Refused(
+                PlatformV2Refusal::new(
+                    "platform_v2_scope_denied",
+                    "This principal holds no resource-read grant",
+                )
+                .unwrap(),
+            ))
+        });
+        assert_eq!(discarded_as(&refused), "platform_v2_scope_denied");
+        let refused = resource_inventory_projection(refused);
+        assert_eq!(refused["state"], "unavailable");
+        assert_eq!(refused["sources"]["inventory"]["state"], "unavailable");
+        assert_eq!(
+            refused["sources"]["inventory"]["category"],
+            "platform_v2_scope_denied"
+        );
+
+        let mut server = ListingServer::new(&[]);
+        let empty = walk_resource_inventory(|query| server.answer(query));
+        assert!(walked(&empty).is_empty());
+        let empty = resource_inventory_projection(empty);
+        assert_eq!(empty["state"], "complete");
+        assert_eq!(empty["total"], "0");
+        assert_eq!(empty["sources"]["inventory"]["state"], "available");
+        assert_ne!(refused["state"], empty["state"]);
+    }
+
+    /// Every mode of the cockpit document carries the same keys, so a browser
+    /// never has to tell "this projection has no resource listing" apart from
+    /// "this build has no resource listing".
+    #[test]
+    fn the_resource_collection_is_present_in_every_projection_mode() {
+        let fallback = v1_fallback(json!({}), "platform_v2_not_negotiated");
+        assert_eq!(fallback["resources"]["state"], "unavailable");
+        assert_eq!(fallback["resources"]["items"], json!([]));
+        assert_eq!(
+            fallback["resources"]["sources"]["inventory"]["category"],
+            "platform_v2_not_negotiated"
+        );
+        let partial = v2_unavailable(json!({}), "platform_v2_unavailable");
+        assert_eq!(partial["resources"]["state"], "unavailable");
     }
 
     #[test]

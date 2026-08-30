@@ -269,6 +269,26 @@ impl ResourceListingPage {
     pub fn into_items(self) -> Vec<ResourceRecord> {
         self.items
     }
+
+    /// Whether this page is the answer to exactly `query`.
+    ///
+    /// Three facts, one spelling. The clamp is *re-derived* from the query's
+    /// own requested limit through [`granted_page_limit`] rather than believed
+    /// from the page, so a server that reports a bound it did not apply is
+    /// refused instead of trusted; the requested limit must come back
+    /// verbatim; and the continuation the page reports having resumed must be
+    /// the one that was presented, so a walk can never splice a page minted
+    /// for a different offset into its own sequence.
+    ///
+    /// Every consumer needs this and none of them should write it out: a
+    /// client that restates the predicate beside its own loop is a copy of the
+    /// contract that drifts the day the contract grows a field.
+    #[must_use]
+    pub fn answers(&self, query: &ResourceListingQuery) -> bool {
+        self.requested_limit == query.requested_limit()
+            && self.granted_limit == granted_page_limit(query.requested_limit())
+            && self.after.as_ref() == query.after()
+    }
 }
 
 /// The answer when a presented cursor no longer names a live listing.
@@ -286,6 +306,17 @@ impl ResourceListingResync {
     #[must_use]
     pub const fn expired_after(&self) -> &ResourceListingCursor {
         &self.expired_after
+    }
+
+    /// Whether this resync expires exactly the cursor `query` presented.
+    ///
+    /// A walk that has presented no cursor has nothing to expire, so a resync
+    /// answering the first page of a walk fails this and is a protocol
+    /// violation rather than an empty inventory. Shared with
+    /// [`ResourceListingPage::answers`] for the same reason.
+    #[must_use]
+    pub fn expires(&self, query: &ResourceListingQuery) -> bool {
+        query.after() == Some(&self.expired_after)
     }
 }
 

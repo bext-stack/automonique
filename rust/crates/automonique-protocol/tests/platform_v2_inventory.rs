@@ -479,3 +479,47 @@ fn coordinates_order_by_declaration_and_not_by_their_spelling() {
         vec!["session-1", "approval-1", "repo-1", "client-1"],
     );
 }
+
+/// The correlation predicate belongs to the contract, not to each consumer.
+///
+/// Every client of this listing has to decide whether the frame in its hand is
+/// the answer to the query it sent, and every one of them was deciding it the
+/// same three ways in its own words. That is the shape of drift: the day the
+/// page grows a field, the copies stop agreeing one at a time. `answers` and
+/// `expires` are that decision, spelled once, and the clamp inside `answers`
+/// is re-derived through `granted_page_limit` rather than read off the page.
+#[test]
+fn a_page_answers_one_query_and_a_resync_expires_one_cursor() {
+    let ceiling = granted_page_limit(u16::MAX);
+    let records = inventory(MAX_RESOURCE_LISTING_PAGE_ITEMS + 4);
+    let all = authorized(&records);
+    let start = query(ceiling, None);
+    let first = page(page_authorized_resources(&start, &all).unwrap());
+    assert!(first.answers(&start));
+
+    // A page is the answer to the query whose continuation it resumed, and to
+    // no other. Presenting the first page against the follow-up query, or the
+    // follow-up page against the opening one, both fail.
+    let next = query(ceiling, Some(first.next_cursor().unwrap().clone()));
+    let second = page(page_authorized_resources(&next, &all).unwrap());
+    assert!(second.answers(&next));
+    assert!(!first.answers(&next));
+    assert!(!second.answers(&start));
+
+    // The clamp is re-derived rather than believed: a page built for a smaller
+    // request carries a smaller granted limit and does not answer a request
+    // for a larger one, though both are legal pages on their own.
+    let narrower = query(ceiling - 1, None);
+    let narrower_page = page(page_authorized_resources(&narrower, &all).unwrap());
+    assert!(narrower_page.answers(&narrower));
+    assert!(!narrower_page.answers(&start));
+
+    // A resync expires exactly the cursor that was presented. A walk that has
+    // presented none has nothing to expire, so a resync answering the opening
+    // page of a walk is a protocol violation and not an empty inventory.
+    let expired = ResourceListingResync::new(first.next_cursor().unwrap().clone());
+    assert!(expired.expires(&next));
+    assert!(!expired.expires(&start));
+    let elsewhere = ResourceListingResync::new(narrower_page.next_cursor().unwrap().clone());
+    assert!(!elsewhere.expires(&next));
+}
