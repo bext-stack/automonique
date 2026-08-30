@@ -442,6 +442,27 @@ test.describe("hosted cockpit attention render", () => {
       const page = await context.newPage();
       if (proofPath) await serveProof(page, proofPath, applied);
 
+      // The cockpit re-reads its projection every five seconds while the
+      // sessions panel is open. Unpinned, the DOM asserted below could have
+      // been built from a later document than the one captured, which would
+      // make this check flaky and, worse, wrong about what it observed. So the
+      // deployment is asked exactly once and every subsequent poll is answered
+      // with the identical bytes it already sent. Nothing is altered: this is
+      // the deployment's own answer, replayed to its own page.
+      let captured = null;
+      let status = null;
+      if (!proofPath) {
+        await page.route(`**${COCKPIT_PATH}`, async (route) => {
+          if (captured !== null) {
+            return route.fulfill({ status: 200, contentType: "application/json", body: captured });
+          }
+          const answer = await route.fetch();
+          status = answer.status();
+          captured = await answer.body();
+          return route.fulfill({ response: answer, body: captured });
+        });
+      }
+
       const answered = page.waitForResponse(
         (response) => new URL(response.url()).pathname === COCKPIT_PATH,
         { timeout: 60_000 },
@@ -449,10 +470,13 @@ test.describe("hosted cockpit attention render", () => {
       await page.goto(`${origin}/#sessions`, { waitUntil: "domcontentloaded", timeout: 60_000 });
       const response = await answered;
       expect(
-        response.status(),
+        status ?? response.status(),
         `${origin}${COCKPIT_PATH} did not answer the signed-in cockpit read`,
       ).toBe(200);
-      const served = await response.json();
+      const served = JSON.parse(
+        captured !== null ? captured.toString("utf8") : (await response.body()).toString("utf8"),
+      );
+      evidence.projection_reads = proofPath ? "served_locally" : "one_network_read_replayed_to_the_page";
 
       // Everything below is derived from `served`. Nothing is a constant.
       expect(served?.schema, "the deployment served a cockpit document under an unknown schema").toBe(
