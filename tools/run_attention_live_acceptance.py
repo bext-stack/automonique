@@ -184,13 +184,28 @@ COCKPIT_RENDER_EVIDENCE_FILE = "live-cockpit-attention.json"
 COCKPIT_RENDER_PROJECT = "live-cockpit"
 COCKPIT_RENDER_TIMEOUT = 600.0
 COCKPIT_RENDER_LOG = "runner.log"
-# Values lifted out of the browser evidence are held to one of two shapes: a
-# bare enumeration token, or a canonical decimal string. That is stricter than
-# the response allow-list above, and it is what keeps a rendered free-text
-# summary or a work coordinate out of this report even though the evidence file
-# beside the screenshot carries them for cross-client correlation.
-ENUM_TOKEN = re.compile(r"\A[a-z0-9_]{1,64}(\.[a-z0-9_]{1,64}){0,3}\Z")
+# Every value lifted out of the browser evidence is held to the shape of the
+# field it came from: a revision is a canonical decimal or it is not recorded, a
+# state is a bare category token, a rendered read model's key is a dotted
+# semantic key. That is stricter than the response allow-list above, and it is
+# what keeps a rendered free-text summary or a work coordinate out of this
+# report even though the evidence file beside the screenshot carries them for
+# cross-client correlation. `CATEGORY_TOKEN` above is the bare-token shape.
+SEMANTIC_TOKEN = re.compile(r"\A[a-z0-9_]{1,64}(\.[a-z0-9_]{1,64}){1,3}\Z")
 DECIMAL_TOKEN = re.compile(r"\A(0|[1-9][0-9]*)\Z")
+COCKPIT_RENDER_ITEM_SHAPES = {
+    "source_kind": CATEGORY_TOKEN,
+    "source_revision": DECIMAL_TOKEN,
+    "item_revision": DECIMAL_TOKEN,
+    "state": CATEGORY_TOKEN,
+    "reason": CATEGORY_TOKEN,
+    "unread": DECIMAL_TOKEN,
+}
+COCKPIT_RENDER_REVIEW_SHAPES = {
+    "source_state": CATEGORY_TOKEN,
+    "source_revision": DECIMAL_TOKEN,
+    "derived": CATEGORY_TOKEN,
+}
 
 
 @dataclass(frozen=True)
@@ -835,21 +850,15 @@ def bounded_reason(value: str) -> str:
     return value if len(value) <= SCALAR_LIMIT else value[: SCALAR_LIMIT - 1] + "\u2026"
 
 
-def evidence_token(value: Any) -> str | None:
-    """Admit an evidence value only as an enumeration token or a decimal."""
-    if not isinstance(value, str):
-        return None
-    return value if ENUM_TOKEN.fullmatch(value) or DECIMAL_TOKEN.fullmatch(value) else None
-
-
-def evidence_tokens(values: Any, keys: tuple[str, ...]) -> dict[str, str]:
+def evidence_tokens(values: Any, shapes: dict[str, Any]) -> dict[str, str]:
+    """Admit each evidence value only in the shape its own field must have."""
     if not isinstance(values, dict):
         return {}
     admitted = {}
-    for key in keys:
-        token = evidence_token(values.get(key))
-        if token is not None:
-            admitted[key] = token
+    for key, shape in shapes.items():
+        value = values.get(key)
+        if isinstance(value, str) and shape.fullmatch(value):
+            admitted[key] = value
     return admitted
 
 
@@ -1018,28 +1027,26 @@ def check_cockpit_render(
         result["attention_items"] = [
             admitted
             for admitted in (
-                evidence_tokens(
-                    item,
-                    ("source_kind", "source_revision", "item_revision", "state", "reason", "unread"),
-                )
-                for item in items[:LIST_LIMIT]
+                evidence_tokens(item, COCKPIT_RENDER_ITEM_SHAPES) for item in items[:LIST_LIMIT]
             )
             if admitted
         ]
     review = declared.get("review")
     if isinstance(review, dict):
         keys = review.get("semantic_keys")
-        admitted_review = evidence_tokens(review, ("source_state", "source_revision", "derived"))
+        admitted_review = evidence_tokens(review, COCKPIT_RENDER_REVIEW_SHAPES)
         if isinstance(keys, dict):
             semantic = {}
             for element, value in keys.items():
-                if not isinstance(element, str) or not ENUM_TOKEN.fullmatch(element.replace("-", "_")):
+                if not isinstance(element, str) or not CATEGORY_TOKEN.fullmatch(
+                    element.replace("-", "_")
+                ):
                     continue
                 if value is None:
                     semantic[element] = None
                     continue
                 tokens = value.split(" ") if isinstance(value, str) else []
-                if tokens and all(ENUM_TOKEN.fullmatch(token) for token in tokens):
+                if tokens and all(SEMANTIC_TOKEN.fullmatch(token) for token in tokens):
                     semantic[element] = tokens
             if semantic:
                 admitted_review["semantic_keys"] = semantic
