@@ -212,7 +212,7 @@ jobs:
 
       # `llvm-tools-preview` arrives with the toolchain file; this is the
       # driver, at an exact version and prebuilt rather than `cargo install`.
-      - uses: taiki-e/install-action@v2.86.5
+      - uses: taiki-e/install-action@v2.86.8
         with:
           tool: cargo-llvm-cov@0.8.7
 
