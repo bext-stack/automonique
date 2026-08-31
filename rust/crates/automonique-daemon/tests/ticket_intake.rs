@@ -12,6 +12,7 @@
 //! `automonique_store::support_tickets::SupportTicketStore` on a real SQLite
 //! file in a private temporary directory.
 
+use automonique_daemon::shutdown_signal::ShutdownSignal;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
@@ -475,6 +476,73 @@ fn every_halt_category_is_distinct() {
 // The loop
 // ---------------------------------------------------------------------------
 
+/// A worker parked between polls leaves when it is told, not when it next
+/// looks.
+///
+/// [`the_loop_polls_until_it_is_stopped_and_joins_promptly`] already proves the
+/// join does not wait out the cadence. It does not distinguish *how* — waking
+/// often enough to notice would satisfy it too, and that is exactly what this
+/// loop used to do: slice a five-minute cadence into hundred-millisecond naps,
+/// about three thousand of them, and still leave up to one nap late.
+///
+/// So this measures the leaving. Each worker is given time to be parked before
+/// it is stopped, and only the interval between the stop and the join is
+/// counted. A napping worker owes most of a nap on each of those; a worker that
+/// waits on the stop owes nothing.
+#[test]
+fn a_parked_worker_leaves_on_the_stop_rather_than_at_its_next_look() {
+    /// Drains to measure. One would be a coin flip against a nap boundary;
+    /// this many makes the two implementations differ by more than the noise.
+    const DRAINS: u32 = 10;
+    /// The slice length this loop used to nap in, mirrored. Mirrored rather
+    /// than imported because it is private — and because it no longer exists,
+    /// which is the point.
+    const FORMER_SLICE: Duration = Duration::from_millis(100);
+    /// Long enough that no implementation can drain by reaching it.
+    const CADENCE: Duration = Duration::from_secs(300);
+
+    let mut drained = Duration::ZERO;
+    for _ in 0..DRAINS {
+        let (_state, path) = PrivateState::new();
+        let store = SupportTicketStore::open(&path).expect("store opens");
+        let mut worker = TicketIntake::new(
+            FakeBoard::new(vec![Answer::Page(vec![issue("iss-1", "open")])]),
+            store,
+            0,
+        );
+        let metrics = worker.metrics();
+        let stop = ShutdownSignal::new();
+        let clock = AtomicI64::new(1_000);
+        let now = || Some(clock.fetch_add(1_000, Ordering::Relaxed));
+
+        std::thread::scope(|scope| {
+            let running = scope.spawn(|| worker.run(&stop, CADENCE, &now));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while metrics.polls() == 0 {
+                assert!(Instant::now() < deadline, "the worker never polled");
+                std::thread::yield_now();
+            }
+            // Well inside the first former slice, so a napping worker is
+            // provably mid-nap and owes the remainder rather than happening to
+            // be at a boundary.
+            std::thread::sleep(FORMER_SLICE / 5);
+
+            let signalled = Instant::now();
+            stop.stop();
+            assert_eq!(running.join().expect("worker joins"), None);
+            drained += signalled.elapsed();
+        });
+    }
+
+    let napping_cost = FORMER_SLICE * DRAINS;
+    assert!(
+        drained < napping_cost / 4,
+        "{DRAINS} drains cost {drained:?} between the stop and the join. A worker waiting on the \
+         stop leaves at once; one napping in {FORMER_SLICE:?} slices owes most of a slice each \
+         time, which is the {napping_cost:?} this is within reach of"
+    );
+}
+
 /// The loop polls repeatedly and ends when it is asked to, well inside a
 /// cadence — which is what makes a daemon shutdown a join rather than a wait.
 #[test]
@@ -488,7 +556,7 @@ fn the_loop_polls_until_it_is_stopped_and_joins_promptly() {
     );
     let metrics = worker.metrics();
 
-    let stop = AtomicBool::new(false);
+    let stop = ShutdownSignal::new();
     let clock = AtomicI64::new(1_000);
     let now = || Some(clock.fetch_add(1_000, Ordering::Relaxed));
     let started = Instant::now();
@@ -501,7 +569,7 @@ fn the_loop_polls_until_it_is_stopped_and_joins_promptly() {
             assert!(Instant::now() < deadline, "the worker never polled");
             std::thread::sleep(Duration::from_millis(5));
         }
-        stop.store(true, Ordering::Release);
+        stop.stop();
         assert_eq!(
             running.join().expect("worker joins"),
             None,
@@ -525,7 +593,8 @@ fn a_worker_stopped_before_it_starts_never_asks_the_fleet_anything() {
     let board = FakeBoard::new(vec![Answer::Page(vec![issue("iss-1", "open")])]);
     let mut worker = TicketIntake::new(board, store, 0);
 
-    let stop = AtomicBool::new(true);
+    let stop = ShutdownSignal::new();
+    stop.stop();
     assert_eq!(
         worker.run(&stop, Duration::from_secs(1), &|| Some(1_000)),
         None
@@ -553,7 +622,7 @@ fn the_loop_returns_the_halt_that_ended_it() {
         0,
     );
     let metrics = worker.metrics();
-    let stop = AtomicBool::new(false);
+    let stop = ShutdownSignal::new();
     let returned = AtomicBool::new(false);
 
     std::thread::scope(|scope| {
@@ -568,7 +637,7 @@ fn the_loop_returns_the_halt_that_ended_it() {
                 // The watchdog fires only when the worker did not halt. It stops
                 // the loop so the assertion below reports `None` — the failure —
                 // instead of this test never finishing.
-                stop.store(true, Ordering::Release);
+                stop.stop();
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -594,7 +663,7 @@ fn an_unreadable_clock_skips_a_poll_rather_than_ending_intake() {
         0,
     );
     let metrics = worker.metrics();
-    let stop = AtomicBool::new(false);
+    let stop = ShutdownSignal::new();
     let ticks = AtomicUsize::new(0);
     // The clock fails once, then works; the worker is asked to stop as soon as
     // it has recorded something.
@@ -612,7 +681,7 @@ fn an_unreadable_clock_skips_a_poll_rather_than_ending_intake() {
             assert!(Instant::now() < deadline, "the worker never recovered");
             std::thread::sleep(Duration::from_millis(5));
         }
-        stop.store(true, Ordering::Release);
+        stop.stop();
         assert_eq!(running.join().expect("worker joins"), None);
     });
     assert_eq!(metrics.tickets_recorded(), 1);

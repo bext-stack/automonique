@@ -142,6 +142,7 @@
 //! [`SystemClock`]; a test hands it a fake and drives [`AutomationSchedulerWorker::tick_at`]
 //! directly, without a thread.
 
+use crate::shutdown_signal::ShutdownSignal;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -917,7 +918,7 @@ fn occurrence(record: &AutomationRecord, at: i64) -> Result<Occurrence, Automati
 /// nothing composed, nothing to start, nothing to drain.
 pub struct AutomationSchedulerHost {
     composed: Option<AutomationSchedulerWorker>,
-    stop: Arc<AtomicBool>,
+    stop: Arc<ShutdownSignal>,
     worker: Option<JoinHandle<()>>,
     fault: Arc<Mutex<Option<&'static str>>>,
 }
@@ -928,7 +929,7 @@ impl AutomationSchedulerHost {
     pub fn disabled() -> Self {
         Self {
             composed: None,
-            stop: Arc::new(AtomicBool::new(false)),
+            stop: ShutdownSignal::new(),
             worker: None,
             fault: Arc::new(Mutex::new(None)),
         }
@@ -942,7 +943,7 @@ impl AutomationSchedulerHost {
     pub fn open(params: &AutomationSchedulerParams<'_>) -> Result<Self, AutomationSchedulerError> {
         Ok(Self {
             composed: Some(AutomationSchedulerWorker::open(params)?),
-            stop: Arc::new(AtomicBool::new(false)),
+            stop: ShutdownSignal::new(),
             worker: None,
             fault: Arc::new(Mutex::new(None)),
         })
@@ -1020,7 +1021,7 @@ impl AutomationSchedulerHost {
     /// The daemon uses this form so all workers can drain together while the
     /// serve thread keeps their shared generation lease renewed.
     pub(crate) fn begin_shutdown(&mut self) -> Option<JoinHandle<()>> {
-        self.stop.store(true, Ordering::Release);
+        self.stop.stop();
         self.worker.take()
     }
 }
@@ -1032,12 +1033,23 @@ impl Drop for AutomationSchedulerHost {
 }
 
 impl AutomationSchedulerWorker {
-    fn run(&mut self, stop: &AtomicBool, fault: &Mutex<Option<&'static str>>) {
-        while !stop.load(Ordering::Acquire) {
+    fn run(&mut self, stop: &ShutdownSignal, fault: &Mutex<Option<&'static str>>) {
+        while !stop.is_stopped() {
             match self.tick() {
                 Ok(report) if !report.is_idle() => {}
-                Ok(_) => std::thread::sleep(IDLE_POLL),
-                Err(error) if error.is_transient() => std::thread::sleep(IDLE_POLL),
+                // The wait is the same length and ends the same way, except
+                // when a drain ends it. A tick that found nothing due is
+                // waiting on a clock — which is this worker doing its job, not
+                // busy-waiting — so the interval stays; what it no longer costs
+                // is a generation handoff waiting one of these out per worker.
+                // The loop condition above reads the answer, so it is not read
+                // here.
+                Ok(_) => {
+                    stop.stopped_within(IDLE_POLL);
+                }
+                Err(error) if error.is_transient() => {
+                    stop.stopped_within(IDLE_POLL);
+                }
                 Err(error) => {
                     // The fault is recorded where the status projection reads
                     // it and where the journal keeps it; the thread then ends
