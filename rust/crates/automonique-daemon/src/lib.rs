@@ -10484,14 +10484,25 @@ mod admin_accept_wait_tests {
         let directory = tempfile::tempdir().expect("create a temporary directory");
         let (listener, _path) = listener(&directory);
 
-        let started = Instant::now();
-        await_admin_connection(&listener, ACCEPT_POLL);
-        let waited = started.elapsed();
+        // A single `poll` can return early on EINTR, so one short wait proves
+        // nothing. Three attempts do: a genuine spin cannot reach the interval
+        // on any of them, while an interrupt would have to land on all three
+        // to fake one. The assertion still fails on the behaviour it guards.
+        const ATTEMPTS: usize = 3;
+        let mut longest = Duration::ZERO;
+        for _ in 0..ATTEMPTS {
+            let started = Instant::now();
+            await_admin_connection(&listener, ACCEPT_POLL);
+            longest = longest.max(started.elapsed());
+            if longest >= ACCEPT_POLL / 2 {
+                break;
+            }
+        }
 
         assert!(
-            waited >= ACCEPT_POLL / 2,
-            "an idle wait returned after {waited:?}, which is short enough of \
-             the {ACCEPT_POLL:?} interval to be a spin"
+            longest >= ACCEPT_POLL / 2,
+            "no idle wait out of {ATTEMPTS} reached half the {ACCEPT_POLL:?} \
+             interval; the longest was {longest:?}, which is a spin"
         );
     }
 }
