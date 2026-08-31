@@ -240,6 +240,7 @@ pub use platform_v2_host::{
     verify_web_principal_binding, verify_web_project_roots,
 };
 pub mod pm2_inventory;
+pub mod program_digest;
 pub mod progress;
 pub mod progress_hub;
 pub mod provider_health;
@@ -1576,6 +1577,15 @@ pub struct Daemon {
     /// a drop could perform. It is `Some` for the whole life of a daemon a
     /// caller can observe.
     execution: Option<execute::ExecutionLane>,
+    /// The one observer of the bytes behind a pinned program path.
+    ///
+    /// Held here rather than inside the execution lane because the approval
+    /// gate reaches it first — [`Daemon::start_run`] consults the composed
+    /// approval requirement before the lane exists in the call — and because a
+    /// generation in disconnected recovery has no lane at all while still
+    /// answering that gate. One handle, so the gate and the lane observe one
+    /// program once between them. See [`program_digest`].
+    programs: Arc<program_digest::ProgramDigests>,
     /// The support-board intake worker, and the gate that decides whether it
     /// exists at all.
     ///
@@ -2720,6 +2730,22 @@ impl Daemon {
         )
         .map_err(|error| DaemonError::AttemptAdoptionFailed(error.category()))?;
 
+        // The program observer starts before the lane that consults it, and is
+        // asked for this deployment's configured provider executable straight
+        // away. That read is hundreds of megabytes of SHA-256, and this is the
+        // moment to spend it: it happens on the observer's own thread while
+        // this function finishes opening, so the first launch does not spend it
+        // on the accept thread. A deployment that has configured no provider
+        // asks for nothing, and a path that cannot be read is simply not
+        // remembered — the launch that needs it reads it then, exactly as it
+        // did before this existed.
+        let programs = program_digest::ProgramDigests::start();
+        if let Ok(Some(provider)) =
+            compose::ProviderConfig::load_execution(&state_dir.join(compose::PROVIDER_CONFIG_NAME))
+        {
+            programs.prefetch(provider.binary());
+        }
+
         // The execution lane opens last, beneath the same fence, and probes
         // nothing: it reads one environment variable and remembers the
         // measurement above. Discovering and preparing a cgroup domain is
@@ -2735,6 +2761,7 @@ impl Daemon {
                 automonique_protocol::admin::ExecutionState::SandboxEnforceableLaneWired
             ),
             Arc::clone(&approval_watch),
+            Arc::clone(&programs),
         );
 
         let database_path = config.database_path();
@@ -2871,6 +2898,7 @@ impl Daemon {
             configured_approval_requirement,
             approval_lifetime,
             execution: Some(execution),
+            programs,
             ticket_intake,
             managed_tui,
             progress_endpoint: Some(progress_endpoint),
@@ -2886,6 +2914,20 @@ impl Daemon {
     #[must_use]
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// This daemon's single observer of pinned program bytes.
+    ///
+    /// Lent because it is shared by construction: the execution lane holds the
+    /// same handle, and that sharing is the whole point — see
+    /// [`program_digest`]. A caller that clones it before [`Daemon::serve`]
+    /// consumes the daemon can ask what this daemon has observed while it is
+    /// serving, which is how the observation is proved to happen off the accept
+    /// thread. It answers questions; it decides nothing, and it is not a second
+    /// route into any gate.
+    #[must_use]
+    pub fn program_digests(&self) -> &Arc<program_digest::ProgramDigests> {
+        &self.programs
     }
 
     /// This daemon's single host-wide cancellation dispatcher.
@@ -3290,6 +3332,7 @@ impl Daemon {
                 automonique_protocol::admin::ExecutionState::SandboxEnforceableLaneWired
             ),
             Arc::clone(&self.approval_watch),
+            Arc::clone(&self.programs),
         );
         self.progress_endpoint
             .as_mut()
@@ -4918,6 +4961,15 @@ impl Daemon {
                         Err(error) => return Err(DaemonError::RunIndexFailed(error.category())),
                     }
                 }
+                // This document names the program a later start will have to
+                // hash, and this is the first moment anything knows the path.
+                // Handing it to the observer costs one bounded send and buys
+                // that start its read; a queue that is full, or a program that
+                // moves before the start, only costs the read that would have
+                // happened here anyway. Nothing about the answer above depends
+                // on it, which is why it is after the receipt rather than in
+                // front of it.
+                self.programs.prefetch(spec.executable());
                 AdminResponse::RunAccepted {
                     request_id: request.request_id().clone(),
                     run_id: spec.run_id().clone(),
@@ -7560,7 +7612,7 @@ impl Daemon {
         // program or prompt that cannot be observed at all is not "unchanged":
         // it is the lane's own refusal, and it is answered as one.
         let (program_sha256, prompt_sha256) =
-            execute::approval_context_digests(&self.state_dir, &spec)
+            execute::approval_context_digests(&self.state_dir, &self.programs, &spec)
                 .ok_or(ExecuteRefusal::ProviderBinaryUnverified)?;
         let observed = ApprovalContext {
             spec_digest,
@@ -7611,8 +7663,9 @@ impl Daemon {
             .ok_or(ExecuteRefusal::ProviderBinaryUnverified)?
             .to_owned();
         let state_dir = self.state_dir.clone();
-        let (program_sha256, prompt_sha256) = execute::approval_context_digests(&state_dir, &spec)
-            .ok_or(ExecuteRefusal::ProviderBinaryUnverified)?;
+        let (program_sha256, prompt_sha256) =
+            execute::approval_context_digests(&state_dir, &self.programs, &spec)
+                .ok_or(ExecuteRefusal::ProviderBinaryUnverified)?;
         let request_key = mint_request_key(subject, run_id, spec_digest, now_ms, history.len());
         let expires_at_ms = self.approval_lifetime.expires_at(now_ms);
         self.approval_requests

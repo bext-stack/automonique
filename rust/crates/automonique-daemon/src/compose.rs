@@ -118,10 +118,7 @@ use automonique_runner::{
     WorkspaceReservation,
 };
 
-use crate::execute::{
-    DAEMON_ATTEMPT_WORKSPACE_REGISTRY, DAEMON_BACKEND_ID, is_within_byte_limit,
-    run_attempt_workspace,
-};
+use crate::execute::{DAEMON_ATTEMPT_WORKSPACE_REGISTRY, DAEMON_BACKEND_ID, run_attempt_workspace};
 
 /// The provider this deployment runs, a sibling of [`crate::DATABASE_NAME`].
 ///
@@ -887,24 +884,9 @@ pub fn read_answer(path: &Path) -> Option<String> {
 /// that pins one. The version travels from the configuration because
 /// [`BinaryProvenance::matches`] compares digests and not versions.
 fn observe_provider_binary(provider: &ProviderConfig) -> Result<BinaryProvenance, ComposeRefusal> {
-    let file = fs::File::open(provider.binary()).map_err(|_| ComposeRefusal::ProviderUnreadable)?;
-    let metadata = file
-        .metadata()
-        .map_err(|_| ComposeRefusal::ProviderUnreadable)?;
-    if !metadata.is_file() || !is_within_byte_limit(metadata.len(), MAX_PROVIDER_BINARY_BYTES) {
-        return Err(ComposeRefusal::ProviderUnreadable);
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_PROVIDER_BINARY_BYTES.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|_| ComposeRefusal::ProviderUnreadable)?;
-    if !is_within_byte_limit(
-        u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-        MAX_PROVIDER_BINARY_BYTES,
-    ) {
-        return Err(ComposeRefusal::ProviderUnreadable);
-    }
-    let observed = crate::execute::provider_binary_digest(&bytes);
+    let observed =
+        crate::program_digest::digest_of_program(provider.binary(), MAX_PROVIDER_BINARY_BYTES)
+            .ok_or(ComposeRefusal::ProviderUnreadable)?;
     BinaryProvenance::new(provider.version(), &observed, None)
         .map_err(|_| ComposeRefusal::ProviderUnreadable)
 }
