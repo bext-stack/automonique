@@ -1277,8 +1277,8 @@ impl ExecutionLane {
     /// no longer reads hundreds of megabytes on the accept thread. What is
     /// compared, and what a mismatch answers, is unchanged: `admit` refuses
     /// unless the observed digest equals the document's pin, and the digest it
-    /// admits is the one the entry helper hashes the staged bytes against at
-    /// `execveat`.
+    /// admits is the one the entry helper hashes the bytes it stages against
+    /// before it execs them.
     ///
     /// The version travels from the document because it is informational —
     /// [`BinaryProvenance::matches`] compares digests, not versions — and the
