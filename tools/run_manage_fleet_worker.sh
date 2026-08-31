@@ -406,13 +406,34 @@ platform_runtime() {
         --argjson runtime "$runtime" \
         --argjson receipts "$receipts" \
         '{node_id:$node,revision:0,capabilities:["execute_jobs","report_jobs","stream_job_logs","platform_commands","local_platform_receipts"],receipts:$receipts,runtime:$runtime}') || return 1
+    # Capture the status alongside the body. Without it a non-2xx answer -- an
+    # HTML error page from an edge mid-deploy, say -- reaches jq as the response
+    # and the only trace left is `jq: parse error: Invalid numeric literal`,
+    # which names neither the endpoint nor the status. The refusal was always
+    # correct; it just could not say why. Observed 2026-08-30 in the journal.
     response=$(curl --silent --show-error --max-time 15 \
+        --write-out '\n%{http_code}' \
         --request PUT "$platform_url" \
         --header "Authorization: Bearer $fleet_token" \
         --header 'Content-Type: application/json' \
         --header 'Accept: application/json' \
-        --data-binary "$body") || return 1
-    jq -e '.ok == true and (.runtime | type) == "object"' >/dev/null <<<"$response" || return 1
+        --data-binary "$body") || {
+        printf 'platform_runtime: no answer from %s\n' "$platform_url" >&2
+        return 1
+    }
+    http_status=${response##*$'\n'}
+    response=${response%$'\n'*}
+    if [ "$http_status" != 200 ]; then
+        # The body is deliberately not echoed: it is whatever an unknown
+        # intermediary chose to return, and this runs where the journal is read.
+        printf 'platform_runtime: %s answered HTTP %s\n' "$platform_url" "$http_status" >&2
+        return 1
+    fi
+    jq -e '.ok == true and (.runtime | type) == "object"' >/dev/null <<<"$response" || {
+        printf 'platform_runtime: %s answered HTTP 200 with a body that is not a runtime document\n' \
+            "$platform_url" >&2
+        return 1
+    }
     enqueue_platform_commands "$response"
     for receipt_file in "${sent_receipt_files[@]}"; do
         rm -f -- "$receipt_file"
