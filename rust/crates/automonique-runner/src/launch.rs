@@ -1809,6 +1809,7 @@ enum ImageError {
 }
 
 /// The verified program, as the object `execveat` will consume.
+#[derive(Debug)]
 enum ProgramImage {
     /// An anonymous, sealed, memory-backed image. No directory entry names it,
     /// so there is no path to reopen and nothing to unlink; the seals make the
@@ -1997,6 +1998,27 @@ fn sealed_program_image(plan: &LaunchPlan) -> Result<ProgramImage, ImageError> {
     Ok(ProgramImage::Sealed(file))
 }
 
+/// Removes a half-built staging path unless the staging succeeded.
+///
+/// Without it a refusal after the copy — a digest mismatch above all — leaves
+/// a full-size copy of the program in `/tmp` that nothing ever collects, since
+/// the successful path hands its cleanup to [`ProgramImage`] instead.
+struct StagingPathGuard<'a>(Option<&'a Path>);
+
+impl StagingPathGuard<'_> {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for StagingPathGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(path) = self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Copy the program from one no-follow open into a verified executable fd.
 ///
 /// The degradation for a kernel that cannot seal an anonymous image. A random
@@ -2019,6 +2041,7 @@ fn staged_verified_program_descriptor(plan: &LaunchPlan) -> Result<ProgramImage,
         .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
         .open(&staged_path)
         .map_err(|_| "program staging file unavailable".to_owned())?;
+    let mut guard = StagingPathGuard(Some(&staged_path));
     let mut hasher = Sha256::new();
     copy_program_bytes(&mut source, &mut staged, expected, Some(&mut hasher))?;
     if hex(&hasher.finalize()) != plan.program_sha256 {
@@ -2042,6 +2065,9 @@ fn staged_verified_program_descriptor(plan: &LaunchPlan) -> Result<ProgramImage,
         .map_err(|_| "program rule descriptor unavailable".to_owned())?;
     file.seek(SeekFrom::Start(0))
         .map_err(|_| "program rewind failed".to_owned())?;
+    // From here the returned image owns the path's removal.
+    guard.disarm();
+    drop(guard);
     Ok(ProgramImage::Staged {
         file,
         rule_descriptor,
@@ -2205,12 +2231,203 @@ fn nibble(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nix::fcntl::FdFlag;
+    use nix::fcntl::{fcntl, FdFlag};
     use std::fs;
     use std::process::Command;
 
     const BUSYBOX: &str = "/usr/bin/busybox";
     const EXEC_FD_ENV: &str = "AUTOMONIQUE_TEST_EXEC_FD";
+
+    /// A plan naming a private 0755 copy of BusyBox, and its true digest.
+    fn busybox_plan(directory: &Path) -> (PathBuf, LaunchPlan) {
+        let program = directory.join("provider");
+        fs::copy(BUSYBOX, &program).unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        let digest = hex(&Sha256::digest(fs::read(&program).unwrap()));
+        let plan = LaunchPlan::new(&program, &digest).unwrap();
+        (program, plan)
+    }
+
+    /// Every seal the image must carry, asserted against the kernel's readback
+    /// rather than against what the code believes it asked for.
+    #[test]
+    fn the_program_image_carries_every_seal_and_the_kernel_agrees() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (_, plan) = busybox_plan(temporary.path());
+        let image = verified_program_image(&plan).unwrap();
+        assert!(
+            matches!(image, ProgramImage::Sealed(_)),
+            "this host seals; a staged fallback here would hide the property under test"
+        );
+
+        let observed =
+            SealFlag::from_bits_truncate(fcntl(image.as_raw_fd(), FcntlArg::F_GET_SEALS).unwrap());
+        for (seal, name) in [
+            (SealFlag::F_SEAL_WRITE, "F_SEAL_WRITE"),
+            (SealFlag::F_SEAL_GROW, "F_SEAL_GROW"),
+            (SealFlag::F_SEAL_SHRINK, "F_SEAL_SHRINK"),
+            (SealFlag::F_SEAL_SEAL, "F_SEAL_SEAL"),
+        ] {
+            assert!(
+                observed.contains(seal),
+                "{name} missing from kernel readback {observed:?}: a write-only seal still \
+                 lets the image grow or be truncated under the running program"
+            );
+        }
+    }
+
+    /// The property, performed rather than inspected: every route that could
+    /// change the bytes is attempted on the descriptor that reaches `execveat`,
+    /// and every one of them must fail.
+    #[test]
+    fn nothing_can_alter_the_sealed_image_after_it_is_verified() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (_, plan) = busybox_plan(temporary.path());
+        let image = verified_program_image(&plan).unwrap();
+        let raw = image.as_raw_fd();
+        let original_len = image.metadata().unwrap().len();
+
+        // A write through the very descriptor `execveat` will consume. The
+        // descriptor is still O_RDWR — memfd_create returns one — so this
+        // reaches the kernel's seal check rather than bouncing off O_RDONLY.
+        let error = (&*image)
+            .write_all(b"tampered")
+            .expect_err("a sealed image accepted a write");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(nix::libc::EPERM),
+            "write refused for the wrong reason: {error}"
+        );
+
+        // Growth and truncation each change what the loader maps even though
+        // no existing byte is rewritten, so F_SEAL_WRITE alone is not enough.
+        assert_eq!(
+            nix::unistd::ftruncate(&*image, i64::try_from(original_len + 4096).unwrap()),
+            Err(nix::errno::Errno::EPERM),
+            "a sealed image could be grown"
+        );
+        assert_eq!(
+            nix::unistd::ftruncate(&*image, 16),
+            Err(nix::errno::Errno::EPERM),
+            "a sealed image could be truncated"
+        );
+
+        // Sealing is itself sealed, so a later holder cannot lift the rest.
+        assert_eq!(
+            fcntl(raw, FcntlArg::F_ADD_SEALS(SealFlag::F_SEAL_WRITE)),
+            Err(nix::errno::Errno::EPERM),
+            "the seal set could still be changed"
+        );
+
+        // A shared writable mapping is the remaining route, and F_SEAL_WRITE
+        // is the same kernel check that refused the write above — the crate
+        // forbids `unsafe`, so `mmap` is not callable here to assert it twice.
+
+        // The bytes still hash to what was verified.
+        let mut reread = image.try_clone().unwrap();
+        reread.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(
+            digest_to_end(&mut reread, "unreadable").unwrap(),
+            plan.program_sha256()
+        );
+    }
+
+    /// The seal is on the object, so re-entering it through a *path* — the one
+    /// name a caller can always construct for an open descriptor — cannot
+    /// substitute bytes. The reopen is allowed to succeed; the write is not.
+    #[test]
+    fn reopening_the_sealed_image_by_path_cannot_substitute_bytes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (_, plan) = busybox_plan(temporary.path());
+        let image = verified_program_image(&plan).unwrap();
+
+        // The image is anonymous: its only "path" is the kernel's own
+        // description of an unnamed object, which resolves to no directory.
+        let link = std::fs::read_link(format!("/proc/self/fd/{}", image.as_raw_fd())).unwrap();
+        let link = link.to_string_lossy();
+        assert!(
+            link.starts_with("/memfd:automonique-program"),
+            "expected an anonymous image, got {link}"
+        );
+        assert!(
+            !Path::new(&*link).exists(),
+            "an anonymous image must not be resolvable as a filesystem path"
+        );
+
+        let mut reopened = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("/proc/self/fd/{}", image.as_raw_fd()))
+            .expect("the reopen itself is expected to succeed; the write is what must fail");
+        let error = reopened
+            .write_all(b"tampered")
+            .expect_err("a path reopen defeated the seal");
+        assert_eq!(error.raw_os_error(), Some(nix::libc::EPERM), "{error}");
+
+        let mut reread = image.try_clone().unwrap();
+        reread.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(
+            digest_to_end(&mut reread, "unreadable").unwrap(),
+            plan.program_sha256()
+        );
+    }
+
+    /// A refusal must be final. If a digest mismatch fell through to the
+    /// staged route, "these are not the bytes you named" would quietly become
+    /// "try the path where the check is shaped differently".
+    #[test]
+    fn a_digest_mismatch_is_refused_without_staging_anything() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (program, _) = busybox_plan(temporary.path());
+        let plan = LaunchPlan::new(&program, &"b".repeat(64)).unwrap();
+
+        let before = staged_program_files();
+        let error = verified_program_image(&plan).expect_err("a wrong digest was accepted");
+        assert_eq!(error, "program digest mismatch");
+        assert_eq!(
+            staged_program_files(),
+            before,
+            "a refused program was copied to /tmp by a fallback that should not have run"
+        );
+    }
+
+    /// The staged degradation must not leave its copy behind when it refuses.
+    /// A provider binary is of the order of a hundred megabytes and this runs
+    /// once per attempt, so a leak here fills /tmp rather than merely littering
+    /// it. Exercised directly: the sealed route is what production takes, and
+    /// it never reaches this code.
+    #[test]
+    fn a_refused_staged_copy_removes_its_own_path() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (program, _) = busybox_plan(temporary.path());
+        let plan = LaunchPlan::new(&program, &"c".repeat(64)).unwrap();
+
+        let before = staged_program_files();
+        let error = staged_verified_program_descriptor(&plan)
+            .err()
+            .expect("a wrong digest was accepted");
+        assert_eq!(error, "program digest mismatch");
+        assert_eq!(
+            staged_program_files(),
+            before,
+            "the refused staging copy was left in /tmp"
+        );
+    }
+
+    fn staged_program_files() -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir("/tmp")
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".automonique-program-"))
+            })
+            .collect();
+        found.sort();
+        found
+    }
 
     #[test]
     fn swapping_the_path_after_verification_cannot_change_the_bytes_executed() {
@@ -2225,7 +2442,7 @@ mod tests {
         let original = fs::read(&program).unwrap();
         let original_sha256 = hex(&Sha256::digest(&original));
         let plan = LaunchPlan::new(&program, &original_sha256).unwrap();
-        let descriptor = staged_verified_program_descriptor(&plan).unwrap();
+        let descriptor = verified_program_image(&plan).unwrap();
 
         // This is the old vulnerable window: the pathname now resolves to a
         // different executable after verification and before exec.
