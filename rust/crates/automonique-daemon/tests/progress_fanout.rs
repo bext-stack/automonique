@@ -226,6 +226,67 @@ fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
+/// Claim 7: a subscriber is greeted when it arrives, not when the loop wakes.
+///
+/// A renderer attaching to a live run is the shape a napping accept loop taxes:
+/// it opens one connection, waits for the greeting, and only then subscribes.
+/// The nap put most of the accept interval in front of the first byte a
+/// watching human sees.
+mod arrival {
+    use super::*;
+
+    /// Sequential arrivals to measure over. One could not be told apart from a
+    /// scheduling hiccup; this many separates the two implementations by more
+    /// than any plausible noise.
+    const ARRIVALS: u32 = 30;
+
+    /// `progress_hub::ACCEPT_POLL`, mirrored.
+    ///
+    /// Mirrored rather than imported because it is private, and because a case
+    /// that read the constant would still pass if the constant and the loop
+    /// were changed together. The number defended is the one written here.
+    const ACCEPT_POLL: Duration = Duration::from_millis(25);
+
+    /// Connect, and wait for the first thing the endpoint says.
+    ///
+    /// Either answer counts. A greeting is the ordinary one; the subscriber
+    /// ceiling is a legitimate second, because a peer whose predecessor's
+    /// thread has not yet been scheduled is refused on the accept thread —
+    /// which is still the endpoint having accepted, which is what is timed.
+    /// Insisting on a greeting would make this case fail for a reason that has
+    /// nothing to do with waiting.
+    fn arrive(endpoint: &Endpoint) {
+        let mut client = endpoint.connect();
+        match client.read() {
+            Some(StreamMessage::Greeting { .. } | StreamMessage::Refused { .. }) => {}
+            other => panic!("the endpoint did not answer an arrival: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_subscriber_is_not_charged_the_accept_interval_to_be_greeted() {
+        let endpoint = Endpoint::start();
+
+        // One arrival before the clock starts, so the measurement is of a
+        // steady state rather than of the endpoint's first connection.
+        arrive(&endpoint);
+
+        let started = Instant::now();
+        for _ in 0..ARRIVALS {
+            arrive(&endpoint);
+        }
+        let elapsed = started.elapsed();
+
+        let sleeping_cost = ACCEPT_POLL * ARRIVALS;
+        assert!(
+            elapsed < sleeping_cost / 2,
+            "{ARRIVALS} sequential arrivals took {elapsed:?}. A loop that waits on its listener \
+             greets each as it arrives; one that naps charges most of {ACCEPT_POLL:?} to each, \
+             which is the {sleeping_cost:?} this is within reach of"
+        );
+    }
+}
+
 /// Claim 1: a slow subscriber costs the producer nothing and ends distinctly.
 mod lagging {
     use super::*;

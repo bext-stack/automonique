@@ -11,7 +11,9 @@
 
 use crate::tempfs::{NamespacedMountedTempfs, start_namespaced_tempfs};
 use crate::{Checkpoint, CheckpointPhase, NamespacedOutcome, TemporaryStorageBudget};
+use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::socket::{getsockopt, sockopt};
 use rustix::net::{
     RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer,
@@ -516,7 +518,41 @@ fn serve(path: &Path, _owner_lock: Flock<fs::File>) -> Result<Never, OwnerError>
             Err(error) => return Err(error.into()),
         }
         tick(&mut runs);
-        std::thread::sleep(IDLE_TICK);
+        await_request(&listener, IDLE_TICK);
+    }
+}
+
+/// Wait up to `timeout` for a request, instead of napping for it.
+///
+/// # Why this loop of all of them
+///
+/// This one is on the run's own critical path twice over. Opening a private
+/// temporary-storage mount is a three-round-trip handshake through this socket,
+/// and every checkpoint afterwards is another request; the client's own retry
+/// (`OWNER_RETRY`) waits on this endpoint too. A blind nap therefore added most
+/// of [`IDLE_TICK`] to each leg of setting a run up, and again to each
+/// checkpoint, for a connection that was usually already there.
+///
+/// `crate::control::ControlServer::serve_once` has waited on its listener this
+/// way from the start. This endpoint is the outlier, not the pattern.
+///
+/// # The bound is the tick, and it stays
+///
+/// [`tick`] runs once per iteration and is what advances every live run's
+/// checkpoint cadence, so this bound is that cadence's ceiling. It is unchanged
+/// deliberately: waiting on the socket must make requests arrive sooner without
+/// making checkpoints arrive later, and a caller that ends the wait early only
+/// ever ticks *more* often.
+///
+/// A failed wait degrades to the sleep it replaced rather than spinning, and an
+/// interrupted one simply returns to the accept above.
+fn await_request(listener: &UnixListener, timeout: Duration) {
+    let milliseconds =
+        u16::try_from(timeout.as_millis().clamp(1, u16::MAX.into())).unwrap_or(u16::MAX);
+    let mut fds = [PollFd::new(listener.as_fd(), PollFlags::POLLIN)];
+    match poll(&mut fds, PollTimeout::from(milliseconds)) {
+        Ok(_) | Err(Errno::EINTR) => {}
+        Err(_) => std::thread::sleep(timeout),
     }
 }
 

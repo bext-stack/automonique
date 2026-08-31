@@ -564,7 +564,13 @@ fn accept_loop(
                 let _ = write_message(&mut stream, &response);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(ACCEPT_POLL);
+                // The peer here is a successor generation adopting this
+                // daemon's live attempts, one request per connection and the
+                // next only after the previous answer. Sleeping meant it paid
+                // most of [`ACCEPT_POLL`] on every one of them, during a
+                // handoff, which is the worst moment to be asleep. The bound is
+                // unchanged: it is still how quickly `stop` is noticed.
+                crate::await_connection(listener, ACCEPT_POLL);
             }
             Err(_) => break,
         }
