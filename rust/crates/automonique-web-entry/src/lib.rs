@@ -98,6 +98,24 @@ const ROBOTS_TXT: &str = "User-agent: *\nDisallow: /\n";
 
 const HEADER_LIMIT: usize = 16 * 1024;
 const HEADER_COUNT_LIMIT: usize = 32;
+/// Request workers, and the bounded queue in front of them.
+///
+/// # The ceiling is the daemon, not this host's cores
+///
+/// Sizing this to the machine would be a mistake. Every request that reaches
+/// Platform v2 or the admin surface ends at the daemon's serve loop, which
+/// accepts one connection and handles it inline before accepting the next, so
+/// daemon-bound work is serialised there no matter how many workers wait on
+/// it. Raising this number does not buy that work any parallelism; it only
+/// moves the queue from this bounded channel — where a full queue answers
+/// `503` immediately and the caller learns it was refused — into the daemon's
+/// backlog, where the caller instead waits without being told.
+///
+/// A handful of workers is therefore the point: enough that requests served
+/// entirely from this process (assets, cached status) are not stuck behind a
+/// daemon round-trip, without pretending the daemon can absorb more than it
+/// can. Change this because the daemon's concurrency changed, not because the
+/// host has more cores.
 const WORKERS: usize = 4;
 const QUEUE_DEPTH: usize = 32;
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
