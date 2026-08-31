@@ -320,6 +320,7 @@ name = "automonique-egress-broker"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "nix 0.29.0",
  "rustls",
  "subtle",
  "webpki-roots 1.0.9",

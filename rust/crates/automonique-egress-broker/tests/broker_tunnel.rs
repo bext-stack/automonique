@@ -681,3 +681,46 @@ fn shutdown_tears_down_an_established_tunnel() {
         "the listener must be closed after shutdown"
     );
 }
+
+/// A workload is not charged the accept interval to open a tunnel.
+///
+/// Both of the broker's listeners sit on the sandboxed workload's critical
+/// path: every outbound connection it opens is one accept here, and the
+/// workload cannot proceed until the tunnel is up. A loop that napped between
+/// accepts put most of its interval in front of each of those.
+///
+/// A refusal is used rather than a tunnel because it is the shortest complete
+/// round trip through the accept loop — connect, one request line, one status
+/// line — with no destination, no relay and no allowlist entry to muddy what is
+/// being timed.
+#[test]
+fn a_workload_is_not_charged_the_accept_interval_per_connection() {
+    /// Sequential connections to measure over. One could not be told apart
+    /// from a scheduling hiccup; this many separates the two implementations
+    /// by more than any plausible noise.
+    const CONNECTIONS: u32 = 40;
+    /// `ACCEPT_POLL_INTERVAL`, mirrored. Mirrored rather than imported because
+    /// it is private, and because a case that read the constant would still
+    /// pass if the constant and the loop were changed together.
+    const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+    let broker = EgressBroker::start(BrokerConfig::default()).expect("deny-all broker starts");
+
+    // One connection before the clock starts, so the measurement is of a
+    // steady state rather than of the listener's first client.
+    refuse_destination(&broker, "warm.example", 443);
+
+    let started = Instant::now();
+    for _ in 0..CONNECTIONS {
+        refuse_destination(&broker, "measured.example", 443);
+    }
+    let elapsed = started.elapsed();
+
+    let napping_cost = ACCEPT_POLL_INTERVAL * CONNECTIONS;
+    assert!(
+        elapsed < napping_cost / 2,
+        "{CONNECTIONS} sequential connections took {elapsed:?}. A loop that waits on its listener \
+         accepts them as they arrive; one that naps charges most of {ACCEPT_POLL_INTERVAL:?} to \
+         each, which is the {napping_cost:?} this is within reach of"
+    );
+}
