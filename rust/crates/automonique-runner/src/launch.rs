@@ -1786,14 +1786,15 @@ fn read_session_launch_frame() -> Result<Vec<u8>, String> {
     Err("plan frame exceeds bound".to_owned())
 }
 
-/// The seal set every anonymous program image carries, and the value
-/// `F_GET_SEALS` must read back before the image is trusted.
+/// The seal set every anonymous image carries, and the value `F_GET_SEALS`
+/// must read back before a program image is trusted.
 ///
 /// `F_SEAL_WRITE` alone is not equivalent to an unlinked staged copy: growth
-/// and truncation would both still change what `execveat` maps. `F_SEAL_SEAL`
-/// closes the sealing interface itself, so no later holder of the descriptor —
-/// the workload included — can lift any of the other three.
-const PROGRAM_SEALS: SealFlag = SealFlag::F_SEAL_WRITE
+/// and truncation would both still change what `execveat` maps without
+/// rewriting a single existing byte. `F_SEAL_SEAL` closes the sealing
+/// interface itself, so no later holder of the descriptor — the workload
+/// included — can lift any of the other three.
+const IMMUTABLE_SEALS: SealFlag = SealFlag::F_SEAL_WRITE
     .union(SealFlag::F_SEAL_GROW)
     .union(SealFlag::F_SEAL_SHRINK)
     .union(SealFlag::F_SEAL_SEAL);
@@ -1982,7 +1983,7 @@ fn sealed_program_image(plan: &LaunchPlan) -> Result<ProgramImage, ImageError> {
     let observed_seals = nix::fcntl::fcntl(file.as_raw_fd(), FcntlArg::F_GET_SEALS)
         .map_err(|error| ImageError::Refused(format!("program seals unreadable: {error}")))?;
     let observed_seals = SealFlag::from_bits_truncate(observed_seals);
-    if !observed_seals.contains(PROGRAM_SEALS) {
+    if !observed_seals.contains(IMMUTABLE_SEALS) {
         return Err(ImageError::Refused(
             "program seals did not take effect".to_owned(),
         ));
@@ -2123,16 +2124,8 @@ fn sealed_prompt_descriptor(prompt: &[u8]) -> Result<File, String> {
 }
 
 fn seal_descriptor(file: &File, label: &str) -> Result<(), String> {
-    nix::fcntl::fcntl(
-        file.as_raw_fd(),
-        FcntlArg::F_ADD_SEALS(
-            SealFlag::F_SEAL_WRITE
-                | SealFlag::F_SEAL_GROW
-                | SealFlag::F_SEAL_SHRINK
-                | SealFlag::F_SEAL_SEAL,
-        ),
-    )
-    .map_err(|error| format!("{label} could not be sealed: {error}"))?;
+    nix::fcntl::fcntl(file.as_raw_fd(), FcntlArg::F_ADD_SEALS(IMMUTABLE_SEALS))
+        .map_err(|error| format!("{label} could not be sealed: {error}"))?;
     Ok(())
 }
 
