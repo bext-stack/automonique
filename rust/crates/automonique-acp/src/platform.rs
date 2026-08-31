@@ -15,7 +15,7 @@ use automonique_protocol::event::EventKind;
 use automonique_protocol::platform::{
     ExecuteRequest, FreshnessState, GetReceiptRequest, IdempotencyKey, PlatformAction,
     PlatformParameter, PlatformText, ReceiptOutcome, ResourceAuthority, ResourceCoordinate,
-    ResourceId, ResourceKind,
+    ResourceId, ResourceKind, SessionRecord,
 };
 use automonique_protocol::progress_api::{
     MAX_PROGRESS_STREAM_CANONICAL_BYTES, StreamMessage, SubscribeRequest,
@@ -112,11 +112,18 @@ impl PlatformAuthority {
                 let sessions = platform
                     .list_sessions(ResourceAuthority::Automonique, None)
                     .map_err(|_| AuthorityError::new("acp_platform_sessions"))?;
+                // Resumability, not liveness. This goes on to submit a
+                // `FollowUp`, whose authority guard admits any session the
+                // listing still summarises as `open`; `attachable` is the
+                // stricter claim that someone is listening right now, and
+                // filtering on it here would refuse exactly the retained
+                // sessions a follow-up exists to resume.
                 let record = sessions
                     .sessions
                     .into_iter()
                     .find(|record| {
-                        record.session.resource.id.as_str() == provider_session && record.attachable
+                        record.session.resource.id.as_str() == provider_session
+                            && session_is_resumable(record)
                     })
                     .ok_or(AuthorityError::new("acp_session_not_resumable"))?;
                 (
@@ -580,9 +587,58 @@ fn receipt_session(explanation: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Whether a follow-up may still be resumed into this listed session.
+///
+/// The listing carries two different claims and they are not interchangeable.
+/// `summary == "open"` says the session can still be resumed, which is exactly
+/// what the authority's `FollowUp` guard requires. `attachable` says someone
+/// observed it live, which a retained session between hosts is not — reading
+/// that one here would refuse the very sessions this path exists to resume.
+fn session_is_resumable(record: &SessionRecord) -> bool {
+    record.session.summary.as_str() == "open"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use automonique_protocol::platform::Freshness;
+    use automonique_protocol::primitives::{EpochMillis, Revision};
+
+    fn listed(summary: &str, attachable: bool) -> SessionRecord {
+        SessionRecord {
+            session: automonique_protocol::platform::ResourceRecord {
+                resource: ResourceCoordinate::new(
+                    ResourceAuthority::Automonique,
+                    ResourceKind::Session,
+                    ResourceId::new("provider-1").expect("session id"),
+                ),
+                freshness: Freshness {
+                    state: if attachable {
+                        FreshnessState::Fresh
+                    } else {
+                        FreshnessState::Unknown
+                    },
+                    observed_at: EpochMillis::from_millis(1),
+                    revision: Revision::new(1).expect("revision"),
+                },
+                summary: PlatformText::new(summary).expect("summary"),
+            },
+            run: None,
+            attachable,
+            controllable: attachable,
+        }
+    }
+
+    #[test]
+    fn a_retained_session_stays_resumable_after_its_host_stops_being_attachable() {
+        assert!(
+            session_is_resumable(&listed("open", false)),
+            "a follow-up resumes a retained session; it does not need a live host"
+        );
+        assert!(session_is_resumable(&listed("open", true)));
+        assert!(!session_is_resumable(&listed("lost", false)));
+        assert!(!session_is_resumable(&listed("closed", false)));
+    }
 
     #[test]
     fn managed_run_identity_matches_the_canonical_worker_algorithm() {

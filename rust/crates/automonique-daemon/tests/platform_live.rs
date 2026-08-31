@@ -20,11 +20,12 @@ use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse};
 use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_frame};
 use automonique_protocol::digest::Sha256;
 use automonique_protocol::platform::{
-    ClaimControlRequest, ClientId, ExecuteRequest, GetReceiptRequest, IdempotencyKey,
-    ListSessionsRequest, PlatformAction, PlatformParameter, PlatformRequest, PlatformResponse,
-    PlatformText, ReceiptId, ReceiptOutcome, ResourceAuthority, ResourceCoordinate, ResourceId,
-    ResourceKind, SessionApprovalDecision, SessionApprovalDecisionRequest,
-    SessionCommandStateRequest, SessionFollowUpRequest, SessionRunStopRequest, SnapshotRequest,
+    AttachRequest, ClaimControlRequest, ClientId, ExecuteRequest, GetReceiptRequest,
+    IdempotencyKey, ListSessionsRequest, PlatformAction, PlatformParameter, PlatformRequest,
+    PlatformResponse, PlatformText, ReceiptId, ReceiptOutcome, ResourceAuthority,
+    ResourceCoordinate, ResourceId, ResourceKind, SessionApprovalDecision,
+    SessionApprovalDecisionRequest, SessionCommandStateRequest, SessionFollowUpRequest,
+    SessionRunStopRequest, SnapshotRequest,
 };
 use automonique_protocol::platform_api::{PlatformRequestMessage, PlatformResponseMessage};
 use automonique_protocol::platform_v2::{
@@ -4897,6 +4898,133 @@ fn a_settled_turn_projects_as_before_and_an_abandoned_binding_heals_on_read() {
             .run_state
             .is_in_flight()
     );
+}
+
+/// A listing offers attach and control only where something was observed live,
+/// and withholds both from a binding whose run the index has already seen end.
+///
+/// This is the production shape of #-orphaned TUI sessions: a generation died
+/// mid-turn, so the binding is still `in_flight` and still `open`, while the run
+/// it names reached `completed` days ago. Nothing ever falsifies the binding's
+/// `open`, so projecting it as `fresh`/`attachable` advertised dozens of dead
+/// sessions as live. Resumability survives — `summary` still reads `open`, which
+/// is exactly what the follow-up guard requires — but liveness is not asserted
+/// without an observation, and the guards refuse what the listing withheld.
+#[test]
+fn a_listing_earns_attach_from_a_live_run_and_withholds_it_from_an_orphaned_binding() {
+    let _guard = full_daemon_test_guard();
+    let (_root, config) = fixture();
+    std::fs::create_dir(config.state_dir()).expect("product state");
+    std::fs::set_permissions(config.state_dir(), std::fs::Permissions::from_mode(0o700))
+        .expect("private product state");
+    register_run(&config, 1, "tui-orphaned-run", true);
+    register_run(&config, 2, "tui-live-run", false);
+
+    let mut sessions = automonique_daemon::managed_sessions::ManagedSessionStore::open(
+        config.managed_sessions_path(),
+    )
+    .expect("managed sessions");
+    sessions
+        .observe_active("orphaned-session", "tui-orphaned-run", 100)
+        .expect("turn starts and never settles");
+    sessions
+        .observe_active("live-session", "tui-live-run", 101)
+        .expect("live turn");
+    drop(sessions);
+
+    let serving = serve(&config);
+    let PlatformResponse::Sessions(listing) = platform(
+        &config,
+        "orphan-listing",
+        PlatformRequest::ListSessions(ListSessionsRequest {
+            authority: ResourceAuthority::Automonique,
+            cursor: None,
+        }),
+    ) else {
+        panic!("sessions response")
+    };
+    let find = |id: &str| {
+        listing
+            .sessions
+            .iter()
+            .find(|record| record.session.resource.id.as_str() == id)
+            .unwrap_or_else(|| panic!("{id} is listed"))
+    };
+
+    let orphaned = find("orphaned-session");
+    assert_eq!(
+        orphaned.session.freshness.state.as_str(),
+        "unknown",
+        "a binding whose run ended is not a current observation of a session"
+    );
+    assert!(
+        !orphaned.attachable,
+        "attach is offered only where a session was observed live"
+    );
+    assert!(
+        !orphaned.controllable,
+        "control is offered only where a session was observed live"
+    );
+    assert_eq!(
+        orphaned.session.summary.as_str(),
+        "open",
+        "the binding still proves the session can be resumed, which is what the \
+         follow-up guard reads"
+    );
+
+    let live = find("live-session");
+    assert_eq!(live.session.freshness.state.as_str(), "fresh");
+    assert!(live.attachable, "a run the index has not seen end is live");
+    assert!(live.controllable);
+
+    let orphaned_coordinate = automonique_coordinate(ResourceKind::Session, "orphaned-session");
+    let PlatformResponse::Refused {
+        outcome,
+        explanation,
+    } = platform(
+        &config,
+        "attach-orphan",
+        PlatformRequest::Attach(AttachRequest {
+            session: orphaned_coordinate.clone(),
+            client: ClientId::new("client-orphan").expect("client"),
+        }),
+    )
+    else {
+        panic!("attaching to an unobserved session is refused")
+    };
+    assert_eq!(outcome, ReceiptOutcome::Rejected);
+    assert_eq!(explanation.as_str(), "session_not_attachable");
+
+    let PlatformResponse::Refused {
+        outcome,
+        explanation,
+    } = platform(
+        &config,
+        "control-orphan",
+        PlatformRequest::ClaimControl(ClaimControlRequest {
+            session: orphaned_coordinate,
+            client: ClientId::new("client-orphan").expect("client"),
+            idempotency_key: IdempotencyKey::new("claim-orphan-1").expect("key"),
+        }),
+    )
+    else {
+        panic!("claiming control of an unobserved session is refused")
+    };
+    assert_eq!(outcome, ReceiptOutcome::Rejected);
+    assert_eq!(explanation.as_str(), "session_not_controllable");
+
+    let PlatformResponse::Attached(attachment) = platform(
+        &config,
+        "attach-live",
+        PlatformRequest::Attach(AttachRequest {
+            session: automonique_coordinate(ResourceKind::Session, "live-session"),
+            client: ClientId::new("client-live").expect("client"),
+        }),
+    ) else {
+        panic!("a live session still attaches")
+    };
+    assert_eq!(attachment.session.id.as_str(), "live-session");
+    serving.shutdown(&config);
 }
 
 /// #130: the adapter's pre-#118 `execute` body (no `client` key) is accepted,

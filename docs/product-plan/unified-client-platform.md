@@ -73,6 +73,13 @@ revision and freshness. A projection may correlate records, but never collapses
 AI Operations `pending`, node `running`, provider activity and GitHub delivery
 into one status.
 
+Freshness states how current an observation is, not what the record says. A row
+that persists is not an observation of the thing it names, so a projection that
+cannot show a recent observation reports `unknown` rather than `fresh`. A
+capability a projection offers — `attachable` and `controllable` above all — is
+earned from that observation and withheld without one, so a client is never
+offered a control the authority would then refuse.
+
 AI Operations owns approval to release a global job. Automonique separately
 owns approvals required by the selected local action, sandbox or provider.
 Granting either approval never grants the other implicitly.
