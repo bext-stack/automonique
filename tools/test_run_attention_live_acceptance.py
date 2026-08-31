@@ -313,6 +313,50 @@ class AttentionCorpusTest(unittest.TestCase):
         result = live.check_attention_corpus(self.root / "absent.json")
         self.assertEqual(result["state"], "blocked")
 
+    def test_a_deployment_that_did_not_answer_is_not_called_a_refusal(self) -> None:
+        """A 503 is a moment, not a fact about what the deployment serves.
+
+        This report gates the GUI steps, so recording a restarting daemon as a
+        deployment that does not serve its attention lane is the most expensive
+        place to get the difference wrong. The parity harness has already
+        worked out why, and its reason is carried rather than replaced.
+        """
+        path = self.report(
+            self.parity(
+                {
+                    "state": "blocked",
+                    "observed": {
+                        "state": "error",
+                        "category": "unexpected_status",
+                        "http_status": 503,
+                    },
+                    "reason": (
+                        "the deployment did not answer: HTTP 503 "
+                        "(unexpected_status). That is the entry or the daemon "
+                        "behind it being unavailable, not the attention lane "
+                        "being refused"
+                    ),
+                }
+            )
+        )
+        result = live.check_attention_corpus(path)
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["observed"]["http_status"], 503)
+        self.assertIn("did not answer", result["reason"])
+        self.assertNotIn(
+            "does not serve its Platform v2 attention lane", result["reason"]
+        )
+
+    def test_a_lane_that_did_not_say_why_is_not_given_a_reason_it_did_not_give(
+        self,
+    ) -> None:
+        path = self.report(
+            self.parity({"state": "blocked", "observed": {"state": "error"}})
+        )
+        result = live.check_attention_corpus(path)
+        self.assertEqual(result["state"], "blocked")
+        self.assertIn("no reason for it", result["reason"])
+
     def test_free_text_in_a_category_is_withheld(self) -> None:
         path = self.report(
             self.parity(

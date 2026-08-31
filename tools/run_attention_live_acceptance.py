@@ -966,15 +966,31 @@ def check_attention_corpus(parity_report: Path | None) -> dict[str, Any]:
     result["observed"] = {
         "state": observed.get("state"),
         "category": refusal_category(observed.get("category")),
+        "http_status": observed.get("http_status"),
     }
     if lane.get("state") == "passed":
         result["state"] = "passed"
         return result
     result["state"] = "blocked"
-    result["reason"] = (
-        "the deployment does not serve its Platform v2 attention lane, so no "
-        "live attention item exists for the cross-client steps to agree about"
-    )
+    # The parity harness has already worked out *why* the lane did not answer,
+    # and the difference matters here more than anywhere: "the deployment does
+    # not serve its attention lane" is a claim about the deployment, while a
+    # `503` from a restarting daemon and a `400` from a request addressed to
+    # the wrong host are claims about the moment and about the harness. Saying
+    # the first about either of the others is how a healthy deployment gets
+    # recorded as broken in the report that gates the GUI steps.
+    upstream = lane.get("reason")
+    if isinstance(upstream, str) and upstream:
+        result["reason"] = bounded_reason(
+            f"{upstream}, so no live attention item exists for the "
+            "cross-client steps to agree about"
+        )
+    else:
+        result["reason"] = (
+            "the parity report records no negotiated attention lane and no "
+            "reason for it, so no live attention item is established for the "
+            "cross-client steps to agree about"
+        )
     return result
 
 

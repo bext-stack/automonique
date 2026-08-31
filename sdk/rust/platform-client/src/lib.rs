@@ -269,6 +269,45 @@ impl PlatformTransport for UnixTransport {
     }
 }
 
+/// What the last HTTP exchange answered, kept so a refusal category can be
+/// diagnosed without re-running the client under a debugger.
+///
+/// A category alone cannot tell a `401` from a `404` from a `503`, and those
+/// are three different facts about a deployment: the credential was refused,
+/// the route is not there, the deployment could not answer. Only the response
+/// side is recorded. The request carries the credential and is never observed
+/// here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HttpExchange {
+    status: u16,
+    content_type: Option<String>,
+}
+
+impl HttpExchange {
+    #[must_use]
+    pub const fn status(&self) -> u16 {
+        self.status
+    }
+
+    #[must_use]
+    pub fn content_type(&self) -> Option<&str> {
+        self.content_type.as_deref()
+    }
+}
+
+/// The `Host` and forwarded scheme a loopback probe must present.
+///
+/// A web entry that answers for one canonical name refuses a request addressed
+/// to `127.0.0.1`, and refuses a canonical-host request that did not arrive
+/// over TLS. Probing such a deployment on loopback therefore needs both
+/// headers, and without them the probe measures the harness rather than the
+/// deployment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoopbackOrigin {
+    host: String,
+    forwarded_proto: String,
+}
+
 /// Remote HTTPS transport carrying the exact canonical platform frame used on
 /// the Unix socket. Authentication is outside the frame and no remote wire
 /// types or retry policy are introduced here.
@@ -278,6 +317,8 @@ pub struct HttpsTransport {
     timeout: Duration,
     agent: ureq::Agent,
     v2_agent: ureq::Agent,
+    loopback: Option<LoopbackOrigin>,
+    last_exchange: Option<HttpExchange>,
 }
 
 impl HttpsTransport {
@@ -293,6 +334,8 @@ impl HttpsTransport {
                 .max_redirects(0)
                 .build()
                 .new_agent(),
+            loopback: None,
+            last_exchange: None,
         })
     }
 
@@ -311,6 +354,8 @@ impl HttpsTransport {
                 .max_redirects(0)
                 .build()
                 .new_agent(),
+            loopback: None,
+            last_exchange: None,
         })
     }
 
@@ -320,10 +365,82 @@ impl HttpsTransport {
         self
     }
 
+    /// Present a different `Host` and a forwarded scheme, for probing a
+    /// deployment on loopback instead of through its public edge.
+    ///
+    /// Gated to a loopback `http://` endpoint on purpose. A `Host` a client
+    /// chose for itself is a claim about which deployment it is talking to,
+    /// and on a public origin that is name spoofing rather than a probe. On
+    /// `127.0.0.1` there is nothing to spoof: the operator has already chosen
+    /// the exact process.
+    pub fn with_loopback_origin(
+        mut self,
+        host: impl Into<String>,
+        forwarded_proto: impl Into<String>,
+    ) -> Result<Self, ClientError> {
+        if !endpoint_is_loopback(&self.endpoint) {
+            return Err(ClientError::Endpoint);
+        }
+        let host = host.into();
+        let forwarded_proto = forwarded_proto.into();
+        if !is_header_value(&host)
+            || host.is_empty()
+            || !matches!(forwarded_proto.as_str(), "http" | "https")
+        {
+            return Err(ClientError::Endpoint);
+        }
+        self.loopback = Some(LoopbackOrigin {
+            host,
+            forwarded_proto,
+        });
+        Ok(self)
+    }
+
     #[must_use]
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
+
+    /// What the deployment answered on the most recent exchange, if it
+    /// answered at all.
+    #[must_use]
+    pub const fn last_exchange(&self) -> Option<&HttpExchange> {
+        self.last_exchange.as_ref()
+    }
+
+    fn record_exchange(&mut self, status: u16, content_type: Option<String>) {
+        self.last_exchange = Some(HttpExchange {
+            status,
+            content_type,
+        });
+    }
+
+    fn loopback_headers(&self) -> Option<(&str, &str)> {
+        self.loopback
+            .as_ref()
+            .map(|origin| (origin.host.as_str(), origin.forwarded_proto.as_str()))
+    }
+}
+
+/// A host name is only ever sent as a header value, so anything that could end
+/// the line or the header is refused rather than escaped.
+fn is_header_value(value: &str) -> bool {
+    value.len() <= 253
+        && value.is_ascii()
+        && !value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b' ')
+}
+
+fn endpoint_is_loopback(endpoint: &str) -> bool {
+    let Ok(uri) = endpoint.parse::<ureq::http::Uri>() else {
+        return false;
+    };
+    uri.scheme_str() == Some("http")
+        && matches!(
+            uri.host(),
+            Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
+        )
 }
 
 impl fmt::Debug for HttpsTransport {
@@ -333,6 +450,8 @@ impl fmt::Debug for HttpsTransport {
             .field("endpoint", &self.endpoint)
             .field("credential", &"<redacted>")
             .field("timeout", &self.timeout)
+            .field("loopback", &self.loopback)
+            .field("last_exchange", &self.last_exchange)
             .finish_non_exhaustive()
     }
 }
@@ -364,36 +483,55 @@ impl PlatformTransport for HttpsTransport {
             .map_err(|_| ClientError::Protocol)?
             .to_canonical_bytes();
         let authorization = self.credential.authorization();
-        let mut response = self
+        let loopback = self
+            .loopback_headers()
+            .map(|(host, proto)| (host.to_owned(), proto.to_owned()));
+        let mut builder = self
             .agent
             .post(&self.endpoint)
             .header("authorization", authorization.as_str())
             .header("content-type", PLATFORM_CONTENT_TYPE)
-            .header("accept", PLATFORM_CONTENT_TYPE)
+            .header("accept", PLATFORM_CONTENT_TYPE);
+        if let Some((host, proto)) = loopback.as_ref() {
+            builder = builder
+                .header("host", host.as_str())
+                .header("x-forwarded-proto", proto.as_str());
+        }
+        let sent = builder
             .config()
             .timeout_global(Some(self.timeout))
             .build()
-            .send(&payload)
-            .map_err(|error| match error {
-                ureq::Error::BodyExceedsLimit(_) => ClientError::ResponseTooLarge,
-                ureq::Error::StatusCode(401 | 403) => ClientError::Unauthorized,
-                ureq::Error::StatusCode(_) => ClientError::UnexpectedStatus,
-                _ => ClientError::Io,
-            })?;
+            .send(&payload);
+        let mut response = match sent {
+            Ok(response) => response,
+            Err(error) => {
+                if let ureq::Error::StatusCode(status) = error {
+                    self.record_exchange(status, None);
+                }
+                return Err(match error {
+                    ureq::Error::BodyExceedsLimit(_) => ClientError::ResponseTooLarge,
+                    ureq::Error::StatusCode(401 | 403) => ClientError::Unauthorized,
+                    ureq::Error::StatusCode(_) => ClientError::UnexpectedStatus,
+                    _ => ClientError::Io,
+                });
+            }
+        };
         let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(str::trim)
+            .map(str::to_owned);
+        self.record_exchange(status, content_type.clone());
         if matches!(status, 401 | 403) {
             return Err(ClientError::Unauthorized);
         }
         if !(200..=299).contains(&status) {
             return Err(ClientError::UnexpectedStatus);
         }
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(';').next())
-            .map(str::trim);
-        if content_type != Some(PLATFORM_CONTENT_TYPE) {
+        if content_type.as_deref() != Some(PLATFORM_CONTENT_TYPE) {
             return Err(ClientError::UnexpectedContentType);
         }
         let mut body = Vec::new();

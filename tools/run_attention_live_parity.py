@@ -405,6 +405,131 @@ def cockpit_read(
         return {"state": "blocked", "reason": "cockpit read did not answer JSON"}
 
 
+def lane_observation(lane_state: dict[str, Any]) -> dict[str, Any]:
+    """What the capture observed of the lane, status included.
+
+    The category on its own is not a diagnosis. `unexpected_status` is the same
+    word for the deployment answering `503` while its daemon restarts, for a
+    `404` at a route that is not deployed, and for the `400` a web entry gives
+    a request addressed to `127.0.0.1` instead of its canonical name. Recording
+    the status is what lets a reader tell those apart without re-running the
+    capture under a debugger.
+    """
+    return {
+        "state": lane_state.get("state"),
+        "category": category(lane_state.get("category")),
+        "version": lane_state.get("version"),
+        "http_status": lane_state.get("http_status"),
+        "http_content_type": lane_state.get("http_content_type"),
+    }
+
+
+def lane_reason(lane_state: dict[str, Any]) -> str:
+    """Say what actually happened to the lane, in the deployment's own terms.
+
+    "The deployment refuses its attention lane" is a serious claim to publish
+    about a deployment, and for most of these outcomes it is not true. A
+    deployment that answered `503` was not reached; one that answered `400`
+    was reached and told the harness it had addressed it wrongly; one that
+    answered a typed Platform v2 refusal is the only one that actually refused
+    the lane. Reporting all three with the refusal sentence is how a harness
+    slanders a healthy deployment.
+    """
+    state = lane_state.get("state")
+    if state is None:
+        return "the attention lane was never read"
+    if state == "downgraded":
+        return (
+            "the deployment negotiated Platform v1 rather than v2, so it serves "
+            "no v2 attention lane"
+        )
+    if state == "refused":
+        return (
+            "the deployment refuses its Platform v2 attention lane "
+            f"({category(lane_state.get('category'))})"
+        )
+    if state != "error":
+        return f"the capture recorded no negotiated lane (state {state!r})"
+
+    status = lane_state.get("http_status")
+    observed = category(lane_state.get("category"))
+    if not isinstance(status, int):
+        return (
+            "the deployment could not be reached at all: the capture never "
+            f"obtained an HTTP status ({observed}). Nothing here is evidence "
+            "about the attention lane"
+        )
+    if 500 <= status <= 599:
+        return (
+            f"the deployment did not answer: HTTP {status} ({observed}). That "
+            "is the entry or the daemon behind it being unavailable, not the "
+            "attention lane being refused"
+        )
+    if status in (401, 403):
+        return (
+            f"the deployment refused the credential: HTTP {status}. The lane "
+            "itself was never reached"
+        )
+    if 400 <= status <= 499:
+        return (
+            f"the deployment refused the request as addressed: HTTP {status} "
+            f"({observed}). That is how the request was made — host, media "
+            "type, route — not what the deployment serves"
+        )
+    return f"the client refused the deployment's answer: HTTP {status} ({observed})"
+
+
+def work_context_reason(work_contexts: dict[str, Any]) -> str:
+    """Distinguish a read that failed from a read that answered nothing.
+
+    A read that errored is not an empty graph. Reporting the two the same way
+    sends a reader looking for a missing workspace that is in fact there, and
+    hides the only thing that was actually wrong — that the graph was never
+    obtained. `state` says which happened and it is not optional information.
+    """
+    state = work_contexts.get("state")
+    observed = category(work_contexts.get("category"))
+    if state == "available":
+        return (
+            "the deployment's work-context graph was read and names no user "
+            "workspace, so no client has a target to derive an attention "
+            "inventory for"
+        )
+    if state == "refused":
+        return (
+            f"the deployment refused the work-context read ({observed}), so no "
+            "record graph was served to derive an inventory from. This is not "
+            "an empty graph: none was obtained"
+        )
+    if state == "error":
+        status = work_contexts.get("http_status")
+        where = f"HTTP {status}" if isinstance(status, int) else "no HTTP status"
+        return (
+            f"the work-context read failed before it produced a graph "
+            f"({observed}, {where}), so no client has a record graph to derive "
+            "an inventory from. This is not an empty graph: none was obtained"
+        )
+    return (
+        f"the work-context read is in state {state!r}, so no record graph was "
+        "obtained. This is not an empty graph: none was obtained"
+    )
+
+
+def cockpit_projects(document: dict[str, Any]) -> list[str]:
+    """The project ids the deployment named in its own cockpit answer.
+
+    The Platform v2 record graph can only be read per project, so the live read
+    needs a project before it can ask for anything. Taking it from the
+    deployment's cockpit answer keeps that coordinate one the deployment named:
+    an operator-supplied project would make a wrong id look like an empty graph.
+    """
+    found: list[str] = []
+    for entry in document.get("projects") or []:
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str):
+            found.append(entry["id"])
+    return found
+
+
 def hosted_projection(document: dict[str, Any], salt: Salt) -> dict[str, Any]:
     """Project the deployment's own cockpit answer into the shared shape.
 
@@ -815,6 +940,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--hosted-host", default=DEFAULT_HOSTED_HOST)
     parser.add_argument(
+        "--project",
+        default=None,
+        help=(
+            "the Platform v2 project to read the record graph for. Omitted, it "
+            "is taken from the deployment's own cockpit answer, so the "
+            "coordinate is one the deployment named rather than one the "
+            "operator supplied."
+        ),
+    )
+    parser.add_argument(
         "--credential-env",
         default="AUTOMONIQUE_OPS_BASIC_AUTH",
         help=(
@@ -985,16 +1120,45 @@ class Run:
             )
         return projections
 
-    def read_lane(self) -> dict[str, Any]:
-        """Ask the deployment, with the production client, for its attention lane."""
+    def capture_arguments(self, project: str) -> list[str]:
+        """The arguments every live capture in this run shares.
+
+        Two of them are load-bearing and were once absent, each in a way that
+        made a check report a fact about the deployment that was really a fact
+        about how the harness asked.
+
+        `--project` because the Platform v2 wire has no project-less
+        `query_work_contexts`: without it the client's own encoder refuses the
+        request, the read never reaches the network, and the capture records a
+        `protocol` error indistinguishable from a deployment answering badly.
+
+        `--host-header` / `--forwarded-proto` because `--hosted-loopback` sends
+        the request to `127.0.0.1`, and a web entry that answers for one
+        canonical name over TLS answers `400` to that. The Python reads here
+        have always carried both; the capture could not, so `--hosted-loopback`
+        silently meant "the lane check cannot run".
+        """
         arguments = [
             "--endpoint",
             self.origin.rstrip("/") + PLATFORM_V2_PATH,
             "--credential-env",
             self.args.credential_env,
+            "--project",
+            project,
         ]
+        if self.host_header:
+            arguments += ["--host-header", self.host_header]
+        if self.forwarded_proto:
+            arguments += ["--forwarded-proto", self.forwarded_proto]
+        return arguments
+
+    def read_lane(self, project: str) -> dict[str, Any]:
+        """Ask the deployment, with the production client, for its attention lane."""
         return capture(
-            self.repo, self.scratch / "capture-target", arguments, self.args.build_timeout
+            self.repo,
+            self.scratch / "capture-target",
+            self.capture_arguments(project),
+            self.args.build_timeout,
         )
 
     def targets(self, pages: list[str]) -> list[tuple[str, str]]:
@@ -1084,50 +1248,6 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             )
         )
 
-    lane = run.read_lane()
-    lane_state: dict[str, Any] = {}
-    if lane["state"] != "passed":
-        run.checks.append(check("live_attention_lane", lane_intent, "blocked", detail=lane))
-    else:
-        document = lane["document"]
-        if document.get("schema") != CAPTURE_SCHEMA:
-            run.checks.append(
-                check(
-                    "live_attention_lane",
-                    lane_intent,
-                    "failed",
-                    reason=f"capture answered under {document.get('schema')!r}",
-                )
-            )
-        else:
-            lane_state = document.get("lane") or {}
-            state = lane_state.get("state")
-            run.checks.append(
-                check(
-                    "live_attention_lane",
-                    lane_intent,
-                    "passed" if state == "negotiated" else "blocked",
-                    observed=
-                    {
-                        "state": state,
-                        "category": category(lane_state.get("category")),
-                        "version": lane_state.get("version"),
-                    },
-                    endpoint=redacted(document.get("endpoint", "")),
-                    **(
-                        {}
-                        if state == "negotiated"
-                        else {
-                            "reason": (
-                                "the deployment does not serve the Platform v2 "
-                                "attention lane, so it serves no attention "
-                                "snapshot for the clients to agree about"
-                            )
-                        }
-                    ),
-                )
-            )
-
     hosted_read = cockpit_read(
         run.origin, None, run.credential, args.timeout, run.host_header, run.forwarded_proto
     )
@@ -1153,6 +1273,80 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
                 projection=hosted,
             )
         )
+
+    # The record graph can only be read per project, so the coordinate has to
+    # exist before the lane can be asked for anything. Taking it from the
+    # deployment's own cockpit answer keeps it a coordinate the deployment
+    # named; `--project` overrides that for a deployment whose cockpit is
+    # unreachable but whose lane is not.
+    project_intent = (
+        "the live read names a project the deployment itself named, because "
+        "the Platform v2 record graph has no project-less read"
+    )
+    named_projects = cockpit_projects(hosted_read["document"]) if hosted is not None else []
+    project = args.project or (named_projects[0] if named_projects else None)
+    if project is None:
+        run.checks.append(
+            check(
+                "live_read_project",
+                project_intent,
+                "blocked",
+                reason=(
+                    "no project to read: the deployment's cockpit named none "
+                    "and --project was not supplied. Without one the client's "
+                    "own encoder refuses the work-context query, so nothing "
+                    "would be asked of the deployment at all"
+                ),
+                cockpit_state=hosted_read.get("state"),
+            )
+        )
+        lane: dict[str, Any] = {
+            "state": "blocked",
+            "reason": "no project to read the record graph for",
+        }
+    else:
+        run.checks.append(
+            check(
+                "live_read_project",
+                project_intent,
+                "passed",
+                project=run.salt.of(project),
+                source="operator" if args.project else "deployment_cockpit",
+            )
+        )
+        lane = run.read_lane(project)
+
+    lane_state: dict[str, Any] = {}
+    if lane["state"] != "passed":
+        run.checks.append(check("live_attention_lane", lane_intent, "blocked", detail=lane))
+    else:
+        document = lane["document"]
+        if document.get("schema") != CAPTURE_SCHEMA:
+            run.checks.append(
+                check(
+                    "live_attention_lane",
+                    lane_intent,
+                    "failed",
+                    reason=f"capture answered under {document.get('schema')!r}",
+                )
+            )
+        else:
+            lane_state = document.get("lane") or {}
+            state = lane_state.get("state")
+            run.checks.append(
+                check(
+                    "live_attention_lane",
+                    lane_intent,
+                    "passed" if state == "negotiated" else "blocked",
+                    observed=lane_observation(lane_state),
+                    endpoint=redacted(document.get("endpoint", "")),
+                    **(
+                        {}
+                        if state == "negotiated"
+                        else {"reason": lane_reason(lane_state)}
+                    ),
+                )
+            )
 
     negotiated = lane_state.get("state") == "negotiated"
     projections: dict[str, dict[str, Any]] = {}
@@ -1239,9 +1433,8 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
                     intent,
                     "not_exercised",
                     reason=(
-                        "the deployment refuses its Platform v2 attention lane "
-                        f"({category(lane_state.get('category'))}), so it served no "
-                        "attention snapshot this run could put through the clients"
+                        f"{lane_reason(lane_state)}, so it served no attention "
+                        "snapshot this run could put through the clients"
                     ),
                 )
             )
@@ -1250,6 +1443,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         pages = work_contexts.get("pages_canonical_base64") or []
         found = run.targets(pages) if work_contexts.get("state") == "available" else []
         if not found:
+            reason = work_context_reason(work_contexts)
             for name, intent in (
                 ("live_source_inventory_parity", live_intent_inventory),
                 ("live_projection_parity", live_intent_projection),
@@ -1260,13 +1454,10 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
                         name,
                         intent,
                         "not_exercised",
-                        reason=(
-                            "the deployment's work-context graph names no user "
-                            "workspace, so no client has a target to derive an "
-                            "attention inventory for"
-                        ),
+                        reason=reason,
                         work_contexts_state=work_contexts.get("state"),
                         work_contexts_category=category(work_contexts.get("category")),
+                        work_contexts_http_status=work_contexts.get("http_status"),
                     )
                 )
         else:
@@ -1275,17 +1466,8 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             probes = capture(
                 run.repo,
                 run.scratch / "capture-target",
-                [
-                    "--endpoint",
-                    run.origin.rstrip("/") + PLATFORM_V2_PATH,
-                    "--credential-env",
-                    args.credential_env,
-                    "--project",
-                    project,
-                    "--user-workspace",
-                    workspace,
-                    "--review-probe",
-                ],
+                run.capture_arguments(project)
+                + ["--user-workspace", workspace, "--review-probe"],
                 args.build_timeout,
             )
             if probes["state"] == "passed":
@@ -1340,13 +1522,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             for index in range(reads):
                 if index:
                     time.sleep(max(0.0, args.interval_seconds))
-                arguments = [
-                    "--endpoint",
-                    run.origin.rstrip("/") + PLATFORM_V2_PATH,
-                    "--credential-env",
-                    args.credential_env,
-                    "--project",
-                    project,
+                arguments = run.capture_arguments(project) + [
                     "--user-workspace",
                     workspace,
                 ]

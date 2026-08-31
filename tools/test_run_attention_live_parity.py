@@ -483,7 +483,7 @@ class ReportStateTest(unittest.TestCase):
         with unittest.mock.patch.object(parity.Run, "prepare", prepare):
             with unittest.mock.patch.object(parity.Run, "control", lambda self: {}):
                 with unittest.mock.patch.object(
-                    parity.Run, "read_lane", lambda self: {"state": "failed"}
+                    parity.Run, "read_lane", lambda self, project: {"state": "failed"}
                 ):
                     with unittest.mock.patch.object(
                         parity, "cockpit_read", lambda *a, **k: {"state": "blocked"}
@@ -513,6 +513,165 @@ class ReportStateTest(unittest.TestCase):
         for client in parity.CLIENTS:
             self.assertIn(client, report["reducers"])
         self.assertIn("read from the deployment", report["reducers"]["hosted"])
+
+
+class CaptureArgumentsTest(unittest.TestCase):
+    """The live read is asked for in a way the deployment can actually answer.
+
+    Both of these were once missing, and each turned a fact about how the
+    harness asked into a published fact about the deployment.
+    """
+
+    def run_for(self, argv: list[str]) -> parity.Run:
+        return parity.Run(parity.parse_args(argv))
+
+    def test_every_live_capture_names_a_project(self) -> None:
+        # `PlatformV2Request::QueryWorkContexts` has no project-less encoding.
+        # Without `--project` the client's own encoder refuses the request, the
+        # read never reaches the network, and the capture records a `protocol`
+        # error that reads exactly like the deployment answering badly.
+        arguments = self.run_for([]).capture_arguments("wc2_project_x")
+        self.assertIn("--project", arguments)
+        self.assertEqual(arguments[arguments.index("--project") + 1], "wc2_project_x")
+
+    def test_a_loopback_probe_carries_the_canonical_host_and_the_tls_hop(self) -> None:
+        # A web entry that answers for one canonical name over TLS answers 400
+        # to a request addressed to 127.0.0.1. Without these the flag silently
+        # means "the lane check cannot run".
+        arguments = self.run_for(
+            ["--hosted-loopback", "http://127.0.0.1:8080", "--hosted-host", "entry.example"]
+        ).capture_arguments("wc2_project_x")
+        self.assertIn("--host-header", arguments)
+        self.assertEqual(arguments[arguments.index("--host-header") + 1], "entry.example")
+        self.assertEqual(
+            arguments[arguments.index("--forwarded-proto") + 1],
+            parity.LOOPBACK_FORWARDED_PROTO,
+        )
+
+    def test_a_public_edge_probe_claims_no_host_of_its_own(self) -> None:
+        arguments = self.run_for(
+            ["--hosted-endpoint", "https://entry.example"]
+        ).capture_arguments("wc2_project_x")
+        self.assertNotIn("--host-header", arguments)
+        self.assertNotIn("--forwarded-proto", arguments)
+
+
+class LaneReasonTest(unittest.TestCase):
+    """The refusal sentence is said only about an actual refusal.
+
+    Everything else a non-negotiated lane can mean — not reached, addressed
+    wrongly, credential refused, never asked — is a different finding and only
+    one of them is about the attention lane.
+    """
+
+    def test_a_deployment_that_did_not_answer_is_not_a_refusal(self) -> None:
+        reason = parity.lane_reason(
+            {"state": "error", "category": "unexpected_status", "http_status": 503}
+        )
+        self.assertIn("503", reason)
+        self.assertIn("did not answer", reason)
+        self.assertNotIn("refuses its Platform v2 attention lane", reason)
+
+    def test_a_request_the_deployment_rejected_is_named_as_such(self) -> None:
+        reason = parity.lane_reason(
+            {"state": "error", "category": "unexpected_status", "http_status": 400}
+        )
+        self.assertIn("400", reason)
+        self.assertIn("as addressed", reason)
+        self.assertNotIn("refuses its Platform v2 attention lane", reason)
+
+    def test_a_refused_credential_is_not_a_refused_lane(self) -> None:
+        reason = parity.lane_reason(
+            {"state": "error", "category": "unauthorized", "http_status": 401}
+        )
+        self.assertIn("credential", reason)
+        self.assertNotIn("refuses its Platform v2 attention lane", reason)
+
+    def test_a_lane_that_was_never_read_is_not_reported_as_a_refusal(self) -> None:
+        # No project, no cockpit answer: the lane was never asked anything, so
+        # the deployment said nothing about it either way.
+        reason = parity.lane_reason({})
+        self.assertIn("never read", reason)
+        self.assertNotIn("refuses its Platform v2 attention lane", reason)
+
+    def test_no_status_at_all_is_reported_as_unreached(self) -> None:
+        reason = parity.lane_reason({"state": "error", "category": "io"})
+        self.assertIn("could not be reached", reason)
+
+    def test_a_typed_refusal_is_the_one_outcome_reported_as_a_refusal(self) -> None:
+        reason = parity.lane_reason(
+            {"state": "refused", "category": "platform_v2_web_binding_unavailable"}
+        )
+        self.assertIn("refuses its Platform v2 attention lane", reason)
+        self.assertIn("platform_v2_web_binding_unavailable", reason)
+
+    def test_the_observation_records_the_status_beside_the_category(self) -> None:
+        observed = parity.lane_observation(
+            {
+                "state": "error",
+                "category": "unexpected_status",
+                "http_status": 503,
+                "http_content_type": "application/json",
+            }
+        )
+        self.assertEqual(observed["http_status"], 503)
+        self.assertEqual(observed["http_content_type"], "application/json")
+
+    def test_free_text_never_enters_the_observation_as_a_category(self) -> None:
+        observed = parity.lane_observation({"state": "error", "category": "a live path /home/x"})
+        self.assertEqual(observed["category"], "<non_category_text_withheld>")
+
+
+class WorkContextReasonTest(unittest.TestCase):
+    """A read that errored is not an empty graph."""
+
+    def test_a_failed_read_is_not_reported_as_an_empty_graph(self) -> None:
+        reason = parity.work_context_reason({"state": "error", "category": "protocol"})
+        self.assertIn("none was obtained", reason)
+        self.assertNotIn("names no user workspace", reason)
+
+    def test_a_refused_read_is_not_reported_as_an_empty_graph(self) -> None:
+        reason = parity.work_context_reason(
+            {"state": "refused", "category": "platform_v2_project_denied"}
+        )
+        self.assertIn("none was obtained", reason)
+        self.assertIn("platform_v2_project_denied", reason)
+        self.assertNotIn("names no user workspace", reason)
+
+    def test_a_read_that_succeeded_and_was_empty_says_so(self) -> None:
+        reason = parity.work_context_reason(
+            {"state": "available", "pages_canonical_base64": []}
+        )
+        self.assertIn("was read and names no user workspace", reason)
+        self.assertNotIn("none was obtained", reason)
+
+    def test_a_failed_read_reports_the_status_it_saw(self) -> None:
+        reason = parity.work_context_reason(
+            {"state": "error", "category": "unexpected_status", "http_status": 503}
+        )
+        self.assertIn("503", reason)
+
+
+class CockpitProjectsTest(unittest.TestCase):
+    """The project the live read names is one the deployment named."""
+
+    def test_the_projects_the_cockpit_named_are_returned_in_order(self) -> None:
+        self.assertEqual(
+            parity.cockpit_projects(
+                {"projects": [{"id": "wc2_project_a"}, {"id": "wc2_project_b"}]}
+            ),
+            ["wc2_project_a", "wc2_project_b"],
+        )
+
+    def test_a_cockpit_that_named_none_yields_none(self) -> None:
+        self.assertEqual(parity.cockpit_projects({"projects": []}), [])
+        self.assertEqual(parity.cockpit_projects({}), [])
+
+    def test_a_malformed_entry_is_skipped_rather_than_raising(self) -> None:
+        self.assertEqual(
+            parity.cockpit_projects({"projects": ["wc2_project_a", {"id": 7}, {"id": "ok"}]}),
+            ["ok"],
+        )
 
 
 if __name__ == "__main__":

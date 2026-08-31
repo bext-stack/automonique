@@ -74,6 +74,14 @@ asked, and the check is `blocked` — which is the honest state, because an
 operator cannot compare three screens against attention nobody has established
 exists.
 
+When the lane did not answer, this check carries the parity report's own reason
+and its HTTP status rather than restating a refusal. The difference matters
+most here: this report gates the GUI steps, and "the deployment does not serve
+its attention lane" is a claim about the deployment, while a `503` from a
+restarting daemon and a `400` from a request addressed to the wrong host are
+claims about the moment and about the harness. See "Finding of 2026-08-31" in
+`docs/attention-live-parity.md`.
+
 `inventory.state` on that projection means a scoped read succeeded, not that
 the whole inventory fit in one response. The projection names the coordinates
 it needs (the serving node, the action catalogue, and the run behind each
