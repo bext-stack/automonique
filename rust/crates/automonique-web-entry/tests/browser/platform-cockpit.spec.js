@@ -57,12 +57,20 @@ const cockpit = {
   review: { state: "available", document: freshCockpitReview },
   attention: { state: "available", known_workspaces: "2", total_workspaces: "2" },
   inbox: {
-    state: "complete", total: "1", omitted: "0", sources: { review: { state: "available" } },
+    state: "complete", total: "1", omitted: "0", sources: { attention: { state: "available" } },
     items: [{
-      id: "attention-comment",
+      // Shaped exactly as `platform_cockpit::attention_inbox()` projects an
+      // item: a composite identity, the source that asserted it, both
+      // revisions, and every count as a decimal string. `normalizeInbox` drops
+      // an item outright on any field it cannot read, so a fixture that drifts
+      // from the projection renders an empty inbox and asserts nothing.
+      id: "review:workspace-1:attention-comment",
       state: "needs_you",
       reason: "comment_reply",
-      origin_kind: "comment",
+      source_kind: "review",
+      source_id: "workspace-1",
+      item_revision: "9007199254741001",
+      observed_at_ms: "1800000000002",
       source_revision: "9007199254741002",
       unread: "1",
       link: {
@@ -266,7 +274,10 @@ test("attention inbox and chronological activity are accessible at desktop and m
   await expect(inbox).toBeVisible();
   await expect(activity).toBeVisible();
   await expect(inbox.getByText("Needs You · comment reply")).toBeVisible();
-  const reviewLink = inbox.getByRole("link", { name: /Open exact review context for comment reply/ });
+  await expect(inbox.getByText("source revision 9007199254741002")).toBeVisible();
+  const reviewLink = inbox.getByRole("link", {
+    name: /Open exact attention context for comment reply at source revision 9007199254741002/,
+  });
   await expect(reviewLink).toHaveAttribute(
     "href",
     "#sessions?workspace=workspace-1&file=file-text&hunk=hunk-text&side=new&line=9007199254740995",
@@ -287,7 +298,7 @@ test("partial and truncated collection coverage is never rendered as known empty
     ...cockpit,
     inbox: {
       state: "unavailable", items: [], total: "0", omitted: "0",
-      sources: { review: { state: "refused", category: "review_authority_refused" } },
+      sources: { attention: { state: "refused", category: "review_authority_refused" } },
     },
     activities: {
       state: "partial",

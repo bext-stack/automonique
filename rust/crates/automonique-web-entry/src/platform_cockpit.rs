@@ -1934,7 +1934,12 @@ fn attention_inbox(
             "source_revision": snapshot.revision().to_string(),
             "item_revision": item.revision().to_string(),
             "observed_at_ms": item.observed_at_ms().to_string(),
-            "unread": item.unread().to_string(),
+            // `normalizeInbox` in `assets/platform-cockpit-core.js` requires a
+            // decimal string here and drops the whole item when it cannot read
+            // one, and the surface renders this as a count. `bool::to_string`
+            // put "true" on the wire, so every attention item the cockpit
+            // projected was discarded before it could reach the inbox.
+            "unread": u64::from(item.unread()).to_string(),
             "link": link
         })
     })).collect();
@@ -3806,5 +3811,84 @@ mod tests {
             operations["add_comment"]["execute_operation"],
             "execute_review_action"
         );
+    }
+
+    /// The committed cockpit render-proof document is this crate's own
+    /// projection, not a document written beside it.
+    ///
+    /// `tests/browser/live-cockpit-attention.spec.js` serves that document to
+    /// the real cockpit assets to prove its live assertions can fail. A proof
+    /// is only worth the document it runs against: one hand-written here would
+    /// agree with whatever this crate misunderstands, and would keep agreeing
+    /// after the projection changed. So the two halves the browser check reads
+    /// are pinned to their producers instead — the attention inbox to
+    /// `attention_inbox()` over the protocol's attention fixture, and the
+    /// review document to the protocol's render conformance corpus, verbatim.
+    /// Changing either projection fails here until the document is regenerated.
+    #[test]
+    fn cockpit_render_proof_document_is_projected_not_authored() {
+        use automonique_protocol::platform_v2_attention_api::decode_attention_source_snapshot;
+
+        let document: Value =
+            serde_json::from_slice(include_bytes!("../fixtures/cockpit-render-proof-v1.json"))
+                .expect("the committed render-proof document parses");
+        assert_eq!(document["schema"], SCHEMA);
+
+        let attention_value: Value = serde_json::from_slice(include_bytes!(
+            "../../automonique-protocol/fixtures/platform-v2-attention-v1.json"
+        ))
+        .expect("the protocol attention fixture parses");
+        let workspace = attention_value["user_workspace"]
+            .as_str()
+            .expect("the attention fixture names its user workspace");
+        let snapshot = decode_attention_source_snapshot(&canonical_json_bytes(&attention_value))
+            .expect("the protocol attention fixture decodes under its own contract");
+        let inbox = attention_inbox(
+            &UserWorkspaceId::new(workspace).expect("a fixture workspace identifier"),
+            &[snapshot],
+        );
+        let available = json!({ "state": "available" });
+        assert_eq!(
+            document["inbox"],
+            collection_projection(inbox, &[("attention", &available)])
+        );
+
+        // Every projected item has to survive `normalizeInbox` in
+        // `assets/platform-cockpit-core.js`, which drops an item outright on
+        // any field it cannot read. The decimal-string fields are the ones that
+        // silently discarded every item when `unread` was projected as a bool.
+        for item in document["inbox"]["items"]
+            .as_array()
+            .expect("the projected inbox is a list")
+        {
+            for field in [
+                "source_revision",
+                "item_revision",
+                "observed_at_ms",
+                "unread",
+            ] {
+                let value = item[field]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{field} is projected as a string"));
+                assert!(
+                    !value.is_empty()
+                        && value.bytes().all(|byte| byte.is_ascii_digit())
+                        && (value == "0" || !value.starts_with('0')),
+                    "{field} must be a canonical decimal string, got {value:?}"
+                );
+            }
+        }
+
+        let corpus: Value = serde_json::from_slice(include_bytes!(
+            "../../automonique-protocol/fixtures/platform-v2-render-conformance-v1.json"
+        ))
+        .expect("the protocol render conformance corpus parses");
+        let needs_you = corpus["cases"]
+            .as_array()
+            .expect("the corpus lists cases")
+            .iter()
+            .find(|case| case["id"] == "needs_you")
+            .expect("the corpus carries the needs_you case");
+        assert_eq!(document["review"]["document"], needs_you["input"]);
     }
 }

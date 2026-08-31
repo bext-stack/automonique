@@ -467,6 +467,193 @@ class SignOffTest(unittest.TestCase):
         self.assertFalse(record["signed_off"])
 
 
+class CockpitRenderTest(unittest.TestCase):
+    """The browser check's verdict is read, not inferred from an exit status.
+
+    A skipped browser test exits zero. If this fold-in trusted the runner's
+    return code, an unobserved render would arrive in the report as an observed
+    one, which is the single failure this whole harness exists to prevent.
+    """
+
+    ORIGIN = live.Origin(key="hosted", url="https://example.invalid")
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = pathlib.Path(self.temporary.name)
+        self.crate = self.root / "crate"
+        (self.crate / "node_modules" / "@playwright" / "test").mkdir(parents=True)
+        (self.crate / "playwright.config.js").write_text("// fixture\n", encoding="utf-8")
+        self.evidence = self.root / "evidence"
+
+    def evidence_document(self, **overrides: object) -> dict[str, object]:
+        document = {
+            "schema": live.COCKPIT_RENDER_EVIDENCE_SCHEMA,
+            "mode": "live",
+            "origin": self.ORIGIN.url,
+            "state": "asserted",
+            "screenshot": "live-cockpit-attention.png",
+            "review_screenshot": "live-cockpit-review.png",
+            "attention_items": [
+                {
+                    "source_kind": "provider_session",
+                    "source_id": "provider-feed-1",
+                    "source_revision": "7",
+                    "item_revision": "5",
+                    "state": "needs_you",
+                    "reason": "approval_required",
+                    "unread": "1",
+                }
+            ],
+            "review": {
+                "source_state": "available",
+                "source_revision": "9007199254741011",
+                "derived": "exact_semantics",
+                "semantic_keys": {"cockpit-delivery-state": "delivery.pending"},
+            },
+        }
+        document.update(overrides)
+        return document
+
+    def run_check(
+        self,
+        *,
+        returncode: int = 0,
+        document: dict[str, object] | None = None,
+        crate: pathlib.Path | None = None,
+        runner: str | None = "/usr/bin/bunx",
+        raises: Exception | None = None,
+    ) -> dict[str, object]:
+        def fake_run(*_arguments: object, **_keywords: object):
+            if raises is not None:
+                raise raises
+            if document is not None:
+                target = self.evidence / live.COCKPIT_RENDER_EVIDENCE_FILE
+                target.write_text(json.dumps(document), encoding="utf-8")
+            return unittest.mock.Mock(returncode=returncode, stdout=b"line", stderr=b"")
+
+        with unittest.mock.patch.object(live.shutil, "which", return_value=runner):
+            with unittest.mock.patch.object(live.subprocess, "run", side_effect=fake_run):
+                return live.check_cockpit_render(
+                    self.ORIGIN,
+                    self.crate if crate is None else crate,
+                    self.evidence,
+                    "AUTOMONIQUE_OPS_BASIC_AUTH",
+                    30.0,
+                )
+
+    def test_a_crate_without_the_browser_check_is_blocked(self) -> None:
+        result = self.run_check(crate=self.root / "absent", document=self.evidence_document())
+        self.assertEqual(result["state"], "blocked")
+
+    def test_no_runner_on_path_is_blocked(self) -> None:
+        result = self.run_check(runner=None, document=self.evidence_document())
+        self.assertEqual(result["state"], "blocked")
+        self.assertIn("bunx", result["reason"])
+
+    def test_an_uninstalled_toolchain_is_blocked_rather_than_fetched(self) -> None:
+        # `bunx playwright` with nothing installed would fetch some version and
+        # drive a browser this crate never measured against. That is a different
+        # check, and a different check reporting `passed` here is a lie.
+        live.shutil.rmtree(self.crate / "node_modules")
+        result = self.run_check(document=self.evidence_document())
+        self.assertEqual(result["state"], "blocked")
+
+    def test_a_timeout_is_blocked(self) -> None:
+        result = self.run_check(
+            raises=live.subprocess.TimeoutExpired(cmd="playwright", timeout=30.0)
+        )
+        self.assertEqual(result["state"], "blocked")
+
+    def test_a_run_that_wrote_no_evidence_is_blocked_even_when_it_exited_zero(self) -> None:
+        result = self.run_check(returncode=0, document=None)
+        self.assertEqual(result["state"], "blocked")
+
+    def test_evidence_that_records_being_blocked_is_blocked_with_its_reason(self) -> None:
+        result = self.run_check(
+            document=self.evidence_document(state="blocked", reason="no attention item served")
+        )
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["reason"], "no attention item served")
+
+    def test_a_proof_run_cannot_stand_in_for_a_deployment(self) -> None:
+        result = self.run_check(document=self.evidence_document(mode="proof"))
+        self.assertEqual(result["state"], "failed")
+
+    def test_evidence_for_another_origin_is_refused(self) -> None:
+        result = self.run_check(document=self.evidence_document(origin="https://elsewhere.invalid"))
+        self.assertEqual(result["state"], "failed")
+
+    def test_an_asserted_render_that_exited_non_zero_is_failed(self) -> None:
+        result = self.run_check(returncode=1, document=self.evidence_document())
+        self.assertEqual(result["state"], "failed")
+
+    def test_an_unknown_evidence_schema_is_failed(self) -> None:
+        result = self.run_check(document=self.evidence_document(schema="something.else/v1"))
+        self.assertEqual(result["state"], "failed")
+
+    def test_an_asserted_render_passes_and_names_the_source_and_generation(self) -> None:
+        result = self.run_check(document=self.evidence_document())
+        self.assertEqual(result["state"], "passed")
+        self.assertEqual(
+            result["attention_items"],
+            [
+                {
+                    "source_kind": "provider_session",
+                    "source_revision": "7",
+                    "item_revision": "5",
+                    "state": "needs_you",
+                    "reason": "approval_required",
+                    "unread": "1",
+                }
+            ],
+        )
+        self.assertEqual(result["review"]["semantic_keys"], {"cockpit-delivery-state": ["delivery.pending"]})
+        self.assertTrue(result["screenshot"].endswith("live-cockpit-attention.png"))
+
+    def test_a_work_coordinate_in_the_evidence_does_not_reach_the_report(self) -> None:
+        # The evidence file beside the screenshot carries `source_id` so the
+        # other two clients can be correlated against this run. The report is a
+        # different artefact and does not get it, nor anything else that is not
+        # an enumeration token or a decimal.
+        result = self.run_check(document=self.evidence_document())
+        recorded = json.dumps(result)
+        self.assertNotIn("provider-feed-1", recorded)
+
+    def test_free_text_and_out_of_shape_values_are_withheld(self) -> None:
+        document = self.evidence_document()
+        document["attention_items"] = [
+            {
+                "source_kind": "Provider session, working on branch secret",
+                "source_revision": "007",
+                "item_revision": "5",
+                "state": "needs_you",
+                "reason": "approval_required",
+                "unread": "1",
+            }
+        ]
+        result = self.run_check(document=document)
+        self.assertEqual(
+            result["attention_items"],
+            [
+                {
+                    "item_revision": "5",
+                    "state": "needs_you",
+                    "reason": "approval_required",
+                    "unread": "1",
+                }
+            ],
+        )
+
+    def test_a_screenshot_name_cannot_escape_the_evidence_directory(self) -> None:
+        result = self.run_check(document=self.evidence_document(screenshot="../../etc/passwd"))
+        self.assertNotIn("screenshot", result)
+
+    def test_a_bounded_reason_says_it_was_cut(self) -> None:
+        self.assertTrue(live.bounded_reason("x" * 400).endswith("\u2026"))
+        self.assertEqual(len(live.bounded_reason("x" * 400)), live.SCALAR_LIMIT)
+        self.assertEqual(live.bounded_reason("short"), "short")
+
 class ReportTest(unittest.TestCase):
     """`passed` is never true while anything is unproven."""
 

@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "test:unit": "bun test assets/platform-cockpit-core.test.js",
-    "test:browser": "playwright test"
+    "test:browser": "playwright test --project=desktop --project=mobile",
+    "test:browser:live": "playwright test --project=live-cockpit --reporter=line"
   },
   "devDependencies": {
     "@playwright/test": "1.58.0"
