@@ -96,6 +96,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
+use std::os::fd::AsFd as _;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -1088,7 +1089,7 @@ fn accept_loop(listener: &UnixListener, hub: &Arc<ProgressHub>, stop: &Arc<Atomi
                 // connection is what this loop is waiting for, so it waits on
                 // the listener rather than on the clock; [`ACCEPT_POLL`] stays
                 // as the bound the stop flag is noticed within, unchanged.
-                crate::await_connection(listener, ACCEPT_POLL);
+                crate::await_readable(listener.as_fd(), ACCEPT_POLL);
             }
             // A listener-level failure ends the loop. Every writer already
             // spawned is still joined below, so no thread outlives this one.

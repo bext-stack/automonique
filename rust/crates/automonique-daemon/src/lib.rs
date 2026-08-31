@@ -59,7 +59,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
@@ -3823,7 +3823,7 @@ impl Daemon {
                             }
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            await_connection(&self.listener, ACCEPT_POLL);
+                            await_readable(self.listener.as_fd(), ACCEPT_POLL);
                         }
                         Err(error) => break 'serving Err(DaemonError::Io(error)),
                     }
@@ -10023,7 +10023,10 @@ fn run_with_mode(config: &DaemonConfig, disconnected_recovery: bool) -> Result<(
                         Some(_) => {}
                     }
                 }
-                Ok(None) => std::thread::sleep(ACCEPT_POLL),
+                // Nothing queued. The kernel knows when there is; this
+                // thread has no cadence of its own to keep, so the interval
+                // is only the ceiling on noticing a descriptor that failed.
+                Ok(None) => await_readable(signal_fd.as_fd(), ACCEPT_POLL),
                 Err(_) => signal_stop.store(true, Ordering::Release),
             }
         }
@@ -10135,19 +10138,23 @@ fn local_peer_policy() -> Result<PeerPolicy, DaemonError> {
 const SYSTEMD_LISTEN_FD_START: i32 = 3;
 const ADMIN_FD_NAME: &str = "admin";
 
-/// Wait for a non-blocking listener to have a connection to accept, bounded by
+/// Wait for a non-blocking descriptor to have something to read, bounded by
 /// the same interval its loop previously slept for outright.
+///
+/// Three kinds of loop use this and they want the same thing: a listener with a
+/// connection to accept, and the signal descriptor with a signal to deliver.
+/// Both are "there is nothing here yet", and both used to be answered by a nap.
 ///
 /// # This is a wait, not a cadence
 ///
-/// An accept loop's periodic work — the admin loop's lease renewal, synthetic
-/// tick, approval sweep, watchdog and stop and reload checks; another loop's
-/// stop flag — is driven by loop iteration, not by this call. Bounding the wait
-/// at the interval the loop already used therefore leaves every one of those
+/// A loop's periodic work — the admin loop's lease renewal, synthetic tick,
+/// approval sweep, watchdog and stop and reload checks; another loop's stop
+/// flag — is driven by loop iteration, not by this call. Bounding the wait at
+/// the interval the loop already used therefore leaves every one of those
 /// cadences exactly where a blind sleep put them, including how quickly a stop
-/// is noticed. What changes is only the idle case: a peer that connects just
-/// after the loop found the listener empty is accepted when it arrives instead
-/// of waiting out the remainder of a fixed nap.
+/// is noticed. What changes is only the idle case: whatever the loop is waiting
+/// for is handled when it arrives instead of waiting out the remainder of a
+/// fixed nap.
 ///
 /// That remainder is the whole cost of a serialized caller. The web entry's
 /// Platform v2 bridge opens one connection per exchange and does not send the
@@ -10159,20 +10166,26 @@ const ADMIN_FD_NAME: &str = "admin";
 /// adopting attempts over [`attempt_adoption`] is the same shape at the same
 /// cost, and it pays it while a handoff is in progress.
 ///
+/// The signal thread is the same shape with a different consequence. It has no
+/// cadence of its own at all — nothing in it is periodic — so the interval was
+/// pure latency in front of a `SIGTERM`, on a thread that woke forty times a
+/// second for the daemon's whole life to find nothing. A stop is now delivered
+/// when the kernel has it.
+///
 /// # Why the caller keeps its interval
 ///
 /// The bound is the caller's, passed in, because it is the caller's other
 /// cadence. Nothing here is entitled to lengthen it and nothing needs it
-/// shortened: the wait ends on the connection, not on the clock, whenever there
-/// is a connection to end it.
+/// shortened: the wait ends on the descriptor, not on the clock, whenever there
+/// is something to end it.
 ///
 /// A failed wait is not fatal and must not become a spin: the caller retries
-/// the accept on its next iteration, so an interrupted poll simply returns and
+/// its read on the next iteration, so an interrupted poll simply returns and
 /// any other failure degrades to the sleep this replaced.
-pub(crate) fn await_connection(listener: &UnixListener, timeout: Duration) {
+pub(crate) fn await_readable(descriptor: BorrowedFd<'_>, timeout: Duration) {
     let milliseconds =
         u16::try_from(timeout.as_millis().clamp(1, u16::MAX.into())).unwrap_or(u16::MAX);
-    let mut poll_fd = [PollFd::new(listener.as_fd(), PollFlags::POLLIN)];
+    let mut poll_fd = [PollFd::new(descriptor, PollFlags::POLLIN)];
     match poll(&mut poll_fd, PollTimeout::from(milliseconds)) {
         Ok(_) | Err(Errno::EINTR) => {}
         Err(_) => std::thread::sleep(timeout),
@@ -10446,7 +10459,8 @@ fn reconciliation_command_refusal(error: &StoreError) -> bool {
 
 #[cfg(test)]
 mod admin_accept_wait_tests {
-    use super::{ACCEPT_POLL, await_connection};
+    use super::{ACCEPT_POLL, await_readable};
+    use std::os::fd::AsFd as _;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::time::{Duration, Instant};
 
@@ -10477,7 +10491,7 @@ mod admin_accept_wait_tests {
         let _client = UnixStream::connect(&path).expect("connect a peer");
 
         let started = Instant::now();
-        await_connection(&listener, ACCEPT_POLL);
+        await_readable(listener.as_fd(), ACCEPT_POLL);
         let waited = started.elapsed();
 
         assert!(
@@ -10505,7 +10519,7 @@ mod admin_accept_wait_tests {
         });
 
         let started = Instant::now();
-        await_connection(&listener, ACCEPT_POLL);
+        await_readable(listener.as_fd(), ACCEPT_POLL);
         let waited = started.elapsed();
 
         let _client = connector.join().expect("join the connecting peer");
@@ -10534,7 +10548,7 @@ mod admin_accept_wait_tests {
         let mut longest = Duration::ZERO;
         for _ in 0..ATTEMPTS {
             let started = Instant::now();
-            await_connection(&listener, ACCEPT_POLL);
+            await_readable(listener.as_fd(), ACCEPT_POLL);
             longest = longest.max(started.elapsed());
             if longest >= ACCEPT_POLL / 2 {
                 break;
@@ -10545,6 +10559,77 @@ mod admin_accept_wait_tests {
             longest >= ACCEPT_POLL / 2,
             "no idle wait out of {ATTEMPTS} reached half the {ACCEPT_POLL:?} \
              interval; the longest was {longest:?}, which is a spin"
+        );
+    }
+}
+
+/// The same wait, on the descriptor the signal thread parks on.
+///
+/// The signal thread is the one caller with no cadence of its own: nothing in
+/// it is periodic, so the interval was pure latency in front of a `SIGTERM` on
+/// a thread that woke forty times a second for the daemon's life to find
+/// nothing.
+///
+/// A real signal is deliberately not raised here. Cargo runs every case in one
+/// process, a signal disposition is process-wide, and a case that reached
+/// another test's thread would be a much worse bug than the one it was
+/// checking. What is asserted instead is the whole of what the signal thread
+/// relies on: that this wait ends when *its own descriptor* becomes readable,
+/// for a descriptor that is not a listener. `signalfd` and a pipe are the same
+/// `POLLIN` to `poll(2)`; nothing in the helper distinguishes them, which is
+/// exactly why it can be shared.
+#[cfg(test)]
+mod signal_wait_tests {
+    use super::{ACCEPT_POLL, await_readable};
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::AsFd as _;
+    use std::time::{Duration, Instant};
+
+    /// A readable non-listener descriptor ends the wait, rather than the
+    /// interval ending it.
+    #[test]
+    fn a_readable_descriptor_is_not_slept_through() {
+        let (mut read_end, mut write_end) = std::io::pipe().expect("a pipe");
+        write_end.write_all(b"!").expect("queue a byte");
+
+        let started = Instant::now();
+        await_readable(read_end.as_fd(), ACCEPT_POLL);
+        let waited = started.elapsed();
+
+        assert!(
+            waited < ACCEPT_POLL / 2,
+            "a descriptor that already had something to read was waited on for {waited:?} of the \
+             {ACCEPT_POLL:?} interval instead of ending it at once"
+        );
+        let mut byte = [0_u8; 1];
+        read_end.read_exact(&mut byte).expect("the queued byte");
+    }
+
+    /// A descriptor with nothing on it waits, rather than spinning.
+    ///
+    /// The interval is still the ceiling, which is what keeps a descriptor that
+    /// failed from being noticed only when something else happens to wake the
+    /// thread. Retried a few times for the reason the accept case is: an
+    /// interrupted poll returns early and legitimately.
+    #[test]
+    fn an_idle_descriptor_waits_out_the_interval() {
+        let (read_end, _write_end) = std::io::pipe().expect("a pipe");
+
+        const ATTEMPTS: usize = 3;
+        let mut longest = Duration::ZERO;
+        for _ in 0..ATTEMPTS {
+            let started = Instant::now();
+            await_readable(read_end.as_fd(), ACCEPT_POLL);
+            longest = longest.max(started.elapsed());
+            if longest >= ACCEPT_POLL / 2 {
+                break;
+            }
+        }
+
+        assert!(
+            longest >= ACCEPT_POLL / 2,
+            "no idle wait out of {ATTEMPTS} reached half the {ACCEPT_POLL:?} interval; the \
+             longest was {longest:?}, which is a spin"
         );
     }
 }
