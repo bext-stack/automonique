@@ -21,13 +21,15 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{Duration, Instant};
 
 use automonique_core::scheduler_conformance::{WorkId, WorkState};
 use automonique_core::{Controller, SchedulerFence, TickOutcome};
 use automonique_daemon::automation_scheduler::{
     AUTOMATION_PARALLELISM_LIMIT, AutomationClock, AutomationSchedulerError,
-    AutomationSchedulerParams, AutomationSchedulerWorker, INTAKE_PAUSED_CATEGORY, IntakeSignal,
-    OCCURRENCE_TRANSPORT, RECONCILIATION_REQUIRED_CATEGORY, TickReport,
+    AutomationSchedulerHost, AutomationSchedulerParams, AutomationSchedulerWorker,
+    INTAKE_PAUSED_CATEGORY, IntakeSignal, OCCURRENCE_TRANSPORT, RECONCILIATION_REQUIRED_CATEGORY,
+    TickReport,
 };
 use automonique_daemon::synthetic::StoreScheduler;
 use automonique_protocol::automation_api::{AutomationId, AutomationOccurrenceKey};
@@ -1283,4 +1285,61 @@ fn a_closed_intake_still_cancels_what_an_operator_withdrew() {
     let skipped = fixture.job("s2");
     assert_eq!(skipped.active_occurrence_ms, None);
     assert_eq!(skipped.next_fire_at_ms, Some(at + MINUTE));
+}
+
+/// An idle scheduler worker leaves on the stop, not at its next look.
+///
+/// The worker's own cadence is legitimate: a tick that found nothing due is
+/// waiting for a deadline to arrive, which is this worker doing its job. What
+/// was not legitimate is a generation handoff paying that cadence to get the
+/// worker back. A drain now ends the wait rather than outlasting it.
+///
+/// Measured over several drains because one would be a coin flip against an
+/// interval boundary. Only the interval between asking and joining is counted:
+/// nothing else about the worker changed.
+#[test]
+fn an_idle_worker_is_joined_on_the_stop_rather_than_at_its_next_tick() {
+    /// Drains to measure.
+    const DRAINS: u32 = 5;
+    /// `automation_scheduler::IDLE_POLL`, mirrored — it is private, and the
+    /// number being defended is the one written here.
+    const IDLE_POLL: Duration = Duration::from_millis(250);
+
+    let mut drained = Duration::ZERO;
+    for _ in 0..DRAINS {
+        let fixture = Fixture::new();
+        let mut host = AutomationSchedulerHost::open(&AutomationSchedulerParams {
+            database_path: &fixture.database_path(),
+            registry_path: &fixture.registry_path(),
+            scheduler_path: &fixture.scheduler_path(),
+            generation_id: GENERATION,
+            holder_id: &fixture.holder,
+            lease_epoch: fixture.epoch,
+            parallelism_limit: AUTOMATION_PARALLELISM_LIMIT,
+            lease_time_source: Arc::clone(&fixture.clock) as Arc<dyn LeaseTimeSource>,
+            clock: Arc::clone(&fixture.clock) as Arc<dyn AutomationClock>,
+            intake_signal: Arc::clone(&fixture.intake_signal),
+        })
+        .expect("open the host");
+        host.start().expect("the worker starts");
+
+        // Nothing is registered, so the first tick is idle and the worker is
+        // parked in the wait this case is about. Well inside one interval, so a
+        // sleeping worker provably owes the remainder.
+        std::thread::sleep(IDLE_POLL / 5);
+
+        let signalled = Instant::now();
+        // The ordered path an operator and a handoff both take: ask, then join.
+        host.shutdown();
+        drained += signalled.elapsed();
+        assert!(host.fault().is_none(), "the worker stopped on a fault");
+    }
+
+    let sleeping_cost = IDLE_POLL * DRAINS;
+    assert!(
+        drained < sleeping_cost / 4,
+        "{DRAINS} drains cost {drained:?} between the stop and the join. A worker waiting on the \
+         stop leaves at once; one sleeping owes most of {IDLE_POLL:?} each time, which is the \
+         {sleeping_cost:?} this is within reach of"
+    );
 }

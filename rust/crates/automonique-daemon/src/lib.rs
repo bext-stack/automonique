@@ -254,6 +254,7 @@ pub mod run_lane;
 pub mod shadow;
 pub mod shadow_config;
 pub mod shot;
+pub mod shutdown_signal;
 pub mod site_inventory;
 pub mod skill_runtime;
 pub mod slack;

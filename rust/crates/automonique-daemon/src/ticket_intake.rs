@@ -73,11 +73,12 @@
 //! are atomics rather than a returned value because the worker runs on its own
 //! thread and the thing that wants to read them is the serve loop.
 
+use crate::shutdown_signal::ShutdownSignal;
 use std::fmt;
 use std::fs;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -109,11 +110,6 @@ pub const DEFAULT_POLL_SECONDS: u64 = 300;
 pub const MIN_POLL_SECONDS: u64 = 30;
 /// Slowest cadence an operator may configure.
 pub const MAX_POLL_SECONDS: u64 = 3_600;
-
-/// How often a sleeping worker wakes to check whether it was asked to stop.
-///
-/// Shutdown latency, not poll latency. A cadence is minutes; a join must not be.
-const STOP_POLL: Duration = Duration::from_millis(100);
 
 /// One source of support board pages.
 ///
@@ -720,12 +716,12 @@ impl<B: SupportBoard> TicketIntake<B> {
     /// Returns the halt that ended it, or `None` when `stop` did.
     pub fn run(
         &mut self,
-        stop: &AtomicBool,
+        stop: &ShutdownSignal,
         cadence: Duration,
         now: &dyn Fn() -> Option<i64>,
     ) -> Option<IntakeHalt> {
         loop {
-            if stop.load(Ordering::Acquire) {
+            if stop.is_stopped() {
                 return None;
             }
             if let Some(now_ms) = now()
@@ -733,16 +729,13 @@ impl<B: SupportBoard> TicketIntake<B> {
             {
                 return Some(halt);
             }
-            // Slept in short steps so a join waits on shutdown latency rather
-            // than on the cadence, which is minutes.
-            let mut remaining = cadence;
-            while !remaining.is_zero() {
-                if stop.load(Ordering::Acquire) {
-                    return None;
-                }
-                let step = remaining.min(STOP_POLL);
-                std::thread::sleep(step);
-                remaining -= step;
+            // One wait for the whole cadence. It used to be the cadence divided
+            // into hundred-millisecond slices, purely so a drain did not have to
+            // wait out five minutes — about three thousand wake-ups per cadence
+            // to read one boolean, and still a slice late. The stop now ends
+            // this wait itself, so the slices bought nothing and cost that.
+            if stop.stopped_within(cadence) {
+                return None;
             }
         }
     }
@@ -764,7 +757,7 @@ pub enum TicketIntakeHost {
         intake: Option<Box<TicketIntake<FleetClient>>>,
         metrics: Arc<IntakeMetrics>,
         cadence: Duration,
-        stop: Arc<AtomicBool>,
+        stop: Arc<ShutdownSignal>,
         worker: Option<JoinHandle<()>>,
     },
 }
@@ -872,7 +865,7 @@ impl TicketIntakeHost {
             intake: Some(Box::new(intake)),
             metrics,
             cadence,
-            stop: Arc::new(AtomicBool::new(false)),
+            stop: ShutdownSignal::new(),
             worker: None,
         })
     }
@@ -955,7 +948,7 @@ impl TicketIntakeHost {
         else {
             return None;
         };
-        stop.store(true, Ordering::Release);
+        stop.stop();
         *intake = None;
         worker.take()
     }

@@ -9,9 +9,9 @@
 //! `PlatformStore`; retained-review Platform v2 actions use an isolated lane
 //! whose terminal marker never enters that v1 receipt pipeline.
 
+use crate::shutdown_signal::ShutdownSignal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -105,7 +105,7 @@ struct OwnedParams {
 
 pub struct ManagedTuiHost {
     composed: Option<ManagedTuiWorker>,
-    stop: Arc<AtomicBool>,
+    stop: Arc<ShutdownSignal>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -128,7 +128,7 @@ impl ManagedTuiHost {
         };
         Ok(Self {
             composed: Some(ManagedTuiWorker::open(owned)?),
-            stop: Arc::new(AtomicBool::new(false)),
+            stop: ShutdownSignal::new(),
             worker: None,
         })
     }
@@ -160,7 +160,7 @@ impl ManagedTuiHost {
     /// The daemon uses this form so all transport workers can drain together
     /// while the serve thread keeps their shared generation lease renewed.
     pub(crate) fn begin_shutdown(&mut self) -> Option<JoinHandle<()>> {
-        self.stop.store(true, Ordering::Release);
+        self.stop.stop();
         self.worker.take()
     }
 }
@@ -267,19 +267,19 @@ impl ManagedTuiWorker {
         })
     }
 
-    fn run(&mut self, stop: &AtomicBool) {
-        while !stop.load(Ordering::Acquire) {
+    fn run(&mut self, stop: &ShutdownSignal) {
+        while !stop.is_stopped() {
             let now_ms = match crate::unix_millis() {
                 Ok(value) => value,
                 Err(_) => {
-                    std::thread::sleep(IDLE_POLL);
+                    stop.stopped_within(IDLE_POLL);
                     continue;
                 }
             };
             let delivered = match self.deliver_one_terminal(now_ms) {
                 Ok(delivered) => delivered,
                 Err(_) => {
-                    std::thread::sleep(IDLE_POLL);
+                    stop.stopped_within(IDLE_POLL);
                     continue;
                 }
             };
@@ -289,13 +289,13 @@ impl ManagedTuiWorker {
                 match self.process_one(now_ms) {
                     Ok(processed) => processed,
                     Err(_) => {
-                        std::thread::sleep(IDLE_POLL);
+                        stop.stopped_within(IDLE_POLL);
                         continue;
                     }
                 }
             };
             if !delivered && !processed {
-                std::thread::sleep(IDLE_POLL);
+                stop.stopped_within(IDLE_POLL);
             }
         }
     }
