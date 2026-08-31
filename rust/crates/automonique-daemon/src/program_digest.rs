@@ -542,8 +542,8 @@ mod tests {
     #[test]
     fn the_ceiling_refuses_a_larger_program_and_admits_an_exact_one() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let exact = program(directory.path(), "exact", &vec![7_u8; 64]);
-        let larger = program(directory.path(), "larger", &vec![7_u8; 65]);
+        let exact = program(directory.path(), "exact", &[7_u8; 64]);
+        let larger = program(directory.path(), "larger", &[7_u8; 65]);
         let digests = ProgramDigests::start();
 
         assert!(digests.digest(&exact, 64).is_some());
