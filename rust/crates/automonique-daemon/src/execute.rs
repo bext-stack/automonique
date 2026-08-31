@@ -133,7 +133,9 @@ use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
+use std::sync::mpsc::{
+    Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
+};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -1964,7 +1966,12 @@ impl JcodePreparedRun {
                             }
                             break 'run state;
                         }
-                        match control.receiver.try_recv() {
+                        // `recv_timeout` rather than `try_recv` plus a sleep: the
+                        // bound is the same, so the temporary-storage check above
+                        // keeps its cadence, but a steer no longer waits out a nap
+                        // that began a moment before it arrived. A person typing
+                        // into a running session is on the other end of this.
+                        match control.receiver.recv_timeout(Duration::from_millis(100)) {
                             Ok(command) => {
                                 let response = host.respond_stdin(
                                     request.request_id(),
@@ -2031,10 +2038,8 @@ impl JcodePreparedRun {
                                     }
                                 }
                             }
-                            Err(TryRecvError::Empty) => {
-                                std::thread::sleep(Duration::from_millis(100));
-                            }
-                            Err(TryRecvError::Disconnected) => {
+                            Err(RecvTimeoutError::Timeout) => {}
+                            Err(RecvTimeoutError::Disconnected) => {
                                 break 'run RunSpoolState::Failed;
                             }
                         }
