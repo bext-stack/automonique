@@ -8,11 +8,14 @@ license.workspace = true
 publish.workspace = true
 
 # The `CONNECT` half of this crate stays dependency-free on purpose: a tunnel
-# that moves opaque bytes needs no parser and no key. The dependencies below
-# belong exclusively to the identity-bound provider path, and their presence is
-# the visible signal that one route through this crate does terminate TLS.
+# that moves opaque bytes needs no parser and no key. `nix` is the one exception
+# and belongs to neither route: it is the `poll(2)` both accept loops wait on,
+# a syscall wrapper that parses nothing and holds no key. The rest belong
+# exclusively to the identity-bound provider path, and their presence is the
+# visible signal that one route through this crate does terminate TLS.
 [dependencies]
 hex = { workspace = true }
+nix = { workspace = true }
 rustls = { workspace = true }
 subtle = { workspace = true }
 webpki-roots = { workspace = true }

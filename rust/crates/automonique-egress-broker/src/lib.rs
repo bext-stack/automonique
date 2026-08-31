@@ -108,10 +108,13 @@ pub mod relay;
 pub mod request;
 pub mod substitute;
 
+use nix::errno::Errno;
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::os::fd::AsFd as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -326,7 +329,13 @@ impl RefusedDestinationObserver {
     }
 }
 
-/// How often the accept loop checks for shutdown while idle.
+/// How long the accept loop waits for a connection before looking at the
+/// shutdown flag.
+///
+/// Unchanged from the interval the loop used to nap for, because it is still
+/// exactly that: the ceiling on how long a stopping broker keeps its listener.
+/// What changed is that a connection ends the wait, so the interval is now a
+/// bound on shutdown rather than a tax on the workload's first byte.
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Why a broker could not be configured or started.
@@ -872,6 +881,28 @@ enum Role {
     Provider,
 }
 
+/// Wait up to `timeout` for a client, rather than napping for it.
+///
+/// Both of a broker's listeners are on the sandboxed workload's critical path:
+/// every outbound connection it opens is one accept here, and the nap sat in
+/// front of the first byte of each. The workload cannot proceed until the
+/// tunnel is up, so the wait was charged to the run.
+///
+/// The bound is the same interval the loop slept for, and it is still what
+/// bounds a shutdown — the loop reads `stopping` once per iteration, and a wait
+/// that ends early only ever reads it sooner. A failed wait degrades to that
+/// sleep rather than spinning, and an interrupted one returns to the accept
+/// above.
+fn await_client(listener: &TcpListener, timeout: Duration) {
+    let milliseconds =
+        u16::try_from(timeout.as_millis().clamp(1, u16::MAX.into())).unwrap_or(u16::MAX);
+    let mut descriptors = [PollFd::new(listener.as_fd(), PollFlags::POLLIN)];
+    match poll(&mut descriptors, PollTimeout::from(milliseconds)) {
+        Ok(_) | Err(Errno::EINTR) => {}
+        Err(_) => thread::sleep(timeout),
+    }
+}
+
 /// Accept until told to stop, then wait for every handler.
 fn accept_loop(listener: &TcpListener, shared: &Arc<Shared>, role: Role) {
     let mut handlers: Vec<JoinHandle<()>> = Vec::new();
@@ -886,7 +917,7 @@ fn accept_loop(listener: &TcpListener, shared: &Arc<Shared>, role: Role) {
                 }));
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(ACCEPT_POLL_INTERVAL);
+                await_client(listener, ACCEPT_POLL_INTERVAL);
             }
             // An accept that fails for any other reason is this listener's
             // problem, not the process's: stop rather than spin.
