@@ -180,6 +180,7 @@ use automonique_store::approval_requests::{
     ApprovalContext, ApprovalProposal, ApprovalRequests, ApprovalState, MAX_APPROVAL_REQUEST_PAGE,
     REQUEST_KEY_HEX_BYTES, REQUEST_KEY_PREFIX,
 };
+use automonique_store::approval_watch::ApprovalWatch;
 use automonique_store::run_index::{RunIndex, RunSpoolState, StateAdvance};
 use nix::libc;
 use sha2::Digest as _;
@@ -527,7 +528,27 @@ pub struct ExecutionLane {
     /// flag abandons the wait instead — leaving the request durably unanswered
     /// for the record, never answering it on the operator's behalf.
     draining: Arc<AtomicBool>,
+    /// The bell this daemon's approval table rings, shared with every waiter.
+    ///
+    /// A run paused on a provider permission waits on this instead of asking
+    /// the table on a timer. It is handed in rather than made here for the
+    /// reason [`automonique_store::approval_watch`] gives: a bell nobody else
+    /// holds is a bell nobody rings, and the wait would silently degrade to its
+    /// bound.
+    approval_watch: Arc<ApprovalWatch>,
 }
+
+/// Upper bound on how long a run paused on a provider permission waits before
+/// it looks at the durable row again.
+///
+/// This was the interval that wait slept for outright, and it is unchanged on
+/// purpose. The loop it bounds does four other things on every pass — it
+/// checkpoints temporary storage, refuses queued steering, honours the drain
+/// flag and enforces the document's deadline — so shortening it would spend
+/// work and lengthening it would slow all four. It is the *floor* under a
+/// missed announcement, not the expected wait: see
+/// [`automonique_store::approval_watch`].
+const APPROVAL_DECISION_POLL: Duration = Duration::from_millis(100);
 
 const MAX_PENDING_JCODE_STEERS: usize = 16;
 const JCODE_STEER_ACK_TIMEOUT: Duration = Duration::from_secs(3);
@@ -672,6 +693,7 @@ impl ExecutionLane {
         state_dir: PathBuf,
         run_index_path: PathBuf,
         sandbox_enforceable: bool,
+        approval_watch: Arc<ApprovalWatch>,
     ) -> Self {
         let helper = locate_launch_helper();
         let egress_destinations =
@@ -716,6 +738,7 @@ impl ExecutionLane {
             progress: Arc::new(ProgressHub::new()),
             jcode_controls: Arc::new(JcodeControlRegistry::default()),
             draining: Arc::new(AtomicBool::new(false)),
+            approval_watch,
         }
     }
 
@@ -1045,6 +1068,7 @@ impl ExecutionLane {
                     refused_destination,
                     approval: ProviderApprovalContext {
                         store_path: self.state_dir.join(crate::APPROVAL_REQUESTS_NAME),
+                        watch: Arc::clone(&self.approval_watch),
                         spec_digest: admitted
                             .spec_digest()
                             .as_str()
@@ -1120,6 +1144,7 @@ impl ExecutionLane {
             session_capture,
             managed_sessions_path: self.managed_sessions_path.clone(),
             approval_requests_path: self.state_dir.join(crate::APPROVAL_REQUESTS_NAME),
+            approval_watch: Arc::clone(&self.approval_watch),
             draining: Arc::clone(&self.draining),
         })
     }
@@ -1493,6 +1518,7 @@ struct JcodePreparedParts<'a> {
 
 struct ProviderApprovalContext {
     store_path: PathBuf,
+    watch: Arc<ApprovalWatch>,
     spec_digest: String,
     program_path: String,
     program_sha256: String,
@@ -2053,6 +2079,11 @@ impl JcodePreparedRun {
                         request.description(),
                     );
                     let (decision, forced_state) = loop {
+                        // Read before the row, so a decision committed between
+                        // this and the read below ends the wait instead of
+                        // being slept through. See
+                        // `automonique_store::approval_watch`.
+                        let observed = approval.watch.observed();
                         match poll_jcode_temporary_storage(
                             &mut host,
                             &mut last_temporary_storage_checkpoint,
@@ -2104,7 +2135,16 @@ impl JcodePreparedRun {
                                 break (automonique_agents::PermissionDecision::Deny, None);
                             }
                             ApprovalState::Pending => {
-                                std::thread::sleep(Duration::from_millis(100));
+                                // Bounded at exactly what the sleep here used
+                                // to be. Every other check in this loop — the
+                                // temporary-storage checkpoint, the drain
+                                // flag, the cancellation, the deadline — is
+                                // driven by loop iteration, so the bound is
+                                // their cadence too and may not grow. What
+                                // changes is only the answered case: an
+                                // operator's decision now ends this wait when
+                                // it lands rather than at the next tick.
+                                approval.watch.wait_beyond(observed, APPROVAL_DECISION_POLL);
                             }
                         }
                     };
@@ -2683,6 +2723,8 @@ struct Attempt {
     /// Where this run's provider-permission proposals live, so the ones it
     /// leaves unanswered can be closed when it becomes terminal.
     approval_requests_path: PathBuf,
+    /// This daemon's approval bell; see [`ExecutionLane::approval_watch`].
+    approval_watch: Arc<ApprovalWatch>,
     /// The lane's drain flag; see [`ExecutionLane::begin_shutdown`].
     draining: Arc<AtomicBool>,
 }
@@ -2711,6 +2753,7 @@ impl Attempt {
             session_capture,
             managed_sessions_path,
             approval_requests_path,
+            approval_watch,
             draining,
         } = self;
 
@@ -2771,7 +2814,7 @@ impl Attempt {
         // nothing for the operator, so the proposal stays pending where it was
         // written, for the next generation to answer.
         if !draining.load(Ordering::Acquire) {
-            expire_unanswered_approvals(&approval_requests_path, &run_id);
+            expire_unanswered_approvals(&approval_requests_path, &run_id, &approval_watch);
         }
         // The turn is over, whichever way it ended. Settling every terminal
         // state, not only a completion, is what keeps the binding honest after
@@ -3016,13 +3059,14 @@ fn advance(
 /// Best-effort, like every other durable write on this path. The run is over
 /// either way, and an expiry that could not be written is still bounded by the
 /// deadline the proposal already carries.
-fn expire_unanswered_approvals(store_path: &Path, run_id: &str) {
+fn expire_unanswered_approvals(store_path: &Path, run_id: &str, watch: &Arc<ApprovalWatch>) {
     let Ok(now_ms) = crate::unix_millis() else {
         return;
     };
     let Ok(mut approvals) = ApprovalRequests::open(store_path) else {
         return;
     };
+    approvals.announce_to(Arc::clone(watch));
     let Ok(pending) = approvals.pending_for_run(run_id, now_ms, MAX_APPROVAL_REQUEST_PAGE) else {
         return;
     };
@@ -3198,6 +3242,7 @@ mod tests {
     use automonique_store::approval_requests::{
         ApprovalContext, ApprovalOutcome, ApprovalProposal, ApprovalRequests, ApprovalState,
     };
+    use automonique_store::approval_watch::ApprovalWatch;
     use automonique_store::run_index::{RunIndex, RunIndexEntry, RunSpoolState};
     use std::fs;
     use std::io::{Read as _, Write as _};
@@ -3407,7 +3452,7 @@ mod tests {
             );
         }
 
-        expire_unanswered_approvals(&path, "run-stopped");
+        expire_unanswered_approvals(&path, "run-stopped", &ApprovalWatch::new());
 
         let store = approval_store(root.path());
         assert_eq!(state_of(&store, mine), ApprovalState::Expired);
@@ -3461,7 +3506,7 @@ mod tests {
                 .expect("operator decision");
         }
 
-        expire_unanswered_approvals(&path, "run-mixed");
+        expire_unanswered_approvals(&path, "run-mixed", &ApprovalWatch::new());
         let after_first = {
             let store = approval_store(root.path());
             (
@@ -3476,7 +3521,7 @@ mod tests {
         );
         assert_eq!(after_first.1.state, ApprovalState::Expired);
 
-        expire_unanswered_approvals(&path, "run-mixed");
+        expire_unanswered_approvals(&path, "run-mixed", &ApprovalWatch::new());
         let store = approval_store(root.path());
         assert_eq!(
             store.entry(granted).expect("read").expect("row"),
@@ -3504,7 +3549,7 @@ mod tests {
             propose(&mut store, gate, "run-gated", "automonique.launch-gate");
         }
 
-        expire_unanswered_approvals(&path, "run-gated");
+        expire_unanswered_approvals(&path, "run-gated", &ApprovalWatch::new());
 
         let store = approval_store(root.path());
         assert_eq!(state_of(&store, gate), ApprovalState::Pending);

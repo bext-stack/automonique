@@ -115,11 +115,13 @@ use std::fmt;
 use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 
+use crate::approval_watch::ApprovalWatch;
 use crate::{StoreError, validate_database_path};
 
 /// The only approval request schema this build can read and write.
@@ -586,6 +588,7 @@ pub struct ApprovalRequests {
     connection: Connection,
     path: PathBuf,
     capacity: usize,
+    watch: Option<Arc<ApprovalWatch>>,
 }
 
 impl ApprovalRequests {
@@ -640,7 +643,34 @@ impl ApprovalRequests {
             connection,
             path: path.to_path_buf(),
             capacity,
+            watch: None,
         })
+    }
+
+    /// Ring `watch` whenever a transition this handle writes commits.
+    ///
+    /// A handle without one is not degraded, it is silent: it writes exactly
+    /// the same rows, and whoever is waiting on them learns from its own bound
+    /// instead of from this handle. Attach one to every handle that decides or
+    /// expires in a process where something waits, and see
+    /// [`crate::approval_watch`] for why a missed ring costs timing and never
+    /// an outcome.
+    pub fn announce_to(&mut self, watch: Arc<ApprovalWatch>) {
+        self.watch = Some(watch);
+    }
+
+    /// This handle's bell, minting one if it has none yet.
+    ///
+    /// The way a waiter is given the bell the writer rings, and deliberately
+    /// the *only* way: taken off the handle that will ring it, "the waiter
+    /// listened to a different bell" stops being a state anything can reach by
+    /// forgetting a line. A caller that mints its own and hands it to one side
+    /// has written that bug and cannot be told so by a type.
+    ///
+    /// Idempotent — a handle has one bell for its whole life, so two callers
+    /// asking are two holders of the same one.
+    pub fn watched(&mut self) -> Arc<ApprovalWatch> {
+        Arc::clone(self.watch.get_or_insert_with(ApprovalWatch::new))
     }
 
     /// Exact path opened by this handle.
@@ -733,6 +763,7 @@ impl ApprovalRequests {
         let record = read_by_key(&transaction, request_key)?
             .ok_or(ApprovalRequestError::Corrupt("request_key"))?;
         transaction.commit()?;
+        self.announce();
         Ok(record)
     }
 
@@ -777,7 +808,19 @@ impl ApprovalRequests {
         let record = read_by_key(&transaction, request_key)?
             .ok_or(ApprovalRequestError::Corrupt("request_key"))?;
         transaction.commit()?;
+        self.announce();
         Ok(record)
+    }
+
+    /// Ring this handle's watch, if it has one.
+    ///
+    /// Called only after a transition has committed, so a waiter that wakes
+    /// reads the row the announcement is about rather than the one it
+    /// replaced.
+    fn announce(&self) {
+        if let Some(watch) = self.watch.as_ref() {
+            watch.announce();
+        }
     }
 
     /// Read the validated row one key addresses, if any.
