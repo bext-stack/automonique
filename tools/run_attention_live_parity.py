@@ -77,7 +77,6 @@ SCHEMA = "automonique.attention-live-parity-report/v1"
 CAPTURE_SCHEMA = "automonique.attention-live-capture/v1"
 REPLAY_INPUT_SCHEMA = "automonique.attention-live-replay-input/v1"
 PROJECTION_SCHEMA = "automonique.attention-live-projection/v1"
-COCKPIT_SCHEMA = "automonique.dashboard.cockpit/v1"
 
 DEFAULT_HOSTED_ORIGIN = "https://monique.1clic.pro"
 DEFAULT_HOSTED_HOST = "monique.1clic.pro"
@@ -123,9 +122,6 @@ class Salt:
     def of(self, value: str) -> str:
         digest = hashlib.sha256(self._salt + value.encode("utf-8")).hexdigest()
         return f"#{digest[:12]}"
-
-    def maybe(self, value: Any) -> Any:
-        return self.of(value) if isinstance(value, str) else value
 
 
 def category(value: Any) -> Any:
