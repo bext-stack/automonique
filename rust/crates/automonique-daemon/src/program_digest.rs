@@ -319,8 +319,13 @@ fn observe(shared: &Arc<Shared>, path: &Path, limit: u64) -> Option<String> {
     // observation of bytes that are already gone is the one thing this must not
     // do. A program any other user may write is never remembered at all, which
     // is the entry helper's own condition for executing one.
-    let after = FileIdentity::of(&file.metadata().ok()?);
-    if after == identity
+    //
+    // A descriptor that will not answer `fstat` is not a reason to withhold a
+    // digest that was computed over bytes actually read: it is a reason not to
+    // remember it. The two are kept apart deliberately, so a failure here costs
+    // a later read rather than a refusal the caller did not earn.
+    if let Ok(after) = file.metadata()
+        && FileIdentity::of(&after) == identity
         && metadata.permissions().mode() & 0o022 == 0
         && let Ok(mut remembered) = shared.remembered.lock()
     {
