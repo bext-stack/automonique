@@ -1084,7 +1084,11 @@ fn accept_loop(listener: &UnixListener, hub: &Arc<ProgressHub>, stop: &Arc<Atomi
                 }));
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(ACCEPT_POLL);
+                // A subscriber is a live renderer waiting to see frames. The
+                // connection is what this loop is waiting for, so it waits on
+                // the listener rather than on the clock; [`ACCEPT_POLL`] stays
+                // as the bound the stop flag is noticed within, unchanged.
+                crate::await_connection(listener, ACCEPT_POLL);
             }
             // A listener-level failure ends the loop. Every writer already
             // spawned is still joined below, so no thread outlives this one.

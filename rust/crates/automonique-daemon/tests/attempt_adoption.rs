@@ -236,6 +236,67 @@ fn concurrent_successors_still_reach_one_source_sink_once() {
         .expect("dispose host");
 }
 
+/// A successor adopting attempts is not charged the accept interval per
+/// request.
+///
+/// Adoption is the shape that suffers most from a napping accept loop: the
+/// successor asks one question per connection and does not ask the next until
+/// the previous answer is in, so it reliably arrives just after the loop went
+/// to sleep and pays the remainder — every request, during a handoff, which is
+/// the worst moment for the source generation to be asleep. An inventory
+/// followed by a question about each live attempt is several of those in a row.
+///
+/// The interval is mirrored rather than imported because it is private, and
+/// because a case that read the constant would still pass if the loop and the
+/// constant were changed together. The number being defended is the one in this
+/// comment.
+#[test]
+fn a_successor_is_not_charged_the_accept_interval_per_request() {
+    /// Sequential requests to measure over. One could not be told apart from a
+    /// scheduling hiccup; this many separates the two implementations by more
+    /// than any plausible noise.
+    const REQUESTS: u32 = 30;
+    /// `attempt_adoption::ACCEPT_POLL`, mirrored.
+    const ACCEPT_POLL: Duration = Duration::from_millis(20);
+
+    let root = tempfile::tempdir().expect("temporary root");
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("private root");
+    let host = Arc::new(
+        DaemonAttemptHost::open(root.path().join("cancel.sqlite3")).expect("attempt host"),
+    );
+    let socket = root.path().join("source-attempts.sock");
+    let mut endpoint =
+        AttemptAdoptionEndpoint::bind(&socket, "daemon-source", 11, Arc::clone(&host))
+            .expect("bind endpoint");
+    endpoint.start().expect("start endpoint");
+
+    let client =
+        AttemptAdoptionClient::new(&socket, "daemon-source", 11).expect("successor client");
+    // One request before the clock starts: the measurement is of a steady
+    // state, not of whatever the first connection had to fault in.
+    client.inventory().expect("the endpoint answers");
+
+    let started = Instant::now();
+    for _ in 0..REQUESTS {
+        client.inventory().expect("the endpoint answers");
+    }
+    let elapsed = started.elapsed();
+
+    let sleeping_cost = ACCEPT_POLL * REQUESTS;
+    assert!(
+        elapsed < sleeping_cost / 2,
+        "{REQUESTS} sequential adoption requests took {elapsed:?}. An endpoint that waits on its \
+         listener answers them as they arrive; one that naps charges each of them most of \
+         {ACCEPT_POLL:?}, which is the {sleeping_cost:?} this is within reach of"
+    );
+
+    drop(endpoint);
+    Arc::try_unwrap(host)
+        .expect("endpoint released host")
+        .dispose()
+        .expect("dispose host");
+}
+
 /// A route whose socket was never bound, and one whose listener is gone,
 /// are the only two failures that prove the route gone. Every other way the
 /// route can fail to answer keeps the snapshot standing.

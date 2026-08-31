@@ -3790,7 +3790,7 @@ impl Daemon {
                             }
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            await_admin_connection(&self.listener, ACCEPT_POLL);
+                            await_connection(&self.listener, ACCEPT_POLL);
                         }
                         Err(error) => break 'serving Err(DaemonError::Io(error)),
                     }
@@ -10102,32 +10102,41 @@ fn local_peer_policy() -> Result<PeerPolicy, DaemonError> {
 const SYSTEMD_LISTEN_FD_START: i32 = 3;
 const ADMIN_FD_NAME: &str = "admin";
 
-/// Wait for the admin listener to have a connection to accept, bounded by the
-/// same interval the serve loop previously slept for outright.
+/// Wait for a non-blocking listener to have a connection to accept, bounded by
+/// the same interval its loop previously slept for outright.
 ///
 /// # This is a wait, not a cadence
 ///
-/// The serve loop's periodic work — the lease renewal, the synthetic tick, the
-/// approval sweep, the watchdog, and the stop and reload checks — is driven by
-/// loop iteration, not by this call. Bounding the wait at [`ACCEPT_POLL`]
-/// therefore leaves every one of those cadences exactly where a blind sleep
-/// put them, including how quickly a stop is noticed. What changes is only the
-/// idle case: a peer that connects just after the loop found the listener
-/// empty is accepted when it arrives instead of waiting out the remainder of a
-/// fixed nap.
+/// An accept loop's periodic work — the admin loop's lease renewal, synthetic
+/// tick, approval sweep, watchdog and stop and reload checks; another loop's
+/// stop flag — is driven by loop iteration, not by this call. Bounding the wait
+/// at the interval the loop already used therefore leaves every one of those
+/// cadences exactly where a blind sleep put them, including how quickly a stop
+/// is noticed. What changes is only the idle case: a peer that connects just
+/// after the loop found the listener empty is accepted when it arrives instead
+/// of waiting out the remainder of a fixed nap.
 ///
 /// That remainder is the whole cost of a serialized caller. The web entry's
 /// Platform v2 bridge opens one connection per exchange and does not send the
 /// next request until it has read the previous response, so it reliably
-/// arrives a fraction of a millisecond after this loop has gone to sleep and
-/// then pays the full interval — once per exchange, on every exchange. A read
-/// that makes a dozen exchanges pays it a dozen times, which is latency the
-/// daemon spends asleep rather than working.
+/// arrives a fraction of a millisecond after the admin loop has gone to sleep
+/// and then pays the full interval — once per exchange, on every exchange. A
+/// read that makes a dozen exchanges pays it a dozen times, which is latency
+/// the daemon spends asleep rather than working. A successor generation
+/// adopting attempts over [`attempt_adoption`] is the same shape at the same
+/// cost, and it pays it while a handoff is in progress.
+///
+/// # Why the caller keeps its interval
+///
+/// The bound is the caller's, passed in, because it is the caller's other
+/// cadence. Nothing here is entitled to lengthen it and nothing needs it
+/// shortened: the wait ends on the connection, not on the clock, whenever there
+/// is a connection to end it.
 ///
 /// A failed wait is not fatal and must not become a spin: the caller retries
 /// the accept on its next iteration, so an interrupted poll simply returns and
 /// any other failure degrades to the sleep this replaced.
-fn await_admin_connection(listener: &UnixListener, timeout: Duration) {
+pub(crate) fn await_connection(listener: &UnixListener, timeout: Duration) {
     let milliseconds =
         u16::try_from(timeout.as_millis().clamp(1, u16::MAX.into())).unwrap_or(u16::MAX);
     let mut poll_fd = [PollFd::new(listener.as_fd(), PollFlags::POLLIN)];
@@ -10404,7 +10413,7 @@ fn reconciliation_command_refusal(error: &StoreError) -> bool {
 
 #[cfg(test)]
 mod admin_accept_wait_tests {
-    use super::{ACCEPT_POLL, await_admin_connection};
+    use super::{ACCEPT_POLL, await_connection};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::time::{Duration, Instant};
 
@@ -10435,7 +10444,7 @@ mod admin_accept_wait_tests {
         let _client = UnixStream::connect(&path).expect("connect a peer");
 
         let started = Instant::now();
-        await_admin_connection(&listener, ACCEPT_POLL);
+        await_connection(&listener, ACCEPT_POLL);
         let waited = started.elapsed();
 
         assert!(
@@ -10463,7 +10472,7 @@ mod admin_accept_wait_tests {
         });
 
         let started = Instant::now();
-        await_admin_connection(&listener, ACCEPT_POLL);
+        await_connection(&listener, ACCEPT_POLL);
         let waited = started.elapsed();
 
         let _client = connector.join().expect("join the connecting peer");
@@ -10492,7 +10501,7 @@ mod admin_accept_wait_tests {
         let mut longest = Duration::ZERO;
         for _ in 0..ATTEMPTS {
             let started = Instant::now();
-            await_admin_connection(&listener, ACCEPT_POLL);
+            await_connection(&listener, ACCEPT_POLL);
             longest = longest.max(started.elapsed());
             if longest >= ACCEPT_POLL / 2 {
                 break;
