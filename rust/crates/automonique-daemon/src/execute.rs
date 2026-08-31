@@ -54,12 +54,16 @@
 //! - **On the serve thread:** the gates above, which are reads and one pure
 //!   mapping. They are bounded, and the two that touch bytes are bounded
 //!   explicitly — the prompt at [`MAX_PROMPT_BYTES`] and the pinned program at
-//!   [`MAX_PROVIDER_BINARY_BYTES`]. This is a deliberate trade, and the cost is
-//!   stated rather than hidden: hashing a maximal program stalls the accept
-//!   loop for as long as reading that many bytes takes. It buys a *synchronous
-//!   typed refusal* for a program whose digest does not match its pin, which is
-//!   a release-trust answer a caller can act on, instead of an acknowledgement
-//!   followed by a failure they have to go and read.
+//!   [`MAX_PROVIDER_BINARY_BYTES`]. The prompt is read here. The program is
+//!   **not**: gate 5 asks [`crate::program_digest::ProgramDigests`] for the
+//!   digest of the bytes at the pinned path, and that observation is made on
+//!   its own thread ahead of the request whenever the daemon has been told the
+//!   path — which is what stops a 150 MiB provider executable stalling the
+//!   accept loop for the length of its own SHA-256. The gate is unchanged: a
+//!   program whose digest does not match its pin is still a *synchronous typed
+//!   refusal* rather than an acknowledgement followed by a failure the caller
+//!   has to go and read, and a path the daemon has not seen before is still
+//!   read here, exactly as it always was.
 //! - **On a worker thread:** the containment, the process, the wait, the
 //!   terminal record and the read-model advance. One thread per attempt,
 //!   bounded by [`MAX_LIVE_ATTEMPTS`], every one of them joined before the
@@ -185,12 +189,12 @@ use automonique_store::approval_requests::{
 use automonique_store::approval_watch::ApprovalWatch;
 use automonique_store::run_index::{RunIndex, RunSpoolState, StateAdvance};
 use nix::libc;
-use sha2::Digest as _;
 
 use crate::attempt_host::DaemonAttemptHost;
 use crate::jcode_session_host::{
     HOST_CLOSED_REASON, JcodeHostError, JcodeInputRequest, JcodeSessionHost, JcodeTurnOutcome,
 };
+use crate::program_digest::ProgramDigests;
 use crate::progress::{JcodeProgressMapper, ProviderProgressMapper};
 use crate::progress_hub::ProgressHub;
 
@@ -342,12 +346,13 @@ pub const MAX_LIVE_ATTEMPTS: usize = 8;
 /// slot a plan can carry.
 pub const MAX_PROMPT_BYTES: usize = automonique_runner::MAX_LAUNCH_PROMPT_BYTES;
 
-/// Largest pinned program this daemon will hash on the serve thread.
+/// Largest pinned program this daemon will hash.
 ///
-/// The bound exists because the hash happens on the accept loop; see the
-/// module's threading note for what that trade buys and costs. A larger program
-/// is not run under a weaker check — it is refused with
-/// [`ExecuteRefusal::ProviderBinaryUnverified`].
+/// A larger program is not run under a weaker check — it is refused with
+/// [`ExecuteRefusal::ProviderBinaryUnverified`]. The bound is applied by
+/// [`crate::program_digest::ProgramDigests`], which is where the read happens,
+/// and it is applied to the file that was opened rather than to a `stat` of
+/// the path.
 pub const MAX_PROVIDER_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Whether one observed byte count fits within a finite read ceiling.
@@ -358,16 +363,6 @@ pub(crate) const fn is_within_byte_limit(bytes: u64, limit: u64) -> bool {
     bytes <= limit
 }
 
-/// Hash provider-file bytes through the optimized large-input implementation.
-///
-/// Protocol messages retain the dependency-free implementation in
-/// `automonique-protocol`; provider executables can be hundreds of MiB and are
-/// verified twice on a live request, so using that small-message transform here
-/// would turn a security check into tens of seconds of control-loop latency.
-pub(crate) fn provider_binary_digest(bytes: &[u8]) -> String {
-    format!("{ALGORITHM}:{:x}", sha2::Sha256::digest(bytes))
-}
-
 /// The two digests an approval binds that are not in the document itself.
 ///
 /// A RunSpec carries the *path* of its program and the *name* of its prompt
@@ -376,22 +371,25 @@ pub(crate) fn provider_binary_digest(bytes: &[u8]) -> String {
 /// approval bind them.
 ///
 /// Both are computed exactly the way the admission path computes them — the
-/// same reads, the same ceilings, the same `read_bounded` — so an approval
-/// binds the values the launch will later be checked against rather than a
-/// second opinion about them. The prefix `provider_binary_digest` carries is
-/// stripped, because these are stored as bare hexadecimal beside the run's
-/// canonical spec digest and a mixed alphabet in one row would be a trap for
-/// the comparison.
+/// same ceilings, and for the program the *same observation*, taken from the
+/// one [`ProgramDigests`] this daemon holds. So an approval binds the values
+/// the launch will later be checked against rather than a second opinion about
+/// them, and one start that passes this gate reads the program once between
+/// here and [`ExecutionLane::observe_provider_binary`] rather than once each.
+/// The `sha256:` prefix is stripped, because these are stored as bare
+/// hexadecimal beside the run's canonical spec digest and a mixed alphabet in
+/// one row would be a trap for the comparison.
 ///
 /// `None` means one of them could not be observed at all: an unreadable
 /// program, an unresolvable prompt, or a prompt this build cannot address. A
 /// caller must treat that as a refusal, never as an empty binding.
 pub(crate) fn approval_context_digests(
     state_dir: &Path,
+    programs: &ProgramDigests,
     spec: &RunSpec,
 ) -> Option<(String, String)> {
-    let program = read_bounded(spec.executable(), MAX_PROVIDER_BINARY_BYTES)?;
-    let program_sha256 = provider_binary_digest(&program)
+    let program_sha256 = programs
+        .digest(spec.executable(), MAX_PROVIDER_BINARY_BYTES)?
         .strip_prefix(&format!("{ALGORITHM}:"))?
         .to_owned();
 
@@ -538,6 +536,13 @@ pub struct ExecutionLane {
     /// holds is a bell nobody rings, and the wait would silently degrade to its
     /// bound.
     approval_watch: Arc<ApprovalWatch>,
+    /// This daemon's one observer of pinned program bytes.
+    ///
+    /// Shared with [`crate::Daemon`] rather than owned here, because the
+    /// approval gate observes the same program immediately before this lane
+    /// does and the two are meant to be one observation. See
+    /// [`crate::program_digest`].
+    programs: Arc<ProgramDigests>,
 }
 
 /// Upper bound on how long a run paused on a provider permission waits before
@@ -696,6 +701,7 @@ impl ExecutionLane {
         run_index_path: PathBuf,
         sandbox_enforceable: bool,
         approval_watch: Arc<ApprovalWatch>,
+        programs: Arc<ProgramDigests>,
     ) -> Self {
         let helper = locate_launch_helper();
         let egress_destinations =
@@ -741,6 +747,7 @@ impl ExecutionLane {
             jcode_controls: Arc::new(JcodeControlRegistry::default()),
             draining: Arc::new(AtomicBool::new(false)),
             approval_watch,
+            programs,
         }
     }
 
@@ -1262,8 +1269,16 @@ impl ExecutionLane {
         Ok((resolved, bytes))
     }
 
-    /// Hash the program the document pins, and report it as observed
+    /// Observe the program the document pins, and report it as observed
     /// provenance.
+    ///
+    /// The digest comes from [`crate::program_digest::ProgramDigests`], which
+    /// is the daemon's one observer of program bytes and the reason this gate
+    /// no longer reads hundreds of megabytes on the accept thread. What is
+    /// compared, and what a mismatch answers, is unchanged: `admit` refuses
+    /// unless the observed digest equals the document's pin, and the digest it
+    /// admits is the one the entry helper hashes the bytes it stages against
+    /// before it execs them.
     ///
     /// The version travels from the document because it is informational —
     /// [`BinaryProvenance::matches`] compares digests, not versions — and the
@@ -1279,9 +1294,10 @@ impl ExecutionLane {
         if pinned.schema_digest().is_some() {
             return Err(ExecuteRefusal::ProviderBinaryUnverified);
         }
-        let bytes = read_bounded(spec.executable(), MAX_PROVIDER_BINARY_BYTES)
+        let observed = self
+            .programs
+            .digest(spec.executable(), MAX_PROVIDER_BINARY_BYTES)
             .ok_or(ExecuteRefusal::ProviderBinaryUnverified)?;
-        let observed = provider_binary_digest(&bytes);
         BinaryProvenance::new(pinned.version(), &observed, None)
             .map_err(|_| ExecuteRefusal::ProviderBinaryUnverified)
     }
@@ -3230,7 +3246,7 @@ mod tests {
         PROVIDER_APPROVAL_PROPOSER, ProgressFrame, ProgressPublisher, TokenCancelSink,
         admission_refusal, advance, describe_refused_destination, expire_unanswered_approvals,
         is_containment_run_id, is_safe_segment, is_within_byte_limit, poll_jcode_temporary_storage,
-        provider_binary_digest, spool_state,
+        spool_state,
     };
     use crate::attempt_host::DaemonAttemptHost;
     use crate::jcode_session_host::{JcodeHostError, JcodeTurnOutcome};
@@ -3571,14 +3587,6 @@ mod tests {
             MAX_PROVIDER_BINARY_BYTES + 1,
             MAX_PROVIDER_BINARY_BYTES
         ));
-    }
-
-    #[test]
-    fn optimized_provider_digest_is_the_canonical_sha256_spelling() {
-        assert_eq!(
-            provider_binary_digest(b"abc"),
-            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
     }
 
     /// The one admission refusal that is about the host rather than the
