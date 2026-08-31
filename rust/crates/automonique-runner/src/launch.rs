@@ -1679,7 +1679,9 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
         .map_err(|error| error.to_string())?
         .enforce_on_current_thread()
         .map_err(|error| error.to_string())?;
-    let filesystem_policy = plan.filesystem_policy().map_err(|error| error.to_string())?;
+    let filesystem_policy = plan
+        .filesystem_policy()
+        .map_err(|error| error.to_string())?;
     match program_descriptor.landlock_binding() {
         // A staged copy is an ordinary inode: it needs an execute rule, and
         // its name is removed while the rule is being built.
@@ -2231,7 +2233,7 @@ fn nibble(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nix::fcntl::{fcntl, FdFlag};
+    use nix::fcntl::{FdFlag, fcntl};
     use std::fs;
     use std::process::Command;
 
@@ -2379,8 +2381,9 @@ mod tests {
     fn a_digest_mismatch_is_refused_without_staging_anything() {
         let temporary = tempfile::tempdir().unwrap();
         let (program, _) = busybox_plan(temporary.path());
-        let plan = LaunchPlan::new(&program, &"b".repeat(64)).unwrap();
+        let plan = LaunchPlan::new(&program, "b".repeat(64)).unwrap();
 
+        let _scan = lock_staged_tmp_scan();
         let before = staged_program_files();
         let error = verified_program_image(&plan).expect_err("a wrong digest was accepted");
         assert_eq!(error, "program digest mismatch");
@@ -2400,18 +2403,29 @@ mod tests {
     fn a_refused_staged_copy_removes_its_own_path() {
         let temporary = tempfile::tempdir().unwrap();
         let (program, _) = busybox_plan(temporary.path());
-        let plan = LaunchPlan::new(&program, &"c".repeat(64)).unwrap();
+        let plan = LaunchPlan::new(&program, "c".repeat(64)).unwrap();
 
+        let _scan = lock_staged_tmp_scan();
         let before = staged_program_files();
-        let error = staged_verified_program_descriptor(&plan)
-            .err()
-            .expect("a wrong digest was accepted");
+        let error =
+            staged_verified_program_descriptor(&plan).expect_err("a wrong digest was accepted");
         assert_eq!(error, "program digest mismatch");
         assert_eq!(
             staged_program_files(),
             before,
             "the refused staging copy was left in /tmp"
         );
+    }
+
+    /// Both /tmp-scanning tests below observe a directory the other one
+    /// briefly writes into, so they must not run at the same time. Nothing
+    /// else in the suite stages a program copy.
+    static STAGED_TMP_SCAN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_staged_tmp_scan() -> std::sync::MutexGuard<'static, ()> {
+        STAGED_TMP_SCAN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn staged_program_files() -> Vec<PathBuf> {
