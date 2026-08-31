@@ -59,6 +59,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
+use std::os::fd::AsFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
@@ -181,6 +182,8 @@ use automonique_store::{
     OutboxReconciliationDecision as StoreOutboxDecision, OutboxReconciliationRequest,
     ReconciliationDecision, ReconciliationRequest, StatusSnapshot, Store, StoreError,
 };
+use nix::errno::Errno;
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
 use nix::sys::signalfd::{SfdFlags, SignalFd};
 use nix::sys::socket::{getsockopt, sockopt};
@@ -3787,7 +3790,7 @@ impl Daemon {
                             }
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(ACCEPT_POLL);
+                            await_admin_connection(&self.listener, ACCEPT_POLL);
                         }
                         Err(error) => break 'serving Err(DaemonError::Io(error)),
                     }
@@ -10012,6 +10015,41 @@ fn local_peer_policy() -> Result<PeerPolicy, DaemonError> {
 const SYSTEMD_LISTEN_FD_START: i32 = 3;
 const ADMIN_FD_NAME: &str = "admin";
 
+/// Wait for the admin listener to have a connection to accept, bounded by the
+/// same interval the serve loop previously slept for outright.
+///
+/// # This is a wait, not a cadence
+///
+/// The serve loop's periodic work — the lease renewal, the synthetic tick, the
+/// approval sweep, the watchdog, and the stop and reload checks — is driven by
+/// loop iteration, not by this call. Bounding the wait at [`ACCEPT_POLL`]
+/// therefore leaves every one of those cadences exactly where a blind sleep
+/// put them, including how quickly a stop is noticed. What changes is only the
+/// idle case: a peer that connects just after the loop found the listener
+/// empty is accepted when it arrives instead of waiting out the remainder of a
+/// fixed nap.
+///
+/// That remainder is the whole cost of a serialized caller. The web entry's
+/// Platform v2 bridge opens one connection per exchange and does not send the
+/// next request until it has read the previous response, so it reliably
+/// arrives a fraction of a millisecond after this loop has gone to sleep and
+/// then pays the full interval — once per exchange, on every exchange. A read
+/// that makes a dozen exchanges pays it a dozen times, which is latency the
+/// daemon spends asleep rather than working.
+///
+/// A failed wait is not fatal and must not become a spin: the caller retries
+/// the accept on its next iteration, so an interrupted poll simply returns and
+/// any other failure degrades to the sleep this replaced.
+fn await_admin_connection(listener: &UnixListener, timeout: Duration) {
+    let milliseconds =
+        u16::try_from(timeout.as_millis().clamp(1, u16::MAX.into())).unwrap_or(u16::MAX);
+    let mut poll_fd = [PollFd::new(listener.as_fd(), PollFlags::POLLIN)];
+    match poll(&mut poll_fd, PollTimeout::from(milliseconds)) {
+        Ok(_) | Err(Errno::EINTR) => {}
+        Err(_) => std::thread::sleep(timeout),
+    }
+}
+
 /// Open the self-bound foreground listener or adopt systemd's one exact fd.
 ///
 /// Activation is all-or-nothing. A matching `LISTEN_PID` must advertise one
@@ -10275,6 +10313,100 @@ fn reconciliation_command_refusal(error: &StoreError) -> bool {
             | StoreError::OutboxConflict
             | StoreError::NotFound(_)
     )
+}
+
+#[cfg(test)]
+mod admin_accept_wait_tests {
+    use super::{ACCEPT_POLL, await_admin_connection};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::time::{Duration, Instant};
+
+    /// The serve loop reaches the wait only after a non-blocking `accept`
+    /// answered `WouldBlock`, so every case here binds a non-blocking listener
+    /// exactly as [`open_admin_listener`](super::open_admin_listener) does.
+    fn listener(directory: &tempfile::TempDir) -> (UnixListener, std::path::PathBuf) {
+        let path = directory.path().join("admin.sock");
+        let listener = UnixListener::bind(&path).expect("bind the admin listener");
+        listener
+            .set_nonblocking(true)
+            .expect("bind a non-blocking listener");
+        (listener, path)
+    }
+
+    /// A peer already in the backlog is served now, not after the interval.
+    ///
+    /// This is the regression that made a serialized caller pay the full
+    /// [`ACCEPT_POLL`] on every exchange: the wait used to be an unconditional
+    /// sleep, so a connection that was *already pending* still waited out the
+    /// whole nap. A sleeping implementation cannot pass this assertion, which
+    /// is the point of asserting on a fraction of the interval rather than on
+    /// the interval itself.
+    #[test]
+    fn a_pending_connection_is_not_slept_through() {
+        let directory = tempfile::tempdir().expect("create a temporary directory");
+        let (listener, path) = listener(&directory);
+        let _client = UnixStream::connect(&path).expect("connect a peer");
+
+        let started = Instant::now();
+        await_admin_connection(&listener, ACCEPT_POLL);
+        let waited = started.elapsed();
+
+        assert!(
+            waited < ACCEPT_POLL / 2,
+            "a pending connection waited {waited:?}, which is not meaningfully \
+             shorter than the {ACCEPT_POLL:?} interval it should not have slept"
+        );
+        listener
+            .accept()
+            .expect("accept the connection the wait reported");
+    }
+
+    /// A peer that arrives mid-wait wakes it, rather than finishing the nap.
+    ///
+    /// This is the shape the Platform v2 bridge actually produces: it opens one
+    /// connection per exchange and only sends the next request once it has read
+    /// the previous response, so it always arrives while the loop is waiting.
+    #[test]
+    fn a_connection_arriving_during_the_wait_ends_it() {
+        let directory = tempfile::tempdir().expect("create a temporary directory");
+        let (listener, path) = listener(&directory);
+        let connector = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2));
+            UnixStream::connect(&path).expect("connect a peer")
+        });
+
+        let started = Instant::now();
+        await_admin_connection(&listener, ACCEPT_POLL);
+        let waited = started.elapsed();
+
+        let _client = connector.join().expect("join the connecting peer");
+        assert!(
+            waited < ACCEPT_POLL / 2,
+            "a connection arriving mid-wait left it waiting {waited:?} of the \
+             {ACCEPT_POLL:?} interval instead of ending it"
+        );
+    }
+
+    /// An idle listener still bounds the wait, because the serve loop's
+    /// periodic work runs on loop iteration and must keep its cadence.
+    ///
+    /// Without this the change could "win" by never waiting at all, which would
+    /// turn an idle daemon into a spin.
+    #[test]
+    fn an_idle_listener_waits_out_the_interval() {
+        let directory = tempfile::tempdir().expect("create a temporary directory");
+        let (listener, _path) = listener(&directory);
+
+        let started = Instant::now();
+        await_admin_connection(&listener, ACCEPT_POLL);
+        let waited = started.elapsed();
+
+        assert!(
+            waited >= ACCEPT_POLL / 2,
+            "an idle wait returned after {waited:?}, which is short enough of \
+             the {ACCEPT_POLL:?} interval to be a spin"
+        );
+    }
 }
 
 #[cfg(test)]
