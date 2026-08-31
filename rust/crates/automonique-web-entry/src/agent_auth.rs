@@ -7,9 +7,9 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nix::unistd::geteuid;
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,23 @@ const HEALTH_SCHEMA: &str = "automonique.provider-account-health/v1";
 const VIEW_SCHEMA: &str = "automonique.dashboard.agent-accounts/v1";
 const SESSION_LIFETIME: Duration = Duration::from_secs(10 * 60);
 const SESSION_RETENTION: Duration = Duration::from_secs(30 * 60);
+/// Longest one provider CLI status or logout call may run before it is killed.
+///
+/// `codex login status` and `claude auth status --json` both validate an OAuth
+/// token against the provider, so a provider that stops answering makes them
+/// hang rather than fail. These calls run on one of this server's fixed
+/// `WORKERS` request threads, so an unbounded wait does not
+/// merely make one dashboard action slow: it retires a request thread for as
+/// long as the provider stays wedged, and four wedged calls take the whole
+/// dashboard down with no recovery short of a restart.
+///
+/// Sized well above a healthy call, which answers in under a second, so a slow
+/// but working provider is never mistaken for a dead one. The daemon bounds its
+/// own provider CLI reads the same way — `codex_usage` at five seconds and
+/// `deepseek_balance` at ten — and this is the one caller that did not.
+const PROVIDER_CALL_TIMEOUT: Duration = Duration::from_secs(20);
+/// How often a bounded provider CLI call is re-checked while waiting.
+const PROVIDER_CALL_POLL: Duration = Duration::from_millis(25);
 const OUTPUT_LIMIT: usize = 32 * 1024;
 const REGISTRY_LIMIT: u64 = 128 * 1024;
 const HEALTH_LIMIT: u64 = 8 * 1024;
@@ -745,13 +762,9 @@ impl AgentAuthManager {
                 command.args(["auth", "logout"]);
             }
         }
-        let status = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|_| "native_logout_unavailable")?;
-        if !status.success() {
+        let call = bounded_provider_call(&mut command, PROVIDER_CALL_TIMEOUT)
+            .ok_or("native_logout_unavailable")?;
+        if !call.success {
             return Err("native_logout_failed");
         }
         let _guard = self.registry_lock.lock().map_err(|_| "agent_auth_busy")?;
@@ -1048,29 +1061,112 @@ fn probe_native_subscription(provider: Provider, binary: &Path, profile: &Path) 
     match provider {
         Provider::Codex => {
             command.args(["login", "status"]);
-            command
-                .output()
-                .ok()
-                .filter(|output| output.status.success())
-                .is_some_and(|output| {
-                    let mut text = output.stdout;
-                    text.extend_from_slice(&output.stderr);
+            bounded_provider_call(&mut command, PROVIDER_CALL_TIMEOUT)
+                .filter(|call| call.success)
+                .is_some_and(|call| {
+                    let mut text = call.stdout;
+                    text.extend_from_slice(&call.stderr);
                     String::from_utf8_lossy(&text).contains("Logged in using ChatGPT")
                 })
         }
         Provider::Claude => {
             command.args(["auth", "status", "--json"]);
-            command
-                .output()
-                .ok()
-                .filter(|output| output.status.success())
-                .and_then(|output| serde_json::from_slice::<Value>(&output.stdout).ok())
+            bounded_provider_call(&mut command, PROVIDER_CALL_TIMEOUT)
+                .filter(|call| call.success)
+                .and_then(|call| serde_json::from_slice::<Value>(&call.stdout).ok())
                 .is_some_and(|status| {
                     status.get("loggedIn").and_then(Value::as_bool) == Some(true)
                         && status.get("authMethod").and_then(Value::as_str) == Some("claude.ai")
                 })
         }
     }
+}
+
+/// What one bounded provider CLI call produced, once it has certainly ended.
+struct BoundedCall {
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Run one provider CLI call under `timeout`, killing it if it outlives that.
+///
+/// Every production caller passes [`PROVIDER_CALL_TIMEOUT`]; the bound is a
+/// parameter so a test can prove the deadline is enforced in milliseconds
+/// rather than spending twenty seconds proving it.
+///
+/// `None` means the call produced no usable answer: it could not be spawned, it
+/// could not be waited on, or it reached the deadline and was killed. Callers
+/// treat all three the same way the `Command::output` this replaces treated a
+/// spawn failure — as "not verified" — so a wedged provider now degrades a
+/// dashboard action instead of retiring the request thread running it.
+///
+/// Every wait here is bounded, including the two that read the child's pipes: a
+/// child that has exited can still have a surviving grandchild holding the write
+/// end, and joining those readers unconditionally would reintroduce the
+/// unbounded wait this function exists to remove. Whatever a reader has not
+/// delivered by the deadline is simply absent, which the callers read as an
+/// unverified account.
+fn bounded_provider_call(command: &mut Command, timeout: Duration) -> Option<BoundedCall> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let (stdout_sender, stdout_reader) = mpsc::channel();
+    let (stderr_sender, stderr_reader) = mpsc::channel();
+    if let Some(stream) = child.stdout.take() {
+        spawn_collecting_reader(stream, stdout_sender);
+    }
+    if let Some(stream) = child.stderr.take() {
+        spawn_collecting_reader(stream, stderr_sender);
+    }
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(PROVIDER_CALL_POLL),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let stdout = stdout_reader
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or_default();
+    let stderr = stderr_reader
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or_default();
+    Some(BoundedCall {
+        success: status.success(),
+        stdout,
+        stderr,
+    })
+}
+
+/// Read one child stream to EOF under [`OUTPUT_LIMIT`] and hand the bytes back
+/// exactly once, so the reader can be waited for with a deadline.
+fn spawn_collecting_reader<R: Read + Send + 'static>(mut stream: R, sender: mpsc::Sender<Vec<u8>>) {
+    thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let Ok(read) = stream.read(&mut chunk) else {
+                break;
+            };
+            if read == 0 {
+                break;
+            }
+            let remaining = OUTPUT_LIMIT.saturating_sub(buffer.len());
+            if remaining > 0 {
+                buffer.extend_from_slice(&chunk[..read.min(remaining)]);
+            }
+        }
+        let _ = sender.send(buffer);
+    });
 }
 
 fn spawn_bounded_reader<R: Read + Send + 'static>(
@@ -1371,6 +1467,123 @@ mod tests {
         assert!(valid_account_id("acct-0123456789abcdef01234567"));
         assert!(!valid_account_id("../auth.json"));
         assert!(valid_session_id("login-0123456789abcdef01234567"));
+    }
+
+    /// Write one executable shell fixture standing in for a provider CLI.
+    fn provider_fixture(directory: &Path, name: &str, script: &str) -> PathBuf {
+        let path = directory.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("fixture binary");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("executable fixture");
+        path
+    }
+
+    /// A provider CLI that never answers must be killed, not waited for.
+    ///
+    /// This is the whole point of [`bounded_provider_call`]. Before it, `select`
+    /// and `refresh` reached `codex login status` / `claude auth status --json`
+    /// through `Command::output`, which waits for as long as the child lives.
+    /// Both run on one of the server's four request threads, so a provider that
+    /// accepts a connection and then stops answering retired a thread for good.
+    /// Without the deadline this test does not fail, it hangs — which is exactly
+    /// the production symptom it stands for.
+    #[test]
+    fn a_provider_cli_that_never_answers_is_killed_at_the_deadline() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let hanging = provider_fixture(temporary.path(), "hanging-provider", "sleep 600");
+        let timeout = Duration::from_millis(200);
+
+        let started = Instant::now();
+        let outcome = bounded_provider_call(&mut Command::new(&hanging), timeout);
+        let elapsed = started.elapsed();
+
+        assert!(
+            outcome.is_none(),
+            "a killed provider call reports no usable answer"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the call must return at its own deadline, not the child's; took {elapsed:?}"
+        );
+    }
+
+    /// The deadline must not cost the answers a healthy provider does give.
+    #[test]
+    fn a_provider_cli_that_answers_keeps_its_status_and_both_streams() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let talking = provider_fixture(
+            temporary.path(),
+            "talking-provider",
+            "echo 'Logged in using ChatGPT'; echo 'a note' >&2",
+        );
+        let refusing = provider_fixture(temporary.path(), "refusing-provider", "exit 3");
+        let timeout = Duration::from_secs(20);
+
+        let call = bounded_provider_call(&mut Command::new(&talking), timeout).expect("answered");
+        assert!(call.success);
+        assert_eq!(
+            "Logged in using ChatGPT\n",
+            String::from_utf8_lossy(&call.stdout)
+        );
+        assert_eq!("a note\n", String::from_utf8_lossy(&call.stderr));
+
+        let refused = bounded_provider_call(&mut Command::new(&refusing), timeout).expect("ran");
+        assert!(
+            !refused.success,
+            "a non-zero exit is an answer, not an unavailable call"
+        );
+    }
+
+    /// The bounded call is what `select` and `refresh` actually reach.
+    ///
+    /// Both dashboard actions route through `probe_account` into
+    /// `probe_native_subscription`, so this pins the wiring and the provider
+    /// verdicts either side of it. The deadline itself is proved by
+    /// [`a_provider_cli_that_never_answers_is_killed_at_the_deadline`]; running a
+    /// wedged fixture through here too would spend
+    /// [`PROVIDER_CALL_TIMEOUT`] twice to re-prove it.
+    #[test]
+    fn probing_reads_each_provider_verdict_through_the_bounded_call() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let profile = temporary.path().join("profile");
+        ensure_private_directory(&profile).expect("profile");
+
+        let codex_in = provider_fixture(
+            temporary.path(),
+            "codex-in",
+            "echo 'Logged in using ChatGPT'",
+        );
+        let codex_out = provider_fixture(temporary.path(), "codex-out", "echo 'Not logged in'");
+        assert!(probe_native_subscription(
+            Provider::Codex,
+            &codex_in,
+            &profile
+        ));
+        assert!(!probe_native_subscription(
+            Provider::Codex,
+            &codex_out,
+            &profile
+        ));
+
+        let claude_in = provider_fixture(
+            temporary.path(),
+            "claude-in",
+            r#"echo '{"loggedIn":true,"authMethod":"claude.ai"}'"#,
+        );
+        let claude_out = provider_fixture(
+            temporary.path(),
+            "claude-out",
+            r#"echo '{"loggedIn":false,"authMethod":"claude.ai"}'"#,
+        );
+        assert!(probe_native_subscription(
+            Provider::Claude,
+            &claude_in,
+            &profile
+        ));
+        assert!(!probe_native_subscription(
+            Provider::Claude,
+            &claude_out,
+            &profile
+        ));
     }
 
     #[test]
