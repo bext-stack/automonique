@@ -44,15 +44,16 @@
 //! # What this is not, stated plainly
 //!
 //! **This is not the check that stands between the pinned path and the process,
-//! and it never was.** That check is `staged_verified_program_descriptor` in
+//! and it never was.** That check is `verified_program_image` in
 //! [`automonique_runner::launch`]: the entry helper opens the program *again*,
-//! copies it to a staged file while hashing what it copies, and refuses on
-//! `program digest mismatch` unless the copy hashes to the digest the launch
-//! plan carries. The plan's digest is the observed digest, and
+//! copies it into an anonymous memory-backed image, seals it, hashes the sealed
+//! object by reading it back, and refuses on `program digest mismatch` unless
+//! that hash is the digest the launch plan carries. The descriptor it hashed is
+//! the descriptor it `execveat`s. The plan's digest is the observed digest, and
 //! [`automonique_runner::admission::admit`] refuses unless the observed digest
-//! equals the document's own pin. So the bytes lifted off the pinned path at
-//! launch are hashed, at launch, against the pin — by a read this daemon does
-//! not perform and this module does not affect.
+//! equals the document's own pin. So the bytes that run are hashed, after they
+//! are immutable, against the pin — by a read this daemon does not perform and
+//! this module does not affect.
 //!
 //! What an observation here buys is a *synchronous typed refusal*
 //! (`ExecuteRefusal::ProviderBinaryUnverified`) for a program whose bytes do not
@@ -64,12 +65,11 @@
 //! spent on bytes nobody checked, and no byte reaches a process without the
 //! helper having hashed it.
 //!
-//! What the helper does with the staged copy *after* it has hashed it — it is a
-//! named same-uid-writable inode under `/tmp` until
-//! `automonique_runner::filesystem` removes its path — is that module's window
-//! and neither this one's nor the daemon's. Nothing here is read by it, nothing
-//! here narrows it, and nothing here would narrow it if it were closed: both of
-//! this daemon's reads happen before the helper process exists.
+//! What the helper does between hashing and executing is that module's business
+//! and neither this one's nor the daemon's. It closed that window in #254 by
+//! sealing the image it hashes, and this module neither depended on the window
+//! being open nor is made redundant by its being shut: both of this daemon's
+//! reads happen before the helper process exists, so neither ever stood there.
 
 use std::collections::VecDeque;
 use std::fs::{File, Metadata};
