@@ -146,7 +146,12 @@ python3 tools/run_attention_live_acceptance.py \
 
 It never marks an operator step satisfied. LIVE-GUI-1..4 stay
 `awaiting_operator` in `run_attention_live_acceptance.py`, which still owns the
-checklist and is not shortened by anything here. What this harness produces is a
+checklist and is not shortened by anything here. LIVE-GUI-2 is the step where
+the most has been subtracted, because `--cockpit-render-check` in that harness
+observes the deployed page rendering the source and generation its projection
+carries, and this harness checks that projection against the other two clients.
+The two meet at the projection and never at a person: what is left is that one
+human saw the same item on two screens in one sitting. What this harness produces is a
 per-step statement of which part of the step a machine now checks against the
 deployment and which part is left, under `operator_steps` in its own report and
 under `residue_after_automation` in the acceptance report. Subtracting is not

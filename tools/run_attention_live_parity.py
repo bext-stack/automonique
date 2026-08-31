@@ -736,10 +736,14 @@ GUI_RESIDUE = (
             "replayed clients, and asserts no review state the source did not."
         ),
         "residue": (
-            "That the browser renders that projection, and renders it for a "
-            "signed-in operator. The projection is verified; the rendering of "
-            "it is not, and a page that drops or relabels a field would pass "
-            "everything here."
+            "That the item on the cockpit is the item ShellDeck showed the same "
+            "person, on their screen, in one sitting. The rendering half stopped "
+            "being residue when `--cockpit-render-check` landed in "
+            "run_attention_live_acceptance.py: it observes the deployed page "
+            "rendering the source and generation its own authorized projection "
+            "carries. That check and this one meet at the projection and never "
+            "at a person, so what neither establishes is that one human saw the "
+            "same thing twice."
         ),
         "reducible": False,
     },
