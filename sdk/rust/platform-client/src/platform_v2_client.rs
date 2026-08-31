@@ -200,36 +200,59 @@ impl PlatformV2Transport for HttpsTransport {
         canonical_request: &[u8],
     ) -> Result<Vec<u8>, ClientError> {
         let authorization = self.credential.authorization();
-        let mut response = self
+        let loopback = self
+            .loopback_headers()
+            .map(|(host, proto)| (host.to_owned(), proto.to_owned()));
+        let mut builder = self
             .v2_agent
             .post(&self.endpoint)
             .header("authorization", authorization.as_str())
             .header("content-type", lane.content_type())
-            .header("accept", lane.content_type())
+            .header("accept", lane.content_type());
+        if let Some((host, proto)) = loopback.as_ref() {
+            builder = builder
+                .header("host", host.as_str())
+                .header("x-forwarded-proto", proto.as_str());
+        }
+        let sent = builder
             .config()
             .timeout_global(Some(self.timeout))
             .build()
-            .send(canonical_request)
-            .map_err(|error| match error {
-                ureq::Error::BodyExceedsLimit(_) => ClientError::ResponseTooLarge,
-                ureq::Error::StatusCode(401 | 403) => ClientError::Unauthorized,
-                ureq::Error::StatusCode(_) => ClientError::UnexpectedStatus,
-                _ => ClientError::Io,
-            })?;
+            .send(canonical_request);
+        let mut response = match sent {
+            Ok(response) => response,
+            Err(error) => {
+                // The status is recorded before the category is chosen: a
+                // category alone cannot tell a refused credential from a
+                // missing route from a deployment that could not answer, and
+                // that difference is the whole diagnosis.
+                if let ureq::Error::StatusCode(status) = error {
+                    self.record_exchange(status, None);
+                }
+                return Err(match error {
+                    ureq::Error::BodyExceedsLimit(_) => ClientError::ResponseTooLarge,
+                    ureq::Error::StatusCode(401 | 403) => ClientError::Unauthorized,
+                    ureq::Error::StatusCode(_) => ClientError::UnexpectedStatus,
+                    _ => ClientError::Io,
+                });
+            }
+        };
         let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(str::trim)
+            .map(str::to_owned);
+        self.record_exchange(status, content_type.clone());
         if matches!(status, 401 | 403) {
             return Err(ClientError::Unauthorized);
         }
         if !(200..=299).contains(&status) {
             return Err(ClientError::UnexpectedStatus);
         }
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(';').next())
-            .map(str::trim);
-        if content_type != Some(lane.content_type()) {
+        if content_type.as_deref() != Some(lane.content_type()) {
             return Err(ClientError::UnexpectedContentType);
         }
         let maximum = lane.maximum_response_bytes();

@@ -46,6 +46,44 @@ production decoder: `decode_work_context_page` and
 would make this harness, not the deployment, the author of what the clients
 decode.
 
+### How the read is addressed
+
+Two arguments on the capture are load-bearing, and each was once absent in a
+way that turned a fact about *how the harness asked* into a published fact
+about the deployment.
+
+`--project`. The Platform v2 wire has no project-less `query_work_contexts`:
+`request_body` in `platform_v2_transport.rs` refuses to encode one. Without a
+project the client's own encoder rejects the request, it never reaches the
+network, and the capture records `{"state": "error", "category": "protocol"}` —
+which is indistinguishable, in the report, from a deployment answering badly.
+The harness takes the project from the deployment's own cockpit answer
+(`projects[].id`) so the coordinate is one the deployment named; `--project`
+overrides that. The capture example now refuses to run a live read without one.
+
+`--host-header` / `--forwarded-proto`. `--hosted-loopback` sends the read to
+`127.0.0.1`, and a web entry that answers only for its canonical name over TLS
+answers `400` to that. The Python cockpit read has always carried both headers;
+the capture could not, so `--hosted-loopback` silently meant "the lane check
+cannot run" while reporting `unexpected_status` — read, reasonably, as the
+deployment refusing its lane. `HttpsTransport::with_loopback_origin` supplies
+them, and is gated to loopback `http://` endpoints: a `Host` a client chose for
+itself is a claim about which deployment it is talking to, and on a public
+origin that is name spoofing rather than a probe.
+
+### Why the status is recorded
+
+A refusal category is not a diagnosis. `unexpected_status` is the client's one
+word for a `503` from a deployment whose daemon is restarting, a `404` at a
+route that is not deployed, and the `400` above. Those are three different
+findings and only one of them is about the attention lane, so
+`HttpsTransport::last_exchange()` keeps the status and content type of the last
+answer and the capture records them beside the category. The report then says
+which happened: a deployment that answered `503` *was not reached*; one that
+answered `400` was reached and said the request was addressed wrongly; only a
+typed Platform v2 refusal is reported as the deployment refusing its lane.
+Nothing from the request side — where the credential is — is observed.
+
 One adapter remains and is named where it lives: the vendored SDK exposes no
 standalone attention-snapshot decoder — a snapshot only ever arrives inside a
 response envelope the transport owns — so `mobile_live_replay.mjs` parses the
@@ -96,6 +134,13 @@ an absent one.
 
 The same applies to the inventory and projection comparisons when the deployment
 serves no attention at all.
+
+A read that *failed* is not an empty graph, and the two are reported
+differently. `work_context_reason` says "was read and names no user workspace"
+only when the read succeeded; a read that errored or was refused says "none was
+obtained", with its category and, where there was one, the HTTP status. The
+earlier wording said the graph named no workspace whatever had happened, which
+sent an operator looking for a missing workspace that was in fact there.
 
 ## Reading the outcome
 
@@ -182,3 +227,39 @@ not touch, so the check passed against 48 v1 resources and zero attention. It
 has been split: `hosted_v1_resource_inventory_available` now answers only for
 what it observes, and `hosted_attention_corpus_available` reads this harness's
 report, where the question can actually be answered.
+
+## Finding of 2026-08-31
+
+Platform v2 was bootstrapped on the non-production deployment, and the lane
+still reported `blocked` with `unexpected_status`. The bridge was not the
+cause; three separate things were, and each of them was a way this harness
+could name a deployment for a fault that was not the deployment's.
+
+**The loopback probe could not carry a host.** `read_lane()` dropped the
+`--hosted-host` and the forwarded scheme that `--hosted-loopback` exists to
+supply, and the capture example had no option to accept them. The entry answers
+`400` to a request addressed to `127.0.0.1`, so `--hosted-loopback` silently
+meant "this check cannot run" — reported as the deployment refusing its lane.
+
+**The work-context read could not be encoded.** The capture walked
+`query_work_contexts` with no project, which the Platform v2 wire cannot
+encode; the request never left the client and the capture recorded
+`{"state": "error", "category": "protocol"}`. The harness then reported *"the
+deployment's work-context graph names no user workspace"* — about a graph it
+had never obtained, and about a workspace that was in fact there.
+
+**A restarting daemon looked like a refused lane.** Measured on the
+non-production deployment: restarting the daemon behind the entry makes the
+same lane answer `503` — `platform_v2_bridge_unavailable`, the category
+`platform_v2_bridge.rs` returns when the admin socket does not answer — which
+the client reports as `unexpected_status`, the same word it uses for the `400`
+above. Sampled across two restarts, two reads out of forty come back
+`{"state": "error", "category": "unexpected_status", "http_status": 503}` and
+every other read negotiates. Nothing about the lane changed. That is why the
+status is now recorded, and why `lane_reason` says "refuses its attention lane"
+for nothing but a typed Platform v2 refusal.
+
+With all three addressed, the non-production deployment serves the lane and the
+three cross-client comparisons run: `live_source_inventory_parity` and
+`live_projection_parity` pass, and `live_succession_parity` is `not_exercised`
+because an idle deployment serves the same generation for every read.

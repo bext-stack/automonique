@@ -12,9 +12,9 @@
 //!
 //! It performs three kinds of read, selected by the arguments:
 //!
-//! * with no `--source`, it negotiates and walks `query_work_contexts`, which
-//!   is the authoritative record graph every client derives its attention
-//!   source inventory from;
+//! * with no `--source`, it negotiates and walks `query_work_contexts` for the
+//!   named `--project`, which is the authoritative record graph every client
+//!   derives its attention source inventory from;
 //! * with `--review-probe`, it additionally asks `get_review` for each named
 //!   workspace, because whether a review source exists is a server fact and
 //!   the inventory derivation needs it;
@@ -29,10 +29,25 @@
 //! line and never printed, never echoed into the document, and never written
 //! anywhere. The document names the variable, not its value.
 //!
+//! `--project` is required for every live read. The Platform v2 wire has no
+//! project-less `query_work_contexts`, so a walk without one is refused by this
+//! client's own encoder and never reaches the deployment; recorded as a capture
+//! document that would be indistinguishable from a deployment answering badly.
+//!
 //! ```text
 //! cargo run --example attention_live_capture -- \
 //!   --endpoint https://host/api/platform/v2 \
-//!   --credential-env AUTOMONIQUE_OPS_BASIC_AUTH
+//!   --credential-env AUTOMONIQUE_OPS_BASIC_AUTH \
+//!   --project wc2_project_...
+//! ```
+//!
+//! To probe the same deployment on loopback rather than through its public
+//! edge, add the canonical name and the TLS hop the entry requires; without
+//! them it answers `400` to a request addressed to `127.0.0.1`:
+//!
+//! ```text
+//!   --endpoint http://127.0.0.1:8080/api/platform/v2 \
+//!   --host-header host --forwarded-proto https
 //! ```
 
 use std::collections::BTreeSet;
@@ -100,6 +115,8 @@ fn text(value: impl Into<String>) -> JsonValue {
 struct Arguments {
     endpoint: String,
     credential_env: String,
+    host_header: Option<String>,
+    forwarded_proto: Option<String>,
     projects: Vec<String>,
     workspaces: Vec<String>,
     sources: Vec<String>,
@@ -111,10 +128,19 @@ struct Arguments {
 fn usage() -> String {
     concat!(
         "usage: attention_live_capture --endpoint <url> --credential-env <NAME>\n",
-        "                             [--project <id>]... [--user-workspace <id>]...\n",
+        "                             --project <id> [--project <id>]...\n",
+        "                             [--user-workspace <id>]...\n",
+        "                             [--host-header <name>] [--forwarded-proto <scheme>]\n",
         "                             [--source <kind:id>]... [--review-probe]\n",
         "                             [--control]\n",
         "                             [--timeout-seconds <n>]\n",
+        "\n",
+        "--project is required for a live read: the Platform v2 wire has no\n",
+        "project-less work-context query, so a walk without one is not a read a\n",
+        "deployment could refuse — it is a request that never leaves the client.\n",
+        "\n",
+        "--host-header and --forwarded-proto exist for probing a deployment on\n",
+        "loopback, where the entry answers for a canonical name it must be told.\n",
     )
     .to_owned()
 }
@@ -122,6 +148,8 @@ fn usage() -> String {
 fn parse_arguments() -> Result<Arguments, String> {
     let mut endpoint = None;
     let mut credential_env = None;
+    let mut host_header = None;
+    let mut forwarded_proto = None;
     let mut projects = Vec::new();
     let mut workspaces = Vec::new();
     let mut sources = Vec::new();
@@ -138,6 +166,8 @@ fn parse_arguments() -> Result<Arguments, String> {
         match argument.as_str() {
             "--endpoint" => endpoint = Some(value()?),
             "--credential-env" => credential_env = Some(value()?),
+            "--host-header" => host_header = Some(value()?),
+            "--forwarded-proto" => forwarded_proto = Some(value()?),
             "--project" => projects.push(value()?),
             "--user-workspace" => workspaces.push(value()?),
             "--source" => sources.push(value()?),
@@ -151,6 +181,19 @@ fn parse_arguments() -> Result<Arguments, String> {
             "--help" | "-h" => return Err(usage()),
             other => return Err(format!("unknown argument {other}\n{}", usage())),
         }
+    }
+    // A live read without a project is not a read the deployment can refuse:
+    // `PlatformV2Request::QueryWorkContexts` has no project-less encoding, so
+    // the request is rejected by this client's own encoder and never reaches
+    // the network. Reported as a capture document it would look exactly like a
+    // deployment answering badly, which is the one thing this example must
+    // never let a harness conclude. Refusing here keeps the impossible read
+    // impossible to ask for.
+    if !control && projects.is_empty() {
+        return Err(format!(
+            "--project is required for a live read\n{}",
+            usage()
+        ));
     }
     Ok(Arguments {
         endpoint: match (endpoint, control) {
@@ -166,6 +209,8 @@ fn parse_arguments() -> Result<Arguments, String> {
                 return Err(format!("--credential-env is required\n{}", usage()));
             }
         },
+        host_header,
+        forwarded_proto,
         projects,
         workspaces,
         sources,
@@ -221,11 +266,53 @@ fn source_json(source: &AttentionSource) -> JsonValue {
 /// A deployment that cannot be reached, or that answers something this client
 /// refuses, is a live observation the parity harness has to be able to state.
 /// Turning it into a non-zero exit would lose which read failed and how.
-fn client_error(error: PlatformV2ClientError) -> JsonValue {
-    object(vec![
-        ("state", text("error")),
-        ("category", text(error.category())),
-    ])
+///
+/// The category alone is not a diagnosis: `unexpected_status` is the same word
+/// for a `400` the harness caused by addressing the wrong host, a `404` at a
+/// route that is not deployed, and a `503` from a deployment whose daemon was
+/// restarting. Those are three different findings and only one of them is
+/// about the attention lane, so the status the deployment actually answered is
+/// recorded beside the category. Only the response side is recorded — the
+/// request carries the credential and never enters this document.
+fn client_error(
+    client: &PlatformV2Client<HttpsTransport>,
+    error: PlatformV2ClientError,
+) -> JsonValue {
+    with_exchange(
+        client,
+        vec![
+            ("state", text("error")),
+            ("category", text(error.category())),
+        ],
+    )
+}
+
+/// Attach what the deployment answered to a record about one exchange.
+///
+/// A missing status is not the same as a status that was not looked for, so
+/// the keys are always present: `null` means the request reached nothing that
+/// could answer.
+fn with_exchange(
+    client: &PlatformV2Client<HttpsTransport>,
+    mut entries: Vec<(&'static str, JsonValue)>,
+) -> JsonValue {
+    match client.transport().last_exchange() {
+        Some(exchange) => {
+            entries.push((
+                "http_status",
+                JsonValue::Integer(i64::from(exchange.status())),
+            ));
+            entries.push((
+                "http_content_type",
+                exchange.content_type().map_or(JsonValue::Null, text),
+            ));
+        }
+        None => {
+            entries.push(("http_status", JsonValue::Null));
+            entries.push(("http_content_type", JsonValue::Null));
+        }
+    }
+    object(entries)
 }
 
 fn refusal(category: &str) -> JsonValue {
@@ -250,7 +337,7 @@ fn canonical(bytes: &[u8]) -> JsonValue {
 
 fn walk_work_contexts(
     client: &mut PlatformV2Client<HttpsTransport>,
-    project: Option<ProjectId>,
+    project: ProjectId,
 ) -> JsonValue {
     let mut pages = Vec::new();
     let mut after: Option<WorkContextCursor> = None;
@@ -258,7 +345,7 @@ fn walk_work_contexts(
         let query = match WorkContextQuery::new(
             WorkContextKind::ALL.to_vec(),
             Vec::new(),
-            project.clone(),
+            Some(project.clone()),
             None,
             after.clone(),
             WORK_CONTEXT_PAGE_LIMIT,
@@ -289,7 +376,7 @@ fn walk_work_contexts(
             Ok(WorkContextQueryResult::Refused(value)) => {
                 return refusal(value.category().as_str());
             }
-            Err(error) => return client_error(error),
+            Err(error) => return client_error(client, error),
         }
     }
     object(vec![
@@ -325,7 +412,7 @@ fn review_presence(
                 refusal(&category)
             }
         }
-        Err(error) => client_error(error),
+        Err(error) => client_error(client, error),
     }
 }
 
@@ -587,33 +674,72 @@ fn control_document() -> Result<JsonValue, String> {
 }
 
 fn capture(arguments: &Arguments) -> Result<JsonValue, String> {
-    let transport = HttpsTransport::new_basic(
+    let mut transport = HttpsTransport::new_basic(
         arguments.endpoint.clone(),
         credential(&arguments.credential_env)?,
     )
     .map_err(|error| format!("endpoint refused by the client: {}", error.category()))?
     .with_timeout(std::time::Duration::from_secs(arguments.timeout_seconds));
+    // A loopback probe reaches a web entry that answers for one canonical name
+    // over TLS. Without both headers it answers `400` to every request, and a
+    // `400` recorded as a lane refusal would name the deployment for a fault
+    // in how it was addressed.
+    if arguments.host_header.is_some() || arguments.forwarded_proto.is_some() {
+        let host = arguments
+            .host_header
+            .clone()
+            .ok_or_else(|| "--forwarded-proto needs --host-header".to_owned())?;
+        let proto = arguments
+            .forwarded_proto
+            .clone()
+            .unwrap_or_else(|| "https".to_owned());
+        transport = transport
+            .with_loopback_origin(host, proto)
+            .map_err(|error| {
+                format!(
+                    "loopback origin refused by the client: {}",
+                    error.category()
+                )
+            })?;
+    }
     let mut client = PlatformV2Client::new_https(transport);
 
     let offer = PlatformVersionOffer::new(VERSION_OFFER.to_vec())
         .map_err(|_| "version offer invalid".to_owned())?;
-    let lane = match client.negotiate(offer) {
-        Ok(NegotiationResult::V2(value)) => object(vec![
-            ("state", text("negotiated")),
-            (
-                "version",
-                JsonValue::Integer(i64::from(value.version() as u16)),
-            ),
-        ]),
-        Ok(NegotiationResult::Downgraded(value)) => object(vec![
-            ("state", text("downgraded")),
-            (
-                "version",
-                JsonValue::Integer(i64::from(value.version() as u16)),
-            ),
-        ]),
-        Ok(NegotiationResult::Refused(value)) => refusal(value.category().as_str()),
-        Err(error) => client_error(error),
+    // The status is recorded on every outcome, not only on the failures. A
+    // report that names the status when the lane refuses and omits it when the
+    // lane answers cannot be compared run to run, which is exactly what an
+    // intermittent deployment needs.
+    let negotiation = client.negotiate(offer);
+    let lane = match negotiation {
+        Ok(NegotiationResult::V2(value)) => with_exchange(
+            &client,
+            vec![
+                ("state", text("negotiated")),
+                (
+                    "version",
+                    JsonValue::Integer(i64::from(value.version() as u16)),
+                ),
+            ],
+        ),
+        Ok(NegotiationResult::Downgraded(value)) => with_exchange(
+            &client,
+            vec![
+                ("state", text("downgraded")),
+                (
+                    "version",
+                    JsonValue::Integer(i64::from(value.version() as u16)),
+                ),
+            ],
+        ),
+        Ok(NegotiationResult::Refused(value)) => with_exchange(
+            &client,
+            vec![
+                ("state", text("refused")),
+                ("category", text(value.category().as_str().to_owned())),
+            ],
+        ),
+        Err(error) => client_error(&client, error),
     };
     let negotiated = lane.get("state").and_then(JsonValue::as_str) == Some("negotiated");
 
@@ -634,20 +760,19 @@ fn capture(arguments: &Arguments) -> Result<JsonValue, String> {
     entries.push(("reads_attempted", JsonValue::Bool(true)));
 
     if arguments.sources.is_empty() {
-        let project = match arguments.projects.first() {
-            Some(value) => Some(
-                ProjectId::new(value.clone())
-                    .map_err(|_| "--project is not a project id".to_owned())?,
-            ),
-            None => None,
-        };
+        let project = ProjectId::new(
+            arguments
+                .projects
+                .first()
+                .cloned()
+                .ok_or_else(|| "--project is required for a live read".to_owned())?,
+        )
+        .map_err(|_| "--project is not a project id".to_owned())?;
         entries.push((
             "work_contexts",
             walk_work_contexts(&mut client, project.clone()),
         ));
         if arguments.review_probe {
-            let project = project
-                .ok_or_else(|| "--review-probe needs a --project to ask against".to_owned())?;
             let mut probes = Vec::new();
             for workspace in &arguments.workspaces {
                 let workspace = UserWorkspaceId::new(workspace.clone())
