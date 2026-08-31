@@ -10,8 +10,10 @@
 //!    no plan content appears in process listings;
 //! 2. migrates itself into the run's [`RunContainment`] cgroup and confirms
 //!    membership from the kernel ([`crate::containment`]);
-//! 3. opens the workload once and copies the verified bytes into an immutable
-//!    sealed descriptor;
+//! 3. opens the workload once, copies the bytes into an anonymous
+//!    memory-backed image, seals it, and verifies the digest by reading the
+//!    sealed object back — so the digest describes the immutable object
+//!    `execveat` will consume, not a buffer that once held its bytes;
 //! 4. when the plan carries `identity=subordinate`, gives itself the workload
 //!    identity ([`crate::identity`]): an unprivileged user namespace whose
 //!    subordinate mapping is written by the host's setuid
@@ -121,11 +123,29 @@
 //!   hidden policy, the plan is the review point, and what such a variable can
 //!   actually reach is bounded by the filesystem allowlist, not by this API.
 //! - **The main executable is pinned, not its dynamic loader or libraries.**
-//!   The executable bytes are copied, hashed, unlinked, and executed from one
-//!   descriptor. An ELF interpreter and shared libraries are still resolved by
-//!   path under the plan's Landlock read-execute grants. The executable's own
-//!   path grant therefore remains necessary even though `execveat` does not
-//!   resolve that path again.
+//!   The executable bytes are copied into an anonymous image, sealed, hashed
+//!   from that sealed image, and executed from the same descriptor. An ELF
+//!   interpreter and shared libraries are still resolved by path under the
+//!   plan's Landlock read-execute grants. The executable's own path grant
+//!   therefore remains necessary even though `execveat` does not resolve that
+//!   path again.
+//! - **Landlock does not mediate the program image, and could not.** A
+//!   `memfd` lives on an `SB_NOUSER` superblock on an internal mount, which
+//!   `landlock_add_rule` rejects with `EBADFD` and which Landlock's own file
+//!   checks exempt. The execute rule the staged degradation adds is therefore
+//!   an allowance for a named inode, not a restriction the sealed image
+//!   evades; and the exemption is a property of the kernel's Landlock, not of
+//!   this helper — a workload that runs at all can already build and execute
+//!   an anonymous image of its own, on either route, because
+//!   [`crate::seccomp`] denies socket shapes and namespace creation rather
+//!   than `memfd_create`.
+//! - **The image is resident memory, not page cache.** A sealed image is
+//!   tmpfs-backed: its pages are reclaimable only to swap, where the staged
+//!   copy's were droppable clean page cache over a real file. The bound is
+//!   [`MAX_PROGRAM_BYTES`] per live attempt, and the daemon caps concurrent
+//!   attempts, so the ceiling is that product — with the provider binaries
+//!   this runs today, of the order of a gigabyte, against a host sized in
+//!   tens. In exchange the staging path writes nothing to disk at all.
 //! - **It is not attestation.** Nothing here proves to a third party what
 //!   was launched; the release-manifest trust chain is a separate concern.
 //! - **The supervisor cannot distinguish a helper refusal from a workload
@@ -199,7 +219,7 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::ops::Deref;
-use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -1576,11 +1596,14 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
         .ok_or_else(|| "no containment target".to_owned())?;
     join_and_confirm_membership(Path::new(&target)).map_err(|error| error.to_string())?;
 
-    // 3. Open, copy, and verify the program before filesystem policy is
-    //    installed. Landlock binds the staged inode, its name is removed, and
-    //    the retained descriptor is the object execveat consumes; the source
-    //    path is never resolved again.
-    let program_descriptor = staged_verified_program_descriptor(&plan)?;
+    // 3. Copy the program into an anonymous memory-backed image, seal it, and
+    //    verify the digest by reading the sealed object back — all before
+    //    filesystem policy is installed. The sealed object has no name, so
+    //    there is no path to unlink and none to re-point; the retained
+    //    descriptor is the object execveat consumes and the source path is
+    //    never resolved again. A kernel without memfd sealing degrades to the
+    //    staged copy, whose inode Landlock binds and whose name is removed.
+    let program_descriptor = verified_program_image(&plan)?;
 
     // 4. When the plan asks, become the workload identity: a host uid that is
     //    not the supervisor's, in a user namespace of this process's own,
@@ -1628,15 +1651,10 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
         drop(stdin_source);
     }
 
-    // 6. Close everything but the standard streams and the staged program.
-    let allowlist = DescriptorAllowlist::new(&[
-        0,
-        1,
-        2,
-        program_descriptor.as_raw_fd(),
-        program_descriptor.rule_descriptor().as_raw_fd(),
-    ])
-    .map_err(|error| error.to_string())?;
+    // 6. Close everything but the standard streams and the program image.
+    let mut allowed = vec![0, 1, 2];
+    allowed.extend(program_descriptor.open_descriptors());
+    let allowlist = DescriptorAllowlist::new(&allowed).map_err(|error| error.to_string())?;
     close_all_except(&allowlist).map_err(|error| error.to_string())?;
     verify_only_allowlist_open(&allowlist).map_err(|error| error.to_string())?;
 
@@ -1661,13 +1679,19 @@ fn enter_enforce_and_exec() -> Result<Never, String> {
         .map_err(|error| error.to_string())?
         .enforce_on_current_thread()
         .map_err(|error| error.to_string())?;
-    plan.filesystem_policy()
-        .map_err(|error| error.to_string())?
-        .enforce_on_current_thread_with_executable(
-            program_descriptor.rule_descriptor(),
-            program_descriptor.staged_path(),
-        )
-        .map_err(|error| error.to_string())?;
+    let filesystem_policy = plan.filesystem_policy().map_err(|error| error.to_string())?;
+    match program_descriptor.landlock_binding() {
+        // A staged copy is an ordinary inode: it needs an execute rule, and
+        // its name is removed while the rule is being built.
+        Some((rule_descriptor, staged_path)) => filesystem_policy
+            .enforce_on_current_thread_with_executable(rule_descriptor, staged_path)
+            .map_err(|error| error.to_string())?,
+        // A sealed anonymous image needs no rule and can carry none; Landlock
+        // does not mediate executing one. See `ProgramImage::landlock_binding`.
+        None => filesystem_policy
+            .enforce_on_current_thread()
+            .map_err(|error| error.to_string())?,
+    };
 
     // 9. The seccomp filter closes what Landlock cannot reach: UDP, raw and
     //    packet sockets, non-TCP stream protocols, and every namespace
@@ -1760,44 +1784,99 @@ fn read_session_launch_frame() -> Result<Vec<u8>, String> {
     Err("plan frame exceeds bound".to_owned())
 }
 
-/// Copy the program from one no-follow open into a verified executable fd.
+/// The seal set every anonymous program image carries, and the value
+/// `F_GET_SEALS` must read back before the image is trusted.
 ///
-/// A random owner-only staging path lets Landlock bind an execute rule to the
-/// copied inode. The path is unlinked before restriction and `execveat`
-/// consumes the independently opened descriptor, so the source path is never
-/// resolved a second time and the workload receives no staging pathname.
-struct StagedProgram {
-    file: File,
-    rule_descriptor: File,
-    path: PathBuf,
+/// `F_SEAL_WRITE` alone is not equivalent to an unlinked staged copy: growth
+/// and truncation would both still change what `execveat` maps. `F_SEAL_SEAL`
+/// closes the sealing interface itself, so no later holder of the descriptor —
+/// the workload included — can lift any of the other three.
+const PROGRAM_SEALS: SealFlag = SealFlag::F_SEAL_WRITE
+    .union(SealFlag::F_SEAL_GROW)
+    .union(SealFlag::F_SEAL_SHRINK)
+    .union(SealFlag::F_SEAL_SEAL);
+
+/// Why a sealed anonymous image could not be produced.
+///
+/// The distinction is load-bearing. A kernel that cannot make one is a
+/// capability gap and degrades to the staged copy, which is what this helper
+/// did before. A program that fails verification is a refusal, and must never
+/// be retried by a second route — otherwise "the digest did not match" would
+/// silently become "try again somewhere the check is differently shaped".
+enum ImageError {
+    Unsupported,
+    Refused(String),
 }
 
-impl StagedProgram {
-    fn rule_descriptor(&self) -> &File {
-        &self.rule_descriptor
+/// The verified program, as the object `execveat` will consume.
+enum ProgramImage {
+    /// An anonymous, sealed, memory-backed image. No directory entry names it,
+    /// so there is no path to reopen and nothing to unlink; the seals make the
+    /// bytes immutable for every holder of every descriptor onto the object.
+    Sealed(File),
+    /// The degradation for a kernel without `memfd` sealing: a copy at an
+    /// owner-only random path, whose inode a Landlock execute rule binds and
+    /// whose name is removed before restriction.
+    Staged {
+        file: File,
+        rule_descriptor: File,
+        path: PathBuf,
+    },
+}
+
+impl ProgramImage {
+    /// The Landlock execute rule this image needs, if it needs one.
+    ///
+    /// A sealed image needs none and can have none. `landlock_add_rule` rejects
+    /// a `memfd` with `EBADFD` — its superblock is `SB_NOUSER` on an internal
+    /// mount — and by the same token Landlock does not mediate executing one,
+    /// so the rule the staged copy adds is an allowance the sealed image has no
+    /// use for rather than a restriction it escapes.
+    fn landlock_binding(&self) -> Option<(&File, &Path)> {
+        match self {
+            Self::Sealed(_) => None,
+            Self::Staged {
+                rule_descriptor,
+                path,
+                ..
+            } => Some((rule_descriptor, path)),
+        }
     }
 
-    fn staged_path(&self) -> &Path {
-        &self.path
+    /// Every descriptor this image keeps open, for the closure allowlist.
+    fn open_descriptors(&self) -> Vec<RawFd> {
+        match self {
+            Self::Sealed(file) => vec![file.as_raw_fd()],
+            Self::Staged {
+                file,
+                rule_descriptor,
+                ..
+            } => vec![file.as_raw_fd(), rule_descriptor.as_raw_fd()],
+        }
     }
 }
 
-impl Deref for StagedProgram {
+impl Deref for ProgramImage {
     type Target = File;
 
     fn deref(&self) -> &Self::Target {
-        &self.file
+        match self {
+            Self::Sealed(file) | Self::Staged { file, .. } => file,
+        }
     }
 }
 
-impl Drop for StagedProgram {
+impl Drop for ProgramImage {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if let Self::Staged { path, .. } = self {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
-fn staged_verified_program_descriptor(plan: &LaunchPlan) -> Result<StagedProgram, String> {
-    let mut source = OpenOptions::new()
+/// Open the program and check the metadata both staging routes require.
+fn open_and_screen_program(plan: &LaunchPlan) -> Result<(File, u64), String> {
+    let source = OpenOptions::new()
         .read(true)
         .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
         .open(&plan.program)
@@ -1813,21 +1892,20 @@ fn staged_verified_program_descriptor(plan: &LaunchPlan) -> Result<StagedProgram
     {
         return Err("program metadata rejected".to_owned());
     }
+    Ok((source, metadata.len()))
+}
 
-    let mut random = [0_u8; 16];
-    File::open("/dev/urandom")
-        .and_then(|mut entropy| entropy.read_exact(&mut random))
-        .map_err(|_| "program staging entropy unavailable".to_owned())?;
-    let staged_path = Path::new("/tmp").join(format!(".automonique-program-{}", hex(&random)));
-    let mut staged = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o700)
-        .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
-        .open(&staged_path)
-        .map_err(|_| "program staging file unavailable".to_owned())?;
-    let mut hasher = Sha256::new();
+/// Copy `source` into `sink`, bounded, refusing a length that moved underneath.
+///
+/// `hasher` digests the bytes as they pass when the caller has no better place
+/// to take the digest from. The sealed route deliberately passes `None` and
+/// hashes the sealed object afterwards instead.
+fn copy_program_bytes(
+    source: &mut File,
+    sink: &mut File,
+    expected: u64,
+    mut hasher: Option<&mut Sha256>,
+) -> Result<(), String> {
     let mut copied = 0_u64;
     let mut buffer = [0_u8; 16 * 1024];
     loop {
@@ -1843,16 +1921,107 @@ fn staged_verified_program_descriptor(plan: &LaunchPlan) -> Result<StagedProgram
         if copied > MAX_PROGRAM_BYTES {
             return Err("program oversized".to_owned());
         }
-        hasher.update(&buffer[..read]);
-        staged
-            .write_all(&buffer[..read])
+        if let Some(hasher) = hasher.as_deref_mut() {
+            hasher.update(&buffer[..read]);
+        }
+        sink.write_all(&buffer[..read])
             .map_err(|_| "program could not be staged".to_owned())?;
     }
-    if copied != metadata.len() {
+    if copied != expected {
         return Err("program changed while being staged".to_owned());
     }
-    let observed = hex(&hasher.finalize());
+    Ok(())
+}
+
+/// The SHA-256 of everything `file` yields from its current offset, as hex.
+fn digest_to_end(file: &mut File, unreadable: &'static str) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|_| unreadable.to_owned())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+/// Copy the program into an anonymous image, seal it, and verify the seals and
+/// the digest by reading the sealed object back.
+///
+/// The order is the whole point. The bytes are sealed *before* they are
+/// hashed, and the hash reads them back out of the sealed object rather than
+/// out of the buffer that produced it, so the digest describes the immutable
+/// artefact `execveat` will consume and not a transient copy of it. Nothing
+/// between verification and exec can alter the object: `F_SEAL_WRITE` is
+/// enforced on the object itself, so it survives a `/proc/self/fd` reopen —
+/// which is exactly the substitution a path-named staging file has to defend
+/// against by unlinking, and which cannot arise here because the object has
+/// never had a name.
+fn sealed_program_image(plan: &LaunchPlan) -> Result<ProgramImage, ImageError> {
+    let (mut source, expected) = open_and_screen_program(plan).map_err(ImageError::Refused)?;
+    let name = CString::new("automonique-program").expect("literal has no interior NUL");
+    let descriptor = nix::sys::memfd::memfd_create(
+        &name,
+        MemFdCreateFlag::MFD_CLOEXEC | MemFdCreateFlag::MFD_ALLOW_SEALING,
+    )
+    .map_err(|_| ImageError::Unsupported)?;
+    let mut file = File::from(descriptor);
+    copy_program_bytes(&mut source, &mut file, expected, None).map_err(ImageError::Refused)?;
+
+    // A kernel that accepted MFD_ALLOW_SEALING and then refuses to seal, or
+    // reports back a weaker set than it was given, is refused rather than
+    // degraded: an unsealed anonymous image is weaker than the staged copy it
+    // would be standing in for, and silently accepting one is the failure this
+    // whole change exists to prevent.
+    seal_descriptor(&file, "program").map_err(ImageError::Refused)?;
+    let observed_seals = nix::fcntl::fcntl(file.as_raw_fd(), FcntlArg::F_GET_SEALS)
+        .map_err(|error| ImageError::Refused(format!("program seals unreadable: {error}")))?;
+    let observed_seals = SealFlag::from_bits_truncate(observed_seals);
+    if !observed_seals.contains(PROGRAM_SEALS) {
+        return Err(ImageError::Refused(
+            "program seals did not take effect".to_owned(),
+        ));
+    }
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| ImageError::Refused("program rewind failed".to_owned()))?;
+    let observed =
+        digest_to_end(&mut file, "sealed program unreadable").map_err(ImageError::Refused)?;
     if observed != plan.program_sha256 {
+        return Err(ImageError::Refused("program digest mismatch".to_owned()));
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| ImageError::Refused("program rewind failed".to_owned()))?;
+    Ok(ProgramImage::Sealed(file))
+}
+
+/// Copy the program from one no-follow open into a verified executable fd.
+///
+/// The degradation for a kernel that cannot seal an anonymous image. A random
+/// owner-only staging path lets Landlock bind an execute rule to the copied
+/// inode. The path is unlinked before restriction and `execveat` consumes the
+/// independently opened descriptor, so the source path is never resolved a
+/// second time and the workload receives no staging pathname.
+fn staged_verified_program_descriptor(plan: &LaunchPlan) -> Result<ProgramImage, String> {
+    let (mut source, expected) = open_and_screen_program(plan)?;
+    let mut random = [0_u8; 16];
+    File::open("/dev/urandom")
+        .and_then(|mut entropy| entropy.read_exact(&mut random))
+        .map_err(|_| "program staging entropy unavailable".to_owned())?;
+    let staged_path = Path::new("/tmp").join(format!(".automonique-program-{}", hex(&random)));
+    let mut staged = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
+        .open(&staged_path)
+        .map_err(|_| "program staging file unavailable".to_owned())?;
+    let mut hasher = Sha256::new();
+    copy_program_bytes(&mut source, &mut staged, expected, Some(&mut hasher))?;
+    if hex(&hasher.finalize()) != plan.program_sha256 {
         return Err("program digest mismatch".to_owned());
     }
     staged
@@ -1873,11 +2042,23 @@ fn staged_verified_program_descriptor(plan: &LaunchPlan) -> Result<StagedProgram
         .map_err(|_| "program rule descriptor unavailable".to_owned())?;
     file.seek(SeekFrom::Start(0))
         .map_err(|_| "program rewind failed".to_owned())?;
-    Ok(StagedProgram {
+    Ok(ProgramImage::Staged {
         file,
         rule_descriptor,
         path: staged_path,
     })
+}
+
+/// The verified program image, sealed and anonymous where the kernel allows it.
+///
+/// Only [`ImageError::Unsupported`] falls back. A refusal — a digest mismatch
+/// above all — is final on both routes.
+fn verified_program_image(plan: &LaunchPlan) -> Result<ProgramImage, String> {
+    match sealed_program_image(plan) {
+        Ok(image) => Ok(image),
+        Err(ImageError::Refused(reason)) => Err(reason),
+        Err(ImageError::Unsupported) => staged_verified_program_descriptor(plan),
+    }
 }
 
 /// An anonymous, sealed, memory-backed descriptor holding `prompt`, rewound.

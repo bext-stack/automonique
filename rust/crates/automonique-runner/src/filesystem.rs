@@ -477,10 +477,15 @@ impl FilesystemPolicy {
     /// Install this allowlist while granting execute access to one already
     /// opened, immutable program descriptor.
     ///
-    /// The launch helper executes a sealed memfd rather than resolving the
-    /// provider path again. That detached inode must be named explicitly in
-    /// the Landlock ruleset; the ordinary path grants still cover the dynamic
-    /// loader, libraries, and provider-owned resources.
+    /// This is the *staged-copy* route only. The launch helper normally
+    /// executes a sealed anonymous image, which needs no rule here and can
+    /// carry none: `landlock_add_rule` rejects a `memfd` with `EBADFD`,
+    /// because it lives on an `SB_NOUSER` superblock on an internal mount,
+    /// and Landlock exempts such objects from its file checks for the same
+    /// reason. On a kernel that cannot seal one, the helper degrades to a copy
+    /// at an owner-only path, and *that* detached inode must be named
+    /// explicitly in the ruleset. Either way the ordinary path grants still
+    /// cover the dynamic loader, libraries, and provider-owned resources.
     pub(crate) fn enforce_on_current_thread_with_executable(
         &self,
         executable_rule: &File,
