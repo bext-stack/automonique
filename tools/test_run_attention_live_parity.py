@@ -448,6 +448,22 @@ class OperatorStepTest(unittest.TestCase):
             self.assertTrue(step["residue"].strip())
             self.assertTrue(step["machine_verified"].strip())
 
+    def test_no_step_claims_the_operator_half_of_a_two_screen_comparison(
+        self,
+    ) -> None:
+        """The residue that survives every automated check is a person.
+
+        LIVE-GUI-2 has had the most subtracted from it: the deployed page's
+        rendering is observed by `--cockpit-render-check` and its projection is
+        compared here. Both meet at the projection. Neither says one human saw
+        the same item on two screens, and no residue may imply otherwise.
+        """
+        step = next(
+            entry for entry in parity.GUI_RESIDUE if entry["id"] == "LIVE-GUI-2"
+        )
+        self.assertIn("same person", step["residue"])
+        self.assertFalse(step["reducible"])
+
     def test_the_harness_records_no_state_that_could_satisfy_a_step(self) -> None:
         """No key in this report can be mistaken for a sign-off."""
         rendered = json.dumps(list(parity.GUI_RESIDUE))

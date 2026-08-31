@@ -385,11 +385,14 @@ MANUAL_STEPS = (
         ),
         evidence_required="screenshot showing the source and the generation",
         residue=(
-            "The browser rendering that projection for a signed-in operator. "
-            "run_attention_live_parity.py reads the deployed cockpit's own "
-            "attention projection and checks it names the same source and "
-            "generation as the other two clients, so what is left is whether "
-            "the page shows what the deployment computed."
+            "That the item on the cockpit is the item ShellDeck showed the same "
+            "person, on their screen, in one sitting. Two machine checks now "
+            "meet here: `--cockpit-render-check` observes the deployed page "
+            "rendering the source and generation its own authorized projection "
+            "carries, and run_attention_live_parity.py checks that projection "
+            "names the same source and generation as ShellDeck and Mobile. "
+            "Neither establishes that one human saw the same thing twice, and "
+            "that is what is left."
         ),
     ),
     ManualStep(

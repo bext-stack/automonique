@@ -803,6 +803,23 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(report["live_verification"]["state"], "blocked")
         self.assertIn("hosted_attention_corpus_available", report["live_verification"]["reason"])
 
+    def test_a_step_whose_machine_half_grew_still_names_a_human_residue(
+        self,
+    ) -> None:
+        """Subtraction narrows a step; it never empties one.
+
+        LIVE-GUI-2 is the step two harnesses now check against the deployment.
+        Its residue must still name something only a person establishes, or the
+        step has become a fence that looks like one and holds nothing.
+        """
+        step = next(
+            entry
+            for entry in live.MANUAL_STEPS
+            if entry.identifier == "LIVE-GUI-2"
+        )
+        self.assertIn("same person", step.residue)
+        self.assertIn("one sitting", step.residue)
+
     def test_the_checklist_names_the_residue_without_shrinking(self) -> None:
         report = self.report(
             [{"name": "a", "state": "passed"}], attention_corpus="passed"
