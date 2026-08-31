@@ -65,6 +65,7 @@ mod test_isolation;
 use automonique_store::approval_requests::{
     ApprovalContext, ApprovalProposal, ApprovalRequests, ApprovalState,
 };
+use automonique_store::approval_watch::ApprovalWatch;
 
 fn fixture() -> (tempfile::TempDir, DaemonConfig) {
     let root = tempfile::tempdir().expect("temporary root");
@@ -298,15 +299,28 @@ struct Serving {
 }
 
 fn serve(config: &DaemonConfig) -> Serving {
+    serve_watching(config).0
+}
+
+/// Serve, and keep the bell this daemon's approval table rings.
+///
+/// The handle has to be taken before the daemon moves onto its own thread,
+/// which is the only reason this is a second function rather than a field on
+/// [`Serving`].
+fn serve_watching(config: &DaemonConfig) -> (Serving, Arc<ApprovalWatch>) {
     let daemon = Daemon::open(config).expect("daemon opens");
+    let watch = daemon.approval_watch();
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
     let thread = std::thread::spawn(move || daemon.serve(&thread_stop));
     wait_for_socket(config);
-    Serving {
-        stop,
-        thread: Some(thread),
-    }
+    (
+        Serving {
+            stop,
+            thread: Some(thread),
+        },
+        watch,
+    )
 }
 
 impl Serving {
@@ -1119,6 +1133,89 @@ fn a_decision_on_a_proposal_reaches_both_databases_and_a_replay_writes_nothing()
     assert_eq!(entry.decider, "test:operator");
     assert_eq!(entry.decided_at_ms, first_instant);
     assert_eq!(ledger.decision_count().expect("count"), 1);
+}
+
+/// A decision entered through the socket **reaches** the run waiting on it,
+/// instead of being discovered by one on its own schedule.
+///
+/// Every other case in this file asserts where a decision lands. This one
+/// asserts that it arrives: the execute lane parks a run paused on a provider
+/// permission against the very bell this daemon's table rings, so an operator
+/// pressing the button ends that wait rather than shortening the odds of the
+/// next look finding it.
+///
+/// The waiter here is stood up exactly the way `execute.rs` stands one up —
+/// read the count, read the durable row, wait beyond what was read — because a
+/// waiter that read the count *after* the row would be testing a different and
+/// racier thing than the one that ships.
+///
+/// The generous bound is deliberate. Passing by timing out is the precise
+/// failure this test exists to catch, so the bound is set where reaching it is
+/// unambiguous rather than where it is merely suspicious.
+#[test]
+fn a_socket_decision_ends_a_waiting_run_rather_than_being_discovered_by_it() {
+    /// Long enough that reaching it means the bell never rang.
+    const BOUND: Duration = Duration::from_secs(10);
+    /// Generous enough for a loaded runner to schedule a woken thread, short
+    /// enough that it cannot be confused with [`BOUND`].
+    const WOKEN: Duration = Duration::from_secs(2);
+
+    let (_root, config) = fixture();
+    seed_proposal(&config, 10_000_000_000_000);
+    let (serving, watch) = serve_watching(&config);
+
+    let observed = watch.observed();
+    {
+        let requests =
+            ApprovalRequests::open(config.approval_requests_path()).expect("proposal table");
+        assert_eq!(
+            requests
+                .entry(PROPOSAL_KEY)
+                .expect("readable row")
+                .expect("a seeded row")
+                .state,
+            ApprovalState::Pending,
+            "the wait under test only means anything while nothing has been decided"
+        );
+    }
+
+    let waiting = {
+        let watch = Arc::clone(&watch);
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            watch.wait_beyond(observed, BOUND);
+            started.elapsed()
+        })
+    };
+
+    let recorded = decide(&config, "decide-woken", ApprovalDecision::Granted);
+    assert!(
+        matches!(&recorded, ApprovalResponse::Recorded { receipt, .. }
+            if receipt.disposition() == ApprovalDisposition::Recorded),
+        "expected the decision to be recorded, got {recorded:?}"
+    );
+
+    let waited = waiting.join().expect("the waiting thread");
+    assert!(
+        waited < WOKEN,
+        "the wait ran for {waited:?}, which is its own {BOUND:?} bound rather than the decision \
+         that should have ended it: the socket recorded a decision the waiter was never told about"
+    );
+
+    serving.shutdown(&config);
+
+    // The wait ended for the right reason. A bell that rang without the row
+    // moving would pass the timing assertion above and be worthless.
+    let requests =
+        ApprovalRequests::open(config.approval_requests_path()).expect("proposal table reopens");
+    assert_eq!(
+        requests
+            .entry(PROPOSAL_KEY)
+            .expect("readable row")
+            .expect("a row under that key")
+            .state,
+        ApprovalState::Granted
+    );
 }
 
 /// A decision that reached the ledger and not its proposal heals on the next

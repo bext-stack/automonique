@@ -152,6 +152,7 @@ use automonique_store::approval_requests::{
     ApprovalRequestRecord, ApprovalRequests, ApprovalState, MAX_APPROVAL_REQUEST_PAGE,
     StoredApprovalContext,
 };
+use automonique_store::approval_watch::ApprovalWatch;
 use automonique_store::audit_chain::{AuditAppend, AuditChain, GENESIS_PREV_HASH};
 use automonique_store::automation_store::{
     AutomationJobSpec, AutomationRecord, AutomationRegistration,
@@ -1479,6 +1480,16 @@ pub struct Daemon {
     /// before any attempt starts — which is what turns
     /// [`Daemon::approvals`] from a record into a gate.
     approval_requests: ApprovalRequests,
+    /// The bell [`Daemon::approval_requests`] rings when a proposal reaches a
+    /// terminal state.
+    ///
+    /// Held rather than created per lane because a bell only reaches whoever
+    /// holds the same one: a second [`ApprovalWatch`] would be a second bell,
+    /// and the run listening to it would hear nothing this daemon rang. Every
+    /// lane that decides, expires or waits on this table is given a clone of
+    /// this exact handle, and [`automonique_store::approval_watch`] states what
+    /// a missed ring does and does not cost.
+    approval_watch: Arc<ApprovalWatch>,
     /// This daemon's private state directory.
     ///
     /// Held because the approval lane hashes a prompt slot out of it when it
@@ -2667,6 +2678,11 @@ impl Daemon {
         // teaching every reader to notice.
         let mut approval_requests = ApprovalRequests::open(config.approval_requests_path())
             .map_err(|error| DaemonError::ApprovalRequestsFailed(error.category()))?;
+        // Taken off the handle that rings it, and before the reconciliation
+        // below so a repaired decision wakes anything already waiting on it
+        // rather than being found later. Every lane that waits on this table is
+        // handed this exact value; see `automonique_store::approval_watch`.
+        let approval_watch = approval_requests.watched();
         reconcile_approval_requests(&mut approval_requests, &approvals)?;
 
         // The batch registry opens beside the ledger, under the same fence and
@@ -2717,6 +2733,7 @@ impl Daemon {
                 execution_state,
                 automonique_protocol::admin::ExecutionState::SandboxEnforceableLaneWired
             ),
+            Arc::clone(&approval_watch),
         );
 
         let database_path = config.database_path();
@@ -2839,6 +2856,7 @@ impl Daemon {
             automation_scheduler,
             approvals,
             approval_requests,
+            approval_watch,
             state_dir,
             batches,
             attempt_host: Some(attempt_host),
@@ -3270,6 +3288,7 @@ impl Daemon {
                 self.execution_state,
                 automonique_protocol::admin::ExecutionState::SandboxEnforceableLaneWired
             ),
+            Arc::clone(&self.approval_watch),
         );
         self.progress_endpoint
             .as_mut()
@@ -3476,6 +3495,20 @@ impl Daemon {
         self.execution
             .as_ref()
             .map(execute::ExecutionLane::progress)
+    }
+
+    /// The bell this daemon's approval table rings when a proposal reaches a
+    /// terminal state.
+    ///
+    /// The same handle every run paused on a provider permission waits on, so
+    /// holding it is how an observer outside the execute lane can tell that a
+    /// decision *reached* a waiter rather than merely landing in a row. It
+    /// answers nothing about what was decided — only the durable row does that,
+    /// which is why [`automonique_store::approval_watch`] calls a ring evidence
+    /// of nothing.
+    #[must_use]
+    pub fn approval_watch(&self) -> Arc<ApprovalWatch> {
+        Arc::clone(&self.approval_watch)
     }
 
     /// Serve until the supplied stop flag is set or an authenticated shutdown
