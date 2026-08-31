@@ -62,7 +62,7 @@ rusqlite = { version = "=0.32.1", features = ["backup", "bundled"] }
 # `ring` rather than the default provider: it is the one already vendored for
 # this workspace, so the direct dependency adds no new transitive crate.
 rustls = { version = "=0.23.43", default-features = false, features = ["logging", "ring", "std", "tls12"] }
-rustix = { version = "=1.1.4", features = ["net"] }
+rustix = { version = "=1.1.4", features = ["net", "process"] }
 serde = "=1.0.229"
 serde_json = "=1.0.149"
 sha2 = "=0.10.9"

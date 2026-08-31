@@ -11,9 +11,11 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::unistd::geteuid;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::os::fd::AsFd;
 
 const REGISTRY_SCHEMA: &str = "automonique.agent-accounts/v1";
 const HEALTH_SCHEMA: &str = "automonique.provider-account-health/v1";
@@ -37,6 +39,44 @@ const SESSION_RETENTION: Duration = Duration::from_secs(30 * 60);
 const PROVIDER_CALL_TIMEOUT: Duration = Duration::from_secs(20);
 /// How often a bounded provider CLI call is re-checked while waiting.
 const PROVIDER_CALL_POLL: Duration = Duration::from_millis(25);
+
+/// Wait for a child to exit, or for the bound to pass, without polling.
+///
+/// A pidfd is pollable, so the wait is the same shape as every other bounded
+/// wait here: block on the thing being waited for, with a deadline. Waiting on
+/// the descriptor rather than the pid also removes the reuse race that killing
+/// a pid after an unobserved reap would carry.
+///
+/// A kernel without pidfd, or a child already reaped, degrades to the sleep it
+/// replaces. The caller re-checks the child either way, so a spurious wake and
+/// a degraded wait are both merely a slower path to the same answer.
+fn await_child_exit(pid: u32, timeout: Duration) -> bool {
+    let Ok(pid) = i32::try_from(pid).map(rustix::process::Pid::from_raw) else {
+        thread::sleep(timeout);
+        return false;
+    };
+    let Some(pid) = pid else {
+        thread::sleep(timeout);
+        return false;
+    };
+    let Ok(descriptor) = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
+    else {
+        thread::sleep(timeout);
+        return false;
+    };
+    let milliseconds =
+        u16::try_from(timeout.as_millis().clamp(1, u16::MAX.into())).unwrap_or(u16::MAX);
+    let mut descriptors = [PollFd::new(descriptor.as_fd(), PollFlags::POLLIN)];
+    match poll(&mut descriptors, PollTimeout::from(milliseconds)) {
+        Ok(ready) => ready > 0,
+        Err(nix::errno::Errno::EINTR) => false,
+        Err(_) => {
+            thread::sleep(timeout);
+            false
+        }
+    }
+}
+
 const OUTPUT_LIMIT: usize = 32 * 1024;
 const REGISTRY_LIMIT: u64 = 128 * 1024;
 const HEALTH_LIMIT: u64 = 8 * 1024;
@@ -993,7 +1033,9 @@ fn run_login_process(process: LoginProcess) {
         }
         match child.try_wait() {
             Ok(Some(status)) => break status.success(),
-            Ok(None) => thread::sleep(Duration::from_millis(200)),
+            Ok(None) => {
+                await_child_exit(child.id(), Duration::from_millis(200));
+            }
             Err(_) => break false,
         }
     };
@@ -1126,7 +1168,10 @@ fn bounded_provider_call(command: &mut Command, timeout: Duration) -> Option<Bou
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(PROVIDER_CALL_POLL),
+            Ok(None) if Instant::now() < deadline => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                await_child_exit(child.id(), remaining.min(PROVIDER_CALL_POLL));
+            }
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -1486,6 +1531,48 @@ mod tests {
     /// accepts a connection and then stops answering retired a thread for good.
     /// Without the deadline this test does not fail, it hangs — which is exactly
     /// the production symptom it stands for.
+    #[test]
+    fn a_child_that_exits_wakes_the_wait_instead_of_serving_out_the_interval() {
+        // The point of the pidfd is that the wait ends when the child does. A
+        // poll-and-sleep cannot tell these apart: it returns after the interval
+        // either way, so this is the assertion that distinguishes them.
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn a child that exits at once");
+        let started = Instant::now();
+        super::await_child_exit(child.id(), Duration::from_secs(5));
+        let waited = started.elapsed();
+        let _ = child.wait();
+
+        assert!(
+            waited < Duration::from_secs(1),
+            "waiting on an exited child took {waited:?}, which means the wait \
+             served out its interval rather than waking on the exit"
+        );
+    }
+
+    #[test]
+    fn a_child_that_keeps_running_holds_the_wait_for_its_bound() {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .expect("spawn a child that outlives the bound");
+        let started = Instant::now();
+        super::await_child_exit(child.id(), Duration::from_millis(200));
+        let waited = started.elapsed();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            waited >= Duration::from_millis(100),
+            "a live child returned after {waited:?}, which is a spin rather \
+             than a bounded wait"
+        );
+    }
+
     #[test]
     fn a_provider_cli_that_never_answers_is_killed_at_the_deadline() {
         let temporary = tempfile::tempdir().expect("temporary root");
