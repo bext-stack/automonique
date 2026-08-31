@@ -5265,9 +5265,15 @@ impl Daemon {
                             .filter(|record| record.resource.kind == ResourceKind::Session)
                         {
                             let run = self.platform_run_for_session(&session.resource)?;
+                            // Both capabilities are earned from the record's own
+                            // observation, never from the fact that a row exists.
+                            // `session_is_live` is the same predicate the Attach
+                            // and ClaimControl guards below apply, so a listing
+                            // cannot offer a control the daemon would refuse.
+                            let live = session_is_live(&session);
                             sessions.push(SessionRecord {
-                                attachable: session.summary.as_str() == "open",
-                                controllable: session.summary.as_str() == "open",
+                                attachable: live,
+                                controllable: live,
                                 run,
                                 session,
                             });
@@ -5299,7 +5305,7 @@ impl Daemon {
             }
             PlatformRequest::Attach(request) => {
                 self.refresh_platform_sessions(now_ms)?;
-                if !self.platform_session_is_open(&request.session)? {
+                if !self.platform_session_is_live(&request.session)? {
                     platform_refusal(ReceiptOutcome::Rejected, "session_not_attachable")?
                 } else {
                     match self.platform.attach(
@@ -5324,7 +5330,7 @@ impl Daemon {
             }
             PlatformRequest::ClaimControl(request) => {
                 self.refresh_platform_sessions(now_ms)?;
-                if !self.platform_session_is_open(&request.session)? {
+                if !self.platform_session_is_live(&request.session)? {
                     platform_refusal(ReceiptOutcome::Rejected, "session_not_controllable")?
                 } else {
                     match self.platform.claim_control(
@@ -5819,6 +5825,16 @@ impl Daemon {
     }
 
     fn refresh_platform_sessions(&mut self, now_ms: i64) -> Result<(), DaemonError> {
+        // Sessions a provider host itself declared open in this pass. A host
+        // writes `closed` when it tears down and cascades to `lost` when its
+        // process is observed to fail, so this is the nearest thing to a
+        // statement that something is listening — and it is the state a live
+        // host sits in between turns, when no run is executing. It is not
+        // airtight: a generation that dies without observing its own process
+        // leaves the row `open` until that attempt key is next reused. Held
+        // here only to keep the binding loop below from contradicting a host
+        // that is still speaking for itself.
+        let mut host_open = std::collections::BTreeSet::new();
         let path = self.state_dir.join(PROVIDER_JOURNAL_NAME);
         if path.exists() {
             let journal = ProviderJournal::open(path)
@@ -5838,6 +5854,9 @@ impl Daemon {
                         (FreshnessState::Unknown, "lost")
                     }
                 };
+                if session.state == automonique_store::provider_journal::SessionState::Open {
+                    host_open.insert(session.provider_session_key.clone());
+                }
                 let record = ResourceRecord {
                     resource: ResourceCoordinate::new(
                         ResourceAuthority::Automonique,
@@ -5864,11 +5883,24 @@ impl Daemon {
         // A retained managed binding is the authority on resumability after
         // the attempt-scoped provider host closes. Apply it last so a normal
         // JCode host teardown does not make a resumable session look closed.
+        //
+        // It is not, however, an observation. `open` on this row is written by
+        // the run worker and never falsified: no code path writes `lost` and
+        // none deletes a row, so a binding stays `open` for as long as the
+        // database survives. Projecting that constant as `fresh` told operators
+        // that sessions whose host exited days ago were still live. Resumability
+        // is what the row proves, so `summary` still carries it; liveness has to
+        // be earned from an observation, and the two observations that exist are
+        // the host's own `open` above and a bound run the index has not yet seen
+        // end. Without one of them the projection says `unknown` rather than
+        // inventing a confidence it cannot back.
         for session in self
             .managed_sessions
             .list()
             .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))?
         {
+            let live = host_open.contains(&session.provider_session_id)
+                || self.bound_run_is_live(&session.run_id)?;
             let record = ResourceRecord {
                 resource: ResourceCoordinate::new(
                     ResourceAuthority::Automonique,
@@ -5877,7 +5909,7 @@ impl Daemon {
                         .map_err(|_| DaemonError::PlatformStoreFailed("session_id_invalid"))?,
                 ),
                 freshness: Freshness {
-                    state: if session.open {
+                    state: if session.open && live {
                         FreshnessState::Fresh
                     } else {
                         FreshnessState::Unknown
@@ -5898,7 +5930,32 @@ impl Daemon {
         Ok(())
     }
 
-    fn platform_session_is_open(&self, session: &ResourceCoordinate) -> Result<bool, DaemonError> {
+    /// Whether the run this session is bound to has not been seen to end.
+    ///
+    /// The index is the same authority [`Self::settle_abandoned_binding`]
+    /// already trusts, and a spool refuses every append after its one terminal
+    /// event, so a terminal row is proof the turn is over. A run the index no
+    /// longer retains is not proof of anything — which is exactly why it is not
+    /// live here: a capability withheld for want of evidence is honest, and one
+    /// offered on an absence is not.
+    fn bound_run_is_live(&self, run_id: &str) -> Result<bool, DaemonError> {
+        Ok(self
+            .run_index
+            .by_run_id(run_id)
+            .map_err(index_failed)?
+            .last()
+            .is_some_and(|record| !record.spool_state.is_terminal()))
+    }
+
+    /// Whether a follow-up may still be resumed into this session.
+    ///
+    /// Deliberately weaker than [`Self::platform_session_is_live`]: resuming a
+    /// retained session is the case the managed binding exists to serve, and it
+    /// does not need a listening host.
+    fn platform_session_is_resumable(
+        &self,
+        session: &ResourceCoordinate,
+    ) -> Result<bool, DaemonError> {
         if session.authority != ResourceAuthority::Automonique
             || session.kind != ResourceKind::Session
         {
@@ -5907,6 +5964,25 @@ impl Daemon {
         self.platform
             .resource(session)
             .map(|record| record.is_some_and(|record| record.summary.as_str() == "open"))
+            .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))
+    }
+
+    /// Whether this session was observed live, which is what attaching to it
+    /// and claiming control over it both require.
+    ///
+    /// The same predicate decides the `attachable`/`controllable` a listing
+    /// offers, so the offer and the door cannot disagree: an operator is never
+    /// shown a control that the daemon would then refuse, and never refused one
+    /// it advertised.
+    fn platform_session_is_live(&self, session: &ResourceCoordinate) -> Result<bool, DaemonError> {
+        if session.authority != ResourceAuthority::Automonique
+            || session.kind != ResourceKind::Session
+        {
+            return Ok(false);
+        }
+        self.platform
+            .resource(session)
+            .map(|record| record.is_some_and(|record| session_is_live(&record)))
             .map_err(|error| DaemonError::PlatformStoreFailed(error.category()))
     }
 
@@ -6363,7 +6439,7 @@ impl Daemon {
                 if request.target.kind != ResourceKind::Session {
                     return platform_refusal(ReceiptOutcome::Rejected, "target_kind_invalid");
                 }
-                if !self.platform_session_is_open(&request.target)? {
+                if !self.platform_session_is_resumable(&request.target)? {
                     return platform_refusal(ReceiptOutcome::Rejected, "session_not_controllable");
                 }
                 if !self
@@ -9513,6 +9589,17 @@ fn telegram_renewal_disposition(
             .min(remaining_ms.saturating_sub(RENEWAL_RETRY_MARGIN_MS)),
         remaining_ms,
     }
+}
+
+/// Whether a projected session record carries evidence that it is live.
+///
+/// `summary` says what the session is for — `open` means a follow-up can still
+/// be resumed into it. `freshness` says whether anyone has observed it lately.
+/// Attaching and claiming control both act on a session *now*, so both need the
+/// second as well as the first: a record whose last observation the projection
+/// could not confirm is `unknown`, and `unknown` earns nothing.
+fn session_is_live(record: &ResourceRecord) -> bool {
+    record.summary.as_str() == "open" && record.freshness.state == FreshnessState::Fresh
 }
 
 fn platform_refusal(
