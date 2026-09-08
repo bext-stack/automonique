@@ -335,7 +335,7 @@ export class ProductionPlatformAuthority implements PlatformRunAuthority {
         ? {kind: "run_refused" as const, code: refusalCode}
         : receipt === null || receipt.outcome === "completed"
           ? {kind: "run_finished" as const}
-          : {kind: "run_refused" as const, code: "policy_refused" as const};
+          : {kind: "run_refused" as const, code: receipt.explanation === "policy_refused" ? "policy_refused" as const : "internal_failure" as const};
       const event = base(input, nativeRunId, lastProgressSequence, 7, Date.now(), terminalEvent);
       if (event.sequence <= requestedSequence) replay.push(event); else yield event;
     };
@@ -555,7 +555,9 @@ function project(
     }));
     interrupted = true;
   }
-  else if (frame.kind === "provider_fault") refusalCode = frame.body.retry?.retryable ? "internal_failure" : "policy_refused";
+  // Retryability describes recovery, not policy authority. A provider crash or
+  // startup/protocol failure must not be presented as an authorization denial.
+  else if (frame.kind === "provider_fault") refusalCode = "internal_failure";
   return {events, started, assistant, messageCompleted, deltaMode, currentTool, refusalCode, interrupted};
 }
 

@@ -99,6 +99,43 @@ describe("production Platform authority", () => {
     expect((await collect(reconnected.events)).map((event) => event.sequence)).toEqual([33, 47]);
   });
 
+  for (const [explanation, expected] of [
+    ["run_failed", "internal_failure"],
+    ["run_timed_out", "internal_failure"],
+    ["policy_refused", "policy_refused"],
+  ] as const) {
+    test(`classifies terminal ${explanation} without inventing a policy denial`, async () => {
+      const runId = `failure-${explanation}`;
+      const platform = fakePlatform();
+      const fetcher = (async (url, init) => {
+        const response = await platform.fetcher(url, init);
+        const request = JSON.parse(String(init?.body));
+        if (request.kind !== "get_receipt") return response;
+        const value = await response.json();
+        value.body = {...receipt("rejected"), explanation};
+        return Response.json(value);
+      }) as typeof fetch;
+      const authority = production(progressSocket(nativeRunIdFor(runId), []), fetcher);
+      const opened = await authority.open({input: admitted(runId), cursor: null});
+      expect(opened.kind).toBe("stream");
+      if (opened.kind !== "stream") return;
+      const events = await collect(opened.events);
+      expect(events.at(-1)).toMatchObject({kind: "run_refused", code: expected});
+      expect(translateNativeStream(events).at(-1)).toMatchObject({type: "RUN_ERROR", code: `automonique.${expected}`});
+    });
+  }
+
+  test("a non-retryable provider fault is an execution failure, not a policy decision", async () => {
+    const runId = "provider-failed";
+    const native = nativeRunIdFor(runId);
+    const frames = [progress(native, 1, "turn_started"), progress(native, 2, "provider_fault", "provider unavailable")];
+    const authority = production(progressSocket(native, frames), fakePlatform().fetcher);
+    const opened = await authority.open({input: admitted(runId), cursor: null});
+    expect(opened.kind).toBe("stream");
+    if (opened.kind !== "stream") return;
+    expect((await collect(opened.events)).at(-1)).toMatchObject({kind: "run_refused", code: "internal_failure"});
+  });
+
   test("checkpoints and projects a pending tool approval as one terminal interrupt", async () => {
     const runId = "public-run-approval";
     const native = nativeRunIdFor(runId);
