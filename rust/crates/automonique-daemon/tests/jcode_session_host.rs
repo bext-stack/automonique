@@ -96,6 +96,15 @@ fn file_sha256(path: &std::path::Path) -> String {
 
 #[test]
 fn installed_jcode_negotiates_inside_the_production_sandbox_when_configured() {
+    installed_jcode_negotiates(false);
+}
+
+#[test]
+fn installed_jcode_negotiates_with_production_identity_and_tempfs_when_configured() {
+    installed_jcode_negotiates(true);
+}
+
+fn installed_jcode_negotiates(namespaced: bool) {
     let (Some(helper), Ok(domain)) = (locate_launch_helper(), ContainmentDomain::discover()) else {
         eprintln!("[jcode_session_host] NOT PROVEN: helper or delegated cgroup unavailable");
         return;
@@ -153,19 +162,47 @@ fn installed_jcode_negotiates_inside_the_production_sandbox_when_configured() {
         .unwrap()
         .socket_grant(SocketGrant::UnixSeqPacket)
         .unwrap();
-    let host = JcodeSessionHost::spawn(
-        &helper,
-        &plan,
-        containment,
-        &root.path().join("provider-journal.sqlite3"),
-        "real-jcode-probe",
-        root.path(),
-        None,
-        None,
-        &server,
-        100,
-        Duration::from_secs(30),
-    )
+    let host = if namespaced {
+        let mountpoint = root.path().join("tmp");
+        fs::create_dir(&mountpoint).unwrap();
+        let plan = plan
+            .filesystem_grant(PathIntent::ReadWrite, &mountpoint)
+            .unwrap()
+            .environment("TMPDIR", mountpoint.as_os_str().as_encoded_bytes())
+            .unwrap()
+            .separate_workload_identity()
+            .unwrap();
+        JcodeSessionHost::spawn_with_namespaced_temporary_storage(
+            &helper,
+            &plan,
+            containment,
+            &root.path().join("provider-journal.sqlite3"),
+            "real-jcode-probe",
+            root.path(),
+            None,
+            None,
+            &server,
+            100,
+            Duration::from_secs(30),
+            &mountpoint,
+            automonique_runner::TemporaryStorageBudget::new(64 * 1024 * 1024, 16384).unwrap(),
+            &root.path().join("tempfs-ledger"),
+        )
+    } else {
+        JcodeSessionHost::spawn(
+            &helper,
+            &plan,
+            containment,
+            &root.path().join("provider-journal.sqlite3"),
+            "real-jcode-probe",
+            root.path(),
+            None,
+            None,
+            &server,
+            100,
+            Duration::from_secs(30),
+        )
+    }
     .expect("installed JCode negotiates inside enforced containment");
     assert!(!host.provider_session_id().is_empty());
     let negotiated = host.input_request_mode();

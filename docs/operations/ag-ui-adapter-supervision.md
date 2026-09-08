@@ -59,3 +59,37 @@ and retried once.
 Rollback atomically restores the previous adapter directory and restarts only
 this service. It must not restart the daemon, Manage worker, dashboard, Slack,
 or any active provider run.
+
+## Diagnosing accepted runs that fail before output
+
+A rejected terminal receipt with `run_failed` is an execution failure, not proof
+of a policy denial. The adapter reports it as `automonique.internal_failure`;
+only an explicit `policy_refused` receipt gets that classification. A provider
+fault's retryability does not establish policy authority either.
+
+Inspect the exact native run's progress and spool before changing permissions.
+Two host prerequisites can leave `/readyz` green while real analysis fails:
+
+- The separated workload identity must traverse the ancestors of the pinned
+  provider binary and private provider home. A private account directory owned
+  by a group outside the namespace's group mapping can deny traversal even
+  with the intended namespace capabilities. Where necessary, grant only
+  execute/traverse on that ancestor to the configured subordinate workload uid
+  (the last uid of the account's first subordinate range), preserving its
+  existing ACL. Do not make private credentials world-readable or disable
+  identity separation/Landlock. Verify with the installed-provider test using
+  production identity separation and namespaced temporary storage.
+- The configured OAuth provider needs both inference and credential-refresh
+  destinations. If native progress specifically reports a refused refresh
+  destination, add that exact host and port to the owner-controlled egress
+  policy. An OpenAI OAuth session may require `auth.openai.com 443 public`
+  in addition to its inference hosts. The daemon loads this policy at startup;
+  after a queues-empty restart, require a real authoritative assistant response
+  and successful terminal event. Never infer execution from readiness alone.
+
+The installed-provider integration test
+`installed_jcode_negotiates_with_production_identity_and_tempfs_when_configured`
+uses the same JCode test inputs as the existing handshake test and requires a
+`Delegate=yes` scope plus the production launch helper. Its private runtime and
+journal are disposable; it creates no model turn. Run both tests so the simpler
+protocol check cannot conceal a failure in the production filesystem boundary.
