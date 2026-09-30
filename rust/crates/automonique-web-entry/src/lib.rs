@@ -1173,7 +1173,7 @@ enum PlatformSessionActionView {
     Open {
         schema: &'static str,
         session: PlatformSessionView,
-        attachment_cursor: PlatformCursorTextView,
+        attachment_cursor: Option<PlatformCursorTextView>,
         history: PlatformSessionHistoryView,
         command: Box<PlatformSessionCommandView>,
         control: PlatformSessionControlView,
@@ -2362,36 +2362,37 @@ impl WebIntegration {
                         explanation: String::from("session_not_visible"),
                     });
                 };
-                if !session.attachable {
-                    return Ok(PlatformSessionActionView::Refused {
-                        schema,
-                        session: Some(coordinate.into()),
-                        outcome: ReceiptOutcome::Rejected.as_str(),
-                        explanation: String::from("session_not_attachable"),
-                    });
-                }
-                let attachment = match client
-                    .request(PlatformRequest::Attach(AttachRequest {
-                        session: coordinate.clone(),
-                        client: dashboard_client,
-                    }))
-                    .map_err(|_| "platform_unavailable")?
-                {
-                    PlatformResponse::Attached(attachment) if attachment.session == coordinate => {
-                        attachment
+                // Retained history and exact command state remain available after
+                // an attempt-scoped provider exits. Only attach to a live host;
+                // opening retained state never grants a control lease.
+                let attachment_cursor = if session.attachable {
+                    match client
+                        .request(PlatformRequest::Attach(AttachRequest {
+                            session: coordinate.clone(),
+                            client: dashboard_client,
+                        }))
+                        .map_err(|_| "platform_unavailable")?
+                    {
+                        PlatformResponse::Attached(attachment)
+                            if attachment.session == coordinate =>
+                        {
+                            Some(attachment.cursor.into())
+                        }
+                        PlatformResponse::Refused {
+                            outcome,
+                            explanation,
+                        } => {
+                            return Ok(PlatformSessionActionView::Refused {
+                                schema,
+                                session: Some(coordinate.into()),
+                                outcome: outcome.as_str(),
+                                explanation: explanation.into_inner(),
+                            });
+                        }
+                        _ => return Err("platform_protocol_invalid"),
                     }
-                    PlatformResponse::Refused {
-                        outcome,
-                        explanation,
-                    } => {
-                        return Ok(PlatformSessionActionView::Refused {
-                            schema,
-                            session: Some(coordinate.into()),
-                            outcome: outcome.as_str(),
-                            explanation: explanation.into_inner(),
-                        });
-                    }
-                    _ => return Err("platform_protocol_invalid"),
+                } else {
+                    None
                 };
                 let history = client
                     .session_history_snapshot(coordinate.clone(), PLATFORM_SESSION_HISTORY_LIMIT)
@@ -2405,7 +2406,7 @@ impl WebIntegration {
                 Ok(PlatformSessionActionView::Open {
                     schema,
                     session: session.into(),
-                    attachment_cursor: attachment.cursor.into(),
+                    attachment_cursor,
                     history,
                     command: Box::new(command),
                     control: PlatformSessionControlView {
@@ -7606,6 +7607,15 @@ mod tests {
 
     #[test]
     fn retained_session_cockpit_preserves_fences_resync_and_ambiguous_receipts() {
+        check_retained_session_cockpit(true);
+    }
+
+    #[test]
+    fn completed_session_opens_without_live_attachment_and_preserves_follow_up_fences() {
+        check_retained_session_cockpit(false);
+    }
+
+    fn check_retained_session_cockpit(live: bool) {
         const LARGE: u64 = 9_007_199_254_740_995;
         let state_dir = tempfile::tempdir().expect("temporary state");
         let runtime_dir = tempfile::tempdir().expect("temporary runtime");
@@ -7635,13 +7645,17 @@ mod tests {
             let record = ResourceRecord {
                 resource: session.clone(),
                 freshness: Freshness {
-                    state: FreshnessState::Fresh,
+                    state: if live {
+                        FreshnessState::Fresh
+                    } else {
+                        FreshnessState::Unknown
+                    },
                     observed_at: EpochMillis::from_millis(i64::try_from(LARGE).unwrap()),
                     revision: Revision::new(LARGE).unwrap(),
                 },
                 summary: PlatformText::new("sanitized retained conversation").unwrap(),
             };
-            for index in 0..8 {
+            for index in (0..8).filter(|index| live || *index != 1) {
                 let (mut stream, _) = platform_listener.accept().expect("platform connection");
                 let mut prefix = [0_u8; 4];
                 stream.read_exact(&mut prefix).expect("platform prefix");
@@ -7658,8 +7672,8 @@ mod tests {
                                 vec![SessionRecord {
                                     session: record.clone(),
                                     run: Some(run.clone()),
-                                    attachable: true,
-                                    controllable: true,
+                                    attachable: live,
+                                    controllable: live,
                                 }],
                                 cursor.clone(),
                             )
@@ -7796,7 +7810,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(open["state"], "open");
-        assert_eq!(open["attachment_cursor"]["sequence"], LARGE.to_string());
+        if live {
+            assert_eq!(open["attachment_cursor"]["sequence"], LARGE.to_string());
+        } else {
+            assert!(open["attachment_cursor"].is_null());
+            assert_eq!(open["session"]["session"]["freshness"], "unknown");
+        }
+        assert_eq!(open["control"]["available"], live);
         assert_eq!(open["history"]["terminal_cursor"], (LARGE + 1).to_string());
         assert_eq!(
             open["history"]["events"][0]["at_ms"],
