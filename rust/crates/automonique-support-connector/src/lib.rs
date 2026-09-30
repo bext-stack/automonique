@@ -90,9 +90,9 @@ pub use request::{
 pub use response::{
     SupportDelivery, SupportIssue, SupportIssues, SupportScope, SupportThreadRef,
     TicketDecisionOutcome, TicketDecisionReceipt, TicketDispatchReceipt, TicketJobStatus,
-    TicketStatus, TicketWorkspace, decode_support_delivery, decode_support_issues,
-    decode_support_note, decode_support_thread, decode_ticket_decision, decode_ticket_dispatch,
-    decode_ticket_status,
+    TicketQueue, TicketQueueItem, TicketStatus, TicketWorkspace, decode_support_delivery,
+    decode_support_issues, decode_support_note, decode_support_thread, decode_ticket_decision,
+    decode_ticket_dispatch, decode_ticket_queue, decode_ticket_status,
 };
 pub use token::{FleetAuthorization, FleetToken, MAX_FLEET_TOKEN_BYTES};
 

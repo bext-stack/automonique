@@ -49,6 +49,7 @@ enum WireAction {
     TicketDispatch,
     TicketDecision,
     TicketStatus,
+    TicketQueue,
 }
 
 impl WireAction {
@@ -62,6 +63,7 @@ impl WireAction {
             Self::TicketDispatch => "automonique-ticket-dispatch",
             Self::TicketDecision => "automonique-ticket-decision",
             Self::TicketStatus => "automonique-ticket-status",
+            Self::TicketQueue => "automonique-ticket-queue",
         }
     }
 }
@@ -514,6 +516,8 @@ pub enum FleetRequest {
     TicketDecision(TicketDecisionRequest),
     /// Read the resulting exact job.
     TicketStatus(TicketStatusRequest),
+    /// Read the bounded queue belonging to this configured instance.
+    TicketQueue,
 }
 
 impl FleetRequest {
@@ -527,6 +531,7 @@ impl FleetRequest {
             Self::TicketDispatch(_) => WireAction::TicketDispatch,
             Self::TicketDecision(_) => WireAction::TicketDecision,
             Self::TicketStatus(_) => WireAction::TicketStatus,
+            Self::TicketQueue => WireAction::TicketQueue,
         }
     }
 
@@ -624,6 +629,7 @@ impl FleetRequest {
                     push_json_string(&mut body, reason);
                 }
             }
+            Self::TicketQueue => {}
             Self::TicketStatus(request) => {
                 body.push_str(",\"job_id\":");
                 push_json_string(&mut body, &request.job_id);

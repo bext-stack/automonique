@@ -257,6 +257,65 @@ pub struct TicketStatus {
     pub updated_at: String,
 }
 
+/// One credential-free ticket queue entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TicketQueueItem {
+    pub job_id: String,
+    pub source_key: String,
+    pub issue_url: String,
+    pub issue_title: String,
+    pub job_status: TicketJobStatus,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TicketQueue {
+    pub items: Vec<TicketQueueItem>,
+    pub has_more: bool,
+}
+
+/// Decode only the bounded queue projection, refusing invalid issue coordinates.
+pub fn decode_ticket_queue(bytes: &[u8]) -> Result<FleetOutcome<TicketQueue>, FleetFailure> {
+    let envelope = envelope(bytes)?;
+    if !is_accepted(&envelope)? {
+        return Ok(FleetOutcome::Rejected(rejection(&envelope)));
+    }
+    let queue = envelope
+        .get("queue")
+        .and_then(Value::as_object)
+        .ok_or(FleetFailure::MissingField)?;
+    let rows = queue
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or(FleetFailure::MissingField)?;
+    if rows.len() > 50 {
+        return Err(FleetFailure::TooManyIssues);
+    }
+    let mut items = Vec::with_capacity(rows.len());
+    for item in rows {
+        let row = item.as_object().ok_or(FleetFailure::InvalidResponse)?;
+        let issue_url = nonempty(row, "issue_url", crate::MAX_TICKET_ISSUE_URL_BYTES)?;
+        let source_key = nonempty(row, "source_key", crate::MAX_TICKET_SOURCE_KEY_BYTES)?;
+        if !is_github_issue_url(&issue_url)
+            || !crate::request::is_ticket_key(&source_key, crate::MAX_TICKET_SOURCE_KEY_BYTES)
+        {
+            return Err(FleetFailure::FieldOutOfBounds);
+        }
+        items.push(TicketQueueItem {
+            job_id: nonempty(row, "job_id", crate::MAX_FLEET_IDENTIFIER_BYTES)?,
+            source_key,
+            issue_url,
+            issue_title: nonempty(row, "issue_title", 300)?,
+            job_status: ticket_status(row, "job_status")?,
+            updated_at: timestamp(row, "updated_at")?,
+        });
+    }
+    Ok(FleetOutcome::Accepted(TicketQueue {
+        items,
+        has_more: boolean(queue, "has_more")?,
+    }))
+}
+
 /// Decode a `support-issues` response.
 ///
 /// # Errors
@@ -1074,5 +1133,28 @@ mod tests {
             decode_ticket_decision(unsafe_rejection),
             Err(FleetFailure::FieldOutOfBounds)
         );
+    }
+}
+
+#[cfg(test)]
+mod mobile_queue_tests {
+    use super::*;
+    #[test]
+    fn queue_decode_rejects_overflow_foreign_urls_and_unknown_states() {
+        let item = serde_json::json!({"job_id":"job-a","source_key":"slack:fixture","issue_url":"https://github.com/example/repo/issues/1","issue_title":"Fixture","job_status":"pending_approval","updated_at":"2026-09-30T12:00:00Z"});
+        let encode = |items: Vec<Value>| {
+            serde_json::to_vec(
+                &serde_json::json!({"ok":true,"queue":{"items":items,"has_more":false}}),
+            )
+            .unwrap()
+        };
+        assert!(decode_ticket_queue(&encode(vec![item.clone()])).is_ok());
+        assert!(decode_ticket_queue(&encode(vec![item.clone(); 51])).is_err());
+        let mut foreign = item.clone();
+        foreign["issue_url"] = serde_json::json!("https://attacker.invalid/issues/1");
+        assert!(decode_ticket_queue(&encode(vec![foreign])).is_err());
+        let mut invalid = item;
+        invalid["job_status"] = serde_json::json!("secret-new-state");
+        assert!(decode_ticket_queue(&encode(vec![invalid])).is_err());
     }
 }

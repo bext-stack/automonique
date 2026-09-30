@@ -34,7 +34,7 @@ pub const MOBILE_AUTH_MEDIA_TYPE: &str = "application/vnd.automonique.mobile-aut
 pub const MOBILE_PLATFORM_V2_AUTH_SCHEMA: &str = "automonique.mobile-platform-v2-authorization/v1";
 pub const MOBILE_PLATFORM_V2_AUTH_MEDIA_TYPE: &str =
     "application/vnd.automonique.mobile-platform-v2-authorization.v1+json";
-pub const MAX_MOBILE_ACTIONS: usize = 5;
+pub const MAX_MOBILE_ACTIONS: usize = 6;
 pub const MAX_MOBILE_PLATFORM_V2_ACTIONS: usize = MobilePlatformV2Action::ALL.len();
 pub const MAX_MOBILE_V2_PROJECT_ROOTS: usize = 32;
 const MAX_MOBILE_V2_RECEIPT_CUSTODY: usize = 128;
@@ -80,6 +80,13 @@ CREATE TABLE IF NOT EXISTS mobile_credentials (
   sessions_json TEXT NOT NULL CHECK(length(sessions_json) BETWEEN 2 AND 26000),
   max_page_events INTEGER NOT NULL CHECK(max_page_events BETWEEN 1 AND 512),
   max_follow_up_bytes INTEGER NOT NULL CHECK(max_follow_up_bytes BETWEEN 1 AND 65536)
+) STRICT;
+CREATE TABLE IF NOT EXISTS mobile_work_requests (
+  credential_id TEXT NOT NULL,
+  request_key TEXT NOT NULL,
+  request_sha256 TEXT NOT NULL CHECK(length(request_sha256)=64),
+  PRIMARY KEY(credential_id,request_key),
+  FOREIGN KEY(credential_id) REFERENCES mobile_credentials(credential_id) ON DELETE CASCADE
 ) STRICT;
 CREATE TABLE IF NOT EXISTS mobile_tasks (
   credential_id TEXT NOT NULL,
@@ -195,6 +202,7 @@ pub enum MobileAction {
     DecideApproval,
     StopRun,
     StartTask,
+    ManageWork,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -772,6 +780,51 @@ impl MobileCredentialAuthority {
             params![authorization.credential_id,key,node,request_sha256])?;
         tx.commit()?;
         Ok(true)
+    }
+
+    pub(crate) fn bind_work_request(
+        &mut self,
+        auth: &MobileAuthorization,
+        key: &str,
+        fingerprint: &str,
+        now: i64,
+    ) -> Result<(), MobileAuthError> {
+        if !auth.allows(MobileAction::ManageWork) {
+            return Err(MobileAuthError::InvalidCredential);
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let live: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mobile_credentials WHERE credential_id=?1 AND credential_revision=?2 AND authorization_revision=?3 AND revoked_at_ms IS NULL AND access_expires_at_ms>?4)",
+            params![auth.credential_id,auth.credential_revision,auth.authorization_revision,now], |row| row.get(0))?;
+        if !live {
+            return Err(MobileAuthError::InvalidCredential);
+        }
+        let previous: Option<String> = tx.query_row(
+            "SELECT request_sha256 FROM mobile_work_requests WHERE credential_id=?1 AND request_key=?2",
+            params![auth.credential_id,key], |row| row.get(0)).optional()?;
+        if let Some(previous) = previous {
+            return if previous == fingerprint {
+                Ok(())
+            } else {
+                Err(MobileAuthError::InvalidRequest)
+            };
+        }
+        let count: usize = tx.query_row(
+            "SELECT COUNT(*) FROM mobile_work_requests WHERE credential_id=?1",
+            params![auth.credential_id],
+            |row| row.get(0),
+        )?;
+        if count >= 512 {
+            return Err(MobileAuthError::InvalidRequest);
+        }
+        tx.execute(
+            "INSERT INTO mobile_work_requests VALUES(?1,?2,?3)",
+            params![auth.credential_id, key, fingerprint],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn require_task_credential(
@@ -2698,6 +2751,41 @@ mod tests {
                 max_follow_up_bytes: 4096,
             },
         }
+    }
+
+    #[test]
+    fn work_requests_require_a_live_explicit_grant_and_bind_exact_payloads() {
+        let (_root, mut authority) = authority();
+        let read_only = authority.operator_provision(request(), NOW).unwrap();
+        let hash = "a".repeat(64);
+        assert!(
+            authority
+                .bind_work_request(&read_only.authorization, "key", &hash, NOW)
+                .is_err()
+        );
+        let mut provision = request();
+        provision.actions.push(MobileAction::ManageWork);
+        let owner = authority.operator_provision(provision, NOW).unwrap();
+        authority
+            .bind_work_request(&owner.authorization, "key", &hash, NOW)
+            .unwrap();
+        authority
+            .bind_work_request(&owner.authorization, "key", &hash, NOW)
+            .unwrap();
+        assert!(
+            authority
+                .bind_work_request(&owner.authorization, "key", &"b".repeat(64), NOW)
+                .is_err()
+        );
+        let mut token = owner.refresh_token.clone();
+        authority
+            .revoke(&mut token, &owner.authorization.server_identity, NOW + 1)
+            .unwrap();
+        assert!(
+            authority
+                .bind_work_request(&owner.authorization, "key", &hash, NOW + 2)
+                .is_err()
+        );
     }
 
     #[test]

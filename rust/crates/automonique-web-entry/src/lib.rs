@@ -5,6 +5,7 @@
 mod agent_auth;
 mod mobile_auth;
 mod mobile_task;
+mod mobile_work;
 mod platform_cockpit;
 mod platform_task;
 mod platform_v2_bridge;
@@ -166,6 +167,7 @@ pub enum Route {
     ApiPlatformSession,
     ApiPlatformTask,
     MobileTask,
+    MobileWork,
     ApiPlatformRemote,
     ApiPlatformV2Remote,
     MobileDiscovery,
@@ -5573,6 +5575,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 "/api/platform/session" => Route::ApiPlatformSession,
                 "/api/platform/task" => Route::ApiPlatformTask,
                 "/api/mobile/task" => Route::MobileTask,
+                "/api/mobile/work" => Route::MobileWork,
                 "/api/platform/v2" => Route::ApiPlatformV2Remote,
                 "/api/mobile/operator-provision" => Route::MobileOperatorProvision,
                 "/api/mobile/pairings" => Route::MobilePairingCreate,
@@ -5605,6 +5608,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                     | Route::ApiPlatformSession
                     | Route::ApiPlatformTask
                     | Route::MobileTask
+                    | Route::MobileWork
                     | Route::ApiPlatformRemote
                     | Route::ApiPlatformV2Remote
                     | Route::MobileOperatorProvision
@@ -6068,6 +6072,7 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         | Route::ApiPlatformSession
         | Route::ApiPlatformTask
         | Route::MobileTask
+        | Route::MobileWork
         | Route::ApiPlatformRemote
         | Route::ApiPlatformV2Remote
         | Route::ApiProcesses
@@ -6202,6 +6207,25 @@ fn api_response(
                 Err(_) => json_error("400 Bad Request", "invalid_json"),
             }
         }
+        Route::MobileWork => match mobile_authorization {
+            None => mobile_error("401 Unauthorized", "mobile_credential_invalid"),
+            Some(authorization) => match serde_json::from_slice::<mobile_work::WorkRequest>(body) {
+                Err(_) => mobile_error("400 Bad Request", "mobile_work_request_invalid"),
+                Ok(request) => match mobile_work::execute(integration, authorization, request) {
+                    Ok(view) => mobile_response("200 OK", &view),
+                    Err("mobile_work_unauthorized") => {
+                        mobile_error("403 Forbidden", "mobile_work_unauthorized")
+                    }
+                    Err("mobile_work_request_invalid") => {
+                        mobile_error("400 Bad Request", "mobile_work_request_invalid")
+                    }
+                    Err("mobile_work_refused") => {
+                        mobile_error("409 Conflict", "mobile_work_refused")
+                    }
+                    Err(category) => mobile_error("503 Service Unavailable", category),
+                },
+            },
+        },
         Route::MobileTask => match mobile_authorization {
             None => mobile_error("401 Unauthorized", "mobile_credential_invalid"),
             Some(authorization) => match serde_json::from_slice::<platform_task::TaskRequest>(body)
@@ -6676,6 +6700,7 @@ fn handle(
                         | Route::MobileRevoke
                         | Route::MobileAuthorization
                         | Route::MobileTask
+                        | Route::MobileWork
                         | Route::MobilePlatformV2Grant
                         | Route::MobilePlatformV2Authorization
                 );
@@ -6697,13 +6722,13 @@ fn handle(
                 let session_authorized = auth.authorize_session(request.cookie);
                 let mobile_authorization = (remote_platform
                     || requested_route == Route::MobileAuthorization
-                    || requested_route == Route::MobileTask)
-                    .then(|| {
-                        integration.and_then(|integration| {
-                            integration.mobile_authorization(request.authorization).ok()
-                        })
+                    || matches!(requested_route, Route::MobileTask | Route::MobileWork))
+                .then(|| {
+                    integration.and_then(|integration| {
+                        integration.mobile_authorization(request.authorization).ok()
                     })
-                    .flatten();
+                })
+                .flatten();
                 let mobile_platform_v2_authorization = (platform_v2
                     || requested_route == Route::MobilePlatformV2Authorization)
                     .then(|| {
@@ -6714,28 +6739,30 @@ fn handle(
                         })
                     })
                     .flatten();
-                let mobile_access_presented =
-                    (remote_platform || platform_v2 || requested_route == Route::MobileTask)
-                        && presents_mobile_access_token(request.authorization);
+                let mobile_access_presented = (remote_platform
+                    || platform_v2
+                    || matches!(requested_route, Route::MobileTask | Route::MobileWork))
+                    && presents_mobile_access_token(request.authorization);
                 let route_mobile_authorized = if platform_v2 {
                     mobile_platform_v2_authorization.is_some()
                 } else {
                     mobile_authorization.is_some()
                 };
-                let bearer_authorized = (requested_route == Route::MobileTask
-                    && mobile_authorization.is_some())
-                    || remote_platform
-                        && authorize_remote_bearer(
-                            request.authorization,
-                            mobile_authorization.is_some(),
-                            || {
-                                integration.is_some_and(|integration| {
-                                    integration
-                                        .manage
-                                        .authorize_platform_bearer(request.authorization)
-                                })
-                            },
-                        );
+                let bearer_authorized =
+                    (matches!(requested_route, Route::MobileTask | Route::MobileWork)
+                        && mobile_authorization.is_some())
+                        || remote_platform
+                            && authorize_remote_bearer(
+                                request.authorization,
+                                mobile_authorization.is_some(),
+                                || {
+                                    integration.is_some_and(|integration| {
+                                        integration
+                                            .manage
+                                            .authorize_platform_bearer(request.authorization)
+                                    })
+                                },
+                            );
                 let credentials_authorized = request_credentials_authorized(
                     mobile_access_presented,
                     route_mobile_authorized,
@@ -6752,7 +6779,9 @@ fn handle(
                 );
                 let route = if !state.admit() {
                     Route::RateLimited
-                } else if requested_route == Route::MobileTask && mobile_authorization.is_none() {
+                } else if matches!(requested_route, Route::MobileTask | Route::MobileWork)
+                    && mobile_authorization.is_none()
+                {
                     Route::MobileAccessUnauthorized
                 } else if manage_chat_route && !manage_chat_auth.authorize(request.authorization) {
                     Route::ManageUnauthorized
@@ -6860,6 +6889,7 @@ fn handle(
             | Route::ApiPlatformSession
             | Route::ApiPlatformTask
             | Route::MobileTask
+            | Route::MobileWork
             | Route::ApiPlatformRemote
             | Route::ApiPlatformV2Remote
             | Route::ApiProcesses
@@ -11066,6 +11096,30 @@ mod tests {
             );
         }
         let get = request("GET", "/api/mobile/task", CANONICAL_HOST);
+        assert_eq!(
+            route(&parse_request(&get).unwrap(), &fixture_hosts()),
+            Route::MethodNotAllowed
+        );
+    }
+
+    #[test]
+    fn mobile_work_is_post_only_and_never_falls_back_to_operator_basic_auth() {
+        for auth in [
+            "",
+            "Authorization: Bearer untrusted\r\n",
+            "Authorization: Basic b3BlcmF0b3I6c2VjcmV0\r\n",
+        ] {
+            let request = format!(
+                "POST /api/mobile/work HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nX-Forwarded-Proto: https\r\n{auth}Content-Type: application/json\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{{\"action\":\"channel\"}}"
+            );
+            let response =
+                String::from_utf8(exchange_without_integration(request.as_bytes())).unwrap();
+            assert!(
+                response.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+                "{response}"
+            );
+        }
+        let get = request("GET", "/api/mobile/work", CANONICAL_HOST);
         assert_eq!(
             route(&parse_request(&get).unwrap(), &fixture_hosts()),
             Route::MethodNotAllowed

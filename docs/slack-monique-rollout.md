@@ -137,3 +137,33 @@ original Block Kit message without action buttons.
 Rollback is a private atomic rewrite to the v1 frame followed by the repository
 documented safe reload. Existing Manage decisions remain authoritative; a
 rollback must never resurrect a cancelled gate.
+
+## Mobile channel and ticket queue
+
+The mobile `manage_work` grant is opt-in when pairing a phone. It allows reading
+one operator-configured Slack channel and submitting, approving or rejecting
+GitHub-linked tickets on this server's configured Manage instance. It does not
+send Slack messages or change a user's Slack workspace membership. Existing
+credentials retain their old grants. An operator must deliberately pair a new
+phone with this permission; an email address alone never grants access.
+
+Create an owner-only, mode `0600` `<state>/mobile-work.json` binding:
+
+```json
+{"channel":"configured-channel-label","display_name":"channel-name"}
+```
+
+`channel` must already appear in `slack/slack.conf`. The app shows a bounded
+recent-message view, not a complete Slack archive. Manage remains authoritative
+for job state. Queue reads return up to 50 recently updated GitHub-linked
+Automonique jobs belonging to the configured instance and tenant; `has_more`
+reports truncation. The support endpoint requires the existing staff token.
+
+`POST /api/mobile/work` is mobile-bearer-only and requires `manage_work` for
+all requests. It accepts `channel`, `snapshot`, `dispatch` and `decide` actions.
+The phone never supplies an instance, tenant, actor, Slack ID or service token.
+Dispatch creates a pending gate, and a separate confirmed approval releases it.
+Rejection requires a reason. Mutation keys are bound durably to the credential
+and exact payload before contacting Manage. A phone retains an uncertain request
+and can explicitly retry that same key; it never queues actions offline or
+retries automatically. Decisions are audited under the issuing mobile credential.

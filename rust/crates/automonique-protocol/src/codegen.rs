@@ -7019,7 +7019,7 @@ fn mobile_auth_module() -> GeneratedModule {
             Constant {
                 name: "MAX_MOBILE_ACTIONS".to_owned(),
                 doc: "Maximum independently granted mobile actions.".to_owned(),
-                value: ConstantValue::Count(5),
+                value: ConstantValue::Count(6),
             },
             Constant {
                 name: "MAX_MOBILE_SESSIONS".to_owned(),
@@ -7180,6 +7180,7 @@ fn mobile_auth_module() -> GeneratedModule {
                 "follow_up".to_owned(),
                 "stop_run".to_owned(),
                 "start_task".to_owned(),
+                "manage_work".to_owned(),
             ],
             wire_order: None,
         }],

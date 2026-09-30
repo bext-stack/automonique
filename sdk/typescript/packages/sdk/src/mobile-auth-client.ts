@@ -52,6 +52,8 @@ import {
 } from "./mobile-platform-v2-authorization.js";
 
 import {encodeMobileTaskRequest, decodeMobileTaskView, type MobileTaskRequest, type MobileTaskView} from "./mobile-task.js";
+import {encodeMobileWorkRequest, decodeMobileWorkView, type MobileWorkRequest, type MobileWorkView} from "./mobile-work.js";
+export type {MobileWorkRequest, MobileWorkView, MobileWorkTicket} from "./mobile-work.js";
 export type {MobileTaskRequest, MobileTaskView, MobileTaskOutcome} from "./mobile-task.js";
 
 export type {
@@ -537,6 +539,13 @@ export class MobileLifecycleClient {
   async task(accessToken: string, request: MobileTaskRequest, signal?: AbortSignal): Promise<MobileTaskView> {
     return this.request(`${this.discovery.origin}/api/mobile/task`, encodeMobileTaskRequest(request),
       (value) => decodeMobileTaskView(value, request),
+      {authorization: `Bearer ${MobileAccessToken(accessToken)}`}, 200, signal);
+  }
+
+  /** Read the configured channel or manage this instance's ticket queue. Requires manage_work. */
+  async work(accessToken: string, request: MobileWorkRequest, signal?: AbortSignal): Promise<MobileWorkView> {
+    return this.request(`${this.discovery.origin}/api/mobile/work`, encodeMobileWorkRequest(request),
+      (value) => decodeMobileWorkView(value, request),
       {authorization: `Bearer ${MobileAccessToken(accessToken)}`}, 200, signal);
   }
 
