@@ -2274,6 +2274,8 @@ fn managed_jcode_follow_up_attaches_the_exact_provider_session() {
         "*'\"req\":\"create_session\"'*) answer=JCODE-NEW-OK ;; ",
         "*'\"req\":\"attach_session\"'*'jcode-resume-session'*) answer=JCODE-RESUME-OK ;; ",
         "*) exit 9 ;; esac; ",
+        r#"case "$request" in *'"working_dir":"'"$PWD"'"'*) ;; *) exit 10 ;; esac; "#,
+        r#"printf '%s' "$answer" > "$PWD/workspace-proof.txt"; "#,
         "printf '%s\\n' '",
         "{\"v\":1,\"reply_to\":2,\"ev\":\"attached\",\"session\":{\"session_id\":\"jcode-resume-session\",\"status\":\"idle\"}}'; ",
         "IFS= read -r request; printf '%s\\n' ",
@@ -2310,6 +2312,22 @@ fn managed_jcode_follow_up_attaches_the_exact_provider_session() {
         .expect("resumed managed JCode turn"),
         "JCODE-RESUME-OK"
     );
+    for (run, expected) in [
+        ("managed-jcode-new-1", "JCODE-NEW-OK"),
+        ("managed-jcode-follow-1", "JCODE-RESUME-OK"),
+    ] {
+        assert_eq!(
+            std::fs::read_to_string(
+                fixture
+                    .state_dir()
+                    .join("runs")
+                    .join(run)
+                    .join("workspace/workspace-proof.txt")
+            )
+            .expect("turn wrote its own workspace"),
+            expected
+        );
+    }
     serving.shutdown(&fixture.config);
 }
 

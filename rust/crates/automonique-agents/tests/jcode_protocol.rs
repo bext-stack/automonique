@@ -61,6 +61,41 @@ fn with_input_capability(capability: &str) -> Vec<&str> {
     capabilities
 }
 
+// Black-box api-stdio observation of the maintained harness: attaching with
+// working_dir changes the returned session directory without changing its ID.
+#[test]
+fn retained_attachment_carries_the_new_workspace_as_protocol_data() {
+    let request = JcodeRequest::AttachSession {
+        session_id: "retained-1".into(),
+        working_dir: Some("/workspaces/next turn".into()),
+    };
+    let encoded = encode_jcode_request(2, &request).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(value["req"], "attach_session");
+    assert_eq!(value["session_id"], "retained-1");
+    assert_eq!(value["working_dir"], "/workspaces/next turn");
+    assert_eq!(
+        encode_jcode_request(
+            2,
+            &JcodeRequest::AttachSession {
+                session_id: "retained-1".into(),
+                working_dir: Some(String::new()),
+            }
+        ),
+        Err(JcodeProtocolError::InvalidField("working_dir"))
+    );
+    let legacy = encode_jcode_request(
+        2,
+        &JcodeRequest::AttachSession {
+            session_id: "retained-1".into(),
+            working_dir: None,
+        },
+    )
+    .unwrap();
+    let legacy: serde_json::Value = serde_json::from_slice(&legacy).unwrap();
+    assert!(legacy.get("working_dir").is_none());
+}
+
 #[test]
 fn typed_requests_are_single_protocol_v1_frames() {
     let request = JcodeRequest::SendMessage {
