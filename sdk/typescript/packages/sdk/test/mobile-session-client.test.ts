@@ -321,3 +321,10 @@ describe("mobile session client", () => {
     })).resolves.toMatchObject({action: "follow_up", target: session});
   });
 });
+
+
+test("task-enabled credentials retain session operations without admitting unknown grants", () => {
+  const transport: PlatformAdapter = {async request() { throw new Error("no network expected"); }};
+  expect(() => new MobileSessionClient(transport, authorization(["attach", "follow_up", "start_task"]), identity, clock)).not.toThrow();
+  expect(() => new MobileSessionClient(transport, {...authorization(), actions: ["unexpected" as MobileAction]}, identity, clock)).toThrow(MobileSessionError);
+});
