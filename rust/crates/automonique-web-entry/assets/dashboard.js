@@ -5181,8 +5181,8 @@ async function pairingLoadSessions() {
     const view = await api("/api/mobile/pairing-sessions");
     const sessions = Array.isArray(view.sessions) ? view.sessions : [];
     if (sessions.length === 0) {
-      pairingSetStatus("No session exists yet, so an invite would reach nothing. Run a task first.", "error");
-      byId("pairing-create").disabled = true;
+      pairingSetStatus("No session exists yet. Enable task creation to let this phone start one.");
+      byId("pairing-create").disabled = !byId("pairing-start-task").checked;
       return;
     }
     for (const entry of sessions) {
@@ -5195,7 +5195,7 @@ async function pairingLoadSessions() {
       option.setAttribute("data-i18n-skip", "");
       select.append(option);
     }
-    byId("pairing-create").disabled = select.options.length === 0;
+    byId("pairing-create").disabled = select.options.length === 0 && !byId("pairing-start-task").checked;
     pairingSetStatus("");
   } catch (error) {
     byId("pairing-create").disabled = true;
@@ -5206,7 +5206,7 @@ async function pairingLoadSessions() {
 async function pairingCreate() {
   const button = byId("pairing-create");
   const scope = Array.from(byId("pairing-sessions").selectedOptions, (option) => option.value);
-  if (scope.length === 0) {
+  if (scope.length === 0 && !byId("pairing-start-task").checked) {
     // session_scope is an allowlist, not a filter: an empty one reaches nothing.
     pairingSetStatus("Select at least one session. A phone can only reach the sessions named here.", "error");
     return;
@@ -5219,7 +5219,7 @@ async function pairingCreate() {
       method: "POST",
       headers: { "Content-Type": "application/vnd.automonique.mobile-auth.v1+json" },
       body: JSON.stringify({
-        actions: ["attach", "follow_up", "decide_approval", "stop_run"],
+        actions: ["attach", "follow_up", "decide_approval", "stop_run", ...(byId("pairing-start-task").checked ? ["start_task"] : [])],
         session_scope: scope,
         limits: { max_follow_up_bytes: 65536, max_page_events: 100 },
       }),
@@ -5285,3 +5285,5 @@ document.addEventListener("click", (event) => {
   if (event.target.closest("#pairing-panel, #pairing-open")) return;
   pairingOpen(false);
 });
+
+byId("pairing-start-task").addEventListener("change", () => { byId("pairing-create").disabled = byId("pairing-sessions").options.length === 0 && !byId("pairing-start-task").checked; });

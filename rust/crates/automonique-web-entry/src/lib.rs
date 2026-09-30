@@ -4,6 +4,7 @@
 
 mod agent_auth;
 mod mobile_auth;
+mod mobile_task;
 mod platform_cockpit;
 mod platform_task;
 mod platform_v2_bridge;
@@ -164,6 +165,7 @@ pub enum Route {
     ApiPlatformCockpit,
     ApiPlatformSession,
     ApiPlatformTask,
+    MobileTask,
     ApiPlatformRemote,
     ApiPlatformV2Remote,
     MobileDiscovery,
@@ -5570,6 +5572,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 "/api/platform/cockpit" => Route::ApiPlatformCockpit,
                 "/api/platform/session" => Route::ApiPlatformSession,
                 "/api/platform/task" => Route::ApiPlatformTask,
+                "/api/mobile/task" => Route::MobileTask,
                 "/api/platform/v2" => Route::ApiPlatformV2Remote,
                 "/api/mobile/operator-provision" => Route::MobileOperatorProvision,
                 "/api/mobile/pairings" => Route::MobilePairingCreate,
@@ -5601,6 +5604,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                     | Route::ApiPlatformCockpit
                     | Route::ApiPlatformSession
                     | Route::ApiPlatformTask
+                    | Route::MobileTask
                     | Route::ApiPlatformRemote
                     | Route::ApiPlatformV2Remote
                     | Route::MobileOperatorProvision
@@ -6063,6 +6067,7 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         | Route::ApiPlatformCockpit
         | Route::ApiPlatformSession
         | Route::ApiPlatformTask
+        | Route::MobileTask
         | Route::ApiPlatformRemote
         | Route::ApiPlatformV2Remote
         | Route::ApiProcesses
@@ -6197,6 +6202,23 @@ fn api_response(
                 Err(_) => json_error("400 Bad Request", "invalid_json"),
             }
         }
+        Route::MobileTask => match mobile_authorization {
+            None => mobile_error("401 Unauthorized", "mobile_credential_invalid"),
+            Some(authorization) => match serde_json::from_slice::<platform_task::TaskRequest>(body)
+            {
+                Err(_) => mobile_error("400 Bad Request", "mobile_task_request_invalid"),
+                Ok(request) => match mobile_task::execute(integration, authorization, request) {
+                    Ok(view) => mobile_response("200 OK", &view),
+                    Err("mobile_task_unauthorized") => {
+                        mobile_error("403 Forbidden", "mobile_task_unauthorized")
+                    }
+                    Err("mobile_task_request_invalid") => {
+                        mobile_error("400 Bad Request", "mobile_task_request_invalid")
+                    }
+                    Err(category) => mobile_error("503 Service Unavailable", category),
+                },
+            },
+        },
         Route::ApiPlatformTask => {
             match serde_json::from_slice::<platform_task::TaskRequest>(body) {
                 Ok(request) => match integration.platform.lock() {
@@ -6653,6 +6675,7 @@ fn handle(
                         | Route::MobileRefresh
                         | Route::MobileRevoke
                         | Route::MobileAuthorization
+                        | Route::MobileTask
                         | Route::MobilePlatformV2Grant
                         | Route::MobilePlatformV2Authorization
                 );
@@ -6673,7 +6696,8 @@ fn handle(
                 let basic_authorized = auth.authorize(request.authorization);
                 let session_authorized = auth.authorize_session(request.cookie);
                 let mobile_authorization = (remote_platform
-                    || requested_route == Route::MobileAuthorization)
+                    || requested_route == Route::MobileAuthorization
+                    || requested_route == Route::MobileTask)
                     .then(|| {
                         integration.and_then(|integration| {
                             integration.mobile_authorization(request.authorization).ok()
@@ -6690,25 +6714,28 @@ fn handle(
                         })
                     })
                     .flatten();
-                let mobile_access_presented = (remote_platform || platform_v2)
-                    && presents_mobile_access_token(request.authorization);
+                let mobile_access_presented =
+                    (remote_platform || platform_v2 || requested_route == Route::MobileTask)
+                        && presents_mobile_access_token(request.authorization);
                 let route_mobile_authorized = if platform_v2 {
                     mobile_platform_v2_authorization.is_some()
                 } else {
                     mobile_authorization.is_some()
                 };
-                let bearer_authorized = remote_platform
-                    && authorize_remote_bearer(
-                        request.authorization,
-                        mobile_authorization.is_some(),
-                        || {
-                            integration.is_some_and(|integration| {
-                                integration
-                                    .manage
-                                    .authorize_platform_bearer(request.authorization)
-                            })
-                        },
-                    );
+                let bearer_authorized = (requested_route == Route::MobileTask
+                    && mobile_authorization.is_some())
+                    || remote_platform
+                        && authorize_remote_bearer(
+                            request.authorization,
+                            mobile_authorization.is_some(),
+                            || {
+                                integration.is_some_and(|integration| {
+                                    integration
+                                        .manage
+                                        .authorize_platform_bearer(request.authorization)
+                                })
+                            },
+                        );
                 let credentials_authorized = request_credentials_authorized(
                     mobile_access_presented,
                     route_mobile_authorized,
@@ -6725,6 +6752,8 @@ fn handle(
                 );
                 let route = if !state.admit() {
                     Route::RateLimited
+                } else if requested_route == Route::MobileTask && mobile_authorization.is_none() {
+                    Route::MobileAccessUnauthorized
                 } else if manage_chat_route && !manage_chat_auth.authorize(request.authorization) {
                     Route::ManageUnauthorized
                 } else if operator_mobile && !basic_authorized {
@@ -6830,6 +6859,7 @@ fn handle(
             | Route::ApiPlatformCockpit
             | Route::ApiPlatformSession
             | Route::ApiPlatformTask
+            | Route::MobileTask
             | Route::ApiPlatformRemote
             | Route::ApiPlatformV2Remote
             | Route::ApiProcesses
@@ -6995,6 +7025,135 @@ mod tests {
 
     fn fixture_hosts() -> DashboardHosts {
         DashboardHosts::new(CANONICAL_HOST, LEGACY_HOST).expect("fixture hosts")
+    }
+
+    #[test]
+    fn mobile_task_lost_reply_reconciles_once_and_grants_only_its_device_the_new_session() {
+        use crate::mobile_auth::MobileAction;
+        use crate::platform_task::TaskRequest;
+        let state_dir = tempfile::tempdir().unwrap();
+        let runtime_dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(state_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(runtime_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let integration = WebIntegration::open(
+            IntegrationConfig {
+                tenant: "operator".into(),
+                actor: "operator:mobile-task-test".into(),
+                hosts: fixture_hosts(),
+            },
+            state_dir.path(),
+            runtime_dir.path(),
+        )
+        .unwrap();
+        let provision = || MobileOperatorProvisionRequest {
+            actions: vec![
+                MobileAction::Attach,
+                MobileAction::FollowUp,
+                MobileAction::StartTask,
+            ],
+            session_scope: vec![],
+            limits: mobile_auth::MobileLimits {
+                max_page_events: 64,
+                max_follow_up_bytes: 8192,
+            },
+        };
+        let owner = integration
+            .mobile_auth
+            .lock()
+            .unwrap()
+            .operator_provision(provision(), now_ms_i64())
+            .unwrap();
+        let other = integration
+            .mobile_auth
+            .lock()
+            .unwrap()
+            .operator_provision(provision(), now_ms_i64())
+            .unwrap();
+        let listener = UnixListener::bind(runtime_dir.path().join("admin.sock")).unwrap();
+        let server = thread::spawn(move || {
+            let mut key = String::new();
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut prefix = [0; 4];
+                stream.read_exact(&mut prefix).unwrap();
+                let mut payload = vec![0; u32::from_be_bytes(prefix) as usize];
+                stream.read_exact(&mut payload).unwrap();
+                let message = PlatformRequestMessage::from_canonical_bytes(&payload).unwrap();
+                if index == 0 {
+                    let PlatformRequest::Execute(request) = message.request() else {
+                        panic!("expected submit")
+                    };
+                    assert_eq!(request.action, PlatformAction::SubmitRequest);
+                    key = request.idempotency_key.as_str().to_owned();
+                    assert_ne!(key, "same-client-key");
+                    continue; // Accepted by authority; response deliberately lost.
+                }
+                let PlatformRequest::GetReceipt(request) = message.request() else {
+                    panic!("must reconcile, never replay")
+                };
+                assert_eq!(request.idempotency_key.as_ref().unwrap().as_str(), key);
+                let response = PlatformResponse::Receipt(ActionReceipt {
+                    id: ReceiptId::new("mobile-task-receipt").unwrap(),
+                    action: PlatformAction::SubmitRequest,
+                    target: ResourceCoordinate::new(
+                        ResourceAuthority::Automonique,
+                        ResourceKind::Node,
+                        ResourceId::new("daemon-task").unwrap(),
+                    ),
+                    outcome: ReceiptOutcome::Completed,
+                    revision: Revision::FIRST,
+                    recorded_at: EpochMillis::from_millis(1),
+                    explanation: Some(
+                        PlatformText::new("run=task-run;session=task-created-session").unwrap(),
+                    ),
+                });
+                let encoded = PlatformResponseMessage::new(message.request_id().clone(), response)
+                    .to_message()
+                    .unwrap()
+                    .to_canonical_bytes();
+                stream
+                    .write_all(&(encoded.len() as u32).to_be_bytes())
+                    .unwrap();
+                stream.write_all(&encoded).unwrap();
+            }
+        });
+        let submit = || TaskRequest::Submit {
+            node_id: "daemon-task".into(),
+            expected_revision: "1".into(),
+            idempotency_key: "same-client-key".into(),
+            text: "write a script".into(),
+        };
+        let uncertain = mobile_task::execute(&integration, &owner.authorization, submit()).unwrap();
+        assert_eq!(uncertain["state"], "ambiguous");
+        assert!(
+            mobile_task::execute(
+                &integration,
+                &other.authorization,
+                TaskRequest::Reconcile {
+                    node_id: "daemon-task".into(),
+                    idempotency_key: "same-client-key".into()
+                }
+            )
+            .is_err()
+        );
+        let completed = mobile_task::execute(&integration, &owner.authorization, submit()).unwrap();
+        assert_eq!(completed["session_id"], "task-created-session");
+        let token = format!("Bearer {}", owner.access_token);
+        assert!(
+            integration
+                .mobile_authorization(Some(&token))
+                .unwrap()
+                .allows_session("task-created-session")
+        );
+        let token = format!("Bearer {}", other.access_token);
+        assert!(
+            !integration
+                .mobile_authorization(Some(&token))
+                .unwrap()
+                .allows_session("task-created-session")
+        );
+        server.join().unwrap();
     }
 
     #[test]
@@ -10887,6 +11046,30 @@ mod tests {
                 assert_eq!(document["provenance"], "unknown", "{document}");
             }
         }
+    }
+
+    #[test]
+    fn mobile_task_is_post_only_and_never_falls_back_to_operator_basic_auth() {
+        for auth in [
+            "",
+            "Authorization: Bearer untrusted\r\n",
+            "Authorization: Basic b3BlcmF0b3I6c2VjcmV0\r\n",
+        ] {
+            let request = format!(
+                "POST /api/mobile/task HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nX-Forwarded-Proto: https\r\n{auth}Content-Type: application/json\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{{\"action\":\"prepare\"}}"
+            );
+            let response =
+                String::from_utf8(exchange_without_integration(request.as_bytes())).unwrap();
+            assert!(
+                response.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+                "{response}"
+            );
+        }
+        let get = request("GET", "/api/mobile/task", CANONICAL_HOST);
+        assert_eq!(
+            route(&parse_request(&get).unwrap(), &fixture_hosts()),
+            Route::MethodNotAllowed
+        );
     }
 
     #[test]
