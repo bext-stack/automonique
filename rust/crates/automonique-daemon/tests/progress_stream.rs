@@ -394,6 +394,17 @@ mod jcode_normalization {
     }
 
     #[test]
+    fn anonymous_input_does_not_invent_authoritative_tool_progress() {
+        let mut mapper = JcodeProgressMapper::new(false);
+        let frames = mapper.push(b"{\"v\":1,\"ev\":\"tool_input_delta\",\"session_id\":\"session-1\",\"call_id\":\"\",\"delta\":\"private tool input\"}\n");
+        assert!(frames.is_empty());
+        let frames = mapper.push(b"{\"v\":1,\"ev\":\"tool_input_delta\",\"session_id\":\"session-1\",\"call_id\":\"call-1\",\"delta\":\"private tool input\"}\n");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].kind, EventKind::ToolCallUpdated);
+        assert!(frames[0].body.text().is_none());
+    }
+
+    #[test]
     fn incompatible_jcode_stream_emits_one_safe_warning() {
         let mut mapper = JcodeProgressMapper::new(false);
         let frames = mapper.push(b"{\"v\":2,\"ev\":\"turn_done\",\"session_id\":\"secret\"}\n");
