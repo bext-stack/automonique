@@ -149,8 +149,17 @@ if [ "$restart" = 1 ]; then
       echo "probe    skipped: the unit declares no canonical host and port"
     fi
   else
-    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$probe" || echo 000)
+    code=000
+    for _ in $(seq 30); do
+      code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$probe") || code=000
+      case "$code" in 2[0-9][0-9]|3[0-9][0-9]) break ;; esac
+      sleep 1
+    done
     echo "probe    $probe -> $code"
+    case "$code" in
+      2[0-9][0-9]|3[0-9][0-9]) ;;
+      *) echo "refused: the explicit health probe did not succeed (got $code); roll back with previous" >&2; exit 1 ;;
+    esac
   fi
 fi
 echo "deployed."
