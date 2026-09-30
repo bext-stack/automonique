@@ -353,7 +353,11 @@ initialize_auth_health() {
     historical_failure=$(latest_job_auth_failure_reason || true)
     if ! probe_local_auth; then
         write_auth_health signed_out local_session_missing "$(previous_verified_at)" || true
-    elif [[ "$selected_account" != legacy && "$previous_status" == authenticated ]]; then
+    elif [[ "$selected_account" != legacy && "$previous_status" == authenticated \
+        && -z "$previous_revision" ]]; then
+        # A newly selected account can already have been verified by the web
+        # login flow. Once we have a revision, that evidence cannot survive a
+        # credential replacement merely because the worker was stopped.
         :
     elif [[ "$current_revision" == "$previous_revision" ]] \
         && [[ "$previous_status" == authenticated || "$previous_status" == expired ]]
