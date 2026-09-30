@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import {
-  IdempotencyKey,
+  MobileAction_VALUES,  IdempotencyKey,
   PlatformParameter,
   PlatformRevision,
   ReceiptId,
@@ -243,12 +243,7 @@ export class MobileSessionClient {
       || authorization.issued_at_ms >= authorization.expires_at_ms
       || authorization.expires_at_ms <= now
       || authorization.actions.length === 0
-      || authorization.actions.some((action) => ![
-        "attach",
-        "decide_approval",
-        "follow_up",
-        "stop_run",
-      ].includes(action))
+      || authorization.actions.some((action) => !MobileAction_VALUES.includes(action))
       || new Set(authorization.actions).size !== authorization.actions.length
       || new Set(authorization.session_scope).size !== authorization.session_scope.length
     ) {
