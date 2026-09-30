@@ -817,6 +817,57 @@ const frenchUi = Object.freeze({
   "Complete the native provider sign-in in your browser.": "Terminez l’authentification native du fournisseur dans votre navigateur.",
   "Reauthenticate the selected provider account, then relaunch blocked work.": "Réauthentifiez le compte fournisseur sélectionné, puis relancez le travail bloqué.",
   "Add a native Codex or Claude account and explicitly select it for the worker.": "Ajoutez un compte Codex ou Claude natif et sélectionnez-le explicitement pour le worker.",
+  "Connect phone": "Connecter un téléphone",
+  "Take Monique with you": "Emportez Monique avec vous",
+  "Connect your phone to this server in three steps.": "Connectez votre téléphone à ce serveur en trois étapes.",
+  "Get the app": "Installez l’application",
+  "Already installed? Go straight to choosing access below.": "Déjà installée ? Choisissez directement les accès ci-dessous.",
+  "Download Android app ↗": "Télécharger l’application Android ↗",
+  "Android preview. An iPhone download is not available yet.": "Aperçu Android. Le téléchargement pour iPhone n’est pas encore disponible.",
+  "Choose what your phone can do": "Choisissez les accès de votre téléphone",
+  "Select one or more options. You can connect without an existing session.": "Sélectionnez une ou plusieurs options. Aucune session existante n’est nécessaire.",
+  "Slack & tickets": "Slack et tickets",
+  "Read the configured channel, submit GitHub tickets, and approve or reject pending work.": "Consultez le canal configuré, soumettez des tickets GitHub et approuvez ou refusez les travaux en attente.",
+  "Start and continue tasks": "Lancer et poursuivre des tâches",
+  "Ask Monique to do work, reply in the sessions it creates, and manage their approvals or stop a run.": "Confiez du travail à Monique, répondez dans les sessions créées, gérez leurs approbations ou arrêtez une exécution.",
+  "Continue existing sessions": "Poursuivre des sessions existantes",
+  "Choose conversations to read, reply to, approve actions in, or stop.": "Choisissez les conversations à consulter, poursuivre, approuver ou arrêter.",
+  "Select only the sessions you want on this phone.": "Sélectionnez uniquement les sessions souhaitées sur ce téléphone.",
+  "Sessions for this phone": "Sessions pour ce téléphone",
+  "Refresh session list": "Actualiser les sessions",
+  "Already paired? A new invitation lets you add these permissions when you pair again.": "Déjà associé ? Une nouvelle invitation permet d’ajouter ces accès lors d’une nouvelle association.",
+  "Connect your phone": "Connectez votre téléphone",
+  "Choose how you want to transfer the invitation.": "Choisissez comment transmettre l’invitation.",
+  "Pairing method": "Méthode d’association",
+  "Scan with another phone": "Scanner avec un autre téléphone",
+  "I’m on my phone": "Je suis sur mon téléphone",
+  "This server": "Ce serveur",
+  "Copy address": "Copier l’adresse",
+  "Choose access above to create your invitation.": "Choisissez les accès ci-dessus pour créer votre invitation.",
+  "Create pairing code": "Créer le QR code",
+  "Create pairing invitation": "Créer l’invitation",
+  "Your invitation is ready": "Votre invitation est prête",
+  "In the Monique app, open Connection and tap Scan pairing QR code. Review the server and confirm.": "Dans Monique, ouvrez Connection puis Scan pairing QR code. Vérifiez le serveur et confirmez.",
+  "Copy the invitation, switch to the Monique app, and paste it into One-time pairing offer. Tap Review pasted invite, then confirm.": "Copiez l’invitation, ouvrez Monique et collez-la dans One-time pairing offer. Appuyez sur Review pasted invite, puis confirmez.",
+  "Copy pairing invitation": "Copier l’invitation",
+  "Select invitation manually": "Sélectionner l’invitation manuellement",
+  "Pairing invitation to copy": "Invitation à copier",
+  "Single use · expires in 5 minutes. Keep this invitation private.": "Usage unique · expire dans 5 minutes. Gardez cette invitation privée.",
+  "Choose at least one session, or turn off existing sessions.": "Choisissez au moins une session ou désactivez les sessions existantes.",
+  "Selected sessions": "Sessions sélectionnées",
+  "Creating invitation…": "Création de l’invitation…",
+  "Invitation expired": "Invitation expirée",
+  "Create a new invitation and try again.": "Créez une nouvelle invitation et réessayez.",
+  "Create a new invitation": "Créer une nouvelle invitation",
+  "Time left": "Temps restant",
+  "Loading sessions…": "Chargement des sessions…",
+  "No sessions yet. Slack & tickets and new tasks still work without one.": "Aucune session pour le moment. Slack, les tickets et les nouvelles tâches restent accessibles.",
+  "Sessions could not load. Retry, or choose Slack & tickets or new tasks instead.": "Impossible de charger les sessions. Réessayez ou choisissez Slack et tickets ou de nouvelles tâches.",
+  "The invitation could not be created. Please try again.": "Impossible de créer l’invitation. Réessayez.",
+  "Server address copied.": "Adresse du serveur copiée.",
+  "Select and copy the server address above.": "Sélectionnez et copiez l’adresse du serveur ci-dessus.",
+  "Invitation copied. Switch to Monique and paste it in One-time pairing offer.": "Invitation copiée. Ouvrez Monique et collez-la dans One-time pairing offer.",
+  "Copy the selected invitation, then paste it in the Monique app.": "Copiez l’invitation sélectionnée, puis collez-la dans Monique.",
   "Pair a phone": "Associer un téléphone",
   "Close pairing": "Fermer l’association",
   "An invite is single use and lives five minutes. Create it with the phone already in your hand.": "Une invitation est à usage unique et vit cinq minutes. Créez-la avec le téléphone déjà en main.",
@@ -5091,28 +5142,25 @@ const PAIRING_QUIET_MODULES = 4;
 let pairingOfferText = null;
 let pairingExpiresAtMs = 0;
 let pairingCountdown = 0;
+let pairingGeneration = 0;
+let pairingSessionLoad = 0;
+let pairingSessionsLoading = false;
+let pairingBusy = false;
+let pairingMethod = "scan";
+let pairingTrigger = null;
 
-/// The offer must reach the phone as the exact bytes the endpoint returned:
-/// the app parses it as canonical JSON, so a re-serialised object is a
-/// different document and pairing fails. `api()` hands back parsed JSON, so
-/// this path reads the response as text and never rebuilds it.
+// Preserve the exact canonical offer bytes. Never put them in a URL or storage.
 async function pairingRequestText(path, options = {}) {
   const response = await fetch(path, {
-    cache: "no-store",
-    credentials: "same-origin",
-    ...options,
+    cache: "no-store", credentials: "same-origin", ...options,
     headers: { Accept: "application/vnd.automonique.mobile-auth.v1+json", ...(options.headers || {}) },
   });
-  const text = await response.text();
-  return { ok: response.ok, status: response.status, text };
+  return { ok: response.ok, status: response.status, text: await response.text() };
 }
-
 function pairingSetStatus(message, kind = "info") {
-  const node = byId("pairing-status");
-  node.textContent = message ? translatePhrase(message) : "";
-  node.dataset.kind = kind;
+  byId("pairing-status").textContent = message ? translatePhrase(message) : "";
+  byId("pairing-status").dataset.kind = kind;
 }
-
 function pairingClearResult() {
   window.clearInterval(pairingCountdown);
   pairingCountdown = 0;
@@ -5120,13 +5168,178 @@ function pairingClearResult() {
   pairingExpiresAtMs = 0;
   byId("pairing-result").hidden = true;
   byId("pairing-copy").hidden = true;
+  byId("pairing-manual").hidden = true;
+  byId("pairing-manual").open = false;
+  byId("pairing-invite-text").value = "";
   byId("pairing-code").replaceChildren();
   byId("pairing-expiry").textContent = "";
   byId("pairing-expiry").classList.remove("is-expired");
 }
+function pairingScope() {
+  return byId("pairing-existing").checked
+    ? Array.from(byId("pairing-sessions").querySelectorAll("input:checked"), (input) => input.value)
+    : [];
+}
+function pairingUpdate() {
+  const work = byId("pairing-manage-work").checked;
+  const tasks = byId("pairing-start-task").checked;
+  const existing = byId("pairing-existing").checked;
+  const scope = pairingScope();
+  byId("pairing-scope").hidden = !existing;
+  byId("pairing-create").disabled = pairingBusy || (!work && !tasks && scope.length === 0) || (existing && (scope.length === 0 || pairingSessionsLoading));
+  byId("pairing-create").textContent = translatePhrase(pairingBusy ? "Creating invitation…" : pairingMethod === "copy" ? "Create pairing invitation" : "Create pairing code");
+  byId("pairing-summary").textContent = existing && scope.length === 0
+    ? translatePhrase("Choose at least one session, or turn off existing sessions.")
+    : [work && translatePhrase("Slack & tickets"), tasks && translatePhrase("Start and continue tasks"), scope.length > 0 && `${translatePhrase("Selected sessions")}: ${scope.length}`].filter(Boolean).join(" · ") || translatePhrase("Choose access above to create your invitation.");
+  byId("pairing-panel").querySelectorAll(".pairing-options input, #pairing-sessions input, #pairing-reload").forEach((input) => { input.disabled = pairingBusy; });
+}
+function pairingSetMethod(method) {
+  pairingMethod = method;
+  byId("pairing-method-scan").setAttribute("aria-pressed", String(method === "scan"));
+  byId("pairing-method-copy").setAttribute("aria-pressed", String(method === "copy"));
+  byId("pairing-scan-help").hidden = !pairingOfferText || method !== "scan";
+  byId("pairing-copy-help").hidden = !pairingOfferText || method !== "copy";
+  pairingUpdate();
+}
+function pairingTick() {
+  const remaining = Math.ceil((pairingExpiresAtMs - Date.now()) / 1000);
+  if (remaining <= 0) {
+    pairingClearResult();
+    byId("pairing-result").hidden = false;
+    byId("pairing-scan-help").hidden = true;
+    byId("pairing-copy-help").hidden = true;
+    byId("pairing-ready").textContent = translatePhrase("Invitation expired");
+    byId("pairing-expiry").textContent = translatePhrase("Create a new invitation and try again.");
+    byId("pairing-expiry").classList.add("is-expired");
+    byId("pairing-create").textContent = translatePhrase("Create a new invitation");
+    return;
+  }
+  byId("pairing-expiry").textContent = `${translatePhrase("Time left")}: ${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, "0")}`;
+}
+async function pairingLoadSessions() {
+  const load = ++pairingSessionLoad;
+  pairingSessionsLoading = true;
+  pairingUpdate();
+  const selected = new Set(pairingScope());
+  byId("pairing-sessions-status").textContent = translatePhrase("Loading sessions…");
+  try {
+    const view = await api("/api/mobile/pairing-sessions");
+    if (load !== pairingSessionLoad || !byId("pairing-panel").open) return;
+    const entries = Array.isArray(view.sessions) ? view.sessions : [];
+    const fragment = document.createDocumentFragment();
+    for (const entry of entries) {
+      const id = entry.session?.resource?.id;
+      if (typeof id !== "string" || !id) continue;
+      const label = document.createElement("label");
+      label.className = "pairing-session";
+      label.setAttribute("data-i18n-skip", "");
+      const input = document.createElement("input");
+      input.type = "checkbox"; input.value = id; input.checked = selected.has(id);
+      const copy = document.createElement("span");
+      copy.textContent = entry.session?.summary || id;
+      if (entry.session?.summary) { const detail = document.createElement("small"); detail.textContent = id; copy.append(detail); }
+      label.append(input, copy); fragment.append(label);
+    }
+    byId("pairing-sessions").replaceChildren(fragment);
+    byId("pairing-sessions-status").textContent = byId("pairing-sessions").childElementCount ? "" : translatePhrase("No sessions yet. Slack & tickets and new tasks still work without one.");
+  } catch (_error) {
+    if (load !== pairingSessionLoad || !byId("pairing-panel").open) return;
+    byId("pairing-sessions").replaceChildren();
+    byId("pairing-sessions-status").textContent = translatePhrase("Sessions could not load. Retry, or choose Slack & tickets or new tasks instead.");
+  }
+  pairingSessionsLoading = false;
+  pairingUpdate();
+}
+async function pairingCreate() {
+  pairingUpdate();
+  if (byId("pairing-create").disabled) return;
+  const generation = ++pairingGeneration;
+  const scope = pairingScope();
+  const tasks = byId("pairing-start-task").checked;
+  const actions = ["attach"];
+  if (tasks || scope.length) actions.push("follow_up", "decide_approval", "stop_run");
+  if (tasks) actions.push("start_task");
+  if (byId("pairing-manage-work").checked) actions.push("manage_work");
+  pairingBusy = true;
+  pairingClearResult(); pairingUpdate(); pairingSetStatus("Creating invitation…");
+  try {
+    const result = await pairingRequestText("/api/mobile/pairings", {
+      method: "POST", headers: { "Content-Type": "application/vnd.automonique.mobile-auth.v1+json" },
+      body: JSON.stringify({ actions, session_scope: scope, limits: { max_follow_up_bytes: 65536, max_page_events: 100 } }),
+    });
+    if (generation !== pairingGeneration || !byId("pairing-panel").open) return;
+    if (!result.ok) { pairingSetStatus("The invite was refused. Check the operator credential and try again.", "error"); return; }
+    const offer = JSON.parse(result.text);
+    const expiry = Number(offer.expires_at_ms);
+    if (offer.origin !== window.location.origin || offer.exchange_endpoint !== `${window.location.origin}/api/mobile/pairings/exchange` || !offer.pairing_token || !Number.isSafeInteger(expiry) || expiry <= Date.now()) throw new Error("invalid_offer");
+    pairingOfferText = result.text.trim(); pairingExpiresAtMs = expiry;
+    byId("pairing-result").hidden = false;
+    byId("pairing-copy").hidden = false;
+    byId("pairing-ready").textContent = translatePhrase("Your invitation is ready");
+    pairingSetMethod(pairingMethod);
+    let qr = false;
+    try { qr = pairingDrawCode(pairingOfferText); } catch (_error) { /* Copy remains available if QR encoding fails. */ }
+    if (!qr) { pairingSetMethod("copy"); pairingSetStatus("The QR encoder did not load. Use Copy invite instead.", "error"); }
+    else pairingSetStatus("");
+    pairingTick(); if (pairingOfferText) pairingCountdown = window.setInterval(pairingTick, 1000);
+    byId("pairing-ready").focus();
+  } catch (_error) {
+    if (generation === pairingGeneration) pairingSetStatus("The invitation could not be created. Please try again.", "error");
+  } finally {
+    if (generation === pairingGeneration) { pairingBusy = false; pairingUpdate(); }
+  }
+}
+function pairingOpen(open, trigger) {
+  const panel = byId("pairing-panel");
+  pairingGeneration += 1; pairingSessionLoad += 1;
+  pairingBusy = false; pairingClearResult(); pairingSetStatus("");
+  if (open) {
+    pairingTrigger = trigger || document.activeElement;
+    panel.hidden = false; panel.showModal();
+    byId("pairing-server").textContent = window.location.origin;
+    pairingSetMethod(window.matchMedia("(pointer: coarse)").matches ? "copy" : "scan");
+    pairingUpdate(); void pairingLoadSessions();
+    byId("pairing-close").focus();
+  } else {
+    panel.close(); panel.hidden = true;
+    pairingTrigger?.focus();
+  }
+  byId("pairing-open").setAttribute("aria-expanded", String(open));
+}
+byId("pairing-open").addEventListener("click", (event) => pairingOpen(true, event.currentTarget));
+document.querySelectorAll("[data-open-pairing]").forEach((button) => button.addEventListener("click", () => pairingOpen(true, button)));
+byId("pairing-close").addEventListener("click", () => pairingOpen(false));
+byId("pairing-panel").addEventListener("cancel", (event) => { event.preventDefault(); pairingOpen(false); });
+byId("pairing-create").addEventListener("click", () => void pairingCreate());
+byId("pairing-reload").addEventListener("click", () => { pairingClearResult(); void pairingLoadSessions(); });
+byId("pairing-panel").addEventListener("change", (event) => {
+  if (!event.target.matches("input[type=checkbox]")) return;
+  pairingGeneration += 1; pairingBusy = false;
+  pairingClearResult(); pairingSetStatus(""); pairingUpdate();
+});
+byId("pairing-method-scan").addEventListener("click", () => pairingSetMethod("scan"));
+byId("pairing-method-copy").addEventListener("click", () => pairingSetMethod("copy"));
+byId("pairing-copy-server").addEventListener("click", async () => {
+  const generation = pairingGeneration;
+  try { await navigator.clipboard.writeText(window.location.origin); if (generation === pairingGeneration) pairingSetStatus("Server address copied."); }
+  catch (_error) { if (generation === pairingGeneration) pairingSetStatus("Select and copy the server address above."); }
+});
+byId("pairing-copy").addEventListener("click", async () => {
+  if (!pairingOfferText) return;
+  if (Date.now() >= pairingExpiresAtMs) { pairingTick(); return; }
+  const generation = pairingGeneration;
+  try { await navigator.clipboard.writeText(pairingOfferText); if (generation === pairingGeneration) pairingSetStatus("Invitation copied. Switch to Monique and paste it in One-time pairing offer."); }
+  catch (_error) {
+    if (generation !== pairingGeneration || !pairingOfferText) return;
+    byId("pairing-manual").hidden = false; byId("pairing-manual").open = true;
+    byId("pairing-invite-text").value = pairingOfferText;
+    byId("pairing-invite-text").focus(); byId("pairing-invite-text").select();
+    pairingSetStatus("Copy the selected invitation, then paste it in the Monique app.");
+  }
+});
+window.addEventListener("pagehide", () => { pairingGeneration += 1; pairingClearResult(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden && pairingOfferText) pairingTick(); });
 
-/// Draw one QR symbol as inline SVG. One path, one rect per dark module, so the
-/// whole symbol is a single node the browser scales without resampling.
 function pairingDrawCode(value) {
   const host = byId("pairing-code");
   host.replaceChildren();
@@ -5159,133 +5372,3 @@ function pairingDrawCode(value) {
   host.append(svg);
   return true;
 }
-
-function pairingTick() {
-  const node = byId("pairing-expiry");
-  const remaining = Math.round((pairingExpiresAtMs - Date.now()) / 1000);
-  if (remaining <= 0) {
-    node.textContent = translatePhrase("This invite has expired. Create another.");
-    node.classList.add("is-expired");
-    window.clearInterval(pairingCountdown);
-    pairingCountdown = 0;
-    return;
-  }
-  node.classList.remove("is-expired");
-  node.textContent = translatePhrase(`Expires in ${remaining} seconds`);
-}
-
-async function pairingLoadSessions() {
-  const select = byId("pairing-sessions");
-  select.replaceChildren();
-  try {
-    const view = await api("/api/mobile/pairing-sessions");
-    const sessions = Array.isArray(view.sessions) ? view.sessions : [];
-    if (sessions.length === 0) {
-      pairingSetStatus("No session exists yet. Enable task creation to let this phone start one.");
-      byId("pairing-create").disabled = !byId("pairing-start-task").checked && !byId("pairing-manage-work").checked;
-      return;
-    }
-    for (const entry of sessions) {
-      const id = entry.session?.resource?.id;
-      if (!id) continue;
-      const option = document.createElement("option");
-      option.value = id;
-      option.selected = true;
-      option.textContent = entry.session?.summary ? `${id} — ${entry.session.summary}` : id;
-      option.setAttribute("data-i18n-skip", "");
-      select.append(option);
-    }
-    byId("pairing-create").disabled = select.options.length === 0 && !byId("pairing-start-task").checked && !byId("pairing-manage-work").checked;
-    pairingSetStatus("");
-  } catch (error) {
-    byId("pairing-create").disabled = true;
-    pairingSetStatus("The session list is unavailable, so the invite could not be scoped.", "error");
-  }
-}
-
-async function pairingCreate() {
-  const button = byId("pairing-create");
-  const scope = Array.from(byId("pairing-sessions").selectedOptions, (option) => option.value);
-  if (scope.length === 0 && !byId("pairing-start-task").checked && !byId("pairing-manage-work").checked) {
-    // session_scope is an allowlist, not a filter: an empty one reaches nothing.
-    pairingSetStatus("Select at least one session. A phone can only reach the sessions named here.", "error");
-    return;
-  }
-  button.disabled = true;
-  pairingClearResult();
-  pairingSetStatus("Creating the invite…");
-  try {
-    const result = await pairingRequestText("/api/mobile/pairings", {
-      method: "POST",
-      headers: { "Content-Type": "application/vnd.automonique.mobile-auth.v1+json" },
-      body: JSON.stringify({
-        actions: ["attach", "follow_up", "decide_approval", "stop_run", ...(byId("pairing-start-task").checked ? ["start_task"] : []), ...(byId("pairing-manage-work").checked ? ["manage_work"] : [])],
-        session_scope: scope,
-        limits: { max_follow_up_bytes: 65536, max_page_events: 100 },
-      }),
-    });
-    if (!result.ok) {
-      pairingSetStatus("The invite was refused. Check the operator credential and try again.", "error");
-      return;
-    }
-    let parsed;
-    try {
-      parsed = JSON.parse(result.text);
-    } catch (_error) {
-      pairingSetStatus("The invite could not be read.", "error");
-      return;
-    }
-    pairingOfferText = result.text.trim();
-    pairingExpiresAtMs = Number(parsed.expires_at_ms) || 0;
-    byId("pairing-result").hidden = false;
-    byId("pairing-copy").hidden = false;
-    pairingDrawCode(pairingOfferText);
-    pairingTick();
-    pairingCountdown = window.setInterval(pairingTick, 1000);
-    pairingSetStatus("");
-  } catch (_error) {
-    pairingSetStatus("The invite could not be created.", "error");
-  } finally {
-    button.disabled = false;
-  }
-}
-
-function pairingOpen(open) {
-  byId("pairing-panel").hidden = !open;
-  byId("pairing-open").setAttribute("aria-expanded", open ? "true" : "false");
-  if (open) {
-    byId("pairing-create").disabled = false;
-    pairingClearResult();
-    pairingSetStatus("");
-    void pairingLoadSessions();
-    byId("pairing-close").focus();
-  } else {
-    pairingClearResult();
-    byId("pairing-open").focus();
-  }
-}
-
-byId("pairing-open").addEventListener("click", () => pairingOpen(byId("pairing-panel").hidden));
-byId("pairing-close").addEventListener("click", () => pairingOpen(false));
-byId("pairing-create").addEventListener("click", () => void pairingCreate());
-byId("pairing-copy").addEventListener("click", async () => {
-  if (!pairingOfferText) return;
-  try {
-    await navigator.clipboard.writeText(pairingOfferText);
-    pairingSetStatus("Invite copied. Paste it in the app.");
-  } catch (_error) {
-    pairingSetStatus("The invite could not be copied.", "error");
-  }
-});
-document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !byId("pairing-panel").hidden) pairingOpen(false);
-});
-document.addEventListener("click", (event) => {
-  if (byId("pairing-panel").hidden) return;
-  if (event.target.closest("#pairing-panel, #pairing-open")) return;
-  pairingOpen(false);
-});
-
-byId("pairing-start-task").addEventListener("change", () => { byId("pairing-create").disabled = byId("pairing-sessions").options.length === 0 && !byId("pairing-start-task").checked && !byId("pairing-manage-work").checked; });
-
-byId("pairing-manage-work").addEventListener("change", () => { byId("pairing-create").disabled = byId("pairing-sessions").options.length === 0 && !byId("pairing-start-task").checked && !byId("pairing-manage-work").checked; });
