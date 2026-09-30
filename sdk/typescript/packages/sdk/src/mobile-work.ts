@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+
 import type {JsonValue} from "../../protocol/src/index.js";
 
 export type MobileWorkRequest =
