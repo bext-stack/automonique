@@ -64,9 +64,33 @@ fn accepted<T>(
 ) -> Result<T, &'static str> {
     match value {
         Ok(FleetOutcome::Accepted(value)) => Ok(value),
+        Ok(FleetOutcome::Rejected(reason)) if refused_before_effect(reason.as_str()) => {
+            Err("mobile_work_not_applied")
+        }
         Ok(FleetOutcome::Rejected(_)) => Err("mobile_work_refused"),
         Err(_) => Err("mobile_work_outcome_unknown"),
     }
+}
+
+// Only refusals whose Manage branches precede the requested queue mutation.
+// Unknown errors (including dispatch_failed) never imply that nothing happened.
+fn refused_before_effect(reason: &str) -> bool {
+    matches!(
+        reason,
+        "issue_url_invalid"
+            | "source_key_invalid"
+            | "instance_out_of_scope"
+            | "project_ambiguous"
+            | "project_missing"
+            | "profile_missing"
+            | "workspace_refused"
+            | "issue_unavailable"
+            | "project_out_of_scope"
+            | "issue_closed"
+            | "executor_unavailable"
+            | "decision_invalid"
+            | "source_mismatch"
+    )
 }
 
 pub(crate) fn execute(
@@ -191,6 +215,26 @@ fn bind(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_known_pre_effect_refusals_release_new_mobile_requests() {
+        for reason in [
+            "issue_closed",
+            "issue_unavailable",
+            "executor_unavailable",
+            "decision_invalid",
+        ] {
+            assert!(refused_before_effect(reason));
+        }
+        for reason in [
+            "dispatch_failed",
+            "job_missing",
+            "decision_conflict",
+            "unknown",
+            "",
+        ] {
+            assert!(!refused_before_effect(reason));
+        }
+    }
     #[test]
     fn work_request_cannot_supply_actor_instance_or_channel_overrides() {
         for body in [
