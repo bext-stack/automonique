@@ -135,6 +135,7 @@ test.beforeEach(async ({ page }) => {
           contentType: "application/json",
           body: JSON.stringify({
             state: "open",
+            attachment_cursor: { authority: "automonique", topic: "sessions", sequence: "4" },
             session,
             history: { state: "page", terminal_cursor: "0", events: [], has_more: false },
             command: { state: "unavailable" },
@@ -336,6 +337,33 @@ test("attention filtering preserves structured workspaces and retained sessions"
   await expect(page.locator(".platform-session-option").filter({ hasText: "Retained cockpit work" })).toBeVisible();
 });
 
+test("completed sessions open history and enable only exact revision follow-ups", async ({ page }) => {
+  const retained = structuredClone(cockpit);
+  const session = retained.retained_v1.sessions[0];
+  session.attachable = false;
+  session.controllable = false;
+  session.session.freshness = "unknown";
+  await page.route("**/api/platform/session", async (route) => {
+    const request = route.request().postDataJSON();
+    if (request.action !== "open") return route.fallback();
+    return route.fulfill({ json: {
+      state: "open", session, attachment_cursor: null,
+      history: { state: "page", terminal_cursor: "1", events: [{ kind: "message", role: "assistant", cursor: "1", text: "Saved task result" }], has_more: false },
+      command: { state: "ready", session: { revision: "9007199254740995" }, pending_approvals: [] },
+      control: { state: "not_claimed", available: false },
+    } });
+  });
+  await page.evaluate((view) => globalThis.renderPlatform(view), retained);
+  const option = page.locator(".platform-session-option").filter({ hasText: "Retained cockpit work" });
+  await expect(option).toBeEnabled();
+  await option.click();
+  await expect(page.locator("#platform-session-status")).toContainText("Retained session");
+  await expect(page.locator("#platform-history")).toContainText("Saved task result");
+  await expect(page.locator("#platform-session-posture")).toContainText("control not claimed");
+  await expect(page.locator("#platform-follow-up")).toBeEnabled();
+  await expect(page.locator("#platform-composer-note")).toContainText("9007199254740995");
+});
+
 test("retained session selection and detach never discard the cockpit snapshot", async ({ page }) => {
   await page.locator(".platform-session-option").filter({ hasText: "Retained cockpit work" }).click();
   await expect(page.locator(".platform-session-option").filter({ hasText: "Retained cockpit work" })).toBeVisible();
@@ -372,7 +400,7 @@ test("cross-workspace retained session selection updates URL and cockpit before 
   await expect(page.getByRole("heading", { name: "Task and workspace cockpit", exact: true })).toBeVisible();
 
   await page.locator(".platform-session-option").filter({ hasText: "Blocked workspace conversation" }).click();
-  await expect(page.locator("#platform-session-status")).toHaveText("Attaching as observer…");
+  await expect(page.locator("#platform-session-status")).toHaveText("Opening session…");
   await expect(page).toHaveURL("https://cockpit.test/#sessions?workspace=workspace-2&session=session-2");
   await expect(page.getByRole("option", { name: /Blocked workspace/ })).toHaveAttribute("aria-selected", "true");
   await expect(page.locator("#cockpit-workspace-title")).toHaveText("Blocked workspace");

@@ -2510,7 +2510,7 @@ function renderRetainedPlatform(retained) {
     button.type = "button";
     button.className = "platform-session-option";
     button.classList.toggle("is-selected", coordinate.id === platformSelectedSession);
-    button.disabled = session.attachable !== true;
+    // A retained session can be read and resumed without a live attachment.
     button.dataset.sessionId = coordinate.id || "";
     const title = document.createElement("strong");
     title.setAttribute("data-i18n-skip", "");
@@ -2668,7 +2668,7 @@ async function openPlatformSession(sessionId) {
   platformBusy = true;
   byId("platform-session-empty").hidden = true;
   byId("platform-session-detail").hidden = false;
-  byId("platform-session-status").textContent = "Attaching as observer…";
+  byId("platform-session-status").textContent = "Opening session…";
   settlePlatformFence(null);
   try {
     const view = await platformPost({ action: "open", session_id: sessionId });
@@ -2685,7 +2685,7 @@ async function openPlatformSession(sessionId) {
     byId("platform-session-posture").textContent = `${words(record.freshness || "unknown")} · Observer · control not claimed${view.control?.available ? " · control available to claim elsewhere" : ""}`;
     const approvals = view.command?.state === "ready" && Array.isArray(view.command.pending_approvals) ? view.command.pending_approvals.length : 0;
     const run = view.command?.state === "ready" && view.command.run ? "run present" : "no active run target";
-    byId("platform-session-status").textContent = `Attached · ${run} · ${approvals} pending approval${approvals === 1 ? "" : "s"}`;
+    byId("platform-session-status").textContent = `${view.attachment_cursor ? "Attached" : "Retained session"} · ${run} · ${approvals} pending approval${approvals === 1 ? "" : "s"}`;
     renderPlatformHistory(view.history, true);
     settlePlatformFence(view.command);
   } catch (error) {
