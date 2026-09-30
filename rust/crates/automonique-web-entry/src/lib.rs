@@ -6955,6 +6955,22 @@ mod tests {
     const LEGACY_HOST: &str = concat!("retired", ".", "example", ".", "invalid");
     const MANAGE_WORKER: &str = include_str!("../../../../tools/run_manage_fleet_worker.sh");
 
+    fn build_typescript_sdk(sdk: &Path) {
+        // Both mobile contracts import the same emitted modules. A second
+        // concurrent tsc build can truncate a module while the first contract
+        // imports it, producing intermittent missing-export errors. Build once
+        // before either reader starts and leave that output unchanged.
+        static BUILD: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        BUILD.get_or_init(|| {
+            let build = Command::new("bun")
+                .args(["run", "build"])
+                .current_dir(sdk)
+                .status()
+                .expect("build TypeScript SDK");
+            assert!(build.success(), "TypeScript SDK build failed");
+        });
+    }
+
     fn fixture_hosts() -> DashboardHosts {
         DashboardHosts::new(CANONICAL_HOST, LEGACY_HOST).expect("fixture hosts")
     }
@@ -8663,12 +8679,7 @@ mod tests {
 
         let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let sdk = repository.join("sdk/typescript/packages/sdk");
-        let build = Command::new("bun")
-            .args(["run", "build"])
-            .current_dir(&sdk)
-            .status()
-            .expect("build TypeScript SDK");
-        assert!(build.success(), "TypeScript SDK build failed");
+        build_typescript_sdk(&sdk);
         let script = sdk.join("conformance/mobile-rust-http-contract.ts");
         let status = Command::new("bun")
             .arg("run")
@@ -10706,12 +10717,7 @@ mod tests {
 
         let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let sdk = repository.join("sdk/typescript/packages/sdk");
-        let build = Command::new("bun")
-            .args(["run", "build"])
-            .current_dir(&sdk)
-            .status()
-            .expect("build TypeScript SDK");
-        assert!(build.success(), "TypeScript SDK build failed");
+        build_typescript_sdk(&sdk);
         let script = sdk.join("conformance/mobile-rust-http-v2-contract.ts");
         let status = Command::new("bun")
             .arg("run")
