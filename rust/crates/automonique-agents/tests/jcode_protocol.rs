@@ -622,3 +622,103 @@ fn additive_events_are_bounded_and_skipped_by_safe_kind() {
         }]
     );
 }
+
+#[test]
+fn streamed_tool_input_without_a_call_id_does_not_end_the_turn() {
+    // Minimized from a maintained JCode black-box tool turn. Input chunks may
+    // omit the provider's call id by sending an empty string; start/exec/done
+    // still carry it. The input bytes confer no execution or completion.
+    let transcript = concat!(
+        "{\"v\":1,\"ev\":\"message_accepted\",\"session_id\":\"session-1\"}\n",
+        "{\"v\":1,\"ev\":\"tool_start\",\"session_id\":\"session-1\",\"call_id\":\"call-1\",\"name\":\"todo\"}\n",
+        "{\"v\":1,\"ev\":\"tool_start\",\"session_id\":\"session-1\",\"call_id\":\"call-2\",\"name\":\"write\"}\n",
+        "{\"v\":1,\"ev\":\"tool_input_delta\",\"session_id\":\"session-1\",\"call_id\":\"\",\"delta\":\"{}\"}\n",
+        "{\"v\":1,\"ev\":\"tool_exec\",\"session_id\":\"session-1\",\"call_id\":\"call-1\",\"name\":\"todo\"}\n",
+        "{\"v\":1,\"ev\":\"tool_done\",\"session_id\":\"session-1\",\"call_id\":\"call-1\",\"name\":\"todo\",\"error\":null}\n",
+        "{\"v\":1,\"ev\":\"tool_exec\",\"session_id\":\"session-1\",\"call_id\":\"call-2\",\"name\":\"write\"}\n",
+        "{\"v\":1,\"ev\":\"tool_done\",\"session_id\":\"session-1\",\"call_id\":\"call-2\",\"name\":\"write\",\"error\":null}\n",
+        "{\"v\":1,\"ev\":\"turn_done\",\"session_id\":\"session-1\"}\n",
+    );
+    let mut decoder = JcodeFrameDecoder::new();
+    let events = decoder
+        .push(transcript.as_bytes())
+        .expect("streamed inputs decode");
+    let mut turn = JcodeTurnCollector::new("session-1").unwrap();
+    for event in &events {
+        turn.observe(event).expect("exact tool lifecycle retained");
+    }
+    turn.finish()
+        .expect("completed only after both named tools finish");
+}
+
+#[test]
+fn anonymous_input_cannot_create_finish_or_retarget_a_tool() {
+    let mut decoder = JcodeFrameDecoder::new();
+    let anonymous = decoder.push(b"{\"v\":1,\"ev\":\"tool_input_delta\",\"session_id\":\"session-1\",\"call_id\":\"\",\"delta\":\"{}\"}\n").unwrap().remove(0);
+    let mut turn = JcodeTurnCollector::new("session-1").unwrap();
+    assert_eq!(
+        turn.observe(&anonymous),
+        Err(JcodeProtocolError::EventOrder)
+    );
+    turn.observe(&JcodeEvent::MessageAccepted {
+        session_id: "session-1".into(),
+    })
+    .unwrap();
+    assert_eq!(
+        turn.observe(&anonymous),
+        Err(JcodeProtocolError::EventOrder)
+    );
+    turn.observe(&JcodeEvent::ToolStart {
+        session_id: "session-1".into(),
+        call_id: "call-1".into(),
+        name: "write".into(),
+    })
+    .unwrap();
+    turn.observe(&anonymous).unwrap();
+    assert_eq!(
+        turn.observe(&JcodeEvent::TurnDone {
+            session_id: "session-1".into()
+        }),
+        Err(JcodeProtocolError::EventOrder)
+    );
+    assert_eq!(
+        turn.observe(&JcodeEvent::ToolInputDelta {
+            session_id: "session-1".into(),
+            call_id: Some("unknown-call".into())
+        }),
+        Err(JcodeProtocolError::EventOrder)
+    );
+    assert_eq!(
+        turn.observe(&JcodeEvent::ToolInputDelta {
+            session_id: "another-session".into(),
+            call_id: None
+        }),
+        Err(JcodeProtocolError::SessionMismatch)
+    );
+}
+
+#[test]
+fn only_input_chunks_allow_an_empty_call_id() {
+    for event in ["tool_start", "tool_exec", "tool_done"] {
+        let frame = format!(
+            "{{\"v\":1,\"ev\":\"{event}\",\"session_id\":\"session-1\",\"call_id\":\"\",\"name\":\"write\"}}\n"
+        );
+        assert_eq!(
+            JcodeFrameDecoder::new().push(frame.as_bytes()),
+            Err(JcodeProtocolError::InvalidField("call_id"))
+        );
+    }
+    for id in [
+        serde_json::Value::Null,
+        serde_json::json!(42),
+        serde_json::json!("\n"),
+        serde_json::json!("x".repeat(4097)),
+    ] {
+        let mut frame = serde_json::json!({"v":1,"ev":"tool_input_delta","session_id":"session-1","call_id":id,"delta":"{}"}).to_string();
+        frame.push('\n');
+        assert_eq!(
+            JcodeFrameDecoder::new().push(frame.as_bytes()),
+            Err(JcodeProtocolError::InvalidField("call_id"))
+        );
+    }
+}

@@ -438,7 +438,13 @@ impl JcodeProgressMapper {
                 Some(StepStatus::InProgress),
                 None,
             ),
-            JcodeEvent::ToolInputDelta { .. } => (
+            // An anonymous input chunk cannot name an authoritative tool
+            // update. The session collector checks ordering, but never guesses
+            // which active call owns it.
+            JcodeEvent::ToolInputDelta { call_id: None, .. } => return None,
+            JcodeEvent::ToolInputDelta {
+                call_id: Some(_), ..
+            } => (
                 EventKind::ToolCallUpdated,
                 Authority::Authoritative,
                 None,

@@ -261,7 +261,9 @@ pub enum JcodeEvent {
     },
     ToolInputDelta {
         session_id: String,
-        call_id: String,
+        /// Streaming chunks may lack an id. Such a chunk is never assigned to
+        /// a guessed tool and cannot establish execution or completion.
+        call_id: Option<String>,
     },
     ToolExec {
         session_id: String,
@@ -927,7 +929,17 @@ impl JcodeTurnCollector {
                     return Err(JcodeProtocolError::EventOrder);
                 }
             }
-            JcodeEvent::ToolInputDelta { call_id, .. } | JcodeEvent::ToolExec { call_id, .. } => {
+            JcodeEvent::ToolInputDelta { call_id, .. } => {
+                if !self.accepted
+                    || self.active_tools.is_empty()
+                    || call_id
+                        .as_ref()
+                        .is_some_and(|id| !self.active_tools.contains(id))
+                {
+                    return Err(JcodeProtocolError::EventOrder);
+                }
+            }
+            JcodeEvent::ToolExec { call_id, .. } => {
                 if !self.active_tools.contains(call_id) {
                     return Err(JcodeProtocolError::EventOrder);
                 }
@@ -1134,10 +1146,19 @@ fn decode_server_frame(bytes: &[u8]) -> Result<JcodeEvent, JcodeProtocolError> {
             call_id: bounded_string(object, "call_id")?.to_owned(),
             name: bounded_string(object, "name")?.to_owned(),
         }),
-        "tool_input_delta" => Ok(JcodeEvent::ToolInputDelta {
-            session_id: session(object)?,
-            call_id: bounded_string(object, "call_id")?.to_owned(),
-        }),
+        "tool_input_delta" => {
+            let call_id = string(object, "call_id")?;
+            let call_id = if call_id.is_empty() {
+                None
+            } else {
+                validate_field(call_id, "call_id")?;
+                Some(call_id.to_owned())
+            };
+            Ok(JcodeEvent::ToolInputDelta {
+                session_id: session(object)?,
+                call_id,
+            })
+        }
         "tool_exec" => Ok(JcodeEvent::ToolExec {
             session_id: session(object)?,
             call_id: bounded_string(object, "call_id")?.to_owned(),
