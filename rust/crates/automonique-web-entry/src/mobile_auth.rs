@@ -34,7 +34,7 @@ pub const MOBILE_AUTH_MEDIA_TYPE: &str = "application/vnd.automonique.mobile-aut
 pub const MOBILE_PLATFORM_V2_AUTH_SCHEMA: &str = "automonique.mobile-platform-v2-authorization/v1";
 pub const MOBILE_PLATFORM_V2_AUTH_MEDIA_TYPE: &str =
     "application/vnd.automonique.mobile-platform-v2-authorization.v1+json";
-pub const MAX_MOBILE_ACTIONS: usize = 4;
+pub const MAX_MOBILE_ACTIONS: usize = 5;
 pub const MAX_MOBILE_PLATFORM_V2_ACTIONS: usize = MobilePlatformV2Action::ALL.len();
 pub const MAX_MOBILE_V2_PROJECT_ROOTS: usize = 32;
 const MAX_MOBILE_V2_RECEIPT_CUSTODY: usize = 128;
@@ -80,6 +80,15 @@ CREATE TABLE IF NOT EXISTS mobile_credentials (
   sessions_json TEXT NOT NULL CHECK(length(sessions_json) BETWEEN 2 AND 26000),
   max_page_events INTEGER NOT NULL CHECK(max_page_events BETWEEN 1 AND 512),
   max_follow_up_bytes INTEGER NOT NULL CHECK(max_follow_up_bytes BETWEEN 1 AND 65536)
+) STRICT;
+CREATE TABLE IF NOT EXISTS mobile_tasks (
+  credential_id TEXT NOT NULL,
+  task_key TEXT NOT NULL CHECK(length(task_key) BETWEEN 1 AND 128),
+  node_id TEXT NOT NULL,
+  request_sha256 TEXT NOT NULL CHECK(length(request_sha256)=64),
+  session_id TEXT,
+  PRIMARY KEY(credential_id,task_key),
+  FOREIGN KEY(credential_id) REFERENCES mobile_credentials(credential_id) ON DELETE CASCADE
 ) STRICT;
 CREATE TABLE IF NOT EXISTS mobile_refresh_history (
   refresh_sha256 BLOB PRIMARY KEY CHECK(length(refresh_sha256) = 32),
@@ -185,6 +194,7 @@ pub enum MobileAction {
     FollowUp,
     DecideApproval,
     StopRun,
+    StartTask,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -711,6 +721,141 @@ impl MobileCredentialAuthority {
             tenant: tenant.to_owned(),
             actor: actor.to_owned(),
         })
+    }
+
+    /// Reserve one task key before dispatch. A repeated key can only reconcile.
+    pub(crate) fn bind_task(
+        &mut self,
+        authorization: &MobileAuthorization,
+        key: &str,
+        node: &str,
+        request_sha256: &str,
+        now_ms: i64,
+    ) -> Result<bool, MobileAuthError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::require_task_credential(&tx, authorization, now_ms)?;
+        let existing: Option<(String, String)> = tx.query_row(
+            "SELECT node_id,request_sha256 FROM mobile_tasks WHERE credential_id=?1 AND task_key=?2",
+            params![authorization.credential_id, key], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        if let Some((old_node, old_digest)) = existing {
+            return if old_node == node && old_digest == request_sha256 {
+                Ok(false)
+            } else {
+                Err(MobileAuthError::InvalidRequest)
+            };
+        }
+        let count: usize = tx.query_row(
+            "SELECT COUNT(*) FROM mobile_tasks WHERE credential_id=?1",
+            params![authorization.credential_id],
+            |row| row.get(0),
+        )?;
+        let pending: usize = tx.query_row(
+            "SELECT COUNT(*) FROM mobile_tasks WHERE credential_id=?1 AND session_id IS NULL",
+            params![authorization.credential_id],
+            |row| row.get(0),
+        )?;
+        let encoded: String = tx.query_row(
+            "SELECT sessions_json FROM mobile_credentials WHERE credential_id=?1",
+            params![authorization.credential_id],
+            |row| row.get(0),
+        )?;
+        let sessions: BTreeSet<String> =
+            serde_json::from_str(&encoded).map_err(|_| MobileAuthError::InvalidRequest)?;
+        // Reserve scope capacity using current durable scope, including unfinished tasks.
+        if count >= 64 || sessions.len() + pending >= MAX_MOBILE_SESSIONS {
+            return Err(MobileAuthError::InvalidRequest);
+        }
+        tx.execute("INSERT INTO mobile_tasks(credential_id,task_key,node_id,request_sha256) VALUES(?1,?2,?3,?4)",
+            params![authorization.credential_id,key,node,request_sha256])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    fn require_task_credential(
+        connection: &Connection,
+        authorization: &MobileAuthorization,
+        now_ms: i64,
+    ) -> Result<(), MobileAuthError> {
+        if !authorization.allows(MobileAction::StartTask) {
+            return Err(MobileAuthError::InvalidCredential);
+        }
+        let live: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mobile_credentials WHERE credential_id=?1 AND credential_revision=?2
+             AND authorization_revision=?3 AND revoked_at_ms IS NULL AND access_expires_at_ms>?4)",
+            params![authorization.credential_id,authorization.credential_revision,authorization.authorization_revision,now_ms],
+            |row| row.get(0))?;
+        if live {
+            Ok(())
+        } else {
+            Err(MobileAuthError::InvalidCredential)
+        }
+    }
+
+    pub(crate) fn task_node(
+        &self,
+        authorization: &MobileAuthorization,
+        key: &str,
+        now_ms: i64,
+    ) -> Result<String, MobileAuthError> {
+        Self::require_task_credential(&self.connection, authorization, now_ms)?;
+        self.connection
+            .query_row(
+                "SELECT node_id FROM mobile_tasks WHERE credential_id=?1 AND task_key=?2",
+                params![authorization.credential_id, key],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(MobileAuthError::InvalidRequest)
+    }
+
+    /// StartTask grants continuation of sessions created by this credential.
+    /// Materialize only a session returned by its custodied completed receipt.
+    pub(crate) fn grant_task_session(
+        &mut self,
+        authorization: &MobileAuthorization,
+        key: &str,
+        session: &str,
+        now_ms: i64,
+    ) -> Result<(), MobileAuthError> {
+        validate_identifier(session)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::require_task_credential(&tx, authorization, now_ms)?;
+        let old: Option<String> = tx.query_row(
+            "SELECT session_id FROM mobile_tasks WHERE credential_id=?1 AND task_key=?2",
+            params![authorization.credential_id, key],
+            |row| row.get(0),
+        )?;
+        if old.as_deref().is_some_and(|id| id != session) {
+            return Err(MobileAuthError::InvalidRequest);
+        }
+        let encoded: String = tx.query_row(
+            "SELECT sessions_json FROM mobile_credentials WHERE credential_id=?1",
+            params![authorization.credential_id],
+            |row| row.get(0),
+        )?;
+        let mut sessions: BTreeSet<String> = serde_json::from_str(&encoded)?;
+        sessions.insert(session.to_owned());
+        if sessions.len() > MAX_MOBILE_SESSIONS {
+            return Err(MobileAuthError::InvalidRequest);
+        }
+        tx.execute(
+            "UPDATE mobile_credentials SET sessions_json=?1 WHERE credential_id=?2",
+            params![
+                serde_json::to_string(&sessions)?,
+                authorization.credential_id
+            ],
+        )?;
+        tx.execute(
+            "UPDATE mobile_tasks SET session_id=?1 WHERE credential_id=?2 AND task_key=?3",
+            params![session, authorization.credential_id, key],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn discovery(&self) -> &MobileDiscovery {
@@ -2315,6 +2460,11 @@ fn admit_scope(
     if actions.is_empty() || actions.len() > MAX_MOBILE_ACTIONS {
         return Err(MobileAuthError::InvalidRequest);
     }
+    if actions.contains(&MobileAction::StartTask)
+        && (!actions.contains(&MobileAction::Attach) || !actions.contains(&MobileAction::FollowUp))
+    {
+        return Err(MobileAuthError::InvalidRequest);
+    }
     let sessions = sessions
         .into_iter()
         .map(|session| {
@@ -2548,6 +2698,163 @@ mod tests {
                 max_follow_up_bytes: 4096,
             },
         }
+    }
+
+    #[test]
+    fn tasks_require_explicit_grants_and_keep_receipts_and_sessions_in_one_credential() {
+        let (_root, mut authority) = authority();
+        let ordinary = authority.operator_provision(request(), NOW).unwrap();
+        let digest = "a".repeat(64);
+        assert!(
+            authority
+                .bind_task(&ordinary.authorization, "key", "node-1", &digest, NOW)
+                .is_err()
+        );
+        let mut provision = request();
+        provision.actions.push(MobileAction::StartTask);
+        let owner = authority
+            .operator_provision(provision.clone(), NOW)
+            .unwrap();
+        let other = authority.operator_provision(provision, NOW).unwrap();
+        assert!(
+            authority
+                .bind_task(&owner.authorization, "key", "node-1", &digest, NOW)
+                .unwrap()
+        );
+        assert!(
+            !authority
+                .bind_task(&owner.authorization, "key", "node-1", &digest, NOW)
+                .unwrap()
+        );
+        assert!(
+            authority
+                .bind_task(&owner.authorization, "key", "node-2", &digest, NOW)
+                .is_err()
+        );
+        assert!(
+            authority
+                .bind_task(&owner.authorization, "key", "node-1", &"b".repeat(64), NOW)
+                .is_err()
+        );
+        assert!(
+            authority
+                .task_node(&other.authorization, "key", NOW)
+                .is_err()
+        );
+        assert!(
+            authority
+                .grant_task_session(&other.authorization, "key", "created-session", NOW)
+                .is_err()
+        );
+        authority
+            .grant_task_session(&owner.authorization, "key", "created-session", NOW)
+            .unwrap();
+        assert!(
+            authority
+                .grant_task_session(&owner.authorization, "key", "foreign-session", NOW)
+                .is_err()
+        );
+        let current = authority
+            .authorize_access(
+                &owner.access_token,
+                &owner.authorization.server_identity,
+                NOW,
+            )
+            .unwrap();
+        assert!(current.allows_session("created-session"));
+        assert!(
+            !authority
+                .authorize_access(
+                    &other.access_token,
+                    &other.authorization.server_identity,
+                    NOW
+                )
+                .unwrap()
+                .allows_session("created-session")
+        );
+        let mut refresh = owner.refresh_token.clone();
+        let renewed = authority
+            .refresh(&mut refresh, &owner.authorization.server_identity, NOW + 1)
+            .unwrap();
+        assert!(renewed.authorization.allows_session("created-session"));
+        assert_eq!(
+            authority
+                .task_node(&renewed.authorization, "key", NOW + 2)
+                .unwrap(),
+            "node-1"
+        );
+        assert!(
+            authority
+                .task_node(&owner.authorization, "key", NOW + 2)
+                .is_err()
+        );
+        let mut refresh = renewed.refresh_token.clone();
+        authority
+            .revoke(
+                &mut refresh,
+                &renewed.authorization.server_identity,
+                NOW + 3,
+            )
+            .unwrap();
+        assert!(
+            authority
+                .task_node(&renewed.authorization, "key", NOW + 4)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn task_grants_require_history_and_follow_up_and_reserve_bounded_scope() {
+        let (_root, mut authority) = authority();
+        let mut provision = request();
+        provision.actions = vec![MobileAction::StartTask];
+        assert!(
+            authority
+                .operator_provision(provision.clone(), NOW)
+                .is_err()
+        );
+        provision.actions = vec![
+            MobileAction::Attach,
+            MobileAction::FollowUp,
+            MobileAction::StartTask,
+        ];
+        provision.session_scope.clear();
+        let owner = authority.operator_provision(provision, NOW).unwrap();
+        for index in 0..64 {
+            assert!(
+                authority
+                    .bind_task(
+                        &owner.authorization,
+                        &format!("key-{index}"),
+                        "node-1",
+                        &"a".repeat(64),
+                        NOW
+                    )
+                    .unwrap()
+            );
+        }
+        assert!(
+            authority
+                .bind_task(
+                    &owner.authorization,
+                    "overflow",
+                    "node-1",
+                    &"a".repeat(64),
+                    NOW
+                )
+                .is_err()
+        );
+        assert!(
+            !authority
+                .bind_task(
+                    &owner.authorization,
+                    "key-0",
+                    "node-1",
+                    &"a".repeat(64),
+                    NOW
+                )
+                .unwrap()
+        );
     }
 
     fn platform_v2_grant(credential_id: &str) -> MobilePlatformV2GrantRequest {

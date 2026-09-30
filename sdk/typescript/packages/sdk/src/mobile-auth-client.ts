@@ -51,6 +51,9 @@ import {
   type MobilePlatformV2GrantRequest,
 } from "./mobile-platform-v2-authorization.js";
 
+import {encodeMobileTaskRequest, decodeMobileTaskView, type MobileTaskRequest, type MobileTaskView} from "./mobile-task.js";
+export type {MobileTaskRequest, MobileTaskView, MobileTaskOutcome} from "./mobile-task.js";
+
 export type {
   IssuedMobileCredentials,
   MobileAuthorization,
@@ -528,6 +531,13 @@ export class MobileLifecycleClient {
     );
     if (!revoked.revoked) throw new MobileLifecycleError(0, "mobile_revocation_incomplete");
     return revoked;
+  }
+
+  /** Start or reconcile one contained task. Generic execution remains unavailable. */
+  async task(accessToken: string, request: MobileTaskRequest, signal?: AbortSignal): Promise<MobileTaskView> {
+    return this.request(`${this.discovery.origin}/api/mobile/task`, encodeMobileTaskRequest(request),
+      (value) => decodeMobileTaskView(value, request),
+      {authorization: `Bearer ${MobileAccessToken(accessToken)}`}, 200, signal);
   }
 
   async authorization(

@@ -165,3 +165,19 @@ script.
 surface for negotiation and structured v2 requests.
 
 This package is licensed under Apache-2.0. Automonique product code outside `sdk/` has a separate licensing boundary.
+
+## Mobile task execution
+
+`MobileLifecycleClient.task(accessToken, request)` exposes the dedicated
+`/api/mobile/task` route. A credential needs the explicit `start_task`, `attach`,
+and `follow_up` grants. Existing credentials are not upgraded. Prepare first,
+persist a fresh idempotency key with the returned node ID, then submit the
+instructions with the exact returned revision. After an interrupted request,
+use `reconcile` with that same key and node; never replay under a new key.
+
+A completed submission receipt identifies the created session, not completion
+of the provider's work. Refresh `authorization()` before constructing the
+session client: only the device that started the task gains that exact session
+in its scope. Use the normal history, follow-up, approval, and stop methods
+with their separate grants. The task route grants no generic Platform execute
+access. Receipts are bounded to 64 tasks per credential; re-pair when exhausted.
