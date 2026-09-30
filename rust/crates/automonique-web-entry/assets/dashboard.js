@@ -838,6 +838,24 @@ const frenchUi = Object.freeze({
   "Select at least one session. A phone can only reach the sessions named here.": "Sélectionnez au moins une session. Un téléphone n’atteint que les sessions nommées ici.",
   "The QR encoder did not load. Use Copy invite instead.": "L’encodeur QR n’a pas été chargé. Utilisez plutôt Copier l’invitation.",
   "LIFECYCLE ACTIONS": "ACTIONS DU CYCLE DE VIE",
+  "Run a task": "Lancer une tâche",
+  "Run task": "Lancer la tâche",
+  "What should Monique do?": "Que doit faire Monique ?",
+  "Ask Monique to write, run, or test code in a private writable workspace. Continue the resulting session here.": "Demandez à Monique d’écrire, d’exécuter ou de tester du code dans un espace de travail privé. Poursuivez ensuite la session ici.",
+  "Create a script, run it, and report the result…": "Crée un script, exécute-le et présente le résultat…",
+  "Each turn gets a fresh workspace; session history is retained. Repository changes use the ticket workflow.": "Chaque tour utilise un nouvel espace de travail ; l’historique de la session est conservé. Les modifications des dépôts passent par les tickets.",
+  "Ready for a new task.": "Prêt pour une nouvelle tâche.",
+  "Check task status": "Vérifier la tâche",
+  "Open task session": "Ouvrir la session de la tâche",
+  "Preparing task…": "Préparation de la tâche…",
+  "Task accepted. Waiting for execution to finish…": "Tâche acceptée. En attente de la fin de l’exécution…",
+  "Task completed. Open its session to read the result or continue.": "Tâche terminée. Ouvrez sa session pour lire le résultat ou continuer.",
+  "Task completed; no retained session was returned.": "Tâche terminée ; aucune session conservée n’a été renvoyée.",
+  "Checking the previous task’s receipt…": "Vérification du résultat de la tâche précédente…",
+  "Task outcome is uncertain. Check its receipt; do not resubmit.": "Le résultat de la tâche est incertain. Vérifiez son état sans la relancer.",
+  "Task was not submitted. Check the connection and browser storage, then try again.": "La tâche n’a pas été envoyée. Vérifiez la connexion et le stockage du navigateur, puis réessayez.",
+  "Task status is unavailable. Check again; the task will not be resubmitted.": "L’état de la tâche est indisponible. Vérifiez à nouveau ; la tâche ne sera pas relancée.",
+  "Task recovery storage is unavailable. Restore browser storage before starting work.": "Le stockage de suivi des tâches est indisponible. Rétablissez le stockage du navigateur avant de lancer une tâche.",
   "Create or resume a workspace": "Créer ou reprendre un espace de travail",
   "Task input remains local while lifecycle actions are unavailable": "La tâche reste locale tant que les actions du cycle de vie sont indisponibles",
   "Create unavailable": "Création indisponible",
@@ -2790,6 +2808,7 @@ async function loadPlatform({ announce = false } = {}) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action: "read", ...(workspaceId ? { workspace_id: workspaceId } : {}) }),
     }));
+    if (platformTask?.pending) await reconcilePlatformTask();
     if (cockpitControlHandle) await reconcileCockpitControl();
     if (platformMutation) await reconcilePlatformMutation();
     else if (platformSelectedSession && platformSelectedSessionVisible() && byId("platform-session-detail").hidden) await openPlatformSession(platformSelectedSession);
@@ -3180,6 +3199,110 @@ byId("operations-refresh").addEventListener("click", () => {
   loadProcesses({ announce: true });
 });
 byId("processes-refresh").addEventListener("click", () => loadProcesses({ announce: true }));
+const platformTaskStorageKey = "monique-platform-task-v1";
+let platformTaskBusy = false;
+let platformTaskStorageError = false;
+let platformTask = (() => {
+  try {
+    const raw = sessionStorage.getItem(platformTaskStorageKey);
+    if (!raw) return null;
+    const value = JSON.parse(raw);
+    if (typeof value.nodeId !== "string" || !/^dashboard-task-[a-zA-Z0-9-]+$/.test(value.key) ||
+        !validPlatformDecimal(value.revision, false) || typeof value.pending !== "boolean" ||
+        (value.sessionId !== null && typeof value.sessionId !== "string")) throw new Error("Invalid task handle");
+    return value;
+  } catch (_error) {
+    platformTaskStorageError = true;
+    return null;
+  }
+})();
+
+function savePlatformTask(value) {
+  // Save only correlation metadata, never the task text. A reload may only
+  // reconcile this handle: it must never create another execution.
+  sessionStorage.setItem(platformTaskStorageKey, JSON.stringify(value));
+  if (sessionStorage.getItem(platformTaskStorageKey) !== JSON.stringify(value)) throw new Error("Task recovery storage unavailable");
+  platformTask = value;
+}
+
+function renderPlatformTask(message) {
+  const pending = platformTask?.pending === true;
+  byId("platform-task-submit").disabled = platformTaskBusy || pending || platformTaskStorageError;
+  byId("platform-task-text").disabled = platformTaskBusy || pending || platformTaskStorageError;
+  byId("platform-task-check").hidden = !pending;
+  byId("platform-task-check").disabled = platformTaskBusy;
+  byId("platform-task-open").hidden = !platformTask?.sessionId || pending;
+  if (message) byId("platform-task-status").textContent = message;
+  else if (platformTaskStorageError) byId("platform-task-status").textContent = "Task recovery storage is unavailable. Restore browser storage before starting work.";
+  else if (pending) byId("platform-task-status").textContent = "Checking the previous task’s receipt…";
+  else if (platformTask?.sessionId) byId("platform-task-status").textContent = "Task completed. Open its session to read the result or continue.";
+}
+
+function platformTaskPost(body) {
+  return api("/api/platform/task", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+}
+
+function acceptPlatformTaskResult(view) {
+  const outcome = view.state === "receipt" ? view.receipt?.outcome : view.state === "refused" ? view.outcome : null;
+  if (["completed", "rejected", "conflict"].includes(outcome)) {
+    const sessionId = outcome === "completed" && typeof view.session_id === "string" ? view.session_id : null;
+    savePlatformTask({ ...platformTask, pending: false, sessionId });
+    if (outcome === "completed") {
+      byId("platform-task-text").value = "";
+      renderPlatformTask(sessionId ? "Task completed. Open its session to read the result or continue." : "Task completed; no retained session was returned.");
+    } else renderPlatformTask(`Task did not run: ${view.receipt?.explanation || view.explanation || outcome}. You can submit a new task.`);
+  } else if (outcome === "accepted") {
+    byId("platform-task-text").value = "";
+    renderPlatformTask("Task accepted. Waiting for execution to finish…");
+  } else renderPlatformTask("Task outcome is uncertain. Check its receipt; do not resubmit.");
+}
+
+async function submitPlatformTask(event) {
+  event.preventDefault();
+  if (platformTaskBusy || platformTask?.pending || platformTaskStorageError) return;
+  const text = byId("platform-task-text").value.trim();
+  if (!text) return;
+  platformTaskBusy = true;
+  renderPlatformTask("Preparing task…");
+  let submitted = false;
+  try {
+    const ready = await platformTaskPost({ action: "prepare" });
+    if (ready.state !== "ready" || typeof ready.node_id !== "string" || !validPlatformDecimal(ready.expected_revision, false)) throw new Error("No ready task runner");
+    savePlatformTask({ nodeId: ready.node_id, revision: ready.expected_revision, key: `dashboard-task-${crypto.randomUUID()}`, pending: true, sessionId: null });
+    submitted = true;
+    acceptPlatformTaskResult(await platformTaskPost({ action: "submit", node_id: platformTask.nodeId, expected_revision: platformTask.revision, idempotency_key: platformTask.key, text }));
+  } catch (_error) {
+    renderPlatformTask(submitted ? "Task outcome is uncertain. Check its receipt; do not resubmit." : "Task was not submitted. Check the connection and browser storage, then try again.");
+  } finally {
+    platformTaskBusy = false;
+    renderPlatformTask(byId("platform-task-status").textContent);
+  }
+}
+
+async function reconcilePlatformTask() {
+  if (!platformTask?.pending || platformTaskBusy) return;
+  platformTaskBusy = true;
+  renderPlatformTask(byId("platform-task-status").textContent);
+  try {
+    acceptPlatformTaskResult(await platformTaskPost({ action: "reconcile", node_id: platformTask.nodeId, idempotency_key: platformTask.key }));
+  } catch (_error) {
+    renderPlatformTask("Task status is unavailable. Check again; the task will not be resubmitted.");
+  } finally {
+    platformTaskBusy = false;
+    renderPlatformTask(byId("platform-task-status").textContent);
+  }
+}
+
+byId("platform-new-task-form").addEventListener("submit", submitPlatformTask);
+byId("platform-task-check").addEventListener("click", reconcilePlatformTask);
+byId("platform-task-open").addEventListener("click", async () => {
+  if (!platformTask?.sessionId) return;
+  document.querySelector('[data-cockpit-surface="conversation"]').click();
+  await selectPlatformSession(platformTask.sessionId);
+  byId("platform-session-detail").scrollIntoView({ block: "start", behavior: "smooth" });
+});
+renderPlatformTask();
+
 byId("platform-refresh").addEventListener("click", () => loadPlatform({ announce: true }));
 byId("platform-history-more").addEventListener("click", () => pagePlatformHistory());
 byId("platform-session-detach").addEventListener("click", () => detachPlatformSession());

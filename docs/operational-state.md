@@ -109,6 +109,30 @@ escalation as an approved card would. The run lane needs a delegated cgroup,
 so run it under `systemd-run --user --scope -p Delegate=yes` with the daemon's
 `XDG_STATE_HOME`, `XDG_RUNTIME_DIR` and `AUTOMONIQUE_LAUNCH_HELPER`.
 
+## Starting work from the dashboard
+
+The hosted workspaces page offers **Run a task**. It submits an operator request
+to the daemon's existing contained execution lane: the agent can create files,
+run code and tests in its private writable workspace. A completed task links to
+its retained session, where the operator can inspect history and send follow-ups.
+Each turn has its own scratch workspace; conversation history persists across
+follow-ups. The managed execution profile grants read/execute access to system
+runtimes while keeping them non-writable. Ordinary chat profiles retain their
+existing grants.
+
+Repository-bound work continues through the ticket workflow; selecting a project
+in the workspace catalogue does not mount that repository into a new task.
+
+The authenticated, POST-only `/api/platform/task` surface has three actions:
+`prepare` resolves only `node/current` to its fresh concrete identity and revision;
+`submit` carries that exact identity, revision, task text and a
+`dashboard-task-` idempotency key; `reconcile` looks up that key and verifies the
+original node and action. Node revisions are decimal strings throughout. A lost
+reply, unknown outcome or page reload never resubmits the task. The browser stores
+only receipt correlation metadata in session storage before sending; if that
+storage is unavailable, it sends nothing. Accepted work remains pending until a
+terminal receipt proves completion or refusal.
+
 ## What an approved job is held to
 
 An approved Manage job receives, after the prompt Manage composed, two blocks

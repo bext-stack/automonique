@@ -145,6 +145,17 @@
               <div><p class="kicker">TASK / WORKSPACE / RETAINED SESSION</p><h1 id="sessions-title">Hosted workspaces</h1><p class="page-lede">Stay with a task from workspace context through its retained conversation. External work and internal agent state remain distinct, explicitly sourced signals.</p></div>
               <div class="heading-actions"><button class="button secondary" id="platform-refresh" type="button">Refresh</button><span class="tag" id="platform-health">LOADING</span></div>
             </div>
+            <article class="panel platform-new-task" aria-labelledby="platform-new-task-title">
+              <form class="platform-composer" id="platform-new-task-form">
+                <h2 id="platform-new-task-title">Run a task</h2>
+                <p>Ask Monique to write, run, or test code in a private writable workspace. Continue the resulting session here.</p>
+                <label for="platform-task-text">What should Monique do?</label>
+                <div><textarea id="platform-task-text" rows="3" maxlength="8192" required placeholder="Create a script, run it, and report the result…"></textarea><button class="button primary" id="platform-task-submit" type="submit">Run task</button></div>
+                <small>Each turn gets a fresh workspace; session history is retained. Repository changes use the ticket workflow.</small>
+              </form>
+              <div id="platform-task-status" role="status" aria-live="polite">Ready for a new task.</div>
+              <div class="cockpit-preview-actions"><button class="button secondary" id="platform-task-check" type="button" hidden>Check task status</button><button class="button secondary" id="platform-task-open" type="button" hidden>Open task session</button></div>
+            </article>
             <article class="panel platform-monitor" aria-labelledby="platform-monitor-title">
               <div class="panel-head process-monitor-head"><div><p class="kicker">PRIMARY WORK SURFACE</p><h2 id="platform-monitor-title">Task and workspace cockpit</h2></div><div class="process-monitor-actions"><small id="platform-cursor">Waiting for workspace context</small></div></div>
               <div class="cockpit-capability-state" id="cockpit-capability-state" data-mode="loading" role="status" aria-live="polite"><strong>Checking workspace capabilities</strong><span>Retained sessions remain available while capability discovery completes.</span></div>

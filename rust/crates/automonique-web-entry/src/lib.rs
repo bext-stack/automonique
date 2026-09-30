@@ -5,6 +5,7 @@
 mod agent_auth;
 mod mobile_auth;
 mod platform_cockpit;
+mod platform_task;
 mod platform_v2_bridge;
 
 pub use agent_auth::AgentAuthConfig;
@@ -162,6 +163,7 @@ pub enum Route {
     ApiPlatform,
     ApiPlatformCockpit,
     ApiPlatformSession,
+    ApiPlatformTask,
     ApiPlatformRemote,
     ApiPlatformV2Remote,
     MobileDiscovery,
@@ -5566,6 +5568,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 }
                 "/api/platform/cockpit" => Route::ApiPlatformCockpit,
                 "/api/platform/session" => Route::ApiPlatformSession,
+                "/api/platform/task" => Route::ApiPlatformTask,
                 "/api/platform/v2" => Route::ApiPlatformV2Remote,
                 "/api/mobile/operator-provision" => Route::MobileOperatorProvision,
                 "/api/mobile/pairings" => Route::MobilePairingCreate,
@@ -5596,6 +5599,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                     | Route::ApiAgentAccountsAction
                     | Route::ApiPlatformCockpit
                     | Route::ApiPlatformSession
+                    | Route::ApiPlatformTask
                     | Route::ApiPlatformRemote
                     | Route::ApiPlatformV2Remote
                     | Route::MobileOperatorProvision
@@ -6057,6 +6061,7 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         | Route::ApiPlatform
         | Route::ApiPlatformCockpit
         | Route::ApiPlatformSession
+        | Route::ApiPlatformTask
         | Route::ApiPlatformRemote
         | Route::ApiPlatformV2Remote
         | Route::ApiProcesses
@@ -6187,6 +6192,21 @@ fn api_response(
                         | "platform_cockpit_exact_task_binding_mismatch",
                     ) => json_error("409 Conflict", "platform_cockpit_control_conflict"),
                     Err(category) => json_error("503 Service Unavailable", category),
+                },
+                Err(_) => json_error("400 Bad Request", "invalid_json"),
+            }
+        }
+        Route::ApiPlatformTask => {
+            match serde_json::from_slice::<platform_task::TaskRequest>(body) {
+                Ok(request) => match integration.platform.lock() {
+                    Ok(mut client) => match platform_task::execute(&mut client, request) {
+                        Ok(view) => json_response("200 OK", &view),
+                        Err("platform_task_request_invalid") => {
+                            json_error("400 Bad Request", "platform_task_request_invalid")
+                        }
+                        Err(category) => json_error("503 Service Unavailable", category),
+                    },
+                    Err(_) => json_error("503 Service Unavailable", "platform_client_unavailable"),
                 },
                 Err(_) => json_error("400 Bad Request", "invalid_json"),
             }
@@ -6808,6 +6828,7 @@ fn handle(
             | Route::ApiPlatform
             | Route::ApiPlatformCockpit
             | Route::ApiPlatformSession
+            | Route::ApiPlatformTask
             | Route::ApiPlatformRemote
             | Route::ApiPlatformV2Remote
             | Route::ApiProcesses
@@ -10846,6 +10867,26 @@ mod tests {
                 assert_eq!(document["provenance"], "unknown", "{document}");
             }
         }
+    }
+
+    #[test]
+    fn task_submission_is_post_only_and_requires_operator_authentication() {
+        for auth in ["", "Authorization: Bearer untrusted\r\n"] {
+            let request = format!(
+                "POST /api/platform/task HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nX-Forwarded-Proto: https\r\n{auth}Content-Type: application/json\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{{\"action\":\"prepare\"}}"
+            );
+            let response =
+                String::from_utf8(exchange_without_integration(request.as_bytes())).unwrap();
+            assert!(
+                response.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+                "{response}"
+            );
+        }
+        let get = request("GET", "/api/platform/task", CANONICAL_HOST);
+        assert_eq!(
+            route(&parse_request(&get).unwrap(), &fixture_hosts()),
+            Route::MethodNotAllowed
+        );
     }
 
     #[test]
