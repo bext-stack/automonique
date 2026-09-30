@@ -570,3 +570,17 @@ test("a definitive task refusal keeps the draft available for a fresh submission
   await expect(page.locator("#platform-task-submit")).toBeEnabled();
   await expect(page.locator("#platform-task-text")).toHaveValue("Create a script");
 });
+
+
+test("a failed execution is not presented as proof that nothing ran", async ({ page }) => {
+  await page.route("**/api/platform/task", async (route) => {
+    const body = route.request().postDataJSON();
+    return route.fulfill({ json: body.action === "prepare"
+      ? { state: "ready", node_id: "daemon-1", expected_revision: "1" }
+      : { state: "receipt", receipt: { outcome: "rejected", explanation: "provider_failed_after_start" }, session_id: null } });
+  });
+  await page.locator("#platform-task-text").fill("Create a script");
+  await page.locator("#platform-task-submit").click();
+  await expect(page.locator("#platform-task-status")).toContainText("Task did not complete");
+  await expect(page.locator("#platform-task-status")).not.toContainText("did not run");
+});

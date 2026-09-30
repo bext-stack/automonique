@@ -3250,7 +3250,7 @@ function acceptPlatformTaskResult(view) {
     if (outcome === "completed") {
       byId("platform-task-text").value = "";
       renderPlatformTask(sessionId ? "Task completed. Open its session to read the result or continue." : "Task completed; no retained session was returned.");
-    } else renderPlatformTask(`Task did not run: ${view.receipt?.explanation || view.explanation || outcome}. You can submit a new task.`);
+    } else renderPlatformTask(`Task did not complete: ${view.receipt?.explanation || view.explanation || outcome}. You can submit a new task.`);
   } else if (outcome === "accepted") {
     byId("platform-task-text").value = "";
     renderPlatformTask("Task accepted. Waiting for execution to finish…");
