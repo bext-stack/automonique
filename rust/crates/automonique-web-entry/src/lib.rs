@@ -6222,6 +6222,9 @@ fn api_response(
                     Err("mobile_work_refused") => {
                         mobile_error("409 Conflict", "mobile_work_refused")
                     }
+                    Err("mobile_work_not_applied") => {
+                        mobile_error("409 Conflict", "mobile_work_not_applied")
+                    }
                     Err(category) => mobile_error("503 Service Unavailable", category),
                 },
             },
