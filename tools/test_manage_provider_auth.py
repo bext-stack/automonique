@@ -20,6 +20,52 @@ def function(name):
 
 
 class ProviderAuthTests(unittest.TestCase):
+    def test_restart_does_not_verify_replaced_account_credentials(self):
+        for provider in ("codex", "claude"):
+            for changed, known_revision in ((False, True), (True, True), (False, False)):
+                with self.subTest(provider=provider, changed=changed, known_revision=known_revision):
+                    with tempfile.TemporaryDirectory() as directory:
+                        home = Path(directory)
+                        leaf = "auth.json" if provider == "codex" else ".credentials.json"
+                        (home / leaf).write_text("original fixture")
+                        script = "\n".join([
+                            "set -euo pipefail",
+                            function("credential_revision"),
+                            function("initialize_auth_health"),
+                            r'''
+probe_local_auth() { return 0; }
+auth_health_status() { printf authenticated; }
+previous_verified_at() { printf 123; }
+latest_job_auth_failure_reason() { return 1; }
+write_auth_health() { printf '%s:%s:%s\n' "$1" "$2" "$3" >> "$selected_home/health"; }
+write_auth_revision() { printf '%s' "$1" > "$auth_revision_file"; }
+if [[ "$known_revision" == yes ]]; then
+    write_auth_revision "$(credential_revision)"
+fi
+if [[ "$replace_credentials" == yes ]]; then
+    printf 'replacement fixture' > "$selected_home/$credential_leaf.next"
+    mv "$selected_home/$credential_leaf.next" "$selected_home/$credential_leaf"
+fi
+initialize_auth_health
+''',
+                        ])
+                        subprocess.run(["bash", "-c", script], env={
+                            **os.environ,
+                            "selected_provider": provider,
+                            "selected_account": "acct-fixture",
+                            "selected_home": directory,
+                            "auth_revision_file": str(home / "revision"),
+                            "credential_leaf": leaf,
+                            "replace_credentials": "yes" if changed else "no",
+                            "known_revision": "yes" if known_revision else "no",
+                        }, check=True)
+                        health = home / "health"
+                        if changed:
+                            self.assertTrue(health.exists(), "replaced credentials kept stale authenticated status")
+                            self.assertEqual(health.read_text(), "configured_unverified:credentials_changed:123\n")
+                        else:
+                            self.assertFalse(health.exists(), "unchanged credentials lost execution evidence")
+
     def test_jcode_rechecks_replaced_credentials_and_access_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
