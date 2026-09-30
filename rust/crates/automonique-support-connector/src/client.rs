@@ -245,6 +245,11 @@ impl FleetClient {
         decode_ticket_status(&body)
     }
 
+    /// Read this instance's ticket queue; never releases work.
+    pub fn ticket_queue(&self) -> Result<FleetOutcome<crate::TicketQueue>, FleetFailure> {
+        crate::decode_ticket_queue(&self.send(&FleetRequest::TicketQueue)?)
+    }
+
     /// Issue one request and return its bounded response body.
     ///
     /// The credential is rendered into an `Authorization` header inside the

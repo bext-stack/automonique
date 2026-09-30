@@ -12,7 +12,7 @@
 import {RefusalError, ValidationError, bodyArray, bodyBool, bodyIntegerOrNull, bodyString, bodyStringOrNull, bodyStrings, bodyUnsigned, bodyValue, byteLength, exactFields, exactInputFields, exactString, isWellFormedUnicode, jsonUnsigned, mapNullable, refuse, type JsonValue} from "./runtime.js";
 
 /** Maximum independently granted mobile actions. */
-export const MAX_MOBILE_ACTIONS = 5;
+export const MAX_MOBILE_ACTIONS = 6;
 
 /** Maximum secret-free credential summaries in one operator page. */
 export const MAX_MOBILE_CREDENTIAL_PAGE_SIZE = 100;
@@ -311,8 +311,8 @@ export function MobileRevision(value: bigint): MobileRevision {
   return value as MobileRevision;
 }
 
-export type MobileAction = "attach" | "decide_approval" | "follow_up" | "start_task" | "stop_run";
-export const MobileAction_VALUES: readonly MobileAction[] = ["attach", "decide_approval", "follow_up", "start_task", "stop_run"];
+export type MobileAction = "attach" | "decide_approval" | "follow_up" | "manage_work" | "start_task" | "stop_run";
+export const MobileAction_VALUES: readonly MobileAction[] = ["attach", "decide_approval", "follow_up", "manage_work", "start_task", "stop_run"];
 /** Security-sensitive: an undefined value is refused. */
 export function decodeMobileAction(value: string): MobileAction {
   if (!(MobileAction_VALUES as readonly string[]).includes(value)) {

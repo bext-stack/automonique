@@ -472,6 +472,7 @@ dependencies = [
  "automonique-platform-client",
  "automonique-protocol",
  "automonique-store",
+ "automonique-support-connector",
  "automonique-transport-runtime",
  "base64 0.22.1",
  "hex",
