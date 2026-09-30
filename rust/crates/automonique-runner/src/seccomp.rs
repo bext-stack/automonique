@@ -152,6 +152,10 @@
 //! twice, once with the bit and once without. Distributions overwhelmingly ship
 //! `x32` disabled, so this costs filter size on a path that usually cannot be
 //! taken, and is kept because the alternative is a silent bypass.
+//! `ptrace` and `process_vm_*` also have distinct x32 entry-point numbers:
+//! setting the bit on their native numbers does not cover those entry points.
+//! [`PROCESS_INSPECTION_SYSCALLS`] includes both number sets, with both bit
+//! forms denied to cover the pre-5.4 kernel aliases as well.
 //!
 //! # Fail closed
 //!
@@ -233,11 +237,18 @@ pub const IO_URING_SYSCALLS: [i64; 3] = [
 
 /// Cross-process inspection and descriptor-copying entry points every policy
 /// denies unconditionally.
-pub const PROCESS_INSPECTION_SYSCALLS: [i64; 4] = [
+///
+/// The compat numbers come from Linux's
+/// `arch/x86/entry/syscalls/syscall_64.tbl`. They are not the native syscall
+/// numbers with `__X32_SYSCALL_BIT` set: the compiler adds that bit separately.
+pub const PROCESS_INSPECTION_SYSCALLS: [i64; 7] = [
     nix::libc::SYS_ptrace & !X32_SYSCALL_BIT,
     nix::libc::SYS_process_vm_readv & !X32_SYSCALL_BIT,
     nix::libc::SYS_process_vm_writev & !X32_SYSCALL_BIT,
     nix::libc::SYS_pidfd_getfd & !X32_SYSCALL_BIT,
+    521, // x32 ptrace
+    539, // x32 process_vm_readv
+    540, // x32 process_vm_writev
 ];
 
 /// Namespace-creation entry points every policy denies unconditionally.

@@ -12,10 +12,12 @@
 //! flat `key=value` lines and makes no judgement about whether an outcome is
 //! correct; the assertions live in `tests/seccomp.rs`.
 //!
-//! Every probe goes through `nix`, not the standard library, because the point
+//! Socket and native process probes go through `nix`, because the point
 //! is to reach socket families and types — raw, netlink, packet, vsock,
 //! seqpacket — that `std::net` has no way to ask for. The `nix` wrappers are
 //! safe functions, which matters in a crate that forbids `unsafe_code`.
+//! The x32 probe execs a fixed Python fixture to issue compat syscall numbers
+//! that `nix` does not expose, without adding unsafe Rust to the runner.
 //!
 //! Usage: `automonique-seccomp-probe <mode>`.
 
@@ -55,6 +57,8 @@ enum Mode {
     UnixAndTcp,
     /// Apply the TCP policy, then `execv` this binary in `PostExecProbe`.
     TcpThenExec,
+    /// Deny all sockets, then issue x32 inspection calls in a child fixture.
+    X32Inspection,
 }
 
 impl Mode {
@@ -68,6 +72,7 @@ impl Mode {
             "tcp" => Some(Self::Tcp),
             "unix-and-tcp" => Some(Self::UnixAndTcp),
             "tcp-then-exec" => Some(Self::TcpThenExec),
+            "x32-inspection" => Some(Self::X32Inspection),
             _ => None,
         }
     }
@@ -82,6 +87,7 @@ impl Mode {
             Self::Tcp => "tcp",
             Self::UnixAndTcp => "unix-and-tcp",
             Self::TcpThenExec => "tcp-then-exec",
+            Self::X32Inspection => "x32-inspection",
         }
     }
 
@@ -90,7 +96,7 @@ impl Mode {
         let policy = SocketFamilyPolicy::deny_all();
         Some(match self {
             Self::Baseline | Self::PostExecProbe => return None,
-            Self::DenyAll => Ok(policy),
+            Self::DenyAll | Self::X32Inspection => Ok(policy),
             Self::Unix => policy.allowing_unix_sockets().map_err(|e| e.to_string()),
             Self::UnixSeqpacket => policy
                 .allowing_unix_sockets()
@@ -138,8 +144,39 @@ fn run() -> i32 {
     if matches!(mode, Mode::TcpThenExec) {
         return exec_post_exec_probe();
     }
+    if matches!(mode, Mode::X32Inspection) {
+        return probe_x32_inspection();
+    }
     probe_all();
     0
+}
+
+fn probe_x32_inspection() -> i32 {
+    // Invalid request/PID and null buffers prevent any process access even if
+    // the filter regresses. Seccomp must refuse before examining arguments,
+    // including on a host with x32 disabled (which would otherwise be ENOSYS).
+    const PROBE: &str = r#"
+import ctypes
+import errno
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+for number in (521, 539, 540):
+    for syscall in (number, number | 0x40000000):
+        ctypes.set_errno(0)
+        result = libc.syscall(ctypes.c_long(syscall), ctypes.c_long(-1),
+                              ctypes.c_long(0), ctypes.c_long(0),
+                              ctypes.c_long(0), ctypes.c_long(0), ctypes.c_long(0))
+        error = ctypes.get_errno()
+        outcome = 'denied_eperm' if result == -1 and error == errno.EPERM else f'unexpected_{result}_{error}'
+        print(f'syscall_{syscall}={outcome}')
+"#;
+    match std::process::Command::new("python3")
+        .args(["-I", "-c", PROBE])
+        .status()
+    {
+        Ok(status) if status.success() => 0,
+        _ => APPLY_FAILED,
+    }
 }
 
 fn refused(error: &str) -> i32 {

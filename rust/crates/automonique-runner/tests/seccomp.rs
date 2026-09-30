@@ -601,6 +601,39 @@ fn every_policy_filters_unconditional_syscalls_and_both_syscall_abis() {
     }
 }
 
+/// Compat entry points are distinct from native syscall numbers plus the bit.
+#[test]
+fn x32_process_inspection_uses_its_own_syscall_numbers() {
+    // Linux arch/x86/entry/syscalls/syscall_64.tbl assigns these compat
+    // entry points separately from native ptrace/process_vm_* numbers.
+    // Do not derive this oracle from the filter's own syscall list.
+    for policy in [SocketFamilyPolicy::deny_all(), unix_policy(), tcp_policy()] {
+        let compiled = policy.compile().expect("policy compiles");
+        for number in [521, 539, 540] {
+            assert!(
+                compiled
+                    .filtered_syscalls()
+                    .contains(&(0x4000_0000 | number)),
+                "x32 process-inspection entry point {number} escaped the filter"
+            );
+            assert!(
+                compiled.filtered_syscalls().contains(&number),
+                "legacy unmarked x32 alias {number} escaped the filter"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_kernel_denies_x32_process_inspection_before_argument_validation() {
+    let report = probe("x32-inspection");
+    for number in [521, 539, 540] {
+        for syscall in [number, number | 0x4000_0000] {
+            assert_field(&report, &format!("syscall_{syscall}"), "denied_eperm");
+        }
+    }
+}
+
 /// Grants are bounded, duplicate-free, and refused with a typed error.
 #[test]
 fn grants_are_bounded_and_duplicates_are_refused() {
