@@ -173,7 +173,23 @@ load_selected_account || {
 }
 
 credential_revision() {
-    if [[ "$selected_provider" == codex || "$selected_provider" == jcode ]]; then
+    local auth_file
+    if [[ "$selected_provider" == jcode ]]; then
+        # JCode stores OpenAI and Claude OAuth separately. Ownership changes
+        # after a contained refresh can also change readability without
+        # changing the credential bytes or mtime.
+        local leaf revision readable
+        for leaf in auth.json openai-auth.json config.toml; do
+            auth_file=$selected_home/$leaf
+            # JCode reapplies private modes while checking auth. Ignore ctime
+            # alone, otherwise that check would invalidate its own evidence.
+            revision=$(stat -c '%y:%s:%i:%u:%g:%a' -- "$auth_file" 2>/dev/null || printf '%s' missing)
+            if [[ -r "$auth_file" ]]; then readable=yes; else readable=no; fi
+            printf '%s:%s:%s|' "$leaf" "$revision" "$readable"
+        done
+        return
+    fi
+    if [[ "$selected_provider" == codex ]]; then
         auth_file=$selected_home/auth.json
     else
         auth_file=$selected_home/.credentials.json

@@ -477,6 +477,8 @@ fn read_bounded(mut reader: impl Read) -> Result<Vec<u8>, ChatProviderFailure> {
 }
 
 fn write_answer(path: &Path, answer: &str) -> Result<(), ChatProviderFailure> {
+    use std::os::unix::fs::PermissionsExt as _;
+
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -484,6 +486,10 @@ fn write_answer(path: &Path, answer: &str) -> Result<(), ChatProviderFailure> {
         .open(path)
         .map_err(|_| ChatProviderFailure::Output)?;
     file.write_all(answer.as_bytes())
+        // The contained provider has a subordinate uid but retains the
+        // supervisor's group. Publish the completed answer to that group;
+        // the supervisor-owned run directory remains private (0700).
+        .and_then(|()| file.set_permissions(std::fs::Permissions::from_mode(0o640)))
         .and_then(|()| file.sync_all())
         .map_err(|_| ChatProviderFailure::Output)
 }
@@ -524,6 +530,52 @@ impl From<TransportFailure> for ChatProviderFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_answer_is_group_readable_without_allowing_replacement() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("private run directory");
+        let path = directory.path().join("answer.md");
+        write_answer(&path, "pong").expect("write completed answer");
+        assert_eq!(std::fs::read_to_string(&path).expect("answer"), "pong");
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640,
+            "the supervisor group can read; other users have no access"
+        );
+        assert_eq!(
+            write_answer(&path, "replacement"),
+            Err(ChatProviderFailure::Output)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("original answer"),
+            "pong"
+        );
+    }
+
+    #[test]
+    fn answer_refuses_a_symlink_without_changing_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("private run directory");
+        let target = directory.path().join("existing");
+        std::fs::write(&target, "preserved").expect("existing file");
+        let path = directory.path().join("answer.md");
+        symlink(&target, &path).expect("symlink");
+        assert_eq!(
+            write_answer(&path, "replacement"),
+            Err(ChatProviderFailure::Output)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("original target"),
+            "preserved"
+        );
+    }
 
     #[test]
     fn request_is_one_flash_non_thinking_harness_step() {
