@@ -8,10 +8,10 @@
     <meta name="theme-color" id="theme-color" content="#0b0d10">
     <title>Monique</title>
     <link rel="icon" href="/favicon.svg?v=3" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/dashboard.css?v=16">
+    <link rel="stylesheet" href="/assets/dashboard.css?v=17">
     <script src="/assets/qrcode.js?v=1" defer></script>
     <script src="/assets/platform-cockpit-core.js?v=2" defer></script>
-    <script src="/assets/dashboard.js?v=18" defer></script>
+    <script src="/assets/dashboard.js?v=19" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#workspace">Skip to workspace</a>
@@ -53,6 +53,7 @@
             <div class="breadcrumb"><span>PRODUCTION</span><b>/</b><strong id="current-view">SESSIONS</strong></div>
           </div>
           <div class="topbar-status">
+            <button class="button primary pairing-launch" id="pairing-open" type="button" aria-haspopup="dialog" aria-controls="pairing-panel">Connect phone</button>
             <span class="status-dot" aria-hidden="true"></span>
             <strong id="global-health">Connecting</strong>
             <span id="global-observed">No snapshot</span>
@@ -67,7 +68,7 @@
           <section class="view" data-panel="overview" aria-labelledby="overview-title">
             <div class="page-heading">
               <div><p class="kicker">CONTROL PLANE / LIVE</p><h1 id="overview-title">Operations overview</h1><p class="page-lede">A live, secret-safe view of Monique’s execution path and delivery certainty.</p></div>
-              <div class="heading-actions"><button class="button primary" type="button" data-open-sessions>Open retained sessions</button><button class="button secondary" id="pairing-open" type="button" aria-haspopup="dialog" aria-controls="pairing-panel">Pair a phone</button><a class="button secondary" id="manage-link" data-manage-link rel="noreferrer" target="_blank" hidden>Open Manage ↗</a></div>
+              <div class="heading-actions"><button class="button primary" type="button" data-open-sessions>Open retained sessions</button><button class="button secondary" data-open-pairing type="button" aria-haspopup="dialog" aria-controls="pairing-panel">Connect phone</button><a class="button secondary" id="manage-link" data-manage-link rel="noreferrer" target="_blank" hidden>Open Manage ↗</a></div>
             </div>
 
             <div class="attention-bar" id="attention-bar">
@@ -421,31 +422,68 @@
       </div>
     </div>
     <button class="sidebar-backdrop" id="sidebar-backdrop" type="button" aria-label="Close navigation" hidden></button>
-    <section class="pairing-panel" id="pairing-panel" role="dialog" aria-modal="true" aria-labelledby="pairing-title" hidden>
+    <dialog class="pairing-panel" id="pairing-panel" aria-modal="true" aria-labelledby="pairing-title" aria-describedby="pairing-lede" hidden>
       <div class="pairing-head">
-        <div><p>Mobile</p><h2 id="pairing-title">Pair a phone</h2></div>
+        <div><p>MONIQUE MOBILE</p><h2 id="pairing-title">Take Monique with you</h2></div>
         <button id="pairing-close" type="button" aria-label="Close pairing">×</button>
       </div>
-      <p class="pairing-lede">An invite is single use and lives five minutes. Create it with the phone already in your hand.</p>
-      <div class="pairing-scope">
-        <label for="pairing-sessions"><span>Sessions this phone may attach to</span>
-          <select id="pairing-sessions" multiple size="6" aria-describedby="pairing-scope-note"></select>
-        </label>
-        <p class="pairing-note" id="pairing-scope-note">Every listed session is selected. A phone can only reach the sessions named here.</p>
-      </div>
-      <label><input type="checkbox" id="pairing-manage-work"> Allow this phone to read the configured Slack channel and submit, approve or reject tickets for this server’s Manage instance</label>
-      <label><input type="checkbox" id="pairing-start-task"> Allow this phone to start tasks and continue the sessions it creates</label>
-      <div class="pairing-actions">
-        <button class="button primary" id="pairing-create" type="button">Create invite</button>
-        <button class="button secondary" id="pairing-copy" type="button" hidden>Copy invite</button>
-      </div>
-      <div class="pairing-result" id="pairing-result" hidden>
-        <div class="pairing-code" id="pairing-code" role="img" aria-label="Pairing QR code"></div>
-        <p class="pairing-expiry" id="pairing-expiry"></p>
-        <p class="pairing-note">Scan it in the app, or use Copy invite and paste it there instead.</p>
-      </div>
-      <p class="pairing-status" id="pairing-status" role="status"></p>
-    </section>
+      <p class="pairing-lede" id="pairing-lede">Connect your phone to this server in three steps.</p>
+      <section class="pairing-step" aria-labelledby="pairing-install-title">
+        <span class="pairing-step-number" aria-hidden="true">1</span>
+        <div class="pairing-step-content">
+          <h3 id="pairing-install-title">Get the app</h3>
+          <p>Already installed? Go straight to choosing access below.</p>
+          <a class="button secondary" href="https://www.automonique.fr/#android-preview" target="_blank" rel="noopener noreferrer">Download Android app ↗</a>
+          <p class="pairing-note">Android preview. An iPhone download is not available yet.</p>
+        </div>
+      </section>
+      <section class="pairing-step" aria-labelledby="pairing-access-title">
+        <span class="pairing-step-number" aria-hidden="true">2</span>
+        <div class="pairing-step-content">
+          <h3 id="pairing-access-title">Choose what your phone can do</h3>
+          <p>Select one or more options. You can connect without an existing session.</p>
+          <div class="pairing-options">
+            <label class="pairing-option"><input type="checkbox" id="pairing-manage-work"><span><strong>Slack &amp; tickets</strong><small>Read the configured channel, submit GitHub tickets, and approve or reject pending work.</small></span></label>
+            <label class="pairing-option"><input type="checkbox" id="pairing-start-task"><span><strong>Start and continue tasks</strong><small>Ask Monique to do work, reply in the sessions it creates, and manage their approvals or stop a run.</small></span></label>
+            <label class="pairing-option"><input type="checkbox" id="pairing-existing"><span><strong>Continue existing sessions</strong><small>Choose conversations to read, reply to, approve actions in, or stop.</small></span></label>
+          </div>
+          <div class="pairing-scope" id="pairing-scope" hidden>
+            <p id="pairing-scope-note">Select only the sessions you want on this phone.</p>
+            <div id="pairing-sessions" role="group" aria-label="Sessions for this phone"></div>
+            <p class="pairing-note" id="pairing-sessions-status" role="status"></p>
+            <button class="button secondary" id="pairing-reload" type="button">Refresh session list</button>
+          </div>
+          <p class="pairing-note">Already paired? A new invitation lets you add these permissions when you pair again.</p>
+        </div>
+      </section>
+      <section class="pairing-step" aria-labelledby="pairing-connect-title">
+        <span class="pairing-step-number" aria-hidden="true">3</span>
+        <div class="pairing-step-content">
+          <h3 id="pairing-connect-title">Connect your phone</h3>
+          <p>Choose how you want to transfer the invitation.</p>
+          <div class="pairing-methods" role="group" aria-label="Pairing method">
+            <button class="button secondary" id="pairing-method-scan" type="button" aria-pressed="true">Scan with another phone</button>
+            <button class="button secondary" id="pairing-method-copy" type="button" aria-pressed="false">I’m on my phone</button>
+          </div>
+          <div class="pairing-server-row"><span>This server</span><code id="pairing-server" data-i18n-skip></code><button class="button secondary" id="pairing-copy-server" type="button">Copy address</button></div>
+          <p class="pairing-note" id="pairing-summary" aria-live="polite">Choose access above to create your invitation.</p>
+          <div class="pairing-actions"><button class="button primary" id="pairing-create" type="button" disabled>Create pairing code</button></div>
+          <div class="pairing-result" id="pairing-result" hidden>
+            <h4 tabindex="-1" id="pairing-ready">Your invitation is ready</h4>
+            <div id="pairing-scan-help">
+              <div class="pairing-code" id="pairing-code" role="img" aria-label="Pairing QR code"></div>
+              <p>In the Monique app, open Connection and tap Scan pairing QR code. Review the server and confirm.</p>
+            </div>
+            <div id="pairing-copy-help" hidden><p>Copy the invitation, switch to the Monique app, and paste it into One-time pairing offer. Tap Review pasted invite, then confirm.</p></div>
+            <button class="button primary" id="pairing-copy" type="button" hidden>Copy pairing invitation</button>
+            <details id="pairing-manual" hidden><summary>Select invitation manually</summary><textarea id="pairing-invite-text" readonly spellcheck="false" autocomplete="off" aria-label="Pairing invitation to copy" data-i18n-skip></textarea></details>
+            <p class="pairing-expiry" id="pairing-expiry" aria-live="off"></p>
+            <p class="pairing-note">Single use · expires in 5 minutes. Keep this invitation private.</p>
+          </div>
+          <p class="pairing-status" id="pairing-status" role="status" aria-live="polite"></p>
+        </div>
+      </section>
+    </dialog>
 
     <section class="appearance-panel" id="appearance-panel" aria-labelledby="appearance-title" hidden>
       <div class="appearance-panel-head"><div><p>Personalize</p><h2 id="appearance-title">Appearance</h2></div><button id="appearance-close" type="button" aria-label="Close appearance settings">×</button></div>

@@ -1794,25 +1794,49 @@ html[data-health="unavailable"] .attention-bar { border-color: var(--danger-bord
 
 /* Pairing a phone. The same floating surface as the appearance panel, so it
    inherits that panel's tokens rather than inventing any. */
-.pairing-panel { position: fixed; z-index: 70; top: 56px; right: 18px; width: min(430px, calc(100vw - 28px)); max-height: calc(100vh - 74px); padding: 20px; border: 1px solid var(--line-bright); border-radius: 18px; background: var(--panel); box-shadow: 0 24px 80px var(--shadow-color); overflow-y: auto; animation: appearance-in .16s ease-out; }
-.pairing-head { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 14px; }
-.pairing-head p { margin: 0 0 4px; color: var(--quiet); font-size: var(--font-xs); font-weight: 650; letter-spacing: .08em; text-transform: uppercase; }
-.pairing-head h2 { font-size: var(--font-title-lg); letter-spacing: -.025em; }
-.pairing-head button { display: grid; width: 32px; height: 32px; place-items: center; border: 0; border-radius: 9px; color: var(--muted); background: var(--panel-2); font-size: var(--font-title); cursor: pointer; }
-.pairing-lede, .pairing-note { margin: 0 0 12px; color: var(--muted); font-size: var(--font-sm); line-height: 1.5; }
-.pairing-note { margin: 6px 0 0; color: var(--quiet); font-size: var(--font-xs); }
-.pairing-scope > label > span { display: block; margin-bottom: 6px; color: var(--quiet); font-size: var(--font-xs); font-weight: 650; letter-spacing: .08em; text-transform: uppercase; }
-.pairing-scope select { width: 100%; padding: 6px; border: 1px solid var(--line); border-radius: 8px; color: var(--text); background: var(--field-surface); font-family: inherit; font-size: var(--font-xs); }
-.pairing-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
-.pairing-result { margin-top: 16px; text-align: center; }
-/* Inline SVG, not an image: the dashboard policy is `img-src 'self'`, which a
-   data: URI would violate. The white plate is the quiet zone a scanner needs. */
-.pairing-code { display: inline-block; padding: 12px; border-radius: 12px; background: #fff; line-height: 0; }
-.pairing-code svg { display: block; width: min(240px, 60vw); height: auto; }
-.pairing-expiry { margin: 10px 0 0; color: var(--text); font-size: var(--font-md); font-variant-numeric: tabular-nums; }
-.pairing-expiry.is-expired { color: var(--danger-text, #e0736b); }
-.pairing-status { margin: 12px 0 0; min-height: 1.2em; color: var(--muted); font-size: var(--font-sm); }
-.pairing-status[data-kind="error"] { color: var(--danger-text, #e0736b); }
+/* Mobile pairing is a native modal: keyboard focus stays inside the flow. */
+.pairing-panel { color: var(--text); width: min(740px, calc(100vw - 24px)); max-height: calc(100dvh - 32px); margin: auto; padding: 26px; border: 1px solid var(--line-bright); border-radius: 20px; background: var(--panel); box-shadow: 0 24px 80px var(--shadow-color); overflow-y: auto; }
+.pairing-panel::backdrop { background: rgba(0, 0, 0, .65); backdrop-filter: blur(4px); }
+.pairing-head { position: sticky; top: -26px; z-index: 2; background: var(--panel); padding: 14px 0; display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
+.pairing-head p { margin: 0 0 6px; color: var(--green); font: 600 var(--font-xs) ui-monospace, monospace; letter-spacing: .1em; }
+.pairing-head h2 { margin: 0; font-size: var(--font-title-lg); }
+.pairing-head button { flex-shrink: 0; width: 44px; height: 44px; border: 1px solid var(--line); border-radius: 12px; color: var(--text); background: var(--panel-2); font-size: 24px; cursor: pointer; }
+.pairing-lede { color: var(--muted); margin: 8px 0 24px; }
+.pairing-step { display: flex; align-items: flex-start; gap: 14px; padding: 20px 0; border-top: 1px solid var(--line); }
+.pairing-step-number { display: grid; flex: 0 0 30px; height: 30px; place-items: center; border: 1px solid var(--accent-border); border-radius: 50%; background: var(--accent-surface); color: var(--green); font-weight: 700; }
+.pairing-step-content { min-width: 0; flex: 1; }
+.pairing-step h3 { margin: 2px 0 8px; font-size: var(--font-lg); }
+.pairing-step p { color: var(--muted); font-size: var(--font-sm); line-height: 1.6; margin: 0 0 12px; }
+.pairing-step .pairing-note { margin: 10px 0 0; color: var(--quiet); font-size: var(--font-xs); }
+.pairing-options { display: grid; gap: 8px; }
+.pairing-option { display: flex; align-items: flex-start; gap: 12px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel-2); cursor: pointer; }
+.pairing-option:has(input:checked) { border-color: var(--accent-hover-border); background: var(--accent-surface); }
+.pairing-option input, .pairing-session input { flex-shrink: 0; width: 20px; height: 20px; margin: 2px 0 0; accent-color: var(--green); }
+.pairing-option strong, .pairing-option small { display: block; }
+.pairing-option strong { font-size: var(--font-md); }
+.pairing-option small { color: var(--muted); margin-top: 5px; font-size: var(--font-sm); line-height: 1.5; }
+.pairing-scope { margin-top: 12px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; }
+#pairing-sessions { max-height: 200px; overflow-y: auto; }
+.pairing-session { display: flex; align-items: flex-start; gap: 10px; padding: 10px 0; min-height: 44px; overflow-wrap: anywhere; cursor: pointer; }
+.pairing-session small { display: block; color: var(--quiet); font-size: var(--font-xs); }
+.pairing-methods, .pairing-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
+.pairing-panel .button { min-height: 44px; white-space: normal; }
+.pairing-methods [aria-pressed="true"] { border-color: var(--accent-hover-border); color: var(--green); background: var(--accent-surface); }
+.pairing-server-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: var(--font-sm); margin: 14px 0; }
+.pairing-server-row code { flex: 1; overflow-wrap: anywhere; min-width: 120px; color: var(--muted); }
+.pairing-result { margin-top: 16px; padding: 20px; border: 1px solid var(--accent-border); border-radius: 14px; background: var(--accent-surface); text-align: center; }
+.pairing-result h4 { scroll-margin-top: 100px; margin: 0 0 16px; font-size: var(--font-lg); }
+.pairing-code { display: inline-block; padding: 12px; margin-bottom: 12px; max-width: 100%; border-radius: 12px; background: #fff; line-height: 0; }
+.pairing-code svg { display: block; width: min(270px, 100%); height: auto; }
+.pairing-step .pairing-expiry { margin: 12px 0 0; color: var(--text); font-size: var(--font-md); font-variant-numeric: tabular-nums; }
+.pairing-expiry.is-expired, .pairing-status[data-kind="error"] { color: var(--danger-text, #e0736b); }
+.pairing-step .pairing-status { margin-top: 12px; min-height: 1.2em; }
+#pairing-manual { margin-top: 12px; text-align: left; }
+#pairing-manual summary { cursor: pointer; padding: 10px 0; }
+#pairing-invite-text { width: 100%; min-height: 110px; padding: 10px; background: var(--field-surface); color: var(--text); border: 1px solid var(--line); border-radius: 8px; font: var(--font-xs) ui-monospace, monospace; }
+.pairing-launch { white-space: nowrap; min-height: 40px; }
+@media (max-width: 760px) { .topbar { flex-wrap: wrap; height: auto; min-height: 64px; padding-top: 8px; padding-bottom: 8px; gap: 8px; } .pairing-panel { padding: 18px; } .pairing-head { top: -18px; } }
+@media (max-width: 460px) { .pairing-step { gap: 10px; } .pairing-step-number { flex-basis: 25px; height: 25px; } .pairing-result { padding: 12px; } .pairing-methods .button { flex: 1 1 140px; } .pairing-launch { padding: 8px 10px; } }
 
 .platform-new-task { margin-bottom: 20px; padding: 20px; }
 .platform-new-task .platform-composer { margin: 0 0 12px; }
