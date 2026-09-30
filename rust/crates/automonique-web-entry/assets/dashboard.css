@@ -1813,3 +1813,9 @@ html[data-health="unavailable"] .attention-bar { border-color: var(--danger-bord
 .pairing-expiry.is-expired { color: var(--danger-text, #e0736b); }
 .pairing-status { margin: 12px 0 0; min-height: 1.2em; color: var(--muted); font-size: var(--font-sm); }
 .pairing-status[data-kind="error"] { color: var(--danger-text, #e0736b); }
+
+.platform-new-task { margin-bottom: 20px; padding: 20px; }
+.platform-new-task .platform-composer { margin: 0 0 12px; }
+.platform-new-task h2 { margin: 0 0 8px; }
+.platform-new-task p { color: var(--muted); margin: 0 0 14px; }
+#platform-task-status { overflow-wrap: anywhere; }

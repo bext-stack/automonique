@@ -775,7 +775,10 @@ pub fn compose_with_profile(
 }
 
 /// Compose a managed request whose normalized provider session remains
-/// resumable by an exact later follow-up.
+/// resumable by an exact later follow-up. This entry point is for authenticated
+/// operator task execution (including authorized retained-session delivery),
+/// so it uses the contained agentic profile. Ordinary conversational reads
+/// continue to select their own, narrower profiles.
 pub fn compose_managed(
     task: &str,
     inputs: &CompositionInputs<'_>,
@@ -785,7 +788,12 @@ pub fn compose_managed(
         automonique_protocol::platform::ResourceId::new(session_id)
             .map_err(|_| ComposeRefusal::IdentityRejected)?;
     }
-    compose_inner(task, inputs, ProviderRunProfile::Standard, Some(mode))
+    compose_inner(
+        task,
+        inputs,
+        ProviderRunProfile::AgenticScratchpad,
+        Some(mode),
+    )
 }
 
 fn compose_inner(
@@ -1076,11 +1084,11 @@ fn argv(
             ],
         );
     }
-    if profile == ProviderRunProfile::AgenticScratchpad
-        && arguments.first().is_some_and(|arg| arg == "exec")
-    {
+    if profile == ProviderRunProfile::AgenticScratchpad && engine == ProviderEngine::Codex {
         // The execution profile is selected by trusted dispatch after an
-        // authenticated administrator approves the frozen task. User text is
+        // authenticated administrator approves the frozen task or explicitly
+        // submits a managed task. This also covers Codex's resumed invocation,
+        // whose argv starts with global options instead of `exec`. User text is
         // stdin data and cannot select or widen this profile. Replace only
         // Codex's reviewed `-s read-only` pair; an owner-configured provider
         // with a different argv retains its exact invocation and remains

@@ -490,3 +490,97 @@ test("an ambiguous durable handle reloads through lookup only and never replays 
   expect(actions).not.toContain("submit_workspace_create");
   expect(actions).not.toContain("submit_workspace_resume");
 });
+
+test("new task survives a lost reply and reload without resubmission", async ({ page }) => {
+  const requests = [];
+  await page.route("**/api/platform/task", async (route) => {
+    const body = route.request().postDataJSON();
+    requests.push(body);
+    if (body.action === "prepare") return route.fulfill({ json: { state: "ready", node_id: "daemon-1", expected_revision: "9007199254740995" } });
+    if (body.action === "submit") {
+      expect(body.expected_revision).toBe("9007199254740995");
+      const stored = await page.evaluate(() => JSON.parse(sessionStorage.getItem("monique-platform-task-v1")));
+      expect(stored.key).toBe(body.idempotency_key);
+      expect(stored).not.toHaveProperty("text");
+      return route.abort();
+    }
+    expect(body.action).toBe("reconcile");
+    expect(body.node_id).toBe("daemon-1");
+    expect(body.idempotency_key).toBe(requests.find((request) => request.action === "submit").idempotency_key);
+    return route.fulfill({ json: { state: "receipt", receipt: { outcome: "completed" }, session_id: "session-1" } });
+  });
+  await page.locator("#platform-task-text").fill("Create and run a script");
+  await page.getByRole("button", { name: "Run task", exact: true }).click();
+  await expect(page.locator("#platform-task-status")).toContainText("uncertain");
+  await expect(page.locator("#platform-task-submit")).toBeDisabled();
+  await page.reload();
+  await expect(page.locator("#platform-task-status")).toContainText("Task completed");
+  expect(requests.filter((request) => request.action === "submit")).toHaveLength(1);
+  await page.getByRole("button", { name: "Open task session" }).click();
+  await expect(page.locator("#platform-session-coordinate")).toContainText("session-1");
+});
+
+test("new task refuses to transmit when recovery storage cannot be written", async ({ page }) => {
+  const requests = [];
+  await page.route("**/api/platform/task", async (route) => {
+    const body = route.request().postDataJSON(); requests.push(body);
+    return route.fulfill({ json: { state: "ready", node_id: "daemon-1", expected_revision: "1" } });
+  });
+  await page.evaluate(() => {
+    const original = Storage.prototype.setItem;
+    Storage.prototype.setItem = function (key, value) {
+      if (key === "monique-platform-task-v1") throw new Error("storage denied");
+      return original.call(this, key, value);
+    };
+  });
+  await page.locator("#platform-task-text").fill("Create a script");
+  await page.locator("#platform-task-submit").click();
+  await expect(page.locator("#platform-task-status")).toContainText("not submitted");
+  expect(requests.map((request) => request.action)).toEqual(["prepare"]);
+});
+
+test("accepted tasks block another submission until a terminal receipt", async ({ page }) => {
+  const requests = [];
+  await page.route("**/api/platform/task", async (route) => {
+    const body = route.request().postDataJSON(); requests.push(body);
+    return route.fulfill({ json: body.action === "prepare"
+      ? { state: "ready", node_id: "daemon-1", expected_revision: "1" }
+      : { state: "receipt", receipt: { outcome: "accepted" }, session_id: null } });
+  });
+  await page.locator("#platform-task-text").fill("Create a script");
+  await page.locator("#platform-task-submit").click();
+  await expect(page.locator("#platform-task-status")).toContainText("Task accepted");
+  await expect(page.locator("#platform-task-submit")).toBeDisabled();
+  await page.locator("#platform-new-task-form").evaluate((form) => form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+  await page.locator("#platform-task-check").click();
+  expect(requests.filter((request) => request.action === "submit")).toHaveLength(1);
+  await expect(page.locator("#platform-task-submit")).toBeDisabled();
+});
+
+test("a definitive task refusal keeps the draft available for a fresh submission", async ({ page }) => {
+  await page.route("**/api/platform/task", async (route) => {
+    const body = route.request().postDataJSON();
+    return route.fulfill({ json: body.action === "prepare"
+      ? { state: "ready", node_id: "daemon-1", expected_revision: "1" }
+      : { state: "refused", outcome: "conflict", explanation: "stale_revision" } });
+  });
+  await page.locator("#platform-task-text").fill("Create a script");
+  await page.locator("#platform-task-submit").click();
+  await expect(page.locator("#platform-task-status")).toContainText("stale_revision");
+  await expect(page.locator("#platform-task-submit")).toBeEnabled();
+  await expect(page.locator("#platform-task-text")).toHaveValue("Create a script");
+});
+
+
+test("a failed execution is not presented as proof that nothing ran", async ({ page }) => {
+  await page.route("**/api/platform/task", async (route) => {
+    const body = route.request().postDataJSON();
+    return route.fulfill({ json: body.action === "prepare"
+      ? { state: "ready", node_id: "daemon-1", expected_revision: "1" }
+      : { state: "receipt", receipt: { outcome: "rejected", explanation: "provider_failed_after_start" }, session_id: null } });
+  });
+  await page.locator("#platform-task-text").fill("Create a script");
+  await page.locator("#platform-task-submit").click();
+  await expect(page.locator("#platform-task-status")).toContainText("Task did not complete");
+  await expect(page.locator("#platform-task-status")).not.toContainText("did not run");
+});

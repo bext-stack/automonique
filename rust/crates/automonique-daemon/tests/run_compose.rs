@@ -583,7 +583,7 @@ fn managed_new_and_follow_up_argv_preserve_and_resume_one_exact_session() {
         arguments,
         [
             "-s",
-            "read-only",
+            "workspace-write",
             "-C",
             follow_up
                 .answer_path()
@@ -675,6 +675,66 @@ fn jcode_composition_selects_the_supervised_protocol_and_exact_resume_binding() 
             name == JCODE_RESUME_ENV && value.to_string_lossy() == session
         })
     );
+}
+
+#[test]
+fn managed_tasks_and_follow_ups_have_bounded_runtime_execution() {
+    let fixture = Fixture::new(None, None);
+    let home = fixture.provider_home();
+    let offered = features();
+    for engine in [ProviderEngine::Codex, ProviderEngine::Jcode] {
+        let config = match engine {
+            ProviderEngine::Codex => busybox_provider(&home, &[]),
+            ProviderEngine::Jcode => format!(
+                "engine=jcode\nbinary={BUSYBOX}\nhome={}\nversion=jcode-fixture\narg=api-stdio\n",
+                home.display()
+            ),
+        };
+        write_private(&fixture.state_dir().join(PROVIDER_CONFIG_NAME), &config);
+        let provider = fixture.provider();
+        for mode in [
+            ManagedSessionMode::New,
+            ManagedSessionMode::Resume("session-1"),
+        ] {
+            let composition = compose_managed(
+                "write and execute a script",
+                &CompositionInputs {
+                    state_dir: &fixture.state_dir(),
+                    run_id: "managed-runtime-1",
+                    provider: &provider,
+                    offered_features: &offered,
+                    egress_configured: true,
+                },
+                mode,
+            )
+            .unwrap();
+            let spec = RunSpec::from_canonical_bytes(composition.document()).unwrap();
+            let grants = spec.sandbox().path_grants().as_slice();
+            for runtime in ["/usr/bin", "/usr/lib"] {
+                assert!(grants.iter().any(|grant| grant.path().as_str() == runtime
+                    && grant.access() == PathAccess::ReadExecute));
+            }
+            assert!(
+                grants
+                    .iter()
+                    .all(|grant| grant.access() != PathAccess::ReadWrite
+                        || grant.path().as_str() == home.to_str().unwrap()
+                        || grant.path().as_str() == "/dev/null"),
+                "no extra writable host mount"
+            );
+            assert_eq!(
+                spec.sandbox().budgets().cgroup_memory().quantity(),
+                COMPOSE_MEMORY_BYTES
+            );
+            if engine == ProviderEngine::Codex {
+                assert!(
+                    spec.arguments()
+                        .windows(2)
+                        .any(|pair| pair[0] == "-s" && pair[1] == "workspace-write")
+                );
+            }
+        }
+    }
 }
 
 /// The operator's task is the prompt, and it is nowhere else in the document.
