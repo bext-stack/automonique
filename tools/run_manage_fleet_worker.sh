@@ -181,7 +181,9 @@ credential_revision() {
         local leaf revision readable
         for leaf in auth.json openai-auth.json config.toml; do
             auth_file=$selected_home/$leaf
-            revision=$(stat -c '%y:%z:%s:%i:%u:%g:%a' -- "$auth_file" 2>/dev/null || printf '%s' missing)
+            # JCode reapplies private modes while checking auth. Ignore ctime
+            # alone, otherwise that check would invalidate its own evidence.
+            revision=$(stat -c '%y:%s:%i:%u:%g:%a' -- "$auth_file" 2>/dev/null || printf '%s' missing)
             if [[ -r "$auth_file" ]]; then readable=yes; else readable=no; fi
             printf '%s:%s:%s|' "$leaf" "$revision" "$readable"
         done

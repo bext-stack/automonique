@@ -46,6 +46,9 @@ refresh_auth_after_credential_change
 refresh_auth_after_credential_change
 chmod 600 "$selected_home/openai-auth.json"
 refresh_auth_after_credential_change
+# JCode reapplies the same private mode during a probe; that is not a new
+# credential or an access change and must not cause a probe loop.
+chmod 600 "$selected_home/openai-auth.json"
 refresh_auth_after_credential_change
 ''',
                 ]
