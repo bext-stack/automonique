@@ -418,6 +418,10 @@ impl JcodeSessionHost {
         let session_request_id = match resume_session_id {
             Some(session_id) => host.send(&JcodeRequest::AttachSession {
                 session_id: session_id.to_owned(),
+                // A retained provider session remembers its old directory. Each
+                // turn has a fresh workspace and grants; rebind the session to
+                // this trusted launch coordinate before sending the follow-up.
+                working_dir: Some(working_dir.to_string_lossy().into_owned()),
             })?,
             None => host.send(&JcodeRequest::CreateSession {
                 working_dir: Some(working_dir.to_string_lossy().into_owned()),

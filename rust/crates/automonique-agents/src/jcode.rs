@@ -152,6 +152,8 @@ pub enum JcodeRequest {
     },
     AttachSession {
         session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        working_dir: Option<String>,
     },
     SendMessage {
         session_id: String,
@@ -1032,8 +1034,17 @@ fn validate_request(request: &JcodeRequest) -> Result<(), JcodeProtocolError> {
             }
             Ok(())
         }
-        JcodeRequest::AttachSession { session_id }
-        | JcodeRequest::Cancel { session_id }
+        JcodeRequest::AttachSession {
+            session_id,
+            working_dir,
+        } => {
+            validate_field(session_id, "session_id")?;
+            if working_dir.as_ref().is_some_and(|path| path.is_empty()) {
+                return Err(JcodeProtocolError::InvalidField("working_dir"));
+            }
+            Ok(())
+        }
+        JcodeRequest::Cancel { session_id }
         | JcodeRequest::GetHistory { session_id }
         | JcodeRequest::ListModels { session_id }
         | JcodeRequest::GetRuntimeInfo { session_id } => validate_field(session_id, "session_id"),
