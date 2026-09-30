@@ -924,6 +924,29 @@ completion_report_is_structured() {
     grep -q 'Demande 1' <<<"$1"
 }
 
+wait_for_provider() {
+    local provider_pid=$1
+    local stdout_logger stderr_logger exit_status=0
+    # Providers write directly to the private spool files. A spawned server
+    # may inherit those descriptors, but cannot keep a pipe to this worker
+    # open after the provider exits. Follow the exact provider PID so both
+    # log readers drain and terminate independently of descendant lifetimes.
+    tail --pid="$provider_pid" --sleep-interval=0.1 -n +1 -f -- "$output" \
+        | while IFS= read -r line || [[ -n "$line" ]]; do
+            log_provider_line "$job_id" "$line"
+        done &
+    stdout_logger=$!
+    tail --pid="$provider_pid" --sleep-interval=0.1 -n +1 -f -- "$error_output" \
+        | while IFS= read -r line || [[ -n "$line" ]]; do
+            post_job_log "$job_id" provider_stderr "$line"
+        done &
+    stderr_logger=$!
+    wait "$provider_pid" || exit_status=$?
+    wait "$stdout_logger" || true
+    wait "$stderr_logger" || true
+    return "$exit_status"
+}
+
 run_job() {
     job=$1
     job_id=$(jq -er '.id | select(type == "string" and test("^[A-Za-z0-9._-]{8,120}$"))' <<<"$job") || return
@@ -980,15 +1003,7 @@ run_job() {
                 --dangerously-bypass-approvals-and-sandbox \
                 --skip-git-repo-check \
                 -C "$cwd" \
-                - 2> >(while IFS= read -r line; do
-                    printf '%s\n' "$line" >>"$error_output"
-                    post_job_log "$job_id" provider_stderr "$line"
-                done) \
-            | tee "$output" \
-            | while IFS= read -r line; do
-                log_provider_line "$job_id" "$line"
-            done
-        provider_status=${PIPESTATUS[1]:-1}
+                - >"$output" 2>"$error_output" &
     elif [[ "$selected_provider" == jcode ]]; then
         cd -- "$cwd" || {
             set -u
@@ -1000,15 +1015,7 @@ run_job() {
                 JCODE_RUNTIME_DIR="$runtime_dir/jcode-runtime" \
                 JCODE_SERVER_EXECUTABLE="$selected_binary" \
                 "$selected_binary" --quiet --no-update --no-selfdev run --ndjson - \
-                2> >(while IFS= read -r line; do
-                    printf '%s\n' "$line" >>"$error_output"
-                    post_job_log "$job_id" provider_stderr "$line"
-                done) \
-            | tee "$output" \
-            | while IFS= read -r line; do
-                log_provider_line "$job_id" "$line"
-            done
-        provider_status=${PIPESTATUS[1]:-1}
+                >"$output" 2>"$error_output" &
     else
         cd -- "$cwd" || {
             set -u
@@ -1021,16 +1028,10 @@ run_job() {
                 --output-format stream-json \
                 --verbose \
                 --dangerously-skip-permissions \
-                2> >(while IFS= read -r line; do
-                    printf '%s\n' "$line" >>"$error_output"
-                    post_job_log "$job_id" provider_stderr "$line"
-                done) \
-            | tee "$output" \
-            | while IFS= read -r line; do
-                log_provider_line "$job_id" "$line"
-            done
-        provider_status=${PIPESTATUS[1]:-1}
+                >"$output" 2>"$error_output" &
     fi
+    wait_for_provider "$!"
+    provider_status=$?
     set -u
 
     if [[ "$selected_provider" == codex ]]; then
