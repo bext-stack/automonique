@@ -49,7 +49,7 @@ const cockpit = {
   projects: [{ id: "project-1", label: "Automonique", revision: "1", lifecycle: "active" }],
   hosts: [{ id: "host-1", label: "Local host", revision: "1", lifecycle: "active", project_id: "project-1", kind: "local" }],
   workspaces: [
-    { id: "workspace-1", label: "Cockpit", revision: "9007199254740995", lifecycle: "active", project_id: "project-1", host_id: "host-1", attempts: [{ id: "attempt-1", label: "Attempt 1", revision: "2", lifecycle: "running", sessions: [{ id: "runtime-session-1", label: "Session 1", revision: "3", lifecycle: "active", platform_session_id: "session-1", panes: [] }] }], attention: "needs_you" },
+    { id: "workspace-1", label: "Release review", revision: "9007199254740995", lifecycle: "active", project_id: "project-1", host_id: "host-1", attempts: [{ id: "attempt-1", label: "Attempt 1", revision: "2", lifecycle: "running", sessions: [{ id: "runtime-session-1", label: "Session 1", revision: "3", lifecycle: "active", platform_session_id: "session-1", panes: [] }] }], attention: "needs_you" },
     { id: "workspace-2", label: "Blocked workspace", revision: "7", lifecycle: "active", project_id: "project-1", host_id: "host-1", attempts: [{ id: "attempt-2", label: "Attempt 2", revision: "2", lifecycle: "running", sessions: [{ id: "runtime-session-2", label: "Session 2", revision: "3", lifecycle: "active", platform_session_id: "session-2", panes: [] }] }], attention: "blocked" },
   ],
   selected: { workspace: "workspace-1" },
@@ -147,12 +147,12 @@ test.beforeEach(async ({ page }) => {
     return route.fulfill({ contentType: "application/json", body: "{}" });
   });
   await page.goto("https://cockpit.test/#sessions");
-  await expect(page.getByRole("heading", { name: "Cockpit", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Task and workspace cockpit", exact: true })).toBeVisible();
 });
 
 test("workspace projection is accessible and lifecycle controls fail closed", async ({ page }) => {
   await expect(page.getByRole("listbox", { name: "Hosted workspaces" })).toBeVisible();
-  await expect(page.getByRole("option", { name: /Cockpit/ })).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByRole("option", { name: /Release review/ })).toHaveAttribute("aria-selected", "true");
   await expect(page.getByRole("tablist", { name: "Selected workspace surfaces" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Create unavailable" })).toBeDisabled();
   await expect(page.getByRole("button", { name: "Resume unavailable" })).toBeDisabled();
@@ -325,26 +325,26 @@ test("attention filtering preserves structured workspaces and retained sessions"
   await expect(page.locator(".platform-session-option").filter({ hasText: "Retained cockpit work" })).toBeVisible();
 
   await page.locator('[data-cockpit-attention="needs_you"]').click();
-  await expect(page.getByRole("option", { name: /Cockpit/ })).toBeVisible();
+  await expect(page.getByRole("option", { name: /Release review/ })).toBeVisible();
   await expect(page.getByRole("option", { name: /Blocked workspace/ })).toHaveCount(0);
   await expect(page.locator(".platform-session-option").filter({ hasText: "Retained cockpit work" })).toBeVisible();
   await expect(page.locator("#cockpit-capability-state")).toHaveAttribute("data-mode", "v2");
 
   await page.locator('[data-cockpit-attention="blocked"]').click();
   await expect(page.getByRole("option", { name: /Blocked workspace/ })).toBeVisible();
-  await expect(page.getByRole("option", { name: /Cockpit/ })).toHaveCount(0);
+  await expect(page.getByRole("option", { name: /Release review/ })).toHaveCount(0);
   await expect(page.locator(".platform-session-option").filter({ hasText: "Retained cockpit work" })).toBeVisible();
 });
 
 test("retained session selection and detach never discard the cockpit snapshot", async ({ page }) => {
   await page.locator(".platform-session-option").filter({ hasText: "Retained cockpit work" }).click();
   await expect(page.locator(".platform-session-option").filter({ hasText: "Retained cockpit work" })).toBeVisible();
-  await expect(page.getByRole("option", { name: /Cockpit/ })).toBeVisible();
+  await expect(page.getByRole("option", { name: /Release review/ })).toBeVisible();
   await expect(page.locator("#cockpit-capability-state")).toHaveAttribute("data-mode", "v2");
 
   await page.locator("#platform-session-detach").click();
   await expect(page.locator(".platform-session-option").filter({ hasText: "Retained cockpit work" })).toBeVisible();
-  await expect(page.getByRole("option", { name: /Cockpit/ })).toBeVisible();
+  await expect(page.getByRole("option", { name: /Release review/ })).toBeVisible();
   await expect(page.locator("#cockpit-capability-state")).toHaveAttribute("data-mode", "v2");
 });
 
@@ -362,14 +362,14 @@ test("partial lineage and review refusals disable attention filtering without in
   await expect(page.locator('[data-cockpit-attention="needs_you"]')).toBeDisabled();
   await expect(page.locator('[data-cockpit-attention="blocked"]')).toBeDisabled();
   await expect(page.locator("#cockpit-needs-you-count")).toHaveText("—");
-  await expect(page.getByRole("option", { name: /Cockpit/ })).toBeVisible();
+  await expect(page.getByRole("option", { name: /Release review/ })).toBeVisible();
   await expect(page.getByRole("option", { name: /Blocked workspace/ })).toBeVisible();
   await expect(page.locator(".platform-session-option").filter({ hasText: "Retained cockpit work" })).toBeVisible();
 });
 
 test("cross-workspace retained session selection updates URL and cockpit before attach settles", async ({ page }) => {
   await page.goto("https://cockpit.test/#sessions?workspace=workspace-1&session=session-1&file=file-1&hunk=hunk-1&side=new&line=1");
-  await expect(page.getByRole("heading", { name: "Cockpit", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Task and workspace cockpit", exact: true })).toBeVisible();
 
   await page.locator(".platform-session-option").filter({ hasText: "Blocked workspace conversation" }).click();
   await expect(page.locator("#platform-session-status")).toHaveText("Attaching as observer…");
