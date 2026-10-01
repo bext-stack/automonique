@@ -482,7 +482,7 @@ test.describe("hosted cockpit attention render", () => {
       expect(served?.schema, "the deployment served a cockpit document under an unknown schema").toBe(
         COCKPIT_SCHEMA,
       );
-      await expect(page.getByRole("heading", { name: "Task and workspace cockpit", exact: true })).toBeVisible();
+      await expect(page.getByRole("heading", { name: "Tasks", exact: true })).toBeVisible();
       await page.getByRole("tab", { name: "Activity" }).click();
 
       const items = Array.isArray(served?.inbox?.items) ? served.inbox.items : [];

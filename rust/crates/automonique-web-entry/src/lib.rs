@@ -9391,9 +9391,9 @@ mod tests {
         assert!(DASHBOARD_JS.contains("renderMemoryInspector"));
         assert!(DASHBOARD_JS.contains("Queued in Manage"));
         assert!(DASHBOARD_JS.contains("ticket.integration !== ticketSurface"));
-        assert!(DASHBOARD_HTML.contains("Support tickets and Manage issue work"));
+        assert!(DASHBOARD_HTML.contains("aria-label=\"Filter by source\""));
         assert!(DASHBOARD_HTML.contains("Only Running means an agent is executing"));
-        assert!(DASHBOARD_CSS.contains(".memory-workspace"));
+        assert!(DASHBOARD_CSS.contains(".memory-table"));
         for theme in [
             "midnight", "ocean", "forest", "monokai", "dracula", "nord", "sand", "rose", "contrast",
         ] {
@@ -9410,18 +9410,14 @@ mod tests {
             .find("id=\"sidebar-new-chat\"")
             .expect("generic recovery navigation");
         assert!(retained_nav < recovery_nav);
-        assert!(
-            DASHBOARD_HTML.contains("href=\"#sessions\" aria-label=\"Open retained sessions\"")
-        );
+        assert!(DASHBOARD_HTML.contains("href=\"#sessions\" aria-label=\"Monique, open tasks\""));
         assert!(
             DASHBOARD_HTML.contains("data-panel=\"sessions\" aria-labelledby=\"sessions-title\"")
         );
-        assert!(DASHBOARD_HTML.contains("PRIMARY WORK SURFACE"));
-        assert!(DASHBOARD_HTML.contains("SECONDARY / RECOVERY"));
-        assert!(DASHBOARD_HTML.contains(
-            "This assistant is not attached to an authority-qualified Platform session."
-        ));
-        assert!(DASHBOARD_HTML.contains("data-open-sessions>Return to retained sessions"));
+        assert!(DASHBOARD_HTML.contains("<h1 id=\"sessions-title\">Tasks</h1>"));
+        assert!(DASHBOARD_HTML.contains("GENERAL HELP"));
+        assert!(DASHBOARD_HTML.contains("For work on a task, reply inside that task instead."));
+        assert!(DASHBOARD_HTML.contains("data-open-sessions>Back to tasks"));
         assert!(DASHBOARD_JS.contains(
             "const startupViews = [\"sessions\", \"overview\", \"operations\", \"tickets\", \"chat\"]"
         ));
@@ -9434,15 +9430,18 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_sidebar_keeps_recovery_controls_scrollable_and_focus_visible() {
-        assert!(DASHBOARD_CSS.contains("height: 100vh; height: 100dvh"));
-        assert!(DASHBOARD_CSS.contains("overflow-x: hidden; overflow-y: auto"));
-        assert!(DASHBOARD_CSS.contains("overscroll-behavior-y: contain"));
-        assert!(DASHBOARD_CSS.contains("scroll-padding-block: 12px"));
-        assert!(DASHBOARD_CSS.contains(".sidebar :is(a, button) { scroll-margin-block: 12px; }"));
+    fn dashboard_top_bar_keeps_every_section_reachable_and_focus_visible() {
+        // The section tabs scroll sideways on narrow screens instead of being cut off,
+        // and detail drawers contain their own scrolling.
+        assert!(
+            DASHBOARD_CSS.contains("align-items: center; overflow-x: auto; scrollbar-width: none;")
+        );
+        assert!(DASHBOARD_CSS.contains("overflow-y: auto; overscroll-behavior: contain;"));
         assert!(DASHBOARD_CSS.contains("button:focus-visible"));
-        assert!(DASHBOARD_HTML.contains("class=\"nav-section-label recovery-nav-label\""));
-        assert!(DASHBOARD_HTML.contains("id=\"sidebar-new-chat\" data-view=\"chat\""));
+        assert!(DASHBOARD_HTML.contains("<nav class=\"tabs\" aria-label=\"Main sections\">"));
+        assert!(
+            DASHBOARD_HTML.contains("id=\"sidebar-new-chat\" type=\"button\" data-view=\"chat\"")
+        );
     }
 
     #[test]
@@ -9480,15 +9479,19 @@ mod tests {
             "id=\"cockpit-action-receipt\" data-state=\"idle\" role=\"status\" aria-live=\"polite\"",
             "role=\"tablist\" aria-label=\"Selected workspace surfaces\"",
             "role=\"listbox\" aria-label=\"Hosted workspaces\"",
-            "OPERATIONAL INVENTORY",
+            "id=\"platform-monitor-title\">Conversations",
         ] {
             assert!(
                 DASHBOARD_HTML.contains(marker),
                 "missing cockpit marker {marker}"
             );
         }
-        assert!(DASHBOARD_JS.contains("Platform v1 retained-session mode"));
-        assert!(DASHBOARD_HTML.contains("no inference from conversation summaries"));
+        assert!(DASHBOARD_JS.contains("Workspaces are not available on this server."));
+        // A branch is shown only when the server reports one, never inferred.
+        assert!(
+            DASHBOARD_JS
+                .contains("workspace?.branch ? `Branch ${workspace.branch}` : \"No branch yet\"")
+        );
         assert!(DASHBOARD_JS.contains("derivePresentation(view, selection)"));
         assert!(!DASHBOARD_JS.contains("function cockpitDocument"));
         assert!(DASHBOARD_JS.contains("/api/platform/cockpit"));
@@ -9502,9 +9505,9 @@ mod tests {
         assert!(!PLATFORM_COCKPIT_JS.contains(".summary"));
         assert!(PLATFORM_COCKPIT_JS.contains("automonique.dashboard.cockpit/v2"));
         assert!(!PLATFORM_COCKPIT_JS.contains("automonique.cockpit/presentation/v1"));
-        assert!(DASHBOARD_CSS.contains(".hosted-workspace-grid"));
+        assert!(DASHBOARD_CSS.contains(".view-split.has-drawer"));
         assert!(DASHBOARD_CSS.contains("@media (max-width: 760px)"));
-        assert!(DASHBOARD_CSS.contains("@media (max-width: 460px)"));
+        assert!(DASHBOARD_CSS.contains("@media (max-width: 1099px)"));
     }
 
     #[test]
@@ -9563,7 +9566,7 @@ mod tests {
         assert!(DASHBOARD_JS.contains("monique-refresh-rate"));
         assert!(DASHBOARD_JS.contains("monique-notifications"));
         assert!(DASHBOARD_JS.contains("applyConfigurationFilter"));
-        assert!(DASHBOARD_HTML.contains("Credentials remain outside this browser."));
+        assert!(DASHBOARD_HTML.contains("Passwords and keys are never shown here."));
         assert!(!DASHBOARD_HTML.contains("type=\"password\""));
         assert!(!DASHBOARD_JS.contains("credential_revision"));
     }
@@ -9674,8 +9677,8 @@ mod tests {
         assert!(received.starts_with(b"HTTP/1.1 200 OK\r\n"));
         assert!(
             received
-                .windows(19)
-                .any(|part| part == b"Operations overview")
+                .windows(17)
+                .any(|part| part == b"Search or jump to")
         );
     }
 

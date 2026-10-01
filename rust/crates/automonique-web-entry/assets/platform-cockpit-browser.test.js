@@ -28,9 +28,11 @@ test("mobile shell stacks the same truthful regions into one responsive column",
     shortcuts: { workspace: "w", conversation: "c", activity: "a" },
   });
   expect(css).toContain("@media (max-width: 760px)");
-  expect(css).toContain(".hosted-workspace-grid { grid-template-columns: 1fr; }");
-  expect(css).toContain("@media (max-width: 460px)");
-  expect(css).toContain(".cockpit-signal-grid, .cockpit-read-model-grid { grid-template-columns: 1fr; }");
+  // One column by default; the detail drawer only becomes a side column on wide screens
+  // and joins the page flow on phones.
+  expect(css).toContain(".view-split { display: grid; grid-template-columns: minmax(0, 1fr);");
+  expect(css).toContain(".drawer.is-open { position: static;");
+  expect(css).toContain(".cockpit-signal-grid, .cockpit-read-model-grid { grid-template-columns: minmax(0, 1fr); }");
 });
 
 test("workspace shell exposes accessible tabs, live receipt state, and keyboard targets", () => {
@@ -85,6 +87,7 @@ test("check rerun requires a server preview followed by a distinct explicit conf
 
 test("generic recovery remains secondary to the hosted workspace surface", () => {
   expect(html.indexOf('data-panel="sessions"')).toBeLessThan(html.indexOf('data-panel="chat"'));
-  expect(html).toContain("SECONDARY / RECOVERY");
-  expect(html).toContain("This assistant is not attached to an authority-qualified Platform session.");
+  expect(html.indexOf('data-view="sessions"')).toBeLessThan(html.indexOf('data-view="chat"'));
+  expect(html).toContain("GENERAL HELP");
+  expect(html).toContain("For work on a task, reply inside that task instead.");
 });

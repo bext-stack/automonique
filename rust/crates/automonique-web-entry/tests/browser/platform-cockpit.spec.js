@@ -148,7 +148,7 @@ test.beforeEach(async ({ page }) => {
     return route.fulfill({ contentType: "application/json", body: "{}" });
   });
   await page.goto("https://cockpit.test/#sessions");
-  await expect(page.getByRole("heading", { name: "Task and workspace cockpit", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Tasks", exact: true })).toBeVisible();
 });
 
 test("workspace projection is accessible and lifecycle controls fail closed", async ({ page }) => {
@@ -357,9 +357,9 @@ test("completed sessions open history and enable only exact revision follow-ups"
   const option = page.locator(".platform-session-option").filter({ hasText: "Retained cockpit work" });
   await expect(option).toBeEnabled();
   await option.click();
-  await expect(page.locator("#platform-session-status")).toContainText("Retained session");
+  await expect(page.locator("#platform-session-status")).toContainText("Saved history");
   await expect(page.locator("#platform-history")).toContainText("Saved task result");
-  await expect(page.locator("#platform-session-posture")).toContainText("control not claimed");
+  await expect(page.locator("#platform-session-posture")).toContainText("read only");
   await expect(page.locator("#platform-follow-up")).toBeEnabled();
   await expect(page.locator("#platform-composer-note")).toContainText("9007199254740995");
 });
@@ -389,7 +389,7 @@ test("partial lineage and review refusals disable attention filtering without in
   await expect(page.locator("#cockpit-capability-state")).toContainText("review_authority_refused");
   await expect(page.locator('[data-cockpit-attention="needs_you"]')).toBeDisabled();
   await expect(page.locator('[data-cockpit-attention="blocked"]')).toBeDisabled();
-  await expect(page.locator("#cockpit-needs-you-count")).toHaveText("—");
+  await expect(page.locator("#cockpit-needs-you-count")).toHaveText("-");
   await expect(page.getByRole("option", { name: /Release review/ })).toBeVisible();
   await expect(page.getByRole("option", { name: /Blocked workspace/ })).toBeVisible();
   await expect(page.locator(".platform-session-option").filter({ hasText: "Retained cockpit work" })).toBeVisible();
@@ -397,16 +397,16 @@ test("partial lineage and review refusals disable attention filtering without in
 
 test("cross-workspace retained session selection updates URL and cockpit before attach settles", async ({ page }) => {
   await page.goto("https://cockpit.test/#sessions?workspace=workspace-1&session=session-1&file=file-1&hunk=hunk-1&side=new&line=1");
-  await expect(page.getByRole("heading", { name: "Task and workspace cockpit", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Tasks", exact: true })).toBeVisible();
 
   await page.locator(".platform-session-option").filter({ hasText: "Blocked workspace conversation" }).click();
-  await expect(page.locator("#platform-session-status")).toHaveText("Opening session…");
+  await expect(page.locator("#platform-session-status")).toHaveText("Opening conversation…");
   await expect(page).toHaveURL("https://cockpit.test/#sessions?workspace=workspace-2&session=session-2");
   await expect(page.getByRole("option", { name: /Blocked workspace/ })).toHaveAttribute("aria-selected", "true");
   await expect(page.locator("#cockpit-workspace-title")).toHaveText("Blocked workspace");
   await expect(page.locator("#cockpit-inspector-workspace")).toHaveText("workspace-2");
   await expect(page.locator("#cockpit-inspector-session")).toHaveText("session-2");
-  await expect(page.locator("#cockpit-inspector-anchor")).toHaveText("—");
+  await expect(page.locator("#cockpit-inspector-anchor")).toHaveText("-");
   await expect(page.locator("#cockpit-conversation")).toBeVisible();
 
   await expect(page.locator("#platform-session-coordinate")).toContainText("session-2");
@@ -544,7 +544,7 @@ test("new task survives a lost reply and reload without resubmission", async ({ 
   await page.reload();
   await expect(page.locator("#platform-task-status")).toContainText("Task completed");
   expect(requests.filter((request) => request.action === "submit")).toHaveLength(1);
-  await page.getByRole("button", { name: "Open task session" }).click();
+  await page.getByRole("button", { name: "Open task conversation" }).click();
   await expect(page.locator("#platform-session-coordinate")).toContainText("session-1");
 });
 

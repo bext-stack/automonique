@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "dev": "bun dev-server.js",
     "test:unit": "bun test assets/platform-cockpit-core.test.js",
     "test:browser": "playwright test --project=desktop --project=mobile",
     "test:browser:live": "playwright test --project=live-cockpit --reporter=line"
