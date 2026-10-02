@@ -109,4 +109,12 @@ An owner-reviewed preference may be seeded operationally without creating an unr
 automonique-memory remember-active /private/state/agent-memory.sqlite3 <tenant> 'telegram:<immutable-user-id>' 'Reviewed preference text'
 ```
 
+That memory is personal and private: the owner's own chats read it, and nothing else does. A standing rule that approved work should follow is recorded separately, as an internal, team-visible procedure:
+
+```sh
+automonique-memory remember-procedure /private/state/agent-memory.sqlite3 <tenant> 'telegram:<immutable-user-id>' 'Open a pull request against staging; never push to main.'
+```
+
+The local brief a fleet job receives (`automonique work-brief`, the `[owner_preferences]` section) carries only active `user_profile` and `procedure` memories that are public or internal and not private, because a job's report is read by other people. `/remember` and `remember-active` both record personal, private memories, so they never reach a job; `remember-procedure` is the way to record one that does. Record it under the owner's own actor so the owner can later remove it with `/forget M-<id>`; the brief requires at least one configured Telegram operator and the tenant named in the memory configuration. The text is redacted and bounded like any other memory, and repeating the same text never records it twice.
+
 Back up the SQLite database with a WAL-aware SQLite backup while the service is running, or with the daemon stopped. Copying only the main file while WAL is active is not a valid backup. Obsidian exports cannot reconstruct identities, raw conversation history, review state, or the audit ledger.

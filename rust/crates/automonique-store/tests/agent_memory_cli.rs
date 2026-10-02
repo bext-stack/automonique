@@ -165,3 +165,61 @@ fn telegram_backfill_is_ninety_day_bounded_replayable_and_redacted() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].content, "my token [REDACTED]");
 }
+
+#[test]
+fn owner_procedure_is_recorded_active_and_job_shareable() {
+    let root = tempfile::tempdir().expect("private root");
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("private mode");
+    let database = root.path().join("agent-memory.sqlite3");
+    drop(AgentMemoryStore::open(&database).expect("memory store"));
+
+    let binary = env!("CARGO_BIN_EXE_automonique-memory");
+    let run = |content: &str| {
+        Command::new(binary)
+            .args([
+                "remember-procedure",
+                database.to_str().expect("database path"),
+                "primary",
+                "telegram:42",
+                content,
+            ])
+            .output()
+            .expect("procedure command")
+    };
+    let recorded = run("Open a pull request against staging; token sk-123456789012345678901234");
+    assert!(recorded.status.success(), "{:?}", recorded.stderr);
+    assert!(
+        std::str::from_utf8(&recorded.stdout)
+            .expect("stdout")
+            .starts_with("memory=M-")
+    );
+    // The store's own validation applies: empty content is refused.
+    assert!(!run("   ").status.success());
+    // The same text again never becomes a second memory.
+    let _ = run("Open a pull request against staging; token sk-123456789012345678901234");
+
+    let now = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_millis(),
+    )
+    .expect("clock range");
+    let store = AgentMemoryStore::open(&database).expect("memory reopens");
+    // Team-visible: another actor of the same tenant reads it, which is what
+    // lets a job brief carry it.
+    let visible = store
+        .active_for_actor("primary", "telegram:7", now)
+        .expect("active memories");
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].kind, MemoryKind::Procedure);
+    assert_eq!(visible[0].status, MemoryStatus::Active);
+    assert_eq!(visible[0].sensitivity, MemorySensitivity::Internal);
+    assert_eq!(visible[0].visibility, MemoryVisibility::Team);
+    assert_eq!(visible[0].source_transport, "owner-cli");
+    assert_eq!(
+        visible[0].content,
+        "Open a pull request against staging; token [REDACTED]"
+    );
+}

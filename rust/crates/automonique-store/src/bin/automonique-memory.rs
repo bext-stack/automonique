@@ -132,6 +132,41 @@ fn run() -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
             println!("memory={}", memory.reference());
         }
+        // A standing working rule the owner wants approved work to follow.
+        // Unlike `remember-active`, which records a personal and private
+        // fact, this is classed internal and team-visible on purpose: that is
+        // the class a job's local brief is allowed to carry, because a job's
+        // report is read by other people. Everything else — redaction, the
+        // content bound, the replay key — is the store's own.
+        "remember-procedure" => {
+            let content = arguments.next().ok_or_else(usage)?;
+            if arguments.next().is_some() {
+                return Err(usage());
+            }
+            let at_ms = now_ms()?;
+            let digest = Sha256::digest(content.as_bytes());
+            let source_key = format!("owner-procedure:{digest:x}");
+            let memory = store
+                .record_memory(&MemoryInput {
+                    tenant: &tenant,
+                    actor: &actor,
+                    scope: &format!("user:{actor}"),
+                    kind: MemoryKind::Procedure,
+                    content: &redact_content(&content),
+                    status: MemoryStatus::Active,
+                    confidence: 1000,
+                    sensitivity: MemorySensitivity::Internal,
+                    visibility: MemoryVisibility::Team,
+                    source_transport: "owner-cli",
+                    source_key: &source_key,
+                    valid_from_ms: at_ms,
+                    expires_at_ms: None,
+                    review_at_ms: None,
+                    created_at_ms: at_ms,
+                })
+                .map_err(|error| error.to_string())?;
+            println!("memory={}", memory.reference());
+        }
         _ => return Err(usage()),
     }
     Ok(())
@@ -139,7 +174,7 @@ fn run() -> Result<(), String> {
 
 fn usage() -> String {
     String::from(
-        "usage: automonique-memory <summary|export-obsidian|propose-obsidian|backfill-telegram|hygiene|link-identity|remember-active> <database> <tenant> <actor> [command arguments]",
+        "usage: automonique-memory <summary|export-obsidian|propose-obsidian|backfill-telegram|hygiene|link-identity|remember-active|remember-procedure> <database> <tenant> <actor> [command arguments]",
     )
 }
 
