@@ -17298,9 +17298,10 @@ impl ControlSurface for StoreControlSurface {
                 let (hosts, hosts_included) =
                     ranked_entity_values(inventory.sites(), &terms, HOSTS_BYTES);
                 brief.push_str(&format!(
-                    "[managed_sites source=enabled_prism_vhosts]\napp_count={}\nhostname_count={}\napps_sample({} of {})={}\nhostnames_sample({} of {})={}\n[/managed_sites]\n",
+                    "[managed_sites source=enabled_prism_vhosts]\napp_count={}\nhostname_count={}\n{}\napps_sample({} of {})={}\nhostnames_sample({} of {})={}\n[/managed_sites]\n",
                     inventory.apps().len(),
                     inventory.sites().len(),
+                    inventory.coverage(),
                     apps_included,
                     inventory.apps().len(),
                     apps,
@@ -17635,9 +17636,16 @@ impl ControlSurface for StoreControlSurface {
         let inventory =
             crate::site_inventory::prism_sites(root).map_err(|_| SurfaceRefusal::Unavailable)?;
         let mut report = format!(
-            "## Active Prism inventory\n\n{} Prism applications currently serve {} hostnames through enabled Nginx virtual hosts.\n\n### Applications ({})\n",
+            "## Active Prism inventory\n\n{} Prism applications currently serve {} hostnames through enabled Nginx virtual hosts.{}\n\n### Applications ({})\n",
             inventory.apps().len(),
             inventory.sites().len(),
+            // Said in the headline, which survives both the count-only reply
+            // and the reply bound that a large inventory reaches first.
+            if inventory.truncated() || inventory.skipped_files() > 0 {
+                format!(" This inventory is partial ({}).", inventory.coverage())
+            } else {
+                String::new()
+            },
             inventory.apps().len()
         );
         for app in inventory.apps() {
@@ -17813,7 +17821,8 @@ impl ControlSurface for StoreControlSurface {
                 let (sites, included_sites) =
                     ranked_entity_values(inventory.sites(), &question_terms, 1_536);
                 format!(
-                    "source=enabled nginx vhosts whose app manifest declares framework.type=prism\nstatus=available\napp_count={}\napps_included={}\napps_omitted={}\napps={}\nhostname_count={}\nhostnames_included={}\nhostnames_omitted={}\nhostnames={}",
+                    "source=enabled nginx vhosts whose app manifest declares framework.type=prism\nstatus=available\n{}\napp_count={}\napps_included={}\napps_omitted={}\napps={}\nhostname_count={}\nhostnames_included={}\nhostnames_omitted={}\nhostnames={}",
+                    inventory.coverage(),
                     inventory.apps().len(),
                     included_apps,
                     inventory.apps().len().saturating_sub(included_apps),
@@ -17844,7 +17853,8 @@ impl ControlSurface for StoreControlSurface {
                     let (sites, included) =
                         ranked_entity_values(inventory.sites(), &question_terms, 3_072);
                     format!(
-                        "source=all enabled nginx vhosts, hostnames only\nstatus=available\nhostname_count={}\nhostnames_included={}\nhostnames_omitted={}\nhostnames={}",
+                        "source=all enabled nginx vhosts, hostnames only\nstatus=available\n{}\nhostname_count={}\nhostnames_included={}\nhostnames_omitted={}\nhostnames={}",
+                        inventory.coverage(),
                         inventory.sites().len(),
                         included,
                         inventory.sites().len().saturating_sub(included),

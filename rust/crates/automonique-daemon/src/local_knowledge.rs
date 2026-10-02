@@ -92,19 +92,20 @@ pub fn lookup(path: &Path, question: &str) -> Result<Option<KnowledgeSelection>,
     let Some(document) = load(path)? else {
         return Ok(None);
     };
-    let question_terms = significant_terms(question);
+    let question_terms = question_match_terms(question);
     if question_terms.is_empty() {
         return Ok(Some(KnowledgeSelection {
             total: document.entities.len(),
             matched: Vec::new(),
         }));
     }
+    let own_terms = question_own_terms(question);
     let mut ranked = document
         .entities
         .into_iter()
         .filter_map(|entity| {
-            let score = entity_score(&entity, &question_terms);
-            (score > 0).then_some((score, entity))
+            let score = entity_score(&entity, &question_terms, &own_terms);
+            (score.1 > 0).then_some((score, entity))
         })
         .collect::<Vec<_>>();
     ranked.sort_by(|left, right| {
@@ -206,15 +207,125 @@ fn normalized_identity(value: &str) -> String {
         .join(" ")
 }
 
-fn entity_score(entity: &KnowledgeEntity, question_terms: &BTreeSet<String>) -> usize {
+/// How well a question names one entity: whether it does so in its own words
+/// (see [`question_own_terms`]), then how many words of the best-matching
+/// name it spells. `(false, 0)` is no match.
+fn entity_score(
+    entity: &KnowledgeEntity,
+    question_terms: &BTreeSet<String>,
+    own_terms: &BTreeSet<String>,
+) -> (bool, usize) {
     std::iter::once(entity.id.as_str())
         .chain(std::iter::once(entity.name.as_str()))
         .chain(entity.aliases.iter().map(String::as_str))
-        .map(significant_terms)
+        .map(alias_match_terms)
         .filter(|alias_terms| !alias_terms.is_empty() && alias_terms.is_subset(question_terms))
-        .map(|alias_terms| alias_terms.len())
+        .map(|alias_terms| (!alias_terms.is_disjoint(own_terms), alias_terms.len()))
         .max()
-        .unwrap_or(0)
+        .unwrap_or((false, 0))
+}
+
+/// The question's terms without the parent domain of each hostname it names.
+///
+/// "shop.platform.example" names the shop. Its parent domain also spells the
+/// platform's own name, so the platform entity still matches, but it must
+/// rank below an entity the request names directly, however many words the
+/// platform's domain happens to have. A host with nothing significant before
+/// its last two labels ("www.shop.example") is the site itself and keeps
+/// every term.
+fn question_own_terms(question: &str) -> BTreeSet<String> {
+    let folded = fold_diacritics(&question.to_lowercase());
+    let mut own = String::with_capacity(folded.len());
+    for word in folded.split_whitespace() {
+        let host = word.trim_matches(|character: char| !character.is_alphanumeric());
+        let labels: Vec<&str> = host.split('.').collect();
+        let is_subdomain = labels.len() >= 3
+            && labels.iter().all(|label| {
+                !label.is_empty()
+                    && label
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '-')
+            });
+        let leading = labels[..labels.len().saturating_sub(2)].join(" ");
+        if is_subdomain && !significant_terms(&leading).is_empty() {
+            own.push_str(&leading);
+        } else {
+            own.push_str(word);
+        }
+        own.push(' ');
+    }
+    let mut terms = significant_terms(&own);
+    terms.extend(apostrophe_compounds(&folded));
+    terms
+}
+
+/// The words a question is matched by: its significant terms with accents
+/// folded, plus each name it writes with an apostrophe in the joined form a
+/// deployment uses ("Regal'Terre" also offers "regalterre").
+///
+/// Matching is deliberately looser than [`normalized_identity`], which keeps
+/// deciding whether two catalog names collide: loosening that would turn a
+/// catalog that loads today into a malformed one.
+fn question_match_terms(question: &str) -> BTreeSet<String> {
+    let folded = fold_diacritics(&question.to_lowercase());
+    let mut terms = significant_terms(&folded);
+    terms.extend(apostrophe_compounds(&folded));
+    terms
+}
+
+/// The words that must all occur in a question for one catalog name to match.
+///
+/// A deployment alias carries its framework suffix ("shop-prism"), but a
+/// request names the site ("shop"), so the suffix is not required when the
+/// alias has another word to be recognised by. A name written with an
+/// apostrophe is also offered joined, as [`question_match_terms`] does.
+fn alias_match_terms(alias: &str) -> BTreeSet<String> {
+    let mut terms = significant_terms(&fold_diacritics(&alias.to_lowercase()));
+    if terms.len() > 1 {
+        terms.remove("prism");
+    }
+    terms
+}
+
+/// Replace accented Latin letters in lowercase text by their plain form, so a
+/// request typed without accents (or a deployment label, which has none)
+/// matches a name written with them.
+pub(crate) fn fold_diacritics(lowercase: &str) -> String {
+    let mut folded = String::with_capacity(lowercase.len());
+    for character in lowercase.chars() {
+        match character {
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => folded.push('a'),
+            'ç' => folded.push('c'),
+            'è' | 'é' | 'ê' | 'ë' => folded.push('e'),
+            'ì' | 'í' | 'î' | 'ï' => folded.push('i'),
+            'ñ' => folded.push('n'),
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' => folded.push('o'),
+            'ù' | 'ú' | 'û' | 'ü' => folded.push('u'),
+            'ý' | 'ÿ' => folded.push('y'),
+            'æ' => folded.push_str("ae"),
+            'œ' => folded.push_str("oe"),
+            other => folded.push(other),
+        }
+    }
+    folded
+}
+
+/// Names written with an apostrophe, joined: "regal'terre" gives
+/// "regalterre". An elision ("l'adresse") is grammar, not a name, so the part
+/// before the apostrophe must be a word of its own.
+pub(crate) fn apostrophe_compounds(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter_map(|word| {
+            let (head, tail) = word.split_once(['\'', '’'])?;
+            let letters = |part: &str| -> String {
+                part.chars()
+                    .filter(|character| character.is_alphanumeric())
+                    .collect()
+            };
+            let (head, tail) = (letters(head), letters(tail));
+            (head.len() >= 3 && !tail.is_empty()).then(|| format!("{head}{tail}"))
+        })
+        .collect()
 }
 
 fn significant_terms(value: &str) -> BTreeSet<String> {
@@ -293,6 +404,84 @@ mod tests {
             .expect("lookup")
             .expect("attached");
         assert!(general.matched.is_empty());
+    }
+
+    #[test]
+    fn hostnames_tags_accents_and_framework_suffixes_find_their_entity() {
+        let catalog = r#"{
+          "schema":"automonique.local-knowledge/v1",
+          "entities":[{
+            "id":"hosting-stack",
+            "name":"Hosting Stack",
+            "aliases":["hosting-stack.test"],
+            "description":{"text":"The hosting namespace.","basis":"operator_asserted","source":"fixture"},
+            "facts":[]
+          },{
+            "id":"regal-terre",
+            "name":"Régal'Terre",
+            "aliases":["regalterre-prism","regalterre.hosting-stack.test"],
+            "description":{"text":"A shop.","basis":"operator_asserted","source":"fixture"},
+            "facts":[]
+          },{
+            "id":"acme-communication",
+            "name":"Acme Communication",
+            "aliases":["acme-communication-prism"],
+            "description":{"text":"An agency site.","basis":"operator_asserted","source":"fixture"},
+            "facts":[]
+          }]
+        }"#;
+        let (_root, path) = fixture(catalog, 0o600);
+        let first = |question: &str| {
+            lookup(&path, question)
+                .expect("lookup")
+                .expect("attached")
+                .matched
+                .first()
+                .map(|entity| entity.id.clone())
+        };
+        // The app alias without its framework suffix, as a ticket tag.
+        assert_eq!(
+            first("[REGALTERRE] page paiement").as_deref(),
+            Some("regal-terre")
+        );
+        // Typed without the accent, joined across the apostrophe.
+        assert_eq!(
+            first("[Regal'Terre] page paiement").as_deref(),
+            Some("regal-terre")
+        );
+        assert_eq!(
+            first("corriger le panier de Régalterre").as_deref(),
+            Some("regal-terre")
+        );
+        // A hostname names the app whose alias carries the framework suffix,
+        // and that outranks the platform entity the host's domain also names,
+        // even though the platform's domain spells more words.
+        let matched = lookup(
+            &path,
+            "[ACME] page dépliant acme-communication.hosting-stack.test",
+        )
+        .expect("lookup")
+        .expect("attached")
+        .matched;
+        assert_eq!(
+            matched
+                .iter()
+                .map(|entity| entity.id.as_str())
+                .collect::<Vec<_>>(),
+            ["acme-communication", "hosting-stack"]
+        );
+        // With no entity of its own, a host still finds its platform; and a
+        // bare domain names the platform outright.
+        assert_eq!(
+            first("fix unknown-shop.hosting-stack.test").as_deref(),
+            Some("hosting-stack")
+        );
+        assert_eq!(
+            first("what is hosting-stack.test?").as_deref(),
+            Some("hosting-stack")
+        );
+        // The suffix alone names nothing.
+        assert_eq!(first("update the prism framework"), None);
     }
 
     #[test]
