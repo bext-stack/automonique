@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod agent_auth;
+mod jev;
 mod mobile_auth;
 mod mobile_task;
 mod mobile_work;
@@ -585,6 +586,20 @@ fn request_credentials_authorized(
     }
 }
 
+/// The Jev router when `<state_dir>/typesafe/api-key` exists and is private.
+/// A refused key or configuration is named once and leaves the router off.
+fn load_jev_router(state_dir: &Path) -> Option<jev::JevConfig> {
+    match jev::JevConfig::load(state_dir, |path, limit| {
+        read_private_config(path, limit).ok()
+    }) {
+        Ok(config) => config,
+        Err(category) => {
+            eprintln!("automonique web entry: jev router off: {category}");
+            None
+        }
+    }
+}
+
 fn read_private_config(path: &Path, limit: u64) -> Result<Vec<u8>, AuthConfigError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| AuthConfigError::Unreadable)?;
     if !metadata.file_type().is_file()
@@ -752,6 +767,8 @@ pub struct WebIntegration {
     shared_assistant: Mutex<Option<AskHost>>,
     sequence: Mutex<u64>,
     agent_auth: Option<AgentAuthManager>,
+    /// The optional Jev read router; `None` keeps keyword routing only.
+    jev: Option<jev::JevConfig>,
 }
 
 struct ManageIntegration {
@@ -2095,6 +2112,7 @@ const MAX_REMEMBERED_ISSUE_CONVERSATIONS: usize = 128;
 /// `live` is tool text read during this turn (the Slack snapshot); history
 /// is chronological, as the memory store returns it. Returns `None` when the
 /// turn neither names issues nor asks about the ones it refers back to.
+#[cfg(test)]
 fn referenced_issue_selection(
     message: &str,
     live: &[&str],
@@ -2102,6 +2120,22 @@ fn referenced_issue_selection(
     remembered: &[String],
     catalog: &RepositoryCatalog,
 ) -> Option<ReferenceSelection> {
+    routed_issue_selection(message, live, history, remembered, catalog, false)
+        .map(|(selection, _)| selection)
+}
+
+/// [`referenced_issue_selection`], also reading when the router judged that
+/// the turn asks about issues (`router_requested`) even though the keyword
+/// check did not. The flag returned says whether the keyword check alone
+/// asked for the read.
+fn routed_issue_selection(
+    message: &str,
+    live: &[&str],
+    history: &[automonique_store::agent_memory::ConversationMessage],
+    remembered: &[String],
+    catalog: &RepositoryCatalog,
+    router_requested: bool,
+) -> Option<(ReferenceSelection, bool)> {
     if catalog.is_empty() {
         return None;
     }
@@ -2120,7 +2154,9 @@ fn referenced_issue_selection(
         },
         catalog,
     );
-    issue_lookup_requested(message, &selection).then_some(selection)
+    let keyword = issue_lookup_requested(message, &selection);
+    (keyword || (router_requested && !selection.references.is_empty()))
+        .then_some((selection, keyword))
 }
 
 fn as_strs(values: &[String]) -> Vec<&str> {
@@ -2219,6 +2255,8 @@ struct ChatPromptContext<'a> {
     /// The Manage fleet worker's agent runs, when the turn asks about them.
     live_agent_runs: Option<&'a str>,
     manage_page: Option<&'a str>,
+    /// The reply-language directive, decided by the router or detected.
+    reply_language: Option<&'static str>,
     manage: &'a ManageIntegration,
 }
 
@@ -2347,6 +2385,7 @@ impl WebIntegration {
             shared_assistant: Mutex::new(shared_assistant),
             sequence: Mutex::new(0),
             agent_auth,
+            jev: load_jev_router(state_dir),
         })
     }
 
@@ -3386,6 +3425,23 @@ impl WebIntegration {
         } else {
             model_capability.as_ref().map(|answer| answer.text.clone())
         };
+        // One Jev call judges every read this turn may need. Its yes adds a
+        // read to what the keyword checks ask for; it never removes one, and
+        // when it is off or fails the turn routes exactly as without it.
+        let router_started = Instant::now();
+        let router_outcome = if direct_answer.is_none() {
+            self.route_with_jev(message, &history)
+        } else {
+            None
+        };
+        let router_latency_ms = router_started.elapsed().as_millis();
+        let router = router_outcome
+            .as_ref()
+            .and_then(|outcome| outcome.as_ref().ok());
+        let router_says = |pick: fn(&jev::JevAnswers) -> Option<f64>| {
+            router.is_some_and(|answers| jev::JevAnswers::says_read(pick(answers)))
+        };
+        let mut trace = RouteTrace::default();
         let github_tool = if direct_answer.is_some() {
             GitHubToolDecision::None
         } else {
@@ -3395,7 +3451,7 @@ impl WebIntegration {
             if direct_answer.is_some() || !matches!(github_tool, GitHubToolDecision::None) {
                 SlackToolDecision::None
             } else {
-                self.slack_tool(message, &history)?
+                self.slack_tool(message, &history, router, &mut trace)?
             };
         let (issue_lookup, issue_lookup_used_slack) = if direct_answer.is_some()
             || !matches!(github_tool, GitHubToolDecision::None)
@@ -3403,16 +3459,42 @@ impl WebIntegration {
         {
             (None, false)
         } else {
-            match self.issue_lookup(message, &slack_tool, &history, &conversation)? {
+            match self.issue_lookup(
+                message,
+                &slack_tool,
+                &history,
+                &conversation,
+                router_says(|answers| answers.issue_lookup),
+                &mut trace,
+            )? {
                 Some((lookup, used_slack)) => (Some(lookup), used_slack),
                 None => (None, false),
             }
         };
-        let agent_tool = if direct_answer.is_none()
+        let router_manage = router_says(|answers| answers.manage_data);
+        let unrouted_agent_tool = direct_answer.is_none()
             && issue_lookup.is_none()
             && matches!(github_tool, GitHubToolDecision::None)
-            && matches!(slack_tool, SlackToolDecision::None)
-        {
+            && matches!(slack_tool, SlackToolDecision::None);
+        // A Slack read only the router asked for must not crowd out the
+        // Manage tools when the router also says the turn is about Manage.
+        let routed_agent_tool = direct_answer.is_none()
+            && router_manage
+            && issue_lookup.is_none()
+            && matches!(github_tool, GitHubToolDecision::None)
+            && matches!(slack_tool, SlackToolDecision::Snapshot { .. })
+            && trace.slack
+                == (ReadTrigger {
+                    keyword: false,
+                    router: true,
+                });
+        if unrouted_agent_tool || routed_agent_tool {
+            trace.agent_tool = ReadTrigger {
+                keyword: unrouted_agent_tool,
+                router: routed_agent_tool,
+            };
+        }
+        let agent_tool = if unrouted_agent_tool || routed_agent_tool {
             self.agent_tool(
                 message,
                 &history,
@@ -3448,16 +3530,31 @@ impl WebIntegration {
             }
             _ => None,
         };
-        let site_context = direct_answer
-            .is_none()
+        let site_trigger = ReadTrigger {
+            keyword: is_site_profile_question(message),
+            router: router_manage,
+        };
+        let site_context = (direct_answer.is_none() && site_trigger.any())
             .then(|| self.site_context(message))
             .flatten();
+        if site_context.is_some() {
+            trace.manage = site_trigger;
+        }
         let knowledge_context = direct_answer
             .is_none()
             .then(|| self.knowledge_context(message))
             .flatten();
-        let agent_runs_context = (direct_answer.is_none() && is_agent_run_question(message))
+        let agent_runs_trigger = ReadTrigger {
+            keyword: is_agent_run_question(message),
+            router: router_says(|answers| answers.agent_runs),
+        };
+        let agent_runs_context = (direct_answer.is_none() && agent_runs_trigger.any())
             .then(|| render_agent_runs(&self.processes()));
+        if agent_runs_context.is_some() {
+            trace.agent_runs = agent_runs_trigger;
+        }
+        let (reply_language, language_source) = routed_reply_language(message, router);
+        trace.language = language_source;
         let process_context = if direct_answer.is_none() && is_pm2_process_question(message) {
             Some(automonique_daemon::pm2_inventory::current().map_or_else(
                 |_| String::from("source=PM2 jlist sanitized read model\nstatus=unavailable"),
@@ -3513,6 +3610,12 @@ impl WebIntegration {
         if agent_runs_context.is_some() {
             live_sources.push(String::from("manage:agent-runs"));
         }
+        if let Some(outcome) = &router_outcome {
+            if outcome.is_ok() {
+                live_sources.push(String::from("jev:router"));
+            }
+            eprintln!("{}", router_log_line(outcome, router_latency_ms, &trace));
+        }
         let prompt = compose_chat_prompt(
             message,
             &history,
@@ -3529,6 +3632,7 @@ impl WebIntegration {
                 live_processes: process_context.as_deref(),
                 live_agent_runs: agent_runs_context.as_deref(),
                 manage_page,
+                reply_language,
                 manage: &self.manage,
             },
         );
@@ -3691,10 +3795,9 @@ impl WebIntegration {
         Ok(None)
     }
 
+    /// The enabled sites and Manage profiles. The caller decides whether the
+    /// turn needs them (keyword check or router).
     fn site_context(&self, message: &str) -> Option<LiveSiteContext> {
-        if !is_site_profile_question(message) {
-            return None;
-        }
         let prism = prism_sites(Path::new(NGINX_SITES_ENABLED));
         let all_hosts = enabled_hosts(Path::new(NGINX_SITES_ENABLED));
         let enabled_sites = match (prism, all_hosts) {
@@ -3769,13 +3872,23 @@ impl WebIntegration {
         &self,
         message: &str,
         history: &[automonique_store::agent_memory::ConversationMessage],
+        router: Option<&jev::JevAnswers>,
+        trace: &mut RouteTrace,
     ) -> Result<SlackToolDecision, &'static str> {
         let mut slack = self.slack.lock().map_err(|_| "slack_tool_unavailable")?;
         let Some(slack) = slack.as_deref_mut() else {
             return Ok(SlackToolDecision::None);
         };
         let labels = slack.channel_labels();
-        let channel = match slack_read_plan(message, history, &labels) {
+        let routed = routed_slack_plan(
+            slack_read_plan(message, history, &labels),
+            router,
+            message,
+            &labels,
+        );
+        trace.slack_refusal = routed.refusal;
+        trace.slack = routed.read;
+        let channel = match routed.plan {
             SlackReadPlan::NotRequested => return Ok(SlackToolDecision::None),
             SlackReadPlan::ReadOnlyRefusal => {
                 return Ok(SlackToolDecision::Clarify(String::from(
@@ -3819,6 +3932,8 @@ impl WebIntegration {
         slack_tool: &SlackToolDecision,
         history: &[automonique_store::agent_memory::ConversationMessage],
         conversation: &str,
+        router_requested: bool,
+        trace: &mut RouteTrace,
     ) -> Result<Option<(ReferencedIssues, bool)>, &'static str> {
         let remembered = self
             .issue_reference_memory
@@ -3838,9 +3953,14 @@ impl WebIntegration {
             SlackToolDecision::Snapshot { content, .. } => vec![content.clone()],
             SlackToolDecision::None | SlackToolDecision::Clarify(_) => Vec::new(),
         };
-        let Some(mut selection) =
-            referenced_issue_selection(message, &as_strs(&live), history, &remembered, &catalog)
-        else {
+        let Some((mut selection, mut keyword)) = routed_issue_selection(
+            message,
+            &as_strs(&live),
+            history,
+            &remembered,
+            &catalog,
+            router_requested,
+        ) else {
             return Ok(None);
         };
         let mut used_slack = false;
@@ -3856,14 +3976,16 @@ impl WebIntegration {
             // in: the same configured Slack read settles them.
             if let Some(snapshot) = self.slack_snapshot_for_references()? {
                 live.push(snapshot);
-                if let Some(resettled) = referenced_issue_selection(
+                if let Some((resettled, resettled_keyword)) = routed_issue_selection(
                     message,
                     &as_strs(&live),
                     history,
                     &remembered,
                     &catalog,
+                    router_requested,
                 ) {
                     selection = resettled;
+                    keyword = resettled_keyword;
                     used_slack = true;
                 }
             }
@@ -3879,6 +4001,10 @@ impl WebIntegration {
                 return Ok(None);
             };
             read_referenced_issues(github, &selection.references, REFERENCED_ISSUES_BUDGET)
+        };
+        trace.issues = ReadTrigger {
+            keyword,
+            router: router_requested,
         };
         if !referenced.is_empty() {
             let mut memory = self
@@ -3908,6 +4034,59 @@ impl WebIntegration {
             return Ok(None);
         }
         Ok(all_channels_snapshot(slack, &labels).ok())
+    }
+
+    /// Ask the Jev router about this turn. `None` when it is not configured.
+    fn route_with_jev(
+        &self,
+        message: &str,
+        history: &[automonique_store::agent_memory::ConversationMessage],
+    ) -> Option<Result<jev::JevAnswers, &'static str>> {
+        let config = self.jev.as_ref()?;
+        let turn = router_turn(message, history, self.router_sources());
+        Some(jev::ask(config, &turn))
+    }
+
+    /// What each configured source holds, from channel labels, repository
+    /// aliases (else repository names) and whether Manage is configured.
+    fn router_sources(&self) -> jev::JevSources {
+        let slack_labels = self
+            .slack
+            .lock()
+            .ok()
+            .and_then(|slack| slack.as_deref().map(|slack| slack.channel_labels()));
+        let github_names = self.github.lock().ok().and_then(|github| {
+            github.as_deref().map(|github| {
+                let mut names: Vec<String> = github
+                    .configured_repository_aliases()
+                    .into_iter()
+                    .map(|(alias, _)| alias)
+                    .collect();
+                if names.is_empty() {
+                    names = github
+                        .configured_repositories()
+                        .iter()
+                        .map(|repository| {
+                            repository
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(repository)
+                                .to_owned()
+                        })
+                        .collect();
+                }
+                names.sort();
+                names.dedup();
+                names
+            })
+        });
+        jev::JevSources::describe(
+            slack_labels.as_deref(),
+            github_names.as_deref(),
+            self.manage.console_url.is_some()
+                || self.manage.profile_source_configured
+                || self.manage.agent_tools_configured,
+        )
     }
 
     fn github_tool(&self, message: &str) -> Result<GitHubToolDecision, &'static str> {
@@ -5560,7 +5739,7 @@ fn compose_chat_prompt(
     prompt.push_str("[/dashboard_context]\n");
     // Stated last, next to the message: history, Slack and ticket text are
     // often in another language and otherwise pull the reply into it.
-    if let Some(language) = message_language(message) {
+    if let Some(language) = context.reply_language {
         prompt.push_str("[reply_language] Write the whole answer in ");
         prompt.push_str(language);
         prompt.push_str(", the language of user_message, even when the supplied data is in another language. [/reply_language]\n");
@@ -5669,6 +5848,173 @@ fn live_section_budgets<const N: usize>(available: usize, requested: &[usize; N]
         remaining -= granted + LIVE_SECTION_OVERHEAD;
     }
     budgets
+}
+
+/// Which judgement asked for one read: the keyword check, the Jev router,
+/// both, or neither.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ReadTrigger {
+    keyword: bool,
+    router: bool,
+}
+
+impl ReadTrigger {
+    const fn any(self) -> bool {
+        self.keyword || self.router
+    }
+
+    const fn label(self) -> &'static str {
+        match (self.keyword, self.router) {
+            (false, false) => "none",
+            (true, false) => "keyword",
+            (false, true) => "jev",
+            (true, true) => "both",
+        }
+    }
+}
+
+/// What asked for each read this turn, for the router's log line.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct RouteTrace {
+    slack: ReadTrigger,
+    slack_refusal: ReadTrigger,
+    issues: ReadTrigger,
+    agent_runs: ReadTrigger,
+    manage: ReadTrigger,
+    agent_tool: ReadTrigger,
+    /// `jev` when the reply language came from the router, else `keyword`.
+    language: &'static str,
+}
+
+/// Jev's language when it is confident, else the keyword detection.
+/// A confident `other_or_unclear` means no directive at all.
+fn routed_reply_language(
+    message: &str,
+    router: Option<&jev::JevAnswers>,
+) -> (Option<&'static str>, &'static str) {
+    match router.and_then(jev::JevAnswers::confident_language) {
+        Some(jev::JevLanguage::English) => (Some("English"), "jev"),
+        Some(jev::JevLanguage::French) => (Some("French"), "jev"),
+        Some(jev::JevLanguage::OtherOrUnclear) => (None, "jev"),
+        None => (message_language(message), "keyword"),
+    }
+}
+
+/// The Slack plan after the router's judgement.
+#[derive(Debug, Eq, PartialEq)]
+struct RoutedSlackPlan {
+    plan: SlackReadPlan,
+    /// What asked for a read-only refusal, when the plan is one.
+    refusal: ReadTrigger,
+    /// What asked for a read, when the plan reads.
+    read: ReadTrigger,
+}
+
+/// Union the keyword plan with the router: a read happens when either asks
+/// for it, and a write is refused when the keywords say so or the router is
+/// at least `SLACK_WRITE_THRESHOLD` sure. Without the router the keyword plan
+/// is returned unchanged.
+fn routed_slack_plan(
+    keyword_plan: SlackReadPlan,
+    router: Option<&jev::JevAnswers>,
+    message: &str,
+    labels: &[String],
+) -> RoutedSlackPlan {
+    let keyword_refusal = keyword_plan == SlackReadPlan::ReadOnlyRefusal;
+    let router_refusal = router.is_some_and(jev::JevAnswers::says_slack_write);
+    if keyword_refusal || router_refusal {
+        return RoutedSlackPlan {
+            plan: SlackReadPlan::ReadOnlyRefusal,
+            refusal: ReadTrigger {
+                keyword: keyword_refusal,
+                router: router_refusal,
+            },
+            read: ReadTrigger::default(),
+        };
+    }
+    let keyword_read = keyword_plan != SlackReadPlan::NotRequested;
+    let router_read = router.is_some_and(|answers| jev::JevAnswers::says_read(answers.read_slack));
+    let plan = if keyword_read || !router_read {
+        keyword_plan
+    } else {
+        let terms = normalized_terms(message);
+        match labels
+            .iter()
+            .find(|label| terms.iter().any(|term| term == &label.to_ascii_lowercase()))
+        {
+            Some(named) => SlackReadPlan::Channel(named.clone()),
+            None => match labels {
+                [] => SlackReadPlan::NotRequested,
+                [only] => SlackReadPlan::Channel(only.clone()),
+                _ => SlackReadPlan::AllChannels,
+            },
+        }
+    };
+    let reads = !matches!(plan, SlackReadPlan::NotRequested);
+    RoutedSlackPlan {
+        plan,
+        refusal: ReadTrigger::default(),
+        read: if reads {
+            ReadTrigger {
+                keyword: keyword_read,
+                router: router_read,
+            }
+        } else {
+            ReadTrigger::default()
+        },
+    }
+}
+
+/// One line per routed turn: rounded probabilities, model, latency, and
+/// what asked for each read. Never the message, never the key.
+fn router_log_line(
+    outcome: &Result<jev::JevAnswers, &'static str>,
+    latency_ms: u128,
+    trace: &RouteTrace,
+) -> String {
+    let head = match outcome {
+        Ok(answers) => format!(
+            "status=ok model={} latency_ms={latency_ms} questions={} p={}",
+            answers.model,
+            jev::QUESTION_IDS.join(","),
+            answers.rounded()
+        ),
+        Err(category) => format!(
+            "status=fallback category={category} latency_ms={latency_ms} questions={}",
+            jev::QUESTION_IDS.join(",")
+        ),
+    };
+    format!(
+        "automonique web entry: jev router {head} reads=slack:{},issues:{},agent_runs:{},manage:{},agent_tool:{} slack_refusal={} language={}",
+        trace.slack.label(),
+        trace.issues.label(),
+        trace.agent_runs.label(),
+        trace.manage.label(),
+        trace.agent_tool.label(),
+        trace.slack_refusal.label(),
+        trace.language,
+    )
+}
+
+/// The router's view of one turn: the message, the last few turns trimmed,
+/// and what each configured source holds.
+fn router_turn(
+    message: &str,
+    history: &[automonique_store::agent_memory::ConversationMessage],
+    sources: jev::JevSources,
+) -> jev::JevTurn {
+    let start = history.len().saturating_sub(jev::RECENT_TURNS);
+    jev::JevTurn {
+        message: message.to_owned(),
+        recent_conversation: history[start..]
+            .iter()
+            .map(|item| {
+                let content: String = item.content.chars().take(jev::RECENT_TURN_CHARS).collect();
+                format!("{}: {content}", item.role)
+            })
+            .collect(),
+        sources,
+    }
 }
 
 fn slack_read_plan(
@@ -11932,6 +12278,7 @@ mod tests {
                 live_processes: None,
                 live_agent_runs: None,
                 manage_page: None,
+                reply_language: None,
                 manage: &ManageIntegration {
                     console_url: None,
                     platform_url: None,
@@ -11988,6 +12335,7 @@ mod tests {
                 live_processes: None,
                 live_agent_runs: None,
                 manage_page: None,
+                reply_language: None,
                 manage: &ManageIntegration {
                     console_url: None,
                     platform_url: None,
@@ -12136,6 +12484,7 @@ mod tests {
                 live_processes: None,
                 live_agent_runs: None,
                 manage_page: None,
+                reply_language: None,
                 manage: &ManageIntegration {
                     console_url: None,
                     platform_url: None,
@@ -12211,6 +12560,7 @@ mod tests {
                 live_processes: None,
                 live_agent_runs: None,
                 manage_page: None,
+                reply_language: None,
                 manage: &ManageIntegration {
                     console_url: Some(String::from("https://manage.example.test/")),
                     platform_url: None,
@@ -12255,6 +12605,7 @@ mod tests {
                 live_processes: None,
                 live_agent_runs: None,
                 manage_page: None,
+                reply_language: None,
                 manage: &ManageIntegration {
                     console_url: None,
                     platform_url: None,
@@ -12317,6 +12668,7 @@ mod tests {
                 live_processes: Some(&processes),
                 live_agent_runs: None,
                 manage_page: None,
+                reply_language: None,
                 manage: &ManageIntegration {
                     console_url: None,
                     platform_url: None,
@@ -12369,6 +12721,7 @@ mod tests {
                 live_processes: None,
                 live_agent_runs: None,
                 manage_page: None,
+                reply_language: None,
                 manage: &ManageIntegration {
                     console_url: None,
                     platform_url: None,
@@ -12773,6 +13126,7 @@ mod tests {
                 live_processes: None,
                 live_agent_runs: None,
                 manage_page: None,
+                reply_language: None,
                 manage: &ManageIntegration {
                     console_url: None,
                     platform_url: None,
@@ -13136,6 +13490,7 @@ mod tests {
                 live_processes: None,
                 live_agent_runs: None,
                 manage_page: None,
+                reply_language: None,
                 manage: &ManageIntegration {
                     console_url: None,
                     platform_url: None,
@@ -13263,5 +13618,309 @@ mod tests {
             GitHubToolDecision::None
         ));
         assert!(github.reads.is_empty());
+    }
+
+    fn router_answers(
+        read_slack: f64,
+        slack_write: f64,
+        language: Option<(jev::JevLanguage, f64)>,
+    ) -> jev::JevAnswers {
+        jev::JevAnswers {
+            model: String::from("jev-1.13.0"),
+            read_slack: Some(read_slack),
+            slack_write: Some(slack_write),
+            issue_lookup: Some(0.0),
+            agent_runs: Some(0.0),
+            manage_data: Some(0.0),
+            reply_language: language,
+        }
+    }
+
+    #[test]
+    fn without_the_router_the_slack_plan_is_exactly_the_keyword_plan() {
+        let labels = [String::from("ops"), String::from("deploys")];
+        let history = [conversation_message(1, "user", "anything in slack?")];
+        for message in [
+            "what's happening in slack today ?",
+            "post this to Slack",
+            "summarize the latest messages from Bruno",
+            "anything new in deploys?",
+            "how are you?",
+        ] {
+            for labels in [&labels[..], &labels[..1], &[]] {
+                let keyword = slack_read_plan(message, &history, labels);
+                let routed = routed_slack_plan(
+                    slack_read_plan(message, &history, labels),
+                    None,
+                    message,
+                    labels,
+                );
+                assert_eq!(routed.plan, keyword, "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_router_yes_adds_a_slack_read_and_never_removes_one() {
+        let labels = [String::from("ops"), String::from("deploys")];
+        let message = "summarize the latest messages from Bruno";
+        assert_eq!(
+            slack_read_plan(message, &[], &labels),
+            SlackReadPlan::NotRequested
+        );
+        let yes = router_answers(0.91, 0.02, None);
+        let routed = routed_slack_plan(
+            slack_read_plan(message, &[], &labels),
+            Some(&yes),
+            message,
+            &labels,
+        );
+        assert_eq!(routed.plan, SlackReadPlan::AllChannels);
+        assert_eq!(routed.read.label(), "jev");
+        // A named channel is read on its own.
+        let named = "what did people ask in ops this morning";
+        assert_eq!(
+            routed_slack_plan(
+                slack_read_plan(named, &[], &labels),
+                Some(&yes),
+                named,
+                &labels
+            )
+            .plan,
+            SlackReadPlan::Channel(String::from("ops"))
+        );
+        // No configured channel: nothing to read, no clarification.
+        assert_eq!(
+            routed_slack_plan(SlackReadPlan::NotRequested, Some(&yes), message, &[]).plan,
+            SlackReadPlan::NotRequested
+        );
+        // A router no keeps the keyword read.
+        let no = router_answers(0.04, 0.0, None);
+        let keyword = "what's happening in slack today ?";
+        let routed = routed_slack_plan(
+            slack_read_plan(keyword, &[], &labels),
+            Some(&no),
+            keyword,
+            &labels,
+        );
+        assert_eq!(routed.plan, SlackReadPlan::AllChannels);
+        assert_eq!(routed.read.label(), "keyword");
+        // Below threshold the router adds nothing.
+        let unsure = router_answers(0.49, 0.0, None);
+        assert_eq!(
+            routed_slack_plan(SlackReadPlan::NotRequested, Some(&unsure), message, &labels).plan,
+            SlackReadPlan::NotRequested
+        );
+    }
+
+    #[test]
+    fn the_router_refuses_a_slack_write_only_from_its_threshold() {
+        let labels = [String::from("ops"), String::from("deploys")];
+        let message = "post a message in #deploys saying the deploy is done";
+        let keyword = slack_read_plan(message, &[], &labels);
+        assert_eq!(keyword, SlackReadPlan::NotRequested);
+        let below = router_answers(0.2, 0.79, None);
+        assert_eq!(
+            routed_slack_plan(
+                slack_read_plan(message, &[], &labels),
+                Some(&below),
+                message,
+                &labels
+            )
+            .plan,
+            keyword
+        );
+        let sure = router_answers(0.2, 0.8, None);
+        let routed = routed_slack_plan(keyword, Some(&sure), message, &labels);
+        assert_eq!(routed.plan, SlackReadPlan::ReadOnlyRefusal);
+        assert_eq!(routed.refusal.label(), "jev");
+        // The keyword refusal stands even when the router disagrees.
+        let routed = routed_slack_plan(
+            slack_read_plan("post this to Slack", &[], &labels),
+            Some(&router_answers(0.9, 0.0, None)),
+            "post this to Slack",
+            &labels,
+        );
+        assert_eq!(routed.plan, SlackReadPlan::ReadOnlyRefusal);
+        assert_eq!(routed.refusal.label(), "keyword");
+    }
+
+    #[test]
+    fn the_reply_language_follows_a_confident_router_else_the_keywords() {
+        let message = "check if what people sent you in slack today is all done";
+        assert_eq!(
+            routed_reply_language(message, None),
+            (Some("English"), "keyword")
+        );
+        let unsure = router_answers(0.0, 0.0, Some((jev::JevLanguage::French, 0.69)));
+        assert_eq!(
+            routed_reply_language(message, Some(&unsure)),
+            (Some("English"), "keyword")
+        );
+        let french = router_answers(0.0, 0.0, Some((jev::JevLanguage::French, 0.7)));
+        assert_eq!(
+            routed_reply_language("ok, et #1119 ?", Some(&french)),
+            (Some("French"), "jev")
+        );
+        let unclear = router_answers(0.0, 0.0, Some((jev::JevLanguage::OtherOrUnclear, 0.9)));
+        assert_eq!(
+            routed_reply_language(message, Some(&unclear)),
+            (None, "jev")
+        );
+    }
+
+    #[test]
+    fn the_prompt_carries_the_decided_reply_language() {
+        let manage = ManageIntegration {
+            console_url: None,
+            platform_url: None,
+            profile_app: None,
+            profile_source_configured: false,
+            agent_tools_configured: false,
+            mcp_servers: Vec::new(),
+            mcp_server: None,
+        };
+        let status = fixture_status();
+        let context = |reply_language| ChatPromptContext {
+            live_slack: None,
+            live_github: None,
+            live_github_issues: None,
+            live_manage: None,
+            status: &status,
+            request_time_utc: "2026-10-02T09:00:00Z",
+            live_sites: None,
+            live_knowledge: None,
+            live_processes: None,
+            live_agent_runs: None,
+            manage_page: None,
+            reply_language,
+            manage: &manage,
+        };
+        let prompt = compose_chat_prompt("ok", &[], &[], &context(Some("French")));
+        assert!(prompt.contains("[reply_language] Write the whole answer in French"));
+        let prompt = compose_chat_prompt("ok", &[], &[], &context(None));
+        assert!(!prompt.contains("[reply_language]"));
+    }
+
+    #[test]
+    fn a_router_yes_reads_referenced_issues_the_keywords_missed() {
+        let catalog = RepositoryCatalog::from_surface(&FakeIssueGitHub::default());
+        let history = [
+            conversation_message(1, "user", "what did people send in slack today?"),
+            conversation_message(2, "assistant", "activ#1119 and activ#1114 were sent."),
+        ];
+        let message = "and those two, where are we?";
+        assert!(
+            routed_issue_selection(message, &[], &history, &[], &catalog, false).is_none(),
+            "the keyword check alone misses this follow-up"
+        );
+        let (selection, keyword) =
+            routed_issue_selection(message, &[], &history, &[], &catalog, true)
+                .expect("the router asks for the read");
+        assert!(!keyword);
+        assert!(!selection.references.is_empty());
+        // The router cannot conjure references a turn does not have.
+        assert!(routed_issue_selection("how are you?", &[], &[], &[], &catalog, true).is_none());
+        // Without the router, the selection is the keyword selection.
+        let (_, keyword) =
+            routed_issue_selection("is activ#1119 done?", &[], &[], &[], &catalog, false)
+                .expect("keyword read");
+        assert!(keyword);
+    }
+
+    #[test]
+    fn the_router_log_line_names_probabilities_and_triggers_but_no_text() {
+        let answers = router_answers(0.913, 0.0, Some((jev::JevLanguage::French, 0.96)));
+        let trace = RouteTrace {
+            slack: ReadTrigger {
+                keyword: false,
+                router: true,
+            },
+            agent_runs: ReadTrigger {
+                keyword: true,
+                router: true,
+            },
+            language: "jev",
+            ..RouteTrace::default()
+        };
+        let line = router_log_line(&Ok(answers), 231, &trace);
+        assert!(line.contains("status=ok model=jev-1.13.0 latency_ms=231"));
+        assert!(line.contains(
+            "questions=read_slack,slack_write,issue_lookup,agent_runs,manage_data,reply_language"
+        ));
+        assert!(line.contains("read_slack:0.91"));
+        assert!(line.contains("reply_language:french@0.96"));
+        assert!(
+            line.contains(
+                "reads=slack:jev,issues:none,agent_runs:both,manage:none,agent_tool:none"
+            )
+        );
+        assert!(line.contains("slack_refusal=none language=jev"));
+        let line = router_log_line(
+            &Err("jev_timeout"),
+            1_500,
+            &RouteTrace {
+                language: "keyword",
+                ..RouteTrace::default()
+            },
+        );
+        assert!(line.contains("status=fallback category=jev_timeout latency_ms=1500"));
+    }
+
+    #[test]
+    fn the_router_is_off_without_a_key_and_sends_configured_sources_when_on() {
+        let state = tempfile::tempdir().expect("state");
+        let runtime = tempfile::tempdir().expect("runtime");
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private state");
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private runtime");
+        let mut integration = WebIntegration::open(
+            IntegrationConfig {
+                tenant: String::from("operator"),
+                actor: String::from("operator:fixture"),
+                hosts: fixture_hosts(),
+            },
+            state.path(),
+            runtime.path(),
+        )
+        .expect("web integration");
+        assert!(integration.jev.is_none());
+        assert!(integration.route_with_jev("ping", &[]).is_none());
+
+        *integration.github.lock().expect("github") = Some(Box::new(FakeIssueGitHub::default()));
+        let (endpoint, captured) = jev::fake::serve(
+            200,
+            &jev::fake::answer(0.1, 0.0, 0.9, 0.0, 0.0, "english", 0.9),
+            Duration::ZERO,
+        );
+        integration.jev = Some(jev::JevConfig::for_test(
+            "fixture-key",
+            endpoint,
+            Duration::from_millis(1_500),
+        ));
+        let history = [
+            conversation_message(1, "user", "check slack"),
+            conversation_message(2, "assistant", "activ#1119 is open"),
+        ];
+        let answers = integration
+            .route_with_jev("who commented last?", &history)
+            .expect("configured")
+            .expect("answered");
+        assert!(jev::JevAnswers::says_read(answers.issue_lookup));
+        let request = captured.recv().expect("request");
+        let state_json = &request.body["state"];
+        assert_eq!(state_json["message"], "who commented last?");
+        assert_eq!(
+            state_json["recent_conversation"],
+            serde_json::json!(["user: check slack", "assistant: activ#1119 is open"])
+        );
+        assert_eq!(state_json["sources"]["slack"], "Not configured");
+        assert_eq!(
+            state_json["sources"]["github"],
+            "Issues in the activ, activ-shop, gamma and manager repositories"
+        );
+        assert_eq!(state_json["sources"]["manage"], "Not configured");
+        assert!(!request.body.to_string().contains("fixture-key"));
     }
 }
