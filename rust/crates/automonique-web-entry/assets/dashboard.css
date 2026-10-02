@@ -672,7 +672,7 @@ kbd { display: inline-block; min-width: 18px; padding: 1px 5px; border: 1px soli
 .topbar { position: sticky; z-index: 30; top: 0; height: var(--topbar-h); border-bottom: 1px solid var(--line); background: var(--bg); }
 .topbar-inner { display: flex; height: 100%; max-width: 1680px; gap: 14px; align-items: center; margin: 0 auto; padding: 0 var(--page-pad); }
 .brand { display: flex; flex: 0 0 auto; gap: 9px; align-items: center; color: var(--text); text-decoration: none; }
-.brand-mark { display: grid; width: 24px; height: 24px; place-items: center; border-radius: 7px; color: var(--accent-ink); background: var(--accent); font: 700 13px/1 var(--font-sans); }
+.brand-mark { display: block; width: 26px; height: 26px; border-radius: 7px; }
 .brand-name { font-weight: 600; letter-spacing: -.01em; }
 .tabs { display: flex; min-width: 0; flex: 0 1 auto; gap: 2px; align-items: center; overflow-x: auto; scrollbar-width: none; }
 .tabs::-webkit-scrollbar { display: none; }
