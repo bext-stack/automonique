@@ -197,6 +197,21 @@ describe("mobile session client", () => {
     });
   });
 
+  test("all-session access reaches future conversations without granting extra actions", async () => {
+    const future = {...session, id: ResourceId("created-after-pairing")};
+    const adapter = new RecordingAdapter([{kind: "receipt", value: receipt("follow_up", future)}]);
+    const client = new MobileSessionClient(adapter, {
+      ...authorization(["attach", "follow_up", "all_sessions"]), session_scope: [],
+    }, identity, clock);
+    await client.followUp({session: future, expectedSessionRevision: 1n, idempotencyKey: "future-follow", text: "hello"});
+    expect(adapter.requests).toHaveLength(1);
+    await expect(client.stopRun({session: future, expectedSessionRevision: 1n, run, expectedRunRevision: 1n, idempotencyKey: "future-stop"}))
+      .rejects.toMatchObject({category: "action_not_authorized"});
+    await expect(client.followUp({session: {...future, authority: "provider"}, expectedSessionRevision: 1n, idempotencyKey: "foreign-follow", text: "hello"}))
+      .rejects.toMatchObject({category: "session_coordinate_invalid"});
+    expect(adapter.requests).toHaveLength(1);
+  });
+
   test("enforces identity, expiry, action, scope, kinds, and exact revisions locally", async () => {
     const never = new RecordingAdapter([]);
     expect(() => new MobileSessionClient(

@@ -518,23 +518,30 @@
         <div><p>Mobile</p><h2 id="pairing-title">Pair a phone</h2></div>
         <button id="pairing-close" type="button" aria-label="Close pairing">×</button>
       </div>
-      <p class="pairing-lede">An invite works once and lasts five minutes. Create it with the phone already in your hand.</p>
-      <div class="pairing-scope">
+      <div id="pairing-setup" class="pairing-setup">
+      <ol class="pairing-steps"><li>Choose this phone’s access.</li><li>Create an invite to display its QR code.</li><li>In the Monique app, open pairing and scan the code.</li></ol>
+      <label class="pairing-access" for="pairing-access"><span>Phone access</span><select id="pairing-access"><option value="selected">Selected conversations</option><option value="admin">Administrator — all conversations</option></select></label>
+      <p class="pairing-note" id="pairing-admin-note" hidden>Includes all current and future conversations on this Monique instance. Task creation and ticket management remain separate permissions. Requires an app version that supports administrator pairing.</p>
+      <div class="pairing-scope" id="pairing-selected-scope">
         <label for="pairing-sessions"><span>Conversations this phone may open</span>
           <select id="pairing-sessions" multiple size="6" aria-describedby="pairing-scope-note"></select>
         </label>
-        <p class="pairing-note" id="pairing-scope-note">Every listed conversation is selected. The phone can only reach the ones named here.</p>
+        <p class="pairing-note" id="pairing-scope-note">Select the conversations this phone can read and continue. New conversations are not included.</p>
       </div>
       <label class="check-row"><input type="checkbox" id="pairing-manage-work"> Allow this phone to read the Slack channel and submit, approve or reject Manage tickets</label>
       <label class="check-row"><input type="checkbox" id="pairing-start-task"> Allow this phone to start tasks and continue the ones it creates</label>
-      <div class="pairing-actions">
-        <button class="button primary" id="pairing-create" type="button">Create invite</button>
-        <button class="button ghost" id="pairing-copy" type="button" hidden>Copy invite</button>
       </div>
       <div class="pairing-result" id="pairing-result" hidden>
         <div class="pairing-code" id="pairing-code" role="img" aria-label="Pairing QR code"></div>
+        <button class="button ghost" id="pairing-download" type="button" hidden>Download QR code</button>
         <p class="pairing-expiry" id="pairing-expiry"></p>
         <p class="pairing-note">Scan it in the app, or use Copy invite and paste it there instead.</p>
+        <p class="pairing-note">This invite works once and expires after five minutes, including downloaded copies. Keep it private.</p>
+      </div>
+      <div class="pairing-actions">
+        <button class="button primary" id="pairing-create" type="button">Create invite</button>
+        <button class="button ghost" id="pairing-copy" type="button" hidden>Copy invite</button>
+        <button class="button ghost" id="pairing-edit" type="button" hidden>Change access</button>
       </div>
       <p class="pairing-status" id="pairing-status" role="status"></p>
     </section>

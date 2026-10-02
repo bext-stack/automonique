@@ -34,7 +34,7 @@ pub const MOBILE_AUTH_MEDIA_TYPE: &str = "application/vnd.automonique.mobile-aut
 pub const MOBILE_PLATFORM_V2_AUTH_SCHEMA: &str = "automonique.mobile-platform-v2-authorization/v1";
 pub const MOBILE_PLATFORM_V2_AUTH_MEDIA_TYPE: &str =
     "application/vnd.automonique.mobile-platform-v2-authorization.v1+json";
-pub const MAX_MOBILE_ACTIONS: usize = 6;
+pub const MAX_MOBILE_ACTIONS: usize = 7;
 pub const MAX_MOBILE_PLATFORM_V2_ACTIONS: usize = MobilePlatformV2Action::ALL.len();
 pub const MAX_MOBILE_V2_PROJECT_ROOTS: usize = 32;
 const MAX_MOBILE_V2_RECEIPT_CUSTODY: usize = 128;
@@ -203,6 +203,9 @@ pub enum MobileAction {
     StopRun,
     StartTask,
     ManageWork,
+    /// Operator-granted access to current and future sessions. Individual
+    /// read/write actions and the server's resource authority still apply.
+    AllSessions,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -334,9 +337,11 @@ impl MobileAuthorization {
     }
 
     pub fn allows_session(&self, session_id: &str) -> bool {
-        self.session_scope
-            .binary_search_by(|candidate| candidate.as_str().cmp(session_id))
-            .is_ok()
+        self.allows(MobileAction::AllSessions)
+            || self
+                .session_scope
+                .binary_search_by(|candidate| candidate.as_str().cmp(session_id))
+                .is_ok()
     }
 }
 
@@ -892,7 +897,9 @@ impl MobileCredentialAuthority {
             |row| row.get(0),
         )?;
         let mut sessions: BTreeSet<String> = serde_json::from_str(&encoded)?;
-        sessions.insert(session.to_owned());
+        if !authorization.allows(MobileAction::AllSessions) {
+            sessions.insert(session.to_owned());
+        }
         if sessions.len() > MAX_MOBILE_SESSIONS {
             return Err(MobileAuthError::InvalidRequest);
         }
@@ -2511,6 +2518,11 @@ fn admit_scope(
     }
     let actions = actions.into_iter().collect::<BTreeSet<_>>();
     if actions.is_empty() || actions.len() > MAX_MOBILE_ACTIONS {
+        return Err(MobileAuthError::InvalidRequest);
+    }
+    if actions.contains(&MobileAction::AllSessions)
+        && (!actions.contains(&MobileAction::Attach) || !sessions.is_empty())
+    {
         return Err(MobileAuthError::InvalidRequest);
     }
     if actions.contains(&MobileAction::StartTask)
@@ -4248,12 +4260,19 @@ mod tests {
         )
         .expect("session list");
 
-        let filtered = filter_sessions(&issued.authorization, sessions);
+        let filtered = filter_sessions(&issued.authorization, sessions.clone());
         assert_eq!(filtered.sessions.len(), 1);
         assert_eq!(
             filtered.sessions[0].session.resource.id.as_str(),
             "session-a"
         );
+        let mut grant = request();
+        grant.actions.push(MobileAction::AllSessions);
+        grant.session_scope.clear();
+        let admin = auth.operator_provision(grant, NOW).expect("admin");
+        let all = filter_sessions(&admin.authorization, sessions);
+        assert_eq!(all.sessions.len(), 2);
+        assert_eq!(all.sessions[1].session.resource.id.as_str(), "session-c");
     }
 
     #[test]
@@ -4368,6 +4387,121 @@ mod tests {
         let filtered = filter_command_state(&issued.authorization, state);
         assert!(filtered.run.is_none());
         assert!(filtered.pending_approvals.is_empty());
+    }
+
+    #[test]
+    fn admin_pairing_survives_restart_refresh_and_obeys_revocation_and_action_limits() {
+        let (root, mut auth) = authority();
+        let mut grant = request();
+        grant.actions = vec![MobileAction::Attach, MobileAction::AllSessions];
+        grant.session_scope.clear();
+        let offer = auth.create_pairing(grant, NOW).expect("admin pairing");
+        drop(auth);
+        let mut auth = MobileCredentialAuthority::open(
+            root.path().join("mobile.sqlite3"),
+            "ops.example.test",
+            "operator:mobile",
+        )
+        .expect("reopen");
+        let mut exchange = MobilePairingExchangeRequest {
+            pairing_id: offer.pairing_id.clone(),
+            pairing_token: offer.pairing_token.clone(),
+            server_identity: offer.server_identity.clone(),
+        };
+        let mut issued = auth
+            .exchange_pairing(&mut exchange, NOW + 1)
+            .expect("exchange");
+        assert!(issued.authorization.session_scope.is_empty());
+        assert!(issued.authorization.allows_session("created-after-pairing"));
+        assert!(!issued.authorization.allows(MobileAction::FollowUp));
+        assert!(!issued.authorization.allows(MobileAction::StartTask));
+        assert!(!issued.authorization.allows(MobileAction::ManageWork));
+        let attach = |authority, kind| {
+            PlatformRequest::Attach(AttachRequest {
+                session: ResourceCoordinate::new(
+                    authority,
+                    kind,
+                    ResourceId::new("created-after-pairing").unwrap(),
+                ),
+                client: ClientId::new(&issued.authorization.credential_id).unwrap(),
+            })
+        };
+        assert!(
+            authorize_platform_request(
+                &issued.authorization,
+                &attach(ResourceAuthority::Automonique, ResourceKind::Session),
+                NOW + 2
+            )
+            .is_ok()
+        );
+        assert!(
+            authorize_platform_request(
+                &issued.authorization,
+                &attach(ResourceAuthority::Provider, ResourceKind::Session),
+                NOW + 2
+            )
+            .is_err()
+        );
+        assert!(
+            authorize_platform_request(
+                &issued.authorization,
+                &attach(ResourceAuthority::Automonique, ResourceKind::Run),
+                NOW + 2
+            )
+            .is_err()
+        );
+        let follow = PlatformRequest::SessionFollowUp(SessionFollowUpRequest {
+            client: ClientId::new(&issued.authorization.credential_id).unwrap(),
+            session: ResourceCoordinate::new(
+                ResourceAuthority::Automonique,
+                ResourceKind::Session,
+                ResourceId::new("created-after-pairing").unwrap(),
+            ),
+            expected_session_revision: Revision::new(1).unwrap(),
+            idempotency_key: IdempotencyKey::new("admin-follow-up").unwrap(),
+            text: PlatformParameter::new("hello").unwrap(),
+        });
+        assert!(authorize_platform_request(&issued.authorization, &follow, NOW + 2).is_err());
+        let refreshed = auth
+            .refresh(&mut issued.refresh_token, &offer.server_identity, NOW + 3)
+            .expect("refresh");
+        assert!(
+            refreshed
+                .authorization
+                .allows_session("another-future-session")
+        );
+        auth.revoke_credential_id(
+            MobileCredentialRevokeRequest {
+                credential_id: refreshed.authorization.credential_id.clone(),
+            },
+            NOW + 4,
+        )
+        .expect("revoke");
+        assert!(
+            auth.authorize_access(&refreshed.access_token, &offer.server_identity, NOW + 5)
+                .is_err()
+        );
+        let limited = auth
+            .operator_provision(request(), NOW + 6)
+            .expect("limited credential");
+        assert!(
+            !limited
+                .authorization
+                .allows_session("created-after-pairing")
+        );
+    }
+
+    #[test]
+    fn admin_scope_requires_explicit_attach_and_cannot_mix_with_an_allowlist() {
+        let (_root, mut auth) = authority();
+        let mut grant = request();
+        grant.actions.push(MobileAction::AllSessions);
+        assert!(auth.create_pairing(grant.clone(), NOW).is_err());
+        grant.session_scope.clear();
+        grant.actions = vec![MobileAction::AllSessions];
+        assert!(auth.create_pairing(grant.clone(), NOW).is_err());
+        grant.actions.push(MobileAction::Attach);
+        assert!(auth.create_pairing(grant, NOW).is_ok());
     }
 
     #[test]

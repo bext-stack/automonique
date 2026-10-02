@@ -131,6 +131,23 @@ receipt bindings locally, and exposes no generic `execute` method. Its
 optional fourth constructor argument is an injectable millisecond clock for
 deterministic runtime integration and testing.
 
+### Administrator phone pairing
+
+The dashboard's phone pairing panel offers selected conversations (the default)
+or administrator access to every current and future Automonique session on the
+instance. Administrator invitations carry the explicit `all_sessions` action
+with `attach` and an empty `session_scope`. An empty scope alone still grants
+no conversation access. Individual action grants, server identity, expiry,
+credential revocation, and resource authority checks continue to apply. Task
+creation, Manage operations, and Platform v2 grants are independent permissions.
+
+Update the mobile application's bundled SDK before using administrator pairing:
+older SDKs reject the new action rather than silently broadening access.
+Existing scoped credentials are unchanged; pair again to grant administrator
+access. The dashboard displays the invitation as a QR code and can download the
+same code as a PNG. Both contain the exact canonical invitation, work once, and
+expire five minutes after creation. Downloading never extends that lifetime.
+
 ## Deterministic fixtures
 
 The optional `@automonique/sdk/testing` subpath provides runtime-neutral test

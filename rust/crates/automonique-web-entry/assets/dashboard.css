@@ -1258,6 +1258,14 @@ html[data-config-details="concise"] .config-list [data-config-technical="true"] 
 .pairing-code svg { width: 100%; max-width: 240px; height: auto; }
 .pairing-status { color: var(--muted); font-size: var(--font-xs); }
 .pairing-status[data-kind="error"] { color: var(--red); }
+.pairing-steps { padding-left: 20px; color: var(--muted); line-height: 1.6; }
+.pairing-access { display: grid; gap: 6px; }
+.pairing-access select { width: 100%; }
+.pairing-result:not([hidden]) { display: grid; gap: 10px; }
+.pairing-setup:not([hidden]) { display: grid; gap: 10px; }
+.pairing-actions { flex-wrap: wrap; }
+.pairing-expiry.is-expired { color: var(--red); }
+.pairing-code:empty { display: none; }
 .theme-select-row { display: none; }
 .theme-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
 .theme-grid button { min-width: 0; padding: 5px; border: 1px solid transparent; border-radius: 9px; color: var(--muted); background: transparent; font-size: var(--font-2xs); }

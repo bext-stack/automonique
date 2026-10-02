@@ -1686,6 +1686,18 @@ const frenchUi = Object.freeze({
   "From the server · no secrets": "Depuis le serveur · aucun secret",
   "Mobile": "Mobile",
   "Conversations this phone may open": "Conversations que ce téléphone peut ouvrir",
+  "Choose this phone’s access.": "Choisissez les accès de ce téléphone.",
+  "Create an invite to display its QR code.": "Créez une invitation pour afficher son QR code.",
+  "In the Monique app, open pairing and scan the code.": "Dans l’application Monique, ouvrez l’association et scannez le code.",
+  "Phone access": "Accès du téléphone",
+  "Selected conversations": "Conversations sélectionnées",
+  "Administrator — all conversations": "Administrateur — toutes les conversations",
+  "Includes all current and future conversations on this Monique instance. Task creation and ticket management remain separate permissions. Requires an app version that supports administrator pairing.": "Inclut toutes les conversations actuelles et futures de cette instance Monique. La création de tâches et la gestion des tickets restent des autorisations distinctes. Nécessite une version de l’application compatible avec l’association administrateur.",
+  "Select the conversations this phone can read and continue. New conversations are not included.": "Sélectionnez les conversations que ce téléphone peut lire et poursuivre. Les nouvelles conversations ne sont pas incluses.",
+  "Download QR code": "Télécharger le QR code",
+  "Change access": "Modifier les accès",
+  "Create another invite": "Créer une autre invitation",
+  "This invite works once and expires after five minutes, including downloaded copies. Keep it private.": "Cette invitation est à usage unique et expire après cinq minutes, y compris les copies téléchargées. Gardez-la privée.",
   "An invite works once and lasts five minutes. Create it with the phone already in your hand.": "Une invitation ne sert qu’une fois et dure cinq minutes. Créez-la avec le téléphone déjà en main.",
   "Every listed conversation is selected. The phone can only reach the ones named here.": "Chaque conversation listée est sélectionnée. Le téléphone ne peut atteindre que celles nommées ici.",
   "Allow this phone to read the Slack channel and submit, approve or reject Manage tickets": "Autoriser ce téléphone à lire le canal Slack et à soumettre, approuver ou refuser les tickets Manage",
@@ -6466,6 +6478,10 @@ const PAIRING_QUIET_MODULES = 4;
 let pairingOfferText = null;
 let pairingExpiresAtMs = 0;
 let pairingCountdown = 0;
+let pairingSymbol = null;
+let pairingRequestGeneration = 0;
+let pairingCreating = false;
+let pairingSessionsLoaded = false;
 
 /// The offer must reach the phone as the exact bytes the endpoint returned:
 /// the app parses it as canonical JSON, so a re-serialised object is a
@@ -6492,8 +6508,13 @@ function pairingClearResult() {
   window.clearInterval(pairingCountdown);
   pairingCountdown = 0;
   pairingOfferText = null;
+  pairingSymbol = null;
   pairingExpiresAtMs = 0;
+  byId("pairing-download").hidden = true;
   byId("pairing-result").hidden = true;
+  byId("pairing-setup").hidden = false;
+  byId("pairing-edit").hidden = true;
+  byId("pairing-create").textContent = translatePhrase("Create invite");
   byId("pairing-copy").hidden = true;
   byId("pairing-code").replaceChildren();
   byId("pairing-expiry").textContent = "";
@@ -6511,6 +6532,7 @@ function pairingDrawCode(value) {
     return false;
   }
   const symbol = encoder.create(value, { errorCorrectionLevel: "M" });
+  pairingSymbol = symbol;
   const size = symbol.modules.size;
   const span = size + PAIRING_QUIET_MODULES * 2;
   let path = "";
@@ -6543,49 +6565,78 @@ function pairingTick() {
     node.classList.add("is-expired");
     window.clearInterval(pairingCountdown);
     pairingCountdown = 0;
+    pairingOfferText = null;
+    pairingSymbol = null;
+    byId("pairing-code").replaceChildren();
+    byId("pairing-copy").hidden = true;
+    byId("pairing-download").hidden = true;
     return;
   }
   node.classList.remove("is-expired");
   node.textContent = translatePhrase(`Expires in ${remaining} seconds`);
 }
 
+function pairingIsAdmin() {
+  return byId("pairing-access").value === "admin";
+}
+
+function pairingUpdateCreate() {
+  byId("pairing-create").disabled = pairingCreating || (!pairingIsAdmin()
+    && ((!pairingSessionsLoaded) || (byId("pairing-sessions").selectedOptions.length === 0
+      && !byId("pairing-start-task").checked && !byId("pairing-manage-work").checked)));
+}
+
+function pairingScopeChanged() {
+  pairingRequestGeneration += 1;
+  pairingCreating = false;
+  pairingClearResult();
+  byId("pairing-selected-scope").hidden = pairingIsAdmin();
+  byId("pairing-admin-note").hidden = !pairingIsAdmin();
+  pairingSetStatus("");
+  pairingUpdateCreate();
+}
+
 async function pairingLoadSessions() {
   const select = byId("pairing-sessions");
   select.replaceChildren();
+  pairingSessionsLoaded = false;
+  pairingUpdateCreate();
+  pairingSetStatus("Loading conversations…");
   try {
     const view = await api("/api/mobile/pairing-sessions");
     const sessions = Array.isArray(view.sessions) ? view.sessions : [];
-    if (sessions.length === 0) {
-      pairingSetStatus("No session exists yet. Enable task creation to let this phone start one.");
-      byId("pairing-create").disabled = !byId("pairing-start-task").checked && !byId("pairing-manage-work").checked;
-      return;
-    }
     for (const entry of sessions) {
       const id = entry.session?.resource?.id;
       if (!id) continue;
       const option = document.createElement("option");
       option.value = id;
       option.selected = true;
-      option.textContent = entry.session?.summary ? `${id} - ${entry.session.summary}` : id;
+      option.textContent = entry.session?.summary || id;
       option.setAttribute("data-i18n-skip", "");
       select.append(option);
     }
-    byId("pairing-create").disabled = select.options.length === 0 && !byId("pairing-start-task").checked && !byId("pairing-manage-work").checked;
-    pairingSetStatus("");
-  } catch (error) {
-    byId("pairing-create").disabled = true;
-    pairingSetStatus("The session list is unavailable, so the invite could not be scoped.", "error");
+    pairingSessionsLoaded = true;
+    if (!pairingCreating && !pairingOfferText) {
+      pairingSetStatus(select.options.length || pairingIsAdmin() ? "" : "No session exists yet. Enable task creation to let this phone start one.");
+    }
+  } catch (_error) {
+    if (!pairingIsAdmin()) pairingSetStatus("The session list is unavailable, so the invite could not be scoped.", "error");
+  } finally {
+    pairingUpdateCreate();
   }
 }
 
 async function pairingCreate() {
   const button = byId("pairing-create");
-  const scope = Array.from(byId("pairing-sessions").selectedOptions, (option) => option.value);
-  if (scope.length === 0 && !byId("pairing-start-task").checked && !byId("pairing-manage-work").checked) {
+  const admin = pairingIsAdmin();
+  const scope = admin ? [] : Array.from(byId("pairing-sessions").selectedOptions, (option) => option.value);
+  if (!admin && scope.length === 0 && !byId("pairing-start-task").checked && !byId("pairing-manage-work").checked) {
     // session_scope is an allowlist, not a filter: an empty one reaches nothing.
     pairingSetStatus("Select at least one session. A phone can only reach the sessions named here.", "error");
     return;
   }
+  const generation = ++pairingRequestGeneration;
+  pairingCreating = true;
   button.disabled = true;
   pairingClearResult();
   pairingSetStatus("Creating the invite…");
@@ -6594,11 +6645,12 @@ async function pairingCreate() {
       method: "POST",
       headers: { "Content-Type": "application/vnd.automonique.mobile-auth.v1+json" },
       body: JSON.stringify({
-        actions: ["attach", "follow_up", "decide_approval", "stop_run", ...(byId("pairing-start-task").checked ? ["start_task"] : []), ...(byId("pairing-manage-work").checked ? ["manage_work"] : [])],
+        actions: ["attach", "follow_up", "decide_approval", "stop_run", ...(admin ? ["all_sessions"] : []), ...(byId("pairing-start-task").checked ? ["start_task"] : []), ...(byId("pairing-manage-work").checked ? ["manage_work"] : [])],
         session_scope: scope,
         limits: { max_follow_up_bytes: 65536, max_page_events: 100 },
       }),
     });
+    if (generation !== pairingRequestGeneration || byId("pairing-panel").hidden) return;
     if (!result.ok) {
       pairingSetStatus("The invite was refused. Check the operator credential and try again.", "error");
       return;
@@ -6613,19 +6665,30 @@ async function pairingCreate() {
     pairingOfferText = result.text.trim();
     pairingExpiresAtMs = Number(parsed.expires_at_ms) || 0;
     byId("pairing-result").hidden = false;
+    byId("pairing-setup").hidden = true;
+    byId("pairing-edit").hidden = false;
+    byId("pairing-create").textContent = translatePhrase("Create another invite");
+    byId("pairing-panel").scrollTop = 0;
     byId("pairing-copy").hidden = false;
-    pairingDrawCode(pairingOfferText);
+    let drawn = false;
+    try { drawn = pairingDrawCode(pairingOfferText); } catch (_error) { /* Copy remains available. */ }
+    byId("pairing-download").hidden = !drawn;
     pairingTick();
-    pairingCountdown = window.setInterval(pairingTick, 1000);
-    pairingSetStatus("");
+    if (pairingOfferText) pairingCountdown = window.setInterval(pairingTick, 1000);
+    pairingSetStatus(drawn ? "" : "The QR encoder did not load. Use Copy invite instead.", drawn ? "info" : "error");
   } catch (_error) {
-    pairingSetStatus("The invite could not be created.", "error");
+    if (generation === pairingRequestGeneration) pairingSetStatus("The invite could not be created.", "error");
   } finally {
-    button.disabled = false;
+    if (generation === pairingRequestGeneration) {
+      pairingCreating = false;
+      pairingUpdateCreate();
+    }
   }
 }
 
 function pairingOpen(open) {
+  pairingRequestGeneration += 1;
+  pairingCreating = false;
   byId("pairing-panel").hidden = !open;
   byId("pairing-open").setAttribute("aria-expanded", open ? "true" : "false");
   if (open) {
@@ -6643,7 +6706,13 @@ function pairingOpen(open) {
 byId("pairing-open").addEventListener("click", () => pairingOpen(byId("pairing-panel").hidden));
 byId("pairing-close").addEventListener("click", () => pairingOpen(false));
 byId("pairing-create").addEventListener("click", () => void pairingCreate());
+byId("pairing-edit").addEventListener("click", () => {
+  pairingScopeChanged();
+  byId("pairing-access").focus();
+});
 byId("pairing-copy").addEventListener("click", async () => {
+  if (!pairingOfferText) return;
+  pairingTick();
   if (!pairingOfferText) return;
   try {
     await navigator.clipboard.writeText(pairingOfferText);
@@ -6661,9 +6730,38 @@ document.addEventListener("click", (event) => {
   pairingOpen(false);
 });
 
-byId("pairing-start-task").addEventListener("change", () => { byId("pairing-create").disabled = byId("pairing-sessions").options.length === 0 && !byId("pairing-start-task").checked && !byId("pairing-manage-work").checked; });
+for (const id of ["pairing-access", "pairing-sessions", "pairing-start-task", "pairing-manage-work"]) {
+  byId(id).addEventListener("change", pairingScopeChanged);
+}
 
-byId("pairing-manage-work").addEventListener("change", () => { byId("pairing-create").disabled = byId("pairing-sessions").options.length === 0 && !byId("pairing-start-task").checked && !byId("pairing-manage-work").checked; });
+byId("pairing-download").addEventListener("click", () => {
+  pairingTick();
+  if (!pairingSymbol || !pairingOfferText) return;
+  const generation = pairingRequestGeneration;
+  // Draw the same matrix directly into a PNG; no credential leaves this page.
+  const modules = pairingSymbol.modules;
+  const scale = 8;
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = (modules.size + PAIRING_QUIET_MODULES * 2) * scale;
+  const context = canvas.getContext("2d");
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.fillStyle = "#000000";
+  for (let row = 0; row < modules.size; row += 1) {
+    for (let column = 0; column < modules.size; column += 1) {
+      if (modules.get(row, column)) context.fillRect((column + PAIRING_QUIET_MODULES) * scale, (row + PAIRING_QUIET_MODULES) * scale, scale, scale);
+    }
+  }
+  canvas.toBlob((blob) => {
+    if (!blob || generation !== pairingRequestGeneration || !pairingOfferText || Date.now() >= pairingExpiresAtMs) return;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "monique-pairing.png";
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }, "image/png");
+});
 
 // ---------------------------------------------------------------------------
 // Ops console shell: detail drawers, list keyboard navigation, tab badges and
